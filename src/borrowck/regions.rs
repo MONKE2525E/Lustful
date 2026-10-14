@@ -5765,6 +5765,8 @@ fn fmt_builder_builtin(b: crate::check::Builtin) -> bool {
             | B::DtField
             | B::DlEntry
             | B::DmEntry
+            | B::DlEntries
+            | B::DmEntries
             | B::DmKey
             | B::DmValue
     )

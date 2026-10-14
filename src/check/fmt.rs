@@ -14,7 +14,7 @@ use crate::ty::fmt::{FmtTy, fmt_kind, fmt_ty};
 
 /// Formatter and builder methods Rust declares that lust does not
 /// implement yet: a call rejects with L0640 naming the method.
-const DECLARED_ONLY: &[&str] = &["align", "flags", "options", "with_options", "sign", "entries", "field_with", "entry_with", "key_with", "value_with"];
+const DECLARED_ONLY: &[&str] = &["align", "flags", "options", "with_options", "sign", "field_with", "entry_with", "key_with", "value_with"];
 
 /// The user (written, not derived) impl of `trait_def` whose Self
 /// pattern heads `t`'s Adt def, when it applies to every args of that
@@ -212,6 +212,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let opt_usize = self.tys.mk_option(USIZE);
         let me = fmt_ty(&mut self.tys, k);
         let me_mut = self.tys.mk_ref(true, me);
+        if n == "entries" && matches!(k, FmtTy::DebugList | FmtTy::DebugSet | FmtTy::DebugMap) {
+            return self.fmt_entries(e, recv, k, derefs, name_span, args, me_mut);
+        }
         // (builtin, autoref, plain params, `&dyn Debug` params, return)
         let found: Option<(B, Autoref, Vec<Ty>, usize, Ty)> = match (k, n) {
             (FmtTy::Formatter, "write_str") => Some((B::FmtWriteStr, Autoref::RefMut, vec![REF_STR], 0, res)),
@@ -297,6 +300,63 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.dyn_debug_arg(a);
         }
         ret
+    }
+
+    /// `entries(iter)` on a DebugList, DebugSet, or DebugMap: any
+    /// IntoIterator whose items are Debug (`(K, V)` pairs of Debug parts
+    /// for a map), one `entry` each, as std loops (lower/iter.rs).
+    #[allow(clippy::too_many_arguments)]
+    fn fmt_entries(&mut self, e: ExprId, recv: ExprId, k: FmtTy, derefs: u8, name_span: Span, args: &[ExprId], me_mut: Ty) -> Ty {
+        let [a] = args else {
+            self.err("L0105", name_span, "`entries` takes 1 argument", "Pass an iterator.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return me_mut;
+        };
+        let at = self.expr(*a, None);
+        let at = self.deep(at);
+        let span = self.span(*a);
+        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at).or_else(|| self.by_next_arg(*a, at)) else {
+            if self.kind(at) != TyKind::Error {
+                let tn = self.tn(at);
+                self.err("L0612", span, format!("`entries` takes an iterator, not `{tn}`"), "Pass an iterator, a Vec, or a slice.");
+            }
+            return me_mut;
+        };
+        if it == ERROR {
+            return me_mut;
+        }
+        if let TyKind::Array(el, _) = self.kind(at)
+            && !self.array_iter_elem_ok(el, span)
+        {
+            return me_mut;
+        }
+        let item = crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR);
+        let item = self.deep(item);
+        let debug = FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };
+        let b = if k == FmtTy::DebugMap {
+            let parts = match self.kind(item) {
+                TyKind::Tuple(ts) if self.tys.tys_of(ts).len() == 2 => self.tys.tys_of(ts).to_vec(),
+                _ => {
+                    if self.kind(item) != TyKind::Error {
+                        let tn = self.tn(item);
+                        self.err("L0612", span, format!("`DebugMap::entries` takes `(K, V)` items, not `{tn}`"), "Iterate over pairs.");
+                    }
+                    return me_mut;
+                }
+            };
+            for t in parts {
+                self.check_fmt_arg(t, debug, span);
+            }
+            Builtin::DmEntries
+        } else {
+            self.check_fmt_arg(item, debug, span);
+            Builtin::DlEntries
+        };
+        self.check_packed_borrow(recv, name_span);
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::RefMut });
+        me_mut
     }
 
     /// One `&dyn Debug` argument of a builder method: a reference to a

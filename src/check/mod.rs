@@ -389,6 +389,11 @@ pub enum Builtin {
     DtField,
     DlEntry,
     DmEntry,
+    /// `entries(iter)` on a DebugList or DebugSet, and on a DebugMap
+    /// (`(K, V)` items): an `entry` per item (W-STD-B, expanded in
+    /// lower/iter.rs).
+    DlEntries,
+    DmEntries,
     DmKey,
     DmValue,
     FmtFinish,

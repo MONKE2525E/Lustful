@@ -78,6 +78,8 @@ fn expands(b: Builtin) -> bool {
             | B::IterFlatten
             | B::IterFlatMap
             | B::HashFromArray
+            | B::DlEntries
+            | B::DmEntries
             | B::IterSizeHint
             | B::IterFold
             | B::IterForEach
@@ -575,6 +577,41 @@ impl Ex<'_, '_, '_> {
                 self.cur = join;
                 self.drop_local(fl);
                 return Ok(());
+            }
+            // `entries(iter)` on a Debug builder (W-STD-B): an `entry`
+            // per item, each formatted and then dropped, as std loops.
+            B::DlEntries | B::DmEntries => {
+                let (r, src) = (arg()?, arg()?);
+                let st = self.op_ty(&src)?;
+                let want = it::as_iter_ty(&mut self.body.tys, st).ok_or("iterator expansion: bad entries argument")?;
+                let iv = self.into_iter(src, want)?;
+                let (owned, ty) = self.own(iv)?;
+                let rt = self.op_ty(&r)?;
+                let rl = self.local(rt);
+                self.assign(Place::local(rl), Rvalue::Use(r));
+                let map = b == B::DmEntries;
+                self.each(&Place::local(owned), ty, &mut |this, x, item| {
+                    let mut args = vec![Operand::Copy(Place::local(rl))];
+                    if map {
+                        let parts: Vec<Ty> = match this.body.tys.kind(item) {
+                            TyKind::Tuple(ts) => this.body.tys.tys_of(ts).to_vec(),
+                            _ => return Err("iterator expansion: map entries of a non-pair".into()),
+                        };
+                        for (i, t) in parts.into_iter().enumerate() {
+                            let r = this.ref_to(false, Place::local(x).project(Proj::Field(i as u32)), t);
+                            args.push(Operand::Move(Place::local(r)));
+                        }
+                    } else {
+                        let r = this.ref_to(false, Place::local(x), item);
+                        args.push(Operand::Move(Place::local(r)));
+                    }
+                    let u = this.local(rt);
+                    this.call_builtin(if map { B::DmEntry } else { B::DlEntry }, args, Place::local(u));
+                    this.drop_local(x);
+                    Ok(())
+                })?;
+                self.drop_local(owned);
+                self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(rl))));
             }
             // `HashMap::from(array)` (W-STD-B): `from_iter`, so
             // `with_hasher(Default::default())` and `extend` from the
