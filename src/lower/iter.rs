@@ -290,6 +290,8 @@ impl Ex<'_, '_, '_> {
             TyKind::FnDef(def, fargs) => {
                 // `Some`, `Ok`, or `Err` as the callable (`.map(Some)`):
                 // the variant comes from the const arg, as below.
+                // `Box::new`, `Rc::new`, and `String::from` call their
+                // builtin (`Ctx::builtin_item_value`).
                 let b = self.body.tys.builtins();
                 if def == b.option || def == b.result {
                     let ty = self.place_ty(&dest)?;
@@ -297,6 +299,11 @@ impl Ex<'_, '_, '_> {
                     let op = args.into_iter().next().ok_or("iterator expansion: a constructor call takes one argument")?;
                     let rv = if def == b.option { Rvalue::Opt(ty, Some(op)) } else { Rvalue::Res(ty, ok, op) };
                     self.assign(dest, rv);
+                    return Ok(());
+                }
+                let builtin = [(b.boxed, Builtin::BoxNew), (b.rc, Builtin::RcNew), (b.string, Builtin::StringFrom)];
+                if let Some(&(_, bf)) = builtin.iter().find(|(d, _)| *d == def) {
+                    self.call(CallTarget::Builtin(bf), args, dest);
                     return Ok(());
                 }
                 if let Some(a) = self.p.adt_by_def(def) {

@@ -262,13 +262,13 @@ impl<'a> Program<'a> {
     pub fn adt_by_def(&self, def: DefId) -> Option<AdtId> {
         self.defs.local_adt(def)
     }
-    /// True when an `FnDef` over `def` is a constructor item, not a fn:
-    /// a user tuple struct or variant (`Ctx::ctor_value_ty`), or the
-    /// builtin `Some`, `Ok`, or `Err` (over the builtin Option or
-    /// Result def, `Ctx::builtin_ctor_value`).
-    pub fn is_ctor_def(&self, def: DefId) -> bool {
-        let b = self.tys.builtins();
-        def == b.option || def == b.result || self.adt_by_def(def).is_some()
+    /// True when an `FnDef` over `def` names a fn with a body (a fn
+    /// item). The other `FnDef`s are constructor items over an Adt
+    /// def: a user tuple struct or variant (`Ctx::ctor_value_ty`), or
+    /// a builtin item over a builtin Adt def (`Some`, `Ok`, `Err`,
+    /// `Box::new`, `Rc::new`, `String::from`; `Ctx::builtin_item_value`).
+    pub fn is_fn_item_def(&self, def: DefId) -> bool {
+        self.tys.builtins().kind_of(def).is_none() && self.adt_by_def(def).is_none()
     }
     /// The index of the const item with this def, if this crate defines it.
     pub fn const_by_def(&self, def: DefId) -> Option<u32> {

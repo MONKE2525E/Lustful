@@ -877,6 +877,10 @@ struct Ctx<'p, 'a> {
     /// at finish like the format traits: the element type can
     /// still be a variable at the call.
     deferred_clone: Vec<(Ty, Span)>,
+    /// Input types of `String::from` used as a value
+    /// (`.map(String::from)`), re-tested at finish: lust's
+    /// `String::from` takes `&str`, `char`, or `String`.
+    deferred_string_from: Vec<(Ty, Span)>,
     /// Element types a builtin Vec method needs to be PartialEq
     /// (`contains`, `dedup`), re-tested at finish as above.
     deferred_eq: Vec<(Ty, Span)>,
@@ -1098,6 +1102,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         deferred_fmt: Vec::new(),
         format_args_ok: Vec::new(),
         deferred_clone: Vec::new(),
+        deferred_string_from: Vec::new(),
         deferred_eq: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_ord: Vec::new(),
@@ -1795,40 +1800,67 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.tys.intern(TyKind::FnDef(p.def_of_adt(a), args))
     }
 
-    /// The item type of a builtin constructor used as a value
-    /// (`.map(Some)`, `Result::Err`): an `FnDef` over the builtin Adt
-    /// def with the variant as its first (const) arg (Some 1, Ok 0,
-    /// Err 1), then the Adt's args from the turbofish or fresh
-    /// variables. `builtin_ctor_res` decodes it.
-    fn builtin_ctor_value(&mut self, e: ExprId, r: Res, segs: &[ast::PathSeg], span: Span) -> Ty {
+    /// The item type of a builtin constructor or std fn used as a value
+    /// (`.map(Some)`, `Result::Err`, `.map(Rc::new)`,
+    /// `.map(String::from)`): an `FnDef` over the builtin Adt def.
+    /// `Some`, `Ok`, and `Err` put the variant first as a const arg
+    /// (Some 1, Ok 0, Err 1), then the Adt's args; `Box::new`,
+    /// `Rc::new`, and `String::from` have their one input type. Args
+    /// come from the turbofish or fresh variables. `builtin_item_res`
+    /// decodes the item.
+    fn builtin_item_value(&mut self, e: ExprId, r: Res, segs: &[ast::PathSeg], span: Span) -> Ty {
         let b = self.tys.builtins();
-        let (def, v, n) = match r {
-            Res::OptSome => (b.option, 1, 1),
-            Res::ResOk => (b.result, 0, 2),
-            _ => (b.result, 1, 2),
+        let (def, variant) = match r {
+            Res::OptSome => (b.option, Some(1)),
+            Res::ResOk => (b.result, Some(0)),
+            Res::ResErr => (b.result, Some(1)),
+            Res::Builtin(Builtin::BoxNew) => (b.boxed, None),
+            Res::Builtin(Builtin::RcNew) => (b.rc, None),
+            _ => (b.string, None),
         };
-        let tys = match self.builtin_ctor_args(segs, n, span) {
-            Some(a) => a,
-            None => (0..n).map(|_| self.new_var(false)).collect(),
+        let tys = if def == b.string {
+            // `From::from` has no params of its own: the input is open
+            // until a use fixes it, then it must be a form lust's
+            // `String::from` takes (checked at finish).
+            if segs.iter().any(|s| !s.type_args().is_empty()) {
+                self.err("L0107", span, "`String::from` takes no generic arguments", "Remove the generic arguments.");
+            }
+            let t = self.new_var(false);
+            self.deferred_string_from.push((t, span));
+            vec![t]
+        } else if variant.is_none() && segs.last().is_some_and(|s| !s.type_args().is_empty()) {
+            // `Box::new` and `Rc::new` have no params of their own; the
+            // element type goes on the type (`Box::<u8>::new`).
+            self.err("L0107", span, "this associated function takes no generic arguments", "Write the type's argument instead: `Box::<T>::new`.");
+            vec![self.new_var(false)]
+        } else {
+            let n = if def == b.result { 2 } else { 1 };
+            match self.builtin_ctor_args(segs, n, span) {
+                Some(a) => a,
+                None => (0..n).map(|_| self.new_var(false)).collect(),
+            }
         };
         self.set_res(e, r);
-        let mut args = vec![GenericArg::Const(self.tys.intern_const(ConstKind::Int(v)))];
+        let mut args: Vec<GenericArg> = variant.map(|v| GenericArg::Const(self.tys.intern_const(ConstKind::Int(v)))).into_iter().collect();
         args.extend(tys.into_iter().map(GenericArg::Ty));
         let args = self.tys.intern_args(&args);
         self.tys.intern(TyKind::FnDef(def, args))
     }
 
-    /// The builtin constructor call a constructor item over the builtin
-    /// Option or Result def makes (see `builtin_ctor_value`).
-    fn builtin_ctor_res(&self, def: DefId, args: ArgsId) -> Option<Res> {
+    /// The call a builtin item over a builtin Adt def makes (see
+    /// `builtin_item_value`), with the item's (params, return).
+    fn builtin_item_res(&mut self, def: DefId, args: ArgsId) -> Option<(Res, Vec<Ty>, Ty)> {
         let b = self.tys.builtins();
-        if def == b.option {
-            Some(Res::OptSome)
-        } else if def == b.result {
-            Some(if self.ctor_variant(args) == 0 { Res::ResOk } else { Res::ResErr })
-        } else {
-            None
-        }
+        let a: Vec<Ty> = self.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
+        Some(match a.as_slice() {
+            &[t] if def == b.option => (Res::OptSome, vec![t], self.tys.mk_option(t)),
+            &[t, e] if def == b.result && self.ctor_variant(args) == 0 => (Res::ResOk, vec![t], self.tys.mk_result(t, e)),
+            &[t, e] if def == b.result => (Res::ResErr, vec![e], self.tys.mk_result(t, e)),
+            &[t] if def == b.boxed => (Res::Builtin(Builtin::BoxNew), vec![t], self.tys.mk_boxed(t)),
+            &[t] if def == b.rc => (Res::Builtin(Builtin::RcNew), vec![t], self.tys.mk_rc(t)),
+            &[t] if def == b.string => (Res::Builtin(Builtin::StringFrom), vec![t], STRING),
+            _ => return None,
+        })
     }
 
     /// The variant a constructor `FnDef` type names, from its const arg.
@@ -1852,14 +1884,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some((self.tys.tys_of(s.inputs).to_vec(), s.output))
             }
             TyKind::FnDef(def, args) => {
-                if let Some(r) = self.builtin_ctor_res(def, args) {
-                    let a: Vec<Ty> = self.tys.args(args).iter().skip(1).filter_map(|g| g.as_ty()).collect();
-                    return match (r, a.as_slice()) {
-                        (Res::OptSome, &[t]) => Some((vec![t], self.tys.mk_option(t))),
-                        (Res::ResOk, &[t, e]) => Some((vec![t], self.tys.mk_result(t, e))),
-                        (Res::ResErr, &[t, e]) => Some((vec![e], self.tys.mk_result(t, e))),
-                        _ => None,
-                    };
+                if let Some((_, params, ret)) = self.builtin_item_res(def, args) {
+                    return Some((params, ret));
                 }
                 if let Some(a) = p.adt_by_def(def) {
                     let v = self.ctor_variant(args);
@@ -1914,7 +1940,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// coerces to a function pointer backed by a slot trampoline.
     fn is_fn_item(&self, t: Ty) -> bool {
         match self.kind(t) {
-            TyKind::FnDef(def, _) => !self.p.is_ctor_def(def),
+            TyKind::FnDef(def, _) => self.p.is_fn_item_def(def),
             _ => false,
         }
     }
@@ -3901,7 +3927,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // A tuple constructor there is not supported yet.
         if lang.is_fn_family(to.def) {
             let fn_value = match self.kind(x) {
-                TyKind::FnDef(def, _) => !p.is_ctor_def(def),
+                TyKind::FnDef(def, _) => p.is_fn_item_def(def),
                 TyKind::Closure(..) | TyKind::Param(_) | TyKind::FnPtr(_) => true,
                 _ => false,
             };
@@ -6891,7 +6917,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let k = p.known;
                 let r = [(k.Some, Res::OptSome), (k.Ok, Res::ResOk), (k.Err, Res::ResErr)].into_iter().find(|&(n, _)| n == name);
                 if let Some((_, r)) = r {
-                    return self.builtin_ctor_value(e, r, segs, span);
+                    return self.builtin_item_value(e, r, segs, span);
                 }
             }
             self.err(
@@ -7068,11 +7094,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let Res::Fn(f) = r {
                 return self.fn_value_ty(e, f, span);
             }
-            if matches!(r, Res::OptSome | Res::ResOk | Res::ResErr) {
-                return self.builtin_ctor_value(e, r, segs, span);
+            if matches!(r, Res::OptSome | Res::ResOk | Res::ResErr | Res::Builtin(Builtin::BoxNew | Builtin::RcNew | Builtin::StringFrom)) {
+                return self.builtin_item_value(e, r, segs, span);
             }
-            // Std fns (`String::from`, `Box::new`) have no value form
-            // yet. An error type without a diagnostic would reach
+            // Other std fns (`String::new`, `Vec::from`) have no value
+            // form yet. An error type without a diagnostic would reach
             // codegen, so report every one.
             self.errs.push(unsupported(span, "this std function used as a value"));
             return ERROR;
@@ -8058,7 +8084,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::FnPtr(_) => Some(Res::Indirect),
             TyKind::FnDef(def, cargs) => match self.p.adt_by_def(def) {
                 Some(a) => Some(Res::Variant(a, self.ctor_variant(cargs))),
-                None => self.builtin_ctor_res(def, cargs).or_else(|| self.p.local_def(def.hash).map(Res::Fn)),
+                None => self.builtin_item_res(def, cargs).map(|(r, _, _)| r).or_else(|| self.p.local_def(def.hash).map(Res::Fn)),
             },
             _ => None,
         }
@@ -14985,6 +15011,29 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if !has_clone(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0112", span, format!("`{tn}` does not implement Clone"), "Add #[derive(Clone)] to the type.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_string_from) {
+            let t = self.deep(t);
+            let tn = self.tn(t);
+            match self.kind(t) {
+                TyKind::Error => {}
+                _ if t == CHAR || t == STRING => {}
+                TyKind::Ref(_, Mut::Shared, s) if self.kind(s) == TyKind::Str => {}
+                TyKind::Infer(_) => self.err("L0610", span, "type annotations needed: the input of `String::from` is not known", "Annotate the input's type."),
+                // No std impl, and no user one can exist (orphan rules).
+                TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Unit => self.err(
+                    "L0612",
+                    span,
+                    format!("the trait bound `String: From<{tn}>` is not satisfied"),
+                    "Convert with `to_string()` or `format!`.",
+                ),
+                // std's `&mut str`, `&String`, and `Box<str>` impls, a
+                // user impl, or a param's bound.
+                _ => {
+                    let what = format!("`String::from` as a value with input `{tn}` (lust takes `&str`, `char`, or `String` there)");
+                    self.errs.push(unsupported(span, &what));
+                }
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_eq) {
