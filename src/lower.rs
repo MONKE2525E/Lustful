@@ -444,7 +444,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                 Self::derefs(b, derefs).project(Proj::Field(index))
             }
             (Expr::Index { base, index }, Res::SliceIndex { derefs }) => {
-                let b = self.place(*base);
+                let span = self.span(e);
+                let b = match self.deref_steps(e, *base, span) {
+                    Some(root) => root,
+                    None => self.place(*base),
+                };
                 let b = Self::derefs(b, derefs);
                 let (lo_e, hi_e, inclusive) = match self.p.ast.expr(*index) {
                     Expr::Range { lo, hi, inclusive } => (*lo, *hi, *inclusive),
@@ -473,12 +477,19 @@ impl<'p, 'a> Lower<'p, 'a> {
                 Place::local(t)
             }
             (Expr::Index { base, index }, Res::Index { derefs }) => {
-                let b = self.place(*base);
+                let span = self.span(e);
+                let (b, root_ty) = match self.deref_steps(e, *base, span) {
+                    Some(root) => {
+                        let t = self.body.locals[root.local as usize].ty;
+                        (root, t)
+                    }
+                    None => (self.place(*base), self.ty(*base)),
+                };
                 let b = Self::derefs(b, derefs);
                 // Mutable use: borrow the container before the index expression runs
                 // (see `place_for_mut`), and index through that borrow.
                 let b = if self.mut_index > 0 {
-                    let bt = self.peel(self.ty(*base), derefs);
+                    let bt = self.peel(root_ty, derefs);
                     let rt = self.ref_ty(true, bt);
                     let t = self.temp(rt);
                     let span = self.span(e);

@@ -4943,7 +4943,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // ARCH 2.12 run point: an index must know the indexed type; the
                 // index type then follows from the selected `Index` impl.
                 self.run_obligations(false);
-                let (derefs, inner) = self.autoderef_smart(bt);
+                let (mut derefs, mut inner) = self.autoderef_smart(bt);
+                // A user type indexes through its `Deref` impls (a wrapper
+                // over a Vec or slice), as rustc's index autoderef.
+                for _ in 0..4 {
+                    let indexable = matches!(self.kind(inner), TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Error)
+                        || self.tys.vec_elem(inner).is_some()
+                        || self.tys.is_string_ty(inner);
+                    if indexable {
+                        break;
+                    }
+                    let Some(target) = self.record_place_deref(e, inner, derefs, span) else { break };
+                    let tref = self.tys.mk_ref(false, target);
+                    (derefs, inner) = self.autoderef_smart(tref);
+                }
                 if let Expr::Range { lo, hi, .. } = p.ast.expr(*index) {
                     // A range index makes a slice place. Bounds are usize.
                     // The range expression itself is not checked as a value;
