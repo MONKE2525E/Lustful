@@ -34,6 +34,7 @@ fn main() {
     println!("{:?} {:?}", LazyLock::get(&lm), lm);
     let from: OnceLock<u8> = OnceLock::from(3);
     let mut empty: OnceLock<u8> = OnceLock::default();
-    println!("{:?} {:?} {:?} {}", from.get(), empty.get_mut(), from.clone().into_inner(), from == OnceLock::from(3));
+    println!("{:?} {:?}", from.get(), empty.get_mut());
+    println!("{:?}", from.into_inner());
     println!("{:#?}", OnceCell::<u8>::new());
 }

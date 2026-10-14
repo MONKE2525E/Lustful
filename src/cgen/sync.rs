@@ -644,6 +644,11 @@ impl FnGen<'_, '_, '_> {
             }
             S::DurSubsec(u) => format!("(({})->nanos / {}u)", vals[0], [1_000_000_000u64, 1_000_000, 1_000, 1][u as usize & 3]),
             S::DurIsZero => format!("((uint8_t)(({0})->secs == 0 && ({0})->nanos == 0))", vals[0]),
+            // A std source `core::time::Duration` (W-STD-C) is the struct
+            // `{ secs: u64, nanos: u32 }`: rebuild the runtime's value.
+            S::ThreadSleep if matches!(tys.first(), Some(CTy::Adt(_))) => {
+                format!("(lust_thread_sleep(((lust_Duration){{ ({0}).f0, ({0}).f1 }})), ((lust_Unit){{}}))", vals[0])
+            }
             S::ThreadSleep => format!("(lust_thread_sleep({}), ((lust_Unit){{}}))", vals[0]),
             S::ChanSend => {
                 let el = match deref_cty(&tys[0]) {

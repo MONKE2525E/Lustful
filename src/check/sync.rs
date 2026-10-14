@@ -569,7 +569,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
             SyncOp::SyncNew(SyncTy::Barrier) => (vec![USIZE], sync_ty(&mut self.tys, SyncTy::Barrier, &[])),
             SyncOp::DurNew => (vec![int(IntTy::U64), int(IntTy::U32)], sync_ty(&mut self.tys, SyncTy::Duration, &[])),
             SyncOp::DurFrom(_) => (vec![int(IntTy::U64)], sync_ty(&mut self.tys, SyncTy::Duration, &[])),
-            SyncOp::ThreadSleep => (vec![sync_ty(&mut self.tys, SyncTy::Duration, &[])], UNIT),
+            // With the std source `core::time::Duration` spliced (W-STD-C),
+            // `std::time::Duration` names it, so `sleep` takes it.
+            SyncOp::ThreadSleep => {
+                let p = self.p;
+                let src = (0..p.adts.len() as u32)
+                    .map(AdtId)
+                    .find(|&a| p.is_std_adt(a) && p.display_path(p.adt(a).name) == "core::time::Duration");
+                let d = match src {
+                    Some(a) => self.tys.adt_ty(a),
+                    None => sync_ty(&mut self.tys, SyncTy::Duration, &[]),
+                };
+                (vec![d], UNIT)
+            }
             SyncOp::SyncNew(k) => {
                 let args: &[Ty] = if k.arity() == 0 { &[] } else { &[elem] };
                 (vec![], sync_ty(&mut self.tys, k, args))
