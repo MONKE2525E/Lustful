@@ -19,6 +19,9 @@ pub enum Proj {
     /// View an enum place as one variant, so `Field` can address that variant's fields.
     Downcast(u32),
     /// Bounds-checked Vec element. The index is in a local of type usize.
+    /// Its panic location is the span of the local's last plain
+    /// assignment (lowering's `mark_index_loc`; cgen's `index_locs`),
+    /// not the span of the statement that uses the place.
     Index(Local),
 }
 

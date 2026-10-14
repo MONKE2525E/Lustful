@@ -171,7 +171,8 @@ int lust_dmap_finish_ne(lust_DebugMap *d, lust_loc loc);
 
 /* The panic after a fmt impl returned Err into a sink that cannot fail:
    `what` 0 is format!, 1 is to_string, 2 is print to stdout, 3 to
-   stderr (Rust's expect texts). */
+   stderr (Rust's texts and std locations; a print writes its pieces
+   first, see `lust_print_failed`). */
 void lust_fmt_failed(uint32_t what, lust_loc loc);
 
 #ifdef LUST_IMPL

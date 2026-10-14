@@ -10,6 +10,7 @@
 // expand one `MacroCall` against one compiled definition to token trees.
 // `lookup_macro` is the one place macro names resolve; it swaps to the
 // frozen `Binding` query fns (S7) without touching callers.
+pub mod assert_msg;
 pub mod builtin;
 pub mod lazy;
 pub mod match_;
@@ -2490,7 +2491,9 @@ impl<'a> Expander<'a> {
                 let (extra, args) = builtin::rustc_depth(fmt_name, &inner);
                 let call_span = segs.first().map_or(group_span, |s| s.span.to(group_span));
                 self.check_depth(depth, extra, call_span, || fmt_name.to_string())?;
+                let msg = if fmt_name == "assert" { builtin::assert_message(self, &inner, call_span) } else { Vec::new() };
                 let mut expanded_inner = self.expand_list(inner, depth + args, false, false, nest + 1)?;
+                expanded_inner.extend(msg);
                 if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut expanded_inner, group_span);
                 }
@@ -2973,7 +2976,9 @@ impl<'a> Expander<'a> {
                     tok.tok = Tok::Ident(canon);
                 }
                 let written_lit = is_str_lit_arg(&call.inner);
+                let msg = if name == "assert" { builtin::assert_message(self, &call.inner, call.span) } else { Vec::new() };
                 let mut inner = self.expand_list(call.inner.clone(), depth + args, false, false, 0)?;
+                inner.extend(msg);
                 if !written_lit && matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut inner, call.span);
                 }

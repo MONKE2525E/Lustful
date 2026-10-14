@@ -255,20 +255,20 @@ void lust_fmt_char_debug(lust_String *out, uint32_t c) LUST_BODY({
     lust_string_push_bytes(out, "'", 1);
 })
 
+/* Stdout goes through Rust's LineWriter model (panic.c); stderr is unbuffered. */
 void lust_write(int to_stderr, lust_String *s) LUST_BODY({
-    FILE *f = to_stderr ? stderr : stdout;
-    if (s->len) fwrite(s->ptr, 1, s->len, f);
-    if (to_stderr) fflush(stderr);
+    if (!to_stderr) lust_print_out(s->ptr, s->len);
+    else if (s->len) { fwrite(s->ptr, 1, s->len, stderr); fflush(stderr); }
     lust_dealloc(s->ptr, s->cap, 1);
 })
 
-void lust_flush(void) LUST_BODY({ fflush(stdout); })
+void lust_flush(void) LUST_BODY({ lust_print_flush(); })
 
-/* The `exit` intrinsic behind std::process::exit: lust print output is
-   buffered in stdio, so flush before the libc exit. Destructors on the
-   stack do not run, as in Rust; the calling thread's thread-local
-   destructors do (glibc's exit() runs them for Rust std). */
-void lust_exit(int32_t code) LUST_BODY({ lust_tls_exit(); fflush(stdout); exit(code); })
+/* The `exit` intrinsic behind std::process::exit: flush the held stdout
+   tail, as Rust's rt::cleanup does. Destructors on the stack do not run,
+   as in Rust; the calling thread's thread-local destructors do (glibc's
+   exit() runs them for Rust std). */
+void lust_exit(int32_t code) LUST_BODY({ lust_tls_exit(); lust_print_flush(); exit(code); })
 
 /* ---------- Vec ---------- */
 
@@ -344,36 +344,62 @@ void *lust_vec_push_slot(lust_Vec *v, uint64_t elem, uint64_t align) LUST_BODY({
     return (char *)v->ptr + (v->len++) * elem;
 })
 
-/* The end of a slice range, checked the way Rust checks it: the start must
-   not pass the end, and the end must not pass the length. An inclusive end
-   of u64::MAX overflows the +1 and always fails the length check. */
+/* Panics with "<a><n><b><m><c>": the shape of Rust's index and range
+   messages ("removal index (is 5) should be < len (is 3)"). */
+void lust_panic_nn(const char *a, uint64_t n, const char *b, uint64_t m, const char *c, lust_loc loc) LUST_BODY({
+    lust_String s = lust_string_new();
+    lust_string_push_cstr(&s, a);
+    lust_fmt_u64(&s, n);
+    lust_string_push_cstr(&s, b);
+    lust_fmt_u64(&s, m);
+    lust_string_push_cstr(&s, c);
+    lust_panic(&s, loc);
+})
+
+/* The end of a slice range, checked in Rust 1.99's order: the start
+   against the length, the end against the length (an inclusive end
+   prints as written; u64::MAX always fails), then start against end. */
 uint64_t lust_slice_range(uint64_t lo, uint64_t hi, int inclusive, uint64_t len, lust_loc loc) LUST_BODY({
+    if (lo > len) lust_panic_nn("range start index ", lo, " out of range for slice of length ", len, "", loc);
+    if (inclusive ? hi >= len : hi > len) lust_panic_nn("range end index ", hi, " out of range for slice of length ", len, "", loc);
     uint64_t end = inclusive ? hi + 1 : hi;
-    if ((inclusive && end == 0) || lo > end || end > len) {
-        lust_String s = lust_string_new();
-        lust_string_push_cstr(&s, "slice index starts at ");
-        lust_fmt_u64(&s, lo);
-        lust_string_push_cstr(&s, " but ends at ");
-        lust_fmt_u64(&s, inclusive ? hi : end);
-        lust_panic(&s, loc);
-    }
+    if (lo > end) lust_panic_nn("slice index starts at ", lo, " but ends at ", end, "", loc);
     return end;
 })
 
-/* The end of a str slice range: the slice range checks, plus both
-   bounds must lie on UTF-8 char boundaries (the end of the string or
-   a byte that is not a continuation byte), as Rust checks. */
+#ifdef LUST_IMPL
+/* Panics because byte `i` of `ptr` is not a char boundary: names the
+   char it falls in, as Rust 1.99 does. */
+static void lust_str_boundary_fail(const char *which, const uint8_t *ptr, uint64_t i, lust_loc loc) {
+    uint64_t a = i;
+    while (a > 0 && (ptr[a] & 0xC0) == 0x80) a--;
+    uint64_t b = a;
+    uint32_t c = lust_utf8_next(ptr, &b);
+    lust_String s = lust_string_new();
+    lust_string_push_cstr(&s, which);
+    lust_fmt_u64(&s, i);
+    lust_string_push_cstr(&s, " is not a char boundary; it is inside ");
+    lust_fmt_char_debug(&s, c);
+    lust_string_push_cstr(&s, " (bytes ");
+    lust_fmt_u64(&s, a);
+    lust_string_push_cstr(&s, "..");
+    lust_fmt_u64(&s, b);
+    lust_string_push_cstr(&s, " of string)");
+    lust_panic(&s, loc);
+}
+#endif
+
+/* The end of a str slice range, checked in Rust 1.99's order: start and
+   end against the length, start against end, then both on UTF-8 char
+   boundaries (the end of the string or a byte that is not a
+   continuation byte). */
 uint64_t lust_str_range(const uint8_t *ptr, uint64_t lo, uint64_t hi, int inclusive, uint64_t len, lust_loc loc) LUST_BODY({
-    uint64_t end = lust_slice_range(lo, hi, inclusive, len, loc);
-    int lo_ok = lo == len || (ptr[lo] & 0xC0) != 0x80;
-    int end_ok = end == len || (ptr[end] & 0xC0) != 0x80;
-    if (!lo_ok || !end_ok) {
-        lust_String s = lust_string_new();
-        lust_string_push_cstr(&s, "byte index ");
-        lust_fmt_u64(&s, lo_ok ? end : lo);
-        lust_string_push_cstr(&s, " is not a char boundary");
-        lust_panic(&s, loc);
-    }
+    if (lo > len) lust_panic_nn("start byte index ", lo, " is out of bounds for string of length ", len, "", loc);
+    if (inclusive ? hi >= len : hi > len) lust_panic_nn("end byte index ", hi, " is out of bounds for string of length ", len, "", loc);
+    uint64_t end = inclusive ? hi + 1 : hi;
+    if (lo > end) lust_panic_nn("byte range starts at ", lo, " but ends at ", end, "", loc);
+    if (lo < len && (ptr[lo] & 0xC0) == 0x80) lust_str_boundary_fail("start byte index ", ptr, lo, loc);
+    if (end < len && (ptr[end] & 0xC0) == 0x80) lust_str_boundary_fail("end byte index ", ptr, end, loc);
     return end;
 })
 
@@ -472,7 +498,7 @@ uint64_t lust_bounds(uint64_t i, uint64_t len, lust_loc loc) LUST_BODY({
 
 /* ---------- Checked integer math ---------- */
 
-#define LUST_OVF(op) lust_panic_cstr("attempt to " op " with overflow", loc)
+#define LUST_OVF(op) lust_ovf(op, loc)
 
 /* Narrow signed types: compute exactly in int64_t, then range check. */
 #define LUST_SIGNED_NARROW(T, N, MINV, MAXV) \
@@ -1307,14 +1333,21 @@ uint32_t lust_string_pop(lust_String *s) LUST_BODY({
     return c;
 })
 
-static void lust_string_check_boundary(lust_String *s, uint64_t idx, lust_loc loc) {
-    if (idx > s->len) lust_panic_cstr("byte index out of bounds", loc);
-    if (idx < s->len && (s->ptr[idx] & 0xC0) == 0x80) lust_panic_cstr("byte index is not a char boundary", loc);
+/* Rust's `assert!(self.is_char_boundary(<what>))` in String methods. */
+static void lust_string_check_boundary(lust_String *s, uint64_t idx, const char *what, lust_loc loc) {
+    if (idx > s->len || (idx < s->len && (s->ptr[idx] & 0xC0) == 0x80)) {
+        lust_String m = lust_string_new();
+        lust_string_push_cstr(&m, "assertion failed: self.is_char_boundary(");
+        lust_string_push_cstr(&m, what);
+        lust_string_push_cstr(&m, ")");
+        lust_panic(&m, loc);
+    }
 }
 
+/* String::remove slices `self[idx..]` first, so it panics as that slice does. */
 uint32_t lust_string_remove(lust_String *s, uint64_t idx, lust_loc loc) LUST_BODY({
-    if (idx >= s->len) lust_panic_cstr("byte index out of bounds", loc);
-    lust_string_check_boundary(s, idx, loc);
+    (void)lust_str_range(s->ptr, idx, s->len, 0, s->len, loc);
+    if (idx == s->len) lust_panic_cstr("cannot remove a char from the end of a string", loc);
     uint64_t j = idx;
     uint32_t c = lust_utf8_next(s->ptr, &j);
     memmove(s->ptr + idx, s->ptr + j, s->len - j);
@@ -1323,7 +1356,7 @@ uint32_t lust_string_remove(lust_String *s, uint64_t idx, lust_loc loc) LUST_BOD
 })
 
 void lust_string_insert_bytes(lust_String *s, uint64_t idx, const uint8_t *p, uint64_t n, lust_loc loc) LUST_BODY({
-    lust_string_check_boundary(s, idx, loc);
+    lust_string_check_boundary(s, idx, "idx", loc);
     /* Copy the inserted bytes first: they may view this String. */
     uint8_t small[4];
     uint8_t *tmp = small;
@@ -1348,13 +1381,13 @@ void lust_string_insert_char(lust_String *s, uint64_t idx, uint32_t c, lust_loc 
 
 void lust_string_truncate(lust_String *s, uint64_t n, lust_loc loc) LUST_BODY({
     if (n < s->len) {
-        lust_string_check_boundary(s, n, loc);
+        lust_string_check_boundary(s, n, "new_len", loc);
         s->len = n;
     }
 })
 
 lust_String lust_string_split_off(lust_String *s, uint64_t at, lust_loc loc) LUST_BODY({
-    lust_string_check_boundary(s, at, loc);
+    lust_string_check_boundary(s, at, "at", loc);
     lust_String r = lust_string_with_capacity(s->len - at);
     memcpy(r.ptr, s->ptr + at, s->len - at);
     r.len = s->len - at;

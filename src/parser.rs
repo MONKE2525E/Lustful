@@ -52,6 +52,10 @@ struct Depths {
 pub struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
+    /// The `(` offset of each parenthesized expression (outermost), which
+    /// the AST drops: a binary, cast, or postfix expression that starts
+    /// with one spans from it, as in rustc (panic locations read it).
+    paren_lo: std::collections::HashMap<u32, u32>,
     ast: Ast,
     interner: &'a Interner,
     known: &'a Known,
@@ -122,6 +126,7 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
     let mut p = Parser {
         toks: &lexed.tokens,
         pos: 0,
+        paren_lo: Default::default(),
         ast: Ast::default(),
         interner,
         known,
@@ -199,6 +204,7 @@ fn parse_tokens(
     let mut p = Parser {
         toks,
         pos: 0,
+        paren_lo: Default::default(),
         ast: Ast::default(),
         interner,
         known,
@@ -313,6 +319,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        paren_lo: Default::default(),
         ast: std::mem::take(ast),
         interner,
         known,
@@ -354,6 +361,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
     let mut p = Parser {
         toks: &v,
         pos: 0,
+        paren_lo: Default::default(),
         ast,
         interner,
         known,
@@ -390,6 +398,7 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
     let mut p = Parser {
         toks: &v,
         pos: 0,
+        paren_lo: Default::default(),
         ast,
         interner,
         known,
@@ -3933,7 +3942,7 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
             let rhs = self.binary(prec, no_struct)?;
-            let span = self.ast.expr_span(lhs).to(self.prev_span());
+            let span = self.outer_span(lhs).to(self.prev_span());
             if op.is_cmp()
                 && let Some((op2, prec2, _)) = self.binop()
                 && prec2 == prec
@@ -4011,6 +4020,15 @@ impl<'a> Parser<'a> {
         Ok(self.push_expr(e, start.to(self.prev_span())))
     }
 
+    /// `e`'s span, widened to its `(` when it was written in parentheses.
+    fn outer_span(&self, e: ExprId) -> Span {
+        let s = self.ast.expr_span(e);
+        match self.paren_lo.get(&e.0) {
+            Some(&lo) if lo < s.lo => Span { lo, ..s },
+            _ => s,
+        }
+    }
+
     fn cast_rest(&mut self, mut e: ExprId) -> PResult<ExprId> {
         while self.peek() == Tok::As {
             self.bump();
@@ -4025,7 +4043,7 @@ impl<'a> Parser<'a> {
                     "`<<` after a cast type is read as generic arguments, not as a shift: parenthesize the cast",
                 ));
             }
-            let span = self.ast.expr_span(e).to(self.prev_span());
+            let span = self.outer_span(e).to(self.prev_span());
             e = self.push_expr(Expr::Cast { expr: e, ty }, span);
         }
         Ok(e)
@@ -4051,7 +4069,7 @@ impl<'a> Parser<'a> {
                     "Split the expression into smaller pieces with `let`.",
                 ));
             }
-            let start = self.ast.expr_span(e);
+            let start = self.outer_span(e);
             match self.peek() {
                 Tok::LParen => {
                     let args = self.call_args()?;
@@ -4335,6 +4353,7 @@ impl<'a> Parser<'a> {
                     if tuple {
                         Expr::Tuple(elems)
                     } else {
+                        self.paren_lo.insert(elems[0].0, start.lo);
                         return Ok(elems[0]);
                     }
                 }
@@ -4729,11 +4748,26 @@ impl<'a> Parser<'a> {
                 }
             }
         } else {
+            let first_at = self.pos;
+            let mut first_end = self.pos;
             for _ in 0..fixed {
                 args.push(self.expr()?);
+                if args.len() == 1 {
+                    first_end = self.pos;
+                }
                 if !self.eat(Tok::Comma) {
                     break;
                 }
+            }
+            // `assert!(cond)` with no message: rustc's text names the
+            // condition (the expander adds it when it runs on the file).
+            if kind == MacroKind::Assert && self.peek() == close {
+                let strings = &self.ast.strings[self.str_base as usize..];
+                let flat = self.toks[first_at..first_end]
+                    .iter()
+                    .map(|t| (crate::expand::tok_text(&t.tok, strings, self.interner), t.tok, t.span))
+                    .collect();
+                fmt = vec![FmtPiece::Lit(format!("assertion failed: {}", crate::expand::assert_msg::cond_text(flat)))];
             }
             if args.len() < fixed {
                 return Err(syntax(self.span(), "too few arguments for this macro"));
@@ -4760,6 +4794,11 @@ impl<'a> Parser<'a> {
                 // A format string a macro produced (concat! and kin) may
                 // not capture variables, as in rustc.
                 fmt = self.format_string(&s, lit_span, base, &mut extra, !crate::diag::is_no_capture(lit_span.ctxt))?;
+                // An empty format string is still a message (`panic!("")`
+                // prints an empty one, not "explicit panic").
+                if fmt.is_empty() {
+                    fmt.push(FmtPiece::Lit(String::new()));
+                }
                 args.extend(extra);
             } else if self.peek() != close {
                 return Err(syntax(self.span(), "expected a format string literal"));

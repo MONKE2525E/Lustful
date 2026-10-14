@@ -302,6 +302,36 @@ fn is128(i: IntTy) -> bool {
     matches!(i, IntTy::I128 | IntTy::U128)
 }
 
+/// A `lust_loc` naming a line of Rust 1.99's own std source, for a panic
+/// rustc reports there (no `#[track_caller]`): `file` indexes
+/// `lust_std_files` in panic.c (0 core/src/num/mod.rs, 1
+/// core/src/char/methods.rs, 2 core/src/char/convert.rs, 3
+/// alloc/src/vec/mod.rs), plus 0x40 for `pow`.
+fn std_loc(file: u64, line: u64, col: u64) -> String {
+    format!("{}ull", ((0xFFFF_FF00u64 + file) << 32) | (line << 12) | col)
+}
+
+/// The std location of an integer method that panics inside core
+/// (`abs`, `pow`, signed `wrapping_div`): the `int_impl!` or
+/// `uint_impl!` line for its type in core/src/num/mod.rs.
+fn num_loc(i: IntTy, pow: bool) -> String {
+    let line = match i {
+        IntTy::I8 => 379,
+        IntTy::I16 => 404,
+        IntTy::I32 => 429,
+        IntTy::I64 => 454,
+        IntTy::I128 => 479,
+        IntTy::Isize => 559,
+        IntTy::U8 => 586,
+        IntTy::U16 => 1234,
+        IntTy::U32 => 1290,
+        IntTy::U64 => 1322,
+        IntTy::U128 => 1354,
+        IntTy::Usize => 1452,
+    };
+    std_loc(if pow { 0x40 } else { 0 }, line, 5)
+}
+
 /// Suffix of the runtime's checked-math helpers for this type.
 fn int_fn(i: IntTy) -> &'static str {
     match i {
@@ -683,6 +713,8 @@ struct FnGen<'b, 'p, 'a> {
     /// `borrowck::const_index_locals`): a move out of `a[c]` is a
     /// partial move like a field move.
     const_index: std::collections::HashMap<Local, u64>,
+    /// The panic location of each index local (see `Proj::Index`).
+    index_spans: Vec<Option<Span>>,
     map: &'b SourceMap,
     /// Types in the signatures of called functions, needed for the call casts.
     sig_types: HashSet<CTy>,
@@ -1298,6 +1330,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         bad_move: false,
         bad_callee: None,
         const_index: crate::borrowck::const_index_locals(body),
+        index_spans: index_spans(body),
         map,
         sig_types: HashSet::new(),
         base_line,
@@ -1353,7 +1386,38 @@ fn bad_move_error(p: &Program, body: &Body) -> String {
     )
 }
 
+/// The span of each local's last plain assignment, where a self-copy
+/// `l = copy l` wins: the panic location of an index local
+/// (`Proj::Index`, lowering's `mark_index_loc`).
+fn index_spans(body: &Body) -> Vec<Option<Span>> {
+    let mut out: Vec<Option<Span>> = vec![None; body.locals.len()];
+    let mut fixed = vec![false; body.locals.len()];
+    for b in &body.blocks {
+        for st in &b.stmts {
+            if let StmtKind::Assign(p, rv) = &st.kind
+                && p.proj.is_empty()
+                && let Some(slot) = out.get_mut(p.local as usize)
+            {
+                let l = p.local as usize;
+                let self_copy = matches!(rv, Rvalue::Use(Operand::Copy(q)) if q.local == p.local && q.proj.is_empty());
+                if self_copy || !fixed[l] {
+                    *slot = Some(st.span);
+                }
+                fixed[l] |= self_copy;
+            }
+        }
+    }
+    out
+}
+
 impl FnGen<'_, '_, '_> {
+    /// The packed panic location of index local `l`, else `loc`.
+    fn index_loc(&self, l: Local, loc: &str) -> String {
+        match self.index_spans.get(l as usize).copied().flatten() {
+            Some(sp) => self.loc(sp),
+            None => loc.to_string(),
+        }
+    }
     /// A packed source location, relative to the function's first line. See `lust_loc`.
     /// The runtime prints one file path for the whole program (`lust_file`), so the packed
     /// value carries line and column only; an expanded span reports at its call site.
@@ -1805,6 +1869,7 @@ impl FnGen<'_, '_, '_> {
                 }
                 (Proj::Downcast(v), _) => variant = Some(*v),
                 (Proj::Index(l), CTy::Vec(el)) => {
+                    let loc = self.index_loc(*l, loc);
                     e = format!("(({}*){e}.ptr)[lust_bounds(l{l}, {e}.len, {loc})]", ctype(&el));
                     t = *el;
                 }
@@ -1813,6 +1878,7 @@ impl FnGen<'_, '_, '_> {
                     t = es[*i as usize].clone();
                 }
                 (Proj::Index(l), CTy::Array(el, n)) => {
+                    let loc = self.index_loc(*l, loc);
                     e = format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]");
                     t = *el;
                 }
@@ -1829,6 +1895,7 @@ impl FnGen<'_, '_, '_> {
                     t = CTy::Slice(el);
                 }
                 (Proj::Index(l), CTy::Slice(el)) => {
+                    let loc = self.index_loc(*l, loc);
                     e = format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]");
                     t = *el;
                 }
@@ -3713,9 +3780,9 @@ impl FnGen<'_, '_, '_> {
                 format!("(((*{0} >= '0' && *{0} <= '9') || ((*{0} | 32) >= 'a' && (*{0} | 32) <= 'f')))", vals[0])
             }
             B::CharIsAsciiControl => format!("(*{0} < 32u || *{0} == 127u)", vals[0]),
-            B::CharIsDigitRadix => format!("(lust_digit({0}, {1}, {loc}) != 0xFFFFFFFFu)", vals[0], vals[1]),
-            B::Abs => format!("lust_abs_{}({}, {loc})", int_fn(int_of(&tys[0])), vals[0]),
-            B::Pow => format!("lust_pow_{}({}, {}, {loc})", int_fn(int_of(&tys[0])), vals[0], vals[1]),
+            B::CharIsDigitRadix => format!("(lust_digit({}, {}, {}) != 0xFFFFFFFFu)", vals[0], vals[1], std_loc(1, 407, 9)),
+            B::Abs => format!("lust_abs_{}({}, {})", int_fn(int_of(&tys[0])), vals[0], num_loc(int_of(&tys[0]), false)),
+            B::Pow => format!("lust_pow_{}({}, {}, {})", int_fn(int_of(&tys[0])), vals[0], vals[1], num_loc(int_of(&tys[0]), true)),
             B::Min | B::Max => {
                 let it = int_of(&tys[0]);
                 if is128(it) {
@@ -4317,7 +4384,8 @@ impl FnGen<'_, '_, '_> {
                 let (vv, i) = (&vals[0], &vals[1]);
                 let _ = writeln!(
                     self.out,
-                    "    lust_bounds({i}, {vv}->len, {loc});\n    {et} {t} = (({et}*){vv}->ptr)[{i}];\n    (({et}*){vv}->ptr)[{i}] = (({et}*){vv}->ptr)[{vv}->len - 1];\n    {vv}->len--;"
+                    "    if ({i} >= {vv}->len) lust_panic_nn(\"swap_remove index (is \", {i}, \") should be < len (is \", {vv}->len, \")\", {});\n    {et} {t} = (({et}*){vv}->ptr)[{i}];\n    (({et}*){vv}->ptr)[{i}] = (({et}*){vv}->ptr)[{vv}->len - 1];\n    {vv}->len--;",
+                    std_loc(3, 2258, 13)
                 );
                 t
             }
@@ -4365,7 +4433,7 @@ impl FnGen<'_, '_, '_> {
                 let (vv, at) = (&vals[0], &vals[1]);
                 let _ = writeln!(
                     self.out,
-                    "    if ({at} > {vv}->len) lust_panic_cstr(\"`at` split index should be <= len\", {loc});\n    lust_Vec {t} = lust_vec_with_capacity({vv}->len - {at}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = {at}; {i} < {vv}->len; {i}++) (({et}*){t}.ptr)[{i} - {at}] = (({et}*){vv}->ptr)[{i}];\n    {t}.len = {vv}->len - {at};\n    {vv}->len = {at};"
+                    "    if ({at} > {vv}->len) lust_panic_nn(\"`at` split index (is \", {at}, \") should be <= len (is \", {vv}->len, \")\", {loc});\n    lust_Vec {t} = lust_vec_with_capacity({vv}->len - {at}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = {at}; {i} < {vv}->len; {i}++) (({et}*){t}.ptr)[{i} - {at}] = (({et}*){vv}->ptr)[{i}];\n    {t}.len = {vv}->len - {at};\n    {vv}->len = {at};"
                 );
                 t
             }
@@ -4544,8 +4612,10 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
                 let _ = writeln!(
                     self.out,
-                    "    {{ uint32_t d = lust_from_digit({}, {}, {loc}); if (d != 0xFFFFFFFFu) {{ {field} = d;{some} }} }}",
-                    vals[0], vals[1]
+                    "    {{ uint32_t d = lust_from_digit({}, {}, {}); if (d != 0xFFFFFFFFu) {{ {field} = d;{some} }} }}",
+                    vals[0],
+                    vals[1],
+                    std_loc(2, 332, 9)
                 );
                 t
             }
@@ -4561,8 +4631,10 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
                 let _ = writeln!(
                     self.out,
-                    "    {{ uint32_t d = lust_digit({}, {}, {loc}); if (d != 0xFFFFFFFFu) {{ {field} = d;{some} }} }}",
-                    vals[0], vals[1]
+                    "    {{ uint32_t d = lust_digit({}, {}, {}); if (d != 0xFFFFFFFFu) {{ {field} = d;{some} }} }}",
+                    vals[0],
+                    vals[1],
+                    std_loc(1, 407, 9)
                 );
                 t
             }
@@ -4660,7 +4732,9 @@ impl FnGen<'_, '_, '_> {
                 let op = if b == B::WrappingDiv { 3 } else { 4 };
                 let (o, rc) = checked_call(self, &ua, &ub, op);
                 let msg = div0(b);
-                let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{msg}\", {loc});");
+                // The signed forms divide inside core; the unsigned ones at the caller.
+                let at = if sgn { num_loc(it, false) } else { loc.to_string() };
+                let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{msg}\", {at});");
                 format!("(({ct}){o})")
             }
             B::WrappingNeg => format!("(({ct})((0ull - {ua}) & {mask}))"),
@@ -5436,7 +5510,7 @@ pub fn main_unit(main_slot: u32, file: &str, slot_lines: &[u32], overlays: &[usi
     }
     let _ = writeln!(
         c,
-        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;\n  lust_base_init();",
+        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;\n  lust_rt_init();\n  lust_base_init();",
         c_string_lit(file.as_bytes())
     );
     for u in overlays {
@@ -5925,7 +5999,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
                 let _ = writeln!(c, "  int rc = 0;");
                 let _ = writeln!(
                     c,
-                    "  if ({disc}) {{ lust_flush(); lust_String s = lust_string_new(); lust_sink k; lust_sink_string(&k, &s); lust_Formatter f; lust_f_init(&f, &k); lust_string_push_cstr(&s, \"Error: \"); (void)dbg_{}(&f, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}{ok}",
+                    "  if ({disc}) {{ lust_String s = lust_string_new(); lust_sink k; lust_sink_string(&k, &s); lust_Formatter f; lust_f_init(&f, &k); lust_string_push_cstr(&s, \"Error: \"); (void)dbg_{}(&f, &{field}); lust_string_push_bytes(&s, \"\\n\", 1); lust_write(1, &s); rc = 1; }}{ok}",
                     mangle(&ec)
                 );
             }

@@ -2822,7 +2822,10 @@ impl Evaluator {
                 if b {
                     Ok((ConstValue::Unit, UNIT))
                 } else {
+                    // The parser gives a message-less assert rustc's
+                    // "assertion failed: <cond>" text as its format string.
                     let msg = fmt_text(fmt).unwrap_or_else(|| "assertion failed".into());
+                    let msg = msg.strip_prefix("assertion failed: ").unwrap_or(&msg);
                     Err(Diag::new(C_OUTSIDE, span, format!("const assertion failed: {msg}"), "Fix the asserted condition."))
                 }
             }

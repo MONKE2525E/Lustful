@@ -307,7 +307,7 @@ fn env_snapshot() -> &'static std::collections::HashMap<String, String> {
 /// the token's span holds that text, and the guards keep a slice from a
 /// different file (an included file's tokens after the swap back) from
 /// leaking in, by checking it against the token's name.
-fn stringify_tok_text(st: &Expander, t: &Token) -> String {
+pub(super) fn stringify_tok_text(st: &Expander, t: &Token) -> String {
     let plain = tok_text(&t.tok, &st.strings, st.ctx.interner);
     let span = t.span;
     let slice = st.cur_src.get(span.lo as usize..span.hi as usize);
@@ -473,6 +473,21 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
     text
 }
 
+/// For `assert!(cond)` with no message: the trees `, "{}", "assertion
+/// failed: <cond>"` to append to its expanded arguments, so the panic
+/// prints rustc's text (see `assert_msg`). The text goes in as an
+/// argument, never as the format string, so braces in it stay literal.
+/// Empty when the call has a message of its own.
+pub fn assert_message(st: &mut Expander, inner: &[Tt], span: Span) -> Vec<Tt> {
+    let args = split_args(inner);
+    if args.len() != 1 {
+        return Vec::new();
+    }
+    let text = format!("assertion failed: {}", super::assert_msg::assert_cond_text(st, &args[0]));
+    let comma = Tt::Tok(Token { tok: Tok::Comma, span });
+    vec![comma.clone(), st.str_tree("{}", span), comma, st.str_tree(&text, span)]
+}
+
 /// Expands one builtin macro call. `name` has no `!` and satisfied
 /// `is_token_builtin`. The walk re-walks output, so nested macro calls
 /// a builtin writes or forwards need no chase here, except where a
@@ -568,13 +583,32 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             }
             let plain = name.strip_prefix("debug_").unwrap_or(name).to_string();
             let mut out = vec![st.ident_tree(&plain, span), Tt::Tok(Token { tok: Tok::Bang, span })];
-            let inner = st.expand_more(call.inner.clone(), depth)?;
+            // The message text comes from the condition as written.
+            let msg = if plain == "assert" { assert_message(st, &call.inner, span) } else { Vec::new() };
+            let mut inner = st.expand_more(call.inner.clone(), depth)?;
+            inner.extend(msg);
             out.push(Tt::Delim(Delim::Paren, inner, span));
             Ok(out)
         }
         "unimplemented" => {
-            let mut out = vec![st.ident_tree("todo", span), Tt::Tok(Token { tok: Tok::Bang, span })];
-            let inner = st.expand_more(call.inner.clone(), depth)?;
+            // `panic!` with rustc's text: "not implemented", then `: ` and
+            // the caller's format string when there is one.
+            let mut out = vec![st.ident_tree("panic", span), Tt::Tok(Token { tok: Tok::Bang, span })];
+            let expanded = st.expand_more(call.inner.clone(), depth)?;
+            let args = split_args(&expanded);
+            let mut inner = Vec::new();
+            if let Some(first) = args.first() {
+                let Some((text, lit)) = literal_string(st, first) else {
+                    return Err(bad("unimplemented! takes a format string literal".into()));
+                };
+                inner.push(st.str_tree(&format!("not implemented: {text}"), lit));
+                for a in &args[1..] {
+                    inner.push(Tt::Tok(Token { tok: Tok::Comma, span }));
+                    inner.extend(a.iter().cloned());
+                }
+            } else {
+                inner.push(st.str_tree("not implemented", span));
+            }
             out.push(Tt::Delim(Delim::Paren, inner, span));
             Ok(out)
         }

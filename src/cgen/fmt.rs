@@ -460,7 +460,12 @@ impl FnGen<'_, '_, '_> {
             }
         }
         if fallible {
-            let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed({what}, {loc});");
+            if what >= 2 {
+                // A print writes the pieces before the failing one, as Rust does.
+                let _ = writeln!(self.out, "    if ({s}e) lust_print_failed({}, &{s});", what - 2);
+            } else {
+                let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed({what}, {loc});");
+            }
         }
         s
     }

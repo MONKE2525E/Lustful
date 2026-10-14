@@ -390,6 +390,33 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn span(&self, e: ExprId) -> Span {
         self.p.ast.expr_span(e)
     }
+    /// The `[` of an index expression, given its index operand: the byte
+    /// before the operand (rustfmt never puts space after `[`). rustc
+    /// reports `Index::index` panics there.
+    fn bracket_span(&self, index: ExprId) -> Span {
+        let s = self.span(index);
+        Span { lo: s.lo.saturating_sub(1), hi: s.lo, ..s }
+    }
+    /// Gives the index local `i` its panic location `at` (see
+    /// `Proj::Index`): re-spans its assignment when that is the last
+    /// statement and cannot panic itself, else adds `i = copy i` at `at`.
+    fn mark_index_loc(&mut self, i: Local, at: Span) {
+        let blk = &mut self.body.blocks[self.cur.0 as usize];
+        let plain = |o: &Operand| match o {
+            Operand::Copy(q) | Operand::Move(q) => !q.proj.iter().any(|x| matches!(x, Proj::Index(_))),
+            _ => true,
+        };
+        if let Some(st) = blk.stmts.last_mut()
+            && let StmtKind::Assign(p, Rvalue::Use(o)) = &st.kind
+            && plain(o)
+            && p.local == i
+            && p.proj.is_empty()
+        {
+            st.span = at;
+            return;
+        }
+        self.assign(Place::local(i), Rvalue::Use(Operand::Copy(Place::local(i))), at);
+    }
     fn ty(&self, e: ExprId) -> Ty {
         self.ck.ty(e)
     }
@@ -548,7 +575,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                     _ => ERROR,
                 };
                 let t = self.temp(slice);
-                let span = self.span(e);
+                // Range indexing is `Index::index`: it panics at the brackets.
+                let span = self.bracket_span(*index);
                 let mutable = self.mut_index > 0;
                 self.assign(Place::local(t), Rvalue::Subslice { base: b, lo, hi, inclusive, mutable }, span);
                 Place::local(t)
@@ -581,6 +609,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let saved = std::mem::take(&mut self.mut_index);
                 self.expr_into(*index, Some(&Place::local(i)));
                 self.mut_index = saved;
+                // The bounds check panics where rustc does: at the whole
+                // `a[i]` for a built-in array or slice index, at the
+                // brackets for `Index::index` (a Vec). See `Proj::Index`.
+                let builtin = matches!(self.kind(self.peel(self.ty(*base), derefs)), TyKind::Array(..) | TyKind::Slice(_));
+                let at = if builtin { self.span(e) } else { self.bracket_span(*index) };
+                self.mark_index_loc(i, at);
                 b.project(Proj::Index(i))
             }
             (Expr::Deref(inner), _) => {
@@ -2633,7 +2667,24 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let ok = self.pick_cmp(f, via, BinOp::Le, &pl(vals[1]), &pl(vals[2]), ty, span);
                 let (good, bad) = branch(self, ok);
                 self.cur = bad;
-                self.terminate(Terminator::Panic(vec![FmtPart::Lit("assertion failed: min <= max".into())]), span);
+                // Primitive `clamp` panics with the bounds in its text;
+                // `Ord::clamp` asserts (rustc reports that one in std's
+                // cmp.rs, which lust does not model yet).
+                let parts = if matches!(self.kind(ty), TyKind::Int(_) | TyKind::Char | TyKind::Bool) {
+                    // A format argument is a reference to the value.
+                    let dbg = FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };
+                    let arg = |this: &mut Self, v: Local| {
+                        let rt = this.ref_ty(false, ty);
+                        let r = this.temp(rt);
+                        this.assign(Place::local(r), Rvalue::Ref(false, Place::local(v)), span);
+                        FmtPart::Arg { value: Operand::Copy(Place::local(r)), ty, debug: true, spec: dbg }
+                    };
+                    let (lo, hi) = (arg(self, vals[1]), arg(self, vals[2]));
+                    vec![FmtPart::Lit("min > max. min = ".into()), lo, FmtPart::Lit(", max = ".into()), hi]
+                } else {
+                    vec![FmtPart::Lit("assertion failed: min <= max".into())]
+                };
+                self.terminate(Terminator::Panic(parts), span);
                 self.cur = good;
                 let below = self.pick_cmp(f, via, BinOp::Lt, &pl(vals[0]), &pl(vals[1]), ty, span);
                 let (t, el) = branch(self, below);
@@ -4768,7 +4819,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
                 self.terminate(Terminator::Panic(parts), span);
             }
-            MacroKind::Todo => self.terminate(Terminator::Panic(vec![FmtPart::Lit("not yet implemented".into())]), span),
+            MacroKind::Todo => {
+                let parts = self.prefixed_parts("not yet implemented", args, fmt);
+                self.terminate(Terminator::Panic(parts), span)
+            }
             // As a `write_fmt` argument on a Formatter or String it lowers
             // in `write_fmt_into`. Any other `write_fmt` argument (the
             // `io::Write` method, W-SHIM) is an `Arguments` value: its
@@ -4778,7 +4832,8 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.set_or_temp(dest, Rvalue::Format(parts), ty, span);
             }
             MacroKind::Unreachable => {
-                self.terminate(Terminator::Panic(vec![FmtPart::Lit("internal error: entered unreachable code".into())]), span)
+                let parts = self.prefixed_parts("internal error: entered unreachable code", args, fmt);
+                self.terminate(Terminator::Panic(parts), span)
             }
             MacroKind::Vec => {
                 let elem = self.peel_vec(ty);
@@ -4842,6 +4897,15 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.unit(dest, span);
             }
         }
+    }
+
+    /// A panic message as rustc's `todo!` and `unreachable!` build it:
+    /// `base`, then `: ` and the caller's format string when given.
+    fn prefixed_parts(&mut self, base: &str, args: &[ExprId], fmt: &[FmtPiece]) -> Vec<FmtPart> {
+        let msg = self.fmt_parts(args, fmt);
+        let mut parts = vec![FmtPart::Lit(if msg.is_empty() { base.to_string() } else { format!("{base}: ") })];
+        parts.extend(msg);
+        parts
     }
 
     /// An operand for a const value, building aggregates in a temporary.
