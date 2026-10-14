@@ -5329,7 +5329,8 @@ pub fn ty_uses_const_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
 }
 
 /// The header rules of one trait impl that are not about its
-/// items: `Sized` cannot be implemented, `unsafe` must match
+/// items: `Sized` cannot be implemented, an auto trait needs a
+/// local nominal Self type, `unsafe` must match
 /// between trait and impl, a `Drop` impl must cover the Adt as
 /// written with no extra bounds, and every impl parameter must
 /// be constrained by the trait ref (Self or a trait input).
@@ -5342,6 +5343,27 @@ fn check_impl_rules(p: &mut Program, imp: &ast::ImplDef, generics: &Generics, se
             "the `Sized` trait cannot be implemented in user code",
             "Remove the impl; sizedness is automatic.",
         ));
+    }
+    // An auto trait (`Send`, `Sync`, `Unpin`) can only be implemented
+    // for a struct, enum, or union of this file (rustc E0321); std
+    // source impls are std's own.
+    if lang.is_auto(tr.def) && !p.std_source_span(imp.span) {
+        let nominal = p.tys.local_adt(self_pat).is_some_and(|a| !p.is_std_adt(a));
+        if !nominal {
+            let name = if tr.def == lang.send {
+                "Send"
+            } else if tr.def == lang.sync {
+                "Sync"
+            } else {
+                "Unpin"
+            };
+            errs.push(Diag::new(
+                "L0110",
+                imp.span,
+                format!("`{name}` can only be implemented for a struct, enum, or union defined in this file"),
+                "Implement it for a local struct, enum, or union, or remove the impl.",
+            ));
+        }
     }
     let trait_unsafe = p.gx.trait_unsafe.get(&tr.def).copied().unwrap_or(false) || tr.def == lang.send || tr.def == lang.sync;
     if trait_unsafe && !imp.is_unsafe {
