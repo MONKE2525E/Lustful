@@ -2734,9 +2734,12 @@ pub fn collect_reuse<'a>(
                 p.gx.adt_info[id.0 as usize] = (def, 1);
                 // Its instances need the generic machinery, but only
                 // in programs that use it (plain programs keep the
-                // fast path; the perf gate measures those).
+                // fast path; the perf gate measures those). Both
+                // flags, like `Cow`: mono's lang-enum fast path
+                // (user_generics false) makes no Adt instances.
                 if generics::ast_uses_bound(ast, interner) {
                     p.gx.has_generics = true;
+                    p.gx.user_generics = true;
                 }
                 let t0 = p.tys.intern(TyKind::Param(ParamId(0)));
                 let sized_args = p.tys.intern_args(&[GenericArg::Ty(t0)]);
