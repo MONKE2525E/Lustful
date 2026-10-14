@@ -396,6 +396,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         self.check_args(&params, args, span);
+        // The expansion calls closures, fn items, and fn pointers; a
+        // `dyn Fn` value, or a reference or box around a callable
+        // (`.map(r)` for `r: &dyn Fn(..)`), meets the bound but has no
+        // expansion yet. Callable params are the `fn_mut_param` vars.
+        for (&a, &pt) in args.iter().zip(&params) {
+            let is_callable_param = matches!(self.tys.kind(pt), TyKind::Infer(v) if self.iter_closure_args.contains_key(&v.0));
+            let t = self.deep(pt);
+            if is_callable_param && (matches!(self.kind(t), TyKind::Dyn(..) | TyKind::Ref(..)) || self.tys.boxed_elem(t).is_some()) {
+                let s = self.span(a);
+                self.errs.push(generics::dyn_not_yet(s, "a `dyn Fn` value or a reference to a callable as an iterator adapter's callable"));
+                return ERROR;
+            }
+        }
         ret
     }
 

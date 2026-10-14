@@ -559,12 +559,16 @@ impl Solver {
             }
         }
 
-        // Closures implement the Fn traits builtin (ARCH 2.9).
+        // Closures implement the Fn traits builtin (ARCH 2.9), and so do
+        // `dyn Fn` types and core's forwarding impls for `&F`, `&mut F`,
+        // and `Box<F>` (the hook answers None for other types).
         {
             let self_ty = self_ty_of(cx.tys(), &obl);
             let deep = cx.deep_resolve(self_ty);
-            if matches!(cx.tys().kind(deep), TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..))
-                && let Some(ok) = cx.closure_select(obl)
+            if matches!(
+                cx.tys().kind(deep),
+                TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Dyn(..) | TyKind::Ref(..) | TyKind::Adt(..)
+            ) && let Some(ok) = cx.closure_select(obl)
             {
                 return if ok { Selection::Builtin } else { Selection::NoImpl };
             }
@@ -797,8 +801,10 @@ impl Solver {
                 // return type (ARCH 2.9), with no impl to read it from.
                 if let Some(self_ty) = cx.tys().args(args).first().and_then(|g| g.as_ty()) {
                     let deep = cx.deep_resolve(self_ty);
-                    if matches!(cx.tys().kind(deep), TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..))
-                        && let Some(out) = cx.closure_output(assoc.0, deep)
+                    if matches!(
+                        cx.tys().kind(deep),
+                        TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Dyn(..) | TyKind::Ref(..) | TyKind::Adt(..)
+                    ) && let Some(out) = cx.closure_output(assoc.0, deep)
                     {
                         return self.normalize_inner(cx, index, env, out, depth + 1);
                     }

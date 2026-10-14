@@ -1715,18 +1715,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let args: Vec<GenericArg> = self.tys.args(obl.args).to_vec();
         let self_ty = self.deep(args.first()?.as_ty()?);
-        let (kind, inputs) = match self.kind(self_ty) {
-            TyKind::Closure(def, _) => {
-                let (kind, inputs, _) = self.closure_facts(def)?;
-                (kind, inputs)
-            }
-            // A safe fn pointer, fn item, or tuple constructor implements
-            // all three Fn traits with its signature (ARCH 2.9).
-            TyKind::FnPtr(_) | TyKind::FnDef(..) => match self.fn_value_sig(self_ty) {
-                Some((params, _)) => (ClosureKind::Fn, params),
-                None => return Some(false),
-            },
-            _ => return None,
+        let (kind, inputs) = match self.fn_like_facts(self_ty, 0) {
+            Some((kind, inputs, _)) => (kind, inputs),
+            // An unsafe or `extern "C"` fn implements no Fn trait.
+            None if matches!(self.kind(self_ty), TyKind::FnPtr(_) | TyKind::FnDef(..)) => return Some(false),
+            None => return None,
         };
         let need = if obl.def == lang.fn_ {
             ClosureKind::Fn
@@ -1794,10 +1787,48 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if Some(assoc) != lang.output_of(lang.fn_once) {
             return None;
         }
-        let deep = self.deep(self_ty);
-        match self.kind(deep) {
-            TyKind::Closure(def, _) => self.closure_facts(def).map(|f| f.2),
-            TyKind::FnPtr(_) | TyKind::FnDef(..) => self.fn_value_sig(deep).map(|f| f.1),
+        self.fn_like_facts(self_ty, 0).map(|f| f.2)
+    }
+
+    /// The Fn-family facts of a callable type for selection: the
+    /// strongest Fn trait it implements (as a closure kind), its inputs,
+    /// and its output. Closures, safe fn items and pointers (ARCH 2.9),
+    /// `dyn Fn`-family types, and core's forwarding impls: `&F` is `Fn`
+    /// when `F: Fn`, `&mut F` is `FnMut` when `F: FnMut`, and `Box<F>`
+    /// is what `F` is.
+    fn fn_like_facts(&mut self, t: Ty, depth: u8) -> Option<(ClosureKind, Vec<Ty>, Ty)> {
+        let lang = self.p.gx.lang;
+        let t = self.deep(t);
+        match self.kind(t) {
+            TyKind::Closure(def, _) => self.closure_facts(def),
+            TyKind::FnPtr(_) | TyKind::FnDef(..) => self.fn_value_sig(t).map(|(params, ret)| (ClosureKind::Fn, params, ret)),
+            TyKind::Dyn(..) => {
+                let (tdef, tuple, out) = self.dyn_fn_parts(t)?;
+                let kind = if tdef == lang.fn_ {
+                    ClosureKind::Fn
+                } else if tdef == lang.fn_mut {
+                    ClosureKind::FnMut
+                } else {
+                    ClosureKind::FnOnce
+                };
+                let inputs = match self.kind(self.resolve(tuple)) {
+                    TyKind::Tuple(ts) => self.tys.tys_of(ts).to_vec(),
+                    _ => Vec::new(),
+                };
+                Some((kind, inputs, out))
+            }
+            TyKind::Ref(_, m, inner) if depth < 4 => {
+                let (k, inputs, out) = self.fn_like_facts(inner, depth + 1)?;
+                if m.is_mut() {
+                    (k <= ClosureKind::FnMut).then_some((ClosureKind::FnMut, inputs, out))
+                } else {
+                    (k == ClosureKind::Fn).then_some((ClosureKind::Fn, inputs, out))
+                }
+            }
+            TyKind::Adt(..) if depth < 4 => {
+                let elem = self.tys.boxed_elem(t)?;
+                self.fn_like_facts(elem, depth + 1)
+            }
             _ => None,
         }
     }
