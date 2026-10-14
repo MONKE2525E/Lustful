@@ -142,4 +142,9 @@ fn main() {
         count += 1;
     }
     println!("stdin lock {count}");
+    let mut count = 0;
+    for _l in io::stdin().lines() {
+        count += 1;
+    }
+    println!("stdin lines {count}");
 }

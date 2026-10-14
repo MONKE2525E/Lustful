@@ -766,6 +766,18 @@ impl Read for &[u8] {
         *self = &cur[cur.len()..];
         Ok(cur.len())
     }
+
+    /// As std: the whole slice is checked first, so invalid UTF-8
+    /// consumes nothing.
+    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        let cur: &[u8] = *self;
+        if core::intrinsics::sys_utf8_valid_up_to(cur) != cur.len() {
+            return Err(invalid_utf8_error());
+        }
+        buf.push_str(core::intrinsics::sys_bytes_as_str(cur));
+        *self = &cur[cur.len()..];
+        Ok(cur.len())
+    }
 }
 
 impl<R: Read + ?Sized> Read for &mut R {
@@ -1165,7 +1177,7 @@ impl<W: Write> BufWriter<W> {
             match self.inner.write(&self.buf[written..]) {
                 Ok(0) => {
                     self.drop_prefix(written);
-                    return Err(Error::simple_message(ErrorKind::WriteZero, "failed to write whole buffer"));
+                    return Err(Error::simple_message(ErrorKind::WriteZero, "failed to write the buffered data"));
                 }
                 Ok(n) => written += n,
                 Err(e) => {
@@ -1305,6 +1317,12 @@ impl Stdin {
     /// is taken for the call, as in std).
     pub fn read_line(&self, buf: &mut String) -> Result<usize> {
         self.lock().read_line(buf)
+    }
+
+    /// An iterator over the lines of standard input (the lock is
+    /// taken for the iterator's life, as in std).
+    pub fn lines(&self) -> Lines<StdinLock<'static>> {
+        self.lock().lines()
     }
 }
 
