@@ -579,7 +579,7 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     match tys.builtin_of(t) {
         Some(
             BuiltinTy::Chars
-            | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter)
+            | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter | IterKind::Windows)
             | BuiltinTy::RefGuard
             | BuiltinTy::RefMutGuard,
         ) => return 1,
@@ -3673,7 +3673,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let cat = |parts: &[&[u32]]| parts.concat();
         Some(match k {
-            K::SliceIter | K::SliceIterMut => cat(&[&own, &args[0]]),
+            K::SliceIter | K::SliceIterMut | K::Windows => cat(&[&own, &args[0]]),
             K::VecIntoIter | K::Range | K::RangeInclusive => args[0].clone(),
             K::Map | K::FilterMap => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
@@ -4090,7 +4090,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             | K::SetIntoIter
             | K::ArrayIntoIter
             | K::RepeatN
-            | K::ByNext => false,
+            | K::ByNext
+            | K::Windows => false,
         }
     }
 

@@ -106,6 +106,9 @@ pub enum IterKind {
     /// with an `Iterator` bound; adapters and consumers wrap it once.
     /// Never named in source: messages print `I`.
     ByNext,
+    /// `core::slice::Windows<T>` (W-STD-B): args `[T]`, item `&[T]`;
+    /// (the slice left, the window size).
+    Windows,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -131,7 +134,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 37] = [
+    pub const ALL: [IterKind; 38] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -169,6 +172,7 @@ impl IterKind {
         IterKind::ArrayIntoIter,
         IterKind::RepeatN,
         IterKind::ByNext,
+        IterKind::Windows,
     ];
 
     /// True for the hashed-collection iterators.
@@ -227,6 +231,7 @@ impl IterKind {
             K::ArrayIntoIter => (&["core", "array", "iter"], "IntoIter"),
             K::RepeatN => (&["core", "iter", "sources", "repeat_n"], "RepeatN"),
             K::ByNext => (&["core", "iter", "lust"], "ByNext"),
+            K::Windows => (&["core", "slice"], "Windows"),
         }
     }
 
@@ -289,6 +294,7 @@ impl IterKind {
             K::ArrayIntoIter => "std::array::IntoIter",
             K::RepeatN => "std::iter::RepeatN",
             K::ByNext => "",
+            K::Windows => "std::slice::Windows",
         }
     }
 
@@ -341,6 +347,7 @@ impl IterKind {
             // (element, count left).
             K::RepeatN => &[F::Arg(0), F::Usize],
             K::ByNext => &[F::Arg(0)],
+            K::Windows => &[F::SliceRef(0, false), F::Usize],
         }
     }
 }
@@ -415,6 +422,10 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::MapIntoValues => a[1],
         K::ArrayIntoIter | K::RepeatN => a[0],
         K::ByNext => a[1],
+        K::Windows => {
+            let s = tys.intern(TyKind::Slice(a[0]));
+            tys.mk_ref(false, s)
+        }
     })
 }
 

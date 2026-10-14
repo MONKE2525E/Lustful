@@ -6101,6 +6101,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
             let item = match k {
                 K::SliceIter => p.tys.mk_ref(false, ps[0]),
                 K::SliceIterMut => p.tys.mk_ref(true, ps[0]),
+                K::Windows => {
+                    let s = p.tys.intern(TyKind::Slice(ps[0]));
+                    p.tys.mk_ref(false, s)
+                }
                 K::VecIntoIter | K::Range | K::RangeInclusive => ps[0],
                 K::Map | K::FilterMap => ps[2],
                 K::Copied | K::Cloned => ps[1],

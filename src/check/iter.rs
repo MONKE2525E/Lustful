@@ -104,8 +104,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "binary_search" => "binary_search",
                 "binary_search_by" => "binary_search_by",
                 "binary_search_by_key" => "binary_search_by_key",
+                "windows" => "windows",
                 _ => return None,
             };
+            if n == "windows" {
+                // `slice::windows(size)` (W-STD-B): the slice by reference.
+                let ret = it::mk_iter(&mut self.tys, IterKind::Windows, &[el]);
+                self.set_res(e, Res::BuiltinMethod { b: Builtin::IterWindows, derefs, autoref: Autoref::Ref });
+                self.check_args(&[USIZE], args, name_span);
+                return Some(ret);
+            }
             if n.starts_with("sort") || n.starts_with("binary_search") {
                 return Some(self.seq_sort(e, recv, el, derefs, n, name_span, args));
             }
@@ -780,7 +788,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn rposition_ok(&self, t: Ty) -> bool {
         use IterKind as K;
         match it::iter_parts(&self.tys, t) {
-            Some((K::SliceIter | K::SliceIterMut | K::ArrayIntoIter, _)) => true,
+            Some((K::SliceIter | K::SliceIterMut | K::ArrayIntoIter | K::Windows, _)) => true,
             Some((K::Map | K::Copied | K::Cloned, a)) => self.rposition_ok(a[0]),
             _ => false,
         }
@@ -795,7 +803,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let Some((k, a)) = it::iter_parts(&self.tys, t) else { return false };
         match k {
-            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive => true,
+            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::Windows => true,
             K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => self.double_ended(a[0]),
             K::Chain => self.double_ended(a[0]) && self.double_ended(a[1]),
             // These need ExactSizeIterator too: lust keeps them forward-only for now.

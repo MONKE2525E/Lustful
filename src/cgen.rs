@@ -298,6 +298,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
     };
     match k {
         K::SliceIter | K::SliceIterMut => ref_to(a[0]),
+        K::Windows => CTy::Slice(Box::new(cty(tys, a[0]))),
         K::VecIntoIter | K::Range | K::RangeInclusive => cty(tys, a[0]),
         K::Map | K::FilterMap => cty(tys, a[2]),
         K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),
@@ -4417,6 +4418,7 @@ impl FnGen<'_, '_, '_> {
             | B::IterFindMap
             | B::IterPosition
             | B::IterRposition
+            | B::IterWindows
             | B::IterFold
             | B::IterForEach
             | B::IterMin

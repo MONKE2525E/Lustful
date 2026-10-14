@@ -327,6 +327,9 @@ pub enum Builtin {
     /// `rposition` (W-STD-B): from the back, over an iterator with an
     /// exact size and `next_back`.
     IterRposition,
+    /// `slice::windows(size)` (W-STD-B): a `Windows` iterator; panics on
+    /// a zero size as std does.
+    IterWindows,
     IterFold,
     IterForEach,
     IterMin,

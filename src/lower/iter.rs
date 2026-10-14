@@ -58,6 +58,7 @@ fn expands(b: Builtin) -> bool {
             | B::IterFindMap
             | B::IterPosition
             | B::IterRposition
+            | B::IterWindows
             | B::IterFold
             | B::IterForEach
             | B::IterMin
@@ -384,6 +385,24 @@ impl Ex<'_, '_, '_> {
             B::ConvInto => {
                 let x = arg()?;
                 return self.conv(x, dest, dest_ty);
+            }
+            // `slice.windows(size)` (W-STD-B): std's `NonZero::new(size).expect(..)`
+            // panic first, then (the whole slice, size).
+            B::IterWindows => {
+                let (r, n) = (arg()?, arg()?);
+                let nl = self.local(USIZE);
+                self.assign(Place::local(nl), Rvalue::Use(n));
+                let c = self.cmp(crate::ast::BinOp::Eq, Operand::Copy(Place::local(nl)), Self::usize_c(0));
+                let (zero, go) = self.branch(c);
+                self.cur = zero;
+                self.term(Terminator::Panic(vec![FmtPart::Lit("window size must be non-zero".into())]));
+                self.cur = go;
+                let rt = self.op_ty(&r)?;
+                let rp = self.op_place(r, rt);
+                let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad windows iterator")?;
+                let s = self.local(fields[0]);
+                self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s)), Operand::Copy(Place::local(nl))]));
             }
             B::IterIter | B::IterIterMut => {
                 let r = arg()?;
@@ -930,6 +949,36 @@ impl Ex<'_, '_, '_> {
                 self.some(&dest, opt, Operand::Copy(f(0)));
                 self.goto(join);
                 self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            // `Windows` (W-STD-B): the first (or last) `size` elements
+            // while that many remain, then the slice loses one element
+            // at that end, as std's `next` and `next_back` do.
+            K::Windows => {
+                let sd = f(0).deref();
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(sd.clone()));
+                let c = self.cmp(Lt, Operand::Copy(Place::local(len)), Operand::Copy(f(1)));
+                let (short, s) = self.branch(c);
+                self.cur = s;
+                let st = self.place_ty(&f(0))?;
+                let (w, rest) = (self.local(st), self.local(st));
+                if back {
+                    let lo = self.local(USIZE);
+                    self.assign(Place::local(lo), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Operand::Copy(f(1))));
+                    let hi = self.local(USIZE);
+                    self.assign(Place::local(hi), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Self::usize_c(1)));
+                    self.assign(Place::local(w), Rvalue::Subslice { base: sd.clone(), lo: Operand::Copy(Place::local(lo)), hi: None, inclusive: false, mutable: false });
+                    self.assign(Place::local(rest), Rvalue::Subslice { base: sd, lo: Self::usize_c(0), hi: Some(Operand::Copy(Place::local(hi))), inclusive: false, mutable: false });
+                } else {
+                    self.assign(Place::local(w), Rvalue::Subslice { base: sd.clone(), lo: Self::usize_c(0), hi: Some(Operand::Copy(f(1))), inclusive: false, mutable: false });
+                    self.assign(Place::local(rest), Rvalue::Subslice { base: sd, lo: Self::usize_c(1), hi: None, inclusive: false, mutable: false });
+                }
+                self.assign(f(0), Rvalue::Use(Operand::Move(Place::local(rest))));
+                self.some(&dest, opt, Operand::Move(Place::local(w)));
+                self.goto(join);
+                self.cur = short;
                 self.none(&dest, opt);
                 self.goto(join);
             }
@@ -2299,7 +2348,7 @@ impl Ex<'_, '_, '_> {
         match k {
             // `array::IntoIter` is random access in Rust 1.99 (a zip with
             // it pulls only `min` items from a mapped side).
-            K::SliceIter | K::SliceIterMut | K::ArrayIntoIter => true,
+            K::SliceIter | K::SliceIterMut | K::ArrayIntoIter | K::Windows => true,
             K::Range => matches!(
                 self.body.tys.kind(a[0]),
                 TyKind::Int(IntTy::Usize | IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::U64 | IntTy::Isize | IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64)
@@ -2349,6 +2398,23 @@ impl Ex<'_, '_, '_> {
                 self.assign(Place::local(out), Rvalue::Bin(Sub, Operand::Copy(f(2)), Operand::Copy(f(1))));
             }
             K::RepeatN => self.assign(Place::local(out), Rvalue::Use(Operand::Copy(f(1)))),
+            // `Windows`: len - size + 1, or 0 when shorter than a window.
+            K::Windows => {
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(f(0).deref()));
+                let c = self.cmp(Lt, Operand::Copy(Place::local(len)), Operand::Copy(f(1)));
+                let (short, s) = self.branch(c);
+                let join = self.block();
+                self.cur = s;
+                let d = self.local(USIZE);
+                self.assign(Place::local(d), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Operand::Copy(f(1))));
+                self.assign(Place::local(out), Rvalue::Bin(Add, Operand::Copy(Place::local(d)), Self::usize_c(1)));
+                self.goto(join);
+                self.cur = short;
+                self.assign(Place::local(out), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = join;
+            }
             _ => return Err("iterator expansion: size of a non-random-access iterator".into()),
         }
         Ok(Operand::Copy(Place::local(out)))
@@ -2367,6 +2433,12 @@ impl Ex<'_, '_, '_> {
                 let m = k == K::SliceIterMut;
                 let pl = f(0).deref().project(Proj::Index(i));
                 self.assign(dest, Rvalue::Ref(m, pl));
+            }
+            // `Windows`: `&v[i..i + size]` of the slice left.
+            K::Windows => {
+                let hi = self.local(USIZE);
+                self.assign(Place::local(hi), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Operand::Copy(f(1))));
+                self.assign(dest, Rvalue::Subslice { base: f(0).deref(), lo: Operand::Copy(Place::local(i)), hi: Some(Operand::Copy(Place::local(hi))), inclusive: false, mutable: false });
             }
             K::Range => {
                 let off = self.local(a[0]);
@@ -2469,7 +2541,7 @@ impl Ex<'_, '_, '_> {
                 self.call_builtin(Builtin::VecIterLen, vec![Operand::Move(Place::local(r))], Place::local(n));
                 set_exact(self, Operand::Copy(Place::local(n)));
             }
-            K::ArrayIntoIter | K::RepeatN => {
+            K::ArrayIntoIter | K::RepeatN | K::Windows => {
                 let n = self.size(itp.clone(), ty)?;
                 set_exact(self, n);
             }
@@ -2773,6 +2845,7 @@ impl Ex<'_, '_, '_> {
             // A user iterator may implement the unstable TrustedLen only
             // in std itself.
             K::ByNext => false,
+            K::Windows => true,
         }
     }
 
