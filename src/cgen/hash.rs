@@ -328,7 +328,13 @@ pub(super) fn hash_value_sig(key: &CTy) -> String {
 /// The body of `uint64_t hk_<map>(S *s, K *k)`: one key hashed with a
 /// fresh hasher from the map's builder, as `make_hash` does.
 pub(super) fn hash_key_body(p: &Program, slots: &[u32], map: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
-    let s_cty = builder_cty(map);
+    hash_with_builder(p, slots, &builder_cty(map), k_cty, need)
+}
+
+/// The body that hashes the key at `k` (a `K*`) with a fresh hasher
+/// from the builder at `s` (an `S*`): `make_hash`, and `hash_one`.
+fn hash_with_builder(p: &Program, slots: &[u32], s_cty: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let s_cty = s_cty.clone();
     let hc = hasher_cty(p, &s_cty);
     let build = build_expr(p, slots, &s_cty, "s", need);
     let stmts = hash_stmts(p, slots, k_cty, &hc, "(&h)", "k", need);
@@ -387,6 +393,11 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
                 format!("  (void)ctx; *({e}*)dst = clone_{}(({e}*)src);\n", mangle(&ec))
             };
             (format!("void hcl_{m}(void *ctx, void *dst, const void *src)"), body)
+        }
+        Glue::HashOne => {
+            let CTy::Tuple(parts) = t else { return (String::new(), String::new()) };
+            let (s, x) = (&parts[0], &parts[1]);
+            (format!("uint64_t hone_{m}({} *s, {} *k)", ctype(s), ctype(x)), hash_with_builder(p, slots, s, x, need))
         }
         Glue::HashKeyQ | Glue::HashEqQ => {
             let CTy::Tuple(parts) = t else { return (String::new(), String::new()) };
@@ -552,6 +563,9 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::HashIterLen
             | B::HashExtendReserve
             | B::HashReserve
+            | B::HashInto
+            | B::HashOne
+            | B::HasherCall
     )
 }
 
@@ -596,6 +610,53 @@ impl FnGen<'_, '_, '_> {
         };
         let t = self.tmp();
         match b {
+            // `x.hash(state)`: (&T, &mut H), through the value glue.
+            B::HashInto => {
+                let (Some(CTy::Ref(x)), Some(CTy::Ref(hc))) = (tys.first(), tys.get(1)) else { return Some("((lust_Unit){})".into()) };
+                // A `&str` or `&[T]` receiver is a fat value, not a
+                // pointer: hash the reference itself (core hashes it as
+                // its pointee) from a temporary.
+                let (xt, xp) = if matches!(**x, CTy::Str | CTy::Slice(_)) {
+                    let _ = writeln!(self.out, "    {} {t}_x = {};", ctype(&tys[0]), vals[0]);
+                    (tys[0].clone(), format!("(&{t}_x)"))
+                } else {
+                    ((**x).clone(), vals[0].clone())
+                };
+                let key = hv_key(&xt, hc);
+                self.want(Glue::HashValue, &key);
+                let _ = writeln!(self.out, "    hv_{}({}, {xp});", mangle(&key), vals[1]);
+                Some("((lust_Unit){})".into())
+            }
+            // `s.hash_one(x)`: (&S, T); `x` is moved in and dropped after.
+            B::HashOne => {
+                let (Some(CTy::Ref(s)), Some(x)) = (tys.first(), tys.get(1)) else { return Some("0".into()) };
+                let key = CTy::Tuple(vec![(**s).clone(), x.clone()]);
+                self.want(Glue::HashOne, &key);
+                let _ = writeln!(self.out, "    {} {t}_x = {}; uint64_t {t} = hone_{}({}, &{t}_x);", ctype(x), vals[1], mangle(&key), vals[0]);
+                if needs_drop_c(self.p, x) {
+                    self.want(Glue::Drop, x);
+                    let _ = writeln!(self.out, "    drop_{}(&{t}_x);", mangle(x));
+                }
+                Some(t)
+            }
+            // A Hasher method, picked by its argument (check/mod.rs `HasherCall`).
+            B::HasherCall => {
+                let hc = match tys.first() {
+                    Some(CTy::Ref(h)) => (**h).clone(),
+                    _ => return Some("0".into()),
+                };
+                let m = match tys.get(1) {
+                    None => 0,
+                    Some(CTy::Int(i)) => write_int(*i),
+                    Some(_) => HASHER_METHODS.iter().position(|n| *n == "write").unwrap_or(1),
+                };
+                let call = hasher_call(self.p, self.slots, &hc, m, &format!("({})", vals[0]), vals.get(1).map_or("", |v| v.as_str()));
+                if m == 0 {
+                    return Some(call);
+                }
+                let _ = writeln!(self.out, "    {call}");
+                Some("((lust_Unit){})".into())
+            }
             B::HashNew | B::HashWithCapacity | B::HashWithHasher | B::HashWithCapacityAndHasher | B::HashDefault => {
                 let CTy::Hash(k, _) = dest else { return Some("((lust_Unit){})".into()) };
                 if !is_table(*k) {

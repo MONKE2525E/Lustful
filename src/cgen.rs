@@ -153,6 +153,9 @@ pub enum Glue {
     HashEqEntry,
     /// `hdr_`: the core's element drop callback.
     HashDrop,
+    /// `hone_`: `BuildHasher::hash_one` of a value with a builder (key
+    /// `(S, T)`).
+    HashOne,
 }
 
 /// Maps a semantic type to its body-independent C form. Builtin Adts reach this
@@ -3415,7 +3418,10 @@ impl FnGen<'_, '_, '_> {
             | B::HashIterNext
             | B::HashIterLen
             | B::HashExtendReserve
-            | B::HashReserve => unreachable!("hash builtins emit in cgen/hash.rs"),
+            | B::HashReserve
+            | B::HashInto
+            | B::HashOne
+            | B::HasherCall => unreachable!("hash builtins emit in cgen/hash.rs"),
             B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN => {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
@@ -7375,7 +7381,8 @@ fn glue_def(
         | Glue::HashKeyQ
         | Glue::HashEqQ
         | Glue::HashEqEntry
-        | Glue::HashDrop => {
+        | Glue::HashDrop
+        | Glue::HashOne => {
             let (sig, body) = hash::glue(p, slots, g, t, &mut need);
             let _ = writeln!(protos, "{sig};");
             let _ = writeln!(defs, "{sig} {{\n{body}}}\n");

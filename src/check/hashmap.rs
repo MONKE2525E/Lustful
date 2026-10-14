@@ -155,6 +155,103 @@ impl<'p, 'a> Ctx<'p, 'a> {
         tys.smart_elem(k) == Some(q)
     }
 
+    /// True when `t` implements `trait_def` here: an impl (core's, a
+    /// derive, or the user's) or a bound.
+    fn implements(&mut self, trait_def: DefId, t: Ty) -> bool {
+        let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        let tr = TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS };
+        matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_))
+    }
+
+    /// The std hash trait `name` is usable here: imported by its std
+    /// path, or a bound in the env (as rustc needs the trait in scope).
+    fn hash_trait_in_scope(&self, trait_def: DefId, name: &str) -> bool {
+        self.std_trait_imported("hash", name) || self.env().iter().any(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == trait_def))
+    }
+
+    /// A value hashed by the glue (`x.hash(..)`, `hash_one(x)`): `T:
+    /// Hash` goes to the queue, and at finish its Hash must be core's or
+    /// derived all the way down (`glue_hash_ok`).
+    fn glue_hashable(&mut self, t: Ty, span: Span) {
+        self.require(self.p.gx.lang.hash, t, span);
+        self.deferred_glue_hash.push((t, span));
+    }
+
+    /// The finish-time test of a glue-hashed value: a written Hash impl
+    /// inside is L0640 (the glue hashes by structure). A type parameter
+    /// is checked in its instances.
+    pub(super) fn glue_hash_ok(&mut self, t: Ty, span: Span) {
+        let t = self.deep(t);
+        let t = self.normalize_here(t);
+        if self.tys.flags(t).contains_param() || matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
+            return;
+        }
+        if self.implements(self.p.gx.lang.hash, t) && !has_hash(self.p, &self.tys, t) {
+            let tn = self.tn(t);
+            self.err("L0640", span, format!("hashing `{tn}`, which reaches a written `Hash` impl, is not implemented yet"), "Derive Hash instead.");
+        }
+    }
+
+    /// `x.hash(&mut state)` (Hash::hash for core and derived impls),
+    /// `s.hash_one(x)` (BuildHasher), and Hasher methods on a concrete
+    /// hasher that lust's glue answers (DefaultHasher's, and the
+    /// provided `write_*` of a user hasher; a written method is the
+    /// impl's own fn, found before this). None for other calls.
+    pub(super) fn hasher_method(&mut self, e: ExprId, base: Ty, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        use Builtin as B;
+        let lang = self.p.gx.lang;
+        let n = self.p.interner.get(name);
+        let base = self.deep(base);
+        match n {
+            "hash" if args.len() == 1 && self.hash_trait_in_scope(lang.hash, "Hash") => {
+                // The receiver must be Hash; the argument `&mut H`, H a hasher.
+                if !self.tys.flags(base).contains_param() && !self.implements(lang.hash, base) {
+                    return None;
+                }
+                // Typed against `&mut ?H`, so a `&mut H` variable reborrows.
+                let hv = self.new_var(false);
+                let want = self.tys.mk_ref(true, hv);
+                self.check_args(&[want], args, name_span);
+                let hty = self.deep(hv);
+                if !self.implements(lang.hasher, hty) {
+                    let tn = self.tn(hty);
+                    self.err("L0612", self.span(args[0]), format!("`hash` takes `&mut H` with `H: Hasher`, not `&mut {tn}`"), "Pass `&mut` a hasher.");
+                    return Some(ERROR);
+                }
+                self.glue_hashable(base, name_span);
+                self.set_res(e, Res::BuiltinMethod { b: B::HashInto, derefs, autoref: Autoref::Ref });
+                Some(UNIT)
+            }
+            "hash_one" if args.len() == 1 && self.hash_trait_in_scope(lang.build_hasher, "BuildHasher") => {
+                if !self.implements(lang.build_hasher, base) {
+                    return None;
+                }
+                let at = self.expr(args[0], None);
+                self.glue_hashable(at, self.span(args[0]));
+                self.set_res(e, Res::BuiltinMethod { b: B::HashOne, derefs, autoref: Autoref::Ref });
+                Some(int(IntTy::U64))
+            }
+            m if HASHER_METHODS.contains(&m) && self.hash_trait_in_scope(lang.hasher, "Hasher") => {
+                // A concrete hasher only: a bound's methods are its stubs.
+                if self.tys.flags(base).contains_param() || !self.implements(lang.hasher, base) {
+                    return None;
+                }
+                let (autoref, params, ret) = match hasher_write_arg(m) {
+                    None => (Autoref::Ref, vec![], int(IntTy::U64)),
+                    Some(None) => {
+                        let s = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
+                        (Autoref::RefMut, vec![self.tys.mk_ref(false, s)], UNIT)
+                    }
+                    Some(Some(i)) => (Autoref::RefMut, vec![int(i)], UNIT),
+                };
+                self.set_res(e, Res::BuiltinMethod { b: B::HasherCall, derefs, autoref });
+                self.check_args(&params, args, name_span);
+                Some(ret)
+            }
+            _ => None,
+        }
+    }
+
     /// Methods on a HashMap, HashSet, or Entry receiver. None when the
     /// base is none of these, so other dispatch runs.
     #[allow(clippy::too_many_arguments)]

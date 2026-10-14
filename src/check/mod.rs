@@ -525,6 +525,17 @@ pub enum Builtin {
     /// `HashMap::from([(k, v); N])` and `HashSet::from([t; N])` (W-STD-B):
     /// `from_iter` over the array, with `RandomState`.
     HashFromArray,
+    /// `x.hash(&mut state)` where `x`'s Hash is core's or derived
+    /// (W-STD-B): the hash glue's exact write sequence into the hasher.
+    HashInto,
+    /// `BuildHasher::hash_one(&self, x)`: build a hasher, hash `x`,
+    /// finish (W-STD-B).
+    HashOne,
+    /// A Hasher method on a concrete hasher (DefaultHasher, or a user
+    /// hasher's provided `write_*`): the method is read off the
+    /// argument (none: `finish`; `&[u8]`: `write`; an integer: its
+    /// `write_<int>`), as cgen/hash.rs `hasher_call` runs it.
+    HasherCall,
     HashWithCapacity,
     HashWithHasher,
     HashWithCapacityAndHasher,
@@ -1173,6 +1184,9 @@ struct Ctx<'p, 'a> {
     /// Map and set keys and lookup types, re-tested at finish
     /// (`check_hash_key`, W-STD-B): (key, lookup, span).
     deferred_hash_key: Vec<(Ty, Ty, Span)>,
+    /// Values the hash glue hashes for `x.hash(..)` and `hash_one(x)`,
+    /// re-tested at finish (`glue_hash_ok`, W-STD-B).
+    deferred_glue_hash: Vec<(Ty, Span)>,
     /// True while normalization runs inside `unify`, to keep
     /// projection normalization from recursing into itself.
     in_norm: bool,
@@ -1432,6 +1446,7 @@ fn check_fn_mode<'p, 'a>(
         deferred_default: Vec::new(),
         deferred_sized: Vec::new(),
         deferred_hash_key: Vec::new(),
+        deferred_glue_hash: Vec::new(),
         in_norm: false,
         const_bindings: std::collections::HashMap::new(),
         next_const_id: generics::INFER_MARKER_BASE,
@@ -11289,6 +11304,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if let Some(ret) = self.hash_coll_method(e, recv, rt, base, derefs, name, name_span, args) {
                 return ret;
             }
+            // `x.hash(&mut h)`, `s.hash_one(x)`, and Hasher methods on a
+            // concrete hasher (check/hashmap.rs).
+            if let Some(ret) = self.hasher_method(e, base, derefs, name, name_span, args) {
+                return ret;
+            }
         }
         // `Ord::max`/`min`/`clamp` on a receiver reached through a
         // deref resolve at the first autoderef step when the receiver
@@ -16730,6 +16750,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         for (k, q, span) in std::mem::take(&mut self.deferred_hash_key) {
             self.check_hash_key(k, q, span);
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_glue_hash) {
+            self.glue_hash_ok(t, span);
         }
         for (t, span) in std::mem::take(&mut self.deferred_ord) {
             let t = self.deep(t);
