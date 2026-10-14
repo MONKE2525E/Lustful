@@ -149,7 +149,8 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
             | Glue::HashKeyQ
             | Glue::HashEqQ
             | Glue::HashEqEntry
-            | Glue::HashDrop => unreachable!("hash glue of an Arc"),
+            | Glue::HashDrop
+            | Glue::HashOne => unreachable!("hash glue of an Arc"),
         };
         let _ = writeln!(protos, "{proto};");
         let _ = writeln!(defs, "{proto} {{\n  return {call};\n}}\n");
