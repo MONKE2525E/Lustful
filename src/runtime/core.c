@@ -408,7 +408,7 @@ uint64_t lust_str_range(const uint8_t *ptr, uint64_t lo, uint64_t hi, int inclus
 /* A `lust_loc` for a line of std source (panic.c's `lust_std_files`
    index, line, col), for a panic rustc reports there. */
 static lust_loc lust_std_loc(uint32_t file, uint32_t line, uint32_t col) {
-    return (((uint64_t)(LUST_STD_SLOT + file)) << 32) | ((uint64_t)line << 12) | (uint64_t)col;
+    return (((uint64_t)(LUST_STD_SLOT + file)) << 40) | ((uint64_t)line << 20) | (uint64_t)col;
 }
 
 /* The `start..end` of a `RangeBounds<usize>` argument (tags: 0 Included,

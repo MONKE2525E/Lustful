@@ -5712,6 +5712,7 @@ fn lang_provided(lang: &LangTraits, tr: DefId, name: &str) -> bool {
         "clone_into" => tr == lang.to_owned,
         "hash_one" => tr == lang.build_hasher,
         "hash_slice" => tr == lang.hash,
+        "contains" => tr == lang.range_bounds,
         n => tr == lang.hasher && n != "finish" && n != "write",
     }
 }
