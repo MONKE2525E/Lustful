@@ -92,7 +92,7 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
     };
-    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default() };
+    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), access_site: None };
     for b in 0..ex.body.blocks.len() {
         let Terminator::Call { target: CallTarget::Builtin(x), .. } = ex.body.blocks[b].term else { continue };
         if !is_key_method(x) {
@@ -113,6 +113,9 @@ struct Ex<'b, 'p, 'g> {
     body: Body<'g>,
     cur: Bb,
     span: Span,
+    /// The local.rs line and column the next `access` reports a
+    /// destroyed value at, when not `with`'s (see `set`).
+    access_site: Option<(u32, u32)>,
 }
 
 impl Ex<'_, '_, '_> {
@@ -141,6 +144,15 @@ impl Ex<'_, '_, '_> {
     }
     fn goto(&mut self, b: Bb) {
         self.term(Terminator::Goto(b));
+    }
+    /// Runs `f` with its statements' span at line `line`, col `col` of
+    /// std's thread/local.rs, where rustc 1.99 reports the panics of
+    /// these key methods (W-PANIC; cgen's `std_loc` file 10).
+    fn at_local_rs<T>(&mut self, line: u32, col: u32, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::replace(&mut self.span, Span::std_site(10, line, col));
+        let r = f(self);
+        self.span = saved;
+        r
     }
     /// Ends the current block with a call and continues after it.
     fn call(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place) {
@@ -222,7 +234,9 @@ impl Ex<'_, '_, '_> {
         let rt = self.body.tys.mk_ref(false, t);
         let Some(on_none) = on_none else {
             let r = self.local(rt);
-            self.call(CallTarget::Builtin(Builtin::TlsAccess), vec![key.clone(), init.clone()], Place::local(r));
+            // `with`'s `expect` in local.rs (`set` passes its own site).
+            let (line, col) = self.access_site.take().unwrap_or((429, 25));
+            self.at_local_rs(line, col, |this| this.call(CallTarget::Builtin(Builtin::TlsAccess), vec![key.clone(), init.clone()], Place::local(r)));
             return Ok((r, None));
         };
         let ot = self.body.tys.mk_option(rt);
@@ -331,7 +345,7 @@ impl Ex<'_, '_, '_> {
                 let u = self.body.tys.refcell_elem(t).ok_or("thread_local expansion: with_borrow on a non-RefCell")?;
                 let (f, fty) = self.own(args.get(1).cloned().ok_or("thread_local expansion: missing closure")?)?;
                 let (r, _) = self.access(&key, &init, t, None)?;
-                let g = self.guard(r, u, m);
+                let g = self.guard(r, u, m, if m { (714, 38) } else { (681, 34) });
                 let ut = self.body.tys.mk_ref(m, u);
                 let ur = self.local(ut);
                 self.assign(Place::local(ur), Rvalue::Ref(m, Place::local(g).deref()));
@@ -376,7 +390,13 @@ impl Ex<'_, '_, '_> {
                 };
                 let mut all = vec![Operand::Copy(Place::local(r))];
                 all.extend(ops);
-                self.call(CallTarget::Builtin(op), all, dest);
+                // `RefCell::replace` reports its call in local.rs; `take`
+                // goes through cell.rs (cgen's RefCellTake site).
+                if op == B::RefCellReplace {
+                    self.at_local_rs(820, 31, |this| this.call(CallTarget::Builtin(op), all, dest));
+                } else {
+                    self.call(CallTarget::Builtin(op), all, dest);
+                }
                 Ok(())
             }
             B::TlsSet => self.set(&key, &init, t, eager, args.get(1).cloned().ok_or("thread_local expansion: missing value")?, dest),
@@ -386,11 +406,13 @@ impl Ex<'_, '_, '_> {
 
     /// A `RefCell` guard over the cell at `&RefCell<U>` local `r`
     /// (`borrow` or `borrow_mut`, with their panics), in a fresh local.
-    fn guard(&mut self, r: Local, u: Ty, m: bool) -> Local {
+    /// Its panic reports local.rs line `site` (rustc's borrow inside the
+    /// key method).
+    fn guard(&mut self, r: Local, u: Ty, m: bool, site: (u32, u32)) -> Local {
         let gt = self.body.tys.mk_builtin1(if m { |d| d.ref_mut_guard } else { |d| d.ref_guard }, u);
         let g = self.local(gt);
         let op = if m { Builtin::RefCellBorrowMut } else { Builtin::RefCellBorrow };
-        self.call(CallTarget::Builtin(op), vec![Operand::Copy(Place::local(r))], Place::local(g));
+        self.at_local_rs(site.0, site.1, |this| this.call(CallTarget::Builtin(op), vec![Operand::Copy(Place::local(r))], Place::local(g)));
         g
     }
 
@@ -426,9 +448,11 @@ impl Ex<'_, '_, '_> {
             let into = if refcell.is_some() { B::RefCellIntoInner } else { B::CellIntoInner };
             self.call(CallTarget::Builtin(into), vec![Operand::Move(Place::local(c2))], Place::local(vl));
         }
+        // `initialize_with`'s own `expect` (local.rs 487:25).
+        self.access_site = Some((487, 25));
         let (r, _) = self.access(key, init, t, None)?;
         if refcell.is_some() {
-            let g = self.guard(r, u, true);
+            let g = self.guard(r, u, true, (752, 23));
             self.assign(Place::local(g).deref(), Rvalue::Use(Operand::Move(Place::local(vl))));
             self.drop_local(g);
         } else {
