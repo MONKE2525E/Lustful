@@ -1273,7 +1273,54 @@ fn bb_parse(m: &mut Matcher, kind: FragKind, input: &[Tt], pos: usize) -> Result
             return Ok(None);
         }
     }
-    Ok(fragment_end(m, kind, input, pos)?.map(|end| (end, bound_trees(m, kind, input, pos, end))))
+    let Some(end) = fragment_end(m, kind, input, pos)? else { return Ok(None) };
+    if parsed_kind(kind) || kind == FragKind::Meta {
+        keyword_lifetimes(m, &input[pos..end], kind == FragKind::Meta)?;
+    }
+    Ok(Some((end, bound_trees(m, kind, input, pos, end))))
+}
+
+/// rustc's error for a lifetime or label named by a keyword (`'fn`; see
+/// `lexer::keyword_lifetime_error`) in a fragment its parser just read.
+/// rustc reports it even when the arm fails later, so the call fails.
+/// Macro call and attribute arguments are token trees the fragment parse
+/// does not read, and neither is a `meta`'s own argument group (`meta`
+/// says so); forwarded fragments were checked when first bound.
+fn keyword_lifetimes(m: &Matcher, trees: &[Tt], meta: bool) -> Result<(), Diag> {
+    let tok = |i: usize| tok_at(trees, i).map(|t| t.tok);
+    // `unsafe(..)` wraps the meta item itself.
+    if let (true, Some(Tok::Unsafe), Some(Tt::Delim(_, inner, _))) = (meta, tok(0), trees.get(1)) {
+        return keyword_lifetimes(m, inner, true);
+    }
+    let mut meta_args = meta;
+    for (i, tree) in trees.iter().enumerate() {
+        let prev = |k: usize| i.checked_sub(k).and_then(tok);
+        match tree {
+            Tt::Tok(t) => {
+                meta_args &= t.tok != Tok::Eq;
+                let Tok::Lifetime(name) = t.tok else { continue };
+                // A label: after `break` or `continue`, or before `:` and a loop or block.
+                let label = matches!(prev(1), Some(Tok::Break | Tok::Continue))
+                    || (tok(i + 1) == Some(Tok::Colon)
+                        && (matches!(tok(i + 2), Some(Tok::Loop | Tok::While | Tok::For))
+                            || matches!(trees.get(i + 2), Some(Tt::Delim(Delim::Brace, _, _)))));
+                let text = m.interner.get(name);
+                if let Some(d) = crate::lexer::keyword_lifetime_error(text, raw_tok(m, t), label, t.span) {
+                    return Err(d);
+                }
+            }
+            Tt::Delim(_, inner, _) => {
+                let call_args = prev(1) == Some(Tok::Bang) && prev(2).is_some_and(is_seg_tok);
+                let rules_body = prev(2) == Some(Tok::Bang) && prev(1).is_some_and(is_seg_tok);
+                let attr_body = prev(1) == Some(Tok::Pound) || (prev(1) == Some(Tok::Bang) && prev(2) == Some(Tok::Pound));
+                if !(call_args || rules_body || attr_body || meta_args) {
+                    keyword_lifetimes(m, inner, false)?;
+                }
+            }
+            Tt::Frag(..) => {}
+        }
+    }
+    Ok(())
 }
 
 /// True when a forwarded `ty` fragment's trees are one plain type path

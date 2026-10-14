@@ -366,6 +366,26 @@ fn raw_ident_invalid(s: &str) -> bool {
     matches!(s, "self" | "Self" | "super" | "crate" | "_")
 }
 
+/// True when a lifetime token named `name` was written raw (`'r#fn`): the
+/// token keeps only the name, and its span also covers the `r#`.
+pub fn lifetime_is_raw(name: &str, span: Span) -> bool {
+    span.hi.saturating_sub(span.lo) as usize == name.len() + 3
+}
+
+/// The error rustc's parser reports for a lifetime (or, with `label`, a
+/// loop label) named by a keyword, such as `'fn` or `'gen`, or None when
+/// the name is fine. A raw name (`'r#fn`) is fine, and so are the
+/// lifetimes `'_` and `'static` (not the labels). Token trees may hold
+/// such names (`stringify!('fn)`): the error is for parsed lifetime and
+/// label positions only, which call this.
+pub fn keyword_lifetime_error(name: &str, raw: bool, label: bool, span: Span) -> Option<Diag> {
+    if raw || (keyword(name).is_none() && !reserved(name)) || (!label && matches!(name, "_" | "static")) {
+        return None;
+    }
+    let what = if label { "labels" } else { "lifetimes" };
+    Some(Diag::new("L0001", span, format!("{what} cannot use keyword names"), format!("Rename `'{name}`, for example to `'a`.")))
+}
+
 fn suffix(s: &str) -> Option<Option<IntSuffix>> {
     use IntSuffix::*;
     Some(Some(match s {

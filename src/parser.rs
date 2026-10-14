@@ -1763,8 +1763,24 @@ impl<'a> Parser<'a> {
     /// One written lifetime ('a, 'static, '_) at the current token.
     fn lifetime_here(&mut self) -> PResult<Lifetime> {
         match self.peek() {
-            Tok::Lifetime(name) => Ok(Lifetime { name, span: self.bump().span }),
+            Tok::Lifetime(name) => {
+                let span = self.bump().span;
+                self.check_lifetime_name(name, span, false);
+                Ok(Lifetime { name, span })
+            }
             t => Err(syntax(self.span(), format!("expected a lifetime, found {}", tok_name(t)))),
+        }
+    }
+
+    /// Records rustc's error for a lifetime or label (`label`) named by a
+    /// keyword (`'fn`; see `lexer::keyword_lifetime_error`). The parse goes
+    /// on, as in rustc, so the error is deferred: fragment probes, which
+    /// ignore deferred errors, read such names the way rustc's parser does.
+    /// Added for fx-lex-small (W-CORELANG owns the parser).
+    fn check_lifetime_name(&mut self, name: Sym, span: Span, label: bool) {
+        let text = self.interner.get(name);
+        if let Some(d) = crate::lexer::keyword_lifetime_error(text, crate::lexer::lifetime_is_raw(text, span), label, span) {
+            self.defer(d);
         }
     }
 
@@ -1995,7 +2011,9 @@ impl<'a> Parser<'a> {
             }
         };
         if let Some((kind, mutable, n, lifetime)) = self_form {
-            if let Some(_lt) = lifetime {}
+            if let Some(lt) = lifetime {
+                self.check_lifetime_name(lt.name, lt.span, false);
+            }
             for _ in 0..n {
                 self.bump();
             }
@@ -3857,6 +3875,7 @@ impl<'a> Parser<'a> {
             Tok::Lifetime(name) => {
                 let span = self.span();
                 self.bump();
+                self.check_lifetime_name(name, span, true);
                 self.expect(Tok::Colon, "`:` after a label")?;
                 let label = Label { name, span };
                 return self.block_like_labeled(Some(label), inner_ok);
@@ -3921,6 +3940,7 @@ impl<'a> Parser<'a> {
             Tok::Lifetime(name) => {
                 let span = self.span();
                 self.bump();
+                self.check_lifetime_name(name, span, true);
                 Some(Label { name, span })
             }
             _ => None,
