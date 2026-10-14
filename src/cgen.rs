@@ -4763,9 +4763,11 @@ impl FnGen<'_, '_, '_> {
                 let t = self.tmp();
                 let (o1, o2) = if b == B::RotateLeft { ("shl", "shr") } else { ("shr", "shl") };
                 if it.signed() {
+                    // Rotate on the unsigned bit pattern: `lust_i128_shr` is
+                    // arithmetic and would fill the high bits with the sign.
                     let _ = writeln!(
                         self.out,
-                        "    {ct} {t} = lust_i128_from_u128(lust_u128_or(lust_u128_from_i128(lust_{f}_{o1}({x}, {n})), lust_u128_from_i128(lust_{f}_{o2}({x}, (128u - {n}) & 127u))));"
+                        "    {ct} {t} = lust_i128_from_u128(lust_u128_or(lust_u128_{o1}(lust_u128_from_i128({x}), {n}), lust_u128_{o2}(lust_u128_from_i128({x}), (128u - {n}) & 127u)));"
                     );
                 } else {
                     let _ = writeln!(
