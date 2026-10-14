@@ -636,6 +636,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
     // The written impls derive glue calls for a value of this type.
     let glue = |tr: DefId| p.gx.glue_methods.contains_key(&(a, tr));
     (glue(p.gx.lang.clone), glue(p.gx.lang.default), glue(p.gx.lang.partial_eq), glue(p.gx.lang.partial_ord)).hash(h);
+    p.gx.written_hash.contains_key(&a).hash(h);
     // The written `Hasher` and `BuildHasher` impls the hash glue calls
     // into: which methods they write, and the `Hasher` type (W-STD-B).
     for tr in [p.gx.lang.hasher, p.gx.lang.build_hasher] {

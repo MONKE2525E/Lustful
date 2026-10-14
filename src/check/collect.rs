@@ -5116,6 +5116,8 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> boo
                 return glue_hash(p, tys, a, seen) && glue_hash(p, tys, b, seen);
             }
             match tys.local_adt(t) {
+                // A written impl the glue calls (`gx.written_hash`).
+                Some(a) if p.gx.written_hash.contains_key(&a) => true,
                 Some(a) if p.adt(a).derives.hash => adt_fields_all(p, a, t, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
                 _ => false,
             }

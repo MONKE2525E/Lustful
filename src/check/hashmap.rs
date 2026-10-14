@@ -99,9 +99,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// The finish-time test of one key (or lookup) type, with types as
     /// bound by then: the hash glue hashes, compares, and borrows by
-    /// structure (derives, core impls), so a key that reaches a written
-    /// `Hash` or a generic written `PartialEq` impl, or a lookup through
-    /// a written `Borrow` impl, rejects with L0640. A key that does not
+    /// structure (derives, core impls) and calls only the written impls
+    /// of `gx.written_hash` and `gx.glue_methods`, so a key that reaches
+    /// another written `Hash` or `PartialEq` impl (a generic one, say),
+    /// or a lookup through a written `Borrow` impl, rejects with L0640.
+    /// A key that does not
     /// implement the traits at all is the obligation queue's report.
     pub(super) fn check_hash_key(&mut self, k: Ty, q: Ty, span: Span) {
         let (k, q) = (self.deep(k), self.deep(q));
@@ -117,8 +119,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.errs.push(Diag::new(
                 "L0640",
                 span,
-                format!("a map or set key of type `{tn}` reaches a written `Hash` or `PartialEq` impl, which lust does not support yet"),
-                "Derive Hash, PartialEq, and Eq on the key types instead.",
+                format!("a map or set key of type `{tn}` reaches a written `Hash` or `PartialEq` impl lust cannot call yet (a generic impl, an impl for a Box or reference, or an impl with its own `hash_slice`)"),
+                "Derive Hash, PartialEq, and Eq on the key types, or write the impls for the plain types.",
             ));
         } else if !self.builtin_borrow(k, q) {
             let (kn, qn) = (self.tn(k), self.tn(q));
@@ -178,8 +180,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// The finish-time test of a glue-hashed value: a written Hash impl
-    /// inside is L0640 (the glue hashes by structure). A type parameter
-    /// is checked in its instances.
+    /// inside that the glue cannot call (not in `gx.written_hash`) is
+    /// L0640. A type parameter is checked in its instances.
     pub(super) fn glue_hash_ok(&mut self, t: Ty, span: Span) {
         let t = self.deep(t);
         let t = self.normalize_here(t);
@@ -188,7 +190,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if self.implements(self.p.gx.lang.hash, t) && !has_hash(self.p, &self.tys, t) {
             let tn = self.tn(t);
-            self.err("L0640", span, format!("hashing `{tn}`, which reaches a written `Hash` impl, is not implemented yet"), "Derive Hash instead.");
+            self.err("L0640", span, format!("hashing `{tn}`, which reaches a written `Hash` impl lust cannot call yet (a generic impl, an impl for a Box or reference, or an impl with its own `hash_slice`), is not implemented yet"), "Derive Hash instead, or write the impl for the plain type.");
         }
     }
 

@@ -1,6 +1,5 @@
-// expect: L0640
-// Valid Rust: a key with a written Hash impl. The hash glue hashes by
-// structure only, so lust rejects it.
+// A key with a written Hash impl: the hash glue calls the impl's
+// `hash::<H>` instance, so K(0) and K(1) share a hash (still unequal).
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 

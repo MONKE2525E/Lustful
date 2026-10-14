@@ -295,6 +295,10 @@ pub(super) fn hash_value_body(p: &Program, slots: &[u32], key: &CTy, need: &mut 
                 hash_stmts(p, slots, a, hc, "h", &fa, need)
             );
         }
+        // A written impl: its `hash::<H>` instance (`gx.hash_impls`).
+        CTy::Adt(a) if let Some(&(_, f)) = p.gx.hash_impls.get(a).and_then(|v| v.iter().find(|(h, _)| cty(&p.tys, *h) == *hc)) => {
+            let _ = writeln!(body, "  ({}lust_fns[{}])(p, h);", fn_ptr_cast(p, f), slots[f.0 as usize]);
+        }
         CTy::Adt(a) => {
             let adt = p.adt(*a);
             if adt.is_enum {

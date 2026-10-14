@@ -466,7 +466,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
             vec![],
             &["cmp", "max", "min", "clamp"],
         ),
-        rec(lang.hash, "Hash", 0, vec![], vec![], &["hash"]),
+        rec(lang.hash, "Hash", 0, vec![], vec![], &["hash", "hash_slice"]),
         rec(lang.default, "Default", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["default"]),
         rec(lang.drop, "Drop", 0, vec![], vec![], &["drop"]),
         rec(lang.send, "Send", 0, vec![], vec![], &[]),
@@ -3816,6 +3816,13 @@ pub struct GenTables<'a> {
     /// reads these for the hash glue).
     pub hasher_methods: FxMap<(AdtId, u8), LocalDefId>,
     pub build_hashers: FxMap<AdtId, (LocalDefId, Ty)>,
+    /// The written `Hash::hash` template of a non-generic impl on a
+    /// non-generic local Adt (no `hash_slice` of its own), and its
+    /// instances by hasher type: the hash glue calls one for a value of
+    /// that Adt, as core's and derived impls call the field's impl
+    /// (W-STD-B; iface: W-CGEN reads `hash_impls`).
+    pub written_hash: FxMap<AdtId, LocalDefId>,
+    pub hash_impls: FxMap<AdtId, Vec<(Ty, LocalDefId)>>,
     /// True when the program uses any generic or trait form. The
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
@@ -3932,6 +3939,8 @@ impl Default for GenTables<'_> {
             deferred_debug_fields: Vec::new(),
             hasher_methods: FxMap::default(),
             build_hashers: FxMap::default(),
+            written_hash: FxMap::default(),
+            hash_impls: FxMap::default(),
             has_generics: false,
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
@@ -5525,6 +5534,7 @@ fn lang_provided(lang: &LangTraits, tr: DefId, name: &str) -> bool {
         "size_hint" => tr == lang.iterator,
         "clone_into" => tr == lang.to_owned,
         "hash_one" => tr == lang.build_hasher,
+        "hash_slice" => tr == lang.hash,
         n => tr == lang.hasher && n != "finish" && n != "write",
     }
 }
@@ -5533,8 +5543,9 @@ fn lang_provided(lang: &LangTraits, tr: DefId, name: &str) -> bool {
 /// required method must be written (rustc E0046), and a written one
 /// must have the trait's signature (E0053, E0050, E0049, E0185,
 /// E0186): the lang signature table's, with the trait ref's args and
-/// the impl's associated types put in. `hash<H: Hasher>` takes one
-/// type parameter, which may have no bound but `Hasher`.
+/// the impl's associated types put in. `hash<H: Hasher>` and
+/// `hash_slice<H: Hasher>` take one type parameter, which may have no
+/// bound but `Hasher`.
 #[allow(clippy::too_many_arguments)]
 fn check_lang_method(
     p: &mut Program,
@@ -5566,7 +5577,7 @@ fn check_lang_method(
         .flatten()
         .map_or(Vec::new(), |t| t.generics.params.into_iter().skip(impl_parent_n).collect());
     let own_tys: Vec<&ParamDef> = own.iter().filter(|g| !matches!(g.kind, ParamKind::Lifetime)).collect();
-    let is_hash = tr.def == lang.hash && n == "hash";
+    let is_hash = tr.def == lang.hash && (n == "hash" || n == "hash_slice");
     // `fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T)` takes
     // one type parameter like `hash`.
     let is_extend = tr.def == lang.extend && n == "extend";
@@ -5589,11 +5600,18 @@ fn check_lang_method(
         }
         // `fn hash<H: Hasher>(&self, state: &mut H)`: H is the method's
         // first own parameter, after the impl's.
+        // `fn hash_slice<H: Hasher>(data: &[Self], state: &mut H)`.
         None if is_hash && own_tys.len() == 1 && matches!(own_tys[0].kind, ParamKind::Type) => {
-            let r0 = p.tys.mk_ref(false, p0);
             let h = p.tys.intern(TyKind::Param(ParamId(trait_n)));
             let mh = p.tys.mk_ref(true, h);
-            LangMethodSig { self_kind: Some(Ref), params: vec![r0, mh], ret: UNIT, ret_borrows_from: None }
+            if n == "hash" {
+                let r0 = p.tys.mk_ref(false, p0);
+                LangMethodSig { self_kind: Some(Ref), params: vec![r0, mh], ret: UNIT, ret_borrows_from: None }
+            } else {
+                let sl = p.tys.intern(TyKind::Slice(p0));
+                let data = p.tys.mk_ref(false, sl);
+                LangMethodSig { self_kind: None, params: vec![data, mh], ret: UNIT, ret_borrows_from: None }
+            }
         }
         None if is_extend && own_tys.len() == 1 && matches!(own_tys[0].kind, ParamKind::Type) => {
             let m0 = p.tys.mk_ref(true, p0);
@@ -5606,7 +5624,13 @@ fn check_lang_method(
                 "L0110",
                 f_name_span,
                 "method has a different number of generic parameters than the trait method",
-                if is_hash { "Write `fn hash<H: Hasher>(&self, state: &mut H)`." } else { "Write `fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T)`." },
+                if n == "hash_slice" {
+                    "Write `fn hash_slice<H: Hasher>(data: &[Self], state: &mut H)`."
+                } else if is_hash {
+                    "Write `fn hash<H: Hasher>(&self, state: &mut H)`."
+                } else {
+                    "Write `fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T)`."
+                },
             ));
             return;
         }
@@ -7821,6 +7845,37 @@ fn args_hold_refs(tys: &GlobalTys, t: Ty) -> bool {
     }
 }
 
+/// The `hash::<H>` instances of the written Hash impls
+/// (`written_hash`) for every hasher type the hash glue may feed them
+/// (W-STD-B): DefaultHasher and each concrete Adt with a written
+/// `Hasher` impl. Pairs made in an earlier pass stay.
+fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
+    use crate::ty::hash::{HashTy, mk_hash};
+    if p.gx.written_hash.is_empty() {
+        return;
+    }
+    let mut user: Vec<AdtId> = p.gx.hasher_methods.keys().map(|&(a, _)| a).collect();
+    user.sort_by_key(|a| a.0);
+    user.dedup();
+    let mut hashers = vec![mk_hash(&mut p.tys, HashTy::DefaultHasher, &[])];
+    hashers.extend(user.into_iter().filter_map(|a| p.tys.full_adt_ty(a)).filter(|&t| !p.tys.flags(t).contains_param()));
+    let mut adts: Vec<(AdtId, LocalDefId)> = p.gx.written_hash.iter().map(|(&a, &f)| (a, f)).collect();
+    adts.sort_by_key(|&(a, _)| a.0);
+    for (a, f) in adts {
+        for &h in &hashers {
+            if p.gx.hash_impls.get(&a).is_some_and(|v| v.iter().any(|&(t, _)| t == h)) {
+                continue;
+            }
+            let before = p.fns.len();
+            let inst = fn_instance(p, f, &[GenericArg::Ty(h)]);
+            if inst.0 as usize >= before {
+                queue.push(inst);
+            }
+            p.gx.hash_impls.entry(a).or_default().push((h, inst));
+        }
+    }
+}
+
 /// Materializes every reachable instance (section 4.1's mono
 /// half for wave A): check plain fns for requests, create the
 /// instances they name, check those, to a fixpoint. Discovery
@@ -8011,6 +8066,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 ensure_fmt_methods(p, a, &mut next_queue);
                 ensure_hash_methods(p, a, &mut next_queue);
             }
+            ensure_written_hash(p, &mut next_queue);
         }
         queue = next_queue;
     }
@@ -8439,6 +8495,29 @@ fn compute_glue_methods(p: &mut Program) {
         out.insert((a, rec.trait_def), f);
     }
     p.gx.glue_methods = out;
+}
+
+/// Fills `written_hash` (W-STD-B): the written `Hash` impls the hash
+/// glue calls, on the terms of `compute_glue_methods` (a non-generic
+/// impl on a non-generic local Adt). An impl with its own `hash_slice`
+/// is left out: slices of the type then hash differently from the
+/// glue's loop, so such keys stay rejected (L0640).
+fn compute_written_hash(p: &mut Program) {
+    use crate::traits::index::Synthetic;
+    let mut out = FxMap::default();
+    for &id in p.gx.index.impls_of_trait(p.gx.lang.hash) {
+        let rec = p.gx.index.get(id);
+        if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
+            continue;
+        }
+        let TyKind::Adt(d, args) = p.tys.kind(rec.self_ty(&p.tys)) else { continue };
+        let Some(a) = p.tys.local_adt_of(d).filter(|_| args == EMPTY_ARGS) else { continue };
+        let named = |n: &str| rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == n));
+        if let (Some(f), None) = (named("hash"), named("hash_slice")) {
+            out.insert(a, f);
+        }
+    }
+    p.gx.written_hash = out;
 }
 
 /// The derived traits that need more than the field checks in
@@ -8972,6 +9051,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     append_trait_default_templates(p);
     add_synthetic_impls(p);
     compute_glue_methods(p);
+    compute_written_hash(p);
     // Dyn compatibility needs the finished trait tables; the dyn
     // type checks over signatures run before mono builds vtables.
     p.gx.dyn_infos = crate::check::object::compute_dyn_infos(p);

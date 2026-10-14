@@ -1,6 +1,5 @@
-// expect: L0640
-// Valid Rust: hash_one of a type with a written Hash impl (the hash glue
-// hashes by structure, so lust does not run written impls there yet).
+// hash_one of a type with a written Hash impl: the glue calls the
+// impl, so K(1) hashes as the byte 2.
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 struct K(u8);
 impl Hash for K {
@@ -11,4 +10,7 @@ impl Hash for K {
 fn main() {
     let s = RandomState::new();
     println!("{}", s.hash_one(K(1)) == s.hash_one(K(1)));
+    let mut h = s.build_hasher();
+    h.write_u8(2);
+    println!("{}", s.hash_one(K(1)) == h.finish());
 }
