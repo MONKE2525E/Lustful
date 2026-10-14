@@ -4650,7 +4650,7 @@ impl Rewrite<'_> {
                     && self.tables.std_platform_has(&full[1..], module, self.interner)
                 {
                     let res = self.tables.resolve_path(module, &full, ns, PathMode::Lexical, true, self.interner);
-                    self.apply(segs, res, span, module);
+                    self.apply(segs, res, span, module, ns, scopes);
                 }
                 return;
             }
@@ -4714,7 +4714,7 @@ impl Rewrite<'_> {
                 let asked = if names.len() > 1 { Namespace::Type } else { ns };
                 let in_ns = names.first().and_then(|n| self.local_names.get(n)).is_some_and(|m| m & (1 << ns_index(asked)) != 0);
                 if !in_ns {
-                    self.apply(segs, res, span, module);
+                    self.apply(segs, res, span, module, ns, scopes);
                     return;
                 }
                 let first = self.interner.get(names[0]).to_string();
