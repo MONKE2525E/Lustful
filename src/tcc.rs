@@ -361,10 +361,12 @@ fn lone_thread() -> bool {
             if list.count() <= 1 {
                 return true;
             }
-            if start.elapsed() > std::time::Duration::from_millis(50) {
+            // A joined pool thread can stay in the task list while the kernel reaps it; on a
+            // loaded machine that took over 50 ms (gates at load 150 fell back to the file run).
+            if start.elapsed() > std::time::Duration::from_millis(500) {
                 return false;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
     #[cfg(not(target_os = "linux"))]
