@@ -2067,6 +2067,24 @@ fn path_call_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<(Vec<Seg>
     }
 }
 
+/// True when the item at `i` is a function: item qualifiers, then `fn`.
+/// A `#[test]` attribute drops only this shape in a non-test build.
+fn next_is_fn(trees: &[Tt], mut i: usize) -> bool {
+    loop {
+        match tok_at(trees, i).map(|t| t.tok) {
+            Some(Tok::Pub) => {
+                i += 1;
+                if matches!(trees.get(i), Some(Tt::Delim(Delim::Paren, _, _))) {
+                    i += 1;
+                }
+            }
+            Some(Tok::Const | Tok::Async | Tok::Unsafe | Tok::Extern | Tok::Str(..)) => i += 1,
+            Some(Tok::Fn) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// True when trees start an item (`fn`, `pub struct`, an attribute, ...),
 /// for the item-position macro rules. A leading item fragment counts,
 /// and any other fragment is looked through to its first tokens.
@@ -2739,7 +2757,9 @@ impl<'a> Expander<'a> {
                         ));
                     }
                 }
-                "test" => off = !self.ctx.cfg.test,
+                // Only a fn item drops: `#[test]` anywhere else is
+                // an error in every build, and the parser reports it.
+                "test" => off = !self.ctx.cfg.test && next_is_fn(trees, after),
                 "macro_export" => exported = true,
                 "macro_use" => macro_use_attr = true,
                 _ => {}
