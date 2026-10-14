@@ -446,12 +446,12 @@ impl Ex<'_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
-    /// The runtime's thread-exit path (runtime/thread.c), which lust code
-    /// cannot reach until `std::thread::spawn` lands (W-THREADS): each
+    /// The runtime's thread-exit path (runtime/thread.c) by itself: each
     /// thread's destructors run newest first when it ends, a destructor
     /// sees a key destroyed before it, and the main thread's run at
     /// `lust_tls_exit`. A C harness stands in for codegen: keys with slots
-    /// 1 and 2, `(u8, int)` cells.
+    /// 1 and 2, `(u8, int)` cells. tests/pass/tls_threads.rs covers the
+    /// same path through `thread::spawn`.
     #[test]
     fn thread_exit_runs_destructors_newest_first() {
         let harness = r#"

@@ -30,8 +30,14 @@ void lust_tls_register(void *cell, void (*dtor)(void *));
 void lust_tls_exit(void);
 
 #ifdef LUST_IMPL
-#include <pthread.h>
-#include <stdatomic.h>
+/* The pthread calls, declared as runtime/sync.c declares them: no
+   <pthread.h>, whose prototypes clash with those under tcc. On glibc a
+   pthread_key_t is an unsigned int and a pthread_once_t an int (0 is
+   PTHREAD_ONCE_INIT). */
+int pthread_key_create(unsigned int *key, void (*dtor)(void *));
+void *pthread_getspecific(unsigned int key);
+int pthread_setspecific(unsigned int key, const void *v);
+int pthread_once(int *once, void (*init)(void));
 
 typedef struct {
     void *cell;
@@ -46,11 +52,19 @@ typedef struct {
     uint64_t dcap;
 } lust_tls_block;
 
-static pthread_key_t lust_tls_key;
-static pthread_once_t lust_tls_once = PTHREAD_ONCE_INIT;
+static unsigned int lust_tls_key;
+static int lust_tls_once;
 /* Set once the key exists: the fast path reads it before the key, and a
-   program that never touches TLS makes no key at exit. */
-static volatile int lust_tls_ready;
+   program that never touches TLS makes no key at exit. Read and written
+   with the `__atomic` builtins (tcc has them; runtime/sync.c owns the
+   fence shim, so no <stdatomic.h> here): 2 is acquire, 3 is release. */
+static int lust_tls_ready;
+
+static int lust_tls_is_ready(void) {
+    int r;
+    __atomic_load(&lust_tls_ready, &r, 2);
+    return r;
+}
 
 static void lust_tls_run(lust_tls_block *b) {
     while (b->ndtors) {
@@ -75,8 +89,8 @@ static void lust_tls_thread_end(void *p) {
 
 static void lust_tls_make_key(void) {
     if (pthread_key_create(&lust_tls_key, lust_tls_thread_end) != 0) abort();
-    atomic_thread_fence(memory_order_release);
-    lust_tls_ready = 1;
+    int one = 1;
+    __atomic_store(&lust_tls_ready, &one, 3);
 }
 
 static lust_tls_block *lust_tls_block_get(void) {
@@ -114,10 +128,11 @@ static void *lust_tls_cell_slow(uint64_t s, uint64_t size, uint64_t align) {
 #endif
 
 void *lust_tls_cell(uint64_t *key, uint64_t size, uint64_t align) LUST_BODY({
-    /* Fast path: plain reads (a key's slot never changes, and the block
-       key exists before any block does). */
+    /* Fast path: the ready flag (an acquire load, a plain read on x86),
+       then plain reads (a key's slot never changes, and the block key
+       exists before any block does). */
     uint64_t s = *key;
-    if (lust_tls_ready) {
+    if (lust_tls_is_ready()) {
         lust_tls_block *b = (lust_tls_block *)pthread_getspecific(lust_tls_key);
         if (b && s <= b->cap && b->cells[s - 1]) return b->cells[s - 1];
     }
@@ -139,7 +154,7 @@ void lust_tls_register(void *cell, void (*dtor)(void *)) LUST_BODY({
 })
 
 void lust_tls_exit(void) LUST_BODY({
-    if (!lust_tls_ready) return;
+    if (!lust_tls_is_ready()) return;
     lust_tls_block *b = (lust_tls_block *)pthread_getspecific(lust_tls_key);
     if (b) lust_tls_run(b);
 })
