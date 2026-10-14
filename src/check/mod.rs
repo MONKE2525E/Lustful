@@ -847,6 +847,10 @@ pub struct Checked<'g> {
     /// The hidden type of each `impl Trait` this body defines
     /// (`check::opaque`), by opaque def.
     pub opaque_hidden: Vec<(DefId, Ty)>,
+    /// The hidden types a revealed check put in place of callee opaque
+    /// types (check/opaque.rs): lowering marks the locals that hold them
+    /// (`Body::opaque_locals`).
+    pub revealed: Vec<Ty>,
 }
 
 impl Checked<'_> {
@@ -1009,6 +1013,23 @@ struct Ctx<'p, 'a> {
     /// This body's own `impl Trait` returns: (opaque def, its args, the
     /// variable standing for the hidden type).
     own_opaques: Vec<(DefId, ArgsId, Ty)>,
+    /// How this check sees the `impl Trait` values of its callees
+    /// (check/opaque.rs): rigid with their bounds, or revealed.
+    opaque_mode: opaque::OpaqueMode,
+    /// The trait picks the opaque view of this same body recorded, which
+    /// its revealed check replays (`replay_pick`).
+    view_picks: crate::intern::FxMap<ExprId, picks::TraitPick>,
+    /// The Fn trait each call of an opaque callable went through in the
+    /// opaque view, which the revealed check keeps (a closure behind
+    /// `impl FnOnce` is consumed even when it is `Fn`).
+    view_calls: crate::intern::FxMap<ExprId, closure::ClosureKind>,
+    /// The bounds of the callee opaque types this body has met, elaborated,
+    /// after the fn's own env (`opaque::note_opaques`); empty until one.
+    opaque_env: Vec<Predicate>,
+    opaque_seen: Vec<Ty>,
+    /// A revealed hidden type is `Copy` where its bounds do not say so:
+    /// lust's borrow checker would see copies where rustc sees moves.
+    opaque_copy_hazard: bool,
     /// This body's closure expressions in token order, for their defs.
     closure_order: Option<Vec<ExprId>>,
     /// The closure-argument type vars of iterator methods (`iter.rs`
@@ -1143,6 +1164,17 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         ck.poisoned = !errs.is_empty();
         return (ck, Vec::new());
     }
+    opaque::check_fn_opaque(p, fid)
+}
+
+/// One check of one fn body under an `impl Trait` mode, with the picks
+/// its opaque view recorded when `mode` is `Revealed` (check/opaque.rs).
+fn check_fn_mode<'p, 'a>(
+    p: &'p Program<'a>,
+    fid: LocalDefId,
+    mode: opaque::OpaqueMode,
+    view: opaque::ViewOut,
+) -> (Checked<'p>, Vec<Diag>) {
     let f = p.fn_info(fid);
     let def = f.def;
     let n_exprs = (def.exprs.1 - def.exprs.0) as usize;
@@ -1180,6 +1212,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             annotations: Vec::new(),
             queue_work: 0,
             opaque_hidden: Vec::new(),
+            revealed: Vec::new(),
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),
@@ -1222,6 +1255,12 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         closure_rets: Vec::new(),
         fn_ret: f.ret,
         own_opaques: Vec::new(),
+        opaque_mode: mode,
+        view_picks: view.picks,
+        view_calls: view.calls,
+        opaque_env: Vec::new(),
+        opaque_seen: Vec::new(),
+        opaque_copy_hazard: false,
         closure_order: None,
         iter_closure_args: std::collections::HashMap::new(),
         scope_closure_vars: Vec::new(),
@@ -2041,7 +2080,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let f = p.local_def(def.hash)?;
                     let fargs: Vec<GenericArg> = self.tys.args(args).to_vec();
                     match p.sig_of(&mut self.out.reads, def) {
-                        SigOf::Fn(info) if fargs.is_empty() => Some((info.params.clone(), p.ret_view(f))),
+                        SigOf::Fn(info) if fargs.is_empty() => Some((info.params.clone(), p.ret_view(f))).map(|(ps, r)| (ps, self.callee_ret(r))),
                         // A generic fn item: its signature under the
                         // item's args (see `fn_value_ty`).
                         SigOf::Fn(info) => {
@@ -2445,6 +2484,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env)
     }
 
+    /// The env selection and normalization use: `env()`, plus the bounds
+    /// of the callee opaque types met so far (`opaque::note_opaques`).
+    fn solve_env(&self) -> std::borrow::Cow<'p, [Predicate]> {
+        if self.opaque_env.is_empty() { std::borrow::Cow::Borrowed(self.env()) } else { std::borrow::Cow::Owned(self.opaque_env.clone()) }
+    }
+
     /// Normalizes one type here (section 2.5) through this body's
     /// solver. The solver state is taken out for the call because
     /// the context itself is the `SolveCx`.
@@ -2453,9 +2498,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return t;
         }
         let p = self.p;
-        let env: &[Predicate] = p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env);
+        self.note_opaques(t);
+        let env = self.solve_env();
         let mut solver = std::mem::take(&mut self.solver);
-        let out = crate::traits::solve::normalize(&mut solver, self, &p.gx.index, env, t);
+        let out = crate::traits::solve::normalize(&mut solver, self, &p.gx.index, &env, t);
         self.solver = solver;
         out
     }
@@ -2552,10 +2598,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return Selection::ParamEvidence(usize::MAX);
             }
         }
-        let env: &[Predicate] = p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env);
+        // An `impl Trait` Self proves its bounds (check/opaque.rs).
+        for g in self.tys.args(tr.args).to_vec() {
+            if let GenericArg::Ty(t) = g {
+                let t = self.deep(t);
+                self.note_opaques(t);
+            }
+        }
+        let env = self.solve_env();
         let mut solver = std::mem::take(&mut self.solver);
         let snap = self.snapshot_vars();
-        let sel = solver.select(self, &p.gx.index, env, tr);
+        let sel = solver.select(self, &p.gx.index, &env, tr);
         self.solver = solver;
         let lang_pick =
             matches!(&sel, Selection::Impl { id, .. } if p.gx.index.get(*id).synthetic == crate::traits::index::Synthetic::Lang);
@@ -2676,8 +2729,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // The answer reads the fields of every Adt in `t` (their
         // layouts' fingerprints cover nested field types).
         self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
-        let env = self.env();
-        crate::check::collect::auto_structural(self.p, &mut self.tys, env, trait_def, t, seen)
+        self.note_opaques(t);
+        let env = self.solve_env();
+        crate::check::collect::auto_structural(self.p, &mut self.tys, &env, trait_def, t, seen)
     }
 
     /// W-BORROW: for each `Fn`-family bound whose self type is a param the
@@ -4976,6 +5030,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let params: Vec<Ty> = info.params.iter().map(|&t| subst(&mut self.tys, t, &args)).collect();
         let ret = subst(&mut self.tys, info.ret, &args);
+        let ret = self.callee_ret(ret);
         let preds = generics.predicates.clone();
         let fn_bounds = p.regions.fns.get(&template).map(|s| s.fn_bounds.clone()).unwrap_or_default();
         self.push_predicates_with(&preds, &args, span, &fn_bounds);
@@ -8802,7 +8857,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         for (tr, method, autoref) in
             [(lang.fn_, "call", Autoref::Ref), (lang.fn_mut, "call_mut", Autoref::RefMut), (lang.fn_once, "call_once", Autoref::None)]
         {
-            let Some(bound) = self.env().iter().find_map(|pred| match pred {
+            self.note_opaques(callee);
+            let env = self.solve_env();
+            let Some(bound) = env.iter().find_map(|pred| match pred {
                 Predicate::Trait(b)
                     if b.count == 0 && b.value.def == tr && self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(callee) =>
                 {
@@ -8910,6 +8967,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let info = p.fn_info(f);
                 (info.params.clone(), p.ret_view(f))
             };
+            let ret = self.callee_ret(ret);
             self.set_res(e, Res::Fn(f));
             self.check_args(&params, args, span);
             return Some(ret);
@@ -9377,6 +9435,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     SigOf::Fn(info) => (info.params.clone(), p.ret_view(f)),
                     _ => return ERROR,
                 };
+                let ret = self.callee_ret(ret);
                 self.unify_written_self(callee, f, &[], span);
                 self.check_args(&params, args, span);
                 ret
@@ -10267,7 +10326,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if p.gx.has_generics
             && !builtin_only
             && (self.tys.local_adt(base).is_some()
-                || matches!(self.tys.kind(base), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Dyn(..)))
+                || matches!(self.tys.kind(base), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Dyn(..) | TyKind::Opaque(..)))
         {
             match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
                 method::Probe::Hit(ret) => return ret,
@@ -10315,6 +10374,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     SigOf::Fn(info) => (info.params.clone(), p.local_def(c.def.hash).map_or(info.ret, |f| p.ret_view(f))),
                     _ => return ERROR,
                 };
+                let ret = self.callee_ret(ret);
                 let snap_vars = self.snapshot_vars();
                 let obl_len = self.obl_len();
                 if params.first().is_none_or(|&want| !self.unify(want, probe.recv_ty)) {

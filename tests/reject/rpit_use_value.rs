@@ -1,5 +1,5 @@
-// expect: L0602
-// Using the value of a fn that returns `impl Trait` is not supported yet.
+// expect: L0104
+// Iterator provided methods (`sum`) on an `impl Iterator` value wait for generic adapters, as on a type parameter.
 fn evens() -> impl Iterator<Item = u32> {
     vec![2u32, 4].into_iter()
 }

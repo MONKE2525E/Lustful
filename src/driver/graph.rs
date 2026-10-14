@@ -1095,6 +1095,11 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // the first needs a `'static` receiver (check::object).
         p.gx.static_dyn_fns.contains(&local).hash(&mut h);
         hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
+        // A generic fn's `impl Trait` return: callers' revealed checks
+        // read its hidden type (check/opaque.rs).
+        if let Some(&hidden) = p.gx.opaque_hidden.get(&crate::check::generics::opaque_def(def)) {
+            hash_ty_deep(&mut h, p, &p.tys, hidden, &mut seen);
+        }
         // `fn f(x: &str)` and `fn f(x: &'static str)` erase alike;
         // callers' borrow checks read the region signature (W-BORROW).
         hash_region_sig(&mut h, p, p.regions.fns.get(&local));

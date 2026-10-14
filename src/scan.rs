@@ -100,7 +100,14 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
         if fn_here {
             // The body is the first `{` at this depth after the signature.
             let mut j = i;
+            // `-> impl Trait`: the body decides the hidden type callers
+            // generate code for (check/opaque.rs), so it is part of the
+            // environment, not a body-only edit.
+            let mut arrow = false;
+            let mut rpit = false;
             while j < toks.len() && toks[j].tok != Tok::LBrace && toks[j].tok != Tok::Eof {
+                arrow |= toks[j].tok == Tok::Arrow;
+                rpit |= arrow && toks[j].tok == Tok::Impl;
                 hash_tok(&mut env, &toks[j].tok, &lexed.strings);
                 j += 1;
             }
@@ -172,6 +179,9 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
                 complete = false;
             }
             let body_hash = body.finish();
+            if rpit {
+                body_hash.hash(&mut env);
+            }
             // A nested fn reads the items of the blocks around it (a
             // sibling fn, const, or `use` that shadows a name), and no
             // recorded read covers those names. Its hash takes in the
@@ -184,8 +194,10 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
             idents.dedup();
             body_idents.push(idents);
             if depth == 0 {
+                // A fn returning `impl Trait` changes callers' generated
+                // code with its body: no fn-only shortcut, a full walk.
                 let fn_name = match toks.get(i + 1).map(|t| t.tok) {
-                    Some(Tok::Ident(s)) => Some(s),
+                    Some(Tok::Ident(s)) if !rpit => Some(s),
                     _ => None,
                 };
                 items.push(ItemScan { hash: std::mem::take(&mut env).finish(), fn_name });

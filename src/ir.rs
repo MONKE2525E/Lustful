@@ -282,6 +282,12 @@ pub struct Body<'g> {
     /// the next arm's start, so arms after an irrefutable one are still
     /// checked. Codegen ignores them; a cached body has none.
     pub false_edges: Vec<(Bb, Bb)>,
+    /// Locals that may hold an `impl Trait` value revealed to its hidden
+    /// type (check/opaque.rs): rustc's drop check assumes an opaque type
+    /// has a destructor that uses every region it captures, so borrowck
+    /// keeps all their regions live to the drop, which lowering emits
+    /// even for a hidden type without drop glue (a no-op in codegen).
+    pub opaque_locals: Vec<Local>,
 }
 
 impl Body<'_> {

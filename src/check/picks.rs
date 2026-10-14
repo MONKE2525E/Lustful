@@ -64,10 +64,12 @@ impl Ctx<'_, '_> {
     /// The pick a template check recorded for one call, when this
     /// body is any other check of that template's body.
     pub(super) fn replay_pick(&self, e: ExprId) -> Option<TraitPick> {
-        if self.is_template_check() {
+        if self.records_picks() {
             return None;
         }
-        self.p.gx.trait_picks.get(&e).copied()
+        // A revealed check replays its own opaque view's picks first
+        // (check/opaque.rs).
+        self.view_picks.get(&e).or_else(|| self.p.gx.trait_picks.get(&e)).copied()
     }
 
     /// Records one confirmed trait call in a template check.
@@ -79,8 +81,11 @@ impl Ctx<'_, '_> {
     /// its index in this body's env (`TraitPick::env_pred`).
     /// `usize::MAX` is selection's structural answer, not a predicate.
     pub(super) fn record_pick_env(&mut self, e: ExprId, trait_def: DefId, derefs: u8, form: ReceiverForm, env: Option<usize>) {
-        if self.is_template_check() {
-            let env_pred = env.filter(|&i| i != usize::MAX).and_then(|i| u32::try_from(i).ok());
+        if self.records_picks() {
+            // An index past the fn's own env names an opaque type's bound
+            // (`Ctx::solve_env`): the revealed check selects on the hidden
+            // type instead.
+            let env_pred = env.filter(|&i| i < self.env().len()).and_then(|i| u32::try_from(i).ok());
             self.out.trait_picks.push((e, TraitPick { trait_def, derefs, form, env_pred }));
         }
     }
@@ -142,11 +147,12 @@ impl Ctx<'_, '_> {
         let p = self.p;
         let Some(traits) = p.gx.traits_by_method.get(&name) else { return Vec::new() };
         let self_ty = self.resolve(self_ty);
-        if !matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..)) {
+        if !matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..)) {
             return Vec::new();
         }
+        let env = self.solve_env();
         let is_bound = |t: DefId| {
-            self.env().iter().any(|pred| {
+            env.iter().any(|pred| {
                 matches!(pred, Predicate::Trait(b) if b.count == 0 && b.value.def == t
                     && self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(self_ty))
             })
@@ -194,6 +200,8 @@ pub(super) fn where_clause_probe(
     explicit: &[Option<GenericArg>],
     expected: Option<Ty>,
 ) -> Probe {
+    let self_ty = cx.resolve(probe.self_ty);
+    cx.note_opaques(self_ty);
     let traits: Vec<DefId> =
         cx.bound_traits_with(probe.self_ty, name).into_iter().filter(|&t| method_form(cx, t, name) == Some(probe.filter)).collect();
     match traits.len() {

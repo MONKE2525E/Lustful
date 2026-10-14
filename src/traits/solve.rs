@@ -193,7 +193,9 @@ fn self_ty_of(cx: &impl TyIntern, tr: &TraitRef) -> Ty {
 fn is_rigid(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) => true,
-        TyKind::Projection(..) => !tys.flags(t).contains_infer(),
+        // An `impl Trait` type is rigid where it is opaque: its bounds
+        // speak for it (check/opaque.rs).
+        TyKind::Projection(..) | TyKind::Opaque(..) => !tys.flags(t).contains_infer(),
         _ => false,
     }
 }

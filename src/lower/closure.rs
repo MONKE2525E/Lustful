@@ -55,6 +55,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         promoted: Vec::new(),
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
+        opaque_locals: Vec::new(),
     };
     let info = ck.closures.iter().find(|c| c.def == def).cloned();
     let poisoned = ck.poisoned;
@@ -146,6 +147,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
     lw.terminate(Terminator::Return, span);
     lw.rewrite_upvars();
     lw.map_annotations();
+    lw.mark_opaque_locals();
     lw.body
 }
 

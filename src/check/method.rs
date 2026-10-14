@@ -166,7 +166,8 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         return true;
     }
     let in_env = |preds: &[Predicate]| preds.iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def));
-    if in_env(cx.env()) {
+    // An opaque type's bounds count like a where clause (check/opaque.rs).
+    if in_env(&cx.solve_env()) {
         return true;
     }
     // An instance body re-checks its template with concrete
@@ -744,6 +745,7 @@ pub(super) fn trait_probe_for(
                         let info = p.fn_info(local);
                         (info.params.clone(), p.ret_view(local))
                     };
+                    let ret = cx.callee_ret(ret);
                     let want_recv = params[0];
                     if !cx.unify(want_recv, probe.recv_ty) {
                         return Probe::Miss;
@@ -985,6 +987,7 @@ pub(super) fn plain_inherent_probe(
             SigOf::Fn(info) => (info.params.clone(), p.ret_view(f)),
             _ => continue,
         };
+        let ret = cx.callee_ret(ret);
         // The candidate set is keyed by the reference-peeled head
         // and by the template Adt, so it also surfaces methods
         // whose receiver type or impl Self pattern does not match
@@ -1090,6 +1093,7 @@ pub(super) fn dyn_probe(
             let info = p.fn_info(f);
             (info.params.clone(), p.ret_view(f))
         };
+        let ret = cx.callee_ret(ret);
         cx.set_res(e, Res::Method { f, derefs, autoref: probe.autoref });
         cx.check_args(&params[1.min(params.len())..], args, name_span);
         return Probe::Hit(ret);

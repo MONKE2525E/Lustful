@@ -4257,6 +4257,7 @@ fn env_proves(tys: &impl TyIntern, t: Ty, trait_def: DefId, rhs: Option<Ty>) -> 
 pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.copy, None),
+        TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.copy),
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
         // Fn items, fn pointers, and (non-capturing) closures are Copy.
         TyKind::FnDef(..) | TyKind::FnPtr(_) => true,
@@ -4483,6 +4484,20 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
         // `Send` closure).
         TyKind::Infer(v) if v.is_int() || v.is_float() => Some(true),
         TyKind::Infer(_) | TyKind::Projection(..) => None,
+        // An `impl Trait` type leaks its hidden type's auto traits, as in
+        // rustc (check/opaque.rs); a bound that names the trait holds too.
+        TyKind::Opaque(od, a) => {
+            if env.iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def && tys.args(b.value.args)[0].as_ty() == Some(t))) {
+                return Some(true);
+            }
+            let h = *p.gx.opaque_hidden.get(&od)?;
+            let args: Vec<GenericArg> = tys.args(a).to_vec();
+            let h = subst(tys, h, &args);
+            seen.push((trait_def, t));
+            let out = auto_structural(p, tys, env, trait_def, h, seen);
+            seen.pop();
+            out
+        }
         TyKind::Param(_) => Some(env.iter().any(|pred| {
             matches!(pred, Predicate::Trait(b) if b.value.def == trait_def && tys.args(b.value.args)[0].as_ty() == Some(t))
         })),
@@ -4702,6 +4717,7 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
+        TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.debug),
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
@@ -4747,6 +4763,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
 pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.display, None),
+        TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.display),
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),

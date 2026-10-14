@@ -3684,6 +3684,10 @@ pub struct GenTables<'a> {
     /// `FnInfo::ret` was revealed to its hidden type for codegen
     /// (`check::opaque::reveal_plain`): the opaque type itself.
     pub opaque_ret_of: FxMap<LocalDefId, Ty>,
+    /// The hidden type of each `impl Trait` return, over its defining
+    /// fn's params (check/opaque.rs): from `reveal_plain` and the
+    /// template check. A revealed check substitutes a use's args.
+    pub opaque_hidden: FxMap<DefId, Ty>,
 }
 
 impl Default for GenTables<'_> {
@@ -3746,6 +3750,7 @@ impl Default for GenTables<'_> {
             param_defaults: FxMap::default(),
             opaques: FxMap::default(),
             opaque_ret_of: FxMap::default(),
+            opaque_hidden: FxMap::default(),
         }
     }
 }
@@ -6287,6 +6292,16 @@ fn add_trait_method_stubs(p: &mut Program) {
             }
         }
     }
+    // The bounds of `impl Trait` returns prove calls in their callers'
+    // opaque views (check/opaque.rs), supertraits included.
+    let opaque_bounds: Vec<Predicate> = p.gx.opaques.values().flat_map(|o| o.bounds.iter().copied()).collect();
+    for pred in crate::traits::solve::elaborate_in(&mut p.tys, &p.gx.index, &opaque_bounds) {
+        if let Predicate::Trait(b) = pred
+            && !bound.contains(&b.value.def)
+        {
+            bound.push(b.value.def);
+        }
+    }
     // A `for` loop over an `IntoIterator` bound also calls
     // `Iterator::next` on the `IntoIter` projection; no env
     // predicate names `Iterator` there (assoc-type bounds of a
@@ -6364,7 +6379,8 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
         // reuse) contributes its picks and closure call kinds without
         // a recheck. A body with closure expressions always rechecks:
         // its check also registers closure body fns.
-        if let Some((picks, calls)) = reuse.template(p, t) {
+        let defines_opaque = p.gx.opaques.contains_key(&opaque_def(p.def_id(t)));
+        if !defines_opaque && let Some((picks, calls)) = reuse.template(p, t) {
             reuse.note_template_out(p, t, &picks, &calls, &[]);
             p.gx.trait_picks.extend(picks);
             record_template_closures(p, t, Vec::new(), calls);
@@ -6387,9 +6403,11 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
                 closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
             }
         }
-        let (body_errs, picks, calls, reads) = {
+        let (body_errs, picks, calls, reads, hidden) = {
             let (c, mut e) = crate::check::check_fn(p, t);
             let picks = c.trait_picks.clone();
+            let hidden: Vec<(DefId, OwnedTy)> =
+                c.opaque_hidden.iter().filter_map(|&(od, h)| snapshot_ty(&c.tys, h).map(|o| (od, o))).collect();
             let calls = c.closure_calls.clone();
             let reads = c.reads.clone();
             if e.is_empty() {
@@ -6401,8 +6419,12 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
                     e.extend(crate::borrowck::borrowck(p, &cbody));
                 }
             }
-            (e, picks, calls, reads)
+            (e, picks, calls, reads, hidden)
         };
+        for (od, owned) in hidden {
+            let h = build_owned_ty(p, &owned);
+            p.gx.opaque_hidden.insert(od, h);
+        }
         reuse.templates_checked += 1;
         reuse.template_errors += body_errs.len();
         reuse.note_template_out(p, t, &picks, &calls, &template_shapes);
@@ -6769,6 +6791,18 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
     let params = subst_norm_all(p, &raw_params, args);
     let raw_ret = subst(&mut p.tys, raw_ret, args);
     let ret = normalize_global(p, raw_ret);
+    // A generic fn's own `impl Trait` return: the instance generates its
+    // hidden type, and callers keep the opaque (check/opaque.rs).
+    let opaque_ret = crate::check::opaque::mentions_opaque(&p.tys, ret, None).then_some(ret);
+    let ret = match opaque_ret {
+        Some(o) => {
+            let hidden = std::mem::take(&mut p.gx.opaque_hidden);
+            let r = crate::check::opaque::reveal(&hidden, &mut p.tys, o, 0);
+            p.gx.opaque_hidden = hidden;
+            r
+        }
+        None => ret,
+    };
     let owner = instance_owner(p, &params, self_kind);
     // Instance identity: template disk identity plus the args
     // fingerprint (the InstanceKeyHash of section 4.2).
@@ -6794,6 +6828,9 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
     data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
     p.defs.insert(def_id, data);
     p.fns.push(crate::check::collect::FnInfo { name, def, owner, self_kind, params, ret, ret_borrows_from, is_const: def.qual.is_const });
+    if let Some(o) = opaque_ret {
+        p.gx.opaque_ret_of.insert(id, o);
+    }
     p.gx.fn_templates.push(None);
     // The body scope of an instance: no parameters, the concrete
     // Self type, and the template's assoc sources substituted. Self
@@ -6999,7 +7036,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     // `dyn Fn` values made from fn items, whose vtables only body
     // checks ask for.
     if !p.gx.has_generics
-        && (p.ast.exprs.iter().any(|e| matches!(e, ast::Expr::Closure { .. })) || p.ast.tys.iter().any(|t| matches!(t, TyExpr::Dyn { .. })))
+        && (p.ast.exprs.iter().any(|e| matches!(e, ast::Expr::Closure { .. }))
+            || p.ast.tys.iter().any(|t| matches!(t, TyExpr::Dyn { .. }))
+            || !p.gx.opaques.is_empty())
     {
         p.gx.has_generics = true;
     }
@@ -7013,6 +7052,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     if !template_errs.is_empty() {
         return template_errs;
     }
+    crate::check::opaque::reveal_plain_rets(p);
     let mut errs: Vec<Diag> = Vec::new();
     // Adt instances named by plain signatures and fields first.
     for a in 0..p.gx.adt_info.len() {

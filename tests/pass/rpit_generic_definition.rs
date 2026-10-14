@@ -1,6 +1,5 @@
-// expect: L0602
-// A generic fn's `impl Trait` return keeps the opaque type in its body,
-// which the borrow checker does not track yet (W-BORROW).
+// A generic fn returning `impl Trait`: the template check lowers its return
+// local as the hidden type, so the borrow checker sees concrete regions (W-CHECK-G3).
 struct M<K, V> {
     entries: Vec<(K, V)>,
 }

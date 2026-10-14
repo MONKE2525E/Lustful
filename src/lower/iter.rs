@@ -88,6 +88,7 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         promoted: Vec::new(),
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
+        opaque_locals: Vec::new(),
     };
     let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default() };
     let n = ex.body.blocks.len();

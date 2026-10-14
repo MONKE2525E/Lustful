@@ -9,16 +9,32 @@
 //
 // The defining body checks against a fresh variable in place of its own
 // opaque: the returns decide the hidden type, which must be fully known,
-// must not name the opaque itself, and must satisfy every bound. A
-// plain fn's `FnInfo::ret` is then revealed to its hidden type for
-// codegen (`reveal_plain`), and callers keep checking against the opaque
-// (`Program::ret_view`).
+// must not name the opaque itself, and must satisfy every bound. The
+// hidden type is stored over the defining fn's params
+// (`GenTables::opaque_hidden`, from `reveal_plain` and the template
+// check), and a plain fn's `FnInfo::ret` is revealed to it for codegen
+// while callers keep the opaque (`Program::ret_view`).
 //
-// Callers see only the opaque type. Using such a value in a body that
-// gets code (any check but a template's) is not supported yet (L0602):
-// that needs the hidden types of generic instances and a replay of the
-// caller's trait picks over them. Template checks may name opaque values.
+// Callers (W-CHECK-G3) see only the opaque type and its bounds, as in
+// rustc. A body that uses an opaque value is checked twice:
+//
+// - The opaque view (`OpaqueMode::View`): an opaque type is rigid; its
+//   elaborated bounds join the env selection and normalization use
+//   (`note_opaques`), so it has exactly the traits and associated types
+//   its bounds name, plus the auto traits its hidden type has (rustc's
+//   auto-trait leakage). Trait calls on it record picks, as a template's
+//   calls do. Errors come from this check.
+// - The revealed check (`OpaqueMode::Revealed`): every callee's opaque
+//   return is its hidden type (`reveal`), and the calls replay the view's
+//   picks, so the hidden type's inherent methods and other traits stay
+//   out of reach. Lowering, borrowck, and codegen get this check.
+//
+// Instances check revealed and replay their template's picks. A template
+// that uses an opaque value checks in the view; its borrow check still
+// rejects opaque locals (L0602), so generic callers wait for region slots
+// for opaque values (W-BORROW).
 use super::*;
+use crate::intern::FxMap;
 
 impl Ctx<'_, '_> {
     /// The return type a body checks against: the fn's return type, with
@@ -95,10 +111,16 @@ impl Ctx<'_, '_> {
     }
 
     /// Rejects a value of an opaque type in a body that gets code
-    /// (L0602, see the file header). Template checks may name them.
+    /// (L0602, see the file header): a revealed check that still has one
+    /// (a hidden type lust does not know). Views may name them.
     pub(super) fn reject_opaque_uses(&mut self) {
         let p = self.p;
-        if p.gx.opaques.is_empty() || self.is_template_check() {
+        if p.gx.opaques.is_empty() || self.is_template_check() || self.opaque_mode == OpaqueMode::View {
+            return;
+        }
+        if self.opaque_copy_hazard {
+            let span = p.fn_info(self.fid).def.name_span;
+            self.errs.push(not_yet("L0602", span, "using an `impl Trait` value whose hidden type is `Copy` when its bounds are not"));
             return;
         }
         let n = self.out.expr_ty.len();
@@ -111,6 +133,262 @@ impl Ctx<'_, '_> {
                 return;
             }
         }
+    }
+
+    /// Adds the elaborated bounds of every opaque type in `t` this body
+    /// has not met yet to its solve env (`Ctx::solve_env`), so selection
+    /// and normalization answer for it as for a type parameter.
+    pub(super) fn note_opaques(&mut self, t: Ty) {
+        let p = self.p;
+        if p.gx.opaques.is_empty() || !mentions_opaque(&self.tys, t, None) {
+            return;
+        }
+        let mut found: Vec<Ty> = Vec::new();
+        collect_opaques(&self.tys, t, &mut found);
+        for o in found {
+            if self.opaque_seen.contains(&o) {
+                continue;
+            }
+            self.opaque_seen.push(o);
+            let TyKind::Opaque(od, args) = self.tys.kind(o) else { continue };
+            let Some(info) = p.gx.opaques.get(&od) else { continue };
+            let mut full: Vec<GenericArg> = self.tys.args(args).to_vec();
+            full.push(GenericArg::Ty(o));
+            let written: Vec<Predicate> =
+                info.bounds.iter().map(|&pred| crate::traits::index::subst_predicate(&mut self.tys, pred, &full)).collect();
+            let more = crate::traits::solve::elaborate_in(&mut self.tys, &p.gx.index, &written);
+            if self.opaque_env.is_empty() {
+                self.opaque_env = self.env().to_vec();
+            }
+            for pred in more {
+                if !self.opaque_env.contains(&pred) {
+                    self.opaque_env.push(pred);
+                }
+            }
+        }
+    }
+
+    /// A callee's return type as this check sees it: unchanged in the
+    /// opaque view, with every opaque type replaced by its hidden type in
+    /// a revealed check (`reveal`). Records the `Sig` read of each
+    /// revealed opaque's defining fn (its fingerprint covers the hidden
+    /// type), so a daemon rechecks this body when the hidden type moves.
+    pub(super) fn callee_ret(&mut self, t: Ty) -> Ty {
+        if self.opaque_mode != OpaqueMode::Revealed || !mentions_opaque(&self.tys, t, None) {
+            return t;
+        }
+        let p = self.p;
+        let mut found: Vec<Ty> = Vec::new();
+        collect_opaques(&self.tys, t, &mut found);
+        for o in found {
+            if let TyKind::Opaque(od, _) = self.tys.kind(o)
+                && let Some(info) = p.gx.opaques.get(&od)
+            {
+                let _ = p.sig_of(&mut self.out.reads, info.owner);
+                let h = reveal(&p.gx.opaque_hidden, &mut self.tys, o, 0);
+                if crate::check::collect::is_copy(p, &self.tys, h) && !opaque_bound_holds(p, &self.tys, o, p.gx.lang.copy) {
+                    self.opaque_copy_hazard = true;
+                }
+                if !self.out.revealed.contains(&h) {
+                    self.out.revealed.push(h);
+                }
+            }
+        }
+        reveal(&p.gx.opaque_hidden, &mut self.tys, t, 0)
+    }
+
+    /// True when this check records its trait picks for a later check of
+    /// the same body: a template check, or an opaque view.
+    pub(super) fn records_picks(&self) -> bool {
+        self.is_template_check() || (self.opaque_mode == OpaqueMode::View && !self.p.gx.opaques.is_empty())
+    }
+}
+
+/// True when an opaque type's bounds name `trait_def` for it, directly
+/// or through supertraits (`impl Error` is `Display` and `Debug`). The
+/// structural queries (`has_display`, `has_debug`, `is_copy`) ask this
+/// where they ask the env for a type parameter.
+pub(crate) fn opaque_bound_holds(p: &Program, tys: &impl TyIntern, t: Ty, trait_def: DefId) -> bool {
+    let TyKind::Opaque(od, _) = tys.kind(t) else { return false };
+    let Some(info) = p.gx.opaques.get(&od) else { return false };
+    fn reaches(p: &Program, from: DefId, want: DefId, seen: &mut Vec<DefId>) -> bool {
+        if from == want {
+            return true;
+        }
+        if seen.contains(&from) {
+            return false;
+        }
+        seen.push(from);
+        let Some(rec) = p.gx.index.trait_record(from) else { return false };
+        rec.generics.predicates.iter().any(|pred| match pred {
+            Predicate::Trait(b) => {
+                matches!(p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).map(|s| p.tys.kind(s)), Some(TyKind::Param(ParamId(0))))
+                    && reaches(p, b.value.def, want, seen)
+            }
+            _ => false,
+        })
+    }
+    // Every trait predicate of an opaque's bounds has the opaque as Self.
+    info.bounds.iter().any(|pred| matches!(pred, Predicate::Trait(b) if reaches(p, b.value.def, trait_def, &mut Vec::new())))
+}
+
+/// What an opaque view hands its revealed check: its trait picks and the
+/// Fn trait of each call of an opaque callable.
+#[derive(Default)]
+pub(super) struct ViewOut {
+    pub picks: FxMap<ExprId, picks::TraitPick>,
+    pub calls: FxMap<ExprId, closure::ClosureKind>,
+}
+
+/// How one check sees opaque types (see the file header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpaqueMode {
+    View,
+    Revealed,
+}
+
+/// `check_fn` for a body that is not a closure body: the opaque view,
+/// then, for a body that gets code and uses an opaque value, the revealed
+/// check that replays the view's picks. An instance checks revealed.
+pub(super) fn check_fn_opaque<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
+    use generics::FnClass;
+    if p.gx.opaques.is_empty() {
+        return check_fn_mode(p, fid, OpaqueMode::View, ViewOut::default());
+    }
+    match p.gx.fn_class.get(fid.0 as usize) {
+        Some(FnClass::Instance) => check_fn_mode(p, fid, OpaqueMode::Revealed, ViewOut::default()),
+        Some(FnClass::Template | FnClass::TemplateClosure | FnClass::Stub) => check_fn_mode(p, fid, OpaqueMode::View, ViewOut::default()),
+        _ => {
+            let (view, errs) = check_fn_mode(p, fid, OpaqueMode::View, ViewOut::default());
+            let uses = view.expr_ty.iter().chain(view.pat_ty.iter()).any(|&t| mentions_opaque(&view.tys, t, None));
+            if !errs.is_empty() || !uses {
+                return (view, errs);
+            }
+            let out = ViewOut { picks: view.trait_picks.iter().copied().collect(), calls: view.closure_calls.iter().copied().collect() };
+            drop(view);
+            check_fn_mode(p, fid, OpaqueMode::Revealed, out)
+        }
+    }
+}
+
+/// `check_fn` in the opaque view only: the hidden types of the body's
+/// own opaques, before any caller is revealed (`reveal_plain`).
+pub(crate) fn check_fn_view<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
+    check_fn_mode(p, fid, OpaqueMode::View, ViewOut::default())
+}
+
+/// `t` with every opaque type replaced by its hidden type at its args,
+/// again inside the result (a hidden type may name another opaque). An
+/// opaque with no stored hidden type stays (the revealed check then
+/// rejects the value, L0602).
+pub(crate) fn reveal(hidden: &FxMap<DefId, Ty>, tys: &mut impl TyIntern, t: Ty, depth: u32) -> Ty {
+    if depth > 32 || !mentions_opaque(tys, t, None) {
+        return t;
+    }
+    match tys.kind(t) {
+        TyKind::Opaque(od, a) => match hidden.get(&od) {
+            Some(&h) => {
+                let a = reveal_args(hidden, tys, a, depth);
+                let args: Vec<GenericArg> = tys.args(a).to_vec();
+                let h = subst(tys, h, &args);
+                reveal(hidden, tys, h, depth + 1)
+            }
+            None => t,
+        },
+        TyKind::Ref(r, m, e) => {
+            let e = reveal(hidden, tys, e, depth + 1);
+            tys.intern(TyKind::Ref(r, m, e))
+        }
+        TyKind::RawPtr(m, e) => {
+            let e = reveal(hidden, tys, e, depth + 1);
+            tys.intern(TyKind::RawPtr(m, e))
+        }
+        TyKind::Slice(e) => {
+            let e = reveal(hidden, tys, e, depth + 1);
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Array(e, n) => {
+            let e = reveal(hidden, tys, e, depth + 1);
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Tuple(ts) => {
+            let old: Vec<Ty> = tys.tys_of(ts).to_vec();
+            let new: Vec<Ty> = old.into_iter().map(|e| reveal(hidden, tys, e, depth + 1)).collect();
+            let ts = tys.intern_tys(&new);
+            tys.intern(TyKind::Tuple(ts))
+        }
+        TyKind::Adt(d, a) => {
+            let a = reveal_args(hidden, tys, a, depth);
+            tys.intern(TyKind::Adt(d, a))
+        }
+        TyKind::FnDef(d, a) => {
+            let a = reveal_args(hidden, tys, a, depth);
+            tys.intern(TyKind::FnDef(d, a))
+        }
+        TyKind::Closure(d, a) => {
+            let a = reveal_args(hidden, tys, a, depth);
+            tys.intern(TyKind::Closure(d, a))
+        }
+        TyKind::Projection(d, a) => {
+            let a = reveal_args(hidden, tys, a, depth);
+            tys.intern(TyKind::Projection(d, a))
+        }
+        _ => t,
+    }
+}
+
+/// `reveal` over each type arg of `a`.
+fn reveal_args(hidden: &FxMap<DefId, Ty>, tys: &mut impl TyIntern, a: ArgsId, depth: u32) -> ArgsId {
+    let old: Vec<GenericArg> = tys.args(a).to_vec();
+    let new: Vec<GenericArg> = old
+        .into_iter()
+        .map(|g| match g {
+            GenericArg::Ty(e) => GenericArg::Ty(reveal(hidden, tys, e, depth + 1)),
+            other => other,
+        })
+        .collect();
+    tys.intern_args(&new)
+}
+
+/// True when a value of type `t` may own a value of type `inner` (is it,
+/// or holds it by value; a reference owns nothing it points at).
+pub(crate) fn ty_contains(tys: &impl TyIntern, t: Ty, inner: Ty) -> bool {
+    if t == inner {
+        return true;
+    }
+    let in_args = |a: ArgsId| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| ty_contains(tys, e, inner)));
+    match tys.kind(t) {
+        TyKind::Slice(e) | TyKind::Array(e, _) => ty_contains(tys, e, inner),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| ty_contains(tys, e, inner)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Projection(_, a) => in_args(a),
+        _ => false,
+    }
+}
+
+/// The opaque types in `t`, outermost first, each once.
+fn collect_opaques(tys: &impl TyIntern, t: Ty, out: &mut Vec<Ty>) {
+    let mut in_args = |a: ArgsId, out: &mut Vec<Ty>| {
+        for g in tys.args(a) {
+            if let GenericArg::Ty(e) = g {
+                collect_opaques(tys, *e, out);
+            }
+        }
+    };
+    match tys.kind(t) {
+        TyKind::Opaque(_, a) => {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+            in_args(a, out);
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => collect_opaques(tys, e, out),
+        TyKind::Tuple(ts) => {
+            for &e in tys.tys_of(ts) {
+                collect_opaques(tys, e, out);
+            }
+        }
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Projection(_, a) => in_args(a, out),
+        _ => {}
     }
 }
 
@@ -147,15 +425,33 @@ pub fn reveal_plain(p: &mut Program) {
         .collect();
     for f in defining {
         let (hidden, ok) = {
-            let (checked, errs) = check_fn(p, f);
+            let (checked, errs) = check_fn_view(p, f);
             let h = checked.opaque_hidden.first().map(|&(_, h)| h);
             (h.and_then(|h| crate::check::generics::snapshot_ty(&checked.tys, h)), errs.is_empty())
         };
         if let (Some(owned), true) = (hidden, ok) {
             let h = crate::check::generics::build_owned_ty(p, &owned);
             let opaque = p.fn_info(f).ret;
+            if let TyKind::Opaque(od, _) = p.tys.kind(opaque) {
+                p.gx.opaque_hidden.insert(od, h);
+            }
             p.gx.opaque_ret_of.insert(f, opaque);
             p.fns[f.0 as usize].ret = h;
         }
+    }
+    reveal_plain_rets(p);
+}
+
+/// Reveals the opaque types left in revealed plain fns' `FnInfo::ret` (a
+/// hidden type that names another fn's opaque), so codegen sees concrete
+/// types. Runs again once the template check has the hidden types of
+/// generic fns.
+pub fn reveal_plain_rets(p: &mut Program) {
+    let mut revealed: Vec<LocalDefId> = p.gx.opaque_ret_of.keys().copied().collect();
+    revealed.sort_by_key(|f| f.0);
+    let hidden = p.gx.opaque_hidden.clone();
+    for f in revealed {
+        let r = p.fns[f.0 as usize].ret;
+        p.fns[f.0 as usize].ret = reveal(&hidden, &mut p.tys, r, 0);
     }
 }

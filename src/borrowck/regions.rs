@@ -1142,6 +1142,22 @@ impl OwnSig {
             }
             own.slots.push(out);
         }
+        // An `impl Trait` return captures every input region (edition
+        // 2024), and callers assume its value lives no longer than any of
+        // them (`call_opaque`): each region of the returned value must
+        // outlive one fresh universal that every other universal outlives
+        // (W-CHECK-G3).
+        if crate::check::opaque::mentions_opaque(&p.tys, p.ret_view(body.fn_id), None) && !own.slots.is_empty() {
+            let ret: Vec<Univ> = own.slots[0].clone();
+            let n = own.n_univ;
+            for &r in &ret {
+                for u in 1..=n {
+                    if !ret.contains(&u) {
+                        own.facts.push((u, r));
+                    }
+                }
+            }
+        }
         own.implied(&mut sc, body);
         own
     }
@@ -1829,7 +1845,11 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             let base = b.owner.len() as u32;
             b.local_base.push(base);
             let mut dl = vec![false; n as usize];
-            if drops && n > 0 && !fat_local(&body.tys, decl.ty) {
+            if body.opaque_locals.contains(&(l as Local)) {
+                // An `impl Trait` value's unknown destructor may use every
+                // region it captures (W-CHECK-G3, `Body::opaque_locals`).
+                dl = vec![true; n as usize];
+            } else if drops && n > 0 && !fat_local(&body.tys, decl.ty) {
                 b.sc.drop_slots(decl.ty, DropMode::Owned, 0, &mut dl);
             }
             for i in 0..n as usize {
@@ -3956,6 +3976,11 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// the signature cannot be paired with the call's types.
     fn call_sig(&mut self, f: LocalDefId, sig: &RegionSig, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         let p = self.p;
+        // An `impl Trait` return captures every input region (edition
+        // 2024): the call takes `call_opaque` (W-CHECK-G3).
+        if p.gx.opaque_ret_of.contains_key(&f) {
+            return false;
+        }
         let info = p.fn_info(f);
         // The callee's bounds name the template's params, like `sig`.
         let src = p.gx.instances.get(&f).and_then(|i| i.template_local).unwrap_or(f);

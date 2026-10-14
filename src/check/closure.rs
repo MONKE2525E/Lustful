@@ -1718,7 +1718,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     // In an instance, a call keeps the Fn trait the
                     // template resolved it through (FnOnce consumes the
                     // closure even when it is Fn), as rustc's generic body.
-                    let mode = self.template_call_mode(e).unwrap_or(kind);
+                    let mode = self.template_call_mode(e).or_else(|| self.view_calls.get(&e).copied()).unwrap_or(kind);
                     self.out.closure_calls.push((e, mode));
                     self.set_res(e, Res::ClosureCall { kind: mode, derefs });
                     self.check_args(&inputs, args, span);
@@ -1791,7 +1791,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // calls through its Fn-family bound: Fn, else FnMut,
                 // else FnOnce (rustc's order), lowered as a call of the
                 // bound's method with the callee as receiver.
-                TyKind::Param(_) | TyKind::Projection(..) => {
+                TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) => {
                     let Some((stub, autoref, params, ret)) = self.fn_bound_call(t) else {
                         for &a in args {
                             self.expr(a, None);

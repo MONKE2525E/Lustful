@@ -97,6 +97,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         promoted: Vec::new(),
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
+        opaque_locals: Vec::new(),
     };
     let mut lw = Lower {
         p,
@@ -119,7 +120,13 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         spine_gen: 0,
         extended: Vec::new(),
     };
-    lw.new_local(f.ret, true, None);
+    // A template's own `impl Trait` return is its hidden type here, so the
+    // borrow checker sees the returned value's regions (check/opaque.rs).
+    let ret = match p.tys.kind(f.ret) {
+        TyKind::Opaque(od, _) => lw.ck.opaque_hidden.iter().find(|(d, _)| *d == od).map_or(f.ret, |&(_, h)| h),
+        _ => f.ret,
+    };
+    lw.new_local(ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
     lw.guard_places = vec![None; lw.ck.locals.len()];
     for i in 0..lw.ck.param_locals.len() {
@@ -161,6 +168,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     lw.emit_drops(&root, span);
     lw.terminate(Terminator::Return, span);
     lw.map_annotations();
+    lw.mark_opaque_locals();
     lw.body
 }
 
@@ -292,10 +300,25 @@ impl<'p, 'a> Lower<'p, 'a> {
         b.term_span = span;
         self.cur = target;
     }
+    /// Fills `Body::opaque_locals` (see `holds_revealed`).
+    fn mark_opaque_locals(&mut self) {
+        if self.ck.revealed.is_empty() {
+            return;
+        }
+        let marked: Vec<Local> = (0..self.body.locals.len() as Local).filter(|&l| self.holds_revealed(self.body.locals[l as usize].ty)).collect();
+        self.body.opaque_locals = marked;
+    }
+    /// True when a value of type `ty` may hold an `impl Trait` value the
+    /// check revealed (`Checked::revealed`): its drop is a use of every
+    /// region it holds (`Body::opaque_locals`). A plain value of the same
+    /// type counts too, which can only make the borrow check stricter.
+    fn holds_revealed(&self, ty: Ty) -> bool {
+        !self.ck.revealed.is_empty() && self.ck.revealed.iter().any(|&r| crate::check::opaque::ty_contains(&self.body.tys, ty, r))
+    }
     fn emit_drops(&mut self, locals: &[Local], span: Span) {
         for &l in locals.iter().rev() {
             let ty = self.body.locals[l as usize].ty;
-            if self.needs_drop_ty(ty) {
+            if self.needs_drop_ty(ty) || self.holds_revealed(ty) {
                 self.push(StmtKind::Drop(l), span);
             }
             self.push(StmtKind::StorageDead(l), span);
