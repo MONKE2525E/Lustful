@@ -582,13 +582,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             SyncOp::PoisonNew => (vec![elem], sync_ty(&mut self.tys, SyncTy::PoisonError, &[elem])),
             // `spawn<F, T>(f: F) -> JoinHandle<T>` where `F: FnOnce() -> T
-            // + Send + 'static, T: Send + 'static` (the borrow checker
-            // proves the `'static` parts, borrowck/regions.rs).
+            // + Send + 'static, T: Send + 'static` (a generic parameter
+            // needs the bound here; the borrow checker proves concrete
+            // borrows, borrowck/regions.rs).
             SyncOp::ThreadSpawn => {
                 let ret = self.new_var(false);
                 let f = self.fn_once_param(&[], ret, span);
                 self.require_send(f, span);
                 self.require_send(ret, span);
+                self.require_static(f, span);
+                self.require_static(ret, span);
                 (vec![f], sync_ty(&mut self.tys, SyncTy::JoinHandle, &[ret]))
             }
             SyncOp::ThreadCurrent => (vec![], sync_ty(&mut self.tys, SyncTy::Thread, &[])),
@@ -746,6 +749,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => t,
         };
         (crate::ty::sync::sync_kind(&self.tys, r) == Some(SyncTy::Receiver)).then(|| self.tys.adt_first_ty_arg(r)).flatten()
+    }
+
+    /// The pending obligation `t: 'static` (a generic parameter needs
+    /// the bound in the env, rustc E0310; concrete borrows are the
+    /// borrow checker's part).
+    fn require_static(&mut self, t: Ty, span: Span) {
+        self.obl.push(obligations::Obligation::TypeStatic { ty: t, span });
     }
 
     /// The pending obligation `t: Send`.
