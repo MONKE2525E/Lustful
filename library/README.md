@@ -31,6 +31,10 @@ machine-checked tables are in `src/ty/lang.rs`; the loader is
 
 ## Crates
 
+Adapter crates in `deps/` follow `src/resolve/adapters.rs`: each has a
+`Cargo.toml` that pins the exact upstream version, the adapter format,
+the upstream features it implements, and its exact-layout types.
+
 | Crate | State in S5 | Next owner |
 |---|---|---|
 | core | Skeleton: lib.rs, intrinsics.rs (signature mirror). No items. | W-STD |
@@ -39,7 +43,8 @@ machine-checked tables are in `src/ty/lang.rs`; the loader is
 | deps/rustc-hash | README only. Upstream 2.1.2. | W-DEPS |
 | deps/indexmap | README only. Upstream 2.14.0. | W-DEPS |
 | deps/smallvec | README only. Upstream 1.15.1. | W-DEPS |
-| deps/memchr, deps/bumpalo, deps/xxhash-rust, deps/ryu-js, deps/num-bigint | No directory yet. Registry rows and privilege lists exist (section 3.6). | W-DEPS |
+| deps/memchr | Adapter for 2.8.2: byte and substring search in source (deps/memchr/README.md). | W-DEPS |
+| deps/bumpalo, deps/xxhash-rust, deps/ryu-js, deps/num-bigint, deps/num-traits | No crate yet (section 3.6). | W-DEPS |
 
 ## Source std fns (`STD_FNS` in src/ty/lang.rs)
 

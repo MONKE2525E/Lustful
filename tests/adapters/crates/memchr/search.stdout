@@ -1,0 +1,20 @@
+Some(2) Some(17)
+None None
+None None
+Some(7) Some(14)
+None Some(24)
+Some(2) Some(3)
+72
+[0, 5, 12, 14]
+Some(0) Some(14) Some(0)
+Some(25) None Some(0)
+[0, 2] [2, 0]
+Some(0) Some(1) Some(2) Some(3) None
+Some(3) Some(2) Some(1) Some(0) None
+Some(4) [111]
+Some(4) Some(8) Some(18)
+Some(17) Some(3)
+Some(17) Some(16)
+Some(20) [97, 103]
+Some(20)
+Some(1)

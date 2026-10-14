@@ -3,7 +3,9 @@
 # the layout corpus in tests/adapters/layout/ (ARCH 4.4 gate),
 # plus the const initializer corpus in tests/consts/ (ARCH
 # 2.13), whose layout queries come from the layout engine.
-# Later waves add std and adapter semantics dirs here.
+# Wave B adds the adapter crates in tests/adapters/crates/ (ARCH
+# 3.6), each against its real crate (see corpus_crate_dir below).
+# The filter also matches a crate dir name: `test-adapters.sh memchr`.
 # Usage: scripts/test-adapters.sh [filter]
 # Modes and knobs: see scripts/test-corpus-lib.sh.
 set -uo pipefail
@@ -30,4 +32,112 @@ corpus_pass_dir tests/consts/pass
 corpus_fail_dir tests/consts/fail
 corpus_pass_dir tests/consts/later/pass
 corpus_fail_dir tests/consts/later/fail
+
+# Adapter crates (ARCH 3.6, package W-DEPS). One dir per adapter in
+# tests/adapters/crates/<package>/: deps.toml holds the [dependencies]
+# lines that pin the upstream version, and each <case>.rs is a bin with
+# its <case>.stdout. The real crate is the oracle: Cargo builds every
+# case against it (offline, from the local registry cache), and its
+# output must equal the pinned .stdout. LUST mode builds each case with
+# lust, which swaps the adapter in, and compares stdout and exit status.
+# A case headed `// lust-reject: L####` is valid Rust that lust must
+# reject with that code (an API or layout the adapter does not
+# implement); Cargo must still build it.
+corpus_crate_dir() {
+  # $1 = dir relative to the repo root
+  corpus_require_dir "$1" || return 0
+  local dir=$corpus_root/$1 pkg proj f name
+  pkg=$(basename "$dir")
+  proj=$corpus_work/crate-$pkg
+  if [ ! -f "$dir/deps.toml" ]; then
+    corpus_report bad "$1" "deps.toml is missing"
+    return
+  fi
+  mkdir -p "$proj/src/bin"
+  {
+    printf '[package]\nname = "adapter-%s"\nversion = "0.0.0"\nedition = "2024"\npublish = false\n\n[dependencies]\n' "$pkg"
+    cat "$dir/deps.toml"
+    printf '\n[workspace]\n'
+  } >"$proj/Cargo.toml"
+  local cases=()
+  for f in "$dir"/*.rs; do
+    name=$(basename "$f" .rs)
+    [[ -n "$corpus_filter" && "$name" != *"$corpus_filter"* && "$pkg" != *"$corpus_filter"* ]] && continue
+    cp "$f" "$proj/src/bin/$name.rs"
+    cases+=("$name")
+  done
+  [ ${#cases[@]} -eq 0 ] && return 0
+  # One Cargo build for every case, so the dependency compiles once.
+  if ! (cd "$proj" && CARGO_NET_OFFLINE=true timeout 600 cargo build -q --bins --target-dir "$proj/target") >"$proj/cargo.out" 2>&1; then
+    corpus_report bad "$1" "cargo build against the real crate failed: $(grep -m3 -E '^error' "$proj/cargo.out" | tr '\n' ' ')"
+    return
+  fi
+  for name in "${cases[@]}"; do
+    corpus_cases=$((corpus_cases + 1))
+    corpus_crate_one "$dir" "$proj" "$name"
+  done
+}
+
+corpus_crate_one() {
+  local dir=$1 proj=$2 name=$3
+  local expected=$dir/$name.stdout reject
+  reject=$(grep -m1 'lust-reject:' "$dir/$name.rs" | sed 's|.*lust-reject: *||; s/[[:space:]]*$//')
+  if [ -z "$reject" ] && [ ! -f "$expected" ]; then
+    corpus_report bad "$name" "missing expected stdout file ${expected##*/}"
+    return
+  fi
+  if [ -z "$reject" ]; then
+    timeout "$run_timeout" "$proj/target/debug/$name" >"$proj/$name.out" 2>"$proj/$name.err"
+    local status=$?
+    if [ $status -ne 0 ]; then
+      corpus_report bad "$name" "the Cargo build exited with status $status"
+      return
+    fi
+    if ! cmp -s "$expected" "$proj/$name.out"; then
+      corpus_report bad "$name" "stdout of the real crate differs from ${expected##*/}:"
+      diff "$expected" "$proj/$name.out" | head -10
+      return
+    fi
+  fi
+  corpus_report ok "$name"
+  [ -n "${LUST:-}" ] || return
+  local build=(build "$proj/src/bin/$name.rs" -o "$proj/$name.lust" --manifest-path "$proj/Cargo.toml" --bin "$name")
+  if [ -n "$reject" ]; then
+    if CARGO_NET_OFFLINE=true timeout "$case_timeout" "$LUST" "${build[@]}" >/dev/null 2>"$proj/$name.lust.err"; then
+      corpus_lust_note wrong "$name" "lust accepted a case it must reject with $reject"
+    elif grep -q "$reject" "$proj/$name.lust.err"; then
+      corpus_lust_note match "$name" ""
+    else
+      corpus_lust_note wrong "$name" "lust rejected without $reject: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
+    fi
+    return
+  fi
+  if ! CARGO_NET_OFFLINE=true timeout "$case_timeout" "$LUST" "${build[@]}" 2>"$proj/$name.lust.err"; then
+    corpus_lust_note unsupported "$name" "lust rejected a case the real crate builds: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
+    return
+  fi
+  timeout "$run_timeout" "$proj/$name.lust" >"$proj/$name.lust.out" 2>/dev/null
+  status=$?
+  if [ $status -ne 0 ] || ! cmp -s "$expected" "$proj/$name.lust.out"; then
+    corpus_lust_note wrong "$name" "lust output differs from the real crate (exit $status)"
+    return
+  fi
+  if [ "${SANITIZE:-0}" = 1 ]; then
+    CARGO_NET_OFFLINE=true timeout "$case_timeout" "$LUST" "${build[@]}" --emit-c "$proj/$name.san" >/dev/null 2>&1
+    if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$proj/$name.sanbin" "$proj/$name.san".*.c 2>"$proj/$name.san.err"; then
+      corpus_lust_note wrong "$name" "gcc could not build the generated C"
+      return
+    fi
+    timeout "$run_timeout" "$proj/$name.sanbin" >"$proj/$name.san.out" 2>"$proj/$name.san.run.err"
+    if grep -q "runtime error\|Sanitizer" "$proj/$name.san.run.err" || ! cmp -s "$expected" "$proj/$name.san.out"; then
+      corpus_lust_note wrong "$name" "sanitized build failed or output differs"
+      return
+    fi
+  fi
+  corpus_lust_note match "$name" ""
+}
+
+for d in "$corpus_root"/tests/adapters/crates/*/; do
+  corpus_crate_dir "tests/adapters/crates/$(basename "$d")"
+done
 corpus_finish test-adapters
