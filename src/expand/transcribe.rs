@@ -304,22 +304,39 @@ pub fn check_template_vars(template: &[Tt], vars: &FxMap<Sym, VarInfo>, interner
         while i < trees.len() {
             match &trees[i] {
                 Tt::Tok(t) if t.tok == Tok::Dollar => {
-                    if let Some(Tt::Delim(Delim::Paren, inner, _)) = trees.get(i + 1) {
-                        let span = t.span;
-                        let (sep, op, used) = super::match_::rep_tail(trees, i + 2, true)
-                            .ok_or_else(|| err(C_DEF, span, "repetition has no operator", "Write `$(...)*`, `$(...)+`, or `$(...)?`."))?;
-                        if sep.is_some() && op == RepOp::Question {
-                            return Err(err(
-                                C_DEF,
-                                span,
-                                "the `?` repetition operator does not take a separator",
-                                "Drop the separator, or use `*` for a separated repetition.",
-                            ));
+                    let span = t.span;
+                    match trees.get(i + 1) {
+                        Some(Tt::Delim(Delim::Paren, inner, _)) => {
+                            let (sep, op, used) = super::match_::rep_tail(trees, i + 2, true).ok_or_else(|| {
+                                err(C_DEF, span, "repetition has no operator", "Write `$(...)*`, `$(...)+`, or `$(...)?`.")
+                            })?;
+                            if sep.is_some() && op == RepOp::Question {
+                                return Err(err(
+                                    C_DEF,
+                                    span,
+                                    "the `?` repetition operator does not take a separator",
+                                    "Drop the separator, or use `*` for a separated repetition.",
+                                ));
+                            }
+                            go(inner)?;
+                            i += 2 + used;
                         }
-                        go(inner)?;
-                        i += 2 + used;
-                    } else {
-                        i += 1;
+                        // rustc reads what follows `$` when it compiles the
+                        // macro, used arm or not: a name (any identifier
+                        // or keyword, bound or not) or `crate` is fine, and
+                        // so is a `$` that ends its group. `${..}` and `$$`
+                        // are unstable metavariable expressions; anything
+                        // else is an error.
+                        Some(Tt::Tok(next)) if super::match_::is_rustc_ident(next.tok) => i += 2,
+                        None => i += 1,
+                        Some(next) => {
+                            let what = match next {
+                                Tt::Delim(Delim::Brace, _, _) => "`${..}` metavariable expressions are unstable",
+                                Tt::Tok(t) if t.tok == Tok::Dollar => "`$$` metavariable expressions are unstable",
+                                _ => "expected a metavariable name or `(` after `$`",
+                            };
+                            return Err(err(C_DEF, span, what, "Write `$name` or `$(...)*`; capture a `$` as a tt argument to forward it."));
+                        }
                     }
                 }
                 Tt::Delim(_, inner, _) => {
