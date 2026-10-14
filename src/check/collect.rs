@@ -540,10 +540,13 @@ fn check_generic_aliases(p: &mut Program, errs: &mut Vec<Diag>) {
 /// defaults, a generic Adt applied to args).
 fn resolve_item_ty(p: &mut Program, id: ast::TyId, self_ty: Option<Ty>) -> Result<Ty, Diag> {
     let (ast, interner, known) = (p.ast, p.interner, p.known);
+    // The plain resolver does not know lazy aliases (W-BORROW's generic
+    // aliases): their errors (arity, defaults) come from the scoped one.
+    let lazy_alias = p.gx.generic_aliases.keys().any(|&n| ty_mentions(ast, id, n));
     resolve_ty(ast, interner, known, &p.type_names, &p.aliases, &mut p.tys, id, self_ty).or_else(|d| {
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let scope = generics::Scope { self_ty, ..generics::Scope::default() };
-        let generic_alias = d.message.contains("needs the scoped resolver");
+        let generic_alias = lazy_alias || d.message.contains("needs the scoped resolver");
         generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, id, &scope).map_err(|e| if generic_alias { e } else { d })
     })
 }
