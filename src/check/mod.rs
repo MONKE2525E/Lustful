@@ -18,6 +18,7 @@ pub mod object;
 pub mod obligations;
 pub mod opaque;
 pub mod picks;
+pub mod platform;
 pub mod project;
 pub mod sized;
 pub mod stdtypes;
@@ -10175,20 +10176,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
             spine.push((cur, *r, *n, *ns, a, g));
             cur = *r;
         }
-        for (_, _, n, _, _, g) in &spine {
+        for (_, _, n, _, a, g) in &spine {
             let seg = ast::PathSeg { name: *n, args: ast::GenericArgs::Angle(g.to_vec()) };
             self.lifetime_turbofish(std::slice::from_ref(&seg));
+            // `write!` into an `io::Write` value (W-SHIM): the
+            // `format_args!` argument is an `Arguments` value.
+            if let [arg] = a
+                && p.interner.get(*n) == "write_fmt"
+                && matches!(p.ast.expr(*arg), Expr::Macro { kind: MacroKind::FormatArgs, .. })
+                && p.resolved.as_ref().is_some_and(|r| r.std_platform.is_some())
+            {
+                self.format_args_ok.push(*arg);
+            }
         }
-        if spine.len() == 1 {
-            return self.method_call(e, recv, name, name_span, args, generic_args, expected);
-        }
-        let mut rt = self.expr(cur, None);
-        let n = spine.len();
-        for (i, (node, r, nm, ns, a, g)) in spine.into_iter().rev().enumerate() {
-            let outer = i + 1 == n;
-            rt = self.method_call_with_rt(node, r, rt, nm, ns, a, g, if outer { expected } else { None });
-            if !outer {
-                self.set(node, rt);
+        let writes: Vec<(ExprId, ExprId, Span)> =
+            spine.iter().filter(|s| p.interner.get(s.2) == "write_fmt").map(|s| (s.0, s.1, s.3)).collect();
+        let rt = if spine.len() == 1 {
+            self.method_call(e, recv, name, name_span, args, generic_args, expected)
+        } else {
+            let mut rt = self.expr(cur, None);
+            let n = spine.len();
+            for (i, (node, r, nm, ns, a, g)) in spine.into_iter().rev().enumerate() {
+                let outer = i + 1 == n;
+                rt = self.method_call_with_rt(node, r, rt, nm, ns, a, g, if outer { expected } else { None });
+                if !outer {
+                    self.set(node, rt);
+                }
+            }
+            rt
+        };
+        // `write!` into a user `io::Write` type (W-SHIM, check/platform.rs).
+        for (node, r, ns) in writes {
+            if let Res::Method { f, .. } = self.out.res(node) {
+                let mut w = self.deep(self.out.ty(r));
+                while let TyKind::Ref(_, _, inner) = self.kind(w) {
+                    w = inner;
+                }
+                if let Some(d) = crate::check::platform::user_write_fmt_call(p, &self.tys, f, w, ns) {
+                    self.errs.push(d);
+                }
             }
         }
         rt

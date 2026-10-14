@@ -338,7 +338,10 @@ fn fmt_size_align(k: crate::ty::fmt::FmtTy) -> (u64, u64) {
 fn fmt_ctype(k: crate::ty::fmt::FmtTy) -> &'static str {
     use crate::ty::fmt::FmtTy as F;
     match k {
-        F::Formatter | F::Arguments => "lust_Formatter",
+        F::Formatter => "lust_Formatter",
+        // A `format_args!` value is formatted when it is made (W-SHIM:
+        // `io::Write::write_fmt`); it holds the text.
+        F::Arguments => "lust_String",
         F::DebugStruct => "lust_DebugStruct",
         F::DebugTuple => "lust_DebugTuple",
         F::DebugList | F::DebugSet => "lust_DebugList",
@@ -5098,7 +5101,9 @@ fn runtime_source(with_impls: bool) -> String {
     let src = src.replacen("#include \"sort.h\"", include_str!("runtime/sort.h"), 1);
     let src = src.replacen("#include \"hash.h\"", &hash, 1);
     let src = src.replacen("#include \"deps.h\"", &deps, 1);
-    src.replacen("#include \"sync.c\"\n", include_str!("runtime/sync.c"), 1)
+    let src = src.replacen("#include \"sync.c\"\n", include_str!("runtime/sync.c"), 1);
+    let sys = include_str!("runtime/sys.h").replacen("#include \"sys.c\"", if with_impls { include_str!("runtime/sys.c") } else { "" }, 1);
+    src.replacen("#include \"sys.h\"", &sys, 1)
 }
 
 /// Removes C comments, replacing each with one space (the C meaning of a

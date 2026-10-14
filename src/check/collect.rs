@@ -2982,6 +2982,21 @@ pub fn collect_reuse<'a>(
                     ));
                     continue;
                 }
+                // An inherent impl of a shipped crate's type (an adapter,
+                // or the std platform crate of W-SHIM) from another crate
+                // (rustc E0116).
+                if trait_ref.is_none()
+                    && let Some(a) = owner
+                    && p.shipped_crate_at(p.adts[a.0 as usize].span) != p.shipped_crate_at(imp.span)
+                {
+                    errs.push(Diag::new(
+                        "L0102",
+                        ast.ty_span(imp.self_ty),
+                        "inherent impls must name a struct or enum defined in this crate",
+                        "Define a trait for the methods and implement it for the type.",
+                    ));
+                    continue;
+                }
                 if trait_ref.is_none() {
                     p.gx.wf_headers.push((self_pat, impl_generics.clone(), imp.span));
                     p.gx.inherent_impl_self.insert(impl_def, (self_pat, impl_generics.clone()));

@@ -35,6 +35,9 @@ runtest_case() {
   probe=$(run_cc "$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
   if grep -q "in memory" <<<"$probe"; then mode=mem; else mode=file; fi
   want_mode=mem; [[ "$name" == glue_shared || "$name" == glue_*_type_cross_unit ]] && want_mode=file
+  # A program that names a std platform module (W-SHIM) compiles the
+  # platform crate's fns too, often more than one unit: either path is fine.
+  grep -oE 'std::(io|fs|env|path|process|ffi)(::[a-z_]+)?' "$f" | grep -vqxE 'std::env::args|std::process::(exit|abort)' && want_mode=$mode
   if [ "$mode" != "$want_mode" ]; then
     report bad "$name" "run took the $mode path, want $want_mode"
   elif [ $ms -ne $bs ] || [ $ms -ne $rs ]; then

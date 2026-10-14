@@ -4948,7 +4948,10 @@ pub fn finish_trait_impl(
     // The orphan rule (section 2.3).
     {
         let rec_scoped = p.gx.index.get(impl_id).clone();
-        let is_local = |d: DefId| d.krate == p.krate;
+        // A def of a shipped crate in the session (an adapter, or the
+        // std platform crate of W-SHIM) is foreign to every other crate.
+        let impl_crate = p.shipped_crate_at(imp.span);
+        let is_local = |d: DefId| d.krate == p.krate && p.defs.get(d).is_none_or(|x| p.shipped_crate_at(x.span) == impl_crate);
         // `Box` is fundamental: `Box<Local>` counts as local.
         let fundamental = [p.tys.builtins().boxed];
         if !p.gx.index.orphan_ok(&p.tys, &rec_scoped, &fundamental, &is_local) {
@@ -7061,6 +7064,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             ensure_global_adt_instances(p, t, 0);
         }
     }
+    let first_instance = p.fns.len();
     let mut queue: Vec<LocalDefId> =
         (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Plain)).collect();
     crate::mono::vtable::eager_vtables(p, &mut queue);
@@ -7217,6 +7221,10 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     }
     p.gx.reuse = reuse;
     p.gx.mono_done = true;
+    // W-SHIM: instances whose behavior lust cannot make exact.
+    for i in first_instance..p.fns.len() {
+        errs.extend(crate::check::platform::user_write_fmt_instance(p, LocalDefId(i as u32)));
+    }
     errs
 }
 

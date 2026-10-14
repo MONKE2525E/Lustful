@@ -221,7 +221,25 @@ pub struct ResolvedTables {
     /// (`ty::lang::STD_IMPORTED_TYPES`) is in scope by glob; an
     /// explicit import of one is a `std_aliases` entry instead.
     pub std_globs: Vec<(ModuleId, Vec<Sym>)>,
+    /// The shipped std platform crate of the session (W-SHIM; see
+    /// `std_platform_path`): its root module and its `$crate` magic
+    /// name. None when no file of the session mentions a platform
+    /// module, so the crate was not loaded.
+    pub std_platform: Option<(ModuleId, Sym)>,
 }
+
+/// The std modules whose items can come from the shipped platform
+/// crate (`library/std/src/platform.rs`, W-SHIM): a written
+/// `std::<module>::<item>` path resolves into that crate when the
+/// crate defines the item. Other std paths keep the std compat
+/// handling of collect and check.
+pub const STD_PLATFORM_MODULES: &[&str] = &["io", "fs", "env", "path", "process", "ffi"];
+
+/// The platform modules the compiler has no std handling for at all:
+/// every `std::<module>::<name>` path resolves in the platform crate,
+/// so a name it lacks is an unresolved path, as in rustc, instead of
+/// an unchecked std alias.
+const STD_PLATFORM_FULL: &[&str] = &["io", "fs", "path", "ffi"];
 
 /// One adapter crate in a session (see `resolve::adapters`).
 #[derive(Clone, Debug)]
@@ -288,6 +306,7 @@ impl ResolvedTables {
             std_aliases: FxMap::default(),
             adapters: Vec::new(),
             std_globs: Vec::new(),
+            std_platform: None,
         }
     }
 
@@ -313,6 +332,65 @@ impl ResolvedTables {
     /// The crate root module of the crate `m` belongs to.
     pub fn root_of(&self, m: ModuleId) -> ModuleId {
         self.modules[m.0 as usize].krate_root
+    }
+
+    /// True when `rest` (the segments after `std`) resolves in the
+    /// shipped std platform crate: a platform module
+    /// (`STD_PLATFORM_MODULES`) and at least one more segment. In a
+    /// `STD_PLATFORM_FULL` module every such path does; in the others
+    /// only an item the crate defines and `from` can see (modules, then
+    /// a last item in any namespace), so items the platform crate lacks
+    /// keep the std compat handling. A path that ends at the module
+    /// (`std::env`) never redirects: module imports keep their std alias.
+    pub fn std_platform_has(&self, rest: &[Sym], from: ModuleId, interner: &Interner) -> bool {
+        let Some((root, _)) = self.std_platform else { return false };
+        if rest.len() < 2 || !STD_PLATFORM_MODULES.contains(&interner.get(rest[0])) {
+            return false;
+        }
+        if STD_PLATFORM_FULL.contains(&interner.get(rest[0])) {
+            return true;
+        }
+        let mut m = root;
+        for (k, &seg) in rest.iter().enumerate() {
+            if k + 1 == rest.len() {
+                return [Namespace::Type, Namespace::Value, Namespace::Macro]
+                    .into_iter()
+                    .any(|ns| matches!(self.segment_in(m, seg, ns, from, interner), PathRes::Done(_)));
+            }
+            match self.segment_in(m, seg, Namespace::Type, from, interner) {
+                PathRes::Done(Target::Module(next)) => m = next,
+                // An Adt with an associated item after it (`std::io::Error::other`).
+                PathRes::Done(Target::Def(_)) => return k > 0,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The written path of a `std::<platform module>::...` import or
+    /// path with `std` replaced by the platform crate's magic root
+    /// segment, when `std_platform_has` holds for it. `path[0]` must
+    /// already be known to name the std extern.
+    pub fn std_platform_path(&self, path: &[Sym], from: ModuleId, interner: &Interner) -> Option<Vec<Sym>> {
+        let (_, magic) = self.std_platform?;
+        if path.first().is_none_or(|s| interner.get(*s) != "std") || !self.std_platform_has(&path[1..], from, interner) {
+            return None;
+        }
+        let mut out = path.to_vec();
+        out[0] = magic;
+        Some(out)
+    }
+
+    /// True when the first segment `std` of a path written in `from`
+    /// names the std extern (no local item or import shadows it).
+    fn std_is_extern(&self, from: ModuleId, interner: &Interner) -> bool {
+        let std_sym = interner.intern("std");
+        let i = match self.first_segment(from, std_sym, Namespace::Type, PathMode::Use, interner) {
+            PathRes::Done(Target::Extern(i)) => i,
+            _ => return false,
+        };
+        let e = &self.externs[i as usize];
+        e.is_std_lib && e.name == "std"
     }
 
     /// Adds a module under a parent and returns its id.
@@ -1054,6 +1132,16 @@ impl ResolvedTables {
                     PathRes::Done(t) => cur = t,
                     other => return other,
                 },
+                // `std::io::Write` and friends: the item lives in the
+                // shipped platform crate (W-SHIM), so walk its tree.
+                Target::Extern(i)
+                    if self.externs[i as usize].is_std_lib
+                        && self.externs[i as usize].name == "std"
+                        && self.std_platform_has(&segs[idx..], from, interner) =>
+                {
+                    cur = Target::Module(self.std_platform.map(|(root, _)| root).unwrap_or(ModuleId(0)));
+                    continue;
+                }
                 Target::Def(_) | Target::Extern(_) | Target::Variant(..) => return PathRes::Partial(cur, idx),
             }
             idx += 1;
@@ -1275,6 +1363,9 @@ pub fn std_import_namespaces(interner: &Interner, path: &[Sym]) -> Option<Vec<Na
         Some(StdPathKind::Fn | StdPathKind::Variant) => vec![Namespace::Value],
         Some(StdPathKind::Macro) => vec![Namespace::Macro],
         None if std_is_module_path(&strs) => vec![Namespace::Type],
+        // A std platform module (W-SHIM): its items resolve through the
+        // alias into the platform crate.
+        None if strs.len() == 2 && strs[0] == "std" && STD_PLATFORM_MODULES.contains(&strs[1]) => vec![Namespace::Type],
         None => return None,
     };
     if std_is_module_path(&strs) && !out.contains(&Namespace::Type) {
@@ -1322,6 +1413,16 @@ fn record_std_alias(tables: &mut ResolvedTables, imp: &Import, path: &[Sym], nam
 
 /// Tries one import against the current tables.
 fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> TryOut {
+    // `use std::io::Write;`: an item of the shipped platform crate
+    // (W-SHIM) imports from that crate's module tree.
+    if let ImportKind::Single { path, name } = &imp.kind
+        && tables.std_platform.is_some()
+        && let Some(redirected) = tables.std_platform_path(path, imp.module, interner)
+        && (imp.leading_colon || tables.std_is_extern(imp.module, interner))
+    {
+        let imp2 = Import { kind: ImportKind::Single { path: redirected, name: *name }, leading_colon: false, ..imp.clone() };
+        return try_import(tables, &imp2, self_sym, interner, diags);
+    }
     match &imp.kind {
         ImportKind::BadLeading { .. } => {
             diags.push(Diag::new(

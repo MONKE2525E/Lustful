@@ -4697,9 +4697,14 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.terminate(Terminator::Panic(parts), span);
             }
             MacroKind::Todo => self.terminate(Terminator::Panic(vec![FmtPart::Lit("not yet implemented".into())]), span),
-            // Checked only as a `write_fmt` argument, which lowers it in
-            // `write_fmt_into`; the checker rejects any other.
-            MacroKind::FormatArgs => self.unit(dest, span),
+            // As a `write_fmt` argument on a Formatter or String it lowers
+            // in `write_fmt_into`. Any other `write_fmt` argument (the
+            // `io::Write` method, W-SHIM) is an `Arguments` value: its
+            // text, formatted here.
+            MacroKind::FormatArgs => {
+                let parts = self.fmt_parts(args, fmt);
+                self.set_or_temp(dest, Rvalue::Format(parts), ty, span);
+            }
             MacroKind::Unreachable => {
                 self.terminate(Terminator::Panic(vec![FmtPart::Lit("internal error: entered unreachable code".into())]), span)
             }

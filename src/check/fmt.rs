@@ -375,6 +375,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let on_formatter = fmt_kind(&self.tys, base) == Some(FmtTy::Formatter);
         let on_string = self.tys.is_string_ty(base) && self.fmt_write_in_scope();
         if !on_formatter && !on_string {
+            // Any other receiver: `io::Write::write_fmt` (W-SHIM, the
+            // method-call arm allows the `Arguments` value) or a user
+            // method of the name; normal method resolution picks it.
             return None;
         }
         self.check_packed_borrow(recv, name_span);

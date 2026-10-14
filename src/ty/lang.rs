@@ -247,6 +247,14 @@ pub enum SigTy {
     Bytes,
     U128,
     StringMut,
+    I64,
+    /// `&mut Vec<u8>`: an output byte buffer (a `lust_Vec *` in C).
+    VecU8Mut,
+    /// `Vec<u8>` by value (a `lust_Vec` in C).
+    VecU8,
+    /// `fmt::Arguments` by value: its formatted text, a `lust_String`
+    /// in C (W-SHIM; see `cgen::fmt_ctype`).
+    Arguments,
 }
 
 impl SigTy {
@@ -269,6 +277,13 @@ impl SigTy {
             }
             SigTy::U128 => super::int(super::IntTy::U128),
             SigTy::StringMut => tys.intern(TyKind::Ref(super::Region::Erased, Mut::Mut, super::STRING)),
+            SigTy::I64 => super::int(super::IntTy::I64),
+            SigTy::VecU8Mut => {
+                let v = tys.mk_vec(super::int(super::IntTy::U8));
+                tys.intern(TyKind::Ref(super::Region::Erased, Mut::Mut, v))
+            }
+            SigTy::VecU8 => tys.mk_vec(super::int(super::IntTy::U8)),
+            SigTy::Arguments => super::fmt::fmt_ty(tys, super::fmt::FmtTy::Arguments),
         }
     }
 }
@@ -724,6 +739,48 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::StringMut, S::F64],
         ret: S::Unit,
         allowed: &[C::RyuJs],
+        implemented: true,
+    },
+    // The std platform crate (W-SHIM, library/std/src/platform.rs; C in
+    // src/runtime/sys.c). Errors come back as negative errno values or
+    // as a nonzero errno.
+    //
+    // Writes the bytes to stdout (fd 1) or stderr (fd 2) through the
+    // runtime's stdio stream that `print!`/`eprint!` use: the count
+    // written, or -errno.
+    IntrinsicDef {
+        name: "sys_write_std",
+        c_symbol: "lust_sys_write_std",
+        params: &[S::I32, S::Bytes],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Flushes that stream: 0, or the errno.
+    IntrinsicDef {
+        name: "sys_flush_std",
+        c_symbol: "lust_sys_flush_std",
+        params: &[S::I32],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // The bytes of a `format_args!` value (`io::Write::write_fmt`).
+    IntrinsicDef {
+        name: "sys_fmt_arguments_bytes",
+        c_symbol: "lust_sys_fmt_arguments_bytes",
+        params: &[S::Arguments],
+        ret: S::VecU8,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Appends the OS text of an error code (strerror) to the String.
+    IntrinsicDef {
+        name: "sys_os_error_text",
+        c_symbol: "lust_sys_os_error_text",
+        params: &[S::I32, S::StringMut],
+        ret: S::Unit,
+        allowed: ONLY_STD,
         implemented: true,
     },
 ];

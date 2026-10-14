@@ -333,6 +333,7 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     use crate::lexer::Tok;
     // Symbols, not texts: this reads every identifier token of the root.
     let (macro_rules, include) = (interner.intern("macro_rules"), interner.intern("include"));
+    let std_sym = interner.intern("std");
     let toks = &lexed.tokens;
     for (i, t) in toks.iter().enumerate() {
         match t.tok {
@@ -364,6 +365,32 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
                 }
             }
             Tok::Ident(s) if s == macro_rules => return true,
+            // `std::io::..` and the other platform modules: their items
+            // live in the shipped platform crate, which only the
+            // worklist loads (W-SHIM).
+            Tok::Ident(s)
+                if s == std_sym
+                    && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::PathSep))
+                    && match toks.get(i + 2).map(|t| t.tok) {
+                        Some(Tok::Ident(m)) => {
+                            // `std::env::args` and `std::process::exit` keep
+                            // the compiler's std handling: no route change.
+                            let item = match (toks.get(i + 3).map(|t| t.tok), toks.get(i + 4).map(|t| t.tok)) {
+                                (Some(Tok::PathSep), Some(Tok::Ident(n))) => interner.get(n),
+                                _ => "",
+                            };
+                            match interner.get(m) {
+                                "env" => item != "args",
+                                "process" => !matches!(item, "exit" | "abort"),
+                                m => super::imports::STD_PLATFORM_MODULES.contains(&m),
+                            }
+                        }
+                        Some(Tok::LBrace) => true,
+                        _ => false,
+                    } =>
+            {
+                return true;
+            }
             // An `include!` can introduce items and macro definitions
             // other chunks would not see (added for W-MACRO).
             Tok::Ident(s) if s == include && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Bang)) => return true,
@@ -987,6 +1014,91 @@ pub fn resolve_crate_cached(
     known: &Known,
     cache: &mut ResolveCache,
 ) -> Result<ResolvedCrate, ResolveError> {
+    // The shipped std platform crate (W-SHIM) joins the session when
+    // some file can name a platform module. Only the root text is known
+    // up front; a mention in another file resolves once more with it.
+    let with_platform = mentions_std_platform(&input.root_text);
+    let out = resolve_crate_with(input, interner, known, cache, with_platform);
+    if with_platform {
+        return out;
+    }
+    let again = match &out {
+        Ok(r) => mentions_std_platform(&r.all_text),
+        Err(e) => mentions_std_platform(&e.all_text),
+    };
+    if again { resolve_crate_with(input, interner, known, cache, true) } else { out }
+}
+
+/// True when `text` can name a std platform module
+/// (`STD_PLATFORM_MODULES`): a plain byte scan, so a mention in a
+/// comment or string only costs the platform crate's resolve.
+pub fn mentions_std_platform(text: &str) -> bool {
+    text.match_indices("std::").any(|(i, _)| {
+        let rest = &text[i + 5..];
+        rest.starts_with('{')
+            || super::imports::STD_PLATFORM_MODULES.iter().any(|m| rest.starts_with(m) && !compiler_std_item(m, &rest[m.len()..]))
+    })
+}
+
+/// True for `std::env::args` and `std::process::exit`/`abort` (`rest`
+/// follows the module name): the compiler's own std handling serves
+/// them, as in `needs_resolve_lexed`, so they need no platform crate.
+fn compiler_std_item(module: &str, rest: &str) -> bool {
+    let items: &[&str] = match module {
+        "env" => &["::args"],
+        "process" => &["::exit", "::abort"],
+        _ => return false,
+    };
+    items.iter().any(|item| {
+        rest.strip_prefix(item).is_some_and(|after| !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+    })
+}
+
+/// The library root of the shipped std platform crate (W-SHIM).
+pub fn std_platform_root() -> PathBuf {
+    super::adapters::library_root().join("std/src/platform.rs")
+}
+
+/// Adds the shipped std platform crate as a job of the session: a
+/// lust-owned crate named `std` (so its paths display as std's) that
+/// registers as the `std` shipped crate for intrinsic privilege, with
+/// no exact-layout types. Returns the job index.
+fn add_platform_job(input: &CrateInput, tables: &mut ResolvedTables, jobs: &mut Vec<CrateJob>, interner: &Interner) -> Result<usize, Diag> {
+    let root = std_platform_root();
+    let root_text = std::fs::read_to_string(&root).map_err(|e| {
+        Diag::new(
+            "L0503",
+            Span::default(),
+            format!("cannot read the lust std platform crate {}: {e}", root.display()),
+            "Reinstall lust, or point LUST_LIBRARY at a complete library tree.",
+        )
+    })?;
+    let stable = crate::ty::lang::ShippedCrate::Std.stable_hash();
+    let magic = interner.intern(&crate_magic_name(stable));
+    let root_module = tables.add_crate_root(interner.intern("std"));
+    tables.crate_magic.insert(magic, root_module);
+    tables.std_platform = Some((root_module, magic));
+    let mut env = input.env.with_features(&[]);
+    env.allow_lust_dev = true;
+    jobs.push(CrateJob {
+        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name: "std".to_string() },
+        root_module,
+        flat_prefix: format!("k{:016x}$", stable.0),
+        magic,
+        deps: Vec::new(),
+        adapter: Some(Vec::new()),
+    });
+    Ok(jobs.len() - 1)
+}
+
+/// `resolve_crate_cached` with the platform crate in or out.
+fn resolve_crate_with(
+    input: &CrateInput,
+    interner: &Interner,
+    known: &Known,
+    cache: &mut ResolveCache,
+    with_platform: bool,
+) -> Result<ResolvedCrate, ResolveError> {
     cache.begin(input);
     let mut tables = ResolvedTables::new(interner.intern(&input.crate_name));
     let main_magic = interner.intern(&crate_magic_name(input.crate_ids.stable));
@@ -1017,6 +1129,13 @@ pub fn resolve_crate_cached(
     for dep in &input.deps {
         match add_dep_job(dep, input, &mut tables, &mut jobs, &mut by_key, interner) {
             Ok(link) => main_deps.push(link),
+            Err(d) => return Err(build_err(d)),
+        }
+    }
+    if with_platform {
+        match add_platform_job(input, &mut tables, &mut jobs, interner) {
+            // First, so it resolves before every crate that names it.
+            Ok(j) => main_deps.insert(0, ("$lust$std".to_string(), Ok(j))),
             Err(d) => return Err(build_err(d)),
         }
     }
@@ -4317,6 +4436,17 @@ impl Rewrite<'_> {
                 return;
             }
             if self.expand_std_alias(segs, &names, ns, module, scopes) {
+                // An alias of a std module whose item the shipped
+                // platform crate defines (`use std::io; io::stdout()`)
+                // resolves into that crate (W-SHIM).
+                let full: Vec<Sym> = segs.iter().map(|s| s.name).collect();
+                if self.tables.std_platform.is_some()
+                    && full.first().is_some_and(|f| self.interner.get(*f) == "std")
+                    && self.tables.std_platform_has(&full[1..], module, self.interner)
+                {
+                    let res = self.tables.resolve_path(module, &full, ns, PathMode::Lexical, true, self.interner);
+                    self.apply(segs, res, span, module);
+                }
                 return;
             }
             // A bare name a module-level glob of a sync or thread module

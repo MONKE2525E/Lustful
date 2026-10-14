@@ -39,7 +39,7 @@ the upstream features it implements, and its exact-layout types.
 |---|---|---|
 | core | Skeleton: lib.rs, intrinsics.rs (signature mirror). No items. | W-STD |
 | alloc | Skeleton: lib.rs only. String/Vec stay builtin. | W-STD |
-| std | `process::exit` in source, over the `exit` intrinsic. | W-STD |
+| std | `process::exit` in source, over the `exit` intrinsic. The platform crate (`platform.rs` root, below). | W-STD, W-SHIM |
 | deps/rustc-hash | Pending for 2.1.2: written and checked with rustc, waits in `pending/` for compiler and std features (deps/rustc-hash/README.md). | W-DEPS |
 | deps/indexmap | Pending for 2.14.0: written and checked with rustc, waits in `pending/` for compiler and std features (deps/indexmap/README.md). | W-DEPS |
 | deps/smallvec | Pending for 1.15.1: written and checked with rustc, waits in `pending/` for compiler and std features (deps/smallvec/README.md). | W-DEPS |
@@ -50,6 +50,37 @@ the upstream features it implements, and its exact-layout types.
 | deps/num-bigint | Adapter for 0.4.6: `BigInt` parse, print, pow, conversions (deps/num-bigint/README.md). | W-DEPS |
 | deps/bumpalo | Adapter for 3.20.3: the Bump subset of leak_arena.rs with upstream's chunk bookkeeping (deps/bumpalo/README.md). | W-DEPS |
 
+## The std platform crate (W-SHIM)
+
+`library/std/src/platform.rs` is a second std crate, loaded the other
+way: the resolver adds it to the session as a lust-owned dependency
+named `std` when a file can name a platform module (a byte scan for
+`std::io`, `std::fs`, `std::env`, `std::path`, `std::process`,
+`std::{`; `resolve::worklist::mentions_std_platform`). Then:
+
+- A written `std::<module>::<item>...` path, a `use` of it, and an
+  alias of the module (`use std::io; io::stdout()`) resolve into the
+  crate's modules. For `io`, `fs`, `path`, and `ffi` every item path
+  does (a name the crate lacks is an unresolved path); for `env` and
+  `process` only items the crate defines do, and the others keep the
+  compiler's std handling (`env::args`, `process::exit`).
+- Its files have the `std` shipped-crate privilege (intrinsics) through
+  the resolver's adapter record. Its types are foreign to user crates:
+  the orphan rule and the inherent-impl rule apply as in rustc.
+- No type of it answers layout queries (no exact-layout list).
+- `write!` into an `io::Write` value passes `format_args!` as an
+  `Arguments` value, which in lust is the formatted text (a
+  `lust_String`). `io::Write::write_fmt` writes it with one
+  `write_all`. A user writer type that relies on that default is
+  rejected (L0641, check/platform.rs): std would call its `write` once
+  per format piece.
+- Unstable std items carry a `__` prefix (`ErrorKind::__Uncategorized`);
+  `Debug` prints std's name.
+
+| Module | State | Test |
+|---|---|---|
+| `io` | `Error` (Os, Simple, SimpleMessage, Custom over `&str`/`String`), `ErrorKind` (all 44 kinds, std order, the Linux errno table), `Result`, `Write` (`write`, `flush`, `write_all`, `write_fmt`, `by_ref`) for `Vec<u8>`, `&mut W`, `Stdout`, `Stderr`, their locks, `Sink`; `stdout`, `stderr`, `sink` | tests/pass/std_io_error.rs, std_io_write.rs, tests/fail/std_io_*, tests/reject/std_io_write_user_type.rs |
+
 ## Source std fns (`STD_FNS` in src/ty/lang.rs)
 
 | Path | Body | Notes |
@@ -59,7 +90,9 @@ the upstream features it implements, and its exact-layout types.
 
 ## Intrinsics (`INTRINSICS` in src/ty/lang.rs)
 
-Implemented (codegen emits them): `exit`; the adapter cores
+Implemented (codegen emits them): `exit`; the platform crate's
+`sys_write_std`, `sys_flush_std`, `sys_os_error_text`,
+`sys_fmt_arguments_bytes` (C in src/runtime/sys.c); the adapter cores
 `xxh3_64`/`xxh3_128` (xxhash-rust, C in src/runtime/deps.c) and
 `ryu_js_fmt_f64` (ryu-js, the JS printer in src/runtime/float.c).
 Adapter crates get their privilege from the resolver's record of their
