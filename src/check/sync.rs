@@ -133,11 +133,23 @@ pub enum SyncOp {
     OnceGetOrInit,
     OnceIntoInner,
     OnceTake,
+    /// `Duration::new(secs, nanos)`.
+    DurNew,
+    /// `Duration::from_secs` (0), `from_millis` (1), `from_micros` (2),
+    /// `from_nanos` (3).
+    DurFrom(u8),
+    /// `as_secs` (0), `as_millis` (1), `as_micros` (2), `as_nanos` (3).
+    DurAs(u8),
+    /// `subsec_millis` (1), `subsec_micros` (2), `subsec_nanos` (3).
+    DurSubsec(u8),
+    DurIsZero,
+    /// `thread::sleep(dur)`.
+    ThreadSleep,
 }
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 80] = [
+    pub const ALL: [SyncOp; 94] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -218,6 +230,20 @@ impl SyncOp {
         SyncOp::OnceGetOrInit,
         SyncOp::OnceIntoInner,
         SyncOp::OnceTake,
+        SyncOp::DurNew,
+        SyncOp::DurFrom(0),
+        SyncOp::DurFrom(1),
+        SyncOp::DurFrom(2),
+        SyncOp::DurFrom(3),
+        SyncOp::DurAs(0),
+        SyncOp::DurAs(1),
+        SyncOp::DurAs(2),
+        SyncOp::DurAs(3),
+        SyncOp::DurSubsec(1),
+        SyncOp::DurSubsec(2),
+        SyncOp::DurSubsec(3),
+        SyncOp::DurIsZero,
+        SyncOp::ThreadSleep,
     ];
 
     /// (types, names, how it is called) for `lust capabilities`.
@@ -307,6 +333,12 @@ impl SyncOp {
             SyncOp::OnceGetOrInit => (&["std::sync::OnceLock<T>"], &["get_or_init"], m),
             SyncOp::OnceIntoInner => (&["std::sync::OnceLock<T>"], &["into_inner"], m),
             SyncOp::OnceTake => (&["std::sync::OnceLock<T>"], &["take"], m),
+            SyncOp::DurNew => (&["std::time::Duration"], &["new"], a),
+            SyncOp::DurFrom(u) => (&["std::time::Duration"], [&["from_secs"], &["from_millis"], &["from_micros"], &["from_nanos"]][u as usize & 3], a),
+            SyncOp::DurAs(u) => (&["std::time::Duration"], [&["as_secs"], &["as_millis"], &["as_micros"], &["as_nanos"]][u as usize & 3], m),
+            SyncOp::DurSubsec(u) => (&["std::time::Duration"], [&["subsec_millis"], &["subsec_millis"], &["subsec_micros"], &["subsec_nanos"]][u as usize & 3], m),
+            SyncOp::DurIsZero => (&["std::time::Duration"], &["is_zero"], m),
+            SyncOp::ThreadSleep => (&["std::thread"], &["sleep"], f),
         }
     }
 }
@@ -350,6 +382,9 @@ pub fn sync_glue(tys: &impl TyIntern, t: Ty, g: SyncGlue) -> Option<Result<bool,
         // for `T: Debug`.
         (SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult, G::Debug) => Ok(true),
         (SyncTy::Condvar | SyncTy::OnceLock, G::Default) => Ok(true),
+        // `Duration` is Copy, Eq, and Default (its Debug, Ord, and
+        // arithmetic are not in lust yet: they reject).
+        (SyncTy::Duration, G::Default | G::Clone | G::Copy | G::PartialEq) => Ok(true),
         (SyncTy::OnceLock, G::Debug) => Err(elem?),
         // `Thread` is `Clone`; `ThreadId` is `Copy` and `Eq`.
         (SyncTy::Thread, G::Clone) => Ok(true),
@@ -391,6 +426,7 @@ pub fn sync_free_fn(path: &[&str]) -> Option<SyncOp> {
         ["std", "thread", "yield_now"] => Some(SyncOp::ThreadYieldNow),
         ["std", "thread", "panicking"] => Some(SyncOp::ThreadPanicking),
         ["std", "thread", "scope"] => Some(SyncOp::ThreadScope),
+        ["std", "thread", "sleep"] => Some(SyncOp::ThreadSleep),
         ["std", "sync", "mpsc", "channel"] => Some(SyncOp::Channel),
         ["std", "sync", "mpsc", "sync_channel"] => Some(SyncOp::SyncChannel),
         _ => None,
@@ -436,6 +472,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (SyncTy::Mutex | SyncTy::RwLock | SyncTy::Condvar | SyncTy::OnceLock, _, "default") => SyncOp::LockDefault(k),
             (SyncTy::Condvar | SyncTy::Barrier | SyncTy::OnceLock, _, "new") => SyncOp::SyncNew(k),
             (SyncTy::OnceLock, _, "from") => SyncOp::LockFrom(k),
+            (SyncTy::Duration, _, "new") => SyncOp::DurNew,
+            (SyncTy::Duration, _, "default") => SyncOp::LockDefault(k),
+            (SyncTy::Duration, _, "from_secs") => SyncOp::DurFrom(0),
+            (SyncTy::Duration, _, "from_millis") => SyncOp::DurFrom(1),
+            (SyncTy::Duration, _, "from_micros") => SyncOp::DurFrom(2),
+            (SyncTy::Duration, _, "from_nanos") => SyncOp::DurFrom(3),
             (SyncTy::PoisonError, _, "new") => SyncOp::PoisonNew,
             _ => {
                 self.err(
@@ -506,6 +548,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (vec![], sync_ty(&mut self.tys, k, args))
             }
             SyncOp::SyncNew(SyncTy::Barrier) => (vec![USIZE], sync_ty(&mut self.tys, SyncTy::Barrier, &[])),
+            SyncOp::DurNew => (vec![int(IntTy::U64), int(IntTy::U32)], sync_ty(&mut self.tys, SyncTy::Duration, &[])),
+            SyncOp::DurFrom(_) => (vec![int(IntTy::U64)], sync_ty(&mut self.tys, SyncTy::Duration, &[])),
+            SyncOp::ThreadSleep => (vec![sync_ty(&mut self.tys, SyncTy::Duration, &[])], UNIT),
             SyncOp::SyncNew(k) => {
                 let args: &[Ty] = if k.arity() == 0 { &[] } else { &[elem] };
                 (vec![], sync_ty(&mut self.tys, k, args))
@@ -818,6 +863,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(op), derefs, autoref });
             self.check_args(&params, args, span);
             return Some(ret);
+        } else if crate::ty::sync::sync_kind(&self.tys, base) == Some(SyncTy::Duration) {
+            let (op, ret) = match n.as_str() {
+                "as_secs" => (SyncOp::DurAs(0), int(IntTy::U64)),
+                "as_millis" => (SyncOp::DurAs(1), int(IntTy::U128)),
+                "as_micros" => (SyncOp::DurAs(2), int(IntTy::U128)),
+                "as_nanos" => (SyncOp::DurAs(3), int(IntTy::U128)),
+                "subsec_millis" => (SyncOp::DurSubsec(1), int(IntTy::U32)),
+                "subsec_micros" => (SyncOp::DurSubsec(2), int(IntTy::U32)),
+                "subsec_nanos" => (SyncOp::DurSubsec(3), int(IntTy::U32)),
+                "is_zero" => (SyncOp::DurIsZero, BOOL),
+                _ => return None,
+            };
+            self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(op), derefs, autoref: Autoref::Ref });
+            self.check_args(&[], args, span);
+            return Some(ret);
         } else if let Some(el) = self.tys.poison_elem(base) {
             match n.as_str() {
                 "into_inner" => (SyncOp::PoisonIntoInner, Autoref::None, el),
@@ -961,6 +1021,11 @@ pub fn add_sync_impls(p: &mut crate::check::collect::Program, ordinal: &mut u32,
             insert_synthetic(p, ordinal, lang.default, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
     }
+    let du = sync_ty(&mut p.tys, SyncTy::Duration, &[]);
+    for tr in [lang.clone, lang.copy, lang.eq, lang.default] {
+        insert_synthetic(p, ordinal, tr, du, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    insert_synthetic(p, ordinal, lang.partial_eq, du, &[du], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
     let ol = sync_ty(&mut p.tys, SyncTy::OnceLock, &[p0]);
     insert_synthetic(p, ordinal, lang.default, ol, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     insert_synthetic(p, ordinal, lang.from, ol, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
@@ -1088,7 +1153,7 @@ pub fn builtin_auto(
         // and Sync for every `T`; `Box<dyn Any + Send>` is Send only.
         B::Sync(SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId) => Some(true),
         B::Sync(SyncTy::JoinError) => Some(send),
-        B::Sync(SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult) => Some(true),
+        B::Sync(SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::Duration) => Some(true),
         // `OnceLock<T>` is Send for `T: Send`, Sync for `T: Send + Sync`.
         B::Sync(SyncTy::OnceLock) => {
             let Some(e) = elem else { return Some(None) };

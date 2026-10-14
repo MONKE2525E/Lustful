@@ -719,3 +719,64 @@ int lust_once_is_done(uint32_t *st) LUST_BODY({
     __atomic_load(st, &s, 2);
     return s == 2;
 })
+
+/* ---------- Duration and thread::sleep ----------
+
+   A Duration is { uint64_t secs; uint32_t nanos; } (nanos < 1e9). */
+typedef struct lust_Duration {
+    uint64_t secs;
+    uint32_t nanos;
+} lust_Duration;
+
+/* `Duration::new(secs, nanos)`: carries whole seconds out of nanos;
+   panics as std on overflow. */
+lust_Duration lust_dur_new(uint64_t secs, uint32_t nanos, lust_loc loc) LUST_BODY({
+    lust_Duration d;
+    uint64_t extra = nanos / 1000000000u;
+    if (secs > UINT64_MAX - extra) lust_panic_cstr("overflow in Duration::new", loc);
+    d.secs = secs + extra;
+    d.nanos = nanos % 1000000000u;
+    return d;
+})
+
+/* secs * per_sec + nanos / nanos_per as a u128 (as_millis and kin). */
+lust_u128 lust_dur_as(lust_Duration d, uint64_t per_sec, uint64_t nanos_per) LUST_BODY({
+    uint64_t a = d.secs, b = per_sec;
+    uint64_t alo = a & 0xffffffffu, ahi = a >> 32, blo = b & 0xffffffffu, bhi = b >> 32;
+    uint64_t ll = alo * blo, lh = alo * bhi, hl = ahi * blo, hh = ahi * bhi;
+    uint64_t mid = (ll >> 32) + (lh & 0xffffffffu) + (hl & 0xffffffffu);
+    lust_u128 r;
+    r.lo = (ll & 0xffffffffu) | (mid << 32);
+    r.hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+    lust_u128 add;
+    add.lo = d.nanos / nanos_per;
+    add.hi = 0;
+    return lust_u128_add(r, add);
+})
+
+#ifdef LUST_IMPL
+#if defined(__linux__) && defined(__x86_64__)
+#define LUST_SYS_NANOSLEEP 35
+#elif defined(__linux__) && defined(__aarch64__)
+#define LUST_SYS_NANOSLEEP 101
+#endif
+#endif
+
+/* `thread::sleep`: nanosleep through syscall (no <time.h> in the runtime
+   text), resumed after a signal. */
+void lust_thread_sleep(lust_Duration d) LUST_BODY({
+#ifdef LUST_SYS_NANOSLEEP
+    long ts[2], rem[2];
+    while (d.secs > 0 || d.nanos > 0) {
+        uint64_t s = d.secs > 0x7fffffff ? 0x7fffffff : d.secs;
+        ts[0] = (long)s;
+        ts[1] = (long)d.nanos;
+        d.secs -= s;
+        d.nanos = 0;
+        while (syscall(LUST_SYS_NANOSLEEP, ts, rem) != 0) { ts[0] = rem[0]; ts[1] = rem[1]; }
+    }
+#else
+    (void)d;
+    sched_yield();
+#endif
+})

@@ -1100,6 +1100,7 @@ const STD_FN_PATHS: &[&str] = &[
     "std/thread/scope",
     "std/sync/mpsc/channel",
     "std/sync/mpsc/sync_channel",
+    "std/thread/sleep",
 ];
 
 const STD_MACRO_PATHS: &[&str] = &[

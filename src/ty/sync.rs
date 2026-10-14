@@ -69,10 +69,12 @@ pub enum SyncTy {
     BarrierWaitResult,
     /// `std::sync::OnceLock<T>`.
     OnceLock,
+    /// `core::time::Duration` (for `thread::sleep`).
+    Duration,
 }
 
 impl SyncTy {
-    pub const ALL: [SyncTy; 33] = [
+    pub const ALL: [SyncTy; 34] = [
         SyncTy::Arc,
         SyncTy::ArcWeak,
         SyncTy::AtomicBool,
@@ -106,6 +108,7 @@ impl SyncTy {
         SyncTy::Barrier,
         SyncTy::BarrierWaitResult,
         SyncTy::OnceLock,
+        SyncTy::Duration,
     ];
 
     /// The struct name (the def hash input and the printed name).
@@ -144,6 +147,7 @@ impl SyncTy {
             SyncTy::Barrier => "Barrier",
             SyncTy::BarrierWaitResult => "BarrierWaitResult",
             SyncTy::OnceLock => "OnceLock",
+            SyncTy::Duration => "Duration",
         }
     }
 
@@ -154,6 +158,7 @@ impl SyncTy {
             _ if k_is_atomic(self) => &["sync", "atomic"],
             SyncTy::JoinHandle | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError | SyncTy::Scope | SyncTy::ScopedJoinHandle => &["thread"],
             SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError => &["sync", "mpsc"],
+            SyncTy::Duration => &["time"],
             _ => &["sync"],
         }
     }
@@ -164,6 +169,7 @@ impl SyncTy {
         match self {
             SyncTy::Arc | SyncTy::ArcWeak => &["alloc", "std"],
             _ if k_is_atomic(self) => &["core", "std"],
+            SyncTy::Duration => &["core", "std"],
             _ => &["std"],
         }
     }
@@ -172,7 +178,14 @@ impl SyncTy {
     pub fn arity(self) -> usize {
         match self {
             _ if k_is_atomic(self) => 0,
-            SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError | SyncTy::Scope | SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult => 0,
+            SyncTy::Thread
+            | SyncTy::ThreadId
+            | SyncTy::JoinError
+            | SyncTy::Scope
+            | SyncTy::Condvar
+            | SyncTy::Barrier
+            | SyncTy::BarrierWaitResult
+            | SyncTy::Duration => 0,
             _ => 1,
         }
     }
@@ -211,7 +224,8 @@ impl SyncTy {
             | SyncTy::Condvar
             | SyncTy::Barrier
             | SyncTy::BarrierWaitResult
-            | SyncTy::OnceLock => return None,
+            | SyncTy::OnceLock
+            | SyncTy::Duration => return None,
             SyncTy::AtomicBool => AtomicVal::Bool,
             SyncTy::AtomicI8 => AtomicVal::Int(IntTy::I8),
             SyncTy::AtomicU8 => AtomicVal::Int(IntTy::U8),

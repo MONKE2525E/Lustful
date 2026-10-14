@@ -23,6 +23,7 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
             format!("Lk{}_{}", if k == SyncTy::Mutex { "M" } else if k == SyncTy::RwLock { "R" } else { "O" }, mangle(e))
         }
         (SyncTy::Condvar, _) => "uint32_t".into(),
+        (SyncTy::Duration, _) => "lust_Duration".into(),
         (SyncTy::Barrier, _) => "lust_Barrier".into(),
         (SyncTy::BarrierWaitResult, _) => "uint8_t".into(),
         (SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard, _) => format!("{}*", sync_ctype(k.guard().expect("a guard").0, e)),
@@ -64,6 +65,7 @@ pub(super) fn sync_layout(k: SyncTy) -> Option<Layout> {
     match k {
         SyncTy::Scope | SyncTy::Condvar => return Some(plain_layout(4, 4)),
         SyncTy::Barrier => return Some(plain_layout(32, 8)),
+        SyncTy::Duration => return Some(plain_layout(16, 8)),
         SyncTy::BarrierWaitResult => return Some(plain_layout(1, 1)),
         _ => {}
     }
@@ -181,6 +183,23 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         }
         (_, SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError) => chan_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
         (_, SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::OnceLock) => once_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
+        // `Duration`: a plain `{ secs, nanos }` value.
+        (Glue::Clone, SyncTy::Duration) => {
+            let _ = writeln!(protos, "{ct} clone_{m}({ct} *p);");
+            let _ = writeln!(defs, "{ct} clone_{m}({ct} *p) {{\n  return *p;\n}}\n");
+        }
+        (Glue::Eq, SyncTy::Duration) => {
+            let _ = writeln!(protos, "uint8_t eq_{m}({ct} *a, {ct} *b);");
+            let _ = writeln!(defs, "uint8_t eq_{m}({ct} *a, {ct} *b) {{\n  return a->secs == b->secs && a->nanos == b->nanos;\n}}\n");
+        }
+        (Glue::Default, SyncTy::Duration) => {
+            let _ = writeln!(protos, "{ct} default_{m}(void);");
+            let _ = writeln!(defs, "{ct} default_{m}(void) {{\n  {ct} r = {{0, 0}}; return r;\n}}\n");
+        }
+        (Glue::Drop, SyncTy::Duration) => {
+            let _ = writeln!(protos, "void drop_{m}({ct} *p);");
+            let _ = writeln!(defs, "void drop_{m}({ct} *p) {{\n  (void)p;\n}}\n");
+        }
         (Glue::Default, _) if k.atomic_value().is_some() => {
             let _ = writeln!(protos, "{ct} default_{m}(void);");
             let _ = writeln!(defs, "{ct} default_{m}(void) {{\n  return 0;\n}}\n");
@@ -547,6 +566,24 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             S::Channel | S::SyncChannel => unreachable!("channel calls go through channel_new"),
+            S::DurNew => format!("lust_dur_new({}, {}, {loc})", vals[0], vals[1]),
+            S::DurFrom(u) => {
+                let per = [1u64, 1_000, 1_000_000, 1_000_000_000][u as usize & 3];
+                let v = &vals[0];
+                if per == 1 {
+                    format!("((lust_Duration){{{v}, 0}})")
+                } else {
+                    format!("((lust_Duration){{({v}) / {per}u, (uint32_t)((({v}) % {per}u) * {}u)}})", 1_000_000_000 / per)
+                }
+            }
+            S::DurAs(0) => format!("({})->secs", vals[0]),
+            S::DurAs(u) => {
+                let per = [1u64, 1_000, 1_000_000, 1_000_000_000][u as usize & 3];
+                format!("lust_dur_as(*({}), {per}u, {}u)", vals[0], 1_000_000_000 / per)
+            }
+            S::DurSubsec(u) => format!("(({})->nanos / {}u)", vals[0], [1_000_000_000u64, 1_000_000, 1_000, 1][u as usize & 3]),
+            S::DurIsZero => format!("((uint8_t)(({0})->secs == 0 && ({0})->nanos == 0))", vals[0]),
+            S::ThreadSleep => format!("(lust_thread_sleep({}), ((lust_Unit){{}}))", vals[0]),
             S::ChanSend => {
                 let el = match deref_cty(&tys[0]) {
                     CTy::Sync(_, e) => *e,
