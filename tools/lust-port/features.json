@@ -852,8 +852,8 @@
   {
    "id": "ext.xxhash_rust",
    "title": "Adapter crate xxhash-rust 0.8.15: xxh3_64, xxh3_128, Xxh3",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
@@ -892,8 +892,8 @@
   {
    "id": "ext.num_bigint",
    "title": "Adapter crate num-bigint 0.4.6: BigInt parse, pow, print",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
@@ -912,8 +912,8 @@
   {
    "id": "ext.num_traits",
    "title": "Adapter crate num-traits 0.2.19: ToPrimitive",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
@@ -932,8 +932,8 @@
   {
    "id": "ext.ryu_js",
    "title": "Adapter crate ryu-js 1.0.2: Buffer::format (JS number to string)",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
