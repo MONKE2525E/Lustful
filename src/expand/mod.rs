@@ -945,6 +945,10 @@ pub struct Expander<'a> {
     /// its text for `line!` / `column!`. `include!` swaps these.
     cur_file: String,
     cur_src: String,
+    /// The file id of the tokens being expanded (the first input token's),
+    /// so `assert_msg` can tell a macro body in this file from one in
+    /// another file.
+    root_file: Option<crate::diag::FileId>,
     /// Hash of files and env vars read by builtins during this run
     /// (it feeds cache keys, ARCH 6.5).
     deps_hash: u64,
@@ -1006,6 +1010,7 @@ impl<'a> Expander<'a> {
             module: ctx.module_path.clone(),
             cur_file: ctx.file_path.clone(),
             cur_src: ctx.src.to_string(),
+            root_file: None,
             deps_hash: 0,
             deps: Vec::new(),
             recursion_limit: DEFAULT_RECURSION_LIMIT,
@@ -1310,6 +1315,7 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(
     }
     let eof = lexed.tokens.last().cloned().unwrap_or(Token { tok: Tok::Eof, span: Span::default() });
     let mut st = Expander::new(ctx, lexed.strings);
+    st.root_file = lexed.tokens.first().map(|t| t.span.file);
     for seed in seeds {
         st.seed_macro(seed)?;
     }
