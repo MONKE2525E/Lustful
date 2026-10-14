@@ -1069,6 +1069,11 @@ pub fn resolve_crate_cached(
     }
     visit(0, &jobs, &mut state, &mut order);
     let mut shared = SharedFiles::default();
+    // The selected crate's root file is FileId(0) even though its
+    // dependencies resolve first: the spliced std ranges, the error
+    // footer, and `Program::shipped_crate_at` all read file 0 as the
+    // selected root.
+    shared.file_id(&input.root_path, ROOT_MODULE);
     let mut all_seen: Vec<(PathBuf, String, FileId)> = Vec::new();
     let mut needs_std = false;
     let mut chunks: Vec<Ast> = Vec::new();

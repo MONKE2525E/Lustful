@@ -1,0 +1,14 @@
+# A crate with a source dependency that calls a source std fn
+# (`std::process::exit`). Dependencies resolve first, so the selected
+# root must still be file 0, where the spliced std ranges live; before
+# the fix this was a false L0642 and the error footer named the
+# dependency's lib.rs.
+[package]
+name = "dep-std-exit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+helper = { path = "helper" }
+
+[workspace]
