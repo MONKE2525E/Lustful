@@ -559,8 +559,8 @@
   {
    "id": "attrs.track_caller",
    "title": "#[track_caller] on user fns and std::panic::Location",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "2",
    "root_cause": "attrs-cfg",
    "fix_class": "compiler",
