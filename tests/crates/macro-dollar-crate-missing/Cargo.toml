@@ -1,0 +1,6 @@
+# `$crate::name!` names the defining crate's root only: base's macro
+# cannot reach a macro that exists only in app (rustc: cannot find
+# macro `only_app` in crate `base`).
+[workspace]
+members = ["base", "app"]
+resolver = "2"

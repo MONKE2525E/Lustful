@@ -1,0 +1,6 @@
+# `$crate::name!` inside exported macros expanded in another crate:
+# app calls base's macros only through mid's re-exports, so `$crate`
+# names a crate app does not depend on directly.
+[workspace]
+members = ["base", "mid", "app"]
+resolver = "2"

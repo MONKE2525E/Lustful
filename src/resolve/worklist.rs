@@ -1073,11 +1073,31 @@ pub fn resolve_crate_cached(
     let mut scan_bodies = Vec::new();
     let mut nested_scan_bodies = Vec::new();
     for &j in &order {
-        let dep_exports: Vec<(String, Vec<OwnedMacroSource>)> = jobs[j]
+        let mut dep_exports: Vec<(String, Vec<OwnedMacroSource>)> = jobs[j]
             .deps
             .iter()
             .filter_map(|(name, t)| t.as_ref().ok().map(|d| (name.clone(), exported_of.get(d).cloned().unwrap_or_default())))
             .collect();
+        // A dependency's macro that calls `$crate::name!` reaches this
+        // crate as a path from the defining crate's magic segment
+        // (rewrite_dollar_crate), and a re-exported macro's defining
+        // crate can be an indirect dependency. So every crate below
+        // this one is also seeded under its magic segment, a name
+        // source text cannot write.
+        let mut below: Vec<usize> = Vec::new();
+        let mut stack: Vec<usize> = jobs[j].deps.iter().filter_map(|(_, t)| t.as_ref().ok().copied()).collect();
+        while let Some(d) = stack.pop() {
+            if !below.contains(&d) {
+                below.push(d);
+                stack.extend(jobs[d].deps.iter().filter_map(|(_, t)| t.as_ref().ok().copied()));
+            }
+        }
+        below.sort_unstable();
+        for d in below {
+            if let Some(sources) = exported_of.get(&d).filter(|s| !s.is_empty()) {
+                dep_exports.push((interner.get(jobs[d].magic).to_string(), sources.clone()));
+            }
+        }
         match resolve_one(&jobs[j], &mut tables, &mut shared, cache, &dep_exports, interner, known) {
             Ok(out) => {
                 if let Some(exact_layout) = &jobs[j].adapter {
