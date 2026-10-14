@@ -15,6 +15,9 @@
 #   target=<triple>   passed to cargo and to lust as --target; the value
 #                     `host` means the rustc host triple. No line = no flag.
 #   args=<words>      program arguments (split on spaces; no quoting)
+#   stderr=exact      also compare the program's stderr, with the thread id
+#                     of a panic line masked (panic location fixtures; the
+#                     package sets panic = "abort" so the exits match)
 #   expect=<L####>    negative fixture: lust must reject with this code.
 #                     Cargo must also reject unless the line cargo=pass is
 #                     present (valid Rust lust rejects on purpose).
@@ -56,6 +59,9 @@ pass=0
 fail=0
 seen=0
 
+# A panic line names the OS thread id, which differs per run: mask it.
+mask_tid() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) panicked/thread '\1' (TID) panicked/" -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
+
 report() {
   if [ "$1" = ok ]; then pass=$((pass + 1)); echo "ok   $2"; else fail=$((fail + 1)); echo "FAIL $2: $3"; fi
 }
@@ -78,6 +84,7 @@ for dir in "$fixtures"/*/; do
   target=""
   expect=""
   cargo_pass=""
+  stderr_mode=""
   prog_args=()
   if [ -f "$case_dir/proj/fixture.txt" ]; then
     while IFS='=' read -r k v; do
@@ -89,6 +96,7 @@ for dir in "$fixtures"/*/; do
         target) target=$v ;;
         expect) expect=$v ;;
         cargo) cargo_pass=$v ;;
+        stderr) stderr_mode=$v ;;
         args) # split on spaces by design (see header)
           read -r -a prog_args <<<"$v" ;;
         "" | \#*) ;;
@@ -161,6 +169,11 @@ for dir in "$fixtures"/*/; do
   if ! cmp -s "$case_dir/cargo.run.out" "$case_dir/lust.run.out"; then
     report bad "$name" "stdout differs:"
     diff "$case_dir/cargo.run.out" "$case_dir/lust.run.out" | head -10
+    continue
+  fi
+  if [ "$stderr_mode" = exact ] && ! diff -q <(mask_tid "$case_dir/cargo.run.err") <(mask_tid "$case_dir/lust.run.err") >/dev/null; then
+    report bad "$name" "stderr differs:"
+    diff <(mask_tid "$case_dir/cargo.run.err") <(mask_tid "$case_dir/lust.run.err") | head -10
     continue
   fi
 

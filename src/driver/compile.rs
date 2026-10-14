@@ -1532,6 +1532,7 @@ fn resolved_setup(
         };
         let graph = cargo::load_graph(&greq).map_err(code2)?;
         t.lap("cargo graph");
+        front.display_root = Some(graph.workspace_root.clone());
         let pre_env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
         let unit =
             cargo::select_unit(&graph, &greq, &key.krate.target_kind, &key.krate.target_name, &pre_env, &front.interner, key.krate.test)
@@ -1556,6 +1557,7 @@ fn resolved_setup(
         };
         (unit.target.src_path.clone(), root_text, ids, env, unit.deps.clone(), unit.package.name.replace('-', "_"))
     } else {
+        front.display_root = None;
         let stem = key.krate.root.file_stem().and_then(|s| s.to_str()).unwrap_or("main").to_string();
         let env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
         (key.krate.root.clone(), user_src.to_string(), crate_ids_default, env, Vec::new(), stem)
@@ -2929,6 +2931,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         })
         .collect();
     let line_base_of = |_: &Front, i: usize| -> u32 { line_bases.get(i).copied().unwrap_or(0) };
+    // Each fn's source file (W-PANIC): a panic in a module file names that
+    // file. An instance takes its source fn's file, as it takes its line.
+    let fn_files: Vec<u32> = (0..program.fns.len())
+        .map(|i| match caches.gen_reuse.source(&program, LocalDefId(i as u32)) {
+            Some(s) => map.call_site(program.fn_info(s).def.name_span).file.0,
+            None => ROOT_FILE.0,
+        })
+        .collect();
     let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot));
     if let Some(e) = outs.iter().find_map(|o| o.error.clone()) {
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
@@ -3082,19 +3092,32 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Instance slots take their template's line: cgen stores an
     // instance's panic lines relative to it (see `line_base_of`).
     let mut slot_lines = vec![0u32; n_slots];
+    let mut slot_files = vec![ROOT_FILE.0; n_slots];
     for i in 0..front.fn_slot.len().min(program.fns.len()) {
         slot_lines[slot(i)] = line_base_of(front, i);
+        slot_files[slot(i)] = fn_files[i];
     }
+    // Paths as rustc prints them: under Cargo, relative to the workspace root.
+    let file_paths: Vec<String> = (0..map.file_count())
+        .map(|f| {
+            let p = map.path(FileId(f as u32));
+            // Else as the user typed the root path (`client_view`).
+            match front.display_root.as_deref().and_then(|r| Path::new(p).strip_prefix(r).ok()) {
+                Some(rel) => rel.to_string_lossy().into_owned(),
+                None => front.client.shown(p),
+            }
+        })
+        .collect();
+    let file_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
+    let files = cgen::SlotFiles { paths: &file_refs, of_slot: &slot_files };
     // Hybrid glue: glue reached by 3 or more units stays in the shared glue unit, the rest is
     // static per unit. The set is frozen until the next fresh base (see cgen::GlueSet). The
     // glue unit's C is built below, only when unit 1 is in `todo`.
     if fresh_base || caches.glue.shared.is_none() {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
-    // Panic locations name the root file as rustc would (see `client_view`).
-    let root_shown = front.client.shown(map.path(ROOT_FILE));
     let gen_unit = |u: usize, overlay: bool| match u {
-        0 => cgen::main_unit(main_slot, &root_shown, &slot_lines, &registered),
+        0 => cgen::main_unit(main_slot, &files, &slot_lines, &registered),
         1 => cgen::glue_unit(&program, &caches.glue),
         2 => cgen::runtime_unit(),
         3 => cgen::table_unit(caches.table_cap, &fn_units),
@@ -3110,7 +3133,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // rebuilt for this (possibly warm, incremental) build.
         for u in [0, 1, 2, 3].into_iter().chain(fn_units.iter().copied()) {
             // The standalone main unit registers no overlays; `lust_base_init` covers all units.
-            let c = if u == 0 { cgen::main_unit(main_slot, &root_shown, &slot_lines, &[]) } else { gen_unit(u, false) };
+            let c = if u == 0 { cgen::main_unit(main_slot, &files, &slot_lines, &[]) } else { gen_unit(u, false) };
             let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
         }
     }

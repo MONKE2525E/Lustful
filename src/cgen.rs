@@ -5499,19 +5499,36 @@ pub fn runtime_unit() -> String {
     format!("#define LUST_IMPL 1\n{}", runtime_source(true))
 }
 
-/// Unit 0: the line table (by slot), globals, overlay registration, and `main`. Rebuilt on every
-/// build.
-pub fn main_unit(main_slot: u32, file: &str, slot_lines: &[u32], overlays: &[usize]) -> String {
+/// The source files panic locations name: every file's path (index 0 is
+/// the crate root) and each slot's file index.
+pub struct SlotFiles<'a> {
+    pub paths: &'a [&'a str],
+    pub of_slot: &'a [u32],
+}
+
+/// Unit 0: the line and file tables (by slot), globals, overlay registration, and `main`.
+/// Rebuilt on every build.
+pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays: &[usize]) -> String {
     let mut c = unit_header();
     let lines: Vec<String> = slot_lines.iter().map(|l| l.to_string()).collect();
     let _ = writeln!(c, "static const uint32_t lines[{}] = {{{}}};", lines.len().max(1), lines.join(","));
+    let file = files.paths.first().copied().unwrap_or("");
+    // A crate of one file needs no per-slot table (`lust_slot_file` NULL).
+    let multi = files.of_slot.iter().any(|&f| f != 0);
+    if multi {
+        let paths: Vec<String> = files.paths.iter().map(|p| c_string_lit(p.as_bytes())).collect();
+        let _ = writeln!(c, "static const char *const files[{}] = {{{}}};", paths.len().max(1), paths.join(","));
+        let of: Vec<String> = files.of_slot.iter().map(|f| f.to_string()).collect();
+        let _ = writeln!(c, "static const uint32_t slot_file[{}] = {{{}}};", of.len().max(1), of.join(","));
+    }
     for u in overlays {
         let _ = writeln!(c, "void lust_overlay_u{u}(void);");
     }
     let _ = writeln!(
         c,
-        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;\n  lust_rt_init();\n  lust_base_init();",
-        c_string_lit(file.as_bytes())
+        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;{}\n  lust_rt_init();\n  lust_base_init();",
+        c_string_lit(file.as_bytes()),
+        if multi { "\n  lust_files = files;\n  lust_slot_file = slot_file;" } else { "" }
     );
     for u in overlays {
         let _ = writeln!(c, "  lust_overlay_u{u}();");
@@ -7274,7 +7291,7 @@ mod tests {
         let mut glue = GlueSet::default();
         glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
         let units = [
-            main_unit(slots[main.0 as usize], "test.rs", &vec![1; n], &[]),
+            main_unit(slots[main.0 as usize], &SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n], &[]),
             glue_unit(&program, &glue),
             runtime_unit(),
             table_unit(n, &[4]),

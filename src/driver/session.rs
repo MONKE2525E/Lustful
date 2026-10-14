@@ -132,6 +132,10 @@ pub(crate) struct Front {
     /// compile, handed from `resolved_setup` to the shared tail for one
     /// request (taken there, so it never outlives its request).
     pub(crate) resolved_crate_ids: Option<CrateIds>,
+    /// The Cargo workspace root of a manifest build (W-PANIC): Cargo runs
+    /// rustc there with relative paths, so panic locations name files
+    /// relative to it (docs/ARCH.md 3.5). None for a single file.
+    pub(crate) display_root: Option<std::path::PathBuf>,
     /// Per-file resolver front-end cache (raw and expanded token
     /// streams plus outlines), kept across requests in this crate
     /// session. Unused until the session first takes the resolver path.
@@ -319,6 +323,7 @@ impl Session {
                 split_mask: None,
                 resolved_crate: false,
                 resolved_crate_ids: None,
+                display_root: None,
                 resolve_cache: crate::resolve::worklist::ResolveCache::new(!persistent),
             },
             caches: Caches {

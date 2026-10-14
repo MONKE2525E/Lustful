@@ -53,12 +53,23 @@ static const char *const lust_std_files[] = {
 };
 #endif
 
+/* Per-slot source files, set by the main unit when the crate has more
+   than one file: slot s's fn lives in lust_files[lust_slot_file[s]].
+   NULL for a one-file crate, which uses lust_file. */
+extern const char *const *lust_files;
+extern const uint32_t *lust_slot_file;
+#ifdef LUST_IMPL
+const char *const *lust_files;
+const uint32_t *lust_slot_file;
+#endif
+
 void lust_panic(lust_String *msg, lust_loc loc) LUST_BODY({
     uint32_t slot = (uint32_t)(loc >> 32);
     if (slot >= LUST_STD_SLOT) {
         lust_panic_at(msg->ptr, msg->len, lust_std_files[(slot - LUST_STD_SLOT) & ~LUST_STD_POW], (loc >> 12) & 0xFFFFF, loc & 0xFFF);
     }
-    lust_panic_at(msg->ptr, msg->len, lust_file, lust_fn_line[slot] + ((loc >> 12) & 0xFFFFF), loc & 0xFFF);
+    const char *file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
+    lust_panic_at(msg->ptr, msg->len, file, lust_fn_line[slot] + ((loc >> 12) & 0xFFFFF), loc & 0xFFF);
 })
 
 void lust_panic_str(lust_str msg, lust_loc loc) LUST_BODY({
