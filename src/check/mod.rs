@@ -2064,6 +2064,48 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some((a, p.tys.args(args).to_vec()))
     }
 
+    /// `alias_adt` for the type segment of a value path, generic
+    /// aliases too: a generic alias's body under the segment's type
+    /// args, fresh variables for the ones not written (`type A<T> =
+    /// S<T>; A::make(5)`, `A::<u8>::make`). The bool is true for a
+    /// generic alias, whose written args are its own, not the Adt's.
+    fn alias_adt_seg(&mut self, seg: &ast::PathSeg, span: Span) -> Option<(AdtId, Vec<GenericArg>, bool)> {
+        if let Some((a, args)) = self.alias_adt(seg.name) {
+            return Some((a, args, false));
+        }
+        let p = self.p;
+        if p.gx.generic_aliases.is_empty() {
+            return None;
+        }
+        let flat = match self.binding(Namespace::Type, seg.name) {
+            BindingRes::Def(def) => p.resolved.as_ref().and_then(|t| t.def_info.get(&def)).map_or(seg.name, |i| i.flat),
+            _ => return None,
+        };
+        let la = p.gx.generic_aliases.get(&flat)?.clone();
+        let written = seg.type_args();
+        if written.len() > la.type_params.len() {
+            self.err("L0107", span, format!("this alias takes {} type argument(s)", la.type_params.len()), "Write one type per parameter.");
+            return None;
+        }
+        let mut body = generics::Scope {
+            alias_lifetimes: la.lifetimes.iter().map(|&n| (n, Region::Erased)).collect(),
+            alias_depth: 1,
+            ..Default::default()
+        };
+        for (i, &(name, _)) in la.type_params.iter().enumerate() {
+            let t = match written.get(i) {
+                Some(&w) => self.resolve_written(w),
+                None => self.new_var(false),
+            };
+            body.param_tys.push((name, t));
+        }
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        let t = generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, la.ty, &body).ok()?;
+        let (d, args) = self.tys.adt_parts(t)?;
+        let a = p.adt_by_def(d)?;
+        Some((a, self.tys.args(args).to_vec(), true))
+    }
+
     /// The args of a value path through `Self` (`Self::V(..)`, `Self {
     /// .. }`, `Self(..)`, `Self::N` in patterns too): `Self` names the
     /// impl's Self type with its own args, never a fresh application of
@@ -2104,14 +2146,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(args) = self.self_path_args(a, segs, span) {
             return args;
         }
-        // A path through an alias of a generic Adt (`type EA = E<u8>;
-        // EA::A(3)`) builds the Adt at the alias's args.
-        if let Some((aa, args)) = self.alias_adt(segs[segs.len().saturating_sub(2)].name)
+        // A path through an alias of a generic Adt builds the Adt at the
+        // alias's args: fixed ones (`type EA = E<u8>; EA::A(3)`), or a
+        // generic alias's at the segment's args (`A::<u8>::make`).
+        if let Some((aa, args, generic)) = self.alias_adt_seg(&segs[segs.len().saturating_sub(2)], span)
             && p.def_of_adt(aa) == p.def_of_adt(a)
             && !args.is_empty()
         {
-            if segs.iter().any(|s| s.has_args()) {
-                self.err("L0105", span, "this type alias takes no generic arguments", "Remove the `::<..>` part.");
+            let stray = if generic { segs.len() >= 2 && segs[segs.len() - 1].has_args() } else { segs.iter().any(|s| s.has_args()) };
+            if stray {
+                self.err("L0105", span, "these generic arguments do not belong here", "Write the type's arguments on the alias only: `A::<u8>::name`.");
                 return self.error_args(&p.gx.adt_generics[a.0 as usize].clone());
             }
             return args;
@@ -7384,8 +7428,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 _ => None,
             }
         };
-        // A type alias of a user Adt (`EA::A(3)`, `SA::new()`).
-        let adt = adt.or_else(|| self.alias_adt(ty_name).map(|(a, _)| a));
+        // A type alias of a user Adt (`EA::A(3)`, `SA::new()`, generic
+        // `A::make(5)`); `value_path_args` gives its args.
+        let adt = adt.or_else(|| self.alias_adt_seg(&segs[segs.len() - 2], span).map(|(a, ..)| a));
         let Some(a) = adt else {
             self.err(
                 "L0101",
@@ -7409,7 +7454,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         p.inherent_reads(&mut self.out.reads, adef, item);
         if let Some(fs) = p.methods.get(&(a, item)).filter(|fs| !fs.is_empty()) {
-            let f = if fs.len() == 1 { fs[0] } else { self.inherent_fn_by_self(a, fs, segs, span)? };
+            // Materialized instances join the same entry; the written
+            // fns (one per impl) are the candidates.
+            let written: Vec<LocalDefId> = fs.iter().copied().filter(|f| !p.gx.instances.contains_key(f)).collect();
+            let f = match written.as_slice() {
+                [] => fs[0],
+                &[f] => f,
+                _ => self.inherent_fn_by_self(a, &written, segs, span)?,
+            };
             let what = if p.fn_info(f).self_kind.is_some() { "method" } else { "associated function" };
             self.check_assoc_vis(a, item, what, span);
             return Some(Res::Fn(f));
@@ -7660,7 +7712,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.self_adt()?
         } else {
             match self.binding(Namespace::Type, ty_name) {
-                BindingRes::Def(def) => p.adt_by_def(def).or_else(|| self.alias_adt(ty_name).map(|(a, _)| a))?,
+                BindingRes::Def(def) => p.adt_by_def(def).or_else(|| self.alias_adt_seg(&segs[0], span).map(|(a, ..)| a))?,
                 _ => return None,
             }
         };
@@ -7766,7 +7818,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn unify_written_self(&mut self, callee: ExprId, f: LocalDefId, inst_args: &[GenericArg], span: Span) {
         let p = self.p;
         let Expr::Path(segs) = p.ast.expr(callee) else { return };
-        if segs.len() != 2 || !(segs[0].has_args() || self.alias_adt(segs[0].name).is_some_and(|(_, args)| !args.is_empty())) {
+        if segs.len() != 2 || !(segs[0].has_args() || self.alias_adt_seg(&segs[0], span).is_some_and(|(_, args, _)| !args.is_empty())) {
             return;
         }
         let Some(owner) = p.fn_info(f).owner else { return };
