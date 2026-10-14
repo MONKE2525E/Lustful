@@ -54,6 +54,12 @@ pub enum CTy {
     /// fat value stands for it, as for slices): the runtime's
     /// `lust_dyn` (data pointer and vtable, ARCH 2.8).
     Dyn,
+    /// A `Box<dyn Trait>`: an owning `lust_dyn` whose data points at
+    /// the heap value (distinct from `Boxed(Dyn)`, a `Box<&dyn Tr>`).
+    BoxDyn,
+    /// An `Rc<dyn Trait>`: an owning `lust_dyn` whose data points at
+    /// the value inside the Rc allocation, right after its two counts.
+    RcDyn,
     /// A `vec::IntoIter<T>` (W-STD-A): the runtime's `lust_VecIter`,
     /// the moved-in buffer plus the front index of what it still owns.
     VecIter(Box<CTy>),
@@ -130,6 +136,9 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Adt(..) => match tys.builtin_of(t) {
             Some(BuiltinTy::String) => CTy::String,
             Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::Boxed | BuiltinTy::Rc) if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Dyn(..))) => {
+                if tys.builtin_of(t) == Some(BuiltinTy::Boxed) { CTy::BoxDyn } else { CTy::RcDyn }
+            }
             Some(BuiltinTy::Boxed) => CTy::Boxed(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Rc) => CTy::Rc(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Option) => CTy::Option(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
@@ -244,6 +253,9 @@ pub fn ctype(t: &CTy) -> String {
         CTy::String => "lust_String".into(),
         CTy::Vec(_) => "lust_Vec".into(),
         CTy::Ref(inner) if **inner == CTy::Str => "lust_str".into(),
+        // `Box<dyn Tr>` and `Rc<dyn Tr>` are owning fat pointers whose
+        // data points at the value (ARCH 2.8).
+        CTy::BoxDyn | CTy::RcDyn => "lust_dyn".into(),
         CTy::Boxed(inner) => format!("{}*", ctype(inner)),
         CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::VecIter(_) => "lust_VecIter".into(),
@@ -312,6 +324,8 @@ fn mangle(t: &CTy) -> String {
             format!("fp{ps}r{}_", mangle(r))
         }
         CTy::Dyn => "dyn".into(),
+        CTy::BoxDyn => "Bxdyn".into(),
+        CTy::RcDyn => "Rcdyn".into(),
         CTy::Fmt(k) => format!("Fmt{}", *k as u8),
     }
 }
@@ -402,7 +416,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) | CTy::VecIter(_) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) => true,
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
@@ -583,6 +597,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             )
             .ok(),
             CTy::Ref(inner) if **inner == CTy::Str => Some(layout::fat_ptr_layout()),
+            CTy::BoxDyn | CTy::RcDyn => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
             CTy::Slice(_) | CTy::Dyn => Some(layout::fat_ptr_layout()),
@@ -767,6 +782,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Args => (8, 8),
             CTy::Fmt(k) => fmt_size_align(*k),
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
+            CTy::BoxDyn | CTy::RcDyn => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
             CTy::Ref(_) => (8, 8),
             CTy::Option(e) => {
@@ -1432,6 +1448,11 @@ impl FnGen<'_, '_, '_> {
                         e = format!("(*{e})");
                         t = *inner;
                     }
+                }
+                // The dyn place behind an owning fat pointer is its fat
+                // value, as behind `&dyn` (the data points at the value).
+                (Proj::Deref, CTy::BoxDyn | CTy::RcDyn) => {
+                    t = CTy::Dyn;
                 }
                 (Proj::Deref, CTy::Boxed(inner)) => {
                     e = format!("(*{e})");
@@ -2167,11 +2188,14 @@ impl FnGen<'_, '_, '_> {
                 }
             }
             Rvalue::MakeDyn { ptr, src, dyn_ty } => {
-                let (v, _) = self.operand(ptr, loc, post);
+                let (v, ct) = self.operand(ptr, loc, post);
                 let vid = crate::check::generics::vtable_for(self.p, &self.body.tys, *src, *dyn_ty)
                     .expect("mono builds a vtable for every unsizing coercion in a concrete body");
                 let vt = self.vtable_sym(vid);
-                format!("((lust_dyn){{ (void *)({v}), {vt} }})")
+                // An `Rc<T>` source points the data at the value in its
+                // allocation (`Rc<dyn Tr>` finds the counts before it).
+                let data = if matches!(ct, CTy::Rc(_)) { format!("&({v})->v") } else { format!("({v})") };
+                format!("((lust_dyn){{ (void *){data}, {vt} }})")
             }
             Rvalue::DynUpcast { ptr, path } => {
                 let (v, _) = self.operand(ptr, loc, post);
@@ -2241,8 +2265,12 @@ impl FnGen<'_, '_, '_> {
         };
         let mut words = vec![drop, format!("(void *)(uintptr_t){size}"), format!("(void *)(uintptr_t){align}")];
         words.extend(supers.iter().map(|s| format!("(void *){s}")));
+        // A `dyn FnOnce` vtable's call entry consumes the value and
+        // frees the box it lives in (ARCH 2.9): the only call is
+        // through `Box<dyn FnOnce>` by value.
+        let consume = (vt.principal.def == p.gx.lang.fn_once).then_some(vt.self_ty);
         for (j, &f) in vt.methods.iter().enumerate() {
-            let shim = self.vtable_shim(&name, j, f);
+            let shim = self.vtable_shim(&name, j, f, consume);
             words.push(format!("(void *){shim}"));
         }
         let tn = crate::check::object::trait_name(p, vt.principal.def);
@@ -2256,8 +2284,11 @@ impl FnGen<'_, '_, '_> {
     /// forwards through `lust_fns[slot]`, so the entry never names a body
     /// an overlay could replace (ARCH 4.5). Its C signature is the
     /// method's with `void *` for the receiver; dyn call sites cast the
-    /// entry to that shape.
-    fn vtable_shim(&mut self, vt_name: &str, j: usize, f: LocalDefId) -> String {
+    /// entry to that shape. With `consume` (the concrete type of a `dyn
+    /// FnOnce` vtable) the shim takes the value out of the box (an
+    /// `FnOnce` closure's by-value env) or drops it after the call (an
+    /// `Fn`/`FnMut` closure's), then frees the box.
+    fn vtable_shim(&mut self, vt_name: &str, j: usize, f: LocalDefId, consume: Option<Ty>) -> String {
         self.note_callee(f);
         let p = self.p;
         let info = p.fn_info(f);
@@ -2276,6 +2307,31 @@ impl FnGen<'_, '_, '_> {
             names.push(format!(", a{i}"));
         }
         let (decls, names) = (decls.iter().map(|d| format!(", {d}")).collect::<String>(), names.concat());
+        if let Some(self_ty) = consume {
+            let ct = cty(&p.tys, self_ty);
+            let cts = ctype(&ct);
+            let by_value = !matches!(p.tys.kind(info.params[0]), TyKind::Ref(..));
+            let env = if by_value { format!("*({cts}*)self") } else { format!("({recv})self") };
+            let drop = if !by_value && needs_drop_c(p, &ct) {
+                self.want(Glue::Drop, &ct);
+                format!("drop_{}(({cts}*)self); ", mangle(&ct))
+            } else {
+                String::new()
+            };
+            let free = format!("lust_dealloc(self, sizeof({cts}), _Alignof({cts}));");
+            if ret_is_large(p, f) {
+                let _ = writeln!(
+                    self.prelude,
+                    "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out, {env}{names}); {drop}{free} }}"
+                );
+            } else {
+                let _ = writeln!(
+                    self.prelude,
+                    "static {ret} {name}(void *self{decls}) {{ {ret} r = ({cast}lust_fns[{slot}])({env}{names}); {drop}{free} return r; }}"
+                );
+            }
+            return name;
+        }
         if ret_is_large(p, f) {
             let _ = writeln!(
                 self.prelude,
@@ -2544,6 +2600,10 @@ impl FnGen<'_, '_, '_> {
                     vals[0]
                 );
                 t
+            }
+            // An `Rc<dyn Tr>`'s two counts sit right before its value.
+            B::RcStrongCount | B::RcWeakCount if matches!(&tys[0], CTy::Ref(r) if **r == CTy::RcDyn) => {
+                format!("((uint64_t *)(*{}).data)[{}]", vals[0], if b == B::RcStrongCount { -2 } else { -1 })
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
             B::RcWeakCount => format!("(*{})->weak", vals[0]),
@@ -5048,6 +5108,17 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                         body.push_str("  if (p->cap) free(p->ptr);\n");
                     }
                 }
+                // Through the vtable: the drop entry (0 when none), then
+                // the allocation by the size and align words.
+                CTy::BoxDyn => {
+                    body.push_str("  if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data);\n");
+                    body.push_str("  lust_dealloc(p->data, (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]);\n");
+                }
+                CTy::RcDyn => {
+                    // The two counts sit right before the value (`RcI_T`).
+                    body.push_str("  uint64_t *h = (uint64_t *)p->data - 2;\n");
+                    body.push_str("  if (--h[0] == 0) { if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data); if (h[1] == 0) lust_dealloc((void *)h, 16 + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }\n");
+                }
                 CTy::Boxed(e) => {
                     if needs_drop_c(p, e) {
                         need(Glue::Drop, e);
@@ -5175,6 +5246,9 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                     let et = ctype(e);
                     let c = clone_of(e, "(**p)", &mut need);
                     let _ = writeln!(body, "  {et} *r = ({et}*)lust_alloc(sizeof({et}), _Alignof({et})); *r = {c}; return r;");
+                }
+                CTy::RcDyn => {
+                    body.push_str("  ((uint64_t *)p->data)[-2]++; return *p;\n");
                 }
                 CTy::Rc(_) => {
                     body.push_str("  (*p)->strong++; return *p;\n");

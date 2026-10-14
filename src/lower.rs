@@ -635,6 +635,20 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// drop) for a dyn source.
     fn unsize(&mut self, op: Operand, found: Ty, target: Ty, span: Span) -> Operand {
         use crate::check::object;
+        // An owning unsizing (`Box<T>` to `Box<dyn Tr>`, `Rc<T>` to
+        // `Rc<dyn Tr>`): the box or Rc moves into the fat pointer.
+        if let (Some(src), Some(dyn_ty)) = (self.body.tys.smart_elem(found), self.body.tys.smart_elem(target)) {
+            let rv = match (object::principal_of(&self.body.tys, src), object::principal_of(&self.body.tys, dyn_ty)) {
+                (Some(from), Some(to)) => {
+                    let path = object::upcast_path(self.p, &mut self.body.tys, from, to).unwrap_or_default();
+                    if path.is_empty() { Rvalue::Use(op) } else { Rvalue::DynUpcast { ptr: op, path } }
+                }
+                _ => Rvalue::MakeDyn { ptr: op, src, dyn_ty },
+            };
+            let out = self.temp(target);
+            self.assign(Place::local(out), rv, span);
+            return Operand::Move(Place::local(out));
+        }
         let TyKind::Ref(_, tm, dyn_ty) = self.kind(target) else { unreachable!() };
         let m = tm.is_mut();
         let place = self.op_place(op, found, span);
@@ -1050,9 +1064,12 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Call { callee, args } => {
                 let res = self.ck.res(e);
                 // A call through an Fn-family bound of a type parameter
-                // (template checks): a method call of the bound's trait
-                // with the callee as its receiver.
-                if let Res::Method { .. } = res {
+                // (template checks), or through a `dyn Fn` value's
+                // vtable: a method call with the callee as its receiver.
+                // (A qualified path call through a dyn receiver,
+                // `Tr::m(d)`, passes its receiver as an argument.)
+                let dyn_fn_call = matches!(res, Res::DynMethod { owner, .. } if self.p.gx.lang.is_fn_family(owner));
+                if matches!(res, Res::Method { .. }) || dyn_fn_call {
                     self.method_into(e, *callee, args, dest, span);
                     return;
                 }
@@ -2618,9 +2635,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             Callee::Fn(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),
             Callee::Builtin(b) => CallTarget::Builtin(b),
             Callee::Dyn(owner, cand, slot) => {
-                let Expr::MethodCall { name, .. } = self.p.ast.expr(e) else { unreachable!() };
                 let r = ops.remove(0);
-                let r = self.dyn_receiver(r, recv_ty, autoref == Autoref::RefMut, owner, cand, *name, span);
+                // A `dyn Fn` value called as a function uses its own
+                // principal's call entry: no upcast.
+                let r = match self.p.ast.expr(e) {
+                    Expr::MethodCall { name, .. } => self.dyn_receiver(r, recv_ty, autoref == Autoref::RefMut, owner, cand, *name, span),
+                    _ => r,
+                };
                 ops.insert(0, r);
                 // The call writes a temporary of the method's own return
                 // type: codegen reads the vtable entry's C signature from

@@ -1080,6 +1080,10 @@ impl GlobalTys {
     pub fn dyn_bounds_get(&self, b: &DynBounds) -> Option<BoundsId> {
         self.bounds.get_id(b)
     }
+    /// The already-interned id of one binding list, if any.
+    pub fn bindings_get(&self, b: &[(DefId, GenericArg)]) -> Option<BindingsId> {
+        self.bindings_a.get_slice(b)
+    }
     /// The full applied type of a session-local Adt, if registered.
     pub fn full_adt_ty(&self, local: AdtId) -> Option<Ty> {
         self.adt_full_tys.get(local.0 as usize).copied().flatten()

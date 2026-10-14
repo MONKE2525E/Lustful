@@ -75,7 +75,20 @@ pub fn eager_vtables(p: &mut Program, made: &mut Vec<LocalDefId>) {
 /// New fn instances go to `made`. None when no impl applies, which a
 /// checked body never asks for.
 pub fn ensure_vtable(p: &mut Program, self_ty: Ty, principal: TraitRef, made: &mut Vec<LocalDefId>) -> Option<u32> {
+    // Keyed without bindings (`check::generics::vtable_for`): the
+    // `Output` of a `dyn Fn` follows from the closure.
+    let principal = TraitRef { bindings: EMPTY_BINDINGS, ..principal };
     if let Some(&id) = p.gx.vtable_by_key.get(&(self_ty, principal)) {
+        return Some(id);
+    }
+    // A `dyn Fn`-family vtable (ARCH 2.9) has one call entry: the
+    // closure's body fn, which `register_closures` made already.
+    if p.gx.lang.is_fn_family(principal.def) {
+        let TyKind::Closure(def, _) = p.tys.kind(self_ty) else { return None };
+        let body_fn = p.gx.closures.get(&def)?.body_fn;
+        let id = p.gx.vtables.len() as u32;
+        p.gx.vtables.push(VtableData { self_ty, principal, methods: vec![body_fn], supers: Vec::new() });
+        p.gx.vtable_by_key.insert((self_ty, principal), id);
         return Some(id);
     }
     let info = p.gx.dyn_infos.get(&principal.def)?.clone();

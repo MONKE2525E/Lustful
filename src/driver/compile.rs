@@ -3160,6 +3160,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     inner(h, p, x);
                 }
                 cgen::CTy::Dyn => 20u8.hash(h),
+                cgen::CTy::BoxDyn => 41u8.hash(h),
+                cgen::CTy::RcDyn => 42u8.hash(h),
                 cgen::CTy::VecIter(x) => {
                     21u8.hash(h);
                     inner(h, p, x);

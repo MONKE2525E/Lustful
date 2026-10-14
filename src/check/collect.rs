@@ -375,7 +375,21 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             if let Some(pr) = b.principal {
                 let name = p.gx.index.trait_record(pr.value.def).map_or("?", |rec| p.name(rec.name));
                 let args: Vec<String> = tys.args(pr.value.args)[1..].iter().filter_map(|g| g.as_ty()).map(|e| ty_name(p, tys, e)).collect();
-                parts.push(if args.is_empty() { name.to_string() } else { format!("{name}<{}>", args.join(", ")) });
+                // The Fn family prints in its sugar: `Fn(A, B) -> R`.
+                let fn_sugar = p.gx.lang.is_fn_family(pr.value.def).then(|| {
+                    let ins = tys.args(pr.value.args).get(1).and_then(|g| g.as_ty()).map_or_else(Vec::new, |t| match tys.kind(t) {
+                        TyKind::Tuple(ts) => tys.tys_of(ts).iter().map(|&e| ty_name(p, tys, e)).collect(),
+                        _ => Vec::new(),
+                    });
+                    let out = tys.bindings(pr.value.bindings).first().and_then(|(_, g)| g.as_ty()).filter(|&t| t != UNIT);
+                    let out = out.map_or_else(String::new, |t| format!(" -> {}", ty_name(p, tys, t)));
+                    format!("{name}({}){out}", ins.join(", "))
+                });
+                parts.push(match fn_sugar {
+                    Some(s) => s,
+                    None if args.is_empty() => name.to_string(),
+                    None => format!("{name}<{}>", args.join(", ")),
+                });
             }
             for (on, name) in [(b.auto.send, "Send"), (b.auto.sync, "Sync"), (b.auto.unpin, "Unpin")] {
                 if on {

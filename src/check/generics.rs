@@ -1789,16 +1789,23 @@ fn resolve_dyn(
                 if !binder.is_empty() {
                     return Err(dyn_not_yet(span, "higher-ranked `dyn for<..>` types"));
                 }
-                // Vtables exist for user traits only: a std trait
-                // (`dyn Display`, `dyn Fn(..)`) has no method bodies
-                // the subset can point a vtable at yet.
-                if !cx.index.trait_record(trait_def).is_some_and(|r| r.local) {
+                // Vtables exist for user traits and the Fn family (ARCH
+                // 2.9: a closure's one call entry); another std trait
+                // (`dyn Display`) has no method bodies the subset can
+                // point a vtable at yet.
+                let fn_family = cx.lang.is_fn_family(trait_def);
+                if !fn_family && !cx.index.trait_record(trait_def).is_some_and(|r| r.local) {
                     let name = interner.get(trait_ref.path.last().unwrap().name).to_string();
                     return Err(dyn_not_yet(span, &format!("`dyn {name}` (a std trait)")));
                 }
                 let seg = trait_ref.path.last().unwrap();
+                if fn_family && !matches!(seg.args, GenericArgs::Parenthesized { .. }) {
+                    return Err(dyn_not_yet(span, "a `dyn` Fn trait without the `Fn(..) -> R` form"));
+                }
                 let tr = resolve_trait_path_args(ast, interner, known, cx, tys, scope, trait_def, seg, DYN_SELF, span)?;
-                if !tys.bindings(tr.bindings).is_empty() {
+                // The `Fn(..) -> R` sugar binds `Output`; other bindings
+                // are not supported yet.
+                if !fn_family && !tys.bindings(tr.bindings).is_empty() {
                     return Err(dyn_not_yet(span, "associated type bindings in `dyn` types"));
                 }
                 principal = Some(Binder::plain(tr));
@@ -1810,6 +1817,16 @@ fn resolve_dyn(
     }
     let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto });
     Ok(tys.intern(TyKind::Dyn(bounds_id, region)))
+}
+
+/// True when a written type is a `dyn` type (through parentheses) with
+/// no lifetime bound: its object lifetime is the context's default.
+fn dyn_lifetime_unwritten(ast: &Ast, t: ast::TyId) -> bool {
+    match ast.ty(t) {
+        TyExpr::Paren(inner) => dyn_lifetime_unwritten(ast, *inner),
+        TyExpr::Dyn { bounds, lifetime, .. } => lifetime.is_none() && !bounds.iter().any(|b| matches!(b, TraitBound::Lifetime(_))),
+        _ => false,
+    }
 }
 
 /// The reject for a `dyn` form the subset has no vtable for yet.
@@ -1951,11 +1968,28 @@ fn resolve_path_ty(
                 ));
             }
         };
-        let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
-        if name == known.Box && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+        let mut elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
+        // The default object lifetime of `Box<dyn Tr>` and `Rc<dyn Tr>`
+        // with no written bound is `'static` in a signature (fields,
+        // params, returns, aliases, impl headers), as in rustc; a body
+        // annotation infers it, and a written bound is the borrow
+        // checker's (regions erased here).
+        if (name == known.Box || name == known.Rc)
+            && scope.infer_cell.is_none()
+            && matches!(scope.regions, RegionMode::Erase)
+            && let TyKind::Dyn(b, Region::Erased) = tys.kind(elem)
+            && let GenericArgs::Angle(a) = &seg.args
+            && let Some(AstArg::Type(t)) = a.iter().find(|g| matches!(g, AstArg::Type(_)))
+            && dyn_lifetime_unwritten(ast, *t)
+        {
+            elem = tys.intern(TyKind::Dyn(b, Region::Static));
+        }
+        // `Box<dyn Tr>` and `Rc<dyn Tr>` are owning fat pointers (ARCH
+        // 2.8); boxed slices and strs are not supported yet.
+        if name == known.Box && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str) {
             return Err(not_yet("L0641", span, "a Box of an unsized type"));
         }
-        if name == known.Rc && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+        if name == known.Rc && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str) {
             return Err(not_yet("L0641", span, "an Rc of an unsized type"));
         }
         return Ok(if name == known.Vec {
@@ -5133,9 +5167,10 @@ pub(crate) enum OwnedTy {
     Opaque(DefId, Vec<OwnedArg>),
     Projection(AssocId, Vec<OwnedArg>),
     FnPtr(Binder<FnSig>, Vec<OwnedTy>, Box<OwnedTy>),
-    /// The principal def and args (bindings and supertraits are always
-    /// empty in a dyn type `resolve_dyn` forms), auto bits, region.
-    Dyn(Option<(DefId, Vec<OwnedArg>)>, AutoTraits, Region),
+    /// The principal def, args, and bindings (only the `Output` of the
+    /// Fn-family sugar; supertraits are always empty in a dyn type
+    /// `resolve_dyn` forms), auto bits, region.
+    Dyn(Option<(DefId, Vec<OwnedArg>, Vec<(DefId, OwnedArg)>)>, AutoTraits, Region),
 }
 
 #[derive(Clone)]
@@ -5189,7 +5224,11 @@ pub(crate) fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
                     for g in src.args(pr.value.args)[1..].to_vec() {
                         args.push(snapshot_arg(src, g)?);
                     }
-                    Some((pr.value.def, args))
+                    let mut bindings = Vec::new();
+                    for (d, g) in src.bindings(pr.value.bindings).to_vec() {
+                        bindings.push((d, snapshot_arg(src, g)?));
+                    }
+                    Some((pr.value.def, args, bindings))
                 }
                 None => None,
             };
@@ -5267,9 +5306,11 @@ pub(crate) fn build_owned_ty(p: &mut Program, t: &OwnedTy) -> Ty {
             p.tys.intern(TyKind::FnPtr(sig))
         }
         OwnedTy::Dyn(principal, auto, r) => {
-            let principal = principal.as_ref().map(|(def, args)| {
+            let principal = principal.as_ref().map(|(def, args, bindings)| {
                 let args = build_owned_args(p, args);
-                Binder::plain(TraitRef { def: *def, args, bindings: EMPTY_BINDINGS })
+                let bindings: Vec<(DefId, GenericArg)> = bindings.iter().map(|(d, g)| (*d, build_owned_arg(p, g))).collect();
+                let bindings = p.tys.intern_bindings(&bindings);
+                Binder::plain(TraitRef { def: *def, args, bindings })
             });
             let b = p.tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto: *auto });
             p.tys.intern(TyKind::Dyn(b, *r))
@@ -5278,15 +5319,16 @@ pub(crate) fn build_owned_ty(p: &mut Program, t: &OwnedTy) -> Ty {
 }
 
 fn build_owned_args(p: &mut Program, args: &[OwnedArg]) -> ArgsId {
-    let out: Vec<GenericArg> = args
-        .iter()
-        .map(|a| match a {
-            OwnedArg::Ty(e) => GenericArg::Ty(build_owned_ty(p, e)),
-            OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
-            OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
-        })
-        .collect();
+    let out: Vec<GenericArg> = args.iter().map(|a| build_owned_arg(p, a)).collect();
     p.tys.intern_args(&out)
+}
+
+fn build_owned_arg(p: &mut Program, a: &OwnedArg) -> GenericArg {
+    match a {
+        OwnedArg::Ty(e) => GenericArg::Ty(build_owned_ty(p, e)),
+        OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
+        OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
+    }
 }
 
 /// Lifts one type from a body-local store into the program's
@@ -5369,10 +5411,18 @@ fn find_global_ty(p: &Program, src: &dyn TyIntern, t: Ty) -> Option<Ty> {
                             other => other,
                         });
                     }
-                    Some(Binder {
-                        count: pr.count,
-                        value: TraitRef { def: pr.value.def, args: g.get_args(&out)?, bindings: EMPTY_BINDINGS },
-                    })
+                    let mut bs: Vec<(DefId, GenericArg)> = Vec::new();
+                    for (d, gg) in src.bindings(pr.value.bindings).to_vec() {
+                        bs.push((
+                            d,
+                            match gg {
+                                GenericArg::Ty(e) => GenericArg::Ty(find_global_ty(p, src, e)?),
+                                other => other,
+                            },
+                        ));
+                    }
+                    let bindings = if bs.is_empty() { EMPTY_BINDINGS } else { g.bindings_get(&bs)? };
+                    Some(Binder { count: pr.count, value: TraitRef { def: pr.value.def, args: g.get_args(&out)?, bindings } })
                 }
                 None => None,
             };

@@ -789,6 +789,12 @@ fn compute(
         }
         TyKind::Adt(..) => match tys.builtin_of(t) {
             // String and Vec are (ptr, len, cap) words in this order for layout.
+            // `Box<dyn Tr>` and `Rc<dyn Tr>` are fat pointers (ARCH 2.8).
+            Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc)
+                if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Dyn(..))) =>
+            {
+                Ok(fat_ptr_layout())
+            }
             Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc) => Ok(ptr_layout()),
             Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => {
                 struct_layout(&[ptr_layout(), int_layout(IntTy::Usize), int_layout(IntTy::Usize)], Repr::default())

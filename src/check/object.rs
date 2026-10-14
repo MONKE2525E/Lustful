@@ -438,8 +438,13 @@ pub fn dyn_type_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Opt
             })
         }
         TyKind::Adt(d, a) => {
-            // A dyn arg for a param that needs `Sized` (`Vec<dyn Tr>`).
+            // A dyn arg for a param that needs `Sized` (`Vec<dyn Tr>`);
+            // `Box<T: ?Sized>` and `Rc<T: ?Sized>` own dyn values.
+            let owns_unsized = matches!(tys.builtin_of(t), Some(BuiltinTy::Boxed | BuiltinTy::Rc));
             let sized_param = |i: usize| {
+                if owns_unsized {
+                    return false;
+                }
                 let Some(adt) = p.adt_by_def(d) else { return true };
                 let is_param_i = |t: Ty| matches!(p.tys.kind(t), TyKind::Param(q) if q.0 as usize == i);
                 p.gx.adt_generics.get(adt.0 as usize).is_none_or(|g| {
@@ -784,8 +789,8 @@ pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool
 
 /// True when a value of type `t` may hold a borrow, so a dyn value made
 /// from it may not live for `'static` (rustc E0597, E0310): a reference,
-/// a type param, a closure (its captures may borrow), a dyn type with
-/// an erased object lifetime, a borrowing std iterator, or anything
+/// a type param, a closure with such a capture, a dyn type with an
+/// erased object lifetime, a borrowing std iterator, or anything
 /// holding one.
 pub fn may_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     may_borrow_in(p, tys, &[], t)
@@ -800,7 +805,9 @@ pub fn may_borrow_in(p: &Program, tys: &impl TyIntern, env: &[Predicate], t: Ty)
         TyKind::Param(_) | TyKind::Projection(..) => {
             !env.iter().any(|q| matches!(q, Predicate::TypeOutlives(x, Region::Static) if *x == t))
         }
-        TyKind::Ref(..) | TyKind::Opaque(..) | TyKind::Infer(_) | TyKind::Closure(..) => true,
+        TyKind::Ref(..) | TyKind::Opaque(..) | TyKind::Infer(_) => true,
+        // A closure holds its captures: by-ref captures are references.
+        TyKind::Closure(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow_in(p, tys, env, e))),
         TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
         TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow_in(p, tys, env, e),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_borrow_in(p, tys, env, e)),

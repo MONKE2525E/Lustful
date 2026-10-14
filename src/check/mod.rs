@@ -2991,6 +2991,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let mut bounds = self.tys.dyn_bounds(b).clone();
                 if let Some(pr) = &mut bounds.principal {
                     pr.value.args = self.rebuild_args(pr.value.args, zonk);
+                    let old: Vec<(DefId, GenericArg)> = self.tys.bindings(pr.value.bindings).to_vec();
+                    if !old.is_empty() {
+                        let new: Vec<(DefId, GenericArg)> = old
+                            .into_iter()
+                            .map(|(d, g)| match g {
+                                GenericArg::Ty(t) => (d, GenericArg::Ty(self.rebuild(t, zonk))),
+                                g => (d, g),
+                            })
+                            .collect();
+                        pr.value.bindings = self.tys.intern_bindings(&new);
+                    }
                 }
                 let b = self.tys.intern_dyn_bounds(bounds);
                 self.tys.intern(TyKind::Dyn(b, r))
@@ -3129,13 +3140,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let (bx, by) = (self.tys.dyn_bounds(x).clone(), self.tys.dyn_bounds(y).clone());
                 match (bx.principal, by.principal) {
                     (Some(px), Some(py)) => {
-                        bx.auto == by.auto && px.value.def == py.value.def && self.unify_args(px.value.args, py.value.args)
+                        bx.auto == by.auto
+                            && px.value.def == py.value.def
+                            && self.unify_args(px.value.args, py.value.args)
+                            && self.unify_bindings(px.value.bindings, py.value.bindings)
                     }
                     _ => false,
                 }
             }
             _ => false,
         }
+    }
+    /// Two binding lists (`Output = R` of a `dyn Fn`) unify when they
+    /// bind the same items, in order, to types that unify.
+    fn unify_bindings(&mut self, a: BindingsId, b: BindingsId) -> bool {
+        if a == b {
+            return true;
+        }
+        let (a, b) = (self.tys.bindings(a).to_vec(), self.tys.bindings(b).to_vec());
+        a.len() == b.len()
+            && a.iter().zip(&b).all(|(&(da, ga), &(db, gb))| {
+                da == db
+                    && match (ga, gb) {
+                        (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
+                        (x, y) => x == y,
+                    }
+            })
     }
     /// Two generic argument lists unify element by element, in declared order.
     /// Type args unify; lifetime and const args must already be equal. Indexed
@@ -3371,6 +3401,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if dyn_target && (!em.is_mut() || fm.is_mut()) && !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float()) =>
             {
+                match self.unsize_coercion(x, y, found, expected, span, e) {
+                    Some(c) => c,
+                    None => return false,
+                }
+            }
+            // `Box<T>` to `Box<dyn Tr>` and `Rc<T>` to `Rc<dyn Tr>`: an
+            // owning unsizing, under the rules of the reference form.
+            (TyKind::Adt(..), TyKind::Adt(..)) if let Some((x, y)) = self.owning_unsize_parts(found, expected) => {
                 match self.unsize_coercion(x, y, found, expected, span, e) {
                     Some(c) => c,
                     None => return false,
@@ -3679,7 +3717,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let have = object::dyn_auto(p, &self.tys, x);
             let auto_ok = (!want.send || have.send) && (!want.sync || have.sync) && (!want.unpin || have.unpin);
             let path_ok = if from.def == to.def {
-                self.unify_args(from.args, to.args)
+                self.unify_args(from.args, to.args) && self.unify_bindings(from.bindings, to.bindings)
             } else {
                 object::upcast_path(p, &mut self.tys, from, to).is_some()
             };
@@ -3708,7 +3746,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if !to_static && borrows {
             self.dyn_borrow_src = true;
         }
-        if to_static && borrows {
+        // An instance replays its template, which proved this under the
+        // env's `'static` bounds (a `T: 'static` arg may be `&'static str`).
+        let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
+        if to_static && borrows && !instance {
             let tn = self.tn(x);
             self.err(
                 "L0705",
@@ -3718,9 +3759,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
             );
             return None;
         }
+        let lang = p.gx.lang;
+        // A `dyn Fn(A) -> R` value (ARCH 2.9): a closure whose body fn is
+        // the vtable's call entry; `R` is its `Output`. Fn items and fn
+        // pointers there are not supported yet.
+        if lang.is_fn_family(to.def) {
+            if !matches!(self.kind(x), TyKind::Closure(..)) {
+                let tn = self.tn(x);
+                self.errs.push(generics::dyn_not_yet(span, &format!("a `dyn` Fn value made from `{tn}` (only closures)")));
+                return None;
+            }
+            let tr = object::with_self(&mut self.tys, to, x);
+            for (assoc, g) in self.tys.bindings(to.bindings).to_vec() {
+                if let GenericArg::Ty(ty) = g {
+                    self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc, trait_args: tr.args, ty }, span });
+                }
+            }
+        }
         let tr = object::with_self(&mut self.tys, to, x);
         self.obl.push_trait_at(tr, span, 0);
-        let lang = p.gx.lang;
         for (on, def) in [(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)] {
             if on {
                 let args = self.tys.intern_args(&[GenericArg::Ty(x)]);
@@ -3731,6 +3788,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
     }
+    /// The pointees of an owning unsizing (`Box<T>` to `Box<dyn Tr>`,
+    /// `Rc<T>` to `Rc<dyn Tr>`, ARCH 2.8): the same smart pointer on
+    /// both sides, a dyn target, and a known source.
+    fn owning_unsize_parts(&self, found: Ty, expected: Ty) -> Option<(Ty, Ty)> {
+        let (f, e) = (self.resolve(found), self.resolve(expected));
+        let (x, y) = match (self.tys.boxed_elem(f), self.tys.boxed_elem(e)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => (self.tys.rc_elem(f)?, self.tys.rc_elem(e)?),
+        };
+        let (x, y) = (self.resolve(x), self.resolve(y));
+        let known = !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float());
+        (known && matches!(self.kind(y), TyKind::Dyn(..))).then_some((x, y))
+    }
+
     /// True when `e` borrows a static item (`&S0`): the one reference
     /// lust knows lives for `'static`.
     fn static_borrow(&self, e: ExprId) -> bool {
@@ -5433,13 +5504,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// The expected type when it is a reference to a dyn type. Branch
+    /// The expected type when it is a pointer to a dyn type: a
+    /// reference, or an owning `Box<dyn Tr>` or `Rc<dyn Tr>`. Branch
     /// results then coerce to it one by one, as rustc's expectation
     /// does, instead of joining the branch types first (ARCH 2.8).
     fn dyn_ref_expectation(&self, expected: Option<Ty>) -> Option<Ty> {
         let t = self.resolve(expected?);
         match self.kind(t) {
             TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..)) => Some(t),
+            TyKind::Adt(..) if self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(self.resolve(e)), TyKind::Dyn(..))) => Some(t),
             _ => None,
         }
     }
@@ -8189,6 +8262,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
             }
             Res::Builtin(b) => {
+                // rustc's expected inputs: `Box::new(|x| ..)` (or `Rc::new`)
+                // where `Box<dyn Fn(A) -> R>` is expected checks the
+                // argument against the dyn type, so a closure takes that
+                // signature; the box of its own type then unsizes at the
+                // caller's coercion.
+                if matches!(b, Builtin::BoxNew | Builtin::RcNew)
+                    && args.len() == 1
+                    && let Expr::Path(segs) = p.ast.expr(callee)
+                    && segs[0].type_args().is_empty()
+                    && let Some(want) = expected.map(|t| self.resolve(t))
+                    && let Some(inner) = if b == Builtin::BoxNew { self.tys.boxed_elem(want) } else { self.tys.rc_elem(want) }
+                    && matches!(self.kind(inner), TyKind::Dyn(..))
+                {
+                    let at = self.expr(args[0], Some(inner));
+                    return if b == Builtin::BoxNew { self.tys.mk_boxed(at) } else { self.tys.mk_rc(at) };
+                }
                 let (params, ret): (Vec<Ty>, Ty) = match b {
                     Builtin::Clone => {
                         // The associated form `Type::clone(&x)`:
@@ -8351,6 +8440,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => unreachable!(),
                 };
                 self.check_args(&params, args, span);
+                // `Rc::try_unwrap` needs `T: Sized` (rustc E0277), and
+                // the other value-reaching Rc builtins are not built for
+                // `Rc<dyn Tr>` yet; the counts are.
+                if matches!(b, Builtin::RcMakeMut | Builtin::RcGetMut | Builtin::RcTryUnwrap)
+                    && let Some(&pt) = params.first()
+                    && let t = self.deep(pt)
+                    && let Some(rc) = Some(match self.kind(t) {
+                        TyKind::Ref(_, _, inner) => inner,
+                        _ => t,
+                    })
+                    && self.tys.rc_elem(rc).is_some_and(|e| matches!(self.kind(e), TyKind::Dyn(..)))
+                {
+                    if b == Builtin::RcTryUnwrap {
+                        self.err("L0110", span, "`Rc::try_unwrap` needs a sized value, not a `dyn` one", "Keep the `Rc<dyn Tr>` and call through it.");
+                    } else {
+                        self.errs.push(generics::dyn_not_yet(span, "this `Rc` function on an `Rc<dyn Tr>`"));
+                    }
+                    return ERROR;
+                }
                 // The byte-move and scalar-cmp builtins have type
                 // limits rustc states as `Sized`, `Default`, and
                 // `Ord` bounds; outside the exact supported shapes

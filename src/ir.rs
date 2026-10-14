@@ -141,7 +141,10 @@ pub enum Rvalue {
     /// A dyn reference from a thin one (ARCH 2.8): `ptr` is `&T` or
     /// `&mut T`, `src` is `T`, and `dyn_ty` the target dyn type. The
     /// result pairs the data pointer with the vtable of (`src`, the dyn
-    /// principal), which mono built and codegen emits.
+    /// principal), which mono built and codegen emits. `ptr` may also
+    /// be a moved `Box<T>` or `Rc<T>`: the result is then the owning
+    /// `Box<dyn Tr>` or `Rc<dyn Tr>`, whose data pointer points at the
+    /// value (inside the Rc allocation, after its two counts).
     MakeDyn { ptr: Operand, src: Ty, dyn_ty: Ty },
     /// Trait upcasting: the same data pointer, with the vtable reached
     /// by loading each super slot word index in `path` in turn.

@@ -3795,7 +3795,16 @@ impl<'a> Parser<'a> {
                 let label = Label { name, span };
                 return self.block_like_labeled(Some(label), inner_ok);
             }
-            Tok::Pipe | Tok::OrOr | Tok::Move => return Err(not_yet(C_CORE, start, "closures")),
+            // A closure as an operand (`&|n| n * 2`, `&mut || ..`): its
+            // body is a full expression, as in rustc, so nothing follows
+            // it at this level.
+            Tok::Pipe | Tok::OrOr | Tok::Move => {
+                if no_struct {
+                    return Err(not_yet(C_CORE, start, "closures"));
+                }
+                self.block_inner_ok = false;
+                return self.closure_expr(start);
+            }
             Tok::Unsafe => return Err(unsafe_error(start)),
             Tok::Async => return Err(async_error(start)),
             Tok::Const => {

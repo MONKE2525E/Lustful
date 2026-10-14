@@ -470,9 +470,14 @@ fn hash_owned_ty(h: &mut FxHasher, t: &OwnedTy) {
         OwnedTy::Dyn(principal, auto, r) => {
             (12u8, auto, r).hash(h);
             match principal {
-                Some((d, a)) => {
+                Some((d, a, bs)) => {
                     (1u8, d).hash(h);
                     hash_owned_args(h, a);
+                    (bs.len() as u64).hash(h);
+                    for (bd, g) in bs {
+                        bd.hash(h);
+                        hash_owned_args(h, std::slice::from_ref(g));
+                    }
                 }
                 None => 0u8.hash(h),
             }

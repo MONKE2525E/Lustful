@@ -195,6 +195,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
         inputs.map(|i| (i, output))
     }
 
+    /// The parts of a `dyn Fn(A, B) -> R` type (any of the Fn family):
+    /// the trait, the input tuple `(A, B)`, and `R`. None for another
+    /// type.
+    pub(super) fn dyn_fn_parts(&self, t: Ty) -> Option<(DefId, Ty, Ty)> {
+        let lang = self.p.gx.lang;
+        let pr = crate::check::object::principal_of(&self.tys, self.resolve(t))?;
+        if !lang.is_fn_family(pr.def) {
+            return None;
+        }
+        let tuple = self.tys.args(pr.args).get(1).and_then(|g| g.as_ty())?;
+        let out_def = lang.output_of(lang.fn_once)?;
+        let out = self.tys.bindings(pr.bindings).iter().find(|(d, _)| *d == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
+        Some((pr.def, tuple, out))
+    }
+
     /// Checks one closure expression: parameters, body, capture
     /// analysis, kind, and the closure type.
     pub(super) fn closure_expr(
@@ -211,6 +226,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // signature and, capturing nothing, becomes a value of that type
         // (lowering materializes its body fn's trampoline).
         let mut to_fn_ptr: Option<(Ty, Ty, Ty)> = None;
+        let mut dyn_sig: Option<(Ty, Option<Ty>)> = None;
         if let Some(t) = expected {
             let t = self.resolve(t);
             match self.kind(t) {
@@ -230,9 +246,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let tuple = self.tys.intern(TyKind::Tuple(ts));
                     to_fn_ptr = Some((t, tuple, s.output));
                 }
+                // `dyn Fn(A) -> R` (behind `&` or a smart pointer) gives
+                // the signature; the unsizing coercion checks the kind.
                 TyKind::Dyn(..) => {
-                    self.err("L0820", span, "closures as `dyn Fn` values are not supported yet", "Pass the closure to a generic parameter instead.");
-                    return ERROR;
+                    if let Some((_, tuple, out)) = self.dyn_fn_parts(t) {
+                        dyn_sig = Some((tuple, Some(out)));
+                    }
                 }
                 _ => {}
             }
@@ -250,7 +269,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // projection over the call's impl args (check/project.rs).
         let sig = match to_fn_ptr {
             Some((_, tuple, out)) => Some((tuple, Some(out))),
-            None => match self.expected_closure_sig(expected) {
+            None => match dyn_sig.or_else(|| self.expected_closure_sig(expected)) {
                 Some((ins, out)) => {
                     let ins = self.deep(ins);
                     let ins = self.normalize_use(ins, span);
@@ -853,6 +872,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Coerce::Deref(n) => (n as usize + 1, CaptureMode::Ref),
             Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => (1, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
             Coerce::BoxToRef(n, m) => (n as usize, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
+            // An owning unsizing (`Box<T>` to `Box<dyn Tr>`) moves the
+            // value: the plain consume.
+            Coerce::Unsize(t) if !matches!(self.kind(t), TyKind::Ref(..)) => return false,
             // A dyn coercion reborrows the source at the target's
             // mutability before it builds the fat pointer.
             Coerce::Unsize(t) => (1, if matches!(self.kind(t), TyKind::Ref(_, m, _) if m.is_mut()) { CaptureMode::MutRef } else { CaptureMode::Ref }),
@@ -1033,8 +1055,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.cap_walk(*callee, kind == ClosureKind::FnMut, w);
                     }
                     // A call through a type parameter's Fn bound (a
-                    // template check): the callee is the receiver.
-                    Res::Method { derefs, autoref, .. } => self.cap_receiver(*callee, derefs, autoref, w),
+                    // template check) or a `dyn Fn` value's vtable: the
+                    // callee is the receiver.
+                    Res::Method { derefs, autoref, .. } | Res::DynMethod { derefs, autoref, .. } => {
+                        self.cap_receiver(*callee, derefs, autoref, w)
+                    }
                     _ => self.cap_consume(*callee, w),
                 }
                 for &a in args {
@@ -1490,7 +1515,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // Smart pointers peeled on the way (`Box<F>`, `Rc<F>`): calls
         // go through the pointee, as `impl Fn for Box<F>` and the
         // callee autoderef do in rustc.
-        let (mut via_box, mut via_rc) = (false, false);
+        let (mut via_box, mut via_rc, mut box_by_value) = (false, false, false);
         loop {
             match self.kind(t) {
                 TyKind::Closure(def, _) => {
@@ -1527,14 +1552,59 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     derefs += 1;
                     t = self.resolve(inner);
                 }
-                TyKind::Adt(..) if derefs < 8 && self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(e), TyKind::Closure(..))) => {
+                TyKind::Adt(..)
+                    if derefs < 8
+                        && self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(e), TyKind::Closure(..) | TyKind::Dyn(..))) =>
+                {
                     if self.tys.rc_elem(t).is_some() {
                         via_rc = true;
                     } else {
                         via_box = true;
                     }
+                    // A `Box<dyn FnOnce>` called by value moves the box.
+                    box_by_value = via_box && derefs == 0;
                     derefs += 1;
                     t = self.tys.smart_elem(t).map_or(ERROR, |e| self.resolve(e));
+                }
+                // A `dyn Fn`-family value calls its vtable's one entry
+                // (ARCH 2.8, 2.9): through `&`/`Box`/`Rc` for `Fn`,
+                // through `&mut` or an owned `Box` for `FnMut`, and only
+                // by value through `Box` for `FnOnce` (the entry consumes
+                // the value and frees the box).
+                TyKind::Dyn(..) if self.dyn_fn_parts(t).is_some() => {
+                    let (tdef, tuple, out) = self.dyn_fn_parts(t).unwrap();
+                    let lang = self.p.gx.lang;
+                    let tuple = self.resolve(tuple);
+                    let inputs: Vec<Ty> = match self.kind(tuple) {
+                        TyKind::Tuple(ts) => self.tys.tys_of(ts).to_vec(),
+                        _ => Vec::new(),
+                    };
+                    let (kind, autoref) = if tdef == lang.fn_ {
+                        (ClosureKind::Fn, Autoref::Ref)
+                    } else if tdef == lang.fn_mut {
+                        (ClosureKind::FnMut, Autoref::RefMut)
+                    } else {
+                        (ClosureKind::FnOnce, Autoref::None)
+                    };
+                    let bad = match kind {
+                        ClosureKind::FnOnce if !(box_by_value && derefs == 1) => {
+                            Some("a `dyn FnOnce` is called only by value, through a `Box<dyn FnOnce>` it consumes")
+                        }
+                        ClosureKind::FnMut if via_rc => Some("a `dyn FnMut` behind an `Rc` cannot be borrowed as mutable"),
+                        _ => None,
+                    };
+                    if let Some(why) = bad {
+                        for &a in args {
+                            self.expr(a, None);
+                        }
+                        self.err("L0110", span, why, "Own the closure in a `Box`, or take `&mut dyn FnMut` for repeated calls.");
+                        return ERROR;
+                    }
+                    let derefs = if kind == ClosureKind::FnOnce { 0 } else { derefs };
+                    let slot = crate::check::object::VT_HEADER;
+                    self.set_res(e, Res::DynMethod { owner: tdef, cand: 0, slot, derefs, autoref });
+                    self.check_args(&inputs, args, span);
+                    return out;
                 }
                 TyKind::Infer(v) if !v.is_int() && !v.is_float() => {
                     self.err("L0610", span, "type annotations needed: the type of this callee must be known here", "Annotate the callee's type.");
