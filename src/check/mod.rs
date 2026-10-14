@@ -1727,6 +1727,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let args = self.tys.intern_args(&args);
             return self.tys.intern(TyKind::FnDef(self.p.def_id(f), args));
         }
+        self.unify_written_self(e, f, &[], span);
         self.tys.intern(TyKind::FnDef(self.p.def_id(f), EMPTY_ARGS))
     }
 
@@ -7407,7 +7408,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Some(Res::Variant(a, v as u32));
         }
         p.inherent_reads(&mut self.out.reads, adef, item);
-        if let Some(&f) = p.methods.get(&(a, item)).and_then(|fs| fs.first()) {
+        if let Some(fs) = p.methods.get(&(a, item)).filter(|fs| !fs.is_empty()) {
+            let f = if fs.len() == 1 { fs[0] } else { self.inherent_fn_by_self(a, fs, segs, span)? };
             let what = if p.fn_info(f).self_kind.is_some() { "method" } else { "associated function" };
             self.check_assoc_vis(a, item, what, span);
             return Some(Res::Fn(f));
@@ -7707,10 +7709,61 @@ impl<'p, 'a> Ctx<'p, 'a> {
         found
     }
 
+    /// One of several inherent fns of one name, each in its own impl
+    /// (`impl W<u8>` and `impl W<u16>` both define `tag`), by the
+    /// path's Self type (`W::<u16>::tag`, an alias, or `Self`): the one
+    /// fn whose impl's Self type unifies with it. None after reporting
+    /// no match (rustc E0599) or more than one (E0034, `W::tag()`).
+    fn inherent_fn_by_self(&mut self, a: AdtId, fs: &[LocalDefId], segs: &[ast::PathSeg], span: Span) -> Option<LocalDefId> {
+        let p = self.p;
+        let gargs = self.value_path_args(a, &segs[..segs.len().saturating_sub(1).max(1)], span);
+        let written = self.tys.mk_adt(p.def_of_adt(a), &gargs);
+        let mut found = Vec::new();
+        for &f in fs {
+            let Some(self_tmpl) = p.gx.fn_scopes.get(f.0 as usize).and_then(|s| s.scope.self_ty) else { continue };
+            let self_ty = match p.gx.fn_templates.get(f.0 as usize) {
+                Some(Some(tmpl)) => {
+                    let args = self.fresh_args(&tmpl.generics.clone());
+                    subst(&mut self.tys, self_tmpl, &args)
+                }
+                _ => self_tmpl,
+            };
+            let snap = self.snapshot_vars();
+            if self.unify(self_ty, written) {
+                found.push(f);
+            }
+            self.rollback_vars(snap);
+        }
+        let item = self.name(segs[segs.len() - 1].name).to_string();
+        match found.as_slice() {
+            &[f] => Some(f),
+            [] => {
+                let tn = self.tn(written);
+                self.err("L0104", span, format!("no associated function `{item}` for `{tn}`"), "Check the type's arguments.");
+                None
+            }
+            _ => {
+                self.err(
+                    "L0720",
+                    span,
+                    format!("multiple applicable items named `{item}` are in scope"),
+                    "Write the type's arguments, such as `W::<u8>::name`.",
+                );
+                None
+            }
+        }
+    }
+
+    /// The Self type a path call or fn value writes before the fn's
+    /// name fixes the impl's params: `S::<u8>::make`, or an alias of
+    /// the Adt at fixed args (`type A = S<u8>; A::make(5)`), where
+    /// `value_path_args` gives the alias's args. `inst_args` is empty
+    /// for a plain fn: a concrete impl's Self (`impl S<u8>`) must then
+    /// be the written type (rustc E0599 for `S::<u16>::make`).
     fn unify_written_self(&mut self, callee: ExprId, f: LocalDefId, inst_args: &[GenericArg], span: Span) {
         let p = self.p;
         let Expr::Path(segs) = p.ast.expr(callee) else { return };
-        if segs.len() != 2 || !segs[0].has_args() {
+        if segs.len() != 2 || !(segs[0].has_args() || self.alias_adt(segs[0].name).is_some_and(|(_, args)| !args.is_empty())) {
             return;
         }
         let Some(owner) = p.fn_info(f).owner else { return };
@@ -8616,6 +8669,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     SigOf::Fn(info) => (info.params.clone(), p.ret_view(f)),
                     _ => return ERROR,
                 };
+                self.unify_written_self(callee, f, &[], span);
                 self.check_args(&params, args, span);
                 ret
             }
