@@ -4131,6 +4131,26 @@ fn apit_param(
     generics.params.push(ParamDef { name, kind: ParamKind::Type, span });
     scope.type_params.push((name, idx));
     let lhs = tys.intern(TyKind::Param(ParamId(idx)));
+    // `impl Trait` in an associated type binding of the bounds
+    // (`impl IntoIterator<Item = impl Into<String>>`) is a param of its
+    // own, as in rustc. Elsewhere in the bound's generic args it stays
+    // L0602 (rustc E0666).
+    for b in bounds {
+        let ast::TraitBound::Trait { trait_ref, .. } = b else { continue };
+        for seg in &trait_ref.path {
+            let ast::GenericArgs::Angle(args) = &seg.args else { continue };
+            for a in args {
+                let ast::GenericArg::Binding { kind: ast::BindingKind::EqTy(t), .. } = a else { continue };
+                let mut nested: Vec<ast::TyId> = Vec::new();
+                nested_impl_traits(ast, *t, &mut nested);
+                for n in nested {
+                    let TyExpr::ImplTrait { bounds: inner } = ast.ty(n) else { continue };
+                    let p = apit_param(ast, interner, known, cx, tys, generics, scope, inner, ast.ty_span(n), errs);
+                    scope.apit.push((n, p));
+                }
+            }
+        }
+    }
     let mut preds: Vec<Predicate> = Vec::new();
     let mut relaxed: Vec<u32> = Vec::new();
     for b in bounds {
