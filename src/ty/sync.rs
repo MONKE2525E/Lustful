@@ -71,10 +71,13 @@ pub enum SyncTy {
     OnceLock,
     /// `core::time::Duration` (for `thread::sleep`).
     Duration,
+    /// `std::sync::TryLockError<T>`: only `WouldBlock` is reachable (no
+    /// lock is ever poisoned), so its C form holds nothing.
+    TryLockError,
 }
 
 impl SyncTy {
-    pub const ALL: [SyncTy; 34] = [
+    pub const ALL: [SyncTy; 35] = [
         SyncTy::Arc,
         SyncTy::ArcWeak,
         SyncTy::AtomicBool,
@@ -109,6 +112,7 @@ impl SyncTy {
         SyncTy::BarrierWaitResult,
         SyncTy::OnceLock,
         SyncTy::Duration,
+        SyncTy::TryLockError,
     ];
 
     /// The struct name (the def hash input and the printed name).
@@ -148,6 +152,7 @@ impl SyncTy {
             SyncTy::BarrierWaitResult => "BarrierWaitResult",
             SyncTy::OnceLock => "OnceLock",
             SyncTy::Duration => "Duration",
+            SyncTy::TryLockError => "TryLockError",
         }
     }
 
@@ -225,7 +230,8 @@ impl SyncTy {
             | SyncTy::Barrier
             | SyncTy::BarrierWaitResult
             | SyncTy::OnceLock
-            | SyncTy::Duration => return None,
+            | SyncTy::Duration
+            | SyncTy::TryLockError => return None,
             SyncTy::AtomicBool => AtomicVal::Bool,
             SyncTy::AtomicI8 => AtomicVal::Int(IntTy::I8),
             SyncTy::AtomicU8 => AtomicVal::Int(IntTy::U8),

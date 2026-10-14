@@ -24,6 +24,7 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
         }
         (SyncTy::Condvar, _) => "uint32_t".into(),
         (SyncTy::Duration, _) => "lust_Duration".into(),
+        (SyncTy::TryLockError, _) => "lust_Unit".into(),
         (SyncTy::Barrier, _) => "lust_Barrier".into(),
         (SyncTy::BarrierWaitResult, _) => "uint8_t".into(),
         (SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard, _) => format!("{}*", sync_ctype(k.guard().expect("a guard").0, e)),
@@ -66,6 +67,7 @@ pub(super) fn sync_layout(k: SyncTy) -> Option<Layout> {
         SyncTy::Scope | SyncTy::Condvar => return Some(plain_layout(4, 4)),
         SyncTy::Barrier => return Some(plain_layout(32, 8)),
         SyncTy::Duration => return Some(plain_layout(16, 8)),
+        SyncTy::TryLockError => return Some(layout::zst_layout(1)),
         SyncTy::BarrierWaitResult => return Some(plain_layout(1, 1)),
         _ => {}
     }
@@ -183,6 +185,20 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         }
         (_, SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError) => chan_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
         (_, SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::OnceLock) => once_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
+        // `TryLockError::WouldBlock` (the only one built).
+        (Glue::Drop, SyncTy::TryLockError) => {
+            let _ = writeln!(protos, "void drop_{m}({ct} *p);");
+            let _ = writeln!(defs, "void drop_{m}({ct} *p) {{\n  (void)p;\n}}\n");
+        }
+        (Glue::Debug, SyncTy::TryLockError) => {
+            let _ = writeln!(protos, "int dbg_{m}(lust_Formatter *f, {ct} *p);");
+            let _ = writeln!(defs, "int dbg_{m}(lust_Formatter *f, {ct} *p) {{\n  (void)p; return lust_f_dbg_str(f, (lust_str){{(uint8_t*)\"WouldBlock\", 10}});\n}}\n");
+        }
+        (Glue::Display, SyncTy::TryLockError) => {
+            let msg = "try_lock failed because the operation would block";
+            let _ = writeln!(protos, "int disp_{m}(lust_Formatter *f, {ct} *p);");
+            let _ = writeln!(defs, "int disp_{m}(lust_Formatter *f, {ct} *p) {{\n  (void)p; return lust_f_pad(f, (lust_str){{(uint8_t*)\"{msg}\", {}}});\n}}\n", msg.len());
+        }
         // `Duration`: a plain `{ secs, nanos }` value.
         (Glue::Clone, SyncTy::Duration) => {
             let _ = writeln!(protos, "{ct} clone_{m}({ct} *p);");
@@ -901,6 +917,27 @@ impl FnGen<'_, '_, '_> {
             S::PoisonNew => vals[0].clone(),
             S::SyncNew(SyncTy::Barrier) => format!("((lust_Barrier){{0, 0, 0, 0, {}}})", vals[0]),
             S::SyncNew(_) => "((uint32_t)0)".into(),
+            S::TryLock(write) => {
+                let (gk, call) = match (k, write) {
+                    (SyncTy::Mutex, _) => (SyncTy::MutexGuard, "lust_mutex_trylock"),
+                    (_, false) => (SyncTy::RwLockReadGuard, "lust_rw_tryread"),
+                    _ => (SyncTy::RwLockWriteGuard, "lust_rw_trywrite"),
+                };
+                let guard = CTy::Sync(gk, Box::new(elem.clone()));
+                let res = CTy::Result(Box::new(guard.clone()), Box::new(CTy::Sync(SyncTy::TryLockError, Box::new(guard.clone()))));
+                collect_types(&res, &mut self.sig_types);
+                let t = self.tmp();
+                let f = variant_field(self.p, &res, &t, 0, 0);
+                let o = &vals[0];
+                let _ = writeln!(
+                    self.out,
+                    "    {} {t}; if ({call}(&({o})->st)) {{ {} {f} = {o}; }} else {{ {} }}",
+                    ctype(&res),
+                    disc_set(self.p, &res, &t, 0),
+                    disc_set(self.p, &res, &t, 1),
+                );
+                t
+            }
             S::CondvarWait => {
                 let guard = tys[1].clone();
                 let _ = writeln!(self.out, "    lust_cv_wait({}, &({})->st);", vals[0], vals[1]);

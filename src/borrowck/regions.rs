@@ -5203,6 +5203,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
                     | crate::check::sync::SyncOp::OnceGet
                     | crate::check::sync::SyncOp::OnceGetMut
                     | crate::check::sync::SyncOp::OnceTake
+                    | crate::check::sync::SyncOp::TryLock(_)
             )
     )
 }

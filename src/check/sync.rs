@@ -145,11 +145,13 @@ pub enum SyncOp {
     DurIsZero,
     /// `thread::sleep(dur)`.
     ThreadSleep,
+    /// `Mutex::try_lock`, `RwLock::try_read` (false), `try_write` (true).
+    TryLock(bool),
 }
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 94] = [
+    pub const ALL: [SyncOp; 96] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -244,6 +246,8 @@ impl SyncOp {
         SyncOp::DurSubsec(3),
         SyncOp::DurIsZero,
         SyncOp::ThreadSleep,
+        SyncOp::TryLock(false),
+        SyncOp::TryLock(true),
     ];
 
     /// (types, names, how it is called) for `lust capabilities`.
@@ -339,6 +343,8 @@ impl SyncOp {
             SyncOp::DurSubsec(u) => (&["std::time::Duration"], [&["subsec_millis"], &["subsec_millis"], &["subsec_micros"], &["subsec_nanos"]][u as usize & 3], m),
             SyncOp::DurIsZero => (&["std::time::Duration"], &["is_zero"], m),
             SyncOp::ThreadSleep => (&["std::thread"], &["sleep"], f),
+            SyncOp::TryLock(false) => (&["std::sync::Mutex<T>", "std::sync::RwLock<T>"], &["try_lock", "try_read"], m),
+            SyncOp::TryLock(true) => (&["std::sync::RwLock<T>"], &["try_write"], m),
         }
     }
 }
@@ -382,6 +388,8 @@ pub fn sync_glue(tys: &impl TyIntern, t: Ty, g: SyncGlue) -> Option<Result<bool,
         // for `T: Debug`.
         (SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult, G::Debug) => Ok(true),
         (SyncTy::Condvar | SyncTy::OnceLock, G::Default) => Ok(true),
+        // `TryLockError<T>` is Debug for every `T`.
+        (SyncTy::TryLockError, G::Debug) => Ok(true),
         // `Duration` is Copy, Eq, and Default (its Debug, Ord, and
         // arithmetic are not in lust yet: they reject).
         (SyncTy::Duration, G::Default | G::Clone | G::Copy | G::PartialEq) => Ok(true),
@@ -746,10 +754,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 (_, "into_inner") => (SyncOp::LockIntoInner, Autoref::None, self.lock_result(el)),
                 (_, "is_poisoned") => (SyncOp::LockIsPoisoned, Autoref::Ref, BOOL),
                 (_, "clear_poison") => (SyncOp::LockClearPoison, Autoref::Ref, UNIT),
-                // Stable std methods lust does not have yet.
-                (_, "try_lock" | "try_read" | "try_write") => {
-                    self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `lock`, `read`, or `write`.");
-                    return Some(self.iter_bail(args));
+                // `TryLockResult<G>`: `Result<G, TryLockError<G>>`.
+                (SyncTy::Mutex, "try_lock") | (SyncTy::RwLock, "try_read" | "try_write") => {
+                    let gk = match n.as_str() {
+                        "try_lock" => SyncTy::MutexGuard,
+                        "try_read" => SyncTy::RwLockReadGuard,
+                        _ => SyncTy::RwLockWriteGuard,
+                    };
+                    let g = sync_ty(&mut self.tys, gk, &[el]);
+                    let te = sync_ty(&mut self.tys, SyncTy::TryLockError, &[g]);
+                    (SyncOp::TryLock(n == "try_write"), Autoref::Ref, self.tys.mk_result(g, te))
                 }
                 _ => return None,
             }
@@ -1044,6 +1058,10 @@ pub fn add_sync_impls(p: &mut crate::check::collect::Program, ordinal: &mut u32,
         insert_synthetic(p, ordinal, tr, tid, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
     insert_synthetic(p, ordinal, lang.partial_eq, tid, &[tid], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    let tle = sync_ty(&mut p.tys, SyncTy::TryLockError, &[p0]);
+    for tr in [lang.debug, lang.display] {
+        insert_synthetic(p, ordinal, tr, tle, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
     let pe = sync_ty(&mut p.tys, SyncTy::PoisonError, &[p0]);
     for tr in [lang.debug, lang.display] {
         insert_synthetic(p, ordinal, tr, pe, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
@@ -1169,6 +1187,12 @@ pub fn builtin_auto(
         // and Sync for every `T`; `Box<dyn Any + Send>` is Send only.
         B::Sync(SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId) => Some(true),
         B::Sync(SyncTy::JoinError) => Some(send),
+        // `TryLockError<T>` follows `T` (its `Poisoned` holds one).
+        B::Sync(SyncTy::TryLockError) => {
+            let Some(e) = elem else { return Some(None) };
+            seen.push((trait_def, t));
+            auto_structural(p, tys, env, trait_def, e, seen)
+        }
         B::Sync(SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::Duration) => Some(true),
         // `OnceLock<T>` is Send for `T: Send`, Sync for `T: Send + Sync`.
         B::Sync(SyncTy::OnceLock) => {

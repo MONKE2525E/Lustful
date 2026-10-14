@@ -4741,7 +4741,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             tys.is_string_ty(t)
                 || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e))
                 || tys.poison_elem(t).is_some()
-                || crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::SendError)
+                || matches!(crate::ty::sync::sync_kind(tys, t), Some(crate::ty::sync::SyncTy::SendError | crate::ty::sync::SyncTy::TryLockError))
                 || tys.adt_parts(t).is_some_and(|(d, _)| {
                     d == crate::check::generics::fmt_error_def()
                         || d == generics::utf8_error_def()
@@ -4782,7 +4782,9 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         return true;
     }
     if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)).or_else(|| tys.lock_elem(t).map(|l| l.1)).or_else(|| tys.poison_elem(t)).or_else(|| {
-        (crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::SendError)).then(|| tys.adt_first_ty_arg(t)).flatten()
+        matches!(crate::ty::sync::sync_kind(tys, t), Some(crate::ty::sync::SyncTy::SendError | crate::ty::sync::SyncTy::OnceLock))
+            .then(|| tys.adt_first_ty_arg(t))
+            .flatten()
     }) {
         return needs_drop(p, tys, e);
     }
