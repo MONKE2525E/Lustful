@@ -123,6 +123,10 @@ void lust_panic_std(const char *msg, const char *where) LUST_BODY({
 #ifdef LUST_IMPL
 static uint8_t lust_out_buf[1024];
 static uint64_t lust_out_len;
+/* io::Write on Stdout (sys.c) returns a write error where print! panics:
+   in soft mode the first error lands in lust_out_err (errno, or EIO for
+   a zero-byte write) and the held bytes are dropped. */
+static int lust_out_soft, lust_out_err;
 
 static void lust_out_raw(const uint8_t *p, uint64_t n) {
     while (n) {
@@ -130,6 +134,11 @@ static void lust_out_raw(const uint8_t *p, uint64_t n) {
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) {
             int e = w < 0 ? errno : 0;
+            if (lust_out_soft) {
+                if (!lust_out_err) lust_out_err = e ? e : EIO;
+                lust_out_len = 0;
+                return;
+            }
             lust_String s = lust_string_new();
             lust_string_push_cstr(&s, "failed printing to stdout: ");
             if (e == EPIPE) lust_string_push_cstr(&s, "Broken pipe (os error 32)");
@@ -173,6 +182,23 @@ void lust_print_out(const uint8_t *p, uint64_t n) LUST_BODY({
 
 /* Flushes stdout: at exit and `process::exit` (Rust's rt::cleanup). */
 void lust_print_flush(void) LUST_BODY({ lust_out_flush_buf(); })
+
+/* `io::Write` for Stdout (sys.c): the same LineWriter as print!, so the
+   two interleave in program order; 0 or an errno instead of a panic. */
+int32_t lust_stdout_write_soft(const uint8_t *p, uint64_t n) LUST_BODY({
+    lust_out_soft = 1;
+    lust_out_err = 0;
+    lust_print_out(p, n);
+    lust_out_soft = 0;
+    return lust_out_err;
+})
+int32_t lust_stdout_flush_soft(void) LUST_BODY({
+    lust_out_soft = 1;
+    lust_out_err = 0;
+    lust_out_flush_buf();
+    lust_out_soft = 0;
+    return lust_out_err;
+})
 
 /* ---------- Stack overflow ----------
    Rust puts a SIGSEGV/SIGBUS handler on an alternate stack: a fault in

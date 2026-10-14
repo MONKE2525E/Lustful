@@ -7,9 +7,17 @@
 
 extern char **environ;
 
+int32_t lust_stdout_write_soft(const uint8_t *p, uint64_t n); /* panic.c */
+int32_t lust_stdout_flush_soft(void);
+
 int64_t lust_sys_write_std(int32_t fd, const uint8_t *p, uint64_t len) {
     FILE *f = fd == 2 ? stderr : stdout;
     if (len == 0) return 0;
+    /* Stdout shares print!'s LineWriter (W-PANIC, panic.c). */
+    if (fd != 2) {
+        int32_t e = lust_stdout_write_soft(p, len);
+        return e ? -(int64_t)e : (int64_t)len;
+    }
     size_t n = fwrite(p, 1, (size_t)len, f);
     if (n < len) {
         int e = errno ? errno : 5; /* EIO when stdio gives no reason */
@@ -25,7 +33,8 @@ int64_t lust_sys_write_std(int32_t fd, const uint8_t *p, uint64_t len) {
 }
 
 int32_t lust_sys_flush_std(int32_t fd) {
-    FILE *f = fd == 2 ? stderr : stdout;
+    if (fd != 2) return lust_stdout_flush_soft();
+    FILE *f = stderr;
     if (fflush(f) != 0) {
         int e = errno ? errno : 5;
         clearerr(f);
