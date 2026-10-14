@@ -1533,7 +1533,7 @@ fn resolve_const_path_arg(
     if let Some(&(_, i, _)) = scope.const_params.iter().find(|(n, ..)| *n == seg.name) {
         return Ok(tys.intern_const(ConstKind::Param(i)));
     }
-    match crate::check::collect::named_const_kind(ast, interner, known, seg.name) {
+    match crate::check::collect::named_const_kind(ast, interner, known, seg.name, span) {
         Some(k) => Ok(tys.intern_const(k)),
         None => Err(err()),
     }

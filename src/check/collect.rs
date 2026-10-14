@@ -4,7 +4,7 @@ use crate::ast::{self, Ast, ItemKind, SelfKind, TyExpr, VariantFields};
 use crate::check::generics::{self, GenTables};
 pub use crate::def::{CrateId, DefId, DefPathHash, LocalDefId, StableCrateHash};
 use crate::def::{CrateIds, DiskDefId};
-use crate::diag::{Diag, Span, not_yet};
+use crate::diag::{CtxtId, Diag, Span, not_yet};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
 use crate::ty::defs::{DefKind as DefsKind, Vis};
@@ -79,6 +79,61 @@ pub enum BodyItem {
     Static(u32),
 }
 
+/// The value name an item inside a function body binds, if any.
+pub(crate) fn stmt_item_name(ast: &Ast, idx: u32) -> Option<Sym> {
+    match &ast.stmt_items[idx as usize].kind {
+        ItemKind::Fn(d) => Some(d.name),
+        ItemKind::Const(c) => c.name,
+        ItemKind::Static(s) => Some(s.name),
+        _ => None,
+    }
+}
+
+/// The innermost body item named `name` visible at the use site
+/// `at`: the item of that name in the smallest block whose span
+/// holds the use. Blocks nest by span, as for fn siblings; a use
+/// in macro-expanded code (a non-root context) may also see a
+/// root block it expanded in, so only a root use requires a root
+/// block. None when no enclosing block holds such an item: the
+/// name then names a module item, or nothing.
+pub(crate) fn stmt_item_in_blocks(ast: &Ast, blocks: &[(Span, Vec<u32>)], name: Sym, at: Span) -> Option<u32> {
+    let mut best: Option<(u32, u32)> = None;
+    for (span, idxs) in blocks {
+        if span.file != at.file || span.lo > at.lo || at.hi > span.hi {
+            continue;
+        }
+        if at.ctxt == CtxtId::ROOT && span.ctxt != CtxtId::ROOT {
+            continue;
+        }
+        for &idx in idxs {
+            if stmt_item_name(ast, idx) == Some(name) {
+                let len = span.hi - span.lo;
+                if best.is_none_or(|(l, _)| len < l) {
+                    best = Some((len, idx));
+                }
+            }
+        }
+    }
+    best.map(|(_, idx)| idx)
+}
+
+/// `stmt_item_in_blocks` over every item block of the crate, for
+/// callers that run before `Program::item_blocks` exists (the
+/// scalar interpreter). The name check first keeps the common
+/// no-body-item case off the block scan.
+pub(crate) fn stmt_item_at(ast: &Ast, name: Sym, at: Span) -> Option<u32> {
+    if !(0..ast.stmt_items.len() as u32).any(|i| stmt_item_name(ast, i) == Some(name)) {
+        return None;
+    }
+    let blocks: Vec<(Span, Vec<u32>)> = ast
+        .blocks
+        .iter()
+        .filter(|b| b.stmts.iter().any(|s| matches!(s, ast::Stmt::Item(_))))
+        .map(|b| (b.span, b.stmts.iter().filter_map(|s| if let ast::Stmt::Item(i) = s { Some(*i) } else { None }).collect()))
+        .collect();
+    stmt_item_in_blocks(ast, &blocks, name, at)
+}
+
 /// One evaluated `static` item: its value becomes static data (ARCH 2.13).
 pub struct StaticItem {
     pub name: Sym,
@@ -146,6 +201,11 @@ pub struct Program<'a> {
     pub static_names: HashMap<Sym, u32>,
     /// Items inside function bodies, by `Ast::stmt_items` index.
     pub body_items: HashMap<u32, BodyItem>,
+    /// Every block that holds items: its span and its stmt item
+    /// indexes. A name use inside a block's span sees that block's
+    /// items (`stmt_item_in_blocks`); const contexts resolve their
+    /// plain names through this, as fn siblings do.
+    pub item_blocks: Vec<(Span, Vec<u32>)>,
     /// Evaluated consts declared inside function bodies.
     pub body_consts: Vec<ConstItem>,
     /// For a nested fn, the stmt item indexes of its containing block:
@@ -1201,20 +1261,29 @@ pub fn named_const_int(ast: &Ast, interner: &Interner, known: &Known, names: &[S
 
 /// The const-generic value of a free const item by name, in the
 /// kind of its declared type: an integer const for the integer
-/// types, `Bool` for `bool`, `Char` for `char`.
-pub fn named_const_kind(ast: &Ast, interner: &Interner, known: &Known, name: Sym) -> Option<ConstKind> {
+/// types, `Bool` for `bool`, `Char` for `char`. A body const in
+/// scope at the use site `at` wins over a module const of the
+/// name, and another body item shadows it.
+pub fn named_const_kind(ast: &Ast, interner: &Interner, known: &Known, name: Sym, at: Span) -> Option<ConstKind> {
+    let kind_of = |c: &ast::ConstDef| -> Option<ConstKind> {
+        let v = c.value?;
+        let scalar = eval_const_int(ast, interner, known, v)?;
+        match ast.ty(c.ty) {
+            TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.bool => Some(ConstKind::Bool(scalar != 0)),
+            TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.char => char::from_u32(scalar as u32).map(ConstKind::Char),
+            _ => u128::try_from(scalar).ok().map(ConstKind::Int),
+        }
+    };
+    if let Some(si) = stmt_item_at(ast, name, at) {
+        let ItemKind::Const(c) = &ast.stmt_items[si as usize].kind else { return None };
+        return kind_of(c);
+    }
     for item in &ast.items {
         let ItemKind::Const(c) = &item.kind else { continue };
         if c.name != Some(name) {
             continue;
         }
-        let v = c.value?;
-        let scalar = eval_const_int(ast, interner, known, v)?;
-        return match ast.ty(c.ty) {
-            TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.bool => Some(ConstKind::Bool(scalar != 0)),
-            TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.char => char::from_u32(scalar as u32).map(ConstKind::Char),
-            _ => u128::try_from(scalar).ok().map(ConstKind::Int),
-        };
+        return kind_of(c);
     }
     None
 }
@@ -1570,8 +1639,24 @@ fn eval_scalar(
                     None => return SFlow::V(None),
                 }
             }
-            for item in &ast.items {
-                let ItemKind::Fn(def) = &item.kind else { continue };
+            // A body item of this name in scope at the call wins: a
+            // nested const fn is the only candidate, and another body
+            // item shadows every module fn.
+            let mut defs: Vec<&ast::FnDef> = Vec::new();
+            match stmt_item_at(ast, name, ast.expr_span(*callee)) {
+                Some(si) => match &ast.stmt_items[si as usize].kind {
+                    ItemKind::Fn(d) => defs.push(d),
+                    _ => return SFlow::V(None),
+                },
+                None => {
+                    for item in &ast.items {
+                        if let ItemKind::Fn(def) = &item.kind {
+                            defs.push(def);
+                        }
+                    }
+                }
+            }
+            for def in defs {
                 if def.name != name || !def.qual.is_const || def.self_param.is_some() || def.params.len() != argv.len() {
                     continue;
                 }
@@ -1595,9 +1680,18 @@ fn eval_scalar(
             if let Some((_, v)) = env.iter().rev().find(|(n, _)| *n == name) {
                 return SFlow::V(Some(*v));
             }
-            // A reference to another const item, found by scanning the
-            // crate's items (collect evaluates all of them later anyway).
-            let out = named_const_expr(ast, &[name]).and_then(|v| {
+            // A reference to another const item: a body const in scope
+            // at this use wins over a module const of the name (found
+            // by scanning the crate's items; collect evaluates all of
+            // them later anyway). Another body item shadows both.
+            let target = match stmt_item_at(ast, name, ast.expr_span(e)) {
+                Some(si) => match &ast.stmt_items[si as usize].kind {
+                    ItemKind::Const(c) => c.value,
+                    _ => None,
+                },
+                None => named_const_expr(ast, &[name]),
+            };
+            let out = target.and_then(|v| {
                 let mut empty = Vec::new();
                 val(ast, interner, known, v, depth + 1, &mut empty, steps)
             });
@@ -1909,6 +2003,7 @@ pub fn collect_reuse<'a>(
         statics: Vec::new(),
         static_names: HashMap::default(),
         body_items: HashMap::default(),
+        item_blocks: Vec::new(),
         body_consts: Vec::new(),
         fn_siblings: HashMap::default(),
         type_names: HashMap::default(),
@@ -3359,7 +3454,14 @@ pub fn collect_reuse<'a>(
     }
     // Sibling visibility for nested fns: the items of the block that
     // directly contains each nested fn, and of the blocks around it.
+    // The same scope (by stmt_items index) also governs what a nested
+    // const or static initializer may name in `eval_const_items`.
+    let mut scope_of_stmt: HashMap<u32, Vec<u32>> = HashMap::default();
     let item_blocks: Vec<&ast::Block> = ast.blocks.iter().filter(|b| b.stmts.iter().any(|s| matches!(s, ast::Stmt::Item(_)))).collect();
+    p.item_blocks = item_blocks
+        .iter()
+        .map(|b| (b.span, b.stmts.iter().filter_map(|s| if let ast::Stmt::Item(i) = s { Some(*i) } else { None }).collect()))
+        .collect();
     for block in &item_blocks {
         let idxs: Vec<u32> = block
             .stmts
@@ -3411,6 +3513,7 @@ pub fn collect_reuse<'a>(
         }
         sibs.extend(idxs.iter().copied());
         for &i in &idxs {
+            scope_of_stmt.insert(i, sibs.clone());
             if let Some(BodyItem::Fn(fid)) = p.body_items.get(&i).copied() {
                 p.fn_siblings.insert(fid, sibs.clone());
             }
@@ -3422,7 +3525,7 @@ pub fn collect_reuse<'a>(
     // This runs before `finish_collect`: its template checks (and, in a
     // build, the instance checks in mono) read consts, statics, and assoc
     // consts from these tables, in generic and plain bodies alike.
-    eval_const_items(&mut p, &mut errs, &mut def_order.statics);
+    eval_const_items(&mut p, &mut errs, &mut def_order.statics, &scope_of_stmt);
     // The generic reuse cache holds while the trait system does (W-PERF);
     // the key needs the resolved trait of each impl, and the cache serves
     // the template checks and discovery that `finish_collect` runs.
@@ -3478,6 +3581,10 @@ struct PendingConst {
     /// Set for a `thread_local!` static: whether it is the `const`
     /// form. Its value is the key's slot word, never evaluated.
     tls: Option<bool>,
+    /// For an item in a function body: the stmt_items indexes its
+    /// initializer may name (its block's items and every enclosing
+    /// block's, outermost first). Empty for module and associated items.
+    scope: Vec<u32>,
 }
 
 enum PendingState {
@@ -3491,7 +3598,12 @@ enum PendingState {
 /// Static indices come from the session `DefOrder` (see `collect`):
 /// top-level statics rank by def hash history, nested statics keep
 /// stmt order after them.
-fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order: &mut Vec<crate::def::DefPathHash>) {
+fn eval_const_items<'a>(
+    p: &mut Program<'a>,
+    errs: &mut Vec<Diag>,
+    static_order: &mut Vec<crate::def::DefPathHash>,
+    scope_of_stmt: &HashMap<u32, Vec<u32>>,
+) {
     let ast = p.ast;
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
     let mut by_name: HashMap<Sym, usize> = HashMap::default();
@@ -3551,9 +3663,9 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         let static_idx = 0;
         if let Some(n) = name {
             let dup = if stmt_idx.is_some() {
-                // A nested name may shadow a top-level one; the by-name map
-                // keeps the first registration for evaluation lookups.
-                by_name.entry(n).or_insert(pending.len());
+                // A nested name is block-scoped: it never enters the
+                // by-name map, so only an initializer whose scope holds
+                // this item can read it (`PendingConst::scope`).
                 false
             } else {
                 // The first value of a name owns it, and a unit or tuple
@@ -3574,7 +3686,8 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
                 ));
             }
         }
-        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx, assoc: None, tls }, PendingState::Todo));
+        let scope = stmt_idx.and_then(|si| scope_of_stmt.get(&si).cloned()).unwrap_or_default();
+        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx, assoc: None, tls, scope }, PendingState::Todo));
     }
     // Associated consts evaluate in the same pending list, so a
     // free const can read an inherent associated const (and back)
@@ -3612,8 +3725,22 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         static_count = nested;
     }
     let n = pending.len();
-    let mut cx =
-        CollectCx { p, pending, by_name, assoc_by_key, self_name: None, self_pat: None, self_stack: Vec::new(), module: None, errs };
+    let by_stmt: HashMap<u32, usize> = pending.iter().enumerate().filter_map(|(i, (it, _))| it.stmt_idx.map(|si| (si, i))).collect();
+    let mut cx = CollectCx {
+        p,
+        pending,
+        by_name,
+        by_stmt,
+        assoc_by_key,
+        self_name: None,
+        self_pat: None,
+        self_stack: Vec::new(),
+        cur_scope: Vec::new(),
+        scope_stack: Vec::new(),
+        next_scope: None,
+        module: None,
+        errs,
+    };
     for i in 0..n {
         cx.eval_pending(i);
     }
@@ -3855,6 +3982,7 @@ fn register_assoc_consts<'a>(
                         stmt_idx: None,
                         assoc: Some(PendingAssoc::TraitImpl { impl_def, assoc }),
                         tls: None,
+                        scope: Vec::new(),
                     },
                     PendingState::Todo,
                 ));
@@ -3901,7 +4029,7 @@ fn register_assoc_consts<'a>(
                     static_idx: 0,
                     stmt_idx: None,
                     assoc: Some(PendingAssoc::Inherent { owner, impl_def, self_pat, generics: impl_generics.clone() }),
-                    tls: None,
+                    tls: None, scope: Vec::new(),
                 },
                 PendingState::Todo,
             ));
@@ -3934,7 +4062,7 @@ fn register_assoc_consts<'a>(
                     static_idx: 0,
                     stmt_idx: None,
                     assoc: Some(PendingAssoc::TraitDefault { trait_def, assoc }),
-                    tls: None,
+                    tls: None, scope: Vec::new(),
                 },
                 PendingState::Todo,
             ));
@@ -4024,11 +4152,34 @@ pub(crate) fn tuple_field_is_private(p: &Program, adt: AdtId, index: u32, from: 
     }
 }
 
+/// What a name in a nested item's scope denotes (`CollectCx::scope_lookup`).
+enum ScopeItem {
+    /// Index into `CollectCx::pending` (a nested const or static).
+    Pending(usize),
+    Fn(LocalDefId),
+    /// An item that is neither (it still shadows module items).
+    Other,
+}
+
 /// The const evaluator's context over the collected tables.
 struct CollectCx<'x, 'a> {
     p: &'x mut Program<'a>,
     pending: Vec<(PendingConst, PendingState)>,
+    /// Module-level pending consts and statics by (flat) name.
+    /// Nested items never enter it: only an initializer whose
+    /// scope holds a nested item can read it.
     by_name: HashMap<Sym, usize>,
+    /// Pending nested consts and statics by stmt_items index, for
+    /// scope-checked reads from another nested item's initializer.
+    by_stmt: HashMap<u32, usize>,
+    /// The stmt_items indexes the initializer now evaluating may name
+    /// (outermost first), set by `eval_pending` and by `enter_const_fn`.
+    cur_scope: Vec<u32>,
+    /// Saved `cur_scope` values for const fn bodies the evaluator entered.
+    scope_stack: Vec<Vec<u32>>,
+    /// The scope `enter_const_fn` installs next: the sibling items of
+    /// the const fn `call_target` just resolved (empty for a module fn).
+    next_scope: Option<Vec<u32>>,
     /// Pending inherent associated consts by (flat type name,
     /// const name), for `Type::CONST` reads in initializers.
     assoc_by_key: HashMap<(Sym, Sym), Vec<usize>>,
@@ -4123,6 +4274,47 @@ impl CollectCx<'_, '_> {
         best.map(|(_, m)| m)
     }
 
+    /// The body item `name` denotes in the scope now evaluating,
+    /// innermost first: a pending const or static, a nested fn, or
+    /// another item (which still shadows any module item of the name).
+    fn scope_lookup(&self, name: Sym) -> Option<ScopeItem> {
+        for &si in self.cur_scope.iter().rev() {
+            let hit = match &self.p.ast.stmt_items[si as usize].kind {
+                ItemKind::Fn(d) => (d.name == name).then(|| match self.p.body_items.get(&si) {
+                    Some(BodyItem::Fn(f)) => ScopeItem::Fn(*f),
+                    _ => ScopeItem::Other,
+                }),
+                ItemKind::Const(c) => (c.name == Some(name)).then(|| match self.by_stmt.get(&si) {
+                    Some(&i) => ScopeItem::Pending(i),
+                    None => ScopeItem::Other,
+                }),
+                ItemKind::Static(s) => (s.name == name).then(|| match self.by_stmt.get(&si) {
+                    Some(&i) => ScopeItem::Pending(i),
+                    None => ScopeItem::Other,
+                }),
+                _ => None,
+            };
+            if hit.is_some() {
+                return hit;
+            }
+        }
+        None
+    }
+
+    /// The body item `name` denotes at the use site `at`, by block
+    /// span (`stmt_item_in_blocks`). This covers blocks inside the
+    /// initializer itself, whose items are in no pending scope.
+    fn span_lookup(&self, name: Sym, at: Span) -> Option<ScopeItem> {
+        let si = stmt_item_in_blocks(self.p.ast, &self.p.item_blocks, name, at)?;
+        Some(match self.p.body_items.get(&si) {
+            Some(BodyItem::Fn(f)) => ScopeItem::Fn(*f),
+            _ => match self.by_stmt.get(&si) {
+                Some(&i) => ScopeItem::Pending(i),
+                None => ScopeItem::Other,
+            },
+        })
+    }
+
     /// Evaluates one pending item, on demand from other items.
     fn eval_pending(&mut self, idx: usize) -> Option<crate::ty::consteval::ConstValue> {
         match &self.pending[idx].1 {
@@ -4174,7 +4366,11 @@ impl CollectCx<'_, '_> {
         };
         let prev_module = self.module;
         self.module = self.pending_module(&self.pending[idx].0);
+        // The initializer names body items through its own scope, not
+        // the scope of the item that asked for this value.
+        let prev_scope = std::mem::replace(&mut self.cur_scope, self.pending[idx].0.scope.clone());
         let evaluated = crate::ty::consteval::eval(self, expr, Some(ty));
+        self.cur_scope = prev_scope;
         self.module = prev_module;
         self.self_name = prev_self;
         self.self_pat = prev_pat;
@@ -4332,7 +4528,19 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
     fn sym_text(&self, s: Sym) -> &str {
         self.p.interner.get(s)
     }
-    fn const_item(&mut self, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+    fn const_item(&mut self, name: Sym, at: Span) -> Option<crate::ty::consteval::TypedValue> {
+        // A body item of this name in scope wins over every module
+        // item, and a name no scope item has never finds a nested
+        // item: nested items are not in `by_name`.
+        if let Some(hit) = self.span_lookup(name, at).or_else(|| self.scope_lookup(name)) {
+            return match hit {
+                ScopeItem::Pending(i) => {
+                    let ty = self.pending[i].0.ty;
+                    self.eval_pending(i).map(|v| (v, ty))
+                }
+                ScopeItem::Fn(_) | ScopeItem::Other => None,
+            };
+        }
         if let Some(&i) = self.by_name.get(&name) {
             let ty = self.pending[i].0.ty;
             return self.eval_pending(i).map(|v| (v, ty));
@@ -4379,7 +4587,16 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         let c = &self.p.consts[idx as usize];
         Some((c.value.clone(), c.ty))
     }
-    fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)> {
+    fn static_item(&mut self, name: Sym, at: Span) -> Option<(u32, Ty)> {
+        if let Some(hit) = self.span_lookup(name, at).or_else(|| self.scope_lookup(name)) {
+            return match hit {
+                ScopeItem::Pending(i) if self.pending[i].0.is_static.is_some() => {
+                    let it = &self.pending[i].0;
+                    Some((it.static_idx, it.ty))
+                }
+                _ => None,
+            };
+        }
         if let Some(&i) = self.by_name.get(&name)
             && self.pending[i].0.is_static.is_some()
         {
@@ -4388,7 +4605,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         }
         self.p.static_names.get(&name).map(|&i| (i, self.p.statics[i as usize].ty))
     }
-    fn fn_item(&mut self, segs: &[ast::PathSeg]) -> Option<crate::ty::consteval::TypedValue> {
+    fn fn_item(&mut self, segs: &[ast::PathSeg], at: Span) -> Option<crate::ty::consteval::TypedValue> {
         // A plain safe Rust-ABI free fn with no generics. With params,
         // none of its types may hold a reference or lifetime: the
         // pointer type here has no late-bound regions, so a region
@@ -4398,7 +4615,11 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         if !seg.type_args().is_empty() {
             return None;
         }
-        let f = *self.p.fn_names.get(&seg.name)?;
+        let f = match self.span_lookup(seg.name, at).or_else(|| self.scope_lookup(seg.name)) {
+            Some(ScopeItem::Fn(f)) => f,
+            Some(_) => return None,
+            None => *self.p.fn_names.get(&seg.name)?,
+        };
         let info = self.p.fn_info(f);
         let q = &info.def.qual;
         if info.owner.is_some() || info.self_kind.is_some() || q.is_async || q.is_unsafe || q.abi.is_some() || info.def.variadic {
@@ -4461,7 +4682,13 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             return CallTarget::VariantCtor { adt: AdtId(u32::MAX - 1), variant: 1, ty: ERROR };
         }
         let fid = if segs.len() == 1 {
-            self.p.fn_names.get(&last).copied()
+            match self.span_lookup(last, self.p.ast.expr_span(callee)).or_else(|| self.scope_lookup(last)) {
+                Some(ScopeItem::Fn(f)) => Some(f),
+                // A body const or static of this name shadows any
+                // module fn: the call names no fn here.
+                Some(_) => return CallTarget::Unknown,
+                None => self.p.fn_names.get(&last).copied(),
+            }
         } else if segs.len() == 2 {
             // `Self::f(..)` names the impl type `Self` means here.
             let head = if segs[0].name == self.p.known.self_type { self.self_name.unwrap_or(segs[0].name) } else { segs[0].name };
@@ -4489,6 +4716,8 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
                 return CallTarget::Unknown;
             }
+            // The body names its own sibling items, not the caller's.
+            self.next_scope = Some(self.p.fn_siblings.get(&f).cloned().unwrap_or_default());
             return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner, generic });
         }
         if let Some((adt, variant, ty)) = self.variant_ctor(segs) {
@@ -4505,11 +4734,16 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         self.self_stack.push((self.self_name, self.self_pat));
         self.self_name = owner;
         self.self_pat = None;
+        let scope = self.next_scope.take().unwrap_or_default();
+        self.scope_stack.push(std::mem::replace(&mut self.cur_scope, scope));
     }
     fn exit_const_fn(&mut self) {
         if let Some((name, pat)) = self.self_stack.pop() {
             self.self_name = name;
             self.self_pat = pat;
+        }
+        if let Some(scope) = self.scope_stack.pop() {
+            self.cur_scope = scope;
         }
     }
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)> {

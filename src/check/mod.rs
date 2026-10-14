@@ -1142,6 +1142,12 @@ struct Ctx<'p, 'a> {
     /// on exit.
     const_fn_self: Option<Option<AdtId>>,
     const_fn_saved: Vec<(Option<Option<AdtId>>, Option<Ty>)>,
+    /// Saved block item scopes for const fn bodies the evaluator
+    /// entered: a const fn body names its own sibling items
+    /// (`next_const_fn_sibs`, stashed by `call_target`), never the
+    /// caller's block items.
+    const_fn_items_saved: Vec<(Vec<Vec<((Sym, CtxtId), u32)>>, Vec<usize>)>,
+    next_const_fn_sibs: Option<Vec<u32>>,
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
     deferred_methods: Vec<method::DeferredMethod>,
@@ -1451,6 +1457,8 @@ fn check_fn_mode<'p, 'a>(
         abstract_consts: Vec::new(),
         const_fn_self: None,
         const_fn_saved: Vec::new(),
+        const_fn_items_saved: Vec::new(),
+        next_const_fn_sibs: None,
         deferred_methods: Vec::new(),
         std_first: Vec::new(),
         user_deref_call: None,
@@ -2792,7 +2800,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ast::GenericArg::Type(t) => match p.ast.ty(*t) {
                     ast::TyExpr::Path(ps) if ps.len() == 1 => match self.const_param(ps[0].name) {
                         Some((pi, _, val)) => Some(GenericArg::Const(self.tys.intern_const(val.unwrap_or(ConstKind::Param(pi))))),
-                        None => crate::check::collect::named_const_kind(p.ast, p.interner, p.known, ps[0].name)
+                        None => crate::check::collect::named_const_kind(p.ast, p.interner, p.known, ps[0].name, span)
                             .map(|k| GenericArg::Const(self.tys.intern_const(k))),
                     },
                     _ => None,
@@ -17052,11 +17060,34 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         cx.const_fn_saved.push((cx.const_fn_self, cx.body_scope.self_ty));
         cx.const_fn_self = Some(a);
         cx.body_scope.self_ty = a.map(|a| cx.tys.adt_ty(a));
+        // The const fn body names its own sibling items, not the
+        // caller's block items.
+        let sibs = cx.next_const_fn_sibs.take().unwrap_or_default();
+        let layer: Vec<((Sym, CtxtId), u32)> = sibs
+            .iter()
+            .filter_map(|&si| {
+                let name = match &cx.p.ast.stmt_items[si as usize].kind {
+                    ItemKind::Fn(d) => Some((d.name, d.name_span.ctxt)),
+                    ItemKind::Const(c) => c.name.map(|n| (n, c.name_span.ctxt)),
+                    ItemKind::Static(st) => Some((st.name, st.name_span.ctxt)),
+                    _ => None,
+                };
+                name.map(|n| (n, si))
+            })
+            .collect();
+        let saved = (std::mem::take(&mut cx.item_scopes), std::mem::take(&mut cx.item_scope_starts));
+        cx.const_fn_items_saved.push(saved);
+        cx.item_scopes.push(layer);
+        cx.item_scope_starts.push(0);
     }
     fn exit_const_fn(&mut self) {
         if let Some((o, t)) = self.cx.const_fn_saved.pop() {
             self.cx.const_fn_self = o;
             self.cx.body_scope.self_ty = t;
+        }
+        if let Some((scopes, starts)) = self.cx.const_fn_items_saved.pop() {
+            self.cx.item_scopes = scopes;
+            self.cx.item_scope_starts = starts;
         }
     }
 
@@ -17072,7 +17103,25 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     fn sym_text(&self, s: Sym) -> &str {
         self.cx.name(s)
     }
-    fn const_item(&mut self, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+    fn const_item(&mut self, name: Sym, at: Span) -> Option<crate::ty::consteval::TypedValue> {
+        // A block item of this name wins over every module item, as
+        // in `path_expr`: a body const answers with its value, a body
+        // static or fn blocks the flat lookup (a static's value is
+        // not a const read; `static_item` answers for it). The span
+        // form covers blocks inside the const expression itself,
+        // which the evaluator walks without the checker's scopes.
+        let body = self.cx.body_item_of(name).or_else(|| {
+            crate::check::collect::stmt_item_in_blocks(self.cx.p.ast, &self.cx.p.item_blocks, name, at)
+                .and_then(|si| self.cx.p.body_items.get(&si).copied())
+        });
+        match body {
+            Some(crate::check::collect::BodyItem::Const(ci)) => {
+                let c = &self.cx.p.body_consts[ci as usize];
+                return Some((c.value.clone(), c.ty));
+            }
+            Some(_) => return None,
+            None => {}
+        }
         // A const read inside body const evaluation consumes the value:
         // record the const's `Sig` read (its fingerprint folds the
         // value), as `path_expr` does for a plain expression use.
@@ -17102,7 +17151,23 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         }
         Some(out)
     }
-    fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)> {
+    fn static_item(&mut self, name: Sym, at: Span) -> Option<(u32, Ty)> {
+        let body = self.cx.body_item_of(name).or_else(|| {
+            crate::check::collect::stmt_item_in_blocks(self.cx.p.ast, &self.cx.p.item_blocks, name, at)
+                .and_then(|si| self.cx.p.body_items.get(&si).copied())
+        });
+        match body {
+            Some(crate::check::collect::BodyItem::Static(idx)) => {
+                let p = self.cx.p;
+                let ty = p.statics[idx as usize].ty;
+                if let Some(&def) = p.static_defs.get(idx as usize) {
+                    let _ = p.sig_of(&mut self.cx.out.reads, def);
+                }
+                return Some((idx, ty));
+            }
+            Some(_) => return None,
+            None => {}
+        }
         let p = self.cx.p;
         let &i = p.static_names.get(&name)?;
         let ty = p.statics[i as usize].ty;
@@ -17141,7 +17206,13 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
             if self.cx.lookup(last, span.ctxt).is_some() {
                 return CallTarget::Unknown;
             }
-            self.cx.binding_fn(last)
+            match self.cx.body_item_of(last) {
+                Some(crate::check::collect::BodyItem::Fn(f)) => Some(f),
+                // A body const or static of this name shadows any
+                // module fn: the call names no fn here.
+                Some(_) => return CallTarget::Unknown,
+                None => self.cx.binding_fn(last),
+            }
         } else {
             match self.cx.resolve_assoc(segs, span) {
                 Some(Res::Fn(f)) => Some(f),
@@ -17175,6 +17246,8 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
             if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
                 return CallTarget::Unknown;
             }
+            // The body names its own sibling items, not the caller's.
+            self.cx.next_const_fn_sibs = Some(p.fn_siblings.get(&f).cloned().unwrap_or_default());
             return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner, generic });
         }
         if let Some(a) = self.cx.tuple_struct_ctor(last)

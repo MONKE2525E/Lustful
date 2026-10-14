@@ -122,8 +122,11 @@ pub trait ConstCx<'a> {
     fn tys(&mut self) -> &mut Self::Tys;
     fn tys_ref(&self) -> &Self::Tys;
     fn ast(&self) -> &'a Ast;
-    /// A const item or immutable static by name, evaluating it if needed.
-    fn const_item(&mut self, name: Sym) -> Option<TypedValue>;
+    /// A const item or immutable static by name, evaluating it if
+    /// needed. `at` is the use site: an item declared in a function
+    /// body answers only inside its block scope, and shadows a
+    /// module item of the same name there.
+    fn const_item(&mut self, name: Sym, at: Span) -> Option<TypedValue>;
     /// An inherent associated const by its path (`Type::CONST`,
     /// module segments may lead), evaluating it if needed.
     fn assoc_const_item(&mut self, _segs: &[ast::PathSeg]) -> Option<TypedValue> {
@@ -133,11 +136,11 @@ pub trait ConstCx<'a> {
     fn call_target(&mut self, callee: ExprId) -> CallTarget;
     /// A path used as a value: a unit variant, if it names one.
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)>;
-    /// A static item by name: its index and type.
-    fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)>;
+    /// A static item by name at a use site: its index and type.
+    fn static_item(&mut self, name: Sym, at: Span) -> Option<(u32, Ty)>;
     /// A safe, non-generic free fn named by a path, as a fn pointer
     /// value with its `fn(..) -> R` type.
-    fn fn_item(&mut self, _segs: &[ast::PathSeg]) -> Option<TypedValue> {
+    fn fn_item(&mut self, _segs: &[ast::PathSeg], _at: Span) -> Option<TypedValue> {
         None
     }
     /// The struct or variant a struct literal names.
@@ -761,7 +764,7 @@ impl Evaluator {
                 // can use it; anything else is a promoted temporary.
                 if let Expr::Path(segs) = cx.ast().expr(*expr)
                     && segs.len() == 1
-                    && let Some((idx, sty)) = cx.static_item(segs[0].name)
+                    && let Some((idx, sty)) = cx.static_item(segs[0].name, cx.ast().expr_span(*expr))
                 {
                     // `&ARR` where a slice reference is wanted is the unsize
                     // coercion; the value keeps the static's identity and the
@@ -1213,13 +1216,13 @@ impl Evaluator {
             if let Some((_, v, _)) = env.iter().rev().find(|(n, _, _)| *n == name) {
                 return Ok(v.clone());
             }
-            if let Some(v) = cx.const_item(name) {
+            if let Some(v) = cx.const_item(name, span) {
                 return Ok(v);
             }
-            if let Some((idx, ty)) = cx.static_item(name) {
+            if let Some((idx, ty)) = cx.static_item(name, span) {
                 // Reading an immutable static in const gives its value; the
                 // context only returns statics it may read this way.
-                if let Some(v) = cx.const_item(name) {
+                if let Some(v) = cx.const_item(name, span) {
                     return Ok(v);
                 }
                 let _ = idx;
@@ -1249,7 +1252,7 @@ impl Evaluator {
         if let Some(v) = self.float_assoc_const(cx, segs) {
             return Ok(v);
         }
-        if let Some(v) = cx.fn_item(segs) {
+        if let Some(v) = cx.fn_item(segs, span) {
             return Ok(v);
         }
         Err(outside(span, "this path"))
@@ -2906,7 +2909,7 @@ impl Evaluator {
                 // against it, as the checker resolves it; a unit
                 // struct name matches its only value.
                 if !mutable && !env.iter().any(|(n, _, _)| n == name) {
-                    if let Some((cv, _)) = cx.const_item(*name) {
+                    if let Some((cv, _)) = cx.const_item(*name, span) {
                         return Ok(values_eq(v, &cv));
                     }
                     let segs = [ast::PathSeg::plain(*name)];
@@ -3207,7 +3210,7 @@ impl Evaluator {
                 let Some((adt, variant)) = cx.pattern_variant(segs) else {
                     // A single name that resolves to a const item compares equal.
                     if segs.len() == 1
-                        && let Some((cv, _)) = cx.const_item(segs[0].name)
+                        && let Some((cv, _)) = cx.const_item(segs[0].name, span)
                     {
                         return Ok(values_eq(&v, &cv));
                     }
