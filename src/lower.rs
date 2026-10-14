@@ -2995,7 +2995,7 @@ impl<'p, 'a> Lower<'p, 'a> {
     ) {
         let p = self.p;
         self.scopes.push(Vec::new());
-        let item_ty = self.ck.pat_ty(pat);
+        let item_ty = self.for_item_ty(for_e, pat, iter);
         let (head, bodyb, exit) = (self.new_block(), self.new_block(), self.new_block());
         // `next` computes the loop variable into this local at the top of each iteration.
         let item = self.temp(item_ty);
@@ -3253,6 +3253,33 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.cur = exit;
         self.pop_scope(span);
         self.unit(dest, span);
+    }
+
+    /// The type of a `for` loop's item: the pattern's type, or, when the
+    /// pattern matches through references (default binding modes:
+    /// `for (k, v) in &map_vec`, `pat_derefs`), the iterator's item those
+    /// references wrap, which `bind_pat` derefs.
+    fn for_item_ty(&mut self, for_e: ExprId, pat: PatId, iter: ExprId) -> Ty {
+        let pt = self.ck.pat_ty(pat);
+        if self.ck.pat_derefs(pat) == 0 {
+            return pt;
+        }
+        let it = self.ty(iter);
+        let elem = |this: &Self, t: Ty| match this.kind(t) {
+            TyKind::Array(e, _) | TyKind::Slice(e) => Some(e),
+            _ => this.body.tys.vec_elem(t),
+        };
+        let item = if let Res::ForTrait { next, .. } = self.ck.res(for_e) {
+            let ret = self.p.fn_info(self.resolve_generic_fn(iter, next)).ret;
+            self.body.tys.option_elem(ret)
+        } else if crate::ty::iter::is_iter(&self.body.tys, it) {
+            crate::ty::iter::item_ty(&mut self.body.tys, it)
+        } else if let TyKind::Ref(_, m, inner) = self.kind(it) {
+            elem(self, inner).map(|e| self.ref_ty(m == Mut::Mut, e))
+        } else {
+            elem(self, it)
+        };
+        item.unwrap_or(pt)
     }
 
     /// True when `pat` has a binding that moves a non-Copy part
