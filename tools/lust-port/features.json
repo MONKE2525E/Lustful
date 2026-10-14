@@ -453,7 +453,9 @@
     "std.expr.std::thread::*",
     "closure.arg_of.spawn",
     "closure.arg_of.spawn_scoped",
-    "method.lock"
+    "method.lock",
+    "std.use.std::thread",
+    "std.use.std::thread::*"
    ]
   },
   {
@@ -1048,7 +1050,11 @@
     "macro.std::mem::offset_of",
     "macro.std::pin::pin",
     "macro.offset_of",
-    "macro.pin"
+    "macro.pin",
+    "std.use.std::fmt",
+    "std.use.std::fmt::*",
+    "std.use.std::ops",
+    "std.use.std::ops::*"
    ]
   },
   {
@@ -1381,7 +1387,13 @@
     "std.expr.std::slice::*",
     "std.type.std::collections::*",
     "std.expr.std::collections::*",
-    "prim.path.*"
+    "prim.path.*",
+    "std.use.std::io",
+    "std.use.std::io::*",
+    "std.use.std::fs",
+    "std.use.std::fs::*",
+    "std.use.std::env",
+    "std.use.std::env::*"
    ]
   },
   {
@@ -1584,6 +1596,136 @@
    ],
    "keys": [
     "ext.*"
+   ]
+  },
+  {
+   "id": "std.net",
+   "title": "TCP and UDP sockets (TcpStream, TcpListener, UdpSocket, Shutdown)",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from std.other (W-STD-C phase 2 scan). Owner: W-SHIM-P2 (system io, with io/fs/process). Probe: std_net.rs (loopback listener). The address types are std.net_addr.",
+   "primary_keys": [
+    "std.type.std::net::TcpStream",
+    "std.type.std::net::TcpListener",
+    "std.type.std::net::UdpSocket"
+   ],
+   "keys": [
+    "std.type.std::net::TcpStream*",
+    "std.expr.std::net::TcpStream*",
+    "std.use.std::net::TcpStream*",
+    "std.type.std::net::TcpListener*",
+    "std.expr.std::net::TcpListener*",
+    "std.use.std::net::TcpListener*",
+    "std.type.std::net::UdpSocket*",
+    "std.expr.std::net::UdpSocket*",
+    "std.use.std::net::UdpSocket*",
+    "std.type.std::net::Shutdown*",
+    "std.expr.std::net::Shutdown*",
+    "std.use.std::net::Shutdown*"
+   ]
+  },
+  {
+   "id": "std.net_addr",
+   "title": "IP and socket address types (IpAddr, SocketAddr, parsing)",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from std.other (W-STD-C phase 2). Probe: std_net_addr.rs. In lust std source (library/std/src/net.rs). str::parse is a str method and counts under its own state.",
+   "primary_keys": [
+    "std.type.std::net::Ipv4Addr",
+    "std.type.std::net::Ipv6Addr",
+    "std.type.std::net::IpAddr",
+    "std.type.std::net::SocketAddr"
+   ],
+   "keys": [
+    "std.type.std::net::Ipv4Addr*",
+    "std.expr.std::net::Ipv4Addr*",
+    "std.use.std::net::Ipv4Addr*",
+    "std.type.std::net::Ipv6Addr*",
+    "std.expr.std::net::Ipv6Addr*",
+    "std.use.std::net::Ipv6Addr*",
+    "std.type.std::net::IpAddr*",
+    "std.expr.std::net::IpAddr*",
+    "std.use.std::net::IpAddr*",
+    "std.type.std::net::SocketAddr*",
+    "std.expr.std::net::SocketAddr*",
+    "std.use.std::net::SocketAddr*",
+    "std.type.std::net::SocketAddrV4*",
+    "std.expr.std::net::SocketAddrV4*",
+    "std.use.std::net::SocketAddrV4*",
+    "std.type.std::net::SocketAddrV6*",
+    "std.expr.std::net::SocketAddrV6*",
+    "std.use.std::net::SocketAddrV6*",
+    "std.type.std::net::AddrParseError*",
+    "std.expr.std::net::AddrParseError*",
+    "std.use.std::net::AddrParseError*"
+   ]
+  },
+  {
+   "id": "std.error",
+   "title": "std::error::Error trait",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from std.other (W-STD-C phase 2); ts-rust has `use std::error::Error` with plain impls (impl.trait keys stay traits.generics). Probe: std_error.rs (impl through a bound). In lust std source (library/core/src/error.rs). dyn Error and source() chains stay with dyn.std (fmt supertraits in vtables, L0702).",
+   "primary_keys": [
+    "std.type.std::error::Error"
+   ],
+   "keys": [
+    "std.type.std::error::*",
+    "std.expr.std::error::*",
+    "std.use.std::error::*",
+    "std.use.std::error"
+   ]
+  },
+  {
+   "id": "std.float_consts",
+   "title": "std::f64::consts and std::f32::consts by full path",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from std.other (W-STD-C phase 2); the const evaluator has these since W-STD-C, only the row was missing. Probe: std_float_consts.rs (bits of PI, E, TAU, SQRT_2, FRAC_1_PI, LN_2).",
+   "primary_keys": [],
+   "keys": [
+    "std.expr.std::f64::consts::*",
+    "std.expr.std::f32::consts::*",
+    "std.use.std::f64::consts::*",
+    "std.use.std::f32::consts::*"
+   ]
+  },
+  {
+   "id": "std.vec_into_iter",
+   "title": "std::vec::IntoIter named as a type",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from std.other (W-STD-C phase 2): supported.std_core claims the expr paths but only the exact Vec type. Probe: std_vec_into_iter.rs. Drain and Splice types stay with fx-vec-drain.",
+   "primary_keys": [
+    "std.type.std::vec::IntoIter"
+   ],
+   "keys": [
+    "std.type.std::vec::IntoIter*"
    ]
   },
   {

@@ -57,6 +57,15 @@ OWNER = {
     "panic.recovery": "wave C (panics)",
     "cinterop.system": "wave C (shims)",
     "ext.unknown_crate": "wave D",
+    "std.net": "W-SHIM-P2",
+    "std.net_addr": "W-STD-C",
+    "std.error": "W-STD-C",
+    "std.float_consts": "W-STD-C",
+    "std.vec_into_iter": "W-STD-C",
+    "std.hashmap": "W-STD-B",
+    "std.hashmap_hasher": "W-STD-B",
+    "std.cow": "W-STD-B",
+    "core.std_basics": "W-SHIM-P2",
 }
 OWNER_BY_CAUSE = {
     "std-runtime": "W-STD-B",
