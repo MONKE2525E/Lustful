@@ -406,6 +406,11 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
                 let shown: Vec<String> = a.iter().map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
                 if shown.is_empty() { k.path().1.to_string() } else { format!("{}<{}>", k.path().1, shown.join(", ")) }
             }
+            // The `next` wrapper of another iterator prints as that iterator.
+            Some(BuiltinTy::Iter(crate::ty::iter::IterKind::ByNext)) => {
+                let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+                a.first().and_then(|g| g.as_ty()).map_or("_".into(), |e| ty_name(p, tys, e))
+            }
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();

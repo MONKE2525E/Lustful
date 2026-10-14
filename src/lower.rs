@@ -32,9 +32,10 @@ struct Lower<'p, 'a> {
     /// Depth of mutable place evaluation (see `place_for_mut`).
     mut_index: u32,
     /// A method receiver lowered as a Cow's `&B` view (W-STD-B,
-    /// `Coerce::CowRecv`): the receiver expression, and the local and
-    /// type of its view, which `place`, `operand`, and `ty` give for it
-    /// while the method call lowers.
+    /// `Coerce::CowRecv`) or moved into a `ByNext` iterator
+    /// (`Coerce::ByNext`): the receiver expression, and the local and
+    /// type of the value made from it, which `place`, `operand`, and
+    /// `ty` give for it while the method call lowers.
     cow_view: Option<(ExprId, Local, Ty)>,
     /// `needs_drop` answers per body type: every scope exit asks for each of
     /// its locals, and the answer walks Adt fields.
@@ -687,10 +688,10 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     /// Evaluates `e` to an operand, applying the coercion recorded by the checker.
     fn operand(&mut self, e: ExprId) -> Operand {
-        if let Some((x, v, _)) = self.cow_view
+        if let Some((x, v, t)) = self.cow_view
             && x == e
         {
-            return Operand::Copy(Place::local(v));
+            return self.operand_from(Place::local(v), t);
         }
         let op = self.operand_raw(e);
         let span = self.span(e);
@@ -776,6 +777,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             // Only a method receiver has it, and `method_into` lowers it.
             Coerce::CowRecv(..) => op,
+            // An iterator moved into its `next` wrapper (W-STD-B): for a
+            // receiver `method_into` does this first.
+            Coerce::ByNext(w) => {
+                let v = self.temp(w);
+                self.assign(Place::local(v), Rvalue::TupleAgg(w, vec![op]), span);
+                Operand::Move(Place::local(v))
+            }
             Coerce::CowDeref(n, target) => {
                 // Down to the `&Cow`, then the Cow's `&B` view (W-STD-B).
                 let place = self.op_place(op, ty, span);
@@ -2826,6 +2834,18 @@ impl<'p, 'a> Lower<'p, 'a> {
         // A receiver through a Cow's `Deref` (W-STD-B): borrow the Cow,
         // make its `&B` view (before the arguments, as rustc adjusts the
         // receiver first), then lower the call on the view.
+        // An iterator receiver moved into its `ByNext` wrapper (W-STD-B).
+        if let Coerce::ByNext(w) = self.ck.coerce(recv)
+            && self.cow_view.is_none_or(|(x, ..)| x != recv)
+        {
+            let o = self.operand_raw(recv);
+            let v = self.temp(w);
+            self.assign(Place::local(v), Rvalue::TupleAgg(w, vec![o]), span);
+            let saved = self.cow_view.replace((recv, v, w));
+            self.method_into(e, recv, args, dest, span);
+            self.cow_view = saved;
+            return;
+        }
         if let Coerce::CowRecv(n, view) = self.ck.coerce(recv)
             && self.cow_view.is_none_or(|(x, ..)| x != recv)
         {

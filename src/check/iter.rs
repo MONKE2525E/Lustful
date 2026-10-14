@@ -112,7 +112,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return self.iter_source(e, rt, base, el, derefs, n, name_span, args);
         }
         if !it::is_iter(&self.tys, base) && !self.param_iter(base) {
-            return None;
+            // A user iterator type by value: wrapped once as `ByNext`,
+            // which every adapter and consumer takes (W-STD-B).
+            let n = self.name(name).to_string();
+            if derefs > 0 || n == "next" || !ITER_METHODS.contains(&n.as_str()) {
+                return None;
+            }
+            let item = self.by_next_item(base, name_span)?;
+            if item == ERROR {
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
+            let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[base, item]);
+            let i = self.ei(recv);
+            self.out.coerce[i] = Coerce::ByNext(wrapped);
+            return Some(self.iter_call(e, recv, wrapped, 0, &n, name_span, args, turbofish, expected));
         }
         let n = self.name(name).to_string();
         // `Chars` keeps its own `next` and `count` builtins.
@@ -623,6 +639,43 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.iter_bail(args)
     }
 
+    /// The item type of `base` as an iterator through its own `next`
+    /// (`IterKind::ByNext`, W-STD-B), or None when it is not one. A type
+    /// parameter, projection, or opaque type needs an `Iterator` bound
+    /// (template checks; instances see the concrete type). A user type
+    /// needs an `Iterator` impl lust can call (`by_next_fns`); one it
+    /// cannot call is L0640 and gives ERROR.
+    fn by_next_item(&mut self, base: Ty, span: Span) -> Option<Ty> {
+        let p = self.p;
+        let lang = p.gx.lang;
+        let user = match self.kind(base) {
+            TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) => false,
+            TyKind::Adt(..) if self.tys.local_adt(base).is_some() && self.tys.builtin_of(base).is_none() => true,
+            _ => return None,
+        };
+        let args = self.tys.intern_args(&[GenericArg::Ty(base)]);
+        // `<I as IntoIterator>::IntoIter` is an Iterator with the
+        // IntoIterator's own Item, by the trait's declaration.
+        if let TyKind::Projection(AssocId(a), pargs) = self.kind(base)
+            && a == lang.assoc_into_iter
+        {
+            let item = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_item), pargs));
+            return Some(self.normalize_here(item));
+        }
+        let tr = TraitRef { def: lang.iterator, args, bindings: EMPTY_BINDINGS };
+        match self.select_obligation(tr) {
+            Selection::Impl { .. } | Selection::ParamEvidence(_) => {}
+            _ => return None,
+        }
+        if user && let Err(why) = by_next_fns(p, base) {
+            let tn = self.tn(base);
+            self.err("L0640", span, format!("adapters over `{tn}` are not implemented yet: {why}"), "Loop with `while let Some(x) = it.next()` instead.");
+            return Some(ERROR);
+        }
+        let item = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_item), args));
+        Some(self.normalize_here(item))
+    }
+
     /// True when an array by value can be iterated (`array::IntoIter`,
     /// W-STD-B): its elements are Copy (no per-element drop state
     /// yet); an element type still unknown is checked at body end.
@@ -681,6 +734,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Vec, slice, or array as a slice iterator, a Vec by value as
     /// `vec::IntoIter`. None for other types.
     fn into_iter_ty(&mut self, t: Ty) -> Option<Ty> {
+        // A user iterator type by value: its `next` wrapper (W-STD-B).
+        if !it::is_iter(&self.tys, t)
+            && !self.param_iter(t)
+            && let Some(item) = self.by_next_item(t, Span::default())
+        {
+            return (item != ERROR).then(|| it::mk_iter(&mut self.tys, IterKind::ByNext, &[t, item]));
+        }
         if it::is_iter(&self.tys, t) || self.param_iter(t) {
             return Some(t);
         }
@@ -730,6 +790,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | K::SetIter
             | K::SetIntoIter => false,
             K::ArrayIntoIter | K::RepeatN => true,
+            // Only `next`: no `next_back` reaches the user's impl yet.
+            K::ByNext => false,
         }
     }
 
@@ -838,3 +900,79 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 }
 
+/// The adapter and consumer methods `iter_call` answers, by name: the
+/// calls that wrap a `ByNext` iterator.
+const ITER_METHODS: &[&str] = &[
+    "map",
+    "filter",
+    "filter_map",
+    "enumerate",
+    "rev",
+    "take",
+    "skip",
+    "step_by",
+    "chain",
+    "zip",
+    "copied",
+    "cloned",
+    "take_while",
+    "skip_while",
+    "peekable",
+    "inspect",
+    "count",
+    "last",
+    "nth",
+    "any",
+    "all",
+    "find",
+    "find_map",
+    "position",
+    "fold",
+    "for_each",
+    "min",
+    "max",
+    "min_by_key",
+    "max_by_key",
+    "collect",
+    "sum",
+    "product",
+    "size_hint",
+];
+
+/// The user fns a `ByNext` iterator calls: `next`, and `size_hint`
+/// when the impl defines it. The impl must be non-generic and define
+/// no other method: std's adapters call the inner iterator's own
+/// `fold`, `nth`, `count`, and kin, which lust's expansions do not
+/// (they loop on `next`), so an impl that overrides one of those is
+/// refused rather than run differently.
+pub struct ByNextFns {
+    pub next: LocalDefId,
+    pub size_hint: Option<LocalDefId>,
+}
+
+/// `by_next_fns` for a user type `t` (concrete), or why lust cannot
+/// iterate it through `next` yet.
+pub fn by_next_fns(p: &Program, t: Ty) -> Result<ByNextFns, &'static str> {
+    let lang = p.gx.lang;
+    let rec = p
+        .gx
+        .index
+        .impls_of_trait(lang.iterator)
+        .iter()
+        .map(|&id| p.gx.index.get(id))
+        .find(|r| r.local && r.self_ty(&p.tys) == t)
+        .ok_or("its `Iterator` impl is generic")?;
+    if !rec.generics.params.is_empty() {
+        return Err("its `Iterator` impl is generic");
+    }
+    let (mut next, mut size_hint) = (None, None);
+    for &d in &rec.items {
+        let Some(l) = p.local_def(d.hash) else { continue };
+        match p.name(p.fn_info(l).name) {
+            "next" => next = Some(l),
+            "size_hint" => size_hint = Some(l),
+            _ => return Err("its `Iterator` impl defines a provided method"),
+        }
+    }
+    Ok(ByNextFns { next: next.ok_or("its `Iterator` impl has no `next`")?, size_hint })
+}

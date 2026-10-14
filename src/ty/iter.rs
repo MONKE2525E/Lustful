@@ -99,6 +99,13 @@ pub enum IterKind {
     ArrayIntoIter,
     /// `iter::RepeatN<T>` (W-STD-B): args `[T]`, item `T`; Copy `T` only.
     RepeatN,
+    /// Any other iterator, reached through its own `Iterator::next`
+    /// (W-STD-B, check/iter.rs `by_next_item`): args `[I, Item]`, the
+    /// iterator value itself as the one field. A user type with an
+    /// `Iterator` impl, or in a template a type parameter or projection
+    /// with an `Iterator` bound; adapters and consumers wrap it once.
+    /// Never named in source: messages print `I`.
+    ByNext,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -124,7 +131,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 36] = [
+    pub const ALL: [IterKind; 37] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -161,6 +168,7 @@ impl IterKind {
         IterKind::SetIntoIter,
         IterKind::ArrayIntoIter,
         IterKind::RepeatN,
+        IterKind::ByNext,
     ];
 
     /// True for the hashed-collection iterators.
@@ -218,6 +226,7 @@ impl IterKind {
             K::SetIntoIter => (HSET, "IntoIter"),
             K::ArrayIntoIter => (&["core", "array", "iter"], "IntoIter"),
             K::RepeatN => (&["core", "iter", "sources", "repeat_n"], "RepeatN"),
+            K::ByNext => (&["core", "iter", "lust"], "ByNext"),
         }
     }
 
@@ -226,7 +235,7 @@ impl IterKind {
         use IterKind as K;
         match self {
             K::Map | K::FilterMap => 3,
-            K::Filter | K::Chain | K::Zip | K::TakeWhile | K::SkipWhile | K::Inspect | K::Copied | K::Cloned | K::ArrayIntoIter => 2,
+            K::Filter | K::Chain | K::Zip | K::TakeWhile | K::SkipWhile | K::Inspect | K::Copied | K::Cloned | K::ArrayIntoIter | K::ByNext => 2,
             K::MapIter
             | K::MapIterMut
             | K::MapKeys
@@ -279,6 +288,7 @@ impl IterKind {
             K::SetIntoIter => "std::collections::hash_set::IntoIter",
             K::ArrayIntoIter => "std::array::IntoIter",
             K::RepeatN => "std::iter::RepeatN",
+            K::ByNext => "",
         }
     }
 
@@ -330,6 +340,7 @@ impl IterKind {
             K::ArrayIntoIter => &[F::Arg(1), F::Usize, F::Usize],
             // (element, count left).
             K::RepeatN => &[F::Arg(0), F::Usize],
+            K::ByNext => &[F::Arg(0)],
         }
     }
 }
@@ -403,6 +414,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::MapIntoKeys | K::SetIntoIter => a[0],
         K::MapIntoValues => a[1],
         K::ArrayIntoIter | K::RepeatN => a[0],
+        K::ByNext => a[1],
     })
 }
 

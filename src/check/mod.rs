@@ -848,6 +848,10 @@ pub enum Coerce {
     /// derefs reach the `Cow<B>` place, whose `&B` view (the payload's
     /// type) is the receiver the method's own adjustments start from.
     CowRecv(u8, Ty),
+    /// An iterator method receiver moved into the `ByNext` wrapper
+    /// (the payload's type, W-STD-B check/iter.rs): adapters over a
+    /// user iterator call its `next`.
+    ByNext(Ty),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16717,6 +16721,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Coerce::Unsize(t) => self.out.coerce[i] = Coerce::Unsize(self.zonk(t)),
                 Coerce::CowDeref(n, t) => self.out.coerce[i] = Coerce::CowDeref(n, self.zonk(t)),
                 Coerce::CowRecv(n, t) => self.out.coerce[i] = Coerce::CowRecv(n, self.zonk(t)),
+                Coerce::ByNext(t) => self.out.coerce[i] = Coerce::ByNext(self.zonk(t)),
                 _ => {}
             }
         }

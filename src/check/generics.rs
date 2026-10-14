@@ -6119,7 +6119,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     p.tys.intern(TyKind::Tuple(ts))
                 }
                 K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => ps[0],
-                K::MapIntoValues => ps[1],
+                K::MapIntoValues | K::ByNext => ps[1],
                 K::Enumerate => {
                     let inner = proj(p, ps[0]);
                     let ts = p.tys.intern_tys(&[USIZE, inner]);
@@ -6263,6 +6263,81 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let mut g1 = one.clone();
         g1.predicates = vec![Predicate::TypeOutlives(p0, Region::Static)];
         insert_synthetic(p, &mut ordinal, lang.any, p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+    }
+    // IntoIterator for the std collections and slices (W-STD-B): Vec<T>
+    // and its references, `&[T]` and `&mut [T]`, and the hash maps and
+    // sets with their references. Selection and Item/IntoIter only;
+    // `into_iter` and `for` stay builtin. Arrays have no record (no
+    // const-param records yet).
+    {
+        use crate::ty::hash::{HashTy, mk_hash};
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        let two = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: p.interner.intern("K"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("V"), kind: ParamKind::Type, span },
+            ],
+            predicates: Vec::new(),
+        };
+        let three = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: p.interner.intern("K"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("V"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("S"), kind: ParamKind::Type, span },
+            ],
+            predicates: Vec::new(),
+        };
+        let p2 = p.tys.intern(TyKind::Param(ParamId(2)));
+        let vec_p0 = p.tys.mk_vec(p0);
+        let slice_p0 = p.tys.intern(TyKind::Slice(p0));
+        let ref_p0 = p.tys.mk_ref(false, p0);
+        let mut_p0 = p.tys.mk_ref(true, p0);
+        let vec_iter = mk_iter(&mut p.tys, K::VecIntoIter, &[p0]);
+        let slice_iter = mk_iter(&mut p.tys, K::SliceIter, &[p0]);
+        let slice_iter_mut = mk_iter(&mut p.tys, K::SliceIterMut, &[p0]);
+        let ref_vec = p.tys.mk_ref(false, vec_p0);
+        let mut_vec = p.tys.mk_ref(true, vec_p0);
+        let ref_slice = p.tys.mk_ref(false, slice_p0);
+        let mut_slice = p.tys.mk_ref(true, slice_p0);
+        for (s, item, iter) in [
+            (vec_p0, p0, vec_iter),
+            (ref_vec, ref_p0, slice_iter),
+            (mut_vec, mut_p0, slice_iter_mut),
+            (ref_slice, ref_p0, slice_iter),
+            (mut_slice, mut_p0, slice_iter_mut),
+        ] {
+            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, iter)];
+            insert_synthetic(p, &mut ordinal, lang.into_iterator, s, &[], one.clone(), assoc, Synthetic::Lang, false, span);
+        }
+        // HashMap<K, V, S> by value, `&`, `&mut`; HashSet<T, S> by value, `&`.
+        let map = mk_hash(&mut p.tys, HashTy::HashMap, &[p0, p1, p2]);
+        let ref_map = p.tys.mk_ref(false, map);
+        let mut_map = p.tys.mk_ref(true, map);
+        let ref_p1 = p.tys.mk_ref(false, p1);
+        let mut_p1 = p.tys.mk_ref(true, p1);
+        let tup = |p: &mut Program, a: Ty, b: Ty| {
+            let ts = p.tys.intern_tys(&[a, b]);
+            p.tys.intern(TyKind::Tuple(ts))
+        };
+        let maps = [
+            (map, tup(p, p0, p1), K::MapIntoIter),
+            (ref_map, tup(p, ref_p0, ref_p1), K::MapIter),
+            (mut_map, tup(p, ref_p0, mut_p1), K::MapIterMut),
+        ];
+        for (s, item, k) in maps {
+            let iter = mk_iter(&mut p.tys, k, &[p0, p1]);
+            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, iter)];
+            insert_synthetic(p, &mut ordinal, lang.into_iterator, s, &[], three.clone(), assoc, Synthetic::Lang, false, span);
+        }
+        let set = mk_hash(&mut p.tys, HashTy::HashSet, &[p0, p1]);
+        let ref_set = p.tys.mk_ref(false, set);
+        for (s, item, k) in [(set, p0, K::SetIntoIter), (ref_set, ref_p0, K::SetIter)] {
+            let iter = mk_iter(&mut p.tys, k, &[p0]);
+            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, iter)];
+            insert_synthetic(p, &mut ordinal, lang.into_iterator, s, &[], two.clone(), assoc, Synthetic::Lang, false, span);
+        }
     }
 }
 

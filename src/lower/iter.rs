@@ -823,6 +823,8 @@ impl Ex<'_, '_, '_> {
                 self.assign(Place::local(s), Rvalue::SliceOf(pl.deref()));
                 self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![Operand::Move(Place::local(s))]));
             }
+            // Another iterator (W-STD-B): moved into its `next` wrapper.
+            IterKind::ByNext => self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![o])),
             _ => return Err("iterator expansion: bad IntoIterator argument".into()),
         }
         Ok(Operand::Move(Place::local(l)))
@@ -924,6 +926,13 @@ impl Ex<'_, '_, '_> {
                 self.goto(join);
                 self.cur = n;
                 self.none(&dest, opt);
+                self.goto(join);
+            }
+            // The wrapped iterator's own `next` (W-STD-B): forward only.
+            K::ByNext => {
+                let fns = crate::check::iter::by_next_fns(self.p, a[0])?;
+                let r = self.ref_to(true, f(0), a[0]);
+                self.call(CallTarget::Fn(fns.next), vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
             // The hash iterators step in the core (cgen/hash.rs, W-STD-B);
@@ -2459,6 +2468,22 @@ impl Ex<'_, '_, '_> {
                 let n = self.size(itp.clone(), ty)?;
                 set_exact(self, n);
             }
+            // The wrapped iterator's own `size_hint`, else the trait's
+            // default `(0, None)` (W-STD-B).
+            K::ByNext => match crate::check::iter::by_next_fns(self.p, a[0])?.size_hint {
+                Some(sh) => {
+                    let r = self.ref_to(false, f(0), a[0]);
+                    let tt = self.tuple_ty(&[USIZE, ou]);
+                    let t = self.local(tt);
+                    self.call(CallTarget::Fn(sh), vec![Operand::Move(Place::local(r))], Place::local(t));
+                    self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(t).project(Proj::Field(0)))));
+                    self.assign(Place::local(hi), Rvalue::Use(Operand::Move(Place::local(t).project(Proj::Field(1)))));
+                }
+                None => {
+                    self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                    self.none(&Place::local(hi), ou);
+                }
+            },
             // hashbrown's iterators know their remaining count exactly.
             K::MapIter
             | K::MapIterMut
@@ -2740,6 +2765,9 @@ impl Ex<'_, '_, '_> {
             | K::SetIter
             | K::SetIntoIter => false,
             K::ArrayIntoIter | K::RepeatN => true,
+            // A user iterator may implement the unstable TrustedLen only
+            // in std itself.
+            K::ByNext => false,
         }
     }
 
