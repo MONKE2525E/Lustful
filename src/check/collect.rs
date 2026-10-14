@@ -1772,15 +1772,25 @@ fn truncate_to_int(v: i128, it: IntTy) -> i128 {
 
 /// Parses the `repr` attributes of an item into layout terms. Unknown or
 /// unsupported forms are errors: this is where the 4.4 grammar cut lands
-/// for `repr(simd)` and `repr(packed(N))` with N other than 1.
+/// for `repr(simd)` and `repr(packed(N))` with N other than 1. Conflicting
+/// hints are rustc's errors, not a cut: more than one integer hint, `Rust`
+/// with `C` or an integer, and `transparent` with any other hint all
+/// reject. `packed` combines with `C` or `Rust` (and wins the kind, in
+/// either order); several `align` hints take the largest.
 fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::layout::Repr, Diag> {
     use crate::ast::AttrInput;
     use crate::lexer::{Tok, TokenTree};
     use crate::ty::layout::{Repr, ReprKind};
     let mut repr = Repr::default();
+    let mut first_span = None;
+    let (mut seen_c, mut seen_rust, mut seen_transparent, mut seen_packed, mut seen_int) = (false, false, false, false, false);
+    let mut hints = 0u32;
     for attr in attrs {
         if attr.path.len() != 1 || interner.get(attr.path[0].name) != "repr" {
             continue;
+        }
+        if first_span.is_none() {
+            first_span = Some(attr.span);
         }
         let AttrInput::List(_, trees) = &attr.input else {
             return Err(Diag::new("L0110", attr.span, "`repr` needs a form such as `repr(C)`", "Write the repr in parentheses."));
@@ -1793,6 +1803,7 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                 "Use a supported repr: C, an integer, transparent, packed, or align.",
             )
         };
+        let conflict = |what: &str| Diag::new("L0110", attr.span, what.to_string(), "Remove one of the conflicting hints.");
         let mut i = 0;
         while i < trees.len() {
             match &trees[i] {
@@ -1802,14 +1813,15 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                         return Err(bad(".."));
                     };
                     let text = interner.get(name);
+                    hints += 1;
                     match text {
-                        "C" => repr.kind = ReprKind::C,
-                        "Rust" => {}
-                        "transparent" => repr.kind = ReprKind::Transparent,
+                        "C" => seen_c = true,
+                        "Rust" => seen_rust = true,
+                        "transparent" => seen_transparent = true,
                         "packed" => {
-                            repr.kind = ReprKind::Packed;
+                            seen_packed = true;
                             if let Some(TokenTree::Delim(_, inner, _)) = trees.get(i + 1) {
-                                let ok = matches!(inner.as_slice(), [TokenTree::Token(t2)] if matches!(t2.tok, Tok::Int(1, _, _)));
+                                let ok = matches!(inner.as_slice(), [TokenTree::Token(t2)] if matches!(t2.tok, Tok::Int(1, None, _)));
                                 if !ok {
                                     return Err(bad("packed(N)"));
                                 }
@@ -1819,8 +1831,8 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                         "align" => match trees.get(i + 1) {
                             Some(TokenTree::Delim(_, inner, _)) => match inner.as_slice() {
                                 [TokenTree::Token(t2)] => match t2.tok {
-                                    Tok::Int(n, _, _) if n > 0 && n <= (1 << 29) && n.is_power_of_two() => {
-                                        repr.align = Some(n as u64);
+                                    Tok::Int(n, None, _) if n > 0 && n <= (1 << 29) && n.is_power_of_two() => {
+                                        repr.align = Some(repr.align.unwrap_or(0).max(n as u64));
                                         i += 1;
                                     }
                                     _ => return Err(bad("align(..)")),
@@ -1830,6 +1842,10 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                             _ => return Err(bad("align")),
                         },
                         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => {
+                            if seen_int {
+                                return Err(conflict("conflicting representation hints"));
+                            }
+                            seen_int = true;
                             let signed = text.starts_with('i');
                             let bits: u32 = match text {
                                 "u8" | "i8" => 8,
@@ -1848,6 +1864,31 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
             }
         }
     }
+    if seen_transparent && hints > 1 {
+        return Err(Diag::new(
+            "L0110",
+            first_span.unwrap_or_default(),
+            "a transparent type cannot have other repr hints",
+            "Remove every other hint, or remove `transparent`.",
+        ));
+    }
+    if seen_rust && (seen_c || seen_int) {
+        return Err(Diag::new(
+            "L0110",
+            first_span.unwrap_or_default(),
+            "conflicting representation hints",
+            "Remove one of the conflicting hints.",
+        ));
+    }
+    repr.kind = if seen_packed {
+        ReprKind::Packed
+    } else if seen_transparent {
+        ReprKind::Transparent
+    } else if seen_c {
+        ReprKind::C
+    } else {
+        ReprKind::Default
+    };
     Ok(repr)
 }
 
@@ -2339,14 +2380,25 @@ pub fn collect_reuse<'a>(
                     Derives { clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
                 // `core::panic::Location` (check/caller.rs): its Debug
-                // prints these field names. No Hash or Ord: std's fields
-                // differ, so their answers could.
+                // prints these field names. Ord compares file, then
+                // line, then column, as std's does. No Hash: a hash
+                // value printed by a program would have to match std's
+                // field hash exactly, which is not checked here.
                 _ => {
                     let file = p.tys.mk_ref(false, STR);
                     (
                         generics::location_def(),
                         named(vec![field("file", file), field("line", int(IntTy::U32)), field("column", int(IntTy::U32))]),
-                        Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                        Derives {
+                            debug: true,
+                            clone: true,
+                            copy: true,
+                            partial_eq: true,
+                            eq: true,
+                            partial_ord: true,
+                            ord: true,
+                            ..Derives::default()
+                        },
                     )
                 }
             };
@@ -2810,17 +2862,18 @@ pub fn collect_reuse<'a>(
                     "Remove one of them: a packed type has alignment 1.",
                 ));
             }
-            if adt.repr.kind == ReprKind::Transparent {
-                let non_unit = adt.variants.first().map(|v| v.fields.iter().filter(|f| f.ty != UNIT && f.ty != ERROR).count()).unwrap_or(0);
-                if adt.is_enum || non_unit != 1 {
-                    errs.push(Diag::new(
-                        "L0110",
-                        adt.span,
-                        "`repr(transparent)` needs a struct with exactly one non-unit field",
-                        "Remove the repr, or give the struct one field plus zero-sized fields.",
-                    ));
-                }
+            if adt.is_enum && adt.repr.kind == ReprKind::Packed {
+                errs.push(Diag::new(
+                    "L0110",
+                    adt.span,
+                    "the `repr(packed)` attribute cannot be used on enums",
+                    "Remove `packed`, or make the type a struct.",
+                ));
             }
+            // `repr(transparent)` field counts are checked after
+            // every Adt has its fields (`check_transparent`, below):
+            // whether a field is zero-sized can need another Adt's
+            // layout.
             if let Some((bits, signed)) = adt.repr.int {
                 let (lo, hi): (i128, i128) = if signed {
                     if bits >= 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
@@ -2878,6 +2931,47 @@ pub fn collect_reuse<'a>(
                         "Add a repr such as `#[repr(u8)]`, or remove the discriminants.",
                     ));
                 }
+            }
+        }
+    }
+
+    // `repr(transparent)` shape, now that every Adt has its fields:
+    // a struct needs at most one field of nonzero size, an enum
+    // exactly one variant with at most one such field (rustc
+    // E0690, E0731). A field whose layout lust cannot compute here
+    // (a type parameter, an unsized type) counts as nonzero, as
+    // rustc counts it.
+    {
+        use crate::ty::layout::ReprKind;
+        for adt in &p.adts {
+            if adt.repr.kind != ReprKind::Transparent {
+                continue;
+            }
+            let nontrivial = |v: &Variant| {
+                v.fields
+                    .iter()
+                    .filter(|f| {
+                        f.ty != ERROR
+                            && crate::ty::layout::layout_of_ty(&p.tys, &UserLayout(&p), f.ty).map_or(true, |l| l.size > 0)
+                    })
+                    .count()
+            };
+            let bad = if adt.is_enum {
+                adt.variants.len() != 1 || nontrivial(&adt.variants[0]) > 1
+            } else {
+                adt.variants.first().map_or(0, nontrivial) > 1
+            };
+            if bad {
+                errs.push(Diag::new(
+                    "L0110",
+                    adt.span,
+                    if adt.is_enum {
+                        "`repr(transparent)` needs an enum with exactly one variant and at most one non-zero-sized field"
+                    } else {
+                        "`repr(transparent)` needs a struct with at most one non-zero-sized field"
+                    },
+                    "Remove the repr, or give the type one field plus zero-sized fields.",
+                ));
             }
         }
     }
