@@ -30,7 +30,7 @@ pub const KNOWN_CFG_NAMES: &[&str] = &[
     "target_endian",
     "target_pointer_width",
     "target_has_atomic",
-    "target_has_atomic_equal_alignment",
+    "target_has_atomic_primitive_alignment",
     "target_feature",
     "target_thread_local",
     "unix",
@@ -42,10 +42,41 @@ pub const KNOWN_CFG_NAMES: &[&str] = &[
     "docsrs",
     "fuzzing",
     "miri",
-    "target_has_atomic_load_store",
     "target_os_version",
     "target_abi_version",
 ];
+
+/// Cfg names rustc 1.99 gates behind a nightly feature (E0658). A
+/// predicate that names one is L0523 wherever it appears, as in rustc,
+/// even under `any`/`all`/`not` that would not need its value.
+pub const UNSTABLE_CFG_NAMES: &[&str] = &[
+    "overflow_checks",
+    "target_has_atomic_load_store",
+    "target_thread_local",
+    "ub_checks",
+    "contract_checks",
+    "sanitize",
+    "relocation_model",
+    "fmt_debug",
+    "sanitizer_cfi_generalize_pointers",
+    "sanitizer_cfi_normalize_integers",
+    "target_has_reliable_f16",
+    "target_has_reliable_f16_math",
+    "target_has_reliable_f128",
+    "target_has_reliable_f128_math",
+];
+
+/// The L0523 error for a cfg name rustc gates as unstable, or None.
+pub fn unstable_cfg(name: &str, span: Span) -> Option<Diag> {
+    UNSTABLE_CFG_NAMES.contains(&name).then(|| {
+        Diag::new(
+            "L0523",
+            span,
+            format!("`cfg({name})` is unstable in Rust"),
+            "Remove the predicate: stable Rust rejects it without a nightly feature.",
+        )
+    })
+}
 
 /// One crate session's cfg environment. Flags are names that are on
 /// (`unix`); pairs are `name = "value"` facts (`target_os = "linux"`). A pair
@@ -128,8 +159,7 @@ impl CfgEnv {
         if arch != "wasm32" {
             for w in ["8", "16", "32", "64", "ptr"] {
                 env.pair("target_has_atomic", w);
-                env.pair("target_has_atomic_load_store", w);
-                env.pair("target_has_atomic_equal_alignment", w);
+                env.pair("target_has_atomic_primitive_alignment", w);
             }
         }
         if arch == "x86_64" {
@@ -213,6 +243,9 @@ impl CfgEnv {
                 "Write `#[cfg(name)]`, `#[cfg(name = \"value\")]`, or `all`/`any`/`not` combinations.",
             ));
         };
+        if let Some(d) = unstable_cfg(&name, name_span) {
+            return Err(d);
+        }
         *pos += 1;
         // Combinators: `all(...)`, `any(...)`, `not(...)`.
         if matches!(name.as_str(), "all" | "any" | "not") {
@@ -456,7 +489,16 @@ mod tests {
         assert!(eval_pred(&mac, "test").unwrap());
         let wasi = CfgEnv::new("wasm32-wasip1", &[], false, ProfileFlags::DEV);
         assert!(eval_pred(&wasi, "target_os = \"wasi\"").unwrap());
-        assert!(!eval_pred(&wasi, "target_thread_local").unwrap());
+        assert!(!eval_pred(&wasi, "target_pointer_width = \"64\"").unwrap());
+    }
+
+    #[test]
+    fn unstable_cfg_name_is_l0523() {
+        let env = CfgEnv::new("", &[], false, ProfileFlags::DEV);
+        assert_eq!(eval_pred(&env, "overflow_checks").unwrap_err().code, "L0523");
+        // Gated even where `any` would not need its value.
+        assert_eq!(eval_pred(&env, "any(unix, target_thread_local)").unwrap_err().code, "L0523");
+        assert!(eval_pred(&env, "target_has_atomic_primitive_alignment = \"8\"").unwrap());
     }
 
     #[test]

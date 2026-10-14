@@ -187,6 +187,9 @@ fn cfg_expr(trees: &[Tt], i: &mut usize, env: &CfgEnv, st: &impl CfgRead) -> Res
         return Err(err(C_CALL, span, "invalid cfg expression", "Check the cfg syntax."));
     };
     *i += 1;
+    if let Some(d) = crate::resolve::cfg::unstable_cfg(&name, name_tok.span) {
+        return Err(d);
+    }
     match name.as_str() {
         "all" | "any" | "not" => {
             let Some(Tt::Delim(Delim::Paren, inner, _)) = trees.get(*i) else {
