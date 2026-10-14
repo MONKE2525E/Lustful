@@ -4767,7 +4767,10 @@ impl<'a> Parser<'a> {
                     .iter()
                     .map(|t| (crate::expand::tok_text(&t.tok, strings, self.interner), t.tok, t.span))
                     .collect();
-                fmt = vec![FmtPiece::Lit(format!("assertion failed: {}", crate::expand::assert_msg::cond_text(flat)))];
+                let Some(cond) = crate::expand::assert_msg::cond_text(flat) else {
+                    return Err(crate::expand::builtin::assert_text_too_long(self.toks[first_at].span));
+                };
+                fmt = vec![FmtPiece::Lit(format!("assertion failed: {cond}"))];
             }
             if args.len() < fixed {
                 return Err(syntax(self.span(), "too few arguments for this macro"));

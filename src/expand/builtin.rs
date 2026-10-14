@@ -477,15 +477,30 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
 /// failed: <cond>"` to append to its expanded arguments, so the panic
 /// prints rustc's text (see `assert_msg`). The text goes in as an
 /// argument, never as the format string, so braces in it stay literal.
-/// Empty when the call has a message of its own.
-pub fn assert_message(st: &mut Expander, inner: &[Tt], span: Span) -> Vec<Tt> {
+/// Empty when the call has a message of its own. An error when rustc
+/// prints the condition over several lines (`assert_msg::cond_text`).
+pub fn assert_message(st: &mut Expander, inner: &[Tt], span: Span) -> Result<Vec<Tt>, Diag> {
     let args = split_args(inner);
     if args.len() != 1 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let text = format!("assertion failed: {}", super::assert_msg::assert_cond_text(st, &args[0]));
+    let Some(cond) = super::assert_msg::assert_cond_text(st, &args[0]) else {
+        return Err(assert_text_too_long(span));
+    };
+    let text = format!("assertion failed: {cond}");
     let comma = Tt::Tok(Token { tok: Tok::Comma, span });
-    vec![comma.clone(), st.str_tree("{}", span), comma, st.str_tree(&text, span)]
+    Ok(vec![comma.clone(), st.str_tree("{}", span), comma, st.str_tree(&text, span)])
+}
+
+/// The reject for an `assert!(cond)` whose panic text rustc breaks over
+/// several lines (more than 78 bytes, or a block with an item).
+pub fn assert_text_too_long(span: Span) -> Diag {
+    err(
+        C_UNSUPPORTED,
+        span,
+        "`assert!` with no message on a long or item-holding condition is not supported yet",
+        "Add a message: assert!(cond, \"...\"), or split the condition.",
+    )
 }
 
 /// Expands one builtin macro call. `name` has no `!` and satisfied
@@ -584,7 +599,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let plain = name.strip_prefix("debug_").unwrap_or(name).to_string();
             let mut out = vec![st.ident_tree(&plain, span), Tt::Tok(Token { tok: Tok::Bang, span })];
             // The message text comes from the condition as written.
-            let msg = if plain == "assert" { assert_message(st, &call.inner, span) } else { Vec::new() };
+            let msg = if plain == "assert" { assert_message(st, &call.inner, span)? } else { Vec::new() };
             let mut inner = st.expand_more(call.inner.clone(), depth)?;
             inner.extend(msg);
             out.push(Tt::Delim(Delim::Paren, inner, span));
