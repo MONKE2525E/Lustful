@@ -1076,11 +1076,28 @@ impl<R: Read> Read for BufReader<R> {
         }
     }
 
-    /// As std's specialization for `BufReader`: the bytes are read
-    /// into a fresh buffer first, so any error leaves the string
-    /// unchanged (the `Read` default keeps the valid bytes read
-    /// before a read error).
+    /// As std's specialization for `BufReader`: into an empty string
+    /// it reads like the `Read` default (valid bytes read before a
+    /// read error stay); into a non-empty string it reads into a
+    /// fresh buffer first and appends only on success, so any error
+    /// leaves the string unchanged.
     fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        if buf.is_empty() {
+            let mut bytes = core::mem::replace(buf, String::new()).into_bytes();
+            let res = self.read_to_end(&mut bytes);
+            let (s, valid) = validate_appended(bytes, 0);
+            *buf = s;
+            return match res {
+                Err(e) => Err(e),
+                Ok(n) => {
+                    if valid {
+                        Ok(n)
+                    } else {
+                        Err(invalid_utf8_error())
+                    }
+                }
+            };
+        }
         let mut bytes: Vec<u8> = Vec::new();
         let n = match self.read_to_end(&mut bytes) {
             Ok(n) => n,
