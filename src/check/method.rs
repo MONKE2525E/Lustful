@@ -786,6 +786,15 @@ pub(super) struct DeferredMethod {
     own: Vec<GenericArg>,
     derefs: u8,
     autoref: Autoref,
+    /// A path call (`S::conv(3u8)`, `assoc_call_deferred`): the call
+    /// names the impl's fn as `Res::Fn`, not as a method.
+    path: bool,
+}
+
+/// Records a path call typed by its trait's signature for
+/// `finish_deferred_methods` (see `Ctx::assoc_call_deferred`).
+pub(super) fn defer_path_call(cx: &mut Ctx, e: ExprId, tr: TraitRef, name: Sym, own: Vec<GenericArg>) {
+    cx.deferred_methods.push(DeferredMethod { e, tr, name, own, derefs: 0, autoref: Autoref::None, path: true });
 }
 
 /// Confirms a trait method whose impl is still ambiguous (an input
@@ -835,7 +844,7 @@ fn confirm_deferred(
     let tr = TraitRef { def: trait_def, args: tr_args, bindings: EMPTY_BINDINGS };
     cx.obl.push_trait_at(tr, name_span, 0);
     let derefs = derefs + probe.extra_derefs;
-    cx.deferred_methods.push(DeferredMethod { e, tr, name: t.name, own: full[n_trait..].to_vec(), derefs, autoref: probe.autoref });
+    cx.deferred_methods.push(DeferredMethod { e, tr, name: t.name, own: full[n_trait..].to_vec(), derefs, autoref: probe.autoref, path: false });
     cx.record_pick(e, trait_def, derefs, probe.filter);
     cx.check_args(&params[1..], args, name_span);
     Probe::Hit(cx.normalize_use(ret, name_span))
@@ -848,7 +857,18 @@ fn confirm_deferred(
 pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
     let p = cx.p;
     for d in std::mem::take(&mut cx.deferred_methods) {
-        let Selection::Impl { id, args: impl_args, .. } = cx.select_obligation(d.tr) else { continue };
+        let sel = cx.select_obligation(d.tr);
+        // A template's path call the env proves calls the signature stub.
+        if d.path
+            && let Selection::ParamEvidence(i) = sel
+            && i != usize::MAX
+            && let Some(m) = p.gx.index.trait_record(d.tr.def).and_then(|r| r.method_by_name(d.name))
+            && let Some((stub, _)) = param_env_hit(cx, m, d.tr)
+        {
+            cx.set_res(d.e, Res::Fn(stub));
+            continue;
+        }
+        let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
         let rec = p.gx.index.get(id);
         let target = match rec.items.iter().copied().find_map(|x| p.local_def(x.hash).filter(|&l| p.fn_info(l).name == d.name)) {
             Some(l) => Some((l, impl_args)),
@@ -863,7 +883,8 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
             let ei = cx.ei(d.e);
             cx.generic_sites.push((ei, local, prefix));
         }
-        cx.set_res(d.e, Res::Method { f: local, derefs: d.derefs, autoref: d.autoref });
+        let res = if d.path { Res::Fn(local) } else { Res::Method { f: local, derefs: d.derefs, autoref: d.autoref } };
+        cx.set_res(d.e, res);
     }
 }
 

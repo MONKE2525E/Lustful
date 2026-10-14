@@ -8532,6 +8532,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut hit_traits: Vec<DefId> = Vec::new();
         // The env predicate of the first param-env hit (`record_pick_env`).
         let mut hit_env: Option<usize> = None;
+        // Traits whose selection the open inputs left ambiguous.
+        let mut ambiguous: Vec<DefId> = Vec::new();
         // A `Default` impl with no method fn (a derive, or core's
         // impl for a builtin type) that builds its value by
         // structure: lowering emits the `default` glue.
@@ -8541,25 +8543,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if rec.method_by_name(name).is_none() {
                 continue;
             }
-            let n_inputs = rec.generics.params.len().saturating_sub(1);
             let snap = self.snapshot_vars();
             let obl_len = self.obl_len();
             let sites_len = self.generic_sites.len();
-            let replayed = self.replayed_trait_ref(e, trait_def);
-            let tr = match hint {
-                Some(written) if written.def == trait_def => written,
-                _ => {
-                    let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
-                    for i in 0..n_inputs {
-                        match replayed.and_then(|r| self.tys.args(r.args).get(i + 1).and_then(|g| g.as_ty())) {
-                            Some(t) => tr_args.push(GenericArg::Ty(t)),
-                            None => tr_args.push(GenericArg::Ty(self.new_var(false))),
-                        }
-                    }
-                    let args_id = self.tys.intern_args(&tr_args);
-                    TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
-                }
-            };
+            let tr = self.assoc_trait_ref(e, base, hint, trait_def, &rec);
             match self.select_obligation_at(tr, span, 0) {
                 Selection::Impl { id, args: impl_args, .. } => {
                     let mname = self.name(name).to_string();
@@ -8596,11 +8583,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         continue;
                     }
                 }
+                // The trait's inputs are open (`S::conv(3u8)` with impls
+                // of `Conv<u8>` and `Conv<u16>`; `S::from(o)`, where
+                // core's identity impl also applies): the args may fix
+                // them (`assoc_call_deferred`).
+                Selection::Ambiguous if rec.generics.params.len() > 1 => ambiguous.push(trait_def),
                 _ => {}
             }
             self.rollback_vars(snap);
             self.obl_truncate(obl_len);
             self.generic_sites.truncate(sites_len);
+        }
+        if hits.is_empty()
+            && !default_glue
+            && let [trait_def] = ambiguous[..]
+        {
+            return self.assoc_call_deferred(e, base, hint, trait_def, name, args, span);
         }
         match hits.len() {
             0 if default_glue && hit_traits.len() == 1 => {
@@ -8643,6 +8641,79 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn record_glue_reads(&mut self, _trait_def: DefId, t: Ty) {
         let t = self.deep(t);
         self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
+    }
+
+    /// The trait ref an assoc call on `base` asks of `trait_def`: the
+    /// written one, or Self with the template's replayed inputs, or
+    /// fresh variables for them.
+    fn assoc_trait_ref(&mut self, e: ExprId, base: Ty, hint: Option<TraitRef>, trait_def: DefId, rec: &crate::traits::index::TraitRecord) -> TraitRef {
+        if let Some(written) = hint.filter(|h| h.def == trait_def) {
+            return written;
+        }
+        let replayed = self.replayed_trait_ref(e, trait_def);
+        let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
+        for (i, param) in rec.generics.params.iter().enumerate().skip(1) {
+            let arg = match replayed.and_then(|r| self.tys.args(r.args).get(i).copied()) {
+                Some(g) => g,
+                None => match param.kind {
+                    ParamKind::Const(_) => GenericArg::Const(self.fresh_const_var()),
+                    _ => GenericArg::Ty(self.new_var(false)),
+                },
+            };
+            tr_args.push(arg);
+        }
+        let args_id = self.tys.intern_args(&tr_args);
+        TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
+    }
+
+    /// An assoc call whose trait inputs only the args fix (see
+    /// `assoc_call`), deferred as rustc does and as method calls do
+    /// (`method::confirm_deferred`): the call is typed by the trait's
+    /// own signature, the trait obligation stays queued (its error is
+    /// rustc's E0277), and body end selects the impl
+    /// (`method::finish_deferred_methods`).
+    #[allow(clippy::too_many_arguments)]
+    fn assoc_call_deferred(
+        &mut self,
+        e: ExprId,
+        base: Ty,
+        hint: Option<TraitRef>,
+        trait_def: DefId,
+        name: Sym,
+        args: &[ExprId],
+        span: Span,
+    ) -> Option<Ty> {
+        let p = self.p;
+        let rec = p.gx.index.trait_record(trait_def)?;
+        let method_def = rec.method_by_name(name)?;
+        let n_trait = rec.generics.params.len();
+        let tr = self.assoc_trait_ref(e, base, hint, trait_def, rec);
+        let mut full: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+        let (sig_params, sig_ret, preds) = match p.gx.trait_methods.get(&method_def) {
+            Some(t) => {
+                for param in t.generics.params.iter().skip(n_trait) {
+                    full.push(match param.kind {
+                        ParamKind::Type => GenericArg::Ty(self.new_var(false)),
+                        ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+                        ParamKind::Const(_) => GenericArg::Const(self.fresh_const_var()),
+                    });
+                }
+                (t.params.clone(), t.ret, t.generics.predicates.clone())
+            }
+            None => {
+                let s = p.gx.lang_method_sigs.get(&method_def)?;
+                (s.params.clone(), s.ret, Vec::new())
+            }
+        };
+        let mut params: Vec<Ty> = sig_params.iter().map(|&t| subst(&mut self.tys, t, &full)).collect();
+        let ret = subst(&mut self.tys, sig_ret, &full);
+        self.normalize_params(&mut params, span);
+        self.push_predicates(&preds, &full, span);
+        self.obl.push_trait_at(tr, span, 0);
+        method::defer_path_call(self, e, tr, name, full[n_trait..].to_vec());
+        self.record_pick(e, trait_def, 0, ReceiverForm::Value);
+        self.check_args(&params, args, span);
+        Some(self.normalize_use(ret, span))
     }
 
     /// `Default::default()` and `From::from(x)` written through the
