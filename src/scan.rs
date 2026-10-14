@@ -280,6 +280,11 @@ pub struct ModDecl {
     pub vis: OutlineVis,
     /// The value of a `#[path = "..."]` attribute, when written.
     pub path_attr: Option<String>,
+    /// The span of a `#[path]` attribute whose input is not
+    /// `= "..."`, when one is written. The resolver reports it as
+    /// L0524: module files load from this outline, so the parser's
+    /// own input check never gets to judge this case first.
+    pub path_bad: Option<crate::diag::Span>,
     /// The token trees inside each `#[cfg(...)]` on the declaration, raw.
     pub cfg: Vec<Vec<crate::lexer::TokenTree>>,
     /// The token trees inside each `#[cfg_attr(...)]` on the declaration,
@@ -332,6 +337,7 @@ pub struct Outline {
 #[derive(Default)]
 struct PendingAttrs {
     path_attr: Option<String>,
+    path_bad: Option<crate::diag::Span>,
     cfg: Vec<Vec<crate::lexer::TokenTree>>,
     cfg_attr: Vec<Vec<crate::lexer::TokenTree>>,
     macro_use: bool,
@@ -446,12 +452,13 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                 }
                 match name.as_deref() {
                     Some("path") => {
-                        // `path = "file.rs"`: the string token after `=`.
-                        if let Some(s) = body.iter().find_map(|t| match t.tok {
-                            Tok::Str(x, _) => lexed.strings.get(x as usize).cloned(),
-                            _ => None,
-                        }) {
-                            pending.path_attr = Some(s);
+                        // The one form rustc accepts: `path = "file.rs"`.
+                        match body {
+                            [_, eq, s] if eq.tok == Tok::Eq => match s.tok {
+                                Tok::Str(x, _) => pending.path_attr = lexed.strings.get(x as usize).cloned(),
+                                _ => pending.path_bad = Some(toks[i].span),
+                            },
+                            _ => pending.path_bad = Some(toks[i].span),
                         }
                     }
                     Some("cfg") | Some("cfg_attr") => {
@@ -511,6 +518,7 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                         name,
                         vis: pending_vis,
                         path_attr: pending.path_attr.take(),
+                        path_bad: pending.path_bad.take(),
                         cfg: std::mem::take(&mut pending.cfg),
                         cfg_attr: std::mem::take(&mut pending.cfg_attr),
                         inline,

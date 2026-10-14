@@ -1507,6 +1507,18 @@ fn outline_mods(
             key.push(decl.name);
             inline_modules.insert(key, child);
         } else if existing.is_none() {
+            // A `#[path]` that is not `= "..."` is the parser's
+            // malformed-input error (L0524), but this load runs from
+            // the outline scan first, so report it here.
+            if let Some(bad) = decl.path_bad {
+                diags.push(Diag::new(
+                    "L0524",
+                    bad,
+                    "malformed `path` attribute input".to_string(),
+                    "Write the attribute in one of the forms Rust documents for it.",
+                ));
+                continue;
+            }
             let inline_names: Vec<String> = decl.container.iter().map(|s| interner.get(*s).to_string()).collect();
             match modules::module_file(&file_path, dir_owner, &inline_names, interner.get(decl.name), decl.path_attr.as_deref(), decl.span) {
                 Ok(f) => {
