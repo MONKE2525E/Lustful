@@ -1040,6 +1040,18 @@ fn ret_is_large(p: &Program, f: LocalDefId) -> bool {
     c_size_align(p, &cty(&p.tys, p.fn_info(f).ret)).0 > 32
 }
 
+/// True when a by-value parameter of C type `t` is dropped from the C
+/// signature and from every call. A zero-sized value carries no bits,
+/// so the callee makes its local from a zero literal instead (see
+/// `FnGen::function`). This is not optional: tcc 0.9.28 misplaces the
+/// parameters after a zero-sized struct parameter that has a
+/// zero-length array member, such as `[T; 0]` or `[[T; 0]; N]`, so
+/// the callee reads garbage. Drop glue still runs once, in the
+/// callee, through the local's drop flag.
+fn param_dropped(p: &Program, t: &CTy) -> bool {
+    c_size_align(p, t).0 == 0
+}
+
 /// True when `f` gets C of its own: a plain fn, an instance, or a
 /// closure body fn, with a source body. A template or a trait
 /// method stub is never generated, and an instance of a trait method
@@ -1070,7 +1082,7 @@ fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
     if ret_is_large(p, f) {
         params.push(format!("{ret}*"));
     }
-    params.extend(info.params.iter().map(|&t| ctype(&cty(&p.tys, t))));
+    params.extend(info.params.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).map(|t| ctype(&t)));
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
     if ret_is_large(p, f) { format!("(void (*)({params}))") } else { format!("({ret} (*)({params}))") }
 }
@@ -1083,7 +1095,14 @@ fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
     if ret_is_large(p, f) {
         params.push(format!("{ret} *out"));
     }
-    params.extend(info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)));
+    params.extend(
+        info.params
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (i, cty(&p.tys, t)))
+            .filter(|(_, t)| !param_dropped(p, t))
+            .map(|(i, t)| format!("{} p{}", ctype(&t), i + 1)),
+    );
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
     if ret_is_large(p, f) { format!("void f{slot}({params})") } else { format!("{ret} f{slot}({params})") }
 }
@@ -1107,19 +1126,21 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
         let env_c = cty(&p.tys, env_ty);
         let by_ref = matches!(env_c, CTy::Ref(ref inner) if **inner == CTy::Unit);
         if by_ref || env_c == CTy::Unit {
-            let names: Vec<String> = (2..=info.params.len()).map(|i| format!("p{i}")).collect();
+            let kept: Vec<usize> =
+                (1..info.params.len()).filter(|&i| !param_dropped(p, &cty(&p.tys, info.params[i]))).collect();
+            let names: Vec<String> = kept.iter().map(|i| format!("p{}", i + 1)).collect();
             let decls: Vec<String> =
-                info.params.iter().enumerate().skip(1).map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
-            let env = if by_ref { "&env" } else { "env" };
-            let mut all = vec![env.to_string()];
+                kept.iter().map(|&i| format!("{} p{}", ctype(&cty(&p.tys, info.params[i])), i + 1)).collect();
+            // A by-value Unit env is a dropped parameter; a by-ref env stays.
+            let mut all: Vec<String> = if by_ref { vec!["&env".to_string()] } else { Vec::new() };
             all.extend(names);
             if ret_is_large(p, f) {
                 let mut params = vec![format!("{ret} *out")];
                 params.extend(decls);
+                let rest = if all.is_empty() { String::new() } else { format!(", {}", all.join(", ")) };
                 return format!(
-                    "static void tramp{slot}({}) {{ lust_Unit env; ({cast}lust_fns[{slot}])(out, {}); }}\n",
-                    params.join(", "),
-                    all.join(", ")
+                    "static void tramp{slot}({}) {{ lust_Unit env; ({cast}lust_fns[{slot}])(out{rest}); }}\n",
+                    params.join(", ")
                 );
             }
             let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
@@ -1129,8 +1150,9 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
             );
         }
     }
-    let names: Vec<String> = (1..=info.params.len()).map(|i| format!("p{i}")).collect();
-    let decls: Vec<String> = info.params.iter().enumerate().map(|(i, &t)| format!("{} p{}", ctype(&cty(&p.tys, t)), i + 1)).collect();
+    let kept: Vec<usize> = (0..info.params.len()).filter(|&i| !param_dropped(p, &cty(&p.tys, info.params[i]))).collect();
+    let names: Vec<String> = kept.iter().map(|i| format!("p{}", i + 1)).collect();
+    let decls: Vec<String> = kept.iter().map(|&i| format!("{} p{}", ctype(&cty(&p.tys, info.params[i])), i + 1)).collect();
     if ret_is_large(p, f) {
         let mut params = vec![format!("{ret} *out")];
         params.extend(decls);
@@ -1257,7 +1279,15 @@ impl FnGen<'_, '_, '_> {
         let mut flags = Vec::new();
         for (i, t) in self.local_cty.iter().enumerate() {
             let is_param = i >= 1 && i <= self.body.arg_count;
-            let decl = if is_param { format!("l{i} = p{i}") } else { format!("l{i}") };
+            // A dropped parameter (see `param_dropped`) has no `p{i}`; its
+            // local is the one possible value of a zero-sized type.
+            let decl = if is_param && param_dropped(p, t) {
+                format!("l{i} = {}", zero_lit(p, t))
+            } else if is_param {
+                format!("l{i} = p{i}")
+            } else {
+                format!("l{i}")
+            };
             let ct = ctype(t);
             match by_type.iter_mut().find(|(c, _)| *c == ct) {
                 Some((_, v)) => v.push(decl),
@@ -1951,7 +1981,14 @@ impl FnGen<'_, '_, '_> {
                     let ct = cty(&self.p.tys, t);
                     collect_types(&ct, &mut self.sig_types);
                 }
-                let args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let dropped: Vec<bool> = info.params.iter().map(|&t| param_dropped(self.p, &cty(&self.p.tys, t))).collect();
+                let mut i = 0;
+                args.retain(|_| {
+                    let keep = !dropped.get(i).copied().unwrap_or(false);
+                    i += 1;
+                    keep
+                });
                 if ret_is_large(self.p, f) {
                     let t = self.tmp();
                     let ret = ctype(&cty(&self.p.tys, info.ret));
@@ -1988,8 +2025,10 @@ impl FnGen<'_, '_, '_> {
                 for o in &args[1..] {
                     let (v, t) = self.operand(o, loc, post);
                     collect_types(&t, &mut self.sig_types);
-                    tys.push(ctype(&t));
-                    vals.push(v);
+                    if !param_dropped(self.p, &t) {
+                        tys.push(ctype(&t));
+                        vals.push(v);
+                    }
                 }
                 let ret = dest_cty.clone();
                 collect_types(&ret, &mut self.sig_types);
@@ -2006,9 +2045,16 @@ impl FnGen<'_, '_, '_> {
             }
             CallTarget::Indirect(callee) => {
                 let ct = self.local_cty[callee as usize].clone();
-                let CTy::FnPtr(_, ret) = &ct else { panic!("indirect call through a non-fn-pointer local") };
+                let CTy::FnPtr(ps, ret) = &ct else { panic!("indirect call through a non-fn-pointer local") };
                 collect_types(&ct, &mut self.sig_types);
-                let args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let dropped: Vec<bool> = ps.iter().map(|t| param_dropped(self.p, t)).collect();
+                let mut i = 0;
+                args.retain(|_| {
+                    let keep = !dropped.get(i).copied().unwrap_or(false);
+                    i += 1;
+                    keep
+                });
                 if c_size_align(self.p, ret).0 > 32 {
                     let t = self.tmp();
                     let rt = ctype(ret);
@@ -2565,13 +2611,17 @@ impl FnGen<'_, '_, '_> {
         let cast = fn_ptr_cast(p, f);
         let slot = self.slots[f.0 as usize];
         let recv = ctype(&cty(&p.tys, info.params[0]));
+        let recv_dropped = param_dropped(p, &cty(&p.tys, info.params[0]));
         let mut decls: Vec<String> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
+        let mut rest: Vec<String> = Vec::new();
         for (i, &t) in info.params.iter().enumerate().skip(1) {
+            if param_dropped(p, &cty(&p.tys, t)) {
+                continue;
+            }
             decls.push(format!("{} a{i}", ctype(&cty(&p.tys, t))));
-            names.push(format!(", a{i}"));
+            rest.push(format!("a{i}"));
         }
-        let (decls, names) = (decls.iter().map(|d| format!(", {d}")).collect::<String>(), names.concat());
+        let decls = decls.iter().map(|d| format!(", {d}")).collect::<String>();
         if let Some(self_ty) = consume {
             let ct = cty(&p.tys, self_ty);
             let cts = ctype(&ct);
@@ -2584,28 +2634,42 @@ impl FnGen<'_, '_, '_> {
                 String::new()
             };
             let free = format!("lust_dealloc(self, sizeof({cts}), _Alignof({cts}));");
+            let mut call: Vec<String> = Vec::new();
+            if !recv_dropped {
+                call.push(env);
+            }
+            call.extend(rest.iter().cloned());
+            let call = call.join(", ");
             if ret_is_large(p, f) {
+                let rest = if call.is_empty() { String::new() } else { format!(", {call}") };
                 let _ = writeln!(
                     self.prelude,
-                    "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out, {env}{names}); {drop}{free} }}"
+                    "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out{rest}); {drop}{free} }}"
                 );
             } else {
                 let _ = writeln!(
                     self.prelude,
-                    "static {ret} {name}(void *self{decls}) {{ {ret} r = ({cast}lust_fns[{slot}])({env}{names}); {drop}{free} return r; }}"
+                    "static {ret} {name}(void *self{decls}) {{ {ret} r = ({cast}lust_fns[{slot}])({call}); {drop}{free} return r; }}"
                 );
             }
             return name;
         }
+        let mut names: Vec<String> = Vec::new();
+        if !recv_dropped {
+            names.push(format!("({recv})self"));
+        }
+        names.extend(rest);
+        let names = names.join(", ");
         if ret_is_large(p, f) {
+            let rest = if names.is_empty() { String::new() } else { format!(", {names}") };
             let _ = writeln!(
                 self.prelude,
-                "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out, ({recv})self{names}); }}"
+                "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out{rest}); }}"
             );
         } else {
             let _ = writeln!(
                 self.prelude,
-                "static {ret} {name}(void *self{decls}) {{ return ({cast}lust_fns[{slot}])(({recv})self{names}); }}"
+                "static {ret} {name}(void *self{decls}) {{ return ({cast}lust_fns[{slot}])({names}); }}"
             );
         }
         name
@@ -5964,7 +6028,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 if large {
                     params.push(format!("{}*", ctype(r)));
                 }
-                params.extend(ps.iter().map(ctype));
+                params.extend(ps.iter().filter(|t| !param_dropped(p, t)).map(ctype));
                 let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
                 if large {
                     let _ = writeln!(out, "typedef void (*{ct})({params});");
