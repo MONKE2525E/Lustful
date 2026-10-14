@@ -281,7 +281,6 @@ pub enum Builtin {
     MemSwap,
     MemReplace,
     MemTake,
-    MemForget,
     CmpMax,
     CmpMin,
     IterIter,
@@ -8694,7 +8693,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ("mem", "swap") => Some(Builtin::MemSwap),
                 ("mem", "replace") => Some(Builtin::MemReplace),
                 ("mem", "take") => Some(Builtin::MemTake),
-                ("mem", "forget") => Some(Builtin::MemForget),
                 ("cmp", "max") => Some(Builtin::CmpMax),
                 ("cmp", "min") => Some(Builtin::CmpMin),
                 ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
@@ -11502,6 +11500,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `LocalKey` methods on a `thread_local!` static (check/tls.rs).
         if let Some(ret) = self.tls_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
         // The inherent methods of `core::ops::Bound<T>` (same).
         if let Some(ret) = self.bound_adt_method(e, recv, base, derefs, name, name_span, args) {
             return ret;

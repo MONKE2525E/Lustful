@@ -3662,9 +3662,6 @@ impl FnGen<'_, '_, '_> {
                 }
                 "((lust_Unit){})".into()
             }
-            // The operand was moved into the call and is simply
-            // never dropped (as `mem::forget`).
-            B::MemForget => "((lust_Unit){})".into(),
             B::StringNew => "lust_string_new()".into(),
             B::StringFrom => match &tys[0] {
                 CTy::Char => {

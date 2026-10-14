@@ -2690,7 +2690,7 @@ pub fn collect_reuse<'a>(
                 // line, then column, as std's does. No Hash: a hash
                 // value printed by a program would have to match std's
                 // field hash exactly, which is not checked here.
-                _ => {
+                8 => {
                     let file = p.tys.mk_ref(false, STR);
                     (
                         generics::location_def(),
@@ -2707,15 +2707,7 @@ pub fn collect_reuse<'a>(
                         },
                     )
                 }
-            };
-            // `core::sync::atomic::Ordering` (index 4) and RefCell's
-            // `BorrowError` and `BorrowMutError` (10, 11) are std's
-            // synthetic `#[non_exhaustive]` types here.
-            let synthetic_ne = matches!(usize::MAX - item_idx, 4 | 10 | 11);
-            p.adts[id.0 as usize] =
-                AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
-            p.gx.adt_info[id.0 as usize] = (def, 0);
-            if generics::std_adt_has_flat_name(usize::MAX - item_idx) && !std_taken.contains(&name) {
+
                 // core: `#[derive(Clone, Copy, Debug, Hash, PartialEq,
                 // Eq)] enum Bound<T>`, in this order.
                 _ => {
@@ -2728,9 +2720,14 @@ pub fn collect_reuse<'a>(
                     )
                 }
             };
-            p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default() };
+            // `core::sync::atomic::Ordering` (index 4) and RefCell's
+            // `BorrowError` and `BorrowMutError` (10, 11) are std's
+            // synthetic `#[non_exhaustive]` types here.
+            let synthetic_ne = matches!(usize::MAX - item_idx, 4 | 10 | 11);
+            p.adts[id.0 as usize] =
+                AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            if usize::MAX - item_idx == 8 {
+            if usize::MAX - item_idx == 12 {
                 // `Bound<T>`: the one generic synthetic std Adt. Give
                 // it its param and field table, as the field pass does
                 // for a user generic enum.

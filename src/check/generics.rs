@@ -653,6 +653,8 @@ pub fn try_recv_error_def() -> DefId {
 /// The `core::sync::atomic::Ordering` type.
 pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
+}
+
 /// The def of `core::ops::Bound<T>`, a synthetic generic enum Adt:
 /// `Included(T)`, `Excluded(T)`, `Unbounded`, in std's order.
 pub fn bound_def() -> DefId {

@@ -1341,7 +1341,7 @@ pub fn builtin_auto(
                         let sl = tys.intern(TyKind::Slice(args[i as usize]));
                         parts.push(tys.mk_ref(m, sl));
                     }
-                    F::Recv(..) => parts.push(crate::ty::iter::field_ty(tys, *f, &args)),
+                    F::Recv(..) | F::VecRefMut(_) | F::StringRefMut => parts.push(crate::ty::iter::field_ty(tys, *f, &args)),
                     // The peeked item: not modelled, so not proven.
                     F::PeekSlot(_) => return Some(None),
                 }

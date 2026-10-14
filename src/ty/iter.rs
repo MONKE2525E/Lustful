@@ -497,6 +497,7 @@ impl IterKind {
             K::Flatten => &[F::OptArg(0), F::OptArg(1), F::OptArg(1)],
             K::OptionIntoIter => &[F::OptArg(0)],
             K::StrSplit => &[F::Str, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Arg(0)],
+            // The drains: the borrowed container, then start, front,
             // back, tail start, and tail length, as indexes into the
             // container's buffer (std's Drain bookkeeping).
             K::VecDrain => &[F::VecRefMut(0), F::Usize, F::Usize, F::Usize, F::Usize, F::Usize],
