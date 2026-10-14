@@ -144,10 +144,16 @@ pub fn route_root(root_text: &str, interner: &Interner) -> (bool, Option<lexer::
     if let Some(pieces) = route_pieces(root_text) {
         let answers = par_map(&pieces, |&(a, b)| {
             let lexed = lexer::lex(&root_text[a..b], FileId(0), a as u32, interner).ok()?;
-            piece_cut_ok(&lexed, b, root_text.len()).then(|| (needs_resolve_lexed(&lexed, interner), lexed))
+            piece_cut_ok(&lexed, b, root_text.len()).then(|| (route_keywords(&lexed, interner), lexed))
         });
         if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, lexer::Lexed)>>>() {
-            let yes = answers.iter().any(|(y, _)| *y);
+            // The brace scan needs the whole file in order: each piece but
+            // the last ends in an end-of-input token that `join_lexed` drops.
+            let last = answers.len() - 1;
+            let yes = answers.iter().any(|(y, _)| *y) || {
+                let mut scan = NestedFnScan::default();
+                answers.iter().enumerate().any(|(k, (_, l))| scan.feed(&l.tokens[..l.tokens.len() - usize::from(k < last)]))
+            };
             return (yes, yes.then(|| join_lexed(answers.into_iter().map(|(_, l)| l).collect())));
         }
     }
@@ -343,6 +349,12 @@ fn is_macro_call(toks: &[lexer::Token], mut i: usize) -> bool {
 
 /// The lexed form of `needs_resolve`, for callers that already lexed.
 pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
+    route_keywords(lexed, interner) || NestedFnScan::default().feed(&lexed.tokens)
+}
+
+/// The token-local part of `needs_resolve_lexed`: each token with a few
+/// after it decides, so a big file's pieces answer it in parallel.
+fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     use crate::lexer::Tok;
     // Symbols, not texts: this reads every identifier token of the root.
     let (macro_rules, include) = (interner.intern("macro_rules"), interner.intern("include"));
@@ -417,44 +429,52 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
             _ => {}
         }
     }
-    nested_fn_in_generic(toks)
+    false
 }
 
-/// True when a `fn` item sits inside the body of a fn of a generic item
-/// (`fn f<T>() { fn g() {} }`, or a method of `impl<T>`): the resolver
-/// rejects a path in it to an outer generic param (rustc E0401), which
-/// otherwise reads the module item that the param shadows. A token scan
-/// with a brace stack; a piece of a big file that closes braces it did
-/// not open counts its earlier fns as possibly nested.
-fn nested_fn_in_generic(toks: &[lexer::Token]) -> bool {
-    use crate::lexer::Tok;
-    // Per open brace: (a fn body, inside a generic item).
-    let mut stack: Vec<(bool, bool)> = Vec::new();
-    let (mut fn_pending, mut generic_pending, mut fn_at_top) = (false, false, false);
-    for (i, t) in toks.iter().enumerate() {
-        let next = |k: usize| toks.get(i + k).map(|t| t.tok);
-        match t.tok {
-            Tok::Fn if matches!(next(1), Some(Tok::Ident(_))) => {
-                if stack.iter().any(|&(body, _)| body) && stack.last().is_some_and(|&(_, g)| g) {
-                    return true;
+/// Finds a `fn` item inside the body of a fn of a generic item (`fn
+/// f<T>() { fn g() {} }`, or a method of `impl<T>`): the resolver rejects
+/// a path in it to an outer generic param (rustc E0401), which otherwise
+/// reads the module item that the param shadows. A brace stack over the
+/// whole file's tokens, fed in order (a big file's pieces one by one).
+#[derive(Default)]
+struct NestedFnScan {
+    /// Per open brace: (a fn body, inside a generic item).
+    stack: Vec<(bool, bool)>,
+    fn_pending: bool,
+    generic_pending: bool,
+}
+
+impl NestedFnScan {
+    /// Scans the next tokens; true once a nested fn in a generic item is found.
+    fn feed(&mut self, toks: &[lexer::Token]) -> bool {
+        use crate::lexer::Tok;
+        for (i, t) in toks.iter().enumerate() {
+            let next = |k: usize| toks.get(i + k).map(|t| t.tok);
+            match t.tok {
+                Tok::Fn if matches!(next(1), Some(Tok::Ident(_))) => {
+                    if self.stack.iter().any(|&(body, _)| body) && self.stack.last().is_some_and(|&(_, g)| g) {
+                        return true;
+                    }
+                    self.fn_pending = true;
+                    self.generic_pending |= next(2) == Some(Tok::Lt);
                 }
-                fn_at_top |= stack.is_empty();
-                fn_pending = true;
-                generic_pending |= next(2) == Some(Tok::Lt);
+                Tok::Impl if next(1) == Some(Tok::Lt) => self.generic_pending = true,
+                Tok::Trait if next(2) == Some(Tok::Lt) => self.generic_pending = true,
+                Tok::Semi => (self.fn_pending, self.generic_pending) = (false, false),
+                Tok::LBrace => {
+                    let outer = self.stack.last().is_some_and(|&(_, g)| g);
+                    self.stack.push((self.fn_pending, self.generic_pending || outer));
+                    (self.fn_pending, self.generic_pending) = (false, false);
+                }
+                Tok::RBrace => {
+                    self.stack.pop();
+                }
+                _ => {}
             }
-            Tok::Impl if next(1) == Some(Tok::Lt) => generic_pending = true,
-            Tok::Trait if next(2) == Some(Tok::Lt) => generic_pending = true,
-            Tok::Semi => (fn_pending, generic_pending) = (false, false),
-            Tok::LBrace => {
-                let outer = stack.last().is_some_and(|&(_, g)| g);
-                stack.push((fn_pending, generic_pending || outer));
-                (fn_pending, generic_pending) = (false, false);
-            }
-            Tok::RBrace if stack.pop().is_none() && fn_at_top => return true,
-            _ => {}
         }
+        false
     }
-    false
 }
 
 /// One file during resolution, or one item segment of a big file (see
