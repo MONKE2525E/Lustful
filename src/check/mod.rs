@@ -582,6 +582,30 @@ pub enum Builtin {
     HashExtend,
     HashExtendReserve,
     HashReserve,
+    /// `Vec::drain` and `String::drain` (fx-vec-drain): the call
+    /// takes the container by `&mut` and the range bounds as four
+    /// words (start tag and value, end tag and value; see
+    /// `lower::drain_into`). The `*Next`/`*NextBack`/`*Len` forms
+    /// stay calls to codegen, as `vec::IntoIter`'s do.
+    VecDrain,
+    StringDrain,
+    VecDrainNext,
+    VecDrainNextBack,
+    VecDrainLen,
+    VecDrainAsSlice,
+    StrDrainNext,
+    StrDrainNextBack,
+    StrDrainAsStr,
+    /// `next_back`, `size_hint`, and `len` called directly on a
+    /// builtin iterator: expanded in lower/iter.rs like `next`.
+    IterNextBack,
+    IterSizeHint,
+    IterLen,
+    /// `RangeBounds::start_bound` and `end_bound` on a builtin
+    /// range kind or a `(Bound, Bound)` pair: expanded in
+    /// lower/iter.rs into a `Bound<&T>` value.
+    RangeStartBound,
+    RangeEndBound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -17840,7 +17864,10 @@ fn bound_type_has_regions(p: &Program, t: Ty) -> bool {
     match p.tys.kind(t) {
         TyKind::Ref(..) | TyKind::Dyn(..) | TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Opaque(..) => true,
         TyKind::Adt(def, args) => {
-            matches!(p.tys.builtin_of(t), Some(BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut)))
+            matches!(
+                p.tys.builtin_of(t),
+                Some(BuiltinTy::Chars | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::VecDrain | IterKind::StringDrain))
+            )
                 || p.gx.adt_lifetimes.get(&def).is_some_and(|v| !v.is_empty())
                 || p.tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| bound_type_has_regions(p, e)))
         }

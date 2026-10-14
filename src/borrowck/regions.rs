@@ -580,7 +580,14 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
         Some(
             BuiltinTy::Chars
             | BuiltinTy::Iter(
-                IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter | IterKind::Windows | IterKind::CharIndices,
+                IterKind::SliceIter
+                | IterKind::SliceIterMut
+                | IterKind::RecvIter
+                | IterKind::RecvTryIter
+                | IterKind::Windows
+                | IterKind::CharIndices
+                | IterKind::VecDrain
+                | IterKind::StringDrain,
             )
             | BuiltinTy::Iter(IterKind::StrSplit)
             | BuiltinTy::RefGuard
@@ -3387,6 +3394,10 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     matches!(crate::ty::sync::sync_kind(tys, x), Some(crate::ty::sync::SyncTy::Receiver | crate::ty::sync::SyncTy::OnceLock))
                         .then(|| tys.adt_first_ty_arg(x))
                         .flatten()
+                })
+                .or_else(|| {
+                    let (k, a) = crate::ty::iter::iter_parts(tys, x)?;
+                    (k == crate::ty::iter::IterKind::VecDrain).then(|| a[0])
                 }),
         };
         // The element type sits at the end of the receiver's slots (after
@@ -4224,6 +4235,11 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             return true;
         }
         let Some((k, a)) = crate::ty::iter::iter_parts(&self.body.tys, t) else { return false };
+        // `string::Drain` yields owned `char`s, like `Chars`.
+        if k == K::StringDrain {
+            out.push(Vec::new());
+            return true;
+        }
         let Some(&a0) = a.first() else { return false };
         let n0 = self.sc.slots(a0) as usize;
         match k {
@@ -4251,6 +4267,16 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
                 None => false,
             },
+            // The item `T` is owned; the drain's own region slot (its
+            // borrow of the Vec) comes first and is not part of it.
+            K::VecDrain => match vars.get(1..1 + n0) {
+                Some(v) => {
+                    out.push(v.to_vec());
+                    true
+                }
+                None => false,
+            },
+            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
                 vars.get(..n0).is_some_and(|v| self.iter_items(a0, v, out))
             }
@@ -5856,6 +5882,10 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
                     | crate::check::sync::SyncOp::TryLock(_)
                     | crate::check::sync::SyncOp::RecvMakeIter(0 | 1)
             )
+            | B::VecDrain
+            | B::StringDrain
+            | B::VecDrainAsSlice
+            | B::StrDrainAsStr
     )
 }
 

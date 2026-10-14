@@ -35,6 +35,13 @@ typedef struct { uint8_t *ptr; uint64_t len; uint64_t cap; } lust_String;
 typedef struct { void *ptr; uint64_t len; uint64_t cap; } lust_Vec;
 /* `vec::IntoIter<T>`: the moved-in Vec buffer; elements `front..len` are still owned. */
 typedef struct { void *ptr; uint64_t len; uint64_t cap; uint64_t front; } lust_VecIter;
+/* `vec::Drain<T>` and `string::Drain`: the drained container (a lust_Vec
+   or a lust_String; both start with ptr, len, cap), the drain start, the
+   elements still to yield (`front..back`, indexes into the container's
+   buffer), and the tail after the drained range. A Vec's length is set
+   to `start` while its Drain lives; the drop glue (cgen.rs) drops what
+   was not yielded and moves the tail down to `start`. */
+typedef struct { void *vec; uint64_t start; uint64_t front; uint64_t back; uint64_t tail_start; uint64_t tail_len; } lust_VecDrain;
 typedef struct { uint64_t n; } lust_Args;
 /* `&dyn Trait` and `&mut dyn Trait` (ARCH 2.8): the data pointer and the
    vtable, an array of words: drop glue, size, align, one super vtable per

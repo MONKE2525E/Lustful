@@ -943,7 +943,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let Some((k, a)) = it::iter_parts(&self.tys, t) else { return false };
         match k {
-            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::Windows | K::CharIndices => true,
+            K::SliceIter
+            | K::SliceIterMut
+            | K::VecIntoIter
+            | K::Range
+            | K::RangeInclusive
+            | K::Windows
+            | K::CharIndices
+            | K::VecDrain
+            | K::StringDrain => true,
             K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => self.double_ended(a[0]),
             K::Chain => self.double_ended(a[0]) && self.double_ended(a[1]),
             // These need ExactSizeIterator too: lust keeps them forward-only for now.
@@ -975,6 +983,23 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(it::SplitMode::SplitWhitespace | it::SplitMode::SplitAsciiWhitespace | it::SplitMode::Lines) => true,
                 Some(_) => !crate::check::split::str_needle(&self.tys, a[0]),
             },
+            K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
+        }
+    }
+
+    /// True when Rust 1.99 implements `ExactSizeIterator` for an
+    /// iterator type (the kinds lust has): the gate for `.len()`.
+    pub(super) fn exact_size(&mut self, t: Ty) -> bool {
+        use IterKind as K;
+        if self.tys.is_chars_ty(t) {
+            return false;
+        }
+        let Some((k, a)) = it::iter_parts(&self.tys, t) else { return false };
+        match k {
+            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => true,
+            K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::Copied | K::Cloned | K::Peekable | K::Inspect => self.exact_size(a[0]),
+            K::Chain | K::Zip => self.exact_size(a[0]) && self.exact_size(a[1]),
+            _ => false,
         }
     }
 

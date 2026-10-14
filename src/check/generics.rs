@@ -646,6 +646,21 @@ pub fn try_recv_error_def() -> DefId {
 /// The `core::sync::atomic::Ordering` type.
 pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
+/// The def of `core::ops::Bound<T>`, a synthetic generic enum Adt:
+/// `Included(T)`, `Excluded(T)`, `Unbounded`, in std's order.
+pub fn bound_def() -> DefId {
+    lang_def(&["core", "ops"], crate::def::DefKind::Adt, "Bound")
+}
+
+/// The `core::ops::Bound<T>` type.
+pub fn bound_ty(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    tys.mk_adt(bound_def(), &[GenericArg::Ty(t)])
+}
+
+/// True when `t` is a `core::ops::Bound<T>` type, with its `T`.
+pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    let (def, _) = tys.adt_parts(t)?;
+    (def == bound_def()).then(|| tys.adt_first_ty_arg(t)).flatten()
 }
 
 /// The synthetic std Adts collect always registers, as (index, name,
@@ -654,14 +669,14 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 12] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 13] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 12] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 12]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 13] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 13]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -677,6 +692,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 12] {
             (9, "Cow", adt(&["alloc", "borrow"], "Cow"), true),
             (10, "BorrowError", adt(&["core", "cell"], "BorrowError"), false),
             (11, "BorrowMutError", adt(&["core", "cell"], "BorrowMutError"), false),
+            (12, "Bound", adt(&["core", "ops"], "Bound"), true),
         ]
     })
 }
@@ -721,6 +737,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
         ("cell", "BorrowMutError", borrow_mut_error_def()),
+        ("ops", "Bound", bound_def()),
     ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
@@ -6518,6 +6535,9 @@ pub fn add_synthetic_impls(p: &mut Program) {
         use crate::ty::iter::{IterKind as K, mk_iter};
         let names = ["I", "F", "B"];
         for k in K::ALL {
+            if !k.is_iterator() {
+                continue;
+            }
             let params: Vec<ParamDef> =
                 (0..k.n_args()).map(|i| ParamDef { name: p.interner.intern(names[i]), kind: ParamKind::Type, span }).collect();
             let ps: Vec<Ty> = (0..k.n_args() as u32).map(|i| p.tys.intern(TyKind::Param(ParamId(i)))).collect();
@@ -6539,7 +6559,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 }
                 K::Flatten => proj(p, ps[1]),
                 K::OptionIntoIter => ps[0],
-                K::VecIntoIter | K::Range | K::RangeInclusive => ps[0],
+                K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => ps[0],
+                K::StringDrain => CHAR,
                 K::Map | K::FilterMap => ps[2],
                 K::Copied | K::Cloned => ps[1],
                 // The hashed-collection iterators (W-STD-B).

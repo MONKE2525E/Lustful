@@ -1480,6 +1480,19 @@ impl Ex<'_, '_, '_> {
                 let r = self.ref_to(true, itp, ty);
                 self.call_builtin(Builtin::HashIterNext, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
+            K::VecDrain | K::StringDrain => {
+                let r = self.ref_to(true, itp, ty);
+                let b = match (k, back) {
+                    (K::VecDrain, false) => Builtin::VecDrainNext,
+                    (K::VecDrain, true) => Builtin::VecDrainNextBack,
+                    (_, false) => Builtin::StrDrainNext,
+                    _ => Builtin::StrDrainNextBack,
+                };
+                self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
+                self.goto(join);
+            }
+            K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => {
+                return Err("iterator expansion: next on an open-ended range kind".into());
             }
             K::Range => {
                 let c = self.cmp(Lt, Operand::Copy(f(0)), Operand::Copy(f(1)));
@@ -3101,6 +3114,25 @@ impl Ex<'_, '_, '_> {
                 self.call_builtin(Builtin::HashIterLen, vec![Operand::Move(Place::local(r))], Place::local(n));
                 set_exact(self, Operand::Copy(Place::local(n)));
             }
+            K::VecDrain => {
+                let r = self.ref_to(false, itp, ty);
+                let n = self.local(USIZE);
+                self.call_builtin(Builtin::VecDrainLen, vec![Operand::Move(Place::local(r))], Place::local(n));
+                set_exact(self, Operand::Copy(Place::local(n)));
+            }
+            K::StringDrain => {
+                // The `Chars` hint over the bytes left, as above.
+                let r = self.ref_to(false, itp, ty);
+                let bytes = self.local(USIZE);
+                self.call_builtin(Builtin::VecDrainLen, vec![Operand::Move(Place::local(r))], Place::local(bytes));
+                let b3 = self.local(USIZE);
+                self.assign(Place::local(b3), Rvalue::Bin(Add, Operand::Copy(Place::local(bytes)), Self::usize_c(3)));
+                self.assign(Place::local(lo), Rvalue::Bin(Div, Operand::Copy(Place::local(b3)), Self::usize_c(4)));
+                self.some(&Place::local(hi), ou, Operand::Copy(Place::local(bytes)));
+            }
+            K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => {
+                return Err("iterator expansion: size_hint of an open-ended range kind".into());
+            }
             K::RangeInclusive => {
                 // Exhausted or empty: (0, Some(0)); else steps + 1, with
                 // `checked_add` on the upper bound.
@@ -3482,7 +3514,7 @@ impl Ex<'_, '_, '_> {
         use IterKind as K;
         let Some((k, a)) = self.kind_args(ty) else { return false };
         match k {
-            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive => true,
+            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => true,
             K::Map | K::Enumerate | K::Rev | K::Take | K::Copied | K::Cloned | K::Peekable => self.trusted_len(a[0]),
             K::Chain | K::Zip => self.trusted_len(a[0]) && self.trusted_len(a[1]),
             K::Skip | K::StepBy => self.tra(a[0]),
@@ -3508,6 +3540,7 @@ impl Ex<'_, '_, '_> {
             // std's impls: an outer TrustedLen over arrays (or references
             // to arrays) of a fixed size.
             K::Flatten => self.trusted_len(a[0]) && self.item_const_size(a[0]).is_some(),
+            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
         }
     }
 

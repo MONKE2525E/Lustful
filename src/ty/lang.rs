@@ -1178,6 +1178,7 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
     (&["std", "core"], "cell", "BorrowError"),
     (&["std", "core"], "cell", "BorrowMutError"),
     (&["std", "core"], "cmp", "Ordering"),
+    (&["std", "core"], "ops", "Bound"),
     (&["std"], "process", "ExitCode"),
     (&["std", "core"], "str", "Utf8Error"),
     (&["std", "alloc"], "string", "FromUtf8Error"),
@@ -1443,6 +1444,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/cell/BorrowMutError",
     "core/cmp/Ordering",
     "std/cmp/Ordering",
+    "core/ops/Bound",
+    "std/ops/Bound",
     "std/process/ExitCode",
     "core/str/Utf8Error",
     "std/str/Utf8Error",
@@ -1723,6 +1726,12 @@ const STD_VARIANT_PATHS: &[&str] = &[
     "std/sync/atomic/Ordering/SeqCst",
     "std/sync/mpsc/TryRecvError/Empty",
     "std/sync/mpsc/TryRecvError/Disconnected",
+    "core/ops/Bound/Included",
+    "std/ops/Bound/Included",
+    "core/ops/Bound/Excluded",
+    "std/ops/Bound/Excluded",
+    "core/ops/Bound/Unbounded",
+    "std/ops/Bound/Unbounded",
 ];
 
 /// True for a trait of the Rust 2024 prelude (and the prelude's

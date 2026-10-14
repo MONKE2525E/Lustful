@@ -79,6 +79,11 @@ pub enum CTy {
     /// A `vec::IntoIter<T>` (W-STD-A): the runtime's `lust_VecIter`,
     /// the moved-in buffer plus the front index of what it still owns.
     VecIter(Box<CTy>),
+    /// A `vec::Drain<T>`: the runtime's `lust_VecDrain`, a pointer to
+    /// the drained Vec plus its range bookkeeping.
+    VecDrain(Box<CTy>),
+    /// A `string::Drain`: the same runtime struct over the String.
+    StrDrain,
     /// A `core::fmt` struct (W-STD-B): the runtime's `lust_Formatter`
     /// or Debug builder (src/runtime/fmt.h).
     Fmt(crate::ty::fmt::FmtTy),
@@ -276,6 +281,11 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
     // The hash iterators' state is the core's (cgen/hash.rs).
     if k.is_hash() {
         return CTy::Hash(crate::ty::hash::HashTy::of_iter(k), args.iter().map(|&a| cty(tys, a)).collect());
+    if k == IterKind::VecDrain {
+        return CTy::VecDrain(Box::new(cty(tys, arg(0))));
+    }
+    if k == IterKind::StringDrain {
+        return CTy::StrDrain;
     }
     let fields = k
         .fields()
@@ -287,6 +297,8 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
             Field::OptArg(i) => CTy::Option(Box::new(cty(tys, arg(i)))),
             Field::SliceRef(i, _) => CTy::Slice(Box::new(cty(tys, arg(i)))),
             Field::VecArg(i) => CTy::Vec(Box::new(cty(tys, arg(i)))),
+            Field::VecRefMut(i) => CTy::Ref(Box::new(CTy::Vec(Box::new(cty(tys, arg(i)))))),
+            Field::StringRefMut => CTy::Ref(Box::new(CTy::String)),
             Field::PeekSlot(i) => CTy::Option(Box::new(CTy::Option(Box::new(iter_item_cty(tys, arg(i)))))),
             Field::Recv(i, owned) => {
                 let r = CTy::Sync(crate::ty::sync::SyncTy::Receiver, Box::new(cty(tys, arg(i))));
@@ -316,7 +328,8 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::CharIndices => CTy::Tuple(vec![CTy::Int(IntTy::Usize), CTy::Char]),
         K::Flatten => iter_item_cty(tys, a[1]),
         K::OptionIntoIter => cty(tys, a[0]),
-        K::VecIntoIter | K::Range | K::RangeInclusive => cty(tys, a[0]),
+        K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => cty(tys, a[0]),
+        K::StringDrain => CTy::Char,
         K::Map | K::FilterMap => cty(tys, a[2]),
         K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),
         K::Zip => CTy::Tuple(vec![iter_item_cty(tys, a[0]), iter_item_cty(tys, a[1])]),
@@ -428,6 +441,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Boxed(inner) => format!("{}*", ctype(inner)),
         CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::VecIter(_) => "lust_VecIter".into(),
+        CTy::VecDrain(_) | CTy::StrDrain => "lust_VecDrain".into(),
         CTy::Weak(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::RefCell(inner) => format!("RCL_{}", mangle(inner)),
         CTy::Cell(inner) => ctype(inner),
@@ -521,6 +535,8 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Boxed(e) => tok(s, "Bx", &[e]),
         CTy::Rc(e) => tok(s, "Rc", &[e]),
         CTy::VecIter(e) => tok(s, "VI", &[e]),
+        CTy::VecDrain(e) => tok(s, "VD", &[e]),
+        CTy::StrDrain => tok(s, "SDr", &[]),
         CTy::Weak(e) => tok(s, "Wk", &[e]),
         CTy::RefCell(e) => tok(s, "RCL", &[e]),
         CTy::Cell(e) => tok(s, "Cl", &[e]),
@@ -578,7 +594,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             ps.iter().for_each(|e| collect_types(e, out));
             collect_types(r, out);
         }
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::Cell(e) | CTy::Unsized(_, e) => collect_types(e, out),
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) => collect_types(e, out),
         CTy::Weak(e) => {
             out.insert(CTy::Rc(e.clone()));
             collect_types(e, out);
@@ -687,7 +703,7 @@ fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::Weak(_) | CTy::Guard(..) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::VecDrain(_) | CTy::StrDrain | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Sync(k, e) => sync::sync_needs_drop(p, *k, e),
         CTy::Hash(k, a) => {
@@ -963,6 +979,18 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 layout::Repr { kind: ReprKind::C, ..layout::Repr::default() },
             )
             .ok(),
+            CTy::VecDrain(_) | CTy::StrDrain => layout::struct_layout(
+                &[
+                    layout::ptr_layout(),
+                    layout::int_layout(IntTy::Usize),
+                    layout::int_layout(IntTy::Usize),
+                    layout::int_layout(IntTy::Usize),
+                    layout::int_layout(IntTy::Usize),
+                    layout::int_layout(IntTy::Usize),
+                ],
+                layout::Repr { kind: ReprKind::C, ..layout::Repr::default() },
+            )
+            .ok(),
             CTy::Ref(inner) if **inner == CTy::Str => Some(layout::fat_ptr_layout()),
             CTy::BoxDyn | CTy::RcDyn => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
@@ -1160,6 +1188,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Str => (16, 8),
             CTy::String | CTy::Vec(_) | CTy::Chars => (24, 8),
             CTy::VecIter(_) => (32, 8),
+            CTy::VecDrain(_) | CTy::StrDrain => (48, 8),
             CTy::Weak(_) | CTy::Guard(..) => (8, 8),
             CTy::Cell(e) => go(p, e, seen),
             CTy::RefCell(e) => {
@@ -4190,6 +4219,83 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    if ({v}->front < {v}->len) {{ {field} = (({}*){v}->ptr)[{idx}];{some} }}", ctype(&e));
                 t
             }
+            // The drains: construction checks the range in the
+            // runtime; `next` and `next_back` take from `front..back`
+            // of the drained buffer (as `vec::Drain` and
+            // `string::Drain`).
+            B::VecDrain => format!("lust_vec_drain({}, {}, {}, {}, {}, {loc})", vals[0], vals[1], vals[2], vals[3], vals[4]),
+            B::StringDrain => format!("lust_string_drain({}, {}, {}, {}, {}, {loc})", vals[0], vals[1], vals[2], vals[3], vals[4]),
+            B::VecDrainLen => format!("({0}->back - {0}->front)", vals[0]),
+            B::VecDrainNext | B::VecDrainNextBack => {
+                let e = match &tys[0] {
+                    CTy::Ref(inner) => match &**inner {
+                        CTy::VecDrain(e) => (**e).clone(),
+                        _ => unreachable!("vec::Drain next takes &mut lust_VecDrain"),
+                    },
+                    _ => unreachable!("vec::Drain next takes &mut lust_VecDrain"),
+                };
+                let opt = CTy::Option(Box::new(e.clone()));
+                let ot = ctype(&opt);
+                let t = self.tmp();
+                let v = &vals[0];
+                let idx = if b == B::VecDrainNext { format!("{v}->front++") } else { format!("--{v}->back") };
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(
+                    self.out,
+                    "    if ({v}->front < {v}->back) {{ {field} = (({}*)((lust_Vec*){v}->vec)->ptr)[{idx}];{some} }}",
+                    ctype(&e)
+                );
+                t
+            }
+            B::VecDrainAsSlice => {
+                let e = match &tys[0] {
+                    CTy::Ref(inner) => match &**inner {
+                        CTy::VecDrain(e) => (**e).clone(),
+                        _ => unreachable!("vec::Drain as_slice takes &lust_VecDrain"),
+                    },
+                    _ => unreachable!("vec::Drain as_slice takes &lust_VecDrain"),
+                };
+                let et = ctype(&e);
+                let sl = CTy::Slice(Box::new(e));
+                let (st, t) = (ctype(&sl), self.tmp());
+                let vv = &vals[0];
+                let _ = writeln!(self.out, "    {st} {t} = {{ (({et}*)((lust_Vec*){vv}->vec)->ptr) + {vv}->front, {vv}->back - {vv}->front }};");
+                t
+            }
+            B::StrDrainNext | B::StrDrainNextBack => {
+                let t = self.tmp();
+                let it = &vals[0];
+                let opt = CTy::Option(Box::new(CTy::Char));
+                let ot = ctype(&opt);
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                if b == B::StrDrainNext {
+                    let _ = writeln!(
+                        self.out,
+                        "    if ({it}->front < {it}->back) {{ {field} = lust_utf8_next(((lust_String*){it}->vec)->ptr, &{it}->front);{some} }}"
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "    if ({it}->front < {it}->back) {{ {field} = lust_utf8_prev(((lust_String*){it}->vec)->ptr, &{it}->back);{some} }}"
+                    );
+                }
+                t
+            }
+            B::StrDrainAsStr => {
+                let (t, vv) = (self.tmp(), &vals[0]);
+                let _ = writeln!(self.out, "    lust_str {t} = {{ ((lust_String*){vv}->vec)->ptr + {vv}->front, {vv}->back - {vv}->front }};");
+                t
+            }
+            // Expanded into plain IR before codegen (lower/iter.rs).
+            B::IterNextBack | B::IterSizeHint | B::IterLen | B::RangeStartBound | B::RangeEndBound => {
+                unreachable!("iterator expansion left a builtin for codegen")
+            }
             // `Rc` weak refs, `RefCell`, and `Cell` (W-STD-A, check/cells.rs).
             // The `RcI` header keeps Rust's counts: `weak` includes the one
             // implicit weak ref the strong refs hold; `Weak::new()` is the
@@ -6936,6 +7042,29 @@ fn glue_def_value(
                     if c_layout(p, e).is_none_or(|l| l.size > 0) {
                         body.push_str("  if (p->cap) free(p->ptr);\n");
                     }
+                }
+                CTy::VecDrain(e) => {
+                    // What `next` has not moved out yet drops in
+                    // order, then the tail moves down to the drain
+                    // start and the Vec takes its new length (as
+                    // `vec::Drain`'s drop).
+                    body.push_str("  lust_Vec *dv = (lust_Vec *)p->vec;\n");
+                    if needs_drop_c(p, e) {
+                        need(Glue::Drop, e);
+                        let _ = writeln!(body, "  for (uint64_t i = p->front; i < p->back; i++) drop_{}(&(({}*)dv->ptr)[i]);", mangle(e), ctype(e));
+                    }
+                    if c_layout(p, e).is_none_or(|l| l.size > 0) {
+                        let et = ctype(e);
+                        let _ = writeln!(body, "  lust_memmove((({et}*)dv->ptr) + p->start, (({et}*)dv->ptr) + p->tail_start, p->tail_len * sizeof({et}));");
+                    }
+                    body.push_str("  dv->len = p->start + p->tail_len;\n");
+                }
+                CTy::StrDrain => {
+                    // The bytes not yielded are removed: the tail
+                    // moves down to the drain start.
+                    body.push_str("  lust_String *dv = (lust_String *)p->vec;\n");
+                    body.push_str("  lust_memmove(dv->ptr + p->start, dv->ptr + p->tail_start, p->tail_len);\n");
+                    body.push_str("  dv->len = p->start + p->tail_len;\n");
                 }
                 CTy::Rc(e) => {
                     let it = format!("RcI_{}", mangle(e));

@@ -175,6 +175,21 @@ pub fn split_mode(tys: &impl TyIntern, marker: Ty) -> Option<SplitMode> {
     let TyKind::Array(_, c) = tys.kind(marker) else { return None };
     let ConstKind::Int(n) = tys.const_kind(c) else { return None };
     SplitMode::ALL.get(n as usize).copied()
+    /// `alloc::vec::Drain<T>`: args `[T]`, item `T`. Holds the
+    /// drained Vec mutably; its drop removes what it did not yield.
+    VecDrain,
+    /// `alloc::string::Drain`: no args, item `char`. Holds the
+    /// drained String mutably.
+    StringDrain,
+    /// `core::ops::RangeFrom<T>`: args `[T]`. Not an iterator here
+    /// (std's Step iterator is not modeled); a `RangeBounds` value.
+    RangeFrom,
+    /// `core::ops::RangeTo<T>`: args `[T]`. A `RangeBounds` value.
+    RangeTo,
+    /// `core::ops::RangeFull`: no args. A `RangeBounds` value.
+    RangeFull,
+    /// `core::ops::RangeToInclusive<T>`: args `[T]`. A `RangeBounds` value.
+    RangeToInclusive,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -201,10 +216,14 @@ pub enum Field {
     Chars,
     /// `&str`.
     Str,
+    /// `&mut Vec<arg>`: the drained Vec of `vec::Drain`.
+    VecRefMut(u8),
+    /// `&mut String`: the drained String of `string::Drain`.
+    StringRefMut,
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 42] = [
+    pub const ALL: [IterKind; 48] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -247,6 +266,12 @@ impl IterKind {
         IterKind::Flatten,
         IterKind::OptionIntoIter,
         IterKind::StrSplit,
+        IterKind::VecDrain,
+        IterKind::StringDrain,
+        IterKind::RangeFrom,
+        IterKind::RangeTo,
+        IterKind::RangeFull,
+        IterKind::RangeToInclusive,
     ];
 
     /// True for the hashed-collection iterators.
@@ -310,7 +335,27 @@ impl IterKind {
             K::Flatten => (ADAPT, "Flatten"),
             K::OptionIntoIter => (&["core", "option"], "IntoIter"),
             K::StrSplit => (&["core", "str", "iter"], "Split"),
+            K::VecDrain => (&["alloc", "vec"], "Drain"),
+            K::StringDrain => (&["alloc", "string"], "Drain"),
+            K::RangeFrom => (&["core", "ops"], "RangeFrom"),
+            K::RangeTo => (&["core", "ops"], "RangeTo"),
+            K::RangeFull => (&["core", "ops"], "RangeFull"),
+            K::RangeToInclusive => (&["core", "ops"], "RangeToInclusive"),
         }
+    }
+
+    /// True for the kinds that are iterators in lust. The four
+    /// open-ended range kinds are `RangeBounds` values only.
+    pub fn is_iterator(self) -> bool {
+        !matches!(self, IterKind::RangeFrom | IterKind::RangeTo | IterKind::RangeFull | IterKind::RangeToInclusive)
+    }
+
+    /// True for the six `core::ops` range kinds.
+    pub fn is_range(self) -> bool {
+        matches!(
+            self,
+            IterKind::Range | IterKind::RangeInclusive | IterKind::RangeFrom | IterKind::RangeTo | IterKind::RangeFull | IterKind::RangeToInclusive
+        )
     }
 
     /// How many type args the builtin type takes (see the kind docs).
@@ -338,7 +383,7 @@ impl IterKind {
             | K::MapIntoIter
             | K::MapIntoKeys
             | K::MapIntoValues => 2,
-            K::CharIndices => 0,
+            K::CharIndices | K::StringDrain | K::RangeFull => 0,
             _ => 1,
         }
     }
@@ -389,6 +434,12 @@ impl IterKind {
             K::Flatten => "std::iter::Flatten",
             K::OptionIntoIter => "std::option::IntoIter",
             K::StrSplit => "std::str::Split",
+            K::VecDrain => "std::vec::Drain",
+            K::StringDrain => "std::string::Drain",
+            K::RangeFrom => "std::ops::RangeFrom",
+            K::RangeTo => "std::ops::RangeTo",
+            K::RangeFull => "std::ops::RangeFull",
+            K::RangeToInclusive => "std::ops::RangeToInclusive",
         }
     }
 
@@ -446,6 +497,14 @@ impl IterKind {
             K::Flatten => &[F::OptArg(0), F::OptArg(1), F::OptArg(1)],
             K::OptionIntoIter => &[F::OptArg(0)],
             K::StrSplit => &[F::Str, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Arg(0)],
+            // back, tail start, and tail length, as indexes into the
+            // container's buffer (std's Drain bookkeeping).
+            K::VecDrain => &[F::VecRefMut(0), F::Usize, F::Usize, F::Usize, F::Usize, F::Usize],
+            K::StringDrain => &[F::StringRefMut, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize],
+            K::RangeFrom | K::RangeTo | K::RangeToInclusive => &[F::Arg(0)],
+            // No stored value; one dummy field, as `RangeInclusive`
+            // stores its flag.
+            K::RangeFull => &[F::Bool],
         }
     }
 }
@@ -473,7 +532,11 @@ pub fn mk_iter(tys: &mut impl TyIntern, k: IterKind, args: &[Ty]) -> Ty {
 
 /// True for the types `item_ty` answers: builtin iterators and `Chars`.
 pub fn is_iter(tys: &impl TyIntern, t: Ty) -> bool {
-    matches!(tys.builtin_of(t), Some(BuiltinTy::Iter(_) | BuiltinTy::Chars))
+    match tys.builtin_of(t) {
+        Some(BuiltinTy::Iter(k)) => k.is_iterator(),
+        Some(BuiltinTy::Chars) => true,
+        _ => false,
+    }
 }
 
 /// The item type of a builtin iterator type or `Chars`.
@@ -483,10 +546,15 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         return Some(CHAR);
     }
     let (k, a) = iter_parts(tys, t)?;
+    if !k.is_iterator() {
+        return None;
+    }
     Some(match k {
         K::SliceIter => tys.mk_ref(false, a[0]),
         K::SliceIterMut => tys.mk_ref(true, a[0]),
-        K::VecIntoIter | K::Range | K::RangeInclusive | K::RecvIter | K::RecvTryIter | K::RecvIntoIter => a[0],
+        K::VecIntoIter | K::Range | K::RangeInclusive | K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::VecDrain => a[0],
+        K::StringDrain => CHAR,
+        K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
         K::Map | K::FilterMap => a[2],
         K::Filter | K::Rev | K::Take | K::Skip | K::Chain | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect => {
             item_ty(tys, a[0])?
@@ -612,6 +680,11 @@ pub fn field_ty(tys: &mut impl TyIntern, f: Field, args: &[Ty]) -> Ty {
             tys.mk_ref(m, s)
         }
         Field::VecArg(i) => tys.mk_vec(args[i as usize]),
+        Field::VecRefMut(i) => {
+            let v = tys.mk_vec(args[i as usize]);
+            tys.mk_ref(true, v)
+        }
+        Field::StringRefMut => tys.mk_ref(true, STRING),
         Field::PeekSlot(i) => {
             let item = item_ty(tys, args[i as usize]).unwrap_or(ERROR);
             let inner = tys.mk_option(item);
@@ -649,5 +722,7 @@ pub fn iter_holds_ref(k: IterKind, args: &[Ty], arg_holds: &dyn Fn(Ty) -> bool) 
             | IterKind::MapValues
             | IterKind::MapValuesMut
             | IterKind::SetIter
+            | IterKind::VecDrain
+            | IterKind::StringDrain
     ) || args.iter().any(|&a| arg_holds(a))
 }

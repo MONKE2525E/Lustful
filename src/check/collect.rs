@@ -2716,6 +2716,40 @@ pub fn collect_reuse<'a>(
                 AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
             if generics::std_adt_has_flat_name(usize::MAX - item_idx) && !std_taken.contains(&name) {
+                // core: `#[derive(Clone, Copy, Debug, Hash, PartialEq,
+                // Eq)] enum Bound<T>`, in this order.
+                _ => {
+                    let t = p.tys.intern(TyKind::Param(ParamId(0)));
+                    let tuple = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Tuple, fields: vec![field("0", t)], disc };
+                    (
+                        generics::bound_def(),
+                        vec![tuple("Included", 0), tuple("Excluded", 1), unit("Unbounded", 2)],
+                        Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, ..Derives::default() },
+                    )
+                }
+            };
+            p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default() };
+            p.gx.adt_info[id.0 as usize] = (def, 0);
+            if usize::MAX - item_idx == 8 {
+                // `Bound<T>`: the one generic synthetic std Adt. Give
+                // it its param and field table, as the field pass does
+                // for a user generic enum.
+                p.gx.adt_info[id.0 as usize] = (def, 1);
+                p.gx.has_generics = true;
+                let t0 = p.tys.intern(TyKind::Param(ParamId(0)));
+                let sized_args = p.tys.intern_args(&[GenericArg::Ty(t0)]);
+                let sized = Predicate::Trait(Binder::plain(TraitRef { def: p.gx.lang.sized, args: sized_args, bindings: EMPTY_BINDINGS }));
+                p.gx.adt_generics[id.0 as usize] = Generics {
+                    parent: None,
+                    params: vec![ParamDef { name: interner.intern("T"), kind: ParamKind::Type, span }],
+                    predicates: vec![sized],
+                };
+                let env = generics::elaborate_env(&mut p.tys, &p.gx.index, &p.gx.adt_generics[id.0 as usize].predicates.clone());
+                p.gx.adt_envs[id.0 as usize] = env;
+                let t = p.tys.intern(TyKind::Param(ParamId(0)));
+                p.regions.adt_fields.insert(def, vec![vec![t], vec![t], Vec::new()]);
+            }
+            if generics::std_adt_has_flat_name(usize::MAX - item_idx) && !std_taken.contains(&name) {
                 p.type_names.insert(name, id);
             }
             p.tys.register_adt(def, id);

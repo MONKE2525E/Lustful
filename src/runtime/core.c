@@ -405,6 +405,101 @@ uint64_t lust_str_range(const uint8_t *ptr, uint64_t lo, uint64_t hi, int inclus
     return end;
 })
 
+/* The `start..end` of a `RangeBounds<usize>` argument (tags: 0 Included,
+   1 Excluded, 2 Unbounded), checked the way core checks it for
+   `Vec::drain` and `String::drain`: the end bound against the length
+   first, then the start bound, then their order, with core's exact
+   panic texts. An excluded start at the end index fails with the end
+   message, as in core. */
+static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc, uint64_t *out_s, uint64_t *out_e) LUST_BODY({
+    uint64_t end;
+    if (e_tag == 0) {
+        if (e_val >= len) {
+            lust_String s = lust_string_new();
+            lust_string_push_cstr(&s, "range end index ");
+            lust_fmt_u64(&s, e_val);
+            lust_string_push_cstr(&s, " out of range for slice of length ");
+            lust_fmt_u64(&s, len);
+            lust_panic(&s, loc);
+        }
+        end = e_val + 1;
+    } else if (e_tag == 1) {
+        if (e_val > len) {
+            lust_String s = lust_string_new();
+            lust_string_push_cstr(&s, "range end index ");
+            lust_fmt_u64(&s, e_val);
+            lust_string_push_cstr(&s, " out of range for slice of length ");
+            lust_fmt_u64(&s, len);
+            lust_panic(&s, loc);
+        }
+        end = e_val;
+    } else {
+        end = len;
+    }
+    uint64_t start;
+    if (s_tag == 2) {
+        start = 0;
+    } else {
+        if (s_val > len) {
+            lust_String s = lust_string_new();
+            lust_string_push_cstr(&s, "range start index ");
+            lust_fmt_u64(&s, s_val);
+            lust_string_push_cstr(&s, " out of range for slice of length ");
+            lust_fmt_u64(&s, len);
+            lust_panic(&s, loc);
+        }
+        if (s_tag == 1 && s_val == end) {
+            lust_String s = lust_string_new();
+            lust_string_push_cstr(&s, "range end index ");
+            lust_fmt_u64(&s, s_val);
+            lust_string_push_cstr(&s, " out of range for slice of length ");
+            lust_fmt_u64(&s, len);
+            lust_panic(&s, loc);
+        }
+        if (s_val > end) {
+            lust_String s = lust_string_new();
+            lust_string_push_cstr(&s, "slice index starts at ");
+            lust_fmt_u64(&s, s_val);
+            lust_string_push_cstr(&s, " but ends at ");
+            lust_fmt_u64(&s, end);
+            lust_panic(&s, loc);
+        }
+        start = s_tag == 1 ? s_val + 1 : s_val;
+    }
+    *out_s = start;
+    *out_e = end;
+})
+
+/* `Vec::drain`: the Vec keeps its buffer and capacity; its length is the
+   drain start while the Drain lives (a leaked Drain leaves it so). */
+lust_VecDrain lust_vec_drain(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
+    uint64_t start, end;
+    lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, loc, &start, &end);
+    lust_VecDrain d = {v, start, start, end, end, v->len - end};
+    v->len = start;
+    return d;
+})
+
+/* `String::drain`: the same range checks over the byte length, then the
+   char boundary asserts. The String is unchanged while the Drain lives
+   (a leaked Drain leaves it whole); the drop glue removes the range. */
+lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
+    uint64_t start, end;
+    lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, loc, &start, &end);
+    if (!(start == v->len || (v->ptr[start] & 0xC0) != 0x80)) {
+        lust_String s = lust_string_new();
+        lust_string_push_cstr(&s, "assertion failed: self.is_char_boundary(start)");
+        lust_panic(&s, loc);
+    }
+    if (!(end == v->len || (v->ptr[end] & 0xC0) != 0x80)) {
+        lust_String s = lust_string_new();
+        lust_string_push_cstr(&s, "assertion failed: self.is_char_boundary(end)");
+        lust_panic(&s, loc);
+    }
+    lust_VecDrain d = {v, start, start, end, end, v->len - end};
+    return d;
+})
+
 /* Exact float remainder (Rust `%`, truncating division), computed on the
    mantissa integers so no libm link is needed. The algorithm is the
    standard normalize-and-subtract loop over the exponent difference. */

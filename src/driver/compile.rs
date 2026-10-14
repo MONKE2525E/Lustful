@@ -3339,6 +3339,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     21u8.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::VecDrain(x) => {
+                    43u8.hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::StrDrain => 44u8.hash(h),
                 cgen::CTy::Weak(x) => {
                     22u8.hash(h);
                     inner(h, p, x);
