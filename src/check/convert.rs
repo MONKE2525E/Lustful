@@ -10,7 +10,146 @@
 // argument comes from the template's bound in an instance of a generic
 // body, else from the expected type, else from a single impl; several
 // impls and no expected type are rustc's E0283 (L0610 here).
+//
+// Also `x.into()` and the std `From` impls between builtin types
+// (`std_from`): selection sees their records (generics.rs), calls are
+// `Builtin::ConvInto`, which lower/iter.rs expands per conversion.
 use super::*;
+
+/// One of std's `From` impls between builtin types (W-STD-B), as
+/// `dst: From<src>`: how the conversion runs (lower/iter.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FromConv {
+    /// `impl<T> From<T> for T`: the value itself.
+    Same,
+    /// String from `&str` or `&mut str`.
+    StringFromStr,
+    /// String from `&String`.
+    StringFromRefString,
+    /// String from a char.
+    StringFromChar,
+    /// String from `Cow<str>`, Vec<T> from `Cow<[T]>`: `into_owned`.
+    CowIntoOwned,
+    /// Vec<u8> from a String (its buffer).
+    BytesFromString,
+    /// Vec<u8> from `&str`.
+    BytesFromStr,
+    /// Vec<T> from `&[T]` or `&mut [T]` (T: Clone).
+    VecFromSlice,
+    /// Vec<T> from `[T; N]`, `&[T; N]`, or `&mut [T; N]` (by
+    /// reference, T: Clone).
+    VecFromArray,
+    /// Vec<T> from `Box<[T]>` (its buffer).
+    VecFromBoxSlice,
+    /// `Box<[T]>` from Vec<T>.
+    BoxSliceFromVec,
+    /// `Option<T>` from T.
+    Some,
+    /// `Box<T>` from T.
+    BoxNew,
+    /// `Rc<T>` from T.
+    RcNew,
+    /// `Cow<str>` from `&str`, `Cow<[T]>` from `&[T]`: `Borrowed`.
+    CowBorrowed,
+    /// `Cow<str>` from `&String`, `Cow<[T]>` from `&Vec<T>`: `Borrowed`
+    /// of the view.
+    CowBorrowedView,
+    /// `Cow<str>` from String, `Cow<[T]>` from Vec<T>: `Owned`.
+    CowOwned,
+}
+
+/// The std `From` impl `dst: From<src>` between builtin types, if std
+/// has one (both types fully known). Element bounds are std's: the
+/// cloning forms need `T: Clone`. Numeric widening is `numeric_from_ok`
+/// (no runtime conversion beyond a cast), user impls are records.
+pub fn std_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<FromConv> {
+    use FromConv as F;
+    if dst == src {
+        return Some(F::Same);
+    }
+    let str_like = |t: Ty| matches!(tys.kind(t), TyKind::Ref(_, _, s) if tys.kind(s) == TyKind::Str);
+    let ref_of = |t: Ty| match tys.kind(t) {
+        TyKind::Ref(_, m, inner) => Some((m, inner)),
+        _ => None,
+    };
+    let slice_elem = |t: Ty| match tys.kind(t) {
+        TyKind::Slice(e) => Some(e),
+        _ => None,
+    };
+    let cow = crate::check::collect::cow_arg(tys, src);
+    if tys.is_string_ty(dst) {
+        return match () {
+            _ if str_like(src) => Some(F::StringFromStr),
+            _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.is_string_ty(i)) => Some(F::StringFromRefString),
+            _ if src == CHAR => Some(F::StringFromChar),
+            _ if cow.is_some_and(|b| tys.kind(b) == TyKind::Str) => Some(F::CowIntoOwned),
+            _ => None,
+        };
+    }
+    if let Some(el) = tys.vec_elem(dst) {
+        if el == int(IntTy::U8) && tys.is_string_ty(src) {
+            return Some(F::BytesFromString);
+        }
+        if el == int(IntTy::U8) && str_like(src) {
+            return Some(F::BytesFromStr);
+        }
+        if let Some((_, inner)) = ref_of(src)
+            && slice_elem(inner) == Some(el)
+        {
+            return has_clone(p, tys, el).then_some(F::VecFromSlice);
+        }
+        if let TyKind::Array(e2, _) = tys.kind(src)
+            && e2 == el
+        {
+            return Some(F::VecFromArray);
+        }
+        if let Some((_, inner)) = ref_of(src)
+            && matches!(tys.kind(inner), TyKind::Array(e2, _) if e2 == el)
+        {
+            return has_clone(p, tys, el).then_some(F::VecFromArray);
+        }
+        if tys.boxed_slice_elem(src) == Some(el) {
+            return Some(F::VecFromBoxSlice);
+        }
+        if cow.and_then(slice_elem) == Some(el) {
+            return has_clone(p, tys, el).then_some(F::CowIntoOwned);
+        }
+        return None;
+    }
+    if let Some(el) = tys.boxed_slice_elem(dst) {
+        return (tys.vec_elem(src) == Some(el)).then_some(F::BoxSliceFromVec);
+    }
+    if tys.option_elem(dst) == Some(src) {
+        return Some(F::Some);
+    }
+    if tys.boxed_elem(dst) == Some(src) {
+        return Some(F::BoxNew);
+    }
+    if tys.rc_elem(dst) == Some(src) {
+        return Some(F::RcNew);
+    }
+    if let Some(b) = crate::check::collect::cow_arg(tys, dst) {
+        if tys.kind(b) == TyKind::Str {
+            return match () {
+                _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.kind(i) == TyKind::Str) => Some(F::CowBorrowed),
+                _ if tys.is_string_ty(src) => Some(F::CowOwned),
+                _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.is_string_ty(i)) => Some(F::CowBorrowedView),
+                _ => None,
+            };
+        }
+        let el = slice_elem(b)?;
+        if !has_clone(p, tys, el) {
+            return None;
+        }
+        return match () {
+            _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && slice_elem(i) == Some(el)) => Some(F::CowBorrowed),
+            _ if tys.vec_elem(src) == Some(el) => Some(F::CowOwned),
+            _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.vec_elem(i) == Some(el)) => Some(F::CowBorrowedView),
+            _ => None,
+        };
+    }
+    None
+}
 
 /// One conversion trait method.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -256,7 +395,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// template's bound `self_ty: trait_def<U>` (substituted at the
     /// instance's args): what the template's call through that bound
     /// meant, which a builtin Self type cannot tell by its impls alone.
-    fn instance_bound_arg(&mut self, trait_def: DefId, self_ty: Ty) -> Option<Ty> {
+    pub(super) fn instance_bound_arg(&mut self, trait_def: DefId, self_ty: Ty) -> Option<Ty> {
         let p = self.p;
         let info = p.gx.instances.get(&self.fid)?;
         let tl = info.template_local?;
@@ -277,5 +416,99 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         None
+    }
+
+    /// `x.into()` through one of std's `From` impls between builtin
+    /// types (`std_from`). Self is the receiver itself: core's blanket
+    /// `impl<T, U: From<T>> Into<U> for T` matches at the first
+    /// autoderef step, so `(&s).into()` converts the reference. The
+    /// target is the expected type, else (in an instance of a generic
+    /// body) the template's `Into<U>` bound. None for other calls.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn std_into_method(
+        &mut self,
+        e: ExprId,
+        rt: Ty,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+    ) -> Option<Ty> {
+        if !turbofish.is_empty() || self.p.interner.get(name) != "into" || !args.is_empty() {
+            return None;
+        }
+        let src = self.deep(rt);
+        // Fully known: no inference variable at all (an integer or float
+        // literal's type too) and no error.
+        let known = |cx: &Self, t: Ty| !cx.tys.flags(t).contains_infer() && !cx.has_error_kind(t);
+        let dst = match expected.map(|t| self.deep(t)) {
+            Some(t) if known(self, t) => t,
+            _ => self.instance_bound_arg(self.p.gx.lang.into, src)?,
+        };
+        if !known(self, dst) {
+            return None;
+        }
+        // A literal's integer or float type comes from the target, as
+        // the one std impl that can apply fixes it in rustc (`5.into()`
+        // as an `Option<i32>`, `[1, 2].into()` as a `Vec<i32>`).
+        let src = if known(self, src) { src } else { self.std_from_literal_src(dst, src)? };
+        std_from(self.p, &self.tys, dst, src)?;
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::ConvInto, derefs: 0, autoref: Autoref::None });
+        Some(dst)
+    }
+
+    /// `std_into_method`'s source when it still has an integer or float
+    /// variable: the variable unified with the element the target fixes
+    /// (`Option<T>`, `Box<T>`, `Rc<T>` from T; `Vec<T>`, `Box<[T]>`,
+    /// `Cow<[T]>` from `[T; N]`, `&[T; N]`, `&[T]`). None for any other
+    /// shape, and when the unification fails (nothing stays bound).
+    fn std_from_literal_src(&mut self, dst: Ty, src: Ty) -> Option<Ty> {
+        let lit = |cx: &Self, t: Ty| matches!(cx.kind(t), k if k.is_int_infer() || k.is_float_infer());
+        let elem_of_seq = |cx: &Self, t: Ty| -> Option<Ty> {
+            let t = match cx.kind(t) {
+                TyKind::Ref(_, _, i) => cx.resolve(i),
+                _ => t,
+            };
+            match cx.kind(t) {
+                TyKind::Array(e, _) | TyKind::Slice(e) => Some(cx.resolve(e)),
+                _ => None,
+            }
+        };
+        let (have, want) = if lit(self, src) {
+            (src, self.tys.option_elem(dst).or_else(|| self.tys.boxed_elem(dst)).or_else(|| self.tys.rc_elem(dst))?)
+        } else {
+            let e = elem_of_seq(self, src).filter(|&e| lit(self, e))?;
+            let want = self
+                .tys
+                .vec_elem(dst)
+                .or_else(|| self.tys.boxed_slice_elem(dst))
+                .or_else(|| crate::check::collect::cow_arg(&self.tys, dst).and_then(|b| elem_of_seq(self, b)))?;
+            (e, want)
+        };
+        let snap = self.snapshot_vars();
+        if !self.unify(have, want) {
+            self.rollback_vars(snap);
+            return None;
+        }
+        let src = self.deep(src);
+        if std_from(self.p, &self.tys, dst, src).is_none() {
+            self.rollback_vars(snap);
+            return None;
+        }
+        Some(src)
+    }
+
+    /// The argument type of a `T::from(x)` call that `std_from` answers
+    /// for the target `dst`: `at` resolved, when fully known.
+    pub(super) fn std_from_arg(&mut self, dst: Ty, at: Ty) -> Option<Ty> {
+        // Inference variables are fine here: `std_from` matches by
+        // equality, so a variable only matches itself (`Vec::from` of a
+        // `Box<[{integer}]>` keeps the literal's variable in both).
+        let at = self.deep(at);
+        if self.has_error_kind(at) {
+            return None;
+        }
+        std_from(self.p, &self.tys, dst, at).map(|_| at)
     }
 }

@@ -71,6 +71,7 @@ fn expands(b: Builtin) -> bool {
             | B::StringExtend
             | B::IterArrayIntoIter
             | B::IterRepeatN
+            | B::ConvInto
     )
 }
 
@@ -266,6 +267,8 @@ impl Ex<'_, '_, '_> {
             Operand::Const(Const::Bool(_)) => Ok(BOOL),
             Operand::Const(Const::Char(_)) => Ok(CHAR),
             Operand::Const(Const::Unit) => Ok(UNIT),
+            // A string literal (a `"..".into()` receiver, W-STD-B).
+            Operand::Const(Const::Str(_)) => Ok(REF_STR),
             Operand::Const(_) => Err("iterator expansion: unexpected constant operand".into()),
         }
     }
@@ -377,6 +380,10 @@ impl Ex<'_, '_, '_> {
         let mut args = args.into_iter();
         let mut arg = || args.next().ok_or_else(|| "iterator expansion: missing argument".to_string());
         match b {
+            B::ConvInto => {
+                let x = arg()?;
+                return self.conv(x, dest, dest_ty);
+            }
             B::IterIter | B::IterIterMut => {
                 let r = arg()?;
                 let rt = self.op_ty(&r)?;
@@ -585,6 +592,60 @@ impl Ex<'_, '_, '_> {
     /// count once (`append_elements`, `extend_trusted`); every other
     /// iterator pushes and reserves `lower + 1` whenever full
     /// (`extend_desugared`). `&T` items copy out.
+    /// `dest = x.into()` through one of std's `From` impls between
+    /// builtin types (W-STD-B, check/convert.rs `std_from`): the
+    /// conversion's builtin calls, or the `Some` and Cow variants.
+    fn conv(&mut self, x: Operand, dest: Place, dst: Ty) -> R {
+        use crate::check::convert::FromConv as F;
+        let src = self.op_ty(&x)?;
+        let how = crate::check::convert::std_from(self.p, &self.body.tys, dst, src).ok_or("conversion: no std From impl")?;
+        let one = |ex: &mut Self, b: Builtin, x: Operand, dest: Place| ex.call_builtin(b, vec![x], dest);
+        match how {
+            F::Same => self.assign(dest, Rvalue::Use(x)),
+            F::StringFromStr | F::StringFromChar => one(self, Builtin::StringFrom, x, dest),
+            F::StringFromRefString => {
+                let s = self.local(REF_STR);
+                one(self, Builtin::StringAsStr, x, Place::local(s));
+                one(self, Builtin::StringFrom, Operand::Copy(Place::local(s)), dest);
+            }
+            F::CowIntoOwned => one(self, Builtin::CowIntoOwned, x, dest),
+            F::BytesFromString => one(self, Builtin::StringIntoBytes, x, dest),
+            F::BytesFromStr => {
+                let s = self.local(STRING);
+                one(self, Builtin::StringFrom, x, Place::local(s));
+                one(self, Builtin::StringIntoBytes, Operand::Move(Place::local(s)), dest);
+            }
+            F::VecFromSlice => one(self, Builtin::SliceToVec, x, dest),
+            F::VecFromArray => one(self, Builtin::VecFrom, x, dest),
+            F::VecFromBoxSlice => one(self, Builtin::BoxSliceIntoVec, x, dest),
+            F::BoxSliceFromVec => one(self, Builtin::VecIntoBoxedSlice, x, dest),
+            F::Some => self.some(&dest, dst, x),
+            F::BoxNew => one(self, Builtin::BoxNew, x, dest),
+            F::RcNew => one(self, Builtin::RcNew, x, dest),
+            F::CowBorrowed | F::CowBorrowedView | F::CowOwned => {
+                // The Cow instance's own Adt (mono gives each one its id).
+                let a = self.body.tys.local_adt(dst).ok_or("conversion: no Cow Adt")?;
+                let v = if how == F::CowOwned { 1 } else { 0 };
+                let x = if how == F::CowBorrowedView {
+                    let b = crate::check::collect::cow_arg(&self.body.tys, dst).ok_or("conversion: bad Cow")?;
+                    let view = self.body.tys.mk_ref(false, b);
+                    let s = self.local(view);
+                    let inner = match self.body.tys.kind(src) {
+                        TyKind::Ref(_, _, i) => i,
+                        _ => src,
+                    };
+                    let b = if self.body.tys.is_string_ty(inner) { Builtin::StringAsStr } else { Builtin::VecAsSlice };
+                    one(self, b, x, Place::local(s));
+                    Operand::Copy(Place::local(s))
+                } else {
+                    x
+                };
+                self.assign(dest, Rvalue::Aggregate(a, v, vec![x]));
+            }
+        }
+        Ok(())
+    }
+
     fn vec_extend(&mut self, itp: Place, ty: Ty, v: Local) -> R {
         use crate::ast::BinOp::*;
         let vt = self.body.locals[v as usize].ty;

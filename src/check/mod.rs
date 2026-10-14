@@ -384,6 +384,10 @@ pub enum Builtin {
     ConvArraySlice,
     ConvDeref,
     ConvRcInner,
+    /// `x.into()` and `T::from(x)` through one of std's `From` impls
+    /// between builtin types (check/convert.rs `std_from`, W-STD-B):
+    /// lower/iter.rs expands it per conversion.
+    ConvInto,
     /// The cmp glue's three-way code for two references to one
     /// structurally ordered type (-1, 0, 1, or 2 for unordered), as
     /// an `i8`: `partial_cmp` and `cmp` read it once.
@@ -8221,9 +8225,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
             && self.name(names[1]) == "borrow"
             && self.name(names[2]) == "Cow"
             && let Some(a) = p.tys.local_adt_of(generics::cow_def())
-            && let Some(v) = p.adt(a).variants.iter().position(|v| v.name == names[3])
         {
-            return Some(Res::Variant(a, v as u32));
+            if let Some(v) = p.adt(a).variants.iter().position(|v| v.name == names[3]) {
+                return Some(Res::Variant(a, v as u32));
+            }
+            // `Cow::from(x)`: std's `From` impls for Cow (check/convert.rs).
+            if names[3] == k.from {
+                return Some(Res::Builtin(Builtin::ConvInto));
+            }
         }
         // `mpsc::RecvError`, the unit struct value (W-THREADS).
         if names.len() == 4
@@ -10127,6 +10136,39 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         (vec![r], base)
                     }
                     Builtin::StringNew => (vec![], STRING),
+                    // `Cow::from(x)` (the String and Vec forms pick it in
+                    // their own arms): the argument picks the Cow, as each
+                    // source type has one std impl.
+                    Builtin::ConvInto => {
+                        let at = if args.len() == 1 { self.expr(args[0], None) } else { ERROR };
+                        let at = self.deep(at);
+                        let (inner, m) = match self.kind(at) {
+                            TyKind::Ref(_, m, i) => (i, Some(m)),
+                            _ => (at, None),
+                        };
+                        let b = match self.kind(inner) {
+                            TyKind::Str if m.is_some() => Some(STR),
+                            TyKind::Slice(_) if m.is_some() => Some(inner),
+                            _ if self.tys.is_string_ty(inner) => Some(STR),
+                            _ => self.tys.vec_elem(inner).map(|e| self.tys.intern(TyKind::Slice(e))),
+                        };
+                        let dst = b.map(|b| self.tys.mk_adt(generics::cow_def(), &[GenericArg::Ty(b)]));
+                        match dst.and_then(|d| self.std_from_arg(d, at).map(|a| (d, a))) {
+                            Some((d, a)) => (vec![a], d),
+                            None => {
+                                let tn = self.tn(at);
+                                if !matches!(self.kind(at), TyKind::Error) {
+                                    self.err(
+                                        "L0612",
+                                        span,
+                                        format!("`Cow` has no `From<{tn}>` impl that lust supports"),
+                                        "Pass `&str`, `String`, `&String`, `&[T]`, `Vec<T>`, or `&Vec<T>`.",
+                                    );
+                                }
+                                (vec![at], ERROR)
+                            }
+                        }
+                    }
                     Builtin::StringFrom => {
                         // The forms lust takes: `&str` (and `&String`
                         // through deref), a String by value, and a
@@ -10134,7 +10176,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // `check_args` then checks it as itself.
                         let at = if args.len() == 1 { self.expr(args[0], None) } else { ERROR };
                         let at = self.resolve(at);
-                        if at == CHAR || at == STRING { (vec![at], STRING) } else { (vec![REF_STR], STRING) }
+                        if at == CHAR || at == STRING {
+                            (vec![at], STRING)
+                        } else if let Some(at) = self.std_from_arg(STRING, at) {
+                            // std's other forms (`String::from(cow)`): the
+                            // conversion builtin (check/convert.rs).
+                            self.set_res(callee, Res::Builtin(Builtin::ConvInto));
+                            self.set_res(e, Res::Builtin(Builtin::ConvInto));
+                            (vec![at], STRING)
+                        } else {
+                            (vec![REF_STR], STRING)
+                        }
                     }
                     Builtin::StringWithCapacity => (vec![USIZE], STRING),
                     Builtin::EnvArgs => (vec![], ARGS),
@@ -10175,14 +10227,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             TyKind::Infer(_) => Some(ERROR),
                             _ => None,
                         };
-                        match elem {
-                            Some(e) => (vec![at], self.tys.mk_vec(e)),
-                            None => {
+                        // std's other forms (`Vec::from(string)`, from
+                        // `&str`, `Box<[T]>`, `Cow<[T]>`): the conversion
+                        // builtin (check/convert.rs).
+                        let other = if elem.is_none() {
+                            let atd = self.deep(at);
+                            let el = if atd == STRING || matches!(self.kind(atd), TyKind::Ref(_, _, s) if s == STR) {
+                                Some(int(IntTy::U8))
+                            } else {
+                                self.tys.boxed_slice_elem(atd).or_else(|| {
+                                    crate::check::collect::cow_arg(&self.tys, atd).and_then(|b| match self.kind(b) {
+                                        TyKind::Slice(e) => Some(e),
+                                        _ => None,
+                                    })
+                                })
+                            };
+                            el.map(|el| self.tys.mk_vec(el)).and_then(|dst| self.std_from_arg(dst, atd).map(|a| (dst, a)))
+                        } else {
+                            None
+                        };
+                        match (elem, other) {
+                            (_, Some((dst, at))) => {
+                                self.set_res(callee, Res::Builtin(Builtin::ConvInto));
+                                self.set_res(e, Res::Builtin(Builtin::ConvInto));
+                                (vec![at], dst)
+                            }
+                            (Some(e), None) => (vec![at], self.tys.mk_vec(e)),
+                            (None, None) => {
                                 let tn = self.tn(at);
                                 self.err(
                                     "L0110",
                                     span,
-                                    format!("`Vec::from` needs a slice or an array, found `{tn}`"),
+                                    format!("`Vec::from` needs a slice, an array, a String, a `&str`, a `Box<[T]>`, or a `Cow<[T]>`, found `{tn}`"),
                                     "Pass `&[T]`, `&[T; N]`, or `[T; N]`.",
                                 );
                                 (vec![at], ERROR)
@@ -11130,6 +11206,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `into_iter()` on a value that is its own iterator.
         if let Some(ret) = self.into_iter_self(e, base, derefs, name, args, turbofish) {
+            return ret;
+        }
+        // `into()` through std's other `From` impls between builtin
+        // types (check/convert.rs, W-STD-B).
+        if let Some(ret) = self.std_into_method(e, rt, name, name_span, args, turbofish, expected) {
             return ret;
         }
         // Iterator sources on sequences and every method on a builtin

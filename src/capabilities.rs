@@ -321,6 +321,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::ConvArraySlice,
     Builtin::ConvDeref,
     Builtin::ConvRcInner,
+    Builtin::ConvInto,
     Builtin::CmpCode,
     Builtin::OptAsRef,
     Builtin::OptAsMut,
@@ -799,6 +800,11 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::ConvIdent | B::ConvStrBytes | B::ConvArraySlice | B::ConvDeref | B::ConvRcInner => (
             &["str", "String", "[T]", "[T; N]", "Vec<T>", "Box<T>", "Rc<T>", "&T"],
             vec![i.intern("as_ref"), i.intern("as_mut"), i.intern("borrow"), i.intern("borrow_mut")],
+            Call::Method,
+        ),
+        B::ConvInto => (
+            &["&str", "&String", "char", "String", "Vec<T>", "&[T]", "[T; N]", "Box<[T]>", "Cow<B>", "T"],
+            vec![i.intern("into")],
             Call::Method,
         ),
         B::CmpCode => (&["any Ord type"], vec![i.intern("cmp")], Call::Method),

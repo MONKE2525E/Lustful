@@ -257,6 +257,14 @@ pub(super) fn replay_method(
             },
         }
     }
+    // A call through an `Into<U>` bound returns U: in an instance the
+    // bound names it even where nothing else expects a type
+    // (`t.into().0`), and the `From` impl to bridge to depends on it.
+    let expected = match expected {
+        Some(t) if !matches!(cx.tys.kind(cx.resolve(t)), TyKind::Infer(_)) => Some(t),
+        _ if pick.trait_def == cx.p.gx.lang.into => cx.instance_bound_arg(pick.trait_def, step).or(expected),
+        _ => expected,
+    };
     if ok {
         let probe = RcvProbe::at(cx, step, pick.form);
         // A `?Sized` param instantiated at a dyn type whose principal (or
