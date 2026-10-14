@@ -32,6 +32,8 @@ pub(super) fn check_input(name: &str, attr: &Attr, interner: &Interner) -> PResu
         },
         "cold" | "test" | "non_exhaustive" => matches!(attr.input, AttrInput::None),
         "must_use" => matches!(&attr.input, AttrInput::None) || eq_str(&attr.input),
+        // `#[path = "..."]` is the only form rustc accepts.
+        "path" => eq_str(&attr.input),
         "deprecated" => match &attr.input {
             AttrInput::None => true,
             AttrInput::List(Delim::Paren, t) => deprecated_list(t, interner),

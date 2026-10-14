@@ -416,7 +416,15 @@ pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Resu
         return Err(());
     }
     if repr.kind == ReprKind::Transparent {
-        return Err(());
+        // One variant (collect checks the count): the layout is
+        // that variant's transparent struct layout, with no tag.
+        if variants.len() != 1 {
+            return Err(());
+        }
+        let mut l = struct_layout(&variants[0], repr)?;
+        l.variant_offsets = vec![l.field_offsets.clone()];
+        l.enum_tag = Some(EnumTag::None);
+        return Ok(l);
     }
     // A fixed integer tag must hold every discriminant.
     if let Some((bits, signed)) = repr.int {
