@@ -150,8 +150,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if n == "to_string" && args.is_empty() && self.tys.local_adt(base).is_some() {
             // `impl<T: Display> ToString for T`, through the receiver's
             // Display impl (Self is bound as rustc's probe binds it).
+            // With no Display impl there is no `to_string`: other
+            // dispatch runs and reports the missing method.
             let t = self.deep(rt);
-            self.require_fmt(t, FmtKind::Display, name_span);
+            if !has_display(self.p, &self.tys, t) && !self.require_fmt(t, FmtKind::Display, name_span) {
+                return None;
+            }
             let derefs = u8::from(matches!(self.tys.kind(t), TyKind::Ref(..)));
             self.check_packed_borrow(recv, name_span);
             self.set_res(e, Res::BuiltinMethod { b: Builtin::ToString, derefs, autoref: Autoref::Ref });
