@@ -64,11 +64,27 @@ require_dir() {
   fi
 }
 
+san_flags=(-O1 -w -Werror=incompatible-pointer-types -fno-sanitize-recover=undefined -fsanitize=address,undefined)
+# san_obj: this run's gcc objects of the generated C units, named by a hash of the unit's
+# bytes. The runtime unit is the same in most cases and is the slow one to build, so each
+# distinct unit compiles once per run. Not kept across runs.
+san_obj=$work/san-obj
+mkdir -p "$san_obj"
+
 sanitize_case() {
   # $1 fixture, $2 name, $3 expected-stdout file. Returns 0 on match. Runs in the case dir.
-  local f=$1 name=$2 expected=$3
+  local f=$1 name=$2 expected=$3 c o objs=()
   run_cc "$lust" build "$f" -o "$name.tmp" --emit-c "$name" 2>/dev/null || return 1
-  if ! gcc -O1 -w -Werror=incompatible-pointer-types -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$name.san" "$name".*.c 2>"$name.san.err"; then
+  : >"$name.san.err"
+  for c in "$name".*.c; do
+    o=$san_obj/$(sha256sum <"$c" | cut -c1-40).o
+    objs+=("$o")
+    (
+      flock 9
+      [ -f "$o" ] || { gcc "${san_flags[@]}" -c -o "$o.tmp" "$c" 2>>"$name.san.err" && mv "$o.tmp" "$o"; }
+    ) 9>"$o.lock"
+  done
+  if ! gcc "${san_flags[@]}" -o "$name.san" "${objs[@]}" 2>>"$name.san.err"; then
     echo "gcc could not build the generated C: $(head -3 "$name.san.err")"
     return 1
   fi
