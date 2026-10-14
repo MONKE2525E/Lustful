@@ -1023,6 +1023,11 @@ pub struct Checked<'g> {
     /// types (check/opaque.rs): lowering marks the locals that hold them
     /// (`Body::opaque_locals`).
     pub revealed: Vec<Ty>,
+    /// A revealed call of a generic definer whose hidden type holds
+    /// closures, before mono made its instance: the types still name the
+    /// template's closures. Mono checks the body again once the instance
+    /// exists (`opaque::build_closure_map`).
+    pub closure_map_pending: bool,
 }
 
 impl Checked<'_> {
@@ -1243,6 +1248,11 @@ struct Ctx<'p, 'a> {
     /// A revealed hidden type is `Copy` where its bounds do not say so:
     /// lust's borrow checker would see copies where rustc sees moves.
     opaque_copy_hazard: bool,
+    /// The revealed callee returns that name a generic definer's opaque,
+    /// and the closure def map body end builds from them for `zonk`
+    /// (`opaque::callee_closure_map`).
+    opaque_calls: Vec<Ty>,
+    closure_map: Vec<(Ty, DefId)>,
     /// This body's closure expressions in token order, for their defs.
     closure_order: Option<Vec<ExprId>>,
     /// The closure-argument type vars of iterator methods (`iter.rs`
@@ -1432,6 +1442,7 @@ fn check_fn_mode<'p, 'a>(
             queue_work: 0,
             opaque_hidden: Vec::new(),
             revealed: Vec::new(),
+            closure_map_pending: false,
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),
@@ -1491,6 +1502,8 @@ fn check_fn_mode<'p, 'a>(
         opaque_env: Vec::new(),
         opaque_seen: Vec::new(),
         opaque_copy_hazard: false,
+        opaque_calls: Vec::new(),
+        closure_map: Vec::new(),
         closure_order: None,
         iter_closure_args: std::collections::HashMap::new(),
         scope_closure_vars: Vec::new(),
@@ -3861,7 +3874,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Fully resolves a type, interning new structural types as needed. Unbound integer
     /// variables become i32.
     fn zonk(&mut self, t: Ty) -> Ty {
-        self.rebuild(t, true)
+        let z = self.rebuild(t, true);
+        if self.closure_map.is_empty() {
+            return z;
+        }
+        opaque::map_closure_defs(&mut self.tys, z, &self.closure_map)
     }
     /// Resolves variables at every depth, keeping unbound ones. Trait queries need this.
     fn deep(&mut self, t: Ty) -> Ty {
@@ -17017,6 +17034,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // A `thread_local!` `const { .. }` init fn proves its const part (check/tls.rs).
         self.tls_const_init_check();
+        self.build_closure_map();
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);

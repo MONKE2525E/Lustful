@@ -2323,7 +2323,7 @@ pub fn collect_with_order_resolved<'a>(
     def_order: &mut DefOrder,
     resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
 ) -> Result<Program<'a>, Vec<Diag>> {
-    collect_reuse(ast, interner, known, crate_ids, walk_instances, def_order, resolved, &mut Default::default())
+    collect_reuse(ast, interner, known, crate_ids, walk_instances, def_order, resolved, &mut Default::default(), &[])
 }
 
 /// `collect_with_order_resolved` with the driver session's generic
@@ -2341,6 +2341,7 @@ pub fn collect_reuse<'a>(
     def_order: &mut DefOrder,
     resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
     reuse: &mut crate::driver::gen_reuse::GenReuse,
+    std_routes: &[&'static crate::ty::lang::StdFnDef],
 ) -> Result<Program<'a>, Vec<Diag>> {
     let mut p = Program {
         ast,
@@ -4006,6 +4007,14 @@ pub fn collect_reuse<'a>(
     // the template checks and discovery that `finish_collect` runs.
     let key = crate::driver::gen_reuse::trait_key(&p, &impl_traits);
     p.gx.reuse.gate(key);
+    // The spliced source std fns route before mono: its body checks
+    // resolve `std::process::exit` and the like as the driver's do. A
+    // missing fn is the driver's error (it routes again after collect).
+    for def in std_routes {
+        if let Some(&f) = p.fn_names.get(&interner.intern(def.mangled)) {
+            p.std_fns.push((def.path.iter().map(|s| interner.intern(s)).collect(), f));
+        }
+    }
     generics::finish_collect(&mut p, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);

@@ -7725,6 +7725,14 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
         krate: p.krate,
         hash: crate::def::item_hash(p.stable_crate, &["<instance>"], crate::def::DefKind::Fn, &format!("{}#{}", p.name(name), kh.0), 0),
     };
+    // The hidden type's closures are this instance's own.
+    let ret = match opaque_ret {
+        Some(_) => {
+            let map = crate::check::opaque::instance_closure_map(p, &p.tys, ret, template, def_id);
+            if map.is_empty() { ret } else { crate::check::opaque::map_closure_defs(&mut p.tys, ret, &map) }
+        }
+        None => ret,
+    };
     let id = LocalDefId(p.fns.len() as u32);
     p.fn_defs.push(def_id);
     p.def_by_hash.entry(def_id.hash).or_insert(id);
@@ -8133,6 +8141,8 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     let mut drop_created = 0usize;
     let mut reuse = std::mem::take(&mut p.gx.reuse);
     let mut lang_checked: Vec<LocalDefId> = Vec::new();
+    // Bodies checked again once (`Checked::closure_map_pending`).
+    let mut rechecked: Vec<LocalDefId> = Vec::new();
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -8145,6 +8155,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             break;
         }
         let mut next_queue: Vec<LocalDefId> = Vec::new();
+        let mut recheck: Vec<LocalDefId> = Vec::new();
         for fid in std::mem::take(&mut queue) {
             let depth = depths.get(&fid).copied().unwrap_or(0);
             // Snapshot everything the instance requests name,
@@ -8172,6 +8183,11 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 }
                 let mut reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = Vec::new();
                 for (template, raw_args) in &checked.inst_requests {
+                    if checked.closure_map_pending
+                        && raw_args.iter().any(|g| matches!(g, GenericArg::Ty(t) if crate::check::opaque::mentions_template_closure(p, &checked.tys, *t)))
+                    {
+                        continue;
+                    }
                     let mut owned: Vec<OwnedArg> = Vec::new();
                     let mut ok = true;
                     for g in raw_args {
@@ -8197,8 +8213,23 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                         reqs.push((*template, owned));
                     }
                 }
-                if discarded.is_empty() {
+                // A body whose types still name a generic definer's
+                // template closures (its instance is made from this very
+                // body's requests) checks again next round; its requests
+                // that name them would make instances over template
+                // closures, which have no code.
+                if checked.closure_map_pending && !rechecked.contains(&fid) {
+                    rechecked.push(fid);
+                    recheck.push(fid);
+                } else if discarded.is_empty() {
                     reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
+                }
+                // A body with errors fails the build (the driver's check
+                // reports them), and its picks may name a trait method
+                // stub, which has no instance (an opaque view's picks on
+                // an `impl Trait` value). Its other requests stand.
+                if discarded.iter().any(|d| d.severity == "error") {
+                    reqs.retain(|(t, _)| p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Stub));
                 }
                 (adt_tys, reqs, closures_owned, vts)
             };
@@ -8285,6 +8316,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             }
             ensure_written_hash(p, &mut next_queue);
         }
+        next_queue.extend(recheck);
         queue = next_queue;
     }
     p.gx.reuse = reuse;

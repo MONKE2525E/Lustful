@@ -2504,6 +2504,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             })
             .map(Box::new),
         &mut caches.gen_reuse,
+        &std_routes,
     ) {
         Ok(p) => p,
         Err(mut ds) => {
@@ -2539,6 +2540,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // installation error, not a user diagnostic.
     if !std_ranges.is_empty() {
         program.shipped_ranges = std_ranges;
+        // Collect routed the ones it found for mono; route all again.
+        program.std_fns.clear();
         for def in std_routes {
             let mangled = front.interner.intern(def.mangled);
             match program.fn_names.get(&mangled) {

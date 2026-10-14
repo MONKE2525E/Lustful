@@ -194,7 +194,68 @@ impl Ctx<'_, '_> {
                 }
             }
         }
+        // A generic definer's hidden closures are its template's; the
+        // instance this call runs has its own, which body end maps in
+        // once the args are known (`build_closure_map`).
+        if !self.opaque_calls.contains(&t) {
+            self.opaque_calls.push(t);
+        }
         reveal(&p.gx.opaque_hidden, &mut self.tys, t, 0)
+    }
+
+    /// Body end: the closure map (`instance_closure_map`) of each generic
+    /// opaque the revealed calls name, at its resolved args, for an
+    /// instance mono made (none exists before mono). `zonk` applies it.
+    /// Two instances whose hidden closures have the same type (`T` only
+    /// in the body, not the captures) cannot be told apart: L0602.
+    pub(super) fn build_closure_map(&mut self) {
+        let p = self.p;
+        let mut found: Vec<Ty> = Vec::new();
+        for t in std::mem::take(&mut self.opaque_calls) {
+            let t = self.deep(t);
+            collect_opaques(&self.tys, t, &mut found);
+        }
+        let mut map: Vec<(Ty, DefId)> = Vec::new();
+        // Per generic opaque met: its args and its hidden closure types.
+        let mut met: Vec<(DefId, ArgsId, Vec<Ty>)> = Vec::new();
+        for o in found {
+            let TyKind::Opaque(od, args) = self.tys.kind(o) else { continue };
+            let Some(info) = p.gx.opaques.get(&od) else { continue };
+            let Some(template) = p.local_def(info.owner.hash) else { continue };
+            if p.gx.fn_templates.get(template.0 as usize).is_none_or(|t| t.is_none()) {
+                continue;
+            }
+            let h = reveal(&p.gx.opaque_hidden, &mut self.tys, o, 0);
+            let mut cts = Vec::new();
+            collect_closures(&self.tys, h, &mut cts);
+            if cts.is_empty() || met.iter().any(|(d, a, _)| *d == od && *a == args) {
+                continue;
+            }
+            if met.iter().any(|(d, _, c)| *d == od && c.iter().any(|t| cts.contains(t))) {
+                let span = p.fn_info(self.fid).def.name_span;
+                self.errs.push(not_yet(
+                    "L0602",
+                    span,
+                    "two calls of one generic `impl Trait` fn at different type args whose hidden closures have the same type",
+                ));
+                return;
+            }
+            met.push((od, args, cts));
+            let args: Vec<GenericArg> = self.tys.args(args).to_vec();
+            let Some(inst) = generics::instance_for(p, &self.tys, template, &args).filter(|&i| i != template) else {
+                self.out.closure_map_pending = true;
+                continue;
+            };
+            map.extend(instance_closure_map(p, &self.tys, h, template, p.def_id(inst)));
+        }
+        if map.is_empty() {
+            return;
+        }
+        for i in 0..self.out.revealed.len() {
+            let h = self.out.revealed[i];
+            self.out.revealed[i] = map_closure_defs(&mut self.tys, h, &map);
+        }
+        self.closure_map = map;
     }
 
     /// True when this check records its trait picks for a later check of
@@ -332,6 +393,115 @@ pub(crate) fn reveal(hidden: &FxMap<DefId, Ty>, tys: &mut impl TyIntern, t: Ty, 
         TyKind::Projection(d, a) => {
             let a = reveal_args(hidden, tys, a, depth);
             tys.intern(TyKind::Projection(d, a))
+        }
+        _ => t,
+    }
+}
+
+/// The closure types of a generic definer's hidden type `t`, each
+/// mapped to the def of the same closure expression in the instance
+/// `inst`: a check gives a closure the def of its parent plus its
+/// ordinal (`Ctx::closure_def`), and an instance's closures sit under
+/// the instance's def.
+pub(crate) fn instance_closure_map(p: &Program, tys: &impl TyIntern, t: Ty, template: LocalDefId, inst: DefId) -> Vec<(Ty, DefId)> {
+    let mut cts: Vec<Ty> = Vec::new();
+    collect_closures(tys, t, &mut cts);
+    cts.into_iter()
+        .filter_map(|ct| {
+            let TyKind::Closure(d, _) = tys.kind(ct) else { return None };
+            Some((ct, instance_closure_def(p, d, template, inst)?))
+        })
+        .collect()
+}
+
+/// The instance's def for the template closure `d` (see
+/// `instance_closure_map`), through enclosing closures.
+fn instance_closure_def(p: &Program, d: DefId, template: LocalDefId, inst: DefId) -> Option<DefId> {
+    use crate::def::{DefKind, child_hash};
+    let e = p.gx.closures.get(&d)?;
+    let (old, new) = if e.parent == template {
+        (p.def_id(template), inst)
+    } else {
+        let pd = *p.gx.closure_fns.get(&e.parent)?;
+        (pd, instance_closure_def(p, pd, template, inst)?)
+    };
+    let ord = (0..4096u32).find(|&o| child_hash(old.hash, DefKind::Closure, "{closure}", o) == d.hash)?;
+    Some(DefId { krate: new.krate, hash: child_hash(new.hash, DefKind::Closure, "{closure}", ord) })
+}
+
+/// True when `t` names a closure of a template body (a hidden type's
+/// closure before its instance is known, `Checked::closure_map_pending`).
+pub(crate) fn mentions_template_closure(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    let mut cts = Vec::new();
+    collect_closures(tys, t, &mut cts);
+    cts.iter().any(|&ct| {
+        matches!(tys.kind(ct), TyKind::Closure(d, _) if p.gx.closures.get(&d).is_some_and(|e| p.gx.fn_class.get(e.body_fn.0 as usize) == Some(&generics::FnClass::TemplateClosure)))
+    })
+}
+
+/// The closure types in `t`, each once.
+fn collect_closures(tys: &impl TyIntern, t: Ty, out: &mut Vec<Ty>) {
+    let in_args = |a: ArgsId, out: &mut Vec<Ty>| {
+        for g in tys.args(a) {
+            if let GenericArg::Ty(e) = *g {
+                collect_closures(tys, e, out);
+            }
+        }
+    };
+    match tys.kind(t) {
+        TyKind::Closure(_, a) => {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+            in_args(a, out);
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => collect_closures(tys, e, out),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().for_each(|&e| collect_closures(tys, e, out)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => in_args(a, out),
+        _ => {}
+    }
+}
+
+/// `t` with the def of each closure type `map` names replaced.
+pub(crate) fn map_closure_defs(tys: &mut impl TyIntern, t: Ty, map: &[(Ty, DefId)]) -> Ty {
+    let args = |tys: &mut _, a: ArgsId| {
+        let old: Vec<GenericArg> = TyIntern::args(tys, a).to_vec();
+        let new: Vec<GenericArg> = old
+            .into_iter()
+            .map(|g| match g {
+                GenericArg::Ty(e) => GenericArg::Ty(map_closure_defs(tys, e, map)),
+                g => g,
+            })
+            .collect();
+        TyIntern::intern_args(tys, &new)
+    };
+    match tys.kind(t) {
+        TyKind::Closure(d, a) => {
+            let d = map.iter().find(|(x, _)| *x == t).map_or(d, |&(_, y)| y);
+            let a = args(tys, a);
+            tys.intern(TyKind::Closure(d, a))
+        }
+        TyKind::Ref(r, m, e) => {
+            let e = map_closure_defs(tys, e, map);
+            tys.intern(TyKind::Ref(r, m, e))
+        }
+        TyKind::Slice(e) => {
+            let e = map_closure_defs(tys, e, map);
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Array(e, n) => {
+            let e = map_closure_defs(tys, e, map);
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Tuple(ts) => {
+            let old: Vec<Ty> = tys.tys_of(ts).to_vec();
+            let new: Vec<Ty> = old.into_iter().map(|e| map_closure_defs(tys, e, map)).collect();
+            let ts = tys.intern_tys(&new);
+            tys.intern(TyKind::Tuple(ts))
+        }
+        TyKind::Adt(d, a) => {
+            let a = args(tys, a);
+            tys.intern(TyKind::Adt(d, a))
         }
         _ => t,
     }
