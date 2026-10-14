@@ -4752,7 +4752,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         crate::ast::OffsetField::Name(fname) => self.check_field_vis(a, fname, span),
                         crate::ast::OffsetField::Index(idx) => self.check_tuple_field_vis(a, idx, span),
                     }
-                    match crate::ty::layout::layout_of_ty(&self.tys, p, cur) {
+                    match crate::ty::layout::layout_of_ty(&self.tys, &UserLayout(p), cur) {
                         Ok(l) => off += l.field_offsets.get(i).copied().unwrap_or(0),
                         Err(()) => {
                             self.err(
@@ -6339,7 +6339,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             return Res::ConstUsize(0);
         }
-        match crate::ty::layout::layout_of_ty(&self.tys, p, t) {
+        match crate::ty::layout::layout_of_ty(&self.tys, &UserLayout(p), t) {
             Ok(l) => Res::ConstUsize(if align { l.align } else { l.size }),
             Err(()) => {
                 self.err(
@@ -6996,7 +6996,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.set_res(e, Res::ConstUsize(0));
             return USIZE;
         }
-        match crate::ty::layout::layout_of_ty(&self.tys, p, inner) {
+        match crate::ty::layout::layout_of_ty(&self.tys, &UserLayout(p), inner) {
             Ok(l) => {
                 self.set_res(e, Res::ConstUsize(if align { l.align } else { l.size }));
                 USIZE
@@ -7009,7 +7009,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // field) stay the layout reject.
                 let tail = match self.kind(inner) {
                     TyKind::Slice(elem) => {
-                        crate::ty::layout::layout_of_ty(&self.tys, p, elem).ok().map(|l| (Builtin::SliceLen, l.size, l.align))
+                        crate::ty::layout::layout_of_ty(&self.tys, &UserLayout(p), elem).ok().map(|l| (Builtin::SliceLen, l.size, l.align))
                     }
                     TyKind::Str => Some((Builtin::StrLen, 1, 1)),
                     _ => None,
@@ -13796,7 +13796,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         // const block or array length) is baked into the body: record
         // the layout reads, as `layout_query` does.
         p.record_layout_reads(&mut self.cx.out.reads, &self.cx.tys, t);
-        crate::ty::layout::layout_of_ty(&self.cx.tys, p, t).ok()
+        crate::ty::layout::layout_of_ty(&self.cx.tys, &UserLayout(p), t).ok()
     }
     fn adt_repr(&self, adt: AdtId) -> crate::ty::layout::Repr {
         self.cx.p.adt(adt).repr

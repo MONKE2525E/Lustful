@@ -280,12 +280,21 @@ impl<'a> Program<'a> {
         self.static_defs.iter().position(|&d| d == def).map(|i| i as u32)
     }
     /// The shipped crate a span's source belongs to, if any. Only spans
-    /// in spliced shipped source answer; every user span gets None.
+    /// in spliced shipped source, or in a file of a shipped adapter
+    /// crate (ARCH 3.6), answer; every user span gets None.
     pub fn shipped_crate_at(&self, span: Span) -> Option<ShippedCrate> {
+        if let Some(a) = self.adapter_at(span) {
+            return ShippedCrate::ALL.iter().copied().find(|k| k.name() == a.name);
+        }
         if span.file != crate::diag::FileId(0) {
             return None;
         }
         self.shipped_ranges.iter().find(|(lo, hi, _)| span.lo >= *lo && span.lo < *hi).map(|(_, _, k)| *k)
+    }
+    /// The adapter crate whose source file holds `span`, if any. The
+    /// resolver records each adapter crate's files (W-DEPS).
+    pub fn adapter_at(&self, span: Span) -> Option<&crate::resolve::imports::AdapterCrate> {
+        self.resolved.as_ref()?.adapters.iter().find(|a| a.files.contains(&span.file))
     }
     /// The shipped crate that defines function `f`, if it is a shipped
     /// (spliced std) fn. Codegen runs its intrinsic privilege check
@@ -3656,7 +3665,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
     }
     fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
         let p: &Program<'_> = self.p;
-        crate::ty::layout::layout_of_ty(&p.tys, p, t).ok()
+        crate::ty::layout::layout_of_ty(&p.tys, &UserLayout(p), t).ok()
     }
     fn adt_repr(&self, adt: AdtId) -> crate::ty::layout::Repr {
         self.p.adt(adt).repr
@@ -4293,6 +4302,28 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             p.gx.drop_methods.contains_key(&a) || p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty)))
         }
         None => false,
+    }
+}
+
+/// Layout shapes for the layout answers user code can observe
+/// (`size_of`, `align_of`, `size_of_val`, `offset_of!`, const
+/// evaluation): `Program`'s shapes, except that an adapter type whose
+/// manifest does not list it as exact-layout (ARCH 3.6) has none, so
+/// the query rejects with L0652 instead of answering with a size the
+/// real crate does not have. Codegen keeps using `Program` itself.
+pub struct UserLayout<'p, 'a>(pub &'p Program<'a>);
+
+impl crate::ty::layout::AdtShapes for UserLayout<'_, '_> {
+    fn adt_shape(&self, id: AdtId) -> Option<crate::ty::layout::AdtShape> {
+        let p = self.0;
+        let adt = p.adts.get(id.0 as usize)?;
+        if let Some(a) = p.adapter_at(adt.span) {
+            let path = p.display_path(adt.name);
+            if !a.exact_layout.iter().any(|t| *t == path) {
+                return None;
+            }
+        }
+        p.adt_shape(id)
     }
 }
 

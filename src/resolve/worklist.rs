@@ -875,6 +875,8 @@ struct CrateJob {
     /// Direct dependencies: (extern name, source job index or the
     /// L0508 reason when the dependency has no lust form yet).
     deps: Vec<(String, Result<usize, String>)>,
+    /// The exact-layout list when this crate is an adapter crate.
+    adapter: Option<Vec<String>>,
 }
 
 /// What one resolved crate contributes to the merged program.
@@ -910,32 +912,14 @@ struct OneError {
     needs_std: bool,
 }
 
-/// Adapter crates and the upstream version each lust adapter matches
-/// (ARCH 3.6). An empty version means the table pins none yet.
-const ADAPTER_VERSIONS: &[(&str, &str)] = &[
-    ("indexmap", "2.14.0"),
-    ("smallvec", "1.15.1"),
-    ("rustc-hash", "2.1.2"),
-    ("memchr", ""),
-    ("bumpalo", ""),
-    ("xxhash-rust", ""),
-    ("ryu-js", ""),
-    ("num-bigint", ""),
-];
-
 /// Shim crates (ARCH 3.7): rustc-built, with a lust source API crate
 /// in front once one exists.
 const SHIM_CRATES: &[&str] = &["rustix", "nix", "signal-hook", "flate2", "jiff", "name-to-handle-at", "tikv-jemallocator"];
 
-/// The lib root of the lust-side crate for an adapter or shim, if one
-/// exists in `library/deps/<name>/src/lib.rs` (under `$LUST_LIBRARY`
-/// when set, else the build-time library tree).
+/// The lib root of the lust-side crate for a shim, if one exists in
+/// `library/deps/<name>/src/lib.rs` (see `adapters::library_root`).
 fn lust_dep_lib_root(name: &str) -> Option<PathBuf> {
-    let base = match std::env::var_os("LUST_LIBRARY") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library"),
-    };
-    let root = base.join("deps").join(name).join("src/lib.rs");
+    let root = super::adapters::library_root().join("deps").join(name).join("src/lib.rs");
     root.is_file().then_some(root)
 }
 
@@ -944,33 +928,33 @@ fn lust_dep_lib_root(name: &str) -> Option<PathBuf> {
 /// or unsupported with a reason that names the crate (L0508). The
 /// class is a property of the resolved package, never of a source
 /// spelling: a path package that happens to be named `indexmap` is
-/// plain lust source.
+/// plain lust source. `lust_owned` marks the library's own crates
+/// (adapters and shims): they skip the edition rule and see
+/// `cfg(lust_dev)`. `adapter` carries an adapter's exact-layout list.
 enum DepClass {
-    Source { root: PathBuf, adapter: bool },
+    Source { root: PathBuf, lust_owned: bool, adapter: Option<Vec<String>> },
     Unsupported(String),
 }
 
 /// Classifies one dependency unit. See `DepClass`.
 fn classify_dep(dep: &super::cargo::DepUnit) -> DepClass {
     if dep.source.is_none() {
-        return DepClass::Source { root: dep.lib_src.clone(), adapter: false };
+        return DepClass::Source { root: dep.lib_src.clone(), lust_owned: false, adapter: None };
     }
     let name = dep.package_name.as_str();
-    if let Some((_, want)) = ADAPTER_VERSIONS.iter().find(|(n, _)| *n == name) {
-        if let Some(root) = lust_dep_lib_root(name) {
-            if !want.is_empty() && dep.version != *want {
-                return DepClass::Unsupported(format!(
-                    "dependency crate `{name}` {} has no matching lust adapter (the adapter matches {want})",
-                    dep.version
-                ));
-            }
-            return DepClass::Source { root, adapter: true };
-        }
-        return DepClass::Unsupported(format!("dependency crate `{name}` has no lust adapter yet"));
+    if super::adapters::ADAPTER_PACKAGES.contains(&name) {
+        return match super::adapters::load(name) {
+            Ok(Some(a)) => match super::adapters::check_unit(&a, name, &dep.version, &dep.features) {
+                Ok(()) => DepClass::Source { root: a.root, lust_owned: true, adapter: Some(a.exact_layout) },
+                Err(why) => DepClass::Unsupported(why),
+            },
+            Ok(None) => DepClass::Unsupported(format!("dependency crate `{name}` has no lust adapter yet")),
+            Err(e) => DepClass::Unsupported(format!("the lust adapter for `{name}` is broken: {e}")),
+        };
     }
     if SHIM_CRATES.contains(&name) {
         if let Some(root) = lust_dep_lib_root(name) {
-            return DepClass::Source { root, adapter: true };
+            return DepClass::Source { root, lust_owned: true, adapter: None };
         }
         return DepClass::Unsupported(format!("dependency crate `{name}` has no lust shim yet"));
     }
@@ -1016,6 +1000,7 @@ pub fn resolve_crate_cached(
         flat_prefix: String::new(),
         magic: main_magic,
         deps: Vec::new(),
+        adapter: None,
     }];
     // The session error map for job-build failures (a dependency root
     // that cannot be read, a non-2024 source dependency): the selected
@@ -1097,6 +1082,13 @@ pub fn resolve_crate_cached(
             .collect();
         match resolve_one(&jobs[j], &mut tables, &mut shared, cache, &dep_exports, interner, known) {
             Ok(out) => {
+                if let Some(exact_layout) = &jobs[j].adapter {
+                    tables.adapters.push(super::imports::AdapterCrate {
+                        name: jobs[j].input.crate_name.clone(),
+                        files: out.seen.iter().map(|s| s.2).collect(),
+                        exact_layout: exact_layout.clone(),
+                    });
+                }
                 needs_std |= out.needs_std;
                 all_seen.extend(out.seen);
                 fn_lines.extend(out.fn_lines);
@@ -1153,15 +1145,15 @@ fn add_dep_job(
     by_key: &mut FxMap<String, usize>,
     interner: &Interner,
 ) -> Result<(String, Result<usize, String>), Diag> {
-    let (root, adapter) = match classify_dep(dep) {
-        DepClass::Source { root, adapter } => (root, adapter),
+    let (root, lust_owned, adapter) = match classify_dep(dep) {
+        DepClass::Source { root, lust_owned, adapter } => (root, lust_owned, adapter),
         DepClass::Unsupported(why) => return Ok((dep.extern_name.clone(), Err(why))),
     };
     let key = format!("{}#{}", dep.package_id, dep.lib_name);
     if let Some(&j) = by_key.get(&key) {
         return Ok((dep.extern_name.clone(), Ok(j)));
     }
-    if !adapter && dep.edition != "2024" {
+    if !lust_owned && dep.edition != "2024" {
         return Err(Diag::new(
             "L0530",
             Span::default(),
@@ -1183,7 +1175,7 @@ fn add_dep_job(
     let root_module = tables.add_crate_root(interner.intern(&crate_name));
     tables.crate_magic.insert(magic, root_module);
     let mut env = input.env.with_features(&dep.features);
-    if adapter {
+    if lust_owned {
         env.allow_lust_dev = true;
     }
     let idx = jobs.len();
@@ -1194,6 +1186,7 @@ fn add_dep_job(
         flat_prefix: format!("k{:016x}$", stable.0),
         magic,
         deps: Vec::new(),
+        adapter,
     });
     let mut sub = Vec::new();
     for d in &dep.deps {
@@ -5511,8 +5504,20 @@ mod tests {
             }
         }
         match classify_dep(&dep_unit("indexmap", "0.1.0", None)) {
-            DepClass::Source { adapter, .. } => assert!(!adapter, "a path package named indexmap is plain source"),
+            DepClass::Source { lust_owned, adapter, .. } => {
+                assert!(!lust_owned && adapter.is_none(), "a path package named indexmap is plain source")
+            }
             DepClass::Unsupported(why) => panic!("path package must be source: {why}"),
+        }
+        // The memchr adapter pins 2.8.2: another version is a mismatch
+        // that names both versions, never a silent swap.
+        match classify_dep(&dep_unit("memchr", "2.8.3", registry)) {
+            DepClass::Unsupported(why) => assert!(why.contains("2.8.3") && why.contains("2.8.2"), "{why}"),
+            DepClass::Source { .. } => panic!("a version the adapter does not match must not swap in"),
+        }
+        match classify_dep(&dep_unit("memchr", "2.8.2", registry)) {
+            DepClass::Source { lust_owned, adapter, .. } => assert!(lust_owned && adapter.is_some()),
+            DepClass::Unsupported(why) => panic!("memchr 2.8.2 has an adapter: {why}"),
         }
         match classify_dep(&dep_unit("rustix", "1.0.0", registry)) {
             DepClass::Unsupported(why) => assert!(why.contains("rustix"), "{why}"),

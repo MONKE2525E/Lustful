@@ -1,0 +1,13 @@
+# Valid Rust lust rejects: the memchr adapter matches 2.8.2 but does not
+# implement the `logging` feature Cargo enabled, so the use rejects with
+# L0508 naming the feature (ARCH 3.6). The vendored directory source
+# stands in for the registry so the fixture runs offline.
+[package]
+name = "adapter-feature"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memchr = { version = "=2.8.2", features = ["logging"] }
+
+[workspace]

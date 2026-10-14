@@ -1,0 +1,13 @@
+# Valid Rust lust rejects: memchr 2.8.3 has a lust adapter crate, but the
+# adapter matches 2.8.2 (library/deps/memchr/Cargo.toml), so the use
+# rejects with L0508 naming both versions (ARCH 3.6). The vendored
+# directory source stands in for the registry so the fixture runs offline.
+[package]
+name = "adapter-version"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memchr = "=2.8.3"
+
+[workspace]

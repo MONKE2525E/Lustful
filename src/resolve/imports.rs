@@ -211,6 +211,20 @@ pub struct ResolvedTables {
     /// to bind, so the rewrite pass expands the name back to the
     /// written path check reads.
     pub std_aliases: FxMap<(ModuleId, u8, Sym), (VisKind, Vec<Sym>)>,
+    /// The adapter crates of the session (ARCH 3.6) and the files each
+    /// one read. Check reads it for intrinsic privilege and to keep
+    /// layout queries off adapter types whose layout is not exact.
+    pub adapters: Vec<AdapterCrate>,
+}
+
+/// One adapter crate in a session (see `resolve::adapters`).
+#[derive(Clone, Debug)]
+pub struct AdapterCrate {
+    /// The crate name as paths write it (`rustc_hash`).
+    pub name: String,
+    pub files: Vec<crate::diag::FileId>,
+    /// Source paths of the types whose layout equals upstream's.
+    pub exact_layout: Vec<String>,
 }
 
 impl ResolvedTables {
@@ -243,6 +257,7 @@ impl ResolvedTables {
             fn_module: Vec::new(),
             crate_magic: FxMap::default(),
             std_aliases: FxMap::default(),
+            adapters: Vec::new(),
         }
     }
 
