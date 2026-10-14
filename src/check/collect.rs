@@ -2732,7 +2732,12 @@ pub fn collect_reuse<'a>(
                 // it its param and field table, as the field pass does
                 // for a user generic enum.
                 p.gx.adt_info[id.0 as usize] = (def, 1);
-                p.gx.has_generics = true;
+                // Its instances need the generic machinery, but only
+                // in programs that use it (plain programs keep the
+                // fast path; the perf gate measures those).
+                if generics::ast_uses_bound(ast, interner) {
+                    p.gx.has_generics = true;
+                }
                 let t0 = p.tys.intern(TyKind::Param(ParamId(0)));
                 let sized_args = p.tys.intern_args(&[GenericArg::Ty(t0)]);
                 let sized = Predicate::Trait(Binder::plain(TraitRef { def: p.gx.lang.sized, args: sized_args, bindings: EMPTY_BINDINGS }));

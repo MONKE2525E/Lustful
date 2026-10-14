@@ -261,7 +261,11 @@ pub(super) fn inherent_template_probe(
     if templates.is_empty() {
         return Probe::Miss;
     }
-    p.inherent_reads(&mut cx.out.reads, adt_def, name);
+    // Record only this probe form, like the plain probe. Recording
+    // every form would make probing appear to continue past a hit
+    // (the graph reads test spells that contract out).
+    let head = Head::of(&cx.tys, probe.self_ty);
+    let _ = p.method_set(&mut cx.out.reads, head, name, probe.filter);
     for (template, tmpl) in templates {
         if let Some(ret) = confirm_method(cx, e, template, &tmpl.generics.clone(), &[], explicit, probe, derefs, args, name_span) {
             return Probe::Hit(ret);

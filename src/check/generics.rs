@@ -8216,6 +8216,28 @@ fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
             p.gx.hash_impls.entry(a).or_default().push((h, inst));
         }
     }
+/// True when the program mentions `Bound`, its variants, or the
+/// `RangeBounds` bound methods by name. `Bound<T>` is a generic
+/// synthetic Adt registered for every program; its instances need
+/// the generic machinery, but only in programs that use it (the
+/// perf gate measures plain programs too).
+pub fn ast_uses_bound(ast: &Ast, interner: &Interner) -> bool {
+    let named = |segs: &[ast::PathSeg]| {
+        segs.iter().any(|s| matches!(interner.get(s.name), "Bound" | "Included" | "Excluded" | "Unbounded" | "RangeBounds"))
+    };
+    ast.exprs.iter().any(|e| match e {
+        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "start_bound" | "end_bound"),
+        ast::Expr::Path(segs) => named(segs),
+        ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.tys.iter().any(|t| match t {
+        TyExpr::Path(segs) => named(segs),
+        TyExpr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.pats.iter().any(|p| match p {
+        ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } => named(segs),
+        _ => false,
+    })
 }
 
 /// Materializes every reachable instance (section 4.1's mono
