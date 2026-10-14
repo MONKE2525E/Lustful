@@ -13,9 +13,11 @@
 //   an existing key keeps (the old one), and every return value are
 //   std's.
 // - `VecDeque` keeps its elements in logical order in one `Vec`, which
-//   grows by the same RawVec rule, so `capacity()` matches. Methods
-//   whose result depends on std's ring layout (`as_slices`,
-//   `make_contiguous`, `rotate_*`) are not here.
+//   grows by the same RawVec rule, so `capacity()` matches. A ghost
+//   `head` field tracks where std's ring head would be (growth keeps
+//   it, front/back shifts follow std's insert/remove/rotate/shrink
+//   rules), so `as_slices` splits and every other ring-observable
+//   result match as well (W-STD-C phase 2).
 // - The iterator types are nominal structs whose one field holds a
 //   builtin adapter (`Map<slice::Iter<'a, (K, V)>, fn(&(K, V)) ->
 //   (&K, &V)>` and kin), so the whole adapter set works on them (the
@@ -41,9 +43,12 @@ pub struct BTreeSet<T> {
     items: Vec<T>,
 }
 
-/// A double-ended queue.
+/// A double-ended queue. `buf` holds the elements in logical
+/// order; `head` is where std's ring head would sit in a buffer
+/// of `buf.capacity()` slots (see the file header).
 pub struct VecDeque<T> {
     buf: Vec<T>,
+    head: usize,
 }
 
 /// The order of two keys. A `.cmp` call on a generic `Q` cannot be
@@ -1056,11 +1061,11 @@ pub mod vec_deque {
 
     impl<T> VecDeque<T> {
         pub const fn new() -> VecDeque<T> {
-            VecDeque { buf: Vec::new() }
+            VecDeque { buf: Vec::new(), head: 0 }
         }
 
         pub fn with_capacity(capacity: usize) -> VecDeque<T> {
-            VecDeque { buf: Vec::with_capacity(capacity) }
+            VecDeque { buf: Vec::with_capacity(capacity), head: 0 }
         }
 
         pub fn len(&self) -> usize {
@@ -1077,14 +1082,163 @@ pub mod vec_deque {
 
         pub fn clear(&mut self) {
             self.buf.clear();
+            self.head = 0;
+        }
+
+        /// The physical index one past the front, in a buffer of
+        /// the current capacity (which a grow has just settled).
+        fn wrap_next(&self, head: usize) -> usize {
+            if head + 1 >= self.buf.capacity() { 0 } else { head + 1 }
+        }
+
+        /// The physical index one before the front, likewise.
+        fn wrap_prev(&self, head: usize) -> usize {
+            if head == 0 { self.buf.capacity() - 1 } else { head - 1 }
+        }
+
+        /// The state a capacity growth copies from: the capacity
+        /// and first-slice length before the growing operation.
+        fn pre_grow(&self) -> (usize, usize) {
+            (self.buf.capacity(), self.first_len())
+        }
+
+        /// Where the ring head lands after the buffer grew from
+        /// the `pre_grow` state: std copies the smaller of the
+        /// two segments to the far end, so when the back segment
+        /// (from the head) is the smaller or equal one it ends
+        /// flush with the new buffer's end; otherwise the head
+        /// keeps its offset.
+        fn note_grow(&mut self, pre: (usize, usize), len_before: usize) {
+            let (cap_before, first_before) = pre;
+            let cap = self.buf.capacity();
+            if cap > cap_before && first_before < len_before && first_before <= len_before - first_before {
+                self.head = cap - first_before;
+            }
+        }
+
+        /// How many elements the first of the two ring slices holds.
+        fn first_len(&self) -> usize {
+            let cap = self.buf.capacity();
+            if cap == 0 {
+                0
+            } else if self.head + self.buf.len() <= cap {
+                self.buf.len()
+            } else {
+                cap - self.head
+            }
+        }
+
+        pub fn as_slices(&self) -> (&[T], &[T]) {
+            let first = self.first_len();
+            (&self.buf[..first], &self.buf[first..])
+        }
+
+        // No `as_mut_slices`: it needs `split_at_mut`, which the
+        // subset has no form of yet.
+
+        pub fn make_contiguous(&mut self) -> &mut [T] {
+            let cap = self.buf.capacity();
+            let len = self.buf.len();
+            if cap > 0 && self.head + len > cap {
+                let free = cap - len;
+                let left = cap - self.head;
+                let right = len - left;
+                self.head = if free >= left || left <= right {
+                    0
+                } else if right < free {
+                    right
+                } else {
+                    free
+                };
+            }
+            self.buf.as_mut_slice()
+        }
+
+        /// Reverses `buf[lo..hi]` in place (for the rotates).
+        fn reverse_range(&mut self, mut lo: usize, mut hi: usize) {
+            while lo + 1 < hi {
+                hi -= 1;
+                self.buf.swap(lo, hi);
+                lo += 1;
+            }
+        }
+
+        /// Logically rotates the buffer left by `k` (three reversals).
+        fn rotate_buf_left(&mut self, k: usize) {
+            let len = self.buf.len();
+            if k == 0 || k >= len {
+                return;
+            }
+            self.reverse_range(0, k);
+            self.reverse_range(k, len);
+            self.reverse_range(0, len);
+        }
+
+        pub fn rotate_left(&mut self, n: usize) {
+            assert!(n <= self.len());
+            let len = self.buf.len();
+            if len <= 1 || n == 0 || n == len {
+                return;
+            }
+            if n <= len / 2 {
+                let mut h = self.head;
+                let mut i = 0;
+                while i < n {
+                    h = self.wrap_next(h);
+                    i += 1;
+                }
+                self.head = h;
+            } else {
+                let mut h = self.head;
+                let mut i = 0;
+                while i < len - n {
+                    h = self.wrap_prev(h);
+                    i += 1;
+                }
+                self.head = h;
+            }
+            self.rotate_buf_left(n);
+        }
+
+        pub fn rotate_right(&mut self, n: usize) {
+            assert!(n <= self.len());
+            let len = self.buf.len();
+            if len <= 1 || n == 0 || n == len {
+                return;
+            }
+            if n <= len / 2 {
+                let mut h = self.head;
+                let mut i = 0;
+                while i < n {
+                    h = self.wrap_prev(h);
+                    i += 1;
+                }
+                self.head = h;
+            } else {
+                let mut h = self.head;
+                let mut i = 0;
+                while i < len - n {
+                    h = self.wrap_next(h);
+                    i += 1;
+                }
+                self.head = h;
+            }
+            self.rotate_buf_left(len - n);
         }
 
         pub fn push_back(&mut self, value: T) {
+            let pre = self.pre_grow();
+            let len = self.buf.len();
             self.buf.push(value);
+            self.note_grow(pre, len);
         }
 
         pub fn push_front(&mut self, value: T) {
+            let pre = self.pre_grow();
+            let len = self.buf.len();
             self.buf.insert(0, value);
+            self.note_grow(pre, len);
+            self.head = self.wrap_prev(self.head);
         }
 
         pub fn pop_back(&mut self) -> Option<T> {
@@ -1092,7 +1246,12 @@ pub mod vec_deque {
         }
 
         pub fn pop_front(&mut self) -> Option<T> {
-            if self.buf.is_empty() { None } else { Some(self.buf.remove(0)) }
+            if self.buf.is_empty() {
+                None
+            } else {
+                self.head = self.wrap_next(self.head);
+                Some(self.buf.remove(0))
+            }
         }
 
         pub fn front(&self) -> Option<&T> {
@@ -1120,14 +1279,32 @@ pub mod vec_deque {
         }
 
         pub fn insert(&mut self, index: usize, value: T) {
-            if index > self.buf.len() {
+            let len = self.buf.len();
+            if index > len {
                 panic!("index out of bounds");
             }
+            let pre = self.pre_grow();
             self.buf.insert(index, value);
+            self.note_grow(pre, len);
+            // Std shifts the shorter side: the front part moves
+            // when `2 * index <= len` (the head steps back).
+            if index * 2 <= len {
+                self.head = self.wrap_prev(self.head);
+            }
         }
 
         pub fn remove(&mut self, index: usize) -> Option<T> {
-            if index < self.buf.len() { Some(self.buf.remove(index)) } else { None }
+            let len = self.buf.len();
+            if index >= len {
+                return None;
+            }
+            let out = self.buf.remove(index);
+            // Std shifts the shorter side: the front part moves
+            // when `2 * index < len` (the head steps forward).
+            if index * 2 < len {
+                self.head = self.wrap_next(self.head);
+            }
+            Some(out)
         }
 
         pub fn swap(&mut self, i: usize, j: usize) {
@@ -1139,15 +1316,48 @@ pub mod vec_deque {
         }
 
         pub fn reserve(&mut self, additional: usize) {
+            let pre = self.pre_grow();
+            let len = self.buf.len();
             self.buf.reserve(additional);
+            self.note_grow(pre, len);
         }
 
         pub fn reserve_exact(&mut self, additional: usize) {
+            let pre = self.pre_grow();
+            let len = self.buf.len();
             self.buf.reserve_exact(additional);
+            self.note_grow(pre, len);
         }
 
         pub fn shrink_to_fit(&mut self) {
+            self.shrink_head(self.buf.len());
             self.buf.shrink_to_fit();
+        }
+
+        pub fn shrink_to(&mut self, min_capacity: usize) {
+            let len = self.buf.len();
+            let target = if min_capacity > len { min_capacity } else { len };
+            self.shrink_head(target);
+            self.buf.shrink_to(target);
+        }
+
+        /// Where the ring head lands when the buffer shrinks to
+        /// `target` slots: a wrapped layout keeps its distance
+        /// from the buffer's end, an unwrapped one keeps its head
+        /// when it still fits, else the front.
+        fn shrink_head(&mut self, target: usize) {
+            let cap = self.buf.capacity();
+            let len = self.buf.len();
+            if target >= cap {
+                return;
+            }
+            self.head = if self.head + len > cap {
+                self.head - (cap - target)
+            } else if self.head < target {
+                self.head
+            } else {
+                0
+            };
         }
 
         pub fn iter(&self) -> Iter<'_, T> {
@@ -1195,11 +1405,14 @@ pub mod vec_deque {
         }
 
         pub fn append(&mut self, other: &mut VecDeque<T>) {
+            let pre = self.pre_grow();
+            let len = self.buf.len();
             self.buf.append(&mut other.buf);
+            self.note_grow(pre, len);
         }
 
         pub fn split_off(&mut self, at: usize) -> VecDeque<T> {
-            VecDeque { buf: self.buf.split_off(at) }
+            VecDeque { buf: self.buf.split_off(at), head: 0 }
         }
 
         pub fn swap_remove_back(&mut self, index: usize) -> Option<T> {
@@ -1208,6 +1421,15 @@ pub mod vec_deque {
 
         pub fn drain<R: core::ops::RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T> {
             self.buf.drain(range)
+        }
+
+        pub fn swap_remove_front(&mut self, index: usize) -> Option<T> {
+            if index >= self.buf.len() {
+                return None;
+            }
+            self.buf.swap(0, index);
+            self.head = self.wrap_next(self.head);
+            Some(self.buf.remove(0))
         }
     }
 
@@ -1221,7 +1443,7 @@ pub mod vec_deque {
 
     impl<T: Clone> Clone for VecDeque<T> {
         fn clone(&self) -> VecDeque<T> {
-            VecDeque { buf: self.buf.clone() }
+            VecDeque { buf: self.buf.clone(), head: 0 }
         }
     }
 
@@ -1245,7 +1467,7 @@ pub mod vec_deque {
 
     impl<T> From<Vec<T>> for VecDeque<T> {
         fn from(buf: Vec<T>) -> VecDeque<T> {
-            VecDeque { buf }
+            VecDeque { buf, head: 0 }
         }
     }
 
@@ -1262,7 +1484,7 @@ pub mod vec_deque {
         fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
             let iter = iter.into_iter();
             let (lower, _) = iter.size_hint();
-            self.buf.reserve(lower);
+            self.reserve(lower);
             for x in iter {
                 self.buf.push(x);
             }
@@ -1290,7 +1512,7 @@ pub mod vec_deque {
 
     impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
         fn from(arr: [T; N]) -> VecDeque<T> {
-            VecDeque { buf: Vec::from(arr) }
+            VecDeque { buf: Vec::from(arr), head: 0 }
         }
     }
 
