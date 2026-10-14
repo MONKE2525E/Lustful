@@ -4994,13 +4994,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// that returns its own type variable (`fn with<R>(f: impl FnOnce()
     /// -> R) -> R`) under an expected type fixes that variable first, so
     /// a closure body that needs its output type sees it (`let s: u32 =
-    /// with(|| v.iter().sum())`). Only for a bare variable with a closure
-    /// argument and no dyn in the expectation, where the result could
-    /// still coerce (rustc's own expectation is not binding there).
+    /// with(|| v.iter().sum())`). The same fixing binds a parameter
+    /// that only rides inside the return type (`LazyCell<T, F>` from
+    /// `LazyCell::new(f)`): under `LazyCell<T, fn() -> T>` the `F` is
+    /// the fn pointer type before the argument checks, so a closure
+    /// or fn item argument coerces to it instead of binding `F` to
+    /// its own item type. Only when the return type still holds a
+    /// variable, an argument is a closure or a path (a fn item), and
+    /// the expectation has no dyn, where the result could still
+    /// coerce (rustc's own expectation is not binding there). A failed
+    /// unify rolls back, so a coercion-only match keeps its old path.
     pub(super) fn expected_output_first(&mut self, ret: Ty, expected: Option<Ty>, args: &[ExprId]) {
         let Some(want) = expected else { return };
-        if !matches!(self.kind(ret), TyKind::Infer(v) if !v.is_int() && !v.is_float())
-            || !args.iter().any(|&a| matches!(self.p.ast.expr(a), Expr::Closure { .. }))
+        let ret_deep = self.deep(ret);
+        if !self.tys.flags(ret_deep).contains_infer()
+            || !args.iter().any(|&a| matches!(self.p.ast.expr(a), Expr::Closure { .. } | Expr::Path(_)))
         {
             return;
         }
