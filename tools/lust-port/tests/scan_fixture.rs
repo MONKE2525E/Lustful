@@ -72,8 +72,10 @@ fn scan_reports_gaps_and_survives_bad_files() {
     assert!(has("std.hashmap", "src/lib.rs", "active"));
     assert!(has("std.hashmap", "src/win_only.rs", "target-specific"));
     assert!(has("std.hashmap", "src/tests_only.rs", "test-only"));
-    assert!(has("dyn.fn", "src/sub/mod.rs", "active"));
-    assert!(has("dyn.boxed", "src/sub/mod.rs", "active"));
+    // Box<dyn Fn> in sub/mod.rs is supported today (dyn.fn and
+    // dyn.boxed are supported rows), so it makes no finding.
+    assert!(!has("dyn.fn", "src/sub/mod.rs", "active"));
+    assert!(!has("dyn.boxed", "src/sub/mod.rs", "active"));
     assert!(has("lifetimes.hrtb", "src/lib.rs", "active"));
 
     // Every finding carries a byte range inside its file and a snippet.
@@ -90,11 +92,12 @@ fn scan_reports_gaps_and_survives_bad_files() {
     assert!(causes.contains(&"std-runtime"), "causes: {causes:?}");
     assert!(causes.contains(&"lifetimes"));
 
-    // feat.rs (empty fn) and elsewhere.rs (a const, supported today)
-    // compile now; lib.rs needs milestone 6 for its for<'a> fn.
+    // feat.rs (empty fn), elsewhere.rs (a const), and sub/mod.rs
+    // (Box<dyn Fn>) compile now; lib.rs needs milestone 6 for its
+    // for<'a> fn.
     let feat = v["files"].as_array().unwrap().iter().find(|f| f["file"] == "src/feat.rs").unwrap();
     assert!(feat["missing_features"].as_array().unwrap().is_empty(), "{feat}");
-    assert_eq!(v["coverage"]["supported_today_files"], 2);
+    assert_eq!(v["coverage"]["supported_today_files"], 3);
     let today = &v["coverage"]["by_plan_milestone"][0];
     let m6 = &v["coverage"]["by_plan_milestone"][3];
     assert_eq!(today["id"], "0");

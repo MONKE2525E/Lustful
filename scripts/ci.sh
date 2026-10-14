@@ -34,6 +34,9 @@ cargo build --release
 step "diagnostic code registry"
 scripts/check-codes.sh
 
+step "lust-port tool tests"
+scripts/test-lust-port.sh
+
 step "difftest"
 scripts/difftest.sh
 
