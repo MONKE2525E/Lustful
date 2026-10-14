@@ -911,6 +911,21 @@ impl<'p, 'a> Lower<'p, 'a> {
                     };
                     self.set_or_temp(dest, Rvalue::FnValue(f, want), ty, span)
                 }
+                // A static's value of a non-Copy type moves out of a
+                // place reached through its address (`place`), which the
+                // borrow checker rejects as a move out of a reference
+                // (rustc E0507); a copy loads it.
+                Res::Static(_) if !is_copy(self.p, &self.body.tys, ty) => {
+                    let pl = self.place(e);
+                    let op = self.operand_from(pl, ty);
+                    match dest {
+                        Some(d) => self.assign(d.clone(), Rvalue::Use(op), span),
+                        None => {
+                            let t = self.temp(ty);
+                            self.assign(Place::local(t), Rvalue::Use(op), span);
+                        }
+                    }
+                }
                 Res::Static(idx) => self.set_or_temp(dest, Rvalue::StaticLoad(idx), ty, span),
                 Res::OptNone => self.set_or_temp(dest, Rvalue::Opt(ty, None), ty, span),
                 _ => {}
