@@ -30,5 +30,7 @@ fn main() {
     println!("{}", cl2([], 2));
     let t: &dyn T = &S;
     println!("{}", t.m([], 21));
+    let bx: Box<dyn FnOnce([u8; 0], u32) -> u32> = Box::new(|_v: [u8; 0], y: u32| y + 1);
+    println!("{}", bx([], 41));
     println!("end");
 }
