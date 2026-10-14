@@ -182,8 +182,13 @@ void lust_print_flush(void) LUST_BODY({ lust_out_flush_buf(); })
    (the stack bounds come from pthread_getattr_np). The region counts 16
    MiB below the stack, as a tcc frame can step past one guard page. */
 #if defined(LUST_IMPL) && defined(__linux__)
-#include <pthread.h>
-int pthread_getattr_np(pthread_t, pthread_attr_t *);
+/* No <pthread.h>: sync.c declares pthread_create with its own types.
+   pthread_attr_t is opaque here (56 bytes on x86_64 and aarch64 glibc). */
+typedef union { char bytes[64]; long align; } lust_pthread_attr;
+unsigned long pthread_self(void);
+int pthread_getattr_np(unsigned long, void *);
+int pthread_attr_getstack(const void *, void **, size_t *);
+int pthread_attr_destroy(void *);
 static uintptr_t lust_guard_lo, lust_guard_hi;
 static char lust_alt_stack[65536];
 
@@ -209,7 +214,7 @@ static void lust_segv(int sig, siginfo_t *info, void *ctx) {
 }
 
 static void lust_stack_guard_init(void) {
-    pthread_attr_t at;
+    lust_pthread_attr at;
     void *addr;
     size_t size;
     if (pthread_getattr_np(pthread_self(), &at) != 0) return;
