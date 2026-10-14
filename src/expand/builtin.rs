@@ -732,6 +732,13 @@ fn matches_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
     if matches!(pat.last(), Some(Tt::Tok(t)) if t.tok == Tok::Comma) {
         pat.pop();
     }
+    // core's matches! takes `$pattern:pat`, and that fragment cannot
+    // begin with `..=` (rustc: "no rules expected `..=`").
+    if let Some(Tt::Tok(t)) = pat.first()
+        && t.tok == Tok::DotDotEq
+    {
+        return Err(err(C_CALL, t.span, "no rules expected `..=` in matches!", "Put the pattern in parentheses: `(..=0)`."));
+    }
     let mut tpl = st.lex_template("match __lust_v { __lust_p => true, _ => false }", span);
     tpl = splice_placeholders(tpl, "__lust_v", &value, st.ctx.interner);
     tpl = splice_placeholders(tpl, "__lust_p", &pat, st.ctx.interner);
