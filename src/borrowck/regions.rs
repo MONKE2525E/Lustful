@@ -982,6 +982,27 @@ impl FnSides {
     }
 }
 
+/// The type params a type names (indices), in order, repeats included.
+fn type_params_in(tys: &impl TyIntern, t: Ty, out: &mut Vec<u32>) {
+    match tys.kind(t) {
+        TyKind::Param(j) => out.push(j.0),
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => type_params_in(tys, e, out),
+        TyKind::Tuple(ts) => {
+            for e in tys.tys_of(ts).to_vec() {
+                type_params_in(tys, e, out);
+            }
+        }
+        TyKind::Adt(_, a) | TyKind::Projection(_, a) => {
+            for g in tys.args(a).to_vec() {
+                if let GenericArg::Ty(e) = g {
+                    type_params_in(tys, e, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The pairs of regions at the same places of two regioned types (a
 /// callee's bound and the argument's signature, `entail_bound`); a type
 /// param or projection on either side (an instantiation) pairs nothing.
@@ -3831,6 +3852,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 self.link_bound_closure(b.value.args, &binds, sig, &univ);
                 self.tie_bound_output(b.value.args, &binds, sig, &univ);
                 self.entail_bound(b.value.args, sig, &univ);
+                self.flow_bound_inputs(b.value.args, &binds, sig, &univ);
             }
         }
         ok
@@ -4321,6 +4343,109 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let ins: Vec<(Side, Side)> = ins.iter().map(|&(a, b)| (gside(a, &mut gn, false), sides.side(self, b, false))).collect();
         let outs: Vec<(Side, Side)> = outs.iter().map(|&(a, b)| (gside(a, &mut gn, true), sides.side(self, b, true))).collect();
         self.match_fn_sides(&ins, &outs);
+    }
+
+    /// A source that is not a closure (a fn item, a constructor, a fn
+    /// pointer, a type param) passed for the callee's `G: Fn*(..) -> R`
+    /// bound: what it returns may hold what it takes, so the regions bound
+    /// to the type params in `G`'s inputs, and the lifetimes `G` writes
+    /// there, flow into the regions bound to the type params in its output
+    /// (rustc instantiates the source's signature with the call's types;
+    /// a closure's sources flow through `closure_sources`).
+    fn flow_bound_inputs(&mut self, trait_args: ArgsId, binds: &FxMap<u32, Vec<u32>>, sig: &RegionSig, univ: &[u32]) {
+        let p = self.p;
+        let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
+        let (Some(self_t), Some(tuple)) = (targs.first().and_then(|g| g.as_ty()), targs.get(1).and_then(|g| g.as_ty())) else { return };
+        let (TyKind::Param(jg), TyKind::Tuple(ts)) = (p.tys.kind(self_t), p.tys.kind(tuple)) else { return };
+        let n_in = p.tys.tys_of(ts).len();
+        let Some(&ft) = self.bind_tys.get(&jg.0) else { return };
+        let mut t = ft;
+        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+            t = inner;
+        }
+        if matches!(self.body.tys.kind(t), TyKind::Closure(..)) {
+            return;
+        }
+        let Some(g) = sig.fn_bounds.iter().find(|b| b.param == jg.0 && b.inputs.len() == n_in) else { return };
+        let Some(out) = g.output else { return };
+        // Bare type params in and out (`Fn(T, U) -> R`): the source's own
+        // signature, where it has one, says exactly which input reaches R.
+        let bare = |t: Ty| match p.tys.kind(t) {
+            TyKind::Param(j) => Some(j.0),
+            _ => None,
+        };
+        if let (Some(ins), Some(r)) = (g.inputs.iter().map(|&t| bare(t)).collect::<Option<Vec<u32>>>(), bare(out))
+            && self.flow_by_signature(t, &ins, r, binds)
+        {
+            return;
+        }
+        let (mut outs, mut ins) = (Vec::new(), Vec::new());
+        type_params_in(&p.tys, out, &mut outs);
+        let dsts: Vec<u32> = outs.iter().filter_map(|j| binds.get(j)).flatten().copied().collect();
+        if dsts.is_empty() {
+            return;
+        }
+        let mut srcs: Vec<u32> = Vec::new();
+        for &it in &g.inputs {
+            type_params_in(&p.tys, it, &mut ins);
+            let mut rs = Vec::new();
+            regions_of(&p.tys, it, &mut rs);
+            srcs.extend(rs.into_iter().filter_map(|r| match r {
+                Region::Param(k) => univ.get(k as usize).copied(),
+                _ => None,
+            }));
+        }
+        srcs.extend(ins.iter().filter_map(|j| binds.get(j)).flatten().copied());
+        self.flow_all(&srcs, &dsts);
+    }
+
+    /// `flow_bound_inputs` through the source's own regioned signature
+    /// (a fn item's, or a type param's `Fn` bound outside a closure body),
+    /// instantiated at this use: its universals are fresh vars, its
+    /// late-bound regions one var of the use, and each input `ins[i]` and
+    /// the output `out` take exactly the regions of the type params the
+    /// call binds there. False when there is no such signature or it does
+    /// not pair (the conservative flow then).
+    fn flow_by_signature(&mut self, src: Ty, ins: &[u32], out: u32, binds: &FxMap<u32, Vec<u32>>) -> bool {
+        let p = self.p;
+        let root = root_fn(p, self.body.fn_id);
+        let (s_ins, s_out, univ): (Vec<Ty>, Ty, Vec<u32>) = match self.body.tys.kind(src) {
+            TyKind::FnDef(def, _) => {
+                let Some(fs) = p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l)) else { return false };
+                let univ: Vec<u32> = (0..fs.n_univ).map(|_| self.fresh()).collect();
+                (fs.params.clone(), fs.ret, univ)
+            }
+            TyKind::Param(jf) if !self.own.closure => {
+                let Some(rs) = p.regions.body_sig(p, root) else { return false };
+                let Some(f) = rs.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == ins.len()) else { return false };
+                let Some(o) = f.output else { return false };
+                (f.inputs.clone(), o, (1..=rs.n_univ).collect())
+            }
+            _ => return false,
+        };
+        if s_ins.len() != ins.len() {
+            return false;
+        }
+        let bv = self.fresh();
+        self.bound_var = Some(bv);
+        let mut ok = true;
+        for (&st, &j) in s_ins.iter().zip(ins).chain(std::iter::once((&s_out, &out))) {
+            let (Some(&at), Some(bvs)) = (self.bind_tys.get(&j), binds.get(&j)) else {
+                ok = false;
+                break;
+            };
+            let (mut pv, mut own) = (Vec::new(), FxMap::default());
+            if !self.inst(st, at, &univ, &mut own, &mut pv) || pv.len() != bvs.len() {
+                ok = false;
+                break;
+            }
+            for (&a, &b) in pv.iter().zip(bvs) {
+                self.edge(a, b);
+                self.edge(b, a);
+            }
+        }
+        self.bound_var = None;
+        ok
     }
 
     /// The regioned signature of a type param `F` of this body's fn (its
