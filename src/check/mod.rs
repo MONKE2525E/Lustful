@@ -1633,17 +1633,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// The callable-item type of a tuple struct or tuple variant
     /// constructor used as a value. It is an `FnDef` over the Adt def
-    /// with the variant index as a const argument, so a later call
-    /// through the value can decode which constructor it is. Generic
-    /// Adts as values are not supported yet.
-    fn ctor_value_ty(&mut self, a: AdtId, v: u32, span: Span) -> Ty {
-        if !self.p.gx.adt_generics[a.0 as usize].params.is_empty() {
-            self.errs.push(not_yet("L0614", span, "generic constructors as values"));
-            return ERROR;
-        }
+    /// with the variant index as its first (const) argument, so a later
+    /// call through the value can decode which constructor it is. A
+    /// generic Adt's args follow (`.map(W)`): from the path's turbofish
+    /// or fresh variables, with the Adt's bounds queued, as a call of
+    /// the constructor does.
+    fn ctor_value_ty(&mut self, e: ExprId, a: AdtId, v: u32, span: Span) -> Ty {
+        let p = self.p;
         let c = self.tys.intern_const(ConstKind::Int(v as u128));
-        let args = self.tys.intern_args(&[GenericArg::Const(c)]);
-        self.tys.intern(TyKind::FnDef(self.p.def_of_adt(a), args))
+        let mut args = vec![GenericArg::Const(c)];
+        let generics = p.gx.adt_generics[a.0 as usize].clone();
+        if !generics.params.is_empty() {
+            let gen_args = match p.ast.expr(e) {
+                Expr::Path(segs) => self.value_path_args(a, segs, span),
+                _ => self.fresh_args(&generics),
+            };
+            if !generics.predicates.is_empty() {
+                self.push_predicates(&generics.predicates, &gen_args, span);
+            }
+            args.extend(gen_args);
+        }
+        let args = self.tys.intern_args(&args);
+        self.tys.intern(TyKind::FnDef(p.def_of_adt(a), args))
     }
 
     /// The variant a constructor `FnDef` type names, from its const arg.
@@ -1670,8 +1681,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if let Some(a) = p.adt_by_def(def) {
                     let v = self.ctor_variant(args);
                     let variant = &p.adt(a).variants[v as usize];
-                    let params = variant.fields.iter().map(|f| f.ty).collect();
-                    Some((params, self.tys.adt_ty(a)))
+                    // A generic Adt's args follow the variant (see
+                    // `ctor_value_ty`).
+                    let adt_args: Vec<GenericArg> = self.tys.args(args).iter().skip(1).copied().collect();
+                    if adt_args.is_empty() {
+                        let params = variant.fields.iter().map(|f| f.ty).collect();
+                        return Some((params, self.tys.adt_ty(a)));
+                    }
+                    let fields: Vec<Ty> = variant.fields.iter().map(|f| f.ty).collect();
+                    let params = fields.into_iter().map(|t| subst(&mut self.tys, t, &adt_args)).collect();
+                    Some((params, self.tys.mk_adt(def, &adt_args)))
                 } else {
                     let f = p.local_def(def.hash)?;
                     let fargs: Vec<GenericArg> = self.tys.args(args).to_vec();
@@ -6121,7 +6140,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     Some(VariantShape::Tuple) => {
                         self.set_res(e, Res::Variant(a, 0));
-                        return self.ctor_value_ty(a, 0, span);
+                        return self.ctor_value_ty(e, a, 0, span);
                     }
                     _ => {}
                 }
@@ -6289,7 +6308,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return self.tys.mk_adt(p.def_of_adt(a), &gen_args);
                 }
                 if variant.shape == VariantShape::Tuple {
-                    return self.ctor_value_ty(a, v, span);
+                    return self.ctor_value_ty(e, a, v, span);
                 }
                 self.err("L0101", span, "expected value, found struct variant", "Write a struct literal: `Enum::Variant { .. }`.");
                 return ERROR;

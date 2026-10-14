@@ -295,6 +295,8 @@ impl Ex<'_, '_, '_> {
                         },
                         _ => 0,
                     };
+                    // A generic Adt builds its mono instance (the dest's type).
+                    let a = self.place_ty(&dest).ok().and_then(|t| self.body.tys.local_adt(t)).unwrap_or(a);
                     self.assign(dest, Rvalue::Aggregate(a, v, args));
                     return Ok(());
                 }
