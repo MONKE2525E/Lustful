@@ -5,9 +5,9 @@ The adapter is written and checked against the real crate with rustc
 in `pending/`, and a dependency on smallvec is L0508 ("no lust adapter
 yet"). The corpus is tests/adapters/crates/smallvec (UNSUPPORTED today).
 
-Blocked on: a user `Deref<Target = [T]>` as an operator and for method
-calls, so `v[i]`, `*v`, and slice methods (rejects on next; W-CHECK-G
-or W-TRAITS); `Iterator::size_hint` overrides,
+Blocked on: indexing through a user `Deref<Target = [T]>`, `v[i]` and
+`&v[a..b]` (L0113 on next; W-CHECK-G; method calls, `*v`, and `&v` to
+`&[T]` work since 4f30cf3f); `Iterator::size_hint` overrides,
 `DoubleEndedIterator`, `ExactSizeIterator`, `Extend`, and the `Hasher`
 trait (W-STD-B, in its queue); `into_iter()` on a generic
 `I: IntoIterator` parameter (in W-TRAITS2's next landing). `drain` (ts-rust
