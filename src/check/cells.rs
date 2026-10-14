@@ -25,6 +25,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             ("Weak", "ptr_eq") => Builtin::WeakPtrEq,
             ("RefCell", "new") => Builtin::RefCellNew,
             ("Cell", "new") => Builtin::CellNew,
+            // `T::default()` inside, built by the default glue (W-STD-B,
+            // `cell_default_sig`).
+            ("RefCell" | "Cell", "default") => Builtin::DefaultGlue,
             ("Weak" | "RefCell" | "Cell", _) => {
                 self.err(
                     "L0104",
@@ -37,6 +40,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => return None,
         };
         Some(Some(Res::Builtin(b)))
+    }
+
+    /// `RefCell::default()` and `Cell::default()`: `() -> RefCell<T>` (or
+    /// `Cell<T>`) with `T: Default`, the element inferred or written
+    /// (`RefCell::<u8>::default()`); the default glue builds the value.
+    pub(super) fn cell_default_sig(&mut self, callee: ExprId, span: Span) -> (Vec<Ty>, Ty) {
+        let elem = self.new_var(false);
+        self.deferred_default.push((elem, span));
+        let refcell = match self.p.ast.expr(callee) {
+            Expr::Path(segs) if segs.len() >= 2 => self.name(segs[segs.len() - 2].name) == "RefCell",
+            _ => true,
+        };
+        let t = if refcell { self.tys.mk_builtin1(|d| d.refcell, elem) } else { self.tys.mk_builtin1(|d| d.cell, elem) };
+        (vec![], t)
     }
 
     /// Parameter and return types of a `cell_assoc` builtin call. The
@@ -112,7 +129,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.deferred_default.push((el, span));
                     (B::RefCellTake, Autoref::Ref, vec![], el)
                 }
-                "try_borrow" | "try_borrow_mut" | "replace_with" | "try_borrow_unguarded" | "undo_leak" => {
+                "try_borrow" | "try_borrow_mut" => {
+                    let m = n == "try_borrow_mut";
+                    let g = if m { self.tys.mk_builtin1(|d| d.ref_mut_guard, el) } else { self.tys.mk_builtin1(|d| d.ref_guard, el) };
+                    let def = if m { crate::check::generics::borrow_mut_error_def() } else { crate::check::generics::borrow_error_def() };
+                    let err = self.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
+                    let r = self.tys.mk_result(g, err);
+                    (if m { B::RefCellTryBorrowMut } else { B::RefCellTryBorrow }, Autoref::Ref, vec![], r)
+                }
+                "replace_with" | "try_borrow_unguarded" | "undo_leak" => {
                     self.err("L0640", span, format!("`RefCell::{n}` is not implemented yet"), "Use `borrow`, `borrow_mut`, or `replace`.");
                     return Some(self.iter_bail(args));
                 }

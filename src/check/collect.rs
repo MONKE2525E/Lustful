@@ -2670,6 +2670,18 @@ pub fn collect_reuse<'a>(
                     named(vec![field("lo", int(IntTy::U64)), field("hi", int(IntTy::U64))]),
                     Derives { clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
+                // `core::cell::BorrowError` and `BorrowMutError` (W-STD-B):
+                // unit structs whose Debug prints the name, as std's does.
+                10 => (
+                    generics::borrow_error_def(),
+                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0, non_exhaustive: false }],
+                    Derives { debug: true, ..Derives::default() },
+                ),
+                11 => (
+                    generics::borrow_mut_error_def(),
+                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0, non_exhaustive: false }],
+                    Derives { debug: true, ..Derives::default() },
+                ),
                 // `core::panic::Location` (check/caller.rs): its Debug
                 // prints these field names. Ord compares file, then
                 // line, then column, as std's does. No Hash: a hash
@@ -2693,9 +2705,10 @@ pub fn collect_reuse<'a>(
                     )
                 }
             };
-            // `core::sync::atomic::Ordering` (index 4) is std's one
-            // synthetic `#[non_exhaustive]` type here.
-            let synthetic_ne = usize::MAX - item_idx == 4;
+            // `core::sync::atomic::Ordering` (index 4) and RefCell's
+            // `BorrowError` and `BorrowMutError` (10, 11) are std's
+            // synthetic `#[non_exhaustive]` types here.
+            let synthetic_ne = matches!(usize::MAX - item_idx, 4 | 10 | 11);
             p.adts[id.0 as usize] =
                 AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
@@ -5977,6 +5990,10 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
                 Some(Err(e)) => return glue_default(p, tys, e, seen),
                 None => {}
             }
+            // core's `impl<T: Default> Default` for RefCell and Cell.
+            if let Some(e) = tys.refcell_elem(t).or_else(|| tys.cell_elem(t)) {
+                return glue_default(p, tys, e, seen);
+            }
             // std's `impl<K, V, S: Default> Default for HashMap<K, V, S>`
             // (and HashSet), and the hashers' own impls (W-STD-B, cgen/hash.rs
             // `default_body`). Entry and the iterators have none here.
@@ -6157,6 +6174,8 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::recv_error_def()
                         || d == generics::try_recv_error_def()
                         || d == generics::location_def()
+                        || d == generics::borrow_error_def()
+                        || d == generics::borrow_mut_error_def()
                 })
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))

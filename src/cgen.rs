@@ -4234,6 +4234,33 @@ impl FnGen<'_, '_, '_> {
                 );
                 t
             }
+            // `try_borrow` (`try_borrow_mut`): `borrow`'s flag test, the
+            // guard in `Ok`, else `Err` of the unit error struct (W-STD-B).
+            B::RefCellTryBorrow | B::RefCellTryBorrowMut => {
+                let m = b == B::RefCellTryBorrowMut;
+                let rc = deref_cty(&tys[0]);
+                let CTy::RefCell(el) = &rc else { unreachable!("try_borrow on a &RefCell") };
+                let def = if m { crate::check::generics::borrow_mut_error_def() } else { crate::check::generics::borrow_error_def() };
+                let err = CTy::Adt(self.p.tys.local_adt_of(def).expect("the RefCell error Adts always exist"));
+                let res = CTy::Result(Box::new(CTy::Guard(el.clone(), m)), Box::new(err.clone()));
+                collect_types(&res, &mut self.sig_types);
+                let (p, t) = (self.tmp(), self.tmp());
+                let ok = self.make_variant(&res, 0, std::slice::from_ref(&p));
+                let fail = self.make_variant(&res, 1, &[zero_lit(self.p, &err)]);
+                let (busy, take) = if m {
+                    (format!("{p}->f0 != 0"), format!("{p}->f0 = -1"))
+                } else {
+                    (format!("{p}->f0 < 0 || {p}->f0 == 0x7fffffffffffffffLL"), format!("{p}->f0++"))
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {}* {p} = {}; {} {t}; if ({busy}) {t} = {fail}; else {{ {take}; {t} = {ok}; }}",
+                    ctype(&rc),
+                    vals[0],
+                    ctype(&res)
+                );
+                t
+            }
             B::RefCellIntoInner => format!("{}.f1", vals[0]),
             B::RefCellReplace => {
                 let (c, old) = (self.tmp(), self.tmp());
@@ -7433,6 +7460,15 @@ fn glue_def_value(
                     let et = ctype(e);
                     let d = def_of(e, &mut need);
                     let _ = writeln!(body, "  {et} *r = ({et}*)lust_alloc(sizeof({et}), _Alignof({et})); *r = {d};\n  return r;");
+                }
+                // An unborrowed RefCell around `T::default()`; a Cell is
+                // its value in C (W-STD-B).
+                CTy::RefCell(e) => {
+                    let d = def_of(e, &mut need);
+                    let _ = writeln!(body, "  {ct} r; r.f0 = 0; r.f1 = {d};\n  return r;");
+                }
+                CTy::Cell(e) => {
+                    let _ = writeln!(body, "  return {};", def_of(e, &mut need));
                 }
                 CTy::Rc(e) => {
                     // The header as `Rc::new` builds it: one implicit weak ref.

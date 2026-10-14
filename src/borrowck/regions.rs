@@ -3451,6 +3451,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             b,
             B::RefCellBorrow
                 | B::RefCellBorrowMut
+                | B::RefCellTryBorrow
+                | B::RefCellTryBorrowMut
                 | B::CellGet
                 | B::CellSet
                 | B::CellReplace
@@ -3471,10 +3473,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let tv = rv[1..].to_vec();
         match b {
-            B::RefCellBorrow | B::RefCellBorrowMut => {
+            // A try form's `Result<Ref<T>, E>` starts with the guard's
+            // slots; the error type has none.
+            B::RefCellBorrow | B::RefCellBorrowMut | B::RefCellTryBorrow | B::RefCellTryBorrowMut => {
                 let Some(&g) = dv.first() else { return true };
                 self.edge(rv[0], g);
-                let v = if b == B::RefCellBorrowMut { Variance::Inv } else { Variance::Co };
+                let v = if matches!(b, B::RefCellBorrowMut | B::RefCellTryBorrowMut) { Variance::Inv } else { Variance::Co };
                 if !self.relate(elem, &tv, elem, &dv[1..], v) {
                     self.equate_all(&tv, &dv[1..]);
                 }

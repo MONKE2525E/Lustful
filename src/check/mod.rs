@@ -425,6 +425,10 @@ pub enum Builtin {
     RefCellNew,
     RefCellBorrow,
     RefCellBorrowMut,
+    /// `try_borrow` and `try_borrow_mut` (W-STD-B): the guard in `Ok`, or
+    /// `Err(BorrowError)` (`BorrowMutError`) where `borrow` would panic.
+    RefCellTryBorrow,
+    RefCellTryBorrowMut,
     RefCellIntoInner,
     RefCellReplace,
     RefCellSwap,
@@ -10619,6 +10623,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::RcDowngrade | Builtin::RcPtrEq | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
                         self.cell_call_sig(b, callee)
                     }
+                    Builtin::DefaultGlue => self.cell_default_sig(callee, span),
                     Builtin::ExitCodeFrom => (vec![int(IntTy::U8)], self.tys.exit_code_ty()),
                     Builtin::StringFromUtf8 | Builtin::StrFromUtf8 => self.utf8_call_sig(b),
                     Builtin::RcTryUnwrap => {

@@ -583,6 +583,17 @@ pub fn type_id_def() -> DefId {
     lang_def(&["core", "any"], crate::def::DefKind::Adt, "TypeId")
 }
 
+/// The defs of `core::cell::BorrowError` and `BorrowMutError`, the
+/// errors of `RefCell::try_borrow` and `try_borrow_mut`: synthetic unit
+/// structs (W-STD-B).
+pub fn borrow_error_def() -> DefId {
+    lang_def(&["core", "cell"], crate::def::DefKind::Adt, "BorrowError")
+}
+
+pub fn borrow_mut_error_def() -> DefId {
+    lang_def(&["core", "cell"], crate::def::DefKind::Adt, "BorrowMutError")
+}
+
 /// The def of `core::panic::Location` (check/caller.rs): a synthetic std
 /// Adt of `file: &str, line: u32, column: u32`, reached by path only.
 pub fn location_def() -> DefId {
@@ -642,7 +653,7 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 10] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 12] {
     [
         (0, "Ordering", ordering_def(), true),
         (1, "Error", fmt_error_def(), false),
@@ -654,6 +665,8 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 10] {
         (7, "TypeId", type_id_def(), false),
         (8, "Location", location_def(), false),
         (9, "Cow", cow_def(), true),
+        (10, "BorrowError", borrow_error_def(), false),
+        (11, "BorrowMutError", borrow_mut_error_def(), false),
     ]
 }
 
@@ -661,7 +674,7 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 10] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -695,6 +708,8 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("mpsc", "TryRecvError", try_recv_error_def()),
         ("any", "TypeId", type_id_def()),
         ("panic", "Location", location_def()),
+        ("cell", "BorrowError", borrow_error_def()),
+        ("cell", "BorrowMutError", borrow_mut_error_def()),
     ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
@@ -6291,6 +6306,33 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 false,
                 span,
             );
+        }
+    }
+    // RefCell<T> and Cell<T>: core's `impl<T: Default> Default` and
+    // Debug (`RefCell<T: Debug>`, `Cell<T: Copy + Debug>`); the guards
+    // `Ref<T>` and `RefMut<T>` are Debug and Display through `T`
+    // (W-STD-B; the default and fmt glue build and print them).
+    {
+        let refcell_p0 = p.tys.mk_builtin1(|d| d.refcell, p0);
+        let cell_p0 = p.tys.mk_builtin1(|d| d.cell, p0);
+        for t in [refcell_p0, cell_p0] {
+            let mut g1 = one.clone();
+            g1.predicates = pred_on_p0(p, lang.default);
+            insert_synthetic(p, &mut ordinal, lang.default, t, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+        }
+        let mut g1 = one.clone();
+        g1.predicates = pred_on_p0(p, lang.debug);
+        insert_synthetic(p, &mut ordinal, lang.debug, refcell_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+        let mut g1 = one.clone();
+        g1.predicates = [pred_on_p0(p, lang.copy), pred_on_p0(p, lang.debug)].concat();
+        insert_synthetic(p, &mut ordinal, lang.debug, cell_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+        for which in [(|d: &crate::ty::BuiltinDefs| d.ref_guard) as fn(&crate::ty::BuiltinDefs) -> DefId, |d| d.ref_mut_guard] {
+            let guard = p.tys.mk_builtin1(which, p0);
+            for tr in [lang.debug, lang.display] {
+                let mut g1 = one.clone();
+                g1.predicates = pred_on_p0(p, tr);
+                insert_synthetic(p, &mut ordinal, tr, guard, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+            }
         }
     }
     // Rc<T>: Clone needs no bound on T (it bumps the count);

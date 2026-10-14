@@ -296,6 +296,13 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut 
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::fmt_error_def()) == Some(*a) => {
             format!("  return lust_f_pad(f, {});\n", lit("an error occurred when formatting an argument"))
         }
+        // RefCell's try errors (W-STD-B): str Display of core's text.
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::borrow_error_def()) == Some(*a) => {
+            format!("  (void)p; return lust_f_pad(f, {});\n", lit("RefCell already mutably borrowed"))
+        }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::borrow_mut_error_def()) == Some(*a) => {
+            format!("  (void)p; return lust_f_pad(f, {});\n", lit("RefCell already borrowed"))
+        }
         // mpsc's errors (W-THREADS): str Display of std's text.
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::recv_error_def()) == Some(*a) => {
             format!("  (void)p; return lust_f_pad(f, {});\n", lit("receiving on a closed channel"))
