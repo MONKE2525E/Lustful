@@ -220,6 +220,7 @@ fn builtin_is_const(b: Builtin) -> bool {
             // `Default`, which is only conditionally const in 1.99.
             | MemSwap
             | MemReplace
+            | MemForget
     )
 }
 

@@ -168,6 +168,244 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(self.iter_call(e, recv, base, base, derefs, &n, name_span, args, turbofish, expected))
     }
 
+    /// `Vec::drain` and `String::drain`: an inherent method whose one
+    /// argument is any `R: RangeBounds<usize>`. The argument form is
+    /// recorded for lowering (check/mod.rs `DrainRange`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn drain_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+    ) -> Option<Ty> {
+        use Builtin as B;
+        if self.name(name) != "drain" {
+            return None;
+        }
+        let elem = self.tys.vec_elem(base);
+        let is_string = self.tys.is_string_ty(base);
+        if elem.is_none() && !is_string {
+            return None;
+        }
+        if !turbofish.is_empty() {
+            self.errs.push(not_yet("L0721", name_span, "turbofish on `drain`"));
+            return Some(self.iter_bail(args));
+        }
+        if args.len() != 1 {
+            self.err("L0105", name_span, "`drain` takes 1 argument", "Pass the range to remove, such as `1..3`.");
+            return Some(self.iter_bail(args));
+        }
+        let arg = args[0];
+        let form = self.drain_range_form(e, arg, name_span)?;
+        self.check_packed_borrow(recv, name_span);
+        self.out.drain_ranges.push((e, form));
+        let (b, ret) = match elem {
+            Some(el) => (B::VecDrain, it::mk_iter(&mut self.tys, IterKind::VecDrain, &[el])),
+            None => (B::StringDrain, it::mk_iter(&mut self.tys, IterKind::StringDrain, &[])),
+        };
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::RefMut });
+        Some(ret)
+    }
+
+    /// The form of one `drain` argument, after checking it (see
+    /// `drain_method`). None when an error already reported.
+    fn drain_range_form(&mut self, e: ExprId, arg: ExprId, span: Span) -> Option<DrainRange> {
+        use DrainRange as DR;
+        let p = self.p;
+        if let Expr::Range { lo, hi, .. } = p.ast.expr(arg) {
+            for b in [lo, hi].into_iter().flatten() {
+                self.expect_expr(*b, USIZE);
+            }
+            self.set(arg, UNIT);
+            return Some(DR::Syntactic);
+        }
+        let t = self.expr(arg, None);
+        let t = self.deep(t);
+        if let Some(form) = self.drain_form_of(t) {
+            return Some(DR::Value(form));
+        }
+        // A generic parameter (or projection) whose env proves the
+        // bound, or a user type's written `RangeBounds` impl.
+        let tr = self.range_bounds_ref(t);
+        match self.select_obligation_at(tr, span, 0) {
+            Selection::Impl { id, args: impl_args, .. } => {
+                let rec = p.gx.index.get(id).clone();
+                if rec.synthetic != crate::traits::index::Synthetic::None {
+                    // A synthetic impl this code did not name above
+                    // (the `&R` blanket over a written impl, say).
+                    return self.drain_reject(t, span);
+                }
+                let (start, ..) = self.method_instance_for_impl(e, id, tr, impl_args.clone(), "start_bound", span)?;
+                let (end, ..) = self.method_instance_for_impl(arg, id, tr, impl_args, "end_bound", span)?;
+                Some(DR::Trait { start, end })
+            }
+            Selection::ParamEvidence(_) => Some(DR::Param),
+            _ => self.drain_reject(t, span),
+        }
+    }
+
+    /// The trait ref `t: RangeBounds<usize>`.
+    fn range_bounds_ref(&mut self, t: Ty) -> TraitRef {
+        let args = self.tys.intern_args(&[GenericArg::Ty(t), GenericArg::Ty(USIZE)]);
+        TraitRef { def: self.p.gx.lang.range_bounds, args, bindings: EMPTY_BINDINGS }
+    }
+
+    /// Reports a drain argument lust cannot read as bounds.
+    fn drain_reject(&mut self, t: Ty, span: Span) -> Option<DrainRange> {
+        if !matches!(self.kind(self.resolve(t)), TyKind::Error) {
+            let tn = self.tn(t);
+            self.err(
+                "L0612",
+                span,
+                format!("`{tn}` does not implement `RangeBounds<usize>` as `drain` needs"),
+                "Pass a range such as `1..3`, `1..`, `..`, or a `(Bound, Bound)` pair.",
+            );
+        }
+        None
+    }
+
+    /// The builtin range form of a value type, when it is one of the
+    /// six range kinds over `usize` (the index type unifies with
+    /// `usize`), a `(Bound<usize>, Bound<usize>)` pair, or a shared
+    /// reference to one of those.
+    fn drain_form_of(&mut self, t: Ty) -> Option<crate::check::DrainForm> {
+        use crate::check::DrainForm as F;
+        use IterKind as K;
+        let t = self.resolve(t);
+        if let Some((k, a)) = it::iter_parts(&self.tys, t) {
+            let form = match k {
+                K::Range => F::Range,
+                K::RangeInclusive => F::RangeInclusive,
+                K::RangeFrom => F::RangeFrom,
+                K::RangeTo => F::RangeTo,
+                K::RangeToInclusive => F::RangeToInclusive,
+                K::RangeFull => return Some(F::RangeFull),
+                _ => return None,
+            };
+            return self.unify(a[0], USIZE).then_some(form);
+        }
+        if let TyKind::Tuple(ts) = self.kind(t) {
+            let es: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+            if es.len() == 2
+                && let (Some(a), Some(b)) = (generics::bound_elem(&self.tys, es[0]), generics::bound_elem(&self.tys, es[1]))
+                && self.unify(a, USIZE)
+                && self.unify(b, USIZE)
+            {
+                return Some(F::Bounds);
+            }
+        }
+        None
+    }
+
+    /// `RangeBounds::start_bound` and `end_bound` on a builtin range
+    /// kind, a `(Bound, Bound)` pair, or a shared reference to one
+    /// (for the reference, `derefs` reaches the value). user impls
+    /// and generic receivers resolve through the trait machinery
+    /// before this hook; instances of a template call land here
+    /// through the builtin dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bound_method(
+        &mut self,
+        e: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+    ) -> Option<Ty> {
+        use Builtin as B;
+        let start = match self.name(name) {
+            "start_bound" => true,
+            "end_bound" => false,
+            _ => return None,
+        };
+        // The receiver must at least be a builtin range kind or pair
+        // (a user type of the same method names is not this hook).
+        if !self.is_range_value_ty(base) {
+            return None;
+        }
+        // The index type: the range's element or the pair's Bound
+        // payload; for `RangeFull` (any `T`), the replayed trait
+        // ref's input or the expected type names it.
+        let idx = self.range_index_ty(base).or_else(|| {
+            let tr = self.replayed_trait_ref(e, self.p.gx.lang.range_bounds)?;
+            self.tys.args(tr.args).get(1).and_then(|g| g.as_ty())
+        }).or_else(|| {
+            let want = expected?;
+            let r = generics::bound_elem(&self.tys, self.resolve(want))?;
+            match self.kind(self.resolve(r)) {
+                TyKind::Ref(_, _, i) => Some(i),
+                _ => None,
+            }
+        })?;
+        if !turbofish.is_empty() {
+            self.errs.push(not_yet("L0721", name_span, "turbofish on this method"));
+            return Some(self.iter_bail(args));
+        }
+        self.check_args(&[], args, name_span);
+        let r = self.tys.mk_ref(false, idx);
+        let ret = generics::bound_ty(&mut self.tys, r);
+        let b = if start { B::RangeStartBound } else { B::RangeEndBound };
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+        Some(ret)
+    }
+
+    /// True for a builtin range kind or a `(Bound, Bound)` pair
+    /// (behind shared references, which the receiver autoderef
+    /// already peeled for `base`, but check anyway).
+    fn is_range_value_ty(&mut self, t: Ty) -> bool {
+        let t = self.resolve(t);
+        if let TyKind::Ref(_, m, inner) = self.kind(t)
+            && !m.is_mut()
+        {
+            return self.is_range_value_ty(inner);
+        }
+        if let Some((k, _)) = it::iter_parts(&self.tys, t) {
+            return k.is_range();
+        }
+        if let TyKind::Tuple(ts) = self.kind(t) {
+            let es: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+            return es.len() == 2 && es.iter().all(|&e| generics::bound_elem(&self.tys, e).is_some());
+        }
+        false
+    }
+
+    /// The index type of a builtin `RangeBounds` value type (a range
+    /// kind's element, or a `(Bound<T>, Bound<T>)` pair's `T`).
+    fn range_index_ty(&mut self, t: Ty) -> Option<Ty> {
+        use IterKind as K;
+        let t = self.resolve(t);
+        if let TyKind::Ref(_, m, inner) = self.kind(t)
+            && !m.is_mut()
+        {
+            return self.range_index_ty(inner);
+        }
+        if let Some((k, a)) = it::iter_parts(&self.tys, t)
+            && k.is_range()
+        {
+            // `RangeFull` alone has no index on the value (it works
+            // for every `T`): it has none to name here.
+            return a.first().copied();
+        }
+        if let TyKind::Tuple(ts) = self.kind(t) {
+            let es: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+            if es.len() == 2
+                && let (Some(a), Some(b)) = (generics::bound_elem(&self.tys, es[0]), generics::bound_elem(&self.tys, es[1]))
+                && self.unify(a, b)
+            {
+                return Some(a);
+            }
+        }
+        None
+    }
+
     /// The sort and binary-search family on a Vec, slice, or array
     /// (runtime/sort.h ports Rust 1.99's algorithms). Comparators are
     /// closures; `binary_search` and its `_by_key` key need an `Ord`
@@ -310,8 +548,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         use Builtin as B;
         use IterKind as K;
         let item = self.iter_item(base);
-        let by_value =
-            !matches!(n, "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek" | "size_hint");
+        let by_value = !matches!(
+            n,
+            "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek" | "size_hint" | "len"
+                | "as_slice" | "as_str"
+        );
         // A by-value method through a reference would use `&mut I:
         // Iterator` (`by_ref`), which lust does not model yet.
         if by_value && derefs > 0 && self.iter_method_known(n) {
@@ -350,6 +591,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 let o = self.tys.mk_option(item);
                 (B::IterNextBack, vec![], o)
+            }
+            "len" => {
+                if !self.exact_size(base) {
+                    return self.iter_unknown(n, span, base, args);
+                }
+                (B::IterLen, vec![], USIZE)
+            }
+            "as_slice" => {
+                let Some((K::VecDrain, a)) = it::iter_parts(&self.tys, base) else { return self.iter_unknown(n, span, base, args) };
+                let sl = self.tys.intern(TyKind::Slice(a[0]));
+                let r = self.tys.mk_ref(false, sl);
+                (B::VecDrainAsSlice, vec![], r)
+            }
+            "as_str" => {
+                let Some((K::StringDrain, _)) = it::iter_parts(&self.tys, base) else { return self.iter_unknown(n, span, base, args) };
+                (B::StrDrainAsStr, vec![], REF_STR)
             }
             "map" => {
                 let out = self.new_var(false);
@@ -605,8 +862,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let autoref = match (by_value, n) {
             (true, _) => Autoref::None,
-            // `size_hint(&self)`.
-            (false, "size_hint") => Autoref::Ref,
+            // `size_hint(&self)`, and the drain views (`len`, `as_slice`, `as_str`).
+            (false, "size_hint" | "len" | "as_slice" | "as_str") => Autoref::Ref,
             (false, _) => Autoref::RefMut,
         };
         if autoref != Autoref::None {
@@ -1086,25 +1343,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
         true
     }
 
-    /// A range expression used as a value: `std::ops::Range<T>` or
-    /// `RangeInclusive<T>` over an integer type (the iterator form;
-    /// `for` loops and slicing keep their own syntactic paths).
-    pub(super) fn range_value(&mut self, e: ExprId, lo: ExprId, hi: ExprId, inclusive: bool, span: Span) -> Ty {
-        let lt = self.expr(lo, None);
-        let ht = self.expr(hi, Some(lt));
-        if !self.unify(lt, ht) {
-            self.mismatch(self.span(hi), lt, ht);
-            return ERROR;
-        }
-        let t = self.resolve(lt);
-        if !(matches!(self.kind(t), TyKind::Int(_)) || self.kind(t).is_int_infer()) {
-            let tn = self.tn(t);
-            self.err("L0641", span, format!("ranges of `{tn}` are not supported yet"), "Use an integer range.");
-            return ERROR;
-        }
+    /// A range expression used as a value: one of the six
+    /// `std::ops` range types over an integer type (`for` loops and
+    /// slicing keep their own syntactic paths). The open-ended
+    /// forms are `RangeBounds` values here, not iterators.
+    pub(super) fn range_value(&mut self, e: ExprId, lo: Option<ExprId>, hi: Option<ExprId>, inclusive: bool, span: Span) -> Ty {
         let _ = e;
-        let k = if inclusive { IterKind::RangeInclusive } else { IterKind::Range };
-        it::mk_iter(&mut self.tys, k, &[t])
+        let bound_ty = |this: &mut Self, b: ExprId, want: Option<Ty>| -> Option<Ty> {
+            let t = this.expr(b, want);
+            let t = this.resolve(t);
+            if matches!(this.kind(t), TyKind::Int(_)) || this.kind(t).is_int_infer() || matches!(this.kind(t), TyKind::Error) {
+                Some(t)
+            } else {
+                let tn = this.tn(t);
+                this.err("L0641", span, format!("ranges of `{tn}` are not supported yet"), "Use an integer range.");
+                None
+            }
+        };
+        match (lo, hi) {
+            (Some(lo), Some(hi)) => {
+                let Some(lt) = bound_ty(self, lo, None) else { return ERROR };
+                let Some(ht) = bound_ty(self, hi, Some(lt)) else { return ERROR };
+                if !self.unify(lt, ht) {
+                    self.mismatch(self.span(hi), lt, ht);
+                    return ERROR;
+                }
+                let k = if inclusive { IterKind::RangeInclusive } else { IterKind::Range };
+                it::mk_iter(&mut self.tys, k, &[lt])
+            }
+            (Some(lo), None) => {
+                let Some(lt) = bound_ty(self, lo, None) else { return ERROR };
+                it::mk_iter(&mut self.tys, IterKind::RangeFrom, &[lt])
+            }
+            (None, Some(hi)) => {
+                let Some(ht) = bound_ty(self, hi, None) else { return ERROR };
+                let k = if inclusive { IterKind::RangeToInclusive } else { IterKind::RangeTo };
+                it::mk_iter(&mut self.tys, k, &[ht])
+            }
+            (None, None) => it::mk_iter(&mut self.tys, IterKind::RangeFull, &[]),
+        }
     }
 }
 

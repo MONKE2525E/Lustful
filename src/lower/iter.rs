@@ -42,6 +42,11 @@ fn expands(b: Builtin) -> bool {
         B::IterIter
             | B::IterIterMut
             | B::IterNext
+            | B::IterNextBack
+            | B::IterSizeHint
+            | B::IterLen
+            | B::RangeStartBound
+            | B::RangeEndBound
             | B::IterMap
             | B::IterFilter
             | B::IterFilterMap
@@ -558,6 +563,18 @@ impl Ex<'_, '_, '_> {
                 let r = arg()?;
                 let (itp, ty) = self.deref_arg(r)?;
                 self.next(itp, ty, dest, b == B::IterNextBack)?;
+            }
+            B::IterLen => {
+                let r = arg()?;
+                let (itp, ty) = self.deref_arg(r)?;
+                let (lo, hi) = self.hint(itp, ty)?;
+                let _ = hi;
+                self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(lo))));
+            }
+            B::RangeStartBound | B::RangeEndBound => {
+                let r = arg()?;
+                let (itp, ty) = self.deref_arg(r)?;
+                self.range_bound(itp, ty, dest, dest_ty, b == B::RangeStartBound)?;
             }
             // The Entry closure forms (W-STD-B): the closure runs only on
             // the branch std runs it on (vacant for the `or_insert_with`
@@ -3542,6 +3559,60 @@ impl Ex<'_, '_, '_> {
             K::Flatten => self.trusted_len(a[0]) && self.item_const_size(a[0]).is_some(),
             K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
         }
+    }
+
+    /// `dest = itp.start_bound()` (or `end_bound`), a `Bound<&T>`
+    /// over the stored field of a builtin range kind, or over one
+    /// side of a `(Bound<T>, Bound<T>)` pair reborrowed through
+    /// `Bound::as_ref`.
+    fn range_bound(&mut self, itp: Place, ty: Ty, dest: Place, dest_ty: Ty, start: bool) -> R {
+        use IterKind as K;
+        let bound = match self.body.tys.local_adt(dest_ty) {
+            Some(a) => a,
+            None => self.p.adt_by_def(crate::check::generics::bound_def()).ok_or("iterator expansion: Bound has no Adt")?,
+        };
+        let idx = crate::check::generics::bound_elem(&self.body.tys, dest_ty)
+            .and_then(|r| match self.body.tys.kind(r) {
+                TyKind::Ref(_, _, i) => Some(i),
+                _ => None,
+            })
+            .ok_or("iterator expansion: bound has no index type")?;
+        let incl = |this: &mut Self, pl: Place, variant: u32| {
+            let r = this.ref_to(false, pl, idx);
+            this.assign(dest.clone(), Rvalue::Aggregate(bound, variant, vec![Operand::Move(Place::local(r))]));
+        };
+        let f = |i: u32| itp.project(Proj::Field(i));
+        if let Some((k, _)) = self.kind_args(ty) {
+            match (k, start) {
+                (K::Range, true) | (K::RangeInclusive, true) | (K::RangeFrom, true) => incl(self, f(0), 0),
+                (K::Range, false) => incl(self, f(1), 1),
+                (K::RangeInclusive, false) => incl(self, f(1), 0),
+                (K::RangeTo, false) => incl(self, f(0), 1),
+                (K::RangeToInclusive, false) => incl(self, f(0), 0),
+                _ => self.assign(dest, Rvalue::Aggregate(bound, 2, Vec::new())),
+            }
+            return Ok(());
+        }
+        // A `(Bound<T>, Bound<T>)` pair: the side's own variant,
+        // with a reference to its payload.
+        let side = f(if start { 0 } else { 1 });
+        let join = self.block();
+        let d = self.local(int(IntTy::U32));
+        self.assign(Place::local(d), Rvalue::Discriminant(side.clone()));
+        let (inc_b, exc_b, unb_b) = (self.block(), self.block(), self.block());
+        self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, inc_b), (1, exc_b)], unb_b));
+        for (bb, variant) in [(inc_b, 0u32), (exc_b, 1u32)] {
+            self.cur = bb;
+            let payload = side.project(Proj::Downcast(variant)).project(Proj::Field(0));
+            let r = self.ref_to(false, payload, idx);
+            self.assign(dest.clone(), Rvalue::Aggregate(bound, variant, vec![Operand::Move(Place::local(r))]));
+            self.goto(join);
+        }
+        self.cur = unb_b;
+        self.assign(dest, Rvalue::Aggregate(bound, 2, Vec::new()));
+        self.goto(join);
+        self.cur = join;
+        Ok(())
     }
 
     // ---------- Consumers ----------

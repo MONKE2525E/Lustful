@@ -84,6 +84,9 @@ pub struct LangTraits {
     /// (`rev` over a user iterator calls its `next_back`).
     pub double_ended_iterator: DefId,
     pub extend: DefId,
+    pub double_ended_iterator: DefId,
+    /// `core::ops::RangeBounds` (fx-vec-drain).
+    pub range_bounds: DefId,
     /// The conversion traits of `core::convert` and `core::borrow`
     /// (W-STD-B, check/convert.rs), and `ToOwned` with its `Owned`.
     pub as_ref: DefId,
@@ -185,6 +188,7 @@ impl LangTraits {
         let exact_size_iterator = lang_trait(&["core", "iter"], "ExactSizeIterator");
         let double_ended_iterator = lang_trait(&["core", "iter"], "DoubleEndedIterator");
         let extend = lang_trait(&["core", "iter"], "Extend");
+        let range_bounds = lang_trait(ops, "RangeBounds");
         let as_ref = lang_trait(&["core", "convert"], "AsRef");
         let as_mut = lang_trait(&["core", "convert"], "AsMut");
         let borrow = lang_trait(&["core", "borrow"], "Borrow");
@@ -249,6 +253,7 @@ impl LangTraits {
             exact_size_iterator,
             double_ended_iterator,
             extend,
+            range_bounds,
             as_ref,
             as_mut,
             borrow,
@@ -353,6 +358,7 @@ impl LangTraits {
             "ExactSizeIterator" => self.exact_size_iterator,
             "DoubleEndedIterator" => self.double_ended_iterator,
             "Extend" => self.extend,
+            "RangeBounds" => self.range_bounds,
             "AsRef" => self.as_ref,
             "AsMut" => self.as_mut,
             "Borrow" => self.borrow,
@@ -512,6 +518,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.exact_size_iterator, "ExactSizeIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["len"]),
         rec(lang.double_ended_iterator, "DoubleEndedIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["next_back"]),
         rec(lang.extend, "Extend", 1, vec![], vec![], &["extend"]),
+        rec(lang.range_bounds, "RangeBounds", 1, vec![], vec![], &["start_bound", "end_bound"]),
         rec(lang.as_ref, "AsRef", 1, vec![], vec![], &["as_ref"]),
         rec(lang.as_mut, "AsMut", 1, vec![], vec![], &["as_mut"]),
         rec(lang.borrow, "Borrow", 1, vec![], vec![], &["borrow"]),
@@ -912,6 +919,14 @@ pub fn lang_method_sigs(
                 }
                 (d, "len") if d == lang.exact_size_iterator => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: USIZE, ret_borrows_from: None }
+                }
+                (d, "next_back") if d == lang.double_ended_iterator => {
+                    let item = proj(tys, lang.assoc_item, &[p0]);
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
+                }
+                (d, "start_bound" | "end_bound") if d == lang.range_bounds => {
+                    let r1 = tys.mk_ref(false, p1);
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: bound_ty(tys, r1), ret_borrows_from: Some(0) }
                 }
                 (d, "index") if d == lang.index => {
                     let o = proj(tys, lang.assoc_index_output, &[p0, p1]);
@@ -6596,6 +6611,38 @@ pub fn add_synthetic_impls(p: &mut Program) {
         }
         let chars = CHARS;
         insert_synthetic(p, &mut ordinal, lang.iterator, chars, &[], g0.clone(), vec![(lang.assoc_item, CHAR)], Synthetic::Lang, false, span);
+    }
+    // ExactSizeIterator and DoubleEndedIterator for the builtin
+    // iterator sources: selection only, like `Iterator` above. The
+    // adapters' conditional impls wait (a bound on an adapter type
+    // rejects instead of proving).
+    {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        for k in [K::SliceIter, K::SliceIterMut, K::VecIntoIter, K::VecDrain, K::Range, K::RangeInclusive] {
+            let self_pat = mk_iter(&mut p.tys, k, &[p0]);
+            insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        let sd = mk_iter(&mut p.tys, K::StringDrain, &[]);
+        insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, sd, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, CHARS, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    // RangeBounds for the six range kinds and the `(Bound, Bound)`
+    // pair (core::ops; std has no reference impl). Selection
+    // only: `start_bound` and `end_bound` stay builtin calls on the
+    // concrete kinds.
+    {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        for k in [K::Range, K::RangeInclusive, K::RangeFrom, K::RangeTo, K::RangeToInclusive] {
+            let self_pat = mk_iter(&mut p.tys, k, &[p0]);
+            insert_synthetic(p, &mut ordinal, lang.range_bounds, self_pat, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        let full = mk_iter(&mut p.tys, K::RangeFull, &[]);
+        insert_synthetic(p, &mut ordinal, lang.range_bounds, full, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        let b0 = bound_ty(&mut p.tys, p0);
+        let pair_ts = p.tys.intern_tys(&[b0, b0]);
+        let pair = p.tys.intern(TyKind::Tuple(pair_ts));
+        insert_synthetic(p, &mut ordinal, lang.range_bounds, pair, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
     // IntoIterator for the builtin collections, as alloc and core
     // declare it: Vec<T> by value (vec::IntoIter<T>), &Vec<T> and &[T]

@@ -281,6 +281,7 @@ pub enum Builtin {
     MemSwap,
     MemReplace,
     MemTake,
+    MemForget,
     CmpMax,
     CmpMin,
     IterIter,
@@ -881,6 +882,33 @@ pub struct DerefRecv {
     pub target_ref: Ty,
 }
 
+/// How a `drain(range)` call's bounds are read at lowering
+/// (`lower::drain_into`): the syntactic range form reads its bound
+/// expressions from the AST, a value of a builtin range kind (or a
+/// `(Bound, Bound)` pair) reads its stored fields, a user
+/// `RangeBounds` impl calls its two methods, and a generic
+/// parameter (template checks only) just evaluates the argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainRange {
+    Syntactic,
+    Value(DrainForm),
+    Trait { start: LocalDefId, end: LocalDefId },
+    Param,
+}
+
+/// The builtin shape a drain argument's bounds are read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainForm {
+    Range,
+    RangeInclusive,
+    RangeFrom,
+    RangeTo,
+    RangeFull,
+    RangeToInclusive,
+    /// A `(Bound<usize>, Bound<usize>)` pair.
+    Bounds,
+}
+
 /// Which `Checked` table a generic `deref` fn's site fills in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DerefTable {
@@ -1019,6 +1047,8 @@ pub struct Checked<'g> {
     /// expression; a chain of impls records one entry per step (see
     /// `DerefRecv::depth`).
     pub deref_recv: Vec<(ExprId, DerefRecv)>,
+    /// The range form of each `drain` call, by expression.
+    pub drain_ranges: Vec<(ExprId, DrainRange)>,
     /// The steps of each `Coerce::UserDeref`, by coerced expression,
     /// outermost first.
     pub deref_coerce: Vec<(ExprId, DerefRecv)>,
@@ -1065,6 +1095,10 @@ impl Checked<'_> {
     }
     pub fn res(&self, e: ExprId) -> Res {
         self.expr_res[(e.0 - self.expr_base) as usize]
+    }
+    /// The range form of a `drain` call (check/iter.rs).
+    pub fn drain_range(&self, e: ExprId) -> Option<DrainRange> {
+        self.drain_ranges.iter().find(|(x, _)| *x == e).map(|(_, d)| *d)
     }
     pub fn coerce(&self, e: ExprId) -> Coerce {
         self.coerce[(e.0 - self.expr_base) as usize]
@@ -1463,6 +1497,7 @@ fn check_fn_mode<'p, 'a>(
             trait_picks: Vec::new(),
             vtable_requests: Vec::new(),
             deref_recv: Vec::new(),
+            drain_ranges: Vec::new(),
             deref_coerce: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
@@ -6588,11 +6623,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 UNIT
             }
             Expr::StructLit { path, fields, update } => self.struct_lit(e, path, fields, *update, span, expected),
-            Expr::Range { lo: Some(lo), hi: Some(hi), inclusive } => self.range_value(e, *lo, *hi, *inclusive, span),
-            Expr::Range { .. } => {
-                self.errs.push(unsupported(span, "ranges outside `for` loops"));
-                ERROR
-            }
+            Expr::Range { lo, hi, inclusive } => self.range_value(e, *lo, *hi, *inclusive, span),
             Expr::Break { label, value: val } => {
                 // Edition 2024 (rustc E0695): an unlabeled break may not
                 // target or pass through a labeled block. If the innermost
@@ -8644,6 +8675,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ("mem", "swap") => Some(Builtin::MemSwap),
                 ("mem", "replace") => Some(Builtin::MemReplace),
                 ("mem", "take") => Some(Builtin::MemTake),
+                ("mem", "forget") => Some(Builtin::MemForget),
                 ("cmp", "max") => Some(Builtin::CmpMax),
                 ("cmp", "min") => Some(Builtin::CmpMin),
                 ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
@@ -11643,6 +11675,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // `into()` through std's other `From` impls between builtin
         // types (check/convert.rs, W-STD-B).
         if let Some(ret) = self.std_into_method(e, rt, name, args, turbofish, expected) {
+        // `Vec::drain` and `String::drain` (check/iter.rs).
+        if let Some(ret) = self.drain_method(e, recv, base, derefs, name, name_span, args, turbofish) {
+            return ret;
+        }
+        // `start_bound` and `end_bound` on a builtin range value.
+        if let Some(ret) = self.bound_method(e, base, derefs, name, name_span, args, turbofish, expected) {
             return ret;
         }
         // Iterator sources on sequences and every method on a builtin

@@ -575,7 +575,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
-                format!("{}<{}>", k.display(), shown.join(", "))
+                if shown.is_empty() { k.display().to_string() } else { format!("{}<{}>", k.display(), shown.join(", ")) }
             }
             None => match tys.local_adt(t) {
                 Some(a) => p.display_path(p.adt(a).name),
@@ -6279,7 +6279,13 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         if k.is_hash() {
             return k.is_hash_owning();
         }
-        return matches!(k, crate::ty::iter::IterKind::VecIntoIter | crate::ty::iter::IterKind::RecvIntoIter) || a.iter().any(|&e| needs_drop(p, tys, e));
+        return matches!(
+            k,
+            crate::ty::iter::IterKind::VecIntoIter
+                | crate::ty::iter::IterKind::RecvIntoIter
+                | crate::ty::iter::IterKind::VecDrain
+                | crate::ty::iter::IterKind::StringDrain
+        ) || a.iter().any(|&e| needs_drop(p, tys, e));
     }
     match tys.local_adt(t) {
         Some(a) => {

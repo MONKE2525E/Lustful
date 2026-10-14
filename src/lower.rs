@@ -1875,16 +1875,24 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.aggregate_into(e, Rvalue::Aggregate(a, v, ops), dest, ty, span);
             }
             // A range value (check/iter.rs): the std struct's fields,
-            // `start`, `end`, and `exhausted` for the inclusive form.
-            Expr::Range { lo: Some(lo), hi: Some(hi), inclusive } => {
+            // `start`, `end`, and `exhausted` for the inclusive form;
+            // the open-ended forms store their one bound (a dummy
+            // `false` for `RangeFull`).
+            Expr::Range { lo, hi, inclusive } => {
                 let ty = self.ty(e);
-                let mut ops = vec![self.operand(*lo), self.operand(*hi)];
-                if *inclusive {
-                    ops.push(Operand::Const(Const::Bool(false)));
-                }
+                let ops = match (lo, hi) {
+                    (Some(lo), Some(hi)) => {
+                        let mut ops = vec![self.operand(*lo), self.operand(*hi)];
+                        if *inclusive {
+                            ops.push(Operand::Const(Const::Bool(false)));
+                        }
+                        ops
+                    }
+                    (Some(b), None) | (None, Some(b)) => vec![self.operand(*b)],
+                    (None, None) => vec![Operand::Const(Const::Bool(false))],
+                };
                 self.set_or_temp(dest, Rvalue::TupleAgg(ty, ops), ty, span);
             }
-            Expr::Range { .. } => {}
             Expr::Break { label, value: val } => {
                 let ti = match label {
                     None => self.loops.len() - 1,
@@ -2729,6 +2737,145 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
     }
 
+    /// `Vec::drain` and `String::drain`: the receiver's `&mut` and
+    /// the range bounds as four words (start tag and value, end tag
+    /// and value; tags are the runtime's 0 Included, 1 Excluded,
+    /// 2 Unbounded). The bounds run under the two-phase reservation
+    /// of an inherent `&mut self` method, as in `method_into`.
+    fn drain_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], derefs: u8, dest: Option<&Place>, span: Span) {
+        let Res::BuiltinMethod { b, .. } = self.ck.res(e) else { return };
+        let Some(form) = self.ck.drain_range(e) else { return };
+        let root = self.deref_steps(e, recv, span);
+        let root_ty = match &root {
+            Some(pl) => self.body.locals[pl.local as usize].ty,
+            None => self.ty(recv),
+        };
+        let recv_ty = self.peel(root_ty, derefs);
+        let pl = Self::derefs(
+            match &root {
+                Some(pl) => pl.clone(),
+                None => self.place_for_mut(recv),
+            },
+            derefs,
+        );
+        let mt = self.ref_ty(true, recv_ty);
+        let t = self.temp(mt);
+        // Through an `IndexMut` place or a user `Deref` step the
+        // autoref is not two-phase (as in `method_into`).
+        let two_phase = root.is_none() && !pl.proj.iter().any(|x| matches!(x, Proj::Index(_)));
+        let bounds = if two_phase {
+            let st = self.ref_ty(false, recv_ty);
+            let reserve = self.temp(st);
+            self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+            let bounds = self.drain_bounds(e, args[0], form, span);
+            self.push(StmtKind::FakeRead(reserve), span);
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            bounds
+        } else {
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            self.drain_bounds(e, args[0], form, span)
+        };
+        let (stag, sval, etag, eval) = bounds;
+        let d = self.call_dest(dest, self.ty(e));
+        self.call_into(CallTarget::Builtin(b), vec![Operand::Move(Place::local(t)), stag, sval, etag, eval], d, span);
+    }
+
+    /// The four bound words of a `drain` argument, by its form
+    /// (check/iter.rs `drain_range_form`).
+    fn drain_bounds(&mut self, e: ExprId, arg: ExprId, form: crate::check::DrainRange, span: Span) -> (Operand, Operand, Operand, Operand) {
+        use crate::check::{DrainForm as F, DrainRange as DR};
+        let p = self.p;
+        let z = |n: u64| Operand::Const(Const::Int(n as u128, IntTy::Usize));
+        match form {
+            DR::Syntactic => {
+                let Expr::Range { lo, hi, inclusive } = p.ast.expr(arg) else { return (z(2), z(0), z(2), z(0)) };
+                let (lo, hi, inclusive) = (*lo, *hi, *inclusive);
+                let (stag, sval) = match lo {
+                    Some(x) => (z(0), self.operand(x)),
+                    None => (z(2), z(0)),
+                };
+                let (etag, eval) = match hi {
+                    Some(x) => (z(if inclusive { 0 } else { 1 }), self.operand(x)),
+                    None => (z(2), z(0)),
+                };
+                (stag, sval, etag, eval)
+            }
+            DR::Value(form) => {
+                let aty = self.ty(arg);
+                let t = self.temp(aty);
+                self.expr_into(arg, Some(&Place::local(t)));
+                let pl = Place::local(t);
+                let f = |i: u32| Operand::Copy(pl.project(Proj::Field(i)));
+                match form {
+                    F::Range => (z(0), f(0), z(1), f(1)),
+                    F::RangeInclusive => (z(0), f(0), z(0), f(1)),
+                    F::RangeFrom => (z(0), f(0), z(2), z(0)),
+                    F::RangeTo => (z(2), z(0), z(1), f(0)),
+                    F::RangeToInclusive => (z(2), z(0), z(0), f(0)),
+                    F::RangeFull => (z(2), z(0), z(2), z(0)),
+                    F::Bounds => {
+                        let (stag, sval) = self.bound_side(pl.project(Proj::Field(0)), false, span);
+                        let (etag, eval) = self.bound_side(pl.project(Proj::Field(1)), false, span);
+                        (stag, sval, etag, eval)
+                    }
+                }
+            }
+            DR::Trait { start, end } => {
+                let aty = self.ty(arg);
+                let t = self.temp(aty);
+                self.expr_into(arg, Some(&Place::local(t)));
+                let mut side = |this: &mut Self, site: ExprId, f: LocalDefId| -> (Operand, Operand) {
+                    let f = this.resolve_generic_fn(site, f);
+                    let rt = this.ref_ty(false, aty);
+                    let r = this.temp(rt);
+                    this.assign(Place::local(r), Rvalue::Ref(false, Place::local(t)), span);
+                    let bt = {
+                        let rr = this.body.tys.mk_ref(false, USIZE);
+                        crate::check::generics::bound_ty(&mut this.body.tys, rr)
+                    };
+                    let bt_l = this.temp(bt);
+                    this.call_into(CallTarget::Fn(f), vec![Operand::Move(Place::local(r))], Place::local(bt_l), span);
+                    this.bound_side(Place::local(bt_l), true, span)
+                };
+                let (stag, sval) = side(self, e, start);
+                let (etag, eval) = side(self, arg, end);
+                (stag, sval, etag, eval)
+            }
+            DR::Param => {
+                let _ = self.operand(arg);
+                (z(2), z(0), z(2), z(0))
+            }
+        }
+    }
+
+    /// The (tag, value) words of one `Bound<usize>` place, or of a
+    /// `Bound<&usize>` place when `deref_payload` (the value is then
+    /// read through the reference).
+    fn bound_side(&mut self, pl: Place, deref_payload: bool, span: Span) -> (Operand, Operand) {
+        let (tag, val) = (self.temp(USIZE), self.temp(USIZE));
+        let z = |n: u64| Operand::Const(Const::Int(n as u128, IntTy::Usize));
+        let d = self.temp(int(IntTy::U32));
+        self.assign(Place::local(d), Rvalue::Discriminant(pl.clone()), span);
+        let (inc_b, exc_b, unb_b, end) = (self.new_block(), self.new_block(), self.new_block(), self.new_block());
+        let b = &mut self.body.blocks[self.cur.0 as usize];
+        b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, inc_b), (1, exc_b)], unb_b);
+        b.term_span = span;
+        for (blk, variant) in [(inc_b, 0u32), (exc_b, 1u32)] {
+            self.cur = blk;
+            self.assign(Place::local(tag), Rvalue::Use(z(variant as u64)), span);
+            let payload = pl.project(Proj::Downcast(variant)).project(Proj::Field(0));
+            let payload = if deref_payload { payload.deref() } else { payload };
+            self.assign(Place::local(val), Rvalue::Use(Operand::Copy(payload)), span);
+            self.goto(end, span);
+        }
+        self.cur = unb_b;
+        self.assign(Place::local(tag), Rvalue::Use(z(2)), span);
+        self.assign(Place::local(val), Rvalue::Use(z(0)), span);
+        self.goto(end, span);
+        self.cur = end;
+        (Operand::Copy(Place::local(tag)), Operand::Copy(Place::local(val)))
+    }
+
     /// Calls the closure value at `place` (type `fty`) with no
     /// arguments through `FnOnce`, into `dest`: an `FnOnce` closure
     /// takes its env by value, the others by reference (the value
@@ -2991,6 +3138,10 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
         if let Res::BuiltinMethod { b: Builtin::FmtWriteFmt, derefs, .. } = self.ck.res(e) {
             self.write_fmt_into(e, recv, args, derefs, dest, span);
+            return;
+        }
+        if let Res::BuiltinMethod { b: Builtin::VecDrain | Builtin::StringDrain, derefs, .. } = self.ck.res(e) {
+            self.drain_into(e, recv, args, derefs, dest, span);
             return;
         }
         if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
