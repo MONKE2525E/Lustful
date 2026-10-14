@@ -13068,10 +13068,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let hint = if trait_path.is_empty() {
             None
         } else {
-            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            // `_` args become body variables, as in a qualified call.
             let tref = ast::TraitRefExpr { path: trait_path.to_vec() };
-            match generics::resolve_trait_ref(p.ast, p.interner, p.known, &cx, &mut self.tys, &self.body_scope.clone(), base, &tref, span)
-            {
+            match self.written_trait_ref(base, &tref, span) {
                 Ok(tr) => Some(tr),
                 Err(d) => {
                     self.errs.push(d);
