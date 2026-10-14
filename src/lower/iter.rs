@@ -2694,6 +2694,8 @@ impl Ex<'_, '_, '_> {
                 self.goto(join);
                 self.cur = bad;
                 self.term(Terminator::Panic(vec![FmtPart::Lit("count overflowed usize".into())]));
+                // `Step::steps_between(..).expect(..)` in core's range.rs.
+                self.body.blocks[self.cur.0 as usize].term_span = crate::diag::Span::std_site(8, 1200, 59);
             }
             K::RangeInclusive => {
                 let (w, _) = self.wide_ty(a[0])?;
@@ -2719,6 +2721,7 @@ impl Ex<'_, '_, '_> {
                 self.goto(join);
                 self.cur = bad;
                 self.term(Terminator::Panic(vec![FmtPart::Lit("count overflowed usize".into())]));
+                self.body.blocks[self.cur.0 as usize].term_span = crate::diag::Span::std_site(8, 1560, 14);
                 self.cur = zero;
                 self.assign(dest.clone(), Rvalue::Use(Self::usize_c(0)));
                 self.goto(join);

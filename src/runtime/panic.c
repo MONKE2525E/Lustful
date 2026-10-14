@@ -54,6 +54,7 @@ static const char *const lust_std_files[] = {
     LUST_STD_SRC "core/src/iter/adapters/step_by.rs",
     LUST_STD_SRC "alloc/src/vec/spec_from_iter_nested.rs",
     LUST_STD_SRC "core/src/iter/traits/accum.rs",
+    LUST_STD_SRC "core/src/iter/range.rs",
 };
 #endif
 
