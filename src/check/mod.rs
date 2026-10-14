@@ -1101,6 +1101,10 @@ struct Ctx<'p, 'a> {
     module: crate::ty::defs::ModuleId,
     tys: Tys<'p>,
     vars: Vec<Var>,
+    /// Variables a `!` value flowed into (rustc's diverging type
+    /// variables). An unbound root of one falls back to `!` at body end
+    /// (edition 2024), so it is no annotation error.
+    diverging: Vec<u32>,
     out: Checked<'p>,
     /// Locals by (name, hygiene context): a local a macro introduces does
     /// not bind a caller ident of the same name, and an ident the caller
@@ -1406,6 +1410,7 @@ fn check_fn_mode<'p, 'a>(
         module: defining_module(p, fid),
         tys: Tys::new(&p.tys),
         vars: Vec::new(),
+        diverging: Vec::new(),
         out: Checked {
             tys: Tys::new(&p.tys),
             expr_base: def.exprs.0,
@@ -3334,7 +3339,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // late bindings have run: an impl with a
                         // still-unbound parameter is the step-4
                         // error, everything else is annotation.
-                        match self.select_obligation(trait_ref) {
+                        let mut sel = self.select_obligation(trait_ref);
+                        // A diverging Self variable falls back to `!`
+                        // first (edition 2024), as in rustc.
+                        if sel == Selection::Ambiguous
+                            && let TyKind::Infer(v) = self.kind(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR))
+                            && self.is_diverging_root(v.index())
+                        {
+                            self.bind_var(v.index(), NEVER);
+                            sel = self.select_obligation(trait_ref);
+                        }
+                        match sel {
                             Selection::Impl { unbound, .. } if !unbound.is_empty() => {
                                 self.err(
                                     "L0613",
@@ -3727,6 +3742,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let id = self.vars.len() as u32 - 1;
         self.tys.intern(TyKind::Infer(InferId(id, InferKind::Float)))
     }
+    /// Records `t` as a diverging variable when it is an unbound general
+    /// one: a `!` value was coerced into it (see `diverging`).
+    fn mark_diverging(&mut self, t: Ty) {
+        if let TyKind::Infer(v) = self.kind(t)
+            && !v.is_int()
+            && !v.is_float()
+        {
+            self.diverging.push(v.index());
+        }
+    }
+    /// True when the unbound variable `v` is the root of a diverging
+    /// variable, so it falls back to `!` and needs no annotation.
+    fn is_diverging_root(&self, v: u32) -> bool {
+        self.diverging.iter().any(|&d| self.var_root(d) == Some(v))
+    }
+    /// The unbound variable that variable `v` resolves to, if any.
+    fn var_root(&self, mut v: u32) -> Option<u32> {
+        loop {
+            match self.vars[v as usize].bound {
+                None => return Some(v),
+                Some(t) => match self.tys.kind(t) {
+                    TyKind::Infer(w) => v = w.index(),
+                    _ => return None,
+                },
+            }
+        }
+    }
     /// Follows variable bindings at the top level only.
     fn resolve(&self, mut t: Ty) -> Ty {
         while let TyKind::Infer(v) = self.tys.kind(t) {
@@ -4106,6 +4148,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.run_obligations(false);
         let (fk, ek) = (self.kind(found), self.kind(expected));
         if fk == TyKind::Never {
+            self.mark_diverging(expected);
             return true;
         }
         // Count reference layers, for deref coercions.
@@ -6798,7 +6841,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.err("L0820", span, "async closures are not supported yet", "Use a plain closure.");
                 ERROR
             }
-            Expr::Try(inner) => self.try_expr(e, *inner, span),
+            Expr::Try(inner) => {
+                // `?` is a match whose break arm returns, so its value
+                // is a diverging variable when nothing else fixes it
+                // (`let _ = Err(e)?;`), as in rustc.
+                let t = self.try_expr(e, *inner, span);
+                self.mark_diverging(t);
+                t
+            }
             Expr::Underscore => {
                 self.err(
                     "L0110",
@@ -7019,9 +7069,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Joins the types of two branches. A diverging branch takes the other branch's type.
     fn join(&mut self, a: Ty, b: Ty, be: Option<ExprId>, span: Span) -> Ty {
         if self.kind(a) == TyKind::Never {
+            self.mark_diverging(b);
             return b;
         }
         if self.kind(b) == TyKind::Never {
+            self.mark_diverging(a);
             return a;
         }
         // Two closures that capture nothing (or one and a fn pointer)
@@ -16509,7 +16561,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return false;
         }
         match self.tys.kind(self.resolve(t)) {
-            TyKind::Infer(v) => !v.is_int() && !v.is_float(),
+            TyKind::Infer(v) => !v.is_int() && !v.is_float() && !self.is_diverging_root(v.index()),
             TyKind::Ref(_, _, e) | TyKind::Slice(e) => self.has_unbound_var(e),
             TyKind::Array(e, n) => self.has_unbound_var(e) || self.unbound_const(n),
             TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.has_unbound_var(e)),
@@ -16517,6 +16569,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 GenericArg::Ty(e) => self.has_unbound_var(e),
                 GenericArg::Const(c) => self.unbound_const(c),
                 GenericArg::Lifetime(_) => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// `has_unbound_var` at every depth: also inside fn items,
+    /// closures, fn pointers, raw pointers, projections, and dyn
+    /// args. The body-end scan of every expression and pattern type
+    /// uses it.
+    fn has_unbound_deep(&self, t: Ty) -> bool {
+        if !self.tys.flags(t).contains_infer() {
+            return false;
+        }
+        let args = |a: ArgsId| self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.has_unbound_deep(e)));
+        match self.tys.kind(self.resolve(t)) {
+            TyKind::Infer(v) => !v.is_int() && !v.is_float() && !self.is_diverging_root(v.index()),
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.has_unbound_deep(e),
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.has_unbound_deep(e)),
+            TyKind::Adt(_, a) | TyKind::Projection(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Opaque(_, a) => args(a),
+            TyKind::FnPtr(sig) => {
+                let b = self.tys.sig(sig);
+                self.tys.tys_of(b.value.inputs).iter().any(|&e| self.has_unbound_deep(e)) || self.has_unbound_deep(b.value.output)
+            }
+            TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).principal.as_ref().is_some_and(|pr| {
+                let bound = self.tys.bindings(pr.value.bindings).iter().any(|&(_, g)| g.as_ty().is_some_and(|e| self.has_unbound_deep(e)));
+                args(pr.value.args) || bound
             }),
             _ => false,
         }
@@ -16692,6 +16770,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     format!("cannot infer the type of `{name}`"),
                     "Add a type annotation, such as `let v: Vec<i64> = Vec::new();`.",
                 );
+            }
+        }
+        // Any other expression or pattern whose type nothing fixed
+        // (`Vec::new();`, `let _ = None;`, `drop;`) is the same error
+        // (rustc E0282): integer and float variables default, and a
+        // variable a `!` value flowed into falls back to `!`.
+        if self.errs.is_empty() {
+            let open = |cx: &Self, t: Ty| cx.has_unbound_deep(t) && !cx.has_error_kind(t);
+            if let Some(i) = (0..self.out.expr_ty.len()).find(|&i| open(self, self.out.expr_ty[i])) {
+                let span = self.span(ExprId(self.out.expr_base + i as u32));
+                let tn = self.tn(self.out.expr_ty[i]);
+                self.err(
+                    "L0610",
+                    span,
+                    format!("type annotations needed: cannot infer the type `{tn}` here"),
+                    "Annotate the type, or name it with a turbofish such as `Vec::<i32>::new()`.",
+                );
+            } else if let Some(i) = (0..self.out.pat_ty.len()).find(|&i| open(self, self.out.pat_ty[i])) {
+                let span = self.p.ast.pat_span(PatId(self.out.pat_base + i as u32));
+                let tn = self.tn(self.out.pat_ty[i]);
+                let msg = format!("type annotations needed: cannot infer the type `{tn}` here");
+                self.err("L0610", span, msg, "Annotate the pattern's type.");
             }
         }
         // The same for a const argument in an expression that is no
