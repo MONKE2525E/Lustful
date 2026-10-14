@@ -2789,6 +2789,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         for i in 0..self.out.expr_res.len() {
             let erased = match self.out.expr_res[i] {
                 Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn(p, &p.tys, p.fn_info(f).ret),
+                // A `dyn Fn` call returns its `Output`: the call's type.
+                Res::DynMethod { owner, .. } if p.gx.lang.is_fn_family(owner) => {
+                    let t = self.deep(self.out.expr_ty[i]);
+                    object::has_erased_dyn(p, &self.tys, t)
+                }
                 Res::DynMethod { owner, slot, .. } => {
                     let info = p.gx.dyn_infos.get(&owner);
                     let m =
