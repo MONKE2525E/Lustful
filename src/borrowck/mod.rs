@@ -1368,11 +1368,12 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                     self.clear_paths(st, li);
                 }
             }
-            StmtKind::FakeRead(l) => {
-                let place = Place::local(*l);
-                let live = self.live_for(q, None, &[]);
-                self.access(&place, Access::Read, span, &live);
-            }
+            // A use for liveness only, as rustc's `FakeRead` and
+            // `PlaceMention`: it keeps a two-phase reservation, a `let`
+            // binding, or a mentioned place live here, and it reads no
+            // memory, so it checks no conflicts (`let _ = x;` while `x` is
+            // mutably borrowed is fine).
+            StmtKind::FakeRead(_) => {}
             StmtKind::Print { parts, .. } => {
                 let mut ops: Vec<&Operand> = Vec::new();
                 parts_operands(parts, &mut |o| ops.push(o));
@@ -1450,13 +1451,26 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
 
     /// True when the call ending block `b` takes a two-phase `&mut`
     /// receiver: its first argument moves the temporary that the block's
-    /// last statement borrows mutably, right after a `FakeRead`.
+    /// last statement borrows mutably, right after a `FakeRead` of the
+    /// reservation, an unnamed shared borrow of the same place (a `let`
+    /// binding's `FakeRead` is not one).
     fn two_phase_receiver(&self, b: u32, args: &[Operand]) -> bool {
         let stmts = &self.body.blocks[b as usize].stmts;
         let [.., before, last] = stmts.as_slice() else { return false };
-        matches!((&before.kind, &last.kind, args.first()),
-            (StmtKind::FakeRead(_), StmtKind::Assign(t, Rvalue::Ref(true, _)), Some(Operand::Move(a)))
-                if t.proj.is_empty() && a.proj.is_empty() && a.local == t.local)
+        let (StmtKind::FakeRead(r), StmtKind::Assign(t, Rvalue::Ref(true, place)), Some(Operand::Move(a))) = (&before.kind, &last.kind, args.first())
+        else {
+            return false;
+        };
+        if !t.proj.is_empty() || !a.proj.is_empty() || a.local != t.local || self.body.locals[*r as usize].name.is_some() {
+            return false;
+        }
+        // The reservation is made before the arguments run, so it is in
+        // this block or (after an argument's call) an earlier one.
+        (0..=b as usize).rev().any(|bi| {
+            self.body.blocks[bi].stmts.iter().rev().any(|s| {
+                matches!(&s.kind, StmtKind::Assign(d, Rvalue::Ref(false, p)) if d.proj.is_empty() && d.local == *r && p == place)
+            })
+        })
     }
 
     /// True when a slice-making assignment's destination is a `&mut [T]` local.
