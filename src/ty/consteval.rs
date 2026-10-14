@@ -929,6 +929,9 @@ impl Evaluator {
             if let Some(v) = self.int_assoc_const(cx, segs) {
                 return Ok(v);
             }
+            if let Some(v) = self.char_assoc_const(cx, segs) {
+                return Ok(v);
+            }
         }
         // Inherent associated consts of user types: `Type::CONST`.
         if segs.len() >= 2
@@ -966,6 +969,28 @@ impl Evaluator {
                 Some((ConstValue::Float(bits, f), t))
             }
             (v, Some(it)) => Some((ConstValue::Int(v as i128), super::int(it))),
+        }
+    }
+
+    /// `char::MAX`, `char::REPLACEMENT_CHARACTER`, and
+    /// `char::UNICODE_VERSION`, resolved by written names.
+    fn char_assoc_const<'a, C: ConstCx<'a>>(&self, cx: &mut C, segs: &[ast::PathSeg]) -> Option<TypedValue> {
+        if cx.sym_text(segs[0].name) != "char" {
+            return None;
+        }
+        match cx.sym_text(segs[1].name) {
+            "MAX" => Some((ConstValue::Char(char::MAX), CHAR)),
+            "MIN" => Some((ConstValue::Char(char::MIN), CHAR)),
+            "REPLACEMENT_CHARACTER" => Some((ConstValue::Char(char::REPLACEMENT_CHARACTER), CHAR)),
+            "UNICODE_VERSION" => {
+                let (maj, min, pat) = char::UNICODE_VERSION;
+                let u8t = super::int(IntTy::U8);
+                let ts = cx.tys().intern_tys(&[u8t, u8t, u8t]);
+                let ty = cx.tys().intern(TyKind::Tuple(ts));
+                let parts = vec![ConstValue::Int(maj as i128), ConstValue::Int(min as i128), ConstValue::Int(pat as i128)];
+                Some((ConstValue::Aggregate(parts), ty))
+            }
+            _ => None,
         }
     }
 
@@ -1293,6 +1318,23 @@ impl Evaluator {
             if tail2 == ["char", "from_u32"] && (names.len() == 2 || (names.len() == 3 && matches!(names[0].as_str(), "std" | "core" | "alloc"))) && args.len() == 1 {
                 let n = self.int_arg(cx, env, args[0], super::int(IntTy::U32), span)?;
                 let v = u32::try_from(n).ok().and_then(char::from_u32).map(ConstValue::Char);
+                return Ok(self.opt_value(cx, CHAR, v));
+            }
+            // `char::from_digit(d, radix)` is a const fn too; it panics
+            // only above radix 36, which rejects here instead of running.
+            if tail2 == ["char", "from_digit"]
+                && (names.len() == 2 || (names.len() == 3 && matches!(names[0].as_str(), "std" | "core" | "alloc")))
+                && args.len() == 2
+            {
+                let d = self.int_arg(cx, env, args[0], super::int(IntTy::U32), span)?;
+                let r = self.int_arg(cx, env, args[1], super::int(IntTy::U32), span)?;
+                let (Some(d), Some(r)) = (u32::try_from(d).ok(), u32::try_from(r).ok()) else {
+                    return Err(outside(span, "this `from_digit` call"));
+                };
+                if r > 36 {
+                    return Err(outside(span, "this `from_digit` radix (above 36)"));
+                }
+                let v = char::from_digit(d, r).map(ConstValue::Char);
                 return Ok(self.opt_value(cx, CHAR, v));
             }
             if tail2 == ["char", "from_u32_unchecked"]
@@ -2133,6 +2175,13 @@ impl Evaluator {
             "is_ascii_punctuation" if args.is_empty() => bool_v(c.is_ascii_punctuation()),
             "is_ascii_graphic" if args.is_empty() => bool_v(c.is_ascii_graphic()),
             "is_ascii_control" if args.is_empty() => bool_v(c.is_ascii_control()),
+            // The const Unicode predicates. is_alphabetic, is_numeric, and
+            // is_alphanumeric are not const fns in rustc 1.99, so they stay
+            // outside the evaluator and reject, as rustc does.
+            "is_lowercase" if args.is_empty() => bool_v(c.is_lowercase()),
+            "is_uppercase" if args.is_empty() => bool_v(c.is_uppercase()),
+            "is_whitespace" if args.is_empty() => bool_v(c.is_whitespace()),
+            "is_control" if args.is_empty() => bool_v(c.is_control()),
             "to_ascii_lowercase" if args.is_empty() => Ok((ConstValue::Char(c.to_ascii_lowercase()), CHAR)),
             "to_ascii_uppercase" if args.is_empty() => Ok((ConstValue::Char(c.to_ascii_uppercase()), CHAR)),
             "len_utf8" if args.is_empty() => Ok((ConstValue::Int(c.len_utf8() as i128), USIZE)),
@@ -2140,14 +2189,23 @@ impl Evaluator {
             "to_digit" if args.len() == 1 => {
                 let (av, _) = self.value(cx, env, args[0], Some(super::int(IntTy::U32)))?;
                 let ConstValue::Int(r) = av else { return Err(outside_err()) };
-                // `to_digit` panics above radix 36; a const panic is
+                // `to_digit` panics outside radix 2..=36; a const panic is
                 // a reject here (and the host call must not run).
                 let radix = u32::try_from(r).map_err(|_| outside_err())?;
-                if radix > 36 {
-                    return Err(outside(span, "this `to_digit` radix (above 36)"));
+                if !(2..=36).contains(&radix) {
+                    return Err(outside(span, "this `to_digit` radix (outside 2 to 36)"));
                 }
                 let v = c.to_digit(radix).map(|d| ConstValue::Int(d as i128));
                 Ok(self.opt_value(cx, super::int(IntTy::U32), v))
+            }
+            "is_digit" if args.len() == 1 => {
+                let (av, _) = self.value(cx, env, args[0], Some(super::int(IntTy::U32)))?;
+                let ConstValue::Int(r) = av else { return Err(outside_err()) };
+                let radix = u32::try_from(r).map_err(|_| outside_err())?;
+                if !(2..=36).contains(&radix) {
+                    return Err(outside(span, "this `is_digit` radix (outside 2 to 36)"));
+                }
+                bool_v(c.is_digit(radix))
             }
             _ => Err(outside_err()),
         }

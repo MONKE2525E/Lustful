@@ -3253,6 +3253,43 @@ impl FnGen<'_, '_, '_> {
             B::CharIsWhitespace => format!("(*{0} == ' ' || *{0} == '\\t' || *{0} == '\\n' || *{0} == '\\r' || *{0} == 12)", vals[0]),
             B::CharIsUppercase => format!("(*{0} >= 'A' && *{0} <= 'Z')", vals[0]),
             B::CharIsLowercase => format!("(*{0} >= 'a' && *{0} <= 'z')", vals[0]),
+            B::CharIsAlphabeticUnicode => format!("lust_char_is_alphabetic({})", vals[0]),
+            B::CharIsNumericUnicode => format!("lust_char_is_numeric({})", vals[0]),
+            B::CharIsAlphanumericUnicode => format!("lust_char_is_alphanumeric({})", vals[0]),
+            B::CharIsLowercaseUnicode => format!("lust_char_is_lowercase({})", vals[0]),
+            B::CharIsUppercaseUnicode => format!("lust_char_is_uppercase({})", vals[0]),
+            B::CharIsWhitespaceUnicode => format!("lust_is_space({})", vals[0]),
+            B::CharIsControlUnicode => format!("lust_char_is_control({})", vals[0]),
+            B::CharFromU32 => {
+                let opt = CTy::Option(Box::new(CTy::Char));
+                let ot = ctype(&opt);
+                let t = self.tmp();
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(
+                    self.out,
+                    "    {{ uint32_t d = {}; if (d <= 0x10FFFFu && !(d >= 0xD800u && d <= 0xDFFFu)) {{ {field} = d;{some} }} }}",
+                    vals[0]
+                );
+                t
+            }
+            B::CharFromDigit => {
+                let opt = CTy::Option(Box::new(CTy::Char));
+                let ot = ctype(&opt);
+                let t = self.tmp();
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(
+                    self.out,
+                    "    {{ uint32_t d = lust_from_digit({}, {}, {loc}); if (d != 0xFFFFFFFFu) {{ {field} = d;{some} }} }}",
+                    vals[0], vals[1]
+                );
+                t
+            }
             B::CharToUppercase => format!("((*{0} >= 'a' && *{0} <= 'z') ? *{0} - 32 : *{0})", vals[0]),
             B::CharToLowercase => format!("((*{0} >= 'A' && *{0} <= 'Z') ? *{0} + 32 : *{0})", vals[0]),
             B::CharToDigit => {
@@ -3946,7 +3983,9 @@ fn runtime_source(with_impls: bool) -> String {
     // the symbols link; a unit whose code calls the core adds
     // `hash_decls()` to its header.
     let hash = if with_impls { hash_source(true) } else { String::new() };
-    let core = include_str!("runtime/core.c").replacen("#include \"escape_table.h\"", include_str!("runtime/escape_table.h"), 1);
+    let core = include_str!("runtime/core.c")
+        .replacen("#include \"escape_table.h\"", include_str!("runtime/escape_table.h"), 1)
+        .replacen("#include \"unicode_table.h\"", include_str!("runtime/unicode_table.h"), 1);
     let (h, core, panic) = (include_str!("runtime/runtime.h"), core.as_str(), include_str!("runtime/panic.c"));
     let mut src = String::with_capacity(h.len() + core.len() + panic.len() + header.len() + hash.len());
     src.push_str(h);

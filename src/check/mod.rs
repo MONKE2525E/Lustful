@@ -177,6 +177,17 @@ pub enum Builtin {
     CharIsWhitespace,
     CharIsUppercase,
     CharIsLowercase,
+    // The Unicode forms of the char predicates (`is_alphabetic` and
+    // friends; the variants above are the `is_ascii_*` forms).
+    CharIsAlphabeticUnicode,
+    CharIsNumericUnicode,
+    CharIsAlphanumericUnicode,
+    CharIsLowercaseUnicode,
+    CharIsUppercaseUnicode,
+    CharIsWhitespaceUnicode,
+    CharIsControlUnicode,
+    CharFromU32,
+    CharFromDigit,
     CharToUppercase,
     CharToLowercase,
     CharToDigit,
@@ -1385,6 +1396,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let c = match item {
                 "MAX" => char::MAX,
                 "MIN" => char::MIN,
+                "REPLACEMENT_CHARACTER" => char::REPLACEMENT_CHARACTER,
                 _ => return None,
             };
             return Some((ConstValue::Char(c), CHAR));
@@ -5813,12 +5825,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let c = match self.name(segs[1].name) {
                 "MAX" => Some(char::MAX),
                 "MIN" => Some(char::MIN),
+                "REPLACEMENT_CHARACTER" => Some(char::REPLACEMENT_CHARACTER),
                 _ => None,
             };
             if let Some(c) = c {
                 let i = self.ei(e);
                 self.out.const_exprs[i] = Some(crate::ty::consteval::ConstValue::Char(c));
                 return CHAR;
+            }
+            if self.name(segs[1].name) == "UNICODE_VERSION" {
+                use crate::ty::consteval::ConstValue;
+                let (maj, min, pat) = char::UNICODE_VERSION;
+                let u8t = int(IntTy::U8);
+                let ts = self.tys.intern_tys(&[u8t, u8t, u8t]);
+                let ty = self.tys.intern(TyKind::Tuple(ts));
+                let parts = vec![ConstValue::Int(maj as i128), ConstValue::Int(min as i128), ConstValue::Int(pat as i128)];
+                let val = ConstValue::Aggregate(parts);
+                let i = self.ei(e);
+                self.out.const_exprs[i] = Some(val);
+                return ty;
             }
         }
         // Primitive associated consts: `i64::MAX`, `u32::BITS`, and kin.
@@ -6007,6 +6032,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             if names[0] == k.f32 {
                 return Some(Res::Builtin(Builtin::F32FromBits));
+            }
+        }
+        // `char::from_u32`, `char::from_digit`, and the Unicode predicate
+        // associated calls (`char::is_alphabetic(&c)`).
+        if names.len() == 2 && names[0] == k.char {
+            let b = match names[1] {
+                n if n == k.from_u32 => Some(Builtin::CharFromU32),
+                n if n == k.from_digit => Some(Builtin::CharFromDigit),
+                n if n == k.is_alphabetic => Some(Builtin::CharIsAlphabeticUnicode),
+                n if n == k.is_numeric => Some(Builtin::CharIsNumericUnicode),
+                n if n == k.is_alphanumeric => Some(Builtin::CharIsAlphanumericUnicode),
+                n if n == k.is_lowercase => Some(Builtin::CharIsLowercaseUnicode),
+                n if n == k.is_uppercase => Some(Builtin::CharIsUppercaseUnicode),
+                n if n == k.is_whitespace => Some(Builtin::CharIsWhitespaceUnicode),
+                n if n == k.is_control => Some(Builtin::CharIsControlUnicode),
+                _ => None,
+            };
+            if let Some(b) = b {
+                return Some(Res::Builtin(b));
             }
         }
         // `fmt::Error`, the unit struct value (W-STD-B).
@@ -7393,6 +7437,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::EnvArgs => (vec![], ARGS),
                     Builtin::F64FromBits => (vec![int(IntTy::U64)], self.tys.float_ty(FloatTy::F64)),
                     Builtin::F32FromBits => (vec![int(IntTy::U32)], self.tys.float_ty(FloatTy::F32)),
+                    Builtin::CharFromU32 => (vec![int(IntTy::U32)], self.tys.mk_option(CHAR)),
+                    Builtin::CharFromDigit => (vec![int(IntTy::U32), int(IntTy::U32)], self.tys.mk_option(CHAR)),
+                    Builtin::CharIsAlphabeticUnicode
+                    | Builtin::CharIsNumericUnicode
+                    | Builtin::CharIsAlphanumericUnicode
+                    | Builtin::CharIsLowercaseUnicode
+                    | Builtin::CharIsUppercaseUnicode
+                    | Builtin::CharIsWhitespaceUnicode
+                    | Builtin::CharIsControlUnicode => (vec![CHAR], BOOL),
                     Builtin::VecFrom => {
                         // The three forms lust takes: `&[T]` and
                         // `&[T; N]` (clone each element, exact
@@ -8453,7 +8506,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     (k.is_ascii_uppercase, B::CharIsUppercase),
                     (k.is_ascii_lowercase, B::CharIsLowercase),
                 ];
-                if let Some(&(_, b)) = b.iter().find(|(n, _)| *n == name) {
+                // The Unicode predicates take `self`, not `&self`.
+                let u = [
+                    (k.is_alphabetic, B::CharIsAlphabeticUnicode),
+                    (k.is_numeric, B::CharIsNumericUnicode),
+                    (k.is_alphanumeric, B::CharIsAlphanumericUnicode),
+                    (k.is_lowercase, B::CharIsLowercaseUnicode),
+                    (k.is_uppercase, B::CharIsUppercaseUnicode),
+                    (k.is_whitespace, B::CharIsWhitespaceUnicode),
+                    (k.is_control, B::CharIsControlUnicode),
+                ];
+                if let Some(&(_, b)) = u.iter().find(|(n, _)| *n == name) {
+                    Some((b, Autoref::None, vec![], BOOL))
+                } else if let Some(&(_, b)) = b.iter().find(|(n, _)| *n == name) {
                     Some((b, Autoref::Ref, vec![], BOOL))
                 } else if name == k.to_ascii_uppercase {
                     Some((B::CharToUppercase, Autoref::Ref, vec![], CHAR))
