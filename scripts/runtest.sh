@@ -17,37 +17,36 @@ export LUST_DAEMON_SOCKET="$work/no-daemon.sock"
 export LUST_NO_DAEMON=1
 export LUST_NO_CACHE=1
 filter=${1:-}
-pass=0
-fail=0
+# Cases run in parallel; rustc's results come from the cache (scripts/case-pool.sh).
+oracle_args=(x y)
+source "$root/scripts/case-pool.sh"
 
-report() {
-  if [ "$1" = ok ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $2: $3"; fi
-}
-
-for f in "$root"/tests/pass/*.rs; do
-  name=$(basename "$f" .rs)
-  [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
-  (cd "$work" && rustc --edition 2024 -C panic=abort -C overflow-checks=on -A warnings -o "$work/$name.rustc" "$f" 2>/dev/null) || { report bad "$name" "rustc rejected it"; continue; }
-  (cd "$work" && "$lust" build "$f" -o "$work/$name.lust" 2>"$work/$name.build.err") || { report bad "$name" "lust build rejected it"; continue; }
-  "$work/$name.rustc" x y >"$work/$name.rustc.out" 2>"$work/$name.rustc.err"; rs=$?
-  "$work/$name.lust" x y >"$work/$name.lust.out" 2>"$work/$name.lust.err"; bs=$?
-  (cd "$work" && "$lust" run "$f" -- x y >"$work/$name.mem.out" 2>"$work/$name.mem.err"); ms=$?
+# runtest_case <name> <file>: one tests/pass case, in its own dir.
+runtest_case() {
+  local name=$1 f=$2 rs bs ms probe mode want_mode
+  rustc_oracle run "$f" --edition 2024 -C panic=abort -C overflow-checks=on -A warnings
+  [ "$(cat rustc.cc)" -eq 0 ] || { report bad "$name" "rustc rejected it"; return; }
+  "$lust" build "$f" -o "$name.lust" 2>"$name.build.err" || { report bad "$name" "lust build rejected it"; return; }
+  rs=$(cat rustc.rs)
+  "./$name.lust" x y >"$name.lust.out" 2>"$name.lust.err"; bs=$?
+  "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
   # Which run path did it take? glue_shared has three function units, so it must use the file.
-  probe=$(cd "$work" && "$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
+  probe=$("$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
   if grep -q "in memory" <<<"$probe"; then mode=mem; else mode=file; fi
   want_mode=mem; [[ "$name" == glue_shared ]] && want_mode=file
   if [ "$mode" != "$want_mode" ]; then
     report bad "$name" "run took the $mode path, want $want_mode"
   elif [ $ms -ne $bs ] || [ $ms -ne $rs ]; then
     report bad "$name" "exit status memory=$ms built=$bs rustc=$rs"
-  elif ! cmp -s "$work/$name.mem.out" "$work/$name.lust.out" || ! cmp -s "$work/$name.mem.out" "$work/$name.rustc.out"; then
+  elif ! cmp -s "$name.mem.out" "$name.lust.out" || ! cmp -s "$name.mem.out" rustc.out; then
     report bad "$name" "stdout differs (memory vs built vs rustc)"
-  elif ! cmp -s "$work/$name.mem.err" "$work/$name.lust.err"; then
-    report bad "$name" "stderr differs (memory vs built)"; diff "$work/$name.mem.err" "$work/$name.lust.err" | head -5
+  elif ! cmp -s "$name.mem.err" "$name.lust.err"; then
+    report bad "$name" "stderr differs (memory vs built)"; diff "$name.mem.err" "$name.lust.err" | head -5
   else
     report ok "$name"
   fi
-done
+}
+run_all runtest_case "$root"/tests/pass/*.rs
 
 echo "runtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]
