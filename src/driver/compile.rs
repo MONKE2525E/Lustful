@@ -691,8 +691,10 @@ fn chunk_end_ok(c: &Chunk) -> bool {
 /// that moved must be lexed and expanded again. The text scan is
 /// deliberately loose (a name inside a longer identifier also hits);
 /// a false hit costs one relex, a miss would serve a stale `line!`.
+/// A chunk that began the file with `#!` is too: the lexer skips a
+/// shebang only at offset 0, so moved later the same text lexes apart.
 fn chunk_pos_sensitive(c: &Chunk) -> bool {
-    ["line!", "column!", "file!", "stringify!", "dbg!"].iter().any(|n| c.text.contains(n))
+    (c.start == 0 && c.text.starts_with("#!")) || ["line!", "column!", "file!", "stringify!", "dbg!"].iter().any(|n| c.text.contains(n))
 }
 
 /// True when `lexed` holds an inner attribute opener (`#` then `!`). A file
