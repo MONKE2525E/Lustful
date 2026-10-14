@@ -3087,6 +3087,8 @@ impl FnGen<'_, '_, '_> {
             | B::ConvArraySlice
             | B::ConvDeref
             | B::ConvRcInner => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
+            // The operand was moved into the call: no drop ever runs.
+            B::MemForget => "((lust_Unit){})".into(),
             B::MemDrop => {
                 // The operand was moved into the call, so its own
                 // drop flag is already clear; this is its one drop.

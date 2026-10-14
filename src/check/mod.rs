@@ -236,6 +236,8 @@ pub enum Builtin {
     SliceToVec,
     VecFrom,
     MemDrop,
+    /// `mem::forget(v)`: takes ownership and never drops (W-STD-C).
+    MemForget,
     StringCapacity,
     StringReserve,
     StringReserveExact,
@@ -7847,6 +7849,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if names.len() == 3 && (names[0] == k.std || names[0] == k.core) {
             let b = match (self.name(names[1]), self.name(names[2])) {
                 ("mem", "drop") => Some(Builtin::MemDrop),
+                ("mem", "forget") => Some(Builtin::MemForget),
                 ("mem", "swap") => Some(Builtin::MemSwap),
                 ("mem", "replace") => Some(Builtin::MemReplace),
                 ("mem", "take") => Some(Builtin::MemTake),
@@ -9700,7 +9703,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let params = if b == Builtin::VecNew { vec![] } else { vec![USIZE] };
                         (params, self.tys.mk_vec(elem))
                     }
-                    Builtin::MemDrop => {
+                    Builtin::MemDrop | Builtin::MemForget => {
                         let t = self.callee_turbo_ty(callee, span);
                         (vec![t], UNIT)
                     }
@@ -9761,11 +9764,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 };
                 match b {
-                    Builtin::MemDrop | Builtin::MemSwap | Builtin::MemReplace => {
-                        // For `drop`, T is the argument itself (a
-                        // reference to an unsized value is sized);
-                        // for swap/replace, T sits behind the `&mut`.
-                        let t = if b == Builtin::MemDrop { self.resolve(params[0]) } else { elem_of(self, 0) };
+                    Builtin::MemDrop | Builtin::MemForget | Builtin::MemSwap | Builtin::MemReplace => {
+                        // For `drop` and `forget`, T is the argument
+                        // itself (a reference to an unsized value is
+                        // sized); for swap/replace, T sits behind the `&mut`.
+                        let t = if matches!(b, Builtin::MemDrop | Builtin::MemForget) { self.resolve(params[0]) } else { elem_of(self, 0) };
                         if matches!(self.tys.kind(t), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
                             let tn = self.tn(t);
                             self.err(
