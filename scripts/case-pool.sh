@@ -34,6 +34,12 @@ fail=0
 seen=0
 unsupported=0
 
+# mask_stderr <file>: a program's stderr without what differs per run: the OS thread id in
+# Rust's `thread '..' (<tid>)` lines, `timeout`'s note on a dumped core, and bash's job
+# note on a signal death ("line 54: <pid> Aborted  timeout ..."), which lands in the
+# redirected stderr of a function call. W-PANIC compares the rest byte for byte.
+mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
+
 # report ok|bad <name> [msg]: a case's result. Runs inside the case's subshell, in its dir.
 report() {
   echo "$1" >st
@@ -71,12 +77,15 @@ rustc_oracle() {
   run_cc rustc "$@" -o rustc.bin "$f" 2>rustc.err; cc=$?
   echo $cc >rustc.cc
   if [ "$mode" = run ] && [ $cc -eq 0 ]; then
-    run_to ./rustc.bin "${args[@]}" >rustc.out 2>/dev/null; rs=$?
+    # stderr (panic text and location) is kept with the case's path as @CASE@, so a
+    # cached result serves any checkout.
+    run_to ./rustc.bin "${args[@]}" >rustc.out 2>rustc.stderr; rs=$?
     echo $rs >rustc.rs
+    sed -i "s|$f|@CASE@|g" rustc.stderr
   fi
   [ -n "$entry" ] && [ $cc -ne 124 ] && [ $cc -ne 137 ] && [ $rs -ne 124 ] && [ $rs -ne 137 ] || return 0
   tmp=$(mktemp -d "$rustc_cache/.tmp.XXXXXX") || return 0
-  cp rustc.cc rustc.err "$tmp"/ && { [ ! -f rustc.out ] || cp rustc.out rustc.rs "$tmp"/; } \
+  cp rustc.cc rustc.err "$tmp"/ && { [ ! -f rustc.out ] || cp rustc.out rustc.rs rustc.stderr "$tmp"/; } \
     && mv -T "$tmp" "$entry" 2>/dev/null || rm -rf "$tmp"
 }
 

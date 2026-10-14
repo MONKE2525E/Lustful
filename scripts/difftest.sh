@@ -2,9 +2,10 @@
 # Differential tests against rustc (the oracle). Two modes (ARCH 9.3
 # runner table):
 #   Default (abort mode, -C panic=abort):
-#     tests/pass/*.rs: rustc and lust must both build. Stdout and exit status must match.
+#     tests/pass/*.rs: rustc and lust must both build. Stdout, exit status, and stderr
+#                      must match (stderr with the thread id masked and the case path as
+#                      @CASE@: panic text and location byte for byte, W-PANIC).
 #                      A `// panic: <text>` comment also requires <text> in lust's stderr.
-#                      Rustc's panic text is not compared (see DESIGN.md).
 #     tests/fail/*.rs: rustc must reject the program, and `lust check` must report the code
 #                      named on the first line (`// expect: L0301`); `lust build` must reject it too.
 #     tests/reject/*.rs: valid Rust that lust rejects on purpose (lifetimes, user macros).
@@ -92,8 +93,10 @@ sanitize_case() {
     return 1
   fi
   run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
-  if grep -q "runtime error\|Sanitizer" "$name.san.err"; then
-    echo "sanitizer: $(grep -m2 "runtime error\|Sanitizer" "$name.san.err")"
+  # UBSan prints "file:line:col: runtime error"; Rust's own "fatal runtime
+  # error: stack overflow" (panic_stack_overflow) is program output.
+  if grep -qE "[0-9]: runtime error|Sanitizer" "$name.san.err"; then
+    echo "sanitizer: $(grep -m2 -E "[0-9]: runtime error|Sanitizer" "$name.san.err")"
     return 1
   fi
   if [ "$st" -ne "$want" ]; then
@@ -183,6 +186,8 @@ pass_case() {
     report bad "$name" "exit status rustc=$rs lust=$ls"
   elif ! diff -q rustc.out "$name.lust.out" >/dev/null; then
     report bad "$name" "stdout differs:"; diff rustc.out "$name.lust.out" | head -10
+  elif ! cmp -s <(mask_stderr rustc.stderr) <(mask_stderr "$name.lust.stderr" | sed "s|$f|@CASE@|g"); then
+    report bad "$name" "stderr differs:"; diff <(mask_stderr rustc.stderr) <(mask_stderr "$name.lust.stderr" | sed "s|$f|@CASE@|g") | head -10
   elif [ -n "$panic_expect" ] && ! grep -qF "$panic_expect" "$name.lust.stderr"; then
     report bad "$name" "lust stderr lacks panic text '$panic_expect': $(head -3 "$name.lust.stderr")"
   elif [ "${SANITIZE:-0}" = 1 ]; then

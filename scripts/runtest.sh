@@ -49,8 +49,8 @@ runtest_case() {
     report bad "$name" "exit status memory=$ms built=$bs rustc=$rs"
   elif ! cmp -s "$name.mem.out" "$name.lust.out" || ! cmp -s "$name.mem.out" rustc.out; then
     report bad "$name" "stdout differs (memory vs built vs rustc)"
-  elif ! cmp -s "$name.mem.err" "$name.lust.err"; then
-    report bad "$name" "stderr differs (memory vs built)"; diff "$name.mem.err" "$name.lust.err" | head -5
+  elif ! cmp -s <(mask_stderr "$name.mem.err") <(mask_stderr "$name.lust.err"); then
+    report bad "$name" "stderr differs (memory vs built)"; diff <(mask_stderr "$name.mem.err") <(mask_stderr "$name.lust.err") | head -5
   else
     report ok "$name"
   fi
