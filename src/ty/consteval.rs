@@ -1282,6 +1282,13 @@ impl Evaluator {
         }
         let _ = rt;
         if op.is_cmp() {
+            // Only primitive scalars compare in const: rustc has no const
+            // `PartialEq` for tuples, arrays, `&str`, `Option`, or fn
+            // pointers (E0658), and this accepted them.
+            let scalar = |v: &ConstValue| matches!(v, ConstValue::Int(_) | ConstValue::Float(..) | ConstValue::Bool(_) | ConstValue::Char(_));
+            if !scalar(&lv) || !scalar(&rv) {
+                return Err(outside(span, "this comparison of non-scalar values"));
+            }
             let eq = values_eq(&lv, &rv);
             let ord = match (&lv, &rv) {
                 (ConstValue::Float(a, FloatTy::F64), ConstValue::Float(b, _)) => f64::from_bits(*a).partial_cmp(&f64::from_bits(*b)),

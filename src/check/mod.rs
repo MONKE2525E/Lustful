@@ -5903,6 +5903,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 });
                 let t = self.expr(*expr, inner_expected);
                 self.check_packed_borrow(*expr, span);
+                // `&mut STATIC` (rustc E0596; `static mut` needs `unsafe`,
+                // which lust has not): lowering makes every static
+                // borrow a shared `StaticRef`, so this was accepted.
+                if *mutable && let Res::Static(_) = self.out.expr_res[self.ei(*expr)] {
+                    self.err("L0308", span, "cannot borrow a static item as mutable", "Use a `const`, or a `static` with interior mutability.");
+                }
                 self.tys.mk_ref(*mutable, t)
             }
             Expr::Deref(inner) => {
