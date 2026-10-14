@@ -514,7 +514,7 @@ impl FnGen<'_, '_, '_> {
                 let (t, old) = (self.tmp(), self.tmp());
                 let _ = writeln!(
                     self.out,
-                    "    {} {t}; {} {old}; int {t}_ok = lust_at_cas_{}({}, {}, {}, {}, {}, &{old}, {loc});",
+                    "    {} {t}; {} {old}; int {t}_ok = lust_at_cas_{}({}, {}, {}, {}, {}, &{old}, {weak});",
                     ctype(&res),
                     word(v),
                     width(v),
@@ -523,6 +523,8 @@ impl FnGen<'_, '_, '_> {
                     arg(v, 2),
                     ord(self.p, &vals[3], &tys[3]),
                     ord(self.p, &vals[4], &tys[4]),
+                    // Its ordering panics report core's atomic.rs line (sync.c).
+                    weak = u8::from(op == S::AtomicCompareExchangeWeak),
                 );
                 let vt = ctype(&vt_of(v));
                 let ok_f = variant_field(self.p, &res, &t, 0, 0);

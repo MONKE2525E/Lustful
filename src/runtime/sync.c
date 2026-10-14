@@ -33,17 +33,22 @@ extern void atomic_signal_fence(int);
 #endif
 #endif
 
+/* Ordering panics come from core's atomic.rs (no track_caller), as rustc
+   1.99 reports them; `weak` picks compare_exchange_weak's lines. The
+   load and store `loc` params stay for the call shape. */
+#define LUST_ATOMIC_RS "core/src/sync/atomic.rs:"
+
 #define LUST_ATOMIC_WIDTH(N, U, S)                                                                                     \
     U lust_at_load_##N(U *p, uint32_t o, lust_loc loc) LUST_BODY({                                                    \
-        if (o == 1) lust_panic_cstr("there is no such thing as a release load", loc);                                 \
-        if (o == 3) lust_panic_cstr("there is no such thing as an acquire-release load", loc);                        \
+        if (o == 1) lust_panic_std("there is no such thing as a release load", LUST_ATOMIC_RS "3997:24");                                       \
+        if (o == 3) lust_panic_std("there is no such thing as an acquire-release load", LUST_ATOMIC_RS "3998:23");                        \
         U r;                                                                                                           \
         __atomic_load(p, &r, LUST_MO(o));                                                                              \
         return r;                                                                                                      \
     })                                                                                                                 \
     void lust_at_store_##N(U *p, U v, uint32_t o, lust_loc loc) LUST_BODY({                                           \
-        if (o == 2) lust_panic_cstr("there is no such thing as an acquire store", loc);                               \
-        if (o == 3) lust_panic_cstr("there is no such thing as an acquire-release store", loc);                       \
+        if (o == 2) lust_panic_std("there is no such thing as an acquire store", LUST_ATOMIC_RS "3981:24");                                   \
+        if (o == 3) lust_panic_std("there is no such thing as an acquire-release store", LUST_ATOMIC_RS "3982:23");                       \
         __atomic_store(p, &v, LUST_MO(o));                                                                             \
     })                                                                                                                 \
     U lust_at_swap_##N(U *p, U v, uint32_t o) LUST_BODY({                                                             \
@@ -51,9 +56,9 @@ extern void atomic_signal_fence(int);
         __atomic_exchange(p, &v, &r, LUST_MO(o));                                                                      \
         return r;                                                                                                      \
     })                                                                                                                 \
-    int lust_at_cas_##N(U *p, U cur, U nv, uint32_t s, uint32_t f, U *old, lust_loc loc) LUST_BODY({                  \
-        if (f == 3) lust_panic_cstr("there is no such thing as an acquire-release failure ordering", loc);            \
-        if (f == 1) lust_panic_cstr("there is no such thing as a release failure ordering", loc);                     \
+    int lust_at_cas_##N(U *p, U cur, U nv, uint32_t s, uint32_t f, U *old, int weak) LUST_BODY({                      \
+        if (f == 3) lust_panic_std("there is no such thing as an acquire-release failure ordering", weak ? LUST_ATOMIC_RS "4184:28" : LUST_ATOMIC_RS "4118:28");            \
+        if (f == 1) lust_panic_std("there is no such thing as a release failure ordering", weak ? LUST_ATOMIC_RS "4185:29" : LUST_ATOMIC_RS "4119:29");                     \
         U e = cur;                                                                                                     \
         int ok = __atomic_compare_exchange(p, &e, &nv, 0, LUST_MO_CAS(s, f), LUST_MO(f));                              \
         *old = e;                                                                                                      \
@@ -117,12 +122,14 @@ uint8_t lust_at_fetch_bnand_1(uint8_t *p, uint8_t v, uint32_t o) LUST_BODY({
 })
 
 void lust_at_fence(uint32_t o, lust_loc loc) LUST_BODY({
-    if (o == 0) lust_panic_cstr("there is no such thing as a relaxed fence", loc);
+    (void)loc;
+    if (o == 0) lust_panic_std("there is no such thing as a relaxed fence", LUST_ATOMIC_RS "4497:24");
     LUST_THREAD_FENCE(LUST_MO(o));
 })
 
 void lust_at_compiler_fence(uint32_t o, lust_loc loc) LUST_BODY({
-    if (o == 0) lust_panic_cstr("there is no such thing as a relaxed fence", loc);
+    (void)loc;
+    if (o == 0) lust_panic_std("there is no such thing as a relaxed fence", LUST_ATOMIC_RS "4582:24");
     LUST_SIGNAL_FENCE(LUST_MO(o));
 })
 
@@ -733,7 +740,8 @@ typedef struct lust_Duration {
 lust_Duration lust_dur_new(uint64_t secs, uint32_t nanos, lust_loc loc) LUST_BODY({
     lust_Duration d;
     uint64_t extra = nanos / 1000000000u;
-    if (secs > UINT64_MAX - extra) lust_panic_cstr("overflow in Duration::new", loc);
+    (void)loc;
+    if (secs > UINT64_MAX - extra) lust_panic_std("overflow in Duration::new", "core/src/time.rs:201:18");
     d.secs = secs + extra;
     d.nanos = nanos % 1000000000u;
     return d;
