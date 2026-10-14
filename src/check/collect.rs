@@ -3008,7 +3008,7 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         };
         let Some(value) = value else { continue };
         let ty = match resolve_item_ty(p, ty_id, None) {
-            Ok(t) => t,
+            Ok(t) => generics::normalize_item_ty(p, t),
             Err(d) => {
                 errs.push(d);
                 continue;

@@ -5748,6 +5748,34 @@ pub fn normalize_global_in(p: &mut Program, env: &[Predicate], t: Ty) -> Ty {
     }
 }
 
+/// A const or static item's type with its projections normalized
+/// (`const C: <A as Tr>::Out`): collect evaluates these items before
+/// `normalize_signatures` runs. A projection normalizes only when its
+/// trait ref is proved, where clauses included; otherwise the type
+/// stays as written and the value's type check rejects it.
+pub fn normalize_item_ty(p: &mut Program, t: Ty) -> Ty {
+    fn goals(p: &Program, t: Ty, out: &mut Vec<TraitRef>) {
+        match p.tys.kind(t) {
+            TyKind::Projection(assoc, a) => {
+                if let Some(def) = p.gx.index.trait_of_assoc(assoc.0) {
+                    out.push(TraitRef { def, args: a, bindings: EMPTY_BINDINGS });
+                }
+                p.tys.args(a).iter().filter_map(|g| g.as_ty()).for_each(|e| goals(p, e, out));
+            }
+            TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => goals(p, e, out),
+            TyKind::Tuple(ts) => p.tys.tys_of(ts).iter().for_each(|&e| goals(p, e, out)),
+            TyKind::Adt(_, a) => p.tys.args(a).iter().filter_map(|g| g.as_ty()).for_each(|e| goals(p, e, out)),
+            _ => {}
+        }
+    }
+    if !p.tys.flags(t).contains_projection() {
+        return t;
+    }
+    let mut needed = Vec::new();
+    goals(p, t, &mut needed);
+    if needed.iter().all(|&g| prove_goal(p, &[], g)) { normalize_global(p, t) } else { t }
+}
+
 /// Normalizes the projections in every fn signature and Adt field
 /// type once the impl index is complete (ARCH 2.5), before any body,
 /// caller, or C signature reads them: a plain `fn f() -> <A as
