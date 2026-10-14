@@ -898,20 +898,22 @@ fn root_fn(p: &Program, f: LocalDefId) -> LocalDefId {
     root
 }
 
-/// True when the fn holding `f` has a regioned `Fn` bound on a type
-/// param: a call may pass that param to a generic fn, which proves the
-/// callee's bound from it (`entail_bound`) even in a body with no loans.
-pub(super) fn has_fn_bounds(p: &Program, f: LocalDefId) -> bool {
-    p.regions.body_sig(p, root_fn(p, f)).is_some_and(|s| !s.fn_bounds.is_empty())
+/// True when a call in `body` may pass a type param with a regioned `Fn`
+/// bound (the fn holding it has one) or a fn item to a generic fn, which
+/// proves the callee's bound from its signature (`entail_bound`) even in
+/// a body with no loans.
+pub(super) fn may_entail_bounds(p: &Program, body: &Body) -> bool {
+    p.regions.body_sig(p, root_fn(p, body.fn_id)).is_some_and(|s| !s.fn_bounds.is_empty())
+        || body.blocks.iter().any(|b| b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Assign(_, Rvalue::FnValue(..)))))
 }
 
 /// The pairs of regions at the same places of two regioned types (a
-/// callee's bound and the caller's, `entail_bound`); a type param or
-/// projection in `a` (the call's instantiation) pairs nothing. False when
-/// the shapes differ.
+/// callee's bound and the argument's signature, `entail_bound`); a type
+/// param or projection on either side (an instantiation) pairs nothing.
+/// False when the shapes differ.
 fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region)>) -> bool {
     match (tys.kind(a), tys.kind(b)) {
-        (TyKind::Param(_) | TyKind::Projection(..), _) => true,
+        (TyKind::Param(_) | TyKind::Projection(..), _) | (_, TyKind::Param(_) | TyKind::Projection(..)) => true,
         (TyKind::Ref(ra, ma, ia), TyKind::Ref(rb, mb, ib)) if ma == mb => {
             out.push((ra, rb));
             region_pairs(tys, ia, ib, out)
@@ -3617,7 +3619,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// conservative rule, which ties the result to the receiver too.
     fn call_fn_bound(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         let p = self.p;
-        if self.own.closure || p.gx.fn_class.get(f.0 as usize) != Some(&crate::check::generics::FnClass::Stub) {
+        if p.gx.fn_class.get(f.0 as usize) != Some(&crate::check::generics::FnClass::Stub) {
             return false;
         }
         let Some(m) = p.regions.stub_method(p, f) else { return false };
@@ -3631,12 +3633,38 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             t = inner;
         }
         let TyKind::Param(j) = self.body.tys.kind(t) else { return false };
-        let Some(sig) = p.regions.body_sig(p, self.body.fn_id) else { return false };
+        // A closure body calls through its enclosing fn's bound; the
+        // fn's lifetimes are not universals there, so only a bound that
+        // names none (`'static` and elided ones) takes this rule.
+        let Some(sig) = p.regions.body_sig(p, root_fn(p, self.body.fn_id)) else { return false };
         let Some(b) = sig.fn_bounds.iter().find(|b| b.param == j.0 && b.inputs.len() + 1 == avs.len()).cloned() else { return false };
         if !is_call {
             return false;
         }
-        let univ: Vec<u32> = (1..=sig.n_univ).collect();
+        if self.own.closure {
+            let named = |ts: &[Ty]| {
+                let mut rs = Vec::new();
+                for &t in ts {
+                    regions_of(&p.tys, t, &mut rs);
+                }
+                rs.iter().any(|r| matches!(r, Region::Param(_)))
+            };
+            // An input that must live for the fn's lifetime cannot be
+            // proved here; an output that does takes the conservative rule.
+            if named(&b.inputs) {
+                self.errs.push(Diag::new(
+                    "L0203",
+                    self.span,
+                    "a call inside a closure through an `Fn` bound whose argument names a lifetime of the enclosing fn is not supported yet",
+                    "Make the call outside the closure, or write the bound with an elided lifetime.",
+                ));
+                return false;
+            }
+            if b.output.is_some_and(|o| named(&[o])) {
+                return false;
+            }
+        }
+        let univ: Vec<u32> = if self.own.closure { Vec::new() } else { (1..=sig.n_univ).collect() };
         let bv = self.fresh();
         self.bound_var = Some(bv);
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
@@ -3810,17 +3838,19 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
     }
 
-    /// A type param `F` of this body (or `&F`) passed for the callee's `G:
-    /// Fn*(..)` bound: `F`'s own regioned bound must prove `G`'s, as rustc
-    /// selects `F: Fn*` from this body's bounds and equates the
-    /// signatures. Region by region: a lifetime both write is one region;
-    /// a higher-ranked `G` input needs a higher-ranked `F` input (L0735),
-    /// and a lifetime `G` writes there is what `F`'s binder takes; a
-    /// higher-ranked `G` output needs a higher-ranked `F` output, and a
-    /// written one the same of `F`, or `F`'s binder taken from a written
-    /// `G` input (else L0733). Type params are the call's instantiation.
-    /// In a closure body the enclosing fn's lifetimes are not universals:
-    /// L0203 where `F`'s bound names one.
+    /// A type param `F` of this body or a fn item (also behind `&`)
+    /// passed for the callee's `G: Fn*(..)` bound: its regioned signature
+    /// (`F`'s own bound, the fn's signature) must prove `G`'s, as rustc
+    /// selects the `Fn*` impl and equates the signatures (trait args are
+    /// invariant). Per pair of places: lifetimes both write are one
+    /// region; a binder of the argument (an elided lifetime of `F`'s
+    /// bound, a late-bound lifetime of the fn) takes the lifetime `G`
+    /// writes there, or stays higher-ranked where `G`'s is (not both); a
+    /// higher-ranked `G` input needs a binder (L0735); outputs must agree
+    /// the same way (L0733). A fn's early-bound lifetimes are fresh here.
+    /// Type params are the call's instantiation. In a closure body the
+    /// enclosing fn's lifetimes are not universals: L0203 where `F`'s
+    /// bound names one.
     fn entail_bound(&mut self, trait_args: ArgsId, sig: &RegionSig, univ: &[u32]) {
         let p = self.p;
         let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
@@ -3833,46 +3863,42 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
             t = inner;
         }
-        let TyKind::Param(jf) = self.body.tys.kind(t) else { return };
-        // `F`'s bound lives in the enclosing fn's signature.
+        // The argument's signature, and what its regions are: `F`'s
+        // bound has this body's universals and one binder; a fn item has
+        // per-lifetime binders (late-bound) and fresh early-bound ones.
         let root = root_fn(p, self.body.fn_id);
         let in_closure = root != self.body.fn_id;
-        let f = p.regions.body_sig(p, root).and_then(|s| s.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned());
+        let (inputs, output, item) = match self.body.tys.kind(t) {
+            TyKind::Param(jf) => {
+                let f = p.regions.body_sig(p, root).and_then(|s| s.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned());
+                match f {
+                    Some(f) => (f.inputs, f.output, None),
+                    None => return self.unproved_bound(&g),
+                }
+            }
+            TyKind::FnDef(def, _) => match p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l)) {
+                Some(fs) if fs.params.len() == n_in => (fs.params.clone(), Some(fs.ret), Some(fs.early.clone())),
+                _ => return self.unproved_bound(&g),
+            },
+            _ => return,
+        };
         let mut ins: Vec<(Region, Region)> = Vec::new();
         let mut outs: Vec<(Region, Region)> = Vec::new();
-        let paired = match &f {
-            Some(f) => {
-                g.inputs.iter().zip(&f.inputs).all(|(&a, &b)| region_pairs(&p.tys, a, b, &mut ins))
-                    && match (g.output, f.output) {
-                        (Some(a), Some(b)) => region_pairs(&p.tys, a, b, &mut outs),
-                        (None, None) => true,
-                        // No output is `()`: it pairs with an output without regions.
-                        (Some(t), None) | (None, Some(t)) => {
-                            let mut rs = Vec::new();
-                            regions_of(&p.tys, t, &mut rs);
-                            rs.is_empty()
-                        }
-                    }
-            }
-            None => false,
-        };
-        let written = |r: Region| matches!(r, Region::Param(_) | Region::Static | Region::Bound(_));
+        let paired = g.inputs.iter().zip(&inputs).all(|(&a, &b)| region_pairs(&p.tys, a, b, &mut ins))
+            && match (g.output, output) {
+                (Some(a), Some(b)) => region_pairs(&p.tys, a, b, &mut outs),
+                (None, None) => true,
+                // No output is `()`: it pairs with an output without regions.
+                (Some(t), None) | (None, Some(t)) => {
+                    let mut rs = Vec::new();
+                    regions_of(&p.tys, t, &mut rs);
+                    rs.is_empty()
+                }
+            };
         if !paired {
-            // `F` has no bound this pairs with (check selected `F: Fn*` some
-            // other way): only a bound without lifetimes is proved.
-            let mut rs = Vec::new();
-            for &it in &g.inputs {
-                regions_of(&p.tys, it, &mut rs);
-            }
-            if let Some(o) = g.output {
-                regions_of(&p.tys, o, &mut rs);
-            }
-            if rs.into_iter().any(written) {
-                self.bound_mismatch();
-            }
-            return;
+            return self.unproved_bound(&g);
         }
-        if in_closure && ins.iter().chain(&outs).any(|&(_, b)| matches!(b, Region::Param(_))) {
+        if item.is_none() && in_closure && ins.iter().chain(&outs).any(|&(_, b)| matches!(b, Region::Param(_))) {
             self.errs.push(Diag::new(
                 "L0203",
                 self.span,
@@ -3881,75 +3907,131 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             ));
             return;
         }
-        let gv = |r: Region| match r {
-            Region::Static => Some(0),
-            Region::Param(k) => univ.get(k as usize).copied(),
-            _ => None,
+        // A binder of a signature: each elided input lifetime of `Fn`
+        // sugar is its own (numbered in order), an elided output is the
+        // one input's; a fn item's late-bound lifetime is one wherever it
+        // is written.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Side {
+            Tie(u32),
+            Binder(u32),
+            Free,
+        }
+        let gside = |r: Region, n: &mut u32, out: bool| match r {
+            Region::Static => Side::Tie(0),
+            Region::Param(k) => univ.get(k as usize).map_or(Side::Free, |&u| Side::Tie(u)),
+            Region::Bound(_) if out => Side::Binder(0),
+            Region::Bound(_) => {
+                *n += 1;
+                Side::Binder(*n - 1)
+            }
+            _ => Side::Free,
         };
-        let fv = |r: Region| match r {
-            Region::Static => Some(0),
-            Region::Param(k) => Some(k + 1),
-            _ => None,
+        let mut early: FxMap<u32, u32> = FxMap::default();
+        let mut fside = |this: &mut Self, r: Region, n: &mut u32, out: bool| match (r, &item) {
+            (Region::Static, _) => Side::Tie(0),
+            (Region::Param(k), None) => Side::Tie(k + 1),
+            (Region::Param(k), Some(e)) if e.get(k as usize) == Some(&true) => Side::Tie(*early.entry(k).or_insert_with(|| this.fresh())),
+            (Region::Param(k), Some(_)) => Side::Binder(k),
+            (Region::Bound(_), None) if out => Side::Binder(0),
+            (Region::Bound(_), None) => {
+                *n += 1;
+                Side::Binder(*n - 1)
+            }
+            _ => Side::Free,
         };
-        // The region `F`'s binder takes: a lifetime `G` writes where `F`
-        // is higher-ranked.
-        let mut binder: Option<u32> = None;
+        // Per binder of the argument: the `G` binder it takes, or the
+        // lifetime `G` writes there (trait args are invariant, so one of
+        // them, once).
+        let mut takes: FxMap<u32, u32> = FxMap::default();
+        let mut inst: FxMap<u32, u32> = FxMap::default();
+        let (mut gn, mut fnn) = (0u32, 0u32);
         for &(a, b) in &ins {
-            match (a, b) {
-                (Region::Bound(_), Region::Bound(_)) => {}
-                (Region::Bound(_), _) if written(b) => {
-                    self.not_general_enough_param();
-                    return;
+            let (ga, fb) = (gside(a, &mut gn, false), fside(self, b, &mut fnn, false));
+            match (ga, fb) {
+                (Side::Binder(gi), Side::Binder(k)) => {
+                    if inst.contains_key(&k) || takes.get(&k).is_some_and(|&gj| gj != gi) {
+                        return self.not_general_enough_param();
+                    }
+                    takes.insert(k, gi);
                 }
-                (_, Region::Bound(_)) => binder = binder.or(gv(a)),
-                _ => {
-                    if let (Some(x), Some(y)) = (gv(a), fv(b)) {
-                        self.edge(x, y);
-                        self.edge(y, x);
+                (Side::Binder(_), Side::Tie(_)) => return self.not_general_enough_param(),
+                (Side::Tie(u), Side::Binder(k)) => {
+                    if takes.contains_key(&k) {
+                        return self.not_general_enough_param();
+                    }
+                    match inst.get(&k) {
+                        Some(&v) => {
+                            self.edge(u, v);
+                            self.edge(v, u);
+                        }
+                        None => {
+                            inst.insert(k, u);
+                        }
                     }
                 }
+                (Side::Tie(u), Side::Tie(v)) => {
+                    self.edge(u, v);
+                    self.edge(v, u);
+                }
+                _ => {}
             }
         }
         for &(a, b) in &outs {
-            let pair = match (a, b) {
-                (Region::Bound(_), Region::Bound(_)) => continue,
-                (Region::Bound(_), _) if written(b) => None,
-                (_, Region::Bound(_)) => gv(a).zip(binder),
-                _ => gv(a).zip(fv(b)),
-            };
-            match pair {
-                Some((x, y)) => {
-                    self.edge(x, y);
-                    self.edge(y, x);
+            let (ga, fb) = (gside(a, &mut gn, true), fside(self, b, &mut fnn, true));
+            match (ga, fb) {
+                (Side::Binder(gi), Side::Binder(k)) if takes.get(&k) == Some(&gi) => {}
+                (Side::Tie(u), Side::Binder(k)) if inst.contains_key(&k) => {
+                    let v = inst[&k];
+                    self.edge(u, v);
+                    self.edge(v, u);
                 }
-                None if written(a) || written(b) => {
-                    self.bound_mismatch();
-                    return;
+                (Side::Tie(u), Side::Tie(v)) => {
+                    self.edge(u, v);
+                    self.edge(v, u);
                 }
-                None => {}
+                (Side::Free, _) | (_, Side::Free) => {}
+                _ => return self.bound_mismatch(),
             }
         }
     }
 
-    /// L0735 for a type param whose `Fn` bound fixes an argument lifetime
-    /// where the callee's bound is higher-ranked (rustc E0277).
+    /// An argument whose signature does not pair with the callee's `G:
+    /// Fn*` bound (check selected the impl some other way): only a bound
+    /// without lifetimes is proved (L0733).
+    fn unproved_bound(&mut self, g: &FnBound) {
+        let mut rs = Vec::new();
+        for &it in &g.inputs {
+            regions_of(&self.p.tys, it, &mut rs);
+        }
+        if let Some(o) = g.output {
+            regions_of(&self.p.tys, o, &mut rs);
+        }
+        if rs.into_iter().any(|r| matches!(r, Region::Param(_) | Region::Static | Region::Bound(_))) {
+            self.bound_mismatch();
+        }
+    }
+
+    /// L0735 for a type param's `Fn` bound or a fn item that fixes an
+    /// argument lifetime where the callee's bound is higher-ranked (rustc
+    /// E0277, "not general enough").
     fn not_general_enough_param(&mut self) {
         self.errs.push(Diag::new(
             "L0735",
             self.span,
-            "this type param's `Fn` bound is not general enough for the callee's: its argument lifetime is fixed, but the callee may pass a borrow of its own data",
-            "Write the bound with an elided lifetime (`F: Fn(&T)`).",
+            "this argument is not general enough for the callee's `Fn` bound: it fixes an argument lifetime, but the callee may pass a borrow of its own data",
+            "Give that argument an elided lifetime (`F: Fn(&T)`, `fn f(x: &T)`).",
         ));
     }
 
-    /// L0733 for a type param whose `Fn` bound does not prove the
-    /// callee's: the lifetimes in their signatures differ.
+    /// L0733 for a type param's `Fn` bound or a fn item whose signature
+    /// does not prove the callee's bound (rustc E0308).
     fn bound_mismatch(&mut self) {
         self.errs.push(Diag::new(
             "L0733",
             self.span,
-            "lifetime may not live long enough: this type param's `Fn` bound does not prove the callee's bound (their lifetimes differ)",
-            "Write the same lifetimes in both bounds.",
+            "lifetime may not live long enough: this argument's signature does not prove the callee's `Fn` bound (their lifetimes differ)",
+            "Write the same lifetimes in both signatures.",
         ));
     }
 

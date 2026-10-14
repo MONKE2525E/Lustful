@@ -2964,14 +2964,17 @@ lifetime (`Fn(&'a u8) -> &u8` returns `'a`), else L0202
 (rustc E0106). Under such a higher-ranked output the body
 may return borrows of the one higher-ranked argument
 (`ClosureEntry::bound_output`; rustc deduces `for<'r>
-fn(&'r T) -> &'r U`). A type param `F` passed on for a
-callee's `G: Fn*` bound proves it from `F`'s own regioned
-bound, region by region (`entail_bound`): lifetimes both
-write are one region, a higher-ranked `G` input needs a
-higher-ranked `F` input (L0735), outputs must match (L0733),
-and `F`'s higher-ranked output takes the lifetime `G`
-writes in that input; fns with such bounds run the region
-pass even without loans. `impl Fn*` arguments are type
+fn(&'r T) -> &'r U`). A type param `F` or a fn item
+passed for a callee's `G: Fn*` bound proves it from its
+regioned signature (`F`'s own bound; the fn's signature,
+late-bound lifetimes as binders, early-bound ones fresh),
+place by place (`entail_bound`; trait args are invariant):
+lifetimes both write are one region, a binder takes the
+lifetime `G` writes there or stays higher-ranked where
+`G`'s is (not both), a higher-ranked `G` input needs a
+binder (L0735), and outputs must agree the same way
+(L0733). Fns with such bounds run the region pass even
+without loans. `impl Fn*` arguments are type
 params with those bounds (also nested ones). A
 parameter annotation that names a lifetime (`|x: &'a T|`,
 `|m: &'static Message|`) is that region of the enclosing
