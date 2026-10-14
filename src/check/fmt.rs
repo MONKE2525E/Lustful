@@ -393,6 +393,16 @@ pub fn check_fmt_impl(p: &mut Program, imp: &ast::ImplDef, tr: TraitRef, self_pa
     if tr.def != p.gx.lang.display && tr.def != p.gx.lang.debug {
         return;
     }
+    // `Box` is fundamental, so `impl Display for Box<Local>` passes the
+    // orphan rule, but fmt glue formats a Box through its contents, as
+    // std's blanket impl does: the user's impl never ran (`{}` aborted,
+    // `{:?}` printed the inner type). Rejected until the glue picks it.
+    if let TyKind::Adt(d, _) = p.tys.kind(self_pat)
+        && d == p.tys.builtins().boxed
+    {
+        errs.push(crate::diag::not_yet("L0641", imp.span, "a `Display` or `Debug` impl for a `Box` type"));
+        return;
+    }
     let fmt_sym = p.interner.intern("fmt");
     let Some(&m) = method_ids.iter().find(|&&id| p.fn_info(id).name == fmt_sym) else {
         errs.push(Diag::new("L0110", imp.span, "the impl is missing the trait method `fmt`", "Add the method to the impl."));
