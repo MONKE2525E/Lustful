@@ -31,9 +31,10 @@ runtest_case() {
   "./$name.lust" x y >"$name.lust.out" 2>"$name.lust.err"; bs=$?
   "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
   # Which run path did it take? glue_shared has three function units, so it must use the file.
+  # The glue_*_type_cross_unit tests force a unit split with filler fns, so they must too.
   probe=$("$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
   if grep -q "in memory" <<<"$probe"; then mode=mem; else mode=file; fi
-  want_mode=mem; [[ "$name" == glue_shared ]] && want_mode=file
+  want_mode=mem; [[ "$name" == glue_shared || "$name" == glue_*_type_cross_unit ]] && want_mode=file
   if [ "$mode" != "$want_mode" ]; then
     report bad "$name" "run took the $mode path, want $want_mode"
   elif [ $ms -ne $bs ] || [ $ms -ne $rs ]; then
