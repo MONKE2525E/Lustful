@@ -45,7 +45,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn generic_alias_body(&mut self, la: &generics::GenericAlias, seg: &ast::PathSeg, span: Span) -> Option<Ty> {
         let p = self.p;
         let written = seg.type_args();
-        if written.len() > la.type_params.len() {
+        // An alias has no const params, so a const arg is one too many.
+        let consts = matches!(&seg.args, ast::GenericArgs::Angle(a) if a.iter().any(|g| matches!(g, ast::GenericArg::Const(_))));
+        if written.len() > la.type_params.len() || consts {
             self.err("L0107", span, format!("this alias takes {} type argument(s)", la.type_params.len()), "Write one type per parameter.");
             return None;
         }

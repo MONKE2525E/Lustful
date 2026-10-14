@@ -1560,7 +1560,9 @@ fn check_fn_mode<'p, 'a>(
         // E0005); a static name cannot be a pattern at all. A `mut`
         // parameter, or one named like an item of the enclosing block
         // (which hides module items), may name no static or const.
-        if param.pat.is_none() && (param.mutable || cx.body_item_of(param.name).is_some()) {
+        if param.pat.is_none() && cx.body_item_of(param.name).is_none() && cx.const_param(param.name).is_some() {
+            cx.binding_shadows_item(param.name, param.span, !param.mutable);
+        } else if param.pat.is_none() && (param.mutable || cx.body_item_of(param.name).is_some()) {
             cx.binding_shadows_item(param.name, param.span, false);
         } else if param.pat.is_none() {
             match cx.pat_ident(param.name) {
@@ -2101,9 +2103,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// rustc E0530: no binding may shadow a static, and only a plain
-    /// binding (no `mut`, `ref`, or `@`) may name a const, as its path
-    /// pattern (checked before this). A block's items come before module
+    /// rustc E0530: no binding may shadow a static or a const generic
+    /// param, and only a plain binding (no `mut`, `ref`, or `@`) may
+    /// name a const, as its path pattern (checked before this); a
+    /// plain name of a const param is E0158. A block's items come before module
     /// items, and a local of the name in between shadows both. Reports
     /// and returns true when `name` is such a static or const.
     fn binding_shadows_item(&mut self, name: Sym, span: Span, plain: bool) -> bool {
@@ -2115,6 +2118,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Some(BodyItem::Static(_)) => "statics",
             Some(BodyItem::Const(_)) if !plain => "constants",
             Some(_) => return false,
+            // A const generic param shadows module items. As a plain
+            // name it would be a pattern, which rustc forbids (E0158).
+            None if self.const_param(name).is_some() => {
+                let msg =
+                    if plain { "constant parameters cannot be referenced in patterns" } else { "bindings cannot shadow const parameters" };
+                let n = self.name(name).to_string();
+                self.err("L0110", span, msg, format!("Rename the binding, or compare with `{n}` in a guard."));
+                return true;
+            }
             None => match self.pat_ident(name) {
                 PatIdent::Static => "statics",
                 PatIdent::Const(_) if !plain => "constants",
@@ -2802,6 +2814,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(args)
     }
 
+    /// False when `name` is a const param or const item whose type is
+    /// not the const param type `want` (an arg for a type param, or a
+    /// name that is neither, is left to the caller).
+    fn bare_const_arg_fits(&mut self, name: Sym, want: Option<ParamKind>) -> bool {
+        let Some(ParamKind::Const(want)) = want else { return true };
+        let have = match self.const_param(name) {
+            Some((_, t, _)) => t,
+            None => match self.p.const_names.get(&name) {
+                Some(&ci) => self.p.consts[ci as usize].ty,
+                None => return true,
+            },
+        };
+        let (have, want) = (generics::ConstScalar::of(&self.tys, have), generics::ConstScalar::of(&self.tys, want));
+        have.is_none() || have == want
+    }
+
     /// The generic args of a value path that names user Adt `a` (a
     /// struct, or an enum through one of its variants): args written on
     /// the type segment or the variant segment, with the defaults of
@@ -2880,6 +2908,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some(g)
                 }
                 ast::GenericArg::Type(t) => match p.ast.ty(*t) {
+                    // A bare const name (`S::<K>`) must have the param's
+                    // type, as in a type position (rustc E0308).
+                    ast::TyExpr::Path(ps)
+                        if ps.len() == 1 && !self.bare_const_arg_fits(ps[0].name, generics.params.get(i).map(|g| g.kind)) =>
+                    {
+                        self.err(
+                            "L0110",
+                            span,
+                            "mismatched types: this const argument has the wrong type",
+                            "Use a const of the parameter's type.",
+                        );
+                        return self.error_args(&generics);
+                    }
                     ast::TyExpr::Path(ps) if ps.len() == 1 => match self.const_param(ps[0].name) {
                         Some((pi, _, val)) => Some(GenericArg::Const(self.tys.intern_const(val.unwrap_or(ConstKind::Param(pi))))),
                         None => crate::check::collect::named_const_kind(p.ast, p.interner, p.known, ps[0].name, span)
@@ -8702,8 +8743,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if ty_name == k.Result && item == k.Err && lang_ty {
             return Some(Res::ResErr);
         }
+        // In an instance `Self` names a materialized Adt; its items are
+        // the template's (a fn of another impl block has no instance yet).
         let adt = if ty_name == p.known.self_type {
-            self.self_adt()
+            self.self_adt().map(|a| match p.gx.adt_instance_of.get(a.0 as usize).copied().flatten() {
+                Some((def, _)) => p.adt_by_def(def).unwrap_or(a),
+                None => a,
+            })
         } else {
             match ty_bound {
                 BindingRes::Def(def) => p.adt_by_def(def),
@@ -9183,15 +9229,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// The Self type a path call or fn value writes before the fn's
-    /// name fixes the impl's params: `S::<u8>::make`, or an alias of
-    /// the Adt at fixed args (`type A = S<u8>; A::make(5)`), where
-    /// `value_path_args` gives the alias's args. `inst_args` is empty
+    /// name fixes the impl's params: `S::<u8>::make`, `Self::make` (the
+    /// impl's own Self type, also in `impl S<u8>` calling a fn of
+    /// `impl<T> S<T>`), or an alias of the Adt at fixed args (`type A =
+    /// S<u8>; A::make(5)`), where `value_path_args` gives the args. `inst_args` is empty
     /// for a plain fn: a concrete impl's Self (`impl S<u8>`) must then
     /// be the written type (rustc E0599 for `S::<u16>::make`).
     fn unify_written_self(&mut self, callee: ExprId, f: LocalDefId, inst_args: &[GenericArg], span: Span) {
         let p = self.p;
         let Expr::Path(segs) = p.ast.expr(callee) else { return };
-        if segs.len() != 2 || !(segs[0].has_args() || self.alias_adt_seg(&segs[0], span).is_some_and(|(_, args, _)| !args.is_empty())) {
+        if segs.len() != 2
+            || !(segs[0].has_args()
+                || segs[0].name == p.known.self_type
+                || self.alias_adt_seg(&segs[0], span).is_some_and(|(_, args, _)| !args.is_empty()))
+        {
             return;
         }
         let Some(owner) = p.fn_info(f).owner else { return };
@@ -14305,6 +14356,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
             && self.body_item_of(*name).is_none()
+            && self.const_param(*name).is_none()
         {
             match self.pat_ident(*name) {
                 PatIdent::Const(idx) => {
