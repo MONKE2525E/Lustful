@@ -56,8 +56,24 @@ impl<K, V, S> IndexMap<K, V, S> {
         Iter { entries: &self.core.entries, front: 0, back: self.core.entries.len() }
     }
 
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut { inner: self.core.entries.iter_mut() }
+    }
+
     pub fn keys(&self) -> Keys<'_, K, V> {
         Keys { inner: self.iter() }
+    }
+
+    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V> {
+        ValuesMut { inner: self.core.entries.iter_mut() }
+    }
+
+    pub fn into_keys(self) -> IntoKeys<K, V> {
+        IntoKeys { inner: self.core.entries.into_iter() }
+    }
+
+    pub fn into_values(self) -> IntoValues<K, V> {
+        IntoValues { inner: self.core.entries.into_iter() }
     }
 
     pub fn values(&self) -> Values<'_, K, V> {
@@ -116,6 +132,16 @@ impl<K, V, S> IndexMap<K, V, S> {
         self.core.rebuild_hash_table();
     }
 
+    pub fn sort_by_key<T: Ord, F: FnMut(&K, &V) -> T>(&mut self, mut sort_key: F) {
+        self.core.entries.sort_by_key(|b| sort_key(&b.key, &b.value));
+        self.core.rebuild_hash_table();
+    }
+
+    pub fn sort_unstable_by_key<T: Ord, F: FnMut(&K, &V) -> T>(&mut self, mut sort_key: F) {
+        self.core.entries.sort_unstable_by_key(|b| sort_key(&b.key, &b.value));
+        self.core.rebuild_hash_table();
+    }
+
     pub fn sort_unstable_keys(&mut self)
     where
         K: Ord,
@@ -153,6 +179,18 @@ impl<K, V, S> IndexMap<K, V, S> {
 
     pub fn last(&self) -> Option<(&K, &V)> {
         if self.core.entries.is_empty() { None } else { self.get_index(self.core.entries.len() - 1) }
+    }
+
+    pub fn first_mut(&mut self) -> Option<(&K, &mut V)> {
+        self.get_index_mut(0)
+    }
+
+    pub fn last_mut(&mut self) -> Option<(&K, &mut V)> {
+        if self.core.entries.is_empty() {
+            return None;
+        }
+        let i = self.core.entries.len() - 1;
+        self.get_index_mut(i)
     }
 
     pub fn swap_remove_index(&mut self, index: usize) -> Option<(K, V)> {
@@ -505,6 +543,130 @@ impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
 }
 
 impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {}
+
+/// The entries in order, as `(&K, &mut V)`.
+pub struct IterMut<'a, K, V> {
+    inner: core::slice::IterMut<'a, Bucket<K, V>>,
+}
+
+impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
+        match self.inner.next() {
+            Some(b) => Some((&b.key, &mut b.value)),
+            None => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
+    fn next_back(&mut self) -> Option<(&'a K, &'a mut V)> {
+        match self.inner.next_back() {
+            Some(b) => Some((&b.key, &mut b.value)),
+            None => None,
+        }
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {}
+
+/// The values in order, mutable.
+pub struct ValuesMut<'a, K, V> {
+    inner: core::slice::IterMut<'a, Bucket<K, V>>,
+}
+
+impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+
+    fn next(&mut self) -> Option<&'a mut V> {
+        match self.inner.next() {
+            Some(b) => Some(&mut b.value),
+            None => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for ValuesMut<'a, K, V> {
+    fn next_back(&mut self) -> Option<&'a mut V> {
+        match self.inner.next_back() {
+            Some(b) => Some(&mut b.value),
+            None => None,
+        }
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for ValuesMut<'a, K, V> {}
+
+/// The keys in order, by value.
+pub struct IntoKeys<K, V> {
+    inner: std::vec::IntoIter<Bucket<K, V>>,
+}
+
+impl<K, V> Iterator for IntoKeys<K, V> {
+    type Item = K;
+
+    fn next(&mut self) -> Option<K> {
+        match self.inner.next() {
+            Some(b) => Some(b.key),
+            None => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> DoubleEndedIterator for IntoKeys<K, V> {
+    fn next_back(&mut self) -> Option<K> {
+        match self.inner.next_back() {
+            Some(b) => Some(b.key),
+            None => None,
+        }
+    }
+}
+
+impl<K, V> ExactSizeIterator for IntoKeys<K, V> {}
+
+/// The values in order, by value.
+pub struct IntoValues<K, V> {
+    inner: std::vec::IntoIter<Bucket<K, V>>,
+}
+
+impl<K, V> Iterator for IntoValues<K, V> {
+    type Item = V;
+
+    fn next(&mut self) -> Option<V> {
+        match self.inner.next() {
+            Some(b) => Some(b.value),
+            None => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> DoubleEndedIterator for IntoValues<K, V> {
+    fn next_back(&mut self) -> Option<V> {
+        match self.inner.next_back() {
+            Some(b) => Some(b.value),
+            None => None,
+        }
+    }
+}
+
+impl<K, V> ExactSizeIterator for IntoValues<K, V> {}
 
 /// The keys in order.
 pub struct Keys<'a, K, V> {
