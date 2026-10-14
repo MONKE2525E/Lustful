@@ -1443,6 +1443,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let n = match self.kind(ty) {
                     TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
                         ConstKind::Int(n) => n as u64,
+                        // A template's const param length: lower the element
+                        // so the borrow checker sees it (templates get no code).
+                        ConstKind::Param(_) => 2,
                         _ => 0,
                     },
                     _ => 0,

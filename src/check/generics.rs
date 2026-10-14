@@ -1163,6 +1163,56 @@ fn resolve_generic_args(
     Ok(out)
 }
 
+/// True when the integer `v` (two's complement in a u128, as
+/// `ConstKind::Int` holds it) is a value of `it`.
+pub(crate) fn const_int_fits(v: u128, it: IntTy) -> bool {
+    let v = v as i128;
+    if it.signed() {
+        let max = (it.max128() as i128).max(0);
+        v >= -max - 1 && v <= max
+    } else {
+        v >= 0 && (v as u128) <= it.max128()
+    }
+}
+
+/// Written const generic args of a type path against the declared
+/// types of its const params in `g` (an integer type, `bool`, or
+/// `char`): rustc's E0308 and out-of-range literal errors. Params and
+/// inference variables pass here.
+fn check_const_arg_types(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    tys: &impl TyIntern,
+    g: &ast::Generics,
+    args: &[GenericArg],
+    span: Span,
+) -> Result<(), Diag> {
+    let decls = g.params.iter().filter(|p| !matches!(p, ast::GenericParam::Lifetime { .. }));
+    let vals = args.iter().filter(|a| !matches!(a, GenericArg::Lifetime(_)));
+    for (param, arg) in decls.zip(vals) {
+        let (ast::GenericParam::Const { ty, .. }, GenericArg::Const(c)) = (param, arg) else { continue };
+        let ast::TyExpr::Path(segs) = ast.ty(*ty) else { continue };
+        let [seg] = segs.as_slice() else { continue };
+        let fits = match tys.const_kind(*c) {
+            ConstKind::Int(v) => known.int_ty(seg.name).is_some_and(|it| const_int_fits(v, it)),
+            ConstKind::Bool(_) => seg.name == known.bool,
+            ConstKind::Char(_) => seg.name == known.char,
+            _ => true,
+        };
+        if !fits {
+            let tn = crate::intern::source_name(interner.get(seg.name));
+            return Err(Diag::new(
+                "L0110",
+                span,
+                format!("mismatched types: this const argument is not a value of type `{tn}`"),
+                format!("Write a `{tn}` value in its range."),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A const generic argument the parser read as a type path
 /// (`Arr<N>`): a const parameter of the enclosing item, or a
 /// free const item. Rust reads a bare generic argument as a
@@ -1986,6 +2036,9 @@ fn resolve_path_ty(
                 return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
             }
         };
+        if let Some(g) = g_ast {
+            check_const_arg_types(ast, interner, known, tys, g, &gargs, span)?;
+        }
         // Omitted trailing params take their defaults.
         let n_written = gargs.iter().filter(|g| !matches!(g, GenericArg::Lifetime(_))).count();
         if n_written < n_params {
