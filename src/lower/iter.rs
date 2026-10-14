@@ -77,6 +77,7 @@ fn expands(b: Builtin) -> bool {
             | B::EntryAndModify
             | B::IterFlatten
             | B::IterFlatMap
+            | B::HashFromArray
             | B::IterSizeHint
             | B::IterFold
             | B::IterForEach
@@ -573,6 +574,25 @@ impl Ex<'_, '_, '_> {
                 self.cur = join;
                 self.drop_local(fl);
                 return Ok(());
+            }
+            // `HashMap::from(array)` (W-STD-B): `from_iter`, so
+            // `with_hasher(Default::default())` and `extend` from the
+            // array's `array::IntoIter`.
+            B::HashFromArray => {
+                let x = arg()?;
+                let at = self.op_ty(&x)?;
+                let TyKind::Array(el, _) = self.body.tys.kind(at) else { return Err("hash expansion: from of a non-array".into()) };
+                let it_ty = it::mk_iter(&mut self.body.tys, IterKind::ArrayIntoIter, &[el, at]);
+                let io = self.into_iter(x, it_ty)?;
+                let il = self.local(it_ty);
+                self.assign(Place::local(il), Rvalue::Use(io));
+                let m = self.local(dest_ty);
+                self.call_builtin(Builtin::HashDefault, vec![], Place::local(m));
+                let rt = self.body.tys.mk_ref(true, dest_ty);
+                let rm = self.local(rt);
+                self.assign(Place::local(rm), Rvalue::Ref(true, Place::local(m)));
+                self.hash_extend(Place::local(il), it_ty, rm)?;
+                self.assign(dest, Rvalue::Use(Operand::Move(Place::local(m))));
             }
             // `flatten()` and `flat_map(f)` (W-STD-B): (Some(iter), None,
             // None); flat_map's iter is `Map<I, F>`.

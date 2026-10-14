@@ -4432,6 +4432,7 @@ impl FnGen<'_, '_, '_> {
             | B::IterWindows
             | B::IterFlatten
             | B::IterFlatMap
+            | B::HashFromArray
             | B::IterSizeHint
             | B::IterNextBack
             | B::StrCharIndices

@@ -525,11 +525,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if fixed_rs && let Some(last) = args.last_mut() {
             if !self.unify(*last, rs) {
                 let tn = self.tn(*last);
+                let f = self.p.interner.get(segs[segs.len() - 1].name);
+                let what = if k == HashTy::HashSet { "set" } else { "map" };
                 self.err(
                     "L0612",
                     span,
-                    format!("`new` and `with_capacity` build a map with `RandomState`, not `{tn}`"),
-                    "Use `with_hasher` for another hasher.",
+                    format!("`{f}` builds a {what} with `RandomState`, not `{tn}`"),
+                    "Use `with_hasher` or `collect` for another hasher.",
                 );
             }
             *last = rs;
@@ -546,8 +548,68 @@ impl<'p, 'a> Ctx<'p, 'a> {
             B::HashWithCapacity => (vec![USIZE], t),
             B::HashWithHasher => (vec![s], t),
             B::HashWithCapacityAndHasher => (vec![USIZE, s], t),
+            // The argument is typed in `hash_from_array_sig`.
+            B::HashFromArray => (vec![], t),
             _ => return None,
         })
+    }
+
+    /// `HashMap::from(array)` and `HashSet::from(array)` at the table type
+    /// `t`: std's `From<[(K, V); N]>` and `From<[T; N]>`, which build the
+    /// table with `RandomState` through `from_iter`. The elements must be
+    /// Copy for now (they iterate as `array::IntoIter`), and the keys
+    /// `Hash + Eq`.
+    pub(super) fn hash_from_array_sig(&mut self, t: Ty, args: &[ExprId], span: Span) -> (Vec<Ty>, Ty) {
+        let Some((kind, targs)) = hash_parts(&self.tys, t) else { return (vec![], ERROR) };
+        let at = match args {
+            [a] => self.expr(*a, None),
+            _ => {
+                self.err("L0105", span, "`from` takes 1 argument", "Pass an array.");
+                return (vec![], ERROR);
+            }
+        };
+        let at = self.deep(at);
+        let what = if kind == HashTy::HashSet { "set" } else { "map" };
+        let el = match self.kind(at) {
+            TyKind::Array(el, _) => el,
+            TyKind::Error => return (vec![at], t),
+            TyKind::Infer(_) => {
+                self.err("L0610", span, "type annotations needed: the argument of `from` is not known", "Pass an array.");
+                return (vec![at], ERROR);
+            }
+            // The identity `From<T> for T`.
+            _ if hash_parts(&self.tys, at).is_some_and(|(k, _)| k == kind) => {
+                self.err("L0640", span, format!("`from` of a {what} is not implemented yet"), "Use the value itself.");
+                return (vec![at], ERROR);
+            }
+            _ => {
+                let tn = self.tn(at);
+                self.err("L0612", span, format!("the {what} has no `From<{tn}>`"), "Pass an array, or collect an iterator.");
+                return (vec![at], ERROR);
+            }
+        };
+        let rs = mk_hash(&mut self.tys, HashTy::RandomState, &[]);
+        let s = *targs.last().unwrap_or(&UNIT);
+        if !self.unify(s, rs) {
+            let tn = self.tn(s);
+            self.err("L0612", span, format!("`from` builds a {what} with `RandomState`, not `{tn}`"), "Use `with_hasher` or `collect` for another hasher.");
+            return (vec![at], ERROR);
+        }
+        let want = if kind == HashTy::HashMap {
+            let ts = self.tys.intern_tys(&[targs[0], targs[1]]);
+            self.tys.intern(TyKind::Tuple(ts))
+        } else {
+            targs[0]
+        };
+        if !self.unify(el, want) {
+            self.mismatch(span, want, el);
+            return (vec![at], ERROR);
+        }
+        if !self.array_iter_elem_ok(el, span) {
+            return (vec![at], ERROR);
+        }
+        self.require_hash_key(targs[0], s, span);
+        (vec![at], t)
     }
 }
 
@@ -555,7 +617,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
 pub fn is_hash_ctor(b: Builtin) -> bool {
     matches!(
         b,
-        Builtin::HashNew | Builtin::HashWithCapacity | Builtin::HashWithHasher | Builtin::HashWithCapacityAndHasher | Builtin::HashDefault
+        Builtin::HashNew
+            | Builtin::HashWithCapacity
+            | Builtin::HashWithHasher
+            | Builtin::HashWithCapacityAndHasher
+            | Builtin::HashDefault
+            | Builtin::HashFromArray
     )
 }
 
@@ -567,6 +634,7 @@ pub fn hash_ctor_builtin(k: HashTy, item: &str) -> Option<Builtin> {
         "with_capacity" if table => Builtin::HashWithCapacity,
         "with_hasher" if table => Builtin::HashWithHasher,
         "with_capacity_and_hasher" if table => Builtin::HashWithCapacityAndHasher,
+        "from" if table => Builtin::HashFromArray,
         "default" if k != HashTy::Entry => Builtin::HashDefault,
         _ => return None,
     })

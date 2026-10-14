@@ -522,6 +522,9 @@ pub enum Builtin {
     /// constructors (the result type tells map, set, or hasher), table
     /// queries, map and set methods, and the Entry methods.
     HashNew,
+    /// `HashMap::from([(k, v); N])` and `HashSet::from([t; N])` (W-STD-B):
+    /// `from_iter` over the array, with `RandomState`.
+    HashFromArray,
     HashWithCapacity,
     HashWithHasher,
     HashWithCapacityAndHasher,
@@ -10159,6 +10162,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let (params, ret): (Vec<Ty>, Ty) = match b {
                     Builtin::Sync(op) => self.sync_call_sig(op, callee, span),
                     b if crate::check::hashmap::is_hash_ctor(b) => match self.hash_ctor_sig(b, callee, span) {
+                        Some(sig) if b == Builtin::HashFromArray => self.hash_from_array_sig(sig.1, args, span),
                         Some(sig) => sig,
                         None => (vec![], ERROR),
                     },
