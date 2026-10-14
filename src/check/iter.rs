@@ -121,7 +121,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // A user iterator type by value: wrapped once as `ByNext`,
             // which every adapter and consumer takes (W-STD-B).
             let n = self.name(name).to_string();
-            if derefs > 0 || n == "next" || !ITER_METHODS.contains(&n.as_str()) {
+            // The `&mut self` consumers and `size_hint` borrow the
+            // iterator, which stays (and drops) where Rust has it: the
+            // call takes it by reference, also through `&I` or `&mut I`,
+            // and the expansion wraps the reference (lower/iter.rs
+            // `user_iter`). The rest move it into the wrapper.
+            let borrowing = matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "position" | "size_hint");
+            if (derefs > 0 && !borrowing) || n == "next" || !ITER_METHODS.contains(&n.as_str()) {
                 return None;
             }
             let item = self.by_next_item(base, name_span)?;
@@ -132,14 +138,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return Some(ERROR);
             }
             let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[base, item]);
-            // The `&mut self` consumers and `size_hint` borrow the
-            // iterator, which stays (and drops) where Rust has it: the
-            // call takes it by reference, and the expansion wraps the
-            // reference (lower/iter.rs `user_iter`). The rest move it in.
-            if !matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "position" | "size_hint") {
-                let i = self.ei(recv);
-                self.out.coerce[i] = Coerce::ByNext(wrapped);
+            if borrowing {
+                return Some(self.iter_call(e, recv, wrapped, derefs, &n, name_span, args, turbofish, expected));
             }
+            let i = self.ei(recv);
+            self.out.coerce[i] = Coerce::ByNext(wrapped);
             return Some(self.iter_call(e, recv, wrapped, 0, &n, name_span, args, turbofish, expected));
         }
         let n = self.name(name).to_string();
