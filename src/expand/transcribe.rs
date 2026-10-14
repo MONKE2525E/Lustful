@@ -122,18 +122,32 @@ impl<'a> Tx<'a> {
             out.push(Tt::Tok(Token { tok: Tok::Crate, span: self.stamp(dollar_span) }));
             return Ok(i + 2);
         }
+        // An unbound name stays as the tokens `$` and the name in rustc's
+        // transcriber; it is not an error. rustc writes a keyword name
+        // back raw (`$if` becomes `$ r#if`), so it no longer matches the
+        // keyword; a raw identifier here is a plain `Ident`.
+        let unbound = |this: &mut Self, out: &mut Vec<Tt>| {
+            let tok = match name_tok.tok {
+                Tok::Reserved(s) => Tok::Ident(s),
+                Tok::True | Tok::False => Tok::Ident(this.interner.intern(&tok_text(&name_tok.tok, &[], this.interner))),
+                Tok::SelfLower | Tok::SelfUpper | Tok::Super | Tok::Crate | Tok::Ident(_) => name_tok.tok,
+                t => meta_sym(t, this.interner).map_or(t, Tok::Ident),
+            };
+            out.push(Tt::Tok(Token { tok: Tok::Dollar, span: this.stamp(dollar_span) }));
+            out.push(Tt::Tok(Token { tok, span: this.stamp(name_tok.span) }));
+            Ok(i + 2)
+        };
         let Some(name) = meta_sym(name_tok.tok, self.interner) else {
+            if matches!(name_tok.tok, Tok::Reserved(_) | Tok::True | Tok::False) {
+                return unbound(self, out);
+            }
             // `$` before a token that cannot name a metavariable is a
             // literal `$`; the token itself is transcribed next round.
             out.push(Tt::Tok(Token { tok: Tok::Dollar, span: self.stamp(dollar_span) }));
             return Ok(i + 1);
         };
         let Some(bind) = self.binds.get(&name) else {
-            // An unbound name stays as the tokens `$` and the name in
-            // rustc's transcriber; it is not an error.
-            out.push(Tt::Tok(Token { tok: Tok::Dollar, span: self.stamp(dollar_span) }));
-            out.push(Tt::Tok(Token { tok: name_tok.tok, span: self.stamp(name_tok.span) }));
-            return Ok(i + 2);
+            return unbound(self, out);
         };
         match select(bind, indices) {
             Ok(Some(leaf)) => out.extend(leaf.iter().cloned()),

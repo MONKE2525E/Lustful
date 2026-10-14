@@ -298,7 +298,7 @@ fn env_snapshot() -> &'static std::collections::HashMap<String, String> {
 }
 
 /// The text of one token for `stringify!`. Written tokens print as
-/// written: raw identifiers keep `r#`, raw and byte strings keep their
+/// written: raw identifiers and lifetimes keep `r#`, raw and byte strings keep their
 /// prefixes, integer literals keep their radix and suffix. The source
 /// slice at the token's span holds that text; the guards keep a slice
 /// from a different file (an included file's tokens after the swap
@@ -318,6 +318,11 @@ fn stringify_tok_text(st: &Expander, t: &Token) -> String {
         }
         Tok::Ident(_) | Tok::Reserved(_) => match slice {
             Some(s) if s == plain || s.strip_prefix("r#") == Some(plain.as_str()) => s.to_string(),
+            _ => plain,
+        },
+        // A raw lifetime keeps its `r#` (`'r#fn`).
+        Tok::Lifetime(_) => match slice {
+            Some(s) if s.strip_prefix("'r#") == plain.strip_prefix('\'') => s.to_string(),
             _ => plain,
         },
         Tok::Str(_) => match slice {

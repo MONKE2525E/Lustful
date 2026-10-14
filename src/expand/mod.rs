@@ -1347,6 +1347,16 @@ fn atomic_shaped(trees: &[Tt]) -> bool {
 fn flatten_final(trees: &[Tt], out: &mut Vec<Token>) {
     for tree in trees {
         match tree {
+            // A doc comment's string bound as a `literal` or `expr` is the
+            // raw string literal rustc's tokens hold; the parser reads a
+            // string token there.
+            Tt::Frag(FragKind::Literal | FragKind::Expr | FragKind::Expr2021, inner, _)
+                if matches!(inner.as_slice(), [Tt::Tok(t)] if matches!(t.tok, Tok::DocStr(_))) =>
+            {
+                if let [Tt::Tok(Token { tok: Tok::DocStr(i), span })] = inner.as_slice() {
+                    out.push(Token { tok: Tok::Str(*i), span: *span });
+                }
+            }
             // A negative literal fragment (`-2`) is one operand; without
             // parens `- 2 . pow(..)` would read as `-(2.pow(..))`.
             Tt::Frag(FragKind::Literal, inner, span) if matches!(inner.first(), Some(Tt::Tok(t)) if t.tok == Tok::Minus) => {

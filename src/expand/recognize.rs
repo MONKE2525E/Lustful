@@ -29,12 +29,31 @@ struct Cur<'a> {
     /// True when the last expression parsed ended in a block-like
     /// tail that needs no `;` as a statement.
     block_like: bool,
+    /// Set by a caller that parses an expression statement: the next
+    /// `parse_expr_bp` applies rustc's statement rule to its head.
+    stmt_start: bool,
+    /// True while the head of an expression statement is parsed: a
+    /// block-like head (`{}`, `if`, `match`, loops) takes no call or
+    /// index after it and ends the statement (only `.` and `?` go on).
+    stmt_head: bool,
     depth: u32,
 }
 
 impl<'a> Cur<'a> {
     fn new(ts: &'a [Tt], interner: &'a Interner, ed2024: bool, depth: u32) -> Self {
-        Cur { ts, i: 0, pending_gt: false, pending_ge: false, interner, ed2024, no_struct: false, block_like: false, depth }
+        Cur {
+            ts,
+            i: 0,
+            pending_gt: false,
+            pending_ge: false,
+            interner,
+            ed2024,
+            no_struct: false,
+            block_like: false,
+            stmt_start: false,
+            stmt_head: false,
+            depth,
+        }
     }
     /// A child cursor for a group's inner trees.
     fn child(&self, ts: &'a [Tt]) -> Self {
@@ -302,6 +321,7 @@ fn parse_path_ty(c: &mut Cur) -> bool {
         }
         c.bump();
         // Generic arguments, plain or turbofish.
+        let mut angle = false;
         if c.at(Tok::PathSep) {
             let save = (c.i, c.pending_gt, c.pending_ge);
             c.bump();
@@ -309,14 +329,19 @@ fn parse_path_ty(c: &mut Cur) -> bool {
                 if !generic_args(c) {
                     return false;
                 }
+                angle = true;
             } else {
                 (c.i, c.pending_gt, c.pending_ge) = save;
             }
-        } else if c.at(Tok::Lt) && !generic_args(c) {
-            return false;
+        } else if c.at(Tok::Lt) {
+            if !generic_args(c) {
+                return false;
+            }
+            angle = true;
         }
-        // `Fn(A, B) -> C` sugar ends the path.
-        if matches!(c.tree(), Some(Tt::Delim(Delim::Paren, _, _))) {
+        // `Fn(A, B) -> C` sugar ends the path; a segment with `<..>`
+        // arguments takes no `(..)` ones.
+        if !angle && matches!(c.tree(), Some(Tt::Delim(Delim::Paren, _, _))) {
             let Some(inner) = c.group(Delim::Paren) else { return false };
             if !pieces_all(inner, |p| is_ty(p, c.interner)) {
                 return false;
@@ -365,6 +390,45 @@ fn parse_qualified(c: &mut Cur, ty: bool) -> bool {
     }
     // In expression position the caller consumes `::seg` chains.
     true
+}
+
+/// The end of the bounds rustc reads after a path type when `ts[pos]`
+/// is `+` (`parse_remaining_bounds`): the `+`, then bounds joined by
+/// `+` while one can begin, a trailing `+` included, possibly none.
+/// None when a bound begins and does not parse.
+pub fn bounds_tail_end(ts: &[Tt], pos: usize, interner: &Interner) -> Option<usize> {
+    let mut c = Cur::new(ts, interner, true, 0);
+    c.i = pos + 1;
+    loop {
+        if !bound_start(&c) {
+            break;
+        }
+        if !parse_bound(&mut c) || c.pending_gt || c.pending_ge {
+            return None;
+        }
+        if !c.eat(Tok::Plus) {
+            break;
+        }
+    }
+    Some(c.i)
+}
+
+/// rustc's `can_begin_bound`: a path, a lifetime, `?`, `!`, `for`,
+/// `const`, `async`, `use`, a parenthesized bound, or `[const]`.
+fn bound_start(c: &Cur) -> bool {
+    match c.tree() {
+        Some(Tt::Delim(Delim::Paren, _, _)) => true,
+        Some(Tt::Delim(Delim::Bracket, inner, _)) => matches!(inner.first(), Some(Tt::Tok(t)) if t.tok == Tok::Const),
+        Some(Tt::Frag(kind, _, _)) => matches!(kind, FragKind::Path | FragKind::Ty),
+        Some(Tt::Tok(t)) => {
+            is_seg(t.tok)
+                || matches!(
+                    t.tok,
+                    Tok::PathSep | Tok::Lt | Tok::Shl | Tok::Lifetime(_) | Tok::Question | Tok::Bang | Tok::For | Tok::Const | Tok::Async | Tok::Use
+                )
+        }
+        _ => false,
+    }
 }
 
 /// Parses one trait-bound list (`A + B + 'a`), at least one bound.
@@ -905,8 +969,18 @@ fn operand_start(c: &Cur) -> bool {
 /// `min_bp`. Sets `block_like` when the whole expression ends in
 /// a block-like tail.
 fn parse_expr_bp(c: &mut Cur, min_bp: u8) -> bool {
-    if !parse_unary(c) {
+    // rustc's statement rule: an expression statement whose head is
+    // block-like ends after it (`{ 1 } - 1` is two statements).
+    let outer_head = c.stmt_head;
+    c.stmt_head = std::mem::take(&mut c.stmt_start);
+    let ok = parse_unary(c);
+    let complete = c.stmt_head && c.block_like;
+    c.stmt_head = outer_head;
+    if !ok {
         return false;
+    }
+    if complete {
+        return true;
     }
     // Comparisons do not chain: `a < b < c` is a parse error in rustc.
     let mut after_cmp = false;
@@ -971,10 +1045,17 @@ fn parse_unary(c: &mut Cur) -> bool {
     }
     c.attrs();
     c.block_like = false;
-    // A label on a loop or block.
+    if matches!(c.tok(), Some(Tok::Minus | Tok::Bang | Tok::Star | Tok::Amp | Tok::AndAnd)) {
+        c.stmt_head = false;
+    }
+    // A label on a loop or block (written: rustc rejects a forwarded
+    // `block` after a label).
     if matches!(c.tok(), Some(Tok::Lifetime(_))) && tok_at(c.ts, c.i + 1).map(|t| t.tok) == Some(Tok::Colon) {
         c.bump();
         c.bump();
+        if matches!(c.tree(), Some(Tt::Frag(..))) {
+            return false;
+        }
         return parse_primary(c);
     }
     match c.tok() {
@@ -1125,6 +1206,7 @@ fn block_inner(c: &mut Cur) -> bool {
             }
             continue;
         }
+        c.stmt_start = true;
         if !parse_expr_bp(c, 0) {
             return false;
         }
@@ -1189,6 +1271,7 @@ fn parse_primary(c: &mut Cur) -> bool {
                 return false;
             }
             c.i += 1;
+            c.block_like = *kind == FragKind::Block;
             return parse_postfix(c);
         }
         Some(Tt::Delim(Delim::Paren, _, _)) => {
@@ -1339,6 +1422,7 @@ fn parse_primary(c: &mut Cur) -> bool {
 fn parse_postfix(c: &mut Cur) -> bool {
     loop {
         match c.tree() {
+            Some(Tt::Delim(Delim::Paren | Delim::Bracket, _, _)) if c.stmt_head && c.block_like => return true,
             Some(Tt::Delim(Delim::Paren, _, _)) => {
                 let Some(inner) = c.group(Delim::Paren) else { return false };
                 if !pieces_all(inner, |p| is_expr(p, c.interner, c.ed2024)) {
@@ -1506,6 +1590,7 @@ pub fn is_stmt(slice: &[Tt], interner: &Interner) -> bool {
     if starts_item_at(&c) {
         return parse_item(&mut c) && c.done();
     }
+    c.stmt_start = true;
     parse_expr_bp(&mut c, 0) && c.done()
 }
 
@@ -1620,6 +1705,16 @@ fn fn_params(inner: &[Tt], interner: &Interner, allow_bare: bool) -> bool {
     })
 }
 
+/// True when the group after `pub` is a visibility restriction:
+/// `crate`, `self`, `super`, or `in` and a module path.
+fn restricted_vis(inner: &[Tt]) -> bool {
+    match inner {
+        [Tt::Tok(t)] => matches!(t.tok, Tok::Crate | Tok::SelfLower | Tok::Super),
+        [Tt::Tok(t), rest @ ..] if t.tok == Tok::In => super::match_::mod_path(rest),
+        _ => false,
+    }
+}
+
 /// Validates struct-like named fields.
 fn named_fields(inner: &[Tt], interner: &Interner) -> bool {
     pieces_all(inner, |p| {
@@ -1630,11 +1725,14 @@ fn named_fields(inner: &[Tt], interner: &Interner) -> bool {
         }
         if matches!(p.get(s), Some(Tt::Tok(t)) if t.tok == Tok::Pub) {
             s += 1;
-            if matches!(p.get(s), Some(Tt::Delim(Delim::Paren, _, _))) {
+            if let Some(Tt::Delim(Delim::Paren, inner, _)) = p.get(s) {
+                if !restricted_vis(inner) {
+                    return false;
+                }
                 s += 1;
             }
         }
-        matches!(p.get(s), Some(Tt::Tok(t)) if is_seg(t.tok) || matches!(t.tok, Tok::Int(..)))
+        matches!(p.get(s), Some(Tt::Tok(t)) if matches!(t.tok, Tok::Ident(_)))
             && matches!(p.get(s + 1), Some(Tt::Tok(t)) if t.tok == Tok::Colon)
             && is_ty(&p[s + 2..], interner)
     })
@@ -1649,7 +1747,7 @@ fn ty_pieces(inner: &[Tt], interner: &Interner) -> bool {
         }
         if matches!(p.get(s), Some(Tt::Tok(t)) if t.tok == Tok::Pub) {
             s += 1;
-            if matches!(p.get(s), Some(Tt::Delim(Delim::Paren, _, _))) {
+            if matches!(p.get(s), Some(Tt::Delim(Delim::Paren, inner, _)) if restricted_vis(inner)) {
                 s += 1;
             }
         }
@@ -1663,8 +1761,13 @@ fn parse_item(c: &mut Cur) -> bool {
         return false;
     }
     c.attrs();
-    // Visibility.
-    if c.eat(Tok::Pub) && matches!(c.tree(), Some(Tt::Delim(Delim::Paren, _, _))) {
+    // Visibility: `pub(..)` must be a restriction here (rustc's E0704).
+    if c.eat(Tok::Pub)
+        && let Some(Tt::Delim(Delim::Paren, inner, _)) = c.tree()
+    {
+        if !restricted_vis(inner) {
+            return false;
+        }
         c.i += 1;
     }
     if c.word().as_deref() == Some("default") {
