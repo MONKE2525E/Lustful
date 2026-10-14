@@ -579,8 +579,8 @@
   {
    "id": "dyn.any",
    "title": "dyn Any and downcast",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "6",
    "root_cause": "dyn-trait",
    "fix_class": "compiler",
