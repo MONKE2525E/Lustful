@@ -2481,8 +2481,16 @@ impl<'a> Expander<'a> {
                 };
                 // The parser owns only the plain `name!` form, so a
                 // path-qualified call (`std::println!`) keeps just its
-                // last segment and the bang.
-                out.push(take(&mut trees, group_idx - 2));
+                // last segment and the bang. The name spans the whole
+                // path: rustc reports a panic at the path's start.
+                let start = tok_at(&trees, i).map(|t| t.span);
+                let mut name_tt = take(&mut trees, group_idx - 2);
+                if let (Tt::Tok(t), Some(start)) = (&mut name_tt, start)
+                    && (start.file, start.ctxt) == (t.span.file, t.span.ctxt)
+                {
+                    t.span = start.to(t.span);
+                }
+                out.push(name_tt);
                 out.push(take(&mut trees, group_idx - 1));
                 let fmt_name = segs.last().map_or("", |s| s.text.as_str());
                 let written_lit = is_str_lit_arg(&inner);
@@ -2967,6 +2975,12 @@ impl<'a> Expander<'a> {
                 // last segment and the bang of a qualified path.
                 let head = &call.head[call.head.len().saturating_sub(2)..];
                 let mut out: Vec<Tt> = head.to_vec();
+                // The name spans the whole path, as in `expand_list`.
+                if let (Some(Tt::Tok(tok)), Some(Tt::Tok(first))) = (out.first_mut(), call.head.first())
+                    && (first.span.file, first.span.ctxt) == (tok.span.file, tok.span.ctxt)
+                {
+                    tok.span = first.span.to(tok.span);
+                }
                 // A renamed call keeps the canonical head name:
                 // the parser owns only the plain builtin spellings.
                 if let Some(canon) = alias
