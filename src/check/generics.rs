@@ -5747,6 +5747,18 @@ pub fn add_synthetic_impls(p: &mut Program) {
     }
     // From<T> for T, and Into through From.
     insert_synthetic(p, &mut ordinal, lang.from, p0, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    // The std `From` impls whose `into` calls stay builtin (check/into.rs):
+    // String from &str, &String, and char; Box<T> and Rc<T> from T.
+    {
+        let ref_string = p.tys.mk_ref(false, STRING);
+        for src in [REF_STR, ref_string, CHAR] {
+            insert_synthetic(p, &mut ordinal, lang.from, STRING, &[src], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        let (box_p0, rc_p0) = (p.tys.mk_boxed(p0), p.tys.mk_rc(p0));
+        for t in [box_p0, rc_p0] {
+            insert_synthetic(p, &mut ordinal, lang.from, t, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
     {
         // impl<T, U> Into<U> for T where U: From<T>
         let args = p.tys.intern_args(&[GenericArg::Ty(p1), GenericArg::Ty(p0)]);

@@ -14,6 +14,7 @@ pub mod convert;
 pub mod defaults;
 pub mod fmt;
 pub mod generics;
+pub mod into;
 pub mod iter;
 pub mod method;
 pub mod object;
@@ -10953,6 +10954,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `into()` to a scalar target core has a `From` impl for.
         if let Some(ret) = self.prim_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
+            return ret;
+        }
+        // `into()` through a std `From` impl lust keeps builtin (check/into.rs).
+        if let Some(ret) = self.builtin_into_method(e, rt, name, args, turbofish, expected) {
             return ret;
         }
         // `into_iter()` on a value that is its own iterator.
