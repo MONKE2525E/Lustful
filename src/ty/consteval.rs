@@ -79,6 +79,9 @@ pub struct ConstFnBody {
     pub param_tys: Vec<Ty>,
     pub ret: Ty,
     pub body: ast::BlockId,
+    /// The flat type name `Self` means inside the body: the impl type of
+    /// a method or associated fn, None for a free fn.
+    pub owner: Option<Sym>,
 }
 
 /// The questions the evaluator asks its caller.
@@ -102,6 +105,11 @@ pub trait ConstCx<'a> {
     fn static_item(&mut self, name: Sym) -> Option<(u32, Ty)>;
     /// The struct or variant a struct literal names.
     fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)>;
+    /// Called around a const fn body the evaluator runs: `Self` inside
+    /// it means `owner` (the fn's impl type), not the caller's. Contexts
+    /// that resolve `Self` some other way keep these no-ops.
+    fn enter_const_fn(&mut self, _owner: Option<Sym>) {}
+    fn exit_const_fn(&mut self) {}
     /// Field names and types of one variant, in declaration order. Tuple
     /// fields answer with a dummy name; position is what matters there.
     fn variant_fields(&self, adt: AdtId, variant: u32) -> Vec<(Sym, Ty)>;
@@ -1468,10 +1476,12 @@ impl Evaluator {
                         None => fenv.push((name, v, mutable)),
                     }
                 }
+                cx.enter_const_fn(body.owner);
                 let flow = match bind_err {
                     Some(d) => Err(d),
                     None => self.block(cx, &mut fenv, body.body, Some(body.ret)),
                 };
+                cx.exit_const_fn();
                 self.call_depth -= 1;
                 match flow? {
                     // The fn body is type-checked as a fn; its value has the

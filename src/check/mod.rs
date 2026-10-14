@@ -14325,7 +14325,8 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
                 return CallTarget::Unknown;
             }
             let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
-            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body });
+            let owner = info.owner.map(|a| p.adt(a).name);
+            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner });
         }
         if let Some(a) = self.cx.tuple_struct_ctor(last)
             && segs.len() == 1

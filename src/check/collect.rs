@@ -3039,7 +3039,8 @@ fn eval_const_items<'a>(p: &mut Program<'a>, errs: &mut Vec<Diag>, static_order:
         static_count = nested;
     }
     let n = pending.len();
-    let mut cx = CollectCx { p, pending, by_name, assoc_by_key, self_name: None, self_pat: None, module: None, errs };
+    let mut cx =
+        CollectCx { p, pending, by_name, assoc_by_key, self_name: None, self_pat: None, self_stack: Vec::new(), module: None, errs };
     for i in 0..n {
         cx.eval_pending(i);
     }
@@ -3395,6 +3396,9 @@ struct CollectCx<'x, 'a> {
     /// `Self::CONST` read picks this impl's const among
     /// same-name consts of disjoint impls.
     self_pat: Option<Ty>,
+    /// The (self_name, self_pat) of each const fn body the evaluator
+    /// entered (`enter_const_fn`), restored on exit.
+    self_stack: Vec<(Option<Sym>, Option<Ty>)>,
     /// The defining module of the item now evaluating, for field
     /// privacy in its initializer. Nested item evaluation (an item
     /// that reads another const) restores the outer module, like
@@ -3737,7 +3741,9 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         let fid = if segs.len() == 1 {
             self.p.fn_names.get(&last).copied()
         } else if segs.len() == 2 {
-            match self.p.type_names.get(&segs[0].name) {
+            // `Self::f(..)` names the impl type `Self` means here.
+            let head = if segs[0].name == self.p.known.self_type { self.self_name.unwrap_or(segs[0].name) } else { segs[0].name };
+            match self.p.type_names.get(&head) {
                 Some(&a) => self.p.methods.get(&(a, last)).and_then(|fs| fs.first()).copied(),
                 None => None,
             }
@@ -3755,7 +3761,8 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
                 return CallTarget::Unknown;
             }
             let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
-            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body });
+            let owner = info.owner.map(|a| self.p.adt(a).name);
+            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner });
         }
         if let Some((adt, variant, ty)) = self.variant_ctor(segs) {
             return CallTarget::VariantCtor { adt, variant, ty };
@@ -3766,6 +3773,17 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             return CallTarget::NonConst;
         }
         CallTarget::Unknown
+    }
+    fn enter_const_fn(&mut self, owner: Option<Sym>) {
+        self.self_stack.push((self.self_name, self.self_pat));
+        self.self_name = owner;
+        self.self_pat = None;
+    }
+    fn exit_const_fn(&mut self) {
+        if let Some((name, pat)) = self.self_stack.pop() {
+            self.self_name = name;
+            self.self_pat = pat;
+        }
     }
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)> {
         if segs.len() == 1 && segs[0].name == self.p.known.None {
@@ -3835,6 +3853,9 @@ impl CollectCx<'_, '_> {
 
     /// The (Adt, variant) a two-segment path or a struct name denotes.
     fn variant_of(&self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+        // `Self` in an inherent associated const's initializer names the
+        // owning Adt (`Self(1)`, `Self::A`, `Self { .. }`).
+        let head = |n: Sym| if n == self.p.known.self_type { self.self_name.unwrap_or(n) } else { n };
         // `std::cmp::Ordering::Less`: the same four-segment path
         // `resolve_assoc` answers, for const contexts.
         if segs.len() == 4
@@ -3847,14 +3868,14 @@ impl CollectCx<'_, '_> {
             return Some((a, v as u32));
         }
         if segs.len() == 1 {
-            let &a = self.p.type_names.get(&segs[0].name)?;
+            let &a = self.p.type_names.get(&head(segs[0].name))?;
             if self.p.adt(a).is_enum {
                 return None;
             }
             return Some((a, 0));
         }
         if segs.len() == 2 {
-            let &a = self.p.type_names.get(&segs[0].name)?;
+            let &a = self.p.type_names.get(&head(segs[0].name))?;
             let v = self.p.adt(a).variants.iter().position(|v| v.name == segs[1].name)?;
             return Some((a, v as u32));
         }
