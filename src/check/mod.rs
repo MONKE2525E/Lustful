@@ -1640,6 +1640,50 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.tys.intern(TyKind::FnDef(self.p.def_id(f), EMPTY_ARGS))
     }
 
+    /// An inherent fn as a value through a qualified path (`<W<u16>>::get`):
+    /// a generic impl's fn instantiates as on a plain path, with the
+    /// written Self type fixing the impl's params.
+    fn inherent_qpath_fn_value(&mut self, e: ExprId, f: LocalDefId, base: Ty, span: Span) -> Ty {
+        let p = self.p;
+        if p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
+            return self.fn_value_ty(e, f, span);
+        }
+        let Some(self_tmpl) = p.gx.fn_scopes.get(f.0 as usize).and_then(|s| s.scope.self_ty) else {
+            self.errs.push(not_yet("L0614", span, "generic functions as values through a qualified path"));
+            return ERROR;
+        };
+        let t = self.fn_value_ty_prefixed(e, f, &[], span);
+        if let TyKind::FnDef(_, args) = self.kind(t) {
+            let args: Vec<GenericArg> = self.tys.args(args).to_vec();
+            let self_ty = subst(&mut self.tys, self_tmpl, &args);
+            if !self.unify(self_ty, base) {
+                self.mismatch(span, base, self_ty);
+            }
+        }
+        t
+    }
+
+    /// `fn_value_ty` for a fn whose leading generic args are already
+    /// known (a trait fn through a qualified path: the selected impl's
+    /// args); the fn's own params come from the path's turbofish
+    /// (`<S as Tr>::conv::<u32>`), else fresh variables.
+    fn fn_value_ty_prefixed(&mut self, e: ExprId, f: LocalDefId, prefix: &[GenericArg], span: Span) -> Ty {
+        let Some(Some(tmpl)) = self.p.gx.fn_templates.get(f.0 as usize).cloned() else {
+            return self.tys.intern(TyKind::FnDef(self.p.def_id(f), EMPTY_ARGS));
+        };
+        let mut explicit: Vec<Option<GenericArg>> = prefix.iter().map(|&g| Some(g)).collect();
+        if let Expr::QPath { segs, .. } = self.p.ast.expr(e)
+            && let Some(last) = segs.last()
+        {
+            for t in last.type_args() {
+                explicit.push(Some(GenericArg::Ty(self.resolve_written(t))));
+            }
+        }
+        let (_, _, args) = self.instantiate_template(e, f, &tmpl.generics, &explicit, span);
+        let args = self.tys.intern_args(&args);
+        self.tys.intern(TyKind::FnDef(self.p.def_id(f), args))
+    }
+
     /// The callable-item type of a tuple struct or tuple variant
     /// constructor used as a value. It is an `FnDef` over the Adt def
     /// with the variant index as its first (const) argument, so a later
@@ -6691,8 +6735,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // (`S::mk`, `.map(S::from)`): the written impl's own fn.
         if p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty()) {
             let base = self.tys.adt_ty(a);
-            if let Some(f) = self.trait_fn_value(base, None, item, span) {
-                return f.map(Res::Fn);
+            if let Some(f) = self.trait_fn_value(base, None, item, false, span) {
+                return f.map(|(f, _)| Res::Fn(f));
             }
         }
         let tn = self.name(ty_name).to_string();
@@ -6703,24 +6747,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// A trait's function as a value on a concrete type (`S::mk`,
     /// `<S as Tr>::mk`): the trait (written in `hint`, else every
     /// trait in scope with a method of that name) selects a written
-    /// impl, and its fn is the value. None when nothing applies;
-    /// Some(None) after reporting an ambiguity. Generic impl fns and
-    /// core's synthetic impls have no fn to name here (a reject).
-    fn trait_fn_value(&mut self, base: Ty, hint: Option<TraitRef>, name: Sym, span: Span) -> Option<Option<LocalDefId>> {
-        use crate::traits::index::Synthetic;
+    /// impl, and its fn is the value: the impl's own fn, or the
+    /// trait's default body when the impl does not write it. Returns
+    /// the fn and its instantiation prefix (the impl's args for an
+    /// impl fn, the trait ref's args for a default body). With
+    /// `generic` false only a plain (non-template) fn answers. None
+    /// when nothing applies; Some(None) after reporting an ambiguity.
+    /// Core's synthetic impls have no fn to name here (a reject).
+    fn trait_fn_value(
+        &mut self,
+        base: Ty,
+        hint: Option<TraitRef>,
+        name: Sym,
+        generic: bool,
+        span: Span,
+    ) -> Option<Option<(LocalDefId, Vec<GenericArg>)>> {
         let p = self.p;
         let traits: Vec<DefId> = match hint {
             Some(tr) => vec![tr.def],
             None => p.gx.traits_by_method.get(&name).cloned().unwrap_or_default().into_iter().filter(|&d| method::trait_in_scope_pub(self, d)).collect(),
         };
-        let mut hits: Vec<LocalDefId> = Vec::new();
+        // First pass, rolled back: which traits answer.
+        let mut hits: Vec<TraitRef> = Vec::new();
         for trait_def in traits {
             let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
             if rec.method_by_name(name).is_none() {
                 continue;
             }
-            let snap = self.snapshot_vars();
-            let obl_len = self.obl_len();
             let tr = match hint {
                 Some(t) => t,
                 None => {
@@ -6732,30 +6785,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
                 }
             };
-            let found = match self.select_obligation_at(tr, span, 0) {
-                Selection::Impl { id, ref unbound, .. } if unbound.is_empty() => {
-                    let rec_impl = p.gx.index.get(id);
-                    if rec_impl.synthetic != Synthetic::None {
-                        None
-                    } else {
-                        rec_impl
-                            .items
-                            .iter()
-                            .find_map(|&d| p.local_def(d.hash).filter(|&l| p.fn_info(l).name == name))
-                            .filter(|&l| p.gx.fn_templates.get(l.0 as usize).is_none_or(|t| t.is_none()))
-                    }
-                }
-                _ => None,
-            };
+            let snap = self.snapshot_vars();
+            let obl_len = self.obl_len();
+            let found = self.trait_fn_of(tr, name, generic, span).is_some();
             self.rollback_vars(snap);
             self.obl_truncate(obl_len);
-            if let Some(f) = found {
-                hits.push(f);
+            if found {
+                hits.push(tr);
             }
         }
         match hits.len() {
             0 => None,
-            1 => Some(Some(hits[0])),
+            // The winner selects again, keeping its bindings.
+            1 => self.trait_fn_of(hits[0], name, generic, span).map(Some),
             _ => {
                 self.err(
                     "L0720",
@@ -6766,6 +6808,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(None)
             }
         }
+    }
+
+    /// One trait's fn `name` for trait ref `tr` (see `trait_fn_value`):
+    /// selection must confirm a written impl with every impl param known.
+    fn trait_fn_of(&mut self, tr: TraitRef, name: Sym, generic: bool, span: Span) -> Option<(LocalDefId, Vec<GenericArg>)> {
+        use crate::traits::index::Synthetic;
+        let p = self.p;
+        let Selection::Impl { id, args: impl_args, unbound, .. } = self.select_obligation_at(tr, span, 0) else { return None };
+        let rec_impl = p.gx.index.get(id);
+        if !unbound.is_empty() || rec_impl.synthetic != Synthetic::None {
+            return None;
+        }
+        let (f, prefix) = match rec_impl.items.iter().find_map(|&d| p.local_def(d.hash).filter(|&l| p.fn_info(l).name == name)) {
+            Some(l) => (l, impl_args),
+            None => {
+                let m = p.gx.index.trait_record(tr.def)?.method_by_name(name)?;
+                let l = p.local_def(m.hash)?;
+                let raw: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+                (l, raw.into_iter().map(|g| if let GenericArg::Ty(t) = g { GenericArg::Ty(self.deep(t)) } else { g }).collect())
+            }
+        };
+        let is_template = p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
+        if is_template && !generic {
+            return None;
+        }
+        Some((f, prefix))
     }
 
     /// The one turbofish type argument on a path callee's last
@@ -10937,17 +11005,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // so it rejects with the error below instead.
                 if let Res::Fn(f) = r {
                     self.set_res(e, r);
-                    return self.fn_value_ty(e, f, span);
+                    return self.inherent_qpath_fn_value(e, f, base, span);
                 }
             } else {
                 return ERROR;
             }
         }
-        // A trait's function as a value: `<S as Tr>::mk`.
-        if let Some(found) = self.trait_fn_value(self.resolve(base), hint, name, span) {
-            let Some(f) = found else { return ERROR };
+        // A trait's function as a value: `<S as Tr>::mk`, also a
+        // generic impl's fn or a trait default body, instantiated at
+        // the selected impl's (or trait ref's) args.
+        if let Some(found) = self.trait_fn_value(self.resolve(base), hint, name, true, span) {
+            let Some((f, prefix)) = found else { return ERROR };
             self.set_res(e, Res::Fn(f));
-            return self.fn_value_ty(e, f, span);
+            return self.fn_value_ty_prefixed(e, f, &prefix, span);
         }
         self.err(
             "L0104",

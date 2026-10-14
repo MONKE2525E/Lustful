@@ -1577,6 +1577,9 @@ impl<'p, 'a> Lower<'p, 'a> {
             // above from its value.
             Expr::QPath { .. } => {
                 if let Res::Fn(f) = self.ck.res(e) {
+                    // A generic fn (an impl's or a trait default) names
+                    // its mono instance, as on a plain path.
+                    let f = self.resolve_generic_fn(e, f);
                     let want = match dest {
                         Some(d) if d.proj.is_empty() => {
                             let dt = self.body.locals[d.local as usize].ty;
