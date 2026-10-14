@@ -25,12 +25,21 @@ use crate::intern::FxMap;
 use crate::traits::solve::Selection;
 use std::sync::OnceLock;
 
-/// Generated table: `<std type name> <letter><item> ...` per line (see the
-/// generator for the letters).
+/// Generated table (see the generator for the format): per std type its
+/// items as receiver letter + name and its non-prelude std traits as
+/// `@path`; per such trait a `#path` line of its items.
 static TABLE: &str = include_str!("std_inherent.txt");
 
-/// Std type name to item name to receiver letters.
-type Table = FxMap<&'static str, FxMap<&'static str, Vec<u8>>>;
+/// Item name to receiver letters.
+type Items = FxMap<&'static str, Vec<u8>>;
+
+/// The parsed table: std types (items, non-prelude traits) and the items
+/// of those traits, by path.
+#[derive(Default)]
+struct Table {
+    types: FxMap<&'static str, (Items, Vec<&'static str>)>,
+    traits: FxMap<&'static str, Items>,
+}
 
 fn table() -> &'static Table {
     static T: OnceLock<Table> = OnceLock::new();
@@ -38,21 +47,28 @@ fn table() -> &'static Table {
         let mut t = Table::default();
         for line in TABLE.lines() {
             let mut words = line.split(' ');
-            let Some(ty) = words.next() else { continue };
-            let items = t.entry(ty).or_default();
+            let Some(head) = words.next() else { continue };
+            let (items, traits) = match head.strip_prefix('#') {
+                Some(path) => (t.traits.entry(path).or_default(), None),
+                None => {
+                    let e = t.types.entry(head).or_default();
+                    (&mut e.0, Some(&mut e.1))
+                }
+            };
+            let mut traits = traits;
             for w in words {
-                if let Some((&letter, name)) = w.as_bytes().split_first() {
-                    items.entry(&w[1..1 + name.len()]).or_default().push(letter);
+                match (w.strip_prefix('@'), traits.as_deref_mut()) {
+                    (Some(path), Some(ts)) => ts.push(path),
+                    _ => {
+                        if let Some((&letter, _)) = w.as_bytes().split_first() {
+                            items.entry(&w[1..]).or_default().push(letter);
+                        }
+                    }
                 }
             }
         }
         t
     })
-}
-
-/// The receiver letters std gives item `item` on the std type named `ty`.
-fn std_letters(ty: &str, item: &str) -> &'static [u8] {
-    table().get(ty).and_then(|m| m.get(item)).map_or(&[], |v| &v[..])
 }
 
 /// What the method probe order says about a call whose receiver chain
@@ -125,13 +141,41 @@ impl Ctx<'_, '_> {
     /// The receiver letters std gives `item` at type `t` (the union over
     /// its table names). Inference variables have no inherent candidates
     /// in rustc, so only their trait letters count.
-    fn std_letters_at(&self, t: Ty, item: &str) -> Vec<u8> {
+    fn std_letters_at(&mut self, t: Ty, item: &str) -> Vec<u8> {
         let infer = matches!(self.tys.kind(t), TyKind::Infer(_));
+        let tab = table();
         let mut out: Vec<u8> = Vec::new();
         for n in self.std_type_names(t) {
-            out.extend(std_letters(&n, item).iter().filter(|l| !infer || l.is_ascii_uppercase()));
+            let Some((items, traits)) = tab.types.get(n.as_str()) else { continue };
+            out.extend(items.get(item).into_iter().flatten().filter(|l| !infer || l.is_ascii_uppercase()));
+            for &path in traits {
+                if let Some(ls) = tab.traits.get(path).and_then(|m| m.get(item))
+                    && self.std_trait_may_be_in_scope(path)
+                {
+                    out.extend(ls);
+                }
+            }
         }
         out
+    }
+
+    /// True unless std trait `path` (not in the prelude) is surely out of
+    /// scope everywhere in the crate: no `use` of a std item of its name,
+    /// no glob of a std module, and no std trait lust models under its
+    /// name in scope here. rustc probes only traits in scope.
+    fn std_trait_may_be_in_scope(&mut self, path: &str) -> bool {
+        let p = self.p;
+        let simple = path.rsplit("::").next().unwrap_or(path);
+        let Some(res) = &p.resolved else { return true };
+        if !res.std_globs.is_empty() {
+            return true;
+        }
+        let named = |s: &Sym| p.interner.get(*s) == simple;
+        if res.std_aliases.values().any(|(_, path)| path.last().is_some_and(named)) {
+            return true;
+        }
+        let modeled: Vec<DefId> = p.gx.trait_names.iter().filter(|(n, _)| named(n)).map(|(_, &d)| d).collect();
+        modeled.into_iter().any(|d| !self.is_user_trait(d) && method::trait_in_scope_pub(self, d))
     }
 
     /// rustc's autoderef steps for a method probe from receiver type `rt`:

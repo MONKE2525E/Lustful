@@ -24,7 +24,10 @@ trait's provided methods too). For `reference` and `pointer`, the impls
 come from the implementor lists of the trait pages (`Ord for &A`). The letter is the receiver: `v`/`V` self,
 `r`/`R` &self, `m`/`M` &mut self, `t`/`T` a typed self (`self: Box<Self>`),
 `-`/`_` none (an associated fn or const, reachable only by a path). One
-name can have several items.
+name can have several items. Uppercase items are the 2024 prelude traits'
+only; a type's other std traits are `@std::io::Read` tokens, and each of
+those traits has a line `#std::io::Read <item> ...` at the end, since
+rustc only probes a trait that is in scope.
 
 Every set is a union: types that share a simple name (the many `Iter`
 structs) share one line, which only rejects more, never less. Traits are
@@ -51,6 +54,14 @@ TRAIT_LINK = re.compile(r'class="trait" href="[^"]*" title="trait ([A-Za-z0-9_:]
 # (`impl-Ord-for-%26A`): rustdoc lists those there, not on the primitive page.
 PTR_IMPLEMENTOR = re.compile(r'<section id="impl-[^"]*?-for-(%26|%2A)')
 TAG = re.compile(r'<[^>]*>')
+# The traits of the 2024 prelude, always in scope; any other std trait
+# counts only where the program may import it (`@path` tokens).
+PRELUDE = {'std::' + p for p in (
+    'marker::Copy marker::Send marker::Sized marker::Sync marker::Unpin ops::Drop ops::Fn ops::FnMut ops::FnOnce '
+    'ops::AsyncFn ops::AsyncFnMut ops::AsyncFnOnce borrow::ToOwned clone::Clone cmp::PartialEq cmp::PartialOrd cmp::Eq '
+    'cmp::Ord convert::AsRef convert::AsMut convert::Into convert::From convert::TryFrom convert::TryInto '
+    'default::Default iter::Iterator iter::Extend iter::IntoIterator iter::DoubleEndedIterator '
+    'iter::ExactSizeIterator iter::FromIterator string::ToString future::Future future::IntoFuture').split()}
 RECEIVER = re.compile(r"\(\s*(?:mut\s+)?(&\s*(?:'\w+\s+)?(mut\s+)?)?self\b(\s*:)?")
 
 
@@ -122,12 +133,21 @@ def main():
                     body = html[start : end.start() if end else len(html)]
                 inherent.setdefault(name, set()).update(items(body, False))
                 impls.setdefault(name, set()).update(impl_traits(html))
+    key = lambda s: (s[1:], s[0])
+    used = set()
     for ty in sorted(inherent):
         names = set(inherent[ty])
+        others = set()
         for tr in impls.get(ty, ()):
-            names |= traits.get(tr, set())
-        if names:
-            print(ty, ' '.join(sorted(names, key=lambda s: (s[1:], s[0]))))
+            if tr in PRELUDE:
+                names |= traits.get(tr, set())
+            elif traits.get(tr):
+                others.add('@' + tr)
+        used |= others
+        if names or others:
+            print(ty, ' '.join(sorted(names, key=key) + sorted(others)))
+    for tr in sorted(used):
+        print('#' + tr[1:], ' '.join(sorted(traits[tr[1:]], key=key)))
 
 
 if __name__ == '__main__':
