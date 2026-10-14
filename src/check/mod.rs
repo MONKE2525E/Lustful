@@ -7630,10 +7630,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// The Self type of `Type::name(..)` when the call goes through a
-    /// trait: `Type` is an Adt with no variant and no inherent fn called
-    /// `name`, or `picked` (the template check already resolved the call
-    /// through a trait). Type arguments are fresh variables.
-    fn trait_assoc_base(&mut self, segs: &[ast::PathSeg], picked: bool) -> Option<Ty> {
+    /// trait: `Type` is an Adt (or an alias of one) with no variant and
+    /// no inherent fn called `name`, or `picked` (the template check
+    /// already resolved the call through a trait). Type arguments are
+    /// the written ones (`M::<u8>::mk`, `Self` in `impl M<u8>`, an
+    /// alias's), else fresh variables: rustc selects the impl for
+    /// that type (E0599 when only `M<u16>` has one).
+    fn trait_assoc_base(&mut self, segs: &[ast::PathSeg], picked: bool, span: Span) -> Option<Ty> {
         let p = self.p;
         let (ty_name, item) = (segs[0].name, segs[1].name);
         // A primitive type names itself as the base (`u32::from(x)`):
@@ -7657,7 +7660,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.self_adt()?
         } else {
             match self.binding(Namespace::Type, ty_name) {
-                BindingRes::Def(def) => p.adt_by_def(def)?,
+                BindingRes::Def(def) => p.adt_by_def(def).or_else(|| self.alias_adt(ty_name).map(|(a, _)| a))?,
                 _ => return None,
             }
         };
@@ -7671,7 +7674,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if generics.params.is_empty() {
             return Some(self.tys.adt_ty(a));
         }
-        let args = self.fresh_args(&generics);
+        let args = self.value_path_args(a, &segs[..1], span);
         Some(self.tys.mk_adt(p.def_of_adt(a), &args))
     }
 
@@ -8567,7 +8570,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if segs.len() == 2
                     && !(segs[1].name == p.known.clone
                         && [p.known.String, p.known.Vec, p.known.Box, p.known.Rc].contains(&segs[0].name))
-                    && let Some(base) = self.trait_assoc_base(segs, self.replay_pick(e).is_some())
+                    && let Some(base) = self.trait_assoc_base(segs, self.replay_pick(e).is_some(), span)
                     && let Some(t) = self.assoc_call(e, callee, base, None, segs[1].name, args, span)
                 {
                     return t;
