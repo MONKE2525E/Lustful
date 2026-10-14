@@ -1858,9 +1858,12 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, " default: goto bb{}; }}", other.0);
             }
             Terminator::Call { target, args, dest, next, unwind } => {
-                // No unwind edges exist yet (W-PANIC builds them); the slot
-                // is carried so that work needs no IR change.
-                debug_assert!(unwind.is_none(), "cgen has no unwind edges yet");
+                // Calls carry a cleanup (unwind) successor since
+                // W-CORELANG. The C form has no edge to it: the cleanup
+                // blocks are emitted like any other block, and a panic
+                // in the callee aborts before they could run. Wave C
+                // gives the edge real work.
+                let _ = unwind;
                 let mentions =
                     args.iter().any(|o| operand_mentions(o, dest.local)) || matches!(target, CallTarget::Indirect(c) if *c == dest.local);
                 // A call to a never fn (unit C form) whose destination
