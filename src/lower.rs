@@ -1408,6 +1408,22 @@ impl<'p, 'a> Lower<'p, 'a> {
                     }
                     return;
                 }
+                // `&|n| n - 1`: a shared borrow of a closure that captures
+                // nothing is promoted too (rustc promotes the constant
+                // value; the env is empty).
+                if !*mutable
+                    && matches!(p.ast.expr(*expr), Expr::Closure { .. })
+                    && self.ck.closures.iter().any(|c| c.expr == *expr && c.captures.is_empty())
+                {
+                    let ct = self.ty(*expr);
+                    let t = self.new_local(ct, true, None);
+                    self.closure_value(*expr, Some(&Place::local(t)), span);
+                    self.body.promoted.push(t);
+                    if let Some(d) = dest {
+                        self.assign(d.clone(), Rvalue::Ref(false, Place::local(t)), span);
+                    }
+                    return;
+                }
                 if let Res::Static(idx) = self.ck.res(*expr) {
                     if let Some(d) = dest {
                         self.assign(d.clone(), Rvalue::StaticRef(idx), span);

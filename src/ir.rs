@@ -262,9 +262,10 @@ pub struct Body<'g> {
     /// the local's regions to it; a cached body has none (it is never
     /// borrow-checked again).
     pub annotations: Vec<(Local, Ty)>,
-    /// Promoted temporaries (W-BORROW): the storage of a `&[]` or `&mut
-    /// []`, which rustc promotes to `'static`. An empty array has no
-    /// bytes, so such a local never dies and its borrows make no loan.
+    /// Promoted temporaries (W-BORROW): the storage of a `&[]`, `&mut
+    /// []`, or `&|..| ..` with no captures, which rustc promotes to
+    /// `'static`. The value has no bytes, so such a local never dies and
+    /// its borrows make no loan.
     pub promoted: Vec<Local>,
 }
 
