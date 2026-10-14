@@ -395,7 +395,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.rollback_vars(snap);
             }
         }
+        // A builtin item as the callable (`.map(Some)`) is fine here:
+        // borrowck checks the adapter call's summary, so it is not a
+        // generic Fn-bound argument (`deferred_item_args`).
+        let item_args = self.deferred_item_args.len();
         self.check_args(&params, args, span);
+        self.deferred_item_args.truncate(item_args);
         // The expansion calls closures, fn items, and fn pointers; a
         // `dyn Fn` value, or a reference or box around a callable
         // (`.map(r)` for `r: &dyn Fn(..)`), meets the bound but has no

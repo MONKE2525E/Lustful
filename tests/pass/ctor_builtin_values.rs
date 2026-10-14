@@ -34,7 +34,7 @@ fn main() {
     println!("{:?}", q(-9));
     let ok = Result::<u8, bool>::Ok;
     println!("{:?}", ok(10));
-    println!("{:?}", twice(Err::<(), &str>, "a", "b"));
+    println!("{:?}", twice(Err::<(), u8>, 1, 2));
     let pick = if v.len() > 1 { Some } else { Some };
     println!("{:?}", pick(11u16));
     println!("{:?}", shadow::run());
