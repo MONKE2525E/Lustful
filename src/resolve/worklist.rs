@@ -417,6 +417,43 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
             _ => {}
         }
     }
+    nested_fn_in_generic(toks)
+}
+
+/// True when a `fn` item sits inside the body of a fn of a generic item
+/// (`fn f<T>() { fn g() {} }`, or a method of `impl<T>`): the resolver
+/// rejects a path in it to an outer generic param (rustc E0401), which
+/// otherwise reads the module item that the param shadows. A token scan
+/// with a brace stack; a piece of a big file that closes braces it did
+/// not open counts its earlier fns as possibly nested.
+fn nested_fn_in_generic(toks: &[lexer::Token]) -> bool {
+    use crate::lexer::Tok;
+    // Per open brace: (a fn body, inside a generic item).
+    let mut stack: Vec<(bool, bool)> = Vec::new();
+    let (mut fn_pending, mut generic_pending, mut fn_at_top) = (false, false, false);
+    for (i, t) in toks.iter().enumerate() {
+        let next = |k: usize| toks.get(i + k).map(|t| t.tok);
+        match t.tok {
+            Tok::Fn if matches!(next(1), Some(Tok::Ident(_))) => {
+                if stack.iter().any(|&(body, _)| body) && stack.last().is_some_and(|&(_, g)| g) {
+                    return true;
+                }
+                fn_at_top |= stack.is_empty();
+                fn_pending = true;
+                generic_pending |= next(2) == Some(Tok::Lt);
+            }
+            Tok::Impl if next(1) == Some(Tok::Lt) => generic_pending = true,
+            Tok::Trait if next(2) == Some(Tok::Lt) => generic_pending = true,
+            Tok::Semi => (fn_pending, generic_pending) = (false, false),
+            Tok::LBrace => {
+                let outer = stack.last().is_some_and(|&(_, g)| g);
+                stack.push((fn_pending, generic_pending || outer));
+                (fn_pending, generic_pending) = (false, false);
+            }
+            Tok::RBrace if stack.pop().is_none() && fn_at_top => return true,
+            _ => {}
+        }
+    }
     false
 }
 
@@ -2769,6 +2806,7 @@ fn resolve_one(
                 diags: Vec::new(),
                 gen_params: Vec::new(),
                 std_splice_lo: input.std_splice_lo,
+                gen_floor: 0,
             };
             rw.file_items(&mut w.ast, *fi, module, &[]);
             rw.diags
@@ -4184,6 +4222,10 @@ struct Rewrite<'a> {
     /// must not resolve to user names; check resolves it in `STD_MODULE`.
     /// (The std source modules are `mod` items: the rewrite walks them.)
     std_splice_lo: Option<u32>,
+    /// `gen_params` below this index belong to items around the block
+    /// item being rewritten (a nested fn, const, or static). They still
+    /// shadow module items, but a path to one is rustc E0401.
+    gen_floor: usize,
 }
 
 impl Rewrite<'_> {
@@ -4200,6 +4242,18 @@ impl Rewrite<'_> {
             if let crate::ast::TraitBound::Trait { trait_ref, .. } = b {
                 self.rewrite_path(&mut trait_ref.path, Namespace::Type, span, module, &[], ast);
             }
+        }
+    }
+
+    /// Whether a generic param (a const one when `is_const`) takes a
+    /// path's first segment in namespace `ns`: any param in a type path,
+    /// a const param as a one-segment value, a type param before `::`
+    /// in a value path (`T::default()`).
+    fn param_takes(ns: Namespace, single: bool, is_const: bool) -> bool {
+        match ns {
+            Namespace::Type => true,
+            Namespace::Value => single == is_const,
+            _ => false,
         }
     }
 
@@ -4516,6 +4570,11 @@ impl Rewrite<'_> {
         if single && ns == Namespace::Value && Self::frames_bind(scopes, flat) {
             return true;
         }
+        // A crate-root item's flat name is its plain name, so a generic
+        // param of the item being checked would take `crate::N` too.
+        if self.gen_params[self.gen_floor..].iter().any(|&(n, is_const)| n == flat && Self::param_takes(ns, single, is_const)) {
+            return true;
+        }
         let ns = if single { ns } else { Namespace::Type };
         match self.tables.lookup(module, ns, flat) {
             Some(BindState::One(b)) => self.tables.target_def(b.target) != def,
@@ -4753,13 +4812,17 @@ impl Rewrite<'_> {
             // imports: a type or const param in a type path, a const
             // param as a value, a type param before `::` in a value path
             // (`T::default()`). Check resolves the path as written.
-            if let Some(&(_, is_const)) = self.gen_params.iter().rev().find(|(n, _)| Some(n) == names.first())
-                && match ns {
-                    Namespace::Type => true,
-                    Namespace::Value => (names.len() == 1) == is_const,
-                    _ => false,
-                }
+            if let Some(i) = self.gen_params.iter().rposition(|(n, _)| Some(n) == names.first())
+                && Self::param_takes(ns, names.len() == 1, self.gen_params[i].1)
             {
+                if i < self.gen_floor {
+                    self.diags.push(Diag::new(
+                        if ns == Namespace::Type || names.len() > 1 { "L0102" } else { "L0101" },
+                        span,
+                        "can't use generic parameters from outer item",
+                        "Give the inner item its own generic parameter, or pass the value in.",
+                    ));
+                }
                 return;
             }
             if self.expand_std_alias(segs, &names, ns, module, scopes) {
@@ -4984,6 +5047,13 @@ impl Rewrite<'_> {
     /// a const, or a static) in `outer`: the enclosing frames with
     /// their locals dropped, since an item cannot see them.
     fn stmt_item_body(&mut self, ast: &mut Ast, idx: u32, module: ModuleId, outer: &[Frame]) {
+        let floor = std::mem::replace(&mut self.gen_floor, self.gen_params.len());
+        self.stmt_item_kind(ast, idx, module, outer);
+        self.gen_floor = floor;
+    }
+
+    /// `stmt_item_body` for one item kind, with the outer params below the floor.
+    fn stmt_item_kind(&mut self, ast: &mut Ast, idx: u32, module: ModuleId, outer: &[Frame]) {
         let Some(item) = ast.stmt_items.get_mut(idx as usize) else { return };
         match &mut item.kind {
             ItemKind::Fn(f) => {
@@ -5509,6 +5579,13 @@ impl Rewrite<'_> {
                 self.rewrite_path(&mut segs, Namespace::Value, span, module, scopes, ast);
                 ast.pats[id.0 as usize] = Pat::Path(segs);
             }
+            Pat::QPath { self_ty, mut trait_path, segs } => {
+                self.ty(ast, self_ty, module, scopes);
+                if !trait_path.is_empty() {
+                    self.rewrite_path(&mut trait_path, Namespace::Type, span, module, scopes, ast);
+                }
+                ast.pats[id.0 as usize] = Pat::QPath { self_ty, trait_path, segs };
+            }
             Pat::TupleStruct { path: mut s, elems } => {
                 self.rewrite_ctor_path(&mut s, span, module, scopes, ast);
                 for e in &elems {
@@ -5601,6 +5678,20 @@ impl Rewrite<'_> {
             let Expr::Path(mut segs) = std::mem::replace(&mut ast.exprs[id.0 as usize], Expr::Unit) else { return };
             self.rewrite_path(&mut segs, Namespace::Value, span, module, scopes, ast);
             ast.exprs[id.0 as usize] = Expr::Path(segs);
+            return;
+        }
+        // `<T as Trait>::item`: the self type and the trait resolve in
+        // this module, as in a type position (a trait of the name at the
+        // crate root must not win).
+        if matches!(ast.exprs[id.0 as usize], Expr::QPath { .. }) {
+            let Expr::QPath { self_ty, mut trait_path, segs } = std::mem::replace(&mut ast.exprs[id.0 as usize], Expr::Unit) else {
+                return;
+            };
+            self.ty(ast, self_ty, module, scopes);
+            if !trait_path.is_empty() {
+                self.rewrite_path(&mut trait_path, Namespace::Type, span, module, scopes, ast);
+            }
+            ast.exprs[id.0 as usize] = Expr::QPath { self_ty, trait_path, segs };
             return;
         }
         if matches!(ast.exprs[id.0 as usize], Expr::StructLit { .. }) {
