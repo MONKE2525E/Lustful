@@ -1,0 +1,205 @@
+// `std::env` (W-SHIM): environment variables, program arguments as
+// `OsString`s, and the current directory, as on Linux.
+//
+// `args()` and `args().count()` keep the compiler's own std handling;
+// this module adds the items that need the OS strings. Setting and
+// removing variables are `unsafe fn` in edition 2024 and stay out.
+
+use crate::ffi::{OsStr, OsString};
+use crate::io;
+use crate::path::{Path, PathBuf};
+use core::fmt;
+
+/// Why `var` failed.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum VarError {
+    /// The variable is not set.
+    NotPresent,
+    /// The variable is set, but its value is not valid Unicode.
+    NotUnicode(OsString),
+}
+
+impl fmt::Display for VarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VarError::NotPresent => f.write_str("environment variable not found"),
+            VarError::NotUnicode(s) => write!(f, "environment variable was not valid unicode: {:?}", s),
+        }
+    }
+}
+
+/// The value of the variable `key` as an `OsString`, None when unset.
+pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
+    let key: &OsStr = key.as_ref();
+    let mut value: Vec<u8> = Vec::new();
+    if core::intrinsics::sys_getenv(key.as_encoded_bytes(), &mut value) { Some(OsString::from_vec(value)) } else { None }
+}
+
+/// The value of the variable `key` as a `String`.
+pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
+    match var_os(key) {
+        Some(s) => match s.into_string() {
+            Ok(text) => Ok(text),
+            Err(s) => Err(VarError::NotUnicode(s)),
+        },
+        None => Err(VarError::NotPresent),
+    }
+}
+
+/// The NUL-terminated entries of a runtime list, as byte vectors.
+fn split_nul(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut start = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] == 0 {
+            out.push(bytes[start..i].to_vec());
+            start = i + 1;
+        }
+    }
+    out
+}
+
+/// The environment as (name, value) pairs, as std's Unix parser reads
+/// `environ`: the name ends at the first `=` after its first byte, and
+/// entries without one are skipped.
+fn env_pairs() -> Vec<(OsString, OsString)> {
+    let mut raw: Vec<u8> = Vec::new();
+    core::intrinsics::sys_environ(&mut raw);
+    let mut out: Vec<(OsString, OsString)> = Vec::new();
+    for entry in split_nul(&raw) {
+        if entry.is_empty() {
+            continue;
+        }
+        let mut pos = 1;
+        while pos < entry.len() && entry[pos] != b'=' {
+            pos += 1;
+        }
+        if pos < entry.len() {
+            out.push((OsString::from_vec(entry[..pos].to_vec()), OsString::from_vec(entry[pos + 1..].to_vec())));
+        }
+    }
+    out
+}
+
+/// An iterator over the environment as `OsString` pairs (`vars_os`).
+pub struct VarsOs {
+    pairs: Vec<(OsString, OsString)>,
+    next: usize,
+}
+
+impl Iterator for VarsOs {
+    type Item = (OsString, OsString);
+
+    fn next(&mut self) -> Option<(OsString, OsString)> {
+        if self.next < self.pairs.len() {
+            self.next += 1;
+            Some(self.pairs[self.next - 1].clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// An iterator over the environment as `String` pairs (`vars`). It
+/// panics on a name or value that is not valid Unicode, as std does.
+pub struct Vars {
+    inner: VarsOs,
+}
+
+impl Iterator for Vars {
+    type Item = (String, String);
+
+    fn next(&mut self) -> Option<(String, String)> {
+        match self.inner.next() {
+            Some((k, v)) => Some((unicode(k), unicode(v))),
+            None => None,
+        }
+    }
+}
+
+/// The text of an environment name or value; panics as std's
+/// `into_string().unwrap()` does when it is not valid Unicode.
+fn unicode(s: OsString) -> String {
+    match s.into_string() {
+        Ok(text) => text,
+        Err(e) => panic!("called `Result::unwrap()` on an `Err` value: {:?}", e),
+    }
+}
+
+/// The environment at the time of the call, as `OsString` pairs.
+pub fn vars_os() -> VarsOs {
+    VarsOs { pairs: env_pairs(), next: 0 }
+}
+
+/// The environment at the time of the call, as `String` pairs.
+pub fn vars() -> Vars {
+    Vars { inner: vars_os() }
+}
+
+/// An iterator over the program arguments as `OsString`s (`args_os`).
+pub struct ArgsOs {
+    args: Vec<Vec<u8>>,
+    next: usize,
+}
+
+impl Iterator for ArgsOs {
+    type Item = OsString;
+
+    fn next(&mut self) -> Option<OsString> {
+        if self.next < self.args.len() {
+            self.next += 1;
+            Some(OsString::from_vec(self.args[self.next - 1].clone()))
+        } else {
+            None
+        }
+    }
+}
+
+/// The program arguments, the program name first, as `OsString`s.
+pub fn args_os() -> ArgsOs {
+    let mut raw: Vec<u8> = Vec::new();
+    core::intrinsics::sys_argv(&mut raw);
+    ArgsOs { args: split_nul(&raw), next: 0 }
+}
+
+/// The error of a path argument that holds a NUL byte.
+fn nul_error() -> io::Error {
+    io::Error::simple_message(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")
+}
+
+/// The current working directory.
+pub fn current_dir() -> io::Result<PathBuf> {
+    let mut buf: Vec<u8> = Vec::new();
+    match core::intrinsics::sys_getcwd(&mut buf) {
+        0 => Ok(PathBuf::from_os_string(OsString::from_vec(buf))),
+        code => Err(io::Error::from_raw_os_error(code)),
+    }
+}
+
+/// Changes the current working directory.
+pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
+    let path: &Path = path.as_ref();
+    match core::intrinsics::sys_chdir(path.as_os_str().as_encoded_bytes()) {
+        0 => Ok(()),
+        -1 => Err(nul_error()),
+        code => Err(io::Error::from_raw_os_error(code)),
+    }
+}
+
+/// The directory for temporary files: `TMPDIR`, else `/tmp`.
+pub fn temp_dir() -> PathBuf {
+    match var_os("TMPDIR") {
+        Some(dir) => PathBuf::from_os_string(dir),
+        None => PathBuf::from_os_string(OsString::from_vec(b"/tmp".to_vec())),
+    }
+}
+
+/// The path of the running executable (`/proc/self/exe`).
+pub fn current_exe() -> io::Result<PathBuf> {
+    let mut buf: Vec<u8> = Vec::new();
+    match core::intrinsics::sys_readlink(&b"/proc/self/exe"[..], &mut buf) {
+        0 => Ok(PathBuf::from_os_string(OsString::from_vec(buf))),
+        2 => Err(io::Error::simple_message(io::ErrorKind::__Uncategorized, "no /proc/self/exe available. Is /proc mounted?")),
+        code => Err(io::Error::from_raw_os_error(code)),
+    }
+}

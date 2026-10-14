@@ -3670,6 +3670,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => false,
         }
     }
+    /// True when `field` is the unsized field of the newtype `outer`,
+    /// directly or through nested newtypes (W-SHIM coercion in shipped
+    /// std source).
+    fn newtype_field_of(&self, outer: Ty, field: Ty) -> bool {
+        let mut t = outer;
+        while let TyKind::Adt(d, _) = self.kind(t) {
+            let Some(f) = self.tys.unsized_field(d) else { return false };
+            if f == field {
+                return true;
+            }
+            t = f;
+        }
+        false
+    }
     fn mismatch(&mut self, span: Span, expected: Ty, found: Ty) {
         let (e, f) = (self.tn(expected), self.tn(found));
         let fix = if e == "&str" && f == "String" {
@@ -3841,6 +3855,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.dyn_regions(xe, ye, em.is_mut(), span);
                 }
                 Coerce::SliceFromVec(em.is_mut())
+            }
+            // Shipped std source only (W-SHIM): a reference to the field
+            // of an unsized newtype is a reference to the newtype, as
+            // std's pointer casts make it (`&OsStr` to `&Path`, `&[u8]`
+            // to `&OsStr`). Both have one C form, so the value stays.
+            (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
+                if (!em.is_mut() || fm.is_mut())
+                    && self.p.shipped_crate_at(span) == Some(crate::ty::lang::ShippedCrate::Std)
+                    && self.newtype_field_of(self.resolve(y), self.resolve(x)) =>
+            {
+                if let Some(e) = e {
+                    self.set(e, expected);
+                }
+                Coerce::None
             }
             // A plain fn item coerces to a function pointer with the
             // same signature (the value materializes as its trampoline).
@@ -8007,6 +8035,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => None,
         };
         if let Some(v) = is_variant {
+            if self.hidden_variant(a, v as u32, span) {
+                return None;
+            }
             return Some(Res::Variant(a, v as u32));
         }
         p.inherent_reads(&mut self.out.reads, adef, item);
@@ -13243,6 +13274,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         self.err("L0110", span, "this variant has fields", "Match its fields with `(..)` or `{ .. }`.");
                         return;
                     }
+                    if self.hidden_variant(a, v, span) {
+                        return;
+                    }
                     self.out.pat_res[pi] = PatRes::Variant(a, v);
                     return;
                 }
@@ -13482,6 +13516,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 }
                                 if p.adt(a).variants[v as usize].shape != VariantShape::Unit {
                                     self.err("L0110", span, "this variant has fields", "Match its fields with `(..)` or `{ .. }`.");
+                                    return;
+                                }
+                                if self.hidden_variant(a, v, span) {
                                     return;
                                 }
                                 self.out.pat_res[pi] = PatRes::Variant(a, v);

@@ -55,8 +55,9 @@ the upstream features it implements, and its exact-layout types.
 `library/std/src/platform.rs` is a second std crate, loaded the other
 way: the resolver adds it to the session as a lust-owned dependency
 named `std` when a file can name a platform module (a byte scan for
-`std::io`, `std::fs`, `std::env`, `std::path`, `std::process`,
-`std::{`; `resolve::worklist::mentions_std_platform`). Then:
+`std::{` and `std::<module>` over `STD_PLATFORM_MODULES`, except
+`std::env::args` and `std::process::exit`/`abort` alone;
+`resolve::worklist::mentions_std_platform`). Then:
 
 - A written `std::<module>::<item>...` path, a `use` of it, and an
   alias of the module (`use std::io; io::stdout()`) resolve into the
@@ -75,11 +76,25 @@ named `std` when a file can name a platform module (a byte scan for
   rejected (L0641, check/platform.rs): std would call its `write` once
   per format piece.
 - Unstable std items carry a `__` prefix (`ErrorKind::__Uncategorized`);
-  `Debug` prints std's name.
+  `Debug` prints std's name. User code that names one is L0104
+  (check/platform.rs `hidden_variant`).
+- `OsStr` and `Path` are unsized newtypes (`struct Path { inner: OsStr }`
+  over `[u8]`): the compiler lays them out as their field
+  (`cgen::CTy::Unsized`, a fat value with the newtype's own glue), and
+  shipped std source may turn `&[u8]` into `&OsStr` and `&OsStr` into
+  `&Path` (check/mod.rs coercion). They are `?Sized` everywhere a
+  `str` is.
+- `process` is `process_os.rs` (`#[path]`): `process.rs` is the
+  compiler's own std source for `exit`.
 
 | Module | State | Test |
 |---|---|---|
 | `io` | `Error` (Os, Simple, SimpleMessage, Custom over `&str`/`String`), `ErrorKind` (all 44 kinds, std order, the Linux errno table), `Result`, `Write` (`write`, `flush`, `write_all`, `write_fmt`, `by_ref`) for `Vec<u8>`, `&mut W`, `Stdout`, `Stderr`, their locks, `Sink`; `stdout`, `stderr`, `sink` | tests/pass/std_io_error.rs, std_io_write.rs, tests/fail/std_io_*, tests/reject/std_io_write_user_type.rs |
+| `ffi` | `OsStr` (`new`, `to_str`, `len`, `is_empty`, `as_encoded_bytes`, ASCII case, `to_os_string`, Debug, Eq, Ord), `OsString` (`new`, `push`, `into_string`, `clear`, `capacity`, Deref to `OsStr`, From `&str`/`String`). No `to_string_lossy` (std returns `Cow`), no `Hash` (no user `Hasher` bound yet) | tests/pass/std_ffi_osstr.rs |
+| `path` | `Path` and `PathBuf`: std's Unix `Components` parser (front and back), `parent`, `file_name`, `file_stem`, `file_prefix`, `extension`, `join`, `push`, `pop`, `set_file_name`, `set_extension` (std's separator panic), `with_*`, `starts_with`, `ends_with`, `strip_prefix`, `ancestors`, `iter`, `display` (std's Utf8Chunks rules), component-wise `==`/`Ord` against `Path`, `PathBuf`, `str`, `String`, `OsStr`; `exists`, `is_file`, `is_dir`, `metadata`, `read_dir`, `canonicalize`. `next_back` is inherent (no user `DoubleEndedIterator` yet); no `Hash` | tests/pass/std_path.rs, std_path_user_trait.rs, tests/fail/std_path_*, tests/reject/std_path_* |
+| `env` | `var`, `var_os`, `VarError`, `vars`, `vars_os`, `args_os`, `current_dir`, `set_current_dir`, `temp_dir`, `current_exe` | tests/pass/std_env.rs, tests/fail/std_env_* |
+| `fs` | `read`, `read_to_string`, `write`, `create_dir`, `create_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `canonicalize`, `exists`, `metadata`, `symlink_metadata` (`Metadata`, `FileType`, `Permissions` with std's Debug), `read_dir` (`ReadDir`, `DirEntry`). No `File`/`OpenOptions` yet | tests/pass/std_fs.rs, tests/fail/std_fs_*, tests/reject/std_fs_write_array.rs |
+| `process` | `id`, `exit` | tests/pass/std_fs.rs (id), tests/fail/std_process_id_type.rs |
 
 ## Source std fns (`STD_FNS` in src/ty/lang.rs)
 
@@ -92,7 +107,13 @@ named `std` when a file can name a platform module (a byte scan for
 
 Implemented (codegen emits them): `exit`; the platform crate's
 `sys_write_std`, `sys_flush_std`, `sys_os_error_text`,
-`sys_fmt_arguments_bytes` (C in src/runtime/sys.c); the adapter cores
+`sys_fmt_arguments_bytes`, the byte views (`sys_str_as_bytes`,
+`sys_bytes_as_str`, `sys_utf8_*`, `sys_string_from_utf8_unchecked`),
+and the syscalls of env, fs, and process (`sys_getenv`, `sys_environ`,
+`sys_argv`, `sys_getcwd`, `sys_chdir`, `sys_readlink`, `sys_read_file`,
+`sys_write_file`, `sys_path_op`, `sys_rename`, `sys_stat`,
+`sys_realpath`, `sys_read_dir`, `sys_remove_dir_all`, `sys_getpid`; C in
+src/runtime/sys.c); the adapter cores
 `xxh3_64`/`xxh3_128` (xxhash-rust, C in src/runtime/deps.c) and
 `ryu_js_fmt_f64` (ryu-js, the JS printer in src/runtime/float.c).
 Adapter crates get their privilege from the resolver's record of their

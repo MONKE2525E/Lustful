@@ -119,7 +119,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // selects it before the result coerces: `let s: &str =
         // boxed_string.as_ref()` is `&String`, deref-coerced), or the
         // expected type among several impls.
-        let bound = self.instance_bound_arg(trait_def, self_ty);
+        // The template's own bound first (its env predicate, by index):
+        // two bounds can name the same Self in an instance (`P:
+        // AsRef<Path>, C: AsRef<[u8]>` at `P = C = &str`; W-SHIM).
+        let replayed = self.replayed_trait_ref(e, trait_def).and_then(|tr| self.tys.args(tr.args).get(1).and_then(|g| g.as_ty()));
+        let bound = replayed.or_else(|| self.instance_bound_arg(trait_def, self_ty));
         let want = bound.or_else(|| {
             if cands.len() == 1 {
                 return Some(cands[0]);

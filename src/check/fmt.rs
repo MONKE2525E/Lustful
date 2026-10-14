@@ -314,7 +314,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return;
         };
         let inner = self.deep(inner);
-        if matches!(self.kind(inner), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) {
+        let unsized_newtype = matches!(self.kind(inner), TyKind::Adt(d, _) if self.tys.unsized_field(d).is_some());
+        if unsized_newtype || matches!(self.kind(inner), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) {
             let tn = self.tn(inner);
             self.err(
                 "L0112",

@@ -169,6 +169,10 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
             let et = ctype(e);
             let _ = writeln!(body, "  {}", builder_list("p->len", &format!("&(({et}*)p->ptr)[i]"), e, need));
         }
+        CTy::Unsized(a, _) => {
+            let call = user_fmt_call(p, *a, FmtKind::Debug, slots, "*p", types).expect("an unsized newtype formatted with {:?} has a written Debug");
+            let _ = writeln!(body, "  {call}");
+        }
         // std's cell types (W-STD-A): `Weak` prints `(Weak)`, `Cell<T:
         // Copy>` and `RefCell` a struct of their value.
         CTy::Weak(_) => {
@@ -211,7 +215,7 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
             );
         }
         CTy::Adt(a) => {
-            if let Some(call) = user_fmt_call(p, *a, FmtKind::Debug, slots, types) {
+            if let Some(call) = user_fmt_call(p, *a, FmtKind::Debug, slots, "p", types) {
                 let _ = writeln!(body, "  {call}");
             } else {
                 let adt = p.adt(*a);
@@ -278,7 +282,7 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], types: &mut
                 lit("incomplete utf-8 byte sequence from index ")
             )
         }
-        CTy::Adt(a) => match user_fmt_call(p, *a, FmtKind::Display, slots, types) {
+        CTy::Adt(a) => match user_fmt_call(p, *a, FmtKind::Display, slots, "p", types) {
             Some(call) => format!("  {call}\n"),
             None => "  abort();\n".to_string(),
         },
@@ -287,19 +291,34 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], types: &mut
 }
 
 /// The call of a user fmt impl's method instance for Adt `a`, as a C
-/// statement that returns 0 or 1, when the program has one.
-/// Adds the method's signature types to `types` (see `glue_callee`).
-fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &[u32], types: &mut Vec<CTy>) -> Option<String> {
+/// statement that returns 0 or 1, when the program has one. `this` is
+/// the `&self` argument: the glue's `p`, or `*p` for an unsized
+/// newtype, whose reference is its fat value. Adds the method's
+/// signature types to `types` (see `glue_callee`).
+fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &[u32], this: &str, types: &mut Vec<CTy>) -> Option<String> {
     let m = *p.gx.fmt_methods.get(&(a, kind as u8))?;
     let ret = cty(&p.tys, p.fn_info(m).ret);
     let rt = ctype(&ret);
     let callee = glue_callee(p, slots, m, types);
     let disc = disc_call(p, &ret, "(&r)");
     Some(if ret_is_large(p, m) {
-        format!("{{ {rt} r; {callee}(&r, p, f); return {disc} != 0; }}")
+        format!("{{ {rt} r; {callee}(&r, {this}, f); return {disc} != 0; }}")
     } else {
-        format!("{{ {rt} r = {callee}(p, f); return {disc} != 0; }}")
+        format!("{{ {rt} r = {callee}({this}, f); return {disc} != 0; }}")
     })
+}
+
+impl FnGen<'_, '_, '_> {
+    /// True for an unsized format argument (`str`, `[T]`, or an unsized
+    /// newtype such as `Path`): it arrives as its fat value, and the
+    /// formatters take a pointer to it.
+    fn unsized_arg(&self, ty: crate::ty::Ty) -> bool {
+        match self.body.tys.kind(ty) {
+            TyKind::Str | TyKind::Slice(_) => true,
+            TyKind::Adt(d, _) => self.body.tys.unsized_field(d).is_some(),
+            _ => false,
+        }
+    }
 }
 
 /// True when formatting a value of `t` can fail (reach a user fmt impl
@@ -314,6 +333,7 @@ fn may_fail(t: &CTy) -> bool {
         CTy::Sync(k, e) if k.is_cell_struct() || k.guard().is_some() => may_fail(e),
         // std's cells and boxed slices (W-STD-A) format their contents.
         CTy::Cell(e) | CTy::RefCell(e) | CTy::Guard(e, _) | CTy::BoxSlice(e) => may_fail(e),
+        CTy::Unsized(..) => true,
         CTy::Result(a, b) => may_fail(a) || may_fail(b),
         CTy::Tuple(es) => es.iter().any(may_fail),
         _ => false,
@@ -407,7 +427,7 @@ impl FnGen<'_, '_, '_> {
                     let t = cty(&self.body.tys, *ty);
                     // An unsized `str` or `[T]` argument arrives as its
                     // fat value; the formatters take a pointer to it.
-                    let ptr = if matches!(self.body.tys.kind(*ty), TyKind::Str | TyKind::Slice(_)) {
+                    let ptr = if self.unsized_arg(*ty) {
                         let tmp = self.tmp();
                         let _ = writeln!(self.out, "    {} {tmp} = {v};", ctype(&vt));
                         format!("(&{tmp})")
@@ -672,7 +692,7 @@ impl FnGen<'_, '_, '_> {
                 FmtPart::Arg { value, ty, spec, .. } => {
                     let (v, vt) = self.operand(value, loc, post);
                     let t = cty(&self.body.tys, *ty);
-                    let ptr = if matches!(self.body.tys.kind(*ty), TyKind::Str | TyKind::Slice(_)) {
+                    let ptr = if self.unsized_arg(*ty) {
                         let tmp = self.tmp();
                         let _ = writeln!(self.out, "    {} {tmp} = {v};", ctype(&vt));
                         format!("(&{tmp})")

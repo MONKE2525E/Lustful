@@ -41,6 +41,7 @@ pub fn is_sized(
     match tys.kind(t) {
         TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => false,
         TyKind::Param(p) => param_sized(p),
+        TyKind::Adt(d, _) if tys.unsized_field(d).is_some() => false,
         TyKind::Adt(d, a) => adt_sized(&|e| is_sized(tys, e, param_sized, adt_sized), d, a),
         TyKind::Tuple(ts) => tys.tys_of(ts).last().is_none_or(|&e| is_sized(tys, e, param_sized, adt_sized)),
         // A projection is sized unless proven otherwise; mono

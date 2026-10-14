@@ -42,6 +42,7 @@ typedef struct { void *data; const void *const *vt; } lust_dyn;
 
 /* Program globals, defined in the runtime unit and set by main. */
 extern int lust_argc;
+extern char **lust_argv;
 extern const char *lust_file;
 
 /* Every function is called through this table (see cgen.rs). */
@@ -62,6 +63,7 @@ typedef uint64_t lust_loc;
 extern const uint32_t *lust_fn_line;
 #ifdef LUST_IMPL
 int lust_argc;
+char **lust_argv;
 const char *lust_file;
 const uint32_t *lust_fn_line;
 #endif

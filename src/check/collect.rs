@@ -2611,8 +2611,36 @@ pub fn collect_reuse<'a>(
 
     p.gx.deferred_debug_fields.extend(deferred_debug);
 
-    // Fields must be sized: a bare slice or str cannot sit in a struct.
-    for adt in &p.adts {
+    // Unsized newtypes (W-SHIM): a non-generic struct whose only field
+    // is `str`, `[T]`, or another unsized newtype is itself unsized and
+    // laid out as that field (`std::path::Path`, `std::ffi::OsStr`).
+    // Nested ones settle in a fixpoint, whatever the declaration order.
+    loop {
+        let mut grew = false;
+        for (i, adt) in p.adts.iter().enumerate() {
+            let [v] = adt.variants.as_slice() else { continue };
+            let [f] = v.fields.as_slice() else { continue };
+            let Some(def) = p.tys.def_of_local_adt(AdtId(i as u32)) else { continue };
+            if adt.is_enum || p.tys.unsized_field(def).is_some() || p.gx.adt_generics.get(i).is_some_and(|g| !g.params.is_empty()) {
+                continue;
+            }
+            if matches!(p.tys.kind(f.ty), TyKind::Str | TyKind::Slice(_)) || !is_sized_ty(&p.tys, f.ty) {
+                let (def, fty) = (def, f.ty);
+                p.tys.register_unsized_adt(def, fty);
+                grew = true;
+                break;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // Fields must be sized: a bare slice or str cannot sit in a struct
+    // (the one field of an unsized newtype excepted).
+    for (i, adt) in p.adts.iter().enumerate() {
+        if p.tys.def_of_local_adt(AdtId(i as u32)).is_some_and(|d| p.tys.unsized_field(d).is_some()) {
+            continue;
+        }
         for v in &adt.variants {
             for f in &v.fields {
                 if !is_sized_ty(&p.tys, f.ty) {
@@ -4216,6 +4244,7 @@ fn contains_adt_by_value(p: &Program, root: AdtId, cur: AdtId, seen: &mut Vec<bo
 pub fn is_sized_ty(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) => false,
+        TyKind::Adt(d, _) if tys.unsized_field(d).is_some() => false,
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_sized_ty(tys, e)),
         TyKind::Array(e, _) => is_sized_ty(tys, e),
         TyKind::Adt(..) => match tys.adt_first_ty_arg(t) {

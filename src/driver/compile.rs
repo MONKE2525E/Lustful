@@ -3178,6 +3178,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 cgen::CTy::Args => 10u8.hash(h),
                 cgen::CTy::Chars => 11u8.hash(h),
                 cgen::CTy::Fmt(k) => (40u8, *k as u8).hash(h),
+                cgen::CTy::Unsized(a, x) => {
+                    (41u8, a.0).hash(h);
+                    crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);
+                    inner(h, p, x);
+                }
                 cgen::CTy::Tuple(ts) => {
                     12u8.hash(h);
                     (ts.len() as u64).hash(h);

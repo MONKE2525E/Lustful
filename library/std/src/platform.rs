@@ -18,3 +18,9 @@
 // in rustc either.
 
 pub mod io;
+pub mod ffi;
+pub mod path;
+pub mod env;
+pub mod fs;
+#[path = "process_os.rs"]
+pub mod process;

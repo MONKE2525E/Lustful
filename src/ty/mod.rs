@@ -760,6 +760,11 @@ pub trait TyIntern {
     fn local_adt_of(&self, def: DefId) -> Option<AdtId>;
     /// The def of the user Adt with this session-local index, if registered.
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId>;
+    /// The unsized field of an unsized newtype Adt (W-SHIM; see
+    /// `GlobalTys::unsized_adts`), None for every other def.
+    fn unsized_field(&self, _def: DefId) -> Option<Ty> {
+        None
+    }
 
     /// The `f32` or `f64` type.
     fn float_ty(&mut self, f: FloatTy) -> Ty {
@@ -1089,6 +1094,10 @@ pub struct GlobalTys {
     /// order where registered: `Adt(def, args)` with the instance's
     /// args, not always `EMPTY_ARGS`.
     adt_full_tys: Vec<Option<Ty>>,
+    /// Unsized newtypes (W-SHIM): a non-generic struct whose only field
+    /// is unsized (`str`, `[T]`, or another such struct), by def, to that
+    /// field's type. `std::path::Path` and `std::ffi::OsStr` are these.
+    unsized_adts: FxMap<DefId, Ty>,
 }
 
 impl GlobalTys {
@@ -1127,6 +1136,7 @@ impl GlobalTys {
             adt_defs: Vec::new(),
             adt_instances: FxMap::default(),
             adt_full_tys: Vec::new(),
+            unsized_adts: FxMap::default(),
         };
         // The intern calls must stay out of the assertions: `debug_assert_eq!`
         // drops its arguments in release builds, which would skip the interning.
@@ -1167,6 +1177,11 @@ impl GlobalTys {
         }
         let t = self.intern(TyKind::Adt(def, EMPTY_ARGS));
         self.adt_full_tys[i] = Some(t);
+    }
+    /// Records an unsized newtype (see `unsized_adts`): collect calls it
+    /// once its single field type is known to be unsized.
+    pub fn register_unsized_adt(&mut self, def: DefId, field: Ty) {
+        self.unsized_adts.insert(def, field);
     }
     /// Records one materialized generic Adt instance: its applied
     /// type (already interned) and its session-local index. The
@@ -1285,6 +1300,9 @@ impl TyIntern for GlobalTys {
     }
     fn local_adt_of(&self, def: DefId) -> Option<AdtId> {
         self.adt_locals.get(&def).copied()
+    }
+    fn unsized_field(&self, def: DefId) -> Option<Ty> {
+        self.unsized_adts.get(&def).copied()
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
         self.adt_defs.get(local.0 as usize).copied().filter(|d| *d != DefId::PLACEHOLDER)
@@ -1468,6 +1486,9 @@ impl TyIntern for Tys<'_> {
     }
     fn local_adt_of(&self, def: DefId) -> Option<AdtId> {
         self.global.local_adt_of(def)
+    }
+    fn unsized_field(&self, def: DefId) -> Option<Ty> {
+        self.global.unsized_field(def)
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
         self.global.def_of_local_adt(local)

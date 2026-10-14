@@ -255,6 +255,10 @@ pub enum SigTy {
     /// `fmt::Arguments` by value: its formatted text, a `lust_String`
     /// in C (W-SHIM; see `cgen::fmt_ctype`).
     Arguments,
+    /// `&str` (a `lust_str` in C).
+    Str,
+    /// `String` by value (a `lust_String` in C).
+    String,
 }
 
 impl SigTy {
@@ -284,6 +288,8 @@ impl SigTy {
             }
             SigTy::VecU8 => tys.mk_vec(super::int(super::IntTy::U8)),
             SigTy::Arguments => super::fmt::fmt_ty(tys, super::fmt::FmtTy::Arguments),
+            SigTy::Str => super::REF_STR,
+            SigTy::String => super::STRING,
         }
     }
 }
@@ -774,6 +780,183 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // Byte views of text (W-SHIM, for OsStr and Path): `&str` as its
+    // bytes, and bytes as `&str` with no check (the caller validated
+    // them, or they are an OsStr's raw bytes only std reads as text).
+    // As a return, `&[u8]` comes back from C as a lust_str.
+    IntrinsicDef {
+        name: "sys_str_as_bytes",
+        c_symbol: "lust_sys_str_as_bytes",
+        params: &[S::Str],
+        ret: S::Bytes,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    IntrinsicDef {
+        name: "sys_bytes_as_str",
+        c_symbol: "lust_sys_bytes_as_str",
+        params: &[S::Bytes],
+        ret: S::Str,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // `Vec<u8>` to `String` with no check, taking over the buffer.
+    IntrinsicDef {
+        name: "sys_string_from_utf8_unchecked",
+        c_symbol: "lust_sys_string_from_utf8_unchecked",
+        params: &[S::VecU8],
+        ret: S::String,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // The length of the longest valid UTF-8 prefix of the bytes.
+    IntrinsicDef {
+        name: "sys_utf8_valid_up_to",
+        c_symbol: "lust_sys_utf8_valid_up_to",
+        params: &[S::Bytes],
+        ret: S::Usize,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Appends the bytes to the String as `String::from_utf8_lossy` does
+    // (U+FFFD per maximal invalid subpart).
+    IntrinsicDef {
+        name: "sys_utf8_lossy",
+        c_symbol: "lust_sys_utf8_lossy",
+        params: &[S::Bytes, S::StringMut],
+        ret: S::Unit,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // getenv: appends the value's bytes to the Vec and returns true, or
+    // returns false when the variable is unset (or the key holds NUL).
+    IntrinsicDef {
+        name: "sys_getenv",
+        c_symbol: "lust_sys_getenv",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::Bool,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Appends every `environ` entry, each with a NUL terminator.
+    IntrinsicDef {
+        name: "sys_environ",
+        c_symbol: "lust_sys_environ",
+        params: &[S::VecU8Mut],
+        ret: S::Unit,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Appends every `argv` entry, each with a NUL terminator.
+    IntrinsicDef {
+        name: "sys_argv",
+        c_symbol: "lust_sys_argv",
+        params: &[S::VecU8Mut],
+        ret: S::Unit,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Appends the current directory; 0, or errno.
+    IntrinsicDef {
+        name: "sys_getcwd",
+        c_symbol: "lust_sys_getcwd",
+        params: &[S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // chdir: 0, errno, or -1 for a path with a NUL byte.
+    IntrinsicDef {
+        name: "sys_chdir",
+        c_symbol: "lust_sys_chdir",
+        params: &[S::Bytes],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // readlink into the Vec: 0, errno, or -1 for a path with a NUL byte.
+    IntrinsicDef {
+        name: "sys_readlink",
+        c_symbol: "lust_sys_readlink",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Reads a whole file into the Vec. 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_read_file",
+        c_symbol: "lust_sys_read_file",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // Creates or truncates a file and writes the bytes. 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_write_file",
+        c_symbol: "lust_sys_write_file",
+        params: &[S::Bytes, S::Bytes],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // mkdir (0), unlink (1), or rmdir (2). 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_path_op",
+        c_symbol: "lust_sys_path_op",
+        params: &[S::Bytes, S::I32],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // rename. 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_rename",
+        c_symbol: "lust_sys_rename",
+        params: &[S::Bytes, S::Bytes],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // stat (true) or lstat as 8-byte fields. 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_stat",
+        c_symbol: "lust_sys_stat",
+        params: &[S::Bytes, S::Bool, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // realpath into the Vec. 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_realpath",
+        c_symbol: "lust_sys_realpath",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // The NUL-terminated names of a directory. 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_read_dir",
+        c_symbol: "lust_sys_read_dir",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // remove_dir_all as std does it on Linux. 0, errno, or -1 for a NUL byte (sys.h).
+    IntrinsicDef {
+        name: "sys_remove_dir_all",
+        c_symbol: "lust_sys_remove_dir_all",
+        params: &[S::Bytes],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // getpid.
+    IntrinsicDef { name: "sys_getpid", c_symbol: "lust_sys_getpid", params: &[], ret: S::U32, allowed: ONLY_STD, implemented: true },
     // Appends the OS text of an error code (strerror) to the String.
     IntrinsicDef {
         name: "sys_os_error_text",

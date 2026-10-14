@@ -273,6 +273,26 @@ pub(super) fn replay_method(
             Probe::Failed => return Some(ERROR),
             Probe::Miss => {}
         }
+        // `impl AsRef<U> for &T where T: AsRef<U>` (and `&mut T`; AsMut
+        // through `&mut T`) has no body in lust: it forwards to T's impl,
+        // so a pick that landed on a reference to a type with a user
+        // impl calls that impl one deref further (W-SHIM: `P:
+        // AsRef<Path>` at `&PathBuf` or `&str`).
+        let lang = cx.p.gx.lang;
+        let (mut step, mut derefs) = (step, pick.derefs);
+        while pick.trait_def == lang.as_ref || pick.trait_def == lang.as_mut {
+            let TyKind::Ref(_, m, inner) = cx.tys.kind(step) else { break };
+            if pick.trait_def == lang.as_mut && !m.is_mut() {
+                break;
+            }
+            (step, derefs) = (cx.resolve(inner), derefs + 1);
+            let probe = RcvProbe::at(cx, step, pick.form);
+            match method::trait_probe_for(cx, e, Some(pick.trait_def), &[probe], derefs, name, name_span, args, explicit, expected) {
+                Probe::Hit(ret) => return Some(ret),
+                Probe::Failed => return Some(ERROR),
+                Probe::Miss => {}
+            }
+        }
     }
     let p = cx.p;
     let templated =

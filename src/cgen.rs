@@ -86,6 +86,11 @@ pub enum CTy {
     /// A `std::sync` or `std::thread` type and its type argument (`Unit`
     /// for the atomics), emitted by cgen/sync.rs (W-THREADS).
     Sync(crate::ty::sync::SyncTy, Box<CTy>),
+    /// An unsized newtype (W-SHIM: `OsStr`, `Path`) and a reference to
+    /// it: the C form of its unsized field (the second part), as `Str`
+    /// stands for both `str` and `&str`. The Adt keeps its identity for
+    /// glue (Debug, PartialEq, Ord call the newtype's own impls).
+    Unsized(AdtId, Box<CTy>),
 }
 
 /// One step of a move path in codegen (see `FnGen::move_paths`): a
@@ -148,10 +153,11 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         }
         TyKind::Slice(e) => CTy::Slice(Box::new(cty(tys, e))),
         TyKind::Dyn(..) => CTy::Dyn,
-        TyKind::Ref(_, _, e) => match tys.kind(e) {
-            TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
-            TyKind::Dyn(..) => CTy::Dyn,
-            _ => CTy::Ref(Box::new(cty(tys, e))),
+        TyKind::Ref(_, _, e) => ref_cty(tys, e),
+        // An unsized newtype is laid out as its field (W-SHIM).
+        TyKind::Adt(d, _) if let Some(f) = tys.unsized_field(d) => match tys.local_adt(t) {
+            Some(a) => CTy::Unsized(a, Box::new(cty(tys, f))),
+            None => cty(tys, f),
         },
         TyKind::Adt(..) => match tys.builtin_of(t) {
             Some(BuiltinTy::String) => CTy::String,
@@ -186,6 +192,18 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             },
         },
         _ => CTy::Unit,
+    }
+}
+
+/// The C form of a reference to `e`: a slice or dyn reference is its
+/// fat value, a reference to an unsized newtype is the newtype's own
+/// fat form (W-SHIM), anything else a pointer.
+fn ref_cty(tys: &impl TyIntern, e: Ty) -> CTy {
+    match tys.kind(e) {
+        TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
+        TyKind::Dyn(..) => CTy::Dyn,
+        TyKind::Adt(d, _) if tys.unsized_field(d).is_some() => cty(tys, e),
+        _ => CTy::Ref(Box::new(cty(tys, e))),
     }
 }
 
@@ -321,6 +339,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::FnPtr(..) => format!("Fp_{}", mangle(t)),
         CTy::Dyn => "lust_dyn".into(),
         CTy::Fmt(k) => fmt_ctype(*k).into(),
+        CTy::Unsized(_, inner) => ctype(inner),
     }
 }
 
@@ -401,6 +420,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Array(e, n) => tok(s, &format!("Y{n}"), &[e]),
         CTy::Tuple(es) => tok(s, &format!("T{}", es.len()), &es.iter().collect::<Vec<_>>()),
         CTy::FnPtr(ps, r) => tok(s, &format!("fp{}", ps.len()), &ps.iter().chain([&**r]).collect::<Vec<_>>()),
+        CTy::Unsized(a, e) => tok(s, &format!("N{}", a.0), &[e]),
     }
 }
 
@@ -444,7 +464,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             ps.iter().for_each(|e| collect_types(e, out));
             collect_types(r, out);
         }
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::Cell(e) => collect_types(e, out),
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::Cell(e) | CTy::Unsized(_, e) => collect_types(e, out),
         CTy::Weak(e) => {
             out.insert(CTy::Rc(e.clone()));
             collect_types(e, out);
@@ -486,6 +506,7 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         // A pointer to a fn pointer still names its typedef, which has
         // no forward form (a closure capturing a fn pointer by ref).
         CTy::Ref(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_)) => by_value_deps(inner, out),
+        CTy::Unsized(_, inner) => by_value_deps(inner, out),
         _ => {}
     }
 }
@@ -503,6 +524,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         | CTy::ExitCode
         | CTy::Chars
         | CTy::Slice(_)
+        | CTy::Unsized(..)
         | CTy::Dyn => true,
         CTy::Option(e) => is_copy_c(p, e),
         CTy::Result(a, b) => is_copy_c(p, a) && is_copy_c(p, b),
@@ -746,7 +768,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::BoxDyn | CTy::RcDyn => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
-            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn => Some(layout::fat_ptr_layout()),
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn | CTy::Unsized(..) => Some(layout::fat_ptr_layout()),
             CTy::Tuple(es) => {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
                 layout::tuple_layout(&fields?).ok()
@@ -992,7 +1014,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let (es, ea) = go(p, e, seen);
                 (es * (*n).max(1), ea)
             }
-            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn => (16, 8),
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn | CTy::Unsized(..) => (16, 8),
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
                     // A by-value cycle has no finite size; check rejects
@@ -1714,6 +1736,11 @@ impl FnGen<'_, '_, '_> {
                 (Proj::Deref, CTy::Slice(_)) | (Proj::Deref, CTy::Dyn) => {
                     // A slice or dyn place is represented by its fat value, like `str`.
                 }
+                (Proj::Deref, CTy::Unsized(..)) => {}
+                (Proj::Field(0), CTy::Unsized(_, inner)) => {
+                    // The field of an unsized newtype (W-SHIM): the same fat value.
+                    t = *inner;
+                }
                 (Proj::Deref, CTy::BoxSlice(el)) => {
                     // The boxed slice's fat value is its slice place too.
                     t = CTy::Slice(el);
@@ -2091,14 +2118,19 @@ impl FnGen<'_, '_, '_> {
                 // The C form cannot tell a `&[T]`/`&dyn` value from the
                 // unsized place behind it, so ask the place's own type:
                 // `&*r` for `r: &&dyn Tr` borrows the `&dyn` value.
-                let sem = self.place_sem_ty(pl).map(|ty| self.body.tys.kind(ty));
-                let slice_place = matches!(t, CTy::Slice(_))
+                // An unsized newtype (`OsStr`, `Path`; W-SHIM) is laid out as
+                // its slice field, so its place is a slice place too.
+                let tys = &self.body.tys;
+                let slice_like = |k: TyKind| match k {
+                    TyKind::Slice(_) => true,
+                    TyKind::Adt(d, _) => tys.unsized_field(d).is_some(),
+                    _ => false,
+                };
+                let sem = self.place_sem_ty(pl).map(|ty| tys.kind(ty));
+                let slice_place = matches!(t, CTy::Slice(_) | CTy::Unsized(..))
                     && match sem {
-                        Some(k) => matches!(k, TyKind::Slice(_)),
-                        None => {
-                            matches!(pl.proj.last(), Some(Proj::Deref))
-                                || matches!(self.body.tys.kind(self.body.locals[pl.local as usize].ty), TyKind::Slice(_))
-                        }
+                        Some(k) => slice_like(k),
+                        None => matches!(pl.proj.last(), Some(Proj::Deref)) || slice_like(tys.kind(self.body.locals[pl.local as usize].ty)),
                     };
                 let dyn_place = t == CTy::Dyn
                     && match sem {
@@ -2337,8 +2369,8 @@ impl FnGen<'_, '_, '_> {
                 let (b, bt) = self.operand(b, loc, post);
                 // A slice operand is already the fat value (not a pointer to
                 // it), so take its address for the glue call.
-                let a = if matches!(at, CTy::Slice(_)) { format!("(&{a})") } else { a };
-                let b = if matches!(bt, CTy::Slice(_)) { format!("(&{b})") } else { b };
+                let a = if matches!(at, CTy::Slice(_) | CTy::Unsized(..)) { format!("(&{a})") } else { a };
+                let b = if matches!(bt, CTy::Slice(_) | CTy::Unsized(..)) { format!("(&{b})") } else { b };
                 let t = cty(&self.body.tys, *ty);
                 let e = self.eq_expr(&t, &a, &b);
                 if *ne { format!("(!{e})") } else { e }
@@ -2346,8 +2378,8 @@ impl FnGen<'_, '_, '_> {
             Rvalue::Cmp { op, a, b, ty } => {
                 let (a, at) = self.operand(a, loc, post);
                 let (b, bt) = self.operand(b, loc, post);
-                let a = if matches!(at, CTy::Slice(_)) { format!("(&{a})") } else { a };
-                let b = if matches!(bt, CTy::Slice(_)) { format!("(&{b})") } else { b };
+                let a = if matches!(at, CTy::Slice(_) | CTy::Unsized(..)) { format!("(&{a})") } else { a };
+                let b = if matches!(bt, CTy::Slice(_) | CTy::Unsized(..)) { format!("(&{b})") } else { b };
                 let t = cty(&self.body.tys, *ty);
                 self.want(Glue::Cmp, &t);
                 let c = format!("cmp_{}({a}, {b})", mangle(&t));
@@ -2963,6 +2995,10 @@ impl FnGen<'_, '_, '_> {
             // comma form still gives the assignment a value of the right
             // shape: `()`, or the dead continuation's.
             format!("({}({}), ((lust_Unit){{}}))", def.c_symbol, args.join(", "))
+        } else if def.ret == SigTy::Bytes {
+            // A `&[u8]` comes back as a lust_str: rebuild the slice value.
+            let sl = ctype(&CTy::Slice(Box::new(CTy::Int(IntTy::U8))));
+            format!("({{ lust_str __b = {}({}); ({sl}){{ .ptr = __b.ptr, .len = __b.len }}; }})", def.c_symbol, args.join(", "))
         } else {
             format!("{}({})", def.c_symbol, args.join(", "))
         }
@@ -5245,7 +5281,7 @@ pub fn main_unit(main_slot: u32, file: &str, slot_lines: &[u32], overlays: &[usi
     }
     let _ = writeln!(
         c,
-        "int main(int argc, char **argv) {{\n  (void)argv;\n  lust_argc = argc;\n  lust_file = {};\n  lust_fn_line = lines;\n  lust_base_init();",
+        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;\n  lust_base_init();",
         c_string_lit(file.as_bytes())
     );
     for u in overlays {
@@ -6485,6 +6521,13 @@ fn glue_def(
                 let _ = writeln!(defs, "uint8_t eq_{m}({ct} *a, {ct} *b) {{\n{call}}}\n");
                 return;
             }
+            // An unsized newtype's `&self` is its fat value (W-SHIM).
+            if let CTy::Unsized(adt_id, _) = t {
+                let f = p.gx.glue_methods.get(&(*adt_id, p.gx.lang.partial_eq)).copied().expect("an unsized newtype compared by == has a written PartialEq");
+                let call = written_glue_call(p, slots, f, "*a, *b", types);
+                let _ = writeln!(defs, "uint8_t eq_{m}({ct} *a, {ct} *b) {{\n{call}}}\n");
+                return;
+            }
             let eq_of = |t: &CTy, x: &str, y: &str, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                 match t {
                     CTy::Unit => "1".into(),
@@ -6578,17 +6621,19 @@ fn glue_def(
             let _ = writeln!(protos, "int8_t cmp_{m}({ct} *a, {ct} *b);");
             // A written `partial_cmp` (see `glue_methods`): its
             // `Option<Ordering>` becomes the glue's code.
-            if let CTy::Adt(adt_id) = t
+            if let CTy::Adt(adt_id) | CTy::Unsized(adt_id, _) = t
                 && let Some(&f) = p.gx.glue_methods.get(&(*adt_id, p.gx.lang.partial_ord))
                 && let Some(ord) = p.tys.local_adt_of(crate::check::generics::ordering_def())
             {
+                // An unsized newtype's `&self` is its fat value (W-SHIM).
+                let (a, b) = if matches!(t, CTy::Unsized(..)) { ("*a", "*b") } else { ("a", "b") };
                 let opt = CTy::Option(Box::new(CTy::Adt(ord)));
                 let callee = glue_callee(p, slots, f, types);
                 let ot = ctype(&opt);
                 if ret_is_large(p, f) {
-                    let _ = writeln!(body, "  {ot} r; {callee}(&r, a, b);");
+                    let _ = writeln!(body, "  {ot} r; {callee}(&r, {a}, {b});");
                 } else {
-                    let _ = writeln!(body, "  {ot} r = {callee}(a, b);");
+                    let _ = writeln!(body, "  {ot} r = {callee}({a}, {b});");
                 }
                 let some = disc_call(p, &opt, "(&r)");
                 let pay = variant_field(p, &opt, "r", 1, 0);

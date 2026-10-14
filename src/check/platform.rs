@@ -12,7 +12,8 @@ use crate::check::collect::Program;
 use crate::def::LocalDefId;
 use crate::diag::{Diag, Span};
 use crate::ty::lang::ShippedCrate;
-use crate::ty::{Ty, TyIntern, TyKind};
+use super::Ctx;
+use crate::ty::{AdtId, Ty, TyIntern, TyKind};
 
 /// L0641 when `inst` is the default `io::Write::write_fmt` body of the
 /// platform crate instantiated for a writer that std does not define.
@@ -65,4 +66,21 @@ fn user_writer_diag(p: &Program, tys: &impl TyIntern, writer: Ty, fallback: Span
         "`write!` into a user-defined `std::io::Write` type is not supported yet",
         "Format into a `String` with `format!`, then call `write_all` with its bytes.",
     ))
+}
+
+impl Ctx<'_, '_> {
+    /// True, after an L0104 error, when user code names a hidden variant
+    /// of an enum a shipped crate defines: std's unstable `io::ErrorKind`
+    /// kinds carry a `__` prefix in lust's source, and rustc has no such
+    /// variant (E0599). The shipped crates themselves may name them.
+    pub(super) fn hidden_variant(&mut self, a: AdtId, v: u32, span: Span) -> bool {
+        let p = self.p;
+        let name = p.adt(a).variants[v as usize].name;
+        if !p.interner.get(name).starts_with("__") || p.shipped_crate_at(span).is_some() || p.shipped_crate_at(p.adt(a).span).is_none() {
+            return false;
+        }
+        let shown = p.interner.get(name)[2..].to_string();
+        self.err("L0104", span, format!("no variant named `{shown}`"), "Use a stable variant of the enum.");
+        true
+    }
 }
