@@ -95,6 +95,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         annotations: Vec::new(),
         promoted: Vec::new(),
         index_exprs: Vec::new(),
+        false_edges: Vec::new(),
     };
     let mut lw = Lower {
         p,
@@ -3509,7 +3510,8 @@ impl<'p, 'a> Lower<'p, 'a> {
         // the rest drops with it (codegen elaborates the drop).
         let sp = self.place(scrut);
         let arm_pats: Vec<PatId> = arms.iter().map(|a| a.pat).collect();
-        let sp = self.pattern_place(sp, self.ty(scrut), &arm_pats, span);
+        let scrut_ty = self.ty(scrut);
+        let sp = self.pattern_place(sp, scrut_ty, &arm_pats, span);
         let end = self.new_block();
         // Reference-typed arms after the first that does not diverge are
         // reborrowed (`arm_into`).
@@ -3558,6 +3560,9 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let row_fail = if r + 1 < rows.len() { row_starts[r + 1] } else { next };
                 self.or_forced = row.clone();
                 self.test_pat(arm.pat, sp.clone(), row_fail);
+                if arm.guard.is_none() {
+                    self.false_edge_if_unreached(row_starts[r], next);
+                }
                 let mut guard_bound: Vec<u32> = Vec::new();
                 let guard_popped;
                 if by_ref_guard {
@@ -3572,11 +3577,13 @@ impl<'p, 'a> Lower<'p, 'a> {
                     Some(g) => {
                         let gspan = self.span(g);
                         self.scopes.push(Vec::new());
+                        let held = self.hold_scrutinee(&sp, scrut_ty, gspan);
                         let c = self.operand(g);
                         // Mutable: the same local is written again on every
                         // pass when the match sits in a loop.
                         let cl = self.new_local(BOOL, true, None);
                         self.assign(Place::local(cl), Rvalue::Use(c), gspan);
+                        self.push(StmtKind::FakeRead(held), gspan);
                         self.pop_scope(gspan);
                         for l in &guard_bound {
                             self.guard_places[*l as usize] = None;
@@ -3616,6 +3623,41 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
         self.terminate(Terminator::Unreachable, span);
         self.cur = end;
+    }
+
+    /// A shared borrow of the scrutinee place that a guard holds until it
+    /// ends (the caller emits the `FakeRead` of the returned local), as
+    /// rustc's fake borrows of the matched places: a guard cannot assign
+    /// to the scrutinee or borrow it mutably (E0510). rustc's borrows are
+    /// shallow and cover only tested places; this one is deep, so a guard
+    /// that writes an untested part is a false reject.
+    fn hold_scrutinee(&mut self, sp: &Place, ty: Ty, span: Span) -> Local {
+        let rt = self.ref_ty(false, ty);
+        let t = self.temp(rt);
+        self.assign(Place::local(t), Rvalue::Ref(false, sp.clone()), span);
+        t
+    }
+
+    /// After an arm's pattern tests, which began in block `start`: when
+    /// none of them jumps to `next` (the pattern is irrefutable), ends the
+    /// current block and adds a borrowck-only edge from it to `next`, as
+    /// rustc's false edge does, so the later arms are borrow-checked. The
+    /// tests' blocks are `start` and every block made after `next`.
+    fn false_edge_if_unreached(&mut self, start: Bb, next: Bb) {
+        let jumps = |t: &Terminator| match t {
+            Terminator::Goto(b) => *b == next,
+            Terminator::If(_, a, b) => *a == next || *b == next,
+            Terminator::Switch(_, cases, other) => *other == next || cases.iter().any(|c| c.1 == next),
+            _ => false,
+        };
+        let blocks = &self.body.blocks;
+        if jumps(&blocks[start.0 as usize].term) || blocks[next.0 as usize..].iter().any(|b| jumps(&b.term)) {
+            return;
+        }
+        let pre = self.cur;
+        let bind = self.new_block();
+        self.goto(bind, Span::default());
+        self.body.false_edges.push((pre, next));
     }
 
     /// True when a slice pattern in `pat` binds its middle by

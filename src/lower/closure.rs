@@ -54,6 +54,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         annotations: Vec::new(),
         promoted: Vec::new(),
         index_exprs: Vec::new(),
+        false_edges: Vec::new(),
     };
     let info = ck.closures.iter().find(|c| c.def == def).cloned();
     let poisoned = ck.poisoned;

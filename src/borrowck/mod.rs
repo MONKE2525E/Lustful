@@ -788,6 +788,9 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     fn compute_preds(&mut self) {
         self.compute_points();
         self.succs = self.body.blocks.iter().map(|b| successors(&b.term)).collect();
+        for &(from, to) in &self.body.false_edges {
+            self.succs[from.0 as usize].push(to);
+        }
         for bi in 0..self.succs.len() {
             for k in 0..self.succs[bi].len() {
                 let s = self.succs[bi][k];

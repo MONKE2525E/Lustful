@@ -272,6 +272,11 @@ pub struct Body<'g> {
     /// `arr[1]` reads the whole array for move checks. Only borrowck reads
     /// it; a cached body has none.
     pub index_exprs: Vec<Local>,
+    /// Edges only borrowck sees, as rustc's `FalseEdge`: from the point
+    /// where a match arm's pattern has matched (before its bindings) to
+    /// the next arm's start, so arms after an irrefutable one are still
+    /// checked. Codegen ignores them; a cached body has none.
+    pub false_edges: Vec<(Bb, Bb)>,
 }
 
 impl Body<'_> {
