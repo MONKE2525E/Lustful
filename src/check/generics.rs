@@ -2211,6 +2211,11 @@ fn resolve_dyn(
     lifetime: Option<ast::Lifetime>,
     span: Span,
 ) -> Result<Ty, Diag> {
+    // One explicit lifetime bound at most (rustc E0226): the
+    // trailing one is `lifetime`, any others stay in `bounds`.
+    if usize::from(lifetime.is_some()) + bounds.iter().filter(|b| matches!(b, TraitBound::Lifetime(_))).count() > 1 {
+        return Err(Diag::new("L0110", span, "a dyn type has at most one lifetime bound", "Keep one lifetime bound."));
+    }
     let mut principal: Option<Binder<TraitRef>> = None;
     let mut auto = AutoTraits::default();
     let mut region = Region::Erased;
@@ -3851,17 +3856,10 @@ pub fn resolve_fn_sig(
             scope.apit.push((n, lhs));
         }
         match resolve_scoped(ast, interner, known, cx, tys, param.ty, &scope) {
-            Ok(t) => {
-                if !crate::check::collect::is_sized_ty(tys, t) {
-                    errs.push(Diag::new(
-                        "L0110",
-                        ast.ty_span(param.ty),
-                        "the size for values of this type cannot be known",
-                        "Put the value behind a reference, such as `&[T]` or `&str`.",
-                    ));
-                }
-                params.push(t);
-            }
+            // No Sized check here: a declaration with no body may
+            // name unsized params (rustc allows it). The value
+            // positions of a fn with a body are `check_written_wf`'s.
+            Ok(t) => params.push(t),
             Err(d) => {
                 errs.push(d);
                 params.push(ERROR);
@@ -3924,15 +3922,8 @@ pub fn resolve_fn_sig(
             ERROR
         }),
     };
-    if !crate::check::collect::is_sized_ty(tys, ret) {
-        let span = def.ret.map_or(def.name_span, |t| ast.ty_span(t));
-        errs.push(Diag::new(
-            "L0110",
-            span,
-            "the size for values of this type cannot be known",
-            "Put the value behind a reference, such as `&[T]` or `&str`.",
-        ));
-    }
+    // The return type gets no Sized check here either, for the
+    // same reason as the params above.
     // The parameter a returned reference borrows from under elision
     // (compat field; the borrow checker reads the region signature).
     // A written `dyn` object lifetime (`+ '_`, `+ 'static`) is one
@@ -7129,17 +7120,11 @@ fn prove_trait_ref(
         return false;
     }
     if tr.def == lang.sized {
-        // Sized by structure: `str`, slices, and dyn types are not; a
-        // parameter is when the env says so (an implicit `T: Sized` is
-        // in every env that has one); every other type lust has is.
+        // Sized by structure (check::sized): a parameter is when the
+        // env says so (an implicit `T: Sized` is in every env that has one).
         let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
-        return match cx.tys.kind(t) {
-            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => false,
-            TyKind::Param(_) => env.iter().any(|pr| {
-                matches!(pr, Predicate::Trait(b) if b.value.def == lang.sized && cx.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(t))
-            }),
-            _ => true,
-        };
+        let sized_params = crate::check::sized::env_sized_params(&cx.tys, env, lang.sized);
+        return crate::check::sized::is_sized(p, &mut cx.tys, t, &|q| sized_params.contains(&q));
     }
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {
@@ -7633,19 +7618,25 @@ fn adt_first_index(p: &Program) -> FxMap<DefId, usize> {
 
 /// Collects the trait goals one type owes to be well-formed:
 /// for every application of a local Adt inside it, the Adt's
-/// parameter predicates under the written arguments, and for every
-/// projection its trait ref (`<B as Tr>::Out` needs `B: Tr`).
-fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>) {
+/// parameter predicates under the written arguments, for every
+/// projection its trait ref (`<B as Tr>::Out` needs `B: Tr`), and
+/// `Sized` for every part `check::sized::parts` names.
+fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>, sized: &mut Vec<TraitRef>) {
     use crate::traits::index::subst_predicate;
     if seen.contains(&t) || t == ERROR {
         return;
     }
     seen.push(t);
-    let in_args = |p: &mut Program, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>, a: ArgsId| {
+    let mut need: Vec<Ty> = Vec::new();
+    crate::check::sized::parts(&p.tys, t, &mut |e| need.push(e));
+    for e in need {
+        sized.push(sized_ref(p, e));
+    }
+    let in_args = |p: &mut Program, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>, sized: &mut Vec<TraitRef>, a: ArgsId| {
         let argv: Vec<GenericArg> = p.tys.args(a).to_vec();
         for g in argv {
             if let Some(e) = g.as_ty() {
-                wf_goals(p, adt_idx, e, seen, out);
+                wf_goals(p, adt_idx, e, seen, out, sized);
             }
         }
     };
@@ -7663,30 +7654,46 @@ fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Ve
                     }
                 }
             }
-            in_args(p, seen, out, a);
+            in_args(p, seen, out, sized, a);
         }
-        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => wf_goals(p, adt_idx, e, seen, out),
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => wf_goals(p, adt_idx, e, seen, out, sized),
         TyKind::Tuple(ts) => {
             for e in p.tys.tys_of(ts).to_vec() {
-                wf_goals(p, adt_idx, e, seen, out);
+                wf_goals(p, adt_idx, e, seen, out, sized);
             }
         }
         TyKind::Projection(assoc, a) => {
             if let Some(def) = p.gx.index.trait_of_assoc(assoc.0) {
                 out.push(TraitRef { def, args: a, bindings: EMPTY_BINDINGS });
             }
-            in_args(p, seen, out, a);
+            in_args(p, seen, out, sized, a);
         }
-        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => in_args(p, seen, out, a),
+        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => in_args(p, seen, out, sized, a),
         TyKind::FnPtr(sig) => {
             let b = p.tys.sig(sig);
             for e in p.tys.tys_of(b.value.inputs).to_vec() {
-                wf_goals(p, adt_idx, e, seen, out);
+                wf_goals(p, adt_idx, e, seen, out, sized);
             }
-            wf_goals(p, adt_idx, b.value.output, seen, out);
+            wf_goals(p, adt_idx, b.value.output, seen, out, sized);
+        }
+        // The principal's args past `Self` (`dyn G<Vec<str>>`).
+        TyKind::Dyn(b, _) => {
+            if let Some(pr) = p.tys.dyn_bounds(b).principal {
+                for g in p.tys.args(pr.value.args).iter().skip(1).copied().collect::<Vec<_>>() {
+                    if let Some(e) = g.as_ty() {
+                        wf_goals(p, adt_idx, e, seen, out, sized);
+                    }
+                }
+            }
         }
         _ => {}
     }
+}
+
+/// The goal `t: Sized`.
+fn sized_ref(p: &mut Program, t: Ty) -> TraitRef {
+    let args = p.tys.intern_args(&[GenericArg::Ty(t)]);
+    TraitRef { def: p.gx.lang.sized, args, bindings: EMPTY_BINDINGS }
 }
 
 /// The `Self: Trait<..>` a trait method's signature and body assume
@@ -7710,21 +7717,31 @@ fn own_trait_pred(p: &mut Program, method_def: DefId, generics: &Generics) -> Op
 
 /// Well-formedness of written types at collect: every type in
 /// a signature, a field list, or an impl header must satisfy
-/// the parameter bounds of the Adts it names, under the item's
-/// own bounds (rustc E0277 at the type). Body-level written
-/// types and literals queue the same obligations in the
-/// checker. A where-clause predicate that mentions no
-/// parameter of its item is a plain fact and must hold as
-/// written.
+/// the parameter bounds of the Adts it names and be `Sized` in
+/// the positions `check::sized` names, under the item's own
+/// bounds (rustc E0277 at the type). Value positions must be
+/// `Sized` themselves: the params (by-value `self` included) and
+/// return of a fn with a body, struct fields but the last, every
+/// enum field. Body-level written types and literals queue the
+/// same obligations in the checker. A where-clause predicate that
+/// mentions no parameter of its item is a plain fact and must
+/// hold as written.
 fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
     use crate::traits::index::Synthetic;
-    // (types, item predicates, span, item generics for the
-    // param-free predicate rule)
-    let mut items: Vec<(Vec<Ty>, Generics, Span)> = Vec::new();
+    // (types, value types, item predicates, span); the generics
+    // also serve the param-free predicate rule.
+    let mut items: Vec<(Vec<Ty>, Vec<Ty>, Generics, Span)> = Vec::new();
     for i in 0..p.fns.len() {
+        // Stubs are trait method signatures again, and a trait
+        // default template is its trait method: both are checked
+        // from `trait_methods` below.
+        if p.gx.fn_class.get(i) == Some(&FnClass::Stub) || p.gx.trait_methods.contains_key(&p.fn_defs[i]) {
+            continue;
+        }
         let info = p.fn_info(LocalDefId(i as u32));
         let mut tys: Vec<Ty> = info.params.clone();
         tys.push(info.ret);
+        let values = if info.def.body.is_some() { tys.clone() } else { Vec::new() };
         // Plain fns keep their generics (with any where clause)
         // only in the def table, so read them from there.
         let mut generics = match p.gx.fn_templates.get(i).cloned().flatten() {
@@ -7736,24 +7753,32 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         if let Some(own) = own_trait_pred(p, p.def_id(LocalDefId(i as u32)), &generics) {
             generics.predicates.push(own);
         }
-        items.push((tys, generics, span));
+        items.push((tys, values, generics, span));
     }
-    let methods: Vec<(DefId, Vec<Ty>, Generics, Span)> = p
+    let methods: Vec<(DefId, Vec<Ty>, bool, Generics, Span)> = p
         .gx
         .trait_methods
         .iter()
-        .map(|(&d, t)| (d, t.params.iter().copied().chain([t.ret]).collect(), t.generics.clone(), t.def.name_span))
+        .map(|(&d, t)| (d, t.params.iter().copied().chain([t.ret]).collect(), t.def.body.is_some(), t.generics.clone(), t.def.name_span))
         .collect();
-    for (method_def, tys, mut generics, span) in methods {
+    for (method_def, tys, has_body, mut generics, span) in methods {
         if let Some(own) = own_trait_pred(p, method_def, &generics) {
             generics.predicates.push(own);
         }
-        items.push((tys, generics, span));
+        let values = if has_body { tys.clone() } else { Vec::new() };
+        items.push((tys, values, generics, span));
     }
     for idx in 0..p.gx.adt_info.len() {
+        if p.gx.adt_instance_of.get(idx).is_some_and(|i| i.is_some()) {
+            continue;
+        }
         let a = p.adt(AdtId(idx as u32));
         let tys: Vec<Ty> = a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
-        items.push((tys, p.gx.adt_generics[idx].clone(), a.span));
+        // Only a struct's last field may be unsized.
+        let unsized_ok = usize::from(!a.is_enum);
+        let values: Vec<Ty> =
+            a.variants.iter().flat_map(|v| v.fields.iter().take(v.fields.len().saturating_sub(unsized_ok)).map(|f| f.ty)).collect();
+        items.push((tys, values, p.gx.adt_generics[idx].clone(), a.span));
     }
     for (_, rec) in p.gx.index.all_impls() {
         if rec.synthetic != Synthetic::None || !rec.local {
@@ -7761,22 +7786,39 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         }
         let mut tys: Vec<Ty> = p.tys.args(rec.trait_ref.args).iter().filter_map(|g| g.as_ty()).collect();
         tys.extend(rec.assoc_tys.iter().map(|&(_, t)| t));
-        items.push((tys, rec.generics.clone(), rec.span));
+        items.push((tys, Vec::new(), rec.generics.clone(), rec.span));
     }
     for (ty, generics, span) in &p.gx.wf_headers {
-        items.push((vec![*ty], generics.clone(), *span));
+        items.push((vec![*ty], Vec::new(), generics.clone(), *span));
     }
     for rec in p.gx.trait_names.values().filter_map(|&d| p.gx.index.trait_record(d)).cloned().collect::<Vec<_>>() {
-        items.push((Vec::new(), rec.generics.clone(), rec.span));
+        items.push((Vec::new(), Vec::new(), rec.generics.clone(), rec.span));
     }
     let adt_idx = adt_first_index(p);
     check_default_wf(p, &adt_idx, errs);
-    for (tys, generics, span) in items {
+    for (tys, values, generics, span) in items {
         let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
         let mut goals: Vec<TraitRef> = Vec::new();
+        // Sized goals from value positions and `parts` fail as
+        // L0110; a failed param-bound goal keeps the L0612 shape.
+        let mut sized_goals: Vec<TraitRef> = Vec::new();
+        for t in values {
+            sized_goals.push(sized_ref(p, t));
+        }
         let mut seen: Vec<Ty> = Vec::new();
         for t in tys {
-            wf_goals(p, &adt_idx, t, &mut seen, &mut goals);
+            wf_goals(p, &adt_idx, t, &mut seen, &mut goals, &mut sized_goals);
+        }
+        // The types a where clause names are written types too
+        // (`where Vec<T>: Clone` needs `T: Sized`).
+        for pred in &generics.predicates {
+            if let Predicate::Trait(b) = pred {
+                for g in p.tys.args(b.value.args).to_vec() {
+                    if let Some(t) = g.as_ty() {
+                        wf_goals(p, &adt_idx, t, &mut seen, &mut goals, &mut sized_goals);
+                    }
+                }
+            }
         }
         // A predicate over no parameter of the item must hold
         // outright (`where String: Copy`).
@@ -7801,6 +7843,11 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
                     "Remove the bound, or change the types so it holds.",
                 ));
             }
+        }
+        if let Some(goal) = sized_goals.into_iter().find(|g| !prove_goal(p, &env, *g)) {
+            let t = p.tys.args(goal.args).first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+            errs.push(crate::check::sized::unsized_diag(p, &p.tys, t, span));
+            continue;
         }
         for goal in goals {
             if !prove_goal(p, &env, goal) {
@@ -7864,7 +7911,9 @@ fn check_default_wf(p: &mut Program, adt_idx: &FxMap<DefId, usize>, errs: &mut V
         for (i, &is_concrete) in concrete.iter().enumerate() {
             let Some(t) = inst[i].as_ty().filter(|_| is_concrete) else { continue };
             let mut goals: Vec<TraitRef> = Vec::new();
-            wf_goals(p, adt_idx, t, &mut Vec::new(), &mut goals);
+            let mut sized_goals: Vec<TraitRef> = Vec::new();
+            wf_goals(p, adt_idx, t, &mut Vec::new(), &mut goals, &mut sized_goals);
+            goals.append(&mut sized_goals);
             let bad_inner = !crate::check::collect::is_sized_ty(&p.tys, t)
                 && !matches!(p.tys.kind(t), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..));
             if bad_inner || goals.into_iter().any(|g| !prove_goal(p, &[], g)) {

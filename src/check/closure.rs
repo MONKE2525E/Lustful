@@ -382,6 +382,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let t = match (prm.ty, exp) {
                 (Some(w), exp) => {
                     let t = if named { self.resolve_annotation(w) } else { self.resolve_written(w) };
+                    // Closure params are values (rustc E0277).
+                    self.require_sized(t, self.p.ast.ty_span(w));
                     if let Some(x) = exp
                         && !self.unify(t, x)
                     {
@@ -421,6 +423,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
                 let t = if named { self.resolve_annotation(w) } else { self.resolve_written(w) };
+                self.require_sized(t, self.p.ast.ty_span(w));
                 if let Some(x) = exp
                     && !self.unify(t, x)
                 {

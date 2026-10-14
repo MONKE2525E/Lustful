@@ -18,6 +18,7 @@ pub mod obligations;
 pub mod opaque;
 pub mod picks;
 pub mod project;
+pub mod sized;
 pub mod stdtypes;
 pub mod usefulness;
 pub mod variance;
@@ -2619,6 +2620,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }),
             TyKind::Projection(..) => true,
             TyKind::Infer(_) => true,
+            // A tuple is as sized as its last element; the others
+            // must be sized for the tuple to be well-formed at all.
+            TyKind::Tuple(ts) => match self.tys.tys_of(ts).last() {
+                Some(&e) => self.sized_ok(e),
+                None => true,
+            },
+            TyKind::Array(..) => true,
             _ => {
                 if let Some(a) = self.tys.local_adt(t) {
                     // Only a last field can be unsized. Without a
@@ -4542,6 +4550,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { pat, ty, init, els, .. } => {
+                    let ty_ann = ty;
                     let annotated = ty.filter(|&t| generics::names_lifetime(self.p.ast, self.p.interner, t));
                     let declared = ty.map(|t| if annotated.is_some() { self.resolve_annotation(t) } else { self.resolve_written(t) });
                     let ty = match (declared, init) {
@@ -4577,6 +4586,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 "End it with `return`, `break`, `continue`, or a panic.",
                             );
                         }
+                    }
+                    // A local is a value: a written type must be
+                    // `Sized` when the let stores one, by an
+                    // initializer or a by-value binding (`let x:
+                    // str;`). A bare `let _: str;` stores nothing.
+                    if let Some(w) = declared.and(*ty_ann)
+                        && (init.is_some() || self.pat_binds_value(*pat))
+                    {
+                        self.require_sized(ty, self.p.ast.ty_span(w));
                     }
                     match self.p.ast.pat(*pat) {
                         // A plain name that resolves to a const, static,
@@ -4797,23 +4815,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Queues the well-formedness obligations of one body
     /// type: for every application of a local Adt inside it,
     /// the Adt's parameter bounds under the written arguments,
-    /// and for every projection its trait ref.
+    /// and for every projection its trait ref. The parts
+    /// `check::sized::parts` names must be `Sized` here (L0110).
     fn wf_check_written(&mut self, t: Ty, span: Span) {
-        if !self.p.gx.has_generics {
-            return;
-        }
+        let generic = self.p.gx.has_generics;
         let mut stack: Vec<Ty> = vec![t];
         let mut seen: Vec<Ty> = Vec::new();
+        let mut need: Vec<Ty> = Vec::new();
         while let Some(t) = stack.pop() {
             let t = self.deep(t);
             if seen.contains(&t) {
                 continue;
             }
             seen.push(t);
+            sized::parts(&self.tys, t, &mut |e| need.push(e));
             match self.tys.kind(t) {
                 TyKind::Adt(d, a) => {
                     let argv: Vec<GenericArg> = self.tys.args(a).to_vec();
-                    if let Some(idx) = self.p.gx.adt_info.iter().position(|&(def, _)| def == d) {
+                    if generic && let Some(idx) = self.p.gx.adt_info.iter().position(|&(def, _)| def == d) {
                         let preds = self.p.gx.adt_generics[idx].predicates.clone();
                         if !preds.is_empty() {
                             self.push_predicates(&preds, &argv, span);
@@ -4829,6 +4848,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 TyKind::Tuple(ts) => stack.extend(self.tys.tys_of(ts).iter().copied()),
                 TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
                     if let TyKind::Projection(assoc, _) = self.tys.kind(t)
+                        && generic
                         && let Some(def) = self.p.gx.index.trait_of_assoc(assoc.0)
                     {
                         self.obl.push_trait_at(TraitRef { def, args: a, bindings: EMPTY_BINDINGS }, span, 0);
@@ -4845,8 +4865,41 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     stack.extend(self.tys.tys_of(b.value.inputs).iter().copied());
                     stack.push(b.value.output);
                 }
+                TyKind::Dyn(b, _) => {
+                    if let Some(pr) = self.tys.dyn_bounds(b).principal {
+                        stack.extend(self.tys.args(pr.value.args).iter().skip(1).filter_map(|g| g.as_ty()));
+                    }
+                }
                 _ => {}
             }
+        }
+        for e in need {
+            self.require_sized(e, span);
+        }
+    }
+
+    /// True when a pattern binds some part by value (a binding
+    /// without `ref`, anywhere inside it).
+    fn pat_binds_value(&self, pat: PatId) -> bool {
+        match self.p.ast.pat(pat) {
+            Pat::Binding { by_ref, .. } => !by_ref,
+            Pat::At { by_ref, inner, .. } => !by_ref || self.pat_binds_value(*inner),
+            Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&e| self.pat_binds_value(e)),
+            Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| self.pat_binds_value(s)),
+            Pat::Slice { prefix, middle, suffix } => {
+                prefix.iter().chain(suffix.iter()).any(|&s| self.pat_binds_value(s)) || middle.is_some_and(|m| self.pat_binds_value(m))
+            }
+            Pat::Ref { inner, .. } | Pat::Paren(inner) => self.pat_binds_value(*inner),
+            _ => false,
+        }
+    }
+
+    /// Reports L0110 when `t` is not `Sized` here (a value
+    /// position: a `let` binding, a closure param or return).
+    fn require_sized(&mut self, t: Ty, span: Span) {
+        if !self.sized_ok(t) {
+            let d = sized::unsized_diag(self.p, &self.tys, t, span);
+            self.errs.push(d);
         }
     }
 
