@@ -4089,10 +4089,13 @@ impl FnGen<'_, '_, '_> {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };
                 let et = ctype(e);
+                let (ti, tx) = (self.tmp(), self.tmp());
                 let (vv, i, x) = (&vals[0], &vals[1], &vals[2]);
+                // Read the index and the value before the shift: both can
+                // read the Vec itself, as in `v.insert(0, v[1])`.
                 let _ = writeln!(
                     self.out,
-                    "    lust_vec_insert_at({vv}, {i}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{i}] = {x};"
+                    "    uint64_t {ti} = {i}; {et} {tx} = {x};\n    lust_vec_insert_at({vv}, {ti}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{ti}] = {tx};"
                 );
                 "((lust_Unit){})".into()
             }
