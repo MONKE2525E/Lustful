@@ -34,6 +34,19 @@ fn async_error(span: Span) -> Diag {
 
 type PResult<T> = Result<T, Diag>;
 
+/// The depth of each arena node built so far (1 for a leaf, else one
+/// more than its deepest child), index-aligned with the `Ast` arenas.
+/// Nodes that were already in the `Ast` when this parser started (a
+/// `parse_body` append) have no entry and read as 1; they were guarded
+/// by the parse that built them.
+#[derive(Default)]
+struct Depths {
+    exprs: Vec<u32>,
+    tys: Vec<u32>,
+    pats: Vec<u32>,
+    blocks: Vec<u32>,
+}
+
 pub struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
@@ -65,11 +78,23 @@ pub struct Parser<'a> {
     /// or tuple element). Taken by the next prefix or block parse, so a
     /// nested subexpression does not inherit it.
     block_inner_ok: bool,
+    /// Arena node depths, for the `MAX_AST_DEPTH` guard in `push_expr`.
+    depths: Depths,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
 /// patterns, and operator or method chains). Real code stays far below this.
 const MAX_DEPTH: u32 = 2000;
+
+/// The deepest AST lust accepts, counting every node on the longest
+/// path (expressions, types, patterns, and blocks). This bounds what
+/// combinations of the per-shape `MAX_DEPTH` caps can build: a chain
+/// of 2000 whose first term holds another parenthesized chain of 2000,
+/// repeated, is far deeper than either cap alone, and every later pass
+/// walks that depth. Later passes run on `pool::STACK_SIZE` stacks,
+/// which hold this depth with a wide margin; past it the parser
+/// rejects with L9001 instead of letting a later pass overflow.
+const MAX_AST_DEPTH: u32 = 16384;
 
 /// Parses a whole file (or chunk) into an `Ast`. Stops at the first error.
 pub fn parse(lexed: &Lexed, interner: &Interner, known: &Known) -> PResult<Ast> {
@@ -95,6 +120,7 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
         let_ok: false,
         scope_allows: Vec::new(),
         block_inner_ok: false,
+        depths: Depths::default(),
     };
     match p.inner_attributes() {
         Ok(inner) => inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect(),
@@ -150,7 +176,7 @@ pub fn parse_items_seeded(
 
 /// The item loop of `parse` over one token list (ending in `Eof`) and its string table.
 fn parse_tokens(toks: &[Token], strings: Vec<String>, interner: &Interner, known: &Known, seed_allows: &[Attr]) -> PResult<Ast> {
-    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: seed_allows.to_vec(), block_inner_ok: false };
+    let mut p = Parser { toks, pos: 0, ast: Ast::default(), interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: seed_allows.to_vec(), block_inner_ok: false, depths: Depths::default() };
     p.ast.strings = strings;
     // Inner attributes are permitted only here, before the first item
     // (and before any outer attribute): they scope over the whole file.
@@ -243,7 +269,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     let str_base = ast.strings.len() as u32;
     ast.strings.extend_from_slice(strings);
     let mut p =
-        Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
+        Parser { toks: &toks, pos: 0, ast: std::mem::take(ast), interner, known, str_base, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false, depths: Depths::default() };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     // A fn body block permits inner attributes at its start.
     p.block_inner_ok = true;
@@ -269,7 +295,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false, depths: Depths::default() };
     f(&mut p)
 }
 
@@ -288,7 +314,7 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
     v.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
     let mut ast = Ast::default();
     ast.strings = strings.to_vec();
-    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false };
+    let mut p = Parser { toks: &v, pos: 0, ast, interner, known, str_base: 0, depth: 0, deferred: None, let_ok: false, scope_allows: Vec::new(), block_inner_ok: false, depths: Depths::default() };
     p.expr().ok().map(|_| p.pos)
 }
 
@@ -764,10 +790,8 @@ impl<'a> Parser<'a> {
 
     /// Records the reject for a form the parser builds but later
     /// stages do not support yet, keeping the earliest by span.
-    /// See the `deferred` field. No form defers today (generic and
-    /// trait forms reach collect since W-TRAITS-CORE); the slot
-    /// stays for the next AST form that parses before it checks.
-    #[allow(dead_code)]
+    /// See the `deferred` field. The `MAX_AST_DEPTH` guard defers
+    /// this way (see `note_depth`).
     fn defer(&mut self, d: Diag) {
         if self.deferred.as_ref().is_none_or(|old| d.span.lo < old.span.lo) {
             self.deferred = Some(d);
@@ -865,23 +889,327 @@ impl<'a> Parser<'a> {
         self.depth -= 1;
         r
     }
+    /// The recorded depth of a node, or 1 for a node this parser did
+    /// not build (see `Depths`).
+    fn ed(&self, e: ExprId) -> u32 {
+        self.depths.exprs.get(e.0 as usize).copied().unwrap_or(1)
+    }
+    fn td(&self, t: TyId) -> u32 {
+        self.depths.tys.get(t.0 as usize).copied().unwrap_or(1)
+    }
+    fn pd(&self, p: PatId) -> u32 {
+        self.depths.pats.get(p.0 as usize).copied().unwrap_or(1)
+    }
+    fn bd(&self, b: BlockId) -> u32 {
+        self.depths.blocks.get(b.0 as usize).copied().unwrap_or(1)
+    }
+
+    /// Records the L9001 reject when a node passes `MAX_AST_DEPTH`.
+    /// Deferred like other parse-but-reject forms: the parse itself
+    /// stays within `MAX_DEPTH` of stack, so it can finish and report.
+    fn note_depth(&mut self, d: u32, span: Span) {
+        if d > MAX_AST_DEPTH {
+            self.defer(Diag::new(
+                "L9001",
+                span,
+                format!("nesting deeper than {MAX_AST_DEPTH} levels is not supported"),
+                "Split the expression into smaller pieces with `let`.",
+            ));
+        }
+    }
+
+    /// The deepest child depth under generic arguments (0 for none).
+    fn arg_depth(&self, a: &GenericArg) -> u32 {
+        match a {
+            GenericArg::Type(t) => self.td(*t),
+            GenericArg::Const(e) => self.ed(*e),
+            GenericArg::Lifetime(_) => 0,
+            GenericArg::Binding { kind, .. } => match kind {
+                BindingKind::EqTy(t) => self.td(*t),
+                BindingKind::EqConst(e) => self.ed(*e),
+                BindingKind::Constraint(bounds) => self.bounds_depth(bounds),
+            },
+        }
+    }
+
+    /// The deepest child depth under a bound list (0 for none).
+    fn bounds_depth(&self, bounds: &[TraitBound]) -> u32 {
+        bounds
+            .iter()
+            .map(|b| match b {
+                TraitBound::Trait { trait_ref, .. } => self.path_depth(&trait_ref.path),
+                TraitBound::Lifetime(_) => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The deepest child depth under a path's generic arguments (0 for none).
+    fn path_depth(&self, segs: &[PathSeg]) -> u32 {
+        let mut m = 0;
+        for s in segs {
+            match &s.args {
+                GenericArgs::None => {}
+                GenericArgs::Angle(args) => {
+                    for a in args {
+                        m = m.max(self.arg_depth(a));
+                    }
+                }
+                GenericArgs::Parenthesized { inputs, output } => {
+                    for t in inputs {
+                        m = m.max(self.td(*t));
+                    }
+                    if let Some(t) = output {
+                        m = m.max(self.td(*t));
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    /// The deepest child depth of an expression node (0 for a leaf).
+    fn expr_kids_depth(&self, e: &Expr) -> u32 {
+        let mut m = 0u32;
+        match e {
+            Expr::Int(..) | Expr::Bool(_) | Expr::Str(_) | Expr::Char(_) | Expr::Unit | Expr::SelfValue | Expr::Float(_)
+            | Expr::Continue(_) | Expr::Underscore | Expr::MacroCall(_) => {}
+            Expr::Path(segs) => m = self.path_depth(segs),
+            Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => m = self.bd(*b),
+            Expr::LabeledBlock { body, .. } | Expr::AsyncBlock { body, .. } => m = self.bd(*body),
+            Expr::If { cond, then, els } => {
+                m = m.max(self.ed(*cond)).max(self.bd(*then));
+                if let Some(x) = els {
+                    m = m.max(self.ed(*x));
+                }
+            }
+            Expr::While { cond, body, .. } => m = m.max(self.ed(*cond)).max(self.bd(*body)),
+            Expr::Loop { body, .. } => m = self.bd(*body),
+            Expr::For { pat, iter, body, .. } => m = m.max(self.pd(*pat)).max(self.ed(*iter)).max(self.bd(*body)),
+            Expr::Match { scrut, arms } => {
+                m = self.ed(*scrut);
+                for a in arms {
+                    m = m.max(self.pd(a.pat)).max(self.ed(a.body));
+                    if let Some(g) = a.guard {
+                        m = m.max(self.ed(g));
+                    }
+                }
+            }
+            Expr::Call { callee, args } => {
+                m = self.ed(*callee);
+                for a in args {
+                    m = m.max(self.ed(*a));
+                }
+            }
+            Expr::MethodCall { recv, generic_args, args, .. } => {
+                m = self.ed(*recv);
+                for a in generic_args {
+                    m = m.max(self.arg_depth(a));
+                }
+                for a in args {
+                    m = m.max(self.ed(*a));
+                }
+            }
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => m = self.ed(*base),
+            Expr::Index { base, index } => m = m.max(self.ed(*base)).max(self.ed(*index)),
+            Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+                m = m.max(self.ed(*lhs)).max(self.ed(*rhs))
+            }
+            Expr::Unary { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) | Expr::Await(expr) => {
+                m = self.ed(*expr)
+            }
+            Expr::Cast { expr, ty } => m = m.max(self.ed(*expr)).max(self.td(*ty)),
+            Expr::StructLit { path, fields, update } => {
+                m = self.path_depth(path);
+                for (_, _, x) in fields {
+                    m = m.max(self.ed(*x));
+                }
+                if let Some(x) = update {
+                    m = m.max(self.ed(*x));
+                }
+            }
+            Expr::Range { lo, hi, .. } => {
+                if let Some(x) = lo {
+                    m = m.max(self.ed(*x));
+                }
+                if let Some(x) = hi {
+                    m = m.max(self.ed(*x));
+                }
+            }
+            Expr::Break { value, .. } | Expr::Return(value) => {
+                if let Some(x) = value {
+                    m = self.ed(*x);
+                }
+            }
+            Expr::Macro { args, .. } | Expr::Tuple(args) | Expr::Array(args) => {
+                for a in args {
+                    m = m.max(self.ed(*a));
+                }
+            }
+            Expr::ArrayRepeat { value, len } => m = m.max(self.ed(*value)).max(self.ed(*len)),
+            Expr::Closure { params, ret, body, .. } => {
+                for p in params {
+                    m = m.max(self.pd(p.pat));
+                    if let Some(t) = p.ty {
+                        m = m.max(self.td(t));
+                    }
+                }
+                if let Some(t) = ret {
+                    m = m.max(self.td(*t));
+                }
+                m = m.max(self.ed(*body));
+            }
+            Expr::Let { pat, scrut } => m = m.max(self.pd(*pat)).max(self.ed(*scrut)),
+            Expr::QPath { self_ty, trait_path, segs } => {
+                m = m.max(self.td(*self_ty)).max(self.path_depth(trait_path)).max(self.path_depth(segs))
+            }
+            Expr::OffsetOf { ty, .. } => m = self.td(*ty),
+        }
+        m
+    }
+
+    /// The deepest child depth of a type node (0 for a leaf).
+    fn ty_kids_depth(&self, t: &TyExpr) -> u32 {
+        let mut m = 0u32;
+        match t {
+            TyExpr::Unit | TyExpr::Never | TyExpr::Infer | TyExpr::MacroCall(_) => {}
+            TyExpr::Path(segs) => m = self.path_depth(segs),
+            TyExpr::Ref { inner, .. } | TyExpr::Slice(inner) | TyExpr::Ptr { inner, .. } | TyExpr::Paren(inner) => {
+                m = self.td(*inner)
+            }
+            TyExpr::Tuple(ts) => {
+                for x in ts {
+                    m = m.max(self.td(*x));
+                }
+            }
+            TyExpr::Array { inner, len } => m = m.max(self.td(*inner)).max(self.ed(*len)),
+            TyExpr::FnPtr { inputs, ret, .. } => {
+                for p in inputs {
+                    m = m.max(self.td(p.ty));
+                }
+                if let Some(r) = ret {
+                    m = m.max(self.td(*r));
+                }
+            }
+            TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds } => m = self.bounds_depth(bounds),
+            TyExpr::QPath { self_ty, trait_path, segs } => {
+                m = m.max(self.td(*self_ty)).max(self.path_depth(trait_path)).max(self.path_depth(segs))
+            }
+        }
+        m
+    }
+
+    /// The deepest child depth of a pattern node (0 for a leaf).
+    fn pat_kids_depth(&self, p: &Pat) -> u32 {
+        let mut m = 0u32;
+        match p {
+            Pat::Wild | Pat::Binding { .. } | Pat::Rest | Pat::MacroCall(_) => {}
+            Pat::Lit(e) => m = self.ed(*e),
+            Pat::Path(segs) => m = self.path_depth(segs),
+            Pat::TupleStruct { path, elems } => {
+                m = self.path_depth(path);
+                for x in elems {
+                    m = m.max(self.pd(*x));
+                }
+            }
+            Pat::Struct { path, fields, .. } => {
+                m = self.path_depth(path);
+                for (_, x) in fields {
+                    m = m.max(self.pd(*x));
+                }
+            }
+            Pat::Or(ps) | Pat::Tuple(ps) => {
+                for x in ps {
+                    m = m.max(self.pd(*x));
+                }
+            }
+            Pat::Range { lo, hi, .. } => {
+                if let Some(x) = lo {
+                    m = m.max(self.ed(*x));
+                }
+                if let Some(x) = hi {
+                    m = m.max(self.ed(*x));
+                }
+            }
+            Pat::Slice { prefix, middle, suffix } => {
+                for x in prefix.iter().chain(suffix) {
+                    m = m.max(self.pd(*x));
+                }
+                if let Some(x) = middle {
+                    m = m.max(self.pd(*x));
+                }
+            }
+            Pat::Ref { inner, .. } | Pat::At { inner, .. } | Pat::Paren(inner) => m = self.pd(*inner),
+            Pat::QPath { self_ty, trait_path, segs } => {
+                m = m.max(self.td(*self_ty)).max(self.path_depth(trait_path)).max(self.path_depth(segs))
+            }
+        }
+        m
+    }
+
+    /// The deepest child depth of a block (0 for an empty block).
+    fn block_kids_depth(&self, b: &Block) -> u32 {
+        let mut m = 0u32;
+        for s in &b.stmts {
+            match s {
+                Stmt::Let { pat, ty, init, els, .. } => {
+                    m = m.max(self.pd(*pat));
+                    if let Some(t) = ty {
+                        m = m.max(self.td(*t));
+                    }
+                    if let Some(x) = init {
+                        m = m.max(self.ed(*x));
+                    }
+                    if let Some(x) = els {
+                        m = m.max(self.bd(*x));
+                    }
+                }
+                Stmt::Expr { expr, .. } => m = m.max(self.ed(*expr)),
+                // An item statement's own nodes were guarded as they
+                // were pushed; walks that enter the item start fresh
+                // from it, so it adds no depth here.
+                Stmt::Item(_) | Stmt::Macro { .. } => {}
+            }
+        }
+        if let Some(x) = b.tail {
+            m = m.max(self.ed(x));
+        }
+        m
+    }
+
     fn push_expr(&mut self, e: Expr, span: Span) -> ExprId {
+        let d = self.expr_kids_depth(&e).saturating_add(1);
+        self.note_depth(d, span);
         self.ast.exprs.push(e);
         self.ast.expr_spans.push(span);
+        self.depths.exprs.resize(self.ast.exprs.len() - 1, 1);
+        self.depths.exprs.push(d);
         ExprId(self.ast.exprs.len() as u32 - 1)
     }
     fn push_pat(&mut self, p: Pat, span: Span) -> PatId {
+        let d = self.pat_kids_depth(&p).saturating_add(1);
+        self.note_depth(d, span);
         self.ast.pats.push(p);
         self.ast.pat_spans.push(span);
+        self.depths.pats.resize(self.ast.pats.len() - 1, 1);
+        self.depths.pats.push(d);
         PatId(self.ast.pats.len() as u32 - 1)
     }
     fn push_ty(&mut self, t: TyExpr, span: Span) -> TyId {
+        let d = self.ty_kids_depth(&t).saturating_add(1);
+        self.note_depth(d, span);
         self.ast.tys.push(t);
         self.ast.ty_spans.push(span);
+        self.depths.tys.resize(self.ast.tys.len() - 1, 1);
+        self.depths.tys.push(d);
         TyId(self.ast.tys.len() as u32 - 1)
     }
     fn push_block(&mut self, b: Block) -> BlockId {
+        let d = self.block_kids_depth(&b).saturating_add(1);
+        self.note_depth(d, b.span);
         self.ast.blocks.push(b);
+        self.depths.blocks.resize(self.ast.blocks.len() - 1, 1);
+        self.depths.blocks.push(d);
         BlockId(self.ast.blocks.len() as u32 - 1)
     }
 
