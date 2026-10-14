@@ -3171,7 +3171,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         3 => cgen::table_unit(caches.table_cap, &fn_units),
         g => {
             let register = if overlay { format!("lust_overlay_u{g}") } else { format!("lust_register_u{g}") };
-            cgen::fn_unit(&program, &caches.out, groups[g - FIRST_FN_UNIT].clone(), &caches.glue, &register)
+            cgen::fn_unit(&program, &caches.out, groups[g - FIRST_FN_UNIT].clone(), &caches.glue, &register, Some(main_slot))
         }
     };
     let units: Vec<(PathBuf, String)> =

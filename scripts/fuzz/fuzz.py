@@ -644,6 +644,80 @@ def make_edit(rng, text, snapshots):
     return text, op
 
 
+# The `main` signatures `make_main_ret_edit` cycles through: the
+# signature text and the tail expression line that form needs just
+# before `main`'s closing brace. Every form exits 0 with the same
+# output as the plain one when the body is statements.
+MAIN_RET_FORMS = [
+    ("fn main() {", None),
+    ("fn main() -> Result<(), String> {", "    Ok(())\n"),
+    ("fn main() -> std::process::ExitCode {", "    std::process::ExitCode::SUCCESS\n"),
+    ("fn main() -> Result<std::process::ExitCode, String> {",
+     "    Ok(std::process::ExitCode::SUCCESS)\n"),
+]
+
+
+def _block_end(text, open_brace):
+    """Index just past the `}` that closes the `{` at `open_brace`,
+    skipping braces in strings, char literals, and line comments.
+    None when the block never closes."""
+    depth = 0
+    k = open_brace
+    while k < len(text):
+        c = text[k]
+        if c == '"':
+            k += 1
+            while k < len(text) and text[k] != '"':
+                k += 2 if text[k] == "\\" else 1
+            k += 1
+            continue
+        if c == "/" and text[k:k + 2] == "//":
+            nl = text.find("\n", k)
+            k = len(text) if nl < 0 else nl
+            continue
+        if c == "'" and k + 2 < len(text) and text[k + 2] == "'" and not text[k + 1].isalnum():
+            k += 3
+            continue
+        depth += (c == "{") - (c == "}")
+        if depth == 0:
+            return k + 1
+        k += 1
+    return None
+
+
+def make_main_ret_edit(rng, text):
+    """Changes `main`'s return type between `()`, `Result`, and
+    `ExitCode` forms (and back). The daemon's termination entry is
+    registered by the unit that holds `main`: a stale or skipped
+    entry only shows when this signature changes across warm edits,
+    which the other ops never do. Own RNG and cadence, like the
+    feature edits; run-compared after each (`feat_` prefix)."""
+    op = "feat_main_ret"
+    cur = None
+    for i, (sig, tail) in enumerate(MAIN_RET_FORMS):
+        at = text.find("\n" + sig)
+        if at >= 0:
+            cur, sig_at = i, at + 1
+            break
+    if cur is None and text.startswith(MAIN_RET_FORMS[0][0]):
+        cur, sig_at = 0, 0
+    if cur is None:
+        return text, op
+    open_brace = sig_at + len(MAIN_RET_FORMS[cur][0]) - 1
+    end = _block_end(text, open_brace)
+    if end is None:
+        return text, op
+    nxt = rng.choice([i for i in range(len(MAIN_RET_FORMS)) if i != cur])
+    body = text[open_brace + 1:end - 1]
+    tail = MAIN_RET_FORMS[cur][1]
+    if tail and body.rstrip().endswith(tail.strip()):
+        body = body[:body.rfind(tail.strip())]
+    new_tail = MAIN_RET_FORMS[nxt][1] or ""
+    if new_tail and not body.endswith("\n"):
+        body += "\n"
+    return text[:sig_at] + MAIN_RET_FORMS[nxt][0] + body + new_tail + text[end - 1:], op
+
+
 def drop_block(text, head):
     """Deletes the brace block that starts at `head` (naive brace count;
     the generated items have no braces in strings). None if absent."""
@@ -975,6 +1049,8 @@ def cmd_run(a):
     # Glue gap detours (glue_detour) on their own RNG; they end on the
     # text they started from, so the main stream stays as it was.
     grng = random.Random(a.seed ^ 0x61E6)
+    # `main` return-type edits (make_main_ret_edit) on their own RNG.
+    mrng = random.Random(a.seed ^ 0x4D41)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -996,7 +1072,9 @@ def cmd_run(a):
         seen_guard = 0
         for it in range(a.edits):
             prev = text
-            if a.crate == "small2" and it % 13 == 7:
+            if it % 17 == 9:
+                text, op = make_main_ret_edit(mrng, text)
+            elif a.crate == "small2" and it % 13 == 7:
                 text, op = make_feature_edit(frng, text)
             elif a.crate == "small3" and it % 11 == 5:
                 text, op = make_feature3_edit(frng3, text)

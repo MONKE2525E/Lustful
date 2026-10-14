@@ -5963,13 +5963,27 @@ fn static_decls(p: &Program) -> String {
 
 /// The unit for the slots in `range` (`fns` is indexed by slot; empty slots have no code). Its
 /// functions are static; the function `register` stores them in `lust_fns`.
-pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &GlueSet, register: &str) -> String {
+/// `main_slot` is the slot of `p.main` (not its `LocalDefId`: slots are
+/// stable across edits, local ids are not).
+pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &GlueSet, register: &str, main_slot: Option<u32>) -> String {
     let mut c = unit_header();
     let mut types = HashSet::new();
     let mut seen: HashSet<&(Glue, CTy)> = HashSet::new();
     for f in &fns[range.clone()] {
         types.extend(f.types.iter().cloned());
         seen.extend(f.glue.iter());
+    }
+    // The termination entry below names main's return type directly.
+    // Declare it in this unit even when main's cached `FnOut` predates
+    // the return-type edit (a warm unit must not name an undeclared
+    // `Result` struct).
+    let main_in_unit = main_slot.filter(|&s| range.contains(&(s as usize)) && fns.get(s as usize).is_some_and(|f| !f.code.is_empty()));
+    let term_main = main_in_unit.and_then(|s| p.main.map(|m| (m, s))).filter(|&(m, _)| {
+        let ret = p.fn_info(m).ret;
+        p.tys.is_exit_code(ret) || p.tys.result_args(ret).is_some()
+    });
+    if let Some((m, _)) = term_main {
+        collect_types(&cty(&p.tys, p.fn_info(m).ret), &mut types);
     }
     for st in &p.statics {
         collect_types(&cty(&p.tys, st.ty), &mut types);
@@ -6021,17 +6035,11 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     // in `lust_main_entry_p`, which the main unit prefers over the
     // plain void call. The Debug and Drop glue it calls is wanted
     // by main's own FnOut (see `gen_fn`).
-    let main_entry = p.main.filter(|m| range.contains(&(m.0 as usize)) && !fns[m.0 as usize].code.is_empty());
-    let term_entry = main_entry.filter(|&m| {
-        let ret = p.fn_info(m).ret;
-        p.tys.is_exit_code(ret) || p.tys.result_args(ret).is_some()
-    });
-    if let Some(m) = term_entry {
+    if let Some((m, idx)) = term_main {
         let ret = p.fn_info(m).ret;
         let rc = cty(&p.tys, ret);
         let rt = ctype(&rc);
         let cast = fn_ptr_cast(p, m);
-        let idx = m.0;
         let _ = writeln!(c, "static int lust_main_entry_impl(void) {{");
         if ret_is_large(p, m) {
             let _ = writeln!(c, "  {rt} r; ({cast}lust_fns[{idx}])(&r);");
@@ -6065,8 +6073,14 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
         let _ = writeln!(c, "  lust_fns[{i}] = (lust_fnptr)f{i};");
         let _ = writeln!(c, "  lust_tramps[{i}] = (lust_fnptr)tramp{i};");
     }
-    if term_entry.is_some() {
+    if term_main.is_some() {
         let _ = writeln!(c, "  lust_main_entry_p = lust_main_entry_impl;");
+    } else if main_in_unit.is_some() {
+        // This unit holds main and main now returns `()`: clear an
+        // entry a base unit from an earlier build may have registered
+        // for a `Result`/`ExitCode` main (overlays register after the
+        // base, so this wins).
+        let _ = writeln!(c, "  lust_main_entry_p = 0;");
     }
     c.push_str("}\n");
     c
@@ -7417,7 +7431,7 @@ mod tests {
             glue_unit(&program, &glue),
             runtime_unit(),
             table_unit(n, &[4]),
-            fn_unit(&program, &outs, 0..n, &glue, "lust_register_u4"),
+            fn_unit(&program, &outs, 0..n, &glue, "lust_register_u4", Some(slots[main.0 as usize])),
         ];
         let dir = std::env::temp_dir().join(format!("lust-cgen-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
