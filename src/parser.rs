@@ -3457,6 +3457,13 @@ impl<'a> Parser<'a> {
         // Like `binary_rest`, a long postfix chain makes a deep tree iteratively.
         let mut chain = 0u32;
         loop {
+            // Only a real postfix link counts: the lookahead that ends
+            // the chain must not make a chain of exactly MAX_DEPTH
+            // links read as one too many.
+            match self.peek() {
+                Tok::LParen | Tok::Dot | Tok::LBracket | Tok::Question => {}
+                _ => return Ok(e),
+            }
             chain += 1;
             if chain > MAX_DEPTH {
                 return Err(Diag::new(
@@ -4156,4 +4163,53 @@ fn macro_error(span: Span) -> Diag {
         "this macro call has no expanded form yet",
         "User macros and most built-in macros expand before parsing. This form (such as format_args!) has no expanded form in the subset yet.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diag::FileId;
+
+    /// Parses `src` as a whole file.
+    fn parse_src(src: &str) -> PResult<Ast> {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let lexed = crate::lexer::lex(src, FileId(0), 0, &interner)?;
+        parse(&lexed, &interner, &known)
+    }
+
+    /// A parenthesized `chain`-term sum whose first term is the
+    /// previous level, `levels` times: AST depth about levels * chain,
+    /// while each per-shape cap (nesting, operator chain) stays met.
+    fn combo(levels: usize, chain: usize) -> String {
+        let mut e = "1i64".to_string();
+        for _ in 0..levels {
+            let mut s = String::from("(");
+            s.push_str(&e);
+            for _ in 1..chain {
+                s.push_str(" + 1i64");
+            }
+            s.push(')');
+            e = s;
+        }
+        format!("fn main() {{ let _x = {e}; }}")
+    }
+
+    /// The total AST depth guard: combinations of the per-shape caps
+    /// that stay under `MAX_AST_DEPTH` parse; past it the error is
+    /// L9001, never a stack overflow in a later pass. Chains of
+    /// exactly the per-shape cap (2000 terms, 2000 method links)
+    /// parse; one link more rejects.
+    #[test]
+    fn ast_depth_guard_and_chain_caps() {
+        assert!(parse_src(&combo(7, 2000)).is_ok(), "depth about 14000 parses");
+        let err = parse_src(&combo(9, 2000)).err().expect("depth about 18000 rejects");
+        assert_eq!(err.code, "L9001");
+        let sum = format!("fn main() {{ let _x = {}; }}", vec!["1i64"; 2000].join(" + "));
+        assert!(parse_src(&sum).is_ok(), "a 2000-term chain parses");
+        let m2000 = format!("fn main() {{ let _x = 5i64{}; }}", ".abs()".repeat(2000));
+        assert!(parse_src(&m2000).is_ok(), "a 2000-link method chain parses");
+        let m2001 = format!("fn main() {{ let _x = 5i64{}; }}", ".abs()".repeat(2001));
+        assert_eq!(parse_src(&m2001).err().expect("2001 links reject").code, "L9001");
+    }
 }

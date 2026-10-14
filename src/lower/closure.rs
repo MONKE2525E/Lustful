@@ -72,6 +72,8 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
         guard_temps: Vec::new(),
         bind_reuse: Vec::new(),
         bind_depth: 0,
+        prelowered: Vec::new(),
+        spine_gen: 0,
     };
     let Some(info) = info.filter(|_| !poisoned) else {
         // The parent failed to check and reports why; keep the shape

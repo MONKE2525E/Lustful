@@ -4094,9 +4094,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.call(e, *callee, args, span, expected)
             }
             Expr::MethodCall { recv, name, name_span, generic_args, args } => {
-                let seg = ast::PathSeg { name: *name, args: ast::GenericArgs::Angle(generic_args.clone()) };
-                self.lifetime_turbofish(std::slice::from_ref(&seg));
-                self.method_call(e, *recv, *name, *name_span, args, generic_args, expected)
+                self.method_chain(e, *recv, *name, *name_span, args, generic_args, expected)
             }
             Expr::Field { base, name } => {
                 let bt = self.expr(*base, None);
@@ -4206,7 +4204,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                 }
             }
-            Expr::Binary { op, lhs, rhs } => self.binary(e, *op, *lhs, *rhs, span),
+            Expr::Binary { op, lhs, rhs } => self.binary_chain(e, *op, *lhs, *rhs, span),
             Expr::Unary { op, expr } => {
                 if *op == UnOp::Neg
                     && let Expr::Int(..) = p.ast.expr(*expr)
@@ -7901,6 +7899,49 @@ impl<'p, 'a> Ctx<'p, 'a> {
         Some(dst)
     }
 
+    /// Checks a method call, walking a receiver chain (`x.m().m()...`,
+    /// up to the parser's 2000-link cap) in a loop: collect the spine,
+    /// run the turbofish lifetime rejects outermost first (the order
+    /// the recursive walk ran them), check the base receiver, then
+    /// fold `method_call_with_rt` back up. A spine of one goes through
+    /// `method_call` exactly as before.
+    fn method_chain(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        generic_args: &[ast::GenericArg],
+        expected: Option<Ty>,
+    ) -> Ty {
+        let p = self.p;
+        let mut spine: Vec<(ExprId, ExprId, Sym, Span, &[ExprId], &[ast::GenericArg])> =
+            vec![(e, recv, name, name_span, args, generic_args)];
+        let mut cur = recv;
+        while let Expr::MethodCall { recv: r, name: n, name_span: ns, generic_args: g, args: a } = p.ast.expr(cur) {
+            spine.push((cur, *r, *n, *ns, a, g));
+            cur = *r;
+        }
+        for (_, _, n, _, _, g) in &spine {
+            let seg = ast::PathSeg { name: *n, args: ast::GenericArgs::Angle(g.to_vec()) };
+            self.lifetime_turbofish(std::slice::from_ref(&seg));
+        }
+        if spine.len() == 1 {
+            return self.method_call(e, recv, name, name_span, args, generic_args, expected);
+        }
+        let mut rt = self.expr(cur, None);
+        let n = spine.len();
+        for (i, (node, r, nm, ns, a, g)) in spine.into_iter().rev().enumerate() {
+            let outer = i + 1 == n;
+            rt = self.method_call_with_rt(node, r, rt, nm, ns, a, g, if outer { expected } else { None });
+            if !outer {
+                self.set(node, rt);
+            }
+        }
+        rt
+    }
+
     fn method_call(
         &mut self,
         e: ExprId,
@@ -7911,9 +7952,28 @@ impl<'p, 'a> Ctx<'p, 'a> {
         turbofish: &[ast::GenericArg],
         expected: Option<Ty>,
     ) -> Ty {
+        let rt = self.expr(recv, None);
+        self.method_call_with_rt(e, recv, rt, name, name_span, args, turbofish, expected)
+    }
+
+    /// `method_call` with the receiver already checked to type `rt`
+    /// (before `deep`); `recv` is still named for the borrow and
+    /// packed-field checks inside. Split out so `expr_inner` can check
+    /// a method chain (`x.m().m()...`) in a loop instead of recursing
+    /// down its receiver spine.
+    fn method_call_with_rt(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        rt: Ty,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+    ) -> Ty {
         let p = self.p;
         let k = p.known;
-        let rt = self.expr(recv, None);
         let rt = self.deep(rt);
         // ARCH 2.12 run point: a method call must know the receiver type. The
         // obligation queue runs just before that head is required (ARCH 2.4).
@@ -9224,6 +9284,44 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Checks a binary expression, walking a left-leaning chain of
+    /// non-`&&`/`||` operators (`a + b + c + ...`, up to the parser's
+    /// 2000-term cap) in a loop: collect the left spine, check its
+    /// base, then fold `binary_with_lt` back up. A spine of one, and
+    /// `&&`/`||` (whose operands check against `bool`, not against
+    /// each other), go through `binary` exactly as before.
+    fn binary_chain(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span) -> Ty {
+        use BinOp::*;
+        if matches!(op, And | Or) {
+            return self.binary(e, op, lhs, rhs, span);
+        }
+        let p = self.p;
+        let mut spine: Vec<(ExprId, BinOp, ExprId, Span)> = vec![(e, op, rhs, span)];
+        let mut cur = lhs;
+        while let Expr::Binary { op: o, lhs: l, rhs: r } = p.ast.expr(cur) {
+            if matches!(o, And | Or) {
+                break;
+            }
+            spine.push((cur, *o, *r, self.span(cur)));
+            cur = *l;
+        }
+        if spine.len() == 1 {
+            return self.binary(e, op, lhs, rhs, span);
+        }
+        let mut lt = self.expr(cur, None);
+        let n = spine.len();
+        for (i, (node, o, r, sp)) in spine.into_iter().rev().enumerate() {
+            lt = self.binary_with_lt(node, o, lt, r, sp);
+            // The outermost node's type is set by `expr` on return,
+            // as `expr_inner` results always are; inner spine nodes
+            // were set by the recursive `expr(lhs)` call they replace.
+            if i + 1 < n {
+                self.set(node, lt);
+            }
+        }
+        lt
+    }
+
     fn binary(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span) -> Ty {
         use BinOp::*;
         if matches!(op, And | Or) {
@@ -9232,6 +9330,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return BOOL;
         }
         let lt = self.expr(lhs, None);
+        self.binary_with_lt(e, op, lt, rhs, span)
+    }
+
+    /// `binary` for a non-`&&`/`||` operator whose left operand type
+    /// `lt` is already checked. Split out so `expr_inner` can check a
+    /// left-leaning operator chain (`a + b + c + ...`) in a loop
+    /// instead of recursing down its left spine.
+    fn binary_with_lt(&mut self, e: ExprId, op: BinOp, lt: Ty, rhs: ExprId, span: Span) -> Ty {
+        use BinOp::*;
+        debug_assert!(!matches!(op, And | Or));
         let rt = self.expr(rhs, Some(lt));
         // ARCH 2.12 run point: an operator on a non-scalar must know the left
         // operand type. The scalar path above and below needs no trait search.

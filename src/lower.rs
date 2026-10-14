@@ -58,6 +58,14 @@ struct Lower<'p, 'a> {
     /// Depth of `bind_pat` recursion, for tag cleanup at the
     /// outermost call (see `bind_pat`).
     bind_depth: u32,
+    /// Binary-chain spine nodes already lowered into a temporary by
+    /// `prelower_binary_spine`, with the generation of the spine run
+    /// that made them (see `expr_into_raw`). An entry is taken out
+    /// when the node's value is consumed, exactly once.
+    prelowered: Vec<(ExprId, Place, u32)>,
+    /// The current binary-spine run number; each run cleans up its
+    /// own unconsumed `prelowered` entries.
+    spine_gen: u32,
 }
 
 /// Lowers one checked function body to IR.
@@ -98,6 +106,8 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
         guard_temps: Vec::new(),
         bind_reuse: Vec::new(),
         bind_depth: 0,
+        prelowered: Vec::new(),
+        spine_gen: 0,
     };
     lw.new_local(f.ret, true, None);
     lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
@@ -384,6 +394,9 @@ impl<'p, 'a> Lower<'p, 'a> {
 
     /// Evaluates `e` to a place. A value expression goes into a new temporary.
     fn place(&mut self, e: ExprId) -> Place {
+        if let Some(pl) = self.take_prelowered(e) {
+            return pl;
+        }
         match (self.p.ast.expr(e), self.ck.res(e)) {
             (Expr::Path(_) | Expr::SelfValue, Res::Local(l)) => match &self.guard_places[l as usize] {
                 // A match guard reads its arm's bindings through a
@@ -642,6 +655,9 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     fn operand_raw(&mut self, e: ExprId) -> Operand {
+        if let Some(pl) = self.take_prelowered(e) {
+            return Operand::Move(pl);
+        }
         let ty = self.ty(e);
         match self.p.ast.expr(e) {
             Expr::Int(v, _) => match self.kind(ty) {
@@ -726,7 +742,67 @@ impl<'p, 'a> Lower<'p, 'a> {
         self.expr_into_raw(e, dest);
     }
 
+    /// Takes out the temporary `prelower_binary_spine` made for `e`,
+    /// if it made one and the value has not been consumed yet.
+    fn take_prelowered(&mut self, e: ExprId) -> Option<Place> {
+        let i = self.prelowered.iter().rposition(|&(x, _, _)| x == e)?;
+        Some(self.prelowered.swap_remove(i).1)
+    }
+
+    /// Lowers every node below `top` on the left spine of a binary
+    /// chain (`a + b + c + ...`) into its own temporary, deepest
+    /// first, and records them in `prelowered`. Evaluating the spine
+    /// this way emits the same statements in the same order as the
+    /// recursive walk (the left operand of every node is ready before
+    /// its right operand runs), but the walk itself is a loop, so a
+    /// 2000-term chain uses constant stack here. A node the checker
+    /// const-evaluated stops the spine: it materializes directly in
+    /// `expr_into_here` and nothing below it must run.
+    /// Returns the run's generation for cleanup of leftovers.
+    fn prelower_binary_spine(&mut self, top: ExprId) -> u32 {
+        self.spine_gen += 1;
+        let run = self.spine_gen;
+        let mut spine: Vec<ExprId> = Vec::new();
+        let mut cur = top;
+        while let Expr::Binary { lhs, .. } = self.p.ast.expr(cur) {
+            if self.ck.const_value(cur).is_some() {
+                break;
+            }
+            spine.push(cur);
+            cur = *lhs;
+        }
+        for &node in spine[1..].iter().rev() {
+            let pl = Place::local(self.temp(self.ty(node)));
+            self.expr_into_here(node, Some(&pl));
+            self.prelowered.push((node, pl, run));
+        }
+        run
+    }
+
     fn expr_into_raw(&mut self, e: ExprId, dest: Option<&Place>) {
+        if let Some(pl) = self.take_prelowered(e) {
+            if let Some(d) = dest {
+                let d = d.clone();
+                let span = self.span(e);
+                self.assign(d, Rvalue::Use(Operand::Move(pl)), span);
+            }
+            return;
+        }
+        if matches!(self.p.ast.expr(e), Expr::Binary { .. }) && self.ck.const_value(e).is_none() {
+            let run = self.prelower_binary_spine(e);
+            self.expr_into_here(e, dest);
+            // Not every spine value is always consumed (a node below
+            // a const-evaluated one, an error path): drop this run's
+            // leftovers so a later use of the same expression (a
+            // match guard row lowers its guard once per row) always
+            // evaluates it fresh.
+            self.prelowered.retain(|&(_, _, g)| g != run);
+            return;
+        }
+        self.expr_into_here(e, dest)
+    }
+
+    fn expr_into_here(&mut self, e: ExprId, dest: Option<&Place>) {
         let span = self.span(e);
         let p = self.p;
         let ty = self.ty(e);
