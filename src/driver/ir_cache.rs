@@ -332,6 +332,9 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
     let mut h = FxHasher::default();
     "ir-v1".hash(&mut h);
     hash_def(&mut h, p, p.def_id(body.fn_id));
+    // `#[track_caller]` changes the fn's C signature and every panic
+    // location in it (check/caller.rs).
+    crate::check::caller::is_track_caller(p, body.fn_id).hash(&mut h);
     (body.arg_count as u64).hash(&mut h);
     let mut seen: Vec<DefId> = Vec::new();
     (body.locals.len() as u64).hash(&mut h);
@@ -382,6 +385,8 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
                     CallTarget::Fn(f) => {
                         0u8.hash(&mut h);
                         hash_def(&mut h, p, p.def_id(*f));
+                        // A `#[track_caller]` callee takes the call's location.
+                        crate::check::caller::is_track_caller(p, *f).hash(&mut h);
                     }
                     CallTarget::Builtin(b) => {
                         1u8.hash(&mut h);
@@ -1223,5 +1228,33 @@ fn main() {
         assert_eq!(base, fp_of(&format!("\n\n{SRC}")), "whole-fn moves keep fingerprints");
         assert_ne!(base, fp_of(&SRC.replace("a * 2", "a * 3")), "body edit moves the fingerprint");
         assert_ne!(base, fp_of(&SRC.replace("struct Foo { x: i64 }", "#[derive(Clone)]\nstruct Foo { x: i64 }")), "layout edit moves fingerprints");
+    }
+
+    /// `#[track_caller]` changes the fn's C signature and its panic
+    /// locations, and every direct call passes one more argument: adding
+    /// it moves the fn's fingerprint and its caller's (a warm daemon
+    /// reused both units before).
+    #[test]
+    fn ir_fingerprint_tracks_track_caller() {
+        const TC: &str = "fn g(x: Option<u8>) -> u8 {\n    x.unwrap()\n}\nfn main() {\n    println!(\"{}\", g(None));\n}\n";
+        let fp_of = |src: &str| -> Vec<(String, u64)> {
+            let mut out = Vec::new();
+            lowered(src, |p, map, bodies| {
+                out = bodies
+                    .iter()
+                    .map(|b| {
+                        let def = &p.fn_info(b.fn_id).def;
+                        (p.name(def.name).to_string(), ir_fingerprint(p, b, map, map.line_col(def.name_span).0))
+                    })
+                    .collect();
+            });
+            out
+        };
+        let (base, tc) = (fp_of(TC), fp_of(&format!("#[track_caller]\n{TC}")));
+        for name in ["g", "main"] {
+            let get = |v: &[(String, u64)]| v.iter().find(|(n, _)| n == name).map(|x| x.1);
+            assert!(get(&base).is_some(), "{name} is lowered");
+            assert_ne!(get(&base), get(&tc), "#[track_caller] on g moves {name}'s fingerprint");
+        }
     }
 }
