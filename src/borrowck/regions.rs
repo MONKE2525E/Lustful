@@ -3711,11 +3711,45 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let [(t0, v0), (it, iv)] = avs else { return false };
         let TyKind::Ref(_, _, table) = self.body.tys.kind(*t0) else { return false };
         let Some((kind, targs)) = crate::ty::hash::hash_parts(&self.body.tys, table) else { return false };
-        let Some(item_vars) = self.item_slots(*it, iv) else { return false };
         let parts = if kind == crate::ty::hash::HashTy::HashMap { 2 } else { 1 };
         let n: usize = targs.iter().take(parts).map(|&t| self.sc.slots(t) as usize).sum();
         let Some(ev) = v0.get(1..1 + n) else { return false };
         let ev = ev.to_vec();
+        // A Vec, array, slice, map, or set argument: its elements' slots
+        // lead its own (after the borrow for `&C`, whose items are copied).
+        let tys = &self.body.tys;
+        let container = |c: Ty| {
+            tys.vec_elem(c).is_some()
+                || matches!(tys.kind(c), TyKind::Array(..) | TyKind::Slice(_))
+                || crate::ty::hash::hash_parts(tys, c).is_some()
+        };
+        let skip = match tys.kind(*it) {
+            TyKind::Ref(_, _, c) if container(c) => Some(1),
+            _ if container(*it) => Some(0),
+            _ => None,
+        };
+        if let Some(skip) = skip {
+            let Some(part) = iv.get(skip..skip + n) else { return false };
+            let part = part.to_vec();
+            self.flow_all(&part, &ev);
+            return true;
+        }
+        let Some(item_vars) = self.item_slots(*it, iv) else { return false };
+        // `Extend<&T>` and `Extend<(&K, &V)>` copy the parts in: each part
+        // has one more (leading) region, the borrow, which does not flow.
+        let item_vars = if item_vars.len() == n + parts {
+            let mut out = Vec::new();
+            let mut at = 0;
+            for &t in targs.iter().take(parts) {
+                let k = self.sc.slots(t) as usize;
+                let Some(part) = item_vars.get(at + 1..at + 1 + k) else { return false };
+                out.extend_from_slice(part);
+                at += 1 + k;
+            }
+            out
+        } else {
+            item_vars
+        };
         self.flow_all(&item_vars, &ev);
         true
     }

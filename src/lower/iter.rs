@@ -23,6 +23,16 @@ use crate::ty::*;
 
 type R = Result<(), String>;
 
+/// How many references wrap `t` (`&&T` is 2).
+fn ref_depth(tys: &Tys, mut t: Ty) -> usize {
+    let mut n = 0;
+    while let TyKind::Ref(_, _, inner) = tys.kind(t) {
+        n += 1;
+        t = inner;
+    }
+    n
+}
+
 /// True for the builtins this pass rewrites. `IterVecIntoIter` and
 /// the `vec::IntoIter` element moves stay calls: codegen emits them.
 fn expands(b: Builtin) -> bool {
@@ -904,12 +914,26 @@ impl Ex<'_, '_, '_> {
         );
         let map = kind == crate::ty::hash::HashTy::HashMap;
         let old_ty = if map { self.body.tys.mk_option(targs[1]) } else { BOOL };
+        // `Extend<&T>` and `Extend<(&K, &V)>` (Copy parts): copy them in.
+        // The item is `T` or `&T` (check/hashmap.rs), so one more
+        // reference than the key type means by reference.
+        let item = self.item(ty)?;
+        let key_item = match self.body.tys.kind(item) {
+            TyKind::Tuple(ts) if map => self.body.tys.tys_of(ts)[0],
+            _ => item,
+        };
+        let by_ref = ref_depth(&self.body.tys, key_item) > ref_depth(&self.body.tys, targs[0]);
         self.each(&itp, ty, &mut |this, x, _| {
             let res = this.local(old_ty);
             let mut args = vec![Operand::Copy(Place::local(table))];
-            if map {
+            if map && by_ref {
+                args.push(Operand::Copy(Place::local(x).project(Proj::Field(0)).deref()));
+                args.push(Operand::Copy(Place::local(x).project(Proj::Field(1)).deref()));
+            } else if map {
                 args.push(Operand::Move(Place::local(x).project(Proj::Field(0))));
                 args.push(Operand::Move(Place::local(x).project(Proj::Field(1))));
+            } else if by_ref {
+                args.push(Operand::Copy(Place::local(x).deref()));
             } else {
                 args.push(Operand::Move(Place::local(x)));
             }

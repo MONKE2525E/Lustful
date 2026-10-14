@@ -423,7 +423,45 @@ impl<'p, 'a> Ctx<'p, 'a> {
         } else {
             k
         };
-        if !self.unify(want, item) {
+        // std's `Extend<&T>` for HashSet<T: Copy> and `Extend<(&K, &V)>`
+        // for HashMap<K: Copy, V: Copy> (W-STD-B): the items copied in.
+        let by_ref = {
+            let it_t = self.deep(item);
+            let refs: Option<Vec<Ty>> = if kind == HashTy::HashMap {
+                match self.kind(it_t) {
+                    TyKind::Tuple(ts) => {
+                        let ts = self.tys.tys_of(ts).to_vec();
+                        match ts[..] {
+                            [a, b] => match (self.kind(a), self.kind(b)) {
+                                (TyKind::Ref(_, Mut::Shared, x), TyKind::Ref(_, Mut::Shared, y)) => Some(vec![x, y]),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                match self.kind(it_t) {
+                    TyKind::Ref(_, Mut::Shared, x) => Some(vec![x]),
+                    _ => None,
+                }
+            };
+            refs.filter(|r| {
+                let want_parts: Vec<Ty> = if kind == HashTy::HashMap { vec![targs[0], targs[1]] } else { vec![k] };
+                let snap = self.snapshot_vars();
+                let ok = r.iter().zip(&want_parts).all(|(&x, &w)| self.unify(x, w));
+                if !ok {
+                    self.rollback_vars(snap);
+                }
+                ok
+            })
+        };
+        if let Some(parts) = by_ref {
+            for p in parts {
+                self.deferred_copy.push((p, self.span(*a)));
+            }
+        } else if !self.unify(want, item) {
             let it_t = self.deep(item);
             if matches!(self.kind(it_t), TyKind::Ref(..)) || matches!(self.kind(it_t), TyKind::Tuple(_)) {
                 let tn = self.tn(it_t);
