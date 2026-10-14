@@ -4153,6 +4153,8 @@ impl FnGen<'_, '_, '_> {
             // `next` and `next_back` take from `front..len`.
             B::IterVecIntoIter => format!("((lust_VecIter){{ {0}.ptr, {0}.len, {0}.cap, 0 }})", vals[0]),
             B::VecIterLen => format!("({0}->len - {0}->front)", vals[0]),
+            B::VecIterCap => format!("({0}->cap)", vals[0]),
+            B::VecIterFront => format!("({0}->front)", vals[0]),
             B::CharsBytesLeft => format!("({0}->s.len - {0}->pos)", vals[0]),
             B::VecIterNext | B::VecIterNextBack => {
                 let e = match &tys[0] {

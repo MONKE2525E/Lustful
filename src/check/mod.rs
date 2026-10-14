@@ -352,6 +352,10 @@ pub enum Builtin {
     IterProduct,
     VecIterNext,
     VecIterNextBack,
+    /// The buffer capacity and the front index of a `vec::IntoIter`
+    /// (W-STD-B, in-place collect).
+    VecIterCap,
+    VecIterFront,
     VecIterLen,
     CharsBytesLeft,
     CharsNextBack,

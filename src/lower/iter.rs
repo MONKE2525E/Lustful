@@ -4253,6 +4253,67 @@ impl Ex<'_, '_, '_> {
             let ax = this.take(Place::local(x), elem);
             this.call_builtin(Builtin::VecPush, vec![Operand::Move(Place::local(rv)), ax], Place::local(u));
         };
+        // std's allocation reuse (W-STD-B, alloc's in_place_collect.rs): the
+        // result keeps the source Vec's buffer, so its capacity is the
+        // source's (in bytes). `vec.into_iter().collect()` itself reuses
+        // the buffer when unadvanced or at least half full, else extends a
+        // new Vec; through the in-place adapters the capacity is
+        // `src_cap * size_of::<S>() / size_of::<T>()` when the alignments
+        // match and `T` is no larger. Every item then fits.
+        if let Some((path, src_elem)) = self.in_place_source(ty, elem) {
+            let mut sp = itp.clone();
+            for _ in 0..path {
+                sp = sp.project(Proj::Field(0));
+            }
+            let vit = it::mk_iter(&mut self.body.tys, IterKind::VecIntoIter, &[src_elem]);
+            let rsp = self.ref_to(false, sp, vit);
+            let scap = self.local(USIZE);
+            self.call_builtin(Builtin::VecIterCap, vec![Operand::Copy(Place::local(rsp))], Place::local(scap));
+            if path == 0 {
+                // `SpecFromIter<T, vec::IntoIter<T>>`.
+                let (front, len) = (self.local(USIZE), self.local(USIZE));
+                self.call_builtin(Builtin::VecIterFront, vec![Operand::Copy(Place::local(rsp))], Place::local(front));
+                self.call_builtin(Builtin::VecIterLen, vec![Operand::Copy(Place::local(rsp))], Place::local(len));
+                let unadvanced = self.cmp(Eq, Operand::Copy(Place::local(front)), Self::usize_c(0));
+                let (reuse, check) = self.branch(unadvanced);
+                let fresh = self.block();
+                let fill = self.block();
+                self.cur = check;
+                let half = self.local(USIZE);
+                self.assign(Place::local(half), Rvalue::Bin(Div, Operand::Copy(Place::local(scap)), Self::usize_c(2)));
+                let big = self.cmp(Ge, Operand::Copy(Place::local(len)), Operand::Copy(Place::local(half)));
+                let (reuse2, small) = self.branch(big);
+                self.cur = reuse2;
+                self.goto(reuse);
+                self.cur = reuse;
+                with_capacity(self, Operand::Copy(Place::local(scap)));
+                self.goto(fill);
+                // `Vec::new()` then `append_elements`: `reserve(len)`.
+                self.cur = small;
+                self.goto(fresh);
+                self.cur = fresh;
+                self.assign(Place::local(v), Rvalue::VecLit(elem, Vec::new()));
+                let rvm = self.ref_to(true, Place::local(v), dest_ty);
+                let u = self.local(UNIT);
+                self.call_builtin(Builtin::VecReserve, vec![Operand::Move(Place::local(rvm)), Operand::Copy(Place::local(len))], Place::local(u));
+                self.goto(fill);
+                self.cur = fill;
+            } else {
+                let (s, t) = (self.layout(src_elem)?, self.layout(elem)?);
+                let dcap = self.local(USIZE);
+                self.assign(Place::local(dcap), Rvalue::Bin(Mul, Operand::Copy(Place::local(scap)), Self::usize_c(s.0)));
+                self.assign(Place::local(dcap), Rvalue::Bin(Div, Operand::Copy(Place::local(dcap)), Self::usize_c(t.0)));
+                with_capacity(self, Operand::Copy(Place::local(dcap)));
+            }
+            self.each(&itp, ty, &mut |this, x, _| {
+                push(this, x);
+                Ok(())
+            })?;
+            self.goto(join);
+            self.cur = join;
+            self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v))));
+            return Ok(());
+        }
         if self.trusted_len(ty) {
             // `with_capacity(upper)`, then every item fits.
             let (_, hi) = self.hint(itp.clone(), ty)?;
@@ -4311,6 +4372,42 @@ impl Ex<'_, '_, '_> {
         self.cur = join;
         self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v))));
         Ok(())
+    }
+
+    /// When `collect` into `Vec<T>` keeps the source buffer (std's
+    /// `SpecFromIter` impls, W-STD-B): a `vec::IntoIter<S>` itself (0
+    /// adapter levels), or through std's InPlaceIterable adapters lust has
+    /// (Map, Filter, FilterMap, Enumerate, Zip's first side, Skip, Take,
+    /// SkipWhile, TakeWhile, Inspect, Cloned) when S and T are not zero
+    /// sized, align the same, and T is no larger. The adapter depth (each
+    /// level's source is its field 0) and S.
+    fn in_place_source(&self, ty: Ty, item: Ty) -> Option<(usize, Ty)> {
+        use IterKind as K;
+        let (k, a) = self.kind_args(ty)?;
+        if k == K::VecIntoIter {
+            return Some((0, a[0]));
+        }
+        let mut depth = 0;
+        let mut cur = (k, a);
+        loop {
+            match cur.0 {
+                K::Map | K::Filter | K::FilterMap | K::Enumerate | K::Zip | K::Skip | K::Take | K::SkipWhile | K::TakeWhile | K::Inspect | K::Cloned => {
+                    depth += 1;
+                    cur = self.kind_args(cur.1[0])?;
+                }
+                K::VecIntoIter => break,
+                _ => return None,
+            }
+        }
+        let src = cur.1[0];
+        let (s, t) = (self.layout(src).ok()?, self.layout(item).ok()?);
+        (s.0 > 0 && t.0 > 0 && s.1 == t.1 && s.0 >= t.0).then_some((depth, src))
+    }
+
+    /// (size, align) of a type, as Rust lays it out.
+    fn layout(&self, t: Ty) -> Result<(u64, u64), String> {
+        let l = crate::ty::layout::layout_of_ty(&self.body.tys, self.p, t).map_err(|_| "iterator expansion: element layout unknown".to_string())?;
+        Ok((l.size, l.align))
     }
 
     /// `RawVec::MIN_NON_ZERO_CAP` for an element type: 8 for 1-byte

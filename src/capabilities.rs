@@ -276,6 +276,8 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::IterRposition,
     Builtin::IterWindows,
     Builtin::IterFlatten,
+    Builtin::VecIterCap,
+    Builtin::VecIterFront,
     Builtin::IterSizeHint,
     Builtin::IterFlatMap,
     Builtin::IterNextBack,
@@ -733,6 +735,8 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::VecIterNext => (&["std::vec::IntoIter<T>"], vec![i.intern("next")], Call::Method),
         B::VecIterNextBack => (&["std::vec::IntoIter<T>"], vec![i.intern("next_back")], Call::Method),
         B::VecIterLen => (&["std::vec::IntoIter<T>"], vec![i.intern("len")], Call::Method),
+        // Internal steps of in-place collect (W-STD-B), never called by name.
+        B::VecIterCap | B::VecIterFront => (&[], vec![], Call::Method),
         B::CharsBytesLeft => (&["str::Chars"], vec![i.intern("size_hint")], Call::Method),
         B::CharsNextBack => (&["str::Chars"], vec![i.intern("next_back")], Call::Method),
         B::DefaultGlue => (&["any Default type"], vec![k.default], Call::Associated),
