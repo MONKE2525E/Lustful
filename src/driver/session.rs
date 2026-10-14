@@ -27,6 +27,9 @@ pub(crate) struct Front {
     /// cached outputs that carry those indices (`FnOut::types`,
     /// the glue set) survive such edits.
     pub(crate) def_order: crate::check::collect::DefOrder,
+    /// The current request's client view (env, shown paths), set at the
+    /// start of each compile (`compile::client_view`).
+    pub(crate) client: crate::expand::ClientView,
     /// How many `def_order` entries (Adts plus statics) the disk
     /// def-order file already holds. Like the slot manifest, the
     /// order is persisted so a restarted daemon numbers defs as
@@ -288,6 +291,7 @@ impl Session {
                 ast: Ast::default(),
                 env_hash: None,
                 def_order: crate::check::collect::DefOrder::default(),
+                client: crate::expand::ClientView::default(),
                 def_order_stored: 0,
                 def_order_loaded: false,
                 prev_adt_ids: FxMap::default(),

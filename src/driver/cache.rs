@@ -161,6 +161,8 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
         None => 0,
     };
     let graph = crate::protocol::graph_key(&req.session);
+    // The root path as typed: `file!`, `dbg!`, and panic locations show it.
+    let shown = req.client.shown.as_deref().map_or(&[][..], |p| p.as_os_str().as_encoded_bytes());
     let (a, b) = hash128(
         &[
             &id.0.to_le_bytes(),
@@ -170,6 +172,7 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
             &flags,
             &req.max_errors.to_le_bytes(),
             req.file.to_string_lossy().as_bytes(),
+            shown,
             session.as_bytes(),
             &graph.to_le_bytes(),
             &build_script.to_le_bytes(),
@@ -445,6 +448,7 @@ mod tests {
             max_errors: 20,
             run_args: None,
             harness: false,
+            client: Default::default(),
         }
     }
 
@@ -464,6 +468,9 @@ mod tests {
         let mut other = req(Cmd::Check, false, false);
         other.file = "/tmp/y/main.rs".into();
         assert_ne!(base, request_key(id, &other, b"fn main() {}"), "source path");
+        let mut other = req(Cmd::Check, false, false);
+        other.client.shown = Some("main.rs".into());
+        assert_ne!(base, request_key(id, &other, b"fn main() {}"), "typed root path");
         let mut other = req(Cmd::Check, false, false);
         other.session.features = vec!["alpha".into()];
         assert_ne!(base, request_key(id, &other, b"fn main() {}"), "feature selection");

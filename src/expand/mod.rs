@@ -631,6 +631,47 @@ pub struct ExpandCtx<'a> {
     /// resolve worklist sets it per module file so `super::mac!`,
     /// `self::mac!`, and prescan module tables read from the right module.
     pub module_path: Vec<Sym>,
+    /// The requesting client's env and shown paths (`for_file` gives `ClientView::PROCESS`).
+    pub client: &'a ClientView,
+}
+
+/// What expansion reads from the client that asked for the compile
+/// rather than from this process: the env `env!` sees, and how source
+/// paths show in `file!` and `dbg!`. The driver builds one per request
+/// from `protocol::Client`, so a daemon started under one env answers
+/// another client as that client's own one-shot compile would.
+#[derive(Clone, Default, Debug)]
+pub struct ClientView {
+    /// The client's env. None reads this process's start env (`builtin::compile_env`).
+    pub env: Option<std::sync::Arc<Vec<(String, String)>>>,
+    /// (absolute dir, shown dir): a path under the absolute dir shows as
+    /// the shown dir joined with the rest, as rustc shows paths relative
+    /// to the root path it was given. None shows paths as they are.
+    pub shown_root: Option<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+impl ClientView {
+    /// This process's env, paths shown as they are.
+    pub const PROCESS: ClientView = ClientView { env: None, shown_root: None };
+
+    /// The value of env var `name` for `env!` and `option_env!`.
+    pub fn env_var(&self, name: &str) -> Option<String> {
+        match &self.env {
+            Some(env) => env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
+            None => builtin::compile_env(name),
+        }
+    }
+
+    /// `path` as `file!` shows it.
+    pub fn shown(&self, path: &str) -> String {
+        match &self.shown_root {
+            Some((abs, shown)) => match std::path::Path::new(path).strip_prefix(abs) {
+                Ok(rest) => shown.join(rest).to_string_lossy().into_owned(),
+                Err(_) => path.to_string(),
+            },
+            None => path.to_string(),
+        }
+    }
 }
 
 impl<'a> ExpandCtx<'a> {
@@ -643,6 +684,7 @@ impl<'a> ExpandCtx<'a> {
             src,
             cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new() },
             module_path: Vec::new(),
+            client: &ClientView::PROCESS,
         }
     }
     /// The crate name `module_path!` starts with: the file stem, with
@@ -674,6 +716,12 @@ pub enum Dep {
     /// a chunk carrying it must not be reused at a different start
     /// line, which the driver checks (see `deps_stale`).
     Position,
+    /// The expansion showed a source path (`file!`, `dbg!`): `path` as
+    /// it was, and the text it showed under the client's view then.
+    Shown {
+        path: String,
+        shown: String,
+    },
 }
 
 /// Hashes bytes for a file dependency record.
@@ -691,13 +739,15 @@ pub fn deps_stale_with(deps: &[Dep], env: &dyn Fn(&str) -> Option<String>) -> bo
     deps.iter().any(|dep| match dep {
         Dep::File { path, hash } => std::fs::read(path).map_or(true, |bytes| dep_bytes_hash(&bytes) != *hash),
         Dep::Env { name, value } => env(name) != *value,
-        Dep::Position => false,
+        Dep::Position | Dep::Shown { .. } => false,
     })
 }
 
-/// `deps_stale_with` against the compile-time env snapshot (ARCH 6.4).
-pub fn deps_stale(deps: &[Dep]) -> bool {
-    deps_stale_with(deps, &builtin::compile_env)
+/// `deps_stale_with` against `client`, the view this request expands
+/// under (ARCH 6.4): its env, and how it shows the paths `file!` read.
+pub fn deps_stale(deps: &[Dep], client: &ClientView) -> bool {
+    deps_stale_with(deps, &|name| client.env_var(name))
+        || deps.iter().any(|dep| matches!(dep, Dep::Shown { path, shown } if client.shown(path) != *shown))
 }
 
 /// One segment of a macro call path.
@@ -997,6 +1047,18 @@ impl<'a> Expander<'a> {
         if !self.deps.contains(&Dep::Position) {
             self.deps.push(Dep::Position);
         }
+    }
+
+    /// The current file as `file!` shows it, recorded as a `Dep::Shown`.
+    pub fn read_dep_shown(&mut self) -> String {
+        let path = self.cur_file.clone();
+        let shown = self.ctx.client.shown(&path);
+        self.fold_dep("shown", shown.as_bytes());
+        let dep = Dep::Shown { path, shown: shown.clone() };
+        if !self.deps.contains(&dep) {
+            self.deps.push(dep);
+        }
+        shown
     }
 
     /// Records an env var a builtin read and the value it saw.
@@ -3168,10 +3230,10 @@ mod tests {
         let (_out, deps) = expand_lexed_with_deps(lexed, &ctx).expect("expansion");
         assert!(deps.iter().any(|d| matches!(d, Dep::File { path, .. } if *path == data)), "deps: {deps:?}");
         assert!(deps.iter().any(|d| matches!(d, Dep::Env { name, value: None } if name == "LUST_DEPS_TEST_UNSET")), "deps: {deps:?}");
-        assert!(!deps_stale(&deps), "fresh deps are not stale");
+        assert!(!deps_stale(&deps, &ClientView::PROCESS), "fresh deps are not stale");
         assert!(deps_stale_with(&deps, &|_: &str| Some("now set".to_string())), "a changed env value is stale");
         std::fs::write(&data, "two").unwrap();
-        assert!(deps_stale(&deps), "a changed included file is stale");
+        assert!(deps_stale(&deps, &ClientView::PROCESS), "a changed included file is stale");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -51,8 +51,21 @@ fn expand_tokens(
     src: &str,
     test: bool,
 ) -> Result<(lexer::Lexed, Vec<expand::Dep>), Diag> {
-    let ctx = expand::ExpandCtx::for_file(&front.interner, &front.known, file, src, test);
+    let mut ctx = expand::ExpandCtx::for_file(&front.interner, &front.known, file, src, test);
+    ctx.client = &front.client;
     expand::expand_lexed_with_deps(lexed, &ctx)
+}
+
+/// The expansion view of `req`'s client (see `protocol::Client`): its env,
+/// and paths shown relative to the root file as the user typed it. A
+/// manifest-selected crate shows paths relative to the workspace root
+/// instead, set once the graph is loaded (`resolved_setup`).
+fn client_view(req: &Request) -> expand::ClientView {
+    let shown_root = match (&req.client.shown, &req.session.krate.manifest_path) {
+        (Some(typed), None) => req.file.parent().zip(typed.parent()).map(|(abs, shown)| (abs.to_path_buf(), shown.to_path_buf())),
+        _ => None,
+    };
+    expand::ClientView { env: req.client.env.clone().map(std::sync::Arc::new), shown_root }
 }
 
 /// Wall time per stage.
@@ -1514,6 +1527,8 @@ fn resolved_setup(
             }
         }
         let env = CfgEnv::new(&key.target_triple, &unit.features, key.krate.test, key.profile);
+        // Cargo runs rustc from the workspace root, so `file!` shows member paths relative to it.
+        front.client.shown_root = Some((graph.workspace_root.clone(), PathBuf::new()));
         let ids = CrateIds {
             local: def::LOCAL_CRATE,
             stable: def::stable_crate_hash(&unit.package_id, &key.krate.target_kind, &unit.target.name, key.krate.test),
@@ -1551,6 +1566,7 @@ fn resolved_setup(
             crate_ids,
             crate_name: crate_name.clone(),
             deps: externs.clone(),
+            client: front.client.clone(),
         };
         match worklist::resolve_crate_cached(&input, &front.interner, &front.known, &mut front.resolve_cache) {
             Ok(r) => {
@@ -1751,6 +1767,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     let session_key = session.key.clone();
+    session.front.client = client_view(req);
     let Session { front, caches, std_cache, disk_cache, .. } = session;
     t.lap("read");
 
@@ -1862,7 +1879,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             false
         }
     });
-    let deps_stale = pos_stale || front.chunks.iter().any(|c| expand::deps_stale(&c.expand_deps));
+    let deps_stale = pos_stale || front.chunks.iter().any(|c| expand::deps_stale(&c.expand_deps, &front.client));
     let mut kept_front = Vec::new();
     let mut kept_back = Vec::new();
     for c in std::mem::take(&mut front.chunks) {
@@ -3020,8 +3037,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if fresh_base || caches.glue.shared.is_none() {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
+    // Panic locations name the root file as rustc would (see `client_view`).
+    let root_shown = front.client.shown(map.path(ROOT_FILE));
     let gen_unit = |u: usize, overlay: bool| match u {
-        0 => cgen::main_unit(main_slot, map.path(ROOT_FILE), &slot_lines, &registered),
+        0 => cgen::main_unit(main_slot, &root_shown, &slot_lines, &registered),
         1 => cgen::glue_unit(&program, &caches.glue),
         2 => cgen::runtime_unit(),
         3 => cgen::table_unit(caches.table_cap, &fn_units),
@@ -3037,7 +3056,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // rebuilt for this (possibly warm, incremental) build.
         for u in [0, 1, 2, 3].into_iter().chain(fn_units.iter().copied()) {
             // The standalone main unit registers no overlays; `lust_base_init` covers all units.
-            let c = if u == 0 { cgen::main_unit(main_slot, map.path(ROOT_FILE), &slot_lines, &[]) } else { gen_unit(u, false) };
+            let c = if u == 0 { cgen::main_unit(main_slot, &root_shown, &slot_lines, &[]) } else { gen_unit(u, false) };
             let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
         }
     }
@@ -3734,6 +3753,7 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
             max_errors: 20,
             run_args: None,
             harness: false,
+            client: Default::default(),
         }
     }
 

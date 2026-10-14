@@ -289,9 +289,10 @@ fn read_include(st: &mut Expander, rel: &str, span: Span) -> Result<(std::path::
     }
 }
 
-/// The compile-time environment snapshot `env!` reads (ARCH 6.4): the
-/// process environment at first use, which for the daemon is its start
-/// environment, so repeated requests in one session agree.
+/// The process environment at first use (ARCH 6.4): what `env!` reads
+/// when the request carries no client env (`ClientView::PROCESS`). A
+/// daemon request carries the client's env, so this snapshot only
+/// serves one-shot compiles, std loading, and tests.
 fn env_snapshot() -> &'static std::collections::HashMap<String, String> {
     static SNAP: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
     SNAP.get_or_init(|| std::env::vars().collect())
@@ -329,9 +330,10 @@ fn stringify_tok_text(st: &Expander, t: &Token) -> String {
     }
 }
 
-/// The value `env!` and `option_env!` see for `name` in this process.
-/// The one lookup both the builtin and the stale-deps check use, so a
-/// recorded env dependency is judged against the same snapshot.
+/// The value of `name` in this process's env snapshot. `ClientView::env_var`
+/// falls back to it, and both the builtin and the stale-deps check read
+/// through that view, so a recorded env dependency is judged against the
+/// same env it was expanded under.
 pub fn compile_env(name: &str) -> Option<String> {
     env_snapshot().get(name).cloned()
 }
@@ -492,7 +494,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
         }
         "file" => {
             expect_args(name, call, 0)?;
-            let file = st.cur_file.clone();
+            let file = st.read_dep_shown();
             Ok(vec![st.str_tree(&file, span)])
         }
         "module_path" => {
@@ -509,7 +511,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let Some((var, _)) = literal_string(st, &expanded) else {
                 return Err(bad(format!("{name}! takes one string literal")));
             };
-            let value = compile_env(&var);
+            let value = st.ctx.client.env_var(&var);
             st.read_dep_env(&var, value.as_deref());
             match (name, value) {
                 ("env", Some(v)) => Ok(vec![st.str_tree(&v, span)]),
@@ -524,7 +526,12 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
                     let some = st.ident_tree("Some", span);
                     Ok(vec![some, Tt::Delim(Delim::Paren, vec![inner], span)])
                 }
-                (_, None) => Ok(vec![st.ident_tree("None", span)]),
+                // `None::<&str>`, as rustc types it, so `{:?}` of a bare `option_env!` checks.
+                (_, None) => {
+                    let tok = |tok| Tt::Tok(Token { tok, span });
+                    let (none, s) = (st.ident_tree("None", span), st.ident_tree("str", span));
+                    Ok(vec![none, tok(Tok::PathSep), tok(Tok::Lt), tok(Tok::Amp), s, tok(Tok::Gt)])
+                }
             }
         }
         "concat" => {
@@ -743,7 +750,7 @@ fn dbg_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
     let span = call.span;
     let site = crate::diag::call_site_span(span);
     let (line, col) = st.line_col(site);
-    let file = st.cur_file.clone();
+    let file = st.read_dep_shown();
     let prefix = st.str_tree(&format!("[{file}:{line}:{col}]"), span);
     if call.inner.is_empty() {
         return Ok(vec![

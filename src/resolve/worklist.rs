@@ -49,6 +49,8 @@ pub struct CrateInput {
     pub crate_name: String,
     /// The selected crate's direct dependency lib units, recursively.
     pub deps: Vec<super::cargo::DepUnit>,
+    /// The requesting client's env and shown paths, for `env!` and `file!` in every crate.
+    pub client: crate::expand::ClientView,
 }
 
 /// One crate's own resolve inputs inside a workspace session (the
@@ -673,6 +675,9 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
     }
     input.env.allow_lust_dev.hash(&mut h);
     input.crate_ids.stable.0.hash(&mut h);
+    // `file!` text: a shown root change re-expands every file. (The env
+    // is not here: files that read it are never cached, see `reads_outside`.)
+    input.client.shown_root.hash(&mut h);
     h.finish()
 }
 
@@ -1098,7 +1103,7 @@ pub fn resolve_crate_cached(
                 dep_exports.push((interner.get(jobs[d].magic).to_string(), sources.clone()));
             }
         }
-        match resolve_one(&jobs[j], &mut tables, &mut shared, cache, &dep_exports, interner, known) {
+        match resolve_one(&jobs[j], &mut tables, &mut shared, cache, &dep_exports, &input.client, interner, known) {
             Ok(out) => {
                 if let Some(exact_layout) = &jobs[j].adapter {
                     tables.adapters.push(super::imports::AdapterCrate {
@@ -2152,6 +2157,7 @@ fn resolve_one(
     shared: &mut SharedFiles,
     cache: &mut ResolveCache,
     dep_exports: &[(String, Vec<OwnedMacroSource>)],
+    client: &crate::expand::ClientView,
     interner: &Interner,
     known: &Known,
 ) -> Result<CrateOut, OneError> {
@@ -2233,6 +2239,7 @@ fn resolve_one(
                 src: &text,
                 cfg: expand_cfg(&input.env),
                 module_path: module_paths[di].clone(),
+                client,
             };
             let spliced = menv.splice(di, orig, job);
             let seeds: Vec<crate::expand::MacroSeed> = match menv.glob_seeds.get(di) {
@@ -5411,6 +5418,7 @@ mod tests {
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash(&format!("pkg:{name}"), "bin", name, false) },
             crate_name: name.into(),
             deps: Vec::new(),
+            client: Default::default(),
         };
         let out = [true, false].map(|one_shot| resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(one_shot)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5547,6 +5555,7 @@ mod tests {
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash(&format!("pkg:{crate_name}"), "bin", crate_name, false) },
             crate_name: crate_name.into(),
             deps: Vec::new(),
+            client: Default::default(),
         };
         // The interner must outlive the tables' Syms only for lookups in
         // the test; leak it (tests are short-lived).
@@ -5576,6 +5585,7 @@ mod tests {
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:cachetest", "bin", "cachetest", false) },
             crate_name: "cachetest".into(),
             deps: Vec::new(),
+            client: Default::default(),
         };
         let mut cache = ResolveCache::new(false);
         let first = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("first resolves");
@@ -5644,6 +5654,7 @@ mod tests {
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:displaytest", "bin", "displaytest", false) },
             crate_name: "displaytest".into(),
             deps: Vec::new(),
+            client: Default::default(),
         };
         let r = resolve_crate(&input, interner, known).ok().expect("display test crate resolves");
         let shown = |flat_text: &str| r.tables.display_names.get(&interner.intern(flat_text)).map(|&d| interner.get(d).to_string());
@@ -5680,6 +5691,7 @@ mod tests {
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:nestedtest", "bin", "nestedtest", false) },
             crate_name: "nestedtest".into(),
             deps: Vec::new(),
+            client: Default::default(),
         };
         let mut cache = ResolveCache::new(false);
         for round in 0..2 {

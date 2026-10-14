@@ -86,5 +86,44 @@ else
   bad "line! after blank lines" "want 1 then 3, got '$w1' then '$w2' (stale baked line)"
 fi
 
+# env! and file! read the client, not the daemon (daemon_env_stale,
+# file_macro_absolute_path): the daemon starts under one env, and each
+# client's env and typed root path must give its own cold answer.
+e=$work/env
+mkdir -p "$e/sub"
+cat >"$e/sub/main.rs" <<'EOF'
+mod m;
+fn main() {
+    println!("{} {:?} {}", env!("LUST_DEPS_BAR"), option_env!("LUST_DEPS_FOO"), file!());
+    m::f();
+}
+EOF
+printf 'pub fn f() { println!("{}", file!()); }\n' >"$e/sub/m.rs"
+grep -v 'm::f\|mod m' "$e/sub/main.rs" >"$e/one.rs"
+(cd "$e" && env -u LUST_DEPS_FOO LUST_DEPS_BAR=daemon LUST_DAEMON_SOCKET="$e/d.sock" "$lust" daemon 2>/dev/null) &
+for i in $(seq 1 100); do [ -S "$e/d.sock" ] && break; sleep 0.05; done
+envrun() { (cd "$e/$1" && shift && export LUST_DAEMON_SOCKET="$e/d.sock" && env "$@" 2>&1); }
+for f in one.rs sub/main.rs; do
+  for args in "LUST_DEPS_BAR=a LUST_DEPS_FOO=b|.|$f" "-u LUST_DEPS_FOO LUST_DEPS_BAR=c|.|./$f" "LUST_DEPS_BAR=d|$(dirname "$f")|$(basename "$f")"; do
+    IFS='|' read -r vars dir path <<<"$args"
+    # shellcheck disable=SC2086
+    warm=$(envrun "$dir" $vars "$lust" run "$path")
+    # shellcheck disable=SC2086
+    cold=$(envrun "$dir" $vars LUST_NO_DAEMON=1 LUST_NO_CACHE=1 "$lust" run "$path")
+    if [ "$warm" = "$cold" ] && grep -q " $path$" <<<"$warm" && ! grep -q "daemon\|$e" <<<"$warm"; then
+      ok "env! and file! follow the client ($vars, $path)"
+    else
+      bad "client env/path ($vars, $path)" "warm '$warm' cold '$cold'"
+    fi
+  done
+done
+unset_out=$(envrun . -u LUST_DEPS_BAR "$lust" check one.rs)
+if grep -q L0806 <<<"$unset_out"; then
+  ok "env! of a var only the daemon has is L0806"
+else
+  bad "env! unset in client" "want L0806, got: $(head -2 <<<"$unset_out")"
+fi
+kill "$(cat "$e/d.sock.lock" 2>/dev/null)" 2>/dev/null
+
 echo "test-macro-deps: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

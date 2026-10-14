@@ -3,10 +3,12 @@
 //
 // Wire format. Request: a header line with no user data in it,
 //   cmd json timings debug max_errors test default_features all_features
-//   panic_abort overflow_checks debug_assertions feature_count
+//   panic_abort overflow_checks debug_assertions feature_count env_count
 // followed by length-prefixed fields, each as "<byte len>\n<bytes>": file, out,
 // emit_c, then the crate selector (package id, manifest path, target kind,
-// target name, crate root, target triple), then one field per feature.
+// target name, crate root, target triple), then one field per feature,
+// then the client's view (see `Client`): the shown root path (len 0 for None),
+// and when the header's env count is not "-", that many name and value fields.
 // Length prefixes carry any byte a path can hold, including tabs and newlines; emit_c
 // and the manifest path use len 0 for None. Run arguments never cross the wire
 // (see `Request::run_args`). The socket name holds the build hash, so a client
@@ -242,6 +244,27 @@ pub struct Request {
     /// an error. The daemon wire format does not carry this (decode sets false): `lust
     /// test` compiles in its own process.
     pub harness: bool,
+    pub client: Client,
+}
+
+/// What a compile reads from the process that asked for it, not from the compiler process:
+/// the environment `env!` sees and the root file path as the user typed it (`file!`, `dbg!`,
+/// panic locations show paths as rustc shows the path it was given). A daemon serves many
+/// clients, so each request carries its own. Default (None, None) reads this process's
+/// environment and shows absolute paths: internal requests and tests.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Client {
+    pub env: Option<Vec<(String, String)>>,
+    pub shown: Option<PathBuf>,
+}
+
+impl Client {
+    /// The calling process's view: its environment (UTF-8 entries only, as `env!` reads
+    /// them) and `typed`, the root file path as written on the command line.
+    pub fn current(typed: &Path) -> Client {
+        let env = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
+        Client { env: Some(env), shown: Some(typed.to_path_buf()) }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -428,6 +451,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     }
     let out = out.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
     let run = cmd == "run";
+    let typed = file.clone();
     let file = abs(&file);
     if let Some(p) = crate_flags.manifest_path.take() {
         crate_flags.manifest_path = Some(abs(&p));
@@ -445,6 +469,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         max_errors,
         run_args: if run { Some(run_args.clone()) } else { None },
         harness: false,
+        client: Client::current(&typed),
     };
     Some(Invocation::Compile { req, run, args: run_args })
 }
@@ -484,8 +509,9 @@ pub fn encode(r: &Request) -> Vec<u8> {
     let b = |x: bool| if x { "1" } else { "0" };
     let cmd = if r.cmd == Cmd::Check { "check" } else { "build" };
     let s = &r.session;
+    let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -512,6 +538,11 @@ pub fn encode(r: &Request) -> Vec<u8> {
     for f in &s.features {
         put_field(&mut out, f.as_bytes());
     }
+    path_field(&mut out, r.client.shown.as_deref());
+    for (k, v) in r.client.env.iter().flatten() {
+        put_field(&mut out, k.as_bytes());
+        put_field(&mut out, v.as_bytes());
+    }
     out
 }
 
@@ -522,7 +553,7 @@ pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
         return None;
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 12 {
+    if f.len() != 13 {
         return None;
     }
     #[allow(unused_imports)]
@@ -548,6 +579,22 @@ pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
         features.push(text(get_field(r)?)?);
     }
     sort_features(&mut features);
+    let shown = get_field(r)?;
+    let env = match f[12] {
+        "-" => None,
+        n => {
+            // Same bound as the feature count: a bad request, not a loop to run.
+            let n: usize = n.parse().ok()?;
+            if n > 1 << 16 {
+                return None;
+            }
+            let mut env = Vec::with_capacity(n);
+            for _ in 0..n {
+                env.push((text(get_field(r)?)?, text(get_field(r)?)?));
+            }
+            Some(env)
+        }
+    };
     Some(Request {
         cmd: if f[0] == "check" { Cmd::Check } else { Cmd::Build },
         session: SessionKey {
@@ -574,6 +621,7 @@ pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
         max_errors: f[4].parse().ok()?,
         run_args: None,
         harness: false,
+        client: Client { env, shown: if shown.is_empty() { None } else { Some(path(shown)) } },
     })
 }
 
@@ -1020,6 +1068,9 @@ mod tests {
         assert_eq!(back.session, req.session);
         assert_eq!((back.file.as_path(), back.out.as_path()), (req.file.as_path(), req.out.as_path()));
         assert!(matches!(back.cmd, Cmd::Build) && !back.harness && back.run_args.is_none());
+        // The client's env and typed root path ride along (env! and file! read them).
+        assert!(req.client.env.is_some() && req.client.shown.is_some());
+        assert_eq!(back.client, req.client);
         // A truncated wire form never reads as a request.
         let bytes = encode(&req);
         assert!(read_request(&mut std::io::Cursor::new(&bytes[..bytes.len() - 3])).is_none());

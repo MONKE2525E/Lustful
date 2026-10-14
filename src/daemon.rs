@@ -682,6 +682,7 @@ pub fn serve(sock: &Path) -> ! {
             max_errors: 20,
             run_args: None,
             harness: false,
+            client: protocol::Client::default(),
             file: file.clone(),
         };
         let entry = entry_for(&mut sessions, &base, &req.session);
