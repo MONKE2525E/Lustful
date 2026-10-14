@@ -3838,16 +3838,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         let lang = p.gx.lang;
-        // A `dyn Fn(A) -> R` value (ARCH 2.9): a closure whose body fn is
-        // the vtable's call entry; `R` is its `Output`. A type param with
-        // an Fn bound (`hooks.push(Box::new(f))` for `f: F`) checks here
-        // and builds the vtable in each instance. Fn items and fn
-        // pointers there are not supported yet (L0702, at build for an
-        // instance of the param).
+        // A `dyn Fn(A) -> R` value (ARCH 2.9): a closure (its body fn is
+        // the vtable's call entry), a fn item, or a fn pointer; `R` is its
+        // `Output`. A type param with an Fn bound (`hooks.push(Box::new(f))`
+        // for `f: F`) checks here and builds the vtable in each instance.
+        // A tuple constructor there is not supported yet.
         if lang.is_fn_family(to.def) {
-            if !matches!(self.kind(x), TyKind::Closure(..) | TyKind::Param(_)) {
+            let fn_value = match self.kind(x) {
+                TyKind::FnDef(def, _) => p.adt_by_def(def).is_none(),
+                TyKind::Closure(..) | TyKind::Param(_) | TyKind::FnPtr(_) => true,
+                _ => false,
+            };
+            if !fn_value {
                 let tn = self.tn(x);
-                self.errs.push(generics::dyn_not_yet(span, &format!("a `dyn` Fn value made from `{tn}` (only closures)")));
+                self.errs.push(generics::dyn_not_yet(span, &format!("a `dyn` Fn value made from `{tn}` (closures, fn items, and fn pointers only)")));
                 return None;
             }
             let tr = object::with_self(&mut self.tys, to, x);

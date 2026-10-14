@@ -2269,14 +2269,62 @@ impl FnGen<'_, '_, '_> {
         // frees the box it lives in (ARCH 2.9): the only call is
         // through `Box<dyn FnOnce>` by value.
         let consume = (vt.principal.def == p.gx.lang.fn_once).then_some(vt.self_ty);
-        for (j, &f) in vt.methods.iter().enumerate() {
-            let shim = self.vtable_shim(&name, j, f, consume);
+        if matches!(p.tys.kind(vt.self_ty), TyKind::FnDef(..) | TyKind::FnPtr(_)) {
+            // A fn item or fn pointer as a `dyn Fn` value: no env.
+            let shim = self.fn_value_shim(&name, &vt, consume.is_some());
             words.push(format!("(void *){shim}"));
+        } else {
+            for (j, &f) in vt.methods.iter().enumerate() {
+                let shim = self.vtable_shim(&name, j, f, consume);
+                words.push(format!("(void *){shim}"));
+            }
         }
         let tn = crate::check::object::trait_name(p, vt.principal.def);
         let _ = writeln!(self.prelude, "/* vtable: {} as {tn} */", ty_name(p, &p.tys, vt.self_ty));
         let _ = writeln!(self.prelude, "static const void *const {name}[] = {{ {} }};", words.join(", "));
         self.vtables.insert(vid, name.clone());
+        name
+    }
+
+    /// The call entry of a `dyn Fn` vtable whose value is a fn item (a
+    /// zero-sized value: the shim calls the fn through `lust_fns[slot]`,
+    /// ignoring the data pointer) or a fn pointer (the shim calls the
+    /// pointer stored at the data pointer). With `consume` (a `dyn
+    /// FnOnce`) the shim then frees the box.
+    fn fn_value_shim(&mut self, vt_name: &str, vt: &crate::check::object::VtableData, consume: bool) -> String {
+        let p = self.p;
+        let name = format!("{vt_name}_m0");
+        let ct = cty(&p.tys, vt.self_ty);
+        let cts = ctype(&ct);
+        let (params, ret, call) = match (p.tys.kind(vt.self_ty), &ct) {
+            (TyKind::FnPtr(_), CTy::FnPtr(ps, r)) => {
+                collect_types(&ct, &mut self.sig_types);
+                (ps.clone(), (**r).clone(), format!("(*({cts}*)self)"))
+            }
+            _ => {
+                let Some(&f) = vt.methods.first() else { return "0".to_string() };
+                self.note_callee(f);
+                let info = p.fn_info(f);
+                let params: Vec<CTy> = info.params.iter().map(|&t| cty(&p.tys, t)).collect();
+                for t in &params {
+                    collect_types(t, &mut self.sig_types);
+                }
+                let call = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), self.slots[f.0 as usize]);
+                (params, cty(&p.tys, info.ret), call)
+            }
+        };
+        collect_types(&ret, &mut self.sig_types);
+        let rt = ctype(&ret);
+        let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", ctype(t))).collect();
+        let names: Vec<String> = (0..params.len()).map(|i| format!("a{i}")).collect();
+        let free = if consume { format!(" lust_dealloc(self, sizeof({cts}), _Alignof({cts}));") } else { String::new() };
+        if c_size_align(p, &ret).0 > 32 {
+            let args: String = std::iter::once("out".to_string()).chain(names).collect::<Vec<_>>().join(", ");
+            let _ = writeln!(self.prelude, "static void {name}({rt} *out, void *self{decls}) {{ {call}({args});{free} }}");
+        } else {
+            let args = names.join(", ");
+            let _ = writeln!(self.prelude, "static {rt} {name}(void *self{decls}) {{ {rt} r = {call}({args});{free} (void)self; return r; }}");
+        }
         name
     }
 

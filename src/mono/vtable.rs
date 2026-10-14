@@ -83,11 +83,21 @@ pub fn ensure_vtable(p: &mut Program, self_ty: Ty, principal: TraitRef, made: &m
     }
     // A `dyn Fn`-family vtable (ARCH 2.9) has one call entry: the
     // closure's body fn, which `register_closures` made already.
+    // A fn item's entry calls its fn (an instance for a generic one); a
+    // fn pointer's has no fn to name (codegen calls the pointer).
     if p.gx.lang.is_fn_family(principal.def) {
-        let TyKind::Closure(def, _) = p.tys.kind(self_ty) else { return None };
-        let body_fn = p.gx.closures.get(&def)?.body_fn;
+        let methods = match p.tys.kind(self_ty) {
+            TyKind::Closure(def, _) => vec![p.gx.closures.get(&def)?.body_fn],
+            TyKind::FnDef(def, args) if p.adt_by_def(def).is_none() => {
+                let f = p.local_def(def.hash)?;
+                let args: Vec<GenericArg> = p.tys.args(args).to_vec();
+                vec![if args.is_empty() { f } else { instance_at(p, f, &args, made) }]
+            }
+            TyKind::FnPtr(_) => Vec::new(),
+            _ => return None,
+        };
         let id = p.gx.vtables.len() as u32;
-        p.gx.vtables.push(VtableData { self_ty, principal, methods: vec![body_fn], supers: Vec::new() });
+        p.gx.vtables.push(VtableData { self_ty, principal, methods, supers: Vec::new() });
         p.gx.vtable_by_key.insert((self_ty, principal), id);
         return Some(id);
     }
