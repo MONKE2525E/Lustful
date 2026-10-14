@@ -26,13 +26,13 @@ runtest_case() {
   local name=$1 f=$2 rs bs ms probe mode want_mode
   rustc_oracle run "$f" --edition 2024 -C panic=abort -C overflow-checks=on -A warnings
   [ "$(cat rustc.cc)" -eq 0 ] || { report bad "$name" "rustc rejected it"; return; }
-  "$lust" build "$f" -o "$name.lust" 2>"$name.build.err" || { report bad "$name" "lust build rejected it"; return; }
+  run_cc "$lust" build "$f" -o "$name.lust" 2>"$name.build.err" || { report bad "$name" "lust build rejected it"; return; }
   rs=$(cat rustc.rs)
-  "./$name.lust" x y >"$name.lust.out" 2>"$name.lust.err"; bs=$?
-  "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
+  run_to "./$name.lust" x y >"$name.lust.out" 2>"$name.lust.err"; bs=$?
+  run_cc "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
   # Which run path did it take? glue_shared has three function units, so it must use the file.
   # The glue_*_type_cross_unit tests force a unit split with filler fns, so they must too.
-  probe=$("$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
+  probe=$(run_cc "$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
   if grep -q "in memory" <<<"$probe"; then mode=mem; else mode=file; fi
   want_mode=mem; [[ "$name" == glue_shared || "$name" == glue_*_type_cross_unit ]] && want_mode=file
   if [ "$mode" != "$want_mode" ]; then

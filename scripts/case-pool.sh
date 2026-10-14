@@ -3,7 +3,8 @@
 # and $filter. Each case runs in its own dir; see run_all.
 #   DIFFTEST_JOBS        cases at the same time (default nproc).
 #   DIFFTEST_RUSTC_CACHE rustc result cache dir (default ~/.cache/lust-difftest; "off" turns
-#                        it off). Only rustc's side is cached, never lust's.
+#                        it off, as the landing gate does). Only rustc's side is cached, never
+#                        lust's.
 #   CASE_TIMEOUT seconds per compile (default 30), RUN_TIMEOUT per run (default 10).
 case_timeout=${CASE_TIMEOUT:-30}
 run_timeout=${RUN_TIMEOUT:-10}
@@ -13,11 +14,16 @@ jobs=${DIFFTEST_JOBS:-$(nproc)}
 rustc_cache=${DIFFTEST_RUSTC_CACHE:-$HOME/.cache/lust-difftest}
 [ "$rustc_cache" = off ] || mkdir -p "$rustc_cache" || rustc_cache=off
 rustc_version=$(rustc -vV 2>&1)
-# inc_hash[dir]: a hash of every non-.rs file in a fixture dir (the include! files), for
-# the rustc cache key.
-declare -A inc_hash
+# For the rustc cache key, per fixture dir:
+#   dep_hash[dir]: every file under the dir (subdirs too) except the dir's own .rs cases:
+#                  include!/include_str! data and module files in subdirs.
+#   sib_hash[dir]: the dir's own .rs cases. Only in the key of a case that names other files
+#                  (`mod x;`, `#[path`, `include!`), because it may read a sibling case.
+declare -A dep_hash sib_hash
 for d in "$root"/tests/{pass,fail,reject,unwind}; do
-  inc_hash[$d]=$(for g in "$d"/*; do [[ "$g" == *.rs || ! -f "$g" ]] || { basename "$g"; cat "$g"; }; done | sha256sum)
+  [ -d "$d" ] || continue
+  dep_hash[$d]=$(cd "$d" && find . -type f ! -regex '\./[^/]*\.rs' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum)
+  sib_hash[$d]=$(cd "$d" && find . -maxdepth 1 -type f -name '*.rs' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum)
 done
 pass=0
 fail=0
@@ -35,18 +41,22 @@ report() {
 # it also runs the program with the args in $oracle_args (if set) and writes rustc.out
 # (stdout) and rustc.rs (exit status). Results come from $rustc_cache when the key
 # matches: a hash of the rustc version, the mode, the flags, the args, the case's name and
-# bytes, and the include files of its dir. A timeout is never cached.
+# bytes, and the files it can read (dep_hash, sib_hash). A timeout is never cached, and
+# neither is a case that reads the environment (env!, option_env!, std::env::var): its
+# result depends on more than its files.
 rustc_oracle() {
   local mode=$1 f=$2; shift 2
-  local key="" entry="" cc rs=0 tmp
+  local key="" entry="" cc rs=0 tmp d
   local args=("${oracle_args[@]}")
-  if [ "$rustc_cache" != off ]; then
+  if [ "$rustc_cache" != off ] && ! grep -qE 'env!|env::(var|vars|var_os|vars_os|current_dir|temp_dir|home_dir)\b' "$f"; then
+    d=$(dirname "$f")
     key=$({
-      printf 'v1\n%s\n%s\n%s\n%s\n%s\n' "$rustc_version" "$mode" "$*" "${args[*]}" "$(basename "$f")"
+      printf 'v2\n%s\n%s\n%s\n%s\n%s\n' "$rustc_version" "$mode" "$*" "${args[*]}" "$(basename "$f")"
       # file!() and panic locations print the path; key those cases on the full path.
       grep -qE 'file!|Location' "$f" && echo "$f"
       cat "$f"
-      echo "${inc_hash[$(dirname "$f")]:-}"
+      echo "${dep_hash[$d]:-}"
+      grep -qE '^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*;|#\[path|include(_str|_bytes)?!' "$f" && echo "${sib_hash[$d]:-}"
     } | sha256sum | cut -c1-40)
     entry=$rustc_cache/$key
     if [ -f "$entry/rustc.cc" ]; then

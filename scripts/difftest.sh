@@ -23,6 +23,7 @@
 #     failure in every mode: lust accepted the program.
 # Usage: scripts/difftest.sh [filter]
 #   SANITIZE=1 also builds the generated C with gcc -fsanitize=address,undefined and runs it.
+#              Its stdout and exit status must match the plain lust build's.
 #              The gcc build uses -Werror=incompatible-pointer-types, so a
 #              miscompile that passes a pointer of the wrong type (which
 #              tcc accepts silently) fails loudly here.
@@ -72,9 +73,11 @@ san_obj=$work/san-obj
 mkdir -p "$san_obj"
 
 sanitize_case() {
-  # $1 fixture, $2 name, $3 expected-stdout file. Returns 0 on match. Runs in the case dir.
-  local f=$1 name=$2 expected=$3 c o objs=()
-  run_cc "$lust" build "$f" -o "$name.tmp" --emit-c "$name" 2>/dev/null || return 1
+  # $1 fixture, $2 name, $3 expected-stdout file, $4 expected exit status (the unsanitized
+  # lust build's, already checked against rustc). Returns 0 on match. Runs in the case dir.
+  # A timeout or another exit status (a death without sanitizer text) is a failure.
+  local f=$1 name=$2 expected=$3 want=$4 c o st objs=()
+  run_cc "$lust" build "$f" -o "$name.tmp" --emit-c "$name" 2>/dev/null || { echo "lust build --emit-c failed"; return 1; }
   : >"$name.san.err"
   for c in "$name".*.c; do
     o=$san_obj/$(sha256sum <"$c" | cut -c1-40).o
@@ -88,9 +91,14 @@ sanitize_case() {
     echo "gcc could not build the generated C: $(head -3 "$name.san.err")"
     return 1
   fi
-  run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"
+  run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
   if grep -q "runtime error\|Sanitizer" "$name.san.err"; then
     echo "sanitizer: $(grep -m2 "runtime error\|Sanitizer" "$name.san.err")"
+    return 1
+  fi
+  if [ "$st" -ne "$want" ]; then
+    if [ "$st" -eq 124 ] && [ "$want" -ne 124 ]; then echo "sanitized build timed out after ${run_timeout}s"
+    else echo "sanitized build exit status $st, want $want: $(head -2 "$name.san.err" | tr '\n' ' ')"; fi
     return 1
   fi
   if ! cmp -s "$expected" "$name.san.out"; then
@@ -133,7 +141,7 @@ if [ "${PANIC:-abort}" = unwind ]; then
     elif ! cmp -s rustc.out "$name.lust.out"; then
       report bad "$name" "stdout differs:"; diff rustc.out "$name.lust.out" | head -10
     elif [ "${SANITIZE:-0}" = 1 ]; then
-      if msg=$(sanitize_case "$f" "$name" rustc.out); then
+      if msg=$(sanitize_case "$f" "$name" rustc.out "$ls"); then
         report ok "$name"
       else
         report bad "$name" "sanitized build: $msg"
@@ -178,7 +186,7 @@ pass_case() {
   elif [ -n "$panic_expect" ] && ! grep -qF "$panic_expect" "$name.lust.stderr"; then
     report bad "$name" "lust stderr lacks panic text '$panic_expect': $(head -3 "$name.lust.stderr")"
   elif [ "${SANITIZE:-0}" = 1 ]; then
-    if msg=$(sanitize_case "$f" "$name" rustc.out); then
+    if msg=$(sanitize_case "$f" "$name" rustc.out "$ls"); then
       report ok "$name"
     else
       report bad "$name" "sanitized build: $msg"

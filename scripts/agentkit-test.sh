@@ -88,8 +88,11 @@ mkdir -p "$work/daemon"
 (cd "$work/daemon" && LUST_DAEMON_SOCKET="$work/daemon/sock" exec "$lust" daemon) >"$work/daemon/log" 2>&1 &
 daemon_pid=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$work/daemon/sock" ] && break; sleep 0.2; done
-out=$(cd "$work/daemon" && LUST_DAEMON_SOCKET="$work/daemon/sock" "$lust" check --json --max-errors 2 "$work/many.rs" 2>/dev/null)
+out=$(cd "$work/daemon" && LUST_DAEMON_SOCKET="$work/daemon/sock" timeout 60 "$lust" check --json --max-errors 2 "$work/many.rs" 2>/dev/null)
+# Bounded stop: a daemon that ignores TERM gets KILL after 5 s, so the wait cannot hang.
 kill "$daemon_pid" 2>/dev/null
+for i in $(seq 50); do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.1; done
+kill -9 "$daemon_pid" 2>/dev/null
 wait "$daemon_pid" 2>/dev/null
 grep -q '"kind":"truncated"' <<<"$out"; check daemon-max-errors $? "daemon must honor --max-errors: $out"
 
