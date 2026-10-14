@@ -79,13 +79,10 @@ fn memrchr3_in(n1: u8, n2: u8, n3: u8, haystack: &[u8], start: usize, end: usize
     None
 }
 
-/// Every index of one needle byte. The unsearched range is `start..end`;
-/// a match moves `start` past it, as upstream's pointer pair does. `end`
-/// is the hook for `next_back`. Upstream also overrides `size_hint` and
-/// implements `DoubleEndedIterator`; lust's `Iterator` has neither yet,
-/// so both reject at the call. Add them here when std gains them, or
-/// `size_hint` answers (and collect capacities) go wrong
-/// (tests/adapters/crates/memchr has the cases that catch it).
+/// Every index of one needle byte. The unsearched range is `start..end`,
+/// as upstream's pointer pair: `next` moves `start` past a match,
+/// `next_back` moves `end` onto one, and `size_hint` is upstream's
+/// `(0, Some(end - start))` (tests/adapters/crates/memchr/iter_hint).
 #[derive(Clone)]
 pub struct Memchr<'h> {
     needle1: u8,
@@ -109,8 +106,18 @@ impl<'h> Iterator for Memchr<'h> {
         Some(i)
     }
 
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.end.saturating_sub(self.start)))
+    }
 }
 
+impl<'h> DoubleEndedIterator for Memchr<'h> {
+    fn next_back(&mut self) -> Option<usize> {
+        let i = self.start + memrchr(self.needle1, &self.haystack[self.start..self.end])?;
+        self.end = i;
+        Some(i)
+    }
+}
 
 /// Every index of either of two needle bytes. See `Memchr`.
 #[derive(Clone)]
@@ -137,8 +144,18 @@ impl<'h> Iterator for Memchr2<'h> {
         Some(i)
     }
 
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.end.saturating_sub(self.start)))
+    }
 }
 
+impl<'h> DoubleEndedIterator for Memchr2<'h> {
+    fn next_back(&mut self) -> Option<usize> {
+        let i = memrchr3_in(self.needle1, self.needle2, self.needle2, self.haystack, self.start, self.end)?;
+        self.end = i;
+        Some(i)
+    }
+}
 
 /// Every index of any of three needle bytes. See `Memchr`.
 #[derive(Clone)]
@@ -166,5 +183,16 @@ impl<'h> Iterator for Memchr3<'h> {
         Some(i)
     }
 
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.end.saturating_sub(self.start)))
+    }
+}
+
+impl<'h> DoubleEndedIterator for Memchr3<'h> {
+    fn next_back(&mut self) -> Option<usize> {
+        let i = memrchr3_in(self.needle1, self.needle2, self.needle3, self.haystack, self.start, self.end)?;
+        self.end = i;
+        Some(i)
+    }
 }
 

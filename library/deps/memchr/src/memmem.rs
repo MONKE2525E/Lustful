@@ -147,7 +147,6 @@ impl<'n> FinderRev<'n> {
 
 /// The non-overlapping matches of one needle, front to back. After a
 /// match the search resumes past it (one byte on for an empty needle).
-/// Upstream overrides `size_hint` (see `Memchr` for why it is not here).
 #[derive(Clone)]
 pub struct FindIter<'h, 'n> {
     haystack: &'h [u8],
@@ -180,6 +179,17 @@ impl<'h, 'n> Iterator for FindIter<'h, 'n> {
         Some(pos)
     }
 
+    /// Upstream's bound: the most non-overlapping matches left, and an
+    /// empty needle matches at every position, the end included.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self.haystack.len().checked_sub(self.pos) {
+            None => (0, Some(0)),
+            Some(haystack_len) => match self.finder.needle().len() {
+                0 => (haystack_len.saturating_add(1), haystack_len.checked_add(1)),
+                needle_len => (0, Some(haystack_len / needle_len)),
+            },
+        }
+    }
 }
 
 /// The matches of one needle, back to front. A match at the current end
