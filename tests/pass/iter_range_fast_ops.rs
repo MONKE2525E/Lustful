@@ -19,4 +19,9 @@ fn main() {
     println!("{:?} {:?} {:?}", r.nth(3), r.nth(100), r.next());
     println!("{:?} {:?} {:?}", (0..20).step_by(3).nth(2), (0..20).step_by(usize::MAX).nth(1), (-10..10).step_by(4).nth(3));
     println!("{:?} {:?}", (0..3).chain(10..13).nth(4), (0..3).chain(10..10).last());
+    // Back iteration stops at the element type's own MIN and MAX.
+    println!("{:?}", (0u16..=8u16).rev().step_by(4).collect::<Vec<_>>());
+    println!("{:?}", (-8i16..=0i16).step_by(4).collect::<Vec<_>>());
+    let mut r = (0u16..=8u16).rev();
+    println!("{:?} {:?} {:?} {:?}", r.nth(0), r.nth(3), r.nth(3), r.nth(0));
 }

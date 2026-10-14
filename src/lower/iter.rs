@@ -1095,8 +1095,11 @@ impl Ex<'_, '_, '_> {
         if max {
             return max_l;
         }
+        if !it.signed() {
+            return self.copy_local(Operand::Const(Const::Int(0, wit)), w);
+        }
         // MIN: -MAX - 1 in signed wide math; MAX + 1 in `u128` patterns
-        // (0 for unsigned elements, the sign bit for `i128`).
+        // (the sign bit for `i128`).
         let one = self.cast_local(Self::usize_c(1), w);
         if w == int(IntTy::I128) {
             let zero = self.copy_local(Operand::Const(Const::Int(0, IntTy::I128)), w);
