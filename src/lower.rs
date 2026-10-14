@@ -1907,7 +1907,11 @@ impl<'p, 'a> Lower<'p, 'a> {
             Expr::Block(_) | Expr::LabeledBlock { .. } | Expr::If { .. } | Expr::Match { .. } | Expr::Loop { .. }
         );
         let ty = self.ty(e);
-        if self.ck.coerce(e) == Coerce::None && (self.is_place_expr(e) || value && self.needs_drop_ty(ty)) {
+        // A const value (`CD;`, an inline const) is no place and
+        // builds no temporary on its own, but the copy it makes is a
+        // statement temporary like any other and drops here.
+        let const_temp = self.ck.const_value(e).is_some() && self.needs_drop_ty(ty);
+        if self.ck.coerce(e) == Coerce::None && (self.is_place_expr(e) || value && self.needs_drop_ty(ty) || const_temp) {
             self.materialize(e, ty, false);
         } else {
             self.expr_into(e, None);
