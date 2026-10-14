@@ -1,6 +1,7 @@
 // Type checking for one function body. Inference is local to the body: unification plus
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
+pub mod any;
 pub mod closure;
 pub mod cells;
 pub mod process;
@@ -501,6 +502,14 @@ pub enum Res {
     /// `size_of_val` or `align_of_val` on a dyn value: reads this
     /// header word of the argument's vtable (`object::VT_SIZE`, `VT_ALIGN`).
     DynMeta(u32),
+    /// A `core::any` operation (check/any.rs): the receiver is reached
+    /// by `derefs` derefs and `autoref` as for `Method`; the type it
+    /// tests or names is `Checked::generic_args[e][0]`.
+    Any {
+        op: any::AnyOp,
+        derefs: u8,
+        autoref: Autoref,
+    },
     /// A binary operator through an operator trait: the trait
     /// method to call (a template until mono rewrites it through
     /// `Checked::generic_args`), with operand deref counts.
@@ -9260,7 +9269,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     return t;
                 }
                 let cs = self.span(callee);
-                match self.resolve_assoc(segs, cs) {
+                let r = if self.is_type_id_of(segs) { self.type_id_of_path(e, segs.last().unwrap(), cs) } else { self.resolve_assoc(segs, cs) };
+                match r {
                     Some(r) => r,
                     None => {
                         for &a in args {
@@ -9340,6 +9350,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0105", span, "this function takes no arguments", "Write `size_of::<Type>()`.");
                 }
                 USIZE
+            }
+            Res::Any { .. } => {
+                if !args.is_empty() {
+                    self.err("L0105", span, "this function takes no arguments", "Write `TypeId::of::<Type>()`.");
+                }
+                generics::type_id_ty(&mut self.tys)
             }
             Res::Fn(f) => {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
@@ -10232,6 +10248,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // The inherent methods of `core::cmp::Ordering` (no user
         // impl can add inherent methods to it).
         if let Some(ret) = self.ordering_method(e, base, derefs, name, name_span, args) {
+            return ret;
+        }
+        // `type_id`, `is`, and the downcasts of `core::any` (check/any.rs).
+        if let Some(ret) = self.any_method(e, rt, name, name_span, args, turbofish, &explicit, expected) {
             return ret;
         }
         // Generic and trait receivers go through the full 2.10

@@ -6,6 +6,7 @@ use crate::diag::Span;
 use crate::ir::*;
 use crate::ty::*;
 
+mod any;
 mod closure;
 pub mod iter;
 
@@ -1258,6 +1259,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     Res::ConstUsize(v) => {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
                     }
+                    Res::Any { .. } => self.type_id_of_into(e, dest, ty, span),
                     Res::SizeOfVal { len, elem } => {
                         if elem == 1 {
                             let d = self.call_dest(dest, ty);
@@ -2645,6 +2647,10 @@ impl<'p, 'a> Lower<'p, 'a> {
         }
         if let Res::OrderingOp { kind, derefs } = self.ck.res(e) {
             self.ordering_op_into(e, recv, args, dest, span, kind, derefs);
+            return;
+        }
+        if let Res::Any { op, derefs, autoref } = self.ck.res(e) {
+            self.any_op_into(e, recv, dest, span, op, derefs, autoref);
             return;
         }
         if let Res::OrdPick { kind, f, via } = self.ck.res(e) {

@@ -153,6 +153,11 @@ pub enum Rvalue {
     /// size or the align of the value behind it (`size_of_val` and
     /// `align_of_val` on a dyn value; word indexes in `check::object`).
     DynMeta { ptr: Operand, word: u32 },
+    /// The data pointer of a dyn pointer (`&dyn`, `&mut dyn`,
+    /// `Box<dyn>`, `Rc<dyn>`) as the thin pointer type `ty` (`&T`,
+    /// `&mut T`, `Box<T>`, `Rc<T>`): a downcast after its type id test
+    /// (lower/any.rs). The operand is moved for an owning pointer.
+    DynData { ptr: Operand, ty: Ty },
     /// `dst.write_fmt(format_args!(..))` (W-STD-B): formats the parts
     /// into `dst` (a `&mut Formatter` or `&mut String`) with a fresh
     /// Formatter over its sink, stopping at the first error; the value

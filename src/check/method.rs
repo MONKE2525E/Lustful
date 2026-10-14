@@ -104,6 +104,7 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         || (trait_def == lang.debug && cx.fmt_trait_in_scope(crate::ast::FmtKind::Debug))
         || (trait_def == lang.borrow && cx.std_trait_imported("borrow", "Borrow"))
         || (trait_def == lang.borrow_mut && cx.std_trait_imported("borrow", "BorrowMut"))
+        || (trait_def == lang.any && cx.std_trait_imported("any", "Any"))
     {
         return true;
     }

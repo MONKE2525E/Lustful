@@ -304,7 +304,7 @@ impl Reads {
 /// fingerprints match across sessions. A foreign session crate cannot occur
 /// today (one crate per session); when W-RESOLVE loads more crates it gives
 /// `Program` a crate table and this fallback goes away.
-fn def_crate_hash(p: &Program, def: DefId) -> u64 {
+pub(crate) fn def_crate_hash(p: &Program, def: DefId) -> u64 {
     if def.krate == p.krate {
         p.stable_crate.0
     } else if def.krate == BUILTIN_CRATE {

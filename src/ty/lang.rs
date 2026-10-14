@@ -920,6 +920,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/sync/mpsc/TryRecvError",
     "alloc/string/FromUtf8Error",
     "std/string/FromUtf8Error",
+    "core/any/TypeId",
+    "std/any/TypeId",
     "std/collections/HashMap",
     "std/collections/HashSet",
     "alloc/collections/BTreeMap",
@@ -947,6 +949,8 @@ const STD_TYPE_PATHS: &[&str] = &[
 ];
 
 const STD_TRAIT_PATHS: &[&str] = &[
+    "core/any/Any",
+    "std/any/Any",
     "core/clone/Clone",
     "std/clone/Clone",
     "core/cmp/PartialEq",

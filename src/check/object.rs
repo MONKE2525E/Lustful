@@ -18,6 +18,9 @@
 //               vtable, in declaration order (the `super_N` slots)
 //   [3+S ..)    one entry per vtable method, in declaration order
 //
+// A `dyn Any` vtable has no super slots and no methods: words 3 and 4
+// hold the value's type id instead (`VT_ANY_ID`, check/any.rs).
+//
 // A method entry is a per-vtable shim that forwards through
 // `lust_fns[slot]`, never a body address, so a daemon overlay that
 // swaps a method body cannot leave a stale entry (ARCH 4.5). A
@@ -35,6 +38,10 @@ pub const VT_HEADER: u32 = 3;
 /// The header words `size_of_val` and `align_of_val` read.
 pub const VT_SIZE: u32 = 1;
 pub const VT_ALIGN: u32 = 2;
+/// The two words of a `dyn Any` vtable that hold the value's type id
+/// (check/any.rs), low word first. `Any` has no super slots and no
+/// vtable methods, so they follow the header.
+pub const VT_ANY_ID: u32 = VT_HEADER;
 
 /// How a vtable method takes its receiver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +111,9 @@ pub struct VtableData {
 /// The dyn info of every user trait. Runs once trait tables exist.
 pub fn compute_dyn_infos(p: &Program) -> FxMap<DefId, DynInfo> {
     let mut memo: FxMap<DefId, DynInfo> = FxMap::default();
+    // `dyn Any` (check/any.rs): no vtable methods; its vtable holds the
+    // value's type id after the header (`VT_ANY_ID`). `trait Any: 'static`.
+    memo.insert(p.gx.lang.any, DynInfo { static_bound: true, ..DynInfo::default() });
     let mut defs: Vec<DefId> = p.gx.trait_names.values().copied().collect();
     defs.sort_by_key(|d| d.hash.0);
     for d in defs {
@@ -120,6 +130,7 @@ pub fn compute_dyn_infos(p: &Program) -> FxMap<DefId, DynInfo> {
             crate::ast::ItemKind::Trait(t) if trait_static_bound(p, t) => p.gx.trait_names.get(&t.name).copied(),
             _ => None,
         })
+        .chain(std::iter::once(p.gx.lang.any))
         .collect();
     // `seen` ends cycles (reported elsewhere) and skips a shared
     // supertrait already searched without a hit.
@@ -246,7 +257,7 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             continue;
         }
         let Some(srec) = p.gx.index.trait_record(sup) else { continue };
-        if !srec.local {
+        if !srec.local && sup != lang.any {
             info.unsupported.get_or_insert(format!("`dyn {tname}` with the std supertrait `{}`", p.name(srec.name)));
             continue;
         }

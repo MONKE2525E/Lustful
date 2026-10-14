@@ -87,6 +87,9 @@ pub struct LangTraits {
     pub borrow: DefId,
     pub borrow_mut: DefId,
     pub to_owned: DefId,
+    /// `core::any::Any` (check/any.rs): every `'static` type has it
+    /// through one synthetic blanket impl.
+    pub any: DefId,
     pub assoc_owned: DefId,
     /// `Iterator::Item`.
     pub assoc_item: DefId,
@@ -177,6 +180,7 @@ impl LangTraits {
         let to_owned = lang_trait(&["alloc", "borrow"], "ToOwned");
         let from = lang_trait(&["core", "convert"], "From");
         let into = lang_trait(&["core", "convert"], "Into");
+        let any = lang_trait(&["core", "any"], "Any");
         let assoc_out = |t: DefId| lang_assoc(t, "Output");
         LangTraits {
             sized,
@@ -234,6 +238,7 @@ impl LangTraits {
             borrow,
             borrow_mut,
             to_owned,
+            any,
             assoc_owned: lang_assoc(to_owned, "Owned"),
             assoc_item: lang_assoc(iterator, "Item"),
             assoc_into_iter: lang_assoc(into_iterator, "IntoIter"),
@@ -337,6 +342,7 @@ impl LangTraits {
             "Fn" => self.fn_,
             "FnMut" => self.fn_mut,
             "FnOnce" => self.fn_once,
+            "Any" => self.any,
             _ => return None,
         })
     }
@@ -491,6 +497,8 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.fn_, "Fn", 1, vec![self_pred(tys, lang.fn_mut, &[1])], vec![], &["call"]),
         rec(lang.fn_mut, "FnMut", 1, vec![self_pred(tys, lang.fn_once, &[1])], vec![], &["call_mut"]),
         rec(lang.fn_once, "FnOnce", 1, vec![], vec![(lang.output_of(lang.fn_once).unwrap(), "Output")], &["call_once"]),
+        // `trait Any: 'static`: a bound `T: Any` elaborates to `T: 'static`.
+        rec(lang.any, "Any", 0, vec![Predicate::TypeOutlives(tys.intern(TyKind::Param(ParamId(0))), Region::Static)], vec![], &["type_id"]),
     ]
 }
 
@@ -532,6 +540,19 @@ pub fn fmt_error_def() -> DefId {
 /// The `core::fmt::Error` type.
 pub fn fmt_error_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(fmt_error_def(), EMPTY_ARGS))
+}
+
+/// The def of `core::any::TypeId` (check/any.rs). Collect registers a
+/// local Adt for it like `fmt::Error`: a struct of two `u64` words of
+/// the type's hash, with field names source text cannot write. Only
+/// `any::TypeId` paths reach it.
+pub fn type_id_def() -> DefId {
+    lang_def(&["core", "any"], crate::def::DefKind::Adt, "TypeId")
+}
+
+/// The `core::any::TypeId` type.
+pub fn type_id_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(type_id_def(), EMPTY_ARGS))
 }
 
 /// `fmt::Result`: `Result<(), fmt::Error>`.
@@ -581,7 +602,7 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// only the flat name (check/collect.rs); `fmt::Error` and
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`).
 /// The driver predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 7] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 8] {
     [
         (0, "Ordering", ordering_def(), true),
         (1, "Error", fmt_error_def(), false),
@@ -590,6 +611,7 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 7] {
         (4, "Ordering", atomic_ordering_def(), true),
         (5, "RecvError", recv_error_def(), false),
         (6, "TryRecvError", try_recv_error_def(), true),
+        (7, "TypeId", type_id_def(), false),
     ]
 }
 
@@ -597,7 +619,7 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 7] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6)
+    !matches!(index, 1 | 4 | 5 | 6 | 7)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -629,6 +651,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("atomic", "Ordering", atomic_ordering_def()),
         ("mpsc", "RecvError", recv_error_def()),
         ("mpsc", "TryRecvError", try_recv_error_def()),
+        ("any", "TypeId", type_id_def()),
     ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
@@ -2328,12 +2351,12 @@ fn resolve_dyn(
                 if !binder.is_empty() {
                     return Err(dyn_not_yet(span, "higher-ranked `dyn for<..>` types"));
                 }
-                // Vtables exist for user traits and the Fn family (ARCH
-                // 2.9: a closure's one call entry); another std trait
-                // (`dyn Display`) has no method bodies the subset can
-                // point a vtable at yet.
+                // Vtables exist for user traits, the Fn family (ARCH
+                // 2.9: a closure's one call entry), and `Any` (a type id,
+                // check/any.rs); another std trait (`dyn Display`) has no
+                // method bodies the subset can point a vtable at yet.
                 let fn_family = cx.lang.is_fn_family(trait_def);
-                if !fn_family && !cx.index.trait_record(trait_def).is_some_and(|r| r.local) {
+                if !fn_family && trait_def != cx.lang.any && !cx.index.trait_record(trait_def).is_some_and(|r| r.local) {
                     let name = interner.get(trait_ref.path.last().unwrap().name).to_string();
                     return Err(dyn_not_yet(span, &format!("`dyn {name}` (a std trait)")));
                 }
@@ -2443,6 +2466,12 @@ fn resolve_path_ty(
             // `Error` and `Result` must never match a bare name.
             if path.len() == 3 && path[1] == "fmt" {
                 return resolve_fmt_path(tys, path[2], segs.last().unwrap(), span);
+            }
+            if path[1..] == ["any", "TypeId"] {
+                if segs[2].has_args() {
+                    return Err(Diag::new("L0110", span, "`TypeId` takes no generic arguments", "Remove the `<...>` part."));
+                }
+                return Ok(type_id_ty(tys));
             }
         } else {
             return Err(not_yet("L0505", span, "module paths in types"));
@@ -5847,6 +5876,14 @@ pub fn add_synthetic_impls(p: &mut Program) {
     }
     // The std::sync and std::thread types (W-THREADS, check/sync.rs).
     crate::check::sync::add_sync_impls(p, &mut ordinal, span);
+    // core's `impl<T: 'static + ?Sized> Any for T` (check/any.rs). The
+    // `'static` bound is a region fact: selection ignores it, as rustc's
+    // probe does, and the checker and the borrow checker prove it.
+    {
+        let mut g1 = one.clone();
+        g1.predicates = vec![Predicate::TypeOutlives(p0, Region::Static)];
+        insert_synthetic(p, &mut ordinal, lang.any, p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+    }
 }
 
 /// An owned snapshot of a type from any store (see `lift_ty`).

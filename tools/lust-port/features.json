@@ -586,7 +586,7 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Needs type ids in vtables. Part of dyn Trait in milestone 5.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_any.rs and _b pass (W-CHECK-G3): Any, TypeId, type_id, is, downcast_ref, downcast_mut, Box and Rc downcast, Any as a supertrait, Debug for dyn Any. Gaps (rejects): Debug, Hash, and Ord of TypeId (rustc prints and orders its hash values); a non-turbofish reference type as an Any type; a user blanket impl whose where clause excludes a dyn receiver is still taken by the method probe (L0612).",
    "primary_keys": [
     "dyn.std::any::Any",
     "method.downcast_ref",

@@ -1910,8 +1910,9 @@ pub fn collect_reuse<'a>(
     // name it; its variants and derives are the plain enum machinery),
     // `fmt::Error` the unit struct of `fmt::Result` (W-STD-B), and
     // `str::Utf8Error` and `string::FromUtf8Error` plain structs
-    // (W-STD-A). They take part in the same stable ranking as user Adts
-    // (the driver predicts the same set: see `predicted_def_ids`). A
+    // (W-STD-A), and `any::TypeId` (W-CHECK-G3, never in the flat name
+    // table either). They take part in the same stable ranking as user
+    // Adts (the driver predicts the same set: see `predicted_def_ids`). A
     // user type, alias, or trait of the same name shadows one in the
     // flat name table, as with any name here; the Adt itself always
     // exists, so `cmp`, `from_utf8`, and the full std paths still name
@@ -2014,7 +2015,7 @@ pub fn collect_reuse<'a>(
                     vec![unit("Empty", 0), unit("Disconnected", 1)],
                     Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
-                _ => {
+                3 => {
                     let bytes = p.tys.mk_vec(int(IntTy::U8));
                     let error = p.tys.intern(TyKind::Adt(generics::utf8_error_def(), EMPTY_ARGS));
                     (
@@ -2023,6 +2024,14 @@ pub fn collect_reuse<'a>(
                         Derives { debug: true, clone: true, partial_eq: true, eq: true, ..Derives::default() },
                     )
                 }
+                // `core::any::TypeId` (check/any.rs): two `u64` words of the
+                // type hash. Only the derives lust can match (no Debug,
+                // Hash, or Ord: their output depends on rustc's hash values).
+                _ => (
+                    generics::type_id_def(),
+                    named(vec![field("lo", int(IntTy::U64)), field("hi", int(IntTy::U64))]),
+                    Derives { clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
             };
             p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default() };
             p.gx.adt_info[id.0 as usize] = (def, 0);
@@ -4699,6 +4708,11 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Ref(_, _, e) => glue_debug(p, tys, e, seen),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_debug(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_debug(p, tys, e, seen),
+        // std's `impl Debug for dyn Any (+ Send (+ Sync))`: `Any { .. }`.
+        TyKind::Dyn(b, _) => {
+            let b = tys.dyn_bounds(b);
+            b.principal.is_some_and(|pr| pr.value.def == p.gx.lang.any) && !b.auto.unpin && (b.auto.send || !b.auto.sync)
+        }
         _ => {
             // `env::Args` prints `Args { inner: [..] }` in Rust; lust has
             // no such rendering, so it is not Debug here (a reject).

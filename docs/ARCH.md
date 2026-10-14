@@ -1267,20 +1267,25 @@ Rules:
 - Upcasting `dyn Sub` to `dyn Super` uses the `super_N`
   slots. Multi-level upcasts chain at check time to a
   fixed slot path; no runtime search.
-- `Any`: identity is the full structural key of the
-  concrete type: kind tag, def disk pair (1.7) for Adts,
+- `Any` (as built, W-CHECK-G3, `src/check/any.rs`): identity
+  is the full structural key of the concrete type: kind tag,
+  stable def pair (1.7) for Adts, closures, and fn items,
   and the full argument structure with regions erased.
   Primitives, tuples, arrays, slices, refs, fn pointers,
-  closures, and dyn types all have keys. Mono keeps a
-  checked table from key to a small integer id per final
-  binary. Two different keys that hash to the same 64-bit
-  fingerprint stop the build with an internal error, as in
-  1.7. An unchecked hash is not enough: a collision would
-  turn a downcast into an unsound reinterpretation.
-  `TypeId::of::<T>` in lust std reads the same table at
-  mono time. `downcast_ref`/`downcast` compare ids, then
-  reinterpret data. `Any` impls keep the `T: 'static`
-  bound; a type with a non-static region has no `TypeId`.
+  closures, and dyn types all have keys. A `TypeId` is a
+  128-bit SipHash of that key (two `u64` words), as rustc's
+  is a 128-bit hash: the same in every body and every
+  daemon build, so no per-binary table has to be renumbered
+  when an object is reused. The planned checked 64-bit
+  table was dropped for that reason; a 128-bit collision is
+  as unlikely as rustc's. A `dyn Any` vtable holds the two
+  words after its header (`object::VT_ANY_ID`); a user trait
+  with `Any` as a supertrait reaches them through its super
+  slot. `type_id`, `TypeId::of`, `is`, `downcast_ref`,
+  `downcast_mut`, and `Box`/`Rc` `downcast` compare words,
+  then read the data pointer (`Rvalue::DynData`). `Any`
+  keeps the `T: 'static` bound; a type with a non-static
+  region has no `TypeId`.
 - Unsizing coercions supported: `T -> dyn`, and inside
   `&`, `&mut`, `Box`, `Rc`, `Arc`, plus `Rc<RefCell<dyn>>`
   style nesting through one smart pointer whose pointee

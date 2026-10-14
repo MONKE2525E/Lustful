@@ -2395,6 +2395,18 @@ impl FnGen<'_, '_, '_> {
                 let (v, _) = self.operand(ptr, loc, post);
                 format!("((uint64_t)(uintptr_t)({v}).vt[{word}])")
             }
+            Rvalue::DynData { ptr, ty } => {
+                let (v, _) = self.operand(ptr, loc, post);
+                let ct = cty(&self.body.tys, *ty);
+                match &ct {
+                    // An `Rc<T>` points at its allocation, the counts first.
+                    CTy::Rc(e) => {
+                        let rc = format!("RcI_{}", mangle(e));
+                        format!("(({rc} *)((char *)({v}).data - (uintptr_t)&(({rc} *)0)->v))")
+                    }
+                    _ => format!("(({})({v}).data)", ctype(&ct)),
+                }
+            }
         }
     }
 
@@ -2450,6 +2462,11 @@ impl FnGen<'_, '_, '_> {
         };
         let mut words = vec![drop, format!("(void *)(uintptr_t){size}"), format!("(void *)(uintptr_t){align}")];
         words.extend(supers.iter().map(|s| format!("(void *){s}")));
+        // A `dyn Any` vtable holds the value's type id (`object::VT_ANY_ID`).
+        if vt.principal.def == p.gx.lang.any {
+            let (lo, hi) = crate::check::any::type_id_words(p, &p.tys, vt.self_ty);
+            words.extend([format!("(void *)(uintptr_t){lo}ull"), format!("(void *)(uintptr_t){hi}ull")]);
+        }
         // A `dyn FnOnce` vtable's call entry consumes the value and
         // frees the box it lives in (ARCH 2.9): the only call is
         // through `Box<dyn FnOnce>` by value.
@@ -6695,7 +6712,8 @@ fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: 
         | Rvalue::Res(_, _, o)
         | Rvalue::MakeDyn { ptr: o, .. }
         | Rvalue::DynUpcast { ptr: o, .. }
-        | Rvalue::DynMeta { ptr: o, .. } => op(o),
+        | Rvalue::DynMeta { ptr: o, .. }
+        | Rvalue::DynData { ptr: o, .. } => op(o),
         Rvalue::Bin(_, a, b)
         | Rvalue::StrCmp(_, a, b)
         | Rvalue::StringAdd(a, b)

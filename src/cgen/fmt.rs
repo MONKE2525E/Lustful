@@ -48,6 +48,9 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
                 crate::ty::sync::AtomicVal::Int(i) => int_expr(i, kind, f, &load),
             }
         }
+        // The only dyn type with Debug is `dyn Any` (`has_debug`): std
+        // prints `Any { .. }` for every flag set.
+        CTy::Dyn | CTy::BoxDyn | CTy::RcDyn if debug => format!("lust_f_write_str({f}, {})", lit("Any { .. }")),
         _ if debug => {
             need(Glue::Debug, t);
             format!("dbg_{}({f}, {v})", mangle(t))

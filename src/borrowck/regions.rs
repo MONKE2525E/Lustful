@@ -2482,6 +2482,16 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                     self.dyn_fn_coercion(*src, *dyn_ty, &data);
                 }
             }
+            // A downcast (W-CHECK-G3): `&'p dyn Any` to `&'q T` needs
+            // `'p: 'q`. T is `'static`; an owning pointer relates nothing.
+            Rvalue::DynData { ptr: o, .. } => {
+                let mut ov = Vec::new();
+                self.operand(o, &mut ov);
+                self.place(dest, &mut dv, &mut d);
+                if let (Some(&x), Some(&y)) = (ov.first(), dv.first()) {
+                    self.edge(x, y);
+                }
+            }
             _ => {}
         }
     }
