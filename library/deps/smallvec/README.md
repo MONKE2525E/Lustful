@@ -9,9 +9,12 @@ Blocked on: method arguments typed by an associated type of the Adt's
 parameter (`push(value: A::Item)`, fixed on b/w-traits2); method calls
 that autoderef from a user type to builtin slice methods (`Deref<Target
 = [T]>`, W-CHECK-G); `Iterator::size_hint` overrides,
-`DoubleEndedIterator`, `ExactSizeIterator`, `Extend`, the
-`std::vec::IntoIter` type name, and `usize::checked_mul` checks
-(W-STD-A, W-STD-B).
+`DoubleEndedIterator`, `ExactSizeIterator`, `Extend`, and the `Hasher`
+trait (W-STD-B, in its queue); `into_iter()` on a generic
+`I: IntoIterator` parameter (W-STD-B or W-TRAITS). W-STD-B's queue
+also rejects an `IntoIterator` impl whose `IntoIter` is
+`slice::Iter<'a, T>` (L0110), which `&SmallVec` and `&mut SmallVec`
+use, as upstream does.
 
 On b/w-traits2 (projections normalized), the core (new, push, spill,
 capacity, clone, into_vec) compiles and prints the same as the real
