@@ -2440,6 +2440,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             return if self.sized_ok(self_ty) { Selection::ParamEvidence(usize::MAX) } else { Selection::NoImpl };
         }
+        // An open input for a scalar Self has several scalar `From`
+        // impls in core, not just the reflexive record: a pick of
+        // `From<T> for T` (or no pick) then defers until inference
+        // names the input (`T: Into<i64>` must not make `T` an i64).
+        let mut defer_reflexive_from = false;
         // Numeric `From` obligations are widening casts, with no
         // impl behind them in this subset's lang records.
         if tr.def == lang.from
@@ -2449,6 +2454,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if Self::numeric_from_ok(self.kind(input), self.kind(self_ty)) {
                 return Selection::ParamEvidence(usize::MAX);
             }
+            let (ik, sk) = (self.kind(input), self.kind(self_ty));
+            if let Some(sel) = self.lit_from_select(input, ik, self_ty, sk) {
+                return sel;
+            }
+            defer_reflexive_from =
+                matches!(ik, TyKind::Infer(_)) && matches!(sk, TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Infer(_));
             if matches!(self.kind(input), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
                 && matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
             {
@@ -2479,8 +2490,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let env: &[Predicate] = p.gx.fn_scopes.get(self.fid.0 as usize).map_or(&[], |fs| &fs.env);
         let mut solver = std::mem::take(&mut self.solver);
+        let snap = self.snapshot_vars();
         let sel = solver.select(self, &p.gx.index, env, tr);
         self.solver = solver;
+        let lang_pick =
+            matches!(&sel, Selection::Impl { id, .. } if p.gx.index.get(*id).synthetic == crate::traits::index::Synthetic::Lang);
+        if defer_reflexive_from && (lang_pick || sel == Selection::NoImpl) {
+            self.rollback_vars(snap);
+            return Selection::Ambiguous;
+        }
         if sel == Selection::NoImpl && self.derive_query_holds(tr.def, self_ty) {
             return Selection::ParamEvidence(usize::MAX);
         }
@@ -7805,6 +7823,37 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// `From` between a literal variable and a scalar (`u32: From<{integer}>`,
+    /// `{float}: From<f32>`), decided as rustc decides it from core's
+    /// numeric impls: none is NoImpl, exactly one binds the literal to
+    /// it (`let c: char = From::from(65)` makes 65 a u8), more defer to
+    /// the literal fallback. None when neither side is such a pair.
+    fn lit_from_select(&mut self, input: Ty, ik: TyKind, self_ty: Ty, sk: TyKind) -> Option<Selection> {
+        let scalar = |k: TyKind| matches!(k, TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool);
+        let floats = [self.tys.float_ty(FloatTy::F32), self.tys.float_ty(FloatTy::F64)];
+        let lit_types = |k: TyKind| -> Option<Vec<Ty>> {
+            if k.is_int_infer() {
+                Some(IntTy::ALL_SUPPORTED.iter().map(|&i| int(i)).collect())
+            } else if k.is_float_infer() {
+                Some(floats.to_vec())
+            } else {
+                None
+            }
+        };
+        let (var, choices): (Ty, Vec<Ty>) = match (lit_types(ik), lit_types(sk)) {
+            (Some(_), Some(_)) => return Some(Selection::Ambiguous),
+            (Some(ts), None) if scalar(sk) => (input, ts.into_iter().filter(|&t| Self::numeric_from_ok(self.kind(t), sk)).collect()),
+            (None, Some(ts)) if scalar(ik) => (self_ty, ts.into_iter().filter(|&t| Self::numeric_from_ok(ik, self.kind(t))).collect()),
+            _ => return None,
+        };
+        Some(match choices[..] {
+            [] => Selection::NoImpl,
+            [t] if self.unify(var, t) => Selection::ParamEvidence(usize::MAX),
+            [_] => Selection::NoImpl,
+            _ => Selection::Ambiguous,
+        })
+    }
+
     /// True for the scalar conversions `From` provides in core
     /// (identity is the blanket's job and also answers true).
     fn numeric_from_ok(src: TyKind, dst: TyKind) -> bool {
@@ -8092,12 +8141,24 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         if !self.unify(src, fb) {
                             break;
                         }
+                        // The fallback type widens like a suffixed literal.
+                        if Self::numeric_from_ok(self.kind(fb), self.kind(base)) {
+                            self.set_res(callee, Res::FromCast);
+                            self.set_res(e, Res::FromCast);
+                            return Some(base);
+                        }
                         let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(fb)]);
                         TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS }
                     };
                     let mut env_pick: Option<usize> = None;
                     let found = match self.select_obligation_at(tr, span, 0) {
                         Selection::Impl { id, args: impl_args, .. } => self.method_instance_for_impl(e, id, tr, impl_args, "from", span),
+                        // The one numeric impl a literal fits (it is bound now).
+                        Selection::ParamEvidence(usize::MAX) => {
+                            self.set_res(callee, Res::FromCast);
+                            self.set_res(e, Res::FromCast);
+                            return Some(base);
+                        }
                         Selection::ParamEvidence(i) => {
                             env_pick = Some(i);
                             self.stub_instance(e, tr, name, span)
@@ -8115,6 +8176,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.rollback_vars(snap);
                     self.obl_truncate(obl_len);
                     self.generic_sites.truncate(sites_len);
+                }
+                // A literal argument with no scalar impl even after its fallback
+                // has no other reading (`let d: u32 = From::from(c)` with
+                // `c = 3` needs `u32: From<i32>`): report it here, not
+                // through a later path that does not check the impl.
+                if let Some(fb) = fallback
+                    && matches!(self.kind(base), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
+                {
+                    let (fbn, tn) = (self.tn(fb), self.tn(base));
+                    let msg = format!("no impl of `From<{fbn}>` for `{tn}`");
+                    self.err("L0612", span, msg, "Add a literal suffix, or change the target type.");
+                    return Some(ERROR);
                 }
                 return None;
             }

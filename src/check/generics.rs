@@ -4891,10 +4891,20 @@ pub fn add_synthetic_impls(p: &mut Program) {
     // so an over-broad set would prove bounds rustc rejects).
     // Ints have every operator except that `Neg` is signed-only;
     // bool has the bit operators and `Not`; char and unit have none.
+    let ints: Vec<Ty> = IntTy::ALL_SUPPORTED.iter().map(|&i| int(i)).collect();
     let op_impls = |p: &mut Program, ordinal: &mut u32, t: Ty, binops: &[DefId], unops: &[DefId], assigns: &[DefId]| {
         for &tr in binops {
             if let Some(out) = lang.output_of(tr) {
-                insert_synthetic(p, ordinal, tr, t, &[t], g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
+                // Shifts take any int right side (`impl Shl<i64> for
+                // i32`), so `{integer}: Shl<i64>` stays ambiguous
+                // until the literal fallback, as in rustc.
+                if tr == lang.shl || tr == lang.shr {
+                    for &r in &ints {
+                        insert_synthetic(p, ordinal, tr, t, &[r], g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
+                    }
+                } else {
+                    insert_synthetic(p, ordinal, tr, t, &[t], g0.clone(), vec![(out, t)], Synthetic::Lang, false, span);
+                }
             }
         }
         for &tr in unops {
@@ -4903,7 +4913,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
             }
         }
         for &tr in assigns {
-            insert_synthetic(p, ordinal, tr, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+            let rhs: &[Ty] = if tr == lang.shl_assign || tr == lang.shr_assign { &ints } else { std::slice::from_ref(&t) };
+            for &r in rhs {
+                insert_synthetic(p, ordinal, tr, t, &[r], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+            }
         }
     };
     let int_binops = [lang.add, lang.sub, lang.mul, lang.div, lang.rem, lang.bit_and, lang.bit_or, lang.bit_xor, lang.shl, lang.shr];
