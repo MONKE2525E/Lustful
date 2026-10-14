@@ -245,7 +245,7 @@ fn once_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, m: &str, ct: &str, pr
             (format!("void drop_{m}({ct} *p)"), body)
         }
         (Glue::Drop, _) => (format!("void drop_{m}({ct} *p)"), "(void)p;".into()),
-        (Glue::Default, _) => (format!("{ct} default_{m}(void)"), format!("{ct} r; memset(&r, 0, sizeof r); return r;")),
+        (Glue::Default, _) => (format!("{ct} default_{m}(void)"), format!("{ct} r; {} return r;", zero_c("r"))),
         // `OnceLock(5)` or `OnceLock(<uninit>)` (a `format_args!`).
         (Glue::Debug, SyncTy::OnceLock) => {
             let v = super::fmt::fmt_expr(e, FmtKind::Debug, "w", "(&p->v)", need);
@@ -378,7 +378,7 @@ fn lock_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, m: &str, ct: &str, pr
         (Glue::Drop, SyncTy::RwLockWriteGuard) => (format!("void drop_{m}({ct} *p)"), "lust_rw_write_unlock(&(*p)->st);".into()),
         (Glue::Default, SyncTy::Mutex | SyncTy::RwLock) => {
             need(Glue::Default, e);
-            (format!("{ct} default_{m}(void)"), format!("{ct} r; memset(&r, 0, sizeof r); r.v = default_{}(); return r;", mangle(e)))
+            (format!("{ct} default_{m}(void)"), format!("{ct} r; {} r.v = default_{}(); return r;", zero_c("r"), mangle(e)))
         }
         // `Mutex { data: .., poisoned: false, .. }`: std's try_lock (or
         // try_read); a held lock prints the str `"<locked>"` (Debug).
@@ -688,9 +688,9 @@ impl FnGen<'_, '_, '_> {
                 let err = variant_field(self.p, &res, &t, 1, 0);
                 // try_recv: 1 is `Empty` (variant 0), 2 `Disconnected`.
                 let err_val = if op == S::ChanRecv {
-                    format!("memset(&{err}, 0, sizeof({err}));")
+                    zero_c(&err)
                 } else {
-                    format!("memset(&{err}, 0, sizeof({err})); if ({r} == 2) {{ {} }} else {{ {} }}", disc_set(self.p, &et, &err, 1), disc_set(self.p, &et, &err, 0))
+                    format!("{} if ({r} == 2) {{ {} }} else {{ {} }}", zero_c(&err), disc_set(self.p, &et, &err, 1), disc_set(self.p, &et, &err, 0))
                 };
                 let _ = writeln!(
                     self.out,
@@ -938,7 +938,7 @@ impl FnGen<'_, '_, '_> {
                 collect_types(&lock, &mut self.sig_types);
                 let t = self.tmp();
                 let set = if k == SyncTy::OnceLock { format!(" {t}.st = 2;") } else { String::new() };
-                let _ = writeln!(self.out, "    {} {t}; memset(&{t}, 0, sizeof {t}); {t}.v = {};{set}", ctype(&lock), vals[0]);
+                let _ = writeln!(self.out, "    {} {t}; {} {t}.v = {};{set}", ctype(&lock), zero_c(&t), vals[0]);
                 t
             }
             S::LockDefault(_) => unreachable!("LockDefault calls the Default glue"),
@@ -1189,4 +1189,10 @@ impl FnGen<'_, '_, '_> {
             _ => unreachable!("arc_builtin takes the Arc ops"),
         }
     }
+}
+
+/// zero_c: C that zeroes the lvalue `place` byte by byte. It needs no declaration, so units
+/// that do not include <string.h> stay valid C for gcc 14, which rejects an implicit `memset`.
+fn zero_c(place: &str) -> String {
+    format!("{{ unsigned char *lust_z_ = (unsigned char *)&({place}); for (unsigned long lust_i_ = 0; lust_i_ < sizeof({place}); lust_i_++) lust_z_[lust_i_] = 0; }}")
 }
