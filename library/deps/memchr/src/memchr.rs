@@ -1,14 +1,21 @@
 // Single-byte searches: one, two, or three needle bytes, forward and
-// reverse, plus the double-ended iterators over all matches.
+// reverse, plus the iterators over all matches. One needle goes through
+// the memchr and memrchr intrinsics (libc, src/runtime/deps.c); two and
+// three needles are loops here.
 
 /// The first index of `needle` in `haystack`.
 pub fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    memchr3_in(needle, needle, needle, haystack, 0, haystack.len())
+    found(core::intrinsics::memchr(needle as u32, haystack))
 }
 
 /// The last index of `needle` in `haystack`.
 pub fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    memrchr3_in(needle, needle, needle, haystack, 0, haystack.len())
+    found(core::intrinsics::memrchr(needle as u32, haystack))
+}
+
+/// An intrinsic's index answer: usize::MAX means no match.
+pub(crate) fn found(i: usize) -> Option<usize> {
+    if i == usize::MAX { None } else { Some(i) }
 }
 
 /// The first index of either needle byte.
@@ -97,8 +104,7 @@ impl<'h> Iterator for Memchr<'h> {
     type Item = usize;
 
     fn next(&mut self) -> Option<usize> {
-        let n = self.needle1;
-        let i = memchr3_in(n, n, n, self.haystack, self.start, self.end)?;
+        let i = self.start + memchr(self.needle1, &self.haystack[self.start..self.end])?;
         self.start = i + 1;
         Some(i)
     }

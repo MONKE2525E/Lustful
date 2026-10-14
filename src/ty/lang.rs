@@ -681,7 +681,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::U32, S::Bytes],
         ret: S::Usize,
         allowed: &[C::Memchr],
-        implemented: false,
+        implemented: true,
     },
     IntrinsicDef {
         name: "memrchr",
@@ -689,7 +689,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::U32, S::Bytes],
         ret: S::Usize,
         allowed: &[C::Memchr],
-        implemented: false,
+        implemented: true,
     },
     IntrinsicDef {
         name: "memmem",
@@ -697,7 +697,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::Bytes, S::Bytes],
         ret: S::Usize,
         allowed: &[C::Memchr],
-        implemented: false,
+        implemented: true,
     },
     // XXH3 of the bytes with a seed (0 is the unseeded hash).
     IntrinsicDef {

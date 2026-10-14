@@ -16,9 +16,11 @@ crate is the oracle).
   `FindIter` and `FindRevIter` (`next`, `into_owned`).
 - Features: `alloc`, `default`, `libc`, `std`, `use_std`.
 
-The searches are plain loops in source. Upstream's SIMD paths change
-speed, not answers. The `memchr`, `memrchr`, and `memmem` intrinsics in
-src/ty/lang.rs stay unused until a profile shows the loops matter.
+One-needle searches and forward substring search go through one
+intrinsic each (`memchr`, `memrchr`, `memmem`; libc memchr and memcmp in
+src/runtime/deps.c). Two- and three-needle searches and reverse
+substring search are loops in source. Upstream's SIMD paths change
+speed, not answers.
 
 ## Rejected (lust error, never a different answer)
 

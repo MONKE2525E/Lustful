@@ -1,4 +1,38 @@
 /* Bodies of the adapter crate cores declared in deps.h (W-DEPS). */
+#include <string.h>
+
+/* memchr through libc. A zero length never touches the pointer (an
+   empty Rust slice may hold a dangling one). */
+uint64_t lust_memchr(uint32_t needle, const uint8_t *p, uint64_t len) {
+    const uint8_t *r = len ? (const uint8_t *)memchr(p, (int)(needle & 0xFFu), (size_t)len) : NULL;
+    return r ? (uint64_t)(r - p) : UINT64_MAX;
+}
+
+/* memrchr is a GNU extension; a backward loop is portable. */
+uint64_t lust_memrchr(uint32_t needle, const uint8_t *p, uint64_t len) {
+    uint8_t b = (uint8_t)needle;
+    while (len) {
+        len--;
+        if (p[len] == b) return len;
+    }
+    return UINT64_MAX;
+}
+
+/* memmem is a GNU extension too: libc memchr finds each candidate first
+   byte, memcmp confirms it. */
+uint64_t lust_memmem(const uint8_t *h, uint64_t hlen, const uint8_t *n, uint64_t nlen) {
+    if (nlen == 0) return 0;
+    if (nlen > hlen) return UINT64_MAX;
+    uint64_t last = hlen - nlen, i = 0;
+    while (i <= last) {
+        const uint8_t *f = (const uint8_t *)memchr(h + i, n[0], (size_t)(last - i + 1));
+        if (!f) return UINT64_MAX;
+        i = (uint64_t)(f - h);
+        if (memcmp(h + i, n, (size_t)nlen) == 0) return i;
+        i++;
+    }
+    return UINT64_MAX;
+}
 
 /* XXH3 one-shot hashes for the xxhash-rust 0.8.15 adapter. A scalar
    port of xxhash-rust's src/xxh3.rs (the default secret, seeded and

@@ -1,6 +1,8 @@
 // Lust adapter for memchr 2.8.2 (docs/ARCH.md section 3.6): byte and
 // substring search with the upstream API and the same results. The
-// searches are plain loops; upstream's SIMD changes speed, not answers.
+// one-needle and forward substring searches call libc through the
+// memchr, memrchr, and memmem intrinsics; upstream's SIMD changes speed,
+// not answers.
 // Module paths follow upstream, so type names print the same
 // (`memchr::memchr::Memchr`, `memchr::memmem::Finder`). Items this file
 // does not define (`arch`, `memrchr_iter`, `FinderBuilder`, ...) reject

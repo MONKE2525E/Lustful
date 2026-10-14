@@ -24,19 +24,9 @@ pub fn rfind_iter<'h, 'n, N: ?Sized + AsRef<[u8]>>(haystack: &'h [u8], needle: &
     FindRevIter::new(haystack, FinderRev::new(needle))
 }
 
+/// The leftmost match, through the memmem intrinsic.
 fn find_in(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if haystack.len() < needle.len() {
-        return None;
-    }
-    let last = haystack.len() - needle.len();
-    let mut i = 0;
-    while i <= last {
-        if starts_at(haystack, needle, i) {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    crate::memchr::found(core::intrinsics::memmem(haystack, needle))
 }
 
 fn rfind_in(haystack: &[u8], needle: &[u8]) -> Option<usize> {
