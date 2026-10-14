@@ -1639,6 +1639,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         && r.head == crate::traits::index::SelfHead::Adt(def)
                         && (r.trait_def == lang.partial_eq || r.trait_def == lang.partial_ord || r.trait_def == lang.ord)
                         && !p.std_source_span(r.span)
+                        // Std's own impls (the platform crate's `String:
+                        // PartialEq<OsStr>`, W-SHIM) agree with its order.
+                        && !matches!(p.shipped_crate_at(r.span), Some(lang::ShippedCrate::Core | lang::ShippedCrate::Alloc | lang::ShippedCrate::Std))
                 });
                 if written {
                     return Some(t);
