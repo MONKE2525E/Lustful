@@ -1,5 +1,5 @@
-// expect: L0702
-// ARCH 2.8: `dyn Fn` comes with closures; a std trait has no vtable yet.
+// A fn item as a `&dyn Fn` argument in a program with no generics and
+// no closures (mono still builds the vtable).
 fn apply(f: &dyn Fn(u8) -> u8) -> u8 {
     f(2)
 }

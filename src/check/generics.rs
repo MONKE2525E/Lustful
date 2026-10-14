@@ -6295,8 +6295,12 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
 /// (instantiation depth and count caps, section 4.2).
 pub fn materialize(p: &mut Program) -> Vec<Diag> {
     // Closures need the instance machinery too: each closure body is
-    // its own fn with a slot, made here (ARCH 2.9, 4.1).
-    if !p.gx.has_generics && p.ast.exprs.iter().any(|e| matches!(e, ast::Expr::Closure { .. })) {
+    // its own fn with a slot, made here (ARCH 2.9, 4.1); and so do
+    // `dyn Fn` values made from fn items, whose vtables only body
+    // checks ask for.
+    if !p.gx.has_generics
+        && (p.ast.exprs.iter().any(|e| matches!(e, ast::Expr::Closure { .. })) || p.ast.tys.iter().any(|t| matches!(t, TyExpr::Dyn { .. })))
+    {
         p.gx.has_generics = true;
     }
     if !p.gx.has_generics {
