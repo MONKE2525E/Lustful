@@ -622,12 +622,17 @@ impl<A: Array> DoubleEndedIterator for IntoIter<A> {
 
 impl<A: Array> ExactSizeIterator for IntoIter<A> {}
 
-/// The items `SmallVec::drain` removes, by value.
-pub struct Drain<'a, T: 'a + Array> {
+/// The items `SmallVec::drain` removes, by value. Upstream writes
+/// `T: 'a + Array`; lust has no named-lifetime bounds yet (L0203), and
+/// for an array type `T: 'a` holds exactly when its items outlive `'a`,
+/// which the `vec::Drain<'a, T::Item>` field already implies.
+/// `FusedIterator` is left out until lust has the trait, as for
+/// `IntoIter` (a bound on it rejects).
+pub struct Drain<'a, T: Array> {
     inner: std::vec::Drain<'a, T::Item>,
 }
 
-impl<'a, T: 'a + Array> core::fmt::Debug for Drain<'a, T>
+impl<'a, T: Array> core::fmt::Debug for Drain<'a, T>
 where
     T::Item: core::fmt::Debug,
 {
@@ -636,7 +641,7 @@ where
     }
 }
 
-impl<'a, T: 'a + Array> Iterator for Drain<'a, T> {
+impl<'a, T: Array> Iterator for Drain<'a, T> {
     type Item = T::Item;
 
     fn next(&mut self) -> Option<T::Item> {
@@ -648,15 +653,13 @@ impl<'a, T: 'a + Array> Iterator for Drain<'a, T> {
     }
 }
 
-impl<'a, T: 'a + Array> DoubleEndedIterator for Drain<'a, T> {
+impl<'a, T: Array> DoubleEndedIterator for Drain<'a, T> {
     fn next_back(&mut self) -> Option<T::Item> {
         self.inner.next_back()
     }
 }
 
 impl<'a, T: Array> ExactSizeIterator for Drain<'a, T> {}
-
-impl<'a, T: Array> core::iter::FusedIterator for Drain<'a, T> {}
 
 /// `smallvec![]`, `smallvec![x; n]`, and `smallvec![a, b, ...]`, as
 /// upstream expands them.
