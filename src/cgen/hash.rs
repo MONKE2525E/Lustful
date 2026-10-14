@@ -116,6 +116,20 @@ fn build_expr(p: &Program, slots: &[u32], s_cty: &CTy, s: &str, need: &mut dyn F
     }
 }
 
+/// `H var = <build_expr>;`, or for a user `build_hasher` whose return is
+/// passed through an out pointer (a large hasher, such as
+/// DefaultHasher) the call that fills `var`.
+fn build_into(p: &Program, slots: &[u32], s_cty: &CTy, s: &str, var: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let ht = ctype(&hasher_cty(p, s_cty));
+    if let CTy::Adt(a) = s_cty
+        && let Some(&(f, _)) = p.gx.build_hashers.get(a)
+        && super::ret_is_large(p, f)
+    {
+        return format!("{ht} {var}; (({}lust_fns[{}])(&{var}, {s}));", fn_ptr_cast(p, f), slots[f.0 as usize]);
+    }
+    format!("{ht} {var} = {};", build_expr(p, slots, s_cty, s, need))
+}
+
 /// The C type of the bytes argument of `Hasher::write` (`&[u8]`).
 fn bytes_cty() -> CTy {
     CTy::Slice(Box::new(CTy::Int(IntTy::U8)))
@@ -336,7 +350,7 @@ pub(super) fn hash_key_body(p: &Program, slots: &[u32], map: &CTy, k_cty: &CTy, 
 fn hash_with_builder(p: &Program, slots: &[u32], s_cty: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let s_cty = s_cty.clone();
     let hc = hasher_cty(p, &s_cty);
-    let build = build_expr(p, slots, &s_cty, "s", need);
+    let build = build_into(p, slots, &s_cty, "s", "h", need);
     let stmts = hash_stmts(p, slots, k_cty, &hc, "(&h)", "k", need);
     let finish = hasher_call(p, slots, &hc, 0, "(&h)", "");
     let drop = if needs_drop_c(p, &hc) {
@@ -345,7 +359,7 @@ fn hash_with_builder(p: &Program, slots: &[u32], s_cty: &CTy, k_cty: &CTy, need:
     } else {
         String::new()
     };
-    format!("  {} h = {build};\n  {stmts}\n  uint64_t r = {finish};{drop}\n  return r;\n", ctype(&hc))
+    format!("  {build}\n  {stmts}\n  uint64_t r = {finish};{drop}\n  return r;\n")
 }
 
 /// One hash glue function: (signature, body).
