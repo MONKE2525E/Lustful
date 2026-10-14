@@ -889,6 +889,64 @@ enum BoundSlot {
     Tie(u32),
 }
 
+/// The fn whose body holds `f`: `f` itself, or a closure's enclosing fn.
+fn root_fn(p: &Program, f: LocalDefId) -> LocalDefId {
+    let mut root = f;
+    while let Some(e) = p.gx.closure_fns.get(&root).and_then(|d| p.gx.closures.get(d)) {
+        root = e.parent;
+    }
+    root
+}
+
+/// True when the fn holding `f` has a regioned `Fn` bound on a type
+/// param: a call may pass that param to a generic fn, which proves the
+/// callee's bound from it (`entail_bound`) even in a body with no loans.
+pub(super) fn has_fn_bounds(p: &Program, f: LocalDefId) -> bool {
+    p.regions.body_sig(p, root_fn(p, f)).is_some_and(|s| !s.fn_bounds.is_empty())
+}
+
+/// The pairs of regions at the same places of two regioned types (a
+/// callee's bound and the caller's, `entail_bound`); a type param or
+/// projection in `a` (the call's instantiation) pairs nothing. False when
+/// the shapes differ.
+fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region)>) -> bool {
+    match (tys.kind(a), tys.kind(b)) {
+        (TyKind::Param(_) | TyKind::Projection(..), _) => true,
+        (TyKind::Ref(ra, ma, ia), TyKind::Ref(rb, mb, ib)) if ma == mb => {
+            out.push((ra, rb));
+            region_pairs(tys, ia, ib, out)
+        }
+        (TyKind::Adt(da, xa), TyKind::Adt(db, xb)) if da == db => {
+            let (xa, xb) = (tys.args(xa).to_vec(), tys.args(xb).to_vec());
+            xa.len() == xb.len()
+                && xa.into_iter().zip(xb).all(|(x, y)| match (x, y) {
+                    (GenericArg::Lifetime(r), GenericArg::Lifetime(s)) => {
+                        out.push((r, s));
+                        true
+                    }
+                    (GenericArg::Ty(x), GenericArg::Ty(y)) => region_pairs(tys, x, y, out),
+                    (GenericArg::Const(_), GenericArg::Const(_)) => true,
+                    _ => false,
+                })
+        }
+        (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+            let (x, y) = (tys.tys_of(x).to_vec(), tys.tys_of(y).to_vec());
+            x.len() == y.len() && x.into_iter().zip(y).all(|(x, y)| region_pairs(tys, x, y, out))
+        }
+        (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => region_pairs(tys, x, y, out),
+        (TyKind::Dyn(_, r), TyKind::Dyn(_, s)) => {
+            out.push((r, s));
+            true
+        }
+        _ => {
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            regions_of(tys, a, &mut x);
+            regions_of(tys, b, &mut y);
+            x.is_empty() && y.is_empty()
+        }
+    }
+}
+
 /// The universal of a regioned signature region.
 fn univ_of(r: Region, fresh: &mut impl FnMut() -> Univ) -> Univ {
     match r {
@@ -1170,6 +1228,24 @@ impl OwnSig {
                 self.ends[u as usize] = Some(End::Arg(j as u32));
             }
         }
+        // A bound's higher-ranked output over its one elided input
+        // lifetime (`F: Fn(&T) -> &U`): rustc gives the closure `for<'r>
+        // fn(&'r T) -> &'r U`, so that argument slot (the only
+        // higher-ranked one) outlives those output slots.
+        if let Some(bo) = entry.and_then(|c| c.bound_output) {
+            let mut named: Vec<Region> = Vec::new();
+            let hr: Vec<usize> = (0..args.len()).filter(|&i| arg_roles.get(i).is_none_or(|r| r.is_none())).collect();
+            if regioned_slots(sc, bo, body.locals[0].ty, &mut named)
+                && let [j] = hr[..]
+            {
+                let outs = self.slots.first().cloned().unwrap_or_default();
+                for (r, &o) in named.iter().zip(&outs) {
+                    if matches!(r, Region::Bound(_)) && o != 0 {
+                        self.facts.push((args[j], o));
+                    }
+                }
+            }
+        }
         self.implied(sc, body);
     }
 
@@ -1362,6 +1438,13 @@ fn regioned_slots<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, r: Ty, e: Ty, out
         }
         (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
             out.push(rr);
+            true
+        }
+        // A bound's type param (`ClosureEntry::bound_output`): the call's
+        // instantiation, no written regions.
+        (TyKind::Param(_) | TyKind::Projection(..), _) => {
+            let n = sc.slots(e) as usize;
+            out.extend(std::iter::repeat_n(Region::Erased, n));
             true
         }
         _ => {
@@ -3319,6 +3402,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             {
                 self.link_bound_closure(b.value.args, &binds, sig, &univ);
                 self.tie_bound_output(b.value.args, &binds, sig, &univ);
+                self.entail_bound(b.value.args, sig, &univ);
             }
         }
         ok
@@ -3724,6 +3808,149 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
             }
         }
+    }
+
+    /// A type param `F` of this body (or `&F`) passed for the callee's `G:
+    /// Fn*(..)` bound: `F`'s own regioned bound must prove `G`'s, as rustc
+    /// selects `F: Fn*` from this body's bounds and equates the
+    /// signatures. Region by region: a lifetime both write is one region;
+    /// a higher-ranked `G` input needs a higher-ranked `F` input (L0735),
+    /// and a lifetime `G` writes there is what `F`'s binder takes; a
+    /// higher-ranked `G` output needs a higher-ranked `F` output, and a
+    /// written one the same of `F`, or `F`'s binder taken from a written
+    /// `G` input (else L0733). Type params are the call's instantiation.
+    /// In a closure body the enclosing fn's lifetimes are not universals:
+    /// L0203 where `F`'s bound names one.
+    fn entail_bound(&mut self, trait_args: ArgsId, sig: &RegionSig, univ: &[u32]) {
+        let p = self.p;
+        let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
+        let (Some(self_t), Some(tuple)) = (targs.first().and_then(|g| g.as_ty()), targs.get(1).and_then(|g| g.as_ty())) else { return };
+        let (TyKind::Param(jg), TyKind::Tuple(ts)) = (p.tys.kind(self_t), p.tys.kind(tuple)) else { return };
+        let n_in = p.tys.tys_of(ts).len();
+        let Some(g) = sig.fn_bounds.iter().find(|b| b.param == jg.0 && b.inputs.len() == n_in).cloned() else { return };
+        let Some(&ft) = self.bind_tys.get(&jg.0) else { return };
+        let mut t = ft;
+        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+            t = inner;
+        }
+        let TyKind::Param(jf) = self.body.tys.kind(t) else { return };
+        // `F`'s bound lives in the enclosing fn's signature.
+        let root = root_fn(p, self.body.fn_id);
+        let in_closure = root != self.body.fn_id;
+        let f = p.regions.body_sig(p, root).and_then(|s| s.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned());
+        let mut ins: Vec<(Region, Region)> = Vec::new();
+        let mut outs: Vec<(Region, Region)> = Vec::new();
+        let paired = match &f {
+            Some(f) => {
+                g.inputs.iter().zip(&f.inputs).all(|(&a, &b)| region_pairs(&p.tys, a, b, &mut ins))
+                    && match (g.output, f.output) {
+                        (Some(a), Some(b)) => region_pairs(&p.tys, a, b, &mut outs),
+                        (None, None) => true,
+                        // No output is `()`: it pairs with an output without regions.
+                        (Some(t), None) | (None, Some(t)) => {
+                            let mut rs = Vec::new();
+                            regions_of(&p.tys, t, &mut rs);
+                            rs.is_empty()
+                        }
+                    }
+            }
+            None => false,
+        };
+        let written = |r: Region| matches!(r, Region::Param(_) | Region::Static | Region::Bound(_));
+        if !paired {
+            // `F` has no bound this pairs with (check selected `F: Fn*` some
+            // other way): only a bound without lifetimes is proved.
+            let mut rs = Vec::new();
+            for &it in &g.inputs {
+                regions_of(&p.tys, it, &mut rs);
+            }
+            if let Some(o) = g.output {
+                regions_of(&p.tys, o, &mut rs);
+            }
+            if rs.into_iter().any(written) {
+                self.bound_mismatch();
+            }
+            return;
+        }
+        if in_closure && ins.iter().chain(&outs).any(|&(_, b)| matches!(b, Region::Param(_))) {
+            self.errs.push(Diag::new(
+                "L0203",
+                self.span,
+                "a type param whose `Fn` bound names a lifetime of the enclosing fn, passed to a generic fn inside a closure, is not supported yet",
+                "Make the call outside the closure, or pass a closure written in place.",
+            ));
+            return;
+        }
+        let gv = |r: Region| match r {
+            Region::Static => Some(0),
+            Region::Param(k) => univ.get(k as usize).copied(),
+            _ => None,
+        };
+        let fv = |r: Region| match r {
+            Region::Static => Some(0),
+            Region::Param(k) => Some(k + 1),
+            _ => None,
+        };
+        // The region `F`'s binder takes: a lifetime `G` writes where `F`
+        // is higher-ranked.
+        let mut binder: Option<u32> = None;
+        for &(a, b) in &ins {
+            match (a, b) {
+                (Region::Bound(_), Region::Bound(_)) => {}
+                (Region::Bound(_), _) if written(b) => {
+                    self.not_general_enough_param();
+                    return;
+                }
+                (_, Region::Bound(_)) => binder = binder.or(gv(a)),
+                _ => {
+                    if let (Some(x), Some(y)) = (gv(a), fv(b)) {
+                        self.edge(x, y);
+                        self.edge(y, x);
+                    }
+                }
+            }
+        }
+        for &(a, b) in &outs {
+            let pair = match (a, b) {
+                (Region::Bound(_), Region::Bound(_)) => continue,
+                (Region::Bound(_), _) if written(b) => None,
+                (_, Region::Bound(_)) => gv(a).zip(binder),
+                _ => gv(a).zip(fv(b)),
+            };
+            match pair {
+                Some((x, y)) => {
+                    self.edge(x, y);
+                    self.edge(y, x);
+                }
+                None if written(a) || written(b) => {
+                    self.bound_mismatch();
+                    return;
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// L0735 for a type param whose `Fn` bound fixes an argument lifetime
+    /// where the callee's bound is higher-ranked (rustc E0277).
+    fn not_general_enough_param(&mut self) {
+        self.errs.push(Diag::new(
+            "L0735",
+            self.span,
+            "this type param's `Fn` bound is not general enough for the callee's: its argument lifetime is fixed, but the callee may pass a borrow of its own data",
+            "Write the bound with an elided lifetime (`F: Fn(&T)`).",
+        ));
+    }
+
+    /// L0733 for a type param whose `Fn` bound does not prove the
+    /// callee's: the lifetimes in their signatures differ.
+    fn bound_mismatch(&mut self) {
+        self.errs.push(Diag::new(
+            "L0733",
+            self.span,
+            "lifetime may not live long enough: this type param's `Fn` bound does not prove the callee's bound (their lifetimes differ)",
+            "Write the same lifetimes in both bounds.",
+        ));
     }
 
     /// Per slot of a closure input's erased type `t`, what the bound's

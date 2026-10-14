@@ -2961,8 +2961,18 @@ output lifetime, and `'static` where the output is
 higher-ranked (`F: Fn(&u8) -> &u8`: the callee picks it).
 In `Fn` sugar an elided output lifetime is the only input
 lifetime (`Fn(&'a u8) -> &u8` returns `'a`), else L0202
-(rustc E0106). `impl Fn*` arguments are type params with
-those bounds (also nested ones). A
+(rustc E0106). Under such a higher-ranked output the body
+may return borrows of the one higher-ranked argument
+(`ClosureEntry::bound_output`; rustc deduces `for<'r>
+fn(&'r T) -> &'r U`). A type param `F` passed on for a
+callee's `G: Fn*` bound proves it from `F`'s own regioned
+bound, region by region (`entail_bound`): lifetimes both
+write are one region, a higher-ranked `G` input needs a
+higher-ranked `F` input (L0735), outputs must match (L0733),
+and `F`'s higher-ranked output takes the lifetime `G`
+writes in that input; fns with such bounds run the region
+pass even without loans. `impl Fn*` arguments are type
+params with those bounds (also nested ones). A
 parameter annotation that names a lifetime (`|x: &'a T|`,
 `|m: &'static Message|`) is that region of the enclosing
 fn: free in the body, tied to it by the creator, and a

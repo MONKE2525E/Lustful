@@ -437,7 +437,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     {
         ck.errs.push(d);
     }
-    let needs_regions = !ck.loans.is_empty() || own.n_univ > 0;
+    let needs_regions = !ck.loans.is_empty() || own.n_univ > 0 || regions::has_fn_bounds(p, body.fn_id);
     if needs_regions {
         let mut b = regions::Builder::new(p, body, own, ck.loans.len(), &ck.loan_at, &ck.stmt_base);
         b.build();

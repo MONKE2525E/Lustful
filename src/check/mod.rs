@@ -854,6 +854,11 @@ struct Ctx<'p, 'a> {
     /// true when its outer reference is higher-ranked (`&item`). W-BORROW:
     /// the other argument regions are free; see `ClosureInfo::free_args`.
     iter_closure_args: std::collections::HashMap<u32, Vec<bool>>,
+    /// W-BORROW: the closure-argument type vars of generic calls whose
+    /// regioned `Fn` bound has a higher-ranked output over its one
+    /// elided input lifetime (`F: Fn(&T) -> &U`), with that output's
+    /// regioned type (`ClosureInfo::bound_output`).
+    closure_bound_outputs: std::collections::HashMap<u32, Ty>,
     /// Scalar operators checked while both operand types were still
     /// open (a closure's `|a, b| a + b`): (expr, op, operand type).
     /// Lowering emits the builtin operator, so the types must turn out
@@ -1034,6 +1039,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         own_opaques: Vec::new(),
         closure_order: None,
         iter_closure_args: std::collections::HashMap::new(),
+        closure_bound_outputs: std::collections::HashMap::new(),
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
         dyn_borrow_src: false,
@@ -2239,7 +2245,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let TyKind::Tuple(ts) = p.tys.kind(inputs) else { continue };
             let opaque = |t: Ty| matches!(p.tys.kind(t), TyKind::Param(_) | TyKind::Projection(..)) || !bound_type_has_regions(p, t);
             let n_in = p.tys.tys_of(ts).len();
-            let regioned = fn_bounds.iter().find(|b| b.param == j.0 && b.inputs.len() == n_in).map(|b| b.inputs.as_slice());
+            let bound = fn_bounds.iter().find(|b| b.param == j.0 && b.inputs.len() == n_in);
+            let regioned = bound.map(|b| b.inputs.as_slice());
+            if let Some(b) = bound
+                && let Some(out) = b.output
+            {
+                let (mut ins, mut outs) = (Vec::new(), Vec::new());
+                for &t in &b.inputs {
+                    crate::borrowck::regions_of(&p.tys, t, &mut ins);
+                }
+                crate::borrowck::regions_of(&p.tys, out, &mut outs);
+                if matches!(ins[..], [Region::Bound(_)]) && outs.iter().any(|r| matches!(r, Region::Bound(_))) {
+                    self.closure_bound_outputs.insert(v.0, out);
+                }
+            }
             let named_ref = |i: usize| {
                 regioned.and_then(|ins| ins.get(i)).is_some_and(|&rt| matches!(p.tys.kind(rt), TyKind::Ref(Region::Static | Region::Param(_), _, _)))
             };

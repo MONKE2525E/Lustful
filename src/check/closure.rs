@@ -78,6 +78,11 @@ pub struct ClosureInfo {
     /// W-BORROW: the return annotation's regioned type when it names a
     /// lifetime (only `'static` is supported there).
     pub output_region: Option<Ty>,
+    /// W-BORROW: the output of the regioned `Fn` bound this closure is
+    /// passed to, when it is higher-ranked over the bound's one elided
+    /// input lifetime (`F: Fn(&T) -> &U`; rustc gives the closure `for<'r>
+    /// fn(&'r T) -> &'r U`): the body may return borrows of that argument.
+    pub bound_output: Option<Ty>,
 }
 
 /// The env field type of one capture.
@@ -237,6 +242,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Infer(v) => self.iter_closure_args.get(&v.0).cloned(),
             _ => None,
         });
+        let bound_output = expected.and_then(|t| match self.kind(self.resolve(t)) {
+            TyKind::Infer(v) => self.closure_bound_outputs.get(&v.0).copied(),
+            _ => None,
+        });
         // The bound's types normalize here: `F: Fn(A::Item)` gives a
         // projection over the call's impl args (check/project.rs).
         let sig = match to_fn_ptr {
@@ -367,7 +376,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
         let captures_any = !captures.is_empty();
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, input_regions, output_region });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, input_regions, output_region, bound_output });
         if let Some((fp, _, _)) = to_fn_ptr {
             if captures_any {
                 self.err(
