@@ -10,6 +10,14 @@ const DIG: bool = 'a'.is_digit(16);
 const FD: Option<char> = char::from_digit(15, 16);
 const VER: (u8, u8, u8) = char::UNICODE_VERSION;
 
+const fn is_low(c: char) -> bool {
+    c.is_lowercase()
+}
+
+const fn next_up(cp: u32) -> Option<char> {
+    char::from_u32(cp)
+}
+
 fn show(c: char) {
     println!(
         "{:?} a={} n={} an={} lo={} up={} ws={} ctl={}",
@@ -63,4 +71,6 @@ fn main() {
         }
     }
     println!("{}", kept);
+    // The const predicates also work inside const fn bodies.
+    println!("{} {:?} {:?}", is_low('σ'), next_up(0xe9), next_up(0xD800));
 }

@@ -195,7 +195,9 @@ fn builtin_is_const(b: Builtin) -> bool {
             | FloatCopysign
             | F32FromBits
             | F64FromBits
-            // `char` inherent queries that are const in core.
+            // `char` inherent queries that are const in core. Of the
+            // Unicode predicates only these four are const in 1.99;
+            // is_alphabetic, is_numeric, and is_alphanumeric are not.
             | CharLenUtf8
             | CharLenUtf16
             | CharIsAscii
@@ -206,6 +208,12 @@ fn builtin_is_const(b: Builtin) -> bool {
             | CharIsDigit
             | CharIsDigitRadix
             | CharToDigit
+            | CharIsLowercaseUnicode
+            | CharIsUppercaseUnicode
+            | CharIsWhitespaceUnicode
+            | CharIsControlUnicode
+            | CharFromU32
+            | CharFromDigit
             // `Option` queries and unwraps that are const in 1.99
             // (`unwrap_or` and `unwrap_or_default` are only
             // conditionally const there, so they stay out).
