@@ -687,6 +687,18 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
         s.zero = true;
         i += 1;
     }
+    // A width or precision from a named argument (`{:>w$}`, `{:.p$}`)
+    // is valid Rust the subset does not have.
+    let named_arg = |cs: &[char], j: usize| {
+        let mut k = j;
+        while k < cs.len() && (cs[k].is_alphanumeric() || cs[k] == '_') {
+            k += 1;
+        }
+        j < cs.len() && (cs[j].is_alphabetic() || cs[j] == '_') && cs.get(k) == Some(&'$')
+    };
+    if named_arg(&cs, i) {
+        return Err(true);
+    }
     // [width]
     if i < cs.len() && cs[i].is_ascii_digit() {
         let (w, j) = digit_run(&cs, i);
@@ -699,7 +711,7 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
     // [.precision]
     if i < cs.len() && cs[i] == '.' {
         i += 1;
-        if i < cs.len() && cs[i] == '*' {
+        if i < cs.len() && cs[i] == '*' || named_arg(&cs, i) {
             return Err(true);
         }
         let (p, j) = digit_run(&cs, i);
