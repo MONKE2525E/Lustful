@@ -765,9 +765,41 @@ struct CacheKey {
     layout: u64,
 }
 
-fn expansion_cache() -> &'static std::sync::Mutex<FxMap<CacheKey, (Vec<Tt>, CtxtId)>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<FxMap<CacheKey, (Vec<Tt>, CtxtId)>>> = std::sync::OnceLock::new();
+/// One cached expansion: its trees, the strings they name as a table of
+/// their own (see `own_strings`), and the expansion context it carried.
+type CachedExpansion = (Vec<Tt>, Vec<String>, CtxtId);
+
+fn expansion_cache() -> &'static std::sync::Mutex<FxMap<CacheKey, CachedExpansion>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<FxMap<CacheKey, CachedExpansion>>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(FxMap::default()))
+}
+
+/// Moves the strings that tokens in `trees` name from `strings` into
+/// `out`, re-indexing the tokens into `out`. The expansion cache outlives
+/// one run's string table (a daemon serves many), so a cached expansion
+/// keeps its strings; a hit appends them to the new table (`shift_tts`).
+fn own_strings(trees: &mut [Tt], strings: &[String], out: &mut Vec<String>) {
+    for tree in trees {
+        match tree {
+            Tt::Tok(t) => {
+                for i in t.tok.string_indices_mut().into_iter().flatten() {
+                    out.push(strings.get(*i as usize).cloned().unwrap_or_default());
+                    *i = out.len() as u32 - 1;
+                }
+            }
+            Tt::Delim(_, inner, _) | Tt::Frag(_, inner, _) => own_strings(inner, strings, out),
+        }
+    }
+}
+
+/// Adds `offset` to every string index in `trees` (see `own_strings`).
+fn shift_tts(trees: &mut [Tt], offset: u32) {
+    for tree in trees {
+        match tree {
+            Tt::Tok(t) => t.tok.shift_strings(offset),
+            Tt::Delim(_, inner, _) | Tt::Frag(_, inner, _) => shift_tts(inner, offset),
+        }
+    }
 }
 
 static CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1707,12 +1739,14 @@ impl<'a> Expander<'a> {
             deps_hash: 0,
             layout: if def.pos_sensitive { span_layout_hash(&call.inner) } else { 0 },
         };
-        if let Some((cached, old_ctxt)) = expansion_cache().lock().unwrap().get(&key).cloned() {
+        if let Some((cached, strings, old_ctxt)) = expansion_cache().lock().unwrap().get(&key).cloned() {
             CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             let ctxt =
                 register_expansion(crate::diag::Expansion { macro_def: DefId::PLACEHOLDER, call_span: call.span, parent: call.span.ctxt });
             register_hygiene(ctxt, HygieneMark { def_span: def.name_span, local_def: def.local_def });
             let mut out = cached;
+            shift_tts(&mut out, self.strings.len() as u32);
+            self.strings.extend(strings);
             restamp_ctxt(&mut out, old_ctxt, ctxt);
             return Ok(out);
         }
@@ -1778,7 +1812,10 @@ impl<'a> Expander<'a> {
         if self.total_tokens > 16_000_000 {
             return Err(err(C_CAP, call.span, "total expanded size limit reached", "Simplify the macros in this file."));
         }
-        expansion_cache().lock().unwrap().insert(key, (out.clone(), ctxt));
+        let mut cached = out.clone();
+        let mut strings = Vec::new();
+        own_strings(&mut cached, &self.strings, &mut strings);
+        expansion_cache().lock().unwrap().insert(key, (cached, strings, ctxt));
         Ok(out)
     }
 }
@@ -3004,6 +3041,28 @@ mod tests {
         assert_eq!(first, second);
         let (hits1, _) = cache_stats();
         assert!(hits1 > hits0, "second identical expansion should hit the cache");
+    }
+
+    /// A cache hit in a later run (a daemon re-check after an edit) gets
+    /// the strings its tokens name, though that run's string table holds
+    /// other strings at those indexes: the edit adds a string literal
+    /// before the call, at the same length, so the call's key is the same.
+    #[test]
+    fn expansion_cache_hit_keeps_its_strings() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let call = "macro_rules! cached_s { ($x:expr) => { ($x, \"tpl\", stringify!(0x10)) } }\nfn main() { let a = ";
+        let tail = "; let _v = cached_s!(\"bee\"); }";
+        let before = expand_src(&interner, &known, &format!("{call}12345{tail}")).expect("first expansion");
+        let (hits0, _) = cache_stats();
+        let after = expand_src(&interner, &known, &format!("{call}\"123\"{tail}")).expect("second expansion");
+        let (hits1, _) = cache_stats();
+        assert!(hits1 > hits0, "the second call should hit the cache");
+        for out in [&before, &after] {
+            for text in ["\"bee\"", "\"tpl\"", "\"0x10\""] {
+                assert!(out.iter().any(|t| t == text), "{text} missing from {out:?}");
+            }
+        }
     }
 
     /// A macro body's locals carry a non-root context; an ident the
