@@ -30,11 +30,16 @@ runtest_case() {
   rs=$(cat rustc.rs)
   run_to_err "$name.lust.err" "./$name.lust" x y >"$name.lust.out"; bs=$?
   run_cc "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
-  # Which run path did it take? glue_shared has three function units, so it must use the file.
-  # The glue_*_type_cross_unit tests force a unit split with filler fns, so they must too.
+  # Which run path did it take? A program with more than one function unit (glue_shared has
+  # three; the glue_*_type_cross_unit tests force a split with filler fns; a program that
+  # splices a std source module has hundreds of functions) must use the file. Units compiled
+  # = main, glue, runtime, table, plus the function units.
   probe=$(run_cc "$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
   if grep -q "in memory" <<<"$probe"; then mode=mem; else mode=file; fi
-  want_mode=mem; [[ "$name" == glue_shared || "$name" == glue_*_type_cross_unit ]] && want_mode=file
+  units=$(run_cc "$lust" build --timings "$f" -o "$name.units" 2>&1 >/dev/null | grep -o '[0-9]* units compiled' | grep -o '^[0-9]*')
+  want_mode=mem; [ "${units:-0}" -gt 5 ] && want_mode=file
+  # The glue_*_type_cross_unit tests force a unit split with filler fns.
+  [[ "$name" == glue_shared || "$name" == glue_*_type_cross_unit ]] && want_mode=file
   # A program that names a std platform module (W-SHIM) compiles the
   # platform crate's fns too, often more than one unit: either path is fine.
   grep -oE 'std::(io|fs|env|path|process|ffi)(::[a-z_]+)?' "$f" | grep -vqxE 'std::env::args|std::process::(exit|abort)' && want_mode=$mode
