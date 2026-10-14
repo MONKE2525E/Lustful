@@ -2522,7 +2522,7 @@ fn resolve_one(
         let per_work = par_map(&cells, |(fi, cell)| {
             let mut w = cell.lock().unwrap();
             let module = w.module;
-            let mut rw = Rewrite { tables, interner, list_module: &list_module, local_names: &local_names, diags: Vec::new() };
+            let mut rw = Rewrite { tables, interner, list_module: &list_module, local_names: &local_names, diags: Vec::new(), gen_params: Vec::new() };
             rw.file_items(&mut w.ast, *fi, module, &[]);
             rw.diags
         });
@@ -3804,6 +3804,12 @@ struct Rewrite<'a> {
     /// frozen tables (`ResolvedTables::local_named_set`).
     local_names: &'a FxMap<Sym, ()>,
     diags: Vec<Diag>,
+    /// The type and const params (name, is const) of the item being
+    /// rewritten, after its impl's or trait's for a method. As in rustc,
+    /// a param shadows module items and imports for a path's first
+    /// segment, so such paths stay as written; check resolves them
+    /// against the item's generics.
+    gen_params: Vec<(Sym, bool)>,
 }
 
 impl Rewrite<'_> {
@@ -3821,6 +3827,20 @@ impl Rewrite<'_> {
                 self.rewrite_path(&mut trait_ref.path, Namespace::Type, span, module, &[], ast);
             }
         }
+    }
+
+    /// Pushes one item's type and const params for the paths inside it;
+    /// returns the length to truncate back to when the item ends.
+    fn push_params(&mut self, g: &crate::ast::Generics) -> usize {
+        let mark = self.gen_params.len();
+        for p in &g.params {
+            match p {
+                crate::ast::GenericParam::Type { name, .. } => self.gen_params.push((*name, false)),
+                crate::ast::GenericParam::Const { name, .. } => self.gen_params.push((*name, true)),
+                crate::ast::GenericParam::Lifetime { .. } => {}
+            }
+        }
+        mark
     }
 
     /// Rewrites one item's generic parameter bounds, defaults,
@@ -3859,6 +3879,7 @@ impl Rewrite<'_> {
                     *f = def;
                 }
                 ItemKind::Struct(s) => {
+                    let mark = self.push_params(&s.generics);
                     self.generics(ast, &mut s.generics, &mut s.where_clause, module);
                     let fields = match &mut s.fields {
                         VariantFields::Struct(fs) | VariantFields::Tuple(fs) => fs.iter_mut().map(|f| f.ty).collect::<Vec<_>>(),
@@ -3867,8 +3888,10 @@ impl Rewrite<'_> {
                     for t in fields {
                         self.ty(ast, t, module, &[]);
                     }
+                    self.gen_params.truncate(mark);
                 }
                 ItemKind::Enum(e) => {
+                    let mark = self.push_params(&e.generics);
                     self.generics(ast, &mut e.generics, &mut e.where_clause, module);
                     let mut tys = Vec::new();
                     let mut discs = Vec::new();
@@ -3883,12 +3906,16 @@ impl Rewrite<'_> {
                     for t in tys {
                         self.ty(ast, t, module, &[]);
                     }
+                    // Discriminants cannot use the enum's params (rustc
+                    // rejects them there), so they resolve as before.
+                    self.gen_params.truncate(mark);
                     let mut scopes = vec![Frame::default()];
                     for d in discs {
                         self.expr(ast, d, module, &mut scopes);
                     }
                 }
                 ItemKind::Impl(imp) => {
+                    let mark = self.push_params(&imp.generics);
                     self.generics(ast, &mut imp.generics, &mut imp.where_clause, module);
                     if let Some(tr) = &mut imp.trait_ref {
                         let span = imp.span;
@@ -3911,8 +3938,10 @@ impl Rewrite<'_> {
                         self.fn_def(ast, f, module);
                     }
                     imp.fns = fns;
+                    self.gen_params.truncate(mark);
                 }
                 ItemKind::Trait(t) => {
+                    let mark = self.push_params(&t.generics);
                     self.generics(ast, &mut t.generics, &mut t.where_clause, module);
                     self.bounds(ast, &mut t.bounds, t.span, module);
                     for at in t.types.iter_mut() {
@@ -3931,6 +3960,7 @@ impl Rewrite<'_> {
                         self.fn_def(ast, f, module);
                     }
                     t.fns = fns;
+                    self.gen_params.truncate(mark);
                 }
                 ItemKind::Const(c) => {
                     self.ty(ast, c.ty, module, &[]);
@@ -3947,8 +3977,10 @@ impl Rewrite<'_> {
                     }
                 }
                 ItemKind::Type(a) => {
+                    let mark = self.push_params(&a.generics);
                     self.generics(ast, &mut a.generics, &mut a.where_clause, module);
                     self.ty(ast, a.ty, module, &[]);
+                    self.gen_params.truncate(mark);
                 }
                 ItemKind::Mod(m) => {
                     let mut key = prefix.to_vec();
@@ -3964,6 +3996,7 @@ impl Rewrite<'_> {
 
     /// Rewrites one fn's signature types and body.
     fn fn_def(&mut self, ast: &mut Ast, def: &mut FnDef, module: ModuleId) {
+        let mark = self.push_params(&def.generics);
         self.generics(ast, &mut def.generics, &mut def.where_clause, module);
         for p in &def.params {
             let t = p.ty;
@@ -3984,6 +4017,7 @@ impl Rewrite<'_> {
             scopes.push(frame);
             self.block(ast, body, module, &mut scopes);
         }
+        self.gen_params.truncate(mark);
     }
 
     /// Collects the binding names a pattern introduces.
@@ -4230,6 +4264,19 @@ impl Rewrite<'_> {
         }
         let (res, local) = self.resolve(&names, ns, module, scopes);
         if !local {
+            // A generic param of the item shadows module items and
+            // imports: a type or const param in a type path, a const
+            // param as a value, a type param before `::` in a value path
+            // (`T::default()`). Check resolves the path as written.
+            if let Some(&(_, is_const)) = self.gen_params.iter().rev().find(|(n, _)| Some(n) == names.first())
+                && match ns {
+                    Namespace::Type => true,
+                    Namespace::Value => (names.len() == 1) == is_const,
+                    _ => false,
+                }
+            {
+                return;
+            }
             if self.expand_std_alias(segs, &names, ns, module, scopes) {
                 return;
             }
