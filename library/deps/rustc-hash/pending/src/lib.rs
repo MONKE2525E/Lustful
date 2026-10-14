@@ -28,7 +28,10 @@ pub struct FxHasher {
     hash: usize,
 }
 
-const K: usize = 0xf1357aea2e62a9c5;
+/// Upstream's `K`, renamed: lust resolves the type param `K` of the
+/// re-exported `FxHashMapSeed<K, V>` to a const of that name here
+/// (repro in the W-DEPS report). Private, so the name is not visible.
+const MULTIPLIER: usize = 0xf1357aea2e62a9c5;
 
 impl FxHasher {
     /// A hasher that starts from `seed`.
@@ -42,7 +45,7 @@ impl FxHasher {
     }
 
     fn add_to_hash(&mut self, i: usize) {
-        self.hash = self.hash.wrapping_add(i).wrapping_mul(K);
+        self.hash = self.hash.wrapping_add(i).wrapping_mul(MULTIPLIER);
     }
 }
 
