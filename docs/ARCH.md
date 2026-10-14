@@ -3073,16 +3073,22 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
   an elided (`'_` or missing) lifetime arg of a trait,
   lifetime args in a trait's own bounds (supertraits,
   `Self` where-clauses), and associated types in a trait
-  with lifetime params; `T: 'a` bounds on named lifetimes.
-  (`'a: 'static` and an Adt's own outlives facts, `struct
-  H<'a, 'b: 'a>`, are checked: every use of the type meets
-  them, and a signature naming it assumes them.)
+  with lifetime params; `T: 'a` bounds on named lifetimes;
+  inside a closure, a call through a type param's `Fn`
+  bound whose argument names a lifetime of the enclosing
+  fn, or passing such a param on to a generic fn (the
+  closure body cannot name that lifetime). (`'a: 'static`
+  and an Adt's own outlives facts, `struct H<'a, 'b: 'a>`,
+  are checked: every use of the type meets them, and a
+  signature naming it assumes them.)
 - L0731: any explicit lifetime turbofish arg (rustc also
   rejects it whenever the fn has a late-bound lifetime,
   E0794).
 - L0820: closure to fn pointer coercion and closures stored
   in Adts (closure.rs). A closure that returns a borrow of
-  its argument is L0733 (arguments are higher-ranked).
+  its higher-ranked argument is L0733, as in rustc, except
+  where its bound's output is that argument's lifetime
+  (`F: Fn(&T) -> &U`).
 - GATs (L0620), higher-ranked binders on bounds (L0203 at
   the parser), async (milestone 8b), as before.
 
