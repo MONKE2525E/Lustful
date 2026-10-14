@@ -5886,20 +5886,35 @@ fn validate_method_sig(
         }
     }
     let self_ty = subst_args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+    // Object lifetime defaults where each type was written, as in
+    // `check_lang_method` (`type Out = dyn Tr` with `fn get(&self) ->
+    // &Self::Out` needs `&(dyn Tr + 'static)` in the impl).
+    let assoc_tys: Vec<(DefId, Ty)> = assoc_tys.iter().map(|&(d, t)| (d, obj_default(&mut p.tys, t, false))).collect();
+    let subst_args: Vec<GenericArg> = subst_args
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| match g {
+            GenericArg::Ty(t) if i > 0 => GenericArg::Ty(obj_default(&mut p.tys, t, false)),
+            x => x,
+        })
+        .collect();
     let want_params: Vec<Ty> = tmpl
         .params
         .iter()
         .map(|&t| {
+            let t = obj_default(&mut p.tys, t, false);
             let t = subst(&mut p.tys, t, &subst_args);
-            rewrite_impl_projections(p, t, self_ty, assoc_tys)
+            rewrite_impl_projections(p, t, self_ty, &assoc_tys)
         })
         .collect();
     let want_ret = {
-        let t = subst(&mut p.tys, tmpl.ret, &subst_args);
-        rewrite_impl_projections(p, t, self_ty, assoc_tys)
+        let t = obj_default(&mut p.tys, tmpl.ret, false);
+        let t = subst(&mut p.tys, t, &subst_args);
+        rewrite_impl_projections(p, t, self_ty, &assoc_tys)
     };
-    let got_params = p.fn_info(local).params.clone();
+    let got_params: Vec<Ty> = p.fn_info(local).params.clone().into_iter().map(|t| obj_default(&mut p.tys, t, false)).collect();
     let got_ret = p.fn_info(local).ret;
+    let got_ret = obj_default(&mut p.tys, got_ret, false);
     let mut cx = PureCx::new(&p.tys);
     let mut solver = Solver::new();
     let same = want_params.len() == got_params.len()
