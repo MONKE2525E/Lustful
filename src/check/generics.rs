@@ -1287,6 +1287,46 @@ fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_ref
     }
 }
 
+/// `t` (an erased signature type) with rustc's object lifetime default
+/// put in where it is `'static`: a `dyn` with no written bound becomes
+/// `dyn + 'static` unless it sits right under a reference, whose
+/// lifetime it then takes (it stays erased). See `check_lang_method`.
+fn obj_default(tys: &mut impl TyIntern, t: Ty, under_ref: bool) -> Ty {
+    match tys.kind(t) {
+        TyKind::Dyn(b, Region::Erased) if !under_ref => tys.intern(TyKind::Dyn(b, Region::Static)),
+        TyKind::Ref(r, m, inner) => {
+            let i = obj_default(tys, inner, true);
+            tys.intern(TyKind::Ref(r, m, i))
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = tys.tys_of(ts).to_vec().into_iter().map(|e| obj_default(tys, e, false)).collect();
+            let id = tys.intern_tys(&elems);
+            tys.intern(TyKind::Tuple(id))
+        }
+        TyKind::Array(e, n) => {
+            let e = obj_default(tys, e, false);
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Slice(e) => {
+            let e = obj_default(tys, e, false);
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Adt(d, a) => {
+            let args: Vec<GenericArg> = tys
+                .args(a)
+                .to_vec()
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(e) => GenericArg::Ty(obj_default(tys, e, false)),
+                    x => x,
+                })
+                .collect();
+            tys.mk_adt(d, &args)
+        }
+        _ => t,
+    }
+}
+
 /// `t` with every reference region `'static`: the region form of a type
 /// alias body, which may only use `'static` (W-BORROW, increment 1), and
 /// of a `thread_local!` value type (check/tls.rs).
@@ -5689,6 +5729,20 @@ fn check_lang_method(
     }
     let mut args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
     let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+    // rustc's object lifetime defaults: a `dyn` written with no bound is
+    // `'static` in an associated type or a trait argument, and takes the
+    // lifetime of a reference right above it. Erased signatures keep
+    // only a written `'static`, so each side takes the default where it
+    // was written, before substitution (`impl Deref` with `Target = dyn
+    // Tr` must return `&(dyn Tr + 'static)`, not `&dyn Tr`).
+    let assoc_tys: Vec<(DefId, Ty)> = assoc_tys.iter().map(|&(d, t)| (d, obj_default(&mut p.tys, t, false))).collect();
+    for g in args.iter_mut().skip(1) {
+        if let GenericArg::Ty(t) = *g {
+            *g = GenericArg::Ty(obj_default(&mut p.tys, t, false));
+        }
+    }
+    let got_params: Vec<Ty> = got_params.iter().map(|&t| obj_default(&mut p.tys, t, false)).collect();
+    let got_ret = obj_default(&mut p.tys, got_ret, false);
     if (is_hash || is_extend) && let Some(h) = h_impl {
         args.push(GenericArg::Ty(h));
     }
@@ -5697,12 +5751,12 @@ fn check_lang_method(
         .iter()
         .map(|&t| {
             let t = subst(&mut p.tys, t, &args);
-            rewrite_impl_projections(p, t, self_ty, assoc_tys)
+            rewrite_impl_projections(p, t, self_ty, &assoc_tys)
         })
         .collect();
     let want_ret = {
         let t = subst(&mut p.tys, sig.ret, &args);
-        rewrite_impl_projections(p, t, self_ty, assoc_tys)
+        rewrite_impl_projections(p, t, self_ty, &assoc_tys)
     };
     let mut cx = PureCx::new(&p.tys);
     let mut solver = Solver::new();
