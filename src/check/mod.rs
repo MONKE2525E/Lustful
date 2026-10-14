@@ -2967,6 +2967,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
         out
     }
 
+    /// True when the trait ref can never hold: every impl candidate's
+    /// header fails or one of its where clauses is provably false
+    /// (`Solver::provably_false`). Binds nothing.
+    pub(super) fn provably_false(&mut self, tr: TraitRef) -> bool {
+        let p = self.p;
+        let env = self.solve_env();
+        let mut solver = std::mem::take(&mut self.solver);
+        let out = solver.provably_false(self, &p.gx.index, &env, tr);
+        self.solver = solver;
+        out
+    }
+
     /// Selects evidence for one trait obligation, with the
     /// structural answers of sections 2.7 (`Sized`, auto traits)
     /// and the derive-family queries ahead of the general solver
@@ -17603,6 +17615,22 @@ impl<'p> SolveCx for Ctx<'p, '_> {
         }
         if lang.is_auto(tr.def) {
             return self.auto_holds(tr.def, self_ty);
+        }
+        // The object candidate (`dyn P` implements `P` and its
+        // supertraits) has no impl record, as in `select_obligation`.
+        if let Some(pr) = object::principal_of(&self.tys, self_ty) {
+            let want = object::with_self(&mut self.tys, tr, DYN_SELF);
+            let want = TraitRef { bindings: EMPTY_BINDINGS, ..want };
+            let snap = self.snapshot_vars();
+            let holds = if pr.def == want.def {
+                self.unify_args(pr.args, want.args)
+            } else {
+                object::upcast_path(p, &mut self.tys, pr, want).is_some()
+            };
+            self.rollback_vars(snap);
+            if holds {
+                return Some(true);
+            }
         }
         if p.gx.index.derive_family.contains(&tr.def)
             && matches!(self.kind(self_ty), TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::Closure(..))

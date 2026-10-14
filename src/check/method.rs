@@ -440,6 +440,18 @@ pub(super) fn trait_probe_for(
             let args_id = cx.tys.intern_args(&tr_args);
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
             let sel = cx.select_obligation(tr);
+            // An impl whose where clauses cannot hold for this receiver
+            // is no candidate (`impl<T: Tag> V for T` at a `Box<dyn V>`
+            // step): rustc's probe filters them before it picks by
+            // autoderef step, so a later step's object or impl
+            // candidate still wins.
+            if let Selection::Impl { nested, .. } = &sel
+                && nested.iter().any(|pr| matches!(pr, Predicate::Trait(b) if b.count == 0 && cx.provably_false(b.value)))
+            {
+                cx.rollback_vars(snap);
+                cx.obl_truncate(obl_len);
+                continue;
+            }
             let ambiguous = matches!(sel, Selection::Ambiguous);
             // A structural answer (`usize::MAX`: tuples, arrays, refs,
             // dyn objects) has no impl record, like a synthetic impl:
