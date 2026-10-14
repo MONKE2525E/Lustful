@@ -10,6 +10,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | Code | Meaning |
 |---|---|
 | [L0001](L0001.md) | syntax error |
+| [L0002](L0002.md) | name is not in Unicode normal form C (NFC) |
 | [L0101](L0101.md) | name not found |
 | [L0102](L0102.md) | type not found |
 | [L0103](L0103.md) | no such field |

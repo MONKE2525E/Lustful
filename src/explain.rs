@@ -9,6 +9,7 @@
 /// All error docs, in code order.
 const DOCS: &[(&str, &str)] = &[
     ("L0001", include_str!("../docs/errors/L0001.md")),
+    ("L0002", include_str!("../docs/errors/L0002.md")),
     ("L0101", include_str!("../docs/errors/L0101.md")),
     ("L0102", include_str!("../docs/errors/L0102.md")),
     ("L0103", include_str!("../docs/errors/L0103.md")),

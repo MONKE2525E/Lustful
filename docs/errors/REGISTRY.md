@@ -29,6 +29,7 @@ prints "reserved, not yet emitted".
 | Code or range | Area | Owner | Status | Notes |
 |---|---|---|---|---|
 | L0001 | Syntax | lexer, parser | in use | |
+| L0002 | Syntax | lexer | in use | Identifier or lifetime name is not in Unicode normal form C (NFC) |
 | L0101-L0107 | Names, types, fields, methods, arity, duplicates | check, collect | in use | |
 | L0110-L0119 | Type mismatch, inference, traits, operators, casts, literals | check, collect | in use | |
 | L0120-L0122 | Break/continue, assignment target, `mut` under a reference | check | in use | |

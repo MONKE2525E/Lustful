@@ -1,6 +1,11 @@
 // Lexer: turns source bytes into a flat token list. Identifiers are interned here.
 use crate::diag::{Diag, FileId, Span};
 use crate::intern::{FxMap, Interner, Sym};
+use std::borrow::Cow;
+
+mod xid_table {
+    include!("xid_table.rs");
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntSuffix {
@@ -460,6 +465,212 @@ pub fn keyword_lifetime_error(name: &str, raw: bool, label: bool, span: Span) ->
     Some(Diag::new("L0001", span, format!("{what} cannot use keyword names"), format!("Rename `'{name}`, for example to `'a`.")))
 }
 
+/// True when code point `cp` is in one of the sorted ranges.
+fn in_ranges(ranges: &[(u32, u32)], cp: u32) -> bool {
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if cp < lo {
+                std::cmp::Ordering::Greater
+            } else if cp > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// True when `c` has the Unicode XID_Start property (Unicode 17, as
+/// rustc 1.99). Callers add `_`, which Rust allows but XID_Start
+/// does not. ASCII answers come from the first two table ranges.
+fn is_xid_start(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphabetic();
+    }
+    in_ranges(xid_table::XID_START_RANGES, c as u32)
+}
+
+/// True when `c` has the Unicode XID_Continue property. Every
+/// XID_Start char is also XID_Continue.
+fn is_xid_continue(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
+    in_ranges(xid_table::XID_CONTINUE_RANGES, c as u32)
+}
+
+/// True when an identifier can start at byte `at` of `src`: an ASCII
+/// letter or `_`, or a non-ASCII XID_Start char.
+fn is_ident_start_at(src: &str, b: &[u8], at: usize) -> bool {
+    match b.get(at) {
+        Some(&c) if c.is_ascii_alphabetic() || c == b'_' => true,
+        Some(&c) if c >= 0x80 => src[at..].chars().next().is_some_and(is_xid_start),
+        _ => false,
+    }
+}
+
+/// Scans identifier chars from `*i`, which must be at a valid start
+/// char. ASCII letters, digits, and `_` scan in a byte loop first;
+/// a non-ASCII char switches to a char loop that stops at the
+/// first char that is not XID_Continue (rustc ends the name there
+/// and then rejects that char on its own). Returns true when the
+/// scanned text holds a non-ASCII char.
+fn scan_ident_tail(src: &str, b: &[u8], i: &mut usize) -> bool {
+    while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+        *i += 1;
+    }
+    if *i >= b.len() || b[*i] < 0x80 {
+        return false;
+    }
+    while *i < b.len() {
+        if b[*i].is_ascii_alphanumeric() || b[*i] == b'_' {
+            *i += 1;
+        } else if b[*i] < 0x80 {
+            break;
+        } else {
+            let ch = src[*i..].chars().next().unwrap();
+            if !is_xid_continue(ch) {
+                break;
+            }
+            *i += ch.len_utf8();
+        }
+    }
+    true
+}
+
+/// The canonical combining class of a code point (0 for starters).
+fn ccc_of(cp: u32) -> u8 {
+    if cp < 0x80 {
+        return 0;
+    }
+    xid_table::CCC_RANGES
+        .binary_search_by(|&(lo, hi, _)| {
+            if cp < lo {
+                std::cmp::Ordering::Greater
+            } else if cp > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .map_or(0, |idx| xid_table::CCC_RANGES[idx].2 as u8)
+}
+
+/// The canonical decomposition of a code point as (first, second),
+/// with second 0 for a one-char mapping, or None. Hangul syllables
+/// are handled by the caller, not by the table.
+fn canon_decomp_of(cp: u32) -> Option<(u32, u32)> {
+    if cp < 0x80 {
+        return None;
+    }
+    xid_table::CANON_DECOMP.binary_search_by_key(&cp, |e| e.0).map_or(None, |idx| {
+        let e = xid_table::CANON_DECOMP[idx];
+        Some((e.1, e.2))
+    })
+}
+
+const HANGUL_S_BASE: u32 = 0xAC00;
+const HANGUL_L_BASE: u32 = 0x1100;
+const HANGUL_V_BASE: u32 = 0x1161;
+const HANGUL_T_BASE: u32 = 0x11A7;
+const HANGUL_V_COUNT: u32 = 21;
+const HANGUL_T_COUNT: u32 = 28;
+const HANGUL_N_COUNT: u32 = HANGUL_V_COUNT * HANGUL_T_COUNT;
+const HANGUL_S_COUNT: u32 = 19 * HANGUL_N_COUNT;
+
+/// The primary composite of `a` and `b` (a starter and a following
+/// char), for NFC composition: a Hangul pair, or a table pair.
+fn compose_pair(a: char, b: char) -> Option<char> {
+    let (x, y) = (a as u32, b as u32);
+    if (HANGUL_L_BASE..HANGUL_L_BASE + 19).contains(&x) && (HANGUL_V_BASE..HANGUL_V_BASE + HANGUL_V_COUNT).contains(&y) {
+        return char::from_u32(HANGUL_S_BASE + ((x - HANGUL_L_BASE) * HANGUL_V_COUNT + (y - HANGUL_V_BASE)) * HANGUL_T_COUNT);
+    }
+    if (HANGUL_S_BASE..HANGUL_S_BASE + HANGUL_S_COUNT).contains(&x)
+        && (x - HANGUL_S_BASE) % HANGUL_T_COUNT == 0
+        && (HANGUL_T_BASE + 1..HANGUL_T_BASE + HANGUL_T_COUNT).contains(&y)
+    {
+        return char::from_u32(x + (y - HANGUL_T_BASE));
+    }
+    xid_table::COMPOSE_PAIRS
+        .binary_search_by(|e| (e.0, e.1).cmp(&(x, y)))
+        .map_or(None, |idx| char::from_u32(xid_table::COMPOSE_PAIRS[idx].2))
+}
+
+/// Pushes the full canonical decomposition of `c` into `out`.
+fn decompose_into(c: char, out: &mut Vec<char>) {
+    let cp = c as u32;
+    if (HANGUL_S_BASE..HANGUL_S_BASE + HANGUL_S_COUNT).contains(&cp) {
+        let s = cp - HANGUL_S_BASE;
+        out.push(char::from_u32(HANGUL_L_BASE + s / HANGUL_N_COUNT).unwrap());
+        out.push(char::from_u32(HANGUL_V_BASE + (s % HANGUL_N_COUNT) / HANGUL_T_COUNT).unwrap());
+        if s % HANGUL_T_COUNT != 0 {
+            out.push(char::from_u32(HANGUL_T_BASE + s % HANGUL_T_COUNT).unwrap());
+        }
+        return;
+    }
+    match canon_decomp_of(cp) {
+        Some((first, second)) => {
+            decompose_into(char::from_u32(first).unwrap(), out);
+            if second != 0 {
+                decompose_into(char::from_u32(second).unwrap(), out);
+            }
+        }
+        None => out.push(c),
+    }
+}
+
+/// The NFC form of `s` (Unicode 17). Returns the input unchanged
+/// when it is already in NFC. Used only for non-ASCII identifier
+/// names, which are short, so the simple O(n^2) ordering and
+/// blocked checks are fine.
+fn nfc_of(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() {
+        return Cow::Borrowed(s);
+    }
+    let mut decomp: Vec<char> = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        decompose_into(ch, &mut decomp);
+    }
+    // Canonical ordering: move each char left past chars with a
+    // higher combining class. A starter (class 0) stops the move.
+    for idx in 1..decomp.len() {
+        let cc = ccc_of(decomp[idx] as u32);
+        if cc == 0 {
+            continue;
+        }
+        let mut j = idx;
+        while j > 0 && ccc_of(decomp[j - 1] as u32) > cc {
+            decomp.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    // Composition: compose a char into the last starter unless a
+    // char between them blocks it (combining class 0, or at least
+    // the composed char's class). Only chars after the last starter
+    // can intervene, and none of those has class 0, so a plain
+    // `>= cc` test is the blocked test; for cc 0 (a Hangul vowel
+    // or trailing char) any intervening char blocks, as required.
+    let mut out: Vec<char> = Vec::with_capacity(decomp.len());
+    for ch in decomp {
+        if let Some(si) = out.iter().rposition(|&c| ccc_of(c as u32) == 0) {
+            let cc = ccc_of(ch as u32);
+            let blocked = out[si + 1..].iter().any(|&c| ccc_of(c as u32) >= cc);
+            if !blocked && let Some(comp) = compose_pair(out[si], ch) {
+                out[si] = comp;
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    let normalized: String = out.into_iter().collect();
+    if normalized == s { Cow::Borrowed(s) } else { Cow::Owned(normalized) }
+}
+
+/// True when `s` is already in Unicode normal form C (NFC).
+fn is_nfc(s: &str) -> bool {
+    matches!(nfc_of(s), Cow::Borrowed(_))
+}
+
 fn suffix(s: &str) -> Option<Option<IntSuffix>> {
     use IntSuffix::*;
     Some(Some(match s {
@@ -523,6 +734,17 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
     let mut cache: FxMap<&str, Sym> = FxMap::default();
     let err = |start: usize, end: usize, msg: &str| {
         Diag::new("L0001", Span::new(file, base + start as u32, base + end as u32), msg, "Fix the syntax.")
+    };
+    // rustc treats two names that are equal after NFC as one name.
+    // Lust interns names as written, so it rejects a name that is
+    // not already in NFC instead of risking two symbols for one name.
+    let nfc_err = |start: usize, end: usize, name: &str| {
+        Diag::new(
+            "L0002",
+            Span::new(file, base + start as u32, base + end as u32),
+            format!("`{name}` is not in Unicode normal form C (NFC)"),
+            "Rewrite the name in NFC form (use precomposed characters), or use an ASCII name.",
+        )
     };
     // A shebang line (`#!/usr/bin/env ...`) at the very start of a file is
     // skipped, as in rustc. `#!` followed (after spaces) by `[` is an inner
@@ -599,10 +821,8 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
         if c == b'#' && b.get(i + 1) == Some(&b'"') {
             return Err(err(start, i + 2, "invalid string literal"));
         }
-        let tok = if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
-                i += 1;
-            }
+        let tok = if c.is_ascii_alphabetic() || c == b'_' || (c >= 0x80 && src[i..].chars().next().is_some_and(is_xid_start)) {
+            let non_ascii = scan_ident_tail(src, b, &mut i);
             let s = &src[start..i];
             // Literal prefixes: raw strings (`r".."`, `r#".."#`), byte strings and C
             // strings (`b".."`, `br".."`, `c".."`, `cr".."`) and byte chars (`b'x'`).
@@ -686,15 +906,10 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 ));
             }
             // A raw identifier: `r#name`. The name may be any keyword except a few (see above).
-            else if s == "r"
-                && b.get(i) == Some(&b'#')
-                && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_' || n >= 0x80)
-            {
+            else if s == "r" && b.get(i) == Some(&b'#') && is_ident_start_at(src, b, i + 1) {
                 i += 1;
                 let name_start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
-                    i += 1;
-                }
+                let name_non_ascii = scan_ident_tail(src, b, &mut i);
                 let name = &src[name_start..i];
                 if raw_ident_invalid(name) {
                     return Err(Diag::new(
@@ -704,12 +919,18 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                         "Use a different name. `self`, `Self`, `super`, `crate`, and `_` cannot be raw identifiers.",
                     ));
                 }
+                if name_non_ascii && !is_nfc(name) {
+                    return Err(nfc_err(start, i, name));
+                }
                 Tok::Ident(*cache.entry(name).or_insert_with(|| interner.intern(name)))
             } else if let Some(k) = keyword(s) {
                 k
             } else if reserved(s) {
                 Tok::Reserved(*cache.entry(s).or_insert_with(|| interner.intern(s)))
             } else {
+                if non_ascii && !is_nfc(s) {
+                    return Err(nfc_err(start, i, s));
+                }
                 Tok::Ident(*cache.entry(s).or_insert_with(|| interner.intern(s)))
             }
         } else if c.is_ascii_digit() {
@@ -769,20 +990,16 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             // Either a char literal or a lifetime.
             let next = src[i + 1..].chars().next();
             let after = next.map(|ch| i + 1 + ch.len_utf8());
-            if next.is_some_and(|ch| ch.is_alphabetic() || ch == '_') && after.and_then(|a| b.get(a)) != Some(&b'\'') {
+            if next.is_some_and(|ch| ch == '_' || is_xid_start(ch)) && after.and_then(|a| b.get(a)) != Some(&b'\'') {
                 i += 1;
                 let mut name_start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
+                let mut name_non_ascii = scan_ident_tail(src, b, &mut i);
                 // A raw lifetime: `'r#name`. The token keeps the name; its
                 // span still covers the `r#`, which macro matching reads.
-                if &src[name_start..i] == "r" && b.get(i) == Some(&b'#') && b.get(i + 1).is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_') {
+                if &src[name_start..i] == "r" && b.get(i) == Some(&b'#') && is_ident_start_at(src, b, i + 1) {
                     i += 1;
                     name_start = i;
-                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                        i += 1;
-                    }
+                    name_non_ascii = scan_ident_tail(src, b, &mut i);
                     let name = &src[name_start..i];
                     if raw_ident_invalid(name) {
                         return Err(Diag::new(
@@ -794,6 +1011,9 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                     }
                 }
                 let name = &src[name_start..i];
+                if name_non_ascii && !is_nfc(name) {
+                    return Err(nfc_err(start, i, name));
+                }
                 Tok::Lifetime(*cache.entry(name).or_insert_with(|| interner.intern(name)))
             } else {
                 i += 1;
@@ -883,7 +1103,13 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                             b'?' => Tok::Question,
                             b'$' => Tok::Dollar,
                             b'@' => Tok::At,
-                            _ => return Err(err(start, start + 1, "unexpected character")),
+                            _ => {
+                                return Err(err(
+                                    start,
+                                    start + src[start..].chars().next().map_or(1, char::len_utf8),
+                                    "unexpected character",
+                                ));
+                            }
                         },
                         1,
                     ),
@@ -1081,9 +1307,7 @@ fn lex_number(src: &str, i: &mut usize, strings: &mut Vec<String>) -> Option<Tok
     // A float literal: `1.5`, `1.`, or `1e3`. Not `1..2` (range) and
     // not `1.foo()` (field): the dot joins the float unless another
     // dot or an identifier start follows it.
-    let dot_joins = radix == 10
-        && b.get(*i) == Some(&b'.')
-        && !matches!(b.get(*i + 1), Some(c) if *c == b'.' || *c == b'_' || c.is_ascii_alphabetic() || *c >= 0x80);
+    let dot_joins = radix == 10 && b.get(*i) == Some(&b'.') && b.get(*i + 1) != Some(&b'.') && !is_ident_start_at(src, b, *i + 1);
     if dot_joins {
         *i += 1;
         while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
@@ -1101,11 +1325,7 @@ fn lex_number(src: &str, i: &mut usize, strings: &mut Vec<String>) -> Option<Tok
     // A trailing dot with no digits after it is still a float (`1.`) when
     // the dot does not start a range (`1..2`) or a field or method name
     // (`1.foo()`): rustc lexes it as one float literal token.
-    if radix == 10
-        && b.get(*i) == Some(&b'.')
-        && b.get(*i + 1) != Some(&b'.')
-        && !b.get(*i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80)
-    {
+    if radix == 10 && b.get(*i) == Some(&b'.') && b.get(*i + 1) != Some(&b'.') && !is_ident_start_at(src, b, *i + 1) {
         *i += 1;
         return Some(float_tok(src, start, *i, strings));
     }
@@ -1194,4 +1414,53 @@ fn lex_escape(src: &str, i: &mut usize) -> Option<char> {
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// XID properties at known chars, as rustc 1.99 (Unicode 17)
+    /// decides them: emoji and circled letters are not identifier
+    /// chars, a combining mark continues but does not start, and a
+    /// char that Unicode 18 added to XID_Start does not start.
+    #[test]
+    fn xid_properties() {
+        assert!(is_xid_start('a') && is_xid_continue('a'));
+        assert!(!is_xid_start('_') && is_xid_continue('_'));
+        assert!(is_xid_start('α') && is_xid_continue('α'));
+        assert!(is_xid_start('变') && is_xid_continue('变'));
+        assert!(!is_xid_start('\u{301}') && is_xid_continue('\u{301}'));
+        assert!(!is_xid_start('🦀') && !is_xid_continue('🦀'));
+        assert!(!is_xid_start('\u{24b6}') && !is_xid_continue('\u{24b6}'));
+        assert!(!is_xid_start('\u{37a}') && !is_xid_continue('\u{37a}'));
+        assert!(!is_xid_start('\u{ff3f}') && is_xid_continue('\u{ff3f}'));
+        assert!(!is_xid_start('\u{558}') && !is_xid_continue('\u{558}'));
+        // Every XID_Start char is also XID_Continue; the lexer's
+        // non-ASCII scan relies on it for the first char.
+        for &(lo, hi) in xid_table::XID_START_RANGES {
+            for cp in [lo, hi] {
+                assert!(in_ranges(xid_table::XID_CONTINUE_RANGES, cp), "U+{cp:04X}");
+            }
+        }
+    }
+
+    /// NFC checks at the forms the lexer must tell apart, as
+    /// decided against rustc 1.99: precomposed text and a
+    /// combining mark that cannot compose are NFC; a decomposed
+    /// letter, out-of-order marks, and Hangul jamo are not.
+    #[test]
+    fn nfc_forms() {
+        assert!(is_nfc("abc"));
+        assert!(is_nfc("caf\u{e9}"));
+        assert!(is_nfc("x\u{301}"));
+        assert!(is_nfc("αβγ"));
+        assert!(is_nfc("\u{ac00}"));
+        assert!(!is_nfc("cafe\u{301}"));
+        assert!(!is_nfc("a\u{315}\u{300}"));
+        assert!(!is_nfc("\u{1100}\u{1161}"));
+        assert_eq!(nfc_of("cafe\u{301}"), "caf\u{e9}");
+        assert_eq!(nfc_of("a\u{315}\u{300}"), "\u{e0}\u{315}");
+        assert_eq!(nfc_of("\u{1100}\u{1161}"), "\u{ac00}");
+    }
 }
