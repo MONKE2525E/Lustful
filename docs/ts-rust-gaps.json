@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 10436,
+  "elapsed_ms": 9628,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,8 +32,8 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 6071,
-    "files_with_findings": 561,
+    "findings": 6028,
+    "files_with_findings": 559,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
@@ -68,11 +68,10 @@
     },
     {
       "root_cause": "traits-generics",
-      "findings": 501,
-      "files": 177,
+      "findings": 458,
+      "files": 167,
       "features": [
         "traits.impl_trait_arg",
-        "traits.impl_trait_ret",
         "generics.const_param"
       ]
     },
@@ -1180,70 +1179,6 @@
           "line": 1979,
           "column": 54,
           "snippet": "std::collections::HashMap<K, V, S>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
-    {
-      "id": "traits.impl_trait_ret",
-      "title": "impl Trait in return position",
-      "status": "unsupported",
-      "milestone": 5,
-      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-      "inventory_step": "6",
-      "root_cause": "traits-generics",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_ret.rs fails (L0602). Split from dyn.trait: the return form needs opaque-type handling, not a vtable. Argument position is traits.impl_trait_arg.",
-      "findings": 43,
-      "raw_uses": 43,
-      "prod_uses": 42,
-      "files": 25,
-      "prod_files": 23,
-      "prod_fns": 41,
-      "scopes": {
-        "active": 42,
-        "test-only": 1
-      },
-      "samples": [
-        {
-          "feature": "traits.impl_trait_ret",
-          "raw_key": "type.impl_trait.ret",
-          "file": "crates/ts_goport/src/api/server.rs",
-          "byte_start": 3972,
-          "byte_end": 3989,
-          "line": 93,
-          "column": 30,
-          "snippet": "impl FnMut() + '_",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "traits.impl_trait_ret",
-          "raw_key": "type.impl_trait.ret",
-          "file": "crates/ts_goport/src/ast/file_version.rs",
-          "byte_start": 9081,
-          "byte_end": 9098,
-          "line": 177,
-          "column": 32,
-          "snippet": "impl Send + use<>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "traits.impl_trait_ret",
-          "raw_key": "type.impl_trait.ret",
-          "file": "crates/ts_goport/src/ast/file_version.rs",
-          "byte_start": 31319,
-          "byte_end": 31336,
-          "line": 753,
-          "column": 68,
-          "snippet": "impl Send + use<>",
           "scope": "active",
           "fix_class": "compiler work",
           "release_safe_rewrite": false
@@ -2441,10 +2376,10 @@
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 657,
-        "lines": 401891,
-        "files_pct": 85.0,
-        "lines_pct": 70.3
+        "files": 669,
+        "lines": 422059,
+        "files_pct": 86.5,
+        "lines_pct": 73.9
       },
       {
         "id": "6",
@@ -2547,10 +2482,10 @@
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 36,
-        "lines": 83244,
-        "files_pct": 4.7,
-        "lines_pct": 14.6
+        "files": 15,
+        "lines": 33313,
+        "files_pct": 1.9,
+        "lines_pct": 5.8
       },
       {
         "id": "7a",
@@ -2693,10 +2628,10 @@
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 659,
-        "lines": 402916,
-        "files_pct": 84.7,
-        "lines_pct": 70.2
+        "files": 671,
+        "lines": 423084,
+        "files_pct": 86.2,
+        "lines_pct": 73.7
       },
       {
         "id": "6",
@@ -2799,10 +2734,10 @@
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 36,
-        "lines": 83244,
-        "files_pct": 4.6,
-        "lines_pct": 14.5
+        "files": 15,
+        "lines": 33313,
+        "files_pct": 1.9,
+        "lines_pct": 5.8
       },
       {
         "id": "7a",
@@ -3098,10 +3033,9 @@
         "core.std_basics",
         "dyn.std",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/api/session_p1.rs",
@@ -3212,10 +3146,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 66
+      "findings": 63
     },
     {
       "file": "crates/ts_goport/src/ast/misc.rs",
@@ -3231,10 +3164,9 @@
         "std.cow",
         "std.lazy_once_lock",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 15
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/src/ast/mod.rs",
@@ -3262,10 +3194,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 48
+      "findings": 47
     },
     {
       "file": "crates/ts_goport/src/ast/source_file_ls.rs",
@@ -3298,10 +3229,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 102
+      "findings": 101
     },
     {
       "file": "crates/ts_goport/src/ast/synthetic.rs",
@@ -3442,10 +3372,9 @@
         "core.std_basics",
         "std.rc_refcell",
         "std.runtime",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/astdata/flow.rs",
@@ -3456,10 +3385,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/astdata/js_string.rs",
@@ -3730,10 +3658,9 @@
         "ext.rustc_hash",
         "std.cow",
         "std.rc_refcell",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p2.rs",
@@ -5067,10 +4994,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 72
+      "findings": 66
     },
     {
       "file": "crates/ts_goport/src/core/lib_names.rs",
@@ -5339,10 +5265,9 @@
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 32
+      "findings": 25
     },
     {
       "file": "crates/ts_goport/src/effect/keybuilder.rs",
@@ -7539,10 +7464,9 @@
         "std.cow",
         "std.rc_refcell",
         "std.runtime",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 16
+      "findings": 12
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/build_info_to_snapshot.rs",
@@ -7637,10 +7561,9 @@
         "core.std_basics",
         "ext.rustc_hash",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 19
+      "findings": 18
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/program_to_snapshot.rs",
@@ -7746,10 +7669,9 @@
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 10
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/emit.rs",
@@ -8174,10 +8096,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 56
+      "findings": 55
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/files_parser.rs",
@@ -9074,10 +8995,9 @@
         "ext.rustc_hash",
         "macros.std_unsupported",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 23
+      "findings": 22
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/parsed_options.rs",
@@ -9152,10 +9072,9 @@
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 17
+      "findings": 16
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/wildcard.rs",
@@ -9606,10 +9525,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 43
+      "findings": 42
     },
     {
       "file": "crates/ts_goport/src/goport_lsproto_root.rs",
@@ -9781,10 +9699,9 @@
         "std.lazy_once_lock",
         "std.other",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 10
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/src/gostd/rlimit.rs",
@@ -10726,10 +10643,9 @@
         "core.std_basics",
         "ext.rustc_hash",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 7
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/ls/hovericon.rs",
@@ -11745,10 +11661,9 @@
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 38
+      "findings": 35
     },
     {
       "file": "crates/ts_goport/src/printer/factory.rs",
@@ -11955,10 +11870,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 133
+      "findings": 132
     },
     {
       "file": "crates/ts_goport/src/program/go_frontend.rs",
@@ -11974,10 +11888,9 @@
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
-        "traits.impl_trait_arg",
-        "traits.impl_trait_ret"
+        "traits.impl_trait_arg"
       ],
-      "findings": 18
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/src/program/ls_program.rs",
@@ -12696,10 +12609,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/sourcemap/generator.rs",
@@ -14267,10 +14179,9 @@
         "panic.recovery",
         "std.hashmap",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 7
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/mod.rs",
@@ -16330,10 +16241,9 @@
         "macros.std_unsupported",
         "std.hashmap",
         "std.rc_refcell",
-        "std.runtime",
-        "traits.impl_trait_ret"
+        "std.runtime"
       ],
-      "findings": 13
+      "findings": 12
     },
     {
       "file": "tools/ts_ast_codegen/src/lib.rs",
@@ -16938,19 +16848,6 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "traits.impl_trait_ret",
-      "raw_key": "type.impl_trait.ret",
-      "file": "crates/ts_goport/src/api/server.rs",
-      "byte_start": 3972,
-      "byte_end": 3989,
-      "line": 93,
-      "column": 30,
-      "snippet": "impl FnMut() + '_",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "panic.recovery",
       "raw_key": "std.expr.std::panic::catch_unwind",
       "file": "crates/ts_goport/src/api/session_p1.rs",
@@ -17068,19 +16965,6 @@
       "release_safe_rewrite": true
     },
     {
-      "feature": "traits.impl_trait_ret",
-      "raw_key": "type.impl_trait.ret",
-      "file": "crates/ts_goport/src/ast/file_version.rs",
-      "byte_start": 9081,
-      "byte_end": 9098,
-      "line": 177,
-      "column": 32,
-      "snippet": "impl Send + use<>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "threads.thread_local",
       "raw_key": "macro.thread_local",
       "file": "crates/ts_goport/src/ast/file_version.rs",
@@ -17133,32 +17017,6 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "traits.impl_trait_ret",
-      "raw_key": "type.impl_trait.ret",
-      "file": "crates/ts_goport/src/ast/file_version.rs",
-      "byte_start": 31319,
-      "byte_end": 31336,
-      "line": 753,
-      "column": 68,
-      "snippet": "impl Send + use<>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "traits.impl_trait_ret",
-      "raw_key": "type.impl_trait.ret",
-      "file": "crates/ts_goport/src/ast/file_version.rs",
-      "byte_start": 32133,
-      "byte_end": 32150,
-      "line": 771,
-      "column": 10,
-      "snippet": "impl Send + use<>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "ext.indexmap",
       "raw_key": "ext.type.indexmap::IndexMap",
       "file": "crates/ts_goport/src/ast/misc.rs",
@@ -17169,19 +17027,6 @@
       "snippet": "IndexMap<&'static str, Vec<usize>>",
       "scope": "active",
       "fix_class": "adapter",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "traits.impl_trait_ret",
-      "raw_key": "type.impl_trait.ret",
-      "file": "crates/ts_goport/src/ast/misc.rs",
-      "byte_start": 35637,
-      "byte_end": 35676,
-      "line": 888,
-      "column": 33,
-      "snippet": "impl Iterator<Item = &'static str> + '_",
-      "scope": "active",
-      "fix_class": "compiler work",
       "release_safe_rewrite": false
     },
     {
@@ -17913,7 +17758,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 6071,
+  "findings_total": 6028,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],

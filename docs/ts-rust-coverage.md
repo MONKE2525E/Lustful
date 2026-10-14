@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `a1ad2d32` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `734ebbf5` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -43,9 +43,9 @@ files where this feature is the only blocker: land it and those files compile.
 | 10 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 1 | 1220 |
 | 11 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 26 | 48900 | 0 | 0 |
 | 12 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 1 | 1419 |
-| 13 | `macros.std_unsupported` | partial | 4 | W-CHECK-G | 34 | 33075 | 0 | 0 |
-| 14 | `panic.recovery` | unsupported | 7 | wave C (panics) | 19 | 23474 | 0 | 0 |
-| 15 | `std.other` | unsupported | 4 | W-STD-B | 19 | 22616 | 0 | 0 |
+| 13 | `panic.recovery` | unsupported | 7 | wave C (panics) | 19 | 23474 | 0 | 0 |
+| 14 | `std.other` | unsupported | 4 | W-STD-B | 19 | 22616 | 0 | 0 |
+| 15 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 0 | 0 |
 
 ## Core CLI curve
 

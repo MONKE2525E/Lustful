@@ -1407,14 +1407,14 @@
   {
    "id": "macros.std_unsupported",
    "title": "Std macros lust does not expand yet (write!, writeln!, include_bytes!)",
-   "status": "partial",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "macros",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_unsupported.rs passes (write! and writeln! into a String under `use std::fmt::Write as _;`). _b fails (L0104): include_bytes! expands through str::as_bytes; ts-rust embeds binary files, which need a byte blob typed &[u8; N]. Split from macros.std_missing by macro name.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_unsupported.rs passes (write! and writeln! into a String under `use std::fmt::Write as _;`). _b passes (W-CHECK-G3): include_bytes! is a byte string literal of the exact bytes, &[u8; N], binary data included. Gap: a blob past about 1 MB in a static, or a const fn loop past 1M steps over one, hits the const evaluator step cap (L0630, a reject). Split from macros.std_missing by macro name.",
    "primary_keys": [
     "macro.write",
     "macro.include_bytes"
