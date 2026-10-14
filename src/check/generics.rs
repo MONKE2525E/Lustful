@@ -7409,25 +7409,30 @@ fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId 
     if let Some(inst) = p.tys.local_adt_instance(def, args_id) {
         return inst;
     }
-    let src_variants: Vec<(Sym, crate::check::collect::VariantShape, i128, Vec<(Sym, Ty)>)> =
-        p.adt(template).variants.iter().map(|v| (v.name, v.shape, v.disc, v.fields.iter().map(|f| (f.name, f.ty)).collect())).collect();
+    let src_variants: Vec<(Sym, crate::check::collect::VariantShape, i128, bool, Vec<(Sym, Ty)>)> =
+        p.adt(template)
+            .variants
+            .iter()
+            .map(|v| (v.name, v.shape, v.disc, v.non_exhaustive, v.fields.iter().map(|f| (f.name, f.ty)).collect()))
+            .collect();
     let mut variants: Vec<crate::check::collect::Variant> = Vec::with_capacity(src_variants.len());
-    for (vname, shape, disc, fields) in src_variants {
+    for (vname, shape, disc, variant_ne, fields) in src_variants {
         let mut out_fields = Vec::with_capacity(fields.len());
         for (name, ty) in fields {
             let ty = subst(&mut p.tys, ty, args);
             let ty = normalize_global(p, ty);
             out_fields.push(crate::check::collect::Field { name, ty });
         }
-        variants.push(crate::check::collect::Variant { name: vname, shape, fields: out_fields, disc });
+        variants.push(crate::check::collect::Variant { name: vname, shape, fields: out_fields, disc, non_exhaustive: variant_ne });
     }
     let id = instance_adt_id(p, def, args_id);
     let at = id.0 as usize;
-    let (name, is_enum, derives, span) = {
+    let (name, is_enum, derives, span, adt_ne) = {
         let src = p.adt(template);
-        (src.name, src.is_enum, src.derives, src.span)
+        (src.name, src.is_enum, src.derives, src.span, src.non_exhaustive)
     };
-    p.adts[at] = crate::check::collect::AdtDef { name, is_enum, variants, derives, span, repr: p.adt(template).repr };
+    p.adts[at] =
+        crate::check::collect::AdtDef { name, is_enum, variants, derives, span, repr: p.adt(template).repr, non_exhaustive: adt_ne };
     p.tys.register_adt_instance(def, args_id, id);
     p.defs.insert_adt_instance(def, id);
     p.gx.adt_info[at] = (def, args.len());
@@ -7464,6 +7469,7 @@ fn instance_adt_id(p: &mut Program, def: DefId, args: ArgsId) -> AdtId {
             derives: Default::default(),
             span: Span::default(),
             repr: Default::default(),
+            non_exhaustive: false,
         });
         p.gx.adt_info.push((DefId::PLACEHOLDER, 0));
         p.gx.adt_generics.push(Generics::default());

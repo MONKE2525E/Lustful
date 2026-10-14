@@ -225,7 +225,7 @@ fn parse_tokens(
     // items carry the same allows as in a whole parse.
     match p.inner_attributes() {
         Ok(inner) => {
-            attrs::check_target(&inner.attrs, "crates", false, false, interner)?;
+            attrs::check_target(&inner.attrs, "crates", 0, interner)?;
             if !inner.attrs.is_empty() {
                 p.scope_allows = inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect();
             }
@@ -287,7 +287,6 @@ const KNOWN_ATTRS: &[&str] = &[
     "cold",
     "must_use",
     "track_caller",
-    "non_exhaustive",
     "deprecated",
     "doc",
     "bench",
@@ -1491,28 +1490,31 @@ impl<'a> Parser<'a> {
     /// module, impl, trait, or match body, or a permitted block, and those
     /// sites call `inner_attributes` before anything else in the body.
     fn attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(true, false, false)
+        self.attributes_at(true, false, false, "", 0)
     }
 
     /// Attributes on a part of an item (a field, parameter, variant, arm, or
     /// statement). `derive` and `test` are not valid there (rustc rejects
     /// them), so they get the unsupported-attribute error, not a free pass.
-    fn part_attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(false, false, false)
+    /// `what` and `flags` name the part for the target check
+    /// (`attrs::check_target`).
+    fn part_attributes(&mut self, what: &'static str, flags: u8) -> PResult<ParsedAttrs> {
+        self.attributes_at(false, false, false, what, flags)
     }
 
-    /// Attributes on an enum variant: part attributes plus `#[default]`,
-    /// which rustc accepts only there (collect checks that the enum
-    /// derives `Default` and that the variant is a unit variant).
+    /// Attributes on an enum variant: part attributes plus `#[default]`
+    /// and `#[non_exhaustive]`, which rustc accepts only there (collect
+    /// checks that the enum derives `Default` and that the `#[default]`
+    /// variant is a unit variant).
     fn variant_attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(false, false, true)
+        self.attributes_at(false, false, true, "enum variants", attrs::T_VARIANT)
     }
 
     /// Parses a run of inner attributes (`#![..]`, `//!` docs) at a site
     /// that permits them. Stops at the first outer attribute, which belongs
     /// to the next item or statement in the body.
     fn inner_attributes(&mut self) -> PResult<ParsedAttrs> {
-        self.attributes_at(true, true, false)
+        self.attributes_at(true, true, false, "", 0)
     }
 
     /// True when the next tokens start an inner attribute (`#!`).
@@ -1520,7 +1522,7 @@ impl<'a> Parser<'a> {
         self.peek() == Tok::Pound && self.peek_at(1) == Tok::Bang
     }
 
-    fn attributes_at(&mut self, item_level: bool, inner_only: bool, variant: bool) -> PResult<ParsedAttrs> {
+    fn attributes_at(&mut self, item_level: bool, inner_only: bool, variant: bool, what: &str, flags: u8) -> PResult<ParsedAttrs> {
         let mut out = ParsedAttrs::default();
         while self.peek() == Tok::Pound {
             if inner_only && !self.at_inner_attr() {
@@ -1625,10 +1627,10 @@ impl<'a> Parser<'a> {
             let k = self.known;
             if path.len() == 1 {
                 attrs::check_input(&name_text, &attr, self.interner)?;
-                // Fields, params, variants, arms, and statements take
-                // neither `inline` nor `repr`.
+                // A part of an item takes only the attributes its kind
+                // permits (`what` and `flags` say which part this is).
                 if !item_level {
-                    attrs::check_target(std::slice::from_ref(&attr), "fields, parameters, variants, or statements", false, false, self.interner)?;
+                    attrs::check_target(std::slice::from_ref(&attr), what, flags, self.interner)?;
                 }
             }
             if path.len() > 1 {
@@ -1683,6 +1685,10 @@ impl<'a> Parser<'a> {
                 // caller's location in panics and `Location::caller()`.
                 _ if name_text == "track_caller" && matches!(attr.input, AttrInput::None) => {}
                 _ if RESOLVE_ATTRS.contains(&name_text.as_str()) => {}
+                // `#[non_exhaustive]` on a struct, enum, or variant:
+                // collect records it on the Adt; the checker enforces
+                // it across crate borders.
+                _ if name_text == "non_exhaustive" => {}
                 // `#[default]` marks the `Default` variant of a derived enum.
                 _ if variant && !inner && name_text == "default" && matches!(attr.input, AttrInput::None) => {}
                 _ if KNOWN_ATTRS.contains(&name_text.as_str()) => {
@@ -1813,12 +1819,18 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `inline` and `repr` on a trait or impl item: rustc takes `inline`
+    /// Attribute targets on a trait or impl item: rustc takes `inline`
     /// on fns (and, with a warning, on consts), never on types, and
-    /// `repr` on none of them. The next token tells the item kind.
+    /// `repr` and `non_exhaustive` on none of them. The next token
+    /// tells the item kind.
     fn check_assoc_targets(&self, parsed: &ParsedAttrs) -> PResult<()> {
         let is_type = self.peek() == Tok::Type || (self.peek() != Tok::Fn && self.peek_at(1) == Tok::Type);
-        attrs::check_target(&parsed.attrs, if is_type { "associated types" } else { "associated items" }, !is_type, false, self.interner)
+        attrs::check_target(
+            &parsed.attrs,
+            if is_type { "associated types" } else { "associated items" },
+            if is_type { 0 } else { attrs::T_FN },
+            self.interner,
+        )
     }
 
     fn item(&mut self) -> PResult<Option<Item>> {
@@ -1838,7 +1850,7 @@ impl<'a> Parser<'a> {
         if self.peek() == Tok::Const && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Underscore) && self.peek_at(2) == Tok::Colon {
             let kind = ItemKind::Const(self.const_def()?);
             self.check_derive_test(&parsed, false, false)?;
-            attrs::check_target(&parsed.attrs, "constants", false, false, self.interner)?;
+            attrs::check_target(&parsed.attrs, "constants", 0, self.interner)?;
             self.scope_allows.truncate(scope_mark);
             return Ok(Some(Item { vis, attrs: parsed.attrs, kind, span: start.to(self.prev_span()) }));
         }
@@ -1957,8 +1969,12 @@ impl<'a> Parser<'a> {
         attrs::check_target(
             &parsed.attrs,
             item_kind_plural(&kind),
-            matches!(kind, ItemKind::Fn(_)),
-            matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_)),
+            match &kind {
+                ItemKind::Fn(_) => attrs::T_FN,
+                ItemKind::Struct(_) | ItemKind::Enum(_) => attrs::T_ADT,
+                ItemKind::Union(_) => attrs::T_UNION,
+                _ => 0,
+            },
             self.interner,
         )?;
         self.scope_allows.truncate(scope_mark);
@@ -2085,7 +2101,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "`{` or `;`")?;
         // Inner attributes are permitted only here, before the first item.
         let inner = self.inner_attributes()?;
-        attrs::check_target(&inner.attrs, "modules", false, false, self.interner)?;
+        attrs::check_target(&inner.attrs, "modules", 0, self.interner)?;
         let scope_mark = self.scope_allows.len();
         self.scope_allows.extend(inner.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
         let mut items = Vec::new();
@@ -2226,7 +2242,7 @@ impl<'a> Parser<'a> {
             if self.eat(Tok::Gt) {
                 break;
             }
-            let pattrs = self.part_attributes()?;
+            let pattrs = self.part_attributes("type parameters", 0)?;
             match self.peek() {
                 Tok::Lifetime(_) => {
                     if !allow_lifetimes {
@@ -2453,7 +2469,7 @@ impl<'a> Parser<'a> {
         // by them.
         let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
         while self.peek() != Tok::RParen {
-            let pattrs = self.part_attributes()?;
+            let pattrs = self.part_attributes("function parameters", attrs::T_PARAM)?;
             let start = self.span();
             if self.cfg_syntax && self.cfg_foreign && (self.peek() == Tok::DotDot || self.peek() == Tok::Ellipsis) {
                 self.bump();
@@ -2541,7 +2557,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while self.peek() != Tok::RBrace {
-            let fattrs = self.part_attributes()?;
+            let fattrs = self.part_attributes("struct fields", attrs::T_FIELD)?;
             let vis = self.vis()?;
             let (name, span) = self.ident()?;
             self.expect(Tok::Colon, "`:`")?;
@@ -2560,7 +2576,7 @@ impl<'a> Parser<'a> {
     fn tuple_fields(&mut self) -> PResult<Vec<FieldDef>> {
         let mut fields = Vec::new();
         while self.peek() != Tok::RParen {
-            let fattrs = self.part_attributes()?;
+            let fattrs = self.part_attributes("struct fields", attrs::T_FIELD)?;
             let _vis = self.vis_ctx(true)?;
             let span = self.span();
             let ty = self.ty()?;
@@ -3329,7 +3345,7 @@ impl<'a> Parser<'a> {
             // Statement attributes: parsed here so a `#[cfg]` on a statement
             // gets the attribute code; lint attributes are kept on the
             // statement (`let`, expression, or the block's tail).
-            let mut stmt_attrs = self.part_attributes()?;
+            let mut stmt_attrs = self.part_attributes("statements", 0)?;
             // A function-local `use` is an item statement; the resolver
             // binds it for the rest of the block (docs/ARCH.md 1.3).
             if self.peek() == Tok::Use {
@@ -3673,7 +3689,7 @@ impl<'a> Parser<'a> {
                                 if matches!(self.peek(), Tok::Int(..)) {
                                     return Err(self.reject(C_CORE, "tuple struct patterns with field numbers"));
                                 }
-                                let _fattrs = self.part_attributes()?;
+                                let _fattrs = self.part_attributes("pattern fields", 0)?;
                                 let by_ref = self.eat(Tok::Ref);
                                 let mutable = self.eat(Tok::Mut);
                                 let (fname, fspan) = self.ident()?;
@@ -4292,7 +4308,7 @@ impl<'a> Parser<'a> {
                 let inner_allows: Vec<Attr> = inner.attrs.iter().filter(|a| is_allow(a, self.known)).cloned().collect();
                 let mut arms = Vec::new();
                 while self.peek() != Tok::RBrace {
-                    let mut aattrs = self.part_attributes()?;
+                    let mut aattrs = self.part_attributes("match arms", 0)?;
                     aattrs.attrs.splice(0..0, inner_allows.iter().cloned());
                     let pat = self.pattern()?;
                     let guard = if self.eat(Tok::If) { Some(self.expr()?) } else { None };

@@ -47,6 +47,10 @@ pub struct Variant {
     pub fields: Vec<Field>,
     /// The discriminant value (explicit, or the previous variant's plus one).
     pub disc: i128,
+    /// `#[non_exhaustive]` on this variant: outside the defining
+    /// crate it cannot be built with a struct literal, its tuple
+    /// constructor is private, and a named-field pattern needs `..`.
+    pub non_exhaustive: bool,
 }
 
 pub struct AdtDef {
@@ -58,6 +62,12 @@ pub struct AdtDef {
     pub span: Span,
     /// The `repr` of the type, in layout terms.
     pub repr: crate::ty::layout::Repr,
+    /// `#[non_exhaustive]` on the type: outside the defining crate a
+    /// struct cannot be built with a struct literal, its tuple and
+    /// unit constructors are private, a named-field pattern needs
+    /// `..`, and an enum match needs a wildcard arm. Inside the
+    /// defining crate it changes nothing.
+    pub non_exhaustive: bool,
 }
 
 /// One evaluated `const` item.
@@ -2191,6 +2201,7 @@ pub fn collect_reuse<'a>(
                 derives: Derives::default(),
                 span: Span::default(),
                 repr: crate::ty::layout::Repr::default(),
+                non_exhaustive: false,
             });
             p.gx.adt_info.push((DefId::PLACEHOLDER, 0));
             p.gx.adt_generics.push(Generics::default());
@@ -2255,9 +2266,9 @@ pub fn collect_reuse<'a>(
             // A synthetic std Adt (see above): variants, fields, and
             // derives are std's, written here directly (no AST item).
             let id = AdtId(adt_base as u32 + rank);
-            let unit = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Unit, fields: Vec::new(), disc };
+            let unit = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Unit, fields: Vec::new(), disc, non_exhaustive: false };
             let field = |n: &str, ty: Ty| Field { name: interner.intern(n), ty };
-            let named = |fields: Vec<Field>| vec![Variant { name, shape: VariantShape::Named, fields, disc: 0 }];
+            let named = |fields: Vec<Field>| vec![Variant { name, shape: VariantShape::Named, fields, disc: 0, non_exhaustive: false }];
             let (def, variants, derives) = match usize::MAX - item_idx {
                 0 => (
                     generics::ordering_def(),
@@ -2268,7 +2279,7 @@ pub fn collect_reuse<'a>(
                 // Ord, PartialEq, PartialOrd)]`; its Display is the runtime's.
                 1 => (
                     generics::fmt_error_def(),
-                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0 }],
+                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0, non_exhaustive: false }],
                     Derives {
                         debug: true,
                         clone: true,
@@ -2302,7 +2313,7 @@ pub fn collect_reuse<'a>(
                 // Disconnected }` with the same derives (W-THREADS).
                 5 => (
                     generics::recv_error_def(),
-                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0 }],
+                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0, non_exhaustive: false }],
                     Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
                 6 => (
@@ -2339,7 +2350,11 @@ pub fn collect_reuse<'a>(
                     )
                 }
             };
-            p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default() };
+            // `core::sync::atomic::Ordering` (index 4) is std's one
+            // synthetic `#[non_exhaustive]` type here.
+            let synthetic_ne = usize::MAX - item_idx == 4;
+            p.adts[id.0 as usize] =
+                AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
             if generics::std_adt_has_flat_name(usize::MAX - item_idx) && !std_taken.contains(&name) {
                 p.type_names.insert(name, id);
@@ -2373,7 +2388,15 @@ pub fn collect_reuse<'a>(
         // two records apart in the def table, as the old dense ids did.
         let def = DefId { krate: p.krate, hash };
         p.adts[id.0 as usize] =
-            AdtDef { name, is_enum, variants: Vec::new(), derives: Derives::default(), span, repr: crate::ty::layout::Repr::default() };
+            AdtDef {
+                name,
+                is_enum,
+                variants: Vec::new(),
+                derives: Derives::default(),
+                span,
+                repr: crate::ty::layout::Repr::default(),
+                non_exhaustive: false,
+            };
         p.gx.adt_info[id.0 as usize] = (def, n_params);
         // Lifetime params (W-BORROW): names only; the field pass gives
         // them meaning.
@@ -2545,12 +2568,12 @@ pub fn collect_reuse<'a>(
     // Pass 2: fields, variants, derives.
     for (item_idx, item) in ast.items.iter().enumerate() {
         type FieldSrc = (Sym, ast::TyId, Span);
-        type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>, Option<ast::ExprId>);
+        type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>, Option<ast::ExprId>, bool);
         let (variants_src, derives_src): (Vec<VariantSrc>, &Vec<(Sym, Span)>) = match &item.kind {
             ItemKind::Struct(s) => {
                 let (shape, fields) = variant_fields_src(interner, &s.fields);
                 let shape = if shape == VariantShape::Unit { VariantShape::Named } else { shape };
-                (vec![(s.name, s.name_span, shape, fields, None)], &s.derives)
+                (vec![(s.name, s.name_span, shape, fields, None, false)], &s.derives)
             }
             ItemKind::Enum(e) => {
                 let vs = e
@@ -2558,7 +2581,7 @@ pub fn collect_reuse<'a>(
                     .iter()
                     .map(|v| {
                         let (shape, fs) = variant_fields_src(interner, &v.fields);
-                        (v.name, v.span, shape, fs, v.discriminant)
+                        (v.name, v.span, shape, fs, v.discriminant, has_non_exhaustive(interner, &v.attrs))
                     })
                     .collect();
                 (vs, &e.derives)
@@ -2609,7 +2632,7 @@ pub fn collect_reuse<'a>(
         let mut region_fields: Vec<(usize, usize, Ty)> = Vec::new();
         let mut disc_explicit: Vec<bool> = Vec::new();
         let mut next_disc: i128 = 0;
-        for (vname, vspan, shape, field_srcs, disc_src) in variants_src {
+        for (vname, vspan, shape, field_srcs, disc_src, variant_ne) in variants_src {
             let shape = if !is_enum && field_srcs.is_empty() { VariantShape::Unit } else { shape };
             let mut fields = Vec::new();
             for (fname, fty, fspan) in field_srcs {
@@ -2670,7 +2693,7 @@ pub fn collect_reuse<'a>(
                 None => next_disc,
             };
             next_disc = disc.wrapping_add(1);
-            variants.push(Variant { name: vname, shape, fields, disc });
+            variants.push(Variant { name: vname, shape, fields, disc, non_exhaustive: variant_ne });
         }
         let mut d = Derives::default();
         for &(name, span) in derives_src {
@@ -2754,6 +2777,7 @@ pub fn collect_reuse<'a>(
         let adt = &mut p.adts[id.0 as usize];
         adt.variants = variants;
         adt.derives = d;
+        adt.non_exhaustive = has_non_exhaustive(interner, &item.attrs);
         match parse_repr(interner, &item.attrs) {
             Ok(r) => adt.repr = r,
             Err(dg) => errs.push(dg),
@@ -4172,6 +4196,74 @@ fn self_pat_matches(tys: &crate::ty::GlobalTys, pat: Ty, target: Ty, map: &mut V
     }
 }
 
+/// True when `attrs` carries `#[non_exhaustive]`.
+pub(crate) fn has_non_exhaustive(interner: &Interner, attrs: &[ast::Attr]) -> bool {
+    attrs.iter().any(|a| a.path.len() == 1 && interner.get(a.path[0].name) == "non_exhaustive")
+}
+
+/// True when `adt` is defined in a different crate than module
+/// `from`, for the `#[non_exhaustive]` rules: the attribute has no
+/// effect inside its defining crate. A synthetic std Adt is foreign
+/// to every body lust checks. With no resolver tables the program is
+/// one crate, so nothing is foreign.
+pub(crate) fn adt_is_foreign(p: &Program, adt: AdtId, from: crate::ty::defs::ModuleId) -> bool {
+    if generics::is_std_adt(&p.tys, adt) {
+        return true;
+    }
+    let Some(tables) = &p.resolved else { return false };
+    let Some(def) = p.defs.def_of_adt(adt) else { return false };
+    let Some(info) = tables.def_info.get(&def) else { return false };
+    tables.root_of(info.module) != tables.root_of(from)
+}
+
+/// What a struct literal of variant `variant` of `adt` may not
+/// build from module `from` under `#[non_exhaustive]` (rustc
+/// E0639): "struct" for a marked struct, "variant" for a marked
+/// variant, only across a crate border. An enum's own mark does not
+/// block its variants' literals.
+pub(crate) fn ne_lit_what(p: &Program, adt: AdtId, variant: u32, from: crate::ty::defs::ModuleId) -> Option<&'static str> {
+    let a = p.adt(adt);
+    let what = if a.is_enum {
+        a.variants.get(variant as usize).is_some_and(|x| x.non_exhaustive).then_some("variant")?
+    } else {
+        a.non_exhaustive.then_some("struct")?
+    };
+    adt_is_foreign(p, adt, from).then_some(what)
+}
+
+/// What a tuple or unit constructor use (call, value, or pattern)
+/// may not name from module `from` under `#[non_exhaustive]`
+/// (rustc E0603): a marked struct's constructors and a marked
+/// variant's tuple constructor are private across a crate border.
+/// A unit variant stays usable.
+pub(crate) fn ne_ctor_what(p: &Program, adt: AdtId, variant: u32, from: crate::ty::defs::ModuleId) -> Option<&'static str> {
+    let a = p.adt(adt);
+    let v = a.variants.get(variant as usize)?;
+    let what = if a.is_enum {
+        (v.non_exhaustive && v.shape == VariantShape::Tuple).then_some("tuple variant")?
+    } else if v.shape == VariantShape::Unit {
+        a.non_exhaustive.then_some("unit struct")?
+    } else {
+        a.non_exhaustive.then_some("tuple struct constructor")?
+    };
+    adt_is_foreign(p, adt, from).then_some(what)
+}
+
+/// What a named-field pattern without `..` may not match from
+/// module `from` under `#[non_exhaustive]` (rustc E0638).
+pub(crate) fn ne_pat_what(p: &Program, adt: AdtId, variant: u32, rest: bool, from: crate::ty::defs::ModuleId) -> Option<&'static str> {
+    if rest {
+        return None;
+    }
+    let a = p.adt(adt);
+    let what = if a.is_enum {
+        a.variants.get(variant as usize).is_some_and(|x| x.non_exhaustive).then_some("variant")?
+    } else {
+        a.non_exhaustive.then_some("struct")?
+    };
+    adt_is_foreign(p, adt, from).then_some(what)
+}
+
 /// True when a named field of `adt` is not visible from module
 /// `from`, by the resolver's field table. The const evaluator's
 /// privacy hooks in collect and in body checking share this test;
@@ -4849,6 +4941,15 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             Some(m) => tuple_field_is_private(self.p, adt, index, m),
             None => false,
         }
+    }
+    fn ne_lit_what(&mut self, adt: AdtId, variant: u32) -> Option<&'static str> {
+        self.module.and_then(|m| ne_lit_what(self.p, adt, variant, m))
+    }
+    fn ne_ctor_what(&mut self, adt: AdtId, variant: u32) -> Option<&'static str> {
+        self.module.and_then(|m| ne_ctor_what(self.p, adt, variant, m))
+    }
+    fn ne_pat_what(&mut self, adt: AdtId, variant: u32, rest: bool) -> Option<&'static str> {
+        self.module.and_then(|m| ne_pat_what(self.p, adt, variant, rest, m))
     }
 }
 

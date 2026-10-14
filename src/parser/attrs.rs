@@ -30,7 +30,7 @@ pub(super) fn check_input(name: &str, attr: &Attr, interner: &Interner) -> PResu
             }
             _ => false,
         },
-        "cold" | "test" => matches!(attr.input, AttrInput::None),
+        "cold" | "test" | "non_exhaustive" => matches!(attr.input, AttrInput::None),
         "must_use" => matches!(&attr.input, AttrInput::None) || eq_str(&attr.input),
         "deprecated" => match &attr.input {
             AttrInput::None => true,
@@ -43,16 +43,37 @@ pub(super) fn check_input(name: &str, attr: &Attr, interner: &Interner) -> PResu
     if ok { Ok(()) } else { Err(malformed(name, attr)) }
 }
 
-/// Rejects `inline` and `repr` on a target that is not a function or
-/// an ADT. `what` names the target in rustc's words ("structs",
-/// "constants"); `is_fn` and `is_adt` say which attributes it takes.
-pub(super) fn check_target(attrs: &[Attr], what: &str, is_fn: bool, is_adt: bool, interner: &Interner) -> PResult<()> {
+/// Target flags for `check_target`: what kind of thing the attributes
+/// sit on. rustc hard-errors on some misplacements and only warns
+/// (future-incompatible) on others; a warning-only placement is
+/// accepted here, as rustc accepts it today.
+pub(super) const T_FN: u8 = 1;
+pub(super) const T_ADT: u8 = 2;
+pub(super) const T_VARIANT: u8 = 4;
+pub(super) const T_FIELD: u8 = 8;
+pub(super) const T_PARAM: u8 = 16;
+pub(super) const T_UNION: u8 = 32;
+
+/// Rejects a built-in attribute on a target rustc rejects it on.
+/// `what` names the target in rustc's words ("structs", "constants").
+/// The rules: `inline` takes functions (a field only warns), `cold`
+/// warns everywhere except function parameters, which take only lint
+/// and cfg attributes, `repr` takes structs, enums, and unions, and
+/// `non_exhaustive` takes structs, enums, and variants (a field only
+/// warns).
+pub(super) fn check_target(attrs: &[Attr], what: &str, flags: u8, interner: &Interner) -> PResult<()> {
     for a in attrs {
         if a.path.len() != 1 {
             continue;
         }
         let name = interner.get(a.path[0].name);
-        let bad = (name == "inline" && !is_fn) || (name == "repr" && !is_adt);
+        let bad = match name {
+            "inline" => flags & (T_FN | T_FIELD) == 0,
+            "cold" => flags & T_PARAM != 0,
+            "repr" => flags & (T_ADT | T_UNION) == 0,
+            "non_exhaustive" => flags & (T_ADT | T_VARIANT | T_FIELD) == 0,
+            _ => false,
+        };
         if bad {
             return Err(Diag::new(
                 C_ATTR_USE,

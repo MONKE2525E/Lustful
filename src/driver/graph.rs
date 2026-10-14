@@ -633,6 +633,9 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
     adt.repr.align.hash(h);
     let d = adt.derives;
     (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(h);
+    // `#[non_exhaustive]` changes match exhaustiveness answers over
+    // this type, which layout readers (a match's scrutinee type) see.
+    adt.non_exhaustive.hash(h);
     // The written impls derive glue calls for a value of this type.
     let glue = |tr: DefId| p.gx.glue_methods.contains_key(&(a, tr));
     (glue(p.gx.lang.clone), glue(p.gx.lang.default), glue(p.gx.lang.partial_eq), glue(p.gx.lang.partial_ord)).hash(h);
@@ -670,6 +673,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
             VariantShape::Named => 2u8.hash(h),
         }
         v.disc.hash(h);
+        v.non_exhaustive.hash(h);
         (v.fields.len() as u64).hash(h);
         for (i, fd) in v.fields.iter().enumerate() {
             // Tuple fields carry a synthetic index `Sym`, not a name.
@@ -985,6 +989,17 @@ fn hash_vis_facts(h: &mut FxHasher, p: &Program, def: DefId) {
             acc = acc.wrapping_add(e.finish());
         }
         (fields.len() as u64, acc).hash(h);
+    }
+    // `#[non_exhaustive]` (the type's and each variant's, in order):
+    // construction, pattern, and exhaustiveness answers in other
+    // crates read it through the same `Sig(adt)` reads as field
+    // privacy, so toggling it must move this fingerprint.
+    if let Some(a) = p.adt_by_def(def) {
+        let adt = p.adt(a);
+        adt.non_exhaustive.hash(h);
+        for v in &adt.variants {
+            v.non_exhaustive.hash(h);
+        }
     }
     if let Some((m, fields)) = t.tuple_field_vis.get(&def) {
         hash_module_path(h, p, t, *m);

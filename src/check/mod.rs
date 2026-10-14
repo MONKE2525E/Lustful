@@ -2233,6 +2233,56 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
+    /// Records the `Sig(adt)` read a `#[non_exhaustive]` answer for
+    /// variant `v` of `a` depends on, like the field privacy checks:
+    /// toggling the attribute rechecks this body. No record when
+    /// neither the type nor the variant is marked.
+    fn ne_read(&mut self, a: AdtId, v: u32) {
+        let p = self.p;
+        let adt = p.adt(a);
+        let marked = adt.non_exhaustive || adt.variants.get(v as usize).is_some_and(|x| x.non_exhaustive);
+        if marked && p.resolved.is_some() {
+            let _ = p.sig_of(&mut self.out.reads, p.def_of_adt(a));
+        }
+    }
+
+    /// A struct literal of a `#[non_exhaustive]` struct, or of a
+    /// variant so marked, is an error outside the defining crate
+    /// (rustc E0639), with or without a `..base` update.
+    fn check_ne_lit(&mut self, a: AdtId, v: u32, span: Span) {
+        self.ne_read(a, v);
+        if let Some(what) = crate::check::collect::ne_lit_what(self.p, a, v, self.module) {
+            self.err(
+                "L0510",
+                span,
+                format!("cannot create non-exhaustive {what} using struct expression"),
+                "Use a constructor function the defining crate exports.",
+            );
+        }
+    }
+
+    /// The tuple or unit constructor of a `#[non_exhaustive]` struct,
+    /// and the tuple constructor of a variant so marked, is private
+    /// outside the defining crate (rustc E0603), for calls, values,
+    /// and patterns alike.
+    fn check_ne_ctor(&mut self, a: AdtId, v: u32, span: Span) {
+        self.ne_read(a, v);
+        if let Some(what) = crate::check::collect::ne_ctor_what(self.p, a, v, self.module) {
+            let name = self.p.display_path(self.p.adt(a).name);
+            self.err("L0510", span, format!("{what} `{name}` is private"), "Use a constructor function the defining crate exports.");
+        }
+    }
+
+    /// A named-field pattern on a `#[non_exhaustive]` struct or
+    /// variant needs `..` outside the defining crate (rustc E0638),
+    /// even when it names every field.
+    fn check_ne_pat(&mut self, a: AdtId, v: u32, rest: bool, span: Span) {
+        self.ne_read(a, v);
+        if let Some(what) = crate::check::collect::ne_pat_what(self.p, a, v, rest, self.module) {
+            self.err("L0510", span, format!("`..` required with {what} marked as non-exhaustive"), "End the pattern with `..`.");
+        }
+    }
+
     /// Inherent method visibility for a method call on a user type.
     fn check_method_vis(&mut self, base: Ty, name: Sym, span: Span) {
         if let Some(a) = self.tys.local_adt(base) {
@@ -2377,6 +2427,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// from the path's turbofish (`S::<7>`) or fresh variables, with its
     /// bounds queued, as the tuple constructor below does.
     fn unit_value_ty(&mut self, e: ExprId, a: AdtId, span: Span) -> Ty {
+        self.check_ne_ctor(a, 0, span);
         let p = self.p;
         let generics = p.gx.adt_generics[a.0 as usize].clone();
         if generics.params.is_empty() {
@@ -2400,6 +2451,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// or fresh variables, with the Adt's bounds queued, as a call of
     /// the constructor does.
     fn ctor_value_ty(&mut self, e: ExprId, a: AdtId, v: u32, span: Span) -> Ty {
+        self.check_ne_ctor(a, v, span);
         let p = self.p;
         let c = self.tys.intern_const(ConstKind::Int(v as u128));
         let mut args = vec![GenericArg::Const(c)];
@@ -7494,6 +7546,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                     }
                 }
+                self.check_ne_pat(a, v, rest, span);
                 if !rest && seen.iter().any(|s| !s) {
                     self.err("L0107", span, "pattern does not mention all fields", "Add the missing fields, or end the pattern with `..`.");
                 }
@@ -7544,6 +7597,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if !p.adt(a).is_enum {
                     self.check_ctor_vis(a, span);
                 }
+                self.check_ne_ctor(a, v, span);
                 match self.map_assign_elems(args, variant.fields.len()) {
                     Some(mapped) => {
                         for (i, sub) in mapped {
@@ -8177,6 +8231,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return self.tys.mk_option(v);
             }
             if let Res::Variant(a, v) = r {
+                self.check_ne_ctor(a, v, span);
                 let variant = &p.adt(a).variants[v as usize];
                 if variant.shape == VariantShape::Unit {
                     if p.gx.adt_generics[a.0 as usize].params.is_empty() {
@@ -10197,6 +10252,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if !p.adt(a).is_enum {
                     self.check_ctor_vis(a, span);
                 }
+                self.check_ne_ctor(a, v, span);
                 let adef = p.def_of_adt(a);
                 let _ = p.sig_of(&mut self.out.reads, adef);
                 let variant = &p.adt(a).variants[v as usize];
@@ -12915,6 +12971,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return ERROR;
         };
         self.set_res(e, Res::Variant(a, v));
+        self.check_ne_lit(a, v, span);
         // A generic Adt literal instantiates its parameters from any
         // turbofish (with defaults) and the written fields: field types
         // are the template's, substituted with those args.
@@ -14573,6 +14630,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Pat::Path(_) => {
                         if variant.shape != VariantShape::Unit {
                             self.err("L0110", span, "this variant has fields", "Match its fields with `(..)` or `{ .. }`.");
+                        } else {
+                            self.check_ne_ctor(a, v, span);
                         }
                     }
                     Pat::TupleStruct { elems, .. } => {
@@ -14588,6 +14647,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         if !p.adt(a).is_enum {
                             self.check_ctor_vis(a, span);
                         }
+                        self.check_ne_ctor(a, v, span);
                         let Some(mapped) = map_tuple_elems(p.ast, elems, variant.fields.len()) else {
                             self.err(
                                 "L0110",
@@ -14629,6 +14689,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 }
                             }
                         }
+                        self.check_ne_pat(a, v, *rest, span);
                         if !rest && fields.len() < variant.fields.len() {
                             self.err(
                                 "L0107",
@@ -17433,6 +17494,18 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
             let _ = p.sig_of(&mut self.cx.out.reads, def);
         }
         crate::check::collect::tuple_field_is_private(p, adt, index, self.cx.module)
+    }
+    fn ne_lit_what(&mut self, adt: AdtId, variant: u32) -> Option<&'static str> {
+        self.cx.ne_read(adt, variant);
+        crate::check::collect::ne_lit_what(self.cx.p, adt, variant, self.cx.module)
+    }
+    fn ne_ctor_what(&mut self, adt: AdtId, variant: u32) -> Option<&'static str> {
+        self.cx.ne_read(adt, variant);
+        crate::check::collect::ne_ctor_what(self.cx.p, adt, variant, self.cx.module)
+    }
+    fn ne_pat_what(&mut self, adt: AdtId, variant: u32, rest: bool) -> Option<&'static str> {
+        self.cx.ne_read(adt, variant);
+        crate::check::collect::ne_pat_what(self.cx.p, adt, variant, rest, self.cx.module)
     }
 }
 

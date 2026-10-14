@@ -179,6 +179,22 @@ pub trait ConstCx<'a> {
     fn tuple_field_private(&mut self, _adt: AdtId, _index: u32) -> bool {
         false
     }
+    /// What a struct literal of this variant may not build under
+    /// `#[non_exhaustive]` from this const expression's crate
+    /// ("struct" or "variant"), like `named_field_private`.
+    fn ne_lit_what(&mut self, _adt: AdtId, _variant: u32) -> Option<&'static str> {
+        None
+    }
+    /// What a tuple or unit constructor use may not name under
+    /// `#[non_exhaustive]`, like `ne_lit_what`.
+    fn ne_ctor_what(&mut self, _adt: AdtId, _variant: u32) -> Option<&'static str> {
+        None
+    }
+    /// What a named-field pattern may not match under
+    /// `#[non_exhaustive]` (`rest` says it ends with `..`).
+    fn ne_pat_what(&mut self, _adt: AdtId, _variant: u32, _rest: bool) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Why evaluation left a block early.
@@ -492,6 +508,14 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
     }
 }
 
+/// Which construction `Evaluator::check_ne` judges.
+#[derive(Clone, Copy)]
+enum NeKind {
+    Lit,
+    Ctor,
+    Pat,
+}
+
 struct Evaluator {
     steps: u64,
     /// Extra steps a byte blob grants: a loop over N bytes needs a
@@ -554,6 +578,38 @@ impl Evaluator {
     fn check_tuple_ctor<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, adt: AdtId, n: usize, span: Span) -> Result<(), Diag> {
         if self.call_depth == 0 && (0..n).any(|i| cx.tuple_field_private(adt, i as u32)) {
             return Err(private_ctor(span));
+        }
+        Ok(())
+    }
+
+    /// Rejects a construction or pattern the context blocks under
+    /// `#[non_exhaustive]`: a struct literal, a tuple or unit
+    /// constructor, or a named-field pattern without `..`. A no-op
+    /// inside a called const fn, like the privacy checks.
+    fn check_ne(&mut self, what: Option<&'static str>, kind: NeKind, span: Span) -> Result<(), Diag> {
+        if self.call_depth == 0
+            && let Some(what) = what
+        {
+            return Err(match kind {
+                NeKind::Lit => Diag::new(
+                    "L0510",
+                    span,
+                    format!("cannot create non-exhaustive {what} using struct expression"),
+                    "Use a constructor function the defining crate exports.",
+                ),
+                NeKind::Ctor => Diag::new(
+                    "L0510",
+                    span,
+                    format!("{what} is private"),
+                    "Use a constructor function the defining crate exports.",
+                ),
+                NeKind::Pat => Diag::new(
+                    "L0510",
+                    span,
+                    format!("`..` required with {what} marked as non-exhaustive"),
+                    "End the pattern with `..`.",
+                ),
+            });
         }
         Ok(())
     }
@@ -914,6 +970,8 @@ impl Evaluator {
                 }
                 // Privacy first: written fields, and every field when
                 // `..base` fills the rest (rustc E0451 for both).
+                let ne_what = cx.ne_lit_what(adt, variant);
+                self.check_ne(ne_what, NeKind::Lit, span)?;
                 for &(fname, fspan, _) in fields {
                     self.check_named_field(cx, adt, fname, fspan)?;
                 }
@@ -1857,6 +1915,10 @@ impl Evaluator {
                 // is; enum variant fields take the enum's visibility.
                 if adt.0 < u32::MAX - 1 && !cx.is_enum(adt) {
                     self.check_tuple_ctor(cx, adt, fields.len(), span)?;
+                }
+                if adt.0 < u32::MAX - 1 {
+                    let what = cx.ne_ctor_what(adt, variant);
+                    self.check_ne(what, NeKind::Ctor, span)?;
                 }
                 let mut vals = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
@@ -3224,11 +3286,23 @@ impl Evaluator {
                 match cx.ast().pat(pat) {
                     Pat::TupleStruct { .. } if !cx.is_enum(adt) => {
                         self.check_tuple_ctor(cx, adt, field_defs.len(), span)?;
+                        let what = cx.ne_ctor_what(adt, variant);
+                        self.check_ne(what, NeKind::Ctor, span)?;
                     }
-                    Pat::Struct { fields, .. } => {
+                    Pat::TupleStruct { .. } => {
+                        let what = cx.ne_ctor_what(adt, variant);
+                        self.check_ne(what, NeKind::Ctor, span)?;
+                    }
+                    Pat::Struct { fields, rest, .. } => {
                         for &(fname, _) in fields {
                             self.check_named_field(cx, adt, fname, span)?;
                         }
+                        let what = cx.ne_pat_what(adt, variant, *rest);
+                        self.check_ne(what, NeKind::Pat, span)?;
+                    }
+                    Pat::Path(_) => {
+                        let what = cx.ne_ctor_what(adt, variant);
+                        self.check_ne(what, NeKind::Ctor, span)?;
                     }
                     _ => {}
                 }
