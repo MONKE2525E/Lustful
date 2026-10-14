@@ -10535,6 +10535,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         return ERROR;
                     }
                 }
+                // rustc checks the arguments against the inputs the expected
+                // output implies: `HashMap::with_capacity_and_hasher(n,
+                // Default::default())` in a typed `let` knows its `S` before
+                // the hasher argument (W-STD-B). A hash table has no coercion,
+                // so a failed try only rolls back.
+                if crate::check::hashmap::is_hash_ctor(b)
+                    && let Some(want) = expected
+                {
+                    let snap = self.snapshot_vars();
+                    if !self.unify(ret, want) {
+                        self.rollback_vars(snap);
+                    }
+                }
                 self.check_args(&params, args, span);
                 // `Rc::try_unwrap` needs `T: Sized` (rustc E0277), and
                 // the other value-reaching Rc builtins are not built for

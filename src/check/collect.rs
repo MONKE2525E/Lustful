@@ -5389,6 +5389,17 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
                 Some(Err(e)) => return glue_default(p, tys, e, seen),
                 None => {}
             }
+            // std's `impl<K, V, S: Default> Default for HashMap<K, V, S>`
+            // (and HashSet), and the hashers' own impls (W-STD-B, cgen/hash.rs
+            // `default_body`). Entry and the iterators have none here.
+            if let Some((k, args)) = crate::ty::hash::hash_parts(tys, t) {
+                use crate::ty::hash::HashTy as H;
+                return match k {
+                    H::HashMap | H::HashSet => args.last().is_some_and(|&s| glue_default(p, tys, s, seen)),
+                    H::RandomState | H::DefaultHasher | H::BuildHasherDefault => true,
+                    _ => false,
+                };
+            }
             if tys.guard_elem(t).is_some() {
                 return false;
             }
