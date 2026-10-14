@@ -52,10 +52,10 @@ struct Depths {
 pub struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
-    /// The `(` offset of each parenthesized expression (outermost), which
-    /// the AST drops: a binary, cast, or postfix expression that starts
-    /// with one spans from it, as in rustc (panic locations read it).
-    paren_lo: std::collections::HashMap<u32, u32>,
+    /// The `(` of each parenthesized expression (outermost), which the
+    /// AST drops: a binary, cast, or postfix expression that starts with
+    /// one spans from it, as in rustc (panic locations read it).
+    paren_lo: std::collections::HashMap<u32, Span>,
     ast: Ast,
     interner: &'a Interner,
     known: &'a Known,
@@ -4023,8 +4023,9 @@ impl<'a> Parser<'a> {
     /// `e`'s span, widened to its `(` when it was written in parentheses.
     fn outer_span(&self, e: ExprId) -> Span {
         let s = self.ast.expr_span(e);
+        // `Span::to`: a `(` a macro wrote around its argument covers the call.
         match self.paren_lo.get(&e.0) {
-            Some(&lo) if lo < s.lo => Span { lo, ..s },
+            Some(&p) if p.lo < s.lo || p.ctxt != s.ctxt => p.to(s),
             _ => s,
         }
     }
@@ -4353,7 +4354,7 @@ impl<'a> Parser<'a> {
                     if tuple {
                         Expr::Tuple(elems)
                     } else {
-                        self.paren_lo.insert(elems[0].0, start.lo);
+                        self.paren_lo.insert(elems[0].0, start);
                         return Ok(elems[0]);
                     }
                 }

@@ -390,17 +390,22 @@ impl<'p, 'a> Lower<'p, 'a> {
     fn span(&self, e: ExprId) -> Span {
         self.p.ast.expr_span(e)
     }
-    /// The `[` of index expression `e`: the byte right after its base
-    /// (whatever spacing follows the `[`). rustc reports `Index::index`
-    /// panics there. When the brackets come from a macro and the base from
-    /// its argument, `e`'s span covers the call site (`Span::to`), where
-    /// rustc reports too.
-    fn bracket_span(&self, e: ExprId, base: ExprId) -> Span {
-        let (whole, b) = (self.span(e), self.span(base));
-        if whole.lo != b.lo || whole.ctxt != b.ctxt {
-            return whole;
+    /// The `[` of index expression `e`, where rustc reports `Index::index`
+    /// panics. The AST keeps no span for it, so: right after a plain base
+    /// (`v[ i ]` too); right before the index after a parenthesized base,
+    /// as rustfmt writes `(v)[i]`; the macro call when the brackets come
+    /// from a macro body (`e`'s span then covers the call, `Span::to`).
+    /// Known gap: `v` and `[i]` on separate lines (rustfmt never does it).
+    fn bracket_span(&self, e: ExprId, base: ExprId, index: ExprId) -> Span {
+        let (whole, b, s) = (self.span(e), self.span(base), self.span(index));
+        if whole.lo == b.lo && whole.ctxt == b.ctxt {
+            return Span { lo: b.hi, hi: b.hi + 1, ..b };
         }
-        Span { lo: b.hi, hi: b.hi + 1, ..b }
+        let before = s.lo.saturating_sub(1);
+        if before >= b.hi && s.ctxt == b.ctxt && s.file == b.file {
+            return Span { lo: before, hi: s.lo, ..s };
+        }
+        whole
     }
     /// Gives the index local `i` its panic location `at` (see
     /// `Proj::Index`): re-spans its assignment when that is the last
@@ -581,7 +586,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 };
                 let t = self.temp(slice);
                 // Range indexing is `Index::index`: it panics at the brackets.
-                let span = self.bracket_span(e, *base);
+                let span = self.bracket_span(e, *base, *index);
                 let mutable = self.mut_index > 0;
                 self.assign(Place::local(t), Rvalue::Subslice { base: b, lo, hi, inclusive, mutable }, span);
                 Place::local(t)
@@ -618,7 +623,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                 // `a[i]` for a built-in array or slice index, at the
                 // brackets for `Index::index` (a Vec). See `Proj::Index`.
                 let builtin = matches!(self.kind(self.peel(self.ty(*base), derefs)), TyKind::Array(..) | TyKind::Slice(_));
-                let at = if builtin { self.span(e) } else { self.bracket_span(e, *base) };
+                let at = if builtin { self.span(e) } else { self.bracket_span(e, *base, *index) };
                 self.mark_index_loc(i, at);
                 b.project(Proj::Index(i))
             }
