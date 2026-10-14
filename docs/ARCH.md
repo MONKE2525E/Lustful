@@ -3077,7 +3077,27 @@ bounds over type params (rustc also frees an unannotated
 closure's arguments); the closure contract's coarser source-to-sink
 edges; `T: 'a`; Adt inferred outlives
 facts (missing facts reject, never accept); precise
-builtin region signatures.
+builtin region signatures; named lifetimes in a closure's
+return annotation (`'static` works); promotion of constants
+other than `&[]` and `&mut []` (they need static storage in
+codegen; `Body::promoted` covers the empty array only).
+
+Fn pointer and `dyn Fn` regions need check's types to keep
+which regions are bound: erased types cannot tell
+`fn(&mut Parser<'a>) -> Node` from `fn(&mut Parser<'_>) ->
+Node` (unify ignores regions, and an Adt drops its lifetime
+args), so a borrowck-only model either loses a free region
+through a copy or misses rustc's "one type is more general
+than the other" when a free pointer meets a higher-ranked
+type. The interface to add with the `dyn Fn` typing: inside
+fn pointer and `dyn Fn(..)` types, an elided (late-bound)
+region is `Region::Bound(k)` and a written one stays
+(`Erased` for a named lifetime, `Static`), also for Adt
+lifetime args there; check rejects a coercion that puts a
+free region where the target is bound; borrowck then gives
+those types one slot per free region, instantiates bound
+ones per call, and relates fn items and closures by their
+signatures.
 
 ## 6. Macros
 
