@@ -582,19 +582,31 @@ pub enum PrimOpKind {
     IntoCast,
 }
 
-/// A method call receiver that goes through a user `Deref` impl
-/// (rustc's autoderef, ARCH 2.10): after `before` builtin derefs of
-/// the receiver, lowering calls `f` (the impl's `deref`, or
-/// `deref_mut` when `mutable`) on a borrow of it; the call's `Res`
-/// derefs and autoref then apply to that `&Target` (`target_ref`).
-/// `args` instantiate a generic `f` (empty for a plain one).
+/// One user `Deref` autoderef step (rustc's autoderef, ARCH 2.10) of
+/// a method call receiver, a field access base, or an explicit `*w`:
+/// after `before` builtin derefs of the step's input, lowering calls
+/// `f` (the impl's `deref`, or `deref_mut` for a method call that
+/// borrows mutably, `mutable`) on a borrow of it; the expression's
+/// `Res` derefs then apply to the `&Target` (`target_ref`) it returns.
+/// A place step also carries the impl's `deref_mut` (`f_mut`), which
+/// lowering calls when it needs the place mutably. `args` and
+/// `args_mut` instantiate generic fns (empty for plain ones).
 #[derive(Clone, Debug)]
 pub struct DerefRecv {
     pub before: u8,
     pub f: LocalDefId,
     pub args: Vec<GenericArg>,
+    pub f_mut: Option<LocalDefId>,
+    pub args_mut: Vec<GenericArg>,
     pub mutable: bool,
     pub target_ref: Ty,
+}
+
+/// Which `Checked` table a generic `deref` fn's site fills in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DerefTable {
+    Recv,
+    Coerce,
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -622,6 +634,11 @@ pub enum Coerce {
     /// `&dyn Super` (trait upcasting, or dropping auto traits). The
     /// payload is the target reference type.
     Unsize(Ty),
+    /// A deref coercion through user `Deref` impls (`&name` to `&str`
+    /// for `Name: Deref<Target = str>`): the steps are in
+    /// `Checked::deref_coerce`; the payload is the target reference
+    /// type.
+    UserDeref(Ty),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,6 +723,9 @@ pub struct Checked<'g> {
     /// (`method_via_user_deref`), by call expression; a chain of impls
     /// records one entry per step, innermost first.
     pub deref_recv: Vec<(ExprId, DerefRecv)>,
+    /// The steps of each `Coerce::UserDeref`, by coerced expression,
+    /// innermost first (as `deref_recv`).
+    pub deref_coerce: Vec<(ExprId, DerefRecv)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
@@ -763,6 +783,10 @@ impl Checked<'_> {
     /// first (a chain `W -> N -> M` records the inner steps first).
     pub fn deref_recv(&self, e: ExprId) -> Vec<&DerefRecv> {
         self.deref_recv.iter().rev().filter(|(x, _)| *x == e).map(|(_, d)| d).collect()
+    }
+    /// The steps of a `Coerce::UserDeref` on `e`, outermost first.
+    pub fn deref_coerce(&self, e: ExprId) -> Vec<&DerefRecv> {
+        self.deref_coerce.iter().filter(|(x, _)| *x == e).map(|(_, d)| d).collect()
     }
 }
 
@@ -901,10 +925,11 @@ struct Ctx<'p, 'a> {
     /// User `Deref` steps the method lookup is inside (a bound on
     /// `Deref` chains).
     deref_depth: u8,
-    /// Generic `deref` fns of `out.deref_recv` entries: the entry,
-    /// the template, and its impl args (zonked into the entry and
-    /// requested as instances at body end).
-    deref_sites: Vec<(usize, LocalDefId, Vec<GenericArg>)>,
+    /// Generic `deref` (or `deref_mut`, the flag) fns of
+    /// `out.deref_recv` entries: the entry, the template, and its impl
+    /// args (zonked into the entry and requested as instances at body
+    /// end).
+    deref_sites: Vec<(DerefTable, usize, bool, LocalDefId, Vec<GenericArg>)>,
     /// Or-pattern alternatives being checked against the first
     /// alternative's bindings, innermost last (see the `Pat::Or`
     /// arm of `pattern_mode`).
@@ -1027,6 +1052,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             trait_picks: Vec::new(),
             vtable_requests: Vec::new(),
             deref_recv: Vec::new(),
+            deref_coerce: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
             reads: if p.record_reads { Reads::new() } else { Reads::off() },
@@ -3455,6 +3481,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             _ => {
                 if !self.unify(found, expected) {
+                    // A deref coercion through user `Deref` impls (`&name`
+                    // where `&str` is wanted).
+                    if let (Some(ex), TyKind::Ref(_, fm, _), TyKind::Ref(_, em, y)) = (e, fk, ek)
+                        && (!em.is_mut() || fm.is_mut())
+                        && let Some(c) = self.user_deref_coercion(ex, found, y, em.is_mut(), span)
+                    {
+                        let i = self.ei(ex);
+                        self.out.coerce[i] = c;
+                        return true;
+                    }
                     if self.coerce_deep(found, expected, e) {
                         // The whole value now has the expected type; the
                         // inner coercions recorded on its parts build it.
@@ -3884,11 +3920,97 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let target_ref = self.tys.mk_ref(mutable, target);
         let idx = self.out.deref_recv.len();
-        self.out.deref_recv.push((e, DerefRecv { before, f, args: Vec::new(), mutable, target_ref }));
+        self.out.deref_recv.push((e, DerefRecv { before, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref }));
         if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
-            self.deref_sites.push((idx, f, impl_args));
+            self.deref_sites.push((DerefTable::Recv, idx, false, f, impl_args));
         }
         Some(ret)
+    }
+
+    /// One user `Deref` step of a place (a field access through it, or
+    /// an explicit `*w`): records the impl's `deref`, and its
+    /// `deref_mut` when `DerefMut` holds, for `e` after `before`
+    /// builtin derefs; lowering picks by the place's use. Returns the
+    /// target type; None when `base` has no written `Deref` impl.
+    fn record_place_deref(&mut self, e: ExprId, base: Ty, before: u8, span: Span) -> Option<Ty> {
+        let lang = self.p.gx.lang;
+        if self.tys.local_adt(base).is_none() {
+            return None;
+        }
+        let (f, target, args) = self.user_deref_fn(lang.deref, base, "deref", span)?;
+        let (f_mut, args_mut) = match self.user_deref_fn(lang.deref_mut, base, "deref_mut", span) {
+            Some((g, _, a)) => (Some(g), a),
+            None => (None, Vec::new()),
+        };
+        let target_ref = self.tys.mk_ref(false, target);
+        let idx = self.out.deref_recv.len();
+        self.out.deref_recv.push((e, DerefRecv { before, f, args: Vec::new(), f_mut, args_mut: Vec::new(), mutable: false, target_ref }));
+        let is_template = |cx: &Self, f: LocalDefId| cx.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
+        if is_template(self, f) {
+            self.deref_sites.push((DerefTable::Recv, idx, false, f, args));
+        }
+        if let Some(g) = f_mut
+            && is_template(self, g)
+        {
+            self.deref_sites.push((DerefTable::Recv, idx, true, g, args_mut));
+        }
+        Some(target)
+    }
+
+    /// A deref coercion through user `Deref` impls (rustc's coercion
+    /// autoderef): from `found` (a reference to a user type, through
+    /// any reference layers) by one or more impl steps to `&y` (`&mut
+    /// y` through `DerefMut` when `mutable`). Records the steps on `e`
+    /// and returns the coercion; None when no chain reaches `y`
+    /// (nothing is bound then).
+    fn user_deref_coercion(&mut self, e: ExprId, found: Ty, y: Ty, mutable: bool, span: Span) -> Option<Coerce> {
+        let lang = self.p.gx.lang;
+        let mut t = self.resolve(found);
+        let mut before = 0u8;
+        while let TyKind::Ref(_, _, inner) = self.kind(t) {
+            t = self.resolve(inner);
+            before += 1;
+        }
+        if before == 0 || self.tys.local_adt(t).is_none() {
+            return None;
+        }
+        // (before, fn, args, target) per step.
+        let mut steps: Vec<(u8, LocalDefId, Vec<GenericArg>, Ty)> = Vec::new();
+        let snap = self.snapshot_vars();
+        let obl_len = self.obl_len();
+        for _ in 0..4 {
+            let (trait_def, fname) = if mutable { (lang.deref_mut, "deref_mut") } else { (lang.deref, "deref") };
+            if self.tys.local_adt(t).is_none() {
+                break;
+            }
+            let Some((f, _, args)) = self.user_deref_fn(trait_def, t, fname, span) else { break };
+            // `deref_mut` returns `&mut Target`: the target is the
+            // same as `deref`'s.
+            let Some((_, target, _)) = self.user_deref_fn(lang.deref, t, "deref", span) else { break };
+            steps.push((before, f, args, target));
+            let inner_snap = self.snapshot_vars();
+            if self.unify(target, y) {
+                let idx0 = self.out.deref_coerce.len();
+                for (i, (b, f, args, target)) in steps.into_iter().enumerate() {
+                    let target_ref = self.tys.mk_ref(mutable, target);
+                    let template = self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
+                    self.out.deref_coerce.push((
+                        e,
+                        DerefRecv { before: b, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref },
+                    ));
+                    if template {
+                        self.deref_sites.push((DerefTable::Coerce, idx0 + i, false, f, args));
+                    }
+                }
+                return Some(Coerce::UserDeref(self.tys.mk_ref(mutable, y)));
+            }
+            self.rollback_vars(inner_snap);
+            t = target;
+            before = 1;
+        }
+        self.rollback_vars(snap);
+        self.obl_truncate(obl_len);
+        None
     }
 
     /// The written impl of `Deref` (or `DerefMut`) for `base`: its
@@ -4768,26 +4890,37 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // ARCH 2.12 run point: a field access must know the base type.
                 self.run_obligations(false);
                 let bt = self.deep(bt);
-                let (derefs, inner) = self.autoderef_smart(bt);
-                if let Some(a) = self.tys.local_adt(inner) {
-                    let adt = p.adt(a);
-                    if !adt.is_enum
-                        && let Some(i) = adt.variants[0].fields.iter().position(|f| f.name == *name)
-                    {
-                        self.check_field_vis(a, *name, span);
-                        self.set_res(e, Res::Field { derefs, index: i as u32 });
-                        // A generic Adt's fields are the template's,
-                        // substituted with this value's args (the
-                        // instance AdtDef already has them concrete).
-                        let fty = adt.variants[0].fields[i].ty;
-                        return match self.tys.adt_parts(inner) {
-                            Some((_, args)) if args != EMPTY_ARGS && self.tys.flags(fty).contains_param() => {
-                                let gargs: Vec<GenericArg> = self.tys.args(args).to_vec();
-                                self.subst_norm(fty, &gargs, span)
-                            }
-                            _ => fty,
-                        };
+                let (mut derefs, mut inner) = self.autoderef_smart(bt);
+                for step in 0..=4 {
+                    if let Some(a) = self.tys.local_adt(inner) {
+                        let adt = p.adt(a);
+                        if !adt.is_enum
+                            && let Some(i) = adt.variants[0].fields.iter().position(|f| f.name == *name)
+                        {
+                            self.check_field_vis(a, *name, span);
+                            self.set_res(e, Res::Field { derefs, index: i as u32 });
+                            // A generic Adt's fields are the template's,
+                            // substituted with this value's args (the
+                            // instance AdtDef already has them concrete).
+                            let fty = adt.variants[0].fields[i].ty;
+                            return match self.tys.adt_parts(inner) {
+                                Some((_, args)) if args != EMPTY_ARGS && self.tys.flags(fty).contains_param() => {
+                                    let gargs: Vec<GenericArg> = self.tys.args(args).to_vec();
+                                    self.subst_norm(fty, &gargs, span)
+                                }
+                                _ => fty,
+                            };
+                        }
                     }
+                    // rustc's autoderef goes on through a user `Deref`
+                    // impl (`info.file_index` on a type that derefs to
+                    // the struct holding it).
+                    if step == 4 {
+                        break;
+                    }
+                    let Some(target) = self.record_place_deref(e, inner, derefs, span) else { break };
+                    let tref = self.tys.mk_ref(false, target);
+                    (derefs, inner) = self.autoderef_smart(tref);
                 }
                 if !matches!(self.kind(inner), TyKind::Error) {
                     let tn = self.tn(bt);
@@ -5012,6 +5145,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     TyKind::Ref(_, _, x) => x,
                     TyKind::Error => ERROR,
                     _ if self.tys.smart_elem(t).is_some() => self.tys.smart_elem(t).unwrap_or(ERROR),
+                    // `*w` through a user `Deref` impl.
+                    _ if let Some(target) = self.record_place_deref(e, t, 0, span) => target,
                     _ => {
                         let tn = self.tn(t);
                         self.err(
@@ -14783,7 +14918,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         // Generic user `deref` fns of method receivers, as call sites.
-        for (idx, template, args) in std::mem::take(&mut self.deref_sites) {
+        for (table, idx, is_mut, template, args) in std::mem::take(&mut self.deref_sites) {
             let zargs: Vec<GenericArg> = args
                 .iter()
                 .map(|&g| match g {
@@ -14792,8 +14927,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     other => other,
                 })
                 .collect();
-            if let Some(entry) = self.out.deref_recv.get_mut(idx) {
-                entry.1.args = zargs.clone();
+            let entries = match table {
+                DerefTable::Recv => &mut self.out.deref_recv,
+                DerefTable::Coerce => &mut self.out.deref_coerce,
+            };
+            if let Some(entry) = entries.get_mut(idx) {
+                if is_mut {
+                    entry.1.args_mut = zargs.clone();
+                } else {
+                    entry.1.args = zargs.clone();
+                }
             }
             self.out.inst_requests.push((template, zargs));
         }

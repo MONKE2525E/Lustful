@@ -1,6 +1,5 @@
-// expect: L0113
-// Valid Rust: an explicit `*w` through a user `Deref` impl. lust takes
-// user `Deref` only in method call autoderef so far.
+// An explicit `*w` through a user `Deref` impl, next to an inherent
+// method of the same name on the outer type (it wins without the `*`).
 use std::ops::Deref;
 struct N;
 impl N {

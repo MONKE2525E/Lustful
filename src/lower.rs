@@ -431,7 +431,12 @@ impl<'p, 'a> Lower<'p, 'a> {
                 None => Place::local(self.local_map[l as usize]),
             },
             (Expr::Field { base, .. }, Res::Field { derefs, index }) => {
-                let b = self.place(*base);
+                // Through a user `Deref` impl, the field is on the target.
+                let span = self.span(e);
+                let b = match self.deref_steps(e, *base, span) {
+                    Some(root) => root,
+                    None => self.place(*base),
+                };
                 Self::derefs(b, derefs).project(Proj::Field(index))
             }
             (Expr::TupleField { base, .. }, Res::Field { derefs, index }) => {
@@ -483,10 +488,19 @@ impl<'p, 'a> Lower<'p, 'a> {
                     b
                 };
                 let i = self.temp(USIZE);
+                // The index is a value, not part of the mutable place.
+                let saved = std::mem::take(&mut self.mut_index);
                 self.expr_into(*index, Some(&Place::local(i)));
+                self.mut_index = saved;
                 b.project(Proj::Index(i))
             }
-            (Expr::Deref(inner), _) => self.place(*inner).deref(),
+            (Expr::Deref(inner), _) => {
+                let span = self.span(e);
+                match self.deref_steps(e, *inner, span) {
+                    Some(root) => root.deref(),
+                    None => self.place(*inner).deref(),
+                }
+            }
             // A static is a place of its own (W-BORROW): reach it through
             // its address, as `&STATIC` does, never through a copy in a
             // temporary. A borrow of it is then `'static`, and a move out
@@ -590,6 +604,14 @@ impl<'p, 'a> Lower<'p, 'a> {
                 if m { Operand::Move(Place::local(tmp)) } else { Operand::Copy(Place::local(tmp)) }
             }
             Coerce::Unsize(target) => self.unsize(op, ty, target, span),
+            // Through user `Deref` impls: the coerced reference's place,
+            // then each impl's `deref` (or `deref_mut`).
+            Coerce::UserDeref(target) => {
+                let steps: Vec<crate::check::DerefRecv> = self.ck.deref_coerce(e).into_iter().cloned().collect();
+                let place = self.op_place(op, ty, span);
+                let root = self.apply_deref_steps(place, ty, steps, span);
+                if matches!(self.kind(target), TyKind::Ref(_, m, _) if m.is_mut()) { Operand::Move(root) } else { Operand::Copy(root) }
+            }
         }
     }
 
@@ -601,7 +623,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         match self.ck.coerce(e) {
             Coerce::None => ty,
             Coerce::StrFromString => REF_STR,
-            Coerce::Unsize(t) => t,
+            Coerce::Unsize(t) | Coerce::UserDeref(t) => t,
             Coerce::Deref(n) => self.peel(ty, n),
             Coerce::BoxToRef(n, m) => {
                 let elem = self.peel(ty, n);
@@ -704,6 +726,48 @@ impl<'p, 'a> Lower<'p, 'a> {
         let t = self.temp(rt);
         self.assign(Place::local(t), Rvalue::DynUpcast { ptr: recv, path }, span);
         if mutable { Operand::Move(Place::local(t)) } else { Operand::Copy(Place::local(t)) }
+    }
+
+    /// The user `Deref` steps check recorded for `e` (a method call's
+    /// receiver, a field access base, or an explicit `*x`), applied to
+    /// the place of `input`. None when `e` has no step.
+    fn deref_steps(&mut self, e: ExprId, input: ExprId, span: Span) -> Option<Place> {
+        let steps: Vec<crate::check::DerefRecv> = self.ck.deref_recv(e).into_iter().cloned().collect();
+        let first = steps.first()?;
+        let mutable = first.mutable || (first.f_mut.is_some() && self.mut_index > 0);
+        let pl = if mutable { self.place_for_mut(input) } else { self.place(input) };
+        let ty = self.ty(input);
+        Some(self.apply_deref_steps(pl, ty, steps, span))
+    }
+
+    /// Applies user `Deref` steps outermost first to `start` (of type
+    /// `start_ty`): borrow the step's input, call the impl's `deref`
+    /// (or `deref_mut`: a step check fixed as mutable, or a place step
+    /// under `place_for_mut`), and go on from the `&Target` it returns.
+    /// Returns that last reference's place.
+    fn apply_deref_steps(&mut self, start: Place, start_ty: Ty, steps: Vec<crate::check::DerefRecv>, span: Span) -> Place {
+        let (mut root, mut root_ty) = (start, start_ty);
+        for dr in steps {
+            let place_mut = dr.f_mut.is_some() && self.mut_index > 0;
+            let mutable = dr.mutable || place_mut;
+            let base = Self::derefs(root, dr.before);
+            let base_ty = self.peel(root_ty, dr.before);
+            let rt = self.ref_ty(mutable, base_ty);
+            let r = self.temp(rt);
+            self.assign(Place::local(r), Rvalue::Ref(mutable, base), span);
+            let (f, args) = match dr.f_mut {
+                Some(g) if place_mut => (g, dr.args_mut.clone()),
+                _ => (dr.f, dr.args.clone()),
+            };
+            let f = if args.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &args).unwrap_or(f) };
+            let target = self.peel(dr.target_ref, 1);
+            let tt = self.ref_ty(mutable, target);
+            let t = self.temp(tt);
+            let arg = if mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
+            self.call_into(CallTarget::Fn(f), vec![arg], Place::local(t), span);
+            (root, root_ty) = (Place::local(t), tt);
+        }
+        root
     }
 
     fn op_place(&mut self, op: Operand, ty: Ty, span: Span) -> Place {
@@ -2556,31 +2620,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         // Through a user `Deref` impl (check's `DerefRecv`): borrow the
         // receiver, call the impl's `deref` (or `deref_mut`), and apply
         // the call's derefs and autoref to the `&Target` it returns.
-        // A chain of impls (`W -> N -> M`) applies each step to the
-        // `&Target` the previous one returned.
-        let steps: Vec<crate::check::DerefRecv> = self.ck.deref_recv(e).into_iter().cloned().collect();
-        let mut root: Option<Place> = None;
-        for dr in steps {
-            let (base, base_ty) = match &root {
-                Some(pl) => (Self::derefs(pl.clone(), dr.before), self.peel(self.body.locals[pl.local as usize].ty, dr.before)),
-                None => {
-                    let pl = if dr.mutable { self.place_for_mut(recv) } else { self.place(recv) };
-                    (Self::derefs(pl, dr.before), self.peel(self.ty(recv), dr.before))
-                }
-            };
-            let rt = self.ref_ty(dr.mutable, base_ty);
-            let r = self.temp(rt);
-            self.assign(Place::local(r), Rvalue::Ref(dr.mutable, base), span);
-            let f = if dr.args.is_empty() {
-                dr.f
-            } else {
-                crate::check::generics::instance_for(self.p, &self.body.tys, dr.f, &dr.args).unwrap_or(dr.f)
-            };
-            let t = self.temp(dr.target_ref);
-            let arg = if dr.mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
-            self.call_into(CallTarget::Fn(f), vec![arg], Place::local(t), span);
-            root = Some(Place::local(t));
-        }
+        let root = self.deref_steps(e, recv, span);
         let root_ty = match &root {
             Some(pl) => self.body.locals[pl.local as usize].ty,
             None => self.ty(recv),

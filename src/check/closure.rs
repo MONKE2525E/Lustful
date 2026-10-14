@@ -635,6 +635,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn cap_cat(&mut self, e: ExprId) -> Cat {
         let p = self.p;
         let ety = self.out.expr_ty[self.ei(e)];
+        // A place through a user `Deref` is the value of its `deref`
+        // call, with the base borrowed (`cap_walk` records that borrow).
+        if matches!(p.ast.expr(e), Expr::Field { .. } | Expr::Deref(_)) && self.out.deref_recv.iter().any(|(x, _)| *x == e) {
+            return Cat::Rvalue;
+        }
         match (p.ast.expr(e), self.out.expr_res[self.ei(e)]) {
             (Expr::Path(_) | Expr::SelfValue, Res::Local(l)) => Cat::Place(CPlace { root: l, projs: Vec::new(), ty: self.out.locals[l as usize].ty }),
             (Expr::Field { base, .. } | Expr::TupleField { base, .. }, Res::Field { derefs, index }) => match self.cap_cat(*base) {
@@ -872,6 +877,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Coerce::Deref(n) => (n as usize + 1, CaptureMode::Ref),
             Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => (1, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
             Coerce::BoxToRef(n, m) => (n as usize, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
+            // A deref coercion through user `Deref` impls borrows the
+            // place below the reference for the first impl's call.
+            Coerce::UserDeref(t) => {
+                let before = self.out.deref_coerce.iter().find(|(x, _)| *x == e).map_or(1, |(_, d)| d.before);
+                (before as usize, if matches!(self.kind(t), TyKind::Ref(_, m, _) if m.is_mut()) { CaptureMode::MutRef } else { CaptureMode::Ref })
+            }
             // An owning unsizing (`Box<T>` to `Box<dyn Tr>`) moves the
             // value: the plain consume.
             Coerce::Unsize(t) if !matches!(self.kind(t), TyKind::Ref(..)) => return false,
@@ -1090,6 +1101,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 for &a in args {
                     self.cap_consume(a, w);
                 }
+            }
+            // Through a user `Deref` impl: `deref(&base)`, or
+            // `deref_mut(&mut base)` in a mutable use.
+            Expr::Field { base: inner, .. } | Expr::Deref(inner)
+                if let Some((before, has_mut)) =
+                    self.out.deref_recv.iter().rev().find(|(x, _)| *x == e).map(|(_, d)| (d.before, d.f_mut.is_some())) =>
+            {
+                let mutable = mut_ctx && has_mut;
+                let span = self.span(*inner);
+                match self.cap_cat(*inner) {
+                    Cat::Place(mut pl) => {
+                        let mut ok = true;
+                        for _ in 0..before {
+                            ok &= self.cap_deref(&mut pl);
+                        }
+                        if ok {
+                            let m = if mutable { CaptureMode::MutRef } else { CaptureMode::Ref };
+                            self.cap_use(pl, m, span, w);
+                        } else {
+                            self.cap_bad_if_upvar(*inner, w);
+                        }
+                    }
+                    Cat::Bad => self.cap_bad_if_upvar(*inner, w),
+                    Cat::Rvalue => {}
+                }
+                self.cap_walk(*inner, mutable, w);
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.cap_walk(*base, mut_ctx, w),
             Expr::Deref(inner) => self.cap_walk(*inner, mut_ctx, w),
