@@ -358,6 +358,13 @@ pub fn needs_resolve_lexed(lexed: &lexer::Lexed, interner: &Interner) -> bool {
             }
             Tok::Const if matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Ident(_)) | Some(Tok::Underscore)) => return true,
             Tok::Type => return true,
+            // A root type named like a std prelude type takes a flat name
+            // only the resolver gives (`flat_name`).
+            Tok::Struct | Tok::Enum | Tok::Trait
+                if matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Ident(s)) if PRELUDE_TYPES.contains(&interner.get(s))) =>
+            {
+                return true;
+            }
             Tok::Pound => {
                 // `#[cfg`, `#[cfg_attr`, `#[path`, `#[macro_use`, inner forms too.
                 let mut j = i + 1;
@@ -3557,10 +3564,22 @@ fn strip_fields(fs: &mut Vec<FieldDef>, input: &OneInput, strings: &[String], in
 /// The flat name of a def in a module: the crate's flat prefix (empty
 /// for the selected crate, a stable-hash prefix for a source
 /// dependency), then the module path joined with `$`, then the name.
-/// The selected crate's root keeps plain names, as before.
+/// The selected crate's root keeps plain names, except names of the
+/// std prelude types the checker knows as builtins (`PRELUDE_TYPES`):
+/// those become `crate$Name`, so a root `enum Option` is never read as
+/// std's `Option` (or the reverse, in modules that do not import it).
+/// Std prelude type names the checker resolves as builtins when they
+/// are written plainly. A crate-root item of one of these names gets a
+/// `crate$` flat name (`flat_name`), and its file goes through the
+/// resolver (`needs_resolve_lexed`).
+pub(crate) const PRELUDE_TYPES: &[&str] = &["Option", "Result", "Vec", "String", "Box"];
+
 fn flat_name(tables: &ResolvedTables, flat_prefix: &str, module: ModuleId, name: Sym, interner: &Interner) -> Sym {
     let path = &tables.modules[module.0 as usize].path;
     if flat_prefix.is_empty() && path.is_empty() {
+        if PRELUDE_TYPES.contains(&interner.get(name)) {
+            return interner.intern(&format!("crate${}", interner.get(name)));
+        }
         return name;
     }
     let mut s = String::from(flat_prefix);
@@ -3982,10 +4001,16 @@ fn collect_assoc_vis(ast: &Ast, items: &[Item], module: ModuleId, interner: &Int
 // into a non-std extern crate is L0505: cross-crate item resolution is
 // not supported yet, and a false accept would be worse.
 
-/// One lexical frame in a body walk.
-#[derive(Default)]
+/// One lexical frame in a body walk. A block's frame holds its items
+/// and `use`s from the block's start (`Rewrite::block` binds them
+/// first), so they cover the whole block, as in rustc.
+#[derive(Default, Clone)]
 struct Frame {
     locals: Vec<Sym>,
+    /// Value names of the block's own items (`fn`, `const`, `static`).
+    /// A path that names one stays written: check resolves it through
+    /// its block item scopes, and it hides module items of the name.
+    items: Vec<Sym>,
     /// Function-local imports: (name, namespace index) to target.
     imports: FxMap<(Sym, usize), LocalBind>,
     /// Function-local `use std::... [as Name]` imports, in the
@@ -4001,6 +4026,17 @@ struct Frame {
 enum LocalBind {
     Target(Target),
     Ambiguous,
+}
+
+/// What the innermost frame that knows a path's first segment says
+/// (`Rewrite::frame_hit`).
+enum FrameHit {
+    /// A local variable or a block item: the path stays written.
+    Local,
+    /// A function-local `use` of a crate item (or an ambiguous glob).
+    Import(LocalBind),
+    /// A function-local `use std::...`: the canonical std path.
+    Std(Vec<Sym>),
 }
 
 struct Rewrite<'a> {
@@ -4213,17 +4249,23 @@ impl Rewrite<'_> {
 
     /// Rewrites one fn's signature types and body.
     fn fn_def(&mut self, ast: &mut Ast, def: &mut FnDef, module: ModuleId) {
+        self.fn_def_in(ast, def, module, &[]);
+    }
+
+    /// `fn_def` for a fn whose signature and body also see `outer`
+    /// (the item frames of the blocks around a nested fn).
+    fn fn_def_in(&mut self, ast: &mut Ast, def: &mut FnDef, module: ModuleId, outer: &[Frame]) {
         let mark = self.push_params(&def.generics);
         self.generics(ast, &mut def.generics, &mut def.where_clause, module);
         for p in &def.params {
             let t = p.ty;
-            self.ty(ast, t, module, &[]);
+            self.ty(ast, t, module, outer);
         }
         if let Some(t) = def.ret {
-            self.ty(ast, t, module, &[]);
+            self.ty(ast, t, module, outer);
         }
         if let Some(body) = def.body {
-            let mut scopes = vec![Frame::default()];
+            let mut scopes = if outer.is_empty() { vec![Frame::default()] } else { outer.to_vec() };
             let mut frame = Frame::default();
             for p in &def.params {
                 match p.pat {
@@ -4268,57 +4310,107 @@ impl Rewrite<'_> {
         }
     }
 
-    /// True when `name` is a local in any open frame.
-    fn is_local(scopes: &[Frame], name: Sym) -> bool {
-        scopes.iter().rev().any(|f| f.locals.contains(&name))
+    /// True when `name` is a local or a block item in any open frame:
+    /// check resolves a written path of that name to it first.
+    fn frames_bind(scopes: &[Frame], name: Sym) -> bool {
+        scopes.iter().rev().any(|f| f.locals.contains(&name) || f.items.contains(&name))
     }
 
-    /// Resolves a path with lexical scopes first. `Done` from a local
-    /// variable is reported as Absent with the `local` flag set through
-    /// the return: callers leave the path written.
-    fn resolve(&self, segs: &[Sym], ns: Namespace, module: ModuleId, scopes: &[Frame]) -> (PathRes, bool) {
-        if segs.len() == 1 && ns != Namespace::Type && Self::is_local(scopes, segs[0]) {
-            return (PathRes::Absent, true);
+    /// The innermost frame binding of a path's first segment, as
+    /// rustc's ribs: frames from the innermost out, and in each one
+    /// its locals, then its items, then its `use`s. The first segment
+    /// of a longer path reads the type namespace.
+    fn frame_hit(&self, segs: &[Sym], ns: Namespace, scopes: &[Frame]) -> Option<FrameHit> {
+        let &first = segs.first()?;
+        if matches!(self.interner.get(first), "crate" | "self" | "super" | "Self" | "::") {
+            return None;
         }
-        // Function-local imports answer for the first segment.
-        if !segs.is_empty() {
-            let first = segs[0];
-            let plain = self.interner.get(first);
-            if !matches!(plain, "crate" | "self" | "super" | "Self") {
-                for frame in scopes.iter().rev() {
-                    if let Some(b) = frame.imports.get(&(first, ns_index(ns))) {
-                        return match b {
-                            LocalBind::Ambiguous => (PathRes::Ambiguous, false),
-                            LocalBind::Target(t) => {
-                                if segs.len() == 1 {
-                                    (PathRes::Done(*t), false)
-                                } else {
-                                    match self.tables.walk_from(module, *t, &segs[1..], ns, self.interner) {
-                                        PathRes::Partial(t2, rest) => (PathRes::Partial(t2, rest + 1), false),
-                                        other => (other, false),
-                                    }
-                                }
-                            }
-                        };
+        let asked = if segs.len() > 1 { Namespace::Type } else { ns };
+        let key = (first, ns_index(asked));
+        for frame in scopes.iter().rev() {
+            if asked != Namespace::Type && (frame.locals.contains(&first) || frame.items.contains(&first)) {
+                return Some(FrameHit::Local);
+            }
+            if let Some(b) = frame.imports.get(&key) {
+                return Some(FrameHit::Import(*b));
+            }
+            if let Some(p) = frame.std_imports.get(&key) {
+                return Some(FrameHit::Std(p.clone()));
+            }
+        }
+        None
+    }
+
+    /// Resolves a path with lexical scopes first. A local variable or
+    /// block item is reported as Absent with the `local` flag set:
+    /// callers leave the path written. A function-local std import
+    /// is Absent too (not local): `expand_std_alias` rewrites it.
+    fn resolve(&self, segs: &[Sym], ns: Namespace, module: ModuleId, scopes: &[Frame]) -> (PathRes, bool) {
+        match self.frame_hit(segs, ns, scopes) {
+            Some(FrameHit::Local) => (PathRes::Absent, true),
+            Some(FrameHit::Std(_)) => (PathRes::Absent, false),
+            Some(FrameHit::Import(LocalBind::Ambiguous)) => (PathRes::Ambiguous, false),
+            Some(FrameHit::Import(LocalBind::Target(t))) => {
+                if segs.len() == 1 {
+                    (PathRes::Done(t), false)
+                } else {
+                    match self.tables.walk_from(module, t, &segs[1..], ns, self.interner) {
+                        PathRes::Partial(t2, rest) => (PathRes::Partial(t2, rest + 1), false),
+                        other => (other, false),
                     }
                 }
             }
+            None => (self.tables.resolve_path(module, segs, ns, PathMode::Lexical, false, self.interner), false),
         }
-        (self.tables.resolve_path(module, segs, ns, PathMode::Lexical, false, self.interner), false)
+    }
+
+    /// True when the checker would read the rewritten head `flat` of a
+    /// path to `def` as something else at this site. It reads a written
+    /// name as a local or block item first (value paths of one segment),
+    /// then in the module's own table, and only then in the flat index.
+    /// A crate-root item keeps its plain name as its flat name, so
+    /// `super::f` from a module with its own `f`, or `crate::f` under a
+    /// local `f`, would land on the nearer binding.
+    fn misread(&self, flat: Sym, def: DefId, ns: Namespace, single: bool, module: ModuleId, scopes: &[Frame]) -> bool {
+        if single && ns == Namespace::Value && Self::frames_bind(scopes, flat) {
+            return true;
+        }
+        let ns = if single { ns } else { Namespace::Type };
+        match self.tables.lookup(module, ns, flat) {
+            Some(BindState::One(b)) => self.tables.target_def(b.target) != def,
+            Some(BindState::Ambiguous) => true,
+            None => false,
+        }
+    }
+
+    /// The L0505 reject for a path `misread` flags (a false reject).
+    fn push_misread(&mut self, span: Span) {
+        self.diags.push(crate::diag::not_yet(
+            "L0505",
+            span,
+            "a path to a crate-root item whose name a nearer item, import, or local also binds",
+        ));
     }
 
     /// Applies a resolution to a written path in place. `span` is the
-    /// path's own span for diagnostics.
-    fn apply(&mut self, segs: &mut Vec<PathSeg>, res: PathRes, span: Span, module: ModuleId) {
+    /// path's own span for diagnostics; `ns` and `scopes` are the
+    /// namespace and frames the checker will read the rewritten path in.
+    fn apply(&mut self, segs: &mut Vec<PathSeg>, res: PathRes, span: Span, module: ModuleId, ns: Namespace, scopes: &[Frame]) {
         match res {
             PathRes::Done(Target::Def(def)) => {
                 if let Some(info) = self.tables.def_info.get(&def) {
+                    if self.misread(info.flat, def, ns, true, module, scopes) {
+                        self.push_misread(span);
+                    }
                     let args = segs.last().map(|s| s.args.clone()).unwrap_or_default();
                     *segs = vec![PathSeg { name: info.flat, args }];
                 }
             }
             PathRes::Done(Target::Variant(def, variant)) => {
                 if let Some(info) = self.tables.def_info.get(&def) {
+                    if self.misread(info.flat, def, ns, false, module, scopes) {
+                        self.push_misread(span);
+                    }
                     // Written generic args stay on their segment
                     // (`E::<u8>::V`, `V::<u8>`): the checker reads them.
                     let n = segs.len();
@@ -4342,6 +4434,9 @@ impl Rewrite<'_> {
             PathRes::Partial(Target::Def(def), rest) => {
                 if rest + 1 == segs.len() {
                     if let Some(info) = self.tables.def_info.get(&def) {
+                        if self.misread(info.flat, def, ns, false, module, scopes) {
+                            self.push_misread(span);
+                        }
                         let item_seg = segs[rest].clone();
                         // Associated fn visibility (variants take the
                         // enum's vis, already checked by resolution).
@@ -4410,8 +4505,19 @@ impl Rewrite<'_> {
         }
         let asked = if names.len() > 1 { Namespace::Type } else { ns };
         let asked_idx = ns_index(asked);
-        if scopes.iter().rev().any(|f| f.imports.contains_key(&(first, asked_idx))) {
-            return false;
+        // A block's std import beats module items (`use std::mem::swap;`
+        // in a body over a crate `fn swap`); a nearer frame binding of
+        // the name beats it.
+        match self.frame_hit(names, ns, scopes) {
+            Some(FrameHit::Std(path)) => {
+                if self.module_keeps_primitive(names, ns, &path) {
+                    return false;
+                }
+                Self::splice_std_path(segs, &path);
+                return true;
+            }
+            Some(_) => return false,
+            None => {}
         }
         if matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank >= 2) {
             return false;
@@ -4436,15 +4542,24 @@ impl Rewrite<'_> {
                     .next()
             });
         let Some(alias) = alias else { return false };
-        // A module import does not shadow a primitive type in a type
-        // position: `use std::str;` keeps `&str` the primitive.
-        if names.len() == 1
-            && ns == Namespace::Type
-            && crate::ty::lang::is_primitive_type_name(self.interner.get(first))
-            && crate::ty::lang::std_is_module_path(&alias.iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>())
-        {
+        if self.module_keeps_primitive(names, ns, alias) {
             return false;
         }
+        Self::splice_std_path(segs, alias);
+        true
+    }
+
+    /// A module import does not shadow a primitive type in a type
+    /// position: `use std::str;` keeps `&str` the primitive.
+    fn module_keeps_primitive(&self, names: &[Sym], ns: Namespace, alias: &[Sym]) -> bool {
+        names.len() == 1
+            && ns == Namespace::Type
+            && crate::ty::lang::is_primitive_type_name(self.interner.get(names[0]))
+            && crate::ty::lang::std_is_module_path(&alias.iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>())
+    }
+
+    /// Replaces a path's first segment with a canonical std path.
+    fn splice_std_path(segs: &mut Vec<PathSeg>, alias: &[Sym]) {
         let mut out: Vec<PathSeg> = alias.iter().map(|s| PathSeg::plain(*s)).collect();
         // Turbofish on the imported name belongs on the aliased item.
         if let Some(last) = out.last_mut() {
@@ -4452,7 +4567,6 @@ impl Rewrite<'_> {
         }
         out.extend(segs.iter().skip(1).cloned());
         *segs = out;
-        true
     }
 
     /// Rewrites one written path (segments borrowed out of the arena by
@@ -4484,7 +4598,7 @@ impl Rewrite<'_> {
                 PathRes::Partial(Target::Extern(i), _) | PathRes::Done(Target::Extern(i)) if self.tables.externs[i as usize].is_std_lib => {
                     segs.remove(0);
                 }
-                _ => self.apply(segs, res, span, module),
+                _ => self.apply(segs, res, span, module, ns, scopes),
             }
             return;
         }
@@ -4566,7 +4680,7 @@ impl Rewrite<'_> {
                     if let PathRes::Done(Target::Def(def)) = vres
                         && self.tables.def_info.get(&def).is_some_and(|i| i.kind == ResKind::Const)
                     {
-                        self.apply(segs, vres, span, module);
+                        self.apply(segs, vres, span, module, Namespace::Value, scopes);
                         return;
                     }
                 }
@@ -4598,7 +4712,7 @@ impl Rewrite<'_> {
                 });
                 return;
             }
-            self.apply(segs, res, span, module);
+            self.apply(segs, res, span, module, ns, scopes);
         }
     }
 
@@ -4667,11 +4781,24 @@ impl Rewrite<'_> {
         }
     }
 
-    /// Rewrites one block: statements in order, with `let` bindings and
-    /// function-local `use` scopes.
+    /// Rewrites one block. Its items and `use`s bind first, for the
+    /// whole block (a `use` after a call still covers the call, as in
+    /// rustc); then the bodies of its items, which see every item and
+    /// `use` of the enclosing blocks but no locals; then the
+    /// statements in order, with `let` bindings.
     fn block(&mut self, ast: &mut Ast, id: BlockId, module: ModuleId, scopes: &mut Vec<Frame>) {
         scopes.push(Frame::default());
         let stmts = std::mem::take(&mut ast.blocks[id.0 as usize].stmts);
+        let items: Vec<u32> = stmts.iter().filter_map(|s| if let Stmt::Item(i) = s { Some(*i) } else { None }).collect();
+        for &idx in &items {
+            self.stmt_item(ast, idx, module, scopes);
+        }
+        if !items.is_empty() {
+            let outer: Vec<Frame> = scopes.iter().map(|f| Frame { locals: Vec::new(), ..f.clone() }).collect();
+            for &idx in &items {
+                self.stmt_item_body(ast, idx, module, &outer);
+            }
+        }
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
             match stmt {
@@ -4697,10 +4824,7 @@ impl Rewrite<'_> {
                     self.expr(ast, expr, module, scopes);
                     out.push(Stmt::Expr { expr, semi, attrs });
                 }
-                Stmt::Item(idx) => {
-                    self.stmt_item(ast, idx, module, scopes);
-                    out.push(Stmt::Item(idx));
-                }
+                Stmt::Item(idx) => out.push(Stmt::Item(idx)),
                 Stmt::Macro { call, semi } => out.push(Stmt::Macro { call, semi }),
             }
         }
@@ -4711,9 +4835,43 @@ impl Rewrite<'_> {
         scopes.pop();
     }
 
-    /// Resolves one statement item. Only `use` reaches here today (the
-    /// parser rejects other body items); its bindings scope to the rest
-    /// of the block.
+    /// Rewrites the signature and body of one block item (a nested fn,
+    /// a const, or a static) in `outer`: the enclosing frames with
+    /// their locals dropped, since an item cannot see them.
+    fn stmt_item_body(&mut self, ast: &mut Ast, idx: u32, module: ModuleId, outer: &[Frame]) {
+        let Some(item) = ast.stmt_items.get_mut(idx as usize) else { return };
+        match &mut item.kind {
+            ItemKind::Fn(f) => {
+                let mut def = std::mem::replace(f, dummy_fn());
+                self.fn_def_in(ast, &mut def, module, outer);
+                if let ItemKind::Fn(f) = &mut ast.stmt_items[idx as usize].kind {
+                    *f = def;
+                }
+            }
+            ItemKind::Const(c) => {
+                let (ty, value) = (c.ty, c.value);
+                self.ty(ast, ty, module, outer);
+                if let Some(v) = value {
+                    let mut scopes = outer.to_vec();
+                    self.expr(ast, v, module, &mut scopes);
+                }
+            }
+            ItemKind::Static(st) => {
+                let (ty, value) = (st.ty, st.value);
+                self.ty(ast, ty, module, outer);
+                if let Some(v) = value {
+                    let mut scopes = outer.to_vec();
+                    self.expr(ast, v, module, &mut scopes);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Binds one statement item in its block's frame: a nested fn,
+    /// const, or static by its value name (`Frame::items`), a `use` by
+    /// its imports. `block` runs this for every item of the block
+    /// before any statement, so both cover the whole block.
     fn stmt_item(&mut self, ast: &mut Ast, idx: u32, module: ModuleId, scopes: &mut Vec<Frame>) {
         let Some(item) = ast.stmt_items.get(idx as usize) else { return };
         // A nested item binds its name in this block at explicit rank, so
@@ -4741,6 +4899,7 @@ impl Rewrite<'_> {
                 } else {
                     frame.explicit.push(key);
                 }
+                frame.items.push(name);
             }
         }
         let ItemKind::Use(u) = &item.kind else { return };
@@ -5151,7 +5310,7 @@ impl Rewrite<'_> {
                 match &node {
                     Pat::Lit(e) => {
                         let e = *e;
-                        let mut sc = scopes.to_vec_shallow();
+                        let mut sc = scopes.to_vec();
                         self.expr(ast, e, module, &mut sc);
                     }
                     Pat::Or(elems) | Pat::Tuple(elems) => {
@@ -5160,7 +5319,7 @@ impl Rewrite<'_> {
                         }
                     }
                     Pat::Range { lo, hi, .. } => {
-                        let mut sc = scopes.to_vec_shallow();
+                        let mut sc = scopes.to_vec();
                         if let Some(e) = lo {
                             self.expr(ast, *e, module, &mut sc);
                         }
@@ -5416,20 +5575,6 @@ fn dummy_fn() -> FnDef {
         body: None,
         exprs: (0, 0),
         pats: (0, 0),
-    }
-}
-
-/// Shallow copy of the scope stack for sub-walks that must not leak
-/// bindings (literal-pattern expressions). Frames are small.
-trait ShallowScopes {
-    fn to_vec_shallow(&self) -> Vec<Frame>;
-}
-
-impl ShallowScopes for [Frame] {
-    fn to_vec_shallow(&self) -> Vec<Frame> {
-        self.iter()
-            .map(|f| Frame { locals: f.locals.clone(), imports: f.imports.clone(), std_imports: f.std_imports.clone(), explicit: f.explicit.clone() })
-            .collect()
     }
 }
 

@@ -1769,11 +1769,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
     // Cross-item reads go through the section 8.2 query functions on
     // `Program`, which record into this body's read set. Bodies ask in
     // their own module (the root in single-file programs).
-    /// The body item a name denotes in the enclosing blocks, innermost first.
-    fn body_item_of(&self, name: Sym, ctxt: CtxtId) -> Option<crate::check::collect::BodyItem> {
+    /// The body item a name denotes in the enclosing blocks, innermost
+    /// first. Items are not hygienic in `macro_rules!` expansions (only
+    /// locals are), so the name alone matches: a macro body's `V` sees a
+    /// `const V` of the block it expands in, as in rustc.
+    fn body_item_of(&self, name: Sym) -> Option<crate::check::collect::BodyItem> {
         for layer in self.item_scopes.iter().rev() {
-            for &(n, idx) in layer.iter().rev() {
-                if n == (name, ctxt) {
+            for &((n, _), idx) in layer.iter().rev() {
+                if n == name {
                     return self.p.body_items.get(&idx).copied();
                 }
             }
@@ -7517,7 +7520,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Local(l));
                 return self.out.locals[l as usize].ty;
             }
-            match self.body_item_of(name, span.ctxt) {
+            match self.body_item_of(name) {
                 Some(crate::check::collect::BodyItem::Fn(f)) => {
                     // A nested fn used as a value is a fn item like a
                     // top-level one (its type was the error type with no
@@ -9310,7 +9313,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => return None,
         };
         if let [seg] = segs.as_slice()
-            && (self.body_item_of(seg.name, self.span(callee).ctxt).is_some() || self.binding_fn(seg.name).is_some())
+            && (self.body_item_of(seg.name).is_some() || self.binding_fn(seg.name).is_some())
         {
             return None;
         }
@@ -9428,7 +9431,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let qualified = matches!(names.as_slice(), ["std" | "core", "mem", "drop"] | ["mem", "drop"]);
             let bare = names.as_slice() == ["drop"]
                 && self.binding_fn(segs[0].name).is_none()
-                && self.body_item_of(segs[0].name, self.span(callee).ctxt).is_none();
+                && self.body_item_of(segs[0].name).is_none();
             if qualified || bare {
                 if args.len() != 1 {
                     self.err("L0105", span, "this function takes 1 argument but a different number was given", "Pass exactly one value.");
@@ -9453,7 +9456,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let res = match p.ast.expr(callee) {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;
-                match self.body_item_of(name, self.span(callee).ctxt) {
+                match self.body_item_of(name) {
                     Some(crate::check::collect::BodyItem::Fn(f)) => Res::Fn(f),
                     _ => match self.binding_fn(name) {
                         Some(f) => Res::Fn(f),
@@ -13569,7 +13572,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // expression.
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
-            && let Some(crate::check::collect::BodyItem::Const(ci)) = self.body_item_of(*name, span.ctxt)
+            && let Some(crate::check::collect::BodyItem::Const(ci)) = self.body_item_of(*name)
         {
             let c = &p.body_consts[ci as usize];
             if !matches!(

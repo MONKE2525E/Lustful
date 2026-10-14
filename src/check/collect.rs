@@ -3169,8 +3169,9 @@ pub fn collect_reuse<'a>(
         }
     }
     // Sibling visibility for nested fns: the items of the block that
-    // directly contains each nested fn.
-    for block in &ast.blocks {
+    // directly contains each nested fn, and of the blocks around it.
+    let item_blocks: Vec<&ast::Block> = ast.blocks.iter().filter(|b| b.stmts.iter().any(|s| matches!(s, ast::Stmt::Item(_)))).collect();
+    for block in &item_blocks {
         let idxs: Vec<u32> = block
             .stmts
             .iter()
@@ -3200,9 +3201,29 @@ pub fn collect_reuse<'a>(
                 }
             }
         }
+        // A nested fn also sees the items of every block around its own
+        // (item scopes are not cut by fn bodies): outer blocks first, so
+        // the innermost item of a name wins. Blocks nest by span; a block
+        // from a macro expansion keeps its own items only.
+        let mut sibs: Vec<u32> = Vec::new();
+        if block.span.ctxt == crate::diag::CtxtId::ROOT {
+            let mut outer: Vec<&ast::Block> = item_blocks
+                .iter()
+                .copied()
+                .filter(|o| {
+                    let (s, b) = (o.span, block.span);
+                    !std::ptr::eq(*o, *block) && s.ctxt == crate::diag::CtxtId::ROOT && s.file == b.file && s.lo <= b.lo && b.hi <= s.hi
+                })
+                .collect();
+            outer.sort_by_key(|o| o.span.lo);
+            for o in outer {
+                sibs.extend(o.stmts.iter().filter_map(|s| if let ast::Stmt::Item(i) = s { Some(*i) } else { None }));
+            }
+        }
+        sibs.extend(idxs.iter().copied());
         for &i in &idxs {
             if let Some(BodyItem::Fn(fid)) = p.body_items.get(&i).copied() {
-                p.fn_siblings.insert(fid, idxs.clone());
+                p.fn_siblings.insert(fid, sibs.clone());
             }
         }
     }
