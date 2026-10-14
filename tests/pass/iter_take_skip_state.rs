@@ -44,6 +44,15 @@ fn main() {
     println!("{:?} {:?}", it.nth(5), it.size_hint());
     let mut it = (W { k: 0 }).take(6).filter(|x| x % 2 == 1);
     println!("{:?} {:?}", it.nth(3), it.size_hint());
+    // Filter's `next` is `find` on its inner: a Take under it counts
+    // only yielded items, also on the last, empty pull.
+    let mut it = (W { k: 0 }).take(3).filter(|x| *x > 1).map(|x| x * 10);
+    println!("{:?} {:?}", it.nth(2), it.size_hint());
+    println!("{:?} {:?}", it.next(), it.size_hint());
+    let mut it = (W { k: 0 }).take(4).filter_map(|x| if x > 5 { Some(x) } else { None });
+    println!("{:?} {:?}", it.next(), it.size_hint());
+    let mut it = (W { k: 0 }).take(4).skip_while(|&x| x < 9);
+    println!("{:?} {:?}", it.next(), it.size_hint());
 
     let mut it = "a,b".split(',').take(5);
     println!("{:?} {:?}", it.find(|_| false), it.size_hint());

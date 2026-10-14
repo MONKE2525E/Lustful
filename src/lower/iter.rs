@@ -143,9 +143,11 @@ struct Ex<'b, 'p, 'g> {
     body: Body<'g>,
     cur: Bb,
     span: Span,
-    /// The pull is a step of std's `try_fold` (`find`, `position`,
-    /// `any`, `all`, `find_map` on a borrowed iterator), not `next`:
-    /// Take and Skip then step as their `try_fold` does (`next_in`).
+    /// The pull is a step of std's `try_fold`, not `next`: `find`,
+    /// `position`, `any`, `all`, `find_map` on a borrowed iterator,
+    /// core's `advance_by`, and the inner pulls of Filter, FilterMap,
+    /// and SkipWhile (their `next` is a `find`). Take and Skip then step
+    /// as their `try_fold` does (`next_in`).
     fold: bool,
 }
 
@@ -1515,12 +1517,16 @@ impl Ex<'_, '_, '_> {
             }
             K::Filter | K::SkipWhile => {
                 // Pull until the predicate keeps an item; rejected items
-                // drop right away.
+                // drop right away. std's `next` here is `self.iter.find(..)`
+                // (`rfind` back), so the pulls are `try_fold` steps.
                 let lp = self.block();
                 self.goto(lp);
                 self.cur = lp;
                 let t = self.local(opt);
-                self.next(f(0), a[0], Place::local(t), back)?;
+                let saved = std::mem::replace(&mut self.fold, true);
+                let pulled = self.next(f(0), a[0], Place::local(t), back);
+                self.fold = saved;
+                pulled?;
                 let (s, n) = self.switch_opt(&Place::local(t));
                 self.cur = n;
                 self.none(&dest, opt);
@@ -1559,13 +1565,17 @@ impl Ex<'_, '_, '_> {
                 self.goto(lp);
             }
             K::FilterMap => {
+                // std: `self.iter.find_map(..)`, `try_fold` steps as Filter.
                 let inner_item = self.item(a[0])?;
                 let iopt = self.body.tys.mk_option(inner_item);
                 let lp = self.block();
                 self.goto(lp);
                 self.cur = lp;
                 let t = self.local(iopt);
-                self.next(f(0), a[0], Place::local(t), back)?;
+                let saved = std::mem::replace(&mut self.fold, true);
+                let pulled = self.next(f(0), a[0], Place::local(t), back);
+                self.fold = saved;
+                pulled?;
                 let (s, n) = self.switch_opt(&Place::local(t));
                 self.cur = n;
                 self.none(&dest, opt);
