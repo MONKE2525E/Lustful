@@ -1052,6 +1052,7 @@ pub(super) fn plain_inherent_probe(
     name: Sym,
     name_span: Span,
     args: &[ExprId],
+    explicit: &[Option<GenericArg>],
 ) -> Probe {
     let p = cx.p;
     let head = Head::of(&cx.tys, probe.self_ty);
@@ -1091,6 +1092,18 @@ pub(super) fn plain_inherent_probe(
             cx.rollback_vars(snap_vars);
             cx.obl_truncate(obl_len);
             continue;
+        }
+        // A turbofish on a method that is not generic names
+        // nothing (the compat dispatch in check/mod.rs reports
+        // the same when generics are absent).
+        if !explicit.is_empty() {
+            cx.rollback_vars(snap_vars);
+            cx.obl_truncate(obl_len);
+            cx.errs.push(crate::diag::not_yet("L0721", name_span, "turbofish on method calls"));
+            for &a in args {
+                cx.expr(a, None);
+            }
+            return Probe::Failed;
         }
         cx.set_res(e, Res::Method { f, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
         cx.check_args(&params[1.min(params.len())..], args, name_span);
@@ -1293,7 +1306,7 @@ pub(super) fn generic_method_search(
                     Probe::Miss => {}
                     hit => return hit,
                 }
-                match plain_inherent_probe(cx, e, probe, derefs, name, name_span, args) {
+                match plain_inherent_probe(cx, e, probe, derefs, name, name_span, args, explicit) {
                     Probe::Miss => {}
                     hit => return hit,
                 }

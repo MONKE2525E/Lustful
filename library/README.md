@@ -230,6 +230,8 @@ source when the generic std pipeline can carry it.
 | Surface | Where | Notes |
 |---|---|---|
 | Iterators over Vec, slices, arrays, ranges, Chars (21 kinds, adapters and consumers) | ty/iter.rs, check/iter.rs, lower/iter.rs | Expanded into IR after borrowck. Pull counts, Zip, and collect capacity follow core and alloc. |
+| `vec::Drain`, `string::Drain` (`Vec::drain`, `String::drain`) and direct `next_back`/`size_hint`/`len` | ty/iter.rs kinds VecDrain/StringDrain, runtime/core.c `lust_vec_drain` | All RangeBounds argument forms with core's exact panic texts; a leaked Vec drain leaves the length at the drain start, a leaked String drain leaves the String whole. |
+| `ops::Bound<T>`, `ops::RangeBounds`, the six range kinds as values, `Range` fields and `contains`, `Range::is_empty` | check/generics.rs (synthetic Adt), ty/iter.rs range kinds | RangeBounds and DoubleEndedIterator are lang traits with synthetic impls; the open-ended kinds are not iterators here, and `Bound::copied` is unstable in 1.99. |
 | `sort`, `sort_unstable`, `binary_search` families | runtime/sort.h | C port of driftsort and ipnsort: same comparator calls and order of equal elements. |
 | `Rc`, `rc::Weak`, `RefCell` (with `Ref`/`RefMut`), `Cell` | check/cells.rs, cgen.rs | Implicit weak count; borrow panics as Rust; `take`, `into_inner`, `unwrap_or_clone`; region rules in borrowck/regions.rs. |
 | `process::ExitCode` | check/process.rs | `main` may return it, or `Result<ExitCode, E>`. |
