@@ -404,7 +404,10 @@ pub(super) fn trait_probe_for(
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
             let sel = cx.select_obligation(tr);
             let ambiguous = matches!(sel, Selection::Ambiguous);
-            let was_impl = matches!(sel, Selection::Impl { .. });
+            // A structural answer (`usize::MAX`: tuples, arrays, refs,
+            // dyn objects) has no impl record, like a synthetic impl:
+            // it counts as a lang candidate, never as a stub call.
+            let was_impl = matches!(sel, Selection::Impl { .. } | Selection::ParamEvidence(usize::MAX));
             let found: Option<(LocalDefId, Vec<GenericArg>, Option<(Ty, Ty)>)> = match sel {
                 Selection::Impl { id, args: impl_args, .. } => {
                     let rec_impl = p.gx.index.get(id);
@@ -469,7 +472,11 @@ pub(super) fn trait_probe_for(
                         }
                     }
                 }
-                Selection::ParamEvidence(_) => param_env_hit(cx, method_def, tr).map(|(l, a)| (l, a, None)),
+                // Only a real env predicate proves a call through the
+                // trait's stub. The stub of a lang method has no body (its
+                // FnInfo borrows an unrelated fn's def), so an instance that
+                // reached it would run that fn.
+                Selection::ParamEvidence(i) if i != usize::MAX => param_env_hit(cx, method_def, tr).map(|(l, a)| (l, a, None)),
                 _ => None,
             };
             let zonked_inputs: Option<Vec<Ty>> = if found.is_some() && !input_vars.is_empty() {
