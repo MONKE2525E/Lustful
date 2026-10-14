@@ -1,6 +1,6 @@
-// expect: L0641
-// Path hashes by components in std; lust has no user Hasher bound yet,
-// so Path and PathBuf are not Hash.
+// expect: L0612
+// Path hashes by components in std; lust's Path and PathBuf have no
+// Hash impl yet, so a PathBuf map key has no `Hash` (L0612).
 use std::collections::HashMap;
 use std::path::PathBuf;
 fn main() {
