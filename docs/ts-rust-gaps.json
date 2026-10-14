@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 10848,
+  "elapsed_ms": 9290,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,7 +32,7 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 7627,
+    "findings": 7624,
     "files_with_findings": 580,
     "parse_errors": 0,
     "missing_modules": 0,
@@ -56,13 +56,12 @@
     },
     {
       "root_cause": "external-crates",
-      "findings": 1787,
-      "files": 349,
+      "findings": 1784,
+      "files": 348,
       "features": [
         "ext.rustc_hash",
         "ext.indexmap",
         "ext.smallvec",
-        "ext.bumpalo",
         "ext.memchr",
         "ext.unknown_crate"
       ]
@@ -1697,69 +1696,6 @@
           "snippet": "std::collections::HashSet<RelationKey, std::hash::BuildHasherDefault<CacheKeyHasher>>",
           "scope": "active",
           "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
-    {
-      "id": "ext.bumpalo",
-      "title": "Adapter crate bumpalo 3.20.3: Bump as the leak arena",
-      "status": "unsupported",
-      "milestone": 5,
-      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-      "inventory_step": "5",
-      "root_cause": "external-crates",
-      "fix_class": "adapter",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh bumpalo. Split from ext.builtin_crates. See dependencies.json.",
-      "findings": 3,
-      "raw_uses": 3,
-      "prod_uses": 3,
-      "files": 1,
-      "prod_files": 1,
-      "prod_fns": 2,
-      "scopes": {
-        "active": 3
-      },
-      "samples": [
-        {
-          "feature": "ext.bumpalo",
-          "raw_key": "ext.type.bumpalo::Bump",
-          "file": "crates/ts_goport/src/leak_arena.rs",
-          "byte_start": 2069,
-          "byte_end": 2073,
-          "line": 42,
-          "column": 28,
-          "snippet": "Bump",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "ext.bumpalo",
-          "raw_key": "ext.type.bumpalo::Bump",
-          "file": "crates/ts_goport/src/leak_arena.rs",
-          "byte_start": 4691,
-          "byte_end": 4695,
-          "line": 117,
-          "column": 53,
-          "snippet": "Bump",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "ext.bumpalo",
-          "raw_key": "ext.type.bumpalo::Bump",
-          "file": "crates/ts_goport/src/leak_arena.rs",
-          "byte_start": 5193,
-          "byte_end": 5197,
-          "line": 131,
-          "column": 43,
-          "snippet": "Bump",
-          "scope": "active",
-          "fix_class": "adapter",
           "release_safe_rewrite": false
         }
       ]
@@ -10467,12 +10403,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.bumpalo",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 8
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/lib.rs",
@@ -18347,45 +18282,6 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.bumpalo",
-      "raw_key": "ext.type.bumpalo::Bump",
-      "file": "crates/ts_goport/src/leak_arena.rs",
-      "byte_start": 2069,
-      "byte_end": 2073,
-      "line": 42,
-      "column": 28,
-      "snippet": "Bump",
-      "scope": "active",
-      "fix_class": "adapter",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "ext.bumpalo",
-      "raw_key": "ext.type.bumpalo::Bump",
-      "file": "crates/ts_goport/src/leak_arena.rs",
-      "byte_start": 4691,
-      "byte_end": 4695,
-      "line": 117,
-      "column": 53,
-      "snippet": "Bump",
-      "scope": "active",
-      "fix_class": "adapter",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "ext.bumpalo",
-      "raw_key": "ext.type.bumpalo::Bump",
-      "file": "crates/ts_goport/src/leak_arena.rs",
-      "byte_start": 5193,
-      "byte_end": 5197,
-      "line": 131,
-      "column": 43,
-      "snippet": "Bump",
-      "scope": "active",
-      "fix_class": "adapter",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "async.await",
       "raw_key": "fn.async",
       "file": "crates/ts_goport/src/project/ata/ata.rs",
@@ -18555,7 +18451,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 7627,
+  "findings_total": 7624,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],

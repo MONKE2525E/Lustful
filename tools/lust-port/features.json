@@ -872,8 +872,8 @@
   {
    "id": "ext.bumpalo",
    "title": "Adapter crate bumpalo 3.20.3: Bump as the leak arena",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
