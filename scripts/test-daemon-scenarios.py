@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Daemon edit scenarios: every tests/daemon/<name>/ version sequence runs
 # against one warm daemon, a cold lust, and rustc. The warm answer must
-# match the cold answer (a check that rejects must give the same first
-# error code) and, when lust accepts the program, the rustc answer. This is the regression net for the dependency edges of
+# match the cold answer (a check or run that rejects must give the same
+# first error code) and, when lust accepts the program, the rustc answer. This is the regression net for the dependency edges of
 # docs/ARCH.md 8.1-8.3 (const/static values from const fns, consts in
 # patterns, derived impls under type edits, layout answers in bodies).
 #
@@ -84,7 +84,7 @@ def scenario(srcdir):
             if rustc_ok:
                 rrc, rout, _ = run([os.path.join(work, "r.bin")], work, env)
             tag = f"{name} {v}"
-            if (wrc == 0) != (crc == 0) or (wrc == 0 and wout != cout):
+            if (wrc == 0) != (crc == 0) or (wrc == 0 and wout != cout) or first_code(werr) != first_code(cerr):
                 problems.append(
                     f"{tag}: warm != cold: warm=({wrc},{wout!r},{werr[:160]!r}) "
                     f"cold=({crc},{cout!r},{cerr[:160]!r})")

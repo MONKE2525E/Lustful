@@ -56,6 +56,25 @@ fn expand_tokens(
     expand::expand_lexed_with_deps(lexed, &ctx)
 }
 
+/// True when `f` exists only after monomorphization: a generic fn
+/// instance, or a closure body inside one.
+fn post_mono(p: &collect::Program, f: LocalDefId) -> bool {
+    use crate::check::generics::FnClass;
+    let mut f = f;
+    // Closure parents were made earlier, so the chain ends; the bound only guards it.
+    for _ in 0..64 {
+        match p.gx.fn_class.get(f.0 as usize) {
+            Some(FnClass::Instance) => return true,
+            Some(FnClass::Closure) => match p.gx.closure_fns.get(&f).and_then(|c| p.gx.closures.get(c)) {
+                Some(c) => f = c.parent,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// The expansion view of `req`'s client (see `protocol::Client`): its env,
 /// and paths shown relative to the root file as the user typed it. A
 /// manifest-selected crate shows paths relative to the workspace root
@@ -2817,6 +2836,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             caches.slot_reads[slot(i)] = Some(stored);
         }
         diags.extend(results[k].1.iter().cloned());
+    }
+    // rustc stops before monomorphization once a pre-mono check fails, so an
+    // instance checked over an erroneous caller (an error-typed closure argument)
+    // must not add cascade errors ahead of the real ones.
+    if work.iter().enumerate().any(|(k, &i)| !results[k].1.is_empty() && !post_mono(&program, LocalDefId(i as u32))) {
+        diags = work
+            .iter()
+            .enumerate()
+            .filter(|&(_, &i)| !post_mono(&program, LocalDefId(i as u32)))
+            .flat_map(|(k, _)| results[k].1.iter().cloned())
+            .collect();
     }
     // A lust file is a bin crate, so check needs `main` too, as `rustc --emit=metadata`
     // does. `lust test` sets `harness`: it adds a generated `main` after this check.
