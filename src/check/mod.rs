@@ -489,6 +489,8 @@ pub enum Res {
     Static(u32),
     /// A compile-time usize constant: `size_of`, `align_of`, `offset_of!`.
     ConstUsize(u64),
+    /// A compile-time bool constant: `mem::needs_drop::<T>()` (W-STD-C).
+    ConstBool(bool),
     /// `size_of_val` of an unsized value (`[T]` or `str`): the length
     /// builtin for the argument times the element size (1 for `str`).
     SizeOfVal {
@@ -972,6 +974,10 @@ struct Ctx<'p, 'a> {
     /// the format check ran: (type, spec, span). The format test
     /// re-runs at finish (W-TRAITS-CORE).
     deferred_fmt: Vec<(Ty, FmtSpec, Span)>,
+    /// `size_of_val` / `align_of_val` calls whose pointee type held an
+    /// inference variable (call, pointee, align, span): answered at the
+    /// body end (W-STD-C).
+    deferred_layout: Vec<(ExprId, Ty, bool, Span)>,
     /// `format_args!` expressions checked as the argument of a
     /// `write_fmt` call (check/fmt.rs); any other is a reject.
     format_args_ok: Vec<ExprId>,
@@ -1249,6 +1255,7 @@ fn check_fn_mode<'p, 'a>(
         deferred_methods: Vec::new(),
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
+        deferred_layout: Vec::new(),
         format_args_ok: Vec::new(),
         deferred_clone: Vec::new(),
         deferred_string_from: Vec::new(),
@@ -7886,6 +7893,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let align = self.name(names[2]) == "align_of";
             return Some(self.layout_query(&segs[2], align, span));
         }
+        if names.len() == 3 && (names[0] == k.std || names[0] == k.core) && self.name(names[1]) == "mem" && self.name(names[2]) == "needs_drop" {
+            return Some(self.needs_drop_query(&segs[2], span));
+        }
         if names.len() == 2 && names[1] == k.from_bits {
             if names[0] == k.f64 {
                 return Some(Res::Builtin(Builtin::F64FromBits));
@@ -8296,6 +8306,43 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// A `size_of` or `align_of` query on the given turbofish type argument:
     /// the layout engine answers, or the layout reject fires (ARCH 4.4).
+    /// `mem::needs_drop::<T>()`: whether `T` has drop glue, baked in as
+    /// a constant like `size_of`. Types whose drop answer lust models
+    /// loosely (closures, iterator adapters, trait objects) reject.
+    fn needs_drop_query(&mut self, seg: &ast::PathSeg, span: Span) -> Res {
+        let args = seg.type_args();
+        if args.len() != 1 {
+            self.err("L0105", span, "this function takes one type argument", "Write `needs_drop::<Type>()`.");
+            return Res::ConstBool(false);
+        }
+        let t = self.resolve_written(args[0]);
+        let t = self.deep(t);
+        let p: &Program<'_> = self.p;
+        p.record_layout_reads(&mut self.out.reads, &self.tys, t);
+        if self.is_template_check() && self.tys.flags(t).contains_param() {
+            return Res::ConstBool(false);
+        }
+        // The question is about a written, concrete type: ask the
+        // global store (a body-local inference leftover answers None).
+        let drop = p.gx.lang.drop;
+        let drop_defs: Vec<DefId> = p
+            .gx
+            .index
+            .all_impls()
+            .filter(|(_, r)| r.trait_def == drop)
+            .filter_map(|(_, r)| p.tys.args(r.trait_ref.args).first().and_then(|g| g.as_ty()).and_then(|s| p.tys.adt_parts(s)).map(|(d, _)| d))
+            .collect();
+        let answer = if self.tys.flags(t).contains_infer() { None } else { needs_drop_answer(p, &mut self.tys, &drop_defs, t) };
+        match answer {
+            Some(b) => Res::ConstBool(b),
+            None => {
+                let tn = self.tn(t);
+                self.err("L0641", span, format!("`needs_drop` of `{tn}` is not supported yet"), "Ask about a type without closures, iterators, or trait objects.");
+                Res::ConstBool(false)
+            }
+        }
+    }
+
     fn layout_query(&mut self, seg: &ast::PathSeg, align: bool, span: Span) -> Res {
         let args = seg.type_args();
         if args.len() != 1 {
@@ -9198,7 +9245,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// the layout of the value's type, or for a dyn value the size or
     /// align word of its vtable.
     fn layout_of_val(&mut self, e: ExprId, args: &[ExprId], align: bool, span: Span) -> Ty {
-        let p = self.p;
         let what = if align { "align_of_val" } else { "size_of_val" };
         if args.len() != 1 {
             self.err("L0105", span, "this function takes 1 argument but a different number was given", "Pass exactly one reference.");
@@ -9218,6 +9264,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         };
         let inner = self.deep(inner);
+        // A literal's type that later code may still fix (`let a = 1;
+        // size_of_val(&a); let b: u64 = a;`) is read at the body end,
+        // after every constraint and the integer and float fallback.
+        if self.tys.flags(inner).contains_infer() {
+            self.deferred_layout.push((e, inner, align, span));
+            return USIZE;
+        }
+        self.layout_val_res(e, inner, align, span)
+    }
+
+    /// The `size_of_val` / `align_of_val` answer for a resolved pointee
+    /// type: `Res` of call `e`, and its type.
+    fn layout_val_res(&mut self, e: ExprId, inner: Ty, align: bool, span: Span) -> Ty {
+        let p = self.p;
         if matches!(self.kind(inner), TyKind::Dyn(..)) {
             self.set_res(e, Res::DynMeta(if align { object::VT_ALIGN } else { object::VT_SIZE }));
             return USIZE;
@@ -9569,6 +9629,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     self.err("L0105", span, "this function takes no arguments", "Write `TypeId::of::<Type>()`.");
                 }
                 generics::type_id_ty(&mut self.tys)
+            }
+            Res::ConstBool(_) => {
+                if !args.is_empty() {
+                    self.err("L0105", span, "this function takes no arguments", "Write `needs_drop::<Type>()`.");
+                }
+                BOOL
             }
             Res::Fn(f) => {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
@@ -15852,6 +15918,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 "Name the value with a turbofish such as `S::<3>`, or annotate the type.",
             );
         }
+        // Deferred layout queries: every constraint is in, so the
+        // fallback (`zonk`) gives the type rustc measures.
+        for (e, t, align, span) in std::mem::take(&mut self.deferred_layout) {
+            let t = self.zonk(t);
+            self.layout_val_res(e, t, align, span);
+        }
         // Deferred format tests, with types as bound by now.
         for (t, spec, span) in std::mem::take(&mut self.deferred_fmt) {
             let t = self.deep(t);
@@ -16136,6 +16208,52 @@ impl<'p, 'a> Ctx<'p, 'a> {
 /// through the program tables and the Binding query, as in body checking.
 struct CheckCx<'x, 'p, 'a> {
     cx: &'x mut Ctx<'p, 'a>,
+}
+
+/// rustc's `needs_drop::<T>()` for a concrete type: a written `Drop`
+/// impl (`drop_defs`: the Adt defs that have one), or a part that
+/// needs drop (`[T; 0]` never does). None for the types lust cannot
+/// answer exactly yet (closures, iterator adapters, trait objects,
+/// params, inference leftovers).
+fn needs_drop_answer(p: &Program, tys: &mut impl TyIntern, drop_defs: &[DefId], t: Ty) -> Option<bool> {
+    if crate::ty::iter::iter_parts(tys, t).is_some() {
+        return None;
+    }
+    if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() {
+        return Some(true);
+    }
+    let parts: Vec<Ty> = match tys.kind(t) {
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str | TyKind::Never => return Some(false),
+        TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) => return Some(false),
+        TyKind::Slice(e) => vec![e],
+        TyKind::Array(e, c) => match tys.const_kind(c) {
+            ConstKind::Int(0) => return Some(false),
+            ConstKind::Int(_) => vec![e],
+            _ => return None,
+        },
+        TyKind::Tuple(ts) => tys.tys_of(ts).to_vec(),
+        TyKind::Adt(def, args) => {
+            if let Some(e) = tys.option_elem(t) {
+                vec![e]
+            } else if let Some((a, b)) = tys.result_args(t) {
+                vec![a, b]
+            } else if drop_defs.contains(&def) {
+                return Some(true);
+            } else {
+                // The template's field types with this instance's args.
+                let a = tys.local_adt_of(def)?;
+                let args: Vec<GenericArg> = tys.args(args).to_vec();
+                let fields: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+                fields.into_iter().map(|f| crate::ty::subst(tys, f, &args)).collect()
+            }
+        }
+        _ => return None,
+    };
+    let mut r = false;
+    for e in parts {
+        r |= needs_drop_answer(p, tys, drop_defs, e)?;
+    }
+    Some(r)
 }
 
 impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {

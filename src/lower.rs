@@ -1283,6 +1283,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
                     }
                     Res::Any { .. } => self.type_id_of_into(e, dest, ty, span),
+                    Res::ConstBool(b) => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Bool(b))), ty, span),
                     Res::SizeOfVal { len, elem } => {
                         if elem == 1 {
                             let d = self.call_dest(dest, ty);

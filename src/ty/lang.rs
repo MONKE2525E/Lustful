@@ -1332,6 +1332,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/mem/align_of_val",
     "core/mem/forget",
     "std/mem/forget",
+    "core/mem/needs_drop",
+    "std/mem/needs_drop",
     "core/cmp/max",
     "std/cmp/max",
     "core/cmp/min",
