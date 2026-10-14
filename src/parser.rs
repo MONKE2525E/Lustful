@@ -95,6 +95,10 @@ pub struct Parser<'a> {
     /// True while a cfg syntax check parses one foreign item of an
     /// extern block, where a variadic `...` parameter is grammar.
     cfg_foreign: bool,
+    /// The `=` half of a `>=` token consumed as the `>` that closes
+    /// generic arguments (its span), still to be read. The lexer
+    /// makes `>=` one token; rustc splits it in this position.
+    split_eq: Option<Span>,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
@@ -139,6 +143,7 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
+        split_eq: None,
     };
     match p.inner_attributes() {
         Ok(inner) => inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect(),
@@ -217,6 +222,7 @@ fn parse_tokens(
         depths: Depths::default(),
         cfg_syntax,
         cfg_foreign: false,
+        split_eq: None,
     };
     p.ast.strings = strings;
     // Inner attributes are permitted only here, before the first item
@@ -331,6 +337,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
+        split_eq: None,
     };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     // A fn body block permits inner attributes at its start.
@@ -373,6 +380,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
+        split_eq: None,
     };
     f(&mut p)
 }
@@ -410,6 +418,7 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
+        split_eq: None,
     };
     match p.expr() {
         Ok(_) => Ok(p.pos),
@@ -933,25 +942,55 @@ fn lifetime_error(span: Span) -> Diag {
 
 impl<'a> Parser<'a> {
     fn peek(&self) -> Tok {
+        if self.split_eq.is_some() {
+            return Tok::Eq;
+        }
         self.toks[self.pos].tok
     }
     fn peek_at(&self, n: usize) -> Tok {
+        if self.split_eq.is_some() {
+            if n == 0 {
+                return Tok::Eq;
+            }
+            return self.toks.get(self.pos + n - 1).map_or(Tok::Eof, |t| t.tok);
+        }
         self.toks.get(self.pos + n).map_or(Tok::Eof, |t| t.tok)
     }
     fn span(&self) -> Span {
+        if let Some(sp) = self.split_eq {
+            return sp;
+        }
         self.toks[self.pos].span
     }
     fn prev_span(&self) -> Span {
         self.toks[self.pos.saturating_sub(1)].span
     }
     fn bump(&mut self) -> Token {
+        if let Some(sp) = self.split_eq.take() {
+            return Token { tok: Tok::Eq, span: sp };
+        }
         let t = self.toks[self.pos];
         if t.tok != Tok::Eof {
             self.pos += 1;
         }
         t
     }
+    /// Consumes a `>=` token as the `>` closing generic arguments,
+    /// leaving its `=` half for the next read. Only `eat` and
+    /// `expect` of `Tok::Gt` split this way.
+    fn eat_split_ge(&mut self) -> Option<Span> {
+        if self.split_eq.is_none() && self.toks[self.pos].tok == Tok::Ge {
+            let t = self.bump();
+            self.split_eq = Some(t.span);
+            Some(t.span)
+        } else {
+            None
+        }
+    }
     fn eat(&mut self, t: Tok) -> bool {
+        if t == Tok::Gt && self.eat_split_ge().is_some() {
+            return true;
+        }
         if self.peek() == t {
             self.bump();
             true
@@ -960,6 +999,11 @@ impl<'a> Parser<'a> {
         }
     }
     fn expect(&mut self, t: Tok, what: &str) -> PResult<Span> {
+        if t == Tok::Gt
+            && let Some(sp) = self.eat_split_ge()
+        {
+            return Ok(sp);
+        }
         if self.peek() == t {
             Ok(self.bump().span)
         } else {

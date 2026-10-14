@@ -1412,6 +1412,243 @@ pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::Exp
     }
 }
 
+/// The written integer type of a discriminant expression, in the
+/// subset `eval_scalar` can value. `AnyInt` is an unsuffixed literal
+/// or arithmetic over only `AnyInt` leaves: rustc infers the
+/// discriminant type for those. Every other leaf must name the
+/// discriminant type exactly (rustc E0308): a suffixed literal, a
+/// const item, an associated const, `T::MAX` and kin, a const fn
+/// call, or a cast. `Bad` covers non-integer leaves and forms this
+/// walk does not type; the caller rejects them, so a form it cannot
+/// prove is a false reject, never a false accept.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DTy {
+    Exact(IntTy),
+    AnyInt,
+    Bad,
+}
+
+fn dty_combine(a: DTy, b: DTy) -> DTy {
+    match (a, b) {
+        (DTy::Exact(x), DTy::Exact(y)) if x == y => DTy::Exact(x),
+        (DTy::Exact(x), DTy::AnyInt) | (DTy::AnyInt, DTy::Exact(x)) => DTy::Exact(x),
+        (DTy::AnyInt, DTy::AnyInt) => DTy::AnyInt,
+        _ => DTy::Bad,
+    }
+}
+
+/// True when a discriminant leaf of type `got` may stand where the
+/// discriminant type is `want`.
+fn dty_accepts(got: DTy, want: IntTy) -> bool {
+    matches!(got, DTy::AnyInt) || matches!(got, DTy::Exact(it) if it == want)
+}
+
+/// The integer type a one-segment written type denotes, as a `DTy`.
+fn dty_of_ty(ast: &Ast, known: &Known, ty: ast::TyId) -> DTy {
+    match ast.ty(ty) {
+        TyExpr::Path(segs) if segs.len() == 1 => match known.int_ty(segs[0].name) {
+            Some(it) => DTy::Exact(it),
+            None => DTy::Bad,
+        },
+        _ => DTy::Bad,
+    }
+}
+
+/// The discriminant type of an enum: the repr integer when written,
+/// else `isize`. Reads the first integer hint in the repr lists;
+/// `parse_repr` reports conflicting hints separately.
+fn disc_want_ty(interner: &Interner, attrs: &[ast::Attr]) -> IntTy {
+    use crate::lexer::{Tok, TokenTree};
+    for attr in attrs {
+        if attr.path.len() != 1 || interner.get(attr.path[0].name) != "repr" {
+            continue;
+        }
+        let ast::AttrInput::List(_, trees) = &attr.input else { continue };
+        for t in trees {
+            let TokenTree::Token(t) = t else { continue };
+            let Tok::Ident(name) = t.tok else { continue };
+            let it = match interner.get(name) {
+                "u8" => IntTy::U8,
+                "u16" => IntTy::U16,
+                "u32" => IntTy::U32,
+                "u64" => IntTy::U64,
+                "u128" => IntTy::U128,
+                "usize" => IntTy::Usize,
+                "i8" => IntTy::I8,
+                "i16" => IntTy::I16,
+                "i32" => IntTy::I32,
+                "i64" => IntTy::I64,
+                "i128" => IntTy::I128,
+                "isize" => IntTy::Isize,
+                _ => continue,
+            };
+            return it;
+        }
+    }
+    IntTy::Isize
+}
+
+/// The written integer type of discriminant expression `e`. Mirrors
+/// the name resolution of `eval_scalar` (scan of the crate's items),
+/// so every leaf that evaluator can value is typed here.
+fn disc_ty(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, env: &mut Vec<(Sym, DTy)>, depth: u32) -> DTy {
+    if depth > 32 {
+        return DTy::Bad;
+    }
+    use crate::ast::{BinOp, Expr, Pat, Stmt};
+    match ast.expr(e) {
+        Expr::Int(_, suffix) => match suffix {
+            Some(s) => DTy::Exact(IntTy::from_suffix(*s)),
+            None => DTy::AnyInt,
+        },
+        Expr::Unary { expr, .. } => disc_ty(ast, interner, known, *expr, env, depth + 1),
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                dty_combine(disc_ty(ast, interner, known, *lhs, env, depth + 1), disc_ty(ast, interner, known, *rhs, env, depth + 1))
+            }
+            BinOp::Shl | BinOp::Shr => {
+                let l = disc_ty(ast, interner, known, *lhs, env, depth + 1);
+                if disc_ty(ast, interner, known, *rhs, env, depth + 1) == DTy::Bad { DTy::Bad } else { l }
+            }
+            _ => DTy::Bad,
+        },
+        Expr::Cast { ty, .. } => dty_of_ty(ast, known, *ty),
+        Expr::Path(segs) if segs.len() == 1 => {
+            let name = segs[0].name;
+            if let Some((_, t)) = env.iter().rev().find(|(n, _)| *n == name) {
+                return *t;
+            }
+            for item in &ast.items {
+                if let ItemKind::Const(c) = &item.kind
+                    && c.name == Some(name)
+                {
+                    return dty_of_ty(ast, known, c.ty);
+                }
+            }
+            DTy::Bad
+        }
+        Expr::Path(segs) if segs.len() == 2 && !segs[0].has_args() => {
+            if let Some(it) = known.int_ty(segs[0].name) {
+                return match interner.get(segs[1].name) {
+                    "MAX" | "MIN" => DTy::Exact(it),
+                    "BITS" => DTy::Exact(IntTy::U32),
+                    _ => DTy::Bad,
+                };
+            }
+            let mut found = DTy::Bad;
+            let mut seen = false;
+            for item in &ast.items {
+                let ItemKind::Impl(imp) = &item.kind else { continue };
+                if imp.trait_ref.is_some() {
+                    continue;
+                }
+                let TyExpr::Path(tsegs) = ast.ty(imp.self_ty) else { continue };
+                if tsegs.first().map(|s| s.name) != Some(segs[0].name) {
+                    continue;
+                }
+                for c in &imp.consts {
+                    if c.name == segs[1].name && c.default.is_some() {
+                        let generic = imp.generics.params.iter().any(|g| !matches!(g, ast::GenericParam::Lifetime { .. }));
+                        if seen || generic {
+                            return DTy::Bad;
+                        }
+                        seen = true;
+                        found = dty_of_ty(ast, known, c.ty);
+                    }
+                }
+            }
+            found
+        }
+        Expr::Call { callee, args } => {
+            let Expr::Path(segs) = ast.expr(*callee) else { return DTy::Bad };
+            if segs.len() != 1 {
+                return DTy::Bad;
+            }
+            let name = segs[0].name;
+            for item in &ast.items {
+                let ItemKind::Fn(def) = &item.kind else { continue };
+                if def.name != name || !def.qual.is_const || def.self_param.is_some() || def.params.len() != args.len() {
+                    continue;
+                }
+                for (param, &arg) in def.params.iter().zip(args) {
+                    if param.pat.is_some() {
+                        return DTy::Bad;
+                    }
+                    if let DTy::Exact(pt) = dty_of_ty(ast, known, param.ty)
+                        && !dty_accepts(disc_ty(ast, interner, known, arg, env, depth + 1), pt)
+                    {
+                        return DTy::Bad;
+                    }
+                }
+                return match def.ret {
+                    Some(ty) => dty_of_ty(ast, known, ty),
+                    None => DTy::Bad,
+                };
+            }
+            DTy::Bad
+        }
+        Expr::Block(b) | Expr::ConstBlock(b) => disc_ty_block(ast, interner, known, *b, env, depth + 1),
+        Expr::If { then, els: Some(els), .. } => {
+            let t = disc_ty_block(ast, interner, known, *then, env, depth + 1);
+            dty_combine(t, disc_ty(ast, interner, known, *els, env, depth + 1))
+        }
+        _ => DTy::Bad,
+    }
+}
+
+/// Block half of `disc_ty`: plain binding lets (a written type on a
+/// let pins the binding, and the init must fit it), then the tail.
+fn disc_ty_block(ast: &Ast, interner: &Interner, known: &Known, b: ast::BlockId, env: &mut Vec<(Sym, DTy)>, depth: u32) -> DTy {
+    use crate::ast::{Pat, Stmt};
+    let saved = env.len();
+    let block = ast.block(b);
+    let mut out = DTy::Bad;
+    let mut ok = true;
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let { pat, ty, init: Some(init), els: None, .. } => {
+                let Pat::Binding { name, .. } = ast.pat(*pat) else {
+                    ok = false;
+                    break;
+                };
+                let name = *name;
+                let it = disc_ty(ast, interner, known, *init, env, depth + 1);
+                let bt = match ty {
+                    Some(t) => {
+                        let wt = dty_of_ty(ast, known, *t);
+                        match wt {
+                            DTy::Exact(x) if dty_accepts(it, x) => wt,
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    None => it,
+                };
+                if bt == DTy::Bad {
+                    ok = false;
+                    break;
+                }
+                env.push((name, bt));
+            }
+            Stmt::Expr { .. } => {}
+            _ => {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok {
+        out = match block.tail {
+            Some(tail) => disc_ty(ast, interner, known, tail, env, depth + 1),
+            None => DTy::Bad,
+        };
+    }
+    env.truncate(saved);
+    out
+}
+
 /// Control flow of the scalar interpreter below.
 enum SFlow {
     /// A plain value (None is unit, or not a scalar).
@@ -2679,6 +2916,7 @@ pub fn collect_reuse<'a>(
             p.defs.insert(def, data);
         }
         let is_enum = p.adts[id.0 as usize].is_enum;
+        let disc_want = disc_want_ty(interner, &item.attrs);
         let mut variants = Vec::new();
         // (variant, field, regioned type) for the borrow checker.
         let mut region_fields: Vec<(usize, usize, Ty)> = Vec::new();
@@ -2731,7 +2969,25 @@ pub fn collect_reuse<'a>(
             disc_explicit.push(disc_src.is_some());
             let disc = match disc_src {
                 Some(de) => match eval_const_int(ast, interner, known, de) {
-                    Some(v) => v,
+                    Some(v) => {
+                        // The written type must be the discriminant
+                        // type (rustc E0308); only unsuffixed literal
+                        // forms take it by inference.
+                        let got = disc_ty(ast, interner, known, de, &mut Vec::new(), 0);
+                        if !dty_accepts(got, disc_want) {
+                            let found = match got {
+                                DTy::Exact(it) => format!("`{}`", it.name()),
+                                _ => "a non-integer or untyped form".to_string(),
+                            };
+                            errs.push(Diag::new(
+                                "L0110",
+                                vspan,
+                                format!("mismatched types: expected `{}`, found {found}", disc_want.name()),
+                                "Write the discriminant as a value of the repr integer type (or `isize` with no repr).",
+                            ));
+                        }
+                        v
+                    }
                     None => {
                         errs.push(Diag::new(
                             "L0110",
@@ -2772,14 +3028,25 @@ pub fn collect_reuse<'a>(
         // `#[default]` variants (rustc's rules): only with a `Default`
         // derive, exactly one per enum, and only on a unit variant.
         if let ItemKind::Enum(e) = &item.kind {
+            let mut dup_default: Option<Span> = None;
             let marked: Vec<(u32, Span)> = e
                 .variants
                 .iter()
                 .enumerate()
                 .filter_map(|(i, v)| {
-                    v.attrs.iter().find(|a| a.path.len() == 1 && interner.get(a.path[0].name) == "default").map(|a| (i as u32, a.span))
+                    let mut it = v.attrs.iter().filter(|a| a.path.len() == 1 && interner.get(a.path[0].name) == "default");
+                    let first = it.next()?;
+                    if let Some(second) = it.next()
+                        && dup_default.is_none()
+                    {
+                        dup_default = Some(second.span);
+                    }
+                    Some((i as u32, first.span))
                 })
                 .collect();
+            if let Some(sp) = dup_default {
+                errs.push(Diag::new("L0403", sp, "multiple `#[default]` attributes", "Keep one `#[default]` on the variant."));
+            }
             if !d.default {
                 if let Some(&(_, sp)) = marked.first() {
                     errs.push(Diag::new(
