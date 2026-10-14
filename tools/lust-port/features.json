@@ -684,14 +684,14 @@
   {
    "id": "traits.impl_trait_ret",
    "title": "impl Trait in return position",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "6",
    "root_cause": "traits-generics",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_ret.rs fails (L0602). Split from dyn.trait: the return form needs opaque-type handling, not a vtable. Argument position is traits.impl_trait_arg.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/traits_impl_trait_ret.rs passes (W-CHECK-G3): callers check in an opaque view (bounds, auto-trait leakage) and a revealed check that replays its picks. Gaps (rejects): Iterator provided methods on an impl Iterator value (as on a type param, L0104); impl Trait in traits; generic callers (template borrowck, L0602); a hidden type that is Copy where the bounds are not (L0602). Argument position is traits.impl_trait_arg.",
    "primary_keys": [
     "type.impl_trait.ret",
     "type.impl_trait.other"
