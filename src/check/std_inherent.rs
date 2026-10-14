@@ -162,11 +162,13 @@ impl Ctx<'_, '_> {
     /// True unless std trait `path` (not in the prelude) is surely out of
     /// scope everywhere in the crate: no `use` of a std item of its name,
     /// no glob of a std module, and no std trait lust models under its
-    /// name in scope here. rustc probes only traits in scope.
+    /// name in scope here. rustc probes only traits in scope (a where
+    /// clause on a concrete type does not bring one in).
     fn std_trait_may_be_in_scope(&mut self, path: &str) -> bool {
         let p = self.p;
         let simple = path.rsplit("::").next().unwrap_or(path);
-        let Some(res) = &p.resolved else { return true };
+        // No resolver tables: the crate has no `use` at all.
+        let Some(res) = &p.resolved else { return false };
         if !res.std_globs.is_empty() {
             return true;
         }
@@ -264,22 +266,22 @@ impl Ctx<'_, '_> {
         None
     }
 
-    /// The earliest probe at which std's item of receiver letter `l` on
-    /// step `j` can match (a `&self` item of `T` already matches at the
-    /// by-value probe of a `&T` step before it). Typed receivers
-    /// (`self: Box<Self>`) count from the first probe. None for an item
-    /// without `self`, which is no method.
-    fn std_probe(&self, steps: &[Ty], j: usize, l: u8) -> Option<usize> {
-        let after_ref = j > 0 && matches!(self.tys.kind(steps[j - 1]), TyKind::Ref(..));
-        match l.to_ascii_lowercase() {
-            b'v' => Some(3 * j),
-            b'r' if after_ref => Some(3 * (j - 1)),
-            b'r' => Some(3 * j + 1),
-            b'm' if after_ref => Some(3 * (j - 1)),
-            b'm' => Some(3 * j + 2),
-            b't' => Some(0),
-            _ => None,
-        }
+    /// The probe at which std's item of receiver letter `l` on step `j`
+    /// matches: its receiver is the step, `&` it, or `&mut` it, placed by
+    /// the same scan as the user side (a `&self` item of `T` matches at
+    /// the by-value probe of a `&T` step before it, not of a `&mut T`).
+    /// None for an item without `self`, which is no method; `Err` for a
+    /// typed receiver (`self: Box<Self>`), which is not placed.
+    fn std_probe(&mut self, steps: &[Ty], j: usize, l: u8) -> Result<Option<usize>, ()> {
+        let s = steps[j];
+        let recv = match l.to_ascii_lowercase() {
+            b'v' => s,
+            b'r' => self.tys.mk_ref(false, s),
+            b'm' => self.tys.mk_ref(true, s),
+            b't' => return Err(()),
+            _ => return Ok(None),
+        };
+        Ok(self.probe_of_receiver(steps, recv))
     }
 
     /// Rule zero for `recv.name(..)` with receiver type `rt` (see the
@@ -302,16 +304,21 @@ impl Ctx<'_, '_> {
         let item = self.name(name).to_string();
         // std's earliest inherent and trait probes.
         let (mut std_inh, mut std_tr): (Option<usize>, Option<usize>) = (None, None);
+        let mut std_typed = false;
         for j in 0..steps.len() {
             for l in self.std_letters_at(steps[j], &item) {
-                let Some(at) = self.std_probe(&steps, j, l) else { continue };
+                let Ok(at) = self.std_probe(&steps, j, l) else {
+                    std_typed = true;
+                    continue;
+                };
+                let Some(at) = at else { continue };
                 let slot = if l.is_ascii_uppercase() { &mut std_tr } else { &mut std_inh };
                 if slot.is_none_or(|s| at < s) {
                     *slot = Some(at);
                 }
             }
         }
-        if std_inh.is_none() && std_tr.is_none() {
+        if std_inh.is_none() && std_tr.is_none() && !std_typed {
             return StdShadow::None;
         }
         // The user side's earliest probe. A candidate's receiver is
@@ -345,10 +352,17 @@ impl Ctx<'_, '_> {
                 }
             }
         }
-        if unplaced {
-            return if std_inh.is_some() { StdShadow::Reject } else { StdShadow::Tie };
+        let Some(user) = user.filter(|_| !unplaced) else {
+            return match (unplaced, std_typed || std_inh.is_some()) {
+                (false, _) => StdShadow::None,
+                (true, true) => StdShadow::Reject,
+                (true, false) => StdShadow::Tie,
+            };
+        };
+        // A typed std receiver is not placed: the order is unknown.
+        if std_typed {
+            return StdShadow::Reject;
         }
-        let Some(user) = user else { return StdShadow::None };
         // In one probe an inherent item wins; a std trait's item first or
         // at the user's probe is the trait probe's to decide.
         match (std_inh, std_tr) {
