@@ -880,6 +880,13 @@ fn impl_content(p: &Program, def: DefId) -> u64 {
         for &r in &head.trait_lifetimes {
             hash_region(&mut h, r);
         }
+        for w in &head.where_lts {
+            w.param.hash(&mut h);
+            hash_def_pub(&mut h, p, w.trait_def);
+            for &r in &w.lifetimes {
+                hash_region(&mut h, r);
+            }
+        }
     }
     hash_generics(&mut h, p, &rec.generics);
     (rec.assoc_tys.len() as u64).hash(&mut h);

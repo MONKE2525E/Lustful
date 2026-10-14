@@ -1,7 +1,6 @@
-// expect: L0306
-// Valid Rust: an impl whose own where-clause names a lifetime trait
-// (`impl<'a, T: Tr<'a>> Tr<'a> for Wrap<T>`) is replayed conservatively as
-// `'static` (no recursive replay yet), so a free inner impl still rejects.
+// An impl whose own where-clause names a lifetime trait
+// (`impl<'a, T: Tr<'a>> Tr<'a> for Wrap<T>`) over a free inner impl: any
+// lifetime, so a local borrow is fine.
 trait Tr<'a> { fn put(&mut self, x: &'a u8); }
 struct Count(usize);
 impl<'a> Tr<'a> for Count { fn put(&mut self, _x: &'a u8) { self.0 += 1; } }

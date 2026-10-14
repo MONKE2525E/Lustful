@@ -2986,7 +2986,9 @@ lifetime the Self type does not name is free), else
 equates the bound's lifetimes with the bound type's (trait
 args are invariant): `impl Mark<'static> for S` makes `S:
 Mark<'a>` force `'a: 'static` (Sol review P0.5). An impl
-whose own where-clauses name such a trait answers `'static`.
+whose own `T: Tr2<'x>` where-clauses name such a trait replays
+them through the part of Self that `T` matches (a bounded
+depth; any other form answers `'static`).
 The impl contract (L0734) reads a trait lifetime as the
 impl header's region.
 

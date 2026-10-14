@@ -135,6 +135,10 @@ pub struct TraitLts {
 pub struct ImplHead {
     pub self_ty: Ty,
     pub trait_lifetimes: Vec<Region>,
+    /// The impl's own bounds on its type params for traits with lifetime
+    /// params (`impl<'a, T: Tr<'a>> Tr<'a> for Wrap<T>`), replayed
+    /// through the parts of Self they name (`trait_lts_for`).
+    pub where_lts: Vec<TraitLts>,
 }
 
 /// A `F: Fn*(A..) -> R` bound on a type param, with regions: a lifetime
@@ -3351,8 +3355,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// None when neither tells, or when the impl has where-clauses that
     /// would need a replay of their own.
     fn trait_lts_for(&mut self, trait_def: DefId, t: Ty, vars: &[u32], n: usize) -> Option<Vec<u32>> {
+        self.trait_lts_at(trait_def, t, vars, n, 0)
+    }
+
+    fn trait_lts_at(&mut self, trait_def: DefId, t: Ty, vars: &[u32], n: usize, depth: u32) -> Option<Vec<u32>> {
         let p = self.p;
-        if self.own.closure {
+        if self.own.closure || depth > 8 {
             return None;
         }
         if let TyKind::Param(j) = self.body.tys.kind(t) {
@@ -3375,11 +3383,41 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 continue;
             }
             let head = p.regions.impl_heads.get(&rec.def)?;
-            if found.is_some() || !rec.generics.predicates.iter().all(|pr| !self.lifetime_trait_pred(pr)) {
+            // Every where-clause on a lifetime trait must be one the head
+            // kept (on a type param), else nothing tells its lifetimes.
+            let nested = rec.generics.predicates.iter().filter(|pr| self.lifetime_trait_pred(pr)).count();
+            if found.is_some() || nested != head.where_lts.len() {
                 return None;
             }
             let mut lts: FxMap<u32, u32> = FxMap::default();
             self.match_impl_lifetimes(head.self_ty, t, vars, &mut 0, &mut lts);
+            // The impl's own `T: Tr2<'x>` bounds: the part of Self that `T`
+            // matched implements `Tr2` with lifetimes equal to the impl's
+            // `'x` (replayed the same way, a bounded number of levels).
+            if !head.where_lts.is_empty() {
+                let mut part_tys: FxMap<u32, Ty> = FxMap::default();
+                self.impl_param_tys(pat, t, &mut part_tys);
+                for w in head.where_lts.clone() {
+                    let pt = *part_tys.get(&w.param)?;
+                    let pv = parts.get(&w.param).cloned().unwrap_or_default();
+                    let inner = self.trait_lts_at(w.trait_def, pt, &pv, w.lifetimes.len(), depth + 1)?;
+                    for (r, v) in w.lifetimes.iter().zip(inner) {
+                        let x = match *r {
+                            Region::Param(m) => match lts.get(&m) {
+                                Some(&x) => x,
+                                None => {
+                                    let x = self.fresh();
+                                    lts.insert(m, x);
+                                    x
+                                }
+                            },
+                            _ => 0,
+                        };
+                        self.edge(x, v);
+                        self.edge(v, x);
+                    }
+                }
+            }
             let mut out = Vec::with_capacity(n);
             for &r in &head.trait_lifetimes {
                 let v = match r {
@@ -3394,6 +3432,34 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             found = Some(out);
         }
         found.filter(|v| v.len() == n)
+    }
+
+    /// The erased part of `actual` each type param of an impl's Self
+    /// pattern `pat` matches.
+    fn impl_param_tys(&self, pat: Ty, actual: Ty, out: &mut FxMap<u32, Ty>) {
+        let tys = &self.body.tys;
+        match (tys.kind(pat), tys.kind(actual)) {
+            (TyKind::Param(k), _) => {
+                out.entry(k.0).or_insert(actual);
+            }
+            (TyKind::Ref(_, _, pi), TyKind::Ref(_, _, ai)) => self.impl_param_tys(pi, ai, out),
+            (TyKind::Adt(pd, pa), TyKind::Adt(ad, aa)) if pd == ad => {
+                let (xs, ys): (Vec<Ty>, Vec<Ty>) =
+                    (tys.args(pa).iter().filter_map(|g| g.as_ty()).collect(), tys.args(aa).iter().filter_map(|g| g.as_ty()).collect());
+                for (x, y) in xs.into_iter().zip(ys) {
+                    self.impl_param_tys(x, y, out);
+                }
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                for (x, y) in tys.tys_of(a).to_vec().into_iter().zip(tys.tys_of(b).to_vec()) {
+                    self.impl_param_tys(x, y, out);
+                }
+            }
+            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
+                self.impl_param_tys(a, b, out)
+            }
+            _ => {}
+        }
     }
 
     /// True for a predicate on a trait with lifetime params.
