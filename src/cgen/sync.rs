@@ -403,6 +403,16 @@ if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_
     let _ = writeln!(defs, "{proto} {{\n  {body}\n}}\n");
 }
 
+/// What a closure-taking thread or sync call calls (`FnGen::callee_of`).
+pub(super) enum Callee {
+    /// A closure's body fn; true when it takes its env by value.
+    Closure(LocalDefId, bool),
+    /// A fn item's instance.
+    Fn(LocalDefId),
+    /// A fn pointer of this C type, held in the operand.
+    Ptr(CTy),
+}
+
 /// The runtime width suffix of an atomic (`1`, `2`, `4`, or `8`).
 fn width(v: AtomicVal) -> u32 {
     v.bytes()
@@ -670,14 +680,14 @@ impl FnGen<'_, '_, '_> {
     /// `once.get_or_init(f)`: runs `f` only in the call that sets the
     /// value (a closure that never runs still drops its env).
     fn closure_wait_or_init(&mut self, op: SyncOp, ops: &[Operand], ci: usize, loc: &str, post: &mut Vec<String>) -> String {
-        let (body_fn, once) = self.closure_of(&ops[ci]);
+        let callee = self.callee_of(&ops[ci]);
+        let once = !matches!(callee, Callee::Closure(_, false));
         let target = self.operand(&ops[0], loc, post).0;
         let guard = (op == SyncOp::CondvarWaitWhile).then(|| self.operand(&ops[1], loc, post));
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
         collect_types(&env_ty, &mut self.sig_types);
         let ev = self.tmp();
         let _ = writeln!(self.out, "    {} {ev} = {env};", ctype(&env_ty));
-        let arg = if once { ev.clone() } else { format!("&{ev}") };
         let drop_env = if needs_drop_c(self.p, &env_ty) {
             self.want(Glue::Drop, &env_ty);
             format!("drop_{}(&{ev});", mangle(&env_ty))
@@ -686,7 +696,7 @@ impl FnGen<'_, '_, '_> {
         };
         let mut body = String::new();
         if let Some((g, gt)) = guard {
-            let (r, _) = self.closure_call_c(&mut body, body_fn, &arg, &[format!("&({g})->v")]);
+            let r = self.callee_call_c(&mut body, &callee, &ev, &[format!("&({g})->v")]);
             let _ = writeln!(body, "  if (!{r}) break; lust_cv_wait({target}, &({g})->st);");
             let _ = writeln!(self.out, "    for (;;) {{\n{body}    }}\n    {drop_env}");
             let res = CTy::Result(Box::new(gt.clone()), Box::new(CTy::Sync(SyncTy::PoisonError, Box::new(gt))));
@@ -696,7 +706,7 @@ impl FnGen<'_, '_, '_> {
             let _ = writeln!(self.out, "    {} {t}; {} {f} = {g};", ctype(&res), disc_set(self.p, &res, &t, 0));
             return t;
         }
-        let (v, _) = self.closure_call_c(&mut body, body_fn, &arg, &[]);
+        let v = self.callee_call_c(&mut body, &callee, &ev, &[]);
         let after = if once { String::new() } else { drop_env.clone() };
         let _ = writeln!(
             self.out,
@@ -705,19 +715,70 @@ impl FnGen<'_, '_, '_> {
         format!("(&({target})->v)")
     }
 
-    /// The closure body fn and FnOnce-ness of a closure operand.
-    fn closure_of(&self, o: &Operand) -> (LocalDefId, bool) {
-        let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a thread call takes a closure value") };
+    /// What a callable operand calls: a closure's body fn (and whether it
+    /// takes its env by value), a fn item's instance, or a fn pointer.
+    fn callee_of(&self, o: &Operand) -> Callee {
+        let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a thread call takes a callable value") };
         let mut t = self.body.locals[pl.local as usize].ty;
         for pr in &pl.proj {
             t = match (self.body.tys.kind(t), pr) {
                 (TyKind::Ref(_, _, i), Proj::Deref) => i,
-                _ => panic!("internal: a thread closure place with projections"),
+                _ => panic!("internal: a thread callable place with projections"),
             };
         }
-        let TyKind::Closure(def, _) = self.body.tys.kind(t) else { panic!("internal: a thread call takes a closure value") };
-        let entry = &self.p.gx.closures[&def];
-        (entry.body_fn, entry.kind == crate::check::closure::ClosureKind::FnOnce)
+        match self.body.tys.kind(t) {
+            TyKind::Closure(def, _) => {
+                let entry = &self.p.gx.closures[&def];
+                Callee::Closure(entry.body_fn, entry.kind == crate::check::closure::ClosureKind::FnOnce)
+            }
+            TyKind::FnDef(def, fargs) => {
+                let f = self.p.local_def(def.hash).expect("internal: a fn item with no local def");
+                let gargs: Vec<GenericArg> = self.body.tys.args(fargs).to_vec();
+                let f = if gargs.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &gargs).expect("internal: no fn instance") };
+                Callee::Fn(f)
+            }
+            TyKind::FnPtr(_) => Callee::Ptr(cty(&self.p.tys, t)),
+            _ => panic!("internal: a thread call takes a closure, fn item, or fn pointer"),
+        }
+    }
+
+    /// A call of `callee` (its env or fn pointer value at `env`) with the
+    /// argument expressions, into a fresh variable written to `out`.
+    fn callee_call_c(&mut self, out: &mut String, callee: &Callee, env: &str, args: &[String]) -> String {
+        match callee {
+            Callee::Closure(f, once) => {
+                let e = if *once { env.to_string() } else { format!("&{env}") };
+                self.closure_call_c(out, *f, &e, args).0
+            }
+            Callee::Fn(f) => {
+                let rt = cty(&self.p.tys, self.p.fn_info(*f).ret);
+                collect_types(&rt, &mut self.sig_types);
+                for &t in &self.p.fn_info(*f).params {
+                    collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
+                }
+                self.note_callee(*f);
+                let v = self.tmp();
+                let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, *f), self.slots[f.0 as usize]);
+                if ret_is_large(self.p, *f) {
+                    let pre: String = args.iter().map(|a| format!(", {a}")).collect();
+                    let _ = writeln!(out, "  {} {v}; {call}(&{v}{pre});", ctype(&rt));
+                } else {
+                    let _ = writeln!(out, "  {} {v} = {call}({});", ctype(&rt), args.join(", "));
+                }
+                v
+            }
+            Callee::Ptr(ft) => {
+                let CTy::FnPtr(_, r) = ft else { unreachable!("a fn pointer type") };
+                let v = self.tmp();
+                if c_size_align(self.p, r).0 > 32 {
+                    let pre: String = args.iter().map(|a| format!(", {a}")).collect();
+                    let _ = writeln!(out, "  {} {v}; {env}(&{v}{pre});", ctype(r));
+                } else {
+                    let _ = writeln!(out, "  {} {v} = {env}({});", ctype(r), args.join(", "));
+                }
+                v
+            }
+        }
     }
 
     /// The thread calls that take a closure: `thread::spawn(f)` and
@@ -735,11 +796,16 @@ impl FnGen<'_, '_, '_> {
         if matches!(op, SyncOp::CondvarWaitWhile | SyncOp::OnceGetOrInit) {
             return self.closure_wait_or_init(op, ops, ci, loc, post);
         }
-        let (body_fn, once) = self.closure_of(&ops[ci]);
+        let callee = self.callee_of(&ops[ci]);
+        let once = !matches!(callee, Callee::Closure(_, false));
         let scope = if op == SyncOp::ScopeSpawn { self.operand(&ops[0], loc, post).0 } else { "0".into() };
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
         collect_types(&env_ty, &mut self.sig_types);
-        let ret = cty(&self.p.tys, self.p.fn_info(body_fn).ret);
+        let ret = match &callee {
+            Callee::Closure(f, _) | Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
+            Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            Callee::Ptr(_) => unreachable!("a fn pointer type"),
+        };
         collect_types(&ret, &mut self.sig_types);
         let drop_env = |this: &mut Self, out: &mut String, e: &str| {
             if !once && needs_drop_c(this.p, &env_ty) {
@@ -750,9 +816,8 @@ impl FnGen<'_, '_, '_> {
         if op == SyncOp::ThreadScope {
             let (sc, ev) = (self.tmp(), self.tmp());
             let _ = writeln!(self.out, "    lust_Scope {sc}; {sc}.live = 0; {} {ev} = {env};", ctype(&env_ty));
-            let arg = if once { ev.clone() } else { format!("&{ev}") };
             let mut call = String::new();
-            let (v, _) = self.closure_call_c(&mut call, body_fn, &arg, &[format!("&{sc}")]);
+            let v = self.callee_call_c(&mut call, &callee, &ev, &[format!("&{sc}")]);
             drop_env(self, &mut call, &ev);
             let _ = writeln!(call, "  lust_scope_wait(&{sc});");
             self.out.push_str(&call);
@@ -764,8 +829,7 @@ impl FnGen<'_, '_, '_> {
         let slot = self.slots[self.body.fn_id.0 as usize];
         let (run, drop) = (format!("lust_thr_{slot}_{n}"), format!("lust_thrdrop_{slot}_{n}"));
         let mut body = String::new();
-        let arg = if once { "k->env".to_string() } else { "&k->env".to_string() };
-        let (v, _) = self.closure_call_c(&mut body, body_fn, &arg, &[]);
+        let v = self.callee_call_c(&mut body, &callee, "k->env", &[]);
         let _ = writeln!(body, "  k->ret = {v};");
         drop_env(self, &mut body, "k->env");
         let drop_ret = if needs_drop_c(self.p, &ret) {

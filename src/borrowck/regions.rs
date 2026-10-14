@@ -1350,8 +1350,11 @@ impl OwnSig {
         // so every captured region (and the `Scope`'s `'env`) outlives the
         // `Scope`'s `'scope` (rustc: `'env: 'scope` from the scope type).
         if entry.is_some_and(|c| c.scope_body)
-            && let Some(&[_, sc, env]) = self.slots.get(2).map(|v| v.as_slice())
+            && let Some(&[rf, sc, env]) = self.slots.get(2).map(|v| v.as_slice())
         {
+            // `&'scope Scope<'scope, 'env>`: one region for both.
+            self.facts.push((rf, sc));
+            self.facts.push((sc, rf));
             for &u in env_caps.iter().chain(self.slots[1].first().filter(|_| self.slots[1].len() > env_caps.len())).chain([&env]) {
                 self.facts.push((u, sc));
             }
@@ -2792,6 +2795,12 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             if let Some(&h) = dv.first() {
                 self.edge(h, r);
                 self.edge(r, h);
+            }
+            // `spawn(&'scope self)`: the receiver's borrow outlives
+            // `'scope` (rustc E0521-style "lifetime may not live long
+            // enough" for `fn f(s: &Scope)` with two elided lifetimes).
+            if let Some(&b) = avs.first().and_then(|(_, v)| v.first()) {
+                self.edge(b, r);
             }
             return;
         }
