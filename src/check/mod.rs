@@ -3,6 +3,7 @@
 // Signature collection runs before body checking, in `collect`.
 pub mod alias_path;
 pub mod any;
+pub mod caller;
 pub mod closure;
 pub mod cells;
 pub mod process;
@@ -439,6 +440,13 @@ pub enum Builtin {
     FromUtf8ErrorIntoBytes,
     Utf8ErrorValidUpTo,
     Utf8ErrorErrorLen,
+    /// `std::panic::Location` (check/caller.rs): `Location::caller()`
+    /// (the call's location, or the received one in a `#[track_caller]`
+    /// fn) and its `file`, `line`, and `column`.
+    LocationCaller,
+    LocationFile,
+    LocationLine,
+    LocationColumn,
     /// A `std::sync` or `std::thread` call (check/sync.rs, W-THREADS).
     Sync(sync::SyncOp),
     /// `LocalKey` methods on a `thread_local!` static (check/tls.rs).
@@ -2096,6 +2104,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// mono), and its `FnDef` carries those args. Qualified paths
     /// (`<S as Tr>::mk`) to generic fns are not supported yet.
     fn fn_value_ty(&mut self, e: ExprId, f: LocalDefId, span: Span) -> Ty {
+        self.reject_track_caller_value(f, span);
         if let Some(Some(tmpl)) = self.p.gx.fn_templates.get(f.0 as usize).cloned() {
             if !matches!(self.p.ast.expr(e), Expr::Path(_)) {
                 self.errs.push(not_yet("L0614", span, "generic functions as values through a qualified path"));
@@ -2139,6 +2148,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// args); the fn's own params come from the path's turbofish
     /// (`<S as Tr>::conv::<u32>`), else fresh variables.
     fn fn_value_ty_prefixed(&mut self, e: ExprId, f: LocalDefId, prefix: &[GenericArg], span: Span) -> Ty {
+        self.reject_track_caller_value(f, span);
         let Some(Some(tmpl)) = self.p.gx.fn_templates.get(f.0 as usize).cloned() else {
             return self.tys.intern(TyKind::FnDef(self.p.def_id(f), EMPTY_ARGS));
         };
@@ -7996,6 +8006,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if names == [k.std, k.env, k.args] {
             return Some(Res::Builtin(Builtin::EnvArgs));
         }
+        // `std::panic::Location::caller()` (check/caller.rs).
+        if names.len() == 4
+            && (names[0] == k.std || names[0] == k.core)
+            && self.name(names[1]) == "panic"
+            && self.name(names[2]) == "Location"
+            && self.name(names[3]) == "caller"
+        {
+            return Some(Res::Builtin(Builtin::LocationCaller));
+        }
         if names.len() == 3
             && (names[0] == k.std || names[0] == k.core)
             && self.name(names[1]) == "mem"
@@ -9929,6 +9948,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     Builtin::StringWithCapacity => (vec![USIZE], STRING),
                     Builtin::EnvArgs => (vec![], ARGS),
+                    Builtin::LocationCaller => {
+                        let l = self.tys.intern(TyKind::Adt(generics::location_def(), EMPTY_ARGS));
+                        (vec![], self.tys.mk_ref(false, l))
+                    }
                     Builtin::F64FromBits => (vec![int(IntTy::U64)], self.tys.float_ty(FloatTy::F64)),
                     Builtin::F32FromBits => (vec![int(IntTy::U32)], self.tys.float_ty(FloatTy::F32)),
                     Builtin::CharFromU32 => (vec![int(IntTy::U32)], self.tys.mk_option(CHAR)),
@@ -10937,6 +10960,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return ret;
         }
         if let Some(ret) = self.utf8_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
+        // `std::panic::Location` (check/caller.rs).
+        if let Some(ret) = self.location_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         use Builtin as B;

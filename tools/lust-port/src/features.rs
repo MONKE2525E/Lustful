@@ -217,7 +217,8 @@ mod tests {
         assert_eq!(t.classify("macro.thread_local").unwrap().id, "threads.thread_local");
         assert_eq!(t.classify("expr.unsafe").unwrap().id, "unsafe.blocks");
         assert_eq!(t.classify("attr.cfg").unwrap().id, "attrs.cfg");
-        assert_eq!(t.classify("attr.track_caller").unwrap().id, "attrs.unsupported");
+        assert_eq!(t.classify("attr.track_caller").unwrap().id, "attrs.track_caller");
+        assert_eq!(t.classify("attr.non_exhaustive").unwrap().id, "attrs.unsupported");
         assert_eq!(t.classify("dyn.std::ops::Fn").unwrap().id, "dyn.fn");
         assert_eq!(t.classify("dyn.std::io::Write").unwrap().id, "dyn.std");
         assert_eq!(t.classify("dyn_in.Box").unwrap().id, "dyn.boxed");

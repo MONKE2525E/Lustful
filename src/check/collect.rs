@@ -2055,11 +2055,22 @@ pub fn collect_reuse<'a>(
                 // `core::any::TypeId` (check/any.rs): two `u64` words of the
                 // type hash. Only the derives lust can match (no Debug,
                 // Hash, or Ord: their output depends on rustc's hash values).
-                _ => (
+                7 => (
                     generics::type_id_def(),
                     named(vec![field("lo", int(IntTy::U64)), field("hi", int(IntTy::U64))]),
                     Derives { clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
+                // `core::panic::Location` (check/caller.rs): its Debug
+                // prints these field names. No Hash or Ord: std's fields
+                // differ, so their answers could.
+                _ => {
+                    let file = p.tys.mk_ref(false, STR);
+                    (
+                        generics::location_def(),
+                        named(vec![field("file", file), field("line", int(IntTy::U32)), field("column", int(IntTy::U32))]),
+                        Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
             };
             p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default() };
             p.gx.adt_info[id.0 as usize] = (def, 0);
@@ -5073,6 +5084,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::from_utf8_error_def()
                         || d == generics::recv_error_def()
                         || d == generics::try_recv_error_def()
+                        || d == generics::location_def()
                 })
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))

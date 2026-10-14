@@ -550,6 +550,12 @@ pub fn type_id_def() -> DefId {
     lang_def(&["core", "any"], crate::def::DefKind::Adt, "TypeId")
 }
 
+/// The def of `core::panic::Location` (check/caller.rs): a synthetic std
+/// Adt of `file: &str, line: u32, column: u32`, reached by path only.
+pub fn location_def() -> DefId {
+    lang_def(&["core", "panic"], crate::def::DefKind::Adt, "Location")
+}
+
 /// The `core::any::TypeId` type.
 pub fn type_id_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(type_id_def(), EMPTY_ARGS))
@@ -602,7 +608,7 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// only the flat name (check/collect.rs); `fmt::Error` and
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`).
 /// The driver predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 8] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 9] {
     [
         (0, "Ordering", ordering_def(), true),
         (1, "Error", fmt_error_def(), false),
@@ -612,6 +618,7 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 8] {
         (5, "RecvError", recv_error_def(), false),
         (6, "TryRecvError", try_recv_error_def(), true),
         (7, "TypeId", type_id_def(), false),
+        (8, "Location", location_def(), false),
     ]
 }
 
@@ -619,7 +626,7 @@ pub fn std_adts() -> [(usize, &'static str, DefId, bool); 8] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -652,6 +659,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("mpsc", "RecvError", recv_error_def()),
         ("mpsc", "TryRecvError", try_recv_error_def()),
         ("any", "TypeId", type_id_def()),
+        ("panic", "Location", location_def()),
     ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
@@ -2467,6 +2475,13 @@ pub(crate) fn resolve_path_ty(
             // `Error` and `Result` must never match a bare name.
             if path.len() == 3 && path[1] == "fmt" {
                 return resolve_fmt_path(tys, path[2], segs.last().unwrap(), span);
+            }
+            // `Location<'a>`: lust erases its one lifetime.
+            if path[1..] == ["panic", "Location"]
+                && let GenericArgs::Angle(a) = &segs[2].args
+                && a.iter().all(|g| matches!(g, ast::GenericArg::Lifetime(_)))
+            {
+                return Ok(tys.intern(TyKind::Adt(location_def(), EMPTY_ARGS)));
             }
             if path[1..] == ["any", "TypeId"] {
                 if segs[2].has_args() {
@@ -8262,6 +8277,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     // type checks over signatures run before mono builds vtables.
     p.gx.dyn_infos = crate::check::object::compute_dyn_infos(p);
     crate::check::object::check_signatures(p, errs);
+    crate::check::caller::check_attrs(p, errs);
     check_supertrait_cycles(p, errs);
     check_impl_obligations(p, errs);
     check_copy_impls(p, errs);

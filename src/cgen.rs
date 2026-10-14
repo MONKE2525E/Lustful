@@ -1128,6 +1128,10 @@ fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
         params.push(format!("{ret}*"));
     }
     params.extend(info.params.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).map(|t| ctype(&t)));
+    // `#[track_caller]`: the caller's location (check/caller.rs).
+    if crate::check::caller::is_track_caller(p, f) {
+        params.push("lust_loc".to_string());
+    }
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
     if ret_is_large(p, f) { format!("(void (*)({params}))") } else { format!("({ret} (*)({params}))") }
 }
@@ -1148,6 +1152,11 @@ fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
             .filter(|(_, t)| !param_dropped(p, t))
             .map(|(i, t)| format!("{} p{}", ctype(&t), i + 1)),
     );
+    // `#[track_caller]`: the caller's location, which `FnGen::loc`
+    // reports for every panic in the body (check/caller.rs).
+    if crate::check::caller::is_track_caller(p, f) {
+        params.push("lust_loc ltc".to_string());
+    }
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
     if ret_is_large(p, f) { format!("void f{slot}({params})") } else { format!("{ret} f{slot}({params})") }
 }
@@ -1196,8 +1205,13 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
         }
     }
     let kept: Vec<usize> = (0..info.params.len()).filter(|&i| !param_dropped(p, &cty(&p.tys, info.params[i]))).collect();
-    let names: Vec<String> = kept.iter().map(|i| format!("p{}", i + 1)).collect();
+    let mut names: Vec<String> = kept.iter().map(|i| format!("p{}", i + 1)).collect();
     let decls: Vec<String> = kept.iter().map(|&i| format!("{} p{}", ctype(&cty(&p.tys, info.params[i])), i + 1)).collect();
+    // Check never lets a `#[track_caller]` fn become a value; this keeps
+    // the trampoline well formed all the same.
+    if crate::check::caller::is_track_caller(p, f) {
+        names.push("0".to_string());
+    }
     if ret_is_large(p, f) {
         let mut params = vec![format!("{ret} *out")];
         params.extend(decls);
@@ -1311,6 +1325,11 @@ impl FnGen<'_, '_, '_> {
     /// The runtime prints one file path for the whole program (`lust_file`), so the packed
     /// value carries line and column only; an expanded span reports at its call site.
     fn loc(&self, span: Span) -> String {
+        // In a `#[track_caller]` fn every panic reports the caller's
+        // location, as rustc does (check/caller.rs).
+        if crate::check::caller::is_track_caller(self.p, self.body.fn_id) {
+            return "ltc".to_string();
+        }
         let (l, c) = self.map.line_col(self.map.call_site(span));
         let rel = l.saturating_sub(self.base_line).min(0xFFFFF) as u64;
         let slot = self.slots[self.body.fn_id.0 as usize] as u64;
@@ -2050,6 +2069,11 @@ impl FnGen<'_, '_, '_> {
                     i += 1;
                     keep
                 });
+                // `#[track_caller]`: this call's location, or the one this
+                // fn received when it is itself `#[track_caller]` (`loc`).
+                if crate::check::caller::is_track_caller(self.p, f) {
+                    args.push(loc.to_string());
+                }
                 if ret_is_large(self.p, f) {
                     let t = self.tmp();
                     let ret = ctype(&cty(&self.p.tys, info.ret));
@@ -3262,6 +3286,28 @@ impl FnGen<'_, '_, '_> {
             }
             B::FromUtf8ErrorIntoBytes => format!("({}).f0", vals[0]),
             B::Utf8ErrorValidUpTo => format!("(*{}).f0", vals[0]),
+            // `std::panic::Location` (check/caller.rs): a fresh value for
+            // the packed location, which lives as long as the program.
+            B::LocationCaller => {
+                // One node per distinct location, kept on a per-site static
+                // list: the value lives as long as the program, is shared by
+                // equal locations, and stays reachable (no leak).
+                let p = self.p;
+                let a = p.tys.local_adt_of(crate::check::generics::location_def()).expect("Location is a std Adt");
+                let ct = ctype(&CTy::Adt(a));
+                let fslot = self.slots[self.body.fn_id.0 as usize];
+                let (t, l, n) = (self.tmp(), self.tmp(), self.tmp());
+                let node = format!("lc{fslot}_{n}");
+                let _ = writeln!(self.prelude, "static struct {node} {{ lust_loc k; struct {node} *next; {ct} v; }} *{node}_head;");
+                let _ = writeln!(
+                    self.out,
+                    "    lust_loc {l} = (lust_loc)({loc}); struct {node} *{n} = {node}_head; while ({n} && {n}->k != {l}) {n} = {n}->next;\n    if (!{n}) {{ {n} = (struct {node}*)lust_alloc(sizeof(struct {node}), _Alignof(struct {node})); {n}->k = {l}; {n}->next = {node}_head; {node}_head = {n}; uint64_t fl = 0; while (lust_file[fl]) fl++; {n}->v.f0 = (lust_str){{(uint8_t*)lust_file, fl}}; {n}->v.f1 = (uint32_t)(lust_fn_line[{l} >> 32] + (({l} >> 12) & 0xFFFFF)); {n}->v.f2 = (uint32_t)({l} & 0xFFF); }}\n    {ct} *{t} = &{n}->v;"
+                );
+                t
+            }
+            B::LocationFile => format!("(*{}).f0", vals[0]),
+            B::LocationLine => format!("(*{}).f1", vals[0]),
+            B::LocationColumn => format!("(*{}).f2", vals[0]),
             B::Utf8ErrorErrorLen => {
                 let p = self.p;
                 let (o8, o64) = (CTy::Option(Box::new(CTy::Int(IntTy::U8))), CTy::Option(Box::new(CTy::Int(IntTy::Usize))));

@@ -274,6 +274,12 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], types: &mut
         // std's UTF-8 errors (W-STD-A): their Display writes with
         // `write!`, a fresh default Formatter over the same sink, so the
         // caller's width and fill do not apply.
+        // `std::panic::Location` (check/caller.rs): std's
+        // `write!(f, "{}:{}:{}", file, line, col)`.
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::location_def()) == Some(*a) => format!(
+            "  lust_Formatter g; lust_f_init(&g, f->buf);\n  return lust_f_write_str(&g, (*p).f0) || lust_f_write_str(&g, {c}) || lust_f_u64(&g, (*p).f1) || lust_f_write_str(&g, {c}) || lust_f_u64(&g, (*p).f2);\n",
+            c = lit(":")
+        ),
         CTy::Adt(_) if let Some(u) = utf8_error_part(p, t, "(*p)") => {
             let opt = CTy::Option(Box::new(CTy::Int(IntTy::U8)));
             types.push(opt.clone());

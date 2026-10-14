@@ -1676,6 +1676,9 @@ impl<'a> Parser<'a> {
                 // `must_use` and `deprecated` are lints with no
                 // warning infrastructure in v1. No output changes.
                 _ if matches!(name_text.as_str(), "inline" | "cold" | "must_use" | "deprecated") => {}
+                // `#[track_caller]` (check/caller.rs): the fn reports its
+                // caller's location in panics and `Location::caller()`.
+                _ if name_text == "track_caller" && matches!(attr.input, AttrInput::None) => {}
                 _ if RESOLVE_ATTRS.contains(&name_text.as_str()) => {}
                 // `#[default]` marks the `Default` variant of a derived enum.
                 _ if variant && !inner && name_text == "default" && matches!(attr.input, AttrInput::None) => {}

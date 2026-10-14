@@ -1098,6 +1098,8 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // `impl dyn Tr` vs `impl dyn Tr + '_`: the same types, but only
         // the first needs a `'static` receiver (check::object).
         p.gx.static_dyn_fns.contains(&local).hash(&mut h);
+        // `#[track_caller]` adds a C parameter callers pass (check/caller.rs).
+        crate::check::caller::is_track_caller(p, local).hash(&mut h);
         hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
         // A generic fn's `impl Trait` return: callers' revealed checks
         // read its hidden type (check/opaque.rs).

@@ -371,6 +371,10 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::FromUtf8ErrorIntoBytes,
     Builtin::Utf8ErrorValidUpTo,
     Builtin::Utf8ErrorErrorLen,
+    Builtin::LocationCaller,
+    Builtin::LocationFile,
+    Builtin::LocationLine,
+    Builtin::LocationColumn,
     Builtin::Sync(crate::check::sync::SyncOp::SpinLoop),
     Builtin::TlsWith,
     Builtin::TlsTryWith,
@@ -771,6 +775,10 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::TlsCloneRc => (&["std::thread::LocalKey<Rc<T>>"], vec![i.intern("with")], Call::Method),
         // Internal to the thread_local! expansion; no user spelling.
         B::TlsAccess | B::TlsTryAccess | B::TlsInitWith => (&["std::thread::LocalKey<T>"], vec![], Call::Method),
+        B::LocationCaller => (&["std::panic::Location"], vec![i.intern("caller")], Call::Associated),
+        B::LocationFile => (&["std::panic::Location"], vec![i.intern("file")], Call::Method),
+        B::LocationLine => (&["std::panic::Location"], vec![i.intern("line")], Call::Method),
+        B::LocationColumn => (&["std::panic::Location"], vec![i.intern("column")], Call::Method),
     }
 }
 
@@ -922,7 +930,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("explicit lifetime turbofish args", "L0731"),
     ("macro calls with no expanded form yet, such as format_args!", "L0401"),
     ("attributes lust does not know by name (named in the message)", "L0402"),
-    ("known attributes such as repr and track_caller (named in the message)", "L0522"),
+    ("known attributes such as non_exhaustive (named in the message)", "L0522"),
     ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, Hash (named in the message)", "L0403"),
     ("`unsafe` blocks and functions", "L0404"),
     ("`async` functions and blocks", "L0405"),

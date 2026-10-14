@@ -1168,6 +1168,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/string/FromUtf8Error",
     "core/any/TypeId",
     "std/any/TypeId",
+    "core/panic/Location",
+    "std/panic/Location",
     "std/collections/HashMap",
     "std/collections/HashSet",
     "alloc/collections/BTreeMap",

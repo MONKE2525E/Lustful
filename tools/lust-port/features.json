@@ -557,8 +557,26 @@
    ]
   },
   {
+   "id": "attrs.track_caller",
+   "title": "#[track_caller] on user fns and std::panic::Location",
+   "status": "unsupported",
+   "milestone": 4,
+   "inventory_step": "2",
+   "root_cause": "attrs-cfg",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_track_caller.rs (W-CHECK-G3): a hidden caller-location parameter; panics and Location::caller() in the fn report the caller's location. Gaps (rejects): on trait methods, and the fn as a value (fn pointer, dyn Fn, generic F: Fn argument).",
+   "primary_keys": [
+    "attr.track_caller"
+   ],
+   "keys": [
+    "attr.track_caller"
+   ]
+  },
+  {
    "id": "attrs.unsupported",
-   "title": "Attribute names lust rejects (track_caller, non_exhaustive, serde)",
+   "title": "Attribute names lust rejects (non_exhaustive, serde)",
    "status": "unsupported",
    "milestone": 4,
    "inventory_step": "2",
@@ -568,7 +586,6 @@
    "release_impact": "unchanged",
    "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0522). The attr.* catch-all lives here, after the accepted names in attrs.cfg, so a new attribute name blocks a file until lust knows it.",
    "primary_keys": [
-    "attr.track_caller",
     "attr.non_exhaustive",
     "attr.serde*"
    ],
