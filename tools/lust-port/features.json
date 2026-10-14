@@ -605,14 +605,14 @@
   {
    "id": "dyn.fn",
    "title": "dyn Fn, FnMut and FnOnce objects",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "6",
    "root_cause": "dyn-trait",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_fn.rs, _b and _c fail (L0820, L0702): &dyn Fn, &mut dyn FnMut and Rc<dyn Fn> fields, the callback shape in ts-rust program.rs.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_fn.rs, _b and _c pass: &dyn Fn, &mut dyn FnMut and Rc<dyn Fn> fields, the callback shape in ts-rust program.rs. Arc<dyn Fn> waits for Arc (std.sync).",
    "primary_keys": [
     "dyn.std::ops::Fn",
     "dyn.std::ops::FnMut",
@@ -664,14 +664,14 @@
   {
    "id": "dyn.boxed",
    "title": "Owned dyn values (Box<dyn>, Rc<dyn>, Arc<dyn>)",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "6",
    "root_cause": "dyn-trait",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_boxed.rs fails (L0641, a Box of an unsized type). dyn_in.& and dyn_in.&mut stay in dyn.trait, which comes first; every other dyn_in wrapper lands here.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/dyn_boxed.rs passes: Box<dyn Tr> and Rc<dyn Tr> (drop through the vtable, upcasts, Rc counts). Arc<dyn Tr> waits for Arc. dyn_in.& and dyn_in.&mut stay in dyn.trait, which comes first; every other dyn_in wrapper lands here.",
    "primary_keys": [
     "dyn_in.Box",
     "dyn_in.Rc",
@@ -1407,14 +1407,14 @@
   {
    "id": "macros.std_unsupported",
    "title": "Std macros lust does not expand yet (write!, writeln!, include_bytes!)",
-   "status": "unsupported",
+   "status": "partial",
    "milestone": 4,
    "inventory_step": "1",
    "root_cause": "macros",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_unsupported.rs and _b fail (L0104): write! into a String needs write_fmt, and include_bytes! expands through str::as_bytes. Split from macros.std_missing by macro name.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_unsupported.rs passes (write! and writeln! into a String under `use std::fmt::Write as _;`). _b fails (L0104): include_bytes! expands through str::as_bytes; ts-rust embeds binary files, which need a byte blob typed &[u8; N]. Split from macros.std_missing by macro name.",
    "primary_keys": [
     "macro.write",
     "macro.include_bytes"

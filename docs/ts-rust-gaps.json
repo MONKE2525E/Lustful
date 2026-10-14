@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 9155,
+  "elapsed_ms": 10848,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,8 +32,8 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 9692,
-    "files_with_findings": 626,
+    "findings": 7627,
+    "files_with_findings": 580,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
@@ -52,17 +52,6 @@
         "std.hashmap",
         "std.hashmap_hasher",
         "std.other"
-      ]
-    },
-    {
-      "root_cause": "dyn-trait",
-      "findings": 2315,
-      "files": 332,
-      "features": [
-        "dyn.boxed",
-        "dyn.fn",
-        "dyn.any",
-        "dyn.std"
       ]
     },
     {
@@ -103,6 +92,15 @@
       "files": 54,
       "features": [
         "panic.recovery"
+      ]
+    },
+    {
+      "root_cause": "dyn-trait",
+      "findings": 250,
+      "files": 78,
+      "features": [
+        "dyn.any",
+        "dyn.std"
       ]
     },
     {
@@ -164,71 +162,6 @@
     }
   ],
   "features": [
-    {
-      "id": "dyn.boxed",
-      "title": "Owned dyn values (Box<dyn>, Rc<dyn>, Arc<dyn>)",
-      "status": "unsupported",
-      "milestone": 5,
-      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-      "inventory_step": "6",
-      "root_cause": "dyn-trait",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/dyn_boxed.rs fails (L0641, a Box of an unsized type). dyn_in.& and dyn_in.&mut stay in dyn.trait, which comes first; every other dyn_in wrapper lands here.",
-      "findings": 1458,
-      "raw_uses": 1458,
-      "prod_uses": 1092,
-      "files": 244,
-      "prod_files": 185,
-      "prod_fns": 479,
-      "scopes": {
-        "active": 1089,
-        "target-specific": 3,
-        "test-only": 366
-      },
-      "samples": [
-        {
-          "feature": "dyn.boxed",
-          "raw_key": "dyn_in.Rc",
-          "file": "crates/ts_goport/src/api/callbackfs.rs",
-          "byte_start": 930,
-          "byte_end": 940,
-          "line": 25,
-          "column": 11,
-          "snippet": "Rc<dyn Fs>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "dyn.boxed",
-          "raw_key": "dyn_in.Rc",
-          "file": "crates/ts_goport/src/api/callbackfs.rs",
-          "byte_start": 1169,
-          "byte_end": 1181,
-          "line": 31,
-          "column": 26,
-          "snippet": "Rc<dyn Conn>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "dyn.boxed",
-          "raw_key": "dyn_in.Rc",
-          "file": "crates/ts_goport/src/api/callbackfs.rs",
-          "byte_start": 2318,
-          "byte_end": 2328,
-          "line": 65,
-          "column": 30,
-          "snippet": "Rc<dyn Fs>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
     {
       "id": "std.rc_refcell",
       "title": "Weak, RefCell, Cell and OnceCell",
@@ -419,70 +352,6 @@
           "snippet": "FxHashMap<Node, u32>",
           "scope": "active",
           "fix_class": "adapter",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
-    {
-      "id": "dyn.fn",
-      "title": "dyn Fn, FnMut and FnOnce objects",
-      "status": "unsupported",
-      "milestone": 5,
-      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-      "inventory_step": "6",
-      "root_cause": "dyn-trait",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/dyn_fn.rs, _b and _c fail (L0820, L0702): &dyn Fn, &mut dyn FnMut and Rc<dyn Fn> fields, the callback shape in ts-rust program.rs.",
-      "findings": 607,
-      "raw_uses": 607,
-      "prod_uses": 559,
-      "files": 194,
-      "prod_files": 168,
-      "prod_fns": 303,
-      "scopes": {
-        "active": 559,
-        "test-only": 48
-      },
-      "samples": [
-        {
-          "feature": "dyn.fn",
-          "raw_key": "dyn.std::ops::FnOnce",
-          "file": "crates/ts_goport/src/api/module_resolution.rs",
-          "byte_start": 2843,
-          "byte_end": 2855,
-          "line": 76,
-          "column": 41,
-          "snippet": "dyn FnOnce()",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "dyn.fn",
-          "raw_key": "dyn.std::ops::FnMut",
-          "file": "crates/ts_goport/src/api/module_resolution.rs",
-          "byte_start": 6744,
-          "byte_end": 6870,
-          "line": 183,
-          "column": 17,
-          "snippet": "dyn FnMut( &tspath::Path, crate::frontend::module::cache::PackageJsonCacheEntry<'_>, ) -> bool",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "dyn.fn",
-          "raw_key": "dyn.std::ops::FnMut",
-          "file": "crates/ts_goport/src/api/requestfilesystem/pathtree.rs",
-          "byte_start": 5975,
-          "byte_end": 6025,
-          "line": 195,
-          "column": 17,
-          "snippet": "dyn FnMut(&tspath::Path, &Rc<RequestSymlinkEntry>)",
-          "scope": "active",
-          "fix_class": "compiler work",
           "release_safe_rewrite": false
         }
       ]
@@ -942,7 +811,7 @@
     {
       "id": "macros.std_unsupported",
       "title": "Std macros lust does not expand yet (write!, writeln!, include_bytes!)",
-      "status": "unsupported",
+      "status": "partial",
       "milestone": 4,
       "milestone_label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
       "inventory_step": "1",
@@ -950,7 +819,7 @@
       "fix_class": "compiler work",
       "release_safe_rewrite": false,
       "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_unsupported.rs and _b fail (L0104): write! into a String needs write_fmt, and include_bytes! expands through str::as_bytes. Split from macros.std_missing by macro name.",
+      "notes": "Probe evidence: tools/lust-port/tests/features/macros_std_unsupported.rs passes (write! and writeln! into a String under `use std::fmt::Write as _;`). _b fails (L0104): include_bytes! expands through str::as_bytes; ts-rust embeds binary files, which need a byte blob typed &[u8; N]. Split from macros.std_missing by macro name.",
       "findings": 97,
       "raw_uses": 97,
       "prod_uses": 93,
@@ -2673,23 +2542,23 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 217,
+    "supported_today_files": 230,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 217,
-        "lines": 42723,
-        "files_pct": 28.1,
-        "lines_pct": 7.5
+        "files": 230,
+        "lines": 49442,
+        "files_pct": 29.8,
+        "lines_pct": 8.7
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 230,
-        "lines": 48320,
-        "files_pct": 29.8,
-        "lines_pct": 8.5
+        "files": 247,
+        "lines": 57721,
+        "files_pct": 32.0,
+        "lines_pct": 10.1
       },
       {
         "id": "5",
@@ -2728,50 +2597,50 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 219,
-        "lines": 44410,
-        "files_pct": 28.3,
-        "lines_pct": 7.8
+        "files": 233,
+        "lines": 51251,
+        "files_pct": 30.1,
+        "lines_pct": 9.0
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 233,
-        "lines": 50085,
-        "files_pct": 30.1,
-        "lines_pct": 8.8
+        "files": 251,
+        "lines": 59608,
+        "files_pct": 32.5,
+        "lines_pct": 10.4
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 233,
-        "lines": 50085,
-        "files_pct": 30.1,
-        "lines_pct": 8.8
+        "files": 251,
+        "lines": 59608,
+        "files_pct": 32.5,
+        "lines_pct": 10.4
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 233,
-        "lines": 50085,
-        "files_pct": 30.1,
-        "lines_pct": 8.8
+        "files": 251,
+        "lines": 59608,
+        "files_pct": 32.5,
+        "lines_pct": 10.4
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 233,
-        "lines": 50085,
-        "files_pct": 30.1,
-        "lines_pct": 8.8
+        "files": 251,
+        "lines": 59608,
+        "files_pct": 32.5,
+        "lines_pct": 10.4
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 447,
-        "lines": 207398,
-        "files_pct": 57.8,
-        "lines_pct": 36.3
+        "files": 586,
+        "lines": 350092,
+        "files_pct": 75.8,
+        "lines_pct": 61.3
       },
       {
         "id": "6",
@@ -2874,10 +2743,10 @@
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 266,
-        "lines": 326162,
-        "files_pct": 34.4,
-        "lines_pct": 57.1
+        "files": 70,
+        "lines": 115980,
+        "files_pct": 9.1,
+        "lines_pct": 20.3
       },
       {
         "id": "7a",
@@ -2925,23 +2794,23 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 218,
+    "supported_today_files": 231,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 218,
-        "lines": 42738,
-        "files_pct": 28.0,
-        "lines_pct": 7.4
+        "files": 231,
+        "lines": 49457,
+        "files_pct": 29.7,
+        "lines_pct": 8.6
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 231,
-        "lines": 48335,
-        "files_pct": 29.7,
-        "lines_pct": 8.4
+        "files": 248,
+        "lines": 57736,
+        "files_pct": 31.9,
+        "lines_pct": 10.1
       },
       {
         "id": "5",
@@ -2980,50 +2849,50 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 220,
-        "lines": 44425,
-        "files_pct": 28.3,
-        "lines_pct": 7.7
+        "files": 234,
+        "lines": 51266,
+        "files_pct": 30.1,
+        "lines_pct": 8.9
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 234,
-        "lines": 50100,
-        "files_pct": 30.1,
-        "lines_pct": 8.7
+        "files": 252,
+        "lines": 59623,
+        "files_pct": 32.4,
+        "lines_pct": 10.4
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 234,
-        "lines": 50100,
-        "files_pct": 30.1,
-        "lines_pct": 8.7
+        "files": 252,
+        "lines": 59623,
+        "files_pct": 32.4,
+        "lines_pct": 10.4
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 234,
-        "lines": 50100,
-        "files_pct": 30.1,
-        "lines_pct": 8.7
+        "files": 252,
+        "lines": 59623,
+        "files_pct": 32.4,
+        "lines_pct": 10.4
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 234,
-        "lines": 50100,
-        "files_pct": 30.1,
-        "lines_pct": 8.7
+        "files": 252,
+        "lines": 59623,
+        "files_pct": 32.4,
+        "lines_pct": 10.4
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 448,
-        "lines": 207413,
-        "files_pct": 57.6,
-        "lines_pct": 36.1
+        "files": 587,
+        "lines": 350107,
+        "files_pct": 75.4,
+        "lines_pct": 61.0
       },
       {
         "id": "6",
@@ -3126,10 +2995,10 @@
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 269,
-        "lines": 328193,
-        "files_pct": 34.6,
-        "lines_pct": 57.2
+        "files": 72,
+        "lines": 117001,
+        "files_pct": 9.3,
+        "lines_pct": 20.4
       },
       {
         "id": "7a",
@@ -3221,13 +3090,12 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 12
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/api/encoder/decoder.rs",
@@ -3322,14 +3190,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 27
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/src/api/proto.rs",
@@ -3340,7 +3206,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.cow",
@@ -3350,7 +3215,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 21
+      "findings": 16
     },
     {
       "file": "crates/ts_goport/src/api/protocol_msgpack.rs",
@@ -3362,11 +3227,10 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 8
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/api/requestfilesystem/filechanges.rs",
@@ -3400,12 +3264,11 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
@@ -3417,15 +3280,13 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.cow",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 32
+      "findings": 19
     },
     {
       "file": "crates/ts_goport/src/api/server.rs",
@@ -3436,13 +3297,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_ret"
       ],
-      "findings": 17
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/api/session_p1.rs",
@@ -3454,8 +3314,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "ext.indexmap",
         "ext.rustc_hash",
@@ -3464,7 +3322,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 101
+      "findings": 72
     },
     {
       "file": "crates/ts_goport/src/api/session_p2.rs",
@@ -3476,15 +3334,13 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 27
+      "findings": 15
     },
     {
       "file": "crates/ts_goport/src/api/stringer_generated.rs",
@@ -3556,7 +3412,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -3566,7 +3421,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 101
+      "findings": 98
     },
     {
       "file": "crates/ts_goport/src/ast/misc.rs",
@@ -3609,7 +3464,6 @@
         "attrs.unsupported",
         "cinterop.system",
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.other",
         "std.rc_refcell",
@@ -3619,7 +3473,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 64
+      "findings": 52
     },
     {
       "file": "crates/ts_goport/src/ast/source_file_ls.rs",
@@ -3630,7 +3484,6 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
@@ -3638,7 +3491,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 14
+      "findings": 12
     },
     {
       "file": "crates/ts_goport/src/ast/store.rs",
@@ -3659,7 +3512,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 126
+      "findings": 124
     },
     {
       "file": "crates/ts_goport/src/ast/synthetic.rs",
@@ -3672,7 +3525,6 @@
         "cinterop.system",
         "closures.fn_ptr_lifetime",
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "lifetimes.hrtb",
         "macros.std_unsupported",
@@ -3683,7 +3535,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 64
+      "findings": 63
     },
     {
       "file": "crates/ts_goport/src/ast/synthetic/print_pack.rs",
@@ -3708,12 +3560,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 6
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/utilities_p1.rs",
@@ -3740,11 +3590,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.lazy_once_lock",
         "traits.impl_trait_arg"
       ],
-      "findings": 13
+      "findings": 12
     },
     {
       "file": "crates/ts_goport/src/ast/utilities_p3.rs",
@@ -3754,12 +3603,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.memchr",
         "ext.rustc_hash",
         "std.lazy_once_lock"
       ],
-      "findings": 9
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/src/ast/utilities_p4.rs",
@@ -3769,10 +3617,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.cow"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/ast/utilities_p5.rs",
@@ -3792,12 +3639,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 9
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/astdata/ast_generated.rs",
@@ -3896,11 +3741,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 17
+      "findings": 12
     },
     {
       "file": "crates/ts_goport/src/baseline/mod.rs",
@@ -3966,7 +3810,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "macros.std_unsupported",
         "panic.recovery",
         "std.rc_refcell",
@@ -3974,7 +3817,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 16
+      "findings": 15
     },
     {
       "file": "crates/ts_goport/src/bin/goport_build.rs",
@@ -3987,14 +3830,13 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "macros.std_unsupported",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/bin/goport_emit.rs",
@@ -4007,7 +3849,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "macros.std_unsupported",
         "panic.recovery",
         "std.hashmap",
@@ -4016,7 +3857,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 28
+      "findings": 27
     },
     {
       "file": "crates/ts_goport/src/bin/goport_live_programs.rs",
@@ -4081,13 +3922,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 19
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/src/bin/tsgo.rs",
@@ -4100,7 +3939,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "ext.unknown_crate",
         "macros.std_unsupported",
         "panic.recovery",
@@ -4109,7 +3947,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 36
+      "findings": 35
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p1.rs",
@@ -4136,11 +3974,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.lazy_once_lock",
         "std.rc_refcell"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p3.rs",
@@ -4203,15 +4040,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "ext.smallvec",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 101
+      "findings": 81
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p02.rs",
@@ -4221,12 +4056,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell"
       ],
-      "findings": 18
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p03.rs",
@@ -4263,11 +4096,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.indexmap",
         "std.rc_refcell"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p06.rs",
@@ -4303,10 +4135,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.indexmap"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p09.rs",
@@ -4330,12 +4161,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.smallvec",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 12
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p11.rs",
@@ -4367,10 +4197,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.fn"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p14.rs",
@@ -4379,10 +4207,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.fn"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p15.rs",
@@ -4392,12 +4218,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p16.rs",
@@ -4524,7 +4348,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "ext.smallvec",
         "std.cow",
@@ -4532,7 +4355,7 @@
         "std.hashmap_hasher",
         "std.rc_refcell"
       ],
-      "findings": 24
+      "findings": 22
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p25.rs",
@@ -4543,11 +4366,10 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.smallvec",
         "std.rc_refcell"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p26.rs",
@@ -4584,14 +4406,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "ext.smallvec",
         "std.cow",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 7
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p29.rs",
@@ -4602,10 +4423,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 6
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p30.rs",
@@ -4615,12 +4435,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "ext.smallvec",
         "std.rc_refcell"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p31.rs",
@@ -4630,10 +4449,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p32.rs",
@@ -4759,13 +4577,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.cow",
         "std.lazy_once_lock",
         "std.rc_refcell"
       ],
-      "findings": 25
+      "findings": 24
     },
     {
       "file": "crates/ts_goport/src/checker/flow_p2.rs",
@@ -4776,12 +4593,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "std.cow",
         "std.lazy_once_lock",
         "std.rc_refcell"
       ],
-      "findings": 21
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/src/checker/flow_p3.rs",
@@ -4868,13 +4684,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "ext.smallvec",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 14
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/checker/inference_p2.rs",
@@ -4910,11 +4725,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 9
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/checker/jsx_p2.rs",
@@ -4946,11 +4759,9 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.runtime"
       ],
-      "findings": 6
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/checker/mod.rs",
@@ -4970,13 +4781,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local"
       ],
-      "findings": 21
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/checker/node_copy.rs",
@@ -4987,11 +4796,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 37
+      "findings": 27
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder.rs",
@@ -5001,11 +4808,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell"
       ],
-      "findings": 44
+      "findings": 27
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder_hover.rs",
@@ -5030,14 +4836,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 53
+      "findings": 49
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder_impl_p2.rs",
@@ -5047,12 +4851,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder_impl_p3.rs",
@@ -5077,10 +4880,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 21
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder_scopes.rs",
@@ -5090,11 +4892,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 22
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder_types.rs",
@@ -5118,7 +4918,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
@@ -5148,13 +4947,12 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.fn",
         "std.hashmap",
         "std.hashmap_hasher",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 27
+      "findings": 18
     },
     {
       "file": "crates/ts_goport/src/checker/relater_p2.rs",
@@ -5165,11 +4963,10 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell"
       ],
-      "findings": 8
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/checker/relater_p3.rs",
@@ -5180,14 +4977,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.memchr",
         "ext.smallvec",
         "std.cow",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 21
+      "findings": 16
     },
     {
       "file": "crates/ts_goport/src/checker/relater_p4.rs",
@@ -5211,12 +5007,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 31
+      "findings": 29
     },
     {
       "file": "crates/ts_goport/src/checker/services.rs",
@@ -5226,12 +5021,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "traits.impl_trait_arg"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/checker/symbol_accessibility.rs",
@@ -5241,12 +5035,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/checker/symbol_tracker.rs",
@@ -5256,10 +5049,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 7
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/checker/types.rs",
@@ -5271,8 +5063,6 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "ext.smallvec",
@@ -5282,7 +5072,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 32
+      "findings": 30
     },
     {
       "file": "crates/ts_goport/src/checker/utilities_p1.rs",
@@ -5308,13 +5098,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 9
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/src/cmd/mod.rs",
@@ -5335,13 +5124,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "macros.std_unsupported",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 5
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/cmd/tsgo/isprocessalive_other.rs",
@@ -5374,14 +5162,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "macros.std_unsupported",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/cmd/tsgo/main.rs",
@@ -5434,14 +5220,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 9
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/contentmapper/hostimpl.rs",
@@ -5454,8 +5238,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "ext.indexmap",
         "ext.rustc_hash",
@@ -5466,7 +5248,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 204
+      "findings": 125
     },
     {
       "file": "crates/ts_goport/src/contentmapper/mod.rs",
@@ -5487,15 +5269,13 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 70
+      "findings": 38
     },
     {
       "file": "crates/ts_goport/src/contentmapper/transform.rs",
@@ -5505,11 +5285,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/core.rs",
@@ -5555,11 +5334,9 @@
       "parse_error": false,
       "missing_features": [
         "closures.fn_ptr_lifetime",
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 6
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/declarations/mod.rs",
@@ -5568,10 +5345,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/declarations/supplementalreferences.rs",
@@ -5580,10 +5355,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/declarations/tracker.rs",
@@ -5593,11 +5366,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 12
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/declarations/transform.rs",
@@ -5608,12 +5379,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 10
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/src/declarations/transform_p2.rs",
@@ -5638,13 +5408,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/declarations/transform_p4.rs",
@@ -5654,11 +5423,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/declarations/util.rs",
@@ -5815,15 +5583,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 40
+      "findings": 32
     },
     {
       "file": "crates/ts_goport/src/effect/keybuilder.rs",
@@ -7113,11 +6879,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/effect/typeparser/context_tag.rs",
@@ -7619,10 +7383,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/effect/typeparser/promise_type.rs",
@@ -7733,11 +7496,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/effect/typeparser/unroll_members.rs",
@@ -7780,12 +7542,11 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.boxed",
         "std.rc_refcell",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 12
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/src/emitter/mod.rs",
@@ -7817,8 +7578,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "panic.recovery",
         "std.lazy_once_lock",
@@ -7827,7 +7586,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 61
+      "findings": 53
     },
     {
       "file": "crates/ts_goport/src/evaluator.rs",
@@ -7836,11 +7595,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed",
-        "dyn.fn"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/build/build_task.rs",
@@ -7853,8 +7609,6 @@
         "attrs.unsupported",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "panic.recovery",
         "std.lazy_once_lock",
@@ -7864,7 +7618,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 85
+      "findings": 72
     },
     {
       "file": "crates/ts_goport/src/execute/build/command_line.rs",
@@ -7890,7 +7644,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "panic.recovery",
@@ -7898,7 +7651,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 54
+      "findings": 51
     },
     {
       "file": "crates/ts_goport/src/execute/build/host.rs",
@@ -7909,14 +7662,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 68
+      "findings": 56
     },
     {
       "file": "crates/ts_goport/src/execute/build/mod.rs",
@@ -7938,14 +7690,13 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 56
+      "findings": 47
     },
     {
       "file": "crates/ts_goport/src/execute/build/orchestrator_watch.rs",
@@ -7957,13 +7708,12 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 22
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/src/execute/build/parse_cache.rs",
@@ -7989,12 +7739,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 5
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/execute/build/up_to_date_status.rs",
@@ -8017,14 +7766,13 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.indexmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 24
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/affected_files.rs",
@@ -8034,12 +7782,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/build_info.rs",
@@ -8086,12 +7833,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/emit_files.rs",
@@ -8132,10 +7878,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.runtime"
       ],
-      "findings": 13
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/mod.rs",
@@ -8157,15 +7902,13 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_ret"
       ],
-      "findings": 27
+      "findings": 19
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/program_to_snapshot.rs",
@@ -8251,7 +7994,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "dyn.std",
         "ext.rustc_hash",
         "macros.std_unsupported",
@@ -8260,7 +8002,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 81
+      "findings": 58
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
@@ -8272,8 +8014,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.cow",
         "std.lazy_once_lock",
@@ -8282,7 +8022,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 19
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/emit.rs",
@@ -8293,14 +8033,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 11
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/help.rs",
@@ -8349,12 +8087,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/stdio.rs",
@@ -8385,7 +8122,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
@@ -8393,7 +8129,7 @@
         "threads.sync",
         "threads.thread_local"
       ],
-      "findings": 48
+      "findings": 28
     },
     {
       "file": "crates/ts_goport/src/execute/watchmanager/mod.rs",
@@ -8413,12 +8149,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 18
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/execute/watchmanager/watchmanager.rs",
@@ -8429,14 +8163,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 43
+      "findings": 34
     },
     {
       "file": "crates/ts_goport/src/flags.rs",
@@ -8547,10 +8279,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/format/mod.rs",
@@ -8570,13 +8301,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 7
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/format/rulecontext.rs",
@@ -8637,12 +8366,10 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 11
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/format/util.rs",
@@ -8672,10 +8399,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "dyn.boxed"
+        "core.std_basics"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/bundled/embed.rs",
@@ -8687,7 +8413,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "macros.std_unsupported",
         "std.lazy_once_lock",
@@ -8696,7 +8421,7 @@
         "threads.sync",
         "threads.thread_local"
       ],
-      "findings": 13
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/frontend/bundled/noembed.rs",
@@ -8706,11 +8431,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.lazy_once_lock",
         "std.rc_refcell"
       ],
-      "findings": 5
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/file_include.rs",
@@ -8721,10 +8445,9 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/file_loader.rs",
@@ -8736,7 +8459,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
@@ -8745,7 +8467,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 83
+      "findings": 73
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/files_parser.rs",
@@ -8757,7 +8479,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "panic.recovery",
@@ -8768,7 +8489,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 205
+      "findings": 199
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/host.rs",
@@ -8778,14 +8499,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 29
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/include_processor.rs",
@@ -8835,7 +8554,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "dyn.std",
         "ext.rustc_hash",
         "std.lazy_once_lock",
@@ -8843,7 +8561,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 30
+      "findings": 27
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/program_new.rs",
@@ -8853,13 +8571,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 29
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/project_references.rs",
@@ -8871,14 +8587,12 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 31
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/resolve_ahead.rs",
@@ -8890,8 +8604,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "macros.std_unsupported",
         "panic.recovery",
@@ -8902,7 +8614,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 131
+      "findings": 102
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/verify.rs",
@@ -8926,13 +8638,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 21
+      "findings": 10
     },
     {
       "file": "crates/ts_goport/src/frontend/core_binarysearch.rs",
@@ -8976,7 +8687,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.hashmap",
@@ -8984,7 +8694,7 @@
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 30
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/src/frontend/core_nodemodules.rs",
@@ -9021,14 +8731,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 25
+      "findings": 12
     },
     {
       "file": "crates/ts_goport/src/frontend/json.rs",
@@ -9061,14 +8769,13 @@
         "attrs.unsupported",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "ext.indexmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 18
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/src/frontend/json_indexmap.rs",
@@ -9101,8 +8808,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "macros.std_unsupported",
         "std.rc_refcell",
@@ -9111,7 +8816,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 118
+      "findings": 110
     },
     {
       "file": "crates/ts_goport/src/frontend/module/entrypoints.rs",
@@ -9146,8 +8851,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
@@ -9155,7 +8858,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 18
+      "findings": 15
     },
     {
       "file": "crates/ts_goport/src/frontend/module/resolver_p2.rs",
@@ -9165,8 +8868,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.memchr",
         "ext.rustc_hash",
@@ -9174,7 +8875,7 @@
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 9
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/frontend/module/staticresolver.rs",
@@ -9184,14 +8885,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 10
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/src/frontend/module/types.rs",
@@ -9201,11 +8900,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 6
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/frontend/module/util.rs",
@@ -9258,11 +8956,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/frontend/packagejson.rs",
@@ -9274,8 +8971,6 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.lazy_once_lock",
@@ -9283,7 +8978,7 @@
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 37
+      "findings": 35
     },
     {
       "file": "crates/ts_goport/src/frontend/parser/jsdoc.rs",
@@ -9513,8 +9208,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.memchr",
         "ext.rustc_hash",
         "std.lazy_once_lock",
@@ -9522,7 +9215,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 18
+      "findings": 16
     },
     {
       "file": "crates/ts_goport/src/frontend/scanner/scanner_p2.rs",
@@ -9600,12 +9293,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/content_mappers.rs",
@@ -9615,10 +9307,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/decls.rs",
@@ -9628,14 +9319,13 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 31
+      "findings": 28
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/enum_maps.rs",
@@ -9746,15 +9436,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 22
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/tsconfig_p2.rs",
@@ -9765,7 +9453,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
@@ -9773,7 +9460,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 20
+      "findings": 18
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/wildcard.rs",
@@ -9819,7 +9506,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.memchr",
         "ext.rustc_hash",
         "std.cow",
@@ -9828,7 +9514,7 @@
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 15
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/src/frontend/util_prelude.rs",
@@ -9848,12 +9534,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 20
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/mod.rs",
@@ -9875,14 +9560,12 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.other",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 9
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/osvfs.rs",
@@ -9894,8 +9577,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.cow",
         "std.lazy_once_lock",
         "std.other",
@@ -9905,7 +9586,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 33
+      "findings": 26
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/trackingvfs.rs",
@@ -9915,12 +9596,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.indexmap",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/vfsmatch.rs",
@@ -9936,7 +9616,7 @@
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/walkdir.rs",
@@ -9959,12 +9639,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 29
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/fswatch/canonicalize_darwin.rs",
@@ -9998,14 +9676,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 29
+      "findings": 21
     },
     {
       "file": "crates/ts_goport/src/fswatch/event.rs",
@@ -10030,13 +9706,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 26
+      "findings": 25
     },
     {
       "file": "crates/ts_goport/src/fswatch/fsevents_darwin.rs",
@@ -10049,14 +9724,13 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 36
+      "findings": 35
     },
     {
       "file": "crates/ts_goport/src/fswatch/inotify_linux.rs",
@@ -10066,13 +9740,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 20
+      "findings": 19
     },
     {
       "file": "crates/ts_goport/src/fswatch/kqueue.rs",
@@ -10083,12 +9756,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 48
+      "findings": 47
     },
     {
       "file": "crates/ts_goport/src/fswatch/mod.rs",
@@ -10185,10 +9857,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "dyn.fn"
+        "core.std_basics"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/walkdir_unix.rs",
@@ -10198,10 +9869,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/watcher.rs",
@@ -10214,8 +9884,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "macros.std_unsupported",
         "panic.recovery",
@@ -10225,7 +9893,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 169
+      "findings": 117
     },
     {
       "file": "crates/ts_goport/src/fswatch/windows.rs",
@@ -10238,13 +9906,12 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 27
+      "findings": 26
     },
     {
       "file": "crates/ts_goport/src/gopanic.rs",
@@ -10257,8 +9924,6 @@
         "attrs.unsupported",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
@@ -10267,7 +9932,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 65
+      "findings": 60
     },
     {
       "file": "crates/ts_goport/src/goport_lsproto_root.rs",
@@ -10299,12 +9964,11 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.boxed",
         "macros.std_unsupported",
         "std.lazy_once_lock",
         "std.rc_refcell"
       ],
-      "findings": 17
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/gostd/context.rs",
@@ -10317,8 +9981,6 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "macros.std_unsupported",
         "std.lazy_once_lock",
@@ -10329,7 +9991,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 78
+      "findings": 58
     },
     {
       "file": "crates/ts_goport/src/gostd/debug.rs",
@@ -10353,13 +10015,12 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 17
+      "findings": 16
     },
     {
       "file": "crates/ts_goport/src/gostd/errors.rs",
@@ -10370,7 +10031,6 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
         "std.lazy_once_lock",
         "std.other",
         "std.rc_refcell",
@@ -10378,7 +10038,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 14
+      "findings": 13
     },
     {
       "file": "crates/ts_goport/src/gostd/local.rs",
@@ -10390,8 +10050,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "macros.std_unsupported",
         "std.rc_refcell",
@@ -10400,7 +10058,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 77
+      "findings": 52
     },
     {
       "file": "crates/ts_goport/src/gostd/mod.rs",
@@ -10497,10 +10155,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "dyn.fn"
+        "core.std_basics"
       ],
-      "findings": 4
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/stack.rs",
@@ -10545,14 +10202,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "macros.std_unsupported",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 50
+      "findings": 48
     },
     {
       "file": "crates/ts_goport/src/gostd/unicode.rs",
@@ -10615,12 +10270,11 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 13
+      "findings": 10
     },
     {
       "file": "crates/ts_goport/src/ipc/conn_async.rs",
@@ -10632,14 +10286,13 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 84
+      "findings": 51
     },
     {
       "file": "crates/ts_goport/src/ipc/conn_sync.rs",
@@ -10649,12 +10302,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 18
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/ipc/mod.rs",
@@ -10674,10 +10326,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ipc/protocol_jsonrpc.rs",
@@ -10688,12 +10339,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 5
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/ipc/timing.rs",
@@ -10717,12 +10367,11 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 48
+      "findings": 29
     },
     {
       "file": "crates/ts_goport/src/ipc/transport_unix.rs",
@@ -10733,13 +10382,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.other",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 5
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/jemalloc_layout.rs",
@@ -10780,12 +10428,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "macros.std_unsupported",
         "std.lazy_once_lock"
       ],
-      "findings": 15
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/jsonrpc/jsonrpc.rs",
@@ -10795,12 +10442,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/jsonrpc/mod.rs",
@@ -10875,14 +10521,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 37
+      "findings": 27
     },
     {
       "file": "crates/ts_goport/src/ls/autoimport/export.rs",
@@ -10905,12 +10549,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 12
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/ls/autoimport/fix.rs",
@@ -10936,13 +10578,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 12
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/ls/autoimport/index.rs",
@@ -10953,10 +10594,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/ls/autoimport/mod.rs",
@@ -10977,15 +10617,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 146
+      "findings": 128
     },
     {
       "file": "crates/ts_goport/src/ls/autoimport/specifiers.rs",
@@ -11008,13 +10646,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 45
+      "findings": 18
     },
     {
       "file": "crates/ts_goport/src/ls/autoimport/view.rs",
@@ -11025,13 +10661,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/ls/autoinsert.rs",
@@ -11136,12 +10771,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/ls/codeactions_fixmissingtypeannotation.rs",
@@ -11151,13 +10785,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell"
       ],
-      "findings": 21
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/ls/codeactions_importfixes.rs",
@@ -11226,13 +10858,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/ls/completions_p3.rs",
@@ -11257,13 +10888,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/ls/constants.rs",
@@ -11285,8 +10915,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "panic.recovery",
@@ -11295,7 +10923,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 54
+      "findings": 40
     },
     {
       "file": "crates/ts_goport/src/ls/definition.rs",
@@ -11346,12 +10974,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 11
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/ls/file_rename.rs",
@@ -11361,11 +10988,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/findallreferences_p1.rs",
@@ -11375,13 +11001,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 51
+      "findings": 45
     },
     {
       "file": "crates/ts_goport/src/ls/findallreferences_p2.rs",
@@ -11392,15 +11016,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.memchr",
         "ext.rustc_hash",
         "std.cow",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 49
+      "findings": 35
     },
     {
       "file": "crates/ts_goport/src/ls/folding.rs",
@@ -11448,13 +11070,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_ret"
       ],
-      "findings": 8
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/src/ls/hovericon.rs",
@@ -11477,14 +11098,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local"
       ],
-      "findings": 18
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/src/ls/inlay_hints.rs",
@@ -11535,11 +11154,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell"
       ],
-      "findings": 5
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/ls/linkedediting.rs",
@@ -11560,15 +11178,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 6
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/ls/lsconv/linemap.rs",
@@ -11655,14 +11271,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 13
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/ls/lsutil/symbol_display.rs",
@@ -11723,13 +11337,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 8
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/ls/program_view.rs",
@@ -11767,8 +11380,6 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
@@ -11776,7 +11387,7 @@
         "threads.sync",
         "threads.thread_local"
       ],
-      "findings": 53
+      "findings": 47
     },
     {
       "file": "crates/ts_goport/src/ls/selectionranges.rs",
@@ -11801,13 +11412,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.cow",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/ls/signaturehelp.rs",
@@ -11841,13 +11451,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 9
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/ls/string_completions.rs",
@@ -11858,14 +11466,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 14
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/src/ls/symbols.rs",
@@ -11892,13 +11498,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.cow",
         "std.rc_refcell"
       ],
-      "findings": 13
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/lsp/dynamic_queue.rs",
@@ -11939,10 +11543,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/lsp/lsproto/baseproto_test.rs",
@@ -11969,10 +11572,9 @@
       "missing_features": [
         "attrs.unsupported",
         "dyn.any",
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 14
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/lsp/lsproto/lsp.rs",
@@ -11983,14 +11585,13 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/lsp/lsproto/lsp_generated/enumerations.rs",
@@ -12130,11 +11731,10 @@
       "missing_features": [
         "attrs.unsupported",
         "dyn.any",
-        "dyn.boxed",
         "ext.indexmap",
         "std.runtime"
       ],
-      "findings": 14
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/lsp/lsproto/lsp_test.rs",
@@ -12182,15 +11782,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 55
+      "findings": 26
     },
     {
       "file": "crates/ts_goport/src/lsp/lspwatcher/mod.rs",
@@ -12220,14 +11818,13 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.indexmap",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 17
+      "findings": 15
     },
     {
       "file": "crates/ts_goport/src/lsp/server.rs",
@@ -12239,8 +11836,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "ext.indexmap",
         "ext.rustc_hash",
@@ -12253,7 +11848,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 173
+      "findings": 123
     },
     {
       "file": "crates/ts_goport/src/lsp/stack_sanitizer.rs",
@@ -12351,11 +11946,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/modulespecifiers/specifiers.rs",
@@ -12437,14 +12030,13 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.fn",
         "ext.indexmap",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/options_json.rs",
@@ -12470,7 +12062,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.fn",
         "ext.memchr",
         "ext.rustc_hash",
         "std.other",
@@ -12478,7 +12069,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 16
+      "findings": 15
     },
     {
       "file": "crates/ts_goport/src/prelude.rs",
@@ -12516,7 +12107,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
@@ -12524,7 +12114,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 41
+      "findings": 39
     },
     {
       "file": "crates/ts_goport/src/printer/factory.rs",
@@ -12547,10 +12137,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.runtime"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/mod.rs",
@@ -12571,13 +12160,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 12
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/printer/printer_p1.rs",
@@ -12587,14 +12174,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.cow",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 38
+      "findings": 19
     },
     {
       "file": "crates/ts_goport/src/printer/printer_p2.rs",
@@ -12635,7 +12220,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "threads.thread_local"
@@ -12650,7 +12234,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
       "findings": 3
@@ -12675,7 +12258,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
       "findings": 1
@@ -12701,10 +12283,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/utilities.rs",
@@ -12715,11 +12296,10 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/program.rs",
@@ -12732,8 +12312,6 @@
         "attrs.unsupported",
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "ext.indexmap",
         "ext.rustc_hash",
@@ -12747,7 +12325,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 216
+      "findings": 197
     },
     {
       "file": "crates/ts_goport/src/program/go_frontend.rs",
@@ -12759,7 +12337,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
@@ -12768,7 +12345,7 @@
         "traits.impl_trait_arg",
         "traits.impl_trait_ret"
       ],
-      "findings": 22
+      "findings": 19
     },
     {
       "file": "crates/ts_goport/src/program/ls_program.rs",
@@ -12780,14 +12357,12 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 23
+      "findings": 12
     },
     {
       "file": "crates/ts_goport/src/project/api.rs",
@@ -12797,11 +12372,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/ata/ata.rs",
@@ -12813,8 +12387,6 @@
       "missing_features": [
         "async.await",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "ext.indexmap",
         "ext.rustc_hash",
@@ -12824,7 +12396,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 104
+      "findings": 86
     },
     {
       "file": "crates/ts_goport/src/project/ata/discovertypings.rs",
@@ -12882,13 +12454,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 11
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/project/background/mod.rs",
@@ -12922,13 +12492,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 36
+      "findings": 32
     },
     {
       "file": "crates/ts_goport/src/project/client.rs",
@@ -12951,8 +12519,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
@@ -12960,7 +12526,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 45
+      "findings": 36
     },
     {
       "file": "crates/ts_goport/src/project/configfileregistry.rs",
@@ -12970,13 +12536,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 21
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/src/project/configfileregistrybuilder.rs",
@@ -12986,14 +12550,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 65
+      "findings": 55
     },
     {
       "file": "crates/ts_goport/src/project/dirty/box_.rs",
@@ -13003,10 +12565,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell"
       ],
-      "findings": 11
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/project/dirty/cloneablemap.rs",
@@ -13039,10 +12600,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.fn"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/dirty/map.rs",
@@ -13052,13 +12611,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 26
+      "findings": 16
     },
     {
       "file": "crates/ts_goport/src/project/dirty/mapbuilder.rs",
@@ -13068,15 +12626,13 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 13
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/src/project/dirty/mod.rs",
@@ -13096,13 +12652,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 39
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/src/project/dirty/util.rs",
@@ -13126,10 +12681,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/filechange.rs",
@@ -13152,11 +12706,10 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/project/logging/logger.rs",
@@ -13168,14 +12721,12 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "macros.std_unsupported",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 15
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/project/logging/logtree.rs",
@@ -13220,8 +12771,6 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
@@ -13229,7 +12778,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 64
+      "findings": 46
     },
     {
       "file": "crates/ts_goport/src/project/ownercache.rs",
@@ -13239,14 +12788,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 12
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/project/parsecache.rs",
@@ -13256,11 +12803,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 6
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/project/programcounter.rs",
@@ -13284,13 +12830,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 34
+      "findings": 18
     },
     {
       "file": "crates/ts_goport/src/project/project_stringer_generated.rs",
@@ -13313,14 +12857,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 52
+      "findings": 45
     },
     {
       "file": "crates/ts_goport/src/project/projectcollectionbuilder.rs",
@@ -13331,15 +12873,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 114
+      "findings": 94
     },
     {
       "file": "crates/ts_goport/src/project/refcountcache.rs",
@@ -13349,14 +12889,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 8
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/project/session.rs",
@@ -13369,8 +12907,6 @@
         "async.await",
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "ext.indexmap",
         "ext.rustc_hash",
@@ -13380,7 +12916,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 108
+      "findings": 79
     },
     {
       "file": "crates/ts_goport/src/project/snapshot.rs",
@@ -13392,15 +12928,13 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 53
+      "findings": 38
     },
     {
       "file": "crates/ts_goport/src/project/snapshotfs.rs",
@@ -13412,8 +12946,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
@@ -13421,7 +12953,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 162
+      "findings": 102
     },
     {
       "file": "crates/ts_goport/src/project/snapshothost.rs",
@@ -13432,14 +12964,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 15
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/project/watch.rs",
@@ -13450,15 +12980,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 29
+      "findings": 23
     },
     {
       "file": "crates/ts_goport/src/pseudochecker/lookup.rs",
@@ -13504,7 +13032,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.memchr",
         "ext.rustc_hash",
         "std.cow",
@@ -13513,7 +13040,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 21
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/src/scanner_util/js_case_tables.rs",
@@ -13695,10 +13222,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "dyn.fn"
+        "core.std_basics"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/async_.rs",
@@ -13723,13 +13249,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 13
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/class_fields_p2.rs",
@@ -13843,10 +13367,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.fn"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/nullish_coalescing.rs",
@@ -13907,11 +13429,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed",
-        "dyn.fn"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/using.rs",
@@ -13949,10 +13468,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/inliners/mod.rs",
@@ -13983,13 +13500,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/transformers/jsxtransforms/mod.rs",
@@ -14029,13 +13545,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 6
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/transformers/moduletransforms/commonjs_module_p2.rs",
@@ -14058,13 +13572,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "ext.rustc_hash",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 5
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/transformers/moduletransforms/external_module_info.rs",
@@ -14086,11 +13598,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed",
-        "dyn.fn"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/moduletransforms/mod.rs",
@@ -14132,11 +13641,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "traits.impl_trait_arg"
       ],
-      "findings": 8
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/transformers/tstransforms/import_elision.rs",
@@ -14145,10 +13652,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/tstransforms/legacy_decorators.rs",
@@ -14158,12 +13663,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/transformers/tstransforms/metadata.rs",
@@ -14172,10 +13676,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/tstransforms/mod.rs",
@@ -14195,12 +13697,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/transformers/tstransforms/type_eraser.rs",
@@ -14219,10 +13720,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/tstransforms/utilities.rs",
@@ -14255,13 +13754,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 11
+      "findings": 10
     },
     {
       "file": "crates/ts_goport/src/util_prelude.rs",
@@ -14304,14 +13802,13 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.fn",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 15
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/tests/fswatch_linux.rs",
@@ -14322,14 +13819,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 14
+      "findings": 13
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/astnav_api/api_encoder.rs",
@@ -14388,7 +13884,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
@@ -14396,7 +13891,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 11
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/astnav_api/jstest.rs",
@@ -14467,7 +13962,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.indexmap",
         "panic.recovery",
         "std.hashmap",
@@ -14476,7 +13970,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 41
+      "findings": 33
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/compiler_runner/mod.rs",
@@ -14500,7 +13994,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.fn",
         "panic.recovery",
         "std.hashmap",
         "std.lazy_once_lock",
@@ -14509,7 +14002,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 24
+      "findings": 23
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/compiler_runner/sourcemap_recorder.rs",
@@ -14563,7 +14056,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.indexmap",
         "macros.std_unsupported",
         "std.hashmap",
@@ -14572,7 +14064,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 11
+      "findings": 10
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/main.rs",
@@ -14594,11 +14086,10 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/api_createsourcefile_stdio_test.rs",
@@ -14738,11 +14229,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/api_session_requestfilesystem_test.rs",
@@ -14752,12 +14242,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.unknown_crate",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/api_util.rs",
@@ -14832,12 +14321,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/autoimport_index_test.rs",
@@ -14917,12 +14405,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/configfilechanges_test.rs",
@@ -14944,13 +14431,12 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 19
+      "findings": 12
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/customconfigfilename_test.rs",
@@ -14985,11 +14471,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.hashmap",
         "std.rc_refcell"
       ],
-      "findings": 5
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/file_version_test.rs",
@@ -15014,10 +14499,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/lsp_dynamic_queue_test.rs",
@@ -15169,12 +14652,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 6
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/lsp_stack_sanitizer_test.rs",
@@ -15197,8 +14679,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "dyn.std",
         "panic.recovery",
         "std.hashmap",
@@ -15207,7 +14687,7 @@
         "threads.sync",
         "traits.impl_trait_ret"
       ],
-      "findings": 31
+      "findings": 21
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/mod.rs",
@@ -15227,12 +14707,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.indexmap",
         "panic.recovery",
         "std.runtime"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/parseahead_test.rs",
@@ -15254,11 +14733,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/projectcollectionbuilder_test.rs",
@@ -15313,14 +14791,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 51
+      "findings": 30
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/refcountcache_test.rs",
@@ -15330,12 +14806,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/released_program_test.rs",
@@ -15358,10 +14833,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/requestfilesystem_pathtree_test.rs",
@@ -15371,11 +14845,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/requestfilesystem_test.rs",
@@ -15386,14 +14859,12 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 43
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/resolveahead_test.rs",
@@ -15405,14 +14876,13 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.fn",
         "ext.rustc_hash",
         "macros.std_unsupported",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 11
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/selectionranges_test.rs",
@@ -15433,14 +14903,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 13
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/sharedtext_test.rs",
@@ -15487,8 +14955,6 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "ext.rustc_hash",
         "panic.recovery",
@@ -15496,7 +14962,7 @@
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 36
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/stringliteralranges_test.rs",
@@ -15584,15 +15050,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "macros.std_unsupported",
         "std.hashmap",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 18
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/child.rs",
@@ -15603,7 +15067,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "ext.rustc_hash",
         "macros.std_unsupported",
         "panic.recovery",
@@ -15612,7 +15075,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 21
+      "findings": 19
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/component.rs",
@@ -15730,12 +15193,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/mod.rs",
@@ -15757,11 +15219,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/registry.rs",
@@ -15771,10 +15232,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/spawner.rs",
@@ -15785,14 +15245,13 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "std.other",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/supplemental.rs",
@@ -15906,7 +15365,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.other",
         "std.rc_refcell",
         "std.runtime",
@@ -15914,7 +15372,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 29
+      "findings": 19
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/mock_watch_backend.rs",
@@ -15924,14 +15382,12 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.hashmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 20
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/mod.rs",
@@ -15984,15 +15440,13 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 13
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/smoke.rs",
@@ -16028,7 +15482,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "dyn.std",
         "ext.rustc_hash",
         "std.cow",
@@ -16037,7 +15490,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 60
+      "findings": 53
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/vfstest.rs",
@@ -16048,13 +15501,12 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 46
+      "findings": 37
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/vfstest_test.rs",
@@ -16066,14 +15518,13 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 11
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsctests/build_info_corrupt.rs",
@@ -16128,7 +15579,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "dyn.std",
         "ext.rustc_hash",
         "generics.const_param",
@@ -16136,7 +15586,7 @@
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 46
+      "findings": 30
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsctests/effect_build_info.rs",
@@ -16297,12 +15747,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsctests/tsbuild_b.rs",
@@ -16461,14 +15910,13 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "dyn.boxed",
         "generics.const_param",
         "std.other",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsoptions/commandlineparser.rs",
@@ -16479,12 +15927,11 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.fn",
         "ext.indexmap",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsoptions/content_mappers.rs",
@@ -16494,11 +15941,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsoptions/misc.rs",
@@ -16561,7 +16007,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "ext.indexmap",
         "ext.rustc_hash",
         "panic.recovery",
@@ -16570,7 +16015,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 25
+      "findings": 20
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/ast_tests.rs",
@@ -16594,11 +16039,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/checkerpool_tests.rs",
@@ -16618,12 +16062,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.runtime",
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/clean_tests.rs",
@@ -16632,10 +16075,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "dyn.boxed"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/emittestutil.rs",
@@ -16659,10 +16100,9 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/ls_tests.rs",
@@ -16713,14 +16153,12 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.boxed",
-        "dyn.fn",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 20
+      "findings": 13
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/outputpaths_tests.rs",
@@ -16805,8 +16243,6 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "panic.recovery",
         "std.rc_refcell",
@@ -16814,7 +16250,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 11
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/scanner_parser.rs",
@@ -16849,11 +16285,10 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "dyn.boxed",
         "ext.indexmap",
         "std.runtime"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/bundled.rs",
@@ -16875,10 +16310,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/collections.rs",
@@ -16970,13 +16404,11 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
-        "dyn.fn",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
       ],
-      "findings": 16
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/fswatch_fsevents_darwin.rs",
@@ -16986,11 +16418,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.fn",
         "std.rc_refcell",
         "threads.sync"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/fswatch_n.rs",
@@ -17001,7 +16432,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
         "panic.recovery",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -17010,7 +16440,7 @@
         "threads.thread_local",
         "traits.impl_trait_arg"
       ],
-      "findings": 49
+      "findings": 40
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/fswatch_walkdir.rs",
@@ -17022,12 +16452,11 @@
       "missing_features": [
         "closures.fn_ptr_lifetime",
         "core.std_basics",
-        "dyn.fn",
         "std.hashmap",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/fswatch_watcher.rs",
@@ -17039,8 +16468,6 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
-        "dyn.fn",
         "panic.recovery",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -17048,7 +16475,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 107
+      "findings": 80
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/jsnum.rs",
@@ -17074,8 +16501,6 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "dyn.boxed",
-        "dyn.fn",
         "ext.indexmap",
         "std.hashmap",
         "std.rc_refcell",
@@ -17083,7 +16508,7 @@
         "threads.sync",
         "traits.impl_trait_arg"
       ],
-      "findings": 25
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/mod.rs",
@@ -17196,11 +16621,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/vfsmatch.rs",
@@ -17210,11 +16634,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 8
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/vfsmock.rs",
@@ -17224,11 +16647,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "dyn.boxed",
         "std.rc_refcell",
         "std.runtime"
       ],
-      "findings": 5
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/watchmanager.rs",
@@ -17340,7 +16762,6 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "dyn.boxed",
         "std.lazy_once_lock",
         "std.rc_refcell",
         "std.runtime",
@@ -17348,7 +16769,7 @@
         "traits.impl_trait_arg",
         "unsafe.blocks"
       ],
-      "findings": 17
+      "findings": 16
     },
     {
       "file": "crates/ts_wasm/src/lib.rs",
@@ -17361,14 +16782,13 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.any",
-        "dyn.boxed",
         "panic.recovery",
         "std.rc_refcell",
         "threads.sync",
         "threads.thread_local",
         "unsafe.blocks"
       ],
-      "findings": 16
+      "findings": 14
     },
     {
       "file": "tools/ts_ast_codegen/src/ast.rs",
@@ -17458,19 +16878,6 @@
   ],
   "findings": [
     {
-      "feature": "dyn.boxed",
-      "raw_key": "dyn_in.Rc",
-      "file": "crates/ts_goport/src/api/callbackfs.rs",
-      "byte_start": 930,
-      "byte_end": 940,
-      "line": 25,
-      "column": 11,
-      "snippet": "Rc<dyn Fs>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "ext.rustc_hash",
       "raw_key": "ext.type.rustc_hash::FxHashMap",
       "file": "crates/ts_goport/src/api/callbackfs.rs",
@@ -17497,19 +16904,6 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "dyn.boxed",
-      "raw_key": "dyn_in.Rc",
-      "file": "crates/ts_goport/src/api/callbackfs.rs",
-      "byte_start": 1169,
-      "byte_end": 1181,
-      "line": 31,
-      "column": 26,
-      "snippet": "Rc<dyn Conn>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "std.rc_refcell",
       "raw_key": "std.type.std::cell::RefCell",
       "file": "crates/ts_goport/src/api/callbackfs.rs",
@@ -17518,19 +16912,6 @@
       "line": 32,
       "column": 10,
       "snippet": "RefCell<Option<Context>>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "dyn.boxed",
-      "raw_key": "dyn_in.Rc",
-      "file": "crates/ts_goport/src/api/callbackfs.rs",
-      "byte_start": 2318,
-      "byte_end": 2328,
-      "line": 65,
-      "column": 30,
-      "snippet": "Rc<dyn Fs>",
       "scope": "active",
       "fix_class": "compiler work",
       "release_safe_rewrite": false
@@ -17546,19 +16927,6 @@
       "snippet": "FxHashMap<String, bool>",
       "scope": "active",
       "fix_class": "adapter",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "dyn.boxed",
-      "raw_key": "dyn_in.Rc",
-      "file": "crates/ts_goport/src/api/callbackfs.rs",
-      "byte_start": 5481,
-      "byte_end": 5493,
-      "line": 162,
-      "column": 55,
-      "snippet": "Rc<dyn Conn>",
-      "scope": "active",
-      "fix_class": "compiler work",
       "release_safe_rewrite": false
     },
     {
@@ -17796,32 +17164,6 @@
       "release_safe_rewrite": true
     },
     {
-      "feature": "dyn.boxed",
-      "raw_key": "dyn_in.Rc",
-      "file": "crates/ts_goport/src/api/module_resolution.rs",
-      "byte_start": 1630,
-      "byte_end": 1647,
-      "line": 40,
-      "column": 18,
-      "snippet": "Rc<dyn ipc::Conn>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "dyn.fn",
-      "raw_key": "dyn.std::ops::FnOnce",
-      "file": "crates/ts_goport/src/api/module_resolution.rs",
-      "byte_start": 2843,
-      "byte_end": 2855,
-      "line": 76,
-      "column": 41,
-      "snippet": "dyn FnOnce()",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "threads.sync",
       "raw_key": "std.type.std::sync::Arc",
       "file": "crates/ts_goport/src/api/module_resolution.rs",
@@ -17843,19 +17185,6 @@
       "line": 140,
       "column": 16,
       "snippet": "Arc<ResolvedModule>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "dyn.fn",
-      "raw_key": "dyn.std::ops::FnMut",
-      "file": "crates/ts_goport/src/api/module_resolution.rs",
-      "byte_start": 6744,
-      "byte_end": 6870,
-      "line": 183,
-      "column": 17,
-      "snippet": "dyn FnMut( &tspath::Path, crate::frontend::module::cache::PackageJsonCacheEntry<'_>, ) -> bool",
       "scope": "active",
       "fix_class": "compiler work",
       "release_safe_rewrite": false
@@ -18030,19 +17359,6 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "dyn.fn",
-      "raw_key": "dyn.std::ops::FnMut",
-      "file": "crates/ts_goport/src/api/requestfilesystem/pathtree.rs",
-      "byte_start": 5975,
-      "byte_end": 6025,
-      "line": 195,
-      "column": 17,
-      "snippet": "dyn FnMut(&tspath::Path, &Rc<RequestSymlinkEntry>)",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "std.cow",
       "raw_key": "std.type.std::borrow::Cow",
       "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
@@ -18103,19 +17419,6 @@
       "line": 678,
       "column": 40,
       "snippet": "std::mem::take",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "dyn.fn",
-      "raw_key": "dyn.std::ops::Fn",
-      "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
-      "byte_start": 29517,
-      "byte_end": 29543,
-      "line": 726,
-      "column": 13,
-      "snippet": "dyn Fn(&str, &str) -> bool",
       "scope": "active",
       "fix_class": "compiler work",
       "release_safe_rewrite": false
@@ -18246,19 +17549,6 @@
       "line": 93,
       "column": 30,
       "snippet": "impl FnMut() + '_",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "dyn.fn",
-      "raw_key": "dyn.std::ops::Fn",
-      "file": "crates/ts_goport/src/api/session_p1.rs",
-      "byte_start": 28538,
-      "byte_end": 28565,
-      "line": 721,
-      "column": 25,
-      "snippet": "dyn Fn(&Context) -> Context",
       "scope": "active",
       "fix_class": "compiler work",
       "release_safe_rewrite": false
@@ -19265,7 +18555,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 9692,
+  "findings_total": 7627,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],
