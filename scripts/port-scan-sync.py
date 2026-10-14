@@ -16,9 +16,15 @@ Modes:
                   and write docs/ts-rust-coverage.md for the core CLI scope
 
 Probes with `// oracle: lust-only` have no single-file rustc oracle
-(an external crate or a proc macro). They never set supported by
-themselves: a lust reject records unsupported, a lust accept is
-reported for a human call with the adapter test suites.
+(a proc macro). They never set supported by themselves: a lust reject
+records unsupported, a lust accept is reported for a human call.
+
+Probes with `// cargo-dep: <dependency line>` headers (one per line,
+as written under [dependencies]) use a registry crate: the probe runs
+as the bin of a temporary Cargo package with those dependencies. Cargo
+builds and runs it against the real crate (offline, from the local
+registry cache) as the oracle, and lust builds it from the same
+manifest, which swaps in the lust adapter (docs/ARCH.md 3.6).
 
 Env: LUST (lust binary), LUST_PORT (scanner binary), TS_RUST (ts-rust
 checkout), LUST_TCC_HOME (passed through to lust).
@@ -50,10 +56,11 @@ OWNER = {
     "threads.send_sync_bounds": "wave C (threads)",
     "panic.recovery": "wave C (panics)",
     "cinterop.system": "wave C (shims)",
+    "ext.unknown_crate": "wave D",
 }
 OWNER_BY_CAUSE = {
     "std-runtime": "W-STD-B",
-    "external-crates": "W-STD-B",
+    "external-crates": "W-DEPS",
     "traits-generics": "W-CHECK-G",
     "closures": "W-CHECK-G",
     "dyn-trait": "W-CHECK-G",
@@ -90,6 +97,17 @@ def first_code(stderr):
     return m.group(0) if m else ""
 
 
+def cargo_package(path, deps, tmp):
+    """A temporary Cargo package whose bin `probe` is the probe file.
+    Returns (manifest path, bin source path)."""
+    pkg = tmp / (path.stem + "-pkg")
+    (pkg / "src").mkdir(parents=True, exist_ok=True)
+    (pkg / "src/main.rs").write_text(path.read_text())
+    lines = ["[package]", 'name = "probe"', 'version = "0.0.0"', 'edition = "2024"', "", "[dependencies]", *deps, "", "[workspace]", ""]
+    (pkg / "Cargo.toml").write_text("\n".join(lines))
+    return pkg / "Cargo.toml", pkg / "src/main.rs"
+
+
 def probe_one(path, lust, tmp, env):
     """Test one probe file. Returns a result dict."""
     head = parse_header(path)
@@ -97,6 +115,9 @@ def probe_one(path, lust, tmp, env):
     if head.get("helper") == "true":
         res["verdict"] = "helper"
         return res
+    deps = re.findall(r"^//\s*cargo-dep:\s*(.+?)\s*$", path.read_text(), re.M)
+    if deps:
+        return probe_package(path, deps, lust, tmp, env, res)
     lust_only = head.get("oracle") == "lust-only"
     if not lust_only:
         panic = head.get("rustc-panic", "abort")
@@ -129,6 +150,37 @@ def probe_one(path, lust, tmp, env):
         res.update(verdict="runfail", detail=first_code(lerr) or "lust run failed after check passed")
     else:
         res.update(verdict="wrong", detail=f"lust stdout {lout!r} != rustc {res['rustc_stdout']!r}")
+    return res
+
+
+def probe_package(path, deps, lust, tmp, env, res):
+    """A `cargo-dep` probe: Cargo with the real crate is the oracle."""
+    manifest, src = cargo_package(path, deps, tmp)
+    cenv = dict(env, CARGO_NET_OFFLINE="true")
+    target = manifest.parent / "target"
+    code, _, err = run(["cargo", "build", "-q", "--manifest-path", str(manifest), "--target-dir", str(target)], 300, cenv)
+    if code != 0:
+        res.update(verdict="rustc-reject", detail=err.strip().splitlines()[-1][:160] if err.strip() else "")
+        return res
+    rcode, rout, _ = run([str(target / "debug/probe")], RUN_TIMEOUT)
+    res["rustc_stdout"] = rout
+    res["rustc_exit"] = rcode
+    lbin = manifest.parent / "probe.lust"
+    ccode, _, cerr = run([str(lust), "build", str(src), "-o", str(lbin), "--manifest-path", str(manifest), "--bin", "probe"], COMPILE_TIMEOUT, cenv)
+    res["lust_code"] = first_code(cerr)
+    if ccode != 0:
+        res["verdict"] = "reject"
+        return res
+    lcode, lout, _ = run([str(lbin)], RUN_TIMEOUT)
+    res["lust_stdout"] = lout
+    res["lust_exit"] = lcode
+    same_exit = lcode == rcode or (lcode != 0 and rcode != 0)
+    if lout == rout and same_exit:
+        res["verdict"] = "pass"
+    elif lcode == 124 or (lcode != 0 and not lout):
+        res.update(verdict="runfail", detail="lust build ran and failed")
+    else:
+        res.update(verdict="wrong", detail=f"lust stdout {lout!r} != cargo {rout!r}")
     return res
 
 

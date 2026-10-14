@@ -768,8 +768,8 @@
    ]
   },
   {
-   "id": "ext.builtin_crates",
-   "title": "Built-in dependency layer (FxHashMap, IndexMap, SmallVec, memchr, xxh3, ryu-js, BigInt, leak arena)",
+   "id": "ext.rustc_hash",
+   "title": "Adapter crate rustc-hash 2.1.2: FxHashMap/FxHashSet aliases, FxHasher, FxBuildHasher",
    "status": "unsupported",
    "milestone": 5,
    "inventory_step": "5",
@@ -777,47 +777,176 @@
    "fix_class": "adapter",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Compiler adapters bind to the resolved package and version. Iteration order must match where output depends on it. See dependencies.json.",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh rustc-hash. Split from ext.builtin_crates. See dependencies.json.",
    "primary_keys": [
-    "ext.type.rustc_hash::*",
-    "ext.type.indexmap::*",
-    "ext.type.smallvec::*",
-    "ext.type.memchr::*",
-    "ext.type.xxhash_rust::*",
-    "ext.type.bumpalo::*",
-    "ext.type.num_bigint::*",
-    "ext.type.ryu_js::*"
+    "ext.type.rustc_hash::*"
    ],
    "keys": [
     "ext.type.rustc_hash::*",
     "ext.expr.rustc_hash::*",
-    "ext.use.rustc_hash::*",
+    "ext.use.rustc_hash::*"
+   ]
+  },
+  {
+   "id": "ext.indexmap",
+   "title": "Adapter crate indexmap 2.14.0: IndexMap/IndexSet with insertion order",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh indexmap. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.indexmap::*"
+   ],
+   "keys": [
     "ext.type.indexmap::*",
     "ext.expr.indexmap::*",
-    "ext.use.indexmap::*",
+    "ext.use.indexmap::*"
+   ]
+  },
+  {
+   "id": "ext.smallvec",
+   "title": "Adapter crate smallvec 1.15.1: SmallVec<[T; N]> with inline storage",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh smallvec. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.smallvec::*"
+   ],
+   "keys": [
     "ext.type.smallvec::*",
     "ext.expr.smallvec::*",
     "ext.use.smallvec::*",
-    "ext.type.memchr::*",
-    "ext.expr.memchr::*",
-    "ext.use.memchr::*",
-    "ext.type.xxhash_rust::*",
-    "ext.expr.xxhash_rust::*",
-    "ext.use.xxhash_rust::*",
-    "ext.type.bumpalo::*",
-    "ext.expr.bumpalo::*",
-    "ext.use.bumpalo::*",
-    "ext.type.num_bigint::*",
-    "ext.expr.num_bigint::*",
-    "ext.use.num_bigint::*",
-    "ext.type.num_traits::*",
-    "ext.expr.num_traits::*",
-    "ext.use.num_traits::*",
-    "ext.type.ryu_js::*",
-    "ext.expr.ryu_js::*",
-    "ext.use.ryu_js::*",
     "macro.smallvec::smallvec",
     "macro.smallvec"
+   ]
+  },
+  {
+   "id": "ext.memchr",
+   "title": "Adapter crate memchr 2.8.2: memchr/memrchr, memchr_iter, memmem::Finder",
+   "status": "partial",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh memchr. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.memchr::*"
+   ],
+   "keys": [
+    "ext.type.memchr::*",
+    "ext.expr.memchr::*",
+    "ext.use.memchr::*"
+   ]
+  },
+  {
+   "id": "ext.xxhash_rust",
+   "title": "Adapter crate xxhash-rust 0.8.15: xxh3_64, xxh3_128, Xxh3",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh xxhash-rust. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.xxhash_rust::*"
+   ],
+   "keys": [
+    "ext.type.xxhash_rust::*",
+    "ext.expr.xxhash_rust::*",
+    "ext.use.xxhash_rust::*"
+   ]
+  },
+  {
+   "id": "ext.bumpalo",
+   "title": "Adapter crate bumpalo 3.20.3: Bump as the leak arena",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh bumpalo. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.bumpalo::*"
+   ],
+   "keys": [
+    "ext.type.bumpalo::*",
+    "ext.expr.bumpalo::*",
+    "ext.use.bumpalo::*"
+   ]
+  },
+  {
+   "id": "ext.num_bigint",
+   "title": "Adapter crate num-bigint 0.4.6: BigInt parse, pow, print",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh num-bigint. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.num_bigint::*"
+   ],
+   "keys": [
+    "ext.type.num_bigint::*",
+    "ext.expr.num_bigint::*",
+    "ext.use.num_bigint::*"
+   ]
+  },
+  {
+   "id": "ext.num_traits",
+   "title": "Adapter crate num-traits 0.2.19: ToPrimitive",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh num-traits. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.num_traits::*"
+   ],
+   "keys": [
+    "ext.type.num_traits::*",
+    "ext.expr.num_traits::*",
+    "ext.use.num_traits::*"
+   ]
+  },
+  {
+   "id": "ext.ryu_js",
+   "title": "Adapter crate ryu-js 1.0.2: Buffer::format (JS number to string)",
+   "status": "unsupported",
+   "milestone": 5,
+   "inventory_step": "5",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh ryu-js. Split from ext.builtin_crates. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.ryu_js::*"
+   ],
+   "keys": [
+    "ext.type.ryu_js::*",
+    "ext.expr.ryu_js::*",
+    "ext.use.ryu_js::*"
    ]
   },
   {
