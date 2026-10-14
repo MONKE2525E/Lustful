@@ -14,6 +14,7 @@ pub mod object;
 pub mod obligations;
 pub mod opaque;
 pub mod picks;
+pub mod project;
 pub mod stdtypes;
 pub mod variance;
 
@@ -1697,7 +1698,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         return Some((params, self.tys.adt_ty(a)));
                     }
                     let fields: Vec<Ty> = variant.fields.iter().map(|f| f.ty).collect();
-                    let params = fields.into_iter().map(|t| subst(&mut self.tys, t, &adt_args)).collect();
+                    let params = fields.into_iter().map(|t| self.subst_settled(t, &adt_args)).collect();
                     Some((params, self.tys.mk_adt(def, &adt_args)))
                 } else {
                     let f = p.local_def(def.hash)?;
@@ -1707,8 +1708,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // A generic fn item: its signature under the
                         // item's args (see `fn_value_ty`).
                         SigOf::Fn(info) => {
-                            let params = info.params.iter().map(|&t| subst(&mut self.tys, t, &fargs)).collect();
-                            Some((params, subst(&mut self.tys, info.ret, &fargs)))
+                            let params = info.params.iter().map(|&t| self.subst_settled(t, &fargs)).collect();
+                            Some((params, self.subst_settled(info.ret, &fargs)))
                         }
                         _ => None,
                     }
@@ -2142,6 +2143,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let lasts: Vec<Ty> = p.adt(a).variants.iter().filter_map(|v| v.fields.last().map(|f| f.ty)).collect();
                     lasts.into_iter().all(|f| {
                         let f = if args.is_empty() { f } else { subst(&mut self.tys, f, &args) };
+                        let f = self.normalize_here(f);
                         self.sized_ok(f)
                     })
                 } else {
@@ -2617,12 +2619,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// Proves one associated equality by normalization. False
-    /// when the projection does not normalize yet.
+    /// when the projection does not normalize yet. A template's
+    /// rigid projection (params, no inference variable) is its own
+    /// normal form: it unifies as it is.
     fn prove_assoc_eq(&mut self, eq: AssocEqData, span: Span) -> bool {
         let proj = self.tys.intern(TyKind::Projection(AssocId(eq.assoc), eq.trait_args));
         let normed = self.normalize_here(proj);
         let want = self.normalize_here(eq.ty);
-        if matches!(self.tys.kind(normed), TyKind::Projection(..)) && normed != want {
+        let flags = self.tys.flags(normed);
+        let rigid = flags.contains_param() && !flags.contains_infer();
+        if matches!(self.tys.kind(normed), TyKind::Projection(..)) && normed != want && !rigid {
             return false;
         }
         if !self.unify(normed, want) {
@@ -3867,12 +3873,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if let Some(d) = object::dyn_type_diag(p, &self.tys, t, span) {
                     self.errs.push(d);
                 }
-                let t = self.normalize_here(t);
                 // A written type must be well-formed: the
-                // bounds of every local Adt it applies become
-                // obligations here (rustc E0277 at the type).
-                self.wf_check_written(t, written_span);
-                t
+                // bounds of every local Adt it applies, and the
+                // trait ref of every projection in it as written,
+                // become obligations here (rustc E0277 at the type).
+                let n = self.normalize_here(t);
+                if n != t {
+                    self.wf_check_written(t, written_span);
+                }
+                self.wf_check_written(n, written_span);
+                n
             }
             Err(d) => {
                 self.errs.push(d);
@@ -3883,7 +3893,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// Queues the well-formedness obligations of one body
     /// type: for every application of a local Adt inside it,
-    /// the Adt's parameter bounds under the written arguments.
+    /// the Adt's parameter bounds under the written arguments,
+    /// and for every projection its trait ref.
     fn wf_check_written(&mut self, t: Ty, span: Span) {
         if !self.p.gx.has_generics {
             return;
@@ -3914,6 +3925,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => stack.push(e),
                 TyKind::Tuple(ts) => stack.extend(self.tys.tys_of(ts).iter().copied()),
                 TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
+                    if let TyKind::Projection(assoc, _) = self.tys.kind(t)
+                        && let Some(def) = self.p.gx.index.trait_of_assoc(assoc.0)
+                    {
+                        self.obl.push_trait_at(TraitRef { def, args: a, bindings: EMPTY_BINDINGS }, span, 0);
+                    }
                     let argv: Vec<GenericArg> = self.tys.args(a).to_vec();
                     for g in argv {
                         if let Some(e) = g.as_ty() {
@@ -4395,7 +4411,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         return match self.tys.adt_parts(inner) {
                             Some((_, args)) if args != EMPTY_ARGS && self.tys.flags(fty).contains_param() => {
                                 let gargs: Vec<GenericArg> = self.tys.args(args).to_vec();
-                                subst(&mut self.tys, fty, &gargs)
+                                self.subst_norm(fty, &gargs, span)
                             }
                             _ => fty,
                         };
@@ -4993,7 +5009,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             p.adt(a).variants[0].fields.get(*index as usize).map(|f| match self.tys.adt_parts(inner) {
                                 Some((_, args)) if args != EMPTY_ARGS && self.tys.flags(f.ty).contains_param() => {
                                     let gargs: Vec<GenericArg> = self.tys.args(args).to_vec();
-                                    subst(&mut self.tys, f.ty, &gargs)
+                                    self.subst_norm(f.ty, &gargs, span)
                                 }
                                 _ => f.ty,
                             })
@@ -5693,7 +5709,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             seen[i] = true;
                             self.check_field_vis(a, fname, fspan);
                             let ft = variant.fields[i].ty;
-                            let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
+                            let ft = if scrut_args.is_empty() { ft } else { self.subst_norm(ft, &scrut_args, span) };
                             self.assign_lhs_expected(fe, ft);
                         }
                         None => {
@@ -5756,7 +5772,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some(mapped) => {
                         for (i, sub) in mapped {
                             let ft = variant.fields[i].ty;
-                            let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
+                            let ft = if scrut_args.is_empty() { ft } else { self.subst_norm(ft, &scrut_args, span) };
                             self.assign_lhs_expected(sub, ft);
                         }
                     }
@@ -7041,7 +7057,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     if let Some((local, params, ret)) = found {
                         self.set_res(e, Res::Fn(local));
                         self.check_args(&params, args, span);
-                        return Some(self.normalize_here(ret));
+                        return Some(self.normalize_use(ret, span));
                     }
                     self.rollback_vars(snap);
                     self.obl_truncate(obl_len);
@@ -7162,7 +7178,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
                 self.set_res(e, Res::Fn(local));
                 self.check_args(&params, args, span);
-                Some(self.normalize_here(ret))
+                Some(self.normalize_use(ret, span))
             }
             0 => None,
             _ => {
@@ -7247,7 +7263,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 })
             })
             .collect();
-        let (params, ret, _) = self.instantiate_template(e, stub, &generics, &prefix, span);
+        let (mut params, ret, _) = self.instantiate_template(e, stub, &generics, &prefix, span);
+        self.normalize_params(&mut params, span);
         Some((stub, params, ret))
     }
 
@@ -7818,10 +7835,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
                 if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned() {
                     let explicit = self.explicit_call_args(callee);
-                    let (params, ret, inst_args) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
+                    let (mut params, ret, inst_args) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
                     self.unify_written_self(callee, f, &inst_args, span);
+                    self.normalize_params(&mut params, span);
                     self.check_args(&params, args, span);
-                    return self.normalize_here(ret);
+                    return self.normalize_use(ret, span);
                 }
                 let (params, ret) = match p.sig_of(&mut self.out.reads, p.def_id(f)) {
                     SigOf::Fn(info) => (info.params.clone(), p.ret_view(f)),
@@ -7863,7 +7881,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             self.rollback_vars(snap);
                         }
                     }
-                    let params: Vec<Ty> = variant.fields.iter().map(|f| subst(&mut self.tys, f.ty, &gen_args)).collect();
+                    let params: Vec<Ty> = variant.fields.iter().map(|f| self.subst_norm(f.ty, &gen_args, span)).collect();
                     self.check_args(&params, args, span);
                     // Forming the type owes its parameter bounds.
                     let preds = p.gx.adt_generics[a.0 as usize].predicates.clone();
@@ -10156,8 +10174,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     seen[i] = true;
                     self.check_field_vis(a, fname, fspan);
-                    let want =
-                        if gen_args.is_empty() { variant.fields[i].ty } else { subst(&mut self.tys, variant.fields[i].ty, &gen_args) };
+                    let want = if gen_args.is_empty() { variant.fields[i].ty } else { self.subst_norm(variant.fields[i].ty, &gen_args, fspan) };
                     self.expect_expr(fe, want);
                 }
                 None => {
@@ -10378,7 +10395,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
             impl_args
         };
         let explicit: Vec<Option<GenericArg>> = prefix.iter().map(|&g| Some(g)).collect();
-        let (params, ret, _) = self.instantiate_template(site, local, &tmpl.generics.clone(), &explicit, span);
+        let (mut params, ret, _) = self.instantiate_template(site, local, &tmpl.generics.clone(), &explicit, span);
+        self.normalize_params(&mut params, span);
         Some((local, params, ret))
     }
 
@@ -11682,7 +11700,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         };
                         for (i, sub) in mapped {
                             let ft = variant.fields[i].ty;
-                            let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
+                            let ft = if scrut_args.is_empty() { ft } else { self.subst_norm(ft, &scrut_args, span) };
                             self.pattern_mode(sub, ft, mode, in_match);
                         }
                     }
@@ -11696,7 +11714,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                                 Some(i) => {
                                     self.check_field_vis(a, fname, p.ast.pat_span(sub));
                                     let ft = variant.fields[i].ty;
-                                    let ft = if scrut_args.is_empty() { ft } else { subst(&mut self.tys, ft, &scrut_args) };
+                                    let ft = if scrut_args.is_empty() { ft } else { self.subst_norm(ft, &scrut_args, span) };
                                     self.pattern_mode(sub, ft, mode, in_match);
                                 }
                                 None => {
@@ -14122,6 +14140,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);
         }
+        self.settle_projections();
         for i in 0..self.out.pat_ty.len() {
             let t = self.out.pat_ty[i];
             self.out.pat_ty[i] = self.zonk(t);

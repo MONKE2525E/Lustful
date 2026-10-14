@@ -237,9 +237,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TyKind::Infer(v) => self.iter_closure_args.get(&v.0).cloned(),
             _ => None,
         });
+        // The bound's types normalize here: `F: Fn(A::Item)` gives a
+        // projection over the call's impl args (check/project.rs).
         let sig = match to_fn_ptr {
             Some((_, tuple, out)) => Some((tuple, Some(out))),
-            None => self.expected_closure_sig(expected),
+            None => match self.expected_closure_sig(expected) {
+                Some((ins, out)) => {
+                    let ins = self.deep(ins);
+                    let ins = self.normalize_use(ins, span);
+                    let out = out.map(|o| {
+                        let o = self.deep(o);
+                        self.normalize_use(o, span)
+                    });
+                    Some((ins, out))
+                }
+                None => None,
+            },
         };
         // W-BORROW: with no expected signature (a `let` closure), rustc
         // infers unannotated parameters' regions as free regions of the

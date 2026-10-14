@@ -216,6 +216,58 @@ fn unify_trait_refs<C: SolveCx>(cx: &mut C, a: TraitRef, b: TraitRef) -> bool {
     true
 }
 
+/// Replaces each projection in an impl header type by a fresh
+/// variable, recording `(projection, variable)` (see `probe_impl`).
+fn split_projections<C: SolveCx>(cx: &mut C, t: Ty, out: &mut Vec<(Ty, Ty)>) -> Ty {
+    if !cx.tys().flags(t).contains_projection() {
+        return t;
+    }
+    match cx.tys().kind(t) {
+        TyKind::Projection(..) => {
+            let v = cx.fresh_var();
+            out.push((t, v));
+            v
+        }
+        TyKind::Ref(r, m, e) => {
+            let e = split_projections(cx, e, out);
+            cx.tys().intern(TyKind::Ref(r, m, e))
+        }
+        TyKind::RawPtr(m, e) => {
+            let e = split_projections(cx, e, out);
+            cx.tys().intern(TyKind::RawPtr(m, e))
+        }
+        TyKind::Slice(e) => {
+            let e = split_projections(cx, e, out);
+            cx.tys().intern(TyKind::Slice(e))
+        }
+        TyKind::Array(e, n) => {
+            let e = split_projections(cx, e, out);
+            cx.tys().intern(TyKind::Array(e, n))
+        }
+        TyKind::Tuple(ts) => {
+            let old: Vec<Ty> = cx.tys().tys_of(ts).to_vec();
+            let new: Vec<Ty> = old.into_iter().map(|e| split_projections(cx, e, out)).collect();
+            let ts = cx.tys().intern_tys(&new);
+            cx.tys().intern(TyKind::Tuple(ts))
+        }
+        TyKind::Adt(d, a) => {
+            let old: Vec<GenericArg> = cx.tys().args(a).to_vec();
+            let new: Vec<GenericArg> = old
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(e) => GenericArg::Ty(split_projections(cx, e, out)),
+                    other => other,
+                })
+                .collect();
+            let a = cx.tys().intern_args(&new);
+            cx.tys().intern(TyKind::Adt(d, a))
+        }
+        // Other forms keep their projections: a header projection
+        // inside a fn pointer or dyn type stays a rigid match.
+        _ => t,
+    }
+}
+
 /// Fresh instantiation arguments for one item's parameters: a fresh
 /// variable per type parameter, an erased region per lifetime, and
 /// a fresh const variable per const parameter.
@@ -249,11 +301,47 @@ impl Solver {
     /// impl's binding for that associated item. On success the
     /// probe's bindings stand and the instantiation args are
     /// returned; on failure the caller rolls back.
-    fn probe_impl<C: SolveCx>(&self, cx: &mut C, rec: &ImplRecord, obl: TraitRef) -> Option<Vec<GenericArg>> {
+    ///
+    /// A projection in the header (`impl<A: Array> Sink<A::Item> for
+    /// P<A>`) matches as a fresh variable, then normalizes once the
+    /// header bound the impl's params, as rustc's `match_impl`
+    /// normalizes the impl trait ref: a rewrite that disagrees drops
+    /// the candidate, and one still blocked on inference comes back
+    /// as an `AssocEq` for the nested predicates.
+    fn probe_impl<C: SolveCx>(
+        &mut self,
+        cx: &mut C,
+        index: &ImplIndex,
+        env: &[Predicate],
+        rec: &ImplRecord,
+        obl: TraitRef,
+    ) -> Option<(Vec<GenericArg>, Vec<Predicate>)> {
         let inst = fresh_inst_args(cx, &rec.generics);
-        let pattern = subst_trait_ref_pub(cx.tys(), rec.trait_ref, &inst);
+        let mut pattern = subst_trait_ref_pub(cx.tys(), rec.trait_ref, &inst);
+        let mut projs: Vec<(Ty, Ty)> = Vec::new();
+        let old: Vec<GenericArg> = cx.tys().args(pattern.args).to_vec();
+        if old.iter().any(|g| g.as_ty().is_some_and(|t| cx.tys().flags(t).contains_projection())) {
+            let new: Vec<GenericArg> = old
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(split_projections(cx, t, &mut projs)),
+                    other => other,
+                })
+                .collect();
+            pattern.args = cx.tys().intern_args(&new);
+        }
         if !unify_trait_refs(cx, pattern, obl) {
             return None;
+        }
+        let mut deferred: Vec<Predicate> = Vec::new();
+        for (proj, var) in projs {
+            let normed = self.normalize_inner(cx, index, env, proj, 0);
+            if matches!(cx.tys().kind(normed), TyKind::Projection(..)) && cx.tys().flags(normed).contains_infer() {
+                let TyKind::Projection(assoc, trait_args) = cx.tys().kind(normed) else { continue };
+                deferred.push(Predicate::AssocEq(Binder::plain(AssocEqData { assoc: assoc.0, trait_args, ty: var })));
+            } else if !cx.unify(normed, var) {
+                return None;
+            }
         }
         let obl_bindings: Vec<(DefId, GenericArg)> = cx.tys().bindings(obl.bindings).to_vec();
         for (assoc, ga) in obl_bindings {
@@ -264,7 +352,7 @@ impl Solver {
                 return None;
             }
         }
-        Some(inst)
+        Some((inst, deferred))
     }
 
     /// The impl's predicates after confirmation: substituted with
@@ -325,13 +413,14 @@ impl Solver {
     /// Callers reach this only with exactly one candidate left.
     fn confirm_impl<C: SolveCx>(&mut self, cx: &mut C, index: &ImplIndex, env: &[Predicate], id: ImplId, obl: TraitRef) -> Selection {
         let rec = index.get(id).clone();
-        let Some(inst) = self.probe_impl(cx, &rec, obl) else {
+        let Some((inst, deferred)) = self.probe_impl(cx, index, env, &rec, obl) else {
             // The candidate matched a probe a moment ago; a failure
             // here means inference moved under it. Defer rather
             // than guess.
             return Selection::Ambiguous;
         };
-        let nested = self.nested_predicates(cx, index, &rec, &inst);
+        let mut nested = self.nested_predicates(cx, index, &rec, &inst);
+        nested.extend(deferred);
         self.bind_unbound_from_assoc_eqs(cx, index, env, &nested, &inst);
         let mut args: Vec<GenericArg> = Vec::with_capacity(inst.len());
         let mut unbound: Vec<ParamId> = Vec::new();
@@ -484,7 +573,7 @@ impl Solver {
         for id in cands {
             let rec = index.get(id).clone();
             let snap = cx.snapshot();
-            let ok = self.probe_impl(cx, &rec, obl).is_some();
+            let ok = self.probe_impl(cx, index, env, &rec, obl).is_some();
             cx.rollback(snap);
             if ok {
                 matched.push(id);
@@ -499,8 +588,8 @@ impl Solver {
             matched.retain(|&id| {
                 let rec = index.get(id).clone();
                 let snap = cx.snapshot();
-                let dropped = match self.probe_impl(cx, &rec, obl) {
-                    Some(inst) => rec.generics.predicates.iter().any(|&p| {
+                let dropped = match self.probe_impl(cx, index, env, &rec, obl) {
+                    Some((inst, _)) => rec.generics.predicates.iter().any(|&p| {
                         let p = subst_predicate(cx.tys(), p, &inst);
                         matches!(p, Predicate::Trait(b) if b.count == 0)
                             && self.provably_false(
@@ -616,9 +705,9 @@ impl Solver {
         'cands: for id in cands {
             let rec = index.get(id).clone();
             let snap = cx.snapshot();
-            let dead = match self.probe_impl(cx, &rec, tr) {
+            let dead = match self.probe_impl(cx, index, env, &rec, tr) {
                 None => true,
-                Some(inst) => {
+                Some((inst, _)) => {
                     let mut any_false_clause = false;
                     for &p in &rec.generics.predicates {
                         let p = subst_predicate(cx.tys(), p, &inst);

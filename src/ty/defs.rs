@@ -148,6 +148,12 @@ impl Defs {
     pub fn get(&self, def: DefId) -> Option<&DefData> {
         self.by_def.get(&def).map(|&i| &self.data[i as usize].1)
     }
+
+    /// The record of a def for an update in place (collect's
+    /// signature normalization keeps `sig` in step with `FnInfo`).
+    pub fn get_mut(&mut self, def: DefId) -> Option<&mut DefData> {
+        self.by_def.get(&def).map(|&i| &mut self.data[i as usize].1)
+    }
     /// The kind of a def, if known.
     #[allow(dead_code)] // First production readers are the trait and mono waves.
     pub fn kind_of(&self, def: DefId) -> Option<DefKind> {

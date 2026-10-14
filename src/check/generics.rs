@@ -1852,6 +1852,11 @@ fn resolve_path_ty(
             let base = tys.intern(TyKind::Param(ParamId(i)));
             return assoc_projection(cx, tys, scope, base, &segs[1..], span, interner);
         }
+        // In an instance body the param name maps to its concrete type,
+        // and the assoc sources are substituted alike (`fn_instance`).
+        if let Some(&(_, base)) = scope.param_tys.iter().find(|(n, _)| *n == segs[0].name) {
+            return assoc_projection(cx, tys, scope, base, &segs[1..], span, interner);
+        }
         if segs[0].name == known.std || interner.get(segs[0].name) == "core" || interner.get(segs[0].name) == "alloc" {
             // Fall through with the last segment, but only for a
             // path that really names a std type there
@@ -5629,18 +5634,62 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
 /// result back into the global store when normalization rewrote
 /// it in the solver's overlay.
 pub fn normalize_global(p: &mut Program, t: Ty) -> Ty {
+    normalize_global_in(p, &[], t)
+}
+
+/// `normalize_global` under one item's param env: a template's
+/// rigid `<T as Tr>::Out` stays, and one its bounds bind
+/// (`T: Tr<Out = u8>`) rewrites.
+pub fn normalize_global_in(p: &mut Program, env: &[Predicate], t: Ty) -> Ty {
     if !p.tys.flags(t).contains_projection() {
         return t;
     }
     let owned = {
         let mut cx = crate::traits::solve::PureCx::new(&p.tys);
         let mut solver = Solver::new();
-        let out = crate::traits::solve::normalize(&mut solver, &mut cx, &p.gx.index, &[], t);
+        let out = crate::traits::solve::normalize(&mut solver, &mut cx, &p.gx.index, env, t);
         snapshot_ty(&cx.tys, out)
     };
     match owned {
         Some(owned) => build_owned_ty(p, &owned),
         None => t,
+    }
+}
+
+/// Normalizes the projections in every fn signature and Adt field
+/// type once the impl index is complete (ARCH 2.5), before any body,
+/// caller, or C signature reads them: a plain `fn f() -> <A as
+/// Tr>::Out` returns the impl's type. Each item normalizes under its
+/// own env (`normalize_global_in`); instances normalize again after
+/// substitution (`fn_instance`, `adt_instance`), and bodies normalize
+/// what they instantiate (check/project.rs).
+fn normalize_signatures(p: &mut Program) {
+    for i in 0..p.fns.len() {
+        let (params, ret) = (p.fns[i].params.clone(), p.fns[i].ret);
+        if !params.iter().chain([&ret]).any(|&t| p.tys.flags(t).contains_projection()) {
+            continue;
+        }
+        let env = p.gx.fn_scopes.get(i).map(|s| s.env.clone()).unwrap_or_default();
+        let params: Vec<Ty> = params.into_iter().map(|t| normalize_global_in(p, &env, t)).collect();
+        let ret = normalize_global_in(p, &env, ret);
+        if let Some(data) = p.defs.get_mut(p.fn_defs[i]) {
+            data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
+        }
+        p.fns[i].params = params;
+        p.fns[i].ret = ret;
+    }
+    for a in 0..p.adts.len() {
+        let has_projection = p.adts[a].variants.iter().flat_map(|v| &v.fields).any(|f| p.tys.flags(f.ty).contains_projection());
+        if !has_projection {
+            continue;
+        }
+        let env = p.gx.adt_envs.get(a).cloned().unwrap_or_default();
+        for v in 0..p.adts[a].variants.len() {
+            for f in 0..p.adts[a].variants[v].fields.len() {
+                let t = p.adts[a].variants[v].fields[f].ty;
+                p.adts[a].variants[v].fields[f].ty = normalize_global_in(p, &env, t);
+            }
+        }
     }
 }
 
@@ -6374,20 +6423,8 @@ pub fn append_trait_default_templates(p: &mut Program) {
         // The body may call the trait's own methods on Self: its env
         // has `Self: Trait<..>` over the trait's params, as in rustc.
         let mut env = tmpl.env.clone();
-        if let Some(td) = p.gx.index.trait_of_method(method_def)
-            && let Some(n) = p.gx.index.trait_record(td).map(|r| r.generics.params.len())
-        {
-            let own: Vec<GenericArg> = tmpl.generics.params[..n]
-                .iter()
-                .enumerate()
-                .map(|(i, d)| match d.kind {
-                    ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
-                    ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
-                    ParamKind::Type => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
-                })
-                .collect();
-            let args = p.tys.intern_args(&own);
-            env.push(Predicate::Trait(Binder::plain(TraitRef { def: td, args, bindings: EMPTY_BINDINGS })));
+        if let Some(own) = own_trait_pred(p, method_def, &tmpl.generics) {
+            env.push(own);
             env = body_env(&mut p.tys, &p.gx.index, &env);
         }
         p.gx.fn_templates.push(Some(FnTemplate { generics: tmpl.generics.clone(), env: env.clone() }));
@@ -6905,7 +6942,8 @@ fn adt_first_index(p: &Program) -> FxMap<DefId, usize> {
 
 /// Collects the trait goals one type owes to be well-formed:
 /// for every application of a local Adt inside it, the Adt's
-/// parameter predicates under the written arguments.
+/// parameter predicates under the written arguments, and for every
+/// projection its trait ref (`<B as Tr>::Out` needs `B: Tr`).
 fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Vec<Ty>, out: &mut Vec<TraitRef>) {
     use crate::traits::index::subst_predicate;
     if seen.contains(&t) || t == ERROR {
@@ -6942,7 +6980,13 @@ fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Ve
                 wf_goals(p, adt_idx, e, seen, out);
             }
         }
-        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => in_args(p, seen, out, a),
+        TyKind::Projection(assoc, a) => {
+            if let Some(def) = p.gx.index.trait_of_assoc(assoc.0) {
+                out.push(TraitRef { def, args: a, bindings: EMPTY_BINDINGS });
+            }
+            in_args(p, seen, out, a);
+        }
+        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => in_args(p, seen, out, a),
         TyKind::FnPtr(sig) => {
             let b = p.tys.sig(sig);
             for e in p.tys.tys_of(b.value.inputs).to_vec() {
@@ -6952,6 +6996,25 @@ fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Ve
         }
         _ => {}
     }
+}
+
+/// The `Self: Trait<..>` a trait method's signature and body assume
+/// (rustc's implicit trait predicate), over the trait's own params
+/// at the front of the method's combined generics.
+fn own_trait_pred(p: &mut Program, method_def: DefId, generics: &Generics) -> Option<Predicate> {
+    let td = p.gx.index.trait_of_method(method_def)?;
+    let n = p.gx.index.trait_record(td)?.generics.params.len();
+    let own: Vec<GenericArg> = generics.params[..n.min(generics.params.len())]
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match d.kind {
+            ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
+            ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+            ParamKind::Type => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
+        })
+        .collect();
+    let args = p.tys.intern_args(&own);
+    Some(Predicate::Trait(Binder::plain(TraitRef { def: td, args, bindings: EMPTY_BINDINGS })))
 }
 
 /// Well-formedness of written types at collect: every type in
@@ -6973,16 +7036,28 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         tys.push(info.ret);
         // Plain fns keep their generics (with any where clause)
         // only in the def table, so read them from there.
-        let generics = match p.gx.fn_templates.get(i).cloned().flatten() {
+        let mut generics = match p.gx.fn_templates.get(i).cloned().flatten() {
             Some(t) => t.generics,
             None => p.defs.get(p.def_id(LocalDefId(i as u32))).map_or_else(Generics::default, |d| d.generics.clone()),
         };
-        items.push((tys, generics, info.def.name_span));
+        let span = info.def.name_span;
+        // A trait default body's signature assumes `Self: Trait`.
+        if let Some(own) = own_trait_pred(p, p.def_id(LocalDefId(i as u32)), &generics) {
+            generics.predicates.push(own);
+        }
+        items.push((tys, generics, span));
     }
-    for tmpl in p.gx.trait_methods.values() {
-        let mut tys: Vec<Ty> = tmpl.params.clone();
-        tys.push(tmpl.ret);
-        items.push((tys, tmpl.generics.clone(), tmpl.def.name_span));
+    let methods: Vec<(DefId, Vec<Ty>, Generics, Span)> = p
+        .gx
+        .trait_methods
+        .iter()
+        .map(|(&d, t)| (d, t.params.iter().copied().chain([t.ret]).collect(), t.generics.clone(), t.def.name_span))
+        .collect();
+    for (method_def, tys, mut generics, span) in methods {
+        if let Some(own) = own_trait_pred(p, method_def, &generics) {
+            generics.predicates.push(own);
+        }
+        items.push((tys, generics, span));
     }
     for idx in 0..p.gx.adt_info.len() {
         let a = p.adt(AdtId(idx as u32));
@@ -7162,7 +7237,10 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     check_copy_impls(p, errs);
     check_derive_bounds(p, errs);
     check_deferred_debug_fields(p, errs);
+    // Well-formedness reads the written projections (each owes its
+    // trait ref, where clauses included); normalization comes after.
     check_written_wf(p, errs);
+    normalize_signatures(p);
     let is_local = |d: DefId| d.krate == p.krate;
     let lang = p.gx.lang;
     let by_construction = [lang.sized, lang.send, lang.sync, lang.unpin];

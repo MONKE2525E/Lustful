@@ -205,7 +205,7 @@ fn confirm_method(
     let err_len = cx.errs.len();
     let mut full_explicit: Vec<Option<GenericArg>> = prefix.iter().map(|&g| Some(g)).collect();
     full_explicit.extend_from_slice(explicit);
-    let (params, ret, _) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
+    let (mut params, ret, _) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
     let want_recv = *params.first()?;
     if !cx.unify(want_recv, probe.recv_ty) {
         cx.rollback_vars(snap_vars);
@@ -214,9 +214,12 @@ fn confirm_method(
         cx.errs.truncate(err_len);
         return None;
     }
+    // As rustc confirms a method: normalize after the receiver binds
+    // the impl's params (check/project.rs).
+    cx.normalize_params(&mut params, name_span);
     cx.set_res(e, Res::Method { f: template, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
     cx.check_args(&params[1.min(params.len())..], args, name_span);
-    Some(cx.normalize_here(ret))
+    Some(cx.normalize_use(ret, name_span))
 }
 
 /// Probes inherent method templates of one probe variant's Self
@@ -787,13 +790,14 @@ fn confirm_deferred(
             (None, ParamKind::Const(_)) => GenericArg::Const(cx.fresh_const_var()),
         });
     }
-    let params: Vec<Ty> = t.params.iter().map(|&pt| subst(&mut cx.tys, pt, &full)).collect();
+    let mut params: Vec<Ty> = t.params.iter().map(|&pt| subst(&mut cx.tys, pt, &full)).collect();
     let ret = subst(&mut cx.tys, t.ret, &full);
     if params.is_empty() || !cx.unify(params[0], probe.recv_ty) {
         cx.rollback_vars(snap);
         cx.obl_truncate(obl_len);
         return Probe::Miss;
     }
+    cx.normalize_params(&mut params, name_span);
     let preds = t.generics.predicates.clone();
     cx.push_predicates(&preds, &full, name_span);
     let tr_args = cx.tys.intern_args(&full[..n_trait]);
@@ -803,7 +807,7 @@ fn confirm_deferred(
     cx.deferred_methods.push(DeferredMethod { e, tr, name: t.name, own: full[n_trait..].to_vec(), derefs, autoref: probe.autoref });
     cx.record_pick(e, trait_def, derefs, probe.filter);
     cx.check_args(&params[1..], args, name_span);
-    Probe::Hit(cx.normalize_here(ret))
+    Probe::Hit(cx.normalize_use(ret, name_span))
 }
 
 /// Body end for `confirm_deferred` calls: after the hard obligation
