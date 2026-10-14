@@ -1021,6 +1021,8 @@ lust_i128 lust_mul_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
     /* Divide back, as the i64 helper does; the -1 edges are handled above. */
     lust_u128 q = lust_u128_divmod(lust_i128_mag(r), lust_i128_mag(b), 0);
     if (lust_u128_cmp(q, lust_i128_mag(a)) != 0) LUST_OVF("multiply");
+    /* |a*b| <= 2^127 now; +2^127 wraps to i128::MIN, so the sign tells. */
+    if (((a.hi ^ b.hi ^ r.hi) >> 63) & 1) LUST_OVF("multiply");
     return r;
 })
 lust_i128 lust_div_i128(lust_i128 a, lust_i128 b, lust_loc loc) LUST_BODY({
