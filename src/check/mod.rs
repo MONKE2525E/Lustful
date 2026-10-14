@@ -2092,14 +2092,22 @@ impl<'p, 'a> Ctx<'p, 'a> {
             alias_depth: 1,
             ..Default::default()
         };
-        for (i, &(name, _)) in la.type_params.iter().enumerate() {
-            let t = match written.get(i) {
-                Some(&w) => self.resolve_written(w),
-                None => self.new_var(false),
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        for (i, &(name, default)) in la.type_params.iter().enumerate() {
+            // rustc infers every param when no args are written, and
+            // takes the missing ones' defaults otherwise (E0107 when one
+            // has none).
+            let t = match (written.get(i), default) {
+                (Some(&w), _) => self.resolve_written(w),
+                _ if written.is_empty() => self.new_var(false),
+                (None, Some(d)) => generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, d, &body).ok()?,
+                (None, None) => {
+                    self.err("L0107", span, format!("this alias takes {} type argument(s)", la.type_params.len()), "Write one type per parameter.");
+                    return None;
+                }
             };
             body.param_tys.push((name, t));
         }
-        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let t = generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, la.ty, &body).ok()?;
         let (d, args) = self.tys.adt_parts(t)?;
         let a = p.adt_by_def(d)?;
