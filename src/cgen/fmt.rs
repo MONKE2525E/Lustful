@@ -136,7 +136,7 @@ fn builder_list(n: &str, elem: &str, et: &CTy, need: &mut dyn FnMut(Glue, &CTy))
 }
 
 /// The body of `dbg_<m>`: Rust's Debug for `t`, through the builders.
-pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy)) -> String {
+pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
     let disc_p = disc_call(p, t, "p");
     let mut body = String::new();
     match t {
@@ -211,7 +211,7 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
             );
         }
         CTy::Adt(a) => {
-            if let Some(call) = user_fmt_call(p, *a, FmtKind::Debug, slots) {
+            if let Some(call) = user_fmt_call(p, *a, FmtKind::Debug, slots, types) {
                 let _ = writeln!(body, "  {call}");
             } else {
                 let adt = p.adt(*a);
@@ -246,7 +246,7 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
 
 /// The body of `disp_<m>`: only types with a user Display impl reach
 /// Display glue (every other Display type is a leaf in `fmt_expr`).
-pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32]) -> String {
+pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], types: &mut Vec<CTy>) -> String {
     match t {
         // `impl Display for fmt::Error`: str Display of core's text.
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::fmt_error_def()) == Some(*a) => {
@@ -267,6 +267,7 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32]) -> String {
         // caller's width and fill do not apply.
         CTy::Adt(_) if let Some(u) = utf8_error_part(p, t, "(*p)") => {
             let opt = CTy::Option(Box::new(CTy::Int(IntTy::U8)));
+            types.push(opt.clone());
             let o = format!("{u}.f1");
             format!(
                 "  lust_Formatter g; lust_f_init(&g, f->buf);\n  if ({}) return lust_f_write_str(&g, {}) || lust_f_u64(&g, {}) || lust_f_write_str(&g, {}) || lust_f_u64(&g, {u}.f0);\n  return lust_f_write_str(&g, {}) || lust_f_u64(&g, {u}.f0);\n",
@@ -277,7 +278,7 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32]) -> String {
                 lit("incomplete utf-8 byte sequence from index ")
             )
         }
-        CTy::Adt(a) => match user_fmt_call(p, *a, FmtKind::Display, slots) {
+        CTy::Adt(a) => match user_fmt_call(p, *a, FmtKind::Display, slots, types) {
             Some(call) => format!("  {call}\n"),
             None => "  abort();\n".to_string(),
         },
@@ -287,17 +288,17 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32]) -> String {
 
 /// The call of a user fmt impl's method instance for Adt `a`, as a C
 /// statement that returns 0 or 1, when the program has one.
-fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &[u32]) -> Option<String> {
+/// Adds the method's signature types to `types` (see `glue_callee`).
+fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &[u32], types: &mut Vec<CTy>) -> Option<String> {
     let m = *p.gx.fmt_methods.get(&(a, kind as u8))?;
     let ret = cty(&p.tys, p.fn_info(m).ret);
     let rt = ctype(&ret);
-    let cast = fn_ptr_cast(p, m);
-    let slot = slots[m.0 as usize];
+    let callee = glue_callee(p, slots, m, types);
     let disc = disc_call(p, &ret, "(&r)");
     Some(if ret_is_large(p, m) {
-        format!("{{ {rt} r; ({cast}lust_fns[{slot}])(&r, p, f); return {disc} != 0; }}")
+        format!("{{ {rt} r; {callee}(&r, p, f); return {disc} != 0; }}")
     } else {
-        format!("{{ {rt} r = ({cast}lust_fns[{slot}])(p, f); return {disc} != 0; }}")
+        format!("{{ {rt} r = {callee}(p, f); return {disc} != 0; }}")
     })
 }
 

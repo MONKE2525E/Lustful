@@ -4838,6 +4838,9 @@ pub struct GlueSet {
     def_map: HashMap<(Glue, CTy), String>,
     /// The glue keys each key's definition calls.
     deps: HashMap<(Glue, CTy), Vec<(Glue, CTy)>>,
+    /// C types each key's definition names beyond its key type: the signature of a written
+    /// method it calls (`glue_callee`). A unit that defines the key must declare them.
+    types: HashMap<(Glue, CTy), Vec<CTy>>,
     /// Keys that live in the shared glue unit. Frozen until the next `compute_shared`.
     pub shared: Option<HashSet<(Glue, CTy)>>,
     /// Keys the last `refresh` did not reach: their text may predate a type edit. `add`
@@ -4899,9 +4902,13 @@ impl GlueSet {
             let mut more = Vec::new();
             let mut proto = String::new();
             let mut def = String::new();
-            glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more);
-            let changed =
-                is_new || self.def_map.get(&g) != Some(&def) || self.protos.get(&g) != Some(&proto) || self.deps.get(&g) != Some(&more);
+            let mut types = Vec::new();
+            glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more, &mut types);
+            let changed = is_new
+                || self.def_map.get(&g) != Some(&def)
+                || self.protos.get(&g) != Some(&proto)
+                || self.deps.get(&g) != Some(&more)
+                || self.types.get(&g) != Some(&types);
             if changed {
                 regenerated |= !is_new;
                 shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(&g));
@@ -4910,6 +4917,7 @@ impl GlueSet {
                 }
                 self.def_map.insert(g.clone(), def);
                 self.deps.insert(g.clone(), more.clone());
+                self.types.insert(g.clone(), types);
                 self.protos.insert(g, proto);
             }
             pending.extend(more);
@@ -4964,6 +4972,13 @@ impl GlueSet {
 
     fn is_shared(&self, k: &(Glue, CTy)) -> bool {
         self.shared.as_ref().is_some_and(|s| s.contains(k))
+    }
+
+    /// Adds the C types that the definition of `k` names to `out`: its key type and the
+    /// types in `types`. A unit that holds the definition must declare all of them.
+    fn def_types(&self, k: &(Glue, CTy), out: &mut HashSet<CTy>) {
+        collect_types(&k.1, out);
+        self.types.get(k).into_iter().flatten().for_each(|t| collect_types(t, out));
     }
 }
 
@@ -5201,7 +5216,7 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         // A stale key (no live body reaches it) may name an Adt or fields that are gone.
         let mut keys: Vec<&(Glue, CTy)> = shared.iter().filter(|k| !g.stale.contains(*k)).collect();
         for k in &keys {
-            collect_types(&k.1, &mut types);
+            g.def_types(k, &mut types);
         }
         type_decls(p, &mut c, &types);
         keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
@@ -5215,7 +5230,7 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         return c;
     }
     for k in g.protos.keys() {
-        collect_types(&k.1, &mut types);
+        g.def_types(k, &mut types);
     }
     type_decls(p, &mut c, &types);
     let mut protos: Vec<&String> = g.protos.values().collect();
@@ -5536,8 +5551,10 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     if hybrid {
         let mut stack: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
         while let Some(k) = stack.pop() {
-            collect_types(&k.1, &mut types);
-            if !g.is_shared(k) {
+            if g.is_shared(k) {
+                collect_types(&k.1, &mut types);
+            } else {
+                g.def_types(k, &mut types);
                 if let Some(deps) = g.deps.get(k) {
                     for dep in deps {
                         if seen.insert(dep) {
@@ -6043,8 +6060,8 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
 /// returns for `args` (the method's C arguments, comma separated),
 /// called through the fn table with the large-return out pointer
 /// when the method uses one (see `FnGen::call_value`).
-fn written_glue_call(p: &Program, slots: &[u32], f: LocalDefId, args: &str) -> String {
-    let callee = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots[f.0 as usize]);
+fn written_glue_call(p: &Program, slots: &[u32], f: LocalDefId, args: &str, types: &mut Vec<CTy>) -> String {
+    let callee = glue_callee(p, slots, f, types);
     if ret_is_large(p, f) {
         let ret = ctype(&cty(&p.tys, p.fn_info(f).ret));
         let pre = if args.is_empty() { String::new() } else { format!(", {args}") };
@@ -6054,7 +6071,29 @@ fn written_glue_call(p: &Program, slots: &[u32], f: LocalDefId, args: &str) -> S
     }
 }
 
-fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, defs: &mut String, more: &mut Vec<(Glue, CTy)>) {
+/// `(CAST lust_fns[SLOT])`, the callee text for glue that calls written fn `f`. Adds the C
+/// types of `f`'s signature to `types` (see `GlueSet::types`): the glue can be a static copy
+/// in a unit whose own fns never name them.
+fn glue_callee(p: &Program, slots: &[u32], f: LocalDefId, types: &mut Vec<CTy>) -> String {
+    let info = p.fn_info(f);
+    types.push(cty(&p.tys, info.ret));
+    types.extend(info.params.iter().map(|&t| cty(&p.tys, t)));
+    format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots[f.0 as usize])
+}
+
+/// Generates the prototype and definition of glue `g` for `t`. Pushes the glue keys the
+/// definition calls to `more` and the extra C types it names to `types`.
+#[allow(clippy::too_many_arguments)]
+fn glue_def(
+    p: &Program,
+    slots: &[u32],
+    g: &Glue,
+    t: &CTy,
+    protos: &mut String,
+    defs: &mut String,
+    more: &mut Vec<(Glue, CTy)>,
+    types: &mut Vec<CTy>,
+) {
     let m = mangle(t);
     let ct = ctype(t);
     let mut need = |g: Glue, t: &CTy| more.push((g, t.clone()));
@@ -6200,7 +6239,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                         if !has_generated_body(p, drop_fn) {
                             let _ = writeln!(body, "#error \"internal: drop glue calls a fn with no generated body\"");
                         }
-                        let _ = writeln!(body, "  ({}lust_fns[{}])(p);", fn_ptr_cast(p, drop_fn), slots[drop_fn.0 as usize]);
+                        let _ = writeln!(body, "  {}(p);", glue_callee(p, slots, drop_fn, types));
                     }
                     let adt = p.adt(*a);
                     if adt.is_enum {
@@ -6248,7 +6287,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
             if let CTy::Adt(a) = t
                 && let Some(&f) = p.gx.glue_methods.get(&(*a, p.gx.lang.clone))
             {
-                let call = written_glue_call(p, slots, f, "p");
+                let call = written_glue_call(p, slots, f, "p", types);
                 let _ = writeln!(defs, "{ct} clone_{m}({ct} *p) {{\n{call}}}\n");
                 return;
             }
@@ -6368,7 +6407,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
             if let CTy::Adt(adt_id) = t
                 && let Some(&f) = p.gx.glue_methods.get(&(*adt_id, p.gx.lang.partial_eq))
             {
-                let call = written_glue_call(p, slots, f, "a, b");
+                let call = written_glue_call(p, slots, f, "a, b", types);
                 let _ = writeln!(defs, "uint8_t eq_{m}({ct} *a, {ct} *b) {{\n{call}}}\n");
                 return;
             }
@@ -6470,7 +6509,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
                 && let Some(ord) = p.tys.local_adt_of(crate::check::generics::ordering_def())
             {
                 let opt = CTy::Option(Box::new(CTy::Adt(ord)));
-                let callee = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots[f.0 as usize]);
+                let callee = glue_callee(p, slots, f, types);
                 let ot = ctype(&opt);
                 if ret_is_large(p, f) {
                     let _ = writeln!(body, "  {ot} r; {callee}(&r, a, b);");
@@ -6608,7 +6647,7 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
             if let CTy::Adt(a) = t
                 && let Some(&f) = p.gx.glue_methods.get(&(*a, p.gx.lang.default))
             {
-                let call = written_glue_call(p, slots, f, "");
+                let call = written_glue_call(p, slots, f, "", types);
                 let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{call}}}\n");
                 return;
             }
@@ -6683,12 +6722,12 @@ fn glue_def(p: &Program, slots: &[u32], g: &Glue, t: &CTy, protos: &mut String, 
         }
         Glue::Debug => {
             let _ = writeln!(protos, "int dbg_{m}(lust_Formatter *f, {ct} *p);");
-            let body = fmt::debug_glue_body(p, t, slots, &mut need);
+            let body = fmt::debug_glue_body(p, t, slots, &mut need, types);
             let _ = writeln!(defs, "int dbg_{m}(lust_Formatter *f, {ct} *p) {{\n{body}}}\n");
         }
         Glue::Display => {
             let _ = writeln!(protos, "int disp_{m}(lust_Formatter *f, {ct} *p);");
-            let body = fmt::display_glue_body(p, t, slots);
+            let body = fmt::display_glue_body(p, t, slots, types);
             let _ = writeln!(defs, "int disp_{m}(lust_Formatter *f, {ct} *p) {{\n{body}}}\n");
         }
     }
