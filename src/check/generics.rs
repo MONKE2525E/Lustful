@@ -842,6 +842,10 @@ pub fn lang_method_sigs(
                 (d, "next_back") if d == lang.double_ended_iterator => {
                     let item = proj(tys, lang.assoc_item, &[p0]);
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_option(item), ret_borrows_from: None }
+                (d, "size_hint") if d == lang.iterator => {
+                    let ou = tys.mk_option(USIZE);
+                    let pair = tys.intern_tys(&[USIZE, ou]);
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: tys.intern(TyKind::Tuple(pair)), ret_borrows_from: None }
                 }
                 (d, "into_iter") if d == lang.into_iterator => LangMethodSig {
                     self_kind: Some(Value),

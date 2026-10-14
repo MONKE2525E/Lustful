@@ -1151,7 +1151,13 @@ pub mod vec_deque {
         pub fn swap_remove_back(&mut self, index: usize) -> Option<T> {
             if index < self.buf.len() { Some(self.buf.swap_remove(index)) } else { None }
         }
+
+        pub fn drain<R: core::ops::RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T> {
+            self.buf.drain(range)
+        }
     }
+
+    pub type Drain<'a, T> = std::vec::Drain<'a, T>;
 
     impl<T> Default for VecDeque<T> {
         fn default() -> VecDeque<T> {
