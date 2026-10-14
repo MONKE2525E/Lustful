@@ -4714,8 +4714,8 @@ impl FnGen<'_, '_, '_> {
                 format!("{f}({a}, {})", vals[1])
             }
             B::StrTrim => format!("lust_str_trim({})", str_of(&vals[0], &tys[0])),
-            B::StrToUppercase => format!("lust_str_ascii_case({}, 1)", str_of(&vals[0], &tys[0])),
-            B::StrToLowercase => format!("lust_str_ascii_case({}, 0)", str_of(&vals[0], &tys[0])),
+            B::StrToUppercase => format!("lust_str_case({}, 1)", str_of(&vals[0], &tys[0])),
+            B::StrToLowercase => format!("lust_str_case({}, 0)", str_of(&vals[0], &tys[0])),
             B::StrChars => format!("lust_chars({})", str_of(&vals[0], &tys[0])),
             B::CharsNext => {
                 let t = self.tmp();
@@ -5521,6 +5521,8 @@ fn runtime_source(with_impls: bool) -> String {
     let core = include_str!("runtime/core.c")
         .replacen("#include \"escape_table.h\"", include_str!("runtime/escape_table.h"), 1)
         .replacen("#include \"unicode_table.h\"", include_str!("runtime/unicode_table.h"), 1);
+    // The Unicode case tables (W-STD-B) only where the bodies are.
+    let core = core.replacen("#include \"case_tables.h\"", if with_impls { include_str!("runtime/case_tables.h") } else { "" }, 1);
     let (h, core, panic) = (include_str!("runtime/runtime.h"), core.as_str(), include_str!("runtime/panic.c"));
     let mut src = String::with_capacity(h.len() + core.len() + panic.len() + header.len() + hash.len());
     src.push_str(h);

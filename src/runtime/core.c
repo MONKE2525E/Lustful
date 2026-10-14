@@ -1445,6 +1445,78 @@ uint32_t lust_utf8_prev(const uint8_t *p, uint64_t *end) LUST_BODY({
     return c;
 })
 
+/* str::to_uppercase and str::to_lowercase as Rust 1.99 runs them
+   (W-STD-B): the ASCII prefix byte by byte into a String with the str's
+   length as capacity (`convert_while_ascii`), then each char through
+   rustc-generated tables (one to three chars, pushed one by one), and in
+   to_lowercase 'Σ' by the final-sigma rule. The tables are in the runtime
+   unit only (`runtime_source`). */
+#include "case_tables.h"
+static int lust_case_in(const uint32_t (*t)[2], uint64_t n, uint32_t c) LUST_BODY({
+    uint64_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint64_t m = lo + (hi - lo) / 2;
+        if (c < t[m][0]) hi = m;
+        else if (c > t[m][1]) lo = m + 1;
+        else return 1;
+    }
+    return 0;
+})
+static const uint32_t *lust_case_map(const uint32_t (*t)[4], uint64_t n, uint32_t c) LUST_BODY({
+    uint64_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint64_t m = lo + (hi - lo) / 2;
+        if (c < t[m][0]) hi = m;
+        else if (c > t[m][0]) lo = m + 1;
+        else return &t[m][1];
+    }
+    return 0;
+})
+/* `case_ignorable_then_cased` over the chars before byte `i` (backward)
+   or from byte `i` on (forward). */
+static int lust_ci_then_cased(lust_str s, uint64_t i, int back) LUST_BODY({
+    for (;;) {
+        uint32_t c;
+        if (back) {
+            if (i == 0) return 0;
+            c = lust_utf8_prev(s.ptr, &i);
+        } else {
+            if (i >= s.len) return 0;
+            c = lust_utf8_next(s.ptr, &i);
+        }
+        if (lust_case_in(lust_case_ignorable, sizeof lust_case_ignorable / sizeof lust_case_ignorable[0], c)) continue;
+        return c == 0x3A3 || lust_case_in(lust_cased, sizeof lust_cased / sizeof lust_cased[0], c);
+    }
+})
+lust_String lust_str_case(lust_str s, int upper) LUST_BODY({
+    lust_String r = lust_string_with_capacity(s.len);
+    uint64_t i = 0;
+    while (i < s.len && s.ptr[i] < 0x80) {
+        uint8_t c = s.ptr[i];
+        if (upper && c >= 'a' && c <= 'z') c -= 32;
+        if (!upper && c >= 'A' && c <= 'Z') c += 32;
+        r.ptr[i] = c;
+        i++;
+    }
+    r.len = i;
+    while (i < s.len) {
+        uint64_t at = i;
+        uint32_t c = lust_utf8_next(s.ptr, &i);
+        if (!upper && c == 0x3A3) {
+            int fin = lust_ci_then_cased(s, at, 1) && !lust_ci_then_cased(s, at + 2, 0);
+            lust_string_push_char(&r, fin ? 0x3C2 : 0x3C3);
+            continue;
+        }
+        const uint32_t *m = upper ? lust_case_map(lust_upper_map, sizeof lust_upper_map / sizeof lust_upper_map[0], c)
+                                  : lust_case_map(lust_lower_map, sizeof lust_lower_map / sizeof lust_lower_map[0], c);
+        if (!m) { lust_string_push_char(&r, c); continue; }
+        lust_string_push_char(&r, m[0]);
+        if (m[1]) lust_string_push_char(&r, m[1]);
+        if (m[2]) lust_string_push_char(&r, m[2]);
+    }
+    return r;
+})
+
 /* UTF-8 validation with Rust's error report (core::str::validations::
    run_utf8_validation): 1 when `v` is valid; else 0 with the length of
    the valid prefix and the invalid sequence's length (1 to 3), or 0 when
