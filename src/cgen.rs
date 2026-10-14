@@ -4738,32 +4738,20 @@ pub struct GlueSet {
     deps: HashMap<(Glue, CTy), Vec<(Glue, CTy)>>,
     /// Keys that live in the shared glue unit. Frozen until the next `compute_shared`.
     pub shared: Option<HashSet<(Glue, CTy)>>,
+    /// Keys the last `refresh` did not reach: their text may predate a type edit. `add`
+    /// regenerates one when a body reaches it again.
+    stale: HashSet<(Glue, CTy)>,
 }
 
 impl GlueSet {
-    /// Adds glue for `keys` and everything it needs. Returns true when the shared glue unit's
-    /// content changed, so the caller must recompile it. New glue that no unit shared at freeze
-    /// time is not in `shared`, so it returns false for that: the new glue is static in the
-    /// function units that reach it.
-    pub fn add<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> bool {
-        let mut pending: Vec<(Glue, CTy)> = keys.filter(|k| !self.protos.contains_key(k)).cloned().collect();
-        let mut shared_changed = false;
-        while let Some(g) = pending.pop() {
-            if self.protos.contains_key(&g) {
-                continue;
-            }
-            let mut more = Vec::new();
-            let mut proto = String::new();
-            let mut def = String::new();
-            glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more);
-            self.defs.push_str(&def);
-            self.def_map.insert(g.clone(), def);
-            self.deps.insert(g.clone(), more.clone());
-            shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(&g));
-            self.protos.insert(g, proto);
-            pending.extend(more);
-        }
-        shared_changed
+    /// Adds glue for `keys` and everything it needs: new keys, and keys the last `refresh` did
+    /// not reach (`stale`), which are regenerated and compared as `refresh` does. Returns
+    /// (shared unit content changed, an existing definition changed), as `refresh`. New glue
+    /// that no unit shared at freeze time is not in `shared`, so it does not count as a shared
+    /// change: the new glue is static in the function units that reach it.
+    pub fn add<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
+        let roots: Vec<(Glue, CTy)> = keys.filter(|k| !self.protos.contains_key(k) || self.stale.contains(k)).cloned().collect();
+        self.regen(p, slots, roots, false).0
     }
 
     /// Regenerates every reached key's definition from the current
@@ -4777,8 +4765,21 @@ impl GlueSet {
     /// definition changed); new keys are added as in `add`. Comparing
     /// the generated text is exact by construction: no second
     /// fingerprint of what `glue_def` reads to keep in sync.
+    ///
+    /// Keys that no live body reaches now are not regenerated (their
+    /// Adt may be gone). They become `stale`, so the next `add` that
+    /// reaches one regenerates it: a type edit in a version that does
+    /// not use the glue must still reach the version that uses it again.
     pub fn refresh<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
-        let mut pending: Vec<(Glue, CTy)> = keys.cloned().collect();
+        let (changed, seen) = self.regen(p, slots, keys.cloned().collect(), true);
+        self.stale = self.protos.keys().filter(|k| !seen.contains(*k)).cloned().collect();
+        changed
+    }
+
+    /// The walk behind `add` and `refresh`: generates each pending key and its deps. With `all`
+    /// false, a key already stored and not stale is kept as is (and its deps are not walked).
+    /// Returns the change flags and the keys walked.
+    fn regen(&mut self, p: &Program, slots: &[u32], mut pending: Vec<(Glue, CTy)>, all: bool) -> ((bool, bool), HashSet<(Glue, CTy)>) {
         let mut seen: HashSet<(Glue, CTy)> = HashSet::new();
         let mut shared_changed = false;
         let mut regenerated = false;
@@ -4786,16 +4787,25 @@ impl GlueSet {
             if !seen.insert(g.clone()) {
                 continue;
             }
+            let is_new = !self.protos.contains_key(&g);
+            let was_stale = self.stale.remove(&g);
+            if !was_stale && !all && !is_new {
+                continue;
+            }
+            // `glue_unit` leaves stale keys out, so a shared one coming back must rebuild it.
+            shared_changed |= was_stale && self.is_shared(&g);
             let mut more = Vec::new();
             let mut proto = String::new();
             let mut def = String::new();
             glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more);
-            let is_new = !self.protos.contains_key(&g);
             let changed =
                 is_new || self.def_map.get(&g) != Some(&def) || self.protos.get(&g) != Some(&proto) || self.deps.get(&g) != Some(&more);
             if changed {
                 regenerated |= !is_new;
                 shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(&g));
+                if is_new {
+                    self.defs.push_str(&def);
+                }
                 self.def_map.insert(g.clone(), def);
                 self.deps.insert(g.clone(), more.clone());
                 self.protos.insert(g, proto);
@@ -4807,7 +4817,7 @@ impl GlueSet {
             // per-key map. Order does not matter: prototypes precede it.
             self.defs = self.def_map.values().cloned().collect();
         }
-        (shared_changed, regenerated)
+        ((shared_changed, regenerated), seen)
     }
 
     /// The glue keys a set of direct needs reaches, deps included.
@@ -5085,11 +5095,12 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         collect_promoted(p, &st.value, &t, &mut types);
     }
     if let Some(shared) = &g.shared {
-        for k in shared {
+        // A stale key (no live body reaches it) may name an Adt or fields that are gone.
+        let mut keys: Vec<&(Glue, CTy)> = shared.iter().filter(|k| !g.stale.contains(*k)).collect();
+        for k in &keys {
             collect_types(&k.1, &mut types);
         }
         type_decls(p, &mut c, &types);
-        let mut keys: Vec<&(Glue, CTy)> = shared.iter().collect();
         keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
         for k in &keys {
             c.push_str(&g.protos[*k]);

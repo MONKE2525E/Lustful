@@ -847,6 +847,100 @@ def make_feature3_edit(rng, text):
     return text, op
 
 
+# Glue gap detour shapes. Each is three versions (A, B, C) of a few items
+# plus the body of `gz<n>()`, which main prints. A uses an Adt's glue
+# (drop, Debug, Clone); B edits the Adt (field or variant order, a field
+# type, a Drop impl) and does not reach that glue (a partial move, no
+# `{:?}`, no Vec of it); C reaches it again with B's Adt. Glue left out
+# of B's build must not come back stale in C (the class of
+# daemon_stale_drop_glue, derive_stale_after_gap, drop_glue_stale_after_gap).
+GAP_SHAPES = [
+    # Field reorder plus a partial move: B moves only `p.b`, so the drop glue of G is not reached.
+    ("struct G{n} {{\n    a: i64,\n    b: String,\n}}\n",
+     "    let p = G{n} {{ a: 3, b: String::from(\"bee\") }};\n    let f = || p.b.len();\n    format!(\"{{}} {{}}\", f(), p.a)\n",
+     "struct G{n} {{\n    b: String,\n    a: i64,\n}}\n",
+     "    let p = G{n} {{ a: 3, b: String::from(\"bee\") }};\n    let moved = p.b;\n    format!(\"{{}} {{}}\", moved.len(), p.a)\n",
+     "struct G{n} {{\n    b: String,\n    a: i64,\n}}\n",
+     "    let p = G{n} {{ a: 3, b: String::from(\"bee\") }};\n    let f = || p.b.len();\n    format!(\"{{}} {{}}\", f(), p.a)\n"),
+    # Derived Debug of an enum whose variants are reordered while no body formats it.
+    ("#[derive(Debug)]\nenum G{n} {{\n    P,\n    Q(i64),\n}}\n",
+     "    let v = G{n}::Q(4);\n    let w = G{n}::P;\n    format!(\"{{:?}} {{:?}}\", v, w)\n",
+     "#[derive(Debug)]\nenum G{n} {{\n    Q(i64),\n    P,\n}}\n",
+     "    let v = G{n}::Q(4);\n    match v {{\n        G{n}::P => String::from(\"p\"),\n        G{n}::Q(x) => x.to_string(),\n    }}\n",
+     "#[derive(Debug)]\nenum G{n} {{\n    Q(i64),\n    P,\n}}\n",
+     "    let v = G{n}::Q(4);\n    let w = G{n}::P;\n    format!(\"{{:?}} {{:?}}\", v, w)\n"),
+    # Derived Debug and Clone of a struct whose fields swap and change type during the gap.
+    ("#[derive(Debug, Clone)]\nstruct G{n} {{\n    a: u64,\n    b: i64,\n}}\n",
+     "    let g = G{n} {{ a: 1, b: 2 }};\n    format!(\"{{:?}}\", g.clone())\n",
+     "#[derive(Debug, Clone)]\nstruct G{n} {{\n    b: i64,\n    a: String,\n}}\n",
+     "    let g = G{n} {{ a: String::from(\"hey\"), b: 2 }};\n    format!(\"{{}} {{}}\", g.a.len(), g.b)\n",
+     "#[derive(Debug, Clone)]\nstruct G{n} {{\n    b: i64,\n    a: String,\n}}\n",
+     "    let g = G{n} {{ a: String::from(\"hey\"), b: 2 }};\n    format!(\"{{:?}}\", g.clone())\n"),
+    # A Drop impl removed while no Vec of the type is built, then the Vec comes back.
+    ("struct G{n} {{\n    id: i64,\n}}\nimpl Drop for G{n} {{\n    fn drop(&mut self) {{\n        println!(\"drop {{}}\", self.id);\n    }}\n}}\n",
+     "    let v = vec![G{n} {{ id: 5 }}, G{n} {{ id: 6 }}];\n    v.len().to_string()\n",
+     "struct G{n} {{\n    id: i64,\n}}\n",
+     "    String::from(\"none\")\n",
+     "struct G{n} {{\n    id: i64,\n}}\n",
+     "    let v = vec![G{n} {{ id: 5 }}, G{n} {{ id: 6 }}];\n    format!(\"{{}} {{}}\", v.len(), v[1].id)\n"),
+]
+
+
+def gap_versions(rng, text):
+    """The three detour texts for one random GAP_SHAPES entry, built on
+    `text` (items before `fn main`, a print of `gz<n>()` as main's first
+    statement). None when `text` has no plain `fn main() {` line."""
+    head = "\nfn main() {\n"
+    k = text.find(head)
+    if k < 0:
+        return None, None
+    n = rng.randint(0, 10**6)
+    shape = rng.randrange(len(GAP_SHAPES))
+    parts = [x.format(n=n) for x in GAP_SHAPES[shape]]
+    out = []
+    for items, body in zip(parts[0::2], parts[1::2]):
+        fn = f"fn gz{n}() -> String {{\n{body}}}\n"
+        out.append(text[:k + 1] + items + fn + head[1:] + f'    println!("gz {{}}", gz{n}());\n' + text[k + len(head):])
+    return out, f"glue_gap{shape}"
+
+
+def glue_detour(h, rng, text, a):
+    """Runs one glue gap detour from `text` (which passed `check`): each
+    version is checked and run on both sides, then `text` is written
+    back and checked, so the main edit stream (and its RNG) is the same
+    as without detours. Returns (op name, failure count)."""
+    versions, op = gap_versions(rng, text)
+    if versions is None:
+        return "glue_gap_skip", 0
+    failures = 0
+    prev = text
+    for i, v in enumerate(versions + [text]):
+        h.write(v)
+        tag = f"{op}-v{i}"
+        for cmd in ("check", "run"):
+            ok, why, da, co = compare(h, cmd, a.strict)
+            if ok and why == "program hang":
+                h.kill_daemon()
+                h.start_daemon()
+            if not ok:
+                failures += 1
+                save_pair(a.out, f"gap-{tag}-{cmd}", prev, v)
+                print(f"FAIL[{cmd} {why}] detour {tag}\n"
+                      f"  daemon={da[0]} out={da[1][:160]!r} err={da[2][:160]!r}\n"
+                      f"  cold  ={co[0] if co else '-'} out={(co[1][:160] if co else '')!r} "
+                      f"err={(co[2][:160] if co else '')!r}", flush=True)
+                if why in ("daemon hang", "daemon died") or not h.daemon_alive():
+                    h.kill_daemon()
+                    h.start_daemon()
+                h.write(text)
+                h.run_cmd("check", True)
+                return op, failures
+            if da[0] != 0:
+                break
+        prev = v
+    return op, failures
+
+
 def crate_text(kind, modules):
     if kind == "small":
         return SMALL_CRATE
@@ -878,6 +972,9 @@ def cmd_run(a):
     # the sequence old seeds have always covered (see SMALL2_CRATE).
     frng = random.Random(a.seed ^ 0xFEA7)
     frng3 = random.Random(a.seed ^ 0x5EED3)
+    # Glue gap detours (glue_detour) on their own RNG; they end on the
+    # text they started from, so the main stream stays as it was.
+    grng = random.Random(a.seed ^ 0x61E6)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -984,6 +1081,14 @@ def cmd_run(a):
                         text = original
                         h.write(original)
                         h.run_cmd("check", True)
+                    if a.stop_first:
+                        break
+            if it % 10 == 5 and da[0] == 0:
+                gop, gf = glue_detour(h, grng, text, a)
+                ops[gop] += 1
+                if gf:
+                    failures += gf
+                    bad_ops[gop] += gf
                     if a.stop_first:
                         break
             if (it + 1) % 250 == 0:

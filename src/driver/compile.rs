@@ -2928,17 +2928,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let statics_fp = crate::driver::graph::statics_fingerprint(&program);
     let statics_changed = caches.statics_fp != statics_fp;
     caches.statics_fp = statics_fp;
-    let glue_changed = if caches.glue_stale || caches.objects != Some(req.debug) {
+    // Glue an earlier refresh did not reach (no live body used it then)
+    // is stale in the set; `add` regenerates it when a body reaches it
+    // again, with the same fresh-base rule.
+    let (shared_changed, regenerated) = if caches.glue_stale || caches.objects != Some(req.debug) {
         caches.glue_stale = false;
-        let (shared_changed, regenerated) =
-            caches.glue.refresh(&program, &front.fn_slot, caches.out.iter().flat_map(|o| o.glue.iter()));
-        if regenerated {
-            caches.objects = None;
-        }
-        shared_changed || regenerated || statics_changed
+        caches.glue.refresh(&program, &front.fn_slot, caches.out.iter().flat_map(|o| o.glue.iter()))
     } else {
-        caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter())) || statics_changed
+        caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()))
     };
+    if regenerated {
+        caches.objects = None;
+    }
+    let glue_changed = shared_changed || regenerated || statics_changed;
     t.lap("codegen (par)");
 
     // Units: 0 = main (always rebuilt), 1 = glue, 2 = runtime, 3 = function table, 4.. = function

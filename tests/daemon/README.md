@@ -15,4 +15,7 @@ patterns, array lengths, discriminants, `size_of`/`align_of`/
 `offset_of!`, type aliases, cfg-gated items, macro-generated items,
 derived impls (Debug/Clone/PartialEq) under field and variant edits,
 and the same flows across module files. The `review_*` dirs are the
-wave-A1 review repros (B1-B3, C3 in the corelang Opus review).
+wave-A1 review repros (B1-B3, C3 in the corelang Opus review). The
+`glue*` dirs edit an Adt in a version that does not reach its glue
+(drop, Debug, Clone), then reach it again: the glue must not come
+back stale (the edit fuzzer's glue gap detours cover the same class).
