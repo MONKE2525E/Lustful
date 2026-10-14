@@ -78,6 +78,13 @@ typedef struct {
     int32_t in_hook;
     int32_t pending;
     lust_exc exc;
+    /* A panic message with arguments is being formatted (std formats
+       it lazily inside the panic, before the hook prints): a panic
+       now is a panic in the hook, which prints the inner message
+       (blank when `msg_dyn`: it has arguments) and aborts in both
+       modes. */
+    int32_t in_fmt;
+    int32_t msg_dyn;
 } lust_unw_state;
 static unsigned int lust_unw_key;
 static int lust_unw_once;
@@ -218,6 +225,14 @@ int32_t lust_unw_main_exit(void) LUST_BODY({
 /* Prints the default hook text for `msg` at `file:line:col` and aborts;
    in unwind mode it raises the panic and returns. */
 void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) LUST_BODY({
+    lust_unw_state *st = lust_unw_peek();
+    if (st && st->in_fmt) {
+        fprintf(stderr, "panicked at %s:%u:%u:\n%.*s\nthread panicked while processing panic. aborting.\n", file, (unsigned)line, (unsigned)col,
+                st->msg_dyn ? 0 : (int)len, (const char *)msg);
+        fflush(stderr);
+        abort();
+    }
+    if (st) st->msg_dyn = 0;
     if (lust_unwind_mode) {
         lust_unw_raise(msg, len, file, line, col);
         return;
@@ -248,6 +263,7 @@ static const char *const lust_std_files[] = {
     LUST_STD_SRC "core/src/iter/range.rs",
     LUST_STD_SRC "core/src/cell.rs",
     LUST_STD_SRC "std/src/thread/local.rs",
+    LUST_STD_SRC "core/src/ops/arith.rs",
 };
 #endif
 
@@ -269,6 +285,37 @@ void lust_panic(lust_String *msg, lust_loc loc) LUST_BODY({
     }
     const char *file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
     lust_panic_at(msg->ptr, msg->len, file, lust_fn_line[slot] + ((loc >> 20) & 0xFFFFF), loc & 0xFFFFF);
+})
+
+/* A panic whose message has arguments (`panic!("{}", x)`, assert_eq!,
+   `Result::unwrap`): cgen calls lust_panic_begin before it formats the
+   message and lust_panic_fmt with the result. */
+void lust_panic_begin(lust_loc loc) LUST_BODY({
+    lust_unw_state *st = lust_unw_get();
+    if (st->in_fmt) {
+        lust_String s = lust_string_new();
+        st->msg_dyn = 1;
+        lust_panic(&s, loc);
+    }
+    st->in_fmt = 1;
+})
+
+void lust_panic_fmt(lust_String *msg, lust_loc loc) LUST_BODY({
+    lust_unw_get()->in_fmt = 0;
+    lust_panic(msg, loc);
+})
+
+/* A runtime panic whose Rust message has arguments (bounds, slice
+   ranges): as lust_panic, but blank when it happens in a panic. */
+void lust_panic_dyn(lust_String *msg, lust_loc loc) LUST_BODY({
+    lust_unw_get()->msg_dyn = 1;
+    lust_panic(msg, loc);
+})
+
+void lust_panic_cstr_dyn(const char *msg, lust_loc loc) LUST_BODY({
+    lust_String s = lust_string_new();
+    lust_string_push_cstr(&s, msg);
+    lust_panic_dyn(&s, loc);
 })
 
 void lust_panic_str(lust_str msg, lust_loc loc) LUST_BODY({
@@ -296,6 +343,12 @@ void lust_ovf(const char *op, lust_loc loc) LUST_BODY({
 /* A panic Rust raises at a fixed line of its own std source: `where` is
    "path:line:col" under library/. */
 void lust_panic_std(const char *msg, const char *where) LUST_BODY({
+    lust_unw_state *st = lust_unw_peek();
+    if (st && st->in_fmt) {
+        fprintf(stderr, "panicked at " LUST_STD_SRC "%s:\n%s\nthread panicked while processing panic. aborting.\n", where, msg);
+        fflush(stderr);
+        abort();
+    }
     if (lust_unwind_mode) {
         /* `where` is "path:line:col"; split it for the hook. */
         const char *c2 = strrchr(where, ':'), *c1 = c2;

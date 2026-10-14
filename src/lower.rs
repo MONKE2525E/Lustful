@@ -1658,6 +1658,13 @@ impl<'p, 'a> Lower<'p, 'a> {
                     _ => 0,
                 };
                 let o = self.operand_derefs(*expr, ld);
+                // `-&x` runs core's `impl Neg for &i32` (forward_ref_unop!,
+                // not track_caller): its overflow reports core's arith.rs.
+                let span = if *op == crate::ast::UnOp::Neg && ld > 0 && matches!(self.kind(ty), TyKind::Int(_)) {
+                    Span::std_site(11, 728, 1)
+                } else {
+                    span
+                };
                 if let Some(d) = dest {
                     self.assign(d.clone(), Rvalue::Un(*op, o), span);
                 } else {
@@ -2899,7 +2906,14 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             K::Un(op) => {
                 let a = self.operand_derefs(recv, derefs);
-                self.set_or_temp(dest, Rvalue::Un(op, a), self.ty(e), span);
+                // `(&x).neg()` runs `impl Neg for &i32`, as `-&x` does.
+                let ty = self.ty(e);
+                let span = if op == crate::ast::UnOp::Neg && derefs > 0 && matches!(self.kind(ty), TyKind::Int(_)) {
+                    Span::std_site(11, 728, 1)
+                } else {
+                    span
+                };
+                self.set_or_temp(dest, Rvalue::Un(op, a), ty, span);
             }
             K::IntoCast => {
                 let a = self.operand_derefs(recv, derefs);

@@ -452,7 +452,8 @@ impl FnGen<'_, '_, '_> {
     /// Emits the formatting of `parts` into a new String temp (with
     /// Rust's capacity for `format!`) and returns the temp's name. A
     /// fmt impl error panics with the message of `what` (see
-    /// `lust_fmt_failed`).
+    /// `lust_fmt_failed`; 4 is a panic message, where std ignores the
+    /// error).
     pub(super) fn format(&mut self, parts: &[FmtPart], loc: &str, post: &mut Vec<String>, what: u32) -> String {
         let s = self.tmp();
         let cap = estimated_capacity(parts);
@@ -468,7 +469,7 @@ impl FnGen<'_, '_, '_> {
             return s;
         }
         let _ = writeln!(self.out, "    lust_sink {s}k; lust_sink_string(&{s}k, &{s}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); int {s}e = 0;");
-        if self.format_parts(parts, &s, loc, post) {
+        if self.format_parts(parts, &s, loc, post) && what != 4 {
             let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed({what}, {loc});");
         }
         s

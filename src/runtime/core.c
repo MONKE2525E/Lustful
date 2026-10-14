@@ -354,7 +354,7 @@ void lust_panic_nn(const char *a, uint64_t n, const char *b, uint64_t m, const c
     lust_string_push_cstr(&s, b);
     lust_fmt_u64(&s, m);
     lust_string_push_cstr(&s, c);
-    lust_panic(&s, loc);
+    lust_panic_dyn(&s, loc);
 })
 
 /* The end of a slice range, checked in Rust 1.99's order: the start
@@ -386,7 +386,7 @@ static void lust_str_boundary_fail(const char *which, const uint8_t *ptr, uint64
     lust_string_push_cstr(&s, "..");
     lust_fmt_u64(&s, b);
     lust_string_push_cstr(&s, " of string)");
-    lust_panic(&s, loc);
+    lust_panic_dyn(&s, loc);
 }
 #endif
 
@@ -492,7 +492,7 @@ uint64_t lust_bounds(uint64_t i, uint64_t len, lust_loc loc) LUST_BODY({
         lust_fmt_u64(&s, len);
         lust_string_push_cstr(&s, " but the index is ");
         lust_fmt_u64(&s, i);
-        lust_panic(&s, loc);
+        lust_panic_dyn(&s, loc);
     }
     return i;
 })
@@ -1189,7 +1189,7 @@ void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, uint64_t align, 
         lust_string_push_cstr(&s, ") should be <= len (is ");
         lust_fmt_u64(&s, v->len);
         lust_string_push_cstr(&s, ")");
-        lust_panic(&s, loc);
+        lust_panic_dyn(&s, loc);
         return;
     }
     lust_vec_reserve(v, 1, elem, align);
@@ -1205,7 +1205,7 @@ void lust_vec_check_remove(lust_Vec *v, uint64_t i, lust_loc loc) LUST_BODY({
         lust_string_push_cstr(&s, ") should be < len (is ");
         lust_fmt_u64(&s, v->len);
         lust_string_push_cstr(&s, ")");
-        lust_panic(&s, loc);
+        lust_panic_dyn(&s, loc);
     }
 })
 

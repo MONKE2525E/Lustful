@@ -368,7 +368,8 @@ fn is128(i: IntTy) -> bool {
 /// core/src/iter/adapters/step_by.rs, 6
 /// alloc/src/vec/spec_from_iter_nested.rs, 7
 /// core/src/iter/traits/accum.rs, 8 core/src/iter/range.rs, 9
-/// core/src/cell.rs, 10 std/src/thread/local.rs), plus 0x40 for `pow`. Lowering names
+/// core/src/cell.rs, 10 std/src/thread/local.rs, 11 core/src/ops/arith.rs), plus 0x40
+/// for `pow`. Lowering names
 /// one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFF_FF00u64 + file) << 40) | (line << 20) | col)
@@ -2402,8 +2403,17 @@ impl FnGen<'_, '_, '_> {
             Terminator::Unreachable => self.out.push_str("  abort();\n"),
             Terminator::Panic(parts) => {
                 self.out.push_str("  {\n");
-                let s = self.format(parts, &loc, &mut post, 0);
-                let _ = writeln!(self.out, "    lust_panic(&{s}, {loc});\n  }}");
+                // A message with arguments formats inside the panic (std's
+                // lazy payload): a panic while it formats aborts as a
+                // nested panic, and a fmt error just ends the text.
+                if parts.iter().any(|p| matches!(p, FmtPart::Arg { .. })) {
+                    let _ = writeln!(self.out, "    lust_panic_begin({loc});");
+                    let s = self.format(parts, &loc, &mut post, 4);
+                    let _ = writeln!(self.out, "    lust_panic_fmt(&{s}, {loc});\n  }}");
+                } else {
+                    let s = self.format(parts, &loc, &mut post, 0);
+                    let _ = writeln!(self.out, "    lust_panic(&{s}, {loc});\n  }}");
+                }
                 if let Some(Unw::Goto(b)) = self.unw {
                     let _ = writeln!(self.out, "  lust_unw_take(&ex);\n  goto bb{b};");
                 }
@@ -4217,7 +4227,7 @@ impl FnGen<'_, '_, '_> {
                 let rc = deref_cty(&tys[0]);
                 let _ = writeln!(
                     self.out,
-                    "    {}* {t} = {}; if ({t}->f0 < 0 || {t}->f0 == 0x7fffffffffffffffLL) lust_panic_cstr(\"RefCell already mutably borrowed\", {loc}); {t}->f0++;",
+                    "    {}* {t} = {}; if ({t}->f0 < 0 || {t}->f0 == 0x7fffffffffffffffLL) lust_panic_cstr_dyn(\"RefCell already mutably borrowed\", {loc}); {t}->f0++;",
                     ctype(&rc),
                     vals[0]
                 );
@@ -4228,7 +4238,7 @@ impl FnGen<'_, '_, '_> {
                 let rc = deref_cty(&tys[0]);
                 let _ = writeln!(
                     self.out,
-                    "    {}* {t} = {}; if ({t}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {t}->f0 = -1;",
+                    "    {}* {t} = {}; if ({t}->f0 != 0) lust_panic_cstr_dyn(\"RefCell already borrowed\", {loc}); {t}->f0 = -1;",
                     ctype(&rc),
                     vals[0]
                 );
@@ -4267,7 +4277,7 @@ impl FnGen<'_, '_, '_> {
                 let rc = deref_cty(&tys[0]);
                 let _ = writeln!(
                     self.out,
-                    "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {loc}); {} {old} = {c}->f1; {c}->f1 = {};",
+                    "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr_dyn(\"RefCell already borrowed\", {loc}); {} {old} = {c}->f1; {c}->f1 = {};",
                     ctype(&rc),
                     vals[0],
                     ctype(&tys[1]),
@@ -4281,7 +4291,7 @@ impl FnGen<'_, '_, '_> {
                 let CTy::RefCell(e) = &rc else { unreachable!("RefCell::swap on a RefCell") };
                 let _ = writeln!(
                     self.out,
-                    "    {rt}* {a} = {}; {rt}* {bb} = {}; if ({a}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {la}); {a}->f0 = -1; if ({bb}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {lb}); {et} {tmp} = {a}->f1; {a}->f1 = {bb}->f1; {bb}->f1 = {tmp}; {a}->f0 = 0;",
+                    "    {rt}* {a} = {}; {rt}* {bb} = {}; if ({a}->f0 != 0) lust_panic_cstr_dyn(\"RefCell already borrowed\", {la}); {a}->f0 = -1; if ({bb}->f0 != 0) lust_panic_cstr_dyn(\"RefCell already borrowed\", {lb}); {et} {tmp} = {a}->f1; {a}->f1 = {bb}->f1; {bb}->f1 = {tmp}; {a}->f0 = 0;",
                     vals[0],
                     vals[1],
                     rt = ctype(&rc),
@@ -4315,7 +4325,7 @@ impl FnGen<'_, '_, '_> {
                 if b == B::RefCellTake {
                     let _ = writeln!(
                         self.out,
-                        "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr(\"RefCell already borrowed\", {}); {et} {old} = {c}->f1; {c}->f1 = {def};",
+                        "    {}* {c} = {}; if ({c}->f0 != 0) lust_panic_cstr_dyn(\"RefCell already borrowed\", {}); {et} {old} = {c}->f1; {c}->f1 = {def};",
                         ctype(cell),
                         vals[0],
                         // `take` is not track_caller: its `replace` panics in cell.rs.
@@ -7044,7 +7054,7 @@ fn glue_def_value(
                     let c = clone_of(e, "p->f1", &mut need);
                     let _ = writeln!(
                         body,
-                        "  if (p->f0 < 0) lust_panic_cstr(\"RefCell already mutably borrowed\", 0);\n  {ct} r; r.f0 = 0; r.f1 = {c}; return r;"
+                        "  if (p->f0 < 0) lust_panic_cstr_dyn(\"RefCell already mutably borrowed\", 0);\n  {ct} r; r.f0 = 0; r.f1 = {c}; return r;"
                     );
                 }
                 CTy::Option(e) => {
