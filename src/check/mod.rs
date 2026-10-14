@@ -663,6 +663,11 @@ pub enum Res {
     Index {
         derefs: u8,
     },
+    /// A `base[idx]` place through a written `Index`/`IndexMut`
+    /// impl (W-STD-C phase 2): the impl fns are in `index_recv`.
+    TraitIndex {
+        derefs: u8,
+    },
     /// A `core::intrinsics::<name>` call that passed the privilege check.
     /// The payload is the intrinsic's registry id (`ty::lang::INTRINSICS`).
     /// Only spliced shipped-library source can produce this resolution.
@@ -929,11 +934,24 @@ pub enum DrainForm {
     BoundsRef,
 }
 
+/// One `base[idx]` place through a written `Index` impl: the
+/// impl's `index` fn, its `index_mut` when `IndexMut` also holds,
+/// their generic args (filled per instance like deref sites),
+/// The place's type is the index expression's own (the `Output`).
+#[derive(Clone, Debug)]
+pub struct IndexRecv {
+    pub f: LocalDefId,
+    pub args: Vec<GenericArg>,
+    pub f_mut: Option<LocalDefId>,
+    pub args_mut: Vec<GenericArg>,
+}
+
 /// Which `Checked` table a generic `deref` fn's site fills in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DerefTable {
     Recv,
     Coerce,
+    Index,
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -1072,6 +1090,8 @@ pub struct Checked<'g> {
     /// The steps of each `Coerce::UserDeref`, by coerced expression,
     /// outermost first.
     pub deref_coerce: Vec<(ExprId, DerefRecv)>,
+    /// Written-`Index` places, by the index expression.
+    pub index_recv: Vec<(ExprId, IndexRecv)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
@@ -1148,6 +1168,10 @@ impl Checked<'_> {
     /// The steps of a `Coerce::UserDeref` on `e`, outermost first.
     pub fn deref_coerce(&self, e: ExprId) -> Vec<&DerefRecv> {
         self.deref_coerce.iter().filter(|(x, _)| *x == e).map(|(_, d)| d).collect()
+    }
+    /// The written-`Index` record of an index expression, if any.
+    pub fn index_recv(&self, e: ExprId) -> Option<&IndexRecv> {
+        self.index_recv.iter().find(|(x, _)| *x == e).map(|(_, d)| d)
     }
 }
 
@@ -1523,6 +1547,7 @@ fn check_fn_mode<'p, 'a>(
             deref_recv: Vec::new(),
             drain_ranges: Vec::new(),
             deref_coerce: Vec::new(),
+            index_recv: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
             reads: if p.record_reads { Reads::new() } else { Reads::off() },
@@ -5264,6 +5289,71 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// The written impl of `Deref` (or `DerefMut`) for `base`: its
     /// `fname` fn, the target type, and the impl args. None for no
     /// impl or a core one.
+    /// One written `Index` (and, when it holds, `IndexMut`) impl
+    /// for `base[idx]`: records the impl fns on `e` and returns the
+    /// `Output` type. None when no written impl answers for this
+    /// index type (a synthetic impl has no fn to call).
+    fn record_trait_index(&mut self, e: ExprId, base: Ty, idx_ty: Ty, span: Span) -> Option<Ty> {
+        use crate::traits::index::Synthetic;
+        let p = self.p;
+        let lang = p.gx.lang;
+        // Selection runs with a fresh input (as the method probe
+        // does): the written index type can still be an open
+        // literal var that only the impl's `Borrow` bound fixes.
+        // The picked input then unifies with the written type;
+        // any failure rolls the whole pick back.
+        let pick = |cx: &mut Self, trait_def: DefId, fname: &str| -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
+            let snap = cx.snapshot_vars();
+            let obl_len = cx.obl_len();
+            let found = (|cx: &mut Self| -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
+                let input = cx.new_var(false);
+                let args = cx.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(input)]);
+                let tr = TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS };
+                let Selection::Impl { id, args: impl_args, .. } = cx.select_obligation_at(tr, span, 0) else { return None };
+                let rec = p.gx.index.get(id).clone();
+                if rec.synthetic != Synthetic::None {
+                    return None;
+                }
+                let input = cx.deep(input);
+                if !cx.unify(input, idx_ty) {
+                    return None;
+                }
+                let f = rec.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == fname))?;
+                let ret = p.fn_info(f).ret;
+                let ret = if impl_args.is_empty() { ret } else { subst(&mut cx.tys, ret, &impl_args) };
+                let ret = cx.normalize_here(ret);
+                let TyKind::Ref(_, _, out) = cx.kind(ret) else { return None };
+                let out = cx.resolve(out);
+                if matches!(cx.kind(out), TyKind::Error) {
+                    return None;
+                }
+                Some((f, out, impl_args))
+            })(cx);
+            if found.is_none() {
+                cx.rollback_vars(snap);
+                cx.obl_truncate(obl_len);
+            }
+            found
+        };
+        let (f, output, args) = pick(self, lang.index, "index")?;
+        let (f_mut, args_mut) = match pick(self, lang.index_mut, "index_mut") {
+            Some((g, _, a)) => (Some(g), a),
+            None => (None, Vec::new()),
+        };
+        let idx = self.out.index_recv.len();
+        self.out.index_recv.push((e, IndexRecv { f, args: Vec::new(), f_mut, args_mut: Vec::new() }));
+        let is_template = |cx: &Self, f: LocalDefId| cx.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
+        if is_template(self, f) {
+            self.deref_sites.push((DerefTable::Index, idx, false, f, args));
+        }
+        if let Some(g) = f_mut
+            && is_template(self, g)
+        {
+            self.deref_sites.push((DerefTable::Index, idx, true, g, args_mut));
+        }
+        Some(output)
+    }
+
     fn user_deref_fn(&mut self, trait_def: DefId, base: Ty, fname: &str, span: Span) -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
         use crate::traits::index::Synthetic;
         let p = self.p;
@@ -6369,8 +6459,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         || self.tys.is_string_ty(inner)
                         || crate::ty::hash::hash_parts(&self.tys, inner).is_some_and(|(k, _)| k == crate::ty::hash::HashTy::HashMap);
                     // rustc tries the type's own `Index` impl before any
-                    // deref; `[]` through a user `Index` impl is not
-                    // supported yet, so such a type stops here (L0113).
+                    // deref, so such a type stops the walk here and the
+                    // written-impl path below answers for it.
                     if indexable || self.has_user_index_impl(inner) {
                         break;
                     }
@@ -6418,6 +6508,35 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 if let Some((crate::ty::hash::HashTy::HashMap, targs)) = crate::ty::hash::hash_parts(&self.tys, inner) {
                     return self.map_index(e, *base, *index, &targs, derefs, span);
+                // A written `Index` impl on a non-builtin type
+                // (`map[&k]`, `deque[i]`, a user container): the
+                // place is the call's returned reference, recorded
+                // for lowering like a user `Deref` step.
+                if self.has_user_index_impl(inner)
+                    && !matches!(self.kind(inner), TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Error)
+                    && self.tys.vec_elem(inner).is_none()
+                    && !self.tys.is_string_ty(inner)
+                {
+                    let idx_ty = self.expr(*index, None);
+                    return match self.record_trait_index(e, inner, idx_ty, span) {
+                        Some(out) => {
+                            self.set_res(e, Res::TraitIndex { derefs });
+                            out
+                        }
+                        None => {
+                            let tn = self.tn(bt);
+                            let itn = self.tn(idx_ty);
+                            if !matches!(self.kind(inner), TyKind::Error) && !matches!(self.kind(idx_ty), TyKind::Error) {
+                                self.err(
+                                    "L0113",
+                                    span,
+                                    format!("cannot index into a value of type `{tn}` with `{itn}`"),
+                                    "Check the index type the `Index` impl takes.",
+                                );
+                            }
+                            ERROR
+                        }
+                    };
                 }
                 self.expect_expr(*index, USIZE);
                 match self.kind(inner) {
@@ -17559,9 +17678,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     other => other,
                 })
                 .collect();
+            if let DerefTable::Index = table {
+                if let Some(entry) = self.out.index_recv.get_mut(idx) {
+                    if is_mut {
+                        entry.1.args_mut = zargs.clone();
+                    } else {
+                        entry.1.args = zargs.clone();
+                    }
+                }
+                self.out.inst_requests.push((template, zargs));
+                continue;
+            }
             let entries = match table {
                 DerefTable::Recv => &mut self.out.deref_recv,
                 DerefTable::Coerce => &mut self.out.deref_coerce,
+                DerefTable::Index => unreachable!(),
             };
             if let Some(entry) = entries.get_mut(idx) {
                 if is_mut {

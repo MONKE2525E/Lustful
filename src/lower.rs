@@ -740,6 +740,43 @@ impl<'p, 'a> Lower<'p, 'a> {
                 self.assign(Place::local(r), Rvalue::Use(Operand::Copy(some)), span);
                 Place::local(r).deref()
             }
+            (Expr::Index { base, index }, Res::TraitIndex { derefs }) => {
+                // `*Index::index(&base, idx)` (or `index_mut` under a
+                // mutable place use), as a user `Deref` step with an
+                // argument: borrow the container first (see
+                // `place_for_mut`), evaluate the index outside that
+                // place, call, and go on from the returned reference.
+                let span = self.span(e);
+                let Some(rec) = self.ck.index_recv(e).cloned() else {
+                    return Place::local(self.temp(self.ty(e)));
+                };
+                let (b, root_ty) = match self.deref_steps(e, *base, span) {
+                    Some(root) => {
+                        let t = self.body.locals[root.local as usize].ty;
+                        (root, t)
+                    }
+                    None => (self.place(*base), self.ty(*base)),
+                };
+                let b = Self::derefs(b, derefs);
+                let bt = self.peel(root_ty, derefs);
+                let mutable = rec.f_mut.is_some() && self.mut_index > 0;
+                let rt = self.ref_ty(mutable, bt);
+                let r = self.temp(rt);
+                self.assign(Place::local(r), Rvalue::Ref(mutable, b), span);
+                let idx_ty = self.ty(*index);
+                let iv = self.temp(idx_ty);
+                let saved = std::mem::take(&mut self.mut_index);
+                self.expr_into(*index, Some(&Place::local(iv)));
+                self.mut_index = saved;
+                let idx_op = self.operand_from(Place::local(iv), idx_ty);
+                let (f, args) = if mutable { (rec.f_mut.unwrap(), &rec.args_mut) } else { (rec.f, &rec.args) };
+                let f = if args.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f) };
+                let out_ref = self.ref_ty(mutable, self.ty(e));
+                let t = self.temp(out_ref);
+                let self_arg = if mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
+                self.call_into(CallTarget::Fn(f), vec![self_arg, idx_op], Place::local(t), span);
+                Place::local(t).deref()
+            }
             (Expr::Deref(inner), _) => match self.ck.coerce(*inner) {
                 // `*cow` (W-STD-B): the place behind the Cow's `&B` view.
                 Coerce::CowRecv(n, view) => {
