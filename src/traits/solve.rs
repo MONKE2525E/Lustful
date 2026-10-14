@@ -352,6 +352,7 @@ impl Solver {
             let pat = rec.assoc_ty(assoc)?;
             let have = subst(cx.tys(), pat, &inst);
             let have = self.normalize_inner(cx, index, env, have, 0);
+            let want = self.normalize_inner(cx, index, env, want, 0);
             if let TyKind::Projection(a, trait_args) = cx.tys().kind(have)
                 && cx.tys().flags(have).contains_infer()
             {

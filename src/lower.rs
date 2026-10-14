@@ -2557,6 +2557,11 @@ impl<'p, 'a> Lower<'p, 'a> {
                 let a = self.operand_derefs(recv, derefs);
                 self.set_or_temp(dest, Rvalue::Cast(a, self.ty(e)), self.ty(e), span);
             }
+            // core's blanket `IntoIterator for I: Iterator`: the receiver moves through.
+            K::IntoIterSelf => {
+                let a = self.operand_derefs(recv, derefs);
+                self.set_or_temp(dest, Rvalue::Use(a), self.ty(e), span);
+            }
             K::Assign(op) => {
                 if args.is_empty() {
                     return;

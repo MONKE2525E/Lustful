@@ -580,6 +580,9 @@ pub enum PrimOpKind {
     /// `recv.into()` to a scalar target: the widening cast core's
     /// `From` impl is, cast to the call's type.
     IntoCast,
+    /// `recv.into_iter()` on an iterator: core's blanket
+    /// `impl<I: Iterator> IntoIterator for I` returns the receiver.
+    IntoIterSelf,
 }
 
 /// One user `Deref` autoderef step (rustc's autoderef, ARCH 2.10) of
@@ -8999,8 +9002,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.check_args(&[rhs_ty], args, name_span);
                 UNIT
             }
-            // `prim_into_method` builds this kind, never this match.
-            K::IntoCast => unreachable!(),
+            // `prim_into_method` and `into_iter_self` build these
+            // kinds, never this match.
+            K::IntoCast | K::IntoIterSelf => unreachable!(),
         };
         self.set_res(e, Res::PrimOp { kind, derefs });
         Some(ret)
@@ -9133,6 +9137,33 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.check_args(&[], args, name_span);
         self.set_res(e, Res::PrimOp { kind: PrimOpKind::IntoCast, derefs });
         Some(dst)
+    }
+
+    /// `x.into_iter()` where `x` is an iterator (a builtin iterator, a
+    /// range, a user `impl Iterator`, or `T: Iterator` in a template):
+    /// core's blanket `impl<I: Iterator> IntoIterator for I` returns the
+    /// receiver itself. By value only: through a deref rustc would move
+    /// out of a borrow.
+    fn into_iter_self(&mut self, e: ExprId, base: Ty, derefs: u8, name: Sym, args: &[ExprId], turbofish: &[ast::GenericArg]) -> Option<Ty> {
+        if derefs > 0 || !args.is_empty() || !turbofish.is_empty() || self.name(name) != "into_iter" {
+            return None;
+        }
+        let base = self.deep(base);
+        if matches!(self.kind(base), TyKind::Infer(_) | TyKind::Error) {
+            return None;
+        }
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(base)]);
+        let tr = TraitRef { def: self.p.gx.lang.iterator, args: args_id, bindings: EMPTY_BINDINGS };
+        let snap = self.snapshot_vars();
+        let is_iter = crate::ty::iter::is_iter(&self.tys, base)
+            || self.tys.is_chars_ty(base)
+            || matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_));
+        self.rollback_vars(snap);
+        if !is_iter {
+            return None;
+        }
+        self.set_res(e, Res::PrimOp { kind: PrimOpKind::IntoIterSelf, derefs });
+        Some(base)
     }
 
     /// Checks a method call, walking a receiver chain (`x.m().m()...`,
@@ -9404,6 +9435,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `into()` to a scalar target core has a `From` impl for.
         if let Some(ret) = self.prim_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
+            return ret;
+        }
+        // `into_iter()` on a value that is its own iterator.
+        if let Some(ret) = self.into_iter_self(e, base, derefs, name, args, turbofish) {
             return ret;
         }
         // Iterator sources on sequences and every method on a builtin
@@ -11024,7 +11059,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let into_from_env = matches!(into_sel, Selection::ParamEvidence(_));
         let into_local = match into_sel {
             Selection::Impl { id, args: impl_args, .. } => {
-                if p.gx.index.get(id).items.is_empty() {
+                let rec = p.gx.index.get(id);
+                // core's synthetic collection impls (`Vec<T>`, `&[T]`)
+                // keep their builtin loop; only the blanket over an
+                // iterator uses the receiver as its own iterator.
+                if rec.items.is_empty() && !matches!(p.tys.kind(rec.self_ty(&p.tys)), TyKind::Param(_)) {
+                    return None;
+                }
+                if rec.items.is_empty() {
                     LocalDefId(u32::MAX)
                 } else {
                     self.method_instance_for_impl(for_e, id, tr, impl_args, "into_iter", span)?.0

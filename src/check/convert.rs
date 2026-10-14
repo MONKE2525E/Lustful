@@ -260,9 +260,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 continue;
             }
             let tr = crate::traits::index::subst_trait_ref_pub(&mut self.tys, b.value, &args);
-            let a = self.tys.args(tr.args).to_vec();
-            if a.first().and_then(|g| g.as_ty()) == Some(self_ty) {
-                return a.get(1).and_then(|g| g.as_ty());
+            // A bound on a projection (`I::Item: AsRef<str>`) names its
+            // Self normalized in the instance (check/project.rs).
+            let a: Vec<Ty> = self.tys.args(tr.args).to_vec().into_iter().filter_map(|g| g.as_ty()).collect();
+            let a: Vec<Ty> = a.into_iter().map(|t| self.normalize_here(t)).collect();
+            if a.first().copied() == Some(self_ty) {
+                return a.get(1).copied();
             }
         }
         None

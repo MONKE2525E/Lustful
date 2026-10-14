@@ -475,7 +475,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
             lang.into_iterator,
             "IntoIterator",
             0,
-            vec![],
+            vec![into_iter_item_bound(lang, tys)],
             vec![(lang.assoc_into_item, "Item"), (lang.assoc_into_iter, "IntoIter")],
             &["into_iter"],
         ),
@@ -492,6 +492,21 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.fn_mut, "FnMut", 1, vec![self_pred(tys, lang.fn_once, &[1])], vec![], &["call_mut"]),
         rec(lang.fn_once, "FnOnce", 1, vec![], vec![(lang.output_of(lang.fn_once).unwrap(), "Output")], &["call_once"]),
     ]
+}
+
+/// core's item bound on `IntoIterator::IntoIter` (`type IntoIter:
+/// Iterator<Item = Self::Item>`), as a predicate of the trait like a
+/// user trait's assoc type bounds: an env with `I: IntoIterator`
+/// elaborates it, so `i.into_iter().next()` checks in a template, and
+/// every impl must satisfy it.
+fn into_iter_item_bound(lang: &LangTraits, tys: &mut impl TyIntern) -> Predicate {
+    let self_ty = tys.intern(TyKind::Param(ParamId(0)));
+    let self_args = tys.intern_args(&[GenericArg::Ty(self_ty)]);
+    let into_iter = tys.intern(TyKind::Projection(AssocId(lang.assoc_into_iter), self_args));
+    let item = tys.intern(TyKind::Projection(AssocId(lang.assoc_into_item), self_args));
+    let args = tys.intern_args(&[GenericArg::Ty(into_iter)]);
+    let bindings = tys.intern_bindings(&[(lang.assoc_item, GenericArg::Ty(item))]);
+    Predicate::Trait(Binder::plain(TraitRef { def: lang.iterator, args, bindings }))
 }
 
 /// The def of `core::cmp::Ordering`, the fieldless enum lang
@@ -5124,6 +5139,32 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let chars = CHARS;
         insert_synthetic(p, &mut ordinal, lang.iterator, chars, &[], g0.clone(), vec![(lang.assoc_item, CHAR)], Synthetic::Lang, false, span);
     }
+    // IntoIterator for the builtin collections, as alloc and core
+    // declare it: Vec<T> by value (vec::IntoIter<T>), &Vec<T> and &[T]
+    // (slice::Iter), &mut Vec<T> and &mut [T] (slice::IterMut). Their
+    // `into_iter` stays a builtin call. Arrays wait for const params
+    // in selection.
+    {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        let t = p.tys.intern(TyKind::Param(ParamId(0)));
+        let vec_t = p.tys.mk_vec(t);
+        let slice_t = p.tys.intern(TyKind::Slice(t));
+        let (ref_t, mut_t) = (p.tys.mk_ref(false, t), p.tys.mk_ref(true, t));
+        let (iter, iter_mut, into_iter) =
+            (mk_iter(&mut p.tys, K::SliceIter, &[t]), mk_iter(&mut p.tys, K::SliceIterMut, &[t]), mk_iter(&mut p.tys, K::VecIntoIter, &[t]));
+        let g1 = Generics { parent: None, params: vec![ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span }], predicates: Vec::new() };
+        let entries = [
+            (vec_t, into_iter, t),
+            (p.tys.mk_ref(false, vec_t), iter, ref_t),
+            (p.tys.mk_ref(true, vec_t), iter_mut, mut_t),
+            (p.tys.mk_ref(false, slice_t), iter, ref_t),
+            (p.tys.mk_ref(true, slice_t), iter_mut, mut_t),
+        ];
+        for (self_pat, it, item) in entries {
+            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, it)];
+            insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g1.clone(), assoc, Synthetic::Lang, false, span);
+        }
+    }
     // The IntoIterator blanket: impl<I: Iterator> IntoIterator
     // for I, Item = I::Item, IntoIter = I.
     {
@@ -6611,7 +6652,18 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
                 })
                 .collect();
             let args = p.tys.intern_args(&new_args);
-            goals.push(TraitRef { def: b.value.def, args, bindings: b.value.bindings });
+            // An item bound's binding names the trait's own assoc types
+            // too (`IntoIter: Iterator<Item = Self::Item>`): the impl's.
+            let old_bindings: Vec<(DefId, GenericArg)> = p.tys.bindings(b.value.bindings).to_vec();
+            let new_bindings: Vec<(DefId, GenericArg)> = old_bindings
+                .into_iter()
+                .map(|(d, g)| match g {
+                    GenericArg::Ty(t) => (d, GenericArg::Ty(rewrite_impl_projections(p, t, &rec.assoc_tys))),
+                    other => (d, other),
+                })
+                .collect();
+            let bindings = p.tys.intern_bindings(&new_bindings);
+            goals.push(TraitRef { def: b.value.def, args, bindings });
         }
         if goals.is_empty() && statics.is_empty() {
             continue;
