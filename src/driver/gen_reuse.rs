@@ -190,7 +190,7 @@ impl GenReuse {
     ) {
         let lo = p.fn_info(t).def.exprs.0;
         let off = |e: ExprId| e.0.wrapping_sub(lo);
-        let mut picks: Vec<(u32, u64, u8, u8)> = picks
+        let mut picks: Vec<(u32, u64, u8, u8, Option<u32>)> = picks
             .iter()
             .map(|(e, k)| {
                 let form = match k.form {
@@ -198,7 +198,7 @@ impl GenReuse {
                     crate::driver::graph::ReceiverForm::Ref => 1,
                     crate::driver::graph::ReceiverForm::RefMut => 2,
                 };
-                (off(*e), k.trait_def.hash.0, k.derefs, form)
+                (off(*e), k.trait_def.hash.0, k.derefs, form, k.env_pred)
             })
             .collect();
         picks.sort_unstable();

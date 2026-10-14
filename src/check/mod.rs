@@ -6989,6 +6989,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         span: Span,
     ) -> Option<Ty> {
         let p = self.p;
+        // An instance replays the template's param-env evidence for a
+        // `from` call (`U: From<u8>` fixes the input: check/picks.rs).
+        let hint = match self.replayed_trait_ref(e, p.gx.lang.from) {
+            Some(r) if self.name(name) == "from" && hint.is_none_or(|h| h.def == p.gx.lang.from) => Some(r),
+            _ => hint,
+        };
         // Numeric `From::from` is a widening cast, with no user
         // fn behind it (the lang blanket covers only identity).
         if self.name(name) == "from" && args.len() == 1 && hint.is_none_or(|h| h.def == p.gx.lang.from) {
@@ -7049,12 +7055,19 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(fb)]);
                         TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS }
                     };
+                    let mut env_pick: Option<usize> = None;
                     let found = match self.select_obligation_at(tr, span, 0) {
                         Selection::Impl { id, args: impl_args, .. } => self.method_instance_for_impl(e, id, tr, impl_args, "from", span),
-                        Selection::ParamEvidence(_) => self.stub_instance(e, tr, name, span),
+                        Selection::ParamEvidence(i) => {
+                            env_pick = Some(i);
+                            self.stub_instance(e, tr, name, span)
+                        }
                         _ => None,
                     };
                     if let Some((local, params, ret)) = found {
+                        if env_pick.is_some() {
+                            self.record_pick_env(e, p.gx.lang.from, 0, ReceiverForm::Value, env_pick);
+                        }
                         self.set_res(e, Res::Fn(local));
                         self.check_args(&params, args, span);
                         return Some(self.normalize_use(ret, span));
@@ -7099,6 +7112,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let mut hits: Vec<(LocalDefId, Vec<Ty>, Ty)> = Vec::new();
         let mut hit_traits: Vec<DefId> = Vec::new();
+        // The env predicate of the first param-env hit (`record_pick_env`).
+        let mut hit_env: Option<usize> = None;
         // A `Default` impl with no method fn (a derive, or core's
         // impl for a builtin type) that builds its value by
         // structure: lowering emits the `default` glue.
@@ -7112,12 +7127,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let snap = self.snapshot_vars();
             let obl_len = self.obl_len();
             let sites_len = self.generic_sites.len();
+            let replayed = self.replayed_trait_ref(e, trait_def);
             let tr = match hint {
                 Some(written) if written.def == trait_def => written,
                 _ => {
                     let mut tr_args: Vec<GenericArg> = vec![GenericArg::Ty(base)];
-                    for _ in 0..n_inputs {
-                        tr_args.push(GenericArg::Ty(self.new_var(false)));
+                    for i in 0..n_inputs {
+                        match replayed.and_then(|r| self.tys.args(r.args).get(i + 1).and_then(|g| g.as_ty())) {
+                            Some(t) => tr_args.push(GenericArg::Ty(t)),
+                            None => tr_args.push(GenericArg::Ty(self.new_var(false))),
+                        }
                     }
                     let args_id = self.tys.intern_args(&tr_args);
                     TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
@@ -7151,10 +7170,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         continue;
                     }
                 }
-                Selection::ParamEvidence(_) => {
+                Selection::ParamEvidence(i) => {
                     if let Some(found) = self.stub_instance(e, tr, name, span) {
                         hits.push(found);
                         hit_traits.push(trait_def);
+                        hit_env.get_or_insert(i);
                         continue;
                     }
                 }
@@ -7175,7 +7195,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             1 if !default_glue => {
                 let (local, params, ret) = hits.into_iter().next().unwrap();
-                self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
+                self.record_pick_env(e, hit_traits[0], 0, ReceiverForm::Value, hit_env);
                 self.set_res(e, Res::Fn(local));
                 self.check_args(&params, args, span);
                 Some(self.normalize_use(ret, span))
@@ -8421,7 +8441,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if !turbofish.is_empty() || self.name(name) != "into" || derefs > 0 {
             return None;
         }
-        let dst = self.deep(expected?);
+        // An instance replays the template's `T: Into<U>` evidence, so
+        // the target is known even with no expected type.
+        let into = self.p.gx.lang.into;
+        let replayed = self.replayed_trait_ref(e, into).and_then(|r| self.tys.args(r.args).get(1).and_then(|g| g.as_ty()));
+        let dst = match replayed {
+            Some(t) => t,
+            None => self.deep(expected?),
+        };
         let src_kind = self.kind(base);
         let dst_kind = self.kind(dst);
         if !Self::numeric_from_ok(src_kind, dst_kind) {
@@ -9496,9 +9523,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             None => EMPTY_BINDINGS,
         };
         let tr = TraitRef { def: trait_def, args: args_id, bindings };
+        self.replay_operands(e, trait_def, &[li, ri]);
         let (id, impl_args) = match self.select_obligation(tr) {
             Selection::Impl { id, args, .. } => (id, args),
-            Selection::ParamEvidence(_) => {
+            Selection::ParamEvidence(i) => {
+                self.record_pick_env(e, trait_def, 0, ReceiverForm::Value, Some(i));
                 // A template check: the bound proves the operator. The
                 // call is the trait method's stub; the result is the
                 // bound's `Output`, or its rigid projection.
@@ -9556,6 +9585,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let args_id = self.tys.intern_args(&[GenericArg::Ty(l), GenericArg::Ty(r)]);
         let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+        self.replay_operands(e, trait_def, &[l, r]);
         match self.select_obligation_at(tr, span, 0) {
             Selection::Impl { id, args: impl_args, .. } => {
                 let rec = p.gx.index.get(id).clone();
@@ -9578,6 +9608,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Selection::ParamEvidence(i) if i != usize::MAX => {
                 let method_def = p.gx.index.trait_record(trait_def)?.method_by_name(p.interner.intern(direct))?;
                 let stub = *p.gx.trait_method_stubs.get(&method_def)?;
+                self.record_pick_env(e, trait_def, 0, ReceiverForm::Value, Some(i));
                 Some((stub, CmpVia::Direct))
             }
             _ => None,
@@ -9820,9 +9851,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         };
         let args_id = self.tys.intern_args(&[GenericArg::Ty(lt), GenericArg::Ty(rinner)]);
         let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+        self.replay_operands(e, trait_def, &[lt, rinner]);
         let local = match self.select_obligation(tr) {
             Selection::Impl { id, args, .. } => self.method_instance_for_impl(e, id, tr, args, method_name, span).map(|l| l.0),
-            Selection::ParamEvidence(_) => {
+            Selection::ParamEvidence(i) => {
+                self.record_pick_env(e, trait_def, 0, ReceiverForm::Value, Some(i));
                 let method_def = p.gx.index.trait_record(trait_def).and_then(|r| r.method_by_name(p.interner.intern(method_name)));
                 method_def.and_then(|m| p.gx.trait_method_stubs.get(&m).copied())
             }
@@ -9897,6 +9930,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // ARCH 2.12 run point: an operator on a non-scalar must know the left
         // operand type. The scalar path above and below needs no trait search.
         self.run_obligations(false);
+        self.replay_pick_operands(e, &[lt, rt]);
         let (lk, rk) = (self.kind(lt), self.kind(rt));
         if lk == TyKind::Error || rk == TyKind::Error {
             return if op.is_cmp() { BOOL } else { ERROR };

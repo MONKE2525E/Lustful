@@ -16,14 +16,16 @@
 // trait at the same probe, and they match by receiver type, so a
 // by-value probe at `&T` takes a `&self` bound method of `T`.
 //
-// Operators (`a + b`, `-a`, `a += b`) and `for` loops record no
-// pick: their instance checks re-select, and that is equal by
-// construction. An operator names exactly one lang trait, so
-// selection in an instance can only find the one impl coherence
-// allows for the operand types (or the builtin scalar path, whose
-// `Output`/`Rhs` are core's own scalar impls); a bound that fixes
-// `Output` is checked again at the call site, so an instance
-// whose impl disagrees with the bound never gets built. A `for`
+// Operators (`a + b`, `-a`, `a += b`) and `for` loops re-select in
+// instances. An operator names exactly one lang trait, so selection
+// in an instance finds the impl coherence allows for the operand
+// types (or the builtin scalar path); a bound that fixes `Output` is
+// checked again at the call site. The one open input is a literal
+// operand: `t == 5` under `T: PartialEq<u8>` must stay `u8` in an
+// instance whose Self also has `PartialEq<u16>`, so a binary operator
+// a param-env predicate proved records that predicate
+// (`TraitPick::env_pred`) and instances unify the operands with it
+// first (`replay_operands`). A `for`
 // loop is the same shape through `IntoIterator`: the blanket
 // `impl<I: Iterator> IntoIterator for I` overlaps any direct
 // impl, so the template proof and the instance selection name
@@ -42,6 +44,14 @@ pub struct TraitPick {
     pub derefs: u8,
     /// Method calls: the method's receiver form on Self.
     pub form: ReceiverForm,
+    /// The template env predicate that proved the call (a
+    /// `ParamEvidence` pick), by index into the template's env. Other
+    /// checks replay that trait ref with its inputs (`U: From<u8>`
+    /// gives `u16: From<u8>`, never an open `u16: From<?X>`), as rustc
+    /// resolves the call once per generic body. Bound order is part of
+    /// the template's own `Sig` fingerprint, so a reused pick's index
+    /// still names the same predicate.
+    pub env_pred: Option<u32>,
 }
 
 impl Ctx<'_, '_> {
@@ -62,8 +72,66 @@ impl Ctx<'_, '_> {
 
     /// Records one confirmed trait call in a template check.
     pub(super) fn record_pick(&mut self, e: ExprId, trait_def: DefId, derefs: u8, form: ReceiverForm) {
+        self.record_pick_env(e, trait_def, derefs, form, None);
+    }
+
+    /// `record_pick` for a call a param-env predicate proved: `env` is
+    /// its index in this body's env (`TraitPick::env_pred`).
+    /// `usize::MAX` is selection's structural answer, not a predicate.
+    pub(super) fn record_pick_env(&mut self, e: ExprId, trait_def: DefId, derefs: u8, form: ReceiverForm, env: Option<usize>) {
         if self.is_template_check() {
-            self.out.trait_picks.push((e, TraitPick { trait_def, derefs, form }));
+            let env_pred = env.filter(|&i| i != usize::MAX).and_then(|i| u32::try_from(i).ok());
+            self.out.trait_picks.push((e, TraitPick { trait_def, derefs, form, env_pred }));
+        }
+    }
+
+    /// The trait ref a replayed param-env pick of trait `trait_def`
+    /// names in this instance: the template's env predicate with the
+    /// instance's args substituted, its projections normalized.
+    pub(super) fn replayed_trait_ref(&mut self, e: ExprId, trait_def: DefId) -> Option<TraitRef> {
+        let pick = self.replay_pick(e).filter(|pk| pk.trait_def == trait_def)?;
+        let i = pick.env_pred? as usize;
+        let p = self.p;
+        let info = p.gx.instances.get(&self.fid)?;
+        let template = info.template_local?;
+        let Some(&Predicate::Trait(b)) = p.gx.fn_scopes.get(template.0 as usize)?.env.get(i) else { return None };
+        if b.count != 0 || b.value.def != trait_def {
+            return None;
+        }
+        let inst: Vec<GenericArg> = p.tys.args(info.args).to_vec();
+        let tr = crate::traits::index::subst_trait_ref_pub(&mut self.tys, b.value, &inst);
+        let raw: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+        let normed: Vec<GenericArg> = raw
+            .into_iter()
+            .map(|g| match g {
+                GenericArg::Ty(t) => GenericArg::Ty(self.normalize_here(t)),
+                other => other,
+            })
+            .collect();
+        let args = self.tys.intern_args(&normed);
+        Some(TraitRef { args, ..tr })
+    }
+
+    /// An operator's operand types against the template's param-env
+    /// pick, in an instance: the template proved `T: PartialEq<u8>`
+    /// for `t == 5`, so the literal is `u8` here too, whatever other
+    /// impls the instance's Self type has.
+    /// All or nothing: operands of another shape (references the
+    /// template peeled) bind nothing.
+    pub(super) fn replay_operands(&mut self, e: ExprId, trait_def: DefId, operands: &[Ty]) {
+        let Some(r) = self.replayed_trait_ref(e, trait_def) else { return };
+        let want: Vec<Ty> = self.tys.args(r.args).iter().filter_map(|g| g.as_ty()).collect();
+        let snap = self.snapshot_vars();
+        if !operands.iter().zip(&want).all(|(&have, &w)| self.unify(have, w)) {
+            self.rollback_vars(snap);
+        }
+    }
+
+    /// `replay_operands` with the trait the pick names, before an
+    /// operator's builtin scalar path can see an open operand.
+    pub(super) fn replay_pick_operands(&mut self, e: ExprId, operands: &[Ty]) {
+        if let Some(pick) = self.replay_pick(e) {
+            self.replay_operands(e, pick.trait_def, operands);
         }
     }
 

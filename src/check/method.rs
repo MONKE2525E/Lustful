@@ -348,6 +348,9 @@ pub(super) fn trait_probe_for(
         } else {
             None
         };
+        // An instance replays the template's param-env pick with its
+        // trait inputs (`U: Add2<u8>` gives `u16: Add2<u8>`).
+        let replayed = if only.is_some() { cx.replayed_trait_ref(e, trait_def) } else { None };
         for &probe in probes {
             let step = probe.self_ty;
             let form = probe.filter;
@@ -382,7 +385,9 @@ pub(super) fn trait_probe_for(
             for i in 0..n_inputs {
                 // `Into::into` returns the trait input itself,
                 // so an expected result type is that input.
-                let t = if trait_def == p.gx.lang.into && i == 0 {
+                let t = if let Some(t) = replayed.and_then(|r| cx.tys.args(r.args).get(i + 1).and_then(|g| g.as_ty())) {
+                    t
+                } else if trait_def == p.gx.lang.into && i == 0 {
                     expected.unwrap_or_else(|| cx.new_var(false))
                 } else {
                     cx.new_var(false)
@@ -428,6 +433,15 @@ pub(super) fn trait_probe_for(
                                             .and_then(|d| p.local_def(d.hash))
                                             .map(|l| (l, args2.clone(), Some((u, cx.deep(step)))))
                                     }
+                                    // A template check: `U: From<T>` in the
+                                    // bounds proves it; the call is `from`'s stub.
+                                    Selection::ParamEvidence(i) if i != usize::MAX => p
+                                        .gx
+                                        .index
+                                        .trait_record(p.gx.lang.from)
+                                        .and_then(|r| r.methods.first().map(|m| m.0))
+                                        .and_then(|m| param_env_hit(cx, m, ftr))
+                                        .map(|(l, a)| (l, a, Some((u, cx.deep(step))))),
                                     _ => None,
                                 }
                             } else {
@@ -673,6 +687,7 @@ pub(super) fn trait_probe_for(
             }
             let args_id = cx.tys.intern_args(&tr_args);
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+            let mut env_pick: Option<usize> = None;
             let prefix: Vec<GenericArg> = if let Some((u, from_step)) = bridge {
                 // Bookkeep the `Into` obligation, then take the
                 // instantiation prefix from the `From` impl whose
@@ -686,6 +701,10 @@ pub(super) fn trait_probe_for(
                 }
             } else {
                 match cx.select_obligation(tr) {
+                    Selection::ParamEvidence(i) => {
+                        env_pick = Some(i);
+                        prefix
+                    }
                     Selection::Impl { args: impl_args, .. } => {
                         // Impl methods take impl args; trait defaults
                         // take the trait ref args.
@@ -724,7 +743,7 @@ pub(super) fn trait_probe_for(
             };
             match confirm_method(cx, e, local, &generics, &prefix, explicit, probe, derefs, args, name_span) {
                 Some(ret) => {
-                    cx.record_pick(e, trait_def, derefs + probe.extra_derefs, probe.filter);
+                    cx.record_pick_env(e, trait_def, derefs + probe.extra_derefs, probe.filter, env_pick);
                     Probe::Hit(ret)
                 }
                 None => Probe::Miss,
