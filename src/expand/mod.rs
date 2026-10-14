@@ -1018,6 +1018,25 @@ impl<'a> Expander<'a> {
         Tt::Tok(Token { tok: Tok::Str(i, None), span })
     }
 
+    /// A byte string literal tree for `bytes` at `span`: the verbatim
+    /// `b"..."` text a `ByteStr` token holds, with every byte that is not
+    /// printable ASCII (and `"`, `\\`) as a `\xNN` escape. `include_bytes!`
+    /// makes one, so its value is the byte string's `&'static [u8; N]`.
+    pub fn byte_str_tree(&mut self, bytes: &[u8], span: Span) -> Tt {
+        let mut text = String::with_capacity(bytes.len() + 3);
+        text.push_str("b\"");
+        for &b in bytes {
+            if (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' {
+                text.push(b as char);
+            } else {
+                let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\\x{b:02x}"));
+            }
+        }
+        text.push('"');
+        let i = self.push_string(text);
+        Tt::Tok(Token { tok: Tok::ByteStr(i), span })
+    }
+
     /// An identifier tree for `name` at `span`.
     pub fn ident_tree(&mut self, name: &str, span: Span) -> Tt {
         Tt::Tok(Token { tok: Tok::Ident(self.ctx.interner.intern(name)), span })

@@ -179,6 +179,16 @@ enum Flow {
 
 type Env = Vec<(Sym, TypedValue, bool)>;
 
+/// The value of a local `e` names (a one-segment path bound in `env`), by
+/// reference.
+fn local_value<'e, 'a, C: ConstCx<'a>>(cx: &C, env: &'e Env, e: ExprId) -> Option<&'e TypedValue> {
+    let Expr::Path(segs) = cx.ast().expr(e) else { return None };
+    if segs.len() != 1 || segs[0].has_args() {
+        return None;
+    }
+    env.iter().rev().find(|(n, _, _)| *n == segs[0].name).map(|(_, v, _)| v)
+}
+
 fn outside(span: Span, what: &str) -> Diag {
     Diag::new(
         C_OUTSIDE,
@@ -795,6 +805,12 @@ impl Evaluator {
                 }
             }
             Expr::Index { base, index } => {
+                // A local base is read in place: cloning a large array
+                // (an `include_bytes!` blob) per element read would make
+                // a loop over it quadratic (W-CHECK-G3).
+                if let Some(got) = self.index_local(cx, env, *base, *index, span)? {
+                    return Ok(Flow::Val(got));
+                }
                 let (v, t) = self.value(cx, env, *base, None)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 let (iv, _) = self.value(cx, env, *index, Some(USIZE))?;
@@ -1898,6 +1914,38 @@ impl Evaluator {
 
     /// The element count of a slice or array const value, through a
     /// promoted reference if the value carries one.
+    /// `base[index]` when `base` names a local holding an array, a slice,
+    /// or a reference to one: the element, read without cloning the
+    /// sequence. None when the base is not such a local.
+    fn index_local<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, base: ExprId, index: ExprId, span: Span) -> Result<Option<TypedValue>, Diag> {
+        if local_value(cx, env, base).is_none() {
+            return Ok(None);
+        }
+        let (iv, _) = self.value(cx, env, index, Some(USIZE))?;
+        let ConstValue::Int(i) = iv else { return Err(outside(span, "this index")) };
+        let i = usize::try_from(i).map_err(|_| outside(span, "this index"))?;
+        let Some((v, t)) = local_value(cx, env, base) else { return Ok(None) };
+        let (mut v, mut t) = (v, *t);
+        while let (ConstValue::Ref(inner), TyKind::Ref(_, _, it)) = (v, cx.tys_ref().kind(t)) {
+            v = inner;
+            t = it;
+        }
+        let elem = match cx.tys_ref().kind(t) {
+            TyKind::Array(el, _) | TyKind::Slice(el) => el,
+            _ => return Ok(None),
+        };
+        let got = match v {
+            ConstValue::Aggregate(vals) => vals.get(i).cloned(),
+            ConstValue::Repeat(v, n) if (i as u64) < *n => Some((**v).clone()),
+            ConstValue::Aggregate(_) | ConstValue::Repeat(..) => None,
+            _ => return Ok(None),
+        };
+        match got {
+            Some(g) => Ok(Some((g, elem))),
+            None => Err(outside(span, "this index (out of bounds)")),
+        }
+    }
+
     fn seq_len(&self, v: &ConstValue) -> Option<usize> {
         match v {
             ConstValue::Aggregate(vals) => Some(vals.len()),
@@ -1958,6 +2006,14 @@ impl Evaluator {
     ) -> Result<TypedValue, Diag> {
         let outside_err = || outside(span, "method calls");
         let name = cx.sym_text(name).to_string();
+        // `len` of a local sequence, read in place (see `index_local`).
+        if name == "len"
+            && args.is_empty()
+            && let Some((v, _)) = local_value(cx, env, recv_e)
+            && let Some(n) = self.seq_len(v)
+        {
+            return Ok((ConstValue::Int(n as i128), USIZE));
+        }
         let (rv, rt) = self.value(cx, env, recv_e, None)?;
         // An inherent integer method on an unpinned receiver is
         // ambiguous (rustc E0689), even where the surroundings

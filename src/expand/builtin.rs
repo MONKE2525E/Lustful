@@ -652,20 +652,9 @@ fn include_macro(st: &mut Expander, name: &str, call: &Call, depth: u32) -> Resu
             })?;
             Ok(vec![st.str_tree(&text, span)])
         }
-        "include_bytes" => {
-            let text = String::from_utf8(bytes).map_err(|_| {
-                err(
-                    C_UNSUPPORTED,
-                    rel_span,
-                    "include_bytes! of non-UTF-8 data is not supported yet",
-                    "This rides on the byte-string form, which has no checker support yet.",
-                )
-            })?;
-            let lit = st.str_tree(&text, span);
-            let mut tpl = st.lex_template("__lust_s.as_bytes()", span);
-            tpl = splice_placeholders(tpl, "__lust_s", &[lit], st.ctx.interner);
-            Ok(tpl)
-        }
+        // The file's bytes as a byte string literal: `&'static [u8; N]`,
+        // as rustc types `include_bytes!`, for any data (W-CHECK-G3).
+        "include_bytes" => Ok(vec![st.byte_str_tree(&bytes, span)]),
         _ => {
             let text = String::from_utf8(bytes)
                 .map_err(|_| err(C_CALL, rel_span, format!("`{}` is not valid UTF-8", path.display()), "Rust source must be UTF-8."))?;
