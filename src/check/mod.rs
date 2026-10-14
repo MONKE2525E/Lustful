@@ -2073,9 +2073,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     /// `alias_adt` for the type segment of a value path, generic
     /// aliases too: a generic alias's body under the segment's type
-    /// args, fresh variables for the ones not written (`type A<T> =
-    /// S<T>; A::make(5)`, `A::<u8>::make`). The bool is true for a
-    /// generic alias, whose written args are its own, not the Adt's.
+    /// args (`A::<u8>::make`), fresh variables when none are written
+    /// (`type A<T> = S<T>; A::make(5)`), and the defaults of the
+    /// missing ones otherwise. The bool is true for a generic alias,
+    /// whose written args are its own, not the Adt's.
     fn alias_adt_seg(&mut self, seg: &ast::PathSeg, span: Span) -> Option<(AdtId, Vec<GenericArg>, bool)> {
         if let Some((a, args)) = self.alias_adt(seg.name) {
             return Some((a, args, false));
@@ -5095,7 +5096,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let indexable = matches!(self.kind(inner), TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Error)
                         || self.tys.vec_elem(inner).is_some()
                         || self.tys.is_string_ty(inner);
-                    if indexable {
+                    // rustc tries the type's own `Index` impl before any
+                    // deref; `[]` through a user `Index` impl is not
+                    // supported yet, so such a type stops here (L0113).
+                    if indexable || self.has_user_index_impl(inner) {
                         break;
                     }
                     let Some(target) = self.record_place_deref(e, inner, derefs, span) else { break };
@@ -7777,6 +7781,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
             found = Some(tr);
         }
         found
+    }
+
+    /// True when `t` is an Adt with a written `Index` or `IndexMut`
+    /// impl (any args).
+    fn has_user_index_impl(&self, t: Ty) -> bool {
+        use crate::traits::index::{SelfHead, Synthetic};
+        let p = self.p;
+        let Some((def, _)) = self.tys.adt_parts(t) else { return false };
+        [p.gx.lang.index, p.gx.lang.index_mut].iter().any(|&tr| {
+            p.gx.index.impls_of_trait(tr).iter().any(|&id| {
+                let rec = p.gx.index.get(id);
+                rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
+            })
+        })
     }
 
     /// One of several inherent fns of one name, each in its own impl
