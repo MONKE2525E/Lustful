@@ -1,3 +1,3 @@
 # A panic in a module file names that file, relative to the workspace
-# root as Cargo gives it to rustc (W-PANIC).
+# root as Cargo gives it to rustc (W-PANIC). file!() names the same path.
 stderr=exact

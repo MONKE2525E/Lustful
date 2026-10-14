@@ -1591,6 +1591,7 @@ fn resolved_setup(
             deps: externs.clone(),
             client: front.client.clone(),
             std_splice_lo: std_ranges.first().map(|r| r.0),
+            display_root: front.display_root.clone(),
         };
         match worklist::resolve_crate_cached(&input, &front.interner, &front.known, &mut front.resolve_cache) {
             Ok(r) => {

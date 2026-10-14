@@ -1,4 +1,4 @@
-// panic: byte index is not a char boundary
+// panic: start byte index 2 is not a char boundary
 fn main() {
     let mut s = "héllo".to_string();
     println!("pre");

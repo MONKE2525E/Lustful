@@ -4,6 +4,7 @@ pub struct Table {
 
 impl Table {
     pub fn new(n: u32) -> Table {
+        println!("{}:{}", file!(), line!());
         let mut cells = Vec::new();
         for i in 0..n {
             cells.push(i * 10);

@@ -55,6 +55,10 @@ pub struct CrateInput {
     /// spliced. Std source modules (src/stdmods.rs) are hidden only
     /// when they sit at or after this offset.
     pub std_splice_lo: Option<u32>,
+    /// The Cargo workspace root (W-PANIC): `file!()` names a file under it
+    /// relative to it, as Cargo hands paths to rustc (docs/ARCH.md 3.5).
+    /// None for a single file.
+    pub display_root: Option<PathBuf>,
 }
 
 /// One crate's own resolve inputs inside a workspace session (the
@@ -73,6 +77,8 @@ struct OneInput {
     /// `CrateInput::std_splice_lo` for the selected crate; None for a
     /// dependency.
     std_splice_lo: Option<u32>,
+    /// See `CrateInput::display_root`.
+    display_root: Option<PathBuf>,
 }
 
 /// The resolved crate the driver compiles: the merged Ast, the source
@@ -719,6 +725,8 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
     // `file!` text: a shown root change re-expands every file. (The env
     // is not here: files that read it are never cached, see `reads_outside`.)
     input.client.shown_root.hash(&mut h);
+    // `file!()` expands relative to it.
+    input.display_root.hash(&mut h);
     h.finish()
 }
 
@@ -1123,7 +1131,15 @@ fn add_platform_job(input: &CrateInput, tables: &mut ResolvedTables, jobs: &mut 
     let mut env = input.env.with_features(&[]);
     env.allow_lust_dev = true;
     jobs.push(CrateJob {
-        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name: "std".to_string(), std_splice_lo: None },
+        input: OneInput {
+            root_path: root,
+            root_text,
+            env,
+            crate_ids: input.crate_ids,
+            crate_name: "std".to_string(),
+            std_splice_lo: None,
+            display_root: input.display_root.clone(),
+        },
         root_module,
         flat_prefix: format!("k{:016x}$", stable.0),
         magic,
@@ -1154,6 +1170,7 @@ fn resolve_crate_with(
             crate_ids: input.crate_ids,
             crate_name: input.crate_name.clone(),
             std_splice_lo: input.std_splice_lo,
+            display_root: input.display_root.clone(),
         },
         root_module: ROOT_MODULE,
         flat_prefix: String::new(),
@@ -1367,7 +1384,15 @@ fn add_dep_job(
     let idx = jobs.len();
     by_key.insert(key, idx);
     jobs.push(CrateJob {
-        input: OneInput { root_path: root, root_text, env, crate_ids: input.crate_ids, crate_name, std_splice_lo: None },
+        input: OneInput {
+            root_path: root,
+            root_text,
+            env,
+            crate_ids: input.crate_ids,
+            crate_name,
+            std_splice_lo: None,
+            display_root: input.display_root.clone(),
+        },
         root_module,
         flat_prefix: format!("k{:016x}$", stable.0),
         magic,
@@ -2411,7 +2436,10 @@ fn resolve_one(
             let ects = crate::expand::ExpandCtx {
                 interner,
                 known,
-                file_path: path.to_string_lossy().to_string(),
+                file_path: match input.display_root.as_deref().and_then(|r| path.strip_prefix(r).ok()) {
+                    Some(rel) => rel.to_string_lossy().to_string(),
+                    None => path.to_string_lossy().to_string(),
+                },
                 src: &text,
                 cfg: expand_cfg(&input.env),
                 module_path: module_paths[di].clone(),
@@ -5936,6 +5964,7 @@ mod tests {
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
+            display_root: None,
         };
         let out = [true, false].map(|one_shot| resolve_crate_cached(&input, &interner, &known, &mut ResolveCache::new(one_shot)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6074,6 +6103,7 @@ mod tests {
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
+            display_root: None,
         };
         // The interner must outlive the tables' Syms only for lookups in
         // the test; leak it (tests are short-lived).
@@ -6105,6 +6135,7 @@ mod tests {
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
+            display_root: None,
         };
         let mut cache = ResolveCache::new(false);
         let first = resolve_crate_cached(&input(&dir), interner, known, &mut cache).ok().expect("first resolves");
@@ -6175,6 +6206,7 @@ mod tests {
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
+            display_root: None,
         };
         let r = resolve_crate(&input, interner, known).ok().expect("display test crate resolves");
         let shown = |flat_text: &str| r.tables.display_names.get(&interner.intern(flat_text)).map(|&d| interner.get(d).to_string());
@@ -6213,6 +6245,7 @@ mod tests {
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
+            display_root: None,
         };
         let mut cache = ResolveCache::new(false);
         for round in 0..2 {

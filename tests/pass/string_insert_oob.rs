@@ -1,4 +1,4 @@
-// panic: byte index out of bounds
+// panic: assertion failed: self.is_char_boundary(idx)
 fn main() {
     let mut s = "héllo".to_string();
     println!("pre");
