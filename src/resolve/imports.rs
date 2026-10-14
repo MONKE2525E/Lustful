@@ -288,6 +288,18 @@ impl ResolvedTables {
         })
     }
 
+    /// True when `module` has a glob import of a std module or enum
+    /// (`std_mod_only`: of a module, not an enum's variants). Lust does
+    /// not know every name such a glob brings (`Rewrite::std_glob_check`).
+    pub fn has_std_glob(&self, module: ModuleId, std_mod_only: bool, interner: &Interner) -> bool {
+        self.std_globs.iter().any(|(m, path)| {
+            *m == module && (!std_mod_only || {
+                let p: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+                crate::ty::lang::std_enum_variants(&p).is_empty()
+            })
+        })
+    }
+
     /// An empty table set with only the first crate's root module (id
     /// 0, the selected crate; dependency crates join with
     /// `add_crate_root`).
@@ -1591,6 +1603,10 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         let mut changed = false;
                         if tables.externs[i as usize].is_std_lib {
                             let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+                            if std_glob_shadows_prelude(&strs) {
+                                diags.push(std_glob_diag(imp.span));
+                                return TryOut::Done(false);
+                            }
                             for v in crate::ty::lang::std_enum_variants(&strs) {
                                 let name = interner.intern(v);
                                 let key = (imp.module, ns_index(Namespace::Value) as u8, name);
@@ -2038,6 +2054,34 @@ fn reexport_diag(name: &str, span: Span) -> Diag {
 }
 
 /// The L0507 diagnostic for a use of a glob-ambiguous name.
+/// True for a glob of a std module that brings its own `Result`
+/// (`std::io`, `std::fmt`, `std::thread`): it shadows the prelude's
+/// `Result`, which lust would still use.
+pub fn std_glob_shadows_prelude(path: &[&str]) -> bool {
+    path.len() == 2 && matches!(path[0], "std" | "core") && matches!(path[1], "io" | "fmt" | "thread")
+}
+
+/// L0505 for a glob import of `std::io`, `std::fmt`, or `std::thread`.
+pub fn std_glob_diag(span: Span) -> Diag {
+    Diag::new(
+        "L0505",
+        span,
+        "a glob import of a std module with its own `Result` is not supported yet",
+        "Import the std items you use by name, such as `use std::io::{self, Write};`.",
+    )
+}
+
+/// L0505 for a name a std glob import may bring or shadow: lust does
+/// not know every name a std module exports.
+pub fn std_glob_name_diag(name: &str, span: Span) -> Diag {
+    Diag::new(
+        "L0505",
+        span,
+        format!("`{name}` next to a std glob import is not supported yet: the glob may also bring `{name}`"),
+        "Import the std items you use by name instead of with `*`, or import this name explicitly.",
+    )
+}
+
 pub fn ambiguous_diag(name: &str, span: Span) -> Diag {
     Diag::new(
         "L0507",

@@ -3369,6 +3369,15 @@ fn collect_inline_modules(items: &[Item], fi: usize, prefix: &[Sym], tables: &Re
 }
 
 /// True when an attribute list names `name` as its one-segment path.
+/// L0522 for `#[no_implicit_prelude]`: paths honor it, but the checker
+/// still finds prelude types, variants, traits' methods, and std macros
+/// in such a module (false accepts), so lust rejects the attribute.
+fn no_prelude_unsupported(attrs: &[Attr], interner: &Interner, diags: &mut Vec<Diag>) {
+    for a in attrs.iter().filter(|a| a.path.len() == 1 && interner.get(a.path[0].name) == "no_implicit_prelude") {
+        diags.push(crate::diag::not_yet("L0522", a.span, "`#[no_implicit_prelude]`"));
+    }
+}
+
 fn has_attr(attrs: &[Attr], name: &str, interner: &Interner) -> bool {
     attrs.iter().any(|a| a.path.len() == 1 && interner.get(a.path[0].name) == name)
 }
@@ -3423,6 +3432,7 @@ fn strip_file(
     let module = w.module;
     if has_attr(&inner, "no_implicit_prelude", interner) {
         tables.modules[module.0 as usize].no_prelude = true;
+        no_prelude_unsupported(&inner, interner, diags);
     }
     match cfg::attrs_enabled(&input.env, &inner, &strings, interner) {
         Ok(false) => {
@@ -3528,6 +3538,8 @@ fn strip_items(
                     tables.modules[child.0 as usize].vis = vis;
                     if has_attr(&item.attrs, "no_implicit_prelude", interner) || has_attr(&m.inner_attrs, "no_implicit_prelude", interner) {
                         tables.modules[child.0 as usize].no_prelude = true;
+                        no_prelude_unsupported(&item.attrs, interner, diags);
+                        no_prelude_unsupported(&m.inner_attrs, interner, diags);
                     }
                     if let Some(body) = &mut m.body {
                         strip_items(body, fi, &key, w, input, interner, list_module, tables, diags);
@@ -4020,6 +4032,10 @@ struct Frame {
     /// or a nested item: a second explicit binding of one name in one
     /// namespace is a duplicate, where a glob binding is not.
     explicit: Vec<(Sym, usize)>,
+    /// The block has a glob import of a std module (not an enum). It
+    /// may bring any name, and it shadows outer scopes for those names
+    /// (`Rewrite::std_glob_check`).
+    std_mod_glob: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -4603,6 +4619,10 @@ impl Rewrite<'_> {
             return;
         }
         let (res, local) = self.resolve(&names, ns, module, scopes);
+        if self.std_glob_check(&names, ns, module, scopes) {
+            self.diags.push(crate::resolve::imports::std_glob_name_diag(self.interner.get(names[0]), span));
+            return;
+        }
         if !local {
             // A generic param of the item shadows module items and
             // imports: a type or const param in a type path, a const
@@ -5115,6 +5135,11 @@ impl Rewrite<'_> {
                                 && let Some(frame) = scopes.last_mut()
                             {
                                 let p: Vec<&str> = path.iter().map(|s| self.interner.get(*s)).collect();
+                                if crate::resolve::imports::std_glob_shadows_prelude(&p) {
+                                    self.diags.push(crate::resolve::imports::std_glob_diag(span));
+                                    continue;
+                                }
+                                frame.std_mod_glob |= crate::ty::lang::std_enum_variants(&p).is_empty();
                                 for n in crate::ty::lang::std_glob_names() {
                                     if crate::ty::lang::std_glob_imports(&p, n) {
                                         let name = self.interner.intern(n);
@@ -5278,11 +5303,64 @@ impl Rewrite<'_> {
         }
     }
 
+    /// True when a std glob import may decide what the path's first
+    /// segment names, and lust would pick something else:
+    /// - a block with a glob of a std module shadows outer scopes for
+    ///   every name the module exports, so a name lust finds only
+    ///   outside that block (an outer local, item, or import, or a
+    ///   module binding) may be the glob's instead;
+    /// - in a module with a std glob, a name from a user glob may be
+    ///   ambiguous with it (rustc E0659).
+    /// Names the block itself binds, generic params, and names lust
+    /// finds nowhere (the prelude, the std types a glob is known to
+    /// bring) are fine.
+    fn std_glob_check(&self, segs: &[Sym], ns: Namespace, module: ModuleId, scopes: &[Frame]) -> bool {
+        let Some(&first) = segs.first() else { return false };
+        if matches!(self.interner.get(first), "crate" | "self" | "super" | "Self" | "::") || self.gen_params.iter().any(|(n, _)| *n == first) {
+            return false;
+        }
+        let asked = if segs.len() > 1 { Namespace::Type } else { ns };
+        let key = (first, ns_index(asked));
+        let binds = |f: &Frame| {
+            (asked != Namespace::Type && (f.locals.contains(&first) || f.items.contains(&first)))
+                || f.imports.contains_key(&key)
+                || f.std_imports.contains_key(&key)
+        };
+        for (i, frame) in scopes.iter().enumerate().rev() {
+            if binds(frame) {
+                // A glob import beside the std glob in one block may
+                // be ambiguous with it; an explicit binding wins.
+                let glob_only = frame.imports.contains_key(&key)
+                    && !frame.explicit.contains(&key)
+                    && !(asked != Namespace::Type && (frame.locals.contains(&first) || frame.items.contains(&first)));
+                return frame.std_mod_glob && glob_only;
+            }
+            if frame.std_mod_glob {
+                return scopes[..i].iter().any(binds) || self.tables.lookup(module, asked, first).is_some();
+            }
+        }
+        self.tables.has_std_glob(module, false, self.interner)
+            && matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank <= 1)
+    }
+
+    /// True when an uppercase binding name sits under a glob of a std
+    /// module (in a block or the module): the glob may bring a const of
+    /// that name (`use std::f64::consts::*; let PI = 3.0;` is rustc
+    /// E0005), so lust rejects the binding.
+    fn binding_under_std_glob(&self, name: Sym, module: ModuleId, scopes: &[Frame]) -> bool {
+        self.interner.get(name).starts_with(|c: char| c.is_ascii_uppercase())
+            && !Self::frames_bind(scopes, name)
+            && (scopes.iter().any(|f| f.std_mod_glob) || self.tables.has_std_glob(module, true, self.interner))
+    }
+
     /// Rewrites one pattern's paths.
     fn pat(&mut self, ast: &mut Ast, id: PatId, module: ModuleId, scopes: &[Frame]) {
         let span = ast.pat_span(id);
         match std::mem::replace(&mut ast.pats[id.0 as usize], Pat::Wild) {
             Pat::Binding { name, mutable, by_ref } => {
+                if self.binding_under_std_glob(name, module, scopes) {
+                    self.diags.push(crate::resolve::imports::std_glob_name_diag(self.interner.get(name), span));
+                }
                 let replacement = if !mutable && !by_ref { self.binding_pat(name, span, module, scopes) } else { None };
                 ast.pats[id.0 as usize] = replacement.unwrap_or(Pat::Binding { name, mutable, by_ref });
             }

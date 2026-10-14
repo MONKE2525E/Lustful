@@ -1364,12 +1364,15 @@ fn check_fn_mode<'p, 'a>(
             }
             seen_params.push(param.name);
         }
+        if param.pat.is_none() && cx.prelude_variant(param.name, param.span.ctxt) {
+            cx.prelude_variant_binding_err(param.name, param.span);
+        }
         // A plain parameter name that resolves to a const item or a
         // unit variant is a refutable pattern, not a binding (rustc
         // E0005); a static name cannot be a pattern at all. A `mut`
         // parameter, or one named like an item of the enclosing block
         // (which hides module items), may name no static or const.
-        if param.pat.is_none() && (param.mutable || cx.body_item_of(param.name, param.span.ctxt).is_some()) {
+        if param.pat.is_none() && (param.mutable || cx.body_item_of(param.name).is_some()) {
             cx.binding_shadows_item(param.name, param.span, false);
         } else if param.pat.is_none() {
             match cx.pat_ident(param.name) {
@@ -1828,17 +1831,36 @@ impl<'p, 'a> Ctx<'p, 'a> {
         None
     }
 
-    /// What a lone identifier in a pattern resolves to through the
-    /// module bindings (imports included): a const item, a static, or
-    /// a unit variant or struct constructor. Anything else stays a
-    /// fresh binding. The binding query records the read, so a body
-    /// rechecks when the name's target changes.
+    /// True when `name` is a std prelude variant (`None`, `Some`, `Ok`,
+    /// `Err`) that no local, block item, or crate item shadows here. Such
+    /// a name in a binding position is not a fresh binding (rustc
+    /// E0530): plain `None` is a path pattern, and every other form
+    /// (`Some`, `mut None`, `ref Ok`, a parameter) is an error.
+    fn prelude_variant(&mut self, name: Sym, ctxt: CtxtId) -> bool {
+        let k = self.p.known;
+        [k.None, k.Some, k.Ok, k.Err].contains(&name)
+            && self.lookup(name, ctxt).is_none()
+            && self.body_item_of(name).is_none()
+            && self.binding(Namespace::Value, name) == BindingRes::Absent
+    }
+
+    /// The L0110 error for a binding that names a prelude variant.
+    fn prelude_variant_binding_err(&mut self, name: Sym, span: Span) {
+        let n = self.name(name).to_string();
+        self.err(
+            "L0110",
+            span,
+            format!("a binding cannot shadow the std variant `{n}`"),
+            format!("Rename the binding: `{n}` names `Option::{n}` or `Result::{n}` here, not a new variable."),
+        );
+    }
+
     /// Whether a plain pattern name, with no local shadowing it, is a
     /// path pattern (a const, static, unit struct, or unit variant), not
     /// a fresh binding. A block's items come first: a body const or
     /// static is one; a body fn is not, and it hides module items.
-    fn names_pattern_item(&mut self, name: Sym, ctxt: CtxtId) -> bool {
-        match self.body_item_of(name, ctxt) {
+    fn names_pattern_item(&mut self, name: Sym) -> bool {
+        match self.body_item_of(name) {
             Some(crate::check::collect::BodyItem::Fn(_)) => false,
             Some(_) => true,
             None => !matches!(self.pat_ident(name), PatIdent::Other),
@@ -1855,7 +1877,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if self.lookup(name, span.ctxt).is_some() {
             return false;
         }
-        let what = match self.body_item_of(name, span.ctxt) {
+        let what = match self.body_item_of(name) {
             Some(BodyItem::Static(_)) => "statics",
             Some(BodyItem::Const(_)) if !plain => "constants",
             Some(_) => return false,
@@ -1870,6 +1892,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         true
     }
 
+    /// What a lone identifier in a pattern resolves to through the
+    /// module bindings (imports included): a const item, a static, or
+    /// a unit variant or struct constructor. Anything else stays a
+    /// fresh binding. The binding query records the read, so a body
+    /// rechecks when the name's target changes.
     fn pat_ident(&mut self, name: Sym) -> PatIdent {
         use crate::resolve::imports::{BindState, Target};
         let p = self.p;
@@ -4860,7 +4887,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         // rejects it as refutable where rustc does.
                         Pat::Binding { name, mutable: false, by_ref: false }
                             if self.lookup(*name, self.p.ast.pat_span(*pat).ctxt).is_none()
-                                && self.names_pattern_item(*name, self.p.ast.pat_span(*pat).ctxt) =>
+                                && (self.names_pattern_item(*name)
+                                    || (*name == self.p.known.None && self.prelude_variant(*name, self.p.ast.pat_span(*pat).ctxt))) =>
                         {
                             if init.is_none() {
                                 let s = self.p.ast.pat_span(*pat);
@@ -4884,6 +4912,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                         Pat::Binding { name, mutable, by_ref } => {
                             let (name, mutable, by_ref) = (*name, *mutable, *by_ref);
+                            let span = self.p.ast.pat_span(*pat);
+                            if self.prelude_variant(name, span.ctxt) {
+                                self.prelude_variant_binding_err(name, span);
+                            }
                             self.binding_shadows_item(name, self.p.ast.pat_span(*pat), !mutable && !by_ref);
                             let lty = if by_ref { self.tys.mk_ref(mutable, ty) } else { ty };
                             // The binding's hygiene key is the pattern name's
@@ -12843,6 +12875,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Checks a pattern against a value of type `t`. Applies default binding modes.
     /// Records one pattern binding with the local type its mode gives it.
     fn bind_pattern_local(&mut self, pi: usize, name: Sym, mutable: bool, by_ref: bool, t: Ty, mode: BindMode, span: Span) {
+        if self.prelude_variant(name, span.ctxt) {
+            self.prelude_variant_binding_err(name, span);
+        }
         // Edition 2024: once a pattern is implicitly borrowing (a default
         // binding mode shift happened above it), an explicit `ref` borrow
         // in it is an error.
@@ -13596,7 +13631,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // static is rejected at the binding below).
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
-            && self.body_item_of(*name, span.ctxt).is_none()
+            && self.body_item_of(*name).is_none()
         {
             match self.pat_ident(*name) {
                 PatIdent::Const(idx) => {
