@@ -582,6 +582,21 @@ pub enum PrimOpKind {
     IntoCast,
 }
 
+/// A method call receiver that goes through a user `Deref` impl
+/// (rustc's autoderef, ARCH 2.10): after `before` builtin derefs of
+/// the receiver, lowering calls `f` (the impl's `deref`, or
+/// `deref_mut` when `mutable`) on a borrow of it; the call's `Res`
+/// derefs and autoref then apply to that `&Target` (`target_ref`).
+/// `args` instantiate a generic `f` (empty for a plain one).
+#[derive(Clone, Debug)]
+pub struct DerefRecv {
+    pub before: u8,
+    pub f: LocalDefId,
+    pub args: Vec<GenericArg>,
+    pub mutable: bool,
+    pub target_ref: Ty,
+}
+
 /// A coercion applied where a value meets an expected type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coerce {
@@ -687,6 +702,10 @@ pub struct Checked<'g> {
     /// Vtable requests from unsizing coercions: (concrete pointee
     /// type, target dyn type), zonked. Mono builds the vtables.
     pub vtable_requests: Vec<(Ty, Ty)>,
+    /// Method calls whose receiver goes through a user `Deref` impl
+    /// (`method_via_user_deref`), by call expression; a chain of impls
+    /// records one entry per step, innermost first.
+    pub deref_recv: Vec<(ExprId, DerefRecv)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
@@ -739,6 +758,11 @@ impl Checked<'_> {
     }
     pub fn pat_derefs(&self, p: PatId) -> u8 {
         self.pat_derefs[(p.0 - self.pat_base) as usize]
+    }
+    /// The user `Deref` steps of a method call's receiver, outermost
+    /// first (a chain `W -> N -> M` records the inner steps first).
+    pub fn deref_recv(&self, e: ExprId) -> Vec<&DerefRecv> {
+        self.deref_recv.iter().rev().filter(|(x, _)| *x == e).map(|(_, d)| d).collect()
     }
 }
 
@@ -874,6 +898,13 @@ struct Ctx<'p, 'a> {
     /// call expression: a generic method's closure arguments read it
     /// (`expected_output_first`).
     pub(super) call_expected: Option<(ExprId, Ty)>,
+    /// User `Deref` steps the method lookup is inside (a bound on
+    /// `Deref` chains).
+    deref_depth: u8,
+    /// Generic `deref` fns of `out.deref_recv` entries: the entry,
+    /// the template, and its impl args (zonked into the entry and
+    /// requested as instances at body end).
+    deref_sites: Vec<(usize, LocalDefId, Vec<GenericArg>)>,
     /// Or-pattern alternatives being checked against the first
     /// alternative's bindings, innermost last (see the `Pat::Or`
     /// arm of `pattern_mode`).
@@ -995,6 +1026,7 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
             inst_requests: Vec::new(),
             trait_picks: Vec::new(),
             vtable_requests: Vec::new(),
+            deref_recv: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
             reads: if p.record_reads { Reads::new() } else { Reads::off() },
@@ -1048,6 +1080,8 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
         vtable_sites: Vec::new(),
         dyn_borrow_src: false,
         call_expected: None,
+        deref_depth: 0,
+        deref_sites: Vec::new(),
         or_frames: Vec::new(),
         or_log: None,
         pat_marks: Vec::new(),
@@ -3793,6 +3827,95 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
     }
+    /// A method found through a user `Deref` impl of the receiver
+    /// (rustc's autoderef, ARCH 2.10; `SmallVec` derefs to `[T]`): when
+    /// nothing answers on `base` (the receiver after `before` builtin
+    /// derefs) and `base` has a written `Deref` impl, the call checks
+    /// on `&Target`, through `DerefMut` when it borrows mutably, and
+    /// lowering calls the impl's fn first (`Checked::deref_recv`).
+    /// None when no such impl applies.
+    #[allow(clippy::too_many_arguments)]
+    fn method_via_user_deref(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        before: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+    ) -> Option<Ty> {
+        let lang = self.p.gx.lang;
+        if self.deref_depth >= 4 || self.tys.local_adt(base).is_none() {
+            return None;
+        }
+        let (f, target, impl_args) = self.user_deref_fn(lang.deref, base, "deref", name_span)?;
+        let tref = self.tys.mk_ref(false, target);
+        self.deref_depth += 1;
+        let ret = self.method_call_with_rt(e, recv, tref, name, name_span, args, turbofish, expected);
+        self.deref_depth -= 1;
+        let mutable = match self.out.expr_res[self.ei(e)] {
+            Res::Method { autoref, .. } | Res::BuiltinMethod { autoref, .. } | Res::DynMethod { autoref, .. } => autoref == Autoref::RefMut,
+            // The lookup on the target failed and reported why.
+            Res::None => return Some(ret),
+            _ => {
+                self.errs.push(not_yet("L0820", name_span, "this method through a user `Deref` impl"));
+                return Some(ERROR);
+            }
+        };
+        let (f, impl_args) = if mutable {
+            match self.user_deref_fn(lang.deref_mut, base, "deref_mut", name_span) {
+                Some((g, _, a)) => (g, a),
+                None => {
+                    let tn = self.tn(base);
+                    self.err(
+                        "L0308",
+                        name_span,
+                        format!("cannot borrow data in a dereference of `{tn}` as mutable"),
+                        format!("Implement `DerefMut` for `{tn}`."),
+                    );
+                    return Some(ERROR);
+                }
+            }
+        } else {
+            (f, impl_args)
+        };
+        let target_ref = self.tys.mk_ref(mutable, target);
+        let idx = self.out.deref_recv.len();
+        self.out.deref_recv.push((e, DerefRecv { before, f, args: Vec::new(), mutable, target_ref }));
+        if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+            self.deref_sites.push((idx, f, impl_args));
+        }
+        Some(ret)
+    }
+
+    /// The written impl of `Deref` (or `DerefMut`) for `base`: its
+    /// `fname` fn, the target type, and the impl args. None for no
+    /// impl or a core one.
+    fn user_deref_fn(&mut self, trait_def: DefId, base: Ty, fname: &str, span: Span) -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
+        use crate::traits::index::Synthetic;
+        let p = self.p;
+        let args = self.tys.intern_args(&[GenericArg::Ty(base)]);
+        let tr = TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS };
+        let Selection::Impl { id, args: impl_args, .. } = self.select_obligation_at(tr, span, 0) else { return None };
+        let rec = p.gx.index.get(id).clone();
+        if rec.synthetic != Synthetic::None {
+            return None;
+        }
+        let f = rec.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == fname))?;
+        let ret = p.fn_info(f).ret;
+        let ret = if impl_args.is_empty() { ret } else { subst(&mut self.tys, ret, &impl_args) };
+        let ret = self.normalize_here(ret);
+        let TyKind::Ref(_, _, target) = self.kind(ret) else { return None };
+        let target = self.resolve(target);
+        if matches!(self.kind(target), TyKind::Infer(_) | TyKind::Error) {
+            return None;
+        }
+        Some((f, target, impl_args))
+    }
+
     /// rustc's expected inputs for a closure argument: a generic call
     /// that returns its own type variable (`fn with<R>(f: impl FnOnce()
     /// -> R) -> R`) under an expected type fixes that variable first, so
@@ -9536,6 +9659,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if let Some(ret) = self.lang_default_method(e, recv, base, derefs, name, name_span, args) {
                     return ret;
                 }
+                if let Some(ret) = self.method_via_user_deref(e, recv, base, derefs, name, name_span, args, turbofish, expected) {
+                    return ret;
+                }
                 for &a in args {
                     self.expr(a, None);
                 }
@@ -14655,6 +14781,21 @@ impl<'p, 'a> Ctx<'p, 'a> {
             {
                 self.out.const_exprs[i] = Some(v);
             }
+        }
+        // Generic user `deref` fns of method receivers, as call sites.
+        for (idx, template, args) in std::mem::take(&mut self.deref_sites) {
+            let zargs: Vec<GenericArg> = args
+                .iter()
+                .map(|&g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(self.zonk(t)),
+                    GenericArg::Const(c) => GenericArg::Const(self.resolve_const(c)),
+                    other => other,
+                })
+                .collect();
+            if let Some(entry) = self.out.deref_recv.get_mut(idx) {
+                entry.1.args = zargs.clone();
+            }
+            self.out.inst_requests.push((template, zargs));
         }
         // Generic call sites become instance requests for mono,
         // with their args zonked into place for lowering.

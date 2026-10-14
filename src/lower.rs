@@ -2553,11 +2553,46 @@ impl<'p, 'a> Lower<'p, 'a> {
             Res::DynMethod { owner, cand, slot, derefs, autoref } => (Callee::Dyn(owner, cand, slot), derefs, autoref),
             _ => return,
         };
-        let recv_ty = self.peel(self.ty(recv), derefs);
+        // Through a user `Deref` impl (check's `DerefRecv`): borrow the
+        // receiver, call the impl's `deref` (or `deref_mut`), and apply
+        // the call's derefs and autoref to the `&Target` it returns.
+        // A chain of impls (`W -> N -> M`) applies each step to the
+        // `&Target` the previous one returned.
+        let steps: Vec<crate::check::DerefRecv> = self.ck.deref_recv(e).into_iter().cloned().collect();
+        let mut root: Option<Place> = None;
+        for dr in steps {
+            let (base, base_ty) = match &root {
+                Some(pl) => (Self::derefs(pl.clone(), dr.before), self.peel(self.body.locals[pl.local as usize].ty, dr.before)),
+                None => {
+                    let pl = if dr.mutable { self.place_for_mut(recv) } else { self.place(recv) };
+                    (Self::derefs(pl, dr.before), self.peel(self.ty(recv), dr.before))
+                }
+            };
+            let rt = self.ref_ty(dr.mutable, base_ty);
+            let r = self.temp(rt);
+            self.assign(Place::local(r), Rvalue::Ref(dr.mutable, base), span);
+            let f = if dr.args.is_empty() {
+                dr.f
+            } else {
+                crate::check::generics::instance_for(self.p, &self.body.tys, dr.f, &dr.args).unwrap_or(dr.f)
+            };
+            let t = self.temp(dr.target_ref);
+            let arg = if dr.mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
+            self.call_into(CallTarget::Fn(f), vec![arg], Place::local(t), span);
+            root = Some(Place::local(t));
+        }
+        let root_ty = match &root {
+            Some(pl) => self.body.locals[pl.local as usize].ty,
+            None => self.ty(recv),
+        };
+        let recv_ty = self.peel(root_ty, derefs);
         let mut ops = Vec::with_capacity(args.len() + 1);
         match autoref {
             Autoref::None => {
-                let o = self.operand_derefs(recv, derefs);
+                let o = match &root {
+                    Some(pl) => self.operand_from(Self::derefs(pl.clone(), derefs), recv_ty),
+                    None => self.operand_derefs(recv, derefs),
+                };
                 ops.push(o);
                 for &a in args {
                     let o = self.operand(a);
@@ -2565,7 +2600,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Autoref::Ref => {
-                let pl = self.place(recv);
+                let pl = match &root {
+                    Some(pl) => pl.clone(),
+                    None => self.place(recv),
+                };
                 let pl = Self::derefs(pl, derefs);
                 let rt = self.ref_ty(false, recv_ty);
                 let t = self.temp(rt);
@@ -2577,7 +2615,10 @@ impl<'p, 'a> Lower<'p, 'a> {
                 }
             }
             Autoref::RefMut => {
-                let pl = self.place_for_mut(recv);
+                let pl = match &root {
+                    Some(pl) => pl.clone(),
+                    None => self.place_for_mut(recv),
+                };
                 let pl = Self::derefs(pl, derefs);
                 let mt = self.ref_ty(true, recv_ty);
                 if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {

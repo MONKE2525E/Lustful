@@ -1070,6 +1070,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 match res {
                     // A dyn method call through the vtable borrows its
                     // receiver like any other method call.
+                    // Through a user `Deref` impl, the receiver is borrowed
+                    // for the `deref` call (its `Res` applies to the target).
+                    Res::Method { .. } | Res::BuiltinMethod { .. } | Res::DynMethod { .. }
+                        if let Some((before, mutable)) =
+                            self.out.deref_recv.iter().rev().find(|(x, _)| *x == e).map(|(_, d)| (d.before, d.mutable)) =>
+                    {
+                        self.cap_receiver(*recv, before, if mutable { Autoref::RefMut } else { Autoref::Ref }, w);
+                    }
                     Res::Method { derefs, autoref, .. }
                     | Res::BuiltinMethod { derefs, autoref, .. }
                     | Res::DynMethod { derefs, autoref, .. } => {
