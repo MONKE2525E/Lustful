@@ -6508,6 +6508,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 if let Some((crate::ty::hash::HashTy::HashMap, targs)) = crate::ty::hash::hash_parts(&self.tys, inner) {
                     return self.map_index(e, *base, *index, &targs, derefs, span);
+                }
                 // A written `Index` impl on a non-builtin type
                 // (`map[&k]`, `deque[i]`, a user container): the
                 // place is the call's returned reference, recorded

@@ -293,7 +293,6 @@ impl LangTraits {
             assoc_index_output: lang_assoc(index, "Output"),
             from_str,
             assoc_from_str_err: lang_assoc(from_str, "Err"),
-            extend,
         }
     }
 
