@@ -59,6 +59,9 @@ fn expands(b: Builtin) -> bool {
             | B::IterPosition
             | B::IterRposition
             | B::IterWindows
+            | B::IterNextBack
+            | B::StrCharIndices
+            | B::StrBytes
             | B::IterFold
             | B::IterForEach
             | B::IterMin
@@ -489,10 +492,40 @@ impl Ex<'_, '_, '_> {
                     ),
                 );
             }
-            B::IterNext => {
+            B::IterNext | B::IterNextBack => {
                 let r = arg()?;
                 let (itp, ty) = self.deref_arg(r)?;
-                self.next(itp, ty, dest, false)?;
+                self.next(itp, ty, dest, b == B::IterNextBack)?;
+            }
+            // `s.char_indices()` (W-STD-B): (s.chars(), 0), as std builds it.
+            B::StrCharIndices => {
+                let s = arg()?;
+                let c = self.local(CHARS);
+                self.call_builtin(Builtin::StrChars, vec![s], Place::local(c));
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(c)), Self::usize_c(0)]));
+            }
+            // `s.bytes()`: std's `Bytes` is `Copied<slice::Iter<u8>>` over
+            // `s.as_bytes()`.
+            B::StrBytes => {
+                let s = arg()?;
+                // A String receiver (`String::bytes` through Deref) gives
+                // its `&str` first.
+                let st = self.op_ty(&s)?;
+                let s = match self.body.tys.kind(st) {
+                    TyKind::Ref(_, _, i) if self.body.tys.is_string_ty(i) => {
+                        let v = self.local(REF_STR);
+                        self.call_builtin(Builtin::StringAsStr, vec![s], Place::local(v));
+                        Operand::Copy(Place::local(v))
+                    }
+                    _ => s,
+                };
+                let (_, inner) = self.kind_args(dest_ty).ok_or("iterator expansion: bad bytes iterator")?;
+                let fields = it::field_tys(&mut self.body.tys, inner[0]).ok_or("iterator expansion: bad bytes iterator")?;
+                let v = self.local(fields[0]);
+                self.call_builtin(Builtin::ConvStrBytes, vec![s], Place::local(v));
+                let si = self.local(inner[0]);
+                self.assign(Place::local(si), Rvalue::TupleAgg(inner[0], vec![Operand::Move(Place::local(v))]));
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(si))]));
             }
             B::IterPeek => {
                 let r = arg()?;
@@ -979,6 +1012,43 @@ impl Ex<'_, '_, '_> {
                 self.some(&dest, opt, Operand::Move(Place::local(w)));
                 self.goto(join);
                 self.cur = short;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            // `CharIndices` (W-STD-B), as std's: the front offset grows by
+            // the bytes `next` consumed; `next_back` gives the offset of
+            // the char it removed (front offset + bytes left).
+            K::CharIndices => {
+                let oc = self.body.tys.mk_option(CHAR);
+                let x = self.local(oc);
+                let pre = self.local(USIZE);
+                if !back {
+                    let r = self.ref_to(false, f(0), CHARS);
+                    self.call_builtin(Builtin::CharsBytesLeft, vec![Operand::Move(Place::local(r))], Place::local(pre));
+                }
+                let rm = self.ref_to(true, f(0), CHARS);
+                let b = if back { Builtin::CharsNextBack } else { Builtin::CharsNext };
+                self.call_builtin(b, vec![Operand::Move(Place::local(rm))], Place::local(x));
+                let (s, n) = self.switch_opt(&Place::local(x));
+                self.cur = s;
+                let left = self.local(USIZE);
+                let r2 = self.ref_to(false, f(0), CHARS);
+                self.call_builtin(Builtin::CharsBytesLeft, vec![Operand::Move(Place::local(r2))], Place::local(left));
+                let idx = self.local(USIZE);
+                if back {
+                    self.assign(Place::local(idx), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(left))));
+                } else {
+                    self.assign(Place::local(idx), Rvalue::Use(Operand::Copy(f(1))));
+                    let used = self.local(USIZE);
+                    self.assign(Place::local(used), Rvalue::Bin(Sub, Operand::Copy(Place::local(pre)), Operand::Copy(Place::local(left))));
+                    self.assign(f(1), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(used))));
+                }
+                let pair = self.tuple_ty(&[USIZE, CHAR]);
+                let t = self.local(pair);
+                self.assign(Place::local(t), Rvalue::TupleAgg(pair, vec![Operand::Copy(Place::local(idx)), Operand::Copy(Self::payload(&Place::local(x)))]));
+                self.some(&dest, opt, Operand::Move(Place::local(t)));
+                self.goto(join);
+                self.cur = n;
                 self.none(&dest, opt);
                 self.goto(join);
             }
@@ -2608,6 +2678,8 @@ impl Ex<'_, '_, '_> {
                 self.cur = join;
             }
             K::Map | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Rev => return self.hint(f(0), a[0]),
+            // `CharIndices` forwards to its `Chars`.
+            K::CharIndices => return self.hint(f(0), CHARS),
             K::Filter | K::FilterMap | K::SkipWhile => {
                 let (_, ih) = self.hint(f(0), a[0])?;
                 self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
@@ -2844,7 +2916,7 @@ impl Ex<'_, '_, '_> {
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator may implement the unstable TrustedLen only
             // in std itself.
-            K::ByNext => false,
+            K::ByNext | K::CharIndices => false,
             K::Windows => true,
         }
     }

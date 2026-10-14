@@ -109,6 +109,10 @@ pub enum IterKind {
     /// `core::slice::Windows<T>` (W-STD-B): args `[T]`, item `&[T]`;
     /// (the slice left, the window size).
     Windows,
+    /// `core::str::CharIndices` (W-STD-B): no args, item `(usize,
+    /// char)`; (the `Chars` left, the byte offset of its front), as std
+    /// stores it.
+    CharIndices,
 }
 
 /// One stored field of a builtin iterator, over the type's args.
@@ -131,10 +135,12 @@ pub enum Field {
     /// `&Receiver<arg>`, or `Receiver<arg>` by value when the flag is
     /// set (the mpsc iterators, W-THREADS).
     Recv(u8, bool),
+    /// `str::Chars`.
+    Chars,
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 38] = [
+    pub const ALL: [IterKind; 39] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -173,6 +179,7 @@ impl IterKind {
         IterKind::RepeatN,
         IterKind::ByNext,
         IterKind::Windows,
+        IterKind::CharIndices,
     ];
 
     /// True for the hashed-collection iterators.
@@ -232,6 +239,7 @@ impl IterKind {
             K::RepeatN => (&["core", "iter", "sources", "repeat_n"], "RepeatN"),
             K::ByNext => (&["core", "iter", "lust"], "ByNext"),
             K::Windows => (&["core", "slice"], "Windows"),
+            K::CharIndices => (&["core", "str"], "CharIndices"),
         }
     }
 
@@ -249,6 +257,7 @@ impl IterKind {
             | K::MapIntoIter
             | K::MapIntoKeys
             | K::MapIntoValues => 2,
+            K::CharIndices => 0,
             _ => 1,
         }
     }
@@ -295,6 +304,7 @@ impl IterKind {
             K::RepeatN => "std::iter::RepeatN",
             K::ByNext => "",
             K::Windows => "std::slice::Windows",
+            K::CharIndices => "std::str::CharIndices",
         }
     }
 
@@ -348,6 +358,7 @@ impl IterKind {
             K::RepeatN => &[F::Arg(0), F::Usize],
             K::ByNext => &[F::Arg(0)],
             K::Windows => &[F::SliceRef(0, false), F::Usize],
+            K::CharIndices => &[F::Chars, F::Usize],
         }
     }
 }
@@ -425,6 +436,10 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::Windows => {
             let s = tys.intern(TyKind::Slice(a[0]));
             tys.mk_ref(false, s)
+        }
+        K::CharIndices => {
+            let ts = tys.intern_tys(&[USIZE, CHAR]);
+            tys.intern(TyKind::Tuple(ts))
         }
     })
 }
@@ -516,6 +531,7 @@ pub fn field_ty(tys: &mut impl TyIntern, f: Field, args: &[Ty]) -> Ty {
             let r = super::sync::sync_ty(tys, super::sync::SyncTy::Receiver, &[args[i as usize]]);
             if owned { r } else { tys.mk_ref(false, r) }
         }
+        Field::Chars => CHARS,
     }
 }
 
@@ -533,6 +549,8 @@ pub fn iter_holds_ref(k: IterKind, args: &[Ty], arg_holds: &dyn Fn(Ty) -> bool) 
         k,
         IterKind::SliceIter
             | IterKind::SliceIterMut
+            | IterKind::Windows
+            | IterKind::CharIndices
             | IterKind::MapIter
             | IterKind::MapIterMut
             | IterKind::MapKeys

@@ -579,7 +579,7 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     match tys.builtin_of(t) {
         Some(
             BuiltinTy::Chars
-            | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter | IterKind::Windows)
+            | BuiltinTy::Iter(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::RecvIter | IterKind::RecvTryIter | IterKind::Windows | IterKind::CharIndices)
             | BuiltinTy::RefGuard
             | BuiltinTy::RefMutGuard,
         ) => return 1,
@@ -3692,6 +3692,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             K::MapIntoIter => cat(&[&args[0], &args[1]]),
             K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => args[0].clone(),
             K::MapIntoValues | K::ByNext => args[1].clone(),
+            // (usize, char): no regions.
+            K::CharIndices => Vec::new(),
         })
     }
 
@@ -4091,7 +4093,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             | K::ArrayIntoIter
             | K::RepeatN
             | K::ByNext
-            | K::Windows => false,
+            | K::Windows
+            | K::CharIndices => false,
         }
     }
 
@@ -5615,7 +5618,17 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
     matches!(
         b,
-        B::IterNext | B::IterNth | B::IterFind | B::IterFindMap | B::IterLast | B::IterMin | B::IterMax | B::IterMinByKey | B::IterMaxByKey | B::IterCollect
+        B::IterNext
+            | B::IterNextBack
+            | B::IterNth
+            | B::IterFind
+            | B::IterFindMap
+            | B::IterLast
+            | B::IterMin
+            | B::IterMax
+            | B::IterMinByKey
+            | B::IterMaxByKey
+            | B::IterCollect
     )
 }
 

@@ -280,6 +280,7 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
                 let r = CTy::Sync(crate::ty::sync::SyncTy::Receiver, Box::new(cty(tys, arg(i))));
                 if owned { r } else { CTy::Ref(Box::new(r)) }
             }
+            Field::Chars => CTy::Chars,
         })
         .collect();
     CTy::Tuple(fields)
@@ -299,6 +300,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
     match k {
         K::SliceIter | K::SliceIterMut => ref_to(a[0]),
         K::Windows => CTy::Slice(Box::new(cty(tys, a[0]))),
+        K::CharIndices => CTy::Tuple(vec![CTy::Int(IntTy::Usize), CTy::Char]),
         K::VecIntoIter | K::Range | K::RangeInclusive => cty(tys, a[0]),
         K::Map | K::FilterMap => cty(tys, a[2]),
         K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),
@@ -4419,6 +4421,9 @@ impl FnGen<'_, '_, '_> {
             | B::IterPosition
             | B::IterRposition
             | B::IterWindows
+            | B::IterNextBack
+            | B::StrCharIndices
+            | B::StrBytes
             | B::IterFold
             | B::IterForEach
             | B::IterMin

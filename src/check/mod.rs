@@ -330,6 +330,12 @@ pub enum Builtin {
     /// `slice::windows(size)` (W-STD-B): a `Windows` iterator; panics on
     /// a zero size as std does.
     IterWindows,
+    /// `DoubleEndedIterator::next_back` (W-STD-B).
+    IterNextBack,
+    /// `str::char_indices` and `str::bytes` (W-STD-B): a `CharIndices`,
+    /// and a `Copied<slice::Iter<u8>>` (std's `Bytes` wraps exactly that).
+    StrCharIndices,
+    StrBytes,
     IterFold,
     IterForEach,
     IterMin,
@@ -12064,6 +12070,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let opt_str = self.tys.mk_option(REF_STR);
         let bytes = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
         let ref_bytes = self.tys.mk_ref(false, bytes);
+        let n = self.p.interner.get(name);
+        if n == "char_indices" || n == "bytes" {
+            // (W-STD-B, lower/iter.rs.)
+            let ret = if n == "bytes" {
+                let it = crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::SliceIter, &[int(IntTy::U8)]);
+                crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::Copied, &[it, int(IntTy::U8)])
+            } else {
+                crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::CharIndices, &[])
+            };
+            return Some((if n == "bytes" { B::StrBytes } else { B::StrCharIndices }, Autoref::Ref, vec![], ret));
+        }
         let table = [
             // The `&[u8]` view, as `AsRef<[u8]>` gives it (W-STD-B).
             (k.as_bytes, B::ConvStrBytes, vec![], ref_bytes),

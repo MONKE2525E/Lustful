@@ -276,7 +276,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         use Builtin as B;
         use IterKind as K;
         let item = self.iter_item(base);
-        let by_value = !matches!(n, "next" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek");
+        let by_value = !matches!(n, "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek");
         // A by-value method through a reference would use `&mut I:
         // Iterator` (`by_ref`), which lust does not model yet.
         if by_value && derefs > 0 && self.iter_method_known(n) {
@@ -298,6 +298,16 @@ impl<'p, 'a> Ctx<'p, 'a> {
             "next" => {
                 let o = self.tys.mk_option(item);
                 (B::IterNext, vec![], o)
+            }
+            // DoubleEndedIterator::next_back (W-STD-B).
+            "next_back" => {
+                if !self.double_ended(base) {
+                    let tn = self.tn(base);
+                    self.err("L0612", span, format!("`{tn}` is not a DoubleEndedIterator here"), "Iterate forward with `next`.");
+                    return self.iter_bail(args);
+                }
+                let o = self.tys.mk_option(item);
+                (B::IterNextBack, vec![], o)
             }
             "map" => {
                 let out = self.new_var(false);
@@ -605,6 +615,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         matches!(
             n,
             "rposition"
+                | "next_back"
                 | "map"
                 | "filter"
                 | "filter_map"
@@ -803,7 +814,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let Some((k, a)) = it::iter_parts(&self.tys, t) else { return false };
         match k {
-            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::Windows => true,
+            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::Windows | K::CharIndices => true,
             K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => self.double_ended(a[0]),
             K::Chain => self.double_ended(a[0]) && self.double_ended(a[1]),
             // These need ExactSizeIterator too: lust keeps them forward-only for now.
