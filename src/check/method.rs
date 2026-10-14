@@ -126,6 +126,7 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.exact_size_iterator,
         lang.double_ended_iterator,
         lang.extend,
+        lang.from_str,
         lang.from,
         lang.into,
         // Prelude conversion traits (W-STD-B).

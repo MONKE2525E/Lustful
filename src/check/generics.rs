@@ -114,6 +114,9 @@ pub struct LangTraits {
     /// `Deref::Target` and `Index::Output`-style single assocs.
     pub assoc_target: DefId,
     pub assoc_index_output: DefId,
+    /// `core::str::FromStr` and its `Err` (W-STD-C phase 2).
+    pub from_str: DefId,
+    pub assoc_from_str_err: DefId,
 }
 
 /// One lang def under the builtin crate identity, hashed from its
@@ -184,6 +187,8 @@ impl LangTraits {
         let iterator = lang_trait(&["core", "iter"], "Iterator");
         let into_iterator = lang_trait(&["core", "iter"], "IntoIterator");
         let from_iterator = lang_trait(&["core", "iter"], "FromIterator");
+        let extend = lang_trait(&["core", "iter"], "Extend");
+        let from_str = lang_trait(&["core", "str"], "FromStr");
         let exact_size_iterator = lang_trait(&["core", "iter"], "ExactSizeIterator");
         let double_ended_iterator = lang_trait(&["core", "iter"], "DoubleEndedIterator");
         let extend = lang_trait(&["core", "iter"], "Extend");
@@ -286,6 +291,9 @@ impl LangTraits {
             ],
             assoc_target: lang_assoc(deref, "Target"),
             assoc_index_output: lang_assoc(index, "Output"),
+            from_str,
+            assoc_from_str_err: lang_assoc(from_str, "Err"),
+            extend,
         }
     }
 
@@ -354,6 +362,8 @@ impl LangTraits {
             "Iterator" => self.iterator,
             "IntoIterator" => self.into_iterator,
             "FromIterator" => self.from_iterator,
+            "Extend" => self.extend,
+            "FromStr" => self.from_str,
             "ExactSizeIterator" => self.exact_size_iterator,
             "DoubleEndedIterator" => self.double_ended_iterator,
             "Extend" => self.extend,
@@ -514,6 +524,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
             &["into_iter"],
         ),
         rec(lang.from_iterator, "FromIterator", 1, vec![], vec![], &["from_iter"]),
+        rec(lang.from_str, "FromStr", 0, vec![self_pred(tys, lang.sized, &[])], vec![(lang.assoc_from_str_err, "Err")], &["from_str"]),
         rec(lang.exact_size_iterator, "ExactSizeIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["len"]),
         rec(lang.double_ended_iterator, "DoubleEndedIterator", 0, vec![self_pred(tys, lang.iterator, &[])], vec![], &["next_back"]),
         rec(lang.extend, "Extend", 1, vec![], vec![], &["extend"]),
@@ -860,6 +871,10 @@ pub fn lang_method_sigs(
                 (d, "deref_mut") if d == lang.deref_mut => {
                     let t = proj(tys, lang.assoc_target, &[p0]);
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0], ret: tys.mk_ref(true, t), ret_borrows_from: Some(0) }
+                }
+                (d, "from_str") if d == lang.from_str => {
+                    let err = proj(tys, lang.assoc_from_str_err, &[p0]);
+                    LangMethodSig { self_kind: None, params: vec![REF_STR], ret: tys.mk_result(p0, err), ret_borrows_from: None }
                 }
                 (d, "from") if d == lang.from => LangMethodSig { self_kind: None, params: vec![p1], ret: p0, ret_borrows_from: None },
                 (d, "into") if d == lang.into => {

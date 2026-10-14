@@ -89,6 +89,22 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["AssertUnwindSafe", "set_hook", "take_hook", "PanicHookInfo", "UnwindSafe", "RefUnwindSafe"],
     },
     StdModule {
+        name: "__lust_core_error",
+        rel: "core/src/error.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "error"), ("std", "error")],
+        full: true,
+        triggers: &["error"],
+    },
+    StdModule {
+        name: "__lust_std_net",
+        rel: "std/src/net.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "net")],
+        full: false,
+        triggers: &["Ipv4Addr", "Ipv6Addr", "IpAddr", "SocketAddr", "SocketAddrV4", "SocketAddrV6", "AddrParseError"],
+    },
+    StdModule {
         name: "__lust_alloc_collections",
         rel: "alloc/src/collections.rs",
         krate: ShippedCrate::Alloc,
