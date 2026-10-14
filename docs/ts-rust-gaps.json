@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 8959,
+  "elapsed_ms": 9943,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -80,8 +80,16 @@
       "findings": 1787,
       "files": 355,
       "features": [
-        "ext.builtin_crates",
-        "ext.unknown_crate"
+        "ext.rustc_hash",
+        "ext.indexmap",
+        "ext.smallvec",
+        "ext.bumpalo",
+        "ext.memchr",
+        "ext.num_bigint",
+        "ext.num_traits",
+        "ext.ryu_js",
+        "ext.unknown_crate",
+        "ext.xxhash_rust"
       ]
     },
     {
@@ -223,71 +231,6 @@
           "scope": "active",
           "fix_class": "compiler work",
           "release_safe_rewrite": true
-        }
-      ]
-    },
-    {
-      "id": "ext.builtin_crates",
-      "title": "Built-in dependency layer (FxHashMap, IndexMap, SmallVec, memchr, xxh3, ryu-js, BigInt, leak arena)",
-      "status": "unsupported",
-      "milestone": 5,
-      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-      "inventory_step": "5",
-      "root_cause": "external-crates",
-      "fix_class": "adapter",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Compiler adapters bind to the resolved package and version. Iteration order must match where output depends on it. See dependencies.json.",
-      "findings": 1787,
-      "raw_uses": 1787,
-      "prod_uses": 1699,
-      "files": 350,
-      "prod_files": 292,
-      "prod_fns": 650,
-      "scopes": {
-        "active": 1684,
-        "target-specific": 15,
-        "test-only": 88
-      },
-      "samples": [
-        {
-          "feature": "ext.builtin_crates",
-          "raw_key": "ext.type.rustc_hash::FxHashMap",
-          "file": "crates/ts_goport/src/api/callbackfs.rs",
-          "byte_start": 965,
-          "byte_end": 988,
-          "line": 26,
-          "column": 24,
-          "snippet": "FxHashMap<String, bool>",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "ext.builtin_crates",
-          "raw_key": "ext.type.rustc_hash::FxHashMap",
-          "file": "crates/ts_goport/src/api/callbackfs.rs",
-          "byte_start": 2393,
-          "byte_end": 2416,
-          "line": 66,
-          "column": 22,
-          "snippet": "FxHashMap<String, bool>",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "ext.builtin_crates",
-          "raw_key": "ext.type.rustc_hash::FxHashMap",
-          "file": "crates/ts_goport/src/api/encoder/encoder.rs",
-          "byte_start": 38225,
-          "byte_end": 38245,
-          "line": 771,
-          "column": 28,
-          "snippet": "FxHashMap<Node, u32>",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
         }
       ]
     },
@@ -481,6 +424,71 @@
           "snippet": "Arc<ResolvedModule>",
           "scope": "active",
           "fix_class": "compiler work",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
+      "id": "ext.rustc_hash",
+      "title": "Adapter crate rustc-hash 2.1.2: FxHashMap/FxHashSet aliases, FxHasher, FxBuildHasher",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh rustc-hash. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 1336,
+      "raw_uses": 1336,
+      "prod_uses": 1294,
+      "files": 274,
+      "prod_files": 249,
+      "prod_fns": 471,
+      "scopes": {
+        "active": 1279,
+        "target-specific": 15,
+        "test-only": 42
+      },
+      "samples": [
+        {
+          "feature": "ext.rustc_hash",
+          "raw_key": "ext.type.rustc_hash::FxHashMap",
+          "file": "crates/ts_goport/src/api/callbackfs.rs",
+          "byte_start": 965,
+          "byte_end": 988,
+          "line": 26,
+          "column": 24,
+          "snippet": "FxHashMap<String, bool>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.rustc_hash",
+          "raw_key": "ext.type.rustc_hash::FxHashMap",
+          "file": "crates/ts_goport/src/api/callbackfs.rs",
+          "byte_start": 2393,
+          "byte_end": 2416,
+          "line": 66,
+          "column": 22,
+          "snippet": "FxHashMap<String, bool>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.rustc_hash",
+          "raw_key": "ext.type.rustc_hash::FxHashMap",
+          "file": "crates/ts_goport/src/api/encoder/encoder.rs",
+          "byte_start": 38225,
+          "byte_end": 38245,
+          "line": 771,
+          "column": 28,
+          "snippet": "FxHashMap<Node, u32>",
+          "scope": "active",
+          "fix_class": "adapter",
           "release_safe_rewrite": false
         }
       ]
@@ -809,6 +817,70 @@
       ]
     },
     {
+      "id": "ext.indexmap",
+      "title": "Adapter crate indexmap 2.14.0: IndexMap/IndexSet with insertion order",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh indexmap. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 369,
+      "raw_uses": 369,
+      "prod_uses": 326,
+      "files": 140,
+      "prod_files": 100,
+      "prod_fns": 169,
+      "scopes": {
+        "active": 326,
+        "test-only": 43
+      },
+      "samples": [
+        {
+          "feature": "ext.indexmap",
+          "raw_key": "ext.type.indexmap::IndexMap",
+          "file": "crates/ts_goport/src/api/proto.rs",
+          "byte_start": 65884,
+          "byte_end": 65925,
+          "line": 1547,
+          "column": 27,
+          "snippet": "IndexMap<project::ID, ProjectFileChanges>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.indexmap",
+          "raw_key": "ext.type.indexmap::IndexMap",
+          "file": "crates/ts_goport/src/api/proto.rs",
+          "byte_start": 66862,
+          "byte_end": 66903,
+          "line": 1573,
+          "column": 35,
+          "snippet": "IndexMap<project::ID, ProjectFileChanges>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.indexmap",
+          "raw_key": "ext.type.indexmap::IndexMap",
+          "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
+          "byte_start": 38785,
+          "byte_end": 38829,
+          "line": 977,
+          "column": 30,
+          "snippet": "IndexMap<tspath::Path, Rc<project::Overlay>>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
       "id": "panic.recovery",
       "title": "Panic recovery (catch_unwind, resume_unwind, panic hooks)",
       "status": "unsupported",
@@ -997,6 +1069,70 @@
           "snippet": "write",
           "scope": "active",
           "fix_class": "compiler work",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
+      "id": "ext.smallvec",
+      "title": "Adapter crate smallvec 1.15.1: SmallVec<[T; N]> with inline storage",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh smallvec. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 76,
+      "raw_uses": 76,
+      "prod_uses": 73,
+      "files": 19,
+      "prod_files": 19,
+      "prod_fns": 38,
+      "scopes": {
+        "active": 73,
+        "test-only": 3
+      },
+      "samples": [
+        {
+          "feature": "ext.smallvec",
+          "raw_key": "ext.type.smallvec::SmallVec",
+          "file": "crates/ts_goport/src/checker/checker_p01.rs",
+          "byte_start": 24498,
+          "byte_end": 24529,
+          "line": 703,
+          "column": 17,
+          "snippet": "smallvec::SmallVec<[TypeId; 8]>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.smallvec",
+          "raw_key": "ext.type.smallvec::SmallVec",
+          "file": "crates/ts_goport/src/checker/checker_p01.rs",
+          "byte_start": 30062,
+          "byte_end": 30093,
+          "line": 844,
+          "column": 46,
+          "snippet": "smallvec::SmallVec<[TypeId; 1]>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.smallvec",
+          "raw_key": "ext.type.smallvec::SmallVec",
+          "file": "crates/ts_goport/src/checker/checker_p10.rs",
+          "byte_start": 1096,
+          "byte_end": 1115,
+          "line": 23,
+          "column": 25,
+          "snippet": "SmallVec<[Node; 4]>",
+          "scope": "active",
+          "fix_class": "adapter",
           "release_safe_rewrite": false
         }
       ]
@@ -1767,6 +1903,132 @@
       ]
     },
     {
+      "id": "ext.bumpalo",
+      "title": "Adapter crate bumpalo 3.20.3: Bump as the leak arena",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh bumpalo. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 3,
+      "raw_uses": 3,
+      "prod_uses": 3,
+      "files": 1,
+      "prod_files": 1,
+      "prod_fns": 2,
+      "scopes": {
+        "active": 3
+      },
+      "samples": [
+        {
+          "feature": "ext.bumpalo",
+          "raw_key": "ext.type.bumpalo::Bump",
+          "file": "crates/ts_goport/src/leak_arena.rs",
+          "byte_start": 2069,
+          "byte_end": 2073,
+          "line": 42,
+          "column": 28,
+          "snippet": "Bump",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.bumpalo",
+          "raw_key": "ext.type.bumpalo::Bump",
+          "file": "crates/ts_goport/src/leak_arena.rs",
+          "byte_start": 4691,
+          "byte_end": 4695,
+          "line": 117,
+          "column": 53,
+          "snippet": "Bump",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.bumpalo",
+          "raw_key": "ext.type.bumpalo::Bump",
+          "file": "crates/ts_goport/src/leak_arena.rs",
+          "byte_start": 5193,
+          "byte_end": 5197,
+          "line": 131,
+          "column": 43,
+          "snippet": "Bump",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
+      "id": "ext.memchr",
+      "title": "Adapter crate memchr 2.8.2: memchr/memrchr, memchr_iter, memmem::Finder",
+      "status": "partial",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh memchr. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 3,
+      "raw_uses": 3,
+      "prod_uses": 3,
+      "files": 15,
+      "prod_files": 2,
+      "prod_fns": 1,
+      "scopes": {
+        "active": 3
+      },
+      "samples": [
+        {
+          "feature": "ext.memchr",
+          "raw_key": "ext.type.memchr::memmem::Finder",
+          "file": "crates/ts_goport/src/frontend/scanner/comment_ranges.rs",
+          "byte_start": 1001,
+          "byte_end": 1024,
+          "line": 26,
+          "column": 36,
+          "snippet": "memmem::Finder<'static>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.memchr",
+          "raw_key": "ext.type.memchr::memmem::Finder",
+          "file": "crates/ts_goport/src/frontend/tspath/path.rs",
+          "byte_start": 26469,
+          "byte_end": 26500,
+          "line": 734,
+          "column": 45,
+          "snippet": "memchr::memmem::Finder<'static>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.memchr",
+          "raw_key": "ext.type.memchr::memmem::Finder",
+          "file": "crates/ts_goport/src/frontend/tspath/path.rs",
+          "byte_start": 26619,
+          "byte_end": 26650,
+          "line": 736,
+          "column": 43,
+          "snippet": "memchr::memmem::Finder<'static>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
       "id": "unsafe.blocks",
       "title": "unsafe blocks and unsafe fns",
       "status": "unsupported",
@@ -1854,6 +2116,69 @@
       ]
     },
     {
+      "id": "ext.num_bigint",
+      "title": "Adapter crate num-bigint 0.4.6: BigInt parse, pow, print",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh num-bigint. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 0,
+      "raw_uses": 0,
+      "prod_uses": 0,
+      "files": 1,
+      "prod_files": 0,
+      "prod_fns": 0,
+      "scopes": {},
+      "samples": []
+    },
+    {
+      "id": "ext.num_traits",
+      "title": "Adapter crate num-traits 0.2.19: ToPrimitive",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh num-traits. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 0,
+      "raw_uses": 0,
+      "prod_uses": 0,
+      "files": 1,
+      "prod_files": 0,
+      "prod_fns": 0,
+      "scopes": {},
+      "samples": []
+    },
+    {
+      "id": "ext.ryu_js",
+      "title": "Adapter crate ryu-js 1.0.2: Buffer::format (JS number to string)",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh ryu-js. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 0,
+      "raw_uses": 0,
+      "prod_uses": 0,
+      "files": 1,
+      "prod_files": 0,
+      "prod_fns": 0,
+      "scopes": {},
+      "samples": []
+    },
+    {
       "id": "ext.unknown_crate",
       "title": "External crate with no adapter decision yet",
       "status": "unsupported",
@@ -1869,6 +2194,27 @@
       "raw_uses": 0,
       "prod_uses": 0,
       "files": 5,
+      "prod_files": 0,
+      "prod_fns": 0,
+      "scopes": {},
+      "samples": []
+    },
+    {
+      "id": "ext.xxhash_rust",
+      "title": "Adapter crate xxhash-rust 0.8.15: xxh3_64, xxh3_128, Xxh3",
+      "status": "unsupported",
+      "milestone": 5,
+      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
+      "inventory_step": "5",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh xxhash-rust. Split from ext.builtin_crates. See dependencies.json.",
+      "findings": 0,
+      "raw_uses": 0,
+      "prod_uses": 0,
+      "files": 18,
       "prod_files": 0,
       "prod_fns": 0,
       "scopes": {},
@@ -3030,7 +3376,7 @@
       "missing_features": [
         "attrs.unsupported",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -3072,7 +3418,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -3137,7 +3484,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -3155,7 +3502,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -3190,7 +3538,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.runtime"
       ],
       "findings": 3
@@ -3215,7 +3563,7 @@
       "missing_features": [
         "attrs.unsupported",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -3233,7 +3581,8 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -3272,7 +3621,8 @@
         "dyn.boxed",
         "dyn.fn",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -3293,7 +3643,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime",
@@ -3374,7 +3724,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -3395,7 +3745,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -3428,7 +3779,7 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.other",
         "std.rc_refcell",
@@ -3450,7 +3801,7 @@
       "missing_features": [
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -3470,7 +3821,7 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -3494,7 +3845,7 @@
         "closures.fn_ptr_lifetime",
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.hrtb",
         "lifetimes.static_anon",
         "macros.std_unsupported",
@@ -3547,7 +3898,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
@@ -3578,7 +3929,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.memchr",
+        "ext.rustc_hash",
         "std.lazy_once_lock"
       ],
       "findings": 10
@@ -3954,7 +4306,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -4000,7 +4352,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.lazy_once_lock",
@@ -4044,7 +4397,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -4062,7 +4416,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -4076,7 +4430,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "traits.impl_trait_arg"
       ],
@@ -4090,7 +4444,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -4105,7 +4460,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -4119,7 +4474,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 5
@@ -4147,7 +4503,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon"
       ],
       "findings": 10
@@ -4175,7 +4531,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -4191,7 +4547,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.smallvec",
         "lifetimes.static_anon"
       ],
       "findings": 5
@@ -4244,7 +4600,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -4274,7 +4630,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -4290,7 +4646,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.runtime"
       ],
       "findings": 4
@@ -4320,7 +4676,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -4336,7 +4692,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.cow",
         "traits.impl_trait_arg"
@@ -4351,7 +4708,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -4366,7 +4723,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.smallvec",
         "std.rc_refcell"
       ],
       "findings": 2
@@ -4381,7 +4738,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.cow",
         "std.hashmap",
@@ -4400,7 +4758,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -4426,7 +4784,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.smallvec",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
@@ -4442,7 +4800,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -4473,7 +4832,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "std.rc_refcell"
       ],
       "findings": 3
@@ -4500,7 +4860,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.smallvec",
         "std.cow",
         "std.rc_refcell"
       ],
@@ -4552,7 +4912,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
@@ -4620,7 +4981,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -4667,7 +5028,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -4709,7 +5071,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow"
       ],
@@ -4737,7 +5099,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -4751,7 +5114,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates"
+        "ext.smallvec"
       ],
       "findings": 8
     },
@@ -4763,7 +5126,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates"
+        "ext.memchr",
+        "ext.rustc_hash"
       ],
       "findings": 2
     },
@@ -4872,7 +5236,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -4886,7 +5250,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -4903,7 +5267,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "traits.impl_trait_arg"
@@ -4919,7 +5284,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -4976,7 +5341,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 1
@@ -4991,7 +5356,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "panic.recovery",
         "std.rc_refcell",
         "std.runtime"
@@ -5039,7 +5404,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -5055,7 +5420,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.memchr",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -5072,7 +5438,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 17
@@ -5086,7 +5452,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -5102,7 +5468,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "traits.impl_trait_arg"
@@ -5118,7 +5484,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -5149,7 +5515,9 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.rc_refcell",
@@ -5168,7 +5536,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -5185,7 +5553,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -5270,7 +5638,7 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -5297,7 +5665,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -5314,7 +5684,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -5336,7 +5706,9 @@
         "dyn.boxed",
         "dyn.fn",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.cow",
@@ -5368,7 +5740,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -5403,7 +5775,8 @@
         "attrs.unsupported",
         "cinterop.system",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.hashmap",
         "std.hashmap_hasher",
@@ -5491,7 +5864,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -5523,7 +5896,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -5620,7 +5993,7 @@
         "cinterop.system",
         "closures.fn_ptr_lifetime",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -5636,7 +6009,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates"
+        "ext.indexmap"
       ],
       "findings": 1
     },
@@ -5648,7 +6021,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.rc_refcell",
         "threads.sync"
       ],
@@ -5673,7 +6046,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
@@ -5689,7 +6062,7 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -5708,7 +6081,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -5739,7 +6112,8 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -5767,7 +6141,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.rc_refcell"
       ],
       "findings": 1
@@ -5796,7 +6170,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "threads.sync"
@@ -5872,7 +6246,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 9
@@ -5957,7 +6331,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -6044,7 +6418,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -6120,7 +6494,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 2
@@ -6362,7 +6736,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -6400,7 +6775,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -6462,7 +6837,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -6488,7 +6863,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -6514,7 +6889,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 4
@@ -6696,7 +7071,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -6761,7 +7136,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 8
@@ -6798,7 +7173,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 10
@@ -6836,7 +7211,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 12
@@ -6849,7 +7225,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 9
@@ -7031,7 +7408,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -7244,7 +7621,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -7286,7 +7663,7 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -7301,7 +7678,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 6
@@ -7395,7 +7772,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -7650,7 +8027,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -7665,7 +8042,7 @@
       "parse_error": false,
       "missing_features": [
         "closures.fn_ptr_lifetime",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "threads.sync"
       ],
@@ -7737,7 +8114,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 8
@@ -7876,7 +8254,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -7968,7 +8346,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.lazy_once_lock",
@@ -8005,7 +8383,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.lazy_once_lock",
@@ -8043,7 +8421,8 @@
         "core.std_basics",
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -8062,7 +8441,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -8091,7 +8471,7 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
@@ -8110,7 +8490,7 @@
         "core.std_basics",
         "dyn.any",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -8125,7 +8505,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
@@ -8142,7 +8522,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -8170,7 +8550,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
@@ -8187,7 +8567,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "threads.sync"
@@ -8203,7 +8583,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "generics.const_param",
         "lifetimes.static_anon",
         "std.cow",
@@ -8241,7 +8622,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "traits.impl_trait_arg"
@@ -8257,7 +8638,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync",
@@ -8274,7 +8656,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.xxhash_rust",
         "std.rc_refcell"
       ],
       "findings": 0
@@ -8314,7 +8696,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -8332,7 +8714,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -8350,7 +8732,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "threads.sync"
       ],
@@ -8364,7 +8746,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "threads.sync"
@@ -8380,7 +8762,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -8411,7 +8794,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.other",
@@ -8433,7 +8816,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -8455,7 +8838,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -8472,7 +8855,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -8487,7 +8870,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -8550,7 +8933,8 @@
         "core.std_basics",
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -8596,7 +8980,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -8859,7 +9243,7 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.lazy_once_lock",
@@ -8911,7 +9295,8 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -8933,7 +9318,8 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.lazy_once_lock",
@@ -8955,7 +9341,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -8972,7 +9358,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "threads.sync",
         "traits.impl_trait_arg"
@@ -8998,7 +9384,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -9014,7 +9400,7 @@
       "missing_features": [
         "dyn.fn",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -9033,7 +9419,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "traits.impl_trait_arg"
@@ -9052,7 +9438,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -9072,7 +9458,8 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "panic.recovery",
@@ -9093,7 +9480,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -9109,7 +9496,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -9160,7 +9548,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.hashmap",
         "std.hashmap_hasher",
         "std.runtime",
@@ -9176,7 +9565,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -9224,7 +9613,9 @@
       "missing_features": [
         "core.std_basics",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.memchr",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -9245,7 +9636,7 @@
         "core.std_basics",
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -9262,7 +9653,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon"
       ],
       "findings": 8
@@ -9288,7 +9679,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.rc_refcell",
@@ -9307,7 +9698,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -9335,7 +9726,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -9354,7 +9746,9 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.memchr",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -9372,7 +9766,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -9466,7 +9860,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -9498,7 +9893,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.lazy_once_lock",
@@ -9527,7 +9924,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -9556,7 +9954,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.smallvec",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "traits.impl_trait_arg"
@@ -9581,7 +9979,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -9621,7 +10019,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "threads.sync",
@@ -9660,7 +10059,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.memchr",
         "lifetimes.static_anon",
         "std.lazy_once_lock"
       ],
@@ -9685,7 +10084,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -9714,7 +10113,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.memchr",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -9732,7 +10132,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.memchr",
         "lifetimes.static_anon",
         "std.cow",
         "traits.impl_trait_arg"
@@ -9786,7 +10186,8 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -9804,7 +10205,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -9832,7 +10234,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -9848,7 +10251,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -9888,7 +10292,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.rc_refcell",
@@ -9919,7 +10323,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "threads.sync"
@@ -9935,7 +10340,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -9953,7 +10359,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -9971,7 +10378,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -9988,7 +10396,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 3
@@ -10026,7 +10434,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.memchr",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -10055,7 +10464,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -10083,7 +10492,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.other",
         "std.rc_refcell",
@@ -10124,7 +10533,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -10139,7 +10548,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -10155,7 +10564,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -10210,7 +10619,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -10225,7 +10634,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "threads.sync"
       ],
@@ -10241,7 +10650,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -10278,7 +10687,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -10296,7 +10705,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "threads.sync"
@@ -10321,7 +10730,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.runtime",
         "threads.sync"
@@ -10364,7 +10773,7 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "generics.const_param",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
@@ -10385,7 +10794,7 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -10434,7 +10843,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "panic.recovery",
@@ -10541,7 +10950,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.lazy_once_lock",
@@ -10618,7 +11027,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.rc_refcell",
@@ -10648,7 +11057,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.memchr",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.other",
@@ -10834,7 +11243,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.memchr",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -10869,7 +11278,7 @@
         "core.std_basics",
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -11003,7 +11412,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.num_bigint",
+        "ext.num_traits",
+        "ext.ryu_js",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.other",
@@ -11062,7 +11473,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.bumpalo",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -11120,7 +11531,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -11167,7 +11578,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -11183,7 +11594,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -11200,7 +11612,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates"
+        "ext.rustc_hash"
       ],
       "findings": 4
     },
@@ -11225,7 +11637,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -11256,7 +11669,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -11273,7 +11686,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -11297,7 +11711,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -11313,7 +11728,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates"
+        "ext.indexmap"
       ],
       "findings": 3
     },
@@ -11336,7 +11751,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 5
@@ -11350,7 +11766,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 4
@@ -11365,7 +11782,8 @@
       "missing_features": [
         "cinterop.system",
         "closures.fn_ptr_lifetime",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -11381,7 +11799,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -11398,7 +11816,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -11428,7 +11846,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -11443,7 +11861,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -11459,7 +11877,7 @@
       "parse_error": false,
       "missing_features": [
         "attrs.unsupported",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -11477,7 +11895,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.thread_local"
@@ -11492,7 +11910,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -11537,7 +11955,8 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -11555,7 +11974,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -11569,7 +11988,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.runtime"
       ],
       "findings": 1
@@ -11597,7 +12016,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -11628,7 +12047,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -11646,7 +12065,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.memchr",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -11663,7 +12083,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -11701,7 +12121,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -11732,7 +12152,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -11748,7 +12168,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -11763,7 +12183,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 4
@@ -11792,7 +12212,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 5
@@ -11818,7 +12238,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -11916,7 +12336,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
@@ -11931,7 +12351,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "traits.impl_trait_arg"
       ],
@@ -11946,7 +12366,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -11984,7 +12405,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -12011,7 +12433,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -12029,7 +12452,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -12064,7 +12487,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -12108,7 +12531,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -12126,7 +12549,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -12142,7 +12566,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -12160,7 +12585,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell"
@@ -12255,7 +12680,8 @@
       "missing_features": [
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -12329,7 +12755,7 @@
       "generated": true,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -12343,7 +12769,7 @@
       "generated": true,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -12370,7 +12796,7 @@
       "generated": true,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -12413,7 +12839,7 @@
         "attrs.unsupported",
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -12439,7 +12865,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.cow",
         "threads.sync"
       ],
@@ -12466,7 +12893,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -12502,7 +12930,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -12524,7 +12952,8 @@
         "dyn.boxed",
         "dyn.fn",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "panic.recovery",
@@ -12565,7 +12994,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -12589,7 +13019,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "threads.sync",
@@ -12618,7 +13048,8 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -12648,7 +13079,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -12664,7 +13095,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.runtime"
       ],
       "findings": 12
@@ -12704,7 +13135,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -12723,7 +13155,7 @@
       "missing_features": [
         "attrs.unsupported",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -12741,7 +13173,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -12758,7 +13190,8 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.memchr",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.other",
         "std.rc_refcell",
@@ -12775,7 +13208,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 0
@@ -12788,7 +13222,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -12804,7 +13238,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -12863,7 +13297,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -12879,7 +13313,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.rc_refcell",
@@ -12927,7 +13361,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "threads.thread_local"
@@ -12982,7 +13416,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates"
+        "ext.memchr"
       ],
       "findings": 2
     },
@@ -13029,7 +13463,8 @@
         "dyn.boxed",
         "dyn.fn",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.cow",
@@ -13054,7 +13489,7 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13112,7 +13547,8 @@
         "dyn.boxed",
         "dyn.fn",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13130,7 +13566,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -13154,7 +13591,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell"
@@ -13181,7 +13618,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -13222,7 +13659,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -13252,7 +13689,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13272,7 +13710,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
@@ -13288,7 +13726,8 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -13315,7 +13754,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -13352,7 +13791,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -13368,7 +13808,8 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13395,7 +13836,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -13410,7 +13852,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.runtime",
         "traits.impl_trait_arg"
       ],
@@ -13425,7 +13867,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.xxhash_rust",
         "std.rc_refcell"
       ],
       "findings": 3
@@ -13438,7 +13880,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates"
+        "ext.rustc_hash"
       ],
       "findings": 4
     },
@@ -13521,7 +13963,9 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13540,7 +13984,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13557,7 +14001,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.xxhash_rust",
         "std.rc_refcell",
         "threads.sync"
       ],
@@ -13571,7 +14015,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -13587,7 +14031,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -13617,7 +14061,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -13634,7 +14079,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -13651,7 +14097,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13673,7 +14119,8 @@
         "dyn.boxed",
         "dyn.fn",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.lazy_once_lock",
         "std.rc_refcell",
@@ -13695,7 +14142,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -13715,7 +14163,9 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13735,7 +14185,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -13753,7 +14204,8 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -13806,7 +14258,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.memchr",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -13866,7 +14319,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -13911,7 +14364,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "traits.impl_trait_arg"
@@ -13972,7 +14425,8 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "panic.recovery",
@@ -14016,7 +14470,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.runtime"
       ],
       "findings": 7
@@ -14032,7 +14487,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -14082,7 +14537,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -14120,7 +14575,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -14177,7 +14632,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 5
@@ -14234,7 +14689,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -14248,7 +14703,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -14299,7 +14754,8 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.runtime",
         "traits.impl_trait_arg"
@@ -14348,7 +14804,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "traits.impl_trait_arg"
@@ -14363,7 +14819,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.runtime"
       ],
       "findings": 1
@@ -14378,7 +14834,7 @@
       "missing_features": [
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.runtime",
         "traits.impl_trait_arg"
@@ -14393,7 +14849,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon"
       ],
       "findings": 5
@@ -14482,7 +14939,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -14519,7 +14976,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -14582,7 +15039,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -14597,7 +15054,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 0
@@ -14798,7 +15256,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.hashmap",
@@ -14898,7 +15356,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "std.hashmap",
@@ -14930,7 +15388,7 @@
         "core.std_basics",
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.xxhash_rust",
         "std.rc_refcell",
         "traits.impl_trait_arg"
       ],
@@ -14946,7 +15404,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.any",
-        "ext.builtin_crates"
+        "ext.xxhash_rust"
       ],
       "findings": 1
     },
@@ -14972,7 +15430,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.any",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.runtime"
       ],
       "findings": 2
@@ -15117,7 +15575,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -15144,7 +15603,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.runtime",
         "threads.sync"
@@ -15170,7 +15629,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -15299,7 +15758,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates"
+        "ext.indexmap"
       ],
       "findings": 0
     },
@@ -15311,7 +15770,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 2
@@ -15419,7 +15878,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.runtime",
         "threads.sync"
       ],
@@ -15434,7 +15893,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -15571,7 +16030,7 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "panic.recovery",
         "std.runtime"
       ],
@@ -15676,7 +16135,8 @@
       "parse_error": false,
       "missing_features": [
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
+        "ext.xxhash_rust",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -15733,7 +16193,8 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -15751,7 +16212,7 @@
         "cinterop.system",
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "macros.std_unsupported",
         "std.rc_refcell",
         "std.runtime",
@@ -15780,7 +16241,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.rc_refcell",
         "std.runtime",
         "threads.sync"
@@ -15817,7 +16278,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell"
       ],
       "findings": 0
@@ -15833,7 +16295,8 @@
         "cinterop.system",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -15950,7 +16413,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "macros.std_unsupported",
         "panic.recovery",
@@ -16201,7 +16664,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.hashmap",
         "std.rc_refcell",
@@ -16227,7 +16690,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -16243,7 +16706,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell"
       ],
@@ -16322,7 +16785,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.hashmap",
         "std.rc_refcell"
@@ -16386,7 +16849,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.cow",
         "std.lazy_once_lock",
@@ -16489,7 +16952,7 @@
         "dyn.any",
         "dyn.boxed",
         "dyn.std",
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "generics.const_param",
         "std.rc_refcell",
         "std.runtime",
@@ -16843,7 +17306,7 @@
       "missing_features": [
         "core.std_basics",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -16873,7 +17336,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.hashmap",
         "std.rc_refcell",
@@ -16911,7 +17374,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -16929,7 +17392,8 @@
         "core.std_basics",
         "dyn.any",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -17046,7 +17510,7 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime"
@@ -17061,7 +17525,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates"
+        "ext.indexmap"
       ],
       "findings": 1
     },
@@ -17184,7 +17648,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "panic.recovery",
         "std.rc_refcell",
@@ -17228,7 +17692,7 @@
       "missing_features": [
         "attrs.unsupported",
         "dyn.boxed",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.runtime"
       ],
@@ -17267,7 +17731,8 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
+        "ext.rustc_hash",
         "std.rc_refcell",
         "std.runtime"
       ],
@@ -17281,7 +17746,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.rustc_hash",
         "lifetimes.static_anon",
         "std.hashmap",
         "std.rc_refcell"
@@ -17461,7 +17926,7 @@
         "core.std_basics",
         "dyn.boxed",
         "dyn.fn",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "std.hashmap",
         "std.rc_refcell",
         "std.runtime",
@@ -17505,7 +17970,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.rc_refcell",
         "std.runtime",
@@ -17557,7 +18022,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.builtin_crates",
+        "ext.indexmap",
         "lifetimes.static_anon",
         "std.hashmap",
         "std.runtime"
@@ -17863,7 +18328,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.builtin_crates",
+      "feature": "ext.rustc_hash",
       "raw_key": "ext.type.rustc_hash::FxHashMap",
       "file": "crates/ts_goport/src/api/callbackfs.rs",
       "byte_start": 965,
@@ -17928,7 +18393,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.builtin_crates",
+      "feature": "ext.rustc_hash",
       "raw_key": "ext.type.rustc_hash::FxHashMap",
       "file": "crates/ts_goport/src/api/callbackfs.rs",
       "byte_start": 2393,
@@ -18136,7 +18601,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.builtin_crates",
+      "feature": "ext.rustc_hash",
       "raw_key": "ext.type.rustc_hash::FxHashMap",
       "file": "crates/ts_goport/src/api/encoder/encoder.rs",
       "byte_start": 38225,
@@ -18162,7 +18627,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.builtin_crates",
+      "feature": "ext.rustc_hash",
       "raw_key": "ext.type.rustc_hash::FxHashMap",
       "file": "crates/ts_goport/src/api/encoder/encoder.rs",
       "byte_start": 40841,
@@ -18175,7 +18640,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.builtin_crates",
+      "feature": "ext.rustc_hash",
       "raw_key": "ext.type.rustc_hash::FxHashMap",
       "file": "crates/ts_goport/src/api/encoder/encoder.rs",
       "byte_start": 41401,
@@ -18409,6 +18874,32 @@
       "release_safe_rewrite": false
     },
     {
+      "feature": "ext.indexmap",
+      "raw_key": "ext.type.indexmap::IndexMap",
+      "file": "crates/ts_goport/src/api/proto.rs",
+      "byte_start": 65884,
+      "byte_end": 65925,
+      "line": 1547,
+      "column": 27,
+      "snippet": "IndexMap<project::ID, ProjectFileChanges>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.indexmap",
+      "raw_key": "ext.type.indexmap::IndexMap",
+      "file": "crates/ts_goport/src/api/proto.rs",
+      "byte_start": 66862,
+      "byte_end": 66903,
+      "line": 1573,
+      "column": 35,
+      "snippet": "IndexMap<project::ID, ProjectFileChanges>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
       "feature": "traits.impl_trait_arg",
       "raw_key": "type.impl_trait.arg",
       "file": "crates/ts_goport/src/api/proto.rs",
@@ -18601,6 +19092,32 @@
       "snippet": "dyn std::any::Any",
       "scope": "active",
       "fix_class": "compiler work",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.indexmap",
+      "raw_key": "ext.type.indexmap::IndexMap",
+      "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
+      "byte_start": 38785,
+      "byte_end": 38829,
+      "line": 977,
+      "column": 30,
+      "snippet": "IndexMap<tspath::Path, Rc<project::Overlay>>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.indexmap",
+      "raw_key": "ext.type.indexmap::IndexMap",
+      "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
+      "byte_start": 38994,
+      "byte_end": 39038,
+      "line": 981,
+      "column": 25,
+      "snippet": "IndexMap<tspath::Path, Rc<project::Overlay>>",
+      "scope": "active",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
@@ -18877,6 +19394,19 @@
       "release_safe_rewrite": false
     },
     {
+      "feature": "ext.indexmap",
+      "raw_key": "ext.type.indexmap::IndexMap",
+      "file": "crates/ts_goport/src/ast/misc.rs",
+      "byte_start": 29939,
+      "byte_end": 29973,
+      "line": 757,
+      "column": 23,
+      "snippet": "IndexMap<&'static str, Vec<usize>>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
       "feature": "traits.impl_trait_ret",
       "raw_key": "type.impl_trait.ret",
       "file": "crates/ts_goport/src/ast/misc.rs",
@@ -19082,6 +19612,71 @@
       "snippet": "fn(&mut Checker, Node, &str, SymbolFlags, Option<&'static Message>, bool, bool) -> SymbolId",
       "scope": "active",
       "fix_class": "compiler work",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.smallvec",
+      "raw_key": "ext.type.smallvec::SmallVec",
+      "file": "crates/ts_goport/src/checker/checker_p01.rs",
+      "byte_start": 24498,
+      "byte_end": 24529,
+      "line": 703,
+      "column": 17,
+      "snippet": "smallvec::SmallVec<[TypeId; 8]>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.smallvec",
+      "raw_key": "ext.type.smallvec::SmallVec",
+      "file": "crates/ts_goport/src/checker/checker_p01.rs",
+      "byte_start": 30062,
+      "byte_end": 30093,
+      "line": 844,
+      "column": 46,
+      "snippet": "smallvec::SmallVec<[TypeId; 1]>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.smallvec",
+      "raw_key": "ext.type.smallvec::SmallVec",
+      "file": "crates/ts_goport/src/checker/checker_p10.rs",
+      "byte_start": 1096,
+      "byte_end": 1115,
+      "line": 23,
+      "column": 25,
+      "snippet": "SmallVec<[Node; 4]>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.smallvec",
+      "raw_key": "ext.type.smallvec::SmallVec",
+      "file": "crates/ts_goport/src/checker/checker_p10.rs",
+      "byte_start": 1131,
+      "byte_end": 1150,
+      "line": 24,
+      "column": 15,
+      "snippet": "SmallVec<[Node; 8]>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.smallvec",
+      "raw_key": "ext.type.smallvec::SmallVec",
+      "file": "crates/ts_goport/src/checker/checker_p10.rs",
+      "byte_start": 1243,
+      "byte_end": 1269,
+      "line": 26,
+      "column": 21,
+      "snippet": "SmallVec<[SignatureId; 4]>",
+      "scope": "active",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
@@ -19293,6 +19888,45 @@
       "release_safe_rewrite": false
     },
     {
+      "feature": "ext.memchr",
+      "raw_key": "ext.type.memchr::memmem::Finder",
+      "file": "crates/ts_goport/src/frontend/scanner/comment_ranges.rs",
+      "byte_start": 1001,
+      "byte_end": 1024,
+      "line": 26,
+      "column": 36,
+      "snippet": "memmem::Finder<'static>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.memchr",
+      "raw_key": "ext.type.memchr::memmem::Finder",
+      "file": "crates/ts_goport/src/frontend/tspath/path.rs",
+      "byte_start": 26469,
+      "byte_end": 26500,
+      "line": 734,
+      "column": 45,
+      "snippet": "memchr::memmem::Finder<'static>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.memchr",
+      "raw_key": "ext.type.memchr::memmem::Finder",
+      "file": "crates/ts_goport/src/frontend/tspath/path.rs",
+      "byte_start": 26619,
+      "byte_end": 26650,
+      "line": 736,
+      "column": 43,
+      "snippet": "memchr::memmem::Finder<'static>",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
       "feature": "generics.const_param",
       "raw_key": "gen.const_param.fn",
       "file": "crates/ts_goport/src/fswatch/unix.rs",
@@ -19342,6 +19976,45 @@
       "snippet": "#[track_caller]",
       "scope": "active",
       "fix_class": "compiler work",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.bumpalo",
+      "raw_key": "ext.type.bumpalo::Bump",
+      "file": "crates/ts_goport/src/leak_arena.rs",
+      "byte_start": 2069,
+      "byte_end": 2073,
+      "line": 42,
+      "column": 28,
+      "snippet": "Bump",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.bumpalo",
+      "raw_key": "ext.type.bumpalo::Bump",
+      "file": "crates/ts_goport/src/leak_arena.rs",
+      "byte_start": 4691,
+      "byte_end": 4695,
+      "line": 117,
+      "column": 53,
+      "snippet": "Bump",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.bumpalo",
+      "raw_key": "ext.type.bumpalo::Bump",
+      "file": "crates/ts_goport/src/leak_arena.rs",
+      "byte_start": 5193,
+      "byte_end": 5197,
+      "line": 131,
+      "column": 43,
+      "snippet": "Bump",
+      "scope": "active",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {

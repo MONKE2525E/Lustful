@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `36a93108` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `4c5b70cc` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -33,19 +33,19 @@ files where this feature is the only blocker: land it and those files compile.
 |---|---|---|---|---|---|---|---|---|
 | 1 | `std.rc_refcell` | unsupported | 5 | W-STD-B | 246 | 310285 | 6 | 5353 |
 | 2 | `lifetimes.static_anon` | partial | 6 | W-BORROW | 226 | 301242 | 6 | 3537 |
-| 3 | `ext.builtin_crates` | unsupported | 5 | W-STD-B | 177 | 244641 | 2 | 1583 |
-| 4 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 6 | 1334 |
-| 5 | `std.runtime` | unsupported | 5 | W-STD-B | 167 | 216508 | 0 | 0 |
+| 3 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 6 | 1334 |
+| 4 | `std.runtime` | unsupported | 5 | W-STD-B | 167 | 216508 | 0 | 0 |
+| 5 | `ext.rustc_hash` | unsupported | 5 | W-DEPS | 139 | 201724 | 0 | 0 |
 | 6 | `traits.impl_trait_arg` | partial | 5 | W-CHECK-G | 96 | 153296 | 1 | 35 |
 | 7 | `dyn.fn` | unsupported | 5 | W-CHECK-G | 102 | 144375 | 0 | 0 |
 | 8 | `dyn.boxed` | unsupported | 5 | W-CHECK-G | 112 | 116352 | 4 | 1297 |
 | 9 | `std.lazy_once_lock` | unsupported | 5 | W-STD-B | 63 | 103221 | 0 | 0 |
 | 10 | `threads.sync` | unsupported | 7 | wave C (threads) | 86 | 101671 | 0 | 0 |
-| 11 | `threads.thread_local` | unsupported | 7 | W-TLS | 38 | 75561 | 0 | 0 |
-| 12 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 1 | 29 |
-| 13 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 0 | 0 |
-| 14 | `traits.impl_trait_ret` | unsupported | 5 | W-CHECK-G | 20 | 52753 | 0 | 0 |
-| 15 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 26 | 48900 | 0 | 0 |
+| 11 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 0 | 0 |
+| 12 | `threads.thread_local` | unsupported | 7 | W-TLS | 38 | 75561 | 0 | 0 |
+| 13 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 1 | 29 |
+| 14 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 0 | 0 |
+| 15 | `traits.impl_trait_ret` | unsupported | 5 | W-CHECK-G | 20 | 52753 | 0 | 0 |
 
 ## Core CLI curve
 
