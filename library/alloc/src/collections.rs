@@ -25,7 +25,7 @@
 //   `collection_iter_inner`), with std's item types. They stay
 //   distinct from the inner types, as std's own iterator structs
 //   are. They have no `Debug` (std's prints the remaining items).
-// Not here yet: `range`, `Hash`, the cursor and `extract_if`
+// Not here yet: `range`, the cursor and `extract_if`
 // APIs, `DoubleEndedIterator`
 // for the `Map` aliases beyond what the builtin adapters provide.
 
@@ -68,6 +68,7 @@ fn cmp_of<Q: ?Sized + Ord>(a: &Q, b: &Q) -> core::cmp::Ordering {
 
 pub mod btree_map {
     use core::borrow::Borrow;
+    use core::hash::{Hash, Hasher};
 
     pub use super::BTreeMap;
 
@@ -650,6 +651,17 @@ pub mod btree_map {
         }
     }
 
+    /// Std's hash: the length, then every entry's key and value.
+    impl<K: Hash, V: Hash> Hash for BTreeMap<K, V> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            state.write_usize(self.len());
+            for (k, v) in self.iter() {
+                k.hash(state);
+                v.hash(state);
+            }
+        }
+    }
+
     impl<K, V> IntoIterator for BTreeMap<K, V> {
         type Item = (K, V);
         type IntoIter = IntoIter<K, V>;
@@ -677,6 +689,7 @@ pub mod btree_map {
 
 pub mod btree_set {
     use core::borrow::Borrow;
+    use core::hash::{Hash, Hasher};
 
     pub use super::BTreeSet;
 
@@ -1010,6 +1023,16 @@ pub mod btree_set {
         }
     }
 
+    /// Std's hash: the length, then every element.
+    impl<T: Hash> Hash for BTreeSet<T> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            state.write_usize(self.len());
+            for elt in self.iter() {
+                elt.hash(state);
+            }
+        }
+    }
+
     impl<T> IntoIterator for BTreeSet<T> {
         type Item = T;
         type IntoIter = IntoIter<T>;
@@ -1028,6 +1051,8 @@ pub mod btree_set {
 }
 
 pub mod vec_deque {
+    use core::hash::{Hash, Hasher};
+
     pub use super::VecDeque;
 
     pub struct Iter<'a, T> {
@@ -1513,6 +1538,16 @@ pub mod vec_deque {
     impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
         fn from(arr: [T; N]) -> VecDeque<T> {
             VecDeque { buf: Vec::from(arr), head: 0 }
+        }
+    }
+
+    /// Std's hash: the length, then every element in order.
+    impl<T: Hash> Hash for VecDeque<T> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            state.write_usize(self.len());
+            for elt in self.iter() {
+                elt.hash(state);
+            }
         }
     }
 
