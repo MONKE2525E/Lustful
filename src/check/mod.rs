@@ -1566,6 +1566,93 @@ impl<'p, 'a> Ctx<'p, 'a> {
         self.p.name(s)
     }
     /// Type name for messages, with inference variables resolved.
+    /// Std source `BTreeMap` and `BTreeSet` (W-STD-C) order their keys
+    /// with `<` and `==` over a sorted `Vec`, where std calls `Ord::cmp`
+    /// in its B-tree's own sequence. Both agree exactly when no key
+    /// compare reaches a written `PartialEq`/`PartialOrd`/`Ord` impl (a
+    /// written one may disagree with `Ord` or log its calls), so a body
+    /// that forms such a map or set with such a key rejects (L0640).
+    fn check_std_order_keys(&mut self) {
+        let p = self.p;
+        let Some(t) = p.resolved.as_ref() else { return };
+        if !t.std_modules.iter().any(|&(n, _)| p.interner.get(n) == "__lust_alloc_collections") {
+            return;
+        }
+        if p.std_source_span(p.fn_info(self.fid).def.name_span) {
+            return;
+        }
+        for i in 0..self.out.expr_ty.len() {
+            let ty = self.out.expr_ty[i];
+            let Some((def, args)) = self.tys.adt_parts(ty) else { continue };
+            let Some(a) = p.tys.local_adt_of(def).or_else(|| self.tys.local_adt(ty)) else { continue };
+            if !p.is_std_adt(a) {
+                continue;
+            }
+            let path = p.display_path(p.adt(a).name);
+            if path != "alloc::collections::BTreeMap" && path != "alloc::collections::BTreeSet" {
+                continue;
+            }
+            let Some(key) = self.tys.args(args).iter().find_map(|g| g.as_ty()) else { continue };
+            if let Some(culprit) = self.written_order_in(key, &mut Vec::new()) {
+                let span = self.span(ExprId(self.out.expr_base + i as u32));
+                let (kn, cn) = (self.tn(key), self.tn(culprit));
+                self.err(
+                    "L0640",
+                    span,
+                    format!("a `BTreeMap` or `BTreeSet` key of type `{kn}` compares through the written `PartialEq`/`PartialOrd`/`Ord` impl of `{cn}`, which lust does not support yet"),
+                    "Derive the comparison traits for the key type.",
+                );
+                return;
+            }
+        }
+    }
+
+    /// The first type inside `t` whose `PartialEq`, `PartialOrd`, or
+    /// `Ord` impl is written (not derived, not core's), if any.
+    fn written_order_in(&self, t: Ty, seen: &mut Vec<Ty>) -> Option<Ty> {
+        let p = self.p;
+        if seen.contains(&t) {
+            return None;
+        }
+        seen.push(t);
+        match self.tys.kind(t) {
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => return self.written_order_in(e, seen),
+            TyKind::Tuple(ts) => {
+                let elems = self.tys.tys_of(ts).to_vec();
+                return elems.into_iter().find_map(|e| self.written_order_in(e, seen));
+            }
+            TyKind::Adt(def, args) => {
+                let lang = &p.gx.lang;
+                let written = p.gx.index.all_impls().any(|(_, r)| {
+                    r.synthetic == crate::traits::index::Synthetic::None
+                        && r.head == crate::traits::index::SelfHead::Adt(def)
+                        && (r.trait_def == lang.partial_eq || r.trait_def == lang.partial_ord || r.trait_def == lang.ord)
+                        && !p.std_source_span(r.span)
+                });
+                if written {
+                    return Some(t);
+                }
+                let targs: Vec<Ty> = self.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
+                if let Some(c) = targs.iter().find_map(|&e| self.written_order_in(e, seen)) {
+                    return Some(c);
+                }
+                if let Some(a) = self.tys.local_adt(t) {
+                    let fields: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+                    for f in fields {
+                        if self.tys.flags(f).contains_param() {
+                            continue;
+                        }
+                        if let Some(c) = self.written_order_in(f, seen) {
+                            return Some(c);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     fn tn(&self, t: Ty) -> String {
         let t = self.resolve(t);
         match self.tys.kind(t) {
@@ -15854,6 +15941,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);
         }
+        self.check_std_order_keys();
         self.settle_projections();
         for i in 0..self.out.pat_ty.len() {
             let t = self.out.pat_ty[i];

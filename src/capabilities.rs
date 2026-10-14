@@ -990,6 +990,7 @@ const TYPES: &[&str] = &[
     "std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH} and core::time::Duration (std source modules; no layout queries)",
     "std::marker::PhantomData<T> (std source; no Debug or Hash yet)",
     "std::cell::{OnceCell, LazyCell} and std::sync::{OnceLock, LazyLock} (std source; single-threaded; static LazyLock not yet)",
+    "std::collections::{BTreeMap, BTreeSet, VecDeque} with btree_map::Entry (std source; keys with derived or std order only; no Index, range, Extend yet)",
 ];
 
 const CONTROL_FLOW: &[&str] = &[

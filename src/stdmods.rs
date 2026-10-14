@@ -80,6 +80,14 @@ pub const STD_MODULES: &[StdModule] = &[
         full: false,
         triggers: &["OnceLock", "LazyLock"],
     },
+    StdModule {
+        name: "__lust_alloc_collections",
+        rel: "alloc/src/collections.rs",
+        krate: ShippedCrate::Alloc,
+        paths: &[("alloc", "collections"), ("std", "collections")],
+        full: false,
+        triggers: &["BTreeMap", "BTreeSet", "VecDeque", "btree_map", "btree_set", "vec_deque"],
+    },
 ];
 
 /// The words whose mention means a compile may need the std modules.

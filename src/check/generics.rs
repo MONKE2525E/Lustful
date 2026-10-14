@@ -6787,6 +6787,18 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
 
 /// Creates (or finds) the concrete instance of one template.
 fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> LocalDefId {
+    // A trait method stub has no body of its own (a lang method's stub
+    // borrows the first fn's def as a placeholder), so an instance of
+    // it would run that unrelated body: wrong code or endless
+    // recursion at run time (seen: `Ord::cmp` on `&T`, `Clone::clone`
+    // on a tuple, reached through a generic `T: Ord`/`T: Clone` call in
+    // an instance). Stop the compile instead (W-STD-C; the pick replay
+    // that leads here is W-CHECK-G/W-TRAITS code).
+    assert!(
+        p.gx.fn_class.get(template.0 as usize) != Some(&FnClass::Stub),
+        "internal: the trait method stub `{}` reached instantiation (a generic call on a builtin type lust cannot dispatch yet)",
+        p.name(p.fn_info(template).name)
+    );
     let template_def = p.def_id(template);
     let args_id = p.tys.intern_args(args);
     if let Some(&existing) = p.gx.instance_by_key.get(&(template_def, args_id)) {
@@ -7012,9 +7024,13 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
         };
         let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
         let record = p.gx.index.get(id).clone();
-        // An impl whose where clauses fail here has no instance: the
-        // format site already reports the unproven bound (L0612).
-        if record.synthetic != Synthetic::None || !prove_goal(p, &[], tr) {
+        // The format site already proved the impl's where clauses (or
+        // reported L0612). `prove_goal` here is weaker than that proof
+        // for args with references (`W<&str>: Debug` fails it), and a
+        // skip made the glue print a structural Debug for a type with
+        // no derive: wrong output (W-STD-C). A selected written impl is
+        // the one to call.
+        if record.synthetic != Synthetic::None {
             continue;
         }
         let Some(local) = record.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "fmt"))
