@@ -5266,6 +5266,10 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Bool(b), _) => (*b as u8).to_string(),
         // An atomic's constant is its value (cgen/sync.rs).
+        // `Vec::new()` and `String::new()`: an empty buffer, its pointer
+        // dangling at the element's alignment (W-THREADS).
+        (CV::Aggregate(vals), CTy::Vec(e)) if vals.is_empty() => format!("{{(void*)(uintptr_t){}, 0, 0}}", c_size_align(p, e).1.max(1)),
+        (CV::Aggregate(vals), CTy::String) if vals.is_empty() => "{(uint8_t*)(uintptr_t)1, 0, 0}".into(),
         // A const lock: unlocked and unpoisoned around its value.
         (CV::Aggregate(vals), CTy::Sync(k, e)) if k.is_cell_struct() && vals.len() == 1 => {
             let words = vec!["0"; sync::cell_words(*k).len()].join(", ");

@@ -722,6 +722,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (Expr::Field { base, .. } | Expr::TupleField { base, .. }, Res::Field { derefs, index }) => match self.cap_cat(*base) {
                 Cat::Place(mut pl) => {
                     for _ in 0..derefs {
+                        // Through `Rc`, `Arc`, or a guard: an overloaded
+                        // deref, a value of the call (`cap_walk` borrows
+                        // the pointer).
+                        if self.cap_smart(pl.ty).is_some() {
+                            return Cat::Rvalue;
+                        }
                         if !self.cap_deref(&mut pl) {
                             return Cat::Bad;
                         }
@@ -732,6 +738,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 other => other,
             },
             (Expr::Deref(inner), _) => match self.cap_cat(*inner) {
+                Cat::Place(_) if let Cat::Place(pl) = self.cap_cat(*inner) && self.cap_smart(pl.ty).is_some() => Cat::Rvalue,
                 Cat::Place(mut pl) => {
                     if self.cap_deref(&mut pl) {
                         Cat::Place(pl)
@@ -765,6 +772,38 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             _ => Cat::Rvalue,
         }
+    }
+
+    /// For a std smart pointer whose deref is an overloaded call (`Rc`,
+    /// `Arc`, a `RefCell` or lock guard): whether it has `DerefMut`.
+    /// None for references, `Box`, and every other type.
+    fn cap_smart(&mut self, t: Ty) -> Option<bool> {
+        let t = self.resolve(t);
+        if self.tys.rc_elem(t).is_some() {
+            return Some(false);
+        }
+        self.tys.guard_elem(t).map(|g| g.1)
+    }
+
+    /// The place an overloaded std deref inside `e` (a field or deref
+    /// expression) is called on, with its `DerefMut`-ness: the base
+    /// place after the builtin derefs before it.
+    fn cap_smart_base(&mut self, e: ExprId) -> Option<(CPlace, bool, ExprId)> {
+        let (inner, derefs) = match (self.p.ast.expr(e), self.out.expr_res[self.ei(e)]) {
+            (Expr::Field { base, .. } | Expr::TupleField { base, .. }, Res::Field { derefs, .. }) => (*base, derefs),
+            (Expr::Deref(inner), _) => (*inner, 1),
+            _ => return None,
+        };
+        let Cat::Place(mut pl) = self.cap_cat(inner) else { return None };
+        for _ in 0..derefs {
+            if let Some(m) = self.cap_smart(pl.ty) {
+                return Some((pl, m, inner));
+            }
+            if !self.cap_deref(&mut pl) {
+                return None;
+            }
+        }
+        None
     }
 
     /// Peels `n` reference layers off a type.
@@ -1210,6 +1249,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if let Expr::Index { index, .. } = p.ast.expr(e) {
                     self.cap_consume(*index, w);
                 }
+            }
+            // Through `Rc`, `Arc`, or a guard (W-THREADS): rustc's capture
+            // stops at the overloaded deref and borrows the pointer
+            // (uniquely for a guard's `deref_mut` in a mutable use).
+            Expr::Field { .. } | Expr::TupleField { .. } | Expr::Deref(_) if let Some((pl, has_mut, inner)) = self.cap_smart_base(e) => {
+                let mutable = mut_ctx && has_mut;
+                let span = self.span(inner);
+                let m = if mutable { CaptureMode::MutRef } else { CaptureMode::Ref };
+                self.cap_use(pl, m, span, w);
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.cap_walk(*base, mut_ctx, w),
             Expr::Deref(inner) => self.cap_walk(*inner, mut_ctx, w),

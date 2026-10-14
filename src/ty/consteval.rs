@@ -1299,6 +1299,22 @@ impl Evaluator {
         span: Span,
         expected: Option<Ty>,
     ) -> Result<TypedValue, Diag> {
+        // `Vec::new()` and `String::new()` are const fns (an empty buffer),
+        // read where the expected type is the std one (W-THREADS: the
+        // `static M: Mutex<Vec<T>> = Mutex::new(Vec::new())` shape).
+        if args.is_empty()
+            && let Some(want) = expected
+            && let Expr::Path(segs) = cx.ast().expr(callee)
+            && segs.len() >= 2
+            && cx.sym_text(segs[segs.len() - 1].name) == "new"
+            && segs[segs.len() - 1].type_args().is_empty()
+        {
+            let ty_name = cx.sym_text(segs[segs.len() - 2].name);
+            let b = cx.tys_ref().builtin_of(want);
+            if (ty_name == "Vec" && b == Some(super::BuiltinTy::Vec)) || (ty_name == "String" && b == Some(super::BuiltinTy::String)) {
+                return Ok((ConstValue::Aggregate(Vec::new()), want));
+            }
+        }
         // `AtomicUsize::new(v)` and the other atomics' `new` are const fns
         // (W-THREADS): the value is the atomic's (its C form is the value).
         if let Expr::Path(segs) = cx.ast().expr(callee)
