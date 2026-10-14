@@ -473,10 +473,7 @@ pub struct Ancestors<'a> {
 
 impl fmt::Debug for Ancestors<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.next {
-            Some(p) => f.debug_struct("Ancestors").field("next", &Some(p)).finish(),
-            None => f.write_str("Ancestors { next: None }"),
-        }
+        f.debug_struct("Ancestors").field("next", &self.next).finish()
     }
 }
 
@@ -518,7 +515,7 @@ pub struct StripPrefixError(());
 
 impl fmt::Display for StripPrefixError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("prefix not found")
+        f.pad("prefix not found")
     }
 }
 
@@ -797,25 +794,13 @@ impl fmt::Debug for Display<'_> {
 
 impl fmt::Display for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // As std's Unix `Slice` Display: valid text formats as a `str`
-        // (padding applies); otherwise each invalid sequence prints as
-        // U+FFFD and only the last valid chunk sees the flags.
-        let mut rest = self.path.bytes();
-        if rest.is_empty() {
-            return f.pad("");
-        }
-        loop {
-            let valid = core::intrinsics::sys_utf8_valid_up_to(rest);
-            let text = core::intrinsics::sys_bytes_as_str(&rest[..valid]);
-            if valid == rest.len() {
-                return f.pad(text);
-            }
-            f.write_str(text)?;
-            f.write_str("\u{FFFD}")?;
-            rest = &rest[valid + crate::ffi::invalid_len(&rest[valid..])..];
-            if rest.is_empty() {
-                return Ok(());
-            }
+        // As std's Unix `Slice` Display: the whole lossy text (each
+        // invalid sequence as U+FFFD) formats as a `str`, so width
+        // and precision apply to all of it.
+        let bytes = self.path.bytes();
+        match crate::ffi::bytes_to_str(bytes) {
+            Some(text) => f.pad(text),
+            None => f.pad(&crate::ffi::bytes_to_string_lossy(bytes)),
         }
     }
 }

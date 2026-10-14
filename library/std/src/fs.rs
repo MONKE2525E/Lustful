@@ -229,7 +229,30 @@ impl fmt::Debug for Permissions {
         text.push(bit(0o004, 'r'));
         text.push(bit(0o002, 'w'));
         text.push(exec(0o001, 0o1000, 't', 'T'));
-        write!(f, "Permissions(FilePermissions {{ mode: {:#08o} ({}) }})", m, text)
+        let mode = PermModeText(format!("{:#08o} ({})", m, text));
+        f.debug_tuple("Permissions").field(&FilePerm { mode }).finish()
+    }
+}
+
+/// Raw text that `Debug`-formats as itself (the mode value of
+/// `Permissions` debug output carries its own `0o… (…)` text).
+struct PermModeText(String);
+
+impl fmt::Debug for PermModeText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The inner value of `Permissions` debug output, built with
+/// `debug_struct` so the alternate (`{:#?}`) form expands as std's does.
+struct FilePerm {
+    mode: PermModeText,
+}
+
+impl fmt::Debug for FilePerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilePermissions").field("mode", &self.mode).finish()
     }
 }
 

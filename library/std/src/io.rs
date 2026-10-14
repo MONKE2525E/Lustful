@@ -128,7 +128,7 @@ impl fmt::Display for Error {
                 write!(f, "{} (os error {})", detail, code)
             }
             Repr::Simple(kind) => f.write_str(kind.as_str()),
-            Repr::SimpleMessage(_, message) => f.write_str(message),
+            Repr::SimpleMessage(_, message) => f.pad(message),
             Repr::Custom(_, text) => f.pad(text),
         }
     }
