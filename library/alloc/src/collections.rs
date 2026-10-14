@@ -1001,14 +1001,32 @@ pub mod vec_deque {
             self.buf.contains(x)
         }
 
+        /// Std's algorithm, for its drop order: kept elements swap to
+        /// the front, and one `truncate` drops the rest at the end, in
+        /// their order after the swaps.
         pub fn retain<F: FnMut(&T) -> bool>(&mut self, mut f: F) {
-            let mut i = 0;
-            while i < self.buf.len() {
-                if f(&self.buf[i]) {
-                    i += 1;
-                } else {
-                    self.buf.remove(i);
+            let len = self.buf.len();
+            let mut idx = 0;
+            let mut cur = 0;
+            while cur < len {
+                if !f(&self.buf[cur]) {
+                    cur += 1;
+                    break;
                 }
+                cur += 1;
+                idx += 1;
+            }
+            while cur < len {
+                if !f(&self.buf[cur]) {
+                    cur += 1;
+                    continue;
+                }
+                self.buf.swap(idx, cur);
+                cur += 1;
+                idx += 1;
+            }
+            if cur != idx {
+                self.buf.truncate(idx);
             }
         }
 
