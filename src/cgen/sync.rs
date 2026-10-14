@@ -880,6 +880,9 @@ impl FnGen<'_, '_, '_> {
             self.out.push_str(&call);
             return v;
         }
+        // Convert packet pointers through `void *` below: a second
+        // anonymous `pk` type in an initializer cast is a distinct
+        // type to strict C compilers, not the declared variable's type.
         let pk = format!("struct {{ lust_JoinHdr h; {} ret; {} env; }}", ctype(&ret), ctype(&env_ty));
         let n = self.adapters;
         self.adapters += 1;
@@ -895,12 +898,12 @@ impl FnGen<'_, '_, '_> {
         } else {
             "(void)hp;".into()
         };
-        let _ = writeln!(self.prelude, "static void {run}(lust_JoinHdr *hp) {{\n  {pk} *k = ({pk} *)hp;\n{body}}}");
+        let _ = writeln!(self.prelude, "static void {run}(lust_JoinHdr *hp) {{\n  {pk} *k = (void *)hp;\n{body}}}");
         let _ = writeln!(self.prelude, "static void {drop}(lust_JoinHdr *hp) {{ {drop_ret} }}");
         let h = self.tmp();
         let _ = writeln!(
             self.out,
-            "    {pk} *{h} = ({pk} *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_thread_spawn(&{h}->h, {loc});"
+            "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_thread_spawn(&{h}->h, {loc});"
         );
         format!("(&{h}->h)")
     }
