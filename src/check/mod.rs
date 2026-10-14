@@ -5,8 +5,8 @@ pub mod closure;
 pub mod collect;
 pub mod constfn;
 pub mod convert;
-pub mod fmt;
 pub mod defaults;
+pub mod fmt;
 pub mod generics;
 pub mod iter;
 pub mod method;
@@ -16,6 +16,7 @@ pub mod opaque;
 pub mod picks;
 pub mod project;
 pub mod stdtypes;
+pub mod usefulness;
 pub mod variance;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
@@ -5467,6 +5468,20 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 NEVER
             }
             Expr::Continue(label) => {
+                // Edition 2024 (rustc E0695), as for `break` above: an
+                // unlabeled continue may not pass through a labeled block.
+                if label.is_none()
+                    && let Some(lp) = self.loops.last()
+                    && lp.is_block
+                {
+                    self.err(
+                        "L0120",
+                        span,
+                        "unlabeled `continue` inside of a labeled block",
+                        "Give the continue the loop's label, such as `continue 'a;`, or move it out of the labeled block.",
+                    );
+                    return NEVER;
+                }
                 let found = match label {
                     None => self.loops.iter().rposition(|lp| !lp.is_block),
                     Some(l) => self
@@ -12276,7 +12291,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let pi = (pat.0 - self.out.pat_base) as usize;
         let span = p.ast.pat_span(pat);
         // Default binding modes: a non-binding pattern auto-derefs a reference scrutinee.
-        let mut t = self.resolve(t);
+        let scrut_t = self.resolve(t);
+        let mut t = scrut_t;
         let mut mode = mode;
         let opt = self.option_pattern(pat);
         let structural = opt.is_some()
@@ -12430,6 +12446,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Pat::Path(segs) = p.ast.pat(pat) {
             let segs = segs.clone();
             if self.try_const_path_pat(pi, &segs, t, span, in_match) {
+                // A const path pattern does not auto-deref (unlike a
+                // literal or a variant): if peeling references above
+                // was needed to reach the const's type, the pattern
+                // does not match the scrutinee (rustc E0308).
+                if self.out.pat_derefs[pi] > 0 {
+                    self.mismatch(span, scrut_t, t);
+                }
                 return;
             }
         }
@@ -12482,6 +12505,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             span,
                             "pattern requires `&mut`, but the matched type is a shared reference",
                             "Use `&` in the pattern, or match on a `&mut` value.",
+                        );
+                    }
+                    if !*mutable && m.is_mut() {
+                        self.err(
+                            "L0110",
+                            span,
+                            "pattern requires `&`, but the matched type is a mutable reference",
+                            "Use `&mut` in the pattern, or match on a shared reference.",
                         );
                     }
                     // An explicit `&` resets the default binding mode inside it.
@@ -12555,12 +12586,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     for (&(b_e, _), v) in bound_tys.iter().zip(&vals) {
                         if v.is_some_and(|v| v.is_nan()) {
                             let b_span = self.span(b_e);
-                            self.err(
-                                "L0110",
-                                b_span,
-                                "cannot use NaN in patterns",
-                                "Use a guard to test for NaN.",
-                            );
+                            self.err("L0110", b_span, "cannot use NaN in patterns", "Use a guard to test for NaN.");
                         }
                     }
                     if let [Some(lo_v), Some(hi_v)] = vals[..] {
@@ -12573,6 +12599,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         (Some(a), Some(b)) => a > b || (!inclusive && a == b),
                         _ => lo_v > hi_v || (!inclusive && lo_v == hi_v),
                     }
+                {
+                    empty = true;
+                }
+                // `..MIN` is empty too: the exclusive upper bound is the
+                // type's minimum, whose order key is 0 (rustc E0579).
+                if lo.is_none()
+                    && !inclusive
+                    && let [(hi_e, _)] = bound_tys[..]
+                    && self.const_scalar(hi_e).is_some_and(|hi_v| self.scalar_key(hi_v, t) == Some(0))
                 {
                     empty = true;
                 }
@@ -12605,6 +12640,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     if segs.len() == 1 {
                         match self.pat_ident(segs[0].name) {
                             PatIdent::Const(idx) => {
+                                // As above: a const pattern does not auto-deref.
+                                if self.out.pat_derefs[pi] > 0 {
+                                    self.mismatch(span, scrut_t, t);
+                                    return;
+                                }
                                 self.const_item_pat(pi, idx, t, span, in_match);
                                 return;
                             }
@@ -12633,6 +12673,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             _ => {}
                         }
                     } else if let Some((cv, ct)) = self.primitive_const_pattern(segs) {
+                        // As above: a const pattern does not auto-deref.
+                        if self.out.pat_derefs[pi] > 0 {
+                            self.mismatch(span, scrut_t, ct);
+                            return;
+                        }
                         if !self.unify(ct, t) {
                             self.mismatch(span, t, ct);
                             return;
@@ -12809,11 +12854,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let first_scope: Vec<((Sym, CtxtId), u32)> = self.scopes[scope0..].to_vec();
                 for &alt in &alts[1..] {
                     self.scopes.truncate(scope0);
-                    self.or_frames.push(OrFrame {
-                        seen: vec![false; first_log.len()],
-                        expected: first_log.clone(),
-                        extra: Vec::new(),
-                    });
+                    self.or_frames.push(OrFrame { seen: vec![false; first_log.len()], expected: first_log.clone(), extra: Vec::new() });
                     self.pattern_mode(alt, t, mode, in_match);
                     let frame = self.or_frames.pop().unwrap();
                     let alt_span = p.ast.pat_span(alt);
@@ -13036,8 +13077,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// Exhaustiveness for `match`. Recurses into nested enum and Option patterns. Conservative:
-    /// in rare multi-field cases it can reject a match that Rust accepts (lust is a subset).
+    /// Exhaustiveness for `match`, by the usefulness check in
+    /// `usefulness.rs`. Patterns it cannot read still make it
+    /// reject a match that Rust accepts (lust is a subset).
     fn exhaustive(&mut self, scrut_ty: Ty, arms: &[ast::Arm], span: Span) {
         let p = self.p;
         let pats: Vec<PatId> = arms.iter().filter(|a| a.guard.is_none()).map(|a| a.pat).collect();
@@ -13133,363 +13175,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
     }
 
-    /// True when integer or char literal, const, and range patterns
-    /// together cover the whole domain of their type. This is the
-    /// const-point and u128 companion to `covers_scalar_domain`:
-    /// it runs only when that one declines (a const item or
-    /// associated const as a point pattern, or a u128 domain).
-    fn covers_scalar_ranges(&self, flat: &[PatId]) -> bool {
-        if flat.is_empty() {
-            return false;
-        }
-        let t = self.out.pat_ty[(flat[0].0 - self.out.pat_base) as usize];
-        let domain: Vec<(u128, u128)> = match self.kind(t) {
-            TyKind::Int(it) => vec![(0, if it.bits() >= 128 { u128::MAX } else { (1u128 << it.bits()) - 1 })],
-            // The char domain skips the surrogate range.
-            TyKind::Char => vec![(0, 0xD7FF), (0xE000, 0x10FFFF)],
-            _ => return false,
-        };
-        let mut ivs: Vec<(u128, u128)> = Vec::new();
-        for &x in flat {
-            let x = self.pat_unwrap(x);
-            match self.p.ast.pat(x) {
-                Pat::Range { lo, hi, inclusive } => {
-                    let lo_k = match lo {
-                        Some(lo) => match self.const_scalar(*lo).and_then(|v| self.scalar_key(v, t)) {
-                            Some(k) => k,
-                            None => return false,
-                        },
-                        None => 0,
-                    };
-                    let hi_k = match hi {
-                        Some(hi) => match self.const_scalar(*hi).and_then(|v| self.scalar_key(v, t)) {
-                            Some(k) => {
-                                if *inclusive {
-                                    k
-                                } else {
-                                    if k == 0 {
-                                        continue;
-                                    }
-                                    k - 1
-                                }
-                            }
-                            None => return false,
-                        },
-                        None => u128::MAX,
-                    };
-                    if lo_k <= hi_k {
-                        ivs.push((lo_k, hi_k));
-                    }
-                }
-                _ => match self.pat_scalar(x).and_then(|v| self.scalar_key(v, t)) {
-                    Some(k) => ivs.push((k, k)),
-                    None => return false,
-                },
-            }
-        }
-        ivs.sort();
-        for (dlo, dhi) in domain {
-            let mut next = dlo;
-            let mut done = false;
-            for &(lo, hi) in &ivs {
-                if hi < next {
-                    continue;
-                }
-                if lo > next {
-                    break;
-                }
-                if hi >= dhi {
-                    done = true;
-                    break;
-                }
-                next = hi + 1;
-            }
-            if !done {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// True if `pats`, all matching values of one type, together match every value.
-    fn covers(&self, pats: &[PatId]) -> bool {
-        let p = self.p;
-        let mut flat = Vec::new();
-        pats.iter().for_each(|&x| self.flatten_or(x, &mut flat));
-        if flat.iter().any(|&x| self.irrefutable(x)) {
-            return true;
-        }
-        if let Some(res) = self.covers_scalar_domain(&flat) {
-            return res;
-        }
-        if self.covers_scalar_ranges(&flat) {
-            return true;
-        }
-        if !flat.is_empty() && flat.iter().all(|&x| matches!(p.ast.pat(self.pat_unwrap(x)), Pat::Slice { .. })) {
-            return self.covers_slice(&flat);
-        }
-        for &x in &flat {
-            match (self.pres(x), p.ast.pat(x)) {
-                (PatRes::Opt(_), _) => {
-                    let none = flat.iter().any(|&y| matches!(self.pres(y), PatRes::Opt(false)));
-                    let somes: Vec<PatId> = flat
-                        .iter()
-                        .filter_map(|&y| match (self.pres(y), p.ast.pat(self.pat_unwrap(y))) {
-                            (PatRes::Opt(true), Pat::TupleStruct { elems, .. }) => Some(elems[0]),
-                            _ => None,
-                        })
-                        .collect();
-                    return none && !somes.is_empty() && self.covers(&somes);
-                }
-                (PatRes::Res(_), _) => {
-                    let side = |want: bool| -> Vec<PatId> {
-                        flat.iter()
-                            .filter_map(|&y| match (self.pres(y), p.ast.pat(self.pat_unwrap(y))) {
-                                (PatRes::Res(w), Pat::TupleStruct { elems, .. }) if w == want => Some(elems[0]),
-                                _ => None,
-                            })
-                            .collect()
-                    };
-                    let (oks, errs) = (side(true), side(false));
-                    return !oks.is_empty() && !errs.is_empty() && self.covers(&oks) && self.covers(&errs);
-                }
-                (PatRes::Variant(a, _), _) if p.adt(a).is_enum => {
-                    return (0..p.adt(a).variants.len()).all(|v| self.covers_variant(&flat, a, v as u32));
-                }
-                (_, Pat::Lit(_)) | (PatRes::ConstItem(_), _)
-                    if matches!(self.kind(self.out.pat_ty[(x.0 - self.out.pat_base) as usize]), TyKind::Bool) =>
-                {
-                    let (mut t, mut f) = (false, false);
-                    for &y in &flat {
-                        self.cover_bools(y, &mut t, &mut f);
-                    }
-                    return t && f;
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Does some combination of rows for variant `v` cover all of its values?
-    fn covers_variant(&self, flat: &[PatId], a: AdtId, v: u32) -> bool {
-        let p = self.p;
-        let nf = p.adt(a).variants[v as usize].fields.len();
-        // One row per pattern for this variant; `None` is a field the pattern skips with `..`.
-        let rows: Vec<Vec<Option<PatId>>> = flat
-            .iter()
-            .filter(|&&y| matches!(self.pres(y), PatRes::Variant(b, w) if b == a && w == v))
-            .map(|&y| {
-                let mut row = vec![None; nf];
-                match p.ast.pat(self.pat_unwrap(y)) {
-                    Pat::TupleStruct { elems, .. } => elems.iter().enumerate().for_each(|(i, &e)| row[i] = Some(e)),
-                    Pat::Struct { fields, .. } => {
-                        for &(fname, sub) in fields {
-                            if let Some(i) = p.adt(a).variants[v as usize].fields.iter().position(|f| f.name == fname) {
-                                row[i] = Some(sub);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                row
-            })
-            .collect();
-        self.rows_cover(&rows)
-    }
-
-    /// Do the rows (one per pattern, `None` is a skipped or wildcard cell)
-    /// together match every tuple of values? Conservative, like `covers`:
-    /// a fully free row wins, else one column must carry the whole split
-    /// while every other column is free in all rows.
-    fn rows_cover(&self, rows: &[Vec<Option<PatId>>]) -> bool {
-        if rows.is_empty() {
-            return false;
-        }
-        let nf = rows[0].len();
-        let free = |c: &Option<PatId>| c.is_none_or(|x| self.irrefutable(x));
-        if rows.iter().any(|r| r.iter().all(free)) {
-            return true;
-        }
-        (0..nf).any(|j| {
-            rows.iter().all(|r| r.iter().enumerate().all(|(i, c)| i == j || free(c)))
-                && rows.iter().all(|r| r[j].is_some())
-                && self.covers(&rows.iter().filter_map(|r| r[j]).collect::<Vec<_>>())
-        })
-    }
-
-    /// Slice and array pattern coverage, split by length. An array has the
-    /// one length; a slice needs a `..` pattern, and then every length up
-    /// to one past the longest fixed part is checked (a longer slice only
-    /// adds wildcard middle cells to the rows that matched there, so the
-    /// same row argument keeps holding). With no `..` pattern a slice
-    /// match can never be exhaustive: some length is missed, and accepting
-    /// it would make the missing length abort at run time.
-    fn covers_slice(&self, flat: &[PatId]) -> bool {
-        let p = self.p;
-        let t = self.out.pat_ty[(flat[0].0 - self.out.pat_base) as usize];
-        let arr_len: Option<usize> = match self.kind(t) {
-            TyKind::Slice(_) => None,
-            TyKind::Array(_, c) => match self.tys.const_kind(c) {
-                ConstKind::Int(n) => Some(n as usize),
-                _ => return false,
-            },
-            _ => return false,
-        };
-        // (prefix, suffix, middle is free over any cells it spans)
-        let mut pats: Vec<(Vec<PatId>, Vec<PatId>, Option<bool>)> = Vec::new();
-        for &x in flat {
-            let Pat::Slice { prefix, middle, suffix } = p.ast.pat(self.pat_unwrap(x)) else { return false };
-            let mid = match middle {
-                None => None,
-                Some(mid) => Some(matches!(p.ast.pat(*mid), Pat::Rest) || self.irrefutable(*mid)),
-            };
-            pats.push((prefix.clone(), suffix.clone(), mid));
-        }
-        let lengths: Vec<usize> = match arr_len {
-            Some(n) => vec![n],
-            None => {
-                if pats.iter().all(|(_, _, m)| m.is_none()) {
-                    return false;
-                }
-                let m = pats.iter().map(|(a, b, _)| a.len() + b.len()).max().unwrap_or(0);
-                (0..=m + 1).collect()
-            }
-        };
-        for len in lengths {
-            let mut rows: Vec<Vec<Option<PatId>>> = Vec::new();
-            for (prefix, suffix, mid) in &pats {
-                let fixed = prefix.len() + suffix.len();
-                match mid {
-                    None if len == fixed => {
-                        rows.push(prefix.iter().chain(suffix.iter()).map(|&s| Some(s)).collect());
-                    }
-                    Some(true) if len >= fixed => {
-                        let mut row: Vec<Option<PatId>> = prefix.iter().map(|&s| Some(s)).collect();
-                        row.resize(len - suffix.len(), None);
-                        row.extend(suffix.iter().map(|&s| Some(s)));
-                        rows.push(row);
-                    }
-                    _ => {}
-                }
-            }
-            if !self.rows_cover(&rows) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Integer and char coverage by literal and range patterns: `Some` when
-    /// the patterns are all scalar literals or ranges with known bounds on
-    /// an int or char type, with the result of merging their intervals
-    /// against the type's whole domain (the char domain skips surrogates).
-    fn covers_scalar_domain(&self, flat: &[PatId]) -> Option<bool> {
-        let p = self.p;
-        let first = *flat.first()?;
-        let t = self.out.pat_ty[(first.0 - self.out.pat_base) as usize];
-        let segments: Vec<(i128, i128)> = match self.kind(t) {
-            TyKind::Int(it) => {
-                let bits = it.bits();
-                if bits >= 128 && !it.signed() {
-                    return None; // u128 bounds do not fit the i128 values here.
-                }
-                if bits >= 128 {
-                    vec![(i128::MIN, i128::MAX)]
-                } else if it.signed() {
-                    vec![(-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)]
-                } else {
-                    vec![(0, (1i128 << bits) - 1)]
-                }
-            }
-            TyKind::Char => vec![(0, 0xD7FF), (0xE000, 0x10FFFF)],
-            _ => return None,
-        };
-        let (dom_lo, dom_hi) = (segments[0].0, segments[segments.len() - 1].1);
-        let mut ivs: Vec<(i128, i128)> = Vec::new();
-        for &x in flat {
-            match p.ast.pat(self.pat_unwrap(x)) {
-                Pat::Lit(l) => {
-                    let v = self.const_scalar(*l)?;
-                    ivs.push((v, v));
-                }
-                Pat::Range { lo, hi, inclusive } => {
-                    let lo_v = match lo {
-                        Some(e) => self.const_scalar(*e)?,
-                        None => dom_lo,
-                    };
-                    let hi_v = match hi {
-                        Some(e) => {
-                            let v = self.const_scalar(*e)?;
-                            if *inclusive { v } else { v.saturating_sub(1) }
-                        }
-                        None => dom_hi,
-                    };
-                    if lo_v <= hi_v {
-                        ivs.push((lo_v, hi_v));
-                    }
-                }
-                _ => return None,
-            }
-        }
-        ivs.sort_unstable();
-        Some(segments.iter().all(|&(slo, shi)| {
-            let mut next = slo;
-            for &(lo, hi) in &ivs {
-                if lo > next {
-                    break;
-                }
-                // An interval that reaches the segment end covers it
-                // (saturating_add would hide that at i128::MAX).
-                if hi >= shi {
-                    return true;
-                }
-                next = next.max(hi.saturating_add(1));
-                if next > shi {
-                    return true;
-                }
-            }
-            next > shi
-        }))
-    }
-
     /// True when a checked pattern matches every value of its
     /// type: the syntactic `irrefutable` test, or, for a pattern
     /// that contains an or-pattern, the exhaustiveness test
     /// (`A(x) | B(x)` over a two-variant enum always matches, as
-    /// in Rust). Tuple rest elements skip the exhaustiveness
-    /// path: `covers_variant` indexes tuple fields by position,
-    /// which a rest would shift.
+    /// in Rust).
     fn pat_always_matches(&self, pat: PatId) -> bool {
         if self.irrefutable(pat) {
             return true;
         }
-        fn walk(p: &Program, pat: PatId, has_or: &mut bool, has_tuple_rest: &mut bool) {
+        fn has_or(p: &Program, pat: PatId) -> bool {
             match p.ast.pat(pat) {
-                Pat::Or(alts) => {
-                    *has_or = true;
-                    alts.iter().for_each(|&a| walk(p, a, has_or, has_tuple_rest));
-                }
-                Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) => {
-                    if elems.iter().any(|&e| matches!(p.ast.pat(e), Pat::Rest)) {
-                        *has_tuple_rest = true;
-                    }
-                    elems.iter().for_each(|&e| walk(p, e, has_or, has_tuple_rest));
-                }
-                Pat::Struct { fields, .. } => fields.iter().for_each(|&(_, s)| walk(p, s, has_or, has_tuple_rest)),
-                Pat::Slice { prefix, middle, suffix } => {
-                    prefix.iter().chain(suffix.iter()).for_each(|&s| walk(p, s, has_or, has_tuple_rest));
-                    if let Some(m) = middle {
-                        walk(p, *m, has_or, has_tuple_rest);
-                    }
-                }
-                Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => walk(p, *inner, has_or, has_tuple_rest),
-                _ => {}
+                Pat::Or(_) => true,
+                Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) => elems.iter().any(|&e| has_or(p, e)),
+                Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| has_or(p, s)),
+                Pat::Slice { prefix, middle, suffix } => prefix.iter().chain(suffix.iter()).chain(middle.iter()).any(|&s| has_or(p, s)),
+                Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => has_or(p, *inner),
+                _ => false,
             }
         }
-        let (mut has_or, mut has_tuple_rest) = (false, false);
-        walk(self.p, pat, &mut has_or, &mut has_tuple_rest);
-        has_or && !has_tuple_rest && self.covers(&[pat])
+        has_or(self.p, pat) && self.covers(&[pat])
     }
 
     /// True when a guarded arm's pattern binds a slice
@@ -13549,10 +13254,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // A binding that resolved to a const item can fail; one
             // that resolved to a unit struct cannot.
             Pat::Binding { .. } => match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
-                PatRes::ConstItem(_) => false,
                 PatRes::Variant(a, _) => one_variant(a),
-                _ if self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_some() => false,
-                _ => true,
+                PatRes::Binding { .. } | PatRes::None => self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_none(),
+                _ => false,
             },
             Pat::Or(alts) => alts.iter().any(|&a| self.irrefutable(a)),
             Pat::Struct { fields, .. } => {
@@ -13574,8 +13278,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Pat::Slice { prefix, middle, suffix } => {
                 // The pattern matches every value only if it matches every
                 // length: an array needs an exact-length pattern, or a `..`
-                // with at most the array's length fixed; a slice always
-                // needs the `..` (`[]` alone matches only the empty slice).
+                // with at most the array's length fixed; a slice needs a
+                // lone `..` (`[]` matches only the empty slice, and
+                // `[.., a]` misses it too).
                 let t = self.out.pat_ty[(pat.0 - self.out.pat_base) as usize];
                 let fixed = (prefix.len() + suffix.len()) as u128;
                 let len_ok = match self.kind(t) {
@@ -13589,7 +13294,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         }
                         _ => false,
                     },
-                    _ => middle.is_some(),
+                    _ => middle.is_some() && fixed == 0,
                 };
                 len_ok
                     && middle.is_none_or(|m| matches!(p.ast.pat(m), Pat::Rest) || self.irrefutable(m))
@@ -13598,30 +13303,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Pat::Paren(inner) => self.irrefutable(*inner),
             Pat::Rest => true,
             _ => false,
-        }
-    }
-
-    fn cover_bools(&self, pat: PatId, t: &mut bool, f: &mut bool) {
-        match self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
-            PatRes::ConstItem(idx) => match self.p.consts[idx as usize].value {
-                crate::ty::consteval::ConstValue::Bool(true) => *t = true,
-                crate::ty::consteval::ConstValue::Bool(false) => *f = true,
-                _ => {}
-            },
-            _ => {}
-        }
-        match self.p.ast.pat(pat) {
-            Pat::Or(alts) => {
-                for &a in alts {
-                    self.cover_bools(a, t, f);
-                }
-            }
-            Pat::Lit(l) => match self.p.ast.expr(*l) {
-                Expr::Bool(true) => *t = true,
-                Expr::Bool(false) => *f = true,
-                _ => {}
-            },
-            _ => {}
         }
     }
 

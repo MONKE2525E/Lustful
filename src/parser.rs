@@ -3098,7 +3098,21 @@ impl<'a> Parser<'a> {
                         seen_rest = true;
                         middle = Some(self.push_pat(Pat::Rest, s));
                     } else {
+                        let parenthesized = self.peek() == Tok::LParen;
                         let e = self.pattern()?;
+                        // An unparenthesized `X..` element is experimental
+                        // in a slice pattern (rustc E0658): the `..` reads
+                        // as the rest. `[(X..)]` and `..X` stay legal.
+                        let half_open = |p: PatId| {
+                            matches!(self.ast.pat(p), Pat::Range { lo: Some(_), hi: None, .. })
+                                || matches!(self.ast.pat(p), Pat::At { inner, .. } if matches!(self.ast.pat(*inner), Pat::Range { lo: Some(_), hi: None, .. }))
+                        };
+                        if !parenthesized && half_open(e) {
+                            return Err(syntax(
+                                self.ast.pat_span(e),
+                                "`X..` patterns in slices are experimental; write `[(X..)]` with parentheses",
+                            ));
+                        }
                         // `rest @ ..` binds the middle slice itself.
                         let at_rest = match self.ast.pat(e) {
                             Pat::At { name, mutable, by_ref, inner } if matches!(self.ast.pat(*inner), Pat::Rest) => {
@@ -3129,7 +3143,16 @@ impl<'a> Parser<'a> {
             Tok::Amp | Tok::AndAnd => {
                 let double = self.bump().tok == Tok::AndAnd;
                 let mutable = self.eat(Tok::Mut);
+                let parenthesized = self.peek() == Tok::LParen;
                 let inner = self.pattern_one()?;
+                // `&0..=9` is ambiguous in Rust: a range directly under
+                // `&` needs parentheses, `&(0..=9)`.
+                if !parenthesized && matches!(self.ast.pat(inner), Pat::Range { .. }) {
+                    return Err(syntax(
+                        self.ast.pat_span(inner),
+                        "the range pattern here has ambiguous interpretation; add parentheses, such as `&(0..=9)`",
+                    ));
+                }
                 let mut pat = Pat::Ref { mutable, inner };
                 if double {
                     let s = start.to(self.prev_span());
