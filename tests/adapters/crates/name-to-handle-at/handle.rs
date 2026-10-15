@@ -31,8 +31,18 @@ fn main() {
     let (hf, _) = name_to_handle_at(&dirfd, Path::new("f.txt"), AT_SYMLINK_FOLLOW).unwrap();
     println!("{}", hf == h1);
 
-    let r = name_to_handle_at(&dirfd, Path::new("f.txt"), AT_HANDLE_MNT_ID_UNIQUE);
-    println!("{} {}", kind(&r), kind(&Ok((h1.clone(), m1))));
+    // AT_HANDLE_MNT_ID_UNIQUE needs kernel 6.8+: the gate
+    // boxes' kernel rejects it. Print only what holds either
+    // way (both calls agree, and a success is Unique with the
+    // same handle).
+    let r1 = name_to_handle_at(&dirfd, Path::new("f.txt"), AT_HANDLE_MNT_ID_UNIQUE);
+    let r2 = name_to_handle_at(&dirfd, Path::new("f.txt"), AT_HANDLE_MNT_ID_UNIQUE);
+    let uniq_ok = match (&r1, &r2) {
+        (Ok((h, MountId::Unique(_))), Ok((h2, MountId::Unique(_)))) => *h == h1 && *h2 == h1,
+        (Err(e1), Err(e2)) => e1.raw_os_error() == e2.raw_os_error(),
+        _ => false,
+    };
+    println!("{} {}", uniq_ok, kind(&Ok((h1.clone(), m1))));
 
     let missing = name_to_handle_at(&dirfd, Path::new("missing"), 0);
     println!("{}", missing.unwrap_err().raw_os_error() == Some(2));
