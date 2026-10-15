@@ -80,12 +80,12 @@ pub(crate) struct Front {
     /// (loaded at session start, then every store). The manifest is
     /// rewritten only when assignment grows past this count.
     pub(crate) slot_manifest_stored: usize,
-    /// The unit size recorded in the disk slot manifest (loaded at
+    /// The unit byte target recorded in the disk slot manifest (loaded at
     /// session start, then every store; 0 = none recorded). A
-    /// persistent session adopts it as `Caches::per_unit` so unit
+    /// persistent session adopts it as `Caches::unit_bytes` so unit
     /// grouping, and therefore unit keys, survive a restart; a
     /// one-shot session only preserves it across its own stores.
-    pub(crate) manifest_per_unit: u32,
+    pub(crate) manifest_unit_bytes: u32,
     /// Body hash per slot, at the last parse. An instance slot of a
     /// generic program holds its source fingerprint at its last check
     /// (`gen_reuse::GenReuse::src_of`).
@@ -234,11 +234,18 @@ pub(crate) struct Caches {
     /// any more. Cleared by the build that reassembles them, like
     /// `glue_stale` (a check request can do the wiping).
     pub(crate) wiped_slots: Vec<u32>,
-    /// Slots per function unit. Chosen at a full rebuild and fixed
-    /// until the next one, so units stay stable; a persistent
-    /// session adopts the slot manifest's recorded value instead,
-    /// so grouping also stays stable across restarts.
-    pub(crate) per_unit: usize,
+    /// Target C bytes per function unit (`cgen::group_fns_by_bytes`).
+    /// 0 = not chosen yet; the first build that groups functions
+    /// picks it from the total C size. A persistent session adopts
+    /// the slot manifest's recorded value instead, so grouping also
+    /// stays stable across restarts.
+    pub(crate) unit_bytes: usize,
+    /// The function groups in use (slot ranges, one per function
+    /// unit). Frozen between fresh bases: a warm edit keeps every
+    /// existing group's membership, and new slots group into new
+    /// groups at the end, so one edit dirties only its own unit
+    /// even though grouping is by bytes. A fresh base regroups all.
+    pub(crate) groups: Vec<std::ops::Range<usize>>,
     /// Slot capacity of `lust_fns` in libbase.so, and how many function units it has.
     pub(crate) table_cap: usize,
     pub(crate) base_units: usize,
@@ -325,7 +332,7 @@ impl Session {
                 slot_of: FxMap::default(),
                 slot_paths: FxMap::default(),
                 slot_manifest_stored: 0,
-                manifest_per_unit: 0,
+                manifest_unit_bytes: 0,
                 slot_hash: Vec::new(),
                 inst_slot: Vec::new(),
                 slot_env: Vec::new(),
@@ -356,7 +363,8 @@ impl Session {
                 glue_slots_fp: 0,
                 glue_stale: false,
                 wiped_slots: Vec::new(),
-                per_unit: 16,
+                unit_bytes: 0,
+                groups: Vec::new(),
                 table_cap: 0,
                 base_units: 0,
                 base_gen: 0,
@@ -400,20 +408,22 @@ impl Session {
 
 /// The slot manifest byte shape: magic, entry count, then one 20-byte
 /// entry per slot (`DiskDefId` bytes + slot), sorted by slot, then the
-/// unit size (`Caches::per_unit`) the stored objects were grouped with
+/// unit byte target (`Caches::unit_bytes`) the stored objects were grouped with
 /// as a trailing u32 (0 = not recorded; files without the trailer,
 /// written before it existed, still decode with 0). Only stable disk
 /// pairs are stored, so a restarted daemon that loads these bytes recovers the
 /// same slot assignment in any crate load or discovery order (docs/ARCH.md
-/// sections 4.2 and 8.4). The unit size rides along because unit keys
-/// depend on the grouping: a restarted daemon that regrouped by its
-/// own fn count would orphan every stored object. The in-memory manifest type is
+/// sections 4.2 and 8.4). The byte target rides along because unit keys
+/// depend on the grouping: a restarted daemon that regrouped with a
+/// different target would orphan every stored object. The in-memory manifest type is
 /// `driver::graph::SlotManifest`; the bytes live in the disk cache
-/// (`driver::cache::Cache::load_slot_manifest`).
-const SLOT_MANIFEST_MAGIC: &[u8; 4] = b"LSS1";
+/// (`driver::cache::Cache::load_slot_manifest`). `LSS1` files recorded
+/// a slot count per unit from the count-based grouping; they read as
+/// a miss under the new magic, so slots number fresh once.
+const SLOT_MANIFEST_MAGIC: &[u8; 4] = b"LSS2";
 
-/// Serializes a slot map and its unit size. See `SLOT_MANIFEST_MAGIC`.
-pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>, per_unit: u32) -> Vec<u8> {
+/// Serializes a slot map and its unit byte target. See `SLOT_MANIFEST_MAGIC`.
+pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>, unit_bytes: u32) -> Vec<u8> {
     let mut entries: Vec<(u32, DiskDefId)> = slot_of.iter().map(|(k, &s)| (s, *k)).collect();
     entries.sort_unstable();
     let mut out = Vec::with_capacity(12 + entries.len() * 20);
@@ -423,7 +433,7 @@ pub(crate) fn encode_slot_manifest(slot_of: &FxMap<DiskDefId, u32>, per_unit: u3
         out.extend_from_slice(&key.to_bytes());
         out.extend_from_slice(&slot.to_le_bytes());
     }
-    out.extend_from_slice(&per_unit.to_le_bytes());
+    out.extend_from_slice(&unit_bytes.to_le_bytes());
     out
 }
 
@@ -508,14 +518,14 @@ pub(crate) fn decode_slot_manifest(b: &[u8]) -> Option<(FxMap<DiskDefId, u32>, u
     }
     let n = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
     let body = n.checked_mul(20)?.checked_add(8)?;
-    let per_unit = if b.len() == body {
+    let unit_bytes = if b.len() == body {
         0
     } else if b.len() == body.checked_add(4)? {
-        let pu = u32::from_le_bytes(b[body..body + 4].try_into().ok()?);
-        if pu > 4096 {
+        let ub = u32::from_le_bytes(b[body..body + 4].try_into().ok()?);
+        if ub > 64 * 1024 * 1024 {
             return None;
         }
-        pu
+        ub
     } else {
         return None;
     };
@@ -530,7 +540,7 @@ pub(crate) fn decode_slot_manifest(b: &[u8]) -> Option<(FxMap<DiskDefId, u32>, u
         }
         slots.push(slot);
     }
-    Some((map, per_unit))
+    Some((map, unit_bytes))
 }
 
 #[cfg(test)]
@@ -571,10 +581,10 @@ mod tests {
         m.insert(key(1, 20), 1);
         m.insert(key(1, 30), 5);
         m.insert(key(2, 10), 3);
-        let back = decode_slot_manifest(&encode_slot_manifest(&m, 18)).unwrap();
-        assert_eq!(back, (m.clone(), 18), "slots and unit size round-trip");
-        // A pre-trailer file (no unit size recorded) still decodes.
-        let mut old = encode_slot_manifest(&m, 18);
+        let back = decode_slot_manifest(&encode_slot_manifest(&m, 131_072)).unwrap();
+        assert_eq!(back, (m.clone(), 131_072), "slots and unit byte target round-trip");
+        // A pre-trailer file (no unit byte target recorded) still decodes.
+        let mut old = encode_slot_manifest(&m, 131_072);
         old.truncate(old.len() - 4);
         assert_eq!(decode_slot_manifest(&old), Some((m, 0)), "old shape keeps its slots");
         let empty: FxMap<DiskDefId, u32> = FxMap::default();

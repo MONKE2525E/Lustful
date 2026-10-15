@@ -1084,7 +1084,6 @@ fn slot_update(
     env: u64,
     changed_names: Option<Vec<Sym>>,
     fn_at: &[(usize, usize)],
-    cores: usize,
     crate_ids: CrateIds,
     scan_of: &dyn Fn(&Front, usize) -> (u64, u32),
     t: &mut Timer,
@@ -1194,17 +1193,17 @@ fn slot_update(
         caches.glue = GlueSet::default();
         caches.objects = None;
         caches.overlays.clear();
-        // Cold builds gain nothing from many small units: each extra unit pays a tcc process
-        // start and a header parse. Use about one unit per core. The daemon keeps small
-        // units, so an edit recompiles little code. A persistent session
-        // that adopted the manifest's recorded unit size keeps it: the
-        // stored objects were grouped with it, and this session's own
-        // fn count would regroup them into misses.
-        if caches.persistent && front.manifest_per_unit != 0 {
-            caches.per_unit = front.manifest_per_unit as usize;
-        } else {
-            caches.per_unit =
-                if caches.persistent { (fn_count / (cores * 4)).clamp(16, 256) } else { (fn_count / cores.max(1)).clamp(64, 512) };
+        // Grouping restarts here: the build below regroups every slot
+        // by C bytes. A persistent session that adopted the manifest's
+        // recorded byte target keeps it: the stored objects were
+        // grouped with it, and a different target would regroup them
+        // into misses. With no recorded target, 0 asks the grouping
+        // step to pick one from the total C size.
+        caches.groups.clear();
+        if caches.persistent && front.manifest_unit_bytes != 0 {
+            caches.unit_bytes = front.manifest_unit_bytes as usize;
+        } else if !caches.persistent {
+            caches.unit_bytes = 0;
         }
     }
     if full_walk && nonfn_changed {
@@ -1854,12 +1853,11 @@ fn resolved_setup(
         "full"
     };
     let fn_at: Vec<(usize, usize)> = (0..fn_count).map(|i| (0, i)).collect();
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let lines = fn_lines.clone();
     let hashes = body_hashes.clone();
     let scan_of = |_: &Front, i: usize| (hashes[i], lines[i]);
     let (changed, mention_only, const_fn_changed) =
-        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, crate_ids, &scan_of, t) {
+        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, crate_ids, &scan_of, t) {
             Ok(c) => c,
             Err(e) => {
                 front.env_hash = None;
@@ -1939,18 +1937,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         session.disk_cache = crate::driver::cache::Cache::open(&req.file);
         if session.front.slot_of.is_empty()
             && let Some(cache) = &session.disk_cache
-            && let Some((manifest, per_unit)) = cache.load_slot_manifest(&session.key)
+            && let Some((manifest, unit_bytes)) = cache.load_slot_manifest(&session.key)
         {
             session.front.slot_manifest_stored = manifest.len();
             session.front.slot_of = manifest;
-            session.front.manifest_per_unit = per_unit;
-            // A restarted daemon groups fns into units exactly as
-            // the daemon that stored the disk objects did, or every
-            // unit key moves and the objects orphan. A one-shot
+            session.front.manifest_unit_bytes = unit_bytes;
+            // A restarted daemon groups fns into units with the same
+            // byte target as the daemon that stored the disk objects,
+            // or every unit key moves and the objects orphan. A one-shot
             // session keeps its own grouping and only preserves
             // the recorded value across its stores.
-            if session.caches.persistent && per_unit != 0 {
-                session.caches.per_unit = per_unit as usize;
+            if session.caches.persistent && unit_bytes != 0 {
+                session.caches.unit_bytes = unit_bytes as usize;
             }
         }
         if session.front.def_order.adts.is_empty()
@@ -2506,7 +2504,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.ast.items = items;
         front.ast.stmt_items = stmt_items;
         front.ast.inner_attrs = inner_attrs;
-        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, cores, crate_ids, &scan_of, &mut t) {
+        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, crate_ids, &scan_of, &mut t) {
             Ok(c) => c,
             Err(e) => {
                 front.env_hash = None;
@@ -2556,7 +2554,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         };
         front.ast = ast;
-        match slot_update(front, caches, item_scans, env, None, &fn_at, cores, crate_ids, &scan_of, &mut t) {
+        match slot_update(front, caches, item_scans, env, None, &fn_at, crate_ids, &scan_of, &mut t) {
             Ok(c) => c,
             Err(e) => {
                 front.env_hash = None;
@@ -2575,19 +2573,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     };
 
     // Persist slot assignment when it grew (or was compacted), and
-    // the unit size with it when a daemon session chose one the
+    // the unit byte target with it when a daemon session chose one the
     // manifest does not record yet: the next daemon seeds from this
     // file even if this compile later fails, because the assignment
     // itself is already in use by cached C. A one-shot session
-    // writes back the recorded unit size unchanged, so its slot
-    // stores never erase a daemon's grouping.
-    let store_per_unit = if caches.persistent { caches.per_unit as u32 } else { front.manifest_per_unit };
-    if front.slot_of.len() != front.slot_manifest_stored || store_per_unit != front.manifest_per_unit {
+    // writes back the recorded byte target unchanged, so its slot
+    // stores never erase a daemon's grouping. A target first picked
+    // by this build's grouping step is stored by the next request
+    // that reaches this point (or re-derived: the picking formula
+    // is a function of the same total C bytes).
+    let store_unit_bytes = if caches.persistent { caches.unit_bytes as u32 } else { front.manifest_unit_bytes };
+    if front.slot_of.len() != front.slot_manifest_stored || store_unit_bytes != front.manifest_unit_bytes {
         if let Some(cache) = disk_cache {
-            cache.store_slot_manifest(&session_key, &front.slot_of, store_per_unit);
+            cache.store_slot_manifest(&session_key, &front.slot_of, store_unit_bytes);
         }
         front.slot_manifest_stored = front.slot_of.len();
-        front.manifest_per_unit = store_per_unit;
+        front.manifest_unit_bytes = store_unit_bytes;
     }
 
     // The resolver path computes crate identity from the Cargo graph;
@@ -3129,17 +3130,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
     let n_slots = caches.out.len();
-    let groups = cgen::group_fns(n_slots, caches.per_unit);
-    let mut dirty_groups = vec![false; groups.len()];
+    // Slots with new C in this build. Their groups are marked dirty
+    // after grouping below (grouping needs the new C sizes first).
+    let mut dirty_slots: Vec<usize> = Vec::new();
     // A slot a compile wiped (a removed fn, a dead instance) still
     // has its old C in its unit's object: reassemble that unit so
     // the dead C (and any symbol only it named) leaves the link.
-    for s in std::mem::take(&mut caches.wiped_slots) {
-        let g = s as usize / caches.per_unit;
-        if let Some(d) = dirty_groups.get_mut(g) {
-            *d = true;
-        }
-    }
+    dirty_slots.extend(std::mem::take(&mut caches.wiped_slots).into_iter().map(|s| s as usize));
     let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);
@@ -3153,7 +3150,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         caches.out[s] = out;
         caches.has_out[s] = true;
-        dirty_groups[s / caches.per_unit] = true;
+        dirty_slots.push(s);
         // The slots this fn's C references: itself (its register store)
         // plus every direct call target and fn-pointer value (printed
         // as `lust_fns[slot]` / `lust_tramps[slot]`). The unit's
@@ -3176,6 +3173,49 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
         if let Some(slot_ir) = caches.slot_ir.get_mut(s) {
             *slot_ir = Some(super::ir_cache::cache_body(&program, body, fh, s as u32, used_pairs, fp));
+        }
+    }
+    // Group slots into function units by C bytes (see
+    // `Caches::groups`): regroup all on a fresh base (or when the
+    // frozen groups no longer cover the slots exactly, after a
+    // renumber); otherwise keep the frozen groups and group only
+    // the new slots at the end. The byte target is picked once,
+    // from the total C size: a one-shot build wants about two units
+    // per core (enough units for the bounded tcc workers to stay
+    // balanced, few enough that per-unit header cost stays small);
+    // a daemon keeps units smaller, about four per core, so a warm
+    // edit recompiles little code.
+    let covered = caches.groups.last().map_or(0, |g| g.end);
+    if caches.groups.is_empty() || covered > n_slots || caches.objects != Some(req.debug) || !caches.persistent {
+        let sizes: Vec<usize> = caches.out.iter().map(|o| o.code.len()).collect();
+        if caches.unit_bytes == 0 {
+            let cores = crate::pool::threads().max(1);
+            let total: usize = sizes.iter().sum();
+            caches.unit_bytes = if caches.persistent {
+                (total / (cores * 4)).clamp(48 * 1024, 384 * 1024)
+            } else {
+                (total / (cores * 2)).clamp(64 * 1024, 768 * 1024)
+            };
+        }
+        caches.groups = cgen::group_fns_by_bytes(&sizes, caches.unit_bytes);
+    } else if covered < n_slots {
+        let sizes: Vec<usize> = caches.out[covered..].iter().map(|o| o.code.len()).collect();
+        let target = if caches.unit_bytes == 0 { 128 * 1024 } else { caches.unit_bytes };
+        caches.groups.extend(cgen::group_fns_by_bytes(&sizes, target).into_iter().map(|r| (r.start + covered)..(r.end + covered)));
+    }
+    let groups = caches.groups.clone();
+    let mut group_of = vec![usize::MAX; n_slots];
+    for (g, range) in groups.iter().enumerate() {
+        for s in range.clone() {
+            group_of[s] = g;
+        }
+    }
+    let mut dirty_groups = vec![false; groups.len()];
+    for s in dirty_slots {
+        if let Some(&g) = group_of.get(s)
+            && let Some(d) = dirty_groups.get_mut(g)
+        {
+            *d = true;
         }
     }
     // Every live slot's C of a generic program is now under these ids

@@ -161,30 +161,60 @@ pub fn compile_units(units: &[(PathBuf, String)], debug: bool) -> Result<(), Str
         }
         return Ok(());
     }
-    let mut children = Vec::with_capacity(units.len());
-    for (obj, src) in units {
-        let c = obj.with_extension("c");
-        std::fs::write(&c, src).map_err(|e| format!("cannot write {}: {e}", c.display()))?;
-        let mut cmd = Command::new(env!("LUST_TCC_BIN"));
-        cmd.arg("-c").arg("-w").arg("-fno-asynchronous-unwind-tables");
-        if debug {
-            cmd.arg("-g");
+    // At most one tcc child per core (the pool size): starting every unit's
+    // child at once oversubscribes the machine and multiplies peak memory
+    // on a large program (one child per unit, hundreds of units). Workers
+    // pull units largest first, so the long units start early and the tail
+    // is short units filling gaps, instead of one big unit starting last.
+    let limit = crate::pool::threads().max(1).min(units.len());
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len()));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let errors = std::sync::Mutex::new(String::new());
+    std::thread::scope(|scope| {
+        for _ in 0..limit {
+            scope.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&i) = order.get(k) else { return };
+                let (obj, src) = &units[i];
+                let c = obj.with_extension("c");
+                let fail = |errors: &std::sync::Mutex<String>, msg: String| {
+                    errors.lock().unwrap_or_else(|e| e.into_inner()).push_str(&msg);
+                };
+                if let Err(e) = std::fs::write(&c, src) {
+                    fail(&errors, format!("cannot write {}: {e}\n", c.display()));
+                    continue;
+                }
+                let mut cmd = Command::new(env!("LUST_TCC_BIN"));
+                cmd.arg("-c").arg("-w").arg("-fno-asynchronous-unwind-tables");
+                if debug {
+                    cmd.arg("-g");
+                }
+                cmd.arg("-o").arg(obj).arg(&c);
+                let child = match cmd.stderr(std::process::Stdio::piped()).spawn() {
+                    Ok(child) => child,
+                    Err(e) => {
+                        fail(&errors, format!("cannot run tcc: {e}\n"));
+                        continue;
+                    }
+                };
+                match child.wait_with_output() {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => {
+                        let mut msg = String::from_utf8_lossy(&out.stderr).into_owned();
+                        // A child killed by a signal (for example the out-of-memory killer)
+                        // prints nothing; it still failed, and its object is missing or stale.
+                        if out.stderr.is_empty() {
+                            msg.push_str(&format!("tcc exited with {}\n", out.status));
+                        }
+                        fail(&errors, msg);
+                    }
+                    Err(e) => fail(&errors, format!("tcc failed: {e}\n")),
+                }
+            });
         }
-        cmd.arg("-o").arg(obj).arg(&c);
-        children.push(cmd.stderr(std::process::Stdio::piped()).spawn().map_err(|e| format!("cannot run tcc: {e}"))?);
-    }
-    let mut errors = String::new();
-    for child in children {
-        let out = child.wait_with_output().map_err(|e| format!("tcc failed: {e}"))?;
-        if !out.status.success() {
-            errors.push_str(&String::from_utf8_lossy(&out.stderr));
-            // A child killed by a signal (for example the out-of-memory killer)
-            // prints nothing; it still failed, and its object is missing or stale.
-            if out.stderr.is_empty() {
-                errors.push_str(&format!("tcc exited with {}\n", out.status));
-            }
-        }
-    }
+    });
+    let errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
     if errors.is_empty() { Ok(()) } else { Err(format!("tcc failed to compile the generated C (this is a lust bug):\n{errors}")) }
 }
 
@@ -416,6 +446,27 @@ mod tests {
         assert_eq!(read().as_deref(), Some("0"));
         super::set_huge_pages(true);
         assert_eq!(read().as_deref(), Some("1"));
+    }
+
+    /// The external path (more than two units) compiles every unit
+    /// through the bounded worker set: all objects land on disk, and
+    /// one bad unit fails the whole call with its error text.
+    #[test]
+    fn compile_units_external_path_compiles_all_and_reports_errors() {
+        let dir = std::env::temp_dir().join(format!("lust-tcc-units-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let units: Vec<(std::path::PathBuf, String)> =
+            (0..9).map(|i| (dir.join(format!("u{i}.o")), format!("int f{i}(void) {{ return {i}; }}\n"))).collect();
+        super::compile_units(&units, false).unwrap();
+        for (obj, _) in &units {
+            assert!(obj.exists(), "{} was compiled", obj.display());
+        }
+        let mut bad = units.clone();
+        bad[4].1 = "int broken( {\n".to_string();
+        let err = super::compile_units(&bad, false).unwrap_err();
+        assert!(err.contains("tcc failed to compile"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `lone_thread` counts every thread the OS lists, not only pool threads:

@@ -5482,9 +5482,36 @@ impl FnGen<'_, '_, '_> {
 // fixed groups of slots. Grouping depends only on the slot count, so an edit that keeps the
 // program's shape recompiles only the units it touches (plus unit 0).
 
-/// Function groups for units 2 and up.
+/// Function groups for units 2 and up, fixed slot counts. Kept for
+/// tests that build units by hand; the driver groups by bytes below.
+#[allow(dead_code)]
 pub fn group_fns(n: usize, per_unit: usize) -> Vec<std::ops::Range<usize>> {
     (0..n).step_by(per_unit.max(1)).map(|a| a..(a + per_unit).min(n)).collect()
+}
+
+/// Function groups sized by generated C bytes: slots in order, a new
+/// group when the next slot would push the current one past `target`
+/// bytes. A single slot over the target forms its own group, and a
+/// group holds at most 4096 slots so a run of empty slots (templates,
+/// stubs) cannot make one unit's register function huge. Equal byte
+/// sizes give tcc units of near equal cost, where a fixed slot count
+/// makes one unit of large functions the tail of the whole compile.
+pub fn group_fns_by_bytes(sizes: &[usize], target: usize) -> Vec<std::ops::Range<usize>> {
+    let target = target.max(1);
+    let mut groups = Vec::new();
+    let (mut start, mut bytes) = (0usize, 0usize);
+    for (i, &size) in sizes.iter().enumerate() {
+        if i > start && (bytes + size > target || i - start >= 4096) {
+            groups.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < sizes.len() {
+        groups.push(start..sizes.len());
+    }
+    groups
 }
 
 /// All glue needed by a set of functions, closed over field types.
@@ -7837,6 +7864,22 @@ fn succ(t: &Terminator) -> Vec<Bb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte grouping: groups fill to the target, an over-target slot
+    /// stands alone, empty input gives no groups, and every slot is
+    /// in exactly one group, in order.
+    #[test]
+    fn group_fns_by_bytes_fills_to_target() {
+        assert_eq!(group_fns_by_bytes(&[], 100), Vec::<std::ops::Range<usize>>::new());
+        assert_eq!(group_fns_by_bytes(&[10, 20, 30, 40], 60), vec![0..3, 3..4]);
+        assert_eq!(group_fns_by_bytes(&[10, 500, 10], 100), vec![0..1, 1..2, 2..3]);
+        assert_eq!(group_fns_by_bytes(&[0, 0, 5], 4), vec![0..2, 2..3]);
+        let sizes = [7usize; 5000];
+        let groups = group_fns_by_bytes(&sizes, 1_000_000);
+        assert_eq!(groups.len(), 2, "the 4096-slot cap splits a run of small slots");
+        assert_eq!(groups[0], 0..4096);
+    }
+
     use crate::check::check_fn;
     use crate::check::collect;
     use crate::diag::{FileId, SourceMap, Span};

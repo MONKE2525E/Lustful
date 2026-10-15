@@ -255,11 +255,11 @@ impl Cache {
     /// collide with the sparse slot later.
     pub fn load_slot_manifest(&self, session: &SessionKey) -> Option<(FxMap<DiskDefId, u32>, u32)> {
         let bytes = std::fs::read(self.slot_manifest_path(session)).ok()?;
-        let (map, per_unit) = super::session::decode_slot_manifest(&bytes)?;
+        let (map, unit_bytes) = super::session::decode_slot_manifest(&bytes)?;
         if map.values().copied().max().is_some_and(|m| m as usize >= map.len()) {
             return None;
         }
-        Some((map, per_unit))
+        Some((map, unit_bytes))
     }
 
     /// The def-order file for one session selection, next to its
@@ -285,8 +285,8 @@ impl Cache {
     }
 
     /// Stores the slot manifest for `session` (atomic, as every write here).
-    pub fn store_slot_manifest(&self, session: &SessionKey, slot_of: &FxMap<DiskDefId, u32>, per_unit: u32) {
-        let bytes = super::session::encode_slot_manifest(slot_of, per_unit);
+    pub fn store_slot_manifest(&self, session: &SessionKey, slot_of: &FxMap<DiskDefId, u32>, unit_bytes: u32) {
+        let bytes = super::session::encode_slot_manifest(slot_of, unit_bytes);
         self.write(&self.slot_manifest_path(session), &bytes);
     }
 
