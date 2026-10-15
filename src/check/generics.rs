@@ -8923,11 +8923,10 @@ pub(crate) fn template_closures_stand(p: &mut Program, t: LocalDefId) -> bool {
     if old == 0 && !fn_has_closures(p, t) {
         return true;
     }
+    // As `check_template`'s closure pass: its errors are the template
+    // check's to report (that check runs next).
     let owned = {
-        let (c, errs) = crate::check::check_fn(p, t);
-        if !errs.is_empty() {
-            return false;
-        }
+        let (c, _) = crate::check::check_fn(p, t);
         snapshot_closures(&c)
     };
     let Some(owned) = owned else { return false };

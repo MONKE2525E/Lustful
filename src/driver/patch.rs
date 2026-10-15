@@ -2318,8 +2318,36 @@ pub fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 {
     g(x)
 }
 
+pub trait Each<K> {
+    fn each(&self, f: &mut dyn FnMut(&K));
+}
+
+impl Each<i64> for Vec<i64> {
+    fn each(&self, f: &mut dyn FnMut(&i64)) {
+        for x in self {
+            f(x);
+        }
+    }
+}
+
+pub fn count_if<K>(m: &dyn Each<K>, mut keep: impl FnMut(&K) -> bool, mut on_hit: Option<&mut dyn FnMut(&K)>) -> i64 {
+    let mut n = 0;
+    m.each(&mut |k| {
+        if keep(k) {
+            n += 1;
+            if let Some(h) = on_hit.as_mut() {
+                h(k);
+            }
+        }
+    });
+    n
+}
+
 pub fn run() -> i64 {
-    map_get(&[(\"a\", 1i64)], \"a\").unwrap_or(0) + apply(|v| v * 2, 3)
+    let v: Vec<i64> = vec![1, 2, 3];
+    let mut seen = 0;
+    let c = count_if(&v, |x| *x > 1, Some(&mut |_k: &i64| seen += 1));
+    map_get(&[(\"a\", 1i64)], \"a\").unwrap_or(0) + apply(|v| v * 2, 3) + c + seen
 }
 ";
 
@@ -2345,6 +2373,7 @@ pub fn run() -> i64 {
             ("    let g = |y: i64| f(y) + 1;\n", "    let g = |y: i64| f(y) + 2;\n", "reuse"),
             ("    let g = |y: i64| f(y) + 2;\n    g(x)\n", "    let g = |y: i64| f(y) + 2;\n    let h = |z: i64| z;\n    h(g(x))\n", "closures"),
             ("    let h = |z: i64| z;\n    h(g(x))\n", "    g(x)\n", "closures"),
+            ("    let mut n = 0;\n    m.each", "    let _z = 1;\n    let mut n = 0;\n    m.each", "reuse"),
             ("    let g = |y: i64| f(y) + 2;\n    g(x)\n", "    let mut n = 0;\n    let mut g = |y: i64| {\n        n += 1;\n        f(y) + n\n    };\n    g(x)\n", "closures"),
         ];
         for &(old, new, kept) in steps {
