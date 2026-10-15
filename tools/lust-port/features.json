@@ -554,15 +554,6 @@
     "ext.type.libc::*"
    ],
    "keys": [
-    "ext.type.flate2::*",
-    "ext.expr.flate2::*",
-    "ext.use.flate2::*",
-    "ext.type.jiff::*",
-    "ext.expr.jiff::*",
-    "ext.use.jiff::*",
-    "ext.type.lzma_rust2::*",
-    "ext.expr.lzma_rust2::*",
-    "ext.use.lzma_rust2::*",
     "ext.type.name_to_handle_at::*",
     "ext.expr.name_to_handle_at::*",
     "ext.use.name_to_handle_at::*",
@@ -1240,6 +1231,66 @@
     "ext.type.signal_hook::*",
     "ext.expr.signal_hook::*",
     "ext.use.signal_hook::*"
+   ]
+  },
+  {
+   "id": "ext.flate2",
+   "title": "Adapter crate flate2 1.1.10: gzip, zlib, and deflate decoders",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh flate2 (2 cases match the real crate, including corrupt-stream errors). Read side only over a pure-Rust inflate; encoders are absent because a byte-exact miniz_oxide compressor is not a small adapter, so pprof.rs stays blocked on the write form. Split from cinterop.system. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.flate2::*"
+   ],
+   "keys": [
+    "ext.type.flate2::*",
+    "ext.expr.flate2::*",
+    "ext.use.flate2::*"
+   ]
+  },
+  {
+   "id": "ext.jiff",
+   "title": "Adapter crate jiff 0.2: Timestamp and tz::TimeZone (TZif) for local times",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs Timestamp::try_from(SystemTime), TimeZone::tzif (a TZif v1-v3 parser plus POSIX footer rule evaluation after the last transition), try_system, and civil date conversion, all exact at DST edges. That is its own adapter slice with a transition corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.jiff::*"
+   ],
+   "keys": [
+    "ext.type.jiff::*",
+    "ext.expr.jiff::*",
+    "ext.use.jiff::*"
+   ]
+  },
+  {
+   "id": "ext.lzma_rust2",
+   "title": "Adapter crate lzma-rust2 0.21: LZMA stream reader and writer",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs an LZMA1 range decoder (embed.rs LzmaReader over the packed libs) and, for the build script, a byte-exact LzmaWriter. That is its own adapter slice with a stream corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.lzma_rust2::*"
+   ],
+   "keys": [
+    "ext.type.lzma_rust2::*",
+    "ext.expr.lzma_rust2::*",
+    "ext.use.lzma_rust2::*"
    ]
   },
   {

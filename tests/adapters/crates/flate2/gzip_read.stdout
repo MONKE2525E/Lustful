@@ -1,0 +1,18 @@
+empty: ok 0 0
+small: ok 23 27130
+small9: ok 23 27130
+small0: ok 23 27130
+rep: ok 100000 502505550000
+rand: ok 4096 1073287666
+text: ok 1800 148857620
+text9: ok 1800 148857620
+text0: ok 1800 148857620
+two: ok 1823 152688950
+single Ok(23) 23
+badmagic: err InvalidInput invalid gzip header got 0
+short: err UnexpectedEof unexpected end of file got 0
+trunc: err UnexpectedEof unexpected end of file got 23
+badcrc: err InvalidInput corrupt gzip stream does not have a matching checksum got 23
+trailing: err UnexpectedEof unexpected end of file got 23
+empty-input: err UnexpectedEof unexpected end of file got 0
+chunked 1800

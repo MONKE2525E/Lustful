@@ -1,0 +1,16 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package flate2 1.1.10; release builds
+# use the real crate through Cargo. The driver checks `version` against
+# the resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "flate2"
+version = "1.1.10"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# The read side only, over the adapter's own inflate; the backend
+# feature names change nothing in the decoder surface. Encoding
+# (write, bufread encoders) is not here.
+features = ["default", "rust_backend", "any_impl", "miniz_oxide", "runtime_detection"]

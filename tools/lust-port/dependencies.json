@@ -76,15 +76,15 @@
   },
   {
    "name": "flate2",
-   "decision": "c-shim",
+   "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Gzip encode and decode. Stream state can be opaque. INVENTORY Q4: gzip API over zlib."
+   "notes": "Adapter in library/deps: read side only (GzDecoder, MultiGzDecoder, ZlibDecoder, DeflateDecoder) over a pure-Rust inflate. Encoders absent: byte-exact miniz_oxide compression is not a small adapter, so pprof.rs stays blocked."
   },
   {
    "name": "jiff",
    "decision": "c-shim",
    "milestone": 7,
-   "notes": "Local time zone for diagnostic timestamps. INVENTORY Q4: built-in over localtime_r."
+   "notes": "Gap (w-cinterop2): not small. Needs Timestamp, a TZif parser with POSIX footer rules, try_system, and civil conversion, exact at DST edges. Its own adapter slice with a transition corpus."
   },
   {
    "name": "rustix",
@@ -210,7 +210,7 @@
    "name": "lzma-rust2",
    "decision": "c-shim",
    "milestone": 7,
-   "notes": "Build-time use runs with Cargo in preparation. Add a decode shim for wasm."
+   "notes": "Gap (w-cinterop2): not small. Needs an LZMA1 range decoder for embed.rs and a byte-exact writer for the build script. Its own adapter slice with a stream corpus."
   },
   {
    "name": "lzma_rust2",

@@ -1,0 +1,12 @@
+zl-empty: ok 0 0
+zl-small: ok 23 27130
+zl-rep: ok 100000 502505550000
+zl-rand: ok 4096 1073287666
+zl-text: ok 1800 148857620
+df-empty: ok 0 0
+df-small: ok 23 27130
+df-rep: ok 100000 502505550000
+df-rand: ok 4096 1073287666
+df-text: ok 1800 148857620
+zl-badadler: Err((InvalidInput, "corrupt deflate stream"))
+zl-short: Err((UnexpectedEof, "incomplete deflate stream"))

@@ -52,6 +52,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "rustix",
     "nix",
     "signal-hook",
+    "flate2",
 ];
 
 /// One adapter crate, read from its manifest.
