@@ -5183,6 +5183,47 @@ impl FnGen<'_, '_> {
                 let _ = write!(self.out, "{body}");
                 "((lust_Unit){})".into()
             }
+            B::BoolThenSome | B::BoolThen => {
+                let elem = if b == B::BoolThenSome {
+                    tys[1].clone()
+                } else {
+                    cty(&self.p.tys, self.p.fn_info(self.closure_arg(&ops[1])).ret)
+                };
+                let opt = CTy::Option(Box::new(elem));
+                collect_types(&opt, &mut self.sig_types);
+                let t = self.tmp();
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                if b == B::BoolThenSome {
+                    // The value is eager: it was evaluated as an
+                    // argument whether the bool holds or not. On
+                    // `false` it drops with the Option it never
+                    // entered, as in Rust.
+                    let _ = writeln!(self.out, "    if ({}) {{ {field} = {};{some} }}", vals[0], vals[1]);
+                    if needs_drop_c(self.p, &tys[1]) {
+                        self.want(Glue::Drop, &tys[1]);
+                        let d = self.tmp();
+                        let _ = writeln!(self.out, "    if (!{}) {{ {} {d} = {}; drop_{}(&{d}); }}", vals[0], ctype(&tys[1]), vals[1], mangle(&tys[1]));
+                    }
+                } else {
+                    let f = self.closure_arg(&ops[1]);
+                    let c = self.tmp();
+                    let mut body = String::new();
+                    let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
+                    let _ = writeln!(body, "    if ({}) {{", vals[0]);
+                    let (v, _) = self.closure_call_c(&mut body, f, &format!("&{c}"), &[]);
+                    let _ = writeln!(body, "      {field} = {v};{some}");
+                    let _ = writeln!(body, "    }}");
+                    if needs_drop_c(self.p, &tys[1]) {
+                        self.want(Glue::Drop, &tys[1]);
+                        let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
+                    }
+                    let _ = write!(self.out, "{body}");
+                }
+                t
+            }
             B::VecReverse => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let et = ctype(&e);

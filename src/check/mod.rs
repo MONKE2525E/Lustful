@@ -284,6 +284,8 @@ pub enum Builtin {
     VecDedup,
     VecRetain,
     VecRetainMut,
+    BoolThenSome,
+    BoolThen,
     VecReverse,
     VecFirstMut,
     VecLastMut,
@@ -13714,6 +13716,31 @@ impl<'p> Ctx<'p> {
                     return ERROR;
                 }
                 None
+            }
+            (None, TyKind::Bool) if name == k.then_some => {
+                let t = self.new_var(false);
+                let o = self.tys.mk_option(t);
+                Some((B::BoolThenSome, Autoref::None, vec![t], o))
+            }
+            (None, TyKind::Bool) if name == k.then => {
+                // `F: FnOnce() -> T`; lowering calls closures only
+                // (as for `Ordering::then_with`).
+                let lang = self.p.gx.lang;
+                let t = self.new_var(false);
+                let f = self.new_var(false);
+                let unit_args = self.tys.intern_tys(&[]);
+                let unit = self.tys.intern(TyKind::Tuple(unit_args));
+                let args_id = self.tys.intern_args(&[GenericArg::Ty(f), GenericArg::Ty(unit)]);
+                self.obl.push(obligations::Obligation::Trait {
+                    trait_ref: TraitRef { def: lang.fn_once, args: args_id, bindings: EMPTY_BINDINGS },
+                    span: name_span,
+                    depth: 0,
+                });
+                if let Some(out) = lang.output_of(lang.fn_once) {
+                    self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc: out, trait_args: args_id, ty: t }, span: name_span });
+                }
+                let o = self.tys.mk_option(t);
+                Some((B::BoolThen, Autoref::None, vec![f], o))
             }
             (None, TyKind::Bool | TyKind::Char) if name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
             (Some(BuiltinTy::Args), _) if name == k.count => Some((B::ArgsCount, Autoref::None, vec![], USIZE)),

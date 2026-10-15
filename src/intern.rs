@@ -229,6 +229,8 @@ known_syms!(
     push,
     push_str,
     as_str,
+    then,
+    then_some,
     to_string,
     to_owned,
     clone,
