@@ -276,6 +276,10 @@ struct Ck<'b, 'p> {
     /// Drop-live locals at the entry of each point (empty when no local's
     /// drop touches regions): locals whose later `Drop` may read a region.
     drop_entry: Vec<u64>,
+    /// The whole writes that drop an old value in place (sorted by point):
+    /// MIR drops the old value, then the local is dead until the write, so
+    /// a loan only the old value held ends there (`loan_scopes`).
+    drop_gap: Vec<(usize, Local)>,
     /// Loans in scope at the entry of each point, `wl` words per point.
     scope: Vec<u64>,
     /// Words per set over loans.
@@ -403,6 +407,7 @@ impl<'b, 'p> Ck<'b, 'p> {
             point_base: Vec::new(),
             live_entry: Vec::new(),
             drop_entry: Vec::new(),
+            drop_gap: Vec::new(),
             scope: Vec::new(),
             wl: 0,
             sol: None,
@@ -1049,23 +1054,35 @@ impl<'b, 'p> Ck<'b, 'p> {
         let mut uses = vec![false; self.point_base[self.body.blocks.len()]];
         let mut st = State::new(self.sh);
         let body = self.body;
-        // A whole write of a local that may still hold an `impl Trait`
-        // value (`Body::opaque_locals`) drops the old value in place, as
-        // the drop rustc puts before the write: rustc keeps the borrows
-        // the old value captured in scope while the local stays live
-        // (E0506 on `it = None; c.n = 1;` after `it = Some(f(&c))`). A
-        // value the write itself moves out first (`it = g(it)`) drops
-        // nothing.
+        // A whole write of a maybe-initialized local whose drop uses its
+        // regions drops the old value first, as the `Drop` rustc puts
+        // before the write: a use of the old value's borrows (E0503 on
+        // `x += 1; h = G(&mut y);` after `h = G(&mut x)`). A value the
+        // write itself moves out first (`h = g(h)`) drops nothing. After
+        // that drop the local is dead until the write (`drop_gap`), but
+        // for an `impl Trait` value (`Body::opaque_locals`) rustc keeps
+        // the borrows the old value captured in scope while the local
+        // stays live (E0506 on `it = None; c.n = 1;` after
+        // `it = Some(f(&c))`).
         let opaque: Vec<Local> = body.opaque_locals.iter().copied().filter(|l| !body.opaque_nodrop.contains(l)).collect();
-        let overwrites = |st: &State, dest: &Place, ops: &[&Operand]| {
+        let mut gaps: Vec<(usize, Local)> = Vec::new();
+        let mut overwrites = |st: &State, q: usize, dest: &Place, ops: &[&Operand]| {
             let l = dest.local;
-            dest.proj.is_empty()
-                && opaque.contains(&l)
+            let hit = dest.proj.is_empty()
+                && (drop_live[l as usize] || opaque.contains(&l))
                 && bit_has(st.init(), l as usize)
-                && !ops.iter().any(|o| matches!(o, Operand::Move(pl) if pl.local == l))
+                && !ops.iter().any(|o| matches!(o, Operand::Move(pl) if pl.local == l && pl.proj.is_empty()));
+            if hit && !opaque.contains(&l) {
+                gaps.push((q, l));
+            }
+            hit
         };
+        let dropping = |l: Local| drop_live[l as usize] || opaque.contains(&l);
         for (bi, b) in body.blocks.iter().enumerate() {
-            if opaque.is_empty() && !b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Drop(l) if drop_live[l as usize])) {
+            let writes = |p: &Place| p.proj.is_empty() && dropping(p.local);
+            if !b.stmts.iter().any(|s| matches!(&s.kind, StmtKind::Drop(l) if drop_live[*l as usize]) || matches!(&s.kind, StmtKind::Assign(d, _) if writes(d)))
+                && !matches!(&b.term, Terminator::Call { dest, .. } if writes(dest))
+            {
                 continue;
             }
             let Some(e) = &entry[bi] else { continue };
@@ -1074,21 +1091,23 @@ impl<'b, 'p> Ck<'b, 'p> {
                 let q = self.point_base[bi] + si;
                 match &s.kind {
                     StmtKind::Drop(l) if drop_live[*l as usize] && bit_has(st.init(), *l as usize) => uses[q] = true,
-                    StmtKind::Assign(dest, rv) if !opaque.is_empty() => {
+                    StmtKind::Assign(dest, rv) => {
                         let mut ops: Vec<&Operand> = Vec::new();
                         rvalue_operands(rv, &mut |o| ops.push(o));
-                        uses[q] |= overwrites(&st, dest, &ops);
+                        uses[q] |= overwrites(&st, q, dest, &ops);
                     }
                     _ => {}
                 }
                 self.stmt(bi as u32, si as u32, &s.kind, s.span, &mut st);
             }
+            let q = self.point_base[bi] + b.stmts.len();
             if let Terminator::Call { args, dest, .. } = &b.term
-                && overwrites(&st, dest, &args.iter().collect::<Vec<_>>())
+                && overwrites(&st, q, dest, &args.iter().collect::<Vec<_>>())
             {
-                uses[self.point_base[bi] + b.stmts.len()] = true;
+                uses[q] = true;
             }
         }
+        self.drop_gap = gaps;
         if uses.iter().any(|&u| u) {
             self.drop_entry = self.backward(Some(&uses), Some(entry));
         }
@@ -1098,20 +1117,29 @@ impl<'b, 'p> Ck<'b, 'p> {
     /// universal region, or a local whose (drop-live) slots it reaches is
     /// (drop-)live at `q`'s entry.
     fn contains(&self, li: usize, q: usize) -> bool {
+        self.contains_but(li, q, None)
+    }
+
+    /// `contains`, with local `skip` (when given) taken as dead at `q`.
+    fn contains_but(&self, li: usize, q: usize, skip: Option<Local>) -> bool {
         let Some(sol) = &self.sol else { return false };
         if sol.univ[li] {
             return true;
         }
         let wn = self.sh.wn;
-        let le = &self.live_entry[q * wn..(q + 1) * wn];
-        if le.iter().zip(sol.use_set(li)).any(|(a, b)| a & b != 0) {
+        let hit = |live: &[u64], set: &[u64]| {
+            live.iter().zip(set).enumerate().any(|(w, (a, b))| {
+                let m = match skip {
+                    Some(l) if l as usize / 64 == w => !(1u64 << (l % 64)),
+                    _ => !0,
+                };
+                a & b & m != 0
+            })
+        };
+        if hit(&self.live_entry[q * wn..(q + 1) * wn], sol.use_set(li)) {
             return true;
         }
-        if !self.drop_entry.is_empty() {
-            let de = &self.drop_entry[q * wn..(q + 1) * wn];
-            return de.iter().zip(sol.drop_set(li)).any(|(a, b)| a & b != 0);
-        }
-        false
+        !self.drop_entry.is_empty() && hit(&self.drop_entry[q * wn..(q + 1) * wn], sol.drop_set(li))
     }
 
     /// The block and index of point `q`.
@@ -1160,6 +1188,12 @@ impl<'b, 'p> Ck<'b, 'p> {
                 }
                 bit_set(&mut scope[q * wl..(q + 1) * wl], li);
                 if self.kills(li, q) {
+                    continue;
+                }
+                // A loan only the dropped old value held ends at the drop.
+                if let Ok(g) = self.drop_gap.binary_search_by_key(&q, |g| g.0)
+                    && !self.contains_but(li, q, Some(self.drop_gap[g].1))
+                {
                     continue;
                 }
                 let (b, i) = self.point_at(q);
