@@ -366,6 +366,19 @@ fn hash_with_builder(p: &Program, slots: &[u32], s_cty: &CTy, k_cty: &CTy, need:
     format!("  {build}\n  {stmts}\n  uint64_t r = {finish};{drop}\n  return r;\n")
 }
 
+/// The hasher type a hash glue body builds (`H h = build_hasher(s)`),
+/// which its key type does not name: a unit that defines the glue must
+/// declare it (a user `BuildHasher`'s `Hasher` in another file's unit).
+pub(super) fn glue_hasher(p: &Program, g: &Glue, t: &CTy) -> Option<CTy> {
+    let s = match (g, t) {
+        (Glue::HashKey, _) => builder_cty(t),
+        (Glue::HashKeyQ, CTy::Tuple(parts)) => builder_cty(&parts[0]),
+        (Glue::HashOne, CTy::Tuple(parts)) => parts[0].clone(),
+        _ => return None,
+    };
+    Some(hasher_cty(p, &s))
+}
+
 /// One hash glue function: (signature, body).
 pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> (String, String) {
     let m = mangle(t);

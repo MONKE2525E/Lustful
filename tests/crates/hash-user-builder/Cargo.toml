@@ -1,0 +1,8 @@
+# A user BuildHasher and Hasher in another module file than the maps that
+# use them: the hash glue in main.rs's C unit must declare the hasher type.
+[package]
+name = "hash-user-builder"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

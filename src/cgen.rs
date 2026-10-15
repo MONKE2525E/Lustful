@@ -7931,6 +7931,7 @@ fn glue_def_value(
         | Glue::HashEqEntry
         | Glue::HashDrop
         | Glue::HashOne => {
+            types.extend(hash::glue_hasher(p, g, t));
             let (sig, body) = hash::glue(p, slots, g, t, &mut need);
             let _ = writeln!(protos, "{sig};");
             let _ = writeln!(defs, "{sig} {{\n{body}}}\n");
