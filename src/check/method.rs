@@ -452,6 +452,12 @@ pub(super) fn trait_probe_for(
         // trait inputs (`U: Add2<u8>` gives `u16: Add2<u8>`).
         let replayed = if only.is_some() { cx.replayed_trait_ref(e, trait_def) } else { None };
         for &probe in probes {
+            // rustc picks `into`/`try_into` at the by-value step for any
+            // receiver (core's blanket `Into` for every `T` may hold
+            // there), so an autoref `&S` is never their Self.
+            if (trait_def == p.gx.lang.into || trait_def == p.gx.lang.try_into) && probe.autoref != Autoref::None && probe.self_ty == probe.recv_ty {
+                continue;
+            }
             let step = probe.self_ty;
             let form = probe.filter;
             // Receiver-form pre-filter for plain receivers; typed
@@ -1509,6 +1515,12 @@ pub(super) fn generic_method_search(
         let slice = cx.tys.intern(TyKind::Slice(el));
         steps.push((slice, derefs, true));
     }
+    // Through a user `Deref` (`method_via_user_deref`), `recv_ty` is
+    // the `&Target` that `deref()` returns, but rustc's step is the
+    // target place itself: `&Target` is no step of its own.
+    if cx.user_deref_call == Some(e) && steps.len() > 1 && matches!(cx.tys.kind(steps[0].0), TyKind::Ref(..)) {
+        steps.remove(0);
+    }
     for (step, derefs, unsize) in steps {
         // One group per receiver type, in probe order: by value
         // (the step type itself; at a reference step this group
@@ -1572,7 +1584,11 @@ pub(super) fn generic_method_search(
         } else {
             (by_value, RcvProbe::at(cx, step, ReceiverForm::Ref), RcvProbe::at(cx, step, ReceiverForm::RefMut))
         };
-        let groups = [by_value, vec![ref_probe], vec![refmut_probe]];
+        // At an autoref the receiver `&step` is also the Self type of
+        // by-value methods (`impl Tr for &S { fn m(self) }`), as in
+        // rustc, where any method whose receiver type is `&step` fits.
+        let autoref_self = |pr: RcvProbe| RcvProbe { self_ty: pr.recv_ty, filter: ReceiverForm::Value, ..pr };
+        let groups = [by_value, vec![ref_probe, autoref_self(ref_probe)], vec![refmut_probe, autoref_self(refmut_probe)]];
         for group in &groups {
             for &probe in group {
                 match dyn_probe(cx, e, probe, derefs, name, name_span, args, None) {

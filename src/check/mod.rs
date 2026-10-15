@@ -5648,6 +5648,18 @@ impl<'p> Ctx<'p> {
         self.user_deref_call = outer;
         self.deref_depth -= 1;
         let mutable = match self.out.expr_res[self.ei(e)] {
+            // A pick on the `&Target` value itself (no deref of it) used
+            // a step rustc does not have (it steps to the target place).
+            Res::Method { derefs: 0, .. } | Res::BuiltinMethod { derefs: 0, .. } | Res::DynMethod { derefs: 0, .. } if ret != ERROR => {
+                let tn = self.tn(base);
+                self.err(
+                    "L0104",
+                    name_span,
+                    format!("no method `{}` on type `{tn}` or its `Deref` target", self.name(name)),
+                    "Call the method on an explicit reference, such as `(&*w).m()`.",
+                );
+                return Some(ERROR);
+            }
             Res::Method { autoref, .. } | Res::BuiltinMethod { autoref, .. } | Res::DynMethod { autoref, .. } => {
                 matches!(autoref, Autoref::RefMut | Autoref::SliceRefMut)
             }
