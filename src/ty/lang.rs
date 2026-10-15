@@ -46,6 +46,8 @@ pub enum ShippedCrate {
     RyuJs,
     NumBigInt,
     Rustix,
+    Nix,
+    SignalHook,
 }
 
 impl ShippedCrate {
@@ -64,6 +66,8 @@ impl ShippedCrate {
         ShippedCrate::RyuJs,
         ShippedCrate::NumBigInt,
         ShippedCrate::Rustix,
+        ShippedCrate::Nix,
+        ShippedCrate::SignalHook,
     ];
 
     /// The crate name as user code writes it in a path (`std::...`).
@@ -81,6 +85,8 @@ impl ShippedCrate {
             ShippedCrate::RyuJs => "ryu_js",
             ShippedCrate::NumBigInt => "num_bigint",
             ShippedCrate::Rustix => "rustix",
+            ShippedCrate::Nix => "nix",
+            ShippedCrate::SignalHook => "signal_hook",
         }
     }
 
@@ -989,11 +995,11 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         c_symbol: "lust_sys_fd_write",
         params: &[S::I32, S::Bytes],
         ret: S::I64,
-        allowed: &[C::Std, C::Rustix],
+        allowed: &[C::Std, C::Rustix, C::SignalHook],
         implemented: true,
     },
     // close.
-    IntrinsicDef { name: "sys_fd_close", c_symbol: "lust_sys_fd_close", params: &[S::I32], ret: S::I32, allowed: &[C::Std, C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_fd_close", c_symbol: "lust_sys_fd_close", params: &[S::I32], ret: S::I32, allowed: &[C::Std, C::Rustix, C::SignalHook], implemented: true },
     // dup with FD_CLOEXEC: the new fd, or -errno.
     IntrinsicDef { name: "sys_fd_dup", c_symbol: "lust_sys_fd_dup", params: &[S::I32], ret: S::I32, allowed: &[C::Std, C::Rustix], implemented: true },
     // fsync.
@@ -1223,6 +1229,20 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     IntrinsicDef { name: "sys_x_pipe", c_symbol: "lust_sys_x_pipe", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
     IntrinsicDef { name: "sys_x_dup2", c_symbol: "lust_sys_x_dup2", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
     IntrinsicDef { name: "sys_x_poll", c_symbol: "lust_sys_x_poll", params: &[S::VecU8Mut, S::I64, S::I64], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    // prctl THP disable for the nix adapter: mode 0 get (0/1 or
+    // -errno), mode 1 set (0 or -errno).
+    IntrinsicDef { name: "sys_x_prctl_thp", c_symbol: "lust_sys_x_prctl_thp", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Nix], implemented: true },
+    // The signal registry behind the signal-hook adapter.
+    IntrinsicDef { name: "sys_sig_register", c_symbol: "lust_sys_sig_register", params: &[S::I32, S::I32, S::Ptr, S::U64], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_register_pipe", c_symbol: "lust_sys_sig_register_pipe", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_unregister_pipe", c_symbol: "lust_sys_sig_unregister_pipe", params: &[S::I32], ret: S::Unit, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_pipe", c_symbol: "lust_sys_sig_pipe", params: &[S::VecU8Mut], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_poll_read", c_symbol: "lust_sys_sig_poll_read", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_read_now", c_symbol: "lust_sys_sig_read_now", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_raise", c_symbol: "lust_sys_sig_raise", params: &[S::I32], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_restore_raise", c_symbol: "lust_sys_sig_restore_raise", params: &[S::I32], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_exit", c_symbol: "lust_sys_sig_exit", params: &[S::I32], ret: S::Never, allowed: &[C::SignalHook], implemented: true },
+    IntrinsicDef { name: "sys_sig_abort", c_symbol: "lust_sys_sig_abort", params: &[], ret: S::Never, allowed: &[C::SignalHook], implemented: true },
     // The Formatter's alignment as `rt::Alignment` encodes it (0 left,
     // 1 right, 2 center, 3 none written), for Debug impls that pad by
     // hand like `Duration`'s (W-STD-C; runtime/stdc.c).

@@ -50,6 +50,8 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "tikv-jemallocator",
     "tikv-jemalloc-ctl",
     "rustix",
+    "nix",
+    "signal-hook",
 ];
 
 /// One adapter crate, read from its manifest.

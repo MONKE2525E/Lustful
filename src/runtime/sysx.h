@@ -19,6 +19,9 @@ int32_t lust_sys_x_kill(int32_t pid, int32_t sig);
 int32_t lust_sys_x_getppid(void);
 /* prctl(PR_SET_PDEATHSIG, sig): 0 or errno. */
 int32_t lust_sys_x_prctl_deathsig(int32_t sig);
+/* prctl THP disable: set (mode 1) returns 0 or -errno; get
+   (mode 0) returns 0 or 1, or -errno. */
+int32_t lust_sys_x_prctl_thp(int32_t mode, int32_t val);
 /* getrlimit: appends current and maximum as two u64 (RLIM_INFINITY
    is UINT64_MAX); 0 or errno. */
 int32_t lust_sys_x_getrlimit(int32_t resource, lust_Vec *out);
@@ -45,6 +48,36 @@ int32_t lust_sys_x_fcntl_setfl(int32_t fd, int32_t flags);
 /* ioctl(TIOCGWINSZ): appends row, col, xpixel, ypixel as u16
    little-endian pairs (8 bytes); 0 or errno. */
 int32_t lust_sys_x_winsize(int32_t fd, lust_Vec *out);
+/* Signal registry behind the signal-hook adapter. Actions by
+   kind: 0 set *flag to 1, 1 emulate the default action when
+   *flag is set, 2 store value in the u64 at flag, 3 _exit(value)
+   when *flag is set, 4 write the signal byte to a pipe fd.
+   Register returns 0 or errno. */
+/* Registers one action of a kind on a signal. */
+int32_t lust_sys_sig_register(int32_t sig, int32_t kind, void *flag, uint64_t value);
+/* Registers a pipe write end on a signal: 0 or errno. */
+int32_t lust_sys_sig_register_pipe(int32_t sig, int32_t write_fd);
+/* Removes every pipe action with this write end. */
+void lust_sys_sig_unregister_pipe(int32_t write_fd);
+/* pipe2 for a Signals instance: read end nonblocking, both
+   CLOEXEC; appends the write fd as one u64, returns the read fd
+   or -errno. */
+int32_t lust_sys_sig_pipe(lust_Vec *out);
+/* Waits for bytes on a Signals pipe, then drains what is there
+   into `out`: the byte count, or -errno. */
+int32_t lust_sys_sig_poll_read(int32_t fd, lust_Vec *out);
+/* One nonblocking read of a Signals pipe into `out`: the byte
+   count (0 when nothing waits), or -errno. */
+int32_t lust_sys_sig_read_now(int32_t fd, lust_Vec *out);
+/* raise(sig): 0 or errno. */
+int32_t lust_sys_sig_raise(int32_t sig);
+/* Restores SIG_DFL, unblocks, and raises; only returns (with an
+   errno) when the restore itself fails, else aborts. */
+int32_t lust_sys_sig_restore_raise(int32_t sig);
+/* _exit(status). */
+void lust_sys_sig_exit(int32_t status);
+/* abort(). */
+void lust_sys_sig_abort(void);
 /* pipe2(2) with the raw Linux flags: appends the two fds as 8-byte
    fields; 0 or errno. */
 int32_t lust_sys_x_pipe(int32_t flags, lust_Vec *out);

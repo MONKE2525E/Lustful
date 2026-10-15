@@ -94,9 +94,9 @@
   },
   {
    "name": "signal-hook",
-   "decision": "c-shim",
+   "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Signal registration and flags. Handlers cannot call lust closures directly."
+   "notes": "Adapter in library/deps over the sysx signal registry: consts, flag, iterator (Signals over a self-pipe), and low_level raise/exit/abort/emulate_default_handler. No handler chaining; see the adapter README."
   },
   {
    "name": "signal_hook",
@@ -118,9 +118,9 @@
   },
   {
    "name": "nix",
-   "decision": "c-shim",
+   "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Linux process and signal operations, fanotify, kqueue, prctl."
+   "notes": "Adapter in library/deps: only sys::prctl get/set_thp_disable and Errno over the sysx prctl shim. Everything else in nix is absent."
   },
   {
    "name": "miow",

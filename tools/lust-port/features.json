@@ -554,12 +554,6 @@
     "ext.type.libc::*"
    ],
    "keys": [
-    "ext.type.nix::*",
-    "ext.expr.nix::*",
-    "ext.use.nix::*",
-    "ext.type.signal_hook::*",
-    "ext.expr.signal_hook::*",
-    "ext.use.signal_hook::*",
     "ext.type.flate2::*",
     "ext.expr.flate2::*",
     "ext.use.flate2::*",
@@ -1206,6 +1200,46 @@
     "std.type.std::os::linux::net::SocketAddrExt*",
     "std.expr.std::os::linux::net::SocketAddrExt*",
     "std.use.std::os::linux::net::SocketAddrExt*"
+   ]
+  },
+  {
+   "id": "ext.nix",
+   "title": "Adapter crate nix 0.31.3: sys::prctl THP forms",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh nix (1 case matches the real crate). Only prctl get/set_thp_disable and Errno; the rest of nix is absent. Split from cinterop.system. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.nix::*"
+   ],
+   "keys": [
+    "ext.type.nix::*",
+    "ext.expr.nix::*",
+    "ext.use.nix::*"
+   ]
+  },
+  {
+   "id": "ext.signal_hook",
+   "title": "Adapter crate signal-hook 0.4.4: consts, flag, iterator, low_level subsets",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh signal-hook (3 cases match the real crate). Over the sysx signal registry; no handler chaining and no generic exfiltrators, as the adapter README lists. Split from cinterop.system. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.signal_hook::*"
+   ],
+   "keys": [
+    "ext.type.signal_hook::*",
+    "ext.expr.signal_hook::*",
+    "ext.use.signal_hook::*"
    ]
   },
   {

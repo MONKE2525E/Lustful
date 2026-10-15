@@ -48,6 +48,21 @@ int32_t lust_sys_x_prctl_deathsig(int32_t sig) {
     return prctl(PR_SET_PDEATHSIG, (unsigned long)sig, 0, 0, 0) == 0 ? 0 : errno;
 }
 
+#ifndef PR_GET_THP_DISABLE
+#define PR_GET_THP_DISABLE 41
+#endif
+#ifndef PR_SET_THP_DISABLE
+#define PR_SET_THP_DISABLE 42
+#endif
+
+int32_t lust_sys_x_prctl_thp(int32_t mode, int32_t val) {
+    if (mode == 1) {
+        return prctl(PR_SET_THP_DISABLE, val != 0, 0, 0, 0) == 0 ? 0 : -errno;
+    }
+    int r = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+    return r < 0 ? -errno : r;
+}
+
 int32_t lust_sys_x_getrlimit(int32_t resource, lust_Vec *out) {
     struct rlimit rl;
     if (getrlimit((int)resource, &rl) != 0) return errno;
@@ -269,4 +284,227 @@ int32_t lust_sys_x_winsize(int32_t fd, lust_Vec *out) {
     }
     lust_sysx_push(out, b, 8);
     return 0;
+}
+
+/* ---- Signal registry (signal-hook adapter) ---- */
+
+#define LUST_SIG_MAX 64
+#define LUST_SIG_ACTIONS 24
+
+struct lust_sig_action {
+    int32_t kind;
+    volatile uint8_t *flag;
+    uint64_t value;
+    int32_t pipe_fd;
+};
+
+static struct lust_sig_action lust_sig_actions[LUST_SIG_MAX + 1][LUST_SIG_ACTIONS];
+static volatile sig_atomic_t lust_sig_counts[LUST_SIG_MAX + 1];
+static int lust_sig_installed[LUST_SIG_MAX + 1];
+
+/* The Term case of emulate_default_handler, shared with the
+   conditional-default action. Async-signal-safe calls only. */
+static void lust_sig_emulate_term(int sig) {
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, NULL);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, sig);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    raise(sig);
+    abort();
+}
+
+/* The default-action kind of a signal, upstream's table:
+   0 ignore, 1 stop, 2 terminate, -1 unknown. */
+static int lust_sig_default_kind(int sig) {
+    switch (sig) {
+        case SIGCHLD:
+        case SIGCONT:
+        case SIGURG:
+        case SIGWINCH:
+        case SIGIO:
+            return 0;
+        case SIGSTOP:
+        case SIGTSTP:
+        case SIGTTIN:
+        case SIGTTOU:
+            return 1;
+        case SIGHUP:
+        case SIGINT:
+        case SIGQUIT:
+        case SIGILL:
+        case SIGTRAP:
+        case SIGABRT:
+        case SIGBUS:
+        case SIGFPE:
+        case SIGKILL:
+        case SIGUSR1:
+        case SIGSEGV:
+        case SIGUSR2:
+        case SIGPIPE:
+        case SIGALRM:
+        case SIGTERM:
+        case SIGPROF:
+        case SIGSYS:
+        case SIGVTALRM:
+        case SIGXCPU:
+        case SIGXFSZ:
+            return 2;
+        default:
+            return -1;
+    }
+}
+
+static void lust_sig_handler(int sig) {
+    int saved = errno;
+    if (sig >= 1 && sig <= LUST_SIG_MAX) {
+        int n = (int)lust_sig_counts[sig];
+        for (int i = 0; i < n; i++) {
+            struct lust_sig_action *a = &lust_sig_actions[sig][i];
+            switch (a->kind) {
+                case 0:
+                    *a->flag = 1;
+                    break;
+                case 1:
+                    if (*a->flag) {
+                        int kind = lust_sig_default_kind(sig);
+                        if (kind == 2) lust_sig_emulate_term(sig);
+                        else if (kind == 1) raise(SIGSTOP);
+                    }
+                    break;
+                case 2:
+                    *(volatile uint64_t *)a->flag = a->value;
+                    break;
+                case 3:
+                    if (*a->flag) _exit((int)a->value);
+                    break;
+                case 4: {
+                    uint8_t b = (uint8_t)sig;
+                    ssize_t unused = write(a->pipe_fd, &b, 1);
+                    (void)unused;
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+    errno = saved;
+}
+
+/* Installs the shared handler for one signal, once. */
+static int lust_sig_install(int sig) {
+    if (lust_sig_installed[sig]) return 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = lust_sig_handler;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(sig, &sa, NULL) != 0) return errno;
+    lust_sig_installed[sig] = 1;
+    return 0;
+}
+
+int32_t lust_sys_sig_register(int32_t sig, int32_t kind, void *flag, uint64_t value) {
+    if (sig < 1 || sig > LUST_SIG_MAX) return EINVAL;
+    int n = (int)lust_sig_counts[sig];
+    if (n >= LUST_SIG_ACTIONS) return ENOMEM;
+    int e = lust_sig_install(sig);
+    if (e) return e;
+    lust_sig_actions[sig][n].kind = kind;
+    lust_sig_actions[sig][n].flag = (volatile uint8_t *)flag;
+    lust_sig_actions[sig][n].value = value;
+    lust_sig_actions[sig][n].pipe_fd = -1;
+    lust_sig_counts[sig] = n + 1;
+    return 0;
+}
+
+int32_t lust_sys_sig_register_pipe(int32_t sig, int32_t write_fd) {
+    if (sig < 1 || sig > LUST_SIG_MAX) return EINVAL;
+    int n = (int)lust_sig_counts[sig];
+    if (n >= LUST_SIG_ACTIONS) return ENOMEM;
+    int e = lust_sig_install(sig);
+    if (e) return e;
+    lust_sig_actions[sig][n].kind = 4;
+    lust_sig_actions[sig][n].flag = NULL;
+    lust_sig_actions[sig][n].value = 0;
+    lust_sig_actions[sig][n].pipe_fd = write_fd;
+    lust_sig_counts[sig] = n + 1;
+    return 0;
+}
+
+void lust_sys_sig_unregister_pipe(int32_t write_fd) {
+    for (int sig = 1; sig <= LUST_SIG_MAX; sig++) {
+        int n = (int)lust_sig_counts[sig];
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (lust_sig_actions[sig][i].kind == 4 && lust_sig_actions[sig][i].pipe_fd == write_fd) continue;
+            lust_sig_actions[sig][w] = lust_sig_actions[sig][i];
+            w++;
+        }
+        lust_sig_counts[sig] = w;
+    }
+}
+
+int32_t lust_sys_sig_pipe(lust_Vec *out) {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) return -errno;
+    lust_sysx_u64(out, (uint64_t)(uint32_t)fds[1]);
+    return fds[0];
+}
+
+int32_t lust_sys_sig_poll_read(int32_t fd, lust_Vec *out) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int r;
+    do {
+        r = poll(&pfd, 1, -1);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) return -errno;
+    uint8_t buf[128];
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n < 0) return errno == EAGAIN ? 0 : -errno;
+    lust_sysx_push(out, buf, (uint64_t)n);
+    return (int32_t)n;
+}
+
+int32_t lust_sys_sig_read_now(int32_t fd, lust_Vec *out) {
+    uint8_t buf[128];
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n < 0) return errno == EAGAIN ? 0 : -errno;
+    lust_sysx_push(out, buf, (uint64_t)n);
+    return (int32_t)n;
+}
+
+int32_t lust_sys_sig_raise(int32_t sig) {
+    return raise(sig) == 0 ? 0 : errno;
+}
+
+int32_t lust_sys_sig_restore_raise(int32_t sig) {
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    if (sigaction(sig, &dfl, NULL) != 0) return errno;
+    lust_sig_installed[sig] = 0;
+    lust_sig_counts[sig] = 0;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, sig);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    raise(sig);
+    abort();
+    return 0;
+}
+
+void lust_sys_sig_exit(int32_t status) {
+    _exit(status);
+}
+
+void lust_sys_sig_abort(void) {
+    abort();
 }
