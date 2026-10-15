@@ -3,7 +3,7 @@
 //
 // Wire format. Request: a header line with no user data in it,
 //   cmd json timings debug max_errors test default_features all_features
-//   panic_abort overflow_checks debug_assertions feature_count env_count
+//   panic_abort overflow_checks debug_assertions feature_count env_count offline locked
 // followed by length-prefixed fields, each as "<byte len>\n<bytes>": file, out,
 // emit_c, then the crate selector (package id, manifest path, target kind,
 // target name, crate root, target triple), then one field per feature,
@@ -75,6 +75,25 @@ pub struct SessionKey {
     pub all_features: bool,
     pub target_triple: String,
     pub profile: ProfileFlags,
+    pub cargo_net: CargoNet,
+}
+
+/// How the Cargo runs lust starts may use the network: `--offline` and
+/// `--locked` (`--frozen` is both), as Cargo takes them. The client fills it
+/// from its own flags and `CARGO_NET_OFFLINE`, so a daemon started from
+/// another environment still runs Cargo the way the caller asked. Cargo
+/// reads `net.offline` from its config files itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CargoNet {
+    pub offline: bool,
+    pub locked: bool,
+}
+
+impl CargoNet {
+    /// The Cargo flags for this mode.
+    pub fn args(self) -> impl Iterator<Item = &'static str> {
+        [(self.offline, "--offline"), (self.locked, "--locked")].into_iter().filter_map(|(on, flag)| on.then_some(flag))
+    }
 }
 
 impl SessionKey {
@@ -100,6 +119,7 @@ impl SessionKey {
             all_features: false,
             target_triple: String::new(),
             profile: ProfileFlags::DEV,
+            cargo_net: CargoNet::default(),
         }
     }
 
@@ -109,7 +129,7 @@ impl SessionKey {
         let b = |x: bool| if x { "1" } else { "0" };
         let manifest = self.krate.manifest_path.as_ref().map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
         format!(
-            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={}",
+            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} offline={} locked={}",
             self.krate.package_id,
             manifest,
             self.krate.target_kind,
@@ -123,6 +143,8 @@ impl SessionKey {
             b(self.profile.panic_abort),
             b(self.profile.overflow_checks),
             b(self.profile.debug_assertions),
+            b(self.cargo_net.offline),
+            b(self.cargo_net.locked),
         )
     }
 }
@@ -291,6 +313,7 @@ pub enum Invocation {
         out: Option<PathBuf>,
         profile: Option<String>,
         debug: bool,
+        net: CargoNet,
     },
     /// `lust check --rustc`: run the real rustc as an oracle. Never sent to the daemon.
     RustcCheck {
@@ -298,7 +321,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort]\n       lust build <file.rs> --release | --profile <name> [-o out]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Default)]
@@ -333,7 +356,7 @@ impl CrateFlags {
 /// package identity comes from the manifest text (`find_manifest` below)
 /// until W-RESOLVE reads real package ids from Cargo metadata. The file is
 /// still the crate root: `lust check file.rs` keeps its meaning.
-fn session_key_for(file: &Path, flags: CrateFlags) -> SessionKey {
+fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey {
     let mut key = SessionKey::synthetic(file, false);
     let mut features = flags.features;
     sort_features(&mut features);
@@ -344,6 +367,8 @@ fn session_key_for(file: &Path, flags: CrateFlags) -> SessionKey {
     if flags.manifest_path.is_none() && flags.package.is_none() && flags.bin.is_none() && !flags.lib {
         return key;
     }
+    // Only a crate session runs Cargo, so only it carries the network mode.
+    key.cargo_net = net;
     // An explicit manifest path wins; else the nearest Cargo.toml above the file.
     let manifest = match &flags.manifest_path {
         Some(p) => std::fs::read_to_string(p).ok().map(|text| {
@@ -387,6 +412,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let (mut release, mut profile, mut rustc) = (false, None, false);
     let mut max_errors = 20usize;
     let mut crate_flags = CrateFlags::default();
+    let mut net = CargoNet { offline: std::env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true"), locked: false };
     // `-C panic=unwind|abort`, as rustc takes it. None keeps the default.
     let mut panic_abort: Option<bool> = None;
     // Splits one `--features` value (comma- or space-separated, as Cargo takes).
@@ -421,6 +447,9 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             _ if a.starts_with("--features=") => push_features(&mut crate_flags.features, &a["--features=".len()..])?,
             "--no-default-features" => crate_flags.no_default_features = true,
             "--all-features" => crate_flags.all_features = true,
+            "--offline" => net.offline = true,
+            "--locked" => net.locked = true,
+            "--frozen" => net = CargoNet { offline: true, locked: true },
             "-C" => match it.next()?.as_str() {
                 "panic=unwind" => panic_abort = Some(false),
                 "panic=abort" => panic_abort = Some(true),
@@ -456,7 +485,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         if release && profile.is_none() {
             profile = Some("release".into());
         }
-        return Some(Invocation::Release { file: abs(&file), out: out.map(|p| abs(&p)), profile, debug });
+        return Some(Invocation::Release { file: abs(&file), out: out.map(|p| abs(&p)), profile, debug, net });
     }
     let out = out.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
     let run = cmd == "run";
@@ -465,7 +494,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     if let Some(p) = crate_flags.manifest_path.take() {
         crate_flags.manifest_path = Some(abs(&p));
     }
-    let mut session = session_key_for(&file, crate_flags);
+    let mut session = session_key_for(&file, crate_flags, net);
     if let Some(abort) = panic_abort {
         session.profile.panic_abort = abort;
     }
@@ -523,7 +552,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
     let s = &r.session;
     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -534,7 +563,9 @@ pub fn encode(r: &Request) -> Vec<u8> {
         b(s.profile.panic_abort),
         b(s.profile.overflow_checks),
         b(s.profile.debug_assertions),
-        s.features.len()
+        s.features.len(),
+        b(s.cargo_net.offline),
+        b(s.cargo_net.locked)
     )
     .into_bytes();
     let path_field = |out: &mut Vec<u8>, p: Option<&Path>| put_field(out, p.map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()));
@@ -565,7 +596,7 @@ pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
         return None;
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 13 {
+    if f.len() != 15 {
         return None;
     }
     #[allow(unused_imports)]
@@ -623,6 +654,7 @@ pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
             all_features: f[7] == "1",
             target_triple,
             profile: ProfileFlags { panic_abort: f[8] == "1", overflow_checks: f[9] == "1", debug_assertions: f[10] == "1" },
+            cargo_net: CargoNet { offline: f[13] == "1", locked: f[14] == "1" },
         },
         file,
         out,
@@ -838,7 +870,7 @@ fn cargo_target_dir(manifest: &Path) -> Option<PathBuf> {
 /// `lust build --release` / `--profile <name>`. With a Cargo.toml above the file, Cargo
 /// builds it with the file's package and bin selection. Without one, rustc builds the
 /// single file with the release oracle flags from DESIGN.md. Never returns.
-pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug: bool) -> ! {
+pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug: bool, net: CargoNet) -> ! {
     let profile = profile.unwrap_or("release");
     let dev = profile == "dev";
     if let Some(m) = find_manifest(file) {
@@ -855,6 +887,7 @@ pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug
         if let Some(bin) = &bin {
             args.extend(["--bin".into(), bin.into()]);
         }
+        args.extend(net.args().map(Into::into));
         eprintln!("lust: release build via cargo: cargo {}", args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
         let status = run_streamed("cargo", std::process::Command::new("cargo").args(&args));
         if !status.success() {
@@ -1100,7 +1133,9 @@ mod tests {
             "widget",
             "--bin",
             "wbin",
+            "--frozen",
         ]);
+        assert_eq!(req.session.cargo_net, CargoNet { offline: true, locked: true });
         req.session.krate.test = true;
         let bytes = encode(&req);
         let back = read_request(&mut std::io::Cursor::new(bytes)).unwrap();

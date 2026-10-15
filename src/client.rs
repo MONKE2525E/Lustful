@@ -133,7 +133,9 @@ fn main() {
     let core = std::env::current_exe().map(|p| p.with_file_name("lust-core")).unwrap_or_else(|_| "lust-core".into());
     match protocol::parse_args(&args) {
         // Release builds and the rustc oracle run right here, streaming output.
-        Some(Invocation::Release { file, out, profile, debug }) => protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug),
+        Some(Invocation::Release { file, out, profile, debug, net }) => {
+            protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net)
+        }
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args: run_args }) => {
             let sock = protocol::socket_path();

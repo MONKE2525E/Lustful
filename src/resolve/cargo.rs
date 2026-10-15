@@ -292,6 +292,7 @@ pub struct GraphRequest {
     pub default_features: bool,
     pub all_features: bool,
     pub target_triple: String,
+    pub cargo_net: crate::protocol::CargoNet,
 }
 
 fn hash_bytes(h: &mut FxHasher, path: &Path) {
@@ -337,6 +338,7 @@ pub fn graph_key(req: &GraphRequest) -> u64 {
     req.default_features.hash(&mut h);
     req.all_features.hash(&mut h);
     req.target_triple.hash(&mut h);
+    req.cargo_net.hash(&mut h);
     h.finish()
 }
 
@@ -379,6 +381,7 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     if !filter.is_empty() {
         cmd.args(["--filter-platform", filter]);
     }
+    cmd.args(req.cargo_net.args());
     let out = cmd.output().map_err(|e| format!("cannot run `cargo metadata`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -531,6 +534,7 @@ fn unit_features_via_check(req: &GraphRequest) -> Option<std::collections::HashM
     if !req.target_triple.is_empty() {
         cmd.args(["--target", &req.target_triple]);
     }
+    cmd.args(req.cargo_net.args());
     let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut map = std::collections::HashMap::new();
@@ -816,6 +820,7 @@ mod tests {
             default_features: true,
             all_features: false,
             target_triple: String::new(),
+            cargo_net: Default::default(),
         };
         let graph = load_graph(&req).expect("cargo metadata on the hello fixture");
         let interner = crate::intern::Interner::default();

@@ -1615,6 +1615,7 @@ fn resolved_setup(
             default_features: key.default_features,
             all_features: key.all_features,
             target_triple: key.target_triple.clone(),
+            cargo_net: key.cargo_net,
         };
         let graph = cargo::load_graph(&greq).map_err(code2)?;
         t.lap("cargo graph");

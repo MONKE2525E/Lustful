@@ -116,7 +116,9 @@ fn main() {
     match protocol::parse_args(&args) {
         Some(Invocation::Daemon) => daemon::serve(&protocol::socket_path()),
         // The `lust` client handles these itself; direct `lust-core` calls work too.
-        Some(Invocation::Release { file, out, profile, debug }) => protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug),
+        Some(Invocation::Release { file, out, profile, debug, net }) => {
+            protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net)
+        }
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args }) => {
             // Whole-request disk cache (cold runs only; the daemon path keeps its own
