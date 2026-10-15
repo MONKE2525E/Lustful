@@ -1,6 +1,6 @@
 pub mod core { pub fn record_unported ( name : & str ) { println ! ( "recorded:{0}" , name ) ; } }
-pub mod gostd { pub mod debug { pub fn assert_failed ( msg : Option < std :: fmt :: Arguments < '_
->> ) -> ! { match msg { Some ( m ) => { :: core :: panicking :: panic_fmt ( format_args ! (
+pub mod gostd { pub mod debug { pub fn assert_failed ( msg : Option < std :: fmt :: Arguments < '_ >
+> ) -> ! { match msg { Some ( m ) => { :: core :: panicking :: panic_fmt ( format_args ! (
 "assertion failed: {0}" , m ) ) ; } None => { :: core :: panicking :: panic_fmt ( format_args ! (
 "assertion failed" ) ) ; } } } } } fn panic_text ( f : impl FnOnce ( ) + std :: panic :: UnwindSafe
 ) -> String { std :: panic :: set_hook ( Box :: new ( | _ | { } ) ) ; match std :: panic ::

@@ -1,18 +1,18 @@
-pub enum LinkSlot { Arena ( usize ) , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl
+pub enum LinkSlot { Arena ( usize ) } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl
 :: core :: clone :: TrivialClone for LinkSlot { } # [ automatically_derived ] impl :: core :: clone
 :: Clone for LinkSlot { # [ inline ] fn clone ( & self ) -> LinkSlot { let _ : :: core :: clone ::
 AssertParamIsClone < usize > ; * self } } # [ automatically_derived ] impl :: core :: marker :: Copy
 for LinkSlot { } # [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for
 LinkSlot { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq for LinkSlot { # [ inline
 ] fn eq ( & self , other : & LinkSlot ) -> bool { match ( self , other ) { ( LinkSlot :: Arena (
-__self_0 ) , LinkSlot :: Arena ( __arg1_0 ) ) => __self_0 == __arg1_0 , } } } # [
+__self_0 ) , LinkSlot :: Arena ( __arg1_0 ) ) => __self_0 == __arg1_0 } } } # [
 automatically_derived ] impl :: core :: fmt :: Debug for LinkSlot { # [ inline ] fn fmt ( & self , f
 : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { match self { LinkSlot :: Arena (
 __self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "Arena" , & __self_0 )
-, } } } pub trait LinkKey { fn link_slot ( self ) -> LinkSlot ; } pub struct NodeId ( pub u32 ) ; #
-[ automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for
-NodeId { } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeId { # [ inline ] fn
-clone ( & self ) -> NodeId { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [
+} } } pub trait LinkKey { fn link_slot ( self ) -> LinkSlot ; } pub struct NodeId ( pub u32 ) ; # [
+automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for NodeId
+{ } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeId { # [ inline ] fn clone (
+& self ) -> NodeId { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [
 automatically_derived ] impl :: core :: marker :: Copy for NodeId { } # [ automatically_derived ]
 impl :: core :: default :: Default for NodeId { # [ inline ] fn default ( ) -> NodeId { NodeId ( ::
 core :: default :: Default :: default ( ) ) } } # [ automatically_derived ] impl :: core :: cmp ::
@@ -67,6 +67,5 @@ inline ] fn link_slot ( self ) -> LinkSlot { LinkSlot :: Arena ( self . index ( 
 some . get ( ) ) ; println ! ( "slot={0:?} ord={1}" , some . link_slot ( ) , NodeId ( 3 ) < NodeId (
 7 ) ) ; let words : Vec < String > = vec ! [ :: std :: string :: ToString :: to_string ( & "alpha" )
 , :: std :: string :: ToString :: to_string ( & 42 ) , :: std :: string :: ToString :: to_string ( &
-true ) ] ; println ! ( "args={1:?} empty={0:?}" , :: alloc :: vec :: Vec :: new ( ) as Vec < String
-> , words ) ; println ! ( "path={0:?}" , vec ! [ :: std :: string :: ToString :: to_string ( & "x" )
-] ) ; }
+true ) ] ; println ! ( "args={1:?} empty={0:?}" , vec ! [ ] as Vec < String > , words ) ; println !
+( "path={0:?}" , vec ! [ :: std :: string :: ToString :: to_string ( & "x" ) ] ) ; }

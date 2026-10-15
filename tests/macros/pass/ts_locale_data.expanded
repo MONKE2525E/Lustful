@@ -1,4 +1,4 @@
-use std :: sync :: OnceLock ; pub struct LocaleMessages { pub text : String , } pub fn
+use std :: sync :: OnceLock ; pub struct LocaleMessages { pub text : String } pub fn
 load_locale_data ( data : & [ u8 ] ) -> LocaleMessages { LocaleMessages { text : String ::
 from_utf8_lossy ( data ) . trim ( ) . to_string ( ) } } static EN_DATA : & [ u8 ] =
 b"hello locale\n" ; fn en ( ) -> & 'static LocaleMessages { static MESSAGES : OnceLock <

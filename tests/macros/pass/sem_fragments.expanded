@@ -1,7 +1,7 @@
 pub fn made_fn ( ) -> i32 { 3 } pub const MADE_CONST : i32 = 4 ; pub fn vis_made ( ) -> i32 { 5 } fn
 twice ( x : i32 ) -> i32 { x * 2 } fn main ( ) { let v = match Some ( 7 ) { Some ( n ) => { n * 10 }
-_ => 0 , } ; println ! ( "pat/block={0}" , v ) ; let s = { let doubled = 21 * 2 ; doubled } ;
-println ! ( "stmt={0}" , s ) ; println ! ( "item={0} {1} vis={2}" , made_fn ( ) , MADE_CONST ,
-vis_made ( ) ) ; println ! ( "path={0}" , twice ( 21 ) ) ; println ! ( "lifetime label={0}" , { let
-out = 9 ; 'a : loop { break 'a ; } out } ) ; println ! ( "nested={0:?}" , vec ! [ vec ! [ 1 , 2 ] ,
-vec ! [ 3 ] ] ) ; println ! ( "plus rep={0}" , 0 + 1 + 2 + 3 ) ; }
+_ => 0 } ; println ! ( "pat/block={0}" , v ) ; let s = { let doubled = 21 * 2 ; doubled } ; println
+! ( "stmt={0}" , s ) ; println ! ( "item={0} {1} vis={2}" , made_fn ( ) , MADE_CONST , vis_made ( )
+) ; println ! ( "path={0}" , twice ( 21 ) ) ; println ! ( "lifetime label={0}" , { let out = 9 ; 'a
+: loop { break 'a ; } out } ) ; println ! ( "nested={0:?}" , vec ! [ vec ! [ 1 , 2 ] , vec ! [ 3 ] ]
+) ; println ! ( "plus rep={0}" , 0 + 1 + 2 + 3 ) ; }

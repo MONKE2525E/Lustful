@@ -33,6 +33,12 @@ user macro expansion, not pretty-printing:
 - rustc's `option_env!` value paths (`::core::option::Option::Some`,
   `::core::option::Option::None::<&'static str>`) map to the prelude
   forms lust prints.
+- rustc's empty `vec![]` expansion (`::alloc::vec::Vec::new()`)
+  maps back to `vec![]`, a `>>` closing two generic lists splits
+  into two `>` (lust prints the closes separately; a shift splits
+  the same way on both sides), and a comma right before `}` is
+  dropped (rustc's printer writes struct field lists with a
+  trailing comma, lust keeps the source's form).
 
 Derive expansions are not canonicalized: rustc prints generated
 impls and lust has no token form for them yet, so a fixture whose
@@ -556,15 +562,50 @@ def map_option_env(toks):
     return out
 
 
+VEC_NEW = ["::", "alloc", "::", "vec", "::", "Vec", "::", "new", "(", ")"]
+
+
+def map_vec_new(toks):
+    """rustc's empty `vec![]` expansion back to `vec ! [ ]`."""
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i:i + len(VEC_NEW)] == VEC_NEW:
+            out += ["vec", "!", "[", "]"]
+            i += len(VEC_NEW)
+            continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
+def split_gg(toks):
+    """A `>>` token as two `>` closes (see the header)."""
+    out = []
+    for t in toks:
+        if t == ">>":
+            out += [">", ">"]
+        else:
+            out.append(t)
+    return out
+
+
+def drop_brace_commas(toks):
+    """Drop a comma right before `}` (see the header)."""
+    return [t for i, t in enumerate(toks) if not (t == "," and toks[i + 1:i + 2] == ["}"])]
+
+
 def canonicalize(toks):
     toks = strip_prelude(toks)
     toks = drop_macro_rules(toks)
     toks = map_alloc_format(toks)
     toks = map_alloc_vec(toks)
+    toks = map_vec_new(toks)
     toks = map_print(toks)
     toks = positionalize_calls(toks)
     toks = unwrap_parens(toks)
     toks = drop_arm_commas(toks)
+    toks = drop_brace_commas(toks)
+    toks = split_gg(toks)
     toks = map_option_env(toks)
     return [canon_literal(t) for t in toks]
 

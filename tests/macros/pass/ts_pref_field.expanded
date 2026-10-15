@@ -1,28 +1,28 @@
-pub enum FieldValue { Int ( i32 ) , String ( String ) , } # [ automatically_derived ] impl :: core
-:: fmt :: Debug for FieldValue { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { match self { FieldValue :: Int ( __self_0 ) => :: core ::
-fmt :: Formatter :: debug_tuple_field1_finish ( f , "Int" , & __self_0 ) , FieldValue :: String (
-__self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "String" , & __self_0 )
-, } } } impl FieldValue { pub fn type_ ( & self ) -> & 'static str { match self { FieldValue :: Int
-( _ ) => "int" , FieldValue :: String ( _ ) => "string" , } } } pub struct Editor { pub tab_size :
-i32 , pub new_line : String , } # [ automatically_derived ] impl :: core :: default :: Default for
-Editor { # [ inline ] fn default ( ) -> Editor { Editor { tab_size : :: core :: default :: Default
-:: default ( ) , new_line : :: core :: default :: Default :: default ( ) , } } } pub struct Prefs {
-pub editor : Editor , } # [ automatically_derived ] impl :: core :: default :: Default for Prefs { #
-[ inline ] fn default ( ) -> Prefs { Prefs { editor : :: core :: default :: Default :: default ( ) }
-} } pub struct StructField { pub name : & 'static str , pub raw_tag : & 'static str , pub config_tag
-: & 'static str , pub fallback_config_tag : & 'static str , pub get : fn ( & Prefs ) -> FieldValue ,
-pub set : fn ( & mut Prefs , FieldValue ) , } static FIELDS : & [ StructField ] = & [ StructField {
-name : "TabSize" , raw_tag : "tabSize" , config_tag : "format.tabSize" , fallback_config_tag : "" ,
-get : | p | FieldValue :: Int ( p . editor . tab_size . clone ( ) ) , set : | p , v | match v {
-FieldValue :: Int ( x ) => p . editor . tab_size = x , other => { :: core :: panicking :: panic_fmt
-( format_args ! ( "reflect.Set: value of type {0:?} is not assignable to type {1}" , other . type_ (
-) , "Int" ) ) ; } } , } , StructField { name : "NewLine" , raw_tag : "newLine" , config_tag :
+pub enum FieldValue { Int ( i32 ) , String ( String ) } # [ automatically_derived ] impl :: core ::
+fmt :: Debug for FieldValue { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
+-> :: core :: fmt :: Result { match self { FieldValue :: Int ( __self_0 ) => :: core :: fmt ::
+Formatter :: debug_tuple_field1_finish ( f , "Int" , & __self_0 ) , FieldValue :: String ( __self_0
+) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "String" , & __self_0 ) } } }
+impl FieldValue { pub fn type_ ( & self ) -> & 'static str { match self { FieldValue :: Int ( _ ) =>
+"int" , FieldValue :: String ( _ ) => "string" } } } pub struct Editor { pub tab_size : i32 , pub
+new_line : String } # [ automatically_derived ] impl :: core :: default :: Default for Editor { # [
+inline ] fn default ( ) -> Editor { Editor { tab_size : :: core :: default :: Default :: default ( )
+, new_line : :: core :: default :: Default :: default ( ) } } } pub struct Prefs { pub editor :
+Editor } # [ automatically_derived ] impl :: core :: default :: Default for Prefs { # [ inline ] fn
+default ( ) -> Prefs { Prefs { editor : :: core :: default :: Default :: default ( ) } } } pub
+struct StructField { pub name : & 'static str , pub raw_tag : & 'static str , pub config_tag : &
+'static str , pub fallback_config_tag : & 'static str , pub get : fn ( & Prefs ) -> FieldValue , pub
+set : fn ( & mut Prefs , FieldValue ) } static FIELDS : & [ StructField ] = & [ StructField { name :
+"TabSize" , raw_tag : "tabSize" , config_tag : "format.tabSize" , fallback_config_tag : "" , get : |
+p | FieldValue :: Int ( p . editor . tab_size . clone ( ) ) , set : | p , v | match v { FieldValue
+:: Int ( x ) => p . editor . tab_size = x , other => { :: core :: panicking :: panic_fmt (
+format_args ! ( "reflect.Set: value of type {0:?} is not assignable to type {1}" , other . type_ ( )
+, "Int" ) ) ; } } } , StructField { name : "NewLine" , raw_tag : "newLine" , config_tag :
 "format.newLine" , fallback_config_tag : "old.newLine" , get : | p | FieldValue :: String ( p .
 editor . new_line . clone ( ) ) , set : | p , v | match v { FieldValue :: String ( x ) => p . editor
 . new_line = x , other => { :: core :: panicking :: panic_fmt ( format_args ! (
 "reflect.Set: value of type {0:?} is not assignable to type {1}" , other . type_ ( ) , "String" ) )
-; } } , } ] ; fn main ( ) { let mut p = Prefs { editor : Editor { tab_size : 4 , new_line : "\n" .
+; } } } ] ; fn main ( ) { let mut p = Prefs { editor : Editor { tab_size : 4 , new_line : "\n" .
 into ( ) } } ; for f in FIELDS { println ! ( "{0} {1} {2:?} fb='{3}'" , f . name , f . config_tag ,
 ( f . get ) ( & p ) , f . fallback_config_tag ) ; } ( FIELDS [ 0 ] . set ) ( & mut p , FieldValue ::
 Int ( 8 ) ) ; println ! ( "tab_size={0}" , p . editor . tab_size ) ; }

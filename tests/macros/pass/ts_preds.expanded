@@ -1,6 +1,6 @@
-use std :: sync :: Arc ; pub struct Ctx { pub value : i32 , } pub type ContextPredicate = Arc < dyn
-Fn ( & mut Ctx ) -> bool + Send + Sync > ; fn is_positive ( ctx : & mut Ctx ) -> bool { ctx . value
-> 0 } fn is_even ( ctx : & mut Ctx ) -> bool { ctx . value % 2 == 0 } fn at_least ( min : i32 ) ->
+use std :: sync :: Arc ; pub struct Ctx { pub value : i32 } pub type ContextPredicate = Arc < dyn Fn
+( & mut Ctx ) -> bool + Send + Sync > ; fn is_positive ( ctx : & mut Ctx ) -> bool { ctx . value > 0
+} fn is_even ( ctx : & mut Ctx ) -> bool { ctx . value % 2 == 0 } fn at_least ( min : i32 ) ->
 ContextPredicate { Arc :: new ( move | ctx : & mut Ctx | ctx . value >= min ) } fn main ( ) { let ps
 : Vec < ContextPredicate > = vec ! [ Arc :: new ( is_positive ) as ContextPredicate , at_least ( 3 )
 , Arc :: new ( is_even ) as ContextPredicate ] ; let mut ctx = Ctx { value : 4 } ; let r : Vec <

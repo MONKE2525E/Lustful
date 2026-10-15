@@ -1,34 +1,34 @@
-pub mod astdata { pub struct PairData { pub left : u32 , pub right : u32 , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for PairData { # [ inline ] fn fmt ( & self , f
-: & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+pub mod astdata { pub struct PairData { pub left : u32 , pub right : u32 } # [ automatically_derived
+] impl :: core :: fmt :: Debug for PairData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
+fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field2_finish ( f , "PairData" , "left" , & self . left , "right" , && self . right ) }
 } # [ automatically_derived ] impl :: core :: default :: Default for PairData { # [ inline ] fn
 default ( ) -> PairData { PairData { left : :: core :: default :: Default :: default ( ) , right :
-:: core :: default :: Default :: default ( ) , } } } pub struct NameData { pub text : String , pub
-flags : u32 , } # [ automatically_derived ] impl :: core :: fmt :: Debug for NameData { # [ inline ]
+:: core :: default :: Default :: default ( ) } } } pub struct NameData { pub text : String , pub
+flags : u32 } # [ automatically_derived ] impl :: core :: fmt :: Debug for NameData { # [ inline ]
 fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
 fmt :: Formatter :: debug_struct_field2_finish ( f , "NameData" , "text" , & self . text , "flags" ,
 && self . flags ) } } # [ automatically_derived ] impl :: core :: default :: Default for NameData {
 # [ inline ] fn default ( ) -> NameData { NameData { text : :: core :: default :: Default :: default
-( ) , flags : :: core :: default :: Default :: default ( ) , } } } } pub enum NodeData { Pair ( Box
-< astdata :: PairData > ) , Named ( Box < astdata :: NameData > ) , } # [ automatically_derived ]
-impl :: core :: fmt :: Debug for NodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt
-:: Formatter ) -> :: core :: fmt :: Result { match self { NodeData :: Pair ( __self_0 ) => :: core
-:: fmt :: Formatter :: debug_tuple_field1_finish ( f , "Pair" , & __self_0 ) , NodeData :: Named (
+( ) , flags : :: core :: default :: Default :: default ( ) } } } } pub enum NodeData { Pair ( Box <
+astdata :: PairData > ) , Named ( Box < astdata :: NameData > ) } # [ automatically_derived ] impl
+:: core :: fmt :: Debug for NodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { match self { NodeData :: Pair ( __self_0 ) => :: core ::
+fmt :: Formatter :: debug_tuple_field1_finish ( f , "Pair" , & __self_0 ) , NodeData :: Named (
 __self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f , "Named" , & __self_0 )
-, } } } pub struct Decoder < 'a > { pub nums : & 'a [ u32 ] , pub pos : usize , } impl Decoder < '_
-> { pub fn num ( & mut self ) -> Option < u32 > { let v = * self . nums . get ( self . pos ) ? ;
-self . pos += 1 ; Some ( v ) } pub fn string ( & mut self ) -> Option < String > { Some ( format ! (
-"s{0}" , self . num ( ) ? ) ) } } pub struct Encoder { pub out : Vec < u32 > , } impl Encoder { pub
-fn u8 ( & mut self , v : u8 ) { self . out . push ( u32 :: from ( v ) ) ; } pub fn num ( & mut self
-, v : & u32 ) -> Result < ( ) , String > { self . out . push ( * v ) ; Ok ( ) } pub fn string ( &
-mut self , v : & String ) -> Result < ( ) , String > { self . out . push ( v . len ( ) as u32 ) ; Ok
-( ) } } fn decode_payload ( dec : & mut Decoder < '_ > , variant_tag : u8 ) -> Option < NodeData > {
-Some ( match variant_tag { 0 => NodeData :: Pair ( Box :: new ( crate :: astdata :: PairData { left
-: dec . num ( ) ? , right : dec . num ( ) ? , } ) ) , 1 => NodeData :: Named ( Box :: new ( crate ::
-astdata :: NameData { text : dec . string ( ) ? , flags : dec . num ( ) ? , } ) ) , _ => return None
-, } ) } fn main ( ) { let mut dec = Decoder { nums : & [ 3 , 4 ] , pos : 0 } ; println ! (
-"pair={0:?}" , decode_payload ( & mut dec , 0 ) ) ; let mut dec = Decoder { nums : & [ 9 , 1 ] , pos
-: 0 } ; println ! ( "named={0:?}" , decode_payload ( & mut dec , 1 ) ) ; let mut dec = Decoder {
-nums : & [ ] , pos : 0 } ; println ! ( "bad={0:?}" , decode_payload ( & mut dec , 7 ) . map ( | _ |
-"some" ) ) ; }
+} } } pub struct Decoder < 'a > { pub nums : & 'a [ u32 ] , pub pos : usize } impl Decoder < '_ > {
+pub fn num ( & mut self ) -> Option < u32 > { let v = * self . nums . get ( self . pos ) ? ; self .
+pos += 1 ; Some ( v ) } pub fn string ( & mut self ) -> Option < String > { Some ( format ! ( "s{0}"
+, self . num ( ) ? ) ) } } pub struct Encoder { pub out : Vec < u32 > } impl Encoder { pub fn u8 ( &
+mut self , v : u8 ) { self . out . push ( u32 :: from ( v ) ) ; } pub fn num ( & mut self , v : &
+u32 ) -> Result < ( ) , String > { self . out . push ( * v ) ; Ok ( ) } pub fn string ( & mut self ,
+v : & String ) -> Result < ( ) , String > { self . out . push ( v . len ( ) as u32 ) ; Ok ( ) } } fn
+decode_payload ( dec : & mut Decoder < '_ > , variant_tag : u8 ) -> Option < NodeData > { Some (
+match variant_tag { 0 => NodeData :: Pair ( Box :: new ( crate :: astdata :: PairData { left : dec .
+num ( ) ? , right : dec . num ( ) ? } ) ) , 1 => NodeData :: Named ( Box :: new ( crate :: astdata
+:: NameData { text : dec . string ( ) ? , flags : dec . num ( ) ? } ) ) , _ => return None } ) } fn
+main ( ) { let mut dec = Decoder { nums : & [ 3 , 4 ] , pos : 0 } ; println ! ( "pair={0:?}" ,
+decode_payload ( & mut dec , 0 ) ) ; let mut dec = Decoder { nums : & [ 9 , 1 ] , pos : 0 } ;
+println ! ( "named={0:?}" , decode_payload ( & mut dec , 1 ) ) ; let mut dec = Decoder { nums : & [
+] , pos : 0 } ; println ! ( "bad={0:?}" , decode_payload ( & mut dec , 7 ) . map ( | _ | "some" ) )
+; }

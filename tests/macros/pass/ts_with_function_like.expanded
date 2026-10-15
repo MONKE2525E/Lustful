@@ -12,8 +12,8 @@ core :: cmp :: PartialEq for NodeId { # [ inline ] fn eq ( & self , other : & No
 self . 0 == other . 0 } } # [ automatically_derived ] impl :: core :: cmp :: Eq for NodeId { # [
 inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : ::
 core :: cmp :: AssertParamIsEq < u32 > ; } } impl NodeId { pub fn index ( self ) -> usize { self . 0
-as usize } } pub struct NodeList { pub items : Vec < NodeId > , } # [ automatically_derived ] impl
-:: core :: clone :: Clone for NodeList { # [ inline ] fn clone ( & self ) -> NodeList { NodeList {
+as usize } } pub struct NodeList { pub items : Vec < NodeId > } # [ automatically_derived ] impl ::
+core :: clone :: Clone for NodeList { # [ inline ] fn clone ( & self ) -> NodeList { NodeList {
 items : :: core :: clone :: Clone :: clone ( & self . items ) } } } # [ automatically_derived ] impl
 :: core :: fmt :: Debug for NodeList { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field1_finish
@@ -24,7 +24,7 @@ core :: default :: Default :: default ( ) } } } # [ automatically_derived ] impl
 for NodeList { # [ inline ] fn eq ( & self , other : & NodeList ) -> bool { self . items == other .
 items } } # [ automatically_derived ] impl :: core :: cmp :: Eq for NodeList { # [ inline ] # [ doc
 ( hidden ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp ::
-AssertParamIsEq < Vec < NodeId >> ; } } pub struct ModFlags ( pub u32 ) ; # [ automatically_derived
+AssertParamIsEq < Vec < NodeId > > ; } } pub struct ModFlags ( pub u32 ) ; # [ automatically_derived
 ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for ModFlags { } # [
 automatically_derived ] impl :: core :: clone :: Clone for ModFlags { # [ inline ] fn clone ( & self
 ) -> ModFlags { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; * self } } # [
@@ -38,44 +38,44 @@ core :: default :: Default :: default ( ) ) } } # [ automatically_derived ] impl
 for ModFlags { # [ inline ] fn eq ( & self , other : & ModFlags ) -> bool { self . 0 == other . 0 }
 } # [ automatically_derived ] impl :: core :: cmp :: Eq for ModFlags { # [ inline ] # [ doc ( hidden
 ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp ::
-AssertParamIsEq < u32 > ; } } pub struct ModifierList { pub list : NodeList , pub flags : ModFlags ,
-} # [ automatically_derived ] impl :: core :: clone :: Clone for ModifierList { # [ inline ] fn
-clone ( & self ) -> ModifierList { ModifierList { list : :: core :: clone :: Clone :: clone ( & self
-. list ) , flags : :: core :: clone :: Clone :: clone ( & self . flags ) , } } } # [
+AssertParamIsEq < u32 > ; } } pub struct ModifierList { pub list : NodeList , pub flags : ModFlags }
+# [ automatically_derived ] impl :: core :: clone :: Clone for ModifierList { # [ inline ] fn clone
+( & self ) -> ModifierList { ModifierList { list : :: core :: clone :: Clone :: clone ( & self .
+list ) , flags : :: core :: clone :: Clone :: clone ( & self . flags ) } } } # [
 automatically_derived ] impl :: core :: fmt :: Debug for ModifierList { # [ inline ] fn fmt ( & self
 , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter
 :: debug_struct_field2_finish ( f , "ModifierList" , "list" , & self . list , "flags" , && self .
 flags ) } } # [ automatically_derived ] impl :: core :: default :: Default for ModifierList { # [
 inline ] fn default ( ) -> ModifierList { ModifierList { list : :: core :: default :: Default ::
-default ( ) , flags : :: core :: default :: Default :: default ( ) , } } } # [ automatically_derived
-] impl :: core :: marker :: StructuralPartialEq for ModifierList { } # [ automatically_derived ]
-impl :: core :: cmp :: PartialEq for ModifierList { # [ inline ] fn eq ( & self , other : &
-ModifierList ) -> bool { self . list == other . list && self . flags == other . flags } } # [
+default ( ) , flags : :: core :: default :: Default :: default ( ) } } } # [ automatically_derived ]
+impl :: core :: marker :: StructuralPartialEq for ModifierList { } # [ automatically_derived ] impl
+:: core :: cmp :: PartialEq for ModifierList { # [ inline ] fn eq ( & self , other : & ModifierList
+) -> bool { self . list == other . list && self . flags == other . flags } } # [
 automatically_derived ] impl :: core :: cmp :: Eq for ModifierList { # [ inline ] # [ doc ( hidden )
 ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp ::
 AssertParamIsEq < NodeList > ; let _ : :: core :: cmp :: AssertParamIsEq < ModFlags > ; } } pub use
 crate :: NodeData ; } pub mod core { pub use crate :: Node ; } pub mod ast { pub use crate :: {
 ModifierList , NodeList } ; pub mod synthetic { use crate :: { Node , NodeData } ; pub enum AnyList
 < 'a > { Nodes ( & 'a crate :: astdata :: NodeList ) , Modifiers ( & 'a crate :: astdata ::
-ModifierList ) , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl < 'a > :: core ::
+ModifierList ) } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl < 'a > :: core ::
 clone :: TrivialClone for AnyList < 'a > { } # [ automatically_derived ] impl < 'a > :: core ::
 clone :: Clone for AnyList < 'a > { # [ inline ] fn clone ( & self ) -> AnyList < 'a > { let _ : ::
 core :: clone :: AssertParamIsClone < & 'a crate :: astdata :: NodeList > ; let _ : :: core :: clone
 :: AssertParamIsClone < & 'a crate :: astdata :: ModifierList > ; * self } } # [
 automatically_derived ] impl < 'a > :: core :: marker :: Copy for AnyList < 'a > { } impl < 'a >
 AnyList < 'a > { pub fn nodes ( self ) -> & 'a crate :: astdata :: NodeList { match self { Self ::
-Nodes ( l ) => l , Self :: Modifiers ( m ) => & m . list , } } pub fn modifiers ( self ) -> & 'a
-crate :: astdata :: ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ )
-=> { :: core :: panicking :: panic_fmt ( format_args ! ( "node list as modifiers" ) ) ; } } } } pub
-struct SelectorSite ; impl SelectorSite { pub const fn new ( ) -> Self { SelectorSite } } pub fn
+Nodes ( l ) => l , Self :: Modifiers ( m ) => & m . list } } pub fn modifiers ( self ) -> & 'a crate
+:: astdata :: ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ ) => { ::
+core :: panicking :: panic_fmt ( format_args ! ( "node list as modifiers" ) ) ; } } } } pub struct
+SelectorSite ; impl SelectorSite { pub const fn new ( ) -> Self { SelectorSite } } pub fn
 static_tier_ast_node ( n : Node ) -> Option < & 'static NodeData > { crate :: static_ast_node ( n )
 } pub fn read_ast_node_miss < R > ( n : Node , read : impl FnOnce ( & NodeData ) -> R ) -> R { read
 ( crate :: static_ast_node ( n ) . expect ( "registered node" ) ) } pub fn scoped_node_list_of ( n :
-Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option < Option < AnyList < '_
->> > ) -> Option < crate :: NodeList > { let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map
-( | l | crate :: NodeList :: from_ts ( n . file_index ( ) , l . map ( AnyList :: nodes ) ) ) } pub
-fn scoped_modifiers_of ( n : Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) ->
-Option < Option < AnyList < '_ >> > ) -> Option < crate :: ModifierList > { let d = crate ::
+Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option < Option < AnyList < '_ >
+> > ) -> Option < crate :: NodeList > { let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map (
+| l | crate :: NodeList :: from_ts ( n . file_index ( ) , l . map ( AnyList :: nodes ) ) ) } pub fn
+scoped_modifiers_of ( n : Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option
+< Option < AnyList < '_ > > > ) -> Option < crate :: ModifierList > { let d = crate ::
 static_ast_node ( n ) ? ; sel ( d ) . map ( | l | crate :: ModifierList :: from_ts ( n . file_index
 ( ) , l . map ( AnyList :: modifiers ) ) ) } } } pub type LoadedData = Option < & 'static NodeData >
 ; pub enum SyntaxKind { ArrayBindingPattern , ArrayType , ArrowFunction , AsExpression ,
@@ -112,8 +112,8 @@ TypeAliasDeclaration , TypeAssertion , TypeAssertionExpression , TypeLiteral , T
 TypeOperator , TypeOperatorNode , TypeParameter , TypeParameterDeclaration , TypePredicate ,
 TypePredicateNode , TypeQuery , TypeQueryNode , TypeReference , TypeReferenceNode , UnionType ,
 Unknown , VariableDeclaration , VariableStatement , VoidExpression , WhileStatement , WithStatement
-, YieldExpression , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone
-:: TrivialClone for SyntaxKind { } # [ automatically_derived ] impl :: core :: clone :: Clone for
+, YieldExpression } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone ::
+TrivialClone for SyntaxKind { } # [ automatically_derived ] impl :: core :: clone :: Clone for
 SyntaxKind { # [ inline ] fn clone ( & self ) -> SyntaxKind { * self } } # [ automatically_derived ]
 impl :: core :: marker :: Copy for SyntaxKind { } # [ automatically_derived ] impl :: core :: fmt ::
 Debug for SyntaxKind { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
@@ -214,110 +214,109 @@ SyntaxKind :: UnionType => "UnionType" , SyntaxKind :: Unknown => "Unknown" , Sy
 VariableDeclaration => "VariableDeclaration" , SyntaxKind :: VariableStatement =>
 "VariableStatement" , SyntaxKind :: VoidExpression => "VoidExpression" , SyntaxKind ::
 WhileStatement => "WhileStatement" , SyntaxKind :: WithStatement => "WithStatement" , SyntaxKind ::
-YieldExpression => "YieldExpression" , } ) } } # [ automatically_derived ] impl :: core :: marker ::
+YieldExpression => "YieldExpression" } ) } } # [ automatically_derived ] impl :: core :: marker ::
 StructuralPartialEq for SyntaxKind { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq
 for SyntaxKind { # [ inline ] fn eq ( & self , other : & SyntaxKind ) -> bool { let __self_discr =
 :: core :: intrinsics :: discriminant_value ( self ) ; let __arg1_discr = :: core :: intrinsics ::
 discriminant_value ( other ) ; __self_discr == __arg1_discr } } # [ automatically_derived ] impl ::
 core :: cmp :: Eq for SyntaxKind { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn
 assert_fields_are_eq ( & self ) { } } impl SyntaxKind { pub fn is_token ( self ) -> bool { # [ allow
-( non_exhaustive_omitted_patterns ) ] match self { SyntaxKind :: Identifier => true , _ => false , }
-} pub fn is_keyword_expression ( self ) -> bool { # [ allow ( non_exhaustive_omitted_patterns ) ]
-match self { SyntaxKind :: Identifier => true , _ => false , } } pub fn is_keyword_type ( self ) ->
+( non_exhaustive_omitted_patterns ) ] match self { SyntaxKind :: Identifier => true , _ => false } }
+pub fn is_keyword_expression ( self ) -> bool { # [ allow ( non_exhaustive_omitted_patterns ) ]
+match self { SyntaxKind :: Identifier => true , _ => false } } pub fn is_keyword_type ( self ) ->
 bool { # [ allow ( non_exhaustive_omitted_patterns ) ] match self { SyntaxKind :: TypeReference =>
-true , _ => false , } } } pub struct ArrowFunctionData { pub value : i32 , pub type_ : Option <
-crate :: astdata :: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , pub
-parameters : crate :: astdata :: NodeList , } # [ automatically_derived ] impl :: core :: fmt ::
-Debug for ArrowFunctionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
--> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f ,
+true , _ => false } } } pub struct ArrowFunctionData { pub value : i32 , pub type_ : Option < crate
+:: astdata :: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , pub
+parameters : crate :: astdata :: NodeList } # [ automatically_derived ] impl :: core :: fmt :: Debug
+for ArrowFunctionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f ,
 "ArrowFunctionData" , "value" , & self . value , "type_" , & self . type_ , "modifiers" , & self .
 modifiers , "parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ArrowFunctionData { # [ inline ] fn default ( ) -> ArrowFunctionData {
 ArrowFunctionData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
 default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) ,
-parameters : :: core :: default :: Default :: default ( ) , } } } pub struct AsExpressionData { pub
-value : i32 , pub expression : crate :: astdata :: NodeId , pub type_ : crate :: astdata :: NodeId ,
-} # [ automatically_derived ] impl :: core :: fmt :: Debug for AsExpressionData { # [ inline ] fn
-fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
-:: Formatter :: debug_struct_field3_finish ( f , "AsExpressionData" , "value" , & self . value ,
+parameters : :: core :: default :: Default :: default ( ) } } } pub struct AsExpressionData { pub
+value : i32 , pub expression : crate :: astdata :: NodeId , pub type_ : crate :: astdata :: NodeId }
+# [ automatically_derived ] impl :: core :: fmt :: Debug for AsExpressionData { # [ inline ] fn fmt
+( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+Formatter :: debug_struct_field3_finish ( f , "AsExpressionData" , "value" , & self . value ,
 "expression" , & self . expression , "type_" , && self . type_ ) } } # [ automatically_derived ]
 impl :: core :: default :: Default for AsExpressionData { # [ inline ] fn default ( ) ->
 AsExpressionData { AsExpressionData { value : :: core :: default :: Default :: default ( ) ,
 expression : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
-default ( ) , } } } pub struct AwaitExpressionData { pub value : i32 , pub expression : crate ::
-astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-AwaitExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"AwaitExpressionData" , "value" , & self . value , "expression" , && self . expression ) } } # [
-automatically_derived ] impl :: core :: default :: Default for AwaitExpressionData { # [ inline ] fn
-default ( ) -> AwaitExpressionData { AwaitExpressionData { value : :: core :: default :: Default ::
-default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub struct
-BinaryExpressionData { pub value : i32 , pub type_ : Option < crate :: astdata :: NodeId > , pub
-modifiers : Option < crate :: astdata :: ModifierList > , pub right : crate :: astdata :: NodeId ,
-pub left : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug
-for BinaryExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
-:: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field5_finish ( f ,
-"BinaryExpressionData" , "value" , & self . value , "type_" , & self . type_ , "modifiers" , & self
-. modifiers , "right" , & self . right , "left" , && self . left ) } } # [ automatically_derived ]
-impl :: core :: default :: Default for BinaryExpressionData { # [ inline ] fn default ( ) ->
-BinaryExpressionData { BinaryExpressionData { value : :: core :: default :: Default :: default ( ) ,
-type_ : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default :: Default ::
-default ( ) , right : :: core :: default :: Default :: default ( ) , left : :: core :: default ::
-Default :: default ( ) , } } } pub struct BindingElementData { pub value : i32 , pub name : Option <
-crate :: astdata :: NodeId > , pub initializer : Option < crate :: astdata :: NodeId > , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for BindingElementData { # [ inline ] fn fmt (
-& self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field3_finish ( f , "BindingElementData" , "value" , & self . value ,
-"name" , & self . name , "initializer" , && self . initializer ) } } # [ automatically_derived ]
-impl :: core :: default :: Default for BindingElementData { # [ inline ] fn default ( ) ->
-BindingElementData { BindingElementData { value : :: core :: default :: Default :: default ( ) ,
-name : :: core :: default :: Default :: default ( ) , initializer : :: core :: default :: Default ::
-default ( ) , } } } pub struct BlockData { pub value : i32 , } # [ automatically_derived ] impl ::
-core :: fmt :: Debug for BlockData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field1_finish
-( f , "BlockData" , "value" , && self . value ) } } # [ automatically_derived ] impl :: core ::
-default :: Default for BlockData { # [ inline ] fn default ( ) -> BlockData { BlockData { value : ::
-core :: default :: Default :: default ( ) } } } pub struct CallExpressionData { pub value : i32 ,
-pub expression : crate :: astdata :: NodeId , pub type_arguments : Option < crate :: astdata ::
-NodeList > , pub question_dot_token : Option < crate :: astdata :: NodeId > , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for CallExpressionData { # [ inline ] fn fmt (
-& self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field4_finish ( f , "CallExpressionData" , "value" , & self . value ,
-"expression" , & self . expression , "type_arguments" , & self . type_arguments ,
-"question_dot_token" , && self . question_dot_token ) } } # [ automatically_derived ] impl :: core
-:: default :: Default for CallExpressionData { # [ inline ] fn default ( ) -> CallExpressionData {
-CallExpressionData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
-default :: Default :: default ( ) , type_arguments : :: core :: default :: Default :: default ( ) ,
-question_dot_token : :: core :: default :: Default :: default ( ) , } } } pub struct
-CallSignatureDeclarationData { pub value : i32 , pub type_ : Option < crate :: astdata :: NodeId > ,
-pub parameters : crate :: astdata :: NodeList , } # [ automatically_derived ] impl :: core :: fmt ::
-Debug for CallSignatureDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+default ( ) } } } pub struct AwaitExpressionData { pub value : i32 , pub expression : crate ::
+astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for AwaitExpressionData
+{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
+{ :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "AwaitExpressionData" , "value" ,
+& self . value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core
+:: default :: Default for AwaitExpressionData { # [ inline ] fn default ( ) -> AwaitExpressionData {
+AwaitExpressionData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
+default :: Default :: default ( ) } } } pub struct BinaryExpressionData { pub value : i32 , pub
+type_ : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate :: astdata ::
+ModifierList > , pub right : crate :: astdata :: NodeId , pub left : crate :: astdata :: NodeId } #
+[ automatically_derived ] impl :: core :: fmt :: Debug for BinaryExpressionData { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_struct_field5_finish ( f , "BinaryExpressionData" , "value" , & self . value ,
+"type_" , & self . type_ , "modifiers" , & self . modifiers , "right" , & self . right , "left" , &&
+self . left ) } } # [ automatically_derived ] impl :: core :: default :: Default for
+BinaryExpressionData { # [ inline ] fn default ( ) -> BinaryExpressionData { BinaryExpressionData {
+value : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
+default ( ) , modifiers : :: core :: default :: Default :: default ( ) , right : :: core :: default
+:: Default :: default ( ) , left : :: core :: default :: Default :: default ( ) } } } pub struct
+BindingElementData { pub value : i32 , pub name : Option < crate :: astdata :: NodeId > , pub
+initializer : Option < crate :: astdata :: NodeId > } # [ automatically_derived ] impl :: core ::
+fmt :: Debug for BindingElementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish
-( f , "CallSignatureDeclarationData" , "value" , & self . value , "type_" , & self . type_ ,
-"parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core :: default ::
-Default for CallSignatureDeclarationData { # [ inline ] fn default ( ) ->
-CallSignatureDeclarationData { CallSignatureDeclarationData { value : :: core :: default :: Default
-:: default ( ) , type_ : :: core :: default :: Default :: default ( ) , parameters : :: core ::
-default :: Default :: default ( ) , } } } pub struct CaseBlockData { pub value : i32 , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for CaseBlockData { # [ inline ] fn fmt ( &
-self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field1_finish ( f , "CaseBlockData" , "value" , && self . value ) } } # [
-automatically_derived ] impl :: core :: default :: Default for CaseBlockData { # [ inline ] fn
+( f , "BindingElementData" , "value" , & self . value , "name" , & self . name , "initializer" , &&
+self . initializer ) } } # [ automatically_derived ] impl :: core :: default :: Default for
+BindingElementData { # [ inline ] fn default ( ) -> BindingElementData { BindingElementData { value
+: :: core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( )
+, initializer : :: core :: default :: Default :: default ( ) } } } pub struct BlockData { pub value
+: i32 } # [ automatically_derived ] impl :: core :: fmt :: Debug for BlockData { # [ inline ] fn fmt
+( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+Formatter :: debug_struct_field1_finish ( f , "BlockData" , "value" , && self . value ) } } # [
+automatically_derived ] impl :: core :: default :: Default for BlockData { # [ inline ] fn default (
+) -> BlockData { BlockData { value : :: core :: default :: Default :: default ( ) } } } pub struct
+CallExpressionData { pub value : i32 , pub expression : crate :: astdata :: NodeId , pub
+type_arguments : Option < crate :: astdata :: NodeList > , pub question_dot_token : Option < crate
+:: astdata :: NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+CallExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f ,
+"CallExpressionData" , "value" , & self . value , "expression" , & self . expression ,
+"type_arguments" , & self . type_arguments , "question_dot_token" , && self . question_dot_token ) }
+} # [ automatically_derived ] impl :: core :: default :: Default for CallExpressionData { # [ inline
+] fn default ( ) -> CallExpressionData { CallExpressionData { value : :: core :: default :: Default
+:: default ( ) , expression : :: core :: default :: Default :: default ( ) , type_arguments : ::
+core :: default :: Default :: default ( ) , question_dot_token : :: core :: default :: Default ::
+default ( ) } } } pub struct CallSignatureDeclarationData { pub value : i32 , pub type_ : Option <
+crate :: astdata :: NodeId > , pub parameters : crate :: astdata :: NodeList } # [
+automatically_derived ] impl :: core :: fmt :: Debug for CallSignatureDeclarationData { # [ inline ]
+fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field3_finish ( f , "CallSignatureDeclarationData" , "value" , &
+self . value , "type_" , & self . type_ , "parameters" , && self . parameters ) } } # [
+automatically_derived ] impl :: core :: default :: Default for CallSignatureDeclarationData { # [
+inline ] fn default ( ) -> CallSignatureDeclarationData { CallSignatureDeclarationData { value : ::
+core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) ,
+parameters : :: core :: default :: Default :: default ( ) } } } pub struct CaseBlockData { pub value
+: i32 } # [ automatically_derived ] impl :: core :: fmt :: Debug for CaseBlockData { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_struct_field1_finish ( f , "CaseBlockData" , "value" , && self . value ) } } #
+[ automatically_derived ] impl :: core :: default :: Default for CaseBlockData { # [ inline ] fn
 default ( ) -> CaseBlockData { CaseBlockData { value : :: core :: default :: Default :: default ( )
-} } } pub struct CaseOrDefaultClauseData { pub value : i32 , } # [ automatically_derived ] impl ::
+} } } pub struct CaseOrDefaultClauseData { pub value : i32 } # [ automatically_derived ] impl ::
 core :: fmt :: Debug for CaseOrDefaultClauseData { # [ inline ] fn fmt ( & self , f : & mut :: core
 :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field1_finish ( f , "CaseOrDefaultClauseData" , "value" , && self . value ) } } # [
 automatically_derived ] impl :: core :: default :: Default for CaseOrDefaultClauseData { # [ inline
 ] fn default ( ) -> CaseOrDefaultClauseData { CaseOrDefaultClauseData { value : :: core :: default
-:: Default :: default ( ) } } } pub struct CatchClauseData { pub value : i32 , } # [
+:: Default :: default ( ) } } } pub struct CatchClauseData { pub value : i32 } # [
 automatically_derived ] impl :: core :: fmt :: Debug for CatchClauseData { # [ inline ] fn fmt ( &
 self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field1_finish ( f , "CatchClauseData" , "value" , && self . value ) } } #
 [ automatically_derived ] impl :: core :: default :: Default for CatchClauseData { # [ inline ] fn
 default ( ) -> CatchClauseData { CatchClauseData { value : :: core :: default :: Default :: default
 ( ) } } } pub struct ClassDeclarationData { pub value : i32 , pub name : Option < crate :: astdata
-:: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , } # [
+:: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > } # [
 automatically_derived ] impl :: core :: fmt :: Debug for ClassDeclarationData { # [ inline ] fn fmt
 ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field3_finish ( f , "ClassDeclarationData" , "value" , & self . value ,
@@ -325,8 +324,8 @@ Formatter :: debug_struct_field3_finish ( f , "ClassDeclarationData" , "value" ,
 core :: default :: Default for ClassDeclarationData { # [ inline ] fn default ( ) ->
 ClassDeclarationData { ClassDeclarationData { value : :: core :: default :: Default :: default ( ) ,
 name : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default :: Default ::
-default ( ) , } } } pub struct ClassExpressionData { pub value : i32 , pub name : Option < crate ::
-astdata :: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , } # [
+default ( ) } } } pub struct ClassExpressionData { pub value : i32 , pub name : Option < crate ::
+astdata :: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > } # [
 automatically_derived ] impl :: core :: fmt :: Debug for ClassExpressionData { # [ inline ] fn fmt (
 & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field3_finish ( f , "ClassExpressionData" , "value" , & self . value ,
@@ -334,39 +333,39 @@ Formatter :: debug_struct_field3_finish ( f , "ClassExpressionData" , "value" , 
 core :: default :: Default for ClassExpressionData { # [ inline ] fn default ( ) ->
 ClassExpressionData { ClassExpressionData { value : :: core :: default :: Default :: default ( ) ,
 name : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default :: Default ::
-default ( ) , } } } pub struct ClassStaticBlockDeclarationData { pub value : i32 , pub modifiers :
-Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt ::
+default ( ) } } } pub struct ClassStaticBlockDeclarationData { pub value : i32 , pub modifiers :
+Option < crate :: astdata :: ModifierList > } # [ automatically_derived ] impl :: core :: fmt ::
 Debug for ClassStaticBlockDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt
 :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field2_finish ( f , "ClassStaticBlockDeclarationData" , "value" , & self . value ,
 "modifiers" , && self . modifiers ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for ClassStaticBlockDeclarationData { # [ inline ] fn default ( ) ->
 ClassStaticBlockDeclarationData { ClassStaticBlockDeclarationData { value : :: core :: default ::
-Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct
-ComputedPropertyNameData { pub value : i32 , pub expression : crate :: astdata :: NodeId , } # [
+Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) } } } pub struct
+ComputedPropertyNameData { pub value : i32 , pub expression : crate :: astdata :: NodeId } # [
 automatically_derived ] impl :: core :: fmt :: Debug for ComputedPropertyNameData { # [ inline ] fn
 fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
 :: Formatter :: debug_struct_field2_finish ( f , "ComputedPropertyNameData" , "value" , & self .
 value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ComputedPropertyNameData { # [ inline ] fn default ( ) ->
 ComputedPropertyNameData { ComputedPropertyNameData { value : :: core :: default :: Default ::
-default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub struct
-ConditionalExpressionData { pub value : i32 , pub question_token : crate :: astdata :: NodeId , } #
-[ automatically_derived ] impl :: core :: fmt :: Debug for ConditionalExpressionData { # [ inline ]
-fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
-fmt :: Formatter :: debug_struct_field2_finish ( f , "ConditionalExpressionData" , "value" , & self
-. value , "question_token" , && self . question_token ) } } # [ automatically_derived ] impl :: core
+default ( ) , expression : :: core :: default :: Default :: default ( ) } } } pub struct
+ConditionalExpressionData { pub value : i32 , pub question_token : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for ConditionalExpressionData { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_struct_field2_finish ( f , "ConditionalExpressionData" , "value" , & self .
+value , "question_token" , && self . question_token ) } } # [ automatically_derived ] impl :: core
 :: default :: Default for ConditionalExpressionData { # [ inline ] fn default ( ) ->
 ConditionalExpressionData { ConditionalExpressionData { value : :: core :: default :: Default ::
-default ( ) , question_token : :: core :: default :: Default :: default ( ) , } } } pub struct
-ConditionalTypeNodeData { pub value : i32 , } # [ automatically_derived ] impl :: core :: fmt ::
-Debug for ConditionalTypeNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field1_finish
-( f , "ConditionalTypeNodeData" , "value" , && self . value ) } } # [ automatically_derived ] impl
-:: core :: default :: Default for ConditionalTypeNodeData { # [ inline ] fn default ( ) ->
+default ( ) , question_token : :: core :: default :: Default :: default ( ) } } } pub struct
+ConditionalTypeNodeData { pub value : i32 } # [ automatically_derived ] impl :: core :: fmt :: Debug
+for ConditionalTypeNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
+-> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field1_finish ( f ,
+"ConditionalTypeNodeData" , "value" , && self . value ) } } # [ automatically_derived ] impl :: core
+:: default :: Default for ConditionalTypeNodeData { # [ inline ] fn default ( ) ->
 ConditionalTypeNodeData { ConditionalTypeNodeData { value : :: core :: default :: Default :: default
 ( ) } } } pub struct ConstructSignatureDeclarationData { pub value : i32 , pub type_ : Option <
-crate :: astdata :: NodeId > , pub parameters : crate :: astdata :: NodeList , } # [
+crate :: astdata :: NodeId > , pub parameters : crate :: astdata :: NodeList } # [
 automatically_derived ] impl :: core :: fmt :: Debug for ConstructSignatureDeclarationData { # [
 inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
 core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "ConstructSignatureDeclarationData" ,
@@ -374,20 +373,20 @@ core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "ConstructSignature
 automatically_derived ] impl :: core :: default :: Default for ConstructSignatureDeclarationData { #
 [ inline ] fn default ( ) -> ConstructSignatureDeclarationData { ConstructSignatureDeclarationData {
 value : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
-default ( ) , parameters : :: core :: default :: Default :: default ( ) , } } } pub struct
+default ( ) , parameters : :: core :: default :: Default :: default ( ) } } } pub struct
 ConstructorDeclarationData { pub value : i32 , pub type_ : Option < crate :: astdata :: NodeId > ,
 pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate :: astdata ::
-NodeList , } # [ automatically_derived ] impl :: core :: fmt :: Debug for ConstructorDeclarationData
-{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
-{ :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f , "ConstructorDeclarationData" ,
+NodeList } # [ automatically_derived ] impl :: core :: fmt :: Debug for ConstructorDeclarationData {
+# [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
+:: core :: fmt :: Formatter :: debug_struct_field4_finish ( f , "ConstructorDeclarationData" ,
 "value" , & self . value , "type_" , & self . type_ , "modifiers" , & self . modifiers ,
 "parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for ConstructorDeclarationData { # [ inline ] fn default ( ) -> ConstructorDeclarationData {
 ConstructorDeclarationData { value : :: core :: default :: Default :: default ( ) , type_ : :: core
 :: default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) ,
-parameters : :: core :: default :: Default :: default ( ) , } } } pub struct ConstructorTypeNodeData
-{ pub value : i32 , pub type_ : Option < crate :: astdata :: NodeId > , pub modifiers : Option <
-crate :: astdata :: ModifierList > , pub parameters : crate :: astdata :: NodeList , } # [
+parameters : :: core :: default :: Default :: default ( ) } } } pub struct ConstructorTypeNodeData {
+pub value : i32 , pub type_ : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate
+:: astdata :: ModifierList > , pub parameters : crate :: astdata :: NodeList } # [
 automatically_derived ] impl :: core :: fmt :: Debug for ConstructorTypeNodeData { # [ inline ] fn
 fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
 :: Formatter :: debug_struct_field4_finish ( f , "ConstructorTypeNodeData" , "value" , & self .
@@ -396,32 +395,32 @@ parameters ) } } # [ automatically_derived ] impl :: core :: default :: Default 
 ConstructorTypeNodeData { # [ inline ] fn default ( ) -> ConstructorTypeNodeData {
 ConstructorTypeNodeData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
 default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) ,
-parameters : :: core :: default :: Default :: default ( ) , } } } pub struct DecoratorData { pub
-value : i32 , pub expression : crate :: astdata :: NodeId , } # [ automatically_derived ] impl ::
-core :: fmt :: Debug for DecoratorData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+parameters : :: core :: default :: Default :: default ( ) } } } pub struct DecoratorData { pub value
+: i32 , pub expression : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core ::
+fmt :: Debug for DecoratorData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
 ( f , "DecoratorData" , "value" , & self . value , "expression" , && self . expression ) } } # [
 automatically_derived ] impl :: core :: default :: Default for DecoratorData { # [ inline ] fn
 default ( ) -> DecoratorData { DecoratorData { value : :: core :: default :: Default :: default ( )
-, expression : :: core :: default :: Default :: default ( ) , } } } pub struct DeleteExpressionData
-{ pub value : i32 , pub expression : crate :: astdata :: NodeId , } # [ automatically_derived ] impl
-:: core :: fmt :: Debug for DeleteExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core
-:: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+, expression : :: core :: default :: Default :: default ( ) } } } pub struct DeleteExpressionData {
+pub value : i32 , pub expression : crate :: astdata :: NodeId } # [ automatically_derived ] impl ::
+core :: fmt :: Debug for DeleteExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
+fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field2_finish ( f , "DeleteExpressionData" , "value" , & self . value , "expression" ,
 && self . expression ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 DeleteExpressionData { # [ inline ] fn default ( ) -> DeleteExpressionData { DeleteExpressionData {
 value : :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default ::
-default ( ) , } } } pub struct DoStatementData { pub value : i32 , pub expression : crate :: astdata
-:: NodeId , pub statement : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core
-:: fmt :: Debug for DoStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+default ( ) } } } pub struct DoStatementData { pub value : i32 , pub expression : crate :: astdata
+:: NodeId , pub statement : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core ::
+fmt :: Debug for DoStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish
 ( f , "DoStatementData" , "value" , & self . value , "expression" , & self . expression ,
 "statement" , && self . statement ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for DoStatementData { # [ inline ] fn default ( ) -> DoStatementData { DoStatementData {
 value : :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default ::
-default ( ) , statement : :: core :: default :: Default :: default ( ) , } } } pub struct
+default ( ) , statement : :: core :: default :: Default :: default ( ) } } } pub struct
 ElementAccessExpressionData { pub value : i32 , pub expression : crate :: astdata :: NodeId , pub
-question_dot_token : Option < crate :: astdata :: NodeId > , } # [ automatically_derived ] impl ::
+question_dot_token : Option < crate :: astdata :: NodeId > } # [ automatically_derived ] impl ::
 core :: fmt :: Debug for ElementAccessExpressionData { # [ inline ] fn fmt ( & self , f : & mut ::
 core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field3_finish ( f , "ElementAccessExpressionData" , "value" , & self . value ,
@@ -429,19 +428,19 @@ debug_struct_field3_finish ( f , "ElementAccessExpressionData" , "value" , & sel
 automatically_derived ] impl :: core :: default :: Default for ElementAccessExpressionData { # [
 inline ] fn default ( ) -> ElementAccessExpressionData { ElementAccessExpressionData { value : ::
 core :: default :: Default :: default ( ) , expression : :: core :: default :: Default :: default (
-) , question_dot_token : :: core :: default :: Default :: default ( ) , } } } pub struct
+) , question_dot_token : :: core :: default :: Default :: default ( ) } } } pub struct
 EnumDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub modifiers :
-Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt ::
+Option < crate :: astdata :: ModifierList > } # [ automatically_derived ] impl :: core :: fmt ::
 Debug for EnumDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter
 ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f ,
 "EnumDeclarationData" , "value" , & self . value , "name" , & self . name , "modifiers" , && self .
 modifiers ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 EnumDeclarationData { # [ inline ] fn default ( ) -> EnumDeclarationData { EnumDeclarationData {
 value : :: core :: default :: Default :: default ( ) , name : :: core :: default :: Default ::
-default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct
+default ( ) , modifiers : :: core :: default :: Default :: default ( ) } } } pub struct
 EnumMemberData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub postfix_token :
 Option < crate :: astdata :: NodeId > , pub initializer : Option < crate :: astdata :: NodeId > ,
-pub modifiers : Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl ::
+pub modifiers : Option < crate :: astdata :: ModifierList > } # [ automatically_derived ] impl ::
 core :: fmt :: Debug for EnumMemberData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field5_finish
 ( f , "EnumMemberData" , "value" , & self . value , "name" , & self . name , "postfix_token" , &
@@ -450,9 +449,9 @@ self . postfix_token , "initializer" , & self . initializer , "modifiers" , && s
 fn default ( ) -> EnumMemberData { EnumMemberData { value : :: core :: default :: Default :: default
 ( ) , name : :: core :: default :: Default :: default ( ) , postfix_token : :: core :: default ::
 Default :: default ( ) , initializer : :: core :: default :: Default :: default ( ) , modifiers : ::
-core :: default :: Default :: default ( ) , } } } pub struct ExportAssignmentData { pub value : i32
-, pub expression : crate :: astdata :: NodeId , pub type_ : Option < crate :: astdata :: NodeId > ,
-pub modifiers : Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl ::
+core :: default :: Default :: default ( ) } } } pub struct ExportAssignmentData { pub value : i32 ,
+pub expression : crate :: astdata :: NodeId , pub type_ : Option < crate :: astdata :: NodeId > ,
+pub modifiers : Option < crate :: astdata :: ModifierList > } # [ automatically_derived ] impl ::
 core :: fmt :: Debug for ExportAssignmentData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
 fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field4_finish ( f , "ExportAssignmentData" , "value" , & self . value , "expression" ,
@@ -460,69 +459,69 @@ debug_struct_field4_finish ( f , "ExportAssignmentData" , "value" , & self . val
 automatically_derived ] impl :: core :: default :: Default for ExportAssignmentData { # [ inline ]
 fn default ( ) -> ExportAssignmentData { ExportAssignmentData { value : :: core :: default ::
 Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) , type_ : :: core
-:: default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , }
-} } pub struct ExportDeclarationData { pub value : i32 , pub modifiers : Option < crate :: astdata
-:: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-ExportDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"ExportDeclarationData" , "value" , & self . value , "modifiers" , && self . modifiers ) } } # [
-automatically_derived ] impl :: core :: default :: Default for ExportDeclarationData { # [ inline ]
-fn default ( ) -> ExportDeclarationData { ExportDeclarationData { value : :: core :: default ::
-Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct
-ExportSpecifierData { pub value : i32 , pub name : crate :: astdata :: NodeId , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for ExportSpecifierData { # [ inline ] fn fmt (
-& self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field2_finish ( f , "ExportSpecifierData" , "value" , & self . value ,
-"name" , && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default for
-ExportSpecifierData { # [ inline ] fn default ( ) -> ExportSpecifierData { ExportSpecifierData {
-value : :: core :: default :: Default :: default ( ) , name : :: core :: default :: Default ::
-default ( ) , } } } pub struct ExpressionStatementData { pub value : i32 , pub expression : crate ::
-astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-ExpressionStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
-:: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"ExpressionStatementData" , "value" , & self . value , "expression" , && self . expression ) } } # [
-automatically_derived ] impl :: core :: default :: Default for ExpressionStatementData { # [ inline
-] fn default ( ) -> ExpressionStatementData { ExpressionStatementData { value : :: core :: default
-:: Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub
-struct ExpressionWithTypeArgumentsData { pub value : i32 , pub expression : crate :: astdata ::
-NodeId , pub type_arguments : Option < crate :: astdata :: NodeList > , } # [ automatically_derived
-] impl :: core :: fmt :: Debug for ExpressionWithTypeArgumentsData { # [ inline ] fn fmt ( & self ,
-f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+:: default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) } }
+} pub struct ExportDeclarationData { pub value : i32 , pub modifiers : Option < crate :: astdata ::
+ModifierList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for ExportDeclarationData
+{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
+{ :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "ExportDeclarationData" , "value"
+, & self . value , "modifiers" , && self . modifiers ) } } # [ automatically_derived ] impl :: core
+:: default :: Default for ExportDeclarationData { # [ inline ] fn default ( ) ->
+ExportDeclarationData { ExportDeclarationData { value : :: core :: default :: Default :: default ( )
+, modifiers : :: core :: default :: Default :: default ( ) } } } pub struct ExportSpecifierData {
+pub value : i32 , pub name : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core
+:: fmt :: Debug for ExportSpecifierData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
+( f , "ExportSpecifierData" , "value" , & self . value , "name" , && self . name ) } } # [
+automatically_derived ] impl :: core :: default :: Default for ExportSpecifierData { # [ inline ] fn
+default ( ) -> ExportSpecifierData { ExportSpecifierData { value : :: core :: default :: Default ::
+default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct
+ExpressionStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for ExpressionStatementData { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_struct_field2_finish ( f , "ExpressionStatementData" , "value" , & self .
+value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for ExpressionStatementData { # [ inline ] fn default ( ) ->
+ExpressionStatementData { ExpressionStatementData { value : :: core :: default :: Default :: default
+( ) , expression : :: core :: default :: Default :: default ( ) } } } pub struct
+ExpressionWithTypeArgumentsData { pub value : i32 , pub expression : crate :: astdata :: NodeId ,
+pub type_arguments : Option < crate :: astdata :: NodeList > } # [ automatically_derived ] impl ::
+core :: fmt :: Debug for ExpressionWithTypeArgumentsData { # [ inline ] fn fmt ( & self , f : & mut
+:: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field3_finish ( f , "ExpressionWithTypeArgumentsData" , "value" , & self . value ,
 "expression" , & self . expression , "type_arguments" , && self . type_arguments ) } } # [
 automatically_derived ] impl :: core :: default :: Default for ExpressionWithTypeArgumentsData { # [
 inline ] fn default ( ) -> ExpressionWithTypeArgumentsData { ExpressionWithTypeArgumentsData { value
 : :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default ::
-default ( ) , type_arguments : :: core :: default :: Default :: default ( ) , } } } pub struct
-ExternalModuleReferenceData { pub value : i32 , pub expression : crate :: astdata :: NodeId , } # [
+default ( ) , type_arguments : :: core :: default :: Default :: default ( ) } } } pub struct
+ExternalModuleReferenceData { pub value : i32 , pub expression : crate :: astdata :: NodeId } # [
 automatically_derived ] impl :: core :: fmt :: Debug for ExternalModuleReferenceData { # [ inline ]
 fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
 fmt :: Formatter :: debug_struct_field2_finish ( f , "ExternalModuleReferenceData" , "value" , &
 self . value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ExternalModuleReferenceData { # [ inline ] fn default ( ) ->
 ExternalModuleReferenceData { ExternalModuleReferenceData { value : :: core :: default :: Default ::
-default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub struct
+default ( ) , expression : :: core :: default :: Default :: default ( ) } } } pub struct
 ForInOrOfStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId , pub
-initializer : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt ::
-Debug for ForInOrOfStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish
-( f , "ForInOrOfStatementData" , "value" , & self . value , "expression" , & self . expression ,
+initializer : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug
+for ForInOrOfStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
+-> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f ,
+"ForInOrOfStatementData" , "value" , & self . value , "expression" , & self . expression ,
 "initializer" , && self . initializer ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for ForInOrOfStatementData { # [ inline ] fn default ( ) -> ForInOrOfStatementData {
 ForInOrOfStatementData { value : :: core :: default :: Default :: default ( ) , expression : :: core
-:: default :: Default :: default ( ) , initializer : :: core :: default :: Default :: default ( ) ,
-} } } pub struct ForStatementData { pub value : i32 , pub initializer : Option < crate :: astdata ::
-NodeId > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for ForStatementData { # [
+:: default :: Default :: default ( ) , initializer : :: core :: default :: Default :: default ( ) }
+} } pub struct ForStatementData { pub value : i32 , pub initializer : Option < crate :: astdata ::
+NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for ForStatementData { # [
 inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
 core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "ForStatementData" , "value" , & self .
 value , "initializer" , && self . initializer ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ForStatementData { # [ inline ] fn default ( ) -> ForStatementData {
 ForStatementData { value : :: core :: default :: Default :: default ( ) , initializer : :: core ::
-default :: Default :: default ( ) , } } } pub struct FunctionDeclarationData { pub value : i32 , pub
+default :: Default :: default ( ) } } } pub struct FunctionDeclarationData { pub value : i32 , pub
 name : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata :: NodeId > ,
 pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate :: astdata ::
-NodeList , } # [ automatically_derived ] impl :: core :: fmt :: Debug for FunctionDeclarationData {
-# [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
+NodeList } # [ automatically_derived ] impl :: core :: fmt :: Debug for FunctionDeclarationData { #
+[ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
 :: core :: fmt :: Formatter :: debug_struct_field5_finish ( f , "FunctionDeclarationData" , "value"
 , & self . value , "name" , & self . name , "type_" , & self . type_ , "modifiers" , & self .
 modifiers , "parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core ::
@@ -530,33 +529,33 @@ default :: Default for FunctionDeclarationData { # [ inline ] fn default ( ) ->
 FunctionDeclarationData { FunctionDeclarationData { value : :: core :: default :: Default :: default
 ( ) , name : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
 default ( ) , modifiers : :: core :: default :: Default :: default ( ) , parameters : :: core ::
-default :: Default :: default ( ) , } } } pub struct FunctionExpressionData { pub value : i32 , pub
+default :: Default :: default ( ) } } } pub struct FunctionExpressionData { pub value : i32 , pub
 name : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata :: NodeId > ,
 pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate :: astdata ::
-NodeList , } # [ automatically_derived ] impl :: core :: fmt :: Debug for FunctionExpressionData { #
-[ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
-:: core :: fmt :: Formatter :: debug_struct_field5_finish ( f , "FunctionExpressionData" , "value" ,
-& self . value , "name" , & self . name , "type_" , & self . type_ , "modifiers" , & self .
-modifiers , "parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core ::
-default :: Default for FunctionExpressionData { # [ inline ] fn default ( ) ->
-FunctionExpressionData { FunctionExpressionData { value : :: core :: default :: Default :: default (
-) , name : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
-default ( ) , modifiers : :: core :: default :: Default :: default ( ) , parameters : :: core ::
-default :: Default :: default ( ) , } } } pub struct FunctionTypeNodeData { pub value : i32 , pub
-type_ : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate :: astdata ::
-ModifierList > , pub parameters : crate :: astdata :: NodeList , } # [ automatically_derived ] impl
-:: core :: fmt :: Debug for FunctionTypeNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core
-:: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
-debug_struct_field4_finish ( f , "FunctionTypeNodeData" , "value" , & self . value , "type_" , &
-self . type_ , "modifiers" , & self . modifiers , "parameters" , && self . parameters ) } } # [
-automatically_derived ] impl :: core :: default :: Default for FunctionTypeNodeData { # [ inline ]
-fn default ( ) -> FunctionTypeNodeData { FunctionTypeNodeData { value : :: core :: default ::
-Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , modifiers : :: core
-:: default :: Default :: default ( ) , parameters : :: core :: default :: Default :: default ( ) , }
-} } pub struct GetAccessorDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId
-, pub postfix_token : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata
-:: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate
-:: astdata :: NodeList , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+NodeList } # [ automatically_derived ] impl :: core :: fmt :: Debug for FunctionExpressionData { # [
+inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
+core :: fmt :: Formatter :: debug_struct_field5_finish ( f , "FunctionExpressionData" , "value" , &
+self . value , "name" , & self . name , "type_" , & self . type_ , "modifiers" , & self . modifiers
+, "parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core :: default ::
+Default for FunctionExpressionData { # [ inline ] fn default ( ) -> FunctionExpressionData {
+FunctionExpressionData { value : :: core :: default :: Default :: default ( ) , name : :: core ::
+default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , modifiers
+: :: core :: default :: Default :: default ( ) , parameters : :: core :: default :: Default ::
+default ( ) } } } pub struct FunctionTypeNodeData { pub value : i32 , pub type_ : Option < crate ::
+astdata :: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters :
+crate :: astdata :: NodeList } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+FunctionTypeNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f ,
+"FunctionTypeNodeData" , "value" , & self . value , "type_" , & self . type_ , "modifiers" , & self
+. modifiers , "parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for FunctionTypeNodeData { # [ inline ] fn default ( ) -> FunctionTypeNodeData {
+FunctionTypeNodeData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
+default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) ,
+parameters : :: core :: default :: Default :: default ( ) } } } pub struct
+GetAccessorDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
+postfix_token : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata ::
+NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate ::
+astdata :: NodeList } # [ automatically_derived ] impl :: core :: fmt :: Debug for
 GetAccessorDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
 -> :: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" , "postfix_token" ,
 "type_" , "modifiers" , "parameters" ] ; let values : & [ & dyn :: core :: fmt :: Debug ] = & [ &
@@ -568,274 +567,271 @@ GetAccessorDeclarationData { GetAccessorDeclarationData { value : :: core :: def
 default ( ) , name : :: core :: default :: Default :: default ( ) , postfix_token : :: core ::
 default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , modifiers
 : :: core :: default :: Default :: default ( ) , parameters : :: core :: default :: Default ::
-default ( ) , } } } pub struct IdentifierData { pub value : i32 , } # [ automatically_derived ] impl
-:: core :: fmt :: Debug for IdentifierData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt
-:: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
-debug_struct_field1_finish ( f , "IdentifierData" , "value" , && self . value ) } } # [
-automatically_derived ] impl :: core :: default :: Default for IdentifierData { # [ inline ] fn
-default ( ) -> IdentifierData { IdentifierData { value : :: core :: default :: Default :: default (
-) } } } pub struct IfStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId ,
-pub then_statement : crate :: astdata :: NodeId , pub else_statement : Option < crate :: astdata ::
-NodeId > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for IfStatementData { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field4_finish ( f , "IfStatementData" , "value" , & self .
-value , "expression" , & self . expression , "then_statement" , & self . then_statement ,
-"else_statement" , && self . else_statement ) } } # [ automatically_derived ] impl :: core ::
-default :: Default for IfStatementData { # [ inline ] fn default ( ) -> IfStatementData {
-IfStatementData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
-default :: Default :: default ( ) , then_statement : :: core :: default :: Default :: default ( ) ,
-else_statement : :: core :: default :: Default :: default ( ) , } } } pub struct ImportAttributeData
-{ pub value : i32 , pub name : crate :: astdata :: NodeId , } # [ automatically_derived ] impl ::
-core :: fmt :: Debug for ImportAttributeData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
-fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
-debug_struct_field2_finish ( f , "ImportAttributeData" , "value" , & self . value , "name" , && self
-. name ) } } # [ automatically_derived ] impl :: core :: default :: Default for ImportAttributeData
-{ # [ inline ] fn default ( ) -> ImportAttributeData { ImportAttributeData { value : :: core ::
-default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub
-struct ImportClauseData { pub value : i32 , pub name : Option < crate :: astdata :: NodeId > , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for ImportClauseData { # [ inline ] fn fmt ( &
+default ( ) } } } pub struct IdentifierData { pub value : i32 } # [ automatically_derived ] impl ::
+core :: fmt :: Debug for IdentifierData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field1_finish
+( f , "IdentifierData" , "value" , && self . value ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for IdentifierData { # [ inline ] fn default ( ) -> IdentifierData {
+IdentifierData { value : :: core :: default :: Default :: default ( ) } } } pub struct
+IfStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId , pub then_statement
+: crate :: astdata :: NodeId , pub else_statement : Option < crate :: astdata :: NodeId > } # [
+automatically_derived ] impl :: core :: fmt :: Debug for IfStatementData { # [ inline ] fn fmt ( &
 self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field2_finish ( f , "ImportClauseData" , "value" , & self . value , "name"
-, && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default for
-ImportClauseData { # [ inline ] fn default ( ) -> ImportClauseData { ImportClauseData { value : ::
-core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , }
-} } pub struct ImportDeclarationData { pub value : i32 , pub modifiers : Option < crate :: astdata
-:: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-ImportDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+Formatter :: debug_struct_field4_finish ( f , "IfStatementData" , "value" , & self . value ,
+"expression" , & self . expression , "then_statement" , & self . then_statement , "else_statement" ,
+&& self . else_statement ) } } # [ automatically_derived ] impl :: core :: default :: Default for
+IfStatementData { # [ inline ] fn default ( ) -> IfStatementData { IfStatementData { value : :: core
+:: default :: Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) ,
+then_statement : :: core :: default :: Default :: default ( ) , else_statement : :: core :: default
+:: Default :: default ( ) } } } pub struct ImportAttributeData { pub value : i32 , pub name : crate
+:: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+ImportAttributeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
 core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"ImportDeclarationData" , "value" , & self . value , "modifiers" , && self . modifiers ) } } # [
-automatically_derived ] impl :: core :: default :: Default for ImportDeclarationData { # [ inline ]
-fn default ( ) -> ImportDeclarationData { ImportDeclarationData { value : :: core :: default ::
-Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct
-ImportEqualsDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
-modifiers : Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core
-:: fmt :: Debug for ImportEqualsDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core
+"ImportAttributeData" , "value" , & self . value , "name" , && self . name ) } } # [
+automatically_derived ] impl :: core :: default :: Default for ImportAttributeData { # [ inline ] fn
+default ( ) -> ImportAttributeData { ImportAttributeData { value : :: core :: default :: Default ::
+default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct ImportClauseData
+{ pub value : i32 , pub name : Option < crate :: astdata :: NodeId > } # [ automatically_derived ]
+impl :: core :: fmt :: Debug for ImportClauseData { # [ inline ] fn fmt ( & self , f : & mut :: core
 :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
-debug_struct_field3_finish ( f , "ImportEqualsDeclarationData" , "value" , & self . value , "name" ,
-& self . name , "modifiers" , && self . modifiers ) } } # [ automatically_derived ] impl :: core ::
-default :: Default for ImportEqualsDeclarationData { # [ inline ] fn default ( ) ->
-ImportEqualsDeclarationData { ImportEqualsDeclarationData { value : :: core :: default :: Default ::
-default ( ) , name : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default
-:: Default :: default ( ) , } } } pub struct ImportSpecifierData { pub value : i32 , pub name :
-crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-ImportSpecifierData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"ImportSpecifierData" , "value" , & self . value , "name" , && self . name ) } } # [
+debug_struct_field2_finish ( f , "ImportClauseData" , "value" , & self . value , "name" , && self .
+name ) } } # [ automatically_derived ] impl :: core :: default :: Default for ImportClauseData { # [
+inline ] fn default ( ) -> ImportClauseData { ImportClauseData { value : :: core :: default ::
+Default :: default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct
+ImportDeclarationData { pub value : i32 , pub modifiers : Option < crate :: astdata :: ModifierList
+> } # [ automatically_derived ] impl :: core :: fmt :: Debug for ImportDeclarationData { # [ inline
+] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field2_finish ( f , "ImportDeclarationData" , "value" , & self .
+value , "modifiers" , && self . modifiers ) } } # [ automatically_derived ] impl :: core :: default
+:: Default for ImportDeclarationData { # [ inline ] fn default ( ) -> ImportDeclarationData {
+ImportDeclarationData { value : :: core :: default :: Default :: default ( ) , modifiers : :: core
+:: default :: Default :: default ( ) } } } pub struct ImportEqualsDeclarationData { pub value : i32
+, pub name : crate :: astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList
+> } # [ automatically_derived ] impl :: core :: fmt :: Debug for ImportEqualsDeclarationData { # [
+inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
+core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "ImportEqualsDeclarationData" , "value"
+, & self . value , "name" , & self . name , "modifiers" , && self . modifiers ) } } # [
+automatically_derived ] impl :: core :: default :: Default for ImportEqualsDeclarationData { # [
+inline ] fn default ( ) -> ImportEqualsDeclarationData { ImportEqualsDeclarationData { value : ::
+core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) ,
+modifiers : :: core :: default :: Default :: default ( ) } } } pub struct ImportSpecifierData { pub
+value : i32 , pub name : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core ::
+fmt :: Debug for ImportSpecifierData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
+( f , "ImportSpecifierData" , "value" , & self . value , "name" , && self . name ) } } # [
 automatically_derived ] impl :: core :: default :: Default for ImportSpecifierData { # [ inline ] fn
 default ( ) -> ImportSpecifierData { ImportSpecifierData { value : :: core :: default :: Default ::
-default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub struct
+default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct
 ImportTypeNodeData { pub value : i32 , pub type_arguments : Option < crate :: astdata :: NodeList >
-, } # [ automatically_derived ] impl :: core :: fmt :: Debug for ImportTypeNodeData { # [ inline ]
-fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
-fmt :: Formatter :: debug_struct_field2_finish ( f , "ImportTypeNodeData" , "value" , & self . value
-, "type_arguments" , && self . type_arguments ) } } # [ automatically_derived ] impl :: core ::
+} # [ automatically_derived ] impl :: core :: fmt :: Debug for ImportTypeNodeData { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_struct_field2_finish ( f , "ImportTypeNodeData" , "value" , & self . value ,
+"type_arguments" , && self . type_arguments ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ImportTypeNodeData { # [ inline ] fn default ( ) -> ImportTypeNodeData {
 ImportTypeNodeData { value : :: core :: default :: Default :: default ( ) , type_arguments : :: core
-:: default :: Default :: default ( ) , } } } pub struct IndexSignatureDeclarationData { pub value :
+:: default :: Default :: default ( ) } } } pub struct IndexSignatureDeclarationData { pub value :
 i32 , pub type_ : crate :: astdata :: NodeId , pub modifiers : Option < crate :: astdata ::
-ModifierList > , pub parameters : crate :: astdata :: NodeList , } # [ automatically_derived ] impl
-:: core :: fmt :: Debug for IndexSignatureDeclarationData { # [ inline ] fn fmt ( & self , f : & mut
-:: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+ModifierList > , pub parameters : crate :: astdata :: NodeList } # [ automatically_derived ] impl ::
+core :: fmt :: Debug for IndexSignatureDeclarationData { # [ inline ] fn fmt ( & self , f : & mut ::
+core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field4_finish ( f , "IndexSignatureDeclarationData" , "value" , & self . value ,
 "type_" , & self . type_ , "modifiers" , & self . modifiers , "parameters" , && self . parameters )
 } } # [ automatically_derived ] impl :: core :: default :: Default for IndexSignatureDeclarationData
 { # [ inline ] fn default ( ) -> IndexSignatureDeclarationData { IndexSignatureDeclarationData {
 value : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
 default ( ) , modifiers : :: core :: default :: Default :: default ( ) , parameters : :: core ::
-default :: Default :: default ( ) , } } } pub struct InterfaceDeclarationData { pub value : i32 ,
-pub name : crate :: astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList >
-, } # [ automatically_derived ] impl :: core :: fmt :: Debug for InterfaceDeclarationData { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "InterfaceDeclarationData" , "value" ,
-& self . value , "name" , & self . name , "modifiers" , && self . modifiers ) } } # [
-automatically_derived ] impl :: core :: default :: Default for InterfaceDeclarationData { # [ inline
-] fn default ( ) -> InterfaceDeclarationData { InterfaceDeclarationData { value : :: core :: default
-:: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , modifiers : ::
-core :: default :: Default :: default ( ) , } } } pub struct JsDocCallbackTagData { pub value : i32
-, pub name : Option < crate :: astdata :: NodeId > , } # [ automatically_derived ] impl :: core ::
-fmt :: Debug for JsDocCallbackTagData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
-( f , "JsDocCallbackTagData" , "value" , & self . value , "name" , && self . name ) } } # [
+default :: Default :: default ( ) } } } pub struct InterfaceDeclarationData { pub value : i32 , pub
+name : crate :: astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList > } #
+[ automatically_derived ] impl :: core :: fmt :: Debug for InterfaceDeclarationData { # [ inline ]
+fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field3_finish ( f , "InterfaceDeclarationData" , "value" , & self .
+value , "name" , & self . name , "modifiers" , && self . modifiers ) } } # [ automatically_derived ]
+impl :: core :: default :: Default for InterfaceDeclarationData { # [ inline ] fn default ( ) ->
+InterfaceDeclarationData { InterfaceDeclarationData { value : :: core :: default :: Default ::
+default ( ) , name : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default
+:: Default :: default ( ) } } } pub struct JsDocCallbackTagData { pub value : i32 , pub name :
+Option < crate :: astdata :: NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+JsDocCallbackTagData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
+"JsDocCallbackTagData" , "value" , & self . value , "name" , && self . name ) } } # [
 automatically_derived ] impl :: core :: default :: Default for JsDocCallbackTagData { # [ inline ]
 fn default ( ) -> JsDocCallbackTagData { JsDocCallbackTagData { value : :: core :: default ::
-Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub struct
-JsDocLinkData { pub value : i32 , pub name : Option < crate :: astdata :: NodeId > , } # [
+Default :: default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct
+JsDocLinkData { pub value : i32 , pub name : Option < crate :: astdata :: NodeId > } # [
 automatically_derived ] impl :: core :: fmt :: Debug for JsDocLinkData { # [ inline ] fn fmt ( &
 self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field2_finish ( f , "JsDocLinkData" , "value" , & self . value , "name" ,
 && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 JsDocLinkData { # [ inline ] fn default ( ) -> JsDocLinkData { JsDocLinkData { value : :: core ::
-default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub
-struct JsDocLinkCodeData { pub value : i32 , pub name : Option < crate :: astdata :: NodeId > , } #
-[ automatically_derived ] impl :: core :: fmt :: Debug for JsDocLinkCodeData { # [ inline ] fn fmt (
-& self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub
+struct JsDocLinkCodeData { pub value : i32 , pub name : Option < crate :: astdata :: NodeId > } # [
+automatically_derived ] impl :: core :: fmt :: Debug for JsDocLinkCodeData { # [ inline ] fn fmt ( &
+self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field2_finish ( f , "JsDocLinkCodeData" , "value" , & self . value ,
 "name" , && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 JsDocLinkCodeData { # [ inline ] fn default ( ) -> JsDocLinkCodeData { JsDocLinkCodeData { value :
-:: core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) ,
-} } } pub struct JsDocLinkPlainData { pub value : i32 , pub name : Option < crate :: astdata ::
-NodeId > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsDocLinkPlainData { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "JsDocLinkPlainData" , "value" , & self
-. value , "name" , && self . name ) } } # [ automatically_derived ] impl :: core :: default ::
-Default for JsDocLinkPlainData { # [ inline ] fn default ( ) -> JsDocLinkPlainData {
-JsDocLinkPlainData { value : :: core :: default :: Default :: default ( ) , name : :: core ::
-default :: Default :: default ( ) , } } } pub struct JsDocNameReferenceData { pub value : i32 , pub
-name : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-JsDocNameReferenceData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
+:: core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) }
+} } pub struct JsDocLinkPlainData { pub value : i32 , pub name : Option < crate :: astdata :: NodeId
+> } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsDocLinkPlainData { # [ inline ]
+fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field2_finish ( f , "JsDocLinkPlainData" , "value" , & self . value
+, "name" , && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default for
+JsDocLinkPlainData { # [ inline ] fn default ( ) -> JsDocLinkPlainData { JsDocLinkPlainData { value
+: :: core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( )
+} } } pub struct JsDocNameReferenceData { pub value : i32 , pub name : crate :: astdata :: NodeId }
+# [ automatically_derived ] impl :: core :: fmt :: Debug for JsDocNameReferenceData { # [ inline ]
+fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field2_finish ( f , "JsDocNameReferenceData" , "value" , & self .
+value , "name" , && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default
+for JsDocNameReferenceData { # [ inline ] fn default ( ) -> JsDocNameReferenceData {
+JsDocNameReferenceData { value : :: core :: default :: Default :: default ( ) , name : :: core ::
+default :: Default :: default ( ) } } } pub struct JsDocNonNullableTypeData { pub value : i32 , pub
+type_ : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+JsDocNonNullableTypeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
 :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"JsDocNameReferenceData" , "value" , & self . value , "name" , && self . name ) } } # [
-automatically_derived ] impl :: core :: default :: Default for JsDocNameReferenceData { # [ inline ]
-fn default ( ) -> JsDocNameReferenceData { JsDocNameReferenceData { value : :: core :: default ::
-Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub struct
-JsDocNonNullableTypeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for JsDocNonNullableTypeData { # [ inline ] fn
-fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
-:: Formatter :: debug_struct_field2_finish ( f , "JsDocNonNullableTypeData" , "value" , & self .
-value , "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default ::
-Default for JsDocNonNullableTypeData { # [ inline ] fn default ( ) -> JsDocNonNullableTypeData {
-JsDocNonNullableTypeData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
-default :: Default :: default ( ) , } } } pub struct JsDocNullableTypeData { pub value : i32 , pub
-type_ : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-JsDocNullableTypeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"JsDocNullableTypeData" , "value" , & self . value , "type_" , && self . type_ ) } } # [
-automatically_derived ] impl :: core :: default :: Default for JsDocNullableTypeData { # [ inline ]
-fn default ( ) -> JsDocNullableTypeData { JsDocNullableTypeData { value : :: core :: default ::
-Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , } } } pub struct
-JsDocOptionalTypeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for JsDocOptionalTypeData { # [ inline ] fn fmt
+"JsDocNonNullableTypeData" , "value" , & self . value , "type_" , && self . type_ ) } } # [
+automatically_derived ] impl :: core :: default :: Default for JsDocNonNullableTypeData { # [ inline
+] fn default ( ) -> JsDocNonNullableTypeData { JsDocNonNullableTypeData { value : :: core :: default
+:: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) } } } pub struct
+JsDocNullableTypeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for JsDocNullableTypeData { # [ inline ] fn fmt
 ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field2_finish ( f , "JsDocOptionalTypeData" , "value" , & self . value ,
+Formatter :: debug_struct_field2_finish ( f , "JsDocNullableTypeData" , "value" , & self . value ,
 "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default :: Default for
-JsDocOptionalTypeData { # [ inline ] fn default ( ) -> JsDocOptionalTypeData { JsDocOptionalTypeData
+JsDocNullableTypeData { # [ inline ] fn default ( ) -> JsDocNullableTypeData { JsDocNullableTypeData
 { value : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
-default ( ) , } } } pub struct JsDocParameterOrPropertyTagData { pub value : i32 , pub name : crate
-:: astdata :: NodeId , pub type_expression : Option < crate :: astdata :: NodeId > , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for JsDocParameterOrPropertyTagData { # [
+default ( ) } } } pub struct JsDocOptionalTypeData { pub value : i32 , pub type_ : crate :: astdata
+:: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsDocOptionalTypeData { # [
 inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "JsDocParameterOrPropertyTagData" ,
+core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "JsDocOptionalTypeData" , "value" , &
+self . value , "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default
+:: Default for JsDocOptionalTypeData { # [ inline ] fn default ( ) -> JsDocOptionalTypeData {
+JsDocOptionalTypeData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
+default :: Default :: default ( ) } } } pub struct JsDocParameterOrPropertyTagData { pub value : i32
+, pub name : crate :: astdata :: NodeId , pub type_expression : Option < crate :: astdata :: NodeId
+> } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsDocParameterOrPropertyTagData { #
+[ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
+:: core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "JsDocParameterOrPropertyTagData" ,
 "value" , & self . value , "name" , & self . name , "type_expression" , && self . type_expression )
 } } # [ automatically_derived ] impl :: core :: default :: Default for
 JsDocParameterOrPropertyTagData { # [ inline ] fn default ( ) -> JsDocParameterOrPropertyTagData {
 JsDocParameterOrPropertyTagData { value : :: core :: default :: Default :: default ( ) , name : ::
 core :: default :: Default :: default ( ) , type_expression : :: core :: default :: Default ::
-default ( ) , } } } pub struct JsDocSignatureData { pub value : i32 , pub type_ : Option < crate ::
-astdata :: NodeId > , pub parameters : crate :: astdata :: NodeList , } # [ automatically_derived ]
+default ( ) } } } pub struct JsDocSignatureData { pub value : i32 , pub type_ : Option < crate ::
+astdata :: NodeId > , pub parameters : crate :: astdata :: NodeList } # [ automatically_derived ]
 impl :: core :: fmt :: Debug for JsDocSignatureData { # [ inline ] fn fmt ( & self , f : & mut ::
 core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field3_finish ( f , "JsDocSignatureData" , "value" , & self . value , "type_" , & self
 . type_ , "parameters" , && self . parameters ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for JsDocSignatureData { # [ inline ] fn default ( ) -> JsDocSignatureData {
 JsDocSignatureData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
-default :: Default :: default ( ) , parameters : :: core :: default :: Default :: default ( ) , } }
-} pub struct JsDocTypeExpressionData { pub value : i32 , pub type_ : crate :: astdata :: NodeId , }
-# [ automatically_derived ] impl :: core :: fmt :: Debug for JsDocTypeExpressionData { # [ inline ]
-fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
-fmt :: Formatter :: debug_struct_field2_finish ( f , "JsDocTypeExpressionData" , "value" , & self .
+default :: Default :: default ( ) , parameters : :: core :: default :: Default :: default ( ) } } }
+pub struct JsDocTypeExpressionData { pub value : i32 , pub type_ : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for JsDocTypeExpressionData { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_struct_field2_finish ( f , "JsDocTypeExpressionData" , "value" , & self .
 value , "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for JsDocTypeExpressionData { # [ inline ] fn default ( ) -> JsDocTypeExpressionData {
 JsDocTypeExpressionData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
-default :: Default :: default ( ) , } } } pub struct JsDocTypedefTagData { pub value : i32 , pub
-name : Option < crate :: astdata :: NodeId > , } # [ automatically_derived ] impl :: core :: fmt ::
-Debug for JsDocTypedefTagData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter
-) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
+default :: Default :: default ( ) } } } pub struct JsDocTypedefTagData { pub value : i32 , pub name
+: Option < crate :: astdata :: NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug
+for JsDocTypedefTagData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
+:: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
 "JsDocTypedefTagData" , "value" , & self . value , "name" , && self . name ) } } # [
 automatically_derived ] impl :: core :: default :: Default for JsDocTypedefTagData { # [ inline ] fn
 default ( ) -> JsDocTypedefTagData { JsDocTypedefTagData { value : :: core :: default :: Default ::
-default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub struct
-JsDocVariadicTypeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId , } # [
+default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct
+JsDocVariadicTypeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId } # [
 automatically_derived ] impl :: core :: fmt :: Debug for JsDocVariadicTypeData { # [ inline ] fn fmt
 ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field2_finish ( f , "JsDocVariadicTypeData" , "value" , & self . value ,
 "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 JsDocVariadicTypeData { # [ inline ] fn default ( ) -> JsDocVariadicTypeData { JsDocVariadicTypeData
 { value : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
-default ( ) , } } } pub struct JsxAttributeData { pub value : i32 , pub name : crate :: astdata ::
-NodeId , pub initializer : Option < crate :: astdata :: NodeId > , } # [ automatically_derived ]
-impl :: core :: fmt :: Debug for JsxAttributeData { # [ inline ] fn fmt ( & self , f : & mut :: core
-:: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+default ( ) } } } pub struct JsxAttributeData { pub value : i32 , pub name : crate :: astdata ::
+NodeId , pub initializer : Option < crate :: astdata :: NodeId > } # [ automatically_derived ] impl
+:: core :: fmt :: Debug for JsxAttributeData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
+fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field3_finish ( f , "JsxAttributeData" , "value" , & self . value , "name" , & self .
 name , "initializer" , && self . initializer ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for JsxAttributeData { # [ inline ] fn default ( ) -> JsxAttributeData {
 JsxAttributeData { value : :: core :: default :: Default :: default ( ) , name : :: core :: default
-:: Default :: default ( ) , initializer : :: core :: default :: Default :: default ( ) , } } } pub
+:: Default :: default ( ) , initializer : :: core :: default :: Default :: default ( ) } } } pub
 struct JsxExpressionData { pub value : i32 , pub expression : Option < crate :: astdata :: NodeId >
-, } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsxExpressionData { # [ inline ] fn
+} # [ automatically_derived ] impl :: core :: fmt :: Debug for JsxExpressionData { # [ inline ] fn
 fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
 :: Formatter :: debug_struct_field2_finish ( f , "JsxExpressionData" , "value" , & self . value ,
 "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for JsxExpressionData { # [ inline ] fn default ( ) -> JsxExpressionData { JsxExpressionData
 { value : :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default
-:: default ( ) , } } } pub struct JsxNamespacedNameData { pub value : i32 , pub name : crate ::
-astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+:: default ( ) } } } pub struct JsxNamespacedNameData { pub value : i32 , pub name : crate ::
+astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for
 JsxNamespacedNameData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
 core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
 "JsxNamespacedNameData" , "value" , & self . value , "name" , && self . name ) } } # [
 automatically_derived ] impl :: core :: default :: Default for JsxNamespacedNameData { # [ inline ]
 fn default ( ) -> JsxNamespacedNameData { JsxNamespacedNameData { value : :: core :: default ::
-Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub struct
+Default :: default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct
 JsxOpeningElementData { pub value : i32 , pub type_arguments : Option < crate :: astdata :: NodeList
-> , } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsxOpeningElementData { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "JsxOpeningElementData" , "value" , &
-self . value , "type_arguments" , && self . type_arguments ) } } # [ automatically_derived ] impl ::
-core :: default :: Default for JsxOpeningElementData { # [ inline ] fn default ( ) ->
+> } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsxOpeningElementData { # [ inline
+] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field2_finish ( f , "JsxOpeningElementData" , "value" , & self .
+value , "type_arguments" , && self . type_arguments ) } } # [ automatically_derived ] impl :: core
+:: default :: Default for JsxOpeningElementData { # [ inline ] fn default ( ) ->
 JsxOpeningElementData { JsxOpeningElementData { value : :: core :: default :: Default :: default ( )
-, type_arguments : :: core :: default :: Default :: default ( ) , } } } pub struct
+, type_arguments : :: core :: default :: Default :: default ( ) } } } pub struct
 JsxSelfClosingElementData { pub value : i32 , pub type_arguments : Option < crate :: astdata ::
-NodeList > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-JsxSelfClosingElementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
--> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"JsxSelfClosingElementData" , "value" , & self . value , "type_arguments" , && self . type_arguments
-) } } # [ automatically_derived ] impl :: core :: default :: Default for JsxSelfClosingElementData {
-# [ inline ] fn default ( ) -> JsxSelfClosingElementData { JsxSelfClosingElementData { value : ::
-core :: default :: Default :: default ( ) , type_arguments : :: core :: default :: Default ::
-default ( ) , } } } pub struct JsxSpreadAttributeData { pub value : i32 , pub expression : crate ::
-astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-JsxSpreadAttributeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
-:: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"JsxSpreadAttributeData" , "value" , & self . value , "expression" , && self . expression ) } } # [
-automatically_derived ] impl :: core :: default :: Default for JsxSpreadAttributeData { # [ inline ]
-fn default ( ) -> JsxSpreadAttributeData { JsxSpreadAttributeData { value : :: core :: default ::
-Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub
-struct MappedTypeNodeData { pub value : i32 , pub question_token : Option < crate :: astdata ::
-NodeId > , pub type_ : Option < crate :: astdata :: NodeId > , } # [ automatically_derived ] impl ::
-core :: fmt :: Debug for MappedTypeNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
-fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
-debug_struct_field3_finish ( f , "MappedTypeNodeData" , "value" , & self . value , "question_token"
-, & self . question_token , "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core
-:: default :: Default for MappedTypeNodeData { # [ inline ] fn default ( ) -> MappedTypeNodeData {
-MappedTypeNodeData { value : :: core :: default :: Default :: default ( ) , question_token : :: core
-:: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , } } }
-pub struct MetaPropertyData { pub value : i32 , pub name : crate :: astdata :: NodeId , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for MetaPropertyData { # [ inline ] fn fmt ( &
-self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field2_finish ( f , "MetaPropertyData" , "value" , & self . value , "name"
-, && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default for
-MetaPropertyData { # [ inline ] fn default ( ) -> MetaPropertyData { MetaPropertyData { value : ::
-core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , }
-} } pub struct MethodDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
-postfix_token : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata ::
-NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate ::
-astdata :: NodeList , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-MethodDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" , "postfix_token" , "type_" ,
-"modifiers" , "parameters" ] ; let values : & [ & dyn :: core :: fmt :: Debug ] = & [ & self . value
-, & self . name , & self . postfix_token , & self . type_ , & self . modifiers , && self .
-parameters ] ; :: core :: fmt :: Formatter :: debug_struct_fields_finish ( f ,
-"MethodDeclarationData" , names , values ) } } # [ automatically_derived ] impl :: core :: default
-:: Default for MethodDeclarationData { # [ inline ] fn default ( ) -> MethodDeclarationData {
-MethodDeclarationData { value : :: core :: default :: Default :: default ( ) , name : :: core ::
-default :: Default :: default ( ) , postfix_token : :: core :: default :: Default :: default ( ) ,
-type_ : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default :: Default ::
-default ( ) , parameters : :: core :: default :: Default :: default ( ) , } } } pub struct
-MethodSignatureDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
-postfix_token : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata ::
-NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate ::
-astdata :: NodeList , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-MethodSignatureDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" ,
+NodeList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsxSelfClosingElementData
+{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
+{ :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "JsxSelfClosingElementData" ,
+"value" , & self . value , "type_arguments" , && self . type_arguments ) } } # [
+automatically_derived ] impl :: core :: default :: Default for JsxSelfClosingElementData { # [
+inline ] fn default ( ) -> JsxSelfClosingElementData { JsxSelfClosingElementData { value : :: core
+:: default :: Default :: default ( ) , type_arguments : :: core :: default :: Default :: default ( )
+} } } pub struct JsxSpreadAttributeData { pub value : i32 , pub expression : crate :: astdata ::
+NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for JsxSpreadAttributeData { # [
+inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
+core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "JsxSpreadAttributeData" , "value" , &
+self . value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for JsxSpreadAttributeData { # [ inline ] fn default ( ) ->
+JsxSpreadAttributeData { JsxSpreadAttributeData { value : :: core :: default :: Default :: default (
+) , expression : :: core :: default :: Default :: default ( ) } } } pub struct MappedTypeNodeData {
+pub value : i32 , pub question_token : Option < crate :: astdata :: NodeId > , pub type_ : Option <
+crate :: astdata :: NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+MappedTypeNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f ,
+"MappedTypeNodeData" , "value" , & self . value , "question_token" , & self . question_token ,
+"type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default :: Default for
+MappedTypeNodeData { # [ inline ] fn default ( ) -> MappedTypeNodeData { MappedTypeNodeData { value
+: :: core :: default :: Default :: default ( ) , question_token : :: core :: default :: Default ::
+default ( ) , type_ : :: core :: default :: Default :: default ( ) } } } pub struct MetaPropertyData
+{ pub value : i32 , pub name : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core
+:: fmt :: Debug for MetaPropertyData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
+( f , "MetaPropertyData" , "value" , & self . value , "name" , && self . name ) } } # [
+automatically_derived ] impl :: core :: default :: Default for MetaPropertyData { # [ inline ] fn
+default ( ) -> MetaPropertyData { MetaPropertyData { value : :: core :: default :: Default ::
+default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct
+MethodDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub postfix_token
+: Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata :: NodeId > , pub
+modifiers : Option < crate :: astdata :: ModifierList > , pub parameters : crate :: astdata ::
+NodeList } # [ automatically_derived ] impl :: core :: fmt :: Debug for MethodDeclarationData { # [
+inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { let
+names : & 'static _ = & [ "value" , "name" , "postfix_token" , "type_" , "modifiers" , "parameters"
+] ; let values : & [ & dyn :: core :: fmt :: Debug ] = & [ & self . value , & self . name , & self .
+postfix_token , & self . type_ , & self . modifiers , && self . parameters ] ; :: core :: fmt ::
+Formatter :: debug_struct_fields_finish ( f , "MethodDeclarationData" , names , values ) } } # [
+automatically_derived ] impl :: core :: default :: Default for MethodDeclarationData { # [ inline ]
+fn default ( ) -> MethodDeclarationData { MethodDeclarationData { value : :: core :: default ::
+Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , postfix_token : ::
+core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) ,
+modifiers : :: core :: default :: Default :: default ( ) , parameters : :: core :: default ::
+Default :: default ( ) } } } pub struct MethodSignatureDeclarationData { pub value : i32 , pub name
+: crate :: astdata :: NodeId , pub postfix_token : Option < crate :: astdata :: NodeId > , pub type_
+: Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate :: astdata :: ModifierList
+> , pub parameters : crate :: astdata :: NodeList } # [ automatically_derived ] impl :: core :: fmt
+:: Debug for MethodSignatureDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
+fmt :: Formatter ) -> :: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" ,
 "postfix_token" , "type_" , "modifiers" , "parameters" ] ; let values : & [ & dyn :: core :: fmt ::
 Debug ] = & [ & self . value , & self . name , & self . postfix_token , & self . type_ , & self .
 modifiers , && self . parameters ] ; :: core :: fmt :: Formatter :: debug_struct_fields_finish ( f ,
@@ -845,26 +841,26 @@ MethodSignatureDeclarationData { MethodSignatureDeclarationData { value : :: cor
 Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , postfix_token : ::
 core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) ,
 modifiers : :: core :: default :: Default :: default ( ) , parameters : :: core :: default ::
-Default :: default ( ) , } } } pub struct MissingDeclarationData { pub value : i32 , pub modifiers :
-Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt ::
+Default :: default ( ) } } } pub struct MissingDeclarationData { pub value : i32 , pub modifiers :
+Option < crate :: astdata :: ModifierList > } # [ automatically_derived ] impl :: core :: fmt ::
 Debug for MissingDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
 ( f , "MissingDeclarationData" , "value" , & self . value , "modifiers" , && self . modifiers ) } }
 # [ automatically_derived ] impl :: core :: default :: Default for MissingDeclarationData { # [
 inline ] fn default ( ) -> MissingDeclarationData { MissingDeclarationData { value : :: core ::
-default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } }
+default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) } } }
 pub struct ModuleDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
-modifiers : Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core
+modifiers : Option < crate :: astdata :: ModifierList > } # [ automatically_derived ] impl :: core
 :: fmt :: Debug for ModuleDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt
 :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field3_finish ( f , "ModuleDeclarationData" , "value" , & self . value , "name" , &
 self . name , "modifiers" , && self . modifiers ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ModuleDeclarationData { # [ inline ] fn default ( ) -> ModuleDeclarationData
 { ModuleDeclarationData { value : :: core :: default :: Default :: default ( ) , name : :: core ::
-default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } }
+default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) } } }
 pub struct NamedTupleMemberData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
-question_token : Option < crate :: astdata :: NodeId > , pub type_ : crate :: astdata :: NodeId , }
-# [ automatically_derived ] impl :: core :: fmt :: Debug for NamedTupleMemberData { # [ inline ] fn
+question_token : Option < crate :: astdata :: NodeId > , pub type_ : crate :: astdata :: NodeId } #
+[ automatically_derived ] impl :: core :: fmt :: Debug for NamedTupleMemberData { # [ inline ] fn
 fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
 :: Formatter :: debug_struct_field4_finish ( f , "NamedTupleMemberData" , "value" , & self . value ,
 "name" , & self . name , "question_token" , & self . question_token , "type_" , && self . type_ ) }
@@ -872,15 +868,15 @@ fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Resu
 inline ] fn default ( ) -> NamedTupleMemberData { NamedTupleMemberData { value : :: core :: default
 :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , question_token :
 :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( )
-, } } } pub struct NamespaceExportData { pub value : i32 , pub name : crate :: astdata :: NodeId , }
-# [ automatically_derived ] impl :: core :: fmt :: Debug for NamespaceExportData { # [ inline ] fn
-fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
-:: Formatter :: debug_struct_field2_finish ( f , "NamespaceExportData" , "value" , & self . value ,
+} } } pub struct NamespaceExportData { pub value : i32 , pub name : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for NamespaceExportData { # [ inline ] fn fmt (
+& self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+Formatter :: debug_struct_field2_finish ( f , "NamespaceExportData" , "value" , & self . value ,
 "name" , && self . name ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 NamespaceExportData { # [ inline ] fn default ( ) -> NamespaceExportData { NamespaceExportData {
 value : :: core :: default :: Default :: default ( ) , name : :: core :: default :: Default ::
-default ( ) , } } } pub struct NamespaceExportDeclarationData { pub value : i32 , pub name : crate
-:: astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList > , } # [
+default ( ) } } } pub struct NamespaceExportDeclarationData { pub value : i32 , pub name : crate ::
+astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList > } # [
 automatically_derived ] impl :: core :: fmt :: Debug for NamespaceExportDeclarationData { # [ inline
 ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
 fmt :: Formatter :: debug_struct_field3_finish ( f , "NamespaceExportDeclarationData" , "value" , &
@@ -888,107 +884,107 @@ self . value , "name" , & self . name , "modifiers" , && self . modifiers ) } } 
 automatically_derived ] impl :: core :: default :: Default for NamespaceExportDeclarationData { # [
 inline ] fn default ( ) -> NamespaceExportDeclarationData { NamespaceExportDeclarationData { value :
 :: core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) ,
-modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct NamespaceImportData {
-pub value : i32 , pub name : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core
-:: fmt :: Debug for NamespaceImportData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+modifiers : :: core :: default :: Default :: default ( ) } } } pub struct NamespaceImportData { pub
+value : i32 , pub name : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core ::
+fmt :: Debug for NamespaceImportData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
 ( f , "NamespaceImportData" , "value" , & self . value , "name" , && self . name ) } } # [
 automatically_derived ] impl :: core :: default :: Default for NamespaceImportData { # [ inline ] fn
 default ( ) -> NamespaceImportData { NamespaceImportData { value : :: core :: default :: Default ::
-default ( ) , name : :: core :: default :: Default :: default ( ) , } } } pub struct
-NewExpressionData { pub value : i32 , pub expression : crate :: astdata :: NodeId , pub
-type_arguments : Option < crate :: astdata :: NodeList > , } # [ automatically_derived ] impl ::
-core :: fmt :: Debug for NewExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt
-:: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
-debug_struct_field3_finish ( f , "NewExpressionData" , "value" , & self . value , "expression" , &
-self . expression , "type_arguments" , && self . type_arguments ) } } # [ automatically_derived ]
-impl :: core :: default :: Default for NewExpressionData { # [ inline ] fn default ( ) ->
-NewExpressionData { NewExpressionData { value : :: core :: default :: Default :: default ( ) ,
-expression : :: core :: default :: Default :: default ( ) , type_arguments : :: core :: default ::
-Default :: default ( ) , } } } pub struct NonNullExpressionData { pub value : i32 , pub expression :
-crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-NonNullExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"NonNullExpressionData" , "value" , & self . value , "expression" , && self . expression ) } } # [
-automatically_derived ] impl :: core :: default :: Default for NonNullExpressionData { # [ inline ]
-fn default ( ) -> NonNullExpressionData { NonNullExpressionData { value : :: core :: default ::
-Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub
-struct OptionalTypeNodeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for OptionalTypeNodeData { # [ inline ] fn fmt
-( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field2_finish ( f , "OptionalTypeNodeData" , "value" , & self . value ,
-"type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default :: Default for
-OptionalTypeNodeData { # [ inline ] fn default ( ) -> OptionalTypeNodeData { OptionalTypeNodeData {
-value : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default ::
-default ( ) , } } } pub struct ParameterDeclarationData { pub value : i32 , pub name : crate ::
-astdata :: NodeId , pub question_token : Option < crate :: astdata :: NodeId > , pub type_ : Option
-< crate :: astdata :: NodeId > , pub initializer : Option < crate :: astdata :: NodeId > , pub
-modifiers : Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core
-:: fmt :: Debug for ParameterDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
-fmt :: Formatter ) -> :: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" ,
-"question_token" , "type_" , "initializer" , "modifiers" ] ; let values : & [ & dyn :: core :: fmt
-:: Debug ] = & [ & self . value , & self . name , & self . question_token , & self . type_ , & self
-. initializer , && self . modifiers ] ; :: core :: fmt :: Formatter :: debug_struct_fields_finish (
-f , "ParameterDeclarationData" , names , values ) } } # [ automatically_derived ] impl :: core ::
+default ( ) , name : :: core :: default :: Default :: default ( ) } } } pub struct NewExpressionData
+{ pub value : i32 , pub expression : crate :: astdata :: NodeId , pub type_arguments : Option <
+crate :: astdata :: NodeList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+NewExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f ,
+"NewExpressionData" , "value" , & self . value , "expression" , & self . expression ,
+"type_arguments" , && self . type_arguments ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for NewExpressionData { # [ inline ] fn default ( ) -> NewExpressionData {
+NewExpressionData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
+default :: Default :: default ( ) , type_arguments : :: core :: default :: Default :: default ( ) }
+} } pub struct NonNullExpressionData { pub value : i32 , pub expression : crate :: astdata :: NodeId
+} # [ automatically_derived ] impl :: core :: fmt :: Debug for NonNullExpressionData { # [ inline ]
+fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field2_finish ( f , "NonNullExpressionData" , "value" , & self .
+value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for NonNullExpressionData { # [ inline ] fn default ( ) -> NonNullExpressionData
+{ NonNullExpressionData { value : :: core :: default :: Default :: default ( ) , expression : ::
+core :: default :: Default :: default ( ) } } } pub struct OptionalTypeNodeData { pub value : i32 ,
+pub type_ : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug
+for OptionalTypeNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
+:: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
+"OptionalTypeNodeData" , "value" , & self . value , "type_" , && self . type_ ) } } # [
+automatically_derived ] impl :: core :: default :: Default for OptionalTypeNodeData { # [ inline ]
+fn default ( ) -> OptionalTypeNodeData { OptionalTypeNodeData { value : :: core :: default ::
+Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) } } } pub struct
+ParameterDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
+question_token : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata ::
+NodeId > , pub initializer : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate
+:: astdata :: ModifierList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+ParameterDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
+:: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" , "question_token" ,
+"type_" , "initializer" , "modifiers" ] ; let values : & [ & dyn :: core :: fmt :: Debug ] = & [ &
+self . value , & self . name , & self . question_token , & self . type_ , & self . initializer , &&
+self . modifiers ] ; :: core :: fmt :: Formatter :: debug_struct_fields_finish ( f ,
+"ParameterDeclarationData" , names , values ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ParameterDeclarationData { # [ inline ] fn default ( ) ->
 ParameterDeclarationData { ParameterDeclarationData { value : :: core :: default :: Default ::
 default ( ) , name : :: core :: default :: Default :: default ( ) , question_token : :: core ::
 default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) ,
 initializer : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default ::
-Default :: default ( ) , } } } pub struct ParenthesizedExpressionData { pub value : i32 , pub
-expression : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug
+Default :: default ( ) } } } pub struct ParenthesizedExpressionData { pub value : i32 , pub
+expression : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug
 for ParenthesizedExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
 ( f , "ParenthesizedExpressionData" , "value" , & self . value , "expression" , && self . expression
 ) } } # [ automatically_derived ] impl :: core :: default :: Default for ParenthesizedExpressionData
 { # [ inline ] fn default ( ) -> ParenthesizedExpressionData { ParenthesizedExpressionData { value :
 :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default :: default
-( ) , } } } pub struct ParenthesizedTypeNodeData { pub value : i32 , pub type_ : crate :: astdata ::
-NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for ParenthesizedTypeNodeData {
-# [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
+( ) } } } pub struct ParenthesizedTypeNodeData { pub value : i32 , pub type_ : crate :: astdata ::
+NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for ParenthesizedTypeNodeData { #
+[ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
 :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "ParenthesizedTypeNodeData" ,
 "value" , & self . value , "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core
 :: default :: Default for ParenthesizedTypeNodeData { # [ inline ] fn default ( ) ->
 ParenthesizedTypeNodeData { ParenthesizedTypeNodeData { value : :: core :: default :: Default ::
-default ( ) , type_ : :: core :: default :: Default :: default ( ) , } } } pub struct
-PartiallyEmittedExpressionData { pub value : i32 , pub expression : crate :: astdata :: NodeId , } #
-[ automatically_derived ] impl :: core :: fmt :: Debug for PartiallyEmittedExpressionData { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "PartiallyEmittedExpressionData" ,
-"value" , & self . value , "expression" , && self . expression ) } } # [ automatically_derived ]
-impl :: core :: default :: Default for PartiallyEmittedExpressionData { # [ inline ] fn default ( )
--> PartiallyEmittedExpressionData { PartiallyEmittedExpressionData { value : :: core :: default ::
-Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub
-struct PropertyAccessExpressionData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
+default ( ) , type_ : :: core :: default :: Default :: default ( ) } } } pub struct
+PartiallyEmittedExpressionData { pub value : i32 , pub expression : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for PartiallyEmittedExpressionData { # [ inline
+] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
+fmt :: Formatter :: debug_struct_field2_finish ( f , "PartiallyEmittedExpressionData" , "value" , &
+self . value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for PartiallyEmittedExpressionData { # [ inline ] fn default ( ) ->
+PartiallyEmittedExpressionData { PartiallyEmittedExpressionData { value : :: core :: default ::
+Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) } } } pub struct
+PropertyAccessExpressionData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
 expression : crate :: astdata :: NodeId , pub question_dot_token : Option < crate :: astdata ::
-NodeId > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-PropertyAccessExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter
-) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f ,
-"PropertyAccessExpressionData" , "value" , & self . value , "name" , & self . name , "expression" ,
-& self . expression , "question_dot_token" , && self . question_dot_token ) } } # [
-automatically_derived ] impl :: core :: default :: Default for PropertyAccessExpressionData { # [
-inline ] fn default ( ) -> PropertyAccessExpressionData { PropertyAccessExpressionData { value : ::
-core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) ,
-expression : :: core :: default :: Default :: default ( ) , question_dot_token : :: core :: default
-:: Default :: default ( ) , } } } pub struct PropertyAssignmentData { pub value : i32 , pub name :
-crate :: astdata :: NodeId , pub postfix_token : Option < crate :: astdata :: NodeId > , pub type_ :
-Option < crate :: astdata :: NodeId > , pub initializer : crate :: astdata :: NodeId , pub modifiers
-: Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt ::
-Debug for PropertyAssignmentData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
-Formatter ) -> :: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" ,
-"postfix_token" , "type_" , "initializer" , "modifiers" ] ; let values : & [ & dyn :: core :: fmt ::
-Debug ] = & [ & self . value , & self . name , & self . postfix_token , & self . type_ , & self .
-initializer , && self . modifiers ] ; :: core :: fmt :: Formatter :: debug_struct_fields_finish ( f
-, "PropertyAssignmentData" , names , values ) } } # [ automatically_derived ] impl :: core ::
-default :: Default for PropertyAssignmentData { # [ inline ] fn default ( ) ->
-PropertyAssignmentData { PropertyAssignmentData { value : :: core :: default :: Default :: default (
-) , name : :: core :: default :: Default :: default ( ) , postfix_token : :: core :: default ::
-Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , initializer : ::
-core :: default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( )
-, } } } pub struct PropertyDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId
+NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for PropertyAccessExpressionData
+{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
+{ :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f , "PropertyAccessExpressionData" ,
+"value" , & self . value , "name" , & self . name , "expression" , & self . expression ,
+"question_dot_token" , && self . question_dot_token ) } } # [ automatically_derived ] impl :: core
+:: default :: Default for PropertyAccessExpressionData { # [ inline ] fn default ( ) ->
+PropertyAccessExpressionData { PropertyAccessExpressionData { value : :: core :: default :: Default
+:: default ( ) , name : :: core :: default :: Default :: default ( ) , expression : :: core ::
+default :: Default :: default ( ) , question_dot_token : :: core :: default :: Default :: default (
+) } } } pub struct PropertyAssignmentData { pub value : i32 , pub name : crate :: astdata :: NodeId
 , pub postfix_token : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata
-:: NodeId > , pub initializer : Option < crate :: astdata :: NodeId > , pub modifiers : Option <
-crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+:: NodeId > , pub initializer : crate :: astdata :: NodeId , pub modifiers : Option < crate ::
+astdata :: ModifierList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+PropertyAssignmentData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
+:: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" , "postfix_token" ,
+"type_" , "initializer" , "modifiers" ] ; let values : & [ & dyn :: core :: fmt :: Debug ] = & [ &
+self . value , & self . name , & self . postfix_token , & self . type_ , & self . initializer , &&
+self . modifiers ] ; :: core :: fmt :: Formatter :: debug_struct_fields_finish ( f ,
+"PropertyAssignmentData" , names , values ) } } # [ automatically_derived ] impl :: core :: default
+:: Default for PropertyAssignmentData { # [ inline ] fn default ( ) -> PropertyAssignmentData {
+PropertyAssignmentData { value : :: core :: default :: Default :: default ( ) , name : :: core ::
+default :: Default :: default ( ) , postfix_token : :: core :: default :: Default :: default ( ) ,
+type_ : :: core :: default :: Default :: default ( ) , initializer : :: core :: default :: Default
+:: default ( ) , modifiers : :: core :: default :: Default :: default ( ) } } } pub struct
+PropertyDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
+postfix_token : Option < crate :: astdata :: NodeId > , pub type_ : Option < crate :: astdata ::
+NodeId > , pub initializer : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate
+:: astdata :: ModifierList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
 PropertyDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) ->
 :: core :: fmt :: Result { let names : & 'static _ = & [ "value" , "name" , "postfix_token" ,
 "type_" , "initializer" , "modifiers" ] ; let values : & [ & dyn :: core :: fmt :: Debug ] = & [ &
@@ -999,13 +995,13 @@ self . modifiers ] ; :: core :: fmt :: Formatter :: debug_struct_fields_finish (
 PropertyDeclarationData { value : :: core :: default :: Default :: default ( ) , name : :: core ::
 default :: Default :: default ( ) , postfix_token : :: core :: default :: Default :: default ( ) ,
 type_ : :: core :: default :: Default :: default ( ) , initializer : :: core :: default :: Default
-:: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct
+:: default ( ) , modifiers : :: core :: default :: Default :: default ( ) } } } pub struct
 PropertySignatureDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
 postfix_token : Option < crate :: astdata :: NodeId > , pub type_ : crate :: astdata :: NodeId , pub
 initializer : crate :: astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList
-> , } # [ automatically_derived ] impl :: core :: fmt :: Debug for PropertySignatureDeclarationData
-{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
-{ let names : & 'static _ = & [ "value" , "name" , "postfix_token" , "type_" , "initializer" ,
+> } # [ automatically_derived ] impl :: core :: fmt :: Debug for PropertySignatureDeclarationData {
+# [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
+let names : & 'static _ = & [ "value" , "name" , "postfix_token" , "type_" , "initializer" ,
 "modifiers" ] ; let values : & [ & dyn :: core :: fmt :: Debug ] = & [ & self . value , & self .
 name , & self . postfix_token , & self . type_ , & self . initializer , && self . modifiers ] ; ::
 core :: fmt :: Formatter :: debug_struct_fields_finish ( f , "PropertySignatureDeclarationData" ,
@@ -1014,31 +1010,31 @@ PropertySignatureDeclarationData { # [ inline ] fn default ( ) -> PropertySignat
 PropertySignatureDeclarationData { value : :: core :: default :: Default :: default ( ) , name : ::
 core :: default :: Default :: default ( ) , postfix_token : :: core :: default :: Default :: default
 ( ) , type_ : :: core :: default :: Default :: default ( ) , initializer : :: core :: default ::
-Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct
+Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) } } } pub struct
 QualifiedNameData { pub value : i32 , pub left : crate :: astdata :: NodeId , pub right : crate ::
-astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for QualifiedNameData
-{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
-{ :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "QualifiedNameData" , "value" , &
+astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for QualifiedNameData {
+# [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
+:: core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "QualifiedNameData" , "value" , &
 self . value , "left" , & self . left , "right" , && self . right ) } } # [ automatically_derived ]
 impl :: core :: default :: Default for QualifiedNameData { # [ inline ] fn default ( ) ->
 QualifiedNameData { QualifiedNameData { value : :: core :: default :: Default :: default ( ) , left
 : :: core :: default :: Default :: default ( ) , right : :: core :: default :: Default :: default (
-) , } } } pub struct RestTypeNodeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId , }
-# [ automatically_derived ] impl :: core :: fmt :: Debug for RestTypeNodeData { # [ inline ] fn fmt
-( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+) } } } pub struct RestTypeNodeData { pub value : i32 , pub type_ : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for RestTypeNodeData { # [ inline ] fn fmt ( &
+self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field2_finish ( f , "RestTypeNodeData" , "value" , & self . value ,
 "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 RestTypeNodeData { # [ inline ] fn default ( ) -> RestTypeNodeData { RestTypeNodeData { value : ::
-core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , }
-} } pub struct ReturnStatementData { pub value : i32 , pub expression : Option < crate :: astdata ::
-NodeId > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for ReturnStatementData { # [
+core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) } }
+} pub struct ReturnStatementData { pub value : i32 , pub expression : Option < crate :: astdata ::
+NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for ReturnStatementData { # [
 inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
 core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "ReturnStatementData" , "value" , &
 self . value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for ReturnStatementData { # [ inline ] fn default ( ) -> ReturnStatementData {
 ReturnStatementData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
-default :: Default :: default ( ) , } } } pub struct SatisfiesExpressionData { pub value : i32 , pub
-expression : crate :: astdata :: NodeId , pub type_ : crate :: astdata :: NodeId , } # [
+default :: Default :: default ( ) } } } pub struct SatisfiesExpressionData { pub value : i32 , pub
+expression : crate :: astdata :: NodeId , pub type_ : crate :: astdata :: NodeId } # [
 automatically_derived ] impl :: core :: fmt :: Debug for SatisfiesExpressionData { # [ inline ] fn
 fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
 :: Formatter :: debug_struct_field3_finish ( f , "SatisfiesExpressionData" , "value" , & self .
@@ -1046,10 +1042,10 @@ value , "expression" , & self . expression , "type_" , && self . type_ ) } } # [
 automatically_derived ] impl :: core :: default :: Default for SatisfiesExpressionData { # [ inline
 ] fn default ( ) -> SatisfiesExpressionData { SatisfiesExpressionData { value : :: core :: default
 :: Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) , type_ : ::
-core :: default :: Default :: default ( ) , } } } pub struct SetAccessorDeclarationData { pub value
-: i32 , pub name : crate :: astdata :: NodeId , pub postfix_token : Option < crate :: astdata ::
+core :: default :: Default :: default ( ) } } } pub struct SetAccessorDeclarationData { pub value :
+i32 , pub name : crate :: astdata :: NodeId , pub postfix_token : Option < crate :: astdata ::
 NodeId > , pub type_ : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate ::
-astdata :: ModifierList > , pub parameters : crate :: astdata :: NodeList , } # [
+astdata :: ModifierList > , pub parameters : crate :: astdata :: NodeList } # [
 automatically_derived ] impl :: core :: fmt :: Debug for SetAccessorDeclarationData { # [ inline ]
 fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { let names :
 & 'static _ = & [ "value" , "name" , "postfix_token" , "type_" , "modifiers" , "parameters" ] ; let
@@ -1061,10 +1057,10 @@ inline ] fn default ( ) -> SetAccessorDeclarationData { SetAccessorDeclarationDa
 :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) ,
 postfix_token : :: core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default
 :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , parameters : :: core ::
-default :: Default :: default ( ) , } } } pub struct ShorthandPropertyAssignmentData { pub value :
-i32 , pub name : crate :: astdata :: NodeId , pub postfix_token : Option < crate :: astdata ::
-NodeId > , pub type_ : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate ::
-astdata :: ModifierList > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+default :: Default :: default ( ) } } } pub struct ShorthandPropertyAssignmentData { pub value : i32
+, pub name : crate :: astdata :: NodeId , pub postfix_token : Option < crate :: astdata :: NodeId >
+, pub type_ : Option < crate :: astdata :: NodeId > , pub modifiers : Option < crate :: astdata ::
+ModifierList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
 ShorthandPropertyAssignmentData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
 Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field5_finish
 ( f , "ShorthandPropertyAssignmentData" , "value" , & self . value , "name" , & self . name ,
@@ -1074,45 +1070,45 @@ ShorthandPropertyAssignmentData { # [ inline ] fn default ( ) -> ShorthandProper
 ShorthandPropertyAssignmentData { value : :: core :: default :: Default :: default ( ) , name : ::
 core :: default :: Default :: default ( ) , postfix_token : :: core :: default :: Default :: default
 ( ) , type_ : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default ::
-Default :: default ( ) , } } } pub struct SourceFileData { pub value : i32 , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for SourceFileData { # [ inline ] fn fmt ( &
-self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field1_finish ( f , "SourceFileData" , "value" , && self . value ) } } # [
+Default :: default ( ) } } } pub struct SourceFileData { pub value : i32 } # [ automatically_derived
+] impl :: core :: fmt :: Debug for SourceFileData { # [ inline ] fn fmt ( & self , f : & mut :: core
+:: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+debug_struct_field1_finish ( f , "SourceFileData" , "value" , && self . value ) } } # [
 automatically_derived ] impl :: core :: default :: Default for SourceFileData { # [ inline ] fn
 default ( ) -> SourceFileData { SourceFileData { value : :: core :: default :: Default :: default (
 ) } } } pub struct SpreadAssignmentData { pub value : i32 , pub expression : crate :: astdata ::
-NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for SpreadAssignmentData { # [
+NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for SpreadAssignmentData { # [
 inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
 core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "SpreadAssignmentData" , "value" , &
 self . value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for SpreadAssignmentData { # [ inline ] fn default ( ) -> SpreadAssignmentData {
 SpreadAssignmentData { value : :: core :: default :: Default :: default ( ) , expression : :: core
-:: default :: Default :: default ( ) , } } } pub struct SpreadElementData { pub value : i32 , pub
-expression : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug
+:: default :: Default :: default ( ) } } } pub struct SpreadElementData { pub value : i32 , pub
+expression : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug
 for SpreadElementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
 core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
 "SpreadElementData" , "value" , & self . value , "expression" , && self . expression ) } } # [
 automatically_derived ] impl :: core :: default :: Default for SpreadElementData { # [ inline ] fn
 default ( ) -> SpreadElementData { SpreadElementData { value : :: core :: default :: Default ::
-default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub struct
-SwitchStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId , } # [
+default ( ) , expression : :: core :: default :: Default :: default ( ) } } } pub struct
+SwitchStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId } # [
 automatically_derived ] impl :: core :: fmt :: Debug for SwitchStatementData { # [ inline ] fn fmt (
 & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field2_finish ( f , "SwitchStatementData" , "value" , & self . value ,
 "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for SwitchStatementData { # [ inline ] fn default ( ) -> SwitchStatementData {
 SwitchStatementData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
-default :: Default :: default ( ) , } } } pub struct SyntheticReferenceExpressionData { pub value :
-i32 , pub expression : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core ::
-fmt :: Debug for SyntheticReferenceExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core
-:: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+default :: Default :: default ( ) } } } pub struct SyntheticReferenceExpressionData { pub value :
+i32 , pub expression : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt
+:: Debug for SyntheticReferenceExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
+fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field2_finish ( f , "SyntheticReferenceExpressionData" , "value" , & self . value ,
 "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for SyntheticReferenceExpressionData { # [ inline ] fn default ( ) ->
 SyntheticReferenceExpressionData { SyntheticReferenceExpressionData { value : :: core :: default ::
-Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub
-struct TaggedTemplateExpressionData { pub value : i32 , pub type_arguments : Option < crate ::
-astdata :: NodeList > , pub question_dot_token : Option < crate :: astdata :: NodeId > , } # [
+Default :: default ( ) , expression : :: core :: default :: Default :: default ( ) } } } pub struct
+TaggedTemplateExpressionData { pub value : i32 , pub type_arguments : Option < crate :: astdata ::
+NodeList > , pub question_dot_token : Option < crate :: astdata :: NodeId > } # [
 automatically_derived ] impl :: core :: fmt :: Debug for TaggedTemplateExpressionData { # [ inline ]
 fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
 fmt :: Formatter :: debug_struct_field3_finish ( f , "TaggedTemplateExpressionData" , "value" , &
@@ -1121,105 +1117,105 @@ question_dot_token ) } } # [ automatically_derived ] impl :: core :: default :: 
 TaggedTemplateExpressionData { # [ inline ] fn default ( ) -> TaggedTemplateExpressionData {
 TaggedTemplateExpressionData { value : :: core :: default :: Default :: default ( ) , type_arguments
 : :: core :: default :: Default :: default ( ) , question_dot_token : :: core :: default :: Default
-:: default ( ) , } } } pub struct TemplateLiteralTypeSpanData { pub value : i32 , pub type_ : crate
-:: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+:: default ( ) } } } pub struct TemplateLiteralTypeSpanData { pub value : i32 , pub type_ : crate ::
+astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for
 TemplateLiteralTypeSpanData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
 -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
 "TemplateLiteralTypeSpanData" , "value" , & self . value , "type_" , && self . type_ ) } } # [
 automatically_derived ] impl :: core :: default :: Default for TemplateLiteralTypeSpanData { # [
 inline ] fn default ( ) -> TemplateLiteralTypeSpanData { TemplateLiteralTypeSpanData { value : ::
-core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , }
-} } pub struct TemplateSpanData { pub value : i32 , pub expression : crate :: astdata :: NodeId , }
-# [ automatically_derived ] impl :: core :: fmt :: Debug for TemplateSpanData { # [ inline ] fn fmt
-( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+core :: default :: Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) } }
+} pub struct TemplateSpanData { pub value : i32 , pub expression : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for TemplateSpanData { # [ inline ] fn fmt ( &
+self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
 Formatter :: debug_struct_field2_finish ( f , "TemplateSpanData" , "value" , & self . value ,
 "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core :: default ::
 Default for TemplateSpanData { # [ inline ] fn default ( ) -> TemplateSpanData { TemplateSpanData {
 value : :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default ::
-default ( ) , } } } pub struct ThrowStatementData { pub value : i32 , pub expression : crate ::
-astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-ThrowStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"ThrowStatementData" , "value" , & self . value , "expression" , && self . expression ) } } # [
-automatically_derived ] impl :: core :: default :: Default for ThrowStatementData { # [ inline ] fn
-default ( ) -> ThrowStatementData { ThrowStatementData { value : :: core :: default :: Default ::
-default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub struct TokenData
-{ pub value : i32 , } # [ automatically_derived ] impl :: core :: fmt :: Debug for TokenData { # [
-inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
-core :: fmt :: Formatter :: debug_struct_field1_finish ( f , "TokenData" , "value" , && self . value
-) } } # [ automatically_derived ] impl :: core :: default :: Default for TokenData { # [ inline ] fn
-default ( ) -> TokenData { TokenData { value : :: core :: default :: Default :: default ( ) } } }
-pub struct TypeAliasDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub
-type_ : crate :: astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList > , }
-# [ automatically_derived ] impl :: core :: fmt :: Debug for TypeAliasDeclarationData { # [ inline ]
-fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core ::
-fmt :: Formatter :: debug_struct_field4_finish ( f , "TypeAliasDeclarationData" , "value" , & self .
+default ( ) } } } pub struct ThrowStatementData { pub value : i32 , pub expression : crate ::
+astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for ThrowStatementData
+{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
+{ :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "ThrowStatementData" , "value" , &
+self . value , "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core ::
+default :: Default for ThrowStatementData { # [ inline ] fn default ( ) -> ThrowStatementData {
+ThrowStatementData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
+default :: Default :: default ( ) } } } pub struct TokenData { pub value : i32 } # [
+automatically_derived ] impl :: core :: fmt :: Debug for TokenData { # [ inline ] fn fmt ( & self ,
+f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+debug_struct_field1_finish ( f , "TokenData" , "value" , && self . value ) } } # [
+automatically_derived ] impl :: core :: default :: Default for TokenData { # [ inline ] fn default (
+) -> TokenData { TokenData { value : :: core :: default :: Default :: default ( ) } } } pub struct
+TypeAliasDeclarationData { pub value : i32 , pub name : crate :: astdata :: NodeId , pub type_ :
+crate :: astdata :: NodeId , pub modifiers : Option < crate :: astdata :: ModifierList > } # [
+automatically_derived ] impl :: core :: fmt :: Debug for TypeAliasDeclarationData { # [ inline ] fn
+fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
+:: Formatter :: debug_struct_field4_finish ( f , "TypeAliasDeclarationData" , "value" , & self .
 value , "name" , & self . name , "type_" , & self . type_ , "modifiers" , && self . modifiers ) } }
 # [ automatically_derived ] impl :: core :: default :: Default for TypeAliasDeclarationData { # [
 inline ] fn default ( ) -> TypeAliasDeclarationData { TypeAliasDeclarationData { value : :: core ::
 default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , type_ : ::
 core :: default :: Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( )
-, } } } pub struct TypeAssertionData { pub value : i32 , pub expression : crate :: astdata :: NodeId
-, pub type_ : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt ::
-Debug for TypeAssertionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
--> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f ,
+} } } pub struct TypeAssertionData { pub value : i32 , pub expression : crate :: astdata :: NodeId ,
+pub type_ : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug
+for TypeAssertionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f ,
 "TypeAssertionData" , "value" , & self . value , "expression" , & self . expression , "type_" , &&
 self . type_ ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 TypeAssertionData { # [ inline ] fn default ( ) -> TypeAssertionData { TypeAssertionData { value :
 :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default :: default
-( ) , type_ : :: core :: default :: Default :: default ( ) , } } } pub struct TypeOfExpressionData {
-pub value : i32 , pub expression : crate :: astdata :: NodeId , } # [ automatically_derived ] impl
-:: core :: fmt :: Debug for TypeOfExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core
-:: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+( ) , type_ : :: core :: default :: Default :: default ( ) } } } pub struct TypeOfExpressionData {
+pub value : i32 , pub expression : crate :: astdata :: NodeId } # [ automatically_derived ] impl ::
+core :: fmt :: Debug for TypeOfExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core ::
+fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field2_finish ( f , "TypeOfExpressionData" , "value" , & self . value , "expression" ,
 && self . expression ) } } # [ automatically_derived ] impl :: core :: default :: Default for
 TypeOfExpressionData { # [ inline ] fn default ( ) -> TypeOfExpressionData { TypeOfExpressionData {
 value : :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default ::
-default ( ) , } } } pub struct TypeOperatorNodeData { pub value : i32 , pub type_ : crate :: astdata
-:: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for TypeOperatorNodeData { #
-[ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result {
-:: core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "TypeOperatorNodeData" , "value" , &
+default ( ) } } } pub struct TypeOperatorNodeData { pub value : i32 , pub type_ : crate :: astdata
+:: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for TypeOperatorNodeData { # [
+inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
+core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "TypeOperatorNodeData" , "value" , &
 self . value , "type_" , && self . type_ ) } } # [ automatically_derived ] impl :: core :: default
 :: Default for TypeOperatorNodeData { # [ inline ] fn default ( ) -> TypeOperatorNodeData {
 TypeOperatorNodeData { value : :: core :: default :: Default :: default ( ) , type_ : :: core ::
-default :: Default :: default ( ) , } } } pub struct TypeParameterDeclarationData { pub value : i32
-, pub name : crate :: astdata :: NodeId , pub expression : Option < crate :: astdata :: NodeId > ,
-pub modifiers : Option < crate :: astdata :: ModifierList > , } # [ automatically_derived ] impl ::
-core :: fmt :: Debug for TypeParameterDeclarationData { # [ inline ] fn fmt ( & self , f : & mut ::
-core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
+default :: Default :: default ( ) } } } pub struct TypeParameterDeclarationData { pub value : i32 ,
+pub name : crate :: astdata :: NodeId , pub expression : Option < crate :: astdata :: NodeId > , pub
+modifiers : Option < crate :: astdata :: ModifierList > } # [ automatically_derived ] impl :: core
+:: fmt :: Debug for TypeParameterDeclarationData { # [ inline ] fn fmt ( & self , f : & mut :: core
+:: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field4_finish ( f , "TypeParameterDeclarationData" , "value" , & self . value , "name"
 , & self . name , "expression" , & self . expression , "modifiers" , && self . modifiers ) } } # [
 automatically_derived ] impl :: core :: default :: Default for TypeParameterDeclarationData { # [
 inline ] fn default ( ) -> TypeParameterDeclarationData { TypeParameterDeclarationData { value : ::
 core :: default :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) ,
 expression : :: core :: default :: Default :: default ( ) , modifiers : :: core :: default ::
-Default :: default ( ) , } } } pub struct TypePredicateNodeData { pub value : i32 , pub type_ :
-Option < crate :: astdata :: NodeId > , } # [ automatically_derived ] impl :: core :: fmt :: Debug
-for TypePredicateNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
--> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
+Default :: default ( ) } } } pub struct TypePredicateNodeData { pub value : i32 , pub type_ : Option
+< crate :: astdata :: NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+TypePredicateNodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
 "TypePredicateNodeData" , "value" , & self . value , "type_" , && self . type_ ) } } # [
 automatically_derived ] impl :: core :: default :: Default for TypePredicateNodeData { # [ inline ]
 fn default ( ) -> TypePredicateNodeData { TypePredicateNodeData { value : :: core :: default ::
-Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) , } } } pub struct
-TypeQueryNodeData { pub value : i32 , pub type_arguments : Option < crate :: astdata :: NodeList > ,
-} # [ automatically_derived ] impl :: core :: fmt :: Debug for TypeQueryNodeData { # [ inline ] fn
-fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt
-:: Formatter :: debug_struct_field2_finish ( f , "TypeQueryNodeData" , "value" , & self . value ,
+Default :: default ( ) , type_ : :: core :: default :: Default :: default ( ) } } } pub struct
+TypeQueryNodeData { pub value : i32 , pub type_arguments : Option < crate :: astdata :: NodeList > }
+# [ automatically_derived ] impl :: core :: fmt :: Debug for TypeQueryNodeData { # [ inline ] fn fmt
+( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+Formatter :: debug_struct_field2_finish ( f , "TypeQueryNodeData" , "value" , & self . value ,
 "type_arguments" , && self . type_arguments ) } } # [ automatically_derived ] impl :: core ::
 default :: Default for TypeQueryNodeData { # [ inline ] fn default ( ) -> TypeQueryNodeData {
 TypeQueryNodeData { value : :: core :: default :: Default :: default ( ) , type_arguments : :: core
-:: default :: Default :: default ( ) , } } } pub struct TypeReferenceNodeData { pub value : i32 ,
-pub type_arguments : Option < crate :: astdata :: NodeList > , pub type_name : crate :: astdata ::
-NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug for TypeReferenceNodeData { # [
+:: default :: Default :: default ( ) } } } pub struct TypeReferenceNodeData { pub value : i32 , pub
+type_arguments : Option < crate :: astdata :: NodeList > , pub type_name : crate :: astdata ::
+NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for TypeReferenceNodeData { # [
 inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { ::
 core :: fmt :: Formatter :: debug_struct_field3_finish ( f , "TypeReferenceNodeData" , "value" , &
 self . value , "type_arguments" , & self . type_arguments , "type_name" , && self . type_name ) } }
 # [ automatically_derived ] impl :: core :: default :: Default for TypeReferenceNodeData { # [
 inline ] fn default ( ) -> TypeReferenceNodeData { TypeReferenceNodeData { value : :: core ::
 default :: Default :: default ( ) , type_arguments : :: core :: default :: Default :: default ( ) ,
-type_name : :: core :: default :: Default :: default ( ) , } } } pub struct VariableDeclarationData
-{ pub value : i32 , pub name : crate :: astdata :: NodeId , pub type_ : Option < crate :: astdata ::
-NodeId > , pub initializer : Option < crate :: astdata :: NodeId > , } # [ automatically_derived ]
+type_name : :: core :: default :: Default :: default ( ) } } } pub struct VariableDeclarationData {
+pub value : i32 , pub name : crate :: astdata :: NodeId , pub type_ : Option < crate :: astdata ::
+NodeId > , pub initializer : Option < crate :: astdata :: NodeId > } # [ automatically_derived ]
 impl :: core :: fmt :: Debug for VariableDeclarationData { # [ inline ] fn fmt ( & self , f : & mut
 :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field4_finish ( f , "VariableDeclarationData" , "value" , & self . value , "name" , &
@@ -1227,83 +1223,82 @@ self . name , "type_" , & self . type_ , "initializer" , && self . initializer )
 automatically_derived ] impl :: core :: default :: Default for VariableDeclarationData { # [ inline
 ] fn default ( ) -> VariableDeclarationData { VariableDeclarationData { value : :: core :: default
 :: Default :: default ( ) , name : :: core :: default :: Default :: default ( ) , type_ : :: core ::
-default :: Default :: default ( ) , initializer : :: core :: default :: Default :: default ( ) , } }
-} pub struct VariableStatementData { pub value : i32 , pub modifiers : Option < crate :: astdata ::
-ModifierList > , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
-VariableStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
-core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"VariableStatementData" , "value" , & self . value , "modifiers" , && self . modifiers ) } } # [
-automatically_derived ] impl :: core :: default :: Default for VariableStatementData { # [ inline ]
-fn default ( ) -> VariableStatementData { VariableStatementData { value : :: core :: default ::
-Default :: default ( ) , modifiers : :: core :: default :: Default :: default ( ) , } } } pub struct
-VoidExpressionData { pub value : i32 , pub expression : crate :: astdata :: NodeId , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for VoidExpressionData { # [ inline ] fn fmt (
-& self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field2_finish ( f , "VoidExpressionData" , "value" , & self . value ,
+default :: Default :: default ( ) , initializer : :: core :: default :: Default :: default ( ) } } }
+pub struct VariableStatementData { pub value : i32 , pub modifiers : Option < crate :: astdata ::
+ModifierList > } # [ automatically_derived ] impl :: core :: fmt :: Debug for VariableStatementData
+{ # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result
+{ :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f , "VariableStatementData" , "value"
+, & self . value , "modifiers" , && self . modifiers ) } } # [ automatically_derived ] impl :: core
+:: default :: Default for VariableStatementData { # [ inline ] fn default ( ) ->
+VariableStatementData { VariableStatementData { value : :: core :: default :: Default :: default ( )
+, modifiers : :: core :: default :: Default :: default ( ) } } } pub struct VoidExpressionData { pub
+value : i32 , pub expression : crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core
+:: fmt :: Debug for VoidExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt ::
+Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish
+( f , "VoidExpressionData" , "value" , & self . value , "expression" , && self . expression ) } } #
+[ automatically_derived ] impl :: core :: default :: Default for VoidExpressionData { # [ inline ]
+fn default ( ) -> VoidExpressionData { VoidExpressionData { value : :: core :: default :: Default ::
+default ( ) , expression : :: core :: default :: Default :: default ( ) } } } pub struct
+WhileStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId , pub statement :
+crate :: astdata :: NodeId } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+WhileStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field3_finish ( f ,
+"WhileStatementData" , "value" , & self . value , "expression" , & self . expression , "statement" ,
+&& self . statement ) } } # [ automatically_derived ] impl :: core :: default :: Default for
+WhileStatementData { # [ inline ] fn default ( ) -> WhileStatementData { WhileStatementData { value
+: :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default ::
+default ( ) , statement : :: core :: default :: Default :: default ( ) } } } pub struct
+WithStatementData { pub value : i32 , pub expression : crate :: astdata :: NodeId } # [
+automatically_derived ] impl :: core :: fmt :: Debug for WithStatementData { # [ inline ] fn fmt ( &
+self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
+Formatter :: debug_struct_field2_finish ( f , "WithStatementData" , "value" , & self . value ,
 "expression" , && self . expression ) } } # [ automatically_derived ] impl :: core :: default ::
-Default for VoidExpressionData { # [ inline ] fn default ( ) -> VoidExpressionData {
-VoidExpressionData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
-default :: Default :: default ( ) , } } } pub struct WhileStatementData { pub value : i32 , pub
-expression : crate :: astdata :: NodeId , pub statement : crate :: astdata :: NodeId , } # [
-automatically_derived ] impl :: core :: fmt :: Debug for WhileStatementData { # [ inline ] fn fmt (
-& self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field3_finish ( f , "WhileStatementData" , "value" , & self . value ,
-"expression" , & self . expression , "statement" , && self . statement ) } } # [
-automatically_derived ] impl :: core :: default :: Default for WhileStatementData { # [ inline ] fn
-default ( ) -> WhileStatementData { WhileStatementData { value : :: core :: default :: Default ::
-default ( ) , expression : :: core :: default :: Default :: default ( ) , statement : :: core ::
-default :: Default :: default ( ) , } } } pub struct WithStatementData { pub value : i32 , pub
-expression : crate :: astdata :: NodeId , } # [ automatically_derived ] impl :: core :: fmt :: Debug
-for WithStatementData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+Default for WithStatementData { # [ inline ] fn default ( ) -> WithStatementData { WithStatementData
+{ value : :: core :: default :: Default :: default ( ) , expression : :: core :: default :: Default
+:: default ( ) } } } pub struct YieldExpressionData { pub value : i32 , pub expression : Option <
+crate :: astdata :: NodeId > } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+YieldExpressionData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
 core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
-"WithStatementData" , "value" , & self . value , "expression" , && self . expression ) } } # [
-automatically_derived ] impl :: core :: default :: Default for WithStatementData { # [ inline ] fn
-default ( ) -> WithStatementData { WithStatementData { value : :: core :: default :: Default ::
-default ( ) , expression : :: core :: default :: Default :: default ( ) , } } } pub struct
-YieldExpressionData { pub value : i32 , pub expression : Option < crate :: astdata :: NodeId > , } #
-[ automatically_derived ] impl :: core :: fmt :: Debug for YieldExpressionData { # [ inline ] fn fmt
-( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt ::
-Formatter :: debug_struct_field2_finish ( f , "YieldExpressionData" , "value" , & self . value ,
-"expression" , && self . expression ) } } # [ automatically_derived ] impl :: core :: default ::
-Default for YieldExpressionData { # [ inline ] fn default ( ) -> YieldExpressionData {
-YieldExpressionData { value : :: core :: default :: Default :: default ( ) , expression : :: core ::
-default :: Default :: default ( ) , } } } pub enum NodeData { ArrowFunction ( Box <
-ArrowFunctionData > ) , AsExpression ( Box < AsExpressionData > ) , AwaitExpression ( Box <
-AwaitExpressionData > ) , BinaryExpression ( Box < BinaryExpressionData > ) , BindingElement ( Box <
-BindingElementData > ) , Block ( Box < BlockData > ) , CallExpression ( Box < CallExpressionData > )
-, CallSignatureDeclaration ( Box < CallSignatureDeclarationData > ) , CaseBlock ( Box <
-CaseBlockData > ) , CaseOrDefaultClause ( Box < CaseOrDefaultClauseData > ) , CatchClause ( Box <
-CatchClauseData > ) , ClassDeclaration ( Box < ClassDeclarationData > ) , ClassExpression ( Box <
-ClassExpressionData > ) , ClassStaticBlockDeclaration ( Box < ClassStaticBlockDeclarationData > ) ,
-ComputedPropertyName ( Box < ComputedPropertyNameData > ) , ConditionalExpression ( Box <
-ConditionalExpressionData > ) , ConditionalTypeNode ( Box < ConditionalTypeNodeData > ) ,
-ConstructSignatureDeclaration ( Box < ConstructSignatureDeclarationData > ) , ConstructorDeclaration
-( Box < ConstructorDeclarationData > ) , ConstructorTypeNode ( Box < ConstructorTypeNodeData > ) ,
-Decorator ( Box < DecoratorData > ) , DeleteExpression ( Box < DeleteExpressionData > ) ,
-DoStatement ( Box < DoStatementData > ) , ElementAccessExpression ( Box <
-ElementAccessExpressionData > ) , EnumDeclaration ( Box < EnumDeclarationData > ) , EnumMember ( Box
-< EnumMemberData > ) , ExportAssignment ( Box < ExportAssignmentData > ) , ExportDeclaration ( Box <
-ExportDeclarationData > ) , ExportSpecifier ( Box < ExportSpecifierData > ) , ExpressionStatement (
-Box < ExpressionStatementData > ) , ExpressionWithTypeArguments ( Box <
-ExpressionWithTypeArgumentsData > ) , ExternalModuleReference ( Box < ExternalModuleReferenceData >
-) , ForInOrOfStatement ( Box < ForInOrOfStatementData > ) , ForStatement ( Box < ForStatementData >
-) , FunctionDeclaration ( Box < FunctionDeclarationData > ) , FunctionExpression ( Box <
-FunctionExpressionData > ) , FunctionTypeNode ( Box < FunctionTypeNodeData > ) ,
-GetAccessorDeclaration ( Box < GetAccessorDeclarationData > ) , Identifier ( Box < IdentifierData >
-) , IfStatement ( Box < IfStatementData > ) , ImportAttribute ( Box < ImportAttributeData > ) ,
-ImportClause ( Box < ImportClauseData > ) , ImportDeclaration ( Box < ImportDeclarationData > ) ,
-ImportEqualsDeclaration ( Box < ImportEqualsDeclarationData > ) , ImportSpecifier ( Box <
-ImportSpecifierData > ) , ImportTypeNode ( Box < ImportTypeNodeData > ) , IndexSignatureDeclaration
-( Box < IndexSignatureDeclarationData > ) , InterfaceDeclaration ( Box < InterfaceDeclarationData >
-) , JsDocCallbackTag ( Box < JsDocCallbackTagData > ) , JsDocLink ( Box < JsDocLinkData > ) ,
-JsDocLinkCode ( Box < JsDocLinkCodeData > ) , JsDocLinkPlain ( Box < JsDocLinkPlainData > ) ,
-JsDocNameReference ( Box < JsDocNameReferenceData > ) , JsDocNonNullableType ( Box <
-JsDocNonNullableTypeData > ) , JsDocNullableType ( Box < JsDocNullableTypeData > ) ,
-JsDocOptionalType ( Box < JsDocOptionalTypeData > ) , JsDocParameterOrPropertyTag ( Box <
-JsDocParameterOrPropertyTagData > ) , JsDocSignature ( Box < JsDocSignatureData > ) ,
-JsDocTypeExpression ( Box < JsDocTypeExpressionData > ) , JsDocTypedefTag ( Box <
-JsDocTypedefTagData > ) , JsDocVariadicType ( Box < JsDocVariadicTypeData > ) , JsxAttribute ( Box <
-JsxAttributeData > ) , JsxExpression ( Box < JsxExpressionData > ) , JsxNamespacedName ( Box <
+"YieldExpressionData" , "value" , & self . value , "expression" , && self . expression ) } } # [
+automatically_derived ] impl :: core :: default :: Default for YieldExpressionData { # [ inline ] fn
+default ( ) -> YieldExpressionData { YieldExpressionData { value : :: core :: default :: Default ::
+default ( ) , expression : :: core :: default :: Default :: default ( ) } } } pub enum NodeData {
+ArrowFunction ( Box < ArrowFunctionData > ) , AsExpression ( Box < AsExpressionData > ) ,
+AwaitExpression ( Box < AwaitExpressionData > ) , BinaryExpression ( Box < BinaryExpressionData > )
+, BindingElement ( Box < BindingElementData > ) , Block ( Box < BlockData > ) , CallExpression ( Box
+< CallExpressionData > ) , CallSignatureDeclaration ( Box < CallSignatureDeclarationData > ) ,
+CaseBlock ( Box < CaseBlockData > ) , CaseOrDefaultClause ( Box < CaseOrDefaultClauseData > ) ,
+CatchClause ( Box < CatchClauseData > ) , ClassDeclaration ( Box < ClassDeclarationData > ) ,
+ClassExpression ( Box < ClassExpressionData > ) , ClassStaticBlockDeclaration ( Box <
+ClassStaticBlockDeclarationData > ) , ComputedPropertyName ( Box < ComputedPropertyNameData > ) ,
+ConditionalExpression ( Box < ConditionalExpressionData > ) , ConditionalTypeNode ( Box <
+ConditionalTypeNodeData > ) , ConstructSignatureDeclaration ( Box <
+ConstructSignatureDeclarationData > ) , ConstructorDeclaration ( Box < ConstructorDeclarationData >
+) , ConstructorTypeNode ( Box < ConstructorTypeNodeData > ) , Decorator ( Box < DecoratorData > ) ,
+DeleteExpression ( Box < DeleteExpressionData > ) , DoStatement ( Box < DoStatementData > ) ,
+ElementAccessExpression ( Box < ElementAccessExpressionData > ) , EnumDeclaration ( Box <
+EnumDeclarationData > ) , EnumMember ( Box < EnumMemberData > ) , ExportAssignment ( Box <
+ExportAssignmentData > ) , ExportDeclaration ( Box < ExportDeclarationData > ) , ExportSpecifier (
+Box < ExportSpecifierData > ) , ExpressionStatement ( Box < ExpressionStatementData > ) ,
+ExpressionWithTypeArguments ( Box < ExpressionWithTypeArgumentsData > ) , ExternalModuleReference (
+Box < ExternalModuleReferenceData > ) , ForInOrOfStatement ( Box < ForInOrOfStatementData > ) ,
+ForStatement ( Box < ForStatementData > ) , FunctionDeclaration ( Box < FunctionDeclarationData > )
+, FunctionExpression ( Box < FunctionExpressionData > ) , FunctionTypeNode ( Box <
+FunctionTypeNodeData > ) , GetAccessorDeclaration ( Box < GetAccessorDeclarationData > ) ,
+Identifier ( Box < IdentifierData > ) , IfStatement ( Box < IfStatementData > ) , ImportAttribute (
+Box < ImportAttributeData > ) , ImportClause ( Box < ImportClauseData > ) , ImportDeclaration ( Box
+< ImportDeclarationData > ) , ImportEqualsDeclaration ( Box < ImportEqualsDeclarationData > ) ,
+ImportSpecifier ( Box < ImportSpecifierData > ) , ImportTypeNode ( Box < ImportTypeNodeData > ) ,
+IndexSignatureDeclaration ( Box < IndexSignatureDeclarationData > ) , InterfaceDeclaration ( Box <
+InterfaceDeclarationData > ) , JsDocCallbackTag ( Box < JsDocCallbackTagData > ) , JsDocLink ( Box <
+JsDocLinkData > ) , JsDocLinkCode ( Box < JsDocLinkCodeData > ) , JsDocLinkPlain ( Box <
+JsDocLinkPlainData > ) , JsDocNameReference ( Box < JsDocNameReferenceData > ) ,
+JsDocNonNullableType ( Box < JsDocNonNullableTypeData > ) , JsDocNullableType ( Box <
+JsDocNullableTypeData > ) , JsDocOptionalType ( Box < JsDocOptionalTypeData > ) ,
+JsDocParameterOrPropertyTag ( Box < JsDocParameterOrPropertyTagData > ) , JsDocSignature ( Box <
+JsDocSignatureData > ) , JsDocTypeExpression ( Box < JsDocTypeExpressionData > ) , JsDocTypedefTag (
+Box < JsDocTypedefTagData > ) , JsDocVariadicType ( Box < JsDocVariadicTypeData > ) , JsxAttribute (
+Box < JsxAttributeData > ) , JsxExpression ( Box < JsxExpressionData > ) , JsxNamespacedName ( Box <
 JsxNamespacedNameData > ) , JsxOpeningElement ( Box < JsxOpeningElementData > ) ,
 JsxSelfClosingElement ( Box < JsxSelfClosingElementData > ) , JsxSpreadAttribute ( Box <
 JsxSpreadAttributeData > ) , MappedTypeNode ( Box < MappedTypeNodeData > ) , MetaProperty ( Box <
@@ -1336,8 +1331,8 @@ TypePredicateNodeData > ) , TypeQueryNode ( Box < TypeQueryNodeData > ) , TypeRe
 TypeReferenceNodeData > ) , VariableDeclaration ( Box < VariableDeclarationData > ) ,
 VariableStatement ( Box < VariableStatementData > ) , VoidExpression ( Box < VoidExpressionData > )
 , WhileStatement ( Box < WhileStatementData > ) , WithStatement ( Box < WithStatementData > ) ,
-YieldExpression ( Box < YieldExpressionData > ) , } # [ automatically_derived ] impl :: core :: fmt
-:: Debug for NodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
+YieldExpression ( Box < YieldExpressionData > ) } # [ automatically_derived ] impl :: core :: fmt ::
+Debug for NodeData { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> ::
 core :: fmt :: Result { match self { NodeData :: ArrowFunction ( __self_0 ) => :: core :: fmt ::
 Formatter :: debug_tuple_field1_finish ( f , "ArrowFunction" , & __self_0 ) , NodeData ::
 AsExpression ( __self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f ,
@@ -1519,8 +1514,8 @@ VoidExpression ( __self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1
 Formatter :: debug_tuple_field1_finish ( f , "WhileStatement" , & __self_0 ) , NodeData ::
 WithStatement ( __self_0 ) => :: core :: fmt :: Formatter :: debug_tuple_field1_finish ( f ,
 "WithStatement" , & __self_0 ) , NodeData :: YieldExpression ( __self_0 ) => :: core :: fmt ::
-Formatter :: debug_tuple_field1_finish ( f , "YieldExpression" , & __self_0 ) , } } } impl NodeData
-{ pub fn schema_name ( & self ) -> & 'static str { match self { NodeData :: ArrowFunction ( _ ) =>
+Formatter :: debug_tuple_field1_finish ( f , "YieldExpression" , & __self_0 ) } } } impl NodeData {
+pub fn schema_name ( & self ) -> & 'static str { match self { NodeData :: ArrowFunction ( _ ) =>
 "ArrowFunction" , NodeData :: AsExpression ( _ ) => "AsExpression" , NodeData :: AwaitExpression ( _
 ) => "AwaitExpression" , NodeData :: BinaryExpression ( _ ) => "BinaryExpression" , NodeData ::
 BindingElement ( _ ) => "BindingElement" , NodeData :: Block ( _ ) => "Block" , NodeData ::
@@ -1596,12 +1591,12 @@ NodeData :: TypeQueryNode ( _ ) => "TypeQueryNode" , NodeData :: TypeReferenceNo
 "TypeReferenceNode" , NodeData :: VariableDeclaration ( _ ) => "VariableDeclaration" , NodeData ::
 VariableStatement ( _ ) => "VariableStatement" , NodeData :: VoidExpression ( _ ) =>
 "VoidExpression" , NodeData :: WhileStatement ( _ ) => "WhileStatement" , NodeData :: WithStatement
-( _ ) => "WithStatement" , NodeData :: YieldExpression ( _ ) => "YieldExpression" , } } pub fn kind
-( & self ) -> SyntaxKind { match self { NodeData :: ArrowFunction ( _ ) => SyntaxKind ::
-ArrowFunction , NodeData :: AsExpression ( _ ) => SyntaxKind :: AsExpression , NodeData ::
-AwaitExpression ( _ ) => SyntaxKind :: AwaitExpression , NodeData :: BinaryExpression ( _ ) =>
-SyntaxKind :: BinaryExpression , NodeData :: BindingElement ( _ ) => SyntaxKind :: BindingElement ,
-NodeData :: Block ( _ ) => SyntaxKind :: Block , NodeData :: CallExpression ( _ ) => SyntaxKind ::
+( _ ) => "WithStatement" , NodeData :: YieldExpression ( _ ) => "YieldExpression" } } pub fn kind (
+& self ) -> SyntaxKind { match self { NodeData :: ArrowFunction ( _ ) => SyntaxKind :: ArrowFunction
+, NodeData :: AsExpression ( _ ) => SyntaxKind :: AsExpression , NodeData :: AwaitExpression ( _ )
+=> SyntaxKind :: AwaitExpression , NodeData :: BinaryExpression ( _ ) => SyntaxKind ::
+BinaryExpression , NodeData :: BindingElement ( _ ) => SyntaxKind :: BindingElement , NodeData ::
+Block ( _ ) => SyntaxKind :: Block , NodeData :: CallExpression ( _ ) => SyntaxKind ::
 CallExpression , NodeData :: CallSignatureDeclaration ( _ ) => SyntaxKind :: CallSignature ,
 NodeData :: CaseBlock ( _ ) => SyntaxKind :: CaseBlock , NodeData :: CaseOrDefaultClause ( _ ) =>
 SyntaxKind :: CaseOrDefaultClause , NodeData :: CatchClause ( _ ) => SyntaxKind :: CatchClause ,
@@ -1686,8 +1681,8 @@ NodeData :: TypeReferenceNode ( _ ) => SyntaxKind :: TypeReference , NodeData ::
 ( _ ) => SyntaxKind :: VariableDeclaration , NodeData :: VariableStatement ( _ ) => SyntaxKind ::
 VariableStatement , NodeData :: VoidExpression ( _ ) => SyntaxKind :: VoidExpression , NodeData ::
 WhileStatement ( _ ) => SyntaxKind :: WhileStatement , NodeData :: WithStatement ( _ ) => SyntaxKind
-:: WithStatement , NodeData :: YieldExpression ( _ ) => SyntaxKind :: YieldExpression , } } } pub
-struct Node { file : u32 , id : u32 , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl
+:: WithStatement , NodeData :: YieldExpression ( _ ) => SyntaxKind :: YieldExpression } } } pub
+struct Node { file : u32 , id : u32 } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl
 :: core :: clone :: TrivialClone for Node { } # [ automatically_derived ] impl :: core :: clone ::
 Clone for Node { # [ inline ] fn clone ( & self ) -> Node { let _ : :: core :: clone ::
 AssertParamIsClone < u32 > ; * self } } # [ automatically_derived ] impl :: core :: marker :: Copy
@@ -1696,7 +1691,7 @@ for Node { } # [ automatically_derived ] impl :: core :: fmt :: Debug for Node {
 Formatter :: debug_struct_field2_finish ( f , "Node" , "file" , & self . file , "id" , && self . id
 ) } } # [ automatically_derived ] impl :: core :: default :: Default for Node { # [ inline ] fn
 default ( ) -> Node { Node { file : :: core :: default :: Default :: default ( ) , id : :: core ::
-default :: Default :: default ( ) , } } } # [ automatically_derived ] impl :: core :: marker ::
+default :: Default :: default ( ) } } } # [ automatically_derived ] impl :: core :: marker ::
 StructuralPartialEq for Node { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq for
 Node { # [ inline ] fn eq ( & self , other : & Node ) -> bool { self . file == other . file && self
 . id == other . id } } # [ automatically_derived ] impl :: core :: cmp :: Eq for Node { # [ inline ]
@@ -1707,8 +1702,8 @@ id : id . 0 } } pub fn file_index ( self ) -> usize { self . file as usize } pub
 u32 { self . id } pub fn is_nil ( self ) -> bool { self . id == 0 } pub fn kind ( self ) ->
 SyntaxKind { if self . is_nil ( ) { return SyntaxKind :: Unknown ; } static_ast_node ( self ) .
 map_or ( SyntaxKind :: Unknown , NodeData :: kind ) } } fn registry ( ) -> & 'static std :: sync ::
-Mutex < Vec < & 'static NodeData >> { static REG : std :: sync :: OnceLock < std :: sync :: Mutex <
-Vec < & 'static NodeData >> > = std :: sync :: OnceLock :: new ( ) ; REG . get_or_init ( || { let
+Mutex < Vec < & 'static NodeData > > { static REG : std :: sync :: OnceLock < std :: sync :: Mutex <
+Vec < & 'static NodeData > > > = std :: sync :: OnceLock :: new ( ) ; REG . get_or_init ( || { let
 nil : & 'static NodeData = Box :: leak ( Box :: new ( NodeData :: Identifier ( Box :: default ( ) )
 ) ) ; std :: sync :: Mutex :: new ( vec ! [ nil ] ) } ) } pub fn register ( file : usize , data :
 NodeData ) -> Node { let leaked : & 'static NodeData = Box :: leak ( Box :: new ( data ) ) ; let mut
@@ -1719,18 +1714,18 @@ frozen_store_kind ( n : Node ) -> Option < SyntaxKind > { if n . is_nil ( ) { re
 SyntaxKind :: Unknown ) ; } static_ast_node ( n ) . map ( NodeData :: kind ) } pub fn is_data_of ( d
 : & NodeData , n : Node ) -> bool { static_ast_node ( n ) . is_some_and ( | data | std :: ptr :: eq
 ( d , data ) ) } pub fn opt ( file : usize , id : Option < crate :: astdata :: NodeId > ) -> Node {
-match id { Some ( id ) => Node :: new ( file , id ) , None => Node :: NIL , } } pub fn req ( file :
+match id { Some ( id ) => Node :: new ( file , id ) , None => Node :: NIL } } pub fn req ( file :
 usize , id : crate :: astdata :: NodeId ) -> Node { Node :: new ( file , id ) } pub fn some_opt (
 file : usize , id : Option < crate :: astdata :: NodeId > ) -> Option < Node > { id . map ( | i |
 req ( file , i ) ) } pub fn some_req ( file : usize , id : crate :: astdata :: NodeId ) -> Option <
 Node > { Some ( req ( file , id ) ) } pub fn mods ( file : usize , m : & 'static Option < crate ::
 astdata :: ModifierList > ) -> ModifierList { ModifierList :: from_ts ( file , m . as_ref ( ) ) }
-pub struct NodeList { file : u32 , list : Option < & 'static crate :: astdata :: NodeList > , } # [
+pub struct NodeList { file : u32 , list : Option < & 'static crate :: astdata :: NodeList > } # [
 automatically_derived ] # [ doc ( hidden ) ] unsafe impl :: core :: clone :: TrivialClone for
 NodeList { } # [ automatically_derived ] impl :: core :: clone :: Clone for NodeList { # [ inline ]
 fn clone ( & self ) -> NodeList { let _ : :: core :: clone :: AssertParamIsClone < u32 > ; let _ :
-:: core :: clone :: AssertParamIsClone < Option < & 'static crate :: astdata :: NodeList >> ; * self
-} } # [ automatically_derived ] impl :: core :: marker :: Copy for NodeList { } # [
+:: core :: clone :: AssertParamIsClone < Option < & 'static crate :: astdata :: NodeList > > ; *
+self } } # [ automatically_derived ] impl :: core :: marker :: Copy for NodeList { } # [
 automatically_derived ] impl :: core :: fmt :: Debug for NodeList { # [ inline ] fn fmt ( & self , f
 : & mut :: core :: fmt :: Formatter ) -> :: core :: fmt :: Result { :: core :: fmt :: Formatter ::
 debug_struct_field2_finish ( f , "NodeList" , "file" , & self . file , "list" , && self . list ) } }
@@ -1740,18 +1735,18 @@ automatically_derived ] impl :: core :: cmp :: PartialEq for NodeList { # [ inli
 automatically_derived ] impl :: core :: cmp :: Eq for NodeList { # [ inline ] # [ doc ( hidden ) ] #
 [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq
 < u32 > ; let _ : :: core :: cmp :: AssertParamIsEq < Option < & 'static crate :: astdata ::
-NodeList >> ; } } impl NodeList { pub const NIL : NodeList = NodeList { file : 0 , list : None } ;
+NodeList > > ; } } impl NodeList { pub const NIL : NodeList = NodeList { file : 0 , list : None } ;
 pub fn from_ts ( file : usize , list : Option < & 'static crate :: astdata :: NodeList > ) -> Self {
 match list { Some ( list ) => NodeList { file : file as u32 , list : Some ( list ) } None => Self ::
-NIL , } } pub fn len ( self ) -> usize { self . list . map_or ( 0 , | l | l . items . len ( ) ) }
-pub fn is_nil ( self ) -> bool { self . list . is_none ( ) } pub fn nodes ( self ) -> Vec < Node > {
+NIL } } pub fn len ( self ) -> usize { self . list . map_or ( 0 , | l | l . items . len ( ) ) } pub
+fn is_nil ( self ) -> bool { self . list . is_none ( ) } pub fn nodes ( self ) -> Vec < Node > {
 self . list . map_or_else ( Vec :: new , | l | l . items . iter ( ) . map ( | i | Node :: new ( self
 . file as usize , * i ) ) . collect ( ) ) } } pub struct ModifierList { file : u32 , list : Option <
-& 'static crate :: astdata :: ModifierList > , } # [ automatically_derived ] # [ doc ( hidden ) ]
+& 'static crate :: astdata :: ModifierList > } # [ automatically_derived ] # [ doc ( hidden ) ]
 unsafe impl :: core :: clone :: TrivialClone for ModifierList { } # [ automatically_derived ] impl
 :: core :: clone :: Clone for ModifierList { # [ inline ] fn clone ( & self ) -> ModifierList { let
 _ : :: core :: clone :: AssertParamIsClone < u32 > ; let _ : :: core :: clone :: AssertParamIsClone
-< Option < & 'static crate :: astdata :: ModifierList >> ; * self } } # [ automatically_derived ]
+< Option < & 'static crate :: astdata :: ModifierList > > ; * self } } # [ automatically_derived ]
 impl :: core :: marker :: Copy for ModifierList { } # [ automatically_derived ] impl :: core :: fmt
 :: Debug for ModifierList { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter )
 -> :: core :: fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field2_finish ( f ,
@@ -1761,17 +1756,17 @@ impl :: core :: marker :: StructuralPartialEq for ModifierList { } # [ automatic
 ) -> bool { self . file == other . file && self . list == other . list } } # [ automatically_derived
 ] impl :: core :: cmp :: Eq for ModifierList { # [ inline ] # [ doc ( hidden ) ] # [ coverage ( off
 ) ] fn assert_fields_are_eq ( & self ) { let _ : :: core :: cmp :: AssertParamIsEq < u32 > ; let _ :
-:: core :: cmp :: AssertParamIsEq < Option < & 'static crate :: astdata :: ModifierList >> ; } }
+:: core :: cmp :: AssertParamIsEq < Option < & 'static crate :: astdata :: ModifierList > > ; } }
 impl ModifierList { pub const NIL : ModifierList = ModifierList { file : 0 , list : None } ; pub fn
 from_ts ( file : usize , list : Option < & 'static crate :: astdata :: ModifierList > ) -> Self {
 match list { Some ( list ) => ModifierList { file : file as u32 , list : Some ( list ) } None =>
-Self :: NIL , } } pub fn bits ( self ) -> u32 { self . list . map_or ( 0 , | l | l . flags . 0 ) } }
+Self :: NIL } } pub fn bits ( self ) -> u32 { self . list . map_or ( 0 , | l | l . flags . 0 ) } }
 pub struct DataList < 'a > { pub file : usize , pub list : Option < & 'a crate :: astdata ::
-NodeList > , } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl < 'a > :: core :: clone
-:: TrivialClone for DataList < 'a > { } # [ automatically_derived ] impl < 'a > :: core :: clone ::
+NodeList > } # [ automatically_derived ] # [ doc ( hidden ) ] unsafe impl < 'a > :: core :: clone ::
+TrivialClone for DataList < 'a > { } # [ automatically_derived ] impl < 'a > :: core :: clone ::
 Clone for DataList < 'a > { # [ inline ] fn clone ( & self ) -> DataList < 'a > { let _ : :: core ::
 clone :: AssertParamIsClone < usize > ; let _ : :: core :: clone :: AssertParamIsClone < Option < &
-'a crate :: astdata :: NodeList >> ; * self } } # [ automatically_derived ] impl < 'a > :: core ::
+'a crate :: astdata :: NodeList > > ; * self } } # [ automatically_derived ] impl < 'a > :: core ::
 marker :: Copy for DataList < 'a > { } impl < 'a > DataList < 'a > { pub fn req ( file : usize , l :
 & 'a crate :: astdata :: NodeList ) -> Self { DataList { file , list : Some ( l ) } } pub fn opt (
 file : usize , l : & 'a Option < crate :: astdata :: NodeList > ) -> Self { DataList { file , list :
@@ -1779,7 +1774,7 @@ l . as_ref ( ) } } pub fn mods ( file : usize , m : & 'a Option < crate :: astda
 ) -> Self { DataList { file , list : m . as_ref ( ) . map ( | m | & m . list ) } } pub fn len ( self
 ) -> usize { self . list . map_or ( 0 , | l | l . items . len ( ) ) } } pub struct SlotChildren {
 pub name : Option < u32 > , pub other : Option < ( u32 , u32 ) > , pub typed : Option < ( u32 , u32
-) > , pub no_type_arguments : bool , } # [ automatically_derived ] impl :: core :: fmt :: Debug for
+) > , pub no_type_arguments : bool } # [ automatically_derived ] impl :: core :: fmt :: Debug for
 SlotChildren { # [ inline ] fn fmt ( & self , f : & mut :: core :: fmt :: Formatter ) -> :: core ::
 fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f , "SlotChildren" ,
 "name" , & self . name , "other" , & self . other , "typed" , & self . typed , "no_type_arguments" ,
@@ -1787,15 +1782,15 @@ fmt :: Result { :: core :: fmt :: Formatter :: debug_struct_field4_finish ( f , 
 SlotChildren { # [ inline ] fn default ( ) -> SlotChildren { SlotChildren { name : :: core ::
 default :: Default :: default ( ) , other : :: core :: default :: Default :: default ( ) , typed :
 :: core :: default :: Default :: default ( ) , no_type_arguments : :: core :: default :: Default ::
-default ( ) , } } } # [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for
+default ( ) } } } # [ automatically_derived ] impl :: core :: marker :: StructuralPartialEq for
 SlotChildren { } # [ automatically_derived ] impl :: core :: cmp :: PartialEq for SlotChildren { # [
 inline ] fn eq ( & self , other : & SlotChildren ) -> bool { self . no_type_arguments == other .
 no_type_arguments && self . name == other . name && self . other == other . other && self . typed ==
 other . typed } } # [ automatically_derived ] impl :: core :: cmp :: Eq for SlotChildren { # [
 inline ] # [ doc ( hidden ) ] # [ coverage ( off ) ] fn assert_fields_are_eq ( & self ) { let _ : ::
-core :: cmp :: AssertParamIsEq < Option < u32 >> ; let _ : :: core :: cmp :: AssertParamIsEq <
-Option < ( u32 , u32 ) >> ; let _ : :: core :: cmp :: AssertParamIsEq < Option < ( u32 , u32 ) >> ;
-let _ : :: core :: cmp :: AssertParamIsEq < bool > ; } } impl SlotChildren { pub const
+core :: cmp :: AssertParamIsEq < Option < u32 > > ; let _ : :: core :: cmp :: AssertParamIsEq <
+Option < ( u32 , u32 ) > > ; let _ : :: core :: cmp :: AssertParamIsEq < Option < ( u32 , u32 ) > >
+; let _ : :: core :: cmp :: AssertParamIsEq < bool > ; } } impl SlotChildren { pub const
 TAG_EXPRESSION : u32 = 1 ; pub const TAG_POSTFIX : u32 = 2 ; pub const TAG_QUESTION : u32 = 3 ; pub
 const TYPED_TYPE : u32 = 4 ; pub const TYPED_INITIALIZER : u32 = 5 ; pub fn new ( name : Option <
 u32 > , other : Option < ( u32 , u32 ) > ) -> Self { SlotChildren { name , other , typed : None ,

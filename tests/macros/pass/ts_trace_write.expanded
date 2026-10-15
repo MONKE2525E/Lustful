@@ -1,11 +1,11 @@
-use std :: cell :: RefCell ; pub struct Tracer { pub log : Vec < String > , } impl Tracer { pub fn
+use std :: cell :: RefCell ; pub struct Tracer { pub log : Vec < String > } impl Tracer { pub fn
 write ( & mut self , msg : & str , args : Vec < String > ) { self . log . push ( format ! (
-"{0}:{1:?}" , msg , args ) ) ; } } pub struct State { pub tracer : Option < RefCell < Tracer >> , }
+"{0}:{1:?}" , msg , args ) ) ; } } pub struct State { pub tracer : Option < RefCell < Tracer > > }
 fn main ( ) { let state = State { tracer : Some ( RefCell :: new ( Tracer { log : Vec :: new ( ) } )
 ) } ; if let Some ( tracer ) = & state . tracer { tracer . borrow_mut ( ) . write ( "resolve" , vec
 ! [ :: std :: string :: ToString :: to_string ( & "a.ts" ) , :: std :: string :: ToString ::
 to_string ( & 2 ) ] ) ; } ; if let Some ( tracer ) = & state . tracer { tracer . borrow_mut ( ) .
-write ( "done" , :: alloc :: vec :: Vec :: new ( ) ) ; } ; let quiet = State { tracer : None } ; if
-let Some ( tracer ) = & quiet . tracer { tracer . borrow_mut ( ) . write ( "never" , vec ! [ :: std
-:: string :: ToString :: to_string ( & 1 ) ] ) ; } ; if let Some ( t ) = & state . tracer { println
-! ( "log={0:?}" , t . borrow ( ) . log ) ; } }
+write ( "done" , vec ! [ ] ) ; } ; let quiet = State { tracer : None } ; if let Some ( tracer ) = &
+quiet . tracer { tracer . borrow_mut ( ) . write ( "never" , vec ! [ :: std :: string :: ToString ::
+to_string ( & 1 ) ] ) ; } ; if let Some ( t ) = & state . tracer { println ! ( "log={0:?}" , t .
+borrow ( ) . log ) ; } }
