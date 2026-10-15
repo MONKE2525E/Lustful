@@ -527,7 +527,7 @@
   },
   {
    "id": "attrs.cfg",
-   "title": "Attributes and cfg lust accepts (cfg, cfg_attr, inline, cold, repr, must_use, allow)",
+   "title": "Attributes and cfg lust accepts (cfg, cfg_attr, inline, cold, repr, must_use, allow, default, rustfmt, ignore, should_panic)",
    "status": "supported",
    "milestone": 0,
    "inventory_step": "2",
@@ -535,7 +535,7 @@
    "fix_class": "compiler",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_cfg.rs, _b and _c pass: cfg, cfg!, cfg_attr, inline, cold, must_use, allow, repr and path. Attribute names lust rejects are split into attrs.unsupported.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_cfg.rs, _b, _c and _d pass: cfg, cfg!, cfg_attr, inline, cold, must_use, allow, repr, path, the derive(Default) helper #[default] on a unit variant, the inert tool attributes rustfmt::* and clippy::*, and the test harness attributes ignore and should_panic in a normal build (lust test honors them; see tests/testrun). Serde helper attributes are split into attrs.serde. Attribute names lust rejects are split into attrs.unsupported.",
    "primary_keys": [],
    "keys": [
     "attr.cfg",
@@ -546,6 +546,11 @@
     "attr.cold",
     "attr.repr",
     "attr.path",
+    "attr.default",
+    "attr.ignore",
+    "attr.should_panic",
+    "attr.rustfmt::*",
+    "attr.clippy::*",
     "attr.inner.*",
     "cfg.*",
     "inline.*",
@@ -596,8 +601,26 @@
    ]
   },
   {
+   "id": "attrs.serde",
+   "title": "#[serde(...)] helper attributes of the serde derives",
+   "status": "unsupported",
+   "milestone": null,
+   "inventory_step": "2",
+   "root_cause": "attrs-cfg",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_serde.rs is a lust-only oracle and lust rejects it (L0402). The attribute only has meaning under derive(Serialize) or derive(Deserialize), which lust also rejects (derives.unknown), so accepting and ignoring it would change program behavior. It stays a clean reject.",
+   "primary_keys": [
+    "attr.serde*"
+   ],
+   "keys": [
+    "attr.serde*"
+   ]
+  },
+  {
    "id": "attrs.unsupported",
-   "title": "Attribute names lust rejects (serde)",
+   "title": "Attribute names lust rejects",
    "status": "unsupported",
    "milestone": 4,
    "inventory_step": "2",
@@ -605,9 +628,9 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0402). The attr.* catch-all lives here, after the accepted names in attrs.cfg, so a new attribute name blocks a file until lust knows it.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_unsupported.rs fails (L0402). The attr.* catch-all lives here, after the accepted names in attrs.cfg and the serde names in attrs.serde, so a new attribute name blocks a file until lust knows it.",
    "primary_keys": [
-    "attr.serde*"
+    "attr.used"
    ],
    "keys": [
     "attr.*"
