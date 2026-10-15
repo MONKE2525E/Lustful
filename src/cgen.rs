@@ -440,8 +440,9 @@ fn std_loc(file: u64, line: u64, col: u64) -> String {
 }
 
 /// The std location of an integer method that panics inside core
-/// (`abs`, `pow`, signed `wrapping_div`): the `int_impl!` or
-/// `uint_impl!` line for its type in core/src/num/mod.rs.
+/// (`abs`, `pow`, signed wrapping/overflowing/saturating division):
+/// the `int_impl!` or `uint_impl!` line for its type in
+/// core/src/num/mod.rs.
 fn num_loc(i: IntTy, pow: bool) -> String {
     let line = match i {
         IntTy::I8 => 379,
@@ -4308,6 +4309,19 @@ impl FnGen<'_, '_> {
                 let CTy::Ref(inner) = &tys[0] else { unreachable!() };
                 if is_copy_c(self.p, inner) || **inner == CTy::Str {
                     format!("(*{})", vals[0])
+                } else if matches!(**inner, CTy::RefCell(_)) {
+                    // `RefCell::clone` is `#[track_caller]`: its borrow
+                    // panics at this call, which the clone glue (called
+                    // without a location) cannot name, so test here.
+                    self.want(Glue::Clone, inner);
+                    let t = self.tmp();
+                    let _ = writeln!(
+                        self.out,
+                        "    {}* {t} = {}; if ({t}->f0 < 0) lust_panic_cstr_dyn(\"RefCell already mutably borrowed\", {loc});",
+                        ctype(inner),
+                        vals[0]
+                    );
+                    format!("clone_{}({t})", mangle(inner))
                 } else {
                     self.want(Glue::Clone, inner);
                     format!("clone_{}({})", mangle(inner), vals[0])
@@ -5712,7 +5726,9 @@ impl FnGen<'_, '_> {
             let (o, rc) = (self.tmp(), self.tmp());
             let _ = writeln!(self.out, "    uint64_t {o}; int {rc} = lust_checked_op({ua}, {ub}, {bits}, {}, {op}, &{o});", sgn as i32);
             let div0msg = if op == 4 { "attempt to calculate the remainder with a divisor of zero" } else { "attempt to divide by zero" };
-            let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{div0msg}\", {loc});");
+            // The signed forms divide inside core; the unsigned ones at the caller.
+            let at = if sgn { num_loc(it, false) } else { loc.to_string() };
+            let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{div0msg}\", {at});");
             if matches!(b, B::SaturatingAdd | B::SaturatingSub | B::SaturatingMul | B::SaturatingDiv) {
                 // Clamp to the endpoint the true result passes.
                 let clamp = if !sgn {
