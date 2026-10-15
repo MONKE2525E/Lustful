@@ -1695,7 +1695,15 @@ fn resolved_setup(
                 ..Default::default()
             };
             t.lap("body patch");
-            return Ok((p.map, p.changed, Vec::new(), false, p.fn_count, "bodies", p.fn_lines, p.body_hashes, Some(p.tables)));
+            // A const fn body edit: as `slot_update` with `const_fn_changed`,
+            // every unchanged passing body joins as a read-set candidate.
+            let (mut changed, mut mention_only) = (p.changed, Vec::new());
+            if p.const_fn {
+                mention_only = (0..p.fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !changed.contains(&i)).collect();
+                changed.extend_from_slice(&mention_only);
+                changed.sort_unstable();
+            }
+            return Ok((p.map, changed, mention_only, p.const_fn, p.fn_count, "bodies", p.fn_lines, p.body_hashes, Some(p.tables)));
         }
         Err(why) => visits.why = why,
     }

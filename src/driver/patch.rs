@@ -25,9 +25,11 @@
 // - the old or new body holds an item keyword, an attribute, a `$`, a
 //   macro the expander owns (anything but the parser's own `println!`
 //   family), or a parser macro while a user macro may take its name;
-// - the fn is a `const fn` or returns `impl Trait` (its body is part of
-//   its item, and `const` values bake it in), or has parameter patterns
-//   or expressions in its parameter types (see `find_body_edit`);
+// - the fn returns `impl Trait` (its body is part of its item), or has
+//   parameter patterns or expressions in its parameter types (see
+//   `find_body_edit`); a `const fn` patches, but `const` values bake its
+//   body in, so the request then collects and walks reads as a cold
+//   resolve of a const fn body edit does (`Patched::const_fn`);
 // - the file's std needs or std platform mention moved;
 // - the new body does not lex, parse, or rewrite cleanly, or its item
 //   scan moved (errors then come from the full path, in cold order);
@@ -253,6 +255,8 @@ pub(super) struct Patched {
     pub std_ranges: Vec<(u32, u32, ShippedCrate)>,
     pub std_routes: Vec<&'static StdFnDef>,
     pub std_methods: (u32, u32),
+    /// Some edited body is a `const fn`'s (see the module docs).
+    pub const_fn: bool,
     /// Files whose text changed, Ast nodes the patch built, bodies
     /// re-parsed, and spans moved.
     pub files: usize,
@@ -295,6 +299,8 @@ struct NewBody {
     plain: bool,
     /// The old body's expression range (`FnDef::exprs`).
     old_exprs: (u32, u32),
+    /// The fn is a `const fn`.
+    is_const: bool,
 }
 
 /// A collected program kept for later requests (W-INCR3), one per mode
@@ -516,8 +522,8 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         })
         .ok_or_else(|| outside_fn_reason(ast, file, a, b))?;
     let def = fn_def_at(ast, item, sub);
-    if def.qual.is_const || def.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. })) {
-        return Err("const fn or impl Trait");
+    if def.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. })) {
+        return Err("impl Trait");
     }
     if !matches!(ast.items[item].kind, ItemKind::Fn(_) | ItemKind::Impl(_)) {
         return Err("not in a fn body");
@@ -575,7 +581,8 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let old_closures = ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
     let new_closures = body_ast.exprs.iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
     let plain = !old_closures && !new_closures && plain_body(&old_body, &front.interner) && plain_body(&new_body, &front.interner);
-    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs })
+    let is_const = def.qual.is_const;
+    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, is_const })
 }
 
 /// Proves that `edit` (the map's text of its file to `text`) sits inside
@@ -904,6 +911,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         std_ranges: base.std_ranges.clone(),
         std_routes: base.std_routes.clone(),
         std_methods: base.std_methods,
+        const_fn: edits.iter().any(|e| e.body.as_ref().is_some_and(|b| b.is_const)),
         files,
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
         bodies: edits_len,
@@ -1582,6 +1590,50 @@ pub trait Twice {
         warm_equals_cold(&mut warm, &root, &m1, "    #[test]\n", "    #[test]\n\n\n");
         let v = warm_equals_cold(&mut warm, &root, &m1, "    v\n}", "    v + true\n}");
         assert_eq!(field(&v, "path"), "patch", "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module whose const fn bodies feed a const, an array length, and
+    /// a static, read by an active fn.
+    const CONSTS: &str = "pub const fn len() -> usize {
+    4
+}
+
+pub const fn seed() -> i64 {
+    3
+}
+
+pub const LEN: usize = len();
+pub static TABLE: [i64; 2] = [seed(), seed() + 1];
+
+pub fn run() -> i64 {
+    let a: [u8; 4] = [0; LEN];
+    a.len() as i64 + TABLE[1]
+}
+";
+
+    /// A const fn body edit patches (no full resolve) and then collects
+    /// and walks reads as a cold resolve does: a new value that breaks an
+    /// array type is the cold error, the fix passes, and a build after a
+    /// static's const fn edit prints the new value, as a cold build does.
+    #[test]
+    fn const_fn_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-constfn-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, CONSTS).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        for (old, new) in [("    4\n", "    5\n"), ("    5\n", "    4\n"), ("    3\n}\n\npub const LEN", "    let x = 7;\n    x\n}\n\npub const LEN")] {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+        }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
