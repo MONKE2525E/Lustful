@@ -984,7 +984,7 @@ fn tn_user_args(p: &Program, tys: &mut impl TyIntern, a: AdtId, def: DefId, args
     // declared position.
     let ast_params: Option<Vec<bool>> = {
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-        crate::check::defaults::type_generics(p.ast, &cx, p.adt(a).name)
+        crate::check::defaults::type_generics(&p.ast, &cx, p.adt(a).name)
             .map(|g| g.params.iter().map(|x| matches!(x, ast::GenericParam::Lifetime { .. })).collect())
     };
     let generics = p.gx.adt_generics.get(a.0 as usize);

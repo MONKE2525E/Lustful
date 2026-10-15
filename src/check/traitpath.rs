@@ -31,7 +31,7 @@ pub(super) enum TraitFnRes {
     Failed,
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The trait a two-or-more segment path heads with, when it is a
     /// trait name (bare, or a canonical std trait path) and its last
     /// segment names one of its methods. Returns the trait def, the
@@ -51,13 +51,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             {
                 return None;
             }
-            p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(p.interner, segs[0].name)?
+            p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(&p.interner, segs[0].name)?
         } else {
             let path: Vec<&str> = segs[..last].iter().map(|s| self.name(s.name)).collect();
             if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Trait) {
                 return None;
             }
-            p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(p.interner, segs[last - 1].name)?
+            p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(&p.interner, segs[last - 1].name)?
         };
         let rec = p.gx.index.trait_record(tdef)?;
         // A std path through another trait of the same bare name must
@@ -296,7 +296,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if self.name(name) == "to_string"
             && (tr.def == generics::to_string_defs().0
-                || p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(p.interner, p.interner.intern("ToString")) == Some(tr.def))
+                || p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(&p.interner, p.interner.intern("ToString")) == Some(tr.def))
             && (has_display(p, &self.tys, self_ty) || self.display_in_env(self_ty))
         {
             return TraitFnRes::Builtin(Builtin::ToString);
