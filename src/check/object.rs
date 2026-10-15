@@ -274,12 +274,15 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
         }
         // The fmt traits are not vtable supertraits: the dyn type
         // implements them through the fixed header shims, as rustc's
-        // object type implements every supertrait.
-        if sup == lang.debug {
+        // object type implements every supertrait. Only for a trait
+        // of this crate: a std trait with fmt supertraits as the
+        // principal (`dyn Error`) stays the documented L0702 reject
+        // below, since its object methods are std's own.
+        if p.shipped_crate_at(rec.span).is_none() && sup == lang.debug {
             info.fmt_debug = true;
             continue;
         }
-        if sup == lang.display {
+        if p.shipped_crate_at(rec.span).is_none() && sup == lang.display {
             info.fmt_display = true;
             continue;
         }
