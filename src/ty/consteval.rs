@@ -591,6 +591,7 @@ pub fn flex_int_expr(ast: &Ast, e: ExprId) -> bool {
 /// Evaluates one const expression. `expected` is the type the context wants,
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
+    check_macro_forms(cx.ast(), e)?;
     let mut ev = Evaluator { steps: 0, extra_cap: 0, call_depth: 0 };
     let mut env: Env = Vec::new();
     match ev.expr(cx, &mut env, e, expected)? {
@@ -2123,6 +2124,17 @@ impl Evaluator {
                 // Parameter patterns and the body are the callee's
                 // code, checked in its own module: run both below
                 // depth 0 so the privacy hooks stay out.
+                // Rustc caps const evaluation at 128 stack frames,
+                // the item itself included, so 127 nested const fn
+                // frames is the most this evaluator may enter.
+                if self.call_depth >= 127 {
+                    return Err(Diag::new(
+                        C_OUTSIDE,
+                        span,
+                        "reached the maximum number of const stack frames",
+                        "Make the const computation shallower, for example with a loop.",
+                    ));
+                }
                 self.call_depth += 1;
                 let mut fenv: Env = Vec::new();
                 let mut bind_err: Option<Diag> = None;
@@ -3030,6 +3042,28 @@ impl Evaluator {
     ) -> Result<TypedValue, Diag> {
         match kind {
             MacroKind::Assert => {
+                // A formatting message is a non-const call even when
+                // the assertion passes (rustc E0015); the one-`{}`
+                // form needs a `&str` argument.
+                let msg_arg = match const_macro_form(kind, fmt) {
+                    ConstMacroForm::Bad => return Err(nonconst_fmt_macro(span)),
+                    ConstMacroForm::OneStrArg(index) => Some(index),
+                    ConstMacroForm::Plain => None,
+                };
+                if let Some(index) = msg_arg {
+                    if is_fmt_capture(cx.ast(), args[index], |s| cx.sym_text(s).len()) {
+                        return Err(nonconst_fmt_macro(span));
+                    }
+                    let (av, _) = self.value(cx, env, args[index], Some(REF_STR))?;
+                    if !matches!(av, ConstValue::Str(_)) {
+                        return Err(Diag::new(
+                            C_NONCONST,
+                            span,
+                            "argument to `panic!()` in a const context must have type `&str`",
+                            "Use a `&str` message, or move the macro out of the const context.",
+                        ));
+                    }
+                }
                 let (v, _) = self.value(cx, env, args[0], Some(BOOL))?;
                 let ConstValue::Bool(b) = v else { return Err(outside(span, "this assert")) };
                 if b {
@@ -3042,18 +3076,30 @@ impl Evaluator {
                     Err(Diag::new(C_OUTSIDE, span, format!("const assertion failed: {msg}"), "Fix the asserted condition."))
                 }
             }
-            MacroKind::AssertEq | MacroKind::AssertNe => {
-                let (a, t) = self.value(cx, env, args[0], None)?;
-                let (b, _) = self.value(cx, env, args[1], Some(t))?;
-                let eq = values_eq(&a, &b);
-                let pass = if kind == MacroKind::AssertEq { eq } else { !eq };
-                if pass {
-                    Ok((ConstValue::Unit, UNIT))
-                } else {
-                    Err(Diag::new(C_OUTSIDE, span, "const assertion failed: values differ", "Fix the asserted values."))
-                }
-            }
+            // `assert_eq!` and `assert_ne!` call the non-const
+            // `assert_failed` in every form (rustc E0015).
+            MacroKind::AssertEq | MacroKind::AssertNe => Err(nonconst_fmt_macro(span)),
             MacroKind::Panic => {
+                match const_macro_form(kind, fmt) {
+                    ConstMacroForm::Bad => return Err(nonconst_fmt_macro(span)),
+                    ConstMacroForm::OneStrArg(index) => {
+                        if is_fmt_capture(cx.ast(), args[index], |s| cx.sym_text(s).len()) {
+                            return Err(nonconst_fmt_macro(span));
+                        }
+                        let (av, _) = self.value(cx, env, args[index], Some(REF_STR))?;
+                        let ConstValue::Str(i) = av else {
+                            return Err(Diag::new(
+                                C_NONCONST,
+                                span,
+                                "argument to `panic!()` in a const context must have type `&str`",
+                                "Use a `&str` message, or move the macro out of the const context.",
+                            ));
+                        };
+                        let msg = cx.ast().strings[i as usize].clone();
+                        return Err(Diag::new(C_OUTSIDE, span, format!("const panic: {msg}"), "Remove the panic from the const item."));
+                    }
+                    ConstMacroForm::Plain => {}
+                }
                 let msg = fmt_text(fmt).unwrap_or_else(|| "explicit panic".into());
                 Err(Diag::new(C_OUTSIDE, span, format!("const panic: {msg}"), "Remove the panic from the const item."))
             }
@@ -3833,6 +3879,288 @@ pub fn float_consts_value(f: FloatTy, item: &str) -> Option<u64> {
         // the f64 value cast to f32 (the values are not near ties).
         FloatTy::F32 => (v as f32).to_bits() as u64,
     })
+}
+
+/// How a panic-family macro form stands in a const context (rustc
+/// E0015). A plain literal message is a const panic; a message that
+/// is exactly one `{}` placeholder is a const panic too, but only
+/// with a `&str` argument (the `index` here). Every other use of
+/// format arguments, and any message at all on `todo!` or
+/// `unreachable!`, calls the non-const formatting machinery. The
+/// `&str` argument check needs types or values, so callers that
+/// have neither (the syntactic walk below) let `OneStrArg` pass and
+/// rely on the checker or the evaluator to judge the argument.
+pub enum ConstMacroForm {
+    /// A const panic form: no message, or a literal message.
+    Plain,
+    /// Exactly one `{}`: const only with a `&str` argument.
+    OneStrArg(usize),
+    /// A non-const formatting macro form.
+    Bad,
+}
+
+/// Classifies one panic-family macro (`panic!`, `assert!`, `todo!`,
+/// `unreachable!`) by its format pieces; see `ConstMacroForm`.
+pub fn const_macro_form(kind: MacroKind, fmt: &[ast::FmtPiece]) -> ConstMacroForm {
+    match kind {
+        MacroKind::Todo | MacroKind::Unreachable => {
+            // With no message these are plain literal panics; any
+            // written message goes through formatting.
+            if fmt.is_empty() { ConstMacroForm::Plain } else { ConstMacroForm::Bad }
+        }
+        MacroKind::Panic | MacroKind::Assert => {
+            let mut args = fmt.iter().filter_map(|p| match p {
+                ast::FmtPiece::Arg { index, debug, spec } => Some((*index, *debug, *spec)),
+                ast::FmtPiece::Lit(_) => None,
+            });
+            match (args.next(), args.next()) {
+                (None, _) => ConstMacroForm::Plain,
+                (Some((index, false, spec)), None) if fmt.len() == 1 && spec == ast::FmtSpec::default() => {
+                    ConstMacroForm::OneStrArg(index)
+                }
+                _ => ConstMacroForm::Bad,
+            }
+        }
+        _ => ConstMacroForm::Bad,
+    }
+}
+
+/// True when a format argument expression is a format-string
+/// capture (`panic!("{x}")`): the parser makes it a one-segment
+/// path whose span is the whole format string token, wider than
+/// the name plus the two bytes a raw identifier (`r#x`) or one
+/// pair of parentheses adds. A captured argument never takes the
+/// one-`{}` `&str` fast path in rustc, even for a `&str` local.
+pub fn is_fmt_capture(ast: &Ast, e: ExprId, name_len: impl Fn(Sym) -> usize) -> bool {
+    let Expr::Path(segs) = ast.expr(e) else { return false };
+    let [seg] = segs.as_slice() else { return false };
+    if seg.has_args() {
+        return false;
+    }
+    let span = ast.expr_span(e);
+    (span.hi - span.lo) as usize > name_len(seg.name) + 2
+}
+
+/// The E0015 error for a non-const formatting macro form in a const
+/// context (an item, not a `const fn` definition; the body checker
+/// words the same error for functions).
+fn nonconst_fmt_macro(span: Span) -> Diag {
+    Diag::new(
+        C_NONCONST,
+        span,
+        "cannot call non-const formatting macro in a const context",
+        "Use a plain literal message, such as `panic!(\"bad\")`, or move the macro out of the const context.",
+    )
+}
+
+/// Rejects the panic-family macro forms rustc rejects in a const
+/// context, anywhere in the expression `e` (dead branches too:
+/// E0015 and E0493-style rules are static, not per-path). Closure
+/// bodies are not const contexts and stay unwalked; nested items
+/// are their own items. `assert_eq!` and `assert_ne!` always call
+/// the non-const `assert_failed`, so they reject here too.
+fn check_macro_forms(ast: &Ast, e: ExprId) -> Result<(), Diag> {
+    fn block(ast: &Ast, b: ast::BlockId) -> Result<(), Diag> {
+        let blk = ast.block(b);
+        for stmt in &blk.stmts {
+            match stmt {
+                ast::Stmt::Let { init, els, .. } => {
+                    if let Some(init) = init {
+                        check_macro_forms(ast, *init)?;
+                    }
+                    if let Some(els) = els {
+                        block(ast, *els)?;
+                    }
+                }
+                ast::Stmt::Expr { expr, .. } => check_macro_forms(ast, *expr)?,
+                ast::Stmt::Item(_) | ast::Stmt::Macro { .. } => {}
+            }
+        }
+        if let Some(tail) = blk.tail {
+            check_macro_forms(ast, tail)?;
+        }
+        Ok(())
+    }
+    fn pat(ast: &Ast, p: PatId) -> Result<(), Diag> {
+        match ast.pat(p) {
+            Pat::Lit(e) => check_macro_forms(ast, *e),
+            Pat::Range { lo, hi, .. } => {
+                for e in [lo, hi].into_iter().flatten() {
+                    check_macro_forms(ast, *e)?;
+                }
+                Ok(())
+            }
+            Pat::TupleStruct { elems, .. } | Pat::Or(elems) | Pat::Tuple(elems) => {
+                for &s in elems {
+                    pat(ast, s)?;
+                }
+                Ok(())
+            }
+            Pat::Struct { fields, .. } => {
+                for &(_, s) in fields {
+                    pat(ast, s)?;
+                }
+                Ok(())
+            }
+            Pat::Slice { prefix, middle, suffix } => {
+                for &s in prefix.iter().chain(suffix) {
+                    pat(ast, s)?;
+                }
+                if let Some(m) = middle {
+                    pat(ast, *m)?;
+                }
+                Ok(())
+            }
+            Pat::Ref { inner, .. } | Pat::At { inner, .. } | Pat::Paren(inner) => pat(ast, *inner),
+            _ => Ok(()),
+        }
+    }
+    let span = ast.expr_span(e);
+    match ast.expr(e) {
+        Expr::Macro { kind, args, fmt, .. } => {
+            match kind {
+                MacroKind::AssertEq | MacroKind::AssertNe => return Err(nonconst_fmt_macro(span)),
+                MacroKind::Panic | MacroKind::Assert | MacroKind::Todo | MacroKind::Unreachable => {
+                    match const_macro_form(*kind, fmt) {
+                        ConstMacroForm::Bad => return Err(nonconst_fmt_macro(span)),
+                        // A literal that is plainly not a `&str`
+                        // needs no type information to reject, dead
+                        // branches included. Other argument shapes
+                        // are judged where types or values are known.
+                        ConstMacroForm::OneStrArg(index) => {
+                            let plainly_not_str = match ast.expr(args[index]) {
+                                Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) => true,
+                                Expr::Unary { expr, .. } => matches!(ast.expr(*expr), Expr::Int(..) | Expr::Float(_)),
+                                _ => false,
+                            };
+                            if plainly_not_str {
+                                return Err(Diag::new(
+                                    C_NONCONST,
+                                    span,
+                                    "argument to `panic!()` in a const context must have type `&str`",
+                                    "Use a `&str` message, or move the macro out of the const context.",
+                                ));
+                            }
+                        }
+                        ConstMacroForm::Plain => {}
+                    }
+                }
+                _ => {}
+            }
+            for &a in args {
+                check_macro_forms(ast, a)?;
+            }
+            Ok(())
+        }
+        Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => block(ast, *b),
+        Expr::LabeledBlock { body, .. } | Expr::AsyncBlock { body, .. } => block(ast, *body),
+        Expr::If { cond, then, els } => {
+            check_macro_forms(ast, *cond)?;
+            block(ast, *then)?;
+            if let Some(els) = els {
+                check_macro_forms(ast, *els)?;
+            }
+            Ok(())
+        }
+        Expr::While { cond, body, .. } => {
+            check_macro_forms(ast, *cond)?;
+            block(ast, *body)
+        }
+        Expr::Loop { body, .. } => block(ast, *body),
+        Expr::For { pat: p, iter, body, .. } => {
+            pat(ast, *p)?;
+            check_macro_forms(ast, *iter)?;
+            block(ast, *body)
+        }
+        Expr::Match { scrut, arms } => {
+            check_macro_forms(ast, *scrut)?;
+            for arm in arms {
+                pat(ast, arm.pat)?;
+                if let Some(g) = arm.guard {
+                    check_macro_forms(ast, g)?;
+                }
+                check_macro_forms(ast, arm.body)?;
+            }
+            Ok(())
+        }
+        Expr::Let { pat: p, scrut } => {
+            pat(ast, *p)?;
+            check_macro_forms(ast, *scrut)
+        }
+        Expr::Call { callee, args } => {
+            check_macro_forms(ast, *callee)?;
+            for &a in args {
+                check_macro_forms(ast, a)?;
+            }
+            Ok(())
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            check_macro_forms(ast, *recv)?;
+            for &a in args {
+                check_macro_forms(ast, a)?;
+            }
+            Ok(())
+        }
+        Expr::Field { base, .. } | Expr::TupleField { base, .. } => check_macro_forms(ast, *base),
+        Expr::Index { base, index } => {
+            check_macro_forms(ast, *base)?;
+            check_macro_forms(ast, *index)
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+            check_macro_forms(ast, *lhs)?;
+            check_macro_forms(ast, *rhs)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Ref { expr, .. }
+        | Expr::Deref(expr)
+        | Expr::Try(expr)
+        | Expr::Await(expr) => check_macro_forms(ast, *expr),
+        Expr::StructLit { fields, update, .. } => {
+            for &(_, _, fe) in fields {
+                check_macro_forms(ast, fe)?;
+            }
+            if let Some(u) = update {
+                check_macro_forms(ast, *u)?;
+            }
+            Ok(())
+        }
+        Expr::Tuple(elems) | Expr::Array(elems) => {
+            for &el in elems {
+                check_macro_forms(ast, el)?;
+            }
+            Ok(())
+        }
+        Expr::ArrayRepeat { value, len } => {
+            check_macro_forms(ast, *value)?;
+            check_macro_forms(ast, *len)
+        }
+        Expr::Range { lo, hi, .. } => {
+            for x in [lo, hi].into_iter().flatten() {
+                check_macro_forms(ast, *x)?;
+            }
+            Ok(())
+        }
+        Expr::Break { value, .. } | Expr::Return(value) => match value {
+            Some(v) => check_macro_forms(ast, *v),
+            None => Ok(()),
+        },
+        Expr::Int(..)
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::ByteStr(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Float(_)
+        | Expr::Path(_)
+        | Expr::SelfValue
+        | Expr::QPath { .. }
+        | Expr::Continue(_)
+        | Expr::Underscore
+        | Expr::MacroCall(_)
+        | Expr::OffsetOf { .. }
+        | Expr::Closure { .. } => Ok(()),
+    }
 }
 
 /// The literal text of a format string with no arguments, if it is all literal.

@@ -31,7 +31,7 @@ use crate::check::collect::{FnInfo, Program, needs_drop, ty_name};
 use crate::check::{Autoref, BindMode, Builtin, Checked, OrderingOpKind, PatRes, Res};
 use crate::def::LocalDefId;
 use crate::diag::{Diag, Span};
-use crate::ty::consteval::C_NONCONST;
+use crate::ty::consteval::{C_NONCONST, ConstMacroForm, const_macro_form, is_fmt_capture};
 use crate::ty::{Ty, TyIntern, TyKind};
 
 /// Checks one checked `const fn` body and returns its diagnostics.
@@ -667,7 +667,7 @@ impl Walk<'_, '_> {
                     self.expr(*v, true, depth, false);
                 }
             }
-            Expr::Macro { kind, args, .. } => {
+            Expr::Macro { kind, args, fmt, .. } => {
                 let nonconst = match kind {
                     MacroKind::Println => Some("println!"),
                     MacroKind::Print => Some("print!"),
@@ -686,6 +686,46 @@ impl Walk<'_, '_> {
                         format!("cannot call non-const macro `{name}` in a const function"),
                         "Move the macro call out of the const function.",
                     );
+                }
+                // The panic family is const only in its plain forms
+                // (rustc E0015): a literal message, or exactly one
+                // `{}` with a `&str` argument that is not a capture.
+                if nonconst.is_none() {
+                    let span = self.p.ast.expr_span(e);
+                    match const_macro_form(*kind, fmt) {
+                        ConstMacroForm::Bad => {
+                            self.err(
+                                span,
+                                "cannot call non-const formatting macro in a const function",
+                                "Use a plain literal message, such as `panic!(\"bad\")`, or move the macro out of the const function.",
+                            );
+                        }
+                        ConstMacroForm::OneStrArg(index) => {
+                            let arg = args[index];
+                            if is_fmt_capture(&self.p.ast, arg, |s| self.p.name(s).len()) {
+                                self.err(
+                                    span,
+                                    "cannot call non-const formatting macro in a const function",
+                                    "Use a plain literal message, such as `panic!(\"bad\")`, or move the macro out of the const function.",
+                                );
+                            } else {
+                                let t = self.ty(arg);
+                                let is_str = match self.ck.tys.kind(t) {
+                                    TyKind::Ref(_, _, inner) => matches!(self.ck.tys.kind(inner), TyKind::Str),
+                                    TyKind::Str | TyKind::Error => true,
+                                    _ => false,
+                                };
+                                if !is_str {
+                                    self.err(
+                                        span,
+                                        "argument to `panic!()` in a const context must have type `&str`",
+                                        "Use a `&str` message, or move the macro out of the const function.",
+                                    );
+                                }
+                            }
+                        }
+                        ConstMacroForm::Plain => {}
+                    }
                 }
                 for &a in args {
                     self.expr(a, false, depth, false);
