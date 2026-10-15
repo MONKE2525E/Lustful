@@ -555,11 +555,69 @@ pub(crate) fn lub_shapes_fit(p: &Program, tys: &impl TyIntern, f: LocalDefId, pt
     shapes_fit(&a, &b)
 }
 
-/// `lub_shapes_fit` for two fn items joined with no element type given
-/// (`[a, b]`): their signatures, reified to `ptr`, must match the same way.
+/// rustc's join of two fn items with no element type given (`[a, b]`):
+/// the later one, `b`, must be a subtype of the first, `a` (both reified;
+/// rustc coerces `b` to `a`'s pointer type). `a`'s binders are
+/// placeholders, `b`'s are picked, early-bound regions are free; a
+/// placeholder may outlive only itself and never `'static`. False when
+/// lust cannot pair the signatures with `ptr`.
 pub(crate) fn lub_items_fit(p: &Program, tys: &impl TyIntern, a: LocalDefId, b: LocalDefId, ptr: Ty) -> bool {
     let (Some(x), Some(y)) = (fn_shape(p, tys, a, ptr), fn_shape(p, tys, b, ptr)) else { return false };
-    shapes_fit(&x, &y)
+    let TyKind::FnPtr(s) = tys.kind(ptr) else { return false };
+    let s = tys.sig(s).value;
+    let mut sc = SlotCx::new(tys, p);
+    let mut var: Vec<Variance> = Vec::new();
+    for &t in tys.tys_of(s.inputs) {
+        sc.each_slot(t, Variance::Contra, 0, &mut |_, v| var.push(v));
+    }
+    sc.each_slot(s.output, Variance::Co, 0, &mut |_, v| var.push(v));
+    if x.len() != y.len() || var.len() != x.len() {
+        return false;
+    }
+    // `y <: x` slot by slot: (sup, sub) pairs, over target placeholders,
+    // source binders, `'static`, and free regions.
+    let node = |sh: Shape, target: bool| match sh {
+        Shape::Static => Node::Var(0),
+        Shape::Var => Node::Var(1),
+        Shape::Bound(i) if target => Node::Ph(i),
+        Shape::Bound(i) => Node::Late(i),
+    };
+    let mut cons: Vec<(Node, Node)> = Vec::new();
+    for ((&sy, &sx), &v) in y.iter().zip(&x).zip(&var) {
+        let (src, dst) = (node(sy, false), node(sx, true));
+        match v {
+            Variance::Co => cons.push((src, dst)),
+            Variance::Contra => cons.push((dst, src)),
+            Variance::Inv => {
+                cons.push((src, dst));
+                cons.push((dst, src));
+            }
+            Variance::Bi => {}
+        }
+    }
+    // Each free region is its own var: they may become anything, so only
+    // placeholders and `'static` can fail.
+    for &(x0, _) in &cons {
+        if matches!(x0, Node::Late(_)) {
+            continue;
+        }
+        let mut seen = vec![x0];
+        let mut work = vec![x0];
+        while let Some(n) = work.pop() {
+            for &(a0, b0) in &cons {
+                if a0 == n && !seen.contains(&b0) {
+                    seen.push(b0);
+                    match (x0, b0) {
+                        (_, Node::Late(_)) => work.push(b0),
+                        (Node::Ph(i), Node::Ph(j)) if i != j => return false,
+                        (Node::Ph(_), Node::Var(0)) => return false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Two canonical shapes LUB to one type (`lub_shapes_fit`).
