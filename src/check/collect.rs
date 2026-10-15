@@ -7692,6 +7692,14 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
                 Some(a) => {
                     (p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
                         || crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.debug)
+                        // A conditional written impl (`impl<K: Debug>
+                        // Debug for W<K>`) whose bounds the glue walks
+                        // prove for this instance: `ensure_fmt_methods`
+                        // selects the same impl for cgen. Without it a
+                        // compound type over the Adt (`&W<u8>`, the
+                        // `entries` item of a generic Debug body at its
+                        // instance) read as not Debug (fx-bench4-gaps).
+                        || written_glue_impl(p, tys, t, p.gx.lang.debug, Some("fmt"), &[], seen)
                 }
                 None => false,
             }

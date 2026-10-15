@@ -10027,22 +10027,77 @@ fn prove_trait_ref(
     }
     // The derive family's container impls have no solver records
     // (`Vec<X>: Debug` from `X: Debug` in an impl's obligations,
-    // where X is a projection the env bounds): decompose one-arg
-    // Debug, Clone, Copy, and Hash goals over the containers std
-    // forwards them through.
-    if (tr.def == lang.debug || tr.def == lang.clone || tr.def == lang.copy || tr.def == lang.hash)
-        && cx.tys.args(tr.args).len() == 1
-        && let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty())
-    {
+    // where X is a projection the env bounds): decompose derive
+    // family goals over the containers std forwards them through.
+    // Self must read deep-resolved here: a confirmed impl's nested
+    // goal names its Self by the probe variable the header bound
+    // (`K: Debug` with `K = &T` from `W<&T>`), and the kind of the
+    // variable itself is `Infer`, not `Ref` (fx-bench4-gaps).
+    let fam_parts: Option<(Ty, bool)> = {
+        let fam = [
+            lang.debug,
+            lang.clone,
+            lang.copy,
+            lang.hash,
+            lang.eq,
+            lang.partial_eq,
+            lang.partial_ord,
+            lang.ord,
+            lang.default,
+        ]
+        .contains(&tr.def);
+        let argv: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
+        let t0 = argv.first().and_then(|g| g.as_ty());
+        match (fam, t0) {
+            (true, Some(t0)) => {
+                let t = crate::traits::solve::SolveCx::deep_resolve(cx, t0);
+                // `PartialEq` and `PartialOrd` goals carry `Rhs` as a
+                // second arg; the component-wise impls need `Rhs = Self`.
+                let arity_ok = match argv.len() {
+                    1 => true,
+                    2 if tr.def == lang.partial_eq || tr.def == lang.partial_ord => {
+                        argv[1].as_ty().is_some_and(|r| crate::traits::solve::SolveCx::deep_resolve(cx, r) == t)
+                    }
+                    _ => false,
+                };
+                arity_ok.then_some((t, argv.len() == 2))
+            }
+            _ => None,
+        }
+    };
+    if let Some((t, two_args)) = fam_parts {
         // `Copy` forwards through fewer containers than the
         // others: `Vec`, `Box`, `Rc`, and `Arc` are never Copy,
         // and a slice is not a sized value at all.
         let is_copy = tr.def == lang.copy;
+        let is_default = tr.def == lang.default;
+        // The container and derived-Adt forwards below are written
+        // for Debug, Clone, Copy, and Hash; the other family traits
+        // decompose only the record-less shapes (tuple, array,
+        // slice, reference) and otherwise keep the solver's answer.
+        let containers = tr.def == lang.debug || tr.def == lang.clone || tr.def == lang.copy || tr.def == lang.hash;
         let parts: Option<Vec<Ty>> = match cx.tys.kind(t) {
+            // A reference defaults only as `&str` or `&[T]`, with no
+            // element goal; the other family traits forward to `T`.
+            TyKind::Ref(_, m, e) if is_default => matches!(cx.tys.kind(e), TyKind::Str | TyKind::Slice(_)).then_some(Vec::new()),
             TyKind::Ref(_, m, e) if !is_copy || !m.is_mut() => Some(vec![e]),
+            // core's array `Default` stops at 32 elements (any
+            // element type at length 0), as in `prove_field_trait`.
+            TyKind::Array(e, n) if is_default => match cx.tys.const_kind(n) {
+                ConstKind::Int(0) => Some(Vec::new()),
+                ConstKind::Int(k) if k <= 32 => Some(vec![e]),
+                _ => None,
+            },
             TyKind::Array(e, _) => Some(vec![e]),
-            TyKind::Slice(e) if !is_copy => Some(vec![e]),
-            TyKind::Tuple(ts) => Some(cx.tys.tys_of(ts).to_vec()),
+            TyKind::Slice(e) if !is_copy && !is_default => Some(vec![e]),
+            // core's tuple impls of the derive family stop at 12
+            // elements (`Clone` and `Copy` hold at every arity).
+            TyKind::Tuple(ts) => {
+                let elems: Vec<Ty> = cx.tys.tys_of(ts).to_vec();
+                let limited = tr.def != lang.clone && tr.def != lang.copy;
+                (!limited || elems.len() <= 12).then_some(elems)
+            }
+            _ if !containers => None,
             _ => {
                 let elem = if is_copy {
                     cx.tys.option_elem(t)
@@ -10082,7 +10137,11 @@ fn prove_trait_ref(
         };
         if let Some(parts) = parts {
             return parts.into_iter().all(|e| {
-                let args = cx.tys.intern_args(&[GenericArg::Ty(e)]);
+                let args = if two_args {
+                    cx.tys.intern_args(&[GenericArg::Ty(e), GenericArg::Ty(e)])
+                } else {
+                    cx.tys.intern_args(&[GenericArg::Ty(e)])
+                };
                 prove_trait_ref(p, solver, cx, env, TraitRef { def: tr.def, args, bindings: EMPTY_BINDINGS }, depth + 1)
             });
         }
