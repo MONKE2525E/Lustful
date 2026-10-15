@@ -3750,6 +3750,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(b) if sort_by_builtin(b)) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
+            _ if let CallTarget::Builtin(b @ (crate::check::Builtin::MapInsert | crate::check::Builtin::MapRemove)) = target
+                && self.call_map_value(b, &avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
                 self.call_opaque(&avs[..1], dt, &dv)
             }
@@ -4302,6 +4304,29 @@ impl<'b, 'p> Builder<'b, 'p> {
             let (a, b) = (mv[at..at + n].to_vec(), iv[at..at + n].to_vec());
             self.relate(t, &a, t, &b, var);
             at += n;
+        }
+        true
+    }
+
+    /// `map.insert(k, v)` and `map.remove(&q)`: rustc's `-> Option<V>`
+    /// holds the map's V (a subtype of it), not the `&mut` loan of the
+    /// map. `insert` stores its arguments: every argument region flows
+    /// into the map's slots, as `call_opaque`'s `&mut` rule. False when
+    /// the types do not pair (the caller takes the conservative rule).
+    fn call_map_value(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, Mut::Mut, map) = self.body.tys.kind(*t0) else { return false };
+        let Some((crate::ty::hash::HashTy::HashMap, margs)) = crate::ty::hash::hash_parts(&self.body.tys, map) else { return false };
+        let (&[k, v, ..], Some(out)) = (&margs[..], self.body.tys.option_elem(dt)) else { return false };
+        let (nk, nv) = (self.sc.slots(k) as usize, self.sc.slots(v) as usize);
+        if out != v || dv.len() != nv || v0.len() < 1 + nk + nv {
+            return false;
+        }
+        let vv = v0[1 + nk..1 + nk + nv].to_vec();
+        self.relate(v, &vv, v, dv, Variance::Co);
+        if b == crate::check::Builtin::MapInsert {
+            let others: Vec<u32> = avs[1..].iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            self.flow_all(&others, &v0[1..]);
         }
         true
     }
