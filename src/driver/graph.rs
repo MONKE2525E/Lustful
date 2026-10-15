@@ -476,7 +476,7 @@ fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty) {
             14u8.hash(h);
             let sig = tys.sig(sig);
             sig.count.hash(h);
-            (sig.value.is_unsafe, sig.value.extern_c).hash(h);
+            (sig.value.is_unsafe, sig.value.extern_c, sig.value.free_slots, sig.value.free_region).hash(h);
             for e in tys.tys_of(sig.value.inputs) {
                 hash_ty(h, p, tys, *e);
             }

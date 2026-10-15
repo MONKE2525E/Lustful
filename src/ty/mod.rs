@@ -381,6 +381,23 @@ pub struct FnSig {
     pub is_unsafe: bool,
     /// True for `extern "C"`. No other ABI is in the subset.
     pub extern_c: bool,
+    /// W-BORROW3: for a fn pointer type that names a lifetime of the
+    /// enclosing item (`fn(&mut Parser<'a>) -> Node`), bit `k` is set when
+    /// region slot `k` of the signature (the borrow checker's slot order
+    /// over the inputs, then the output) is that free region. Every other
+    /// slot is `'static` where written, else late-bound. 0 for all other
+    /// signatures.
+    pub free_slots: u32,
+    /// The free region of `free_slots`: `Erased` in check's types, the
+    /// item's lifetime (`Region::Param`) in region signatures.
+    pub free_region: Region,
+}
+
+impl FnSig {
+    /// A signature with no free region (`free_slots` 0).
+    pub fn plain(inputs: TysId, output: Ty) -> FnSig {
+        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased }
+    }
 }
 
 /// A trait reference: `Self` is `args[0]`. `bindings` is the interned list of

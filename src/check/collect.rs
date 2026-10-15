@@ -1376,6 +1376,12 @@ pub fn resolve_ty(
             if *variadic || qual.is_unsafe || qual.is_async || qual.is_const || qual.abi.is_some() {
                 return Err(not_yet("L0602", span, "qualified or variadic function pointer types"));
             }
+            // W-BORROW3: this resolver erases every region, but a fn pointer
+            // type keeps a written `'static` and its free lifetimes
+            // (`generics::resolve_scoped`). Callers fall back to that one.
+            if generics::fn_ptr_names_lifetime(ast, interner, id) {
+                return Err(not_yet("L0602", span, "a fn pointer type with lifetimes here (it needs the scoped resolver)"));
+            }
             let mut ins = Vec::with_capacity(inputs.len());
             for p in inputs {
                 ins.push(resolve_ty(ast, interner, known, type_names, aliases, tys, p.ty, self_ty)?);
@@ -1385,10 +1391,47 @@ pub fn resolve_ty(
                 None => UNIT,
             };
             let inputs = tys.intern_tys(&ins);
-            let sig = tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig { inputs, output: out, is_unsafe: false, extern_c: false }));
+            let sig = tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig::plain(inputs, out)));
             Ok(tys.intern(TyKind::FnPtr(sig)))
         }
         _ => Err(not_yet("L0602", span, "this type form")),
+    }
+}
+
+/// `t` with each reference `'static`, through tuples, arrays, slices,
+/// and type args (a no-param fn's return type, `fn_item`).
+fn static_refs_in(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    match tys.kind(t) {
+        TyKind::Ref(_, m, inner) => {
+            let i = static_refs_in(tys, inner);
+            tys.intern(TyKind::Ref(crate::ty::Region::Static, m, i))
+        }
+        TyKind::Tuple(ts) => {
+            let v: Vec<Ty> = tys.tys_of(ts).to_vec().into_iter().map(|e| static_refs_in(tys, e)).collect();
+            let id = tys.intern_tys(&v);
+            tys.intern(TyKind::Tuple(id))
+        }
+        TyKind::Array(e, n) => {
+            let e = static_refs_in(tys, e);
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Slice(e) => {
+            let e = static_refs_in(tys, e);
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Adt(d, a) => {
+            let args: Vec<crate::ty::GenericArg> = tys
+                .args(a)
+                .to_vec()
+                .into_iter()
+                .map(|g| match g {
+                    crate::ty::GenericArg::Ty(e) => crate::ty::GenericArg::Ty(static_refs_in(tys, e)),
+                    g => g,
+                })
+                .collect();
+            tys.mk_adt(d, &args)
+        }
+        _ => t,
     }
 }
 
@@ -5474,7 +5517,10 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             return None;
         }
         let inputs = self.p.tys.intern_tys(&params);
-        let sig = self.p.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig { inputs, output: ret, is_unsafe: false, extern_c: false }));
+        // With no params, every reference the fn returns is `'static`
+        // (elision): the pointer type keeps that (W-BORROW3).
+        let ret = if params.is_empty() { static_refs_in(&mut self.p.tys, ret) } else { ret };
+        let sig = self.p.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig::plain(inputs, ret)));
         let t = self.p.tys.intern(TyKind::FnPtr(sig));
         Some((crate::ty::consteval::ConstValue::FnPtr(f.0), t))
     }

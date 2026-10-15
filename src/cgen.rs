@@ -8543,7 +8543,7 @@ mod tests {
         let f64_ty = body.tys.intern(TyKind::Float(FloatTy::F64));
         let u128_ty = int(IntTy::U128);
         let inputs = body.tys.intern_tys(&[i64_ty]);
-        let sig = body.tys.intern_sig(Binder::plain(FnSig { inputs, output: i64_ty, is_unsafe: false, extern_c: false }));
+        let sig = body.tys.intern_sig(Binder::plain(FnSig::plain(inputs, i64_ty)));
         let fnptr_ty = body.tys.intern(TyKind::FnPtr(sig));
         let local = |ty: Ty| LocalDecl { ty, mutable: false, name: None };
         // Print args hold a reference to the value, as lower emits them:

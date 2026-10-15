@@ -35,6 +35,7 @@ fn async_error(span: Span) -> Diag {
 type PResult<T> = Result<T, Diag>;
 
 mod attrs;
+mod hrtb;
 
 /// The depth of each arena node built so far (1 for a leaf, else one
 /// more than its deepest child), index-aligned with the `Ast` arenas.
@@ -2396,6 +2397,12 @@ impl<'a> Parser<'a> {
         // The legacy `~const` and `async` bound modifiers are not
         // in the subset; plain paths and `?Trait` are.
         let path = self.trait_path()?;
+        // W-BORROW3: `for<'a> Fn(&'a T) -> &'a U` reads as `Fn(&T) -> &U`.
+        if !binder.is_empty()
+            && let Some(GenericArgs::Parenthesized { inputs, output }) = path.last().map(|s| s.args.clone())
+        {
+            self.canon_binder(&binder, &inputs, output)?;
+        }
         Ok(TraitBound::Trait { binder, trait_ref: TraitRefExpr { path }, maybe })
     }
 
@@ -3082,6 +3089,12 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let binder = self.opt_binder()?;
                 let mut bounds = self.bounds()?;
+                // W-BORROW3: `dyn for<'a> Fn(&'a T)` as `dyn Fn(&T)`.
+                if let Some(TraitBound::Trait { trait_ref, .. }) = bounds.first()
+                    && let Some(GenericArgs::Parenthesized { inputs, output }) = trait_ref.path.last().map(|s| s.args.clone())
+                {
+                    self.canon_binder(&binder, &inputs, output)?;
+                }
                 // A trailing lifetime bound is the dyn lifetime.
                 let lifetime = match bounds.last() {
                     Some(TraitBound::Lifetime(lt)) if bounds.len() > 1 => {
@@ -3181,13 +3194,25 @@ impl<'a> Parser<'a> {
                 let _binder = self.opt_binder()?;
                 self.ty()
             }
-            Tok::For => {
-                if self.peek_at(1) == Tok::Lt && matches!(self.peek_at(2), Tok::Lifetime(_)) {
-                    Err(lifetime_error(self.toks[self.pos + 2].span))
-                } else {
-                    Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types and bounds"))
+            // W-BORROW3: `for<'a> fn(&'a T) -> &'a U`, read as the elided
+            // form when it means the same (`canon_binder`).
+            Tok::For if self.peek_at(1) == Tok::Lt && self.peek_at(2) != Tok::Gt => {
+                let binder = self.opt_binder()?;
+                if self.peek() != Tok::Fn {
+                    return Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types other than fn pointers"));
                 }
+                let t = self.ty()?;
+                let TyExpr::FnPtr { inputs, ret, .. } = &self.ast.tys[t.0 as usize] else {
+                    return Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types other than fn pointers"));
+                };
+                let (inputs, ret): (Vec<TyId>, Option<TyId>) = (inputs.iter().map(|p| p.ty).collect(), *ret);
+                self.canon_binder(&binder, &inputs, ret)?;
+                if let TyExpr::FnPtr { binder: b, .. } = &mut self.ast.tys[t.0 as usize] {
+                    *b = binder;
+                }
+                Ok(t)
             }
+            Tok::For => Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types and bounds")),
             Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
                 let (span, _) = self.skip_macro_invocation()?;
                 Ok(self.push_ty(TyExpr::Unit, span))

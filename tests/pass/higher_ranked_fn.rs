@@ -1,4 +1,4 @@
-// expect: L0203
+// W-BORROW3: an explicit `for<'a>` binder that means what elision means.
 fn apply(f: for<'a> fn(&'a i64) -> i64) -> i64 {
     f(&2)
 }

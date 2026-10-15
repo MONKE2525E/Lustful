@@ -14,7 +14,8 @@
 // 5. Each access is checked against the in-scope loans it conflicts with, and region
 //    relations the signature does not give are L0733.
 mod regions;
-pub use regions::{FnBound, ImplHead, RegionSig, RegionTables, TraitLts, impl_trait_method, regions_of};
+pub use regions::{FnBound, ImplHead, RegionSig, RegionTables, TraitLts, elision_regions, impl_trait_method, regions_of};
+pub(crate) use regions::paired_slot_regions;
 
 use crate::check::collect::*;
 use crate::diag::{Diag, Span, unsupported};
@@ -457,7 +458,6 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     // A body with no loans needs no regions: no loan can conflict, and a
     // universal relation can only fail through a loan or a reference value
     // that flows between parameters, which the region pass checks below.
-    ck.errs.extend(regions::fn_item_coercions(p, body));
     let own = own_sig(p, body);
     if own.check
         && let Some(d) = regions::impl_contract(p, body.fn_id)

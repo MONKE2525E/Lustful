@@ -63,7 +63,7 @@ impl Lower<'_> {
         let (key, ty) = (st.tls.expect("check/tls.rs: a key method names a thread_local! static"), st.ty);
         let t = self.body.tys.local_key_elem(ty).expect("a thread_local! static is a LocalKey");
         let inputs = self.body.tys.intern_tys(&[]);
-        let sig = self.body.tys.intern_sig(Binder::plain(FnSig { inputs, output: t, is_unsafe: false, extern_c: false }));
+        let sig = self.body.tys.intern_sig(Binder::plain(FnSig::plain(inputs, t)));
         let fp = self.body.tys.intern(TyKind::FnPtr(sig));
         let l = self.temp(fp);
         self.assign(Place::local(l), Rvalue::FnValue(key.init, fp), span);

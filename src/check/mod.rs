@@ -2699,7 +2699,7 @@ impl<'p> Ctx<'p> {
     fn fn_ptr_ty(&mut self, params: &[Ty], ret: Ty) -> Ty {
         let inputs = self.tys.intern_tys(params);
         let sig =
-            self.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig { inputs, output: ret, is_unsafe: false, extern_c: false }));
+            self.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig::plain(inputs, ret)));
         self.tys.intern(TyKind::FnPtr(sig))
     }
 
@@ -5178,9 +5178,17 @@ impl<'p> Ctx<'p> {
     /// True when the fn item to fn pointer coercion takes `f` to `e`.
     /// Pure: no unification (the same test `coerce_at` applies).
     fn fn_coercible(&mut self, f: Ty, e: Ty) -> bool {
-        matches!(self.kind(e), TyKind::FnPtr(_))
-            && self.is_fn_item(f)
-            && self.callable_sig(f).is_some_and(|(params, ret)| self.fn_ptr_ty(&params, ret) == self.resolve(e))
+        if !matches!(self.kind(e), TyKind::FnPtr(_)) || !self.is_fn_item(f) {
+            return false;
+        }
+        // Part by part, as `unify` compares fn pointers: a written
+        // `&'static` or free lifetime in `e` (W-BORROW3) is the borrow
+        // checker's to prove (`fnptr::fn_item_to_ptr`).
+        let (snap, obl) = (self.snapshot_vars(), self.obl_len());
+        let ok = self.fn_item_ptr_unifies(f, e);
+        self.rollback_vars(snap);
+        self.obl_truncate(obl);
+        ok
     }
 
     /// Coercion inside an aggregate value whose producer is in hand: a
@@ -5880,10 +5888,11 @@ impl<'p> Ctx<'p> {
     /// any written type, with explicit lifetimes allowed, since
     /// `record_annotation` keeps their regions for the borrow checker.
     fn resolve_annotation(&mut self, t: ast::TyId) -> Ty {
-        let saved = self.body_scope.annotation;
+        let saved = (self.body_scope.annotation, self.body_scope.fn_ptr_free);
         self.body_scope.annotation = true;
+        self.body_scope.fn_ptr_free = true;
         let ty = self.resolve_written(t);
-        self.body_scope.annotation = saved;
+        (self.body_scope.annotation, self.body_scope.fn_ptr_free) = saved;
         ty
     }
 
@@ -5916,6 +5925,7 @@ impl<'p> Ctx<'p> {
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let mut sc = self.body_scope.clone();
         sc.annotation = true;
+        sc.fn_ptr_free = true;
         sc.infer_cell = None;
         sc.regions = generics::RegionMode::Keep { next: None, elided: Some(elided) };
         match generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, t, &sc) {
@@ -7779,10 +7789,14 @@ impl<'p> Ctx<'p> {
     /// The expected type when it is a pointer to a dyn type: a
     /// reference, or an owning `Box<dyn Tr>` or `Rc<dyn Tr>`. Branch
     /// results then coerce to it one by one, as rustc's expectation
-    /// does, instead of joining the branch types first (ARCH 2.8).
+    /// does, instead of joining the branch types first (ARCH 2.8). Also a
+    /// fn pointer type that names a lifetime of the fn (W-BORROW3): a
+    /// method with the impl's early-bound lifetime fits it, never the
+    /// joined pointer type of the branches.
     fn dyn_ref_expectation(&self, expected: Option<Ty>) -> Option<Ty> {
         let t = self.resolve(expected?);
         match self.kind(t) {
+            TyKind::FnPtr(s) if self.tys.sig(s).value.free_slots != 0 => Some(t),
             TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..)) => Some(t),
             TyKind::Adt(..) if self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(self.resolve(e)), TyKind::Dyn(..))) => Some(t),
             _ => None,

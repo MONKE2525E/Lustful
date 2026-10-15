@@ -288,6 +288,21 @@ pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
             a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| const_ty_compatible(tys, x, y))
         }
         (TyKind::Array(e1, n1), TyKind::Array(e2, n2)) => n1 == n2 && const_ty_compatible(tys, e1, e2),
+        // A fn item value here has no references in its params, or none
+        // and only `'static` ones in its return (`fn_item` in
+        // check/collect.rs), so a written `&'static` in the pointer type
+        // (W-BORROW3: no longer erased) fits it part by part.
+        (TyKind::FnPtr(s1), TyKind::FnPtr(s2)) => {
+            let (a, b) = (tys.sig(s1).value, tys.sig(s2).value);
+            let (ai, bi) = (tys.tys_of(a.inputs), tys.tys_of(b.inputs));
+            a.is_unsafe == b.is_unsafe
+                && a.extern_c == b.extern_c
+                && b.free_slots == 0
+                && ai.len() == bi.len()
+                && ai.iter().zip(bi).all(|(&x, &y)| const_ty_compatible(tys, y, x) && static_marks_fit(tys, x, y, true, false))
+                && const_ty_compatible(tys, a.output, b.output)
+                && static_marks_fit(tys, a.output, b.output, false, false)
+        }
         (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
             let (a, b) = (tys.args(a1), tys.args(a2));
             a.len() == b.len()
@@ -295,6 +310,79 @@ pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
                     (super::GenericArg::Ty(x), super::GenericArg::Ty(y)) => const_ty_compatible(tys, *x, *y),
                     _ => x == y,
                 })
+        }
+        _ => false,
+    }
+}
+
+/// The written `&'static` references of two fn pointer signature parts
+/// (W-BORROW3): an input (`contra`) of `found` may not demand `'static`
+/// where `expected` takes any lifetime, an output of `found` must be
+/// `'static` where `expected` promises it, and under `&mut` (`inv`) the
+/// two must agree.
+fn static_marks_fit<T: TyIntern>(tys: &T, found: Ty, expected: Ty, contra: bool, inv: bool) -> bool {
+    let st = |r: super::Region| r == super::Region::Static;
+    match (tys.kind(found), tys.kind(expected)) {
+        (TyKind::Ref(rf, m, a), TyKind::Ref(re, _, b)) => {
+            let ok = if inv {
+                st(rf) == st(re)
+            } else if contra {
+                !st(rf) || st(re)
+            } else {
+                !st(re) || st(rf)
+            };
+            ok && static_marks_fit(tys, a, b, contra, inv || m.is_mut())
+        }
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+            let (a, b) = (tys.tys_of(a), tys.tys_of(b));
+            a.iter().zip(b).all(|(&x, &y)| static_marks_fit(tys, x, y, contra, inv))
+        }
+        (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => static_marks_fit(tys, x, y, contra, inv),
+        // The covariant std containers keep the position; any other
+        // Adt holds its args invariant (lust computes no variance here).
+        (TyKind::Adt(_, a1), TyKind::Adt(_, a2)) => {
+            use super::BuiltinTy as B;
+            let co = matches!(tys.builtin_of(found), Some(B::Option | B::Result | B::Vec | B::Boxed | B::Rc));
+            tys.args(a1).iter().zip(tys.args(a2)).all(|(x, y)| match (x.as_ty(), y.as_ty()) {
+                (Some(x), Some(y)) => static_marks_fit(tys, x, y, contra, inv || !co),
+                _ => true,
+            })
+        }
+        (TyKind::FnPtr(_), TyKind::FnPtr(_)) => const_ty_compatible(tys, found, expected) || !inv,
+        _ => true,
+    }
+}
+
+/// Two types equal but for their regions (`bind_params`).
+fn same_up_to_regions<T: TyIntern>(tys: &T, a: Ty, b: Ty) -> bool {
+    if a == b {
+        return true;
+    }
+    match (tys.kind(a), tys.kind(b)) {
+        (TyKind::Ref(_, m1, x), TyKind::Ref(_, m2, y)) => m1 == m2 && same_up_to_regions(tys, x, y),
+        (TyKind::RawPtr(m1, x), TyKind::RawPtr(m2, y)) => m1 == m2 && same_up_to_regions(tys, x, y),
+        (TyKind::Slice(x), TyKind::Slice(y)) => same_up_to_regions(tys, x, y),
+        (TyKind::Array(x, n1), TyKind::Array(y, n2)) => n1 == n2 && same_up_to_regions(tys, x, y),
+        (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+            let (x, y) = (tys.tys_of(x), tys.tys_of(y));
+            x.len() == y.len() && x.iter().zip(y).all(|(&p, &q)| same_up_to_regions(tys, p, q))
+        }
+        (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
+            let (x, y) = (tys.args(a1), tys.args(a2));
+            x.len() == y.len()
+                && x.iter().zip(y).all(|(p, q)| match (p.as_ty(), q.as_ty()) {
+                    (Some(p), Some(q)) => same_up_to_regions(tys, p, q),
+                    _ => p == q,
+                })
+        }
+        (TyKind::FnPtr(s1), TyKind::FnPtr(s2)) => {
+            let (p, q) = (tys.sig(s1).value, tys.sig(s2).value);
+            let (pi, qi) = (tys.tys_of(p.inputs), tys.tys_of(q.inputs));
+            p.is_unsafe == q.is_unsafe
+                && p.extern_c == q.extern_c
+                && pi.len() == qi.len()
+                && pi.iter().zip(qi).all(|(&x, &y)| same_up_to_regions(tys, x, y))
+                && same_up_to_regions(tys, p.output, q.output)
         }
         _ => false,
     }
@@ -318,7 +406,10 @@ fn bind_params<T: TyIntern>(tys: &mut T, pat: Ty, actual: Ty, binds: &mut Vec<Op
                 binds.resize(i + 1, None);
             }
             match binds[i] {
-                Some(b) => b == actual,
+                // Up to regions: a no-param fn item's value keeps its
+                // `'static` returns (W-BORROW3), a type from a signature
+                // may not.
+                Some(b) => same_up_to_regions(tys, b, actual),
                 None => {
                     binds[i] = Some(actual);
                     true
