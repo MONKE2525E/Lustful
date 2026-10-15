@@ -6146,7 +6146,7 @@ pub fn finish_trait_impl(
             }
             continue;
         };
-        validate_method_sig(p, &tmpl, local, tr, impl_parent_n, &assoc_tys, imp.span, errs);
+        validate_method_sig(p, &tmpl, local, tr, impl_parent_n, &impl_generics.predicates.clone(), &assoc_tys, imp.span, errs);
     }
     // A method signature that names this impl's own associated types
     // (`fn next(&mut self) -> Option<Self::Item>`) means its bindings:
@@ -6665,6 +6665,7 @@ fn validate_method_sig(
     local: LocalDefId,
     tr: TraitRef,
     impl_parent_n: usize,
+    impl_preds: &[Predicate],
     assoc_tys: &[(DefId, Ty)],
     span: Span,
     errs: &mut Vec<Diag>,
@@ -6749,24 +6750,36 @@ fn validate_method_sig(
     }
     if let Some(ig) = &impl_gen {
         use crate::traits::index::subst_predicate;
-        let env_subst: Vec<Predicate> = tmpl.generics.predicates.iter().map(|&pr| subst_predicate(&mut p.tys, pr, &subst_args)).collect();
+        // Every requirement of the impl method must follow from
+        // what a caller of the trait method knows: the trait
+        // method's own predicates (substituted) and the impl
+        // header's. A stricter impl method (rustc E0276) can be
+        // called through the trait without its extra bound, on
+        // the method's own params (`U: Copy`) or the impl's
+        // (`where T: Copy`, `Vec<T>: Clone`, `Self: Copy`).
+        let mut env_subst: Vec<Predicate> = tmpl.generics.predicates.iter().map(|&pr| subst_predicate(&mut p.tys, pr, &subst_args)).collect();
+        env_subst.extend_from_slice(impl_preds);
         let env = elaborate_env(&mut p.tys, &p.gx.index, &env_subst);
+        let header_self = subst_args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
         for pred in &ig.predicates {
             let Predicate::Trait(b) = pred else { continue };
             if b.count != 0 || b.value.def == p.gx.lang.sized {
                 continue;
             }
-            let mentions_own = p
-                .tys
-                .args(b.value.args)
+            let raw_args: Vec<GenericArg> = p.tys.args(b.value.args).to_vec();
+            let goal_args: Vec<GenericArg> = raw_args
                 .iter()
-                .filter_map(|g| g.as_ty())
-                .any(|t| (0..own_impl as u32).any(|j| ty_uses_param(&p.tys, t, impl_parent_n as u32 + j)));
-            if mentions_own && !prove_goal(p, &env, b.value) {
+                .map(|&g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(rewrite_impl_projections(p, t, header_self, assoc_tys)),
+                    other => other,
+                })
+                .collect();
+            let goal = TraitRef { def: b.value.def, args: p.tys.intern_args(&goal_args), bindings: b.value.bindings };
+            if !prove_goal(p, &env, goal) {
                 errs.push(Diag::new(
                     "L0110",
                     f_name_span,
-                    "this method requires more of its generic parameters than the trait method does",
+                    "impl has stricter requirements than the trait method",
                     "Remove the extra bound, or add it to the trait definition.",
                 ));
                 break;
