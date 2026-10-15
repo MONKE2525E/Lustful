@@ -252,8 +252,10 @@ fn item_consts(ast: &Ast, item: &Item, out: &mut ConstRoots) {
 /// block, and pattern range bound of the arena nodes from `from`
 /// (expression, type, and pattern arena lengths) to the end. With
 /// `items`, also those of every item and body item outside fn bodies
-/// (`item_consts`).
-pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool) -> ConstRoots {
+/// (`item_consts`). `bodies` (sorted expression ranges of fn bodies),
+/// when given, keeps a `const` block outside them out of `scalar`: it
+/// sits in an item value, which `values` covers.
+pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool, bodies: Option<&[(u32, u32)]>) -> ConstRoots {
     let mut out = ConstRoots::default();
     if items {
         for it in ast.items.iter().chain(&ast.stmt_items) {
@@ -278,10 +280,16 @@ pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool) 
             }
         }
     }
-    for e in ast.exprs.get(from.0..).unwrap_or(&[]) {
+    let in_body = |i: usize| {
+        bodies.is_none_or(|r| {
+            let k = r.partition_point(|&(lo, _)| lo as usize <= i);
+            k > 0 && i < r[k - 1].1 as usize
+        })
+    };
+    for (i, e) in ast.exprs.iter().enumerate().skip(from.0) {
         match e {
             Expr::ArrayRepeat { len, .. } => w.expr(&mut h, *len),
-            Expr::ConstBlock(b) => w.block(&mut h, *b),
+            Expr::ConstBlock(b) if in_body(i) => w.block(&mut h, *b),
             Expr::Path(p) | Expr::StructLit { path: p, .. } => segs(&mut w, &mut h, p),
             Expr::QPath { trait_path, segs: p, .. } => {
                 segs(&mut w, &mut h, trait_path);

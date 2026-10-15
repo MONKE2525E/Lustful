@@ -2155,9 +2155,9 @@ pub fn run() -> i64 {
     }
 
     /// Const fns whose results reach only const and static values
-    /// (`base` through `SCALE`, `pair` through `PAIRS`), a const that
-    /// patterns match on, and one whose result reaches an array length
-    /// (`width`).
+    /// (`base` through `SCALE`, `pair` through `PAIRS`, `Num::new` through
+    /// a `const` block in `NUMS`), a const that patterns match on, and one
+    /// whose result reaches an array length (`width`).
     const VALUES: &str = "pub const fn base() -> i64 {
     3
 }
@@ -2170,8 +2170,17 @@ pub const fn width() -> usize {
     2
 }
 
+pub struct Num(i64);
+
+impl Num {
+    pub const fn new(v: i64) -> Num {
+        Num(v)
+    }
+}
+
 pub const SCALE: i64 = base() * 2;
 pub static PAIRS: [(i64, i64); 2] = [pair(1), pair(SCALE)];
+pub static NUMS: [Num; 2] = [const { Num::new(4) }; 2];
 const W: usize = width();
 
 pub fn run() -> i64 {
@@ -2180,7 +2189,7 @@ pub fn run() -> i64 {
         SCALE => 1,
         _ => 2,
     };
-    SCALE + PAIRS[1].1 + k + a.len() as i64
+    SCALE + PAIRS[1].1 + k + a.len() as i64 + NUMS[1].0
 }
 ";
 
@@ -2210,7 +2219,10 @@ pub fn run() -> i64 {
             ("    let b = 3;\n    b\n", "    let b: i64 = 9223372036854775807;\n    b + 1\n", "gen_state"),
             ("    let b: i64 = 9223372036854775807;\n    b + 1\n", "    let b = 4;\n    b\n", "gen_state"),
             ("    let b = 4;\n    b\n", "    let b = 4;\n    let _c = 1;\n    b\n", "reuse"),
-            ("    2\n}\n\npub const SCALE", "    let w = 2;\n    w\n}\n\npub const SCALE", "gen_state"),
+            // A const block in a static's value evaluates with the value.
+            ("        Num(v)\n", "        let w = v;\n        Num(w)\n", "reuse"),
+            ("        let w = v;\n        Num(w)\n", "        Num(v + 1)\n", "gen_state"),
+            ("    2\n}\n\npub struct Num", "    let w = 2;\n    w\n}\n\npub struct Num", "gen_state"),
         ];
         for &(old, new, kept) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);

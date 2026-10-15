@@ -18,8 +18,9 @@
 // (`collect::const_values_hold`). `revaluable` says so when the names
 // that can carry the fn's result (the fn, the const fns that name one of
 // them, and the const and static items whose value names one) meet no
-// other evaluator start: no array length, const argument, `const` block,
-// discriminant, or const param default names one.
+// other evaluator start: no array length, const argument, `const` block
+// in a body, discriminant, or const param default names one. (A `const`
+// block in a const or static value evaluates with that value.)
 //
 // The sets live in the patch base and only grow: each patch adds what its
 // new nodes and its edited const fns can reach, and never removes what an
@@ -57,7 +58,12 @@ pub(crate) struct ConstReach {
 impl ConstReach {
     /// The sets for the front's current Ast.
     pub(crate) fn build(front: &Front) -> ConstReach {
-        let roots = super::ast_hash::const_idents(&front.ast, (0, 0, 0), true);
+        // A `const` block in a body runs in a body check; one in a const
+        // or static value runs with that value.
+        let mut bodies: Vec<(u32, u32)> = front.fn_loc.iter().map(|&(item, sub)| fn_def_at(&front.ast, item, sub).exprs).collect();
+        trait_bodies(&front.ast.items, &mut bodies);
+        bodies.sort_unstable();
+        let roots = super::ast_hash::const_idents(&front.ast, (0, 0, 0), true, Some(&bodies));
         let consts: Vec<(usize, Sym)> = front
             .fn_loc
             .iter()
@@ -85,7 +91,7 @@ impl ConstReach {
     /// nodes, and the new bodies of the edited fns (`Front::fn_loc`
     /// indexes) that are reachable const fns.
     pub(crate) fn update(&mut self, front: &Front, edited: &[usize]) {
-        let roots = super::ast_hash::const_idents(&front.ast, self.seen, false);
+        let roots = super::ast_hash::const_idents(&front.ast, self.seen, false, None);
         self.scalar.extend(roots.scalar.iter().copied());
         self.names.extend(roots.scalar);
         self.seen = arena_lens(front);
@@ -153,6 +159,18 @@ impl ConstReach {
             if !grew {
                 return;
             }
+        }
+    }
+}
+
+/// The expression ranges of trait default method bodies (not in
+/// `Front::fn_loc`), in nested modules too.
+fn trait_bodies(items: &[crate::ast::Item], out: &mut Vec<(u32, u32)>) {
+    for it in items {
+        match &it.kind {
+            crate::ast::ItemKind::Trait(t) => out.extend(t.fns.iter().filter(|f| f.body.is_some()).map(|f| f.exprs)),
+            crate::ast::ItemKind::Mod(m) => trait_bodies(m.body.as_deref().unwrap_or(&[]), out),
+            _ => {}
         }
     }
 }
