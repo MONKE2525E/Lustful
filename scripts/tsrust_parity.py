@@ -21,6 +21,7 @@ Last line: "tsrust-parity: <same>/<runs> runs same, <same>/<tests> test bins sam
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -69,13 +70,17 @@ def tree_digest(d):
     return out
 
 
+# `tsc -b --verbose` starts lines with the wall clock time; two runs differ there only.
+CLOCK = re.compile(rb"^\d\d:\d\d:\d\d [AP]M - ", re.M)
+
+
 def run_one(cmd, src, work, timeout):
     if work.exists():
         shutil.rmtree(work)
     shutil.copytree(src, work, symlinks=True)
     try:
         r = subprocess.run(cmd, cwd=work, capture_output=True, timeout=timeout)
-        res = (r.returncode, r.stdout, r.stderr)
+        res = (r.returncode, CLOCK.sub(b"HH:MM:SS - ", r.stdout), r.stderr)
     except subprocess.TimeoutExpired:
         res = ("hang", b"", b"")
     return res, tree_digest(work)
@@ -182,6 +187,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=300)
     a = ap.parse_args()
     fork, cb, lb, out = a.fork.resolve(), a.cargo_bins.resolve(), a.lust_bins.resolve(), a.out.resolve()
+    out.mkdir(parents=True, exist_ok=True)
     if not cb.exists():
         sys.exit(f"tsrust-parity: no Cargo bins at {cb}")
     runs = parity_runs(fork, cb, lb, out, a.timeout)
@@ -189,7 +195,10 @@ def main():
     with open(out / "parity.txt", "w") as f:
         for tag, res in runs + tests:
             f.write(f"{res}\t{tag}\n")
-    bad = [(t, r) for t, r in runs + tests if r != "same"]
+    bad = [(t, r) for t, r in runs + tests if r != "same" and not r.startswith("no lust bin")]
+    nobin = sum(r.startswith("no lust bin") for _, r in runs)
+    if nobin:
+        print(f"tsrust-parity: {nobin} runs have no lust bin yet")
     for t, r in bad[:40]:
         print(f"tsrust-parity: DIFF {t}: {r}")
     rs = sum(r == "same" for _, r in runs)
