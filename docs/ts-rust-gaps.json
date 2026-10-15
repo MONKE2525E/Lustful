@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "tool": "lust-port scan",
-  "manifest_path": "/home/theo/.t3/projects/ts-rust/Cargo.toml",
-  "workspace_root": "/home/theo/.t3/projects/ts-rust",
+  "manifest_path": "/home/user/up/tsrust-copy/Cargo.toml",
+  "workspace_root": "/home/user/up/tsrust-copy",
   "packages": [
     "ts_goport",
     "goport_lsproto",
@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 8824,
+  "elapsed_ms": 3928,
   "totals": {
     "files": 1036,
     "lines": 789064,
