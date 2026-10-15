@@ -130,7 +130,7 @@ def test_exe(deps, name):
 
 def run_tests(exe, cwd, timeout):
     try:
-        r = subprocess.run([str(exe), "--test-threads", "4"], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([str(exe), "--test-threads", "1"], cwd=cwd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return "hang", ""
     tail = [ln for ln in r.stdout.splitlines() if ln.startswith("test result:")]

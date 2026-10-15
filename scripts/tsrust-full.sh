@@ -4,7 +4,7 @@
 # The fork is the submodule third_party/ts-rust (docs/PLAN.md, BRIEF "The ts-rust fork").
 # Steps: get the fork tree, build and test it with Cargo, `lust check` then `lust build` every
 # lib, bin and cdylib target, and print the errors grouped by root cause. The last line is
-#   tsrust-full: <ok>/<n> check, <ok>/<n> build, <k> root causes
+#   tsrust-full: <ok>/<targets> check, <ok>/<bins> build, <k> root causes
 # Census options go to scripts/tsrust_full.py: --skip-cargo, --skip-build, --only a,b, -j N,
 # --timeout SECS, --parity (scripts/tsrust_parity.py after the builds). Results: <out>/results.json, <out>/cargo.log, <out>/bin/ (lust builds).
 # Default out: $TMPDIR/tsrust-full (/tmp/tsrust-full when TMPDIR is unset).

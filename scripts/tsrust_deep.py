@@ -52,6 +52,12 @@ def errors(lust, t, work, env):
     return r.returncode, out, r.stderr
 
 
+def in_item(err, cache):
+    """True when a removable item holds the error's line (else prune.py would search by name)."""
+    f = str(Path(err[0]).resolve())
+    return any(it[0] <= err[1] <= it[1] for it in prune.items_of(f, cache))
+
+
 def names_in(msg):
     """Item names an error message points at: the last path segment of each `...` text."""
     out = set()
@@ -90,9 +96,18 @@ def main():
             if not errs:
                 status[name] = f"stopped: exit {rc} with no diagnostic: {tsrust_full.crash_reason({'stderr': stderr, 'rc': rc})}"
                 break
+            # Only errors with a span on disk inside an item: prune.py's fallback for the others
+            # (remove every item whose text names the error's one `name`) takes out unrelated code.
+            # Each round's errors are kept in <work>/round-<target>-<n>.json.
+            (work / f"round-{name}-{rnd}.json").write_text(json.dumps(errs))
+            cache = {}
+            located = [e for e in errs if e[1] > 0 and Path(e[0]).resolve().is_relative_to(copy) and in_item(e, cache)]
+            if not located:
+                status[name] = f"stopped: no located error: {errs[0][2]} {errs[0][3][:160]}"
+                break
             before = len(removed)
             try:
-                prune.prune_round([e for e in errs if e[1] > 0] or errs, "lust", removed, copy, [], lambda c, m: None)
+                prune.prune_round(located, "lust", removed, copy, [], lambda c, m: None)
             except SystemExit as e:
                 status[name] = f"stopped: {e}"
                 break

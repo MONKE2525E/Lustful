@@ -4,11 +4,11 @@
 scripts/tsrust-full.sh calls this after it has the fork tree. Steps:
   cargo   build and test the fork with Cargo (the fork must stay green under rustc)
   check   `lust check` of every lib, bin and cdylib target of the workspace
-  build   `lust build` of every target whose check passed
+  build   `lust build` of every bin target whose check passed (lust builds bins only)
   parity  (--parity) scripts/tsrust_parity.py: lust bins vs Cargo bins on the fork's inputs
   report  errors grouped by root cause (code + normalized message), with counts
            and the first span, then the last line
-           "tsrust-full: <ok>/<n> check, <ok>/<n> build, <k> root causes"
+           "tsrust-full: <ok>/<targets> check, <ok>/<bins> build, <k> root causes"
 
 lust stops a crate at its first failing stage (expansion, resolve, check), so a
 target shows only the errors of that stage. Fix the top rows and run it again.
@@ -28,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TARGET_KINDS = ("lib", "bin", "cdylib")
+# Fork tests that read the Go checkout's testdata (TS_GO_REPO), which is not here.
+NEEDS_GO_CHECKOUT = ["format::api_test::test_format_format_checker_ts"]
 
 
 def targets(fork):
@@ -57,9 +59,12 @@ def targets(fork):
 def run_cargo(fork, out, log):
     """cargo test --release --workspace, then cargo build --release --bins (same profile, so the
     second step reuses the first). Returns (ok, summary line)."""
-    env = dict(os.environ, CARGO_TARGET_DIR=str(out / "cargo-target"))
+    # One test thread: the fork's tests share process state (its scripts/goport/goport-tests.sh
+    # sets RUST_TEST_THREADS=1; with more threads about 67 ts_goport lib tests fail).
+    env = dict(os.environ, CARGO_TARGET_DIR=str(out / "cargo-target"), RUST_TEST_THREADS="1")
+    skips = [a for t in NEEDS_GO_CHECKOUT for a in ("--skip", t)]
     steps = [
-        ["cargo", "test", "--release", "--workspace", "--offline", "--no-fail-fast"],
+        ["cargo", "test", "--release", "--workspace", "--offline", "--no-fail-fast", "--"] + skips,
         ["cargo", "build", "--release", "--workspace", "--bins", "--offline"],
     ]
     passed = failed = 0
@@ -204,7 +209,8 @@ def main():
         print(f"tsrust-full: check {r['target']}: {r['status']} ({len(r['diags'])} errors, {r['secs']}s)", flush=True)
     builds = []
     if not a.skip_build:
-        ok_ts = [t for t, r in zip(ts, checks) if r["status"] == "ok"]
+        # lust builds bin targets only (a lib has no main and lust has no rlib).
+        ok_ts = [t for t, r in zip(ts, checks) if r["status"] == "ok" and t["kind"] == "bin"]
         with ThreadPoolExecutor(a.j) as pool:
             builds = list(pool.map(lambda t: run_lust(a.lust, "build", t, out, a.timeout), ok_ts))
         for r in builds:
@@ -221,9 +227,10 @@ def main():
         subprocess.run([sys.executable, str(here / "tsrust_parity.py"), "--fork", str(fork), "--cargo-bins", str(out / "cargo-target/release"),
                         "--lust-bins", str(out / "bin"), "--out", str(out)])
     n = len(ts)
+    n_bins = sum(t["kind"] == "bin" for t in ts)
     c_ok = sum(r["status"] == "ok" for r in checks)
     b_ok = sum(r["status"] == "ok" for r in builds)
-    print(f"tsrust-full: {c_ok}/{n} check, {b_ok}/{n} build, {len(rows)} root causes")
+    print(f"tsrust-full: {c_ok}/{n} check, {b_ok}/{n_bins} build, {len(rows)} root causes")
 
 
 if __name__ == "__main__":
