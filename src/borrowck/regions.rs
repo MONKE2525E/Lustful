@@ -3866,8 +3866,8 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// A builtin that borrows into its receiver (`v.get(i)`, `v.last_mut()`,
     /// `s.trim()`, `v.iter()`): Rust's `fn f<'r>(&'r self, ..) -> R<'r>`.
     /// Each part of the result whose type is one of the receiver's
-    /// components (a `Vec`'s element type, a slice's) equals that
-    /// component's regions; every other region of the result is outlived
+    /// components (a `Vec`'s element type, a slice's) is a subtype of that
+    /// component (equal behind `&mut`); every other region of the result is outlived
     /// by the receiver borrow's region. The other arguments do not flow
     /// into the result. False (nothing added) when the receiver is not a
     /// reference.
@@ -3905,49 +3905,59 @@ impl<'b, 'p> Builder<'b, 'p> {
             None => Vec::new(),
         };
         let mut at = 0usize;
-        self.receiver_walk(dt, dv, &mut at, r, comp, &comp_vars);
+        self.receiver_walk(dt, dv, &mut at, r, comp, &comp_vars, Variance::Co);
         true
     }
 
-    fn receiver_walk(&mut self, t: Ty, dv: &[u32], at: &mut usize, r: u32, comp: Option<Ty>, comp_vars: &[u32]) {
+    /// The result slots of a `receiver_builtin` call (`call_receiver`): an
+    /// element of the receiver's component type takes the component's
+    /// vars by subtyping at the variance of its position (`v`; equal behind
+    /// `&mut`), as rustc's assignment of the call's value; any other slot
+    /// is outlived by the receiver's borrow `r`.
+    #[allow(clippy::too_many_arguments)]
+    fn receiver_walk(&mut self, t: Ty, dv: &[u32], at: &mut usize, r: u32, comp: Option<Ty>, comp_vars: &[u32], v: Variance) {
         if comp == Some(t) && self.sc.slots(t) as usize == comp_vars.len() {
-            for (i, &c) in comp_vars.iter().enumerate() {
-                if let Some(&d) = dv.get(*at + i) {
-                    self.edge(c, d);
-                    self.edge(d, c);
-                }
+            let n = comp_vars.len();
+            if let Some(d) = dv.get(*at..*at + n) {
+                let d = d.to_vec();
+                self.relate(t, comp_vars, t, &d, v);
             }
-            *at += comp_vars.len();
+            *at += n;
             return;
         }
         let tys = &self.body.tys;
         match tys.kind(t) {
-            TyKind::Ref(_, _, inner) => {
+            TyKind::Ref(_, m, inner) => {
                 if let Some(&d) = dv.get(*at) {
                     self.edge(r, d);
                 }
                 *at += 1;
-                self.receiver_walk(inner, dv, at, r, comp, comp_vars);
+                let iv = if m.is_mut() { Variance::Inv } else { Variance::Co };
+                self.receiver_walk(inner, dv, at, r, comp, comp_vars, v.then(iv));
             }
-            TyKind::Adt(_, args) => {
+            TyKind::Adt(def, args) => {
                 for _ in 0..adt_regions(self.p, tys, t) {
                     if let Some(&d) = dv.get(*at) {
                         self.edge(r, d);
                     }
                     *at += 1;
                 }
-                for g in tys.args(args).to_vec() {
-                    if let GenericArg::Ty(e) = g {
-                        self.receiver_walk(e, dv, at, r, comp, comp_vars);
-                    }
+                let tys_args: Vec<Ty> = tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
+                for (j, e) in tys_args.into_iter().enumerate() {
+                    let (pv, _) = self.p.regions.adts(self.p).arg_modes(self.p, def, j);
+                    self.receiver_walk(e, dv, at, r, comp, comp_vars, v.then(pv));
                 }
             }
             TyKind::Tuple(ts) => {
                 for e in tys.tys_of(ts).to_vec() {
-                    self.receiver_walk(e, dv, at, r, comp, comp_vars);
+                    self.receiver_walk(e, dv, at, r, comp, comp_vars, v);
                 }
             }
-            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.receiver_walk(e, dv, at, r, comp, comp_vars),
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.receiver_walk(e, dv, at, r, comp, comp_vars, v),
+            TyKind::RawPtr(m, e) => {
+                let iv = if m.is_mut() { Variance::Inv } else { Variance::Co };
+                self.receiver_walk(e, dv, at, r, comp, comp_vars, v.then(iv))
+            }
             _ => {
                 let n = self.sc.slots(t) as usize;
                 for i in 0..n {
