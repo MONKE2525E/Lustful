@@ -373,14 +373,14 @@
   {
    "id": "panic.recovery",
    "title": "Panic recovery (catch_unwind, resume_unwind, panic hooks)",
-   "status": "unsupported",
-   "milestone": 7,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "9",
    "root_cause": "panic",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "runtime-review",
-   "notes": "Probe evidence: tools/lust-port/tests/features/panic_recovery.rs fails at the std::panic::catch_unwind path form (L0505). Lust aborts on panic today. Milestone 7 adds unwinding with drops.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/panic_recovery*.rs pass under panic=unwind (W-UNWIND): catch_unwind with AssertUnwindSafe, set_hook/take_hook, resume_unwind, thread join Err and Mutex poisoning. A Cargo package unwinds by its dev profile; a single file needs -C panic=unwind. Gaps: thread::Builder (L0505), a hook closure that calls a captured Box<dyn Fn> (L0820).",
    "primary_keys": [
     "std.expr.std::panic::*",
     "std.type.std::panic::*",

@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `87c31d5c` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `dc34a0e3` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 150 files, 76344 lines (36.9% of files, 19.5% of lines).
+Core: 406 files, 390709 lines. Compiles today: 152 files, 77258 lines (37.4% of files, 19.8% of lines).
 
-All active prod files: 362 of 773 files compile today (20.8% of lines).
+All active prod files: 364 of 773 files compile today (20.9% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,30 +31,30 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 34 | 24978 |
+| 1 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 37 | 26427 |
 | 2 | `ext.rustc_hash` | unsupported | 5 | W-DEPS | 139 | 201724 | 35 | 31913 |
 | 3 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 11 | 8648 |
 | 4 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 1 | 29 |
 | 5 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 1 | 1220 |
 | 6 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 22 | 42181 | 5 | 4516 |
 | 7 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 4 | 6517 |
-| 8 | `panic.recovery` | unsupported | 7 | wave C (panics) | 19 | 23474 | 2 | 914 |
-| 9 | `std.other` | unsupported | 4 | W-STD-B | 19 | 22616 | 2 | 1379 |
-| 10 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 1 | 143 |
-| 11 | `std.hashmap` | unsupported | 4 | W-STD-B | 10 | 17381 | 0 | 0 |
-| 12 | `std.hashmap_hasher` | unsupported | 4 | W-STD-B | 4 | 9817 | 0 | 0 |
-| 13 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
-| 14 | `generics.const_param` | unsupported | 8 | W-CHECK-G | 2 | 4299 | 0 | 0 |
-| 15 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 0 | 0 |
+| 8 | `std.other` | unsupported | 4 | W-STD-B | 19 | 22616 | 2 | 1379 |
+| 9 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 1 | 143 |
+| 10 | `std.hashmap` | unsupported | 4 | W-STD-B | 10 | 17381 | 0 | 0 |
+| 11 | `std.hashmap_hasher` | unsupported | 4 | W-STD-B | 4 | 9817 | 0 | 0 |
+| 12 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
+| 13 | `generics.const_param` | unsupported | 8 | W-CHECK-G | 2 | 4299 | 0 | 0 |
+| 14 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 0 | 0 |
+| 15 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
 
 ## Core CLI curve
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 150 | 36.9 | 19.5 |
-| milestone 4 | 201 | 49.5 | 32.1 |
-| milestone 5 | 352 | 86.7 | 80.5 |
-| milestone 6 | 355 | 87.4 | 81.5 |
+| supported today | 152 | 37.4 | 19.8 |
+| milestone 4 | 206 | 50.7 | 32.7 |
+| milestone 5 | 362 | 89.2 | 83.1 |
+| milestone 6 | 365 | 89.9 | 84.0 |
 | milestone 7 | 400 | 98.5 | 98.0 |
 | milestone 8 | 402 | 99.0 | 99.1 |
 
@@ -62,10 +62,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 362 | 46.8 | 20.8 |
-| milestone 4 | 436 | 56.4 | 31.0 |
-| milestone 5 | 699 | 90.4 | 80.6 |
-| milestone 6 | 704 | 91.1 | 81.3 |
+| supported today | 364 | 47.1 | 20.9 |
+| milestone 4 | 441 | 57.1 | 31.4 |
+| milestone 5 | 717 | 92.8 | 85.6 |
+| milestone 6 | 722 | 93.4 | 86.3 |
 | milestone 7 | 764 | 98.8 | 97.6 |
 | milestone 8 | 769 | 99.5 | 99.4 |
 

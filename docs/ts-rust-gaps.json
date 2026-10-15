@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 9165,
+  "elapsed_ms": 8630,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,8 +32,8 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 2856,
-    "files_with_findings": 420,
+    "findings": 2576,
+    "files_with_findings": 403,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
@@ -61,14 +61,6 @@
         "std.hashmap",
         "std.hashmap_hasher",
         "std.other"
-      ]
-    },
-    {
-      "root_cause": "panic",
-      "findings": 280,
-      "files": 54,
-      "features": [
-        "panic.recovery"
       ]
     },
     {
@@ -320,70 +312,6 @@
           "snippet": "IndexMap<tspath::Path, Rc<project::Overlay>>",
           "scope": "active",
           "fix_class": "adapter",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
-    {
-      "id": "panic.recovery",
-      "title": "Panic recovery (catch_unwind, resume_unwind, panic hooks)",
-      "status": "unsupported",
-      "milestone": 7,
-      "milestone_label": "milestone 7: Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
-      "inventory_step": "9",
-      "root_cause": "panic",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false,
-      "release_impact": "runtime-review",
-      "notes": "Probe evidence: tools/lust-port/tests/features/panic_recovery.rs fails at the std::panic::catch_unwind path form (L0505). Lust aborts on panic today. Milestone 7 adds unwinding with drops.",
-      "findings": 280,
-      "raw_uses": 280,
-      "prod_uses": 163,
-      "files": 70,
-      "prod_files": 29,
-      "prod_fns": 81,
-      "scopes": {
-        "active": 163,
-        "test-only": 117
-      },
-      "samples": [
-        {
-          "feature": "panic.recovery",
-          "raw_key": "std.expr.std::panic::catch_unwind",
-          "file": "crates/ts_goport/src/api/session_p1.rs",
-          "byte_start": 83750,
-          "byte_end": 83774,
-          "line": 1908,
-          "column": 23,
-          "snippet": "std::panic::catch_unwind",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "panic.recovery",
-          "raw_key": "std.expr.std::panic::AssertUnwindSafe",
-          "file": "crates/ts_goport/src/api/session_p1.rs",
-          "byte_start": 83775,
-          "byte_end": 83803,
-          "line": 1908,
-          "column": 48,
-          "snippet": "std::panic::AssertUnwindSafe",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "panic.recovery",
-          "raw_key": "std.expr.std::panic::catch_unwind",
-          "file": "crates/ts_goport/src/api/session_p2.rs",
-          "byte_start": 101113,
-          "byte_end": 101137,
-          "line": 2675,
-          "column": 27,
-          "snippet": "std::panic::catch_unwind",
-          "scope": "active",
-          "fix_class": "compiler work",
           "release_safe_rewrite": false
         }
       ]
@@ -1802,39 +1730,39 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 362,
+    "supported_today_files": 364,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 362,
-        "lines": 118548,
-        "files_pct": 46.8,
-        "lines_pct": 20.8
+        "files": 364,
+        "lines": 119462,
+        "files_pct": 47.1,
+        "lines_pct": 20.9
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 436,
-        "lines": 177081,
-        "files_pct": 56.4,
-        "lines_pct": 31.0
+        "files": 441,
+        "lines": 179444,
+        "files_pct": 57.1,
+        "lines_pct": 31.4
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 699,
-        "lines": 460417,
-        "files_pct": 90.4,
-        "lines_pct": 80.6
+        "files": 717,
+        "lines": 489010,
+        "files_pct": 92.8,
+        "lines_pct": 85.6
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 704,
-        "lines": 464347,
-        "files_pct": 91.1,
-        "lines_pct": 81.3
+        "files": 722,
+        "lines": 492940,
+        "files_pct": 93.4,
+        "lines_pct": 86.3
       },
       {
         "id": "7",
@@ -1857,82 +1785,82 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 362,
-        "lines": 118548,
-        "files_pct": 46.8,
-        "lines_pct": 20.8
+        "files": 364,
+        "lines": 119462,
+        "files_pct": 47.1,
+        "lines_pct": 20.9
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 428,
-        "lines": 162544,
-        "files_pct": 55.4,
-        "lines_pct": 28.5
+        "files": 433,
+        "lines": 164907,
+        "files_pct": 56.0,
+        "lines_pct": 28.9
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 437,
-        "lines": 179418,
-        "files_pct": 56.5,
-        "lines_pct": 31.4
+        "files": 442,
+        "lines": 181781,
+        "files_pct": 57.2,
+        "lines_pct": 31.8
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 437,
-        "lines": 179418,
-        "files_pct": 56.5,
-        "lines_pct": 31.4
+        "files": 442,
+        "lines": 181781,
+        "files_pct": 57.2,
+        "lines_pct": 31.8
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 437,
-        "lines": 179418,
-        "files_pct": 56.5,
-        "lines_pct": 31.4
+        "files": 442,
+        "lines": 181781,
+        "files_pct": 57.2,
+        "lines_pct": 31.8
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 703,
-        "lines": 470125,
-        "files_pct": 90.9,
-        "lines_pct": 82.3
+        "files": 721,
+        "lines": 498718,
+        "files_pct": 93.3,
+        "lines_pct": 87.3
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 703,
-        "lines": 470125,
-        "files_pct": 90.9,
-        "lines_pct": 82.3
+        "files": 721,
+        "lines": 498718,
+        "files_pct": 93.3,
+        "lines_pct": 87.3
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 703,
-        "lines": 470125,
-        "files_pct": 90.9,
-        "lines_pct": 82.3
+        "files": 721,
+        "lines": 498718,
+        "files_pct": 93.3,
+        "lines_pct": 87.3
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 708,
-        "lines": 474055,
-        "files_pct": 91.6,
-        "lines_pct": 83.0
+        "files": 726,
+        "lines": 502648,
+        "files_pct": 93.9,
+        "lines_pct": 88.0
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 708,
-        "lines": 474055,
-        "files_pct": 91.6,
-        "lines_pct": 83.0
+        "files": 726,
+        "lines": 502648,
+        "files_pct": 93.9,
+        "lines_pct": 88.0
       },
       {
         "id": "9",
@@ -2035,10 +1963,10 @@
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 30,
-        "lines": 50307,
-        "files_pct": 3.9,
-        "lines_pct": 8.8
+        "files": 0,
+        "lines": 0,
+        "files_pct": 0.0,
+        "lines_pct": 0.0
       },
       {
         "id": "10",
@@ -2054,39 +1982,39 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 363,
+    "supported_today_files": 365,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 363,
-        "lines": 118563,
-        "files_pct": 46.7,
-        "lines_pct": 20.7
+        "files": 365,
+        "lines": 119477,
+        "files_pct": 46.9,
+        "lines_pct": 20.8
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 437,
-        "lines": 177096,
-        "files_pct": 56.2,
-        "lines_pct": 30.9
+        "files": 442,
+        "lines": 179459,
+        "files_pct": 56.8,
+        "lines_pct": 31.3
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 701,
-        "lines": 461442,
-        "files_pct": 90.1,
-        "lines_pct": 80.4
+        "files": 719,
+        "lines": 490035,
+        "files_pct": 92.4,
+        "lines_pct": 85.4
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 706,
-        "lines": 465372,
-        "files_pct": 90.7,
-        "lines_pct": 81.1
+        "files": 724,
+        "lines": 493965,
+        "files_pct": 93.1,
+        "lines_pct": 86.1
       },
       {
         "id": "7",
@@ -2109,82 +2037,82 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 363,
-        "lines": 118563,
-        "files_pct": 46.7,
-        "lines_pct": 20.7
+        "files": 365,
+        "lines": 119477,
+        "files_pct": 46.9,
+        "lines_pct": 20.8
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 429,
-        "lines": 162559,
-        "files_pct": 55.1,
-        "lines_pct": 28.3
+        "files": 434,
+        "lines": 164922,
+        "files_pct": 55.8,
+        "lines_pct": 28.7
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 438,
-        "lines": 179433,
-        "files_pct": 56.3,
-        "lines_pct": 31.3
+        "files": 443,
+        "lines": 181796,
+        "files_pct": 56.9,
+        "lines_pct": 31.7
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 438,
-        "lines": 179433,
-        "files_pct": 56.3,
-        "lines_pct": 31.3
+        "files": 443,
+        "lines": 181796,
+        "files_pct": 56.9,
+        "lines_pct": 31.7
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 438,
-        "lines": 179433,
-        "files_pct": 56.3,
-        "lines_pct": 31.3
+        "files": 443,
+        "lines": 181796,
+        "files_pct": 56.9,
+        "lines_pct": 31.7
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 705,
-        "lines": 471150,
-        "files_pct": 90.6,
-        "lines_pct": 82.1
+        "files": 723,
+        "lines": 499743,
+        "files_pct": 92.9,
+        "lines_pct": 87.1
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 705,
-        "lines": 471150,
-        "files_pct": 90.6,
-        "lines_pct": 82.1
+        "files": 723,
+        "lines": 499743,
+        "files_pct": 92.9,
+        "lines_pct": 87.1
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 705,
-        "lines": 471150,
-        "files_pct": 90.6,
-        "lines_pct": 82.1
+        "files": 723,
+        "lines": 499743,
+        "files_pct": 92.9,
+        "lines_pct": 87.1
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 710,
-        "lines": 475080,
-        "files_pct": 91.3,
-        "lines_pct": 82.8
+        "files": 728,
+        "lines": 503673,
+        "files_pct": 93.6,
+        "lines_pct": 87.8
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 710,
-        "lines": 475080,
-        "files_pct": 91.3,
-        "lines_pct": 82.8
+        "files": 728,
+        "lines": 503673,
+        "files_pct": 93.6,
+        "lines_pct": 87.8
       },
       {
         "id": "9",
@@ -2287,10 +2215,10 @@
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 30,
-        "lines": 50307,
-        "files_pct": 3.9,
-        "lines_pct": 8.8
+        "files": 0,
+        "lines": 0,
+        "files_pct": 0.0,
+        "lines_pct": 0.0
       },
       {
         "id": "10",
@@ -2540,10 +2468,9 @@
       "missing_features": [
         "core.std_basics",
         "ext.indexmap",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 20
+      "findings": 18
     },
     {
       "file": "crates/ts_goport/src/api/session_p2.rs",
@@ -2554,10 +2481,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 9
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/api/stringer_generated.rs",
@@ -2624,7 +2550,7 @@
         "core.std_basics",
         "ext.rustc_hash"
       ],
-      "findings": 34
+      "findings": 32
     },
     {
       "file": "crates/ts_goport/src/ast/misc.rs",
@@ -2639,7 +2565,7 @@
         "ext.rustc_hash",
         "std.cow"
       ],
-      "findings": 12
+      "findings": 10
     },
     {
       "file": "crates/ts_goport/src/ast/mod.rs",
@@ -2691,7 +2617,7 @@
         "core.std_basics",
         "ext.rustc_hash"
       ],
-      "findings": 39
+      "findings": 38
     },
     {
       "file": "crates/ts_goport/src/ast/synthetic.rs",
@@ -2707,7 +2633,7 @@
         "ext.rustc_hash",
         "lifetimes.hrtb"
       ],
-      "findings": 21
+      "findings": 16
     },
     {
       "file": "crates/ts_goport/src/ast/synthetic/print_pack.rs",
@@ -2719,7 +2645,7 @@
       "missing_features": [
         "core.std_basics"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/ast/update.rs",
@@ -2843,7 +2769,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 7
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/astdata/syntax_kind.rs",
@@ -2905,10 +2831,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "panic.recovery"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/baseline/util.rs",
@@ -2941,10 +2865,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 8
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/bin/goport_build.rs",
@@ -2955,10 +2878,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/bin/goport_emit.rs",
@@ -2970,10 +2892,9 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "panic.recovery",
         "std.hashmap"
       ],
-      "findings": 10
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/bin/goport_live_programs.rs",
@@ -2983,10 +2904,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/bin/goport_multiprog.rs",
@@ -2996,10 +2916,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 6
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/bin/goport_typesyms.rs",
@@ -3010,10 +2929,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 8
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/bin/goport_watch.rs",
@@ -3037,10 +2955,9 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.unknown_crate",
-        "panic.recovery"
+        "ext.unknown_crate"
       ],
-      "findings": 11
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p1.rs",
@@ -3906,10 +3823,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 7
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/checker/pseudo_type_node_builder.rs",
@@ -4181,10 +4097,9 @@
         "core.std_basics",
         "ext.indexmap",
         "ext.rustc_hash",
-        "panic.recovery",
         "std.cow"
       ],
-      "findings": 15
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/src/contentmapper/mod.rs",
@@ -4204,10 +4119,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 10
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/contentmapper/transform.rs",
@@ -4235,7 +4149,7 @@
         "std.hashmap",
         "std.hashmap_hasher"
       ],
-      "findings": 35
+      "findings": 27
     },
     {
       "file": "crates/ts_goport/src/core/lib_names.rs",
@@ -6347,10 +6261,9 @@
       "missing_features": [
         "core.std_basics",
         "ext.rustc_hash",
-        "panic.recovery",
         "std.other"
       ],
-      "findings": 27
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/evaluator.rs",
@@ -6372,10 +6285,9 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 24
+      "findings": 18
     },
     {
       "file": "crates/ts_goport/src/execute/build/command_line.rs",
@@ -6398,10 +6310,9 @@
         "cinterop.system",
         "core.std_basics",
         "ext.indexmap",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 23
+      "findings": 13
     },
     {
       "file": "crates/ts_goport/src/execute/build/host.rs",
@@ -6567,7 +6478,7 @@
         "ext.indexmap",
         "ext.rustc_hash"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/hash.rs",
@@ -6704,7 +6615,7 @@
         "ext.rustc_hash",
         "std.cow"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/emit.rs",
@@ -7096,10 +7007,9 @@
         "cinterop.system",
         "core.std_basics",
         "ext.indexmap",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 84
+      "findings": 76
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/host.rs",
@@ -7196,8 +7106,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
       "findings": 34
     },
@@ -7924,7 +7833,7 @@
         "ext.indexmap",
         "ext.rustc_hash"
       ],
-      "findings": 13
+      "findings": 11
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/wildcard.rs",
@@ -8288,10 +8197,9 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 8
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/fswatch/windows.rs",
@@ -8314,10 +8222,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 17
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/goport_lsproto_root.rs",
@@ -8375,7 +8282,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/errgroup.rs",
@@ -8384,10 +8291,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "panic.recovery"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/errors.rs",
@@ -8613,10 +8518,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 20
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/ipc/conn_sync.rs",
@@ -8681,7 +8585,7 @@
         "cinterop.system",
         "core.std_basics"
       ],
-      "findings": 6
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/src/ipc/transport_unix.rs",
@@ -9150,10 +9054,9 @@
       "missing_features": [
         "core.std_basics",
         "ext.indexmap",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 20
+      "findings": 14
     },
     {
       "file": "crates/ts_goport/src/ls/definition.rs",
@@ -9556,10 +9459,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 24
+      "findings": 17
     },
     {
       "file": "crates/ts_goport/src/ls/selectionranges.rs",
@@ -9936,10 +9838,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.indexmap",
-        "panic.recovery"
+        "ext.indexmap"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/lsp/server.rs",
@@ -9952,10 +9853,9 @@
         "core.std_basics",
         "ext.indexmap",
         "ext.rustc_hash",
-        "panic.recovery",
         "std.hashmap"
       ],
-      "findings": 22
+      "findings": 13
     },
     {
       "file": "crates/ts_goport/src/lsp/stack_sanitizer.rs",
@@ -10195,7 +10095,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/helpers.rs",
@@ -10271,7 +10171,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 4
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/printer_p5.rs",
@@ -10351,7 +10251,7 @@
       "missing_features": [
         "core.std_basics"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/program.rs",
@@ -10365,10 +10265,9 @@
         "core.std_basics",
         "ext.indexmap",
         "ext.rustc_hash",
-        "panic.recovery",
         "std.cow"
       ],
-      "findings": 63
+      "findings": 53
     },
     {
       "file": "crates/ts_goport/src/program/go_frontend.rs",
@@ -10878,10 +10777,9 @@
         "cinterop.system",
         "core.std_basics",
         "ext.indexmap",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 33
+      "findings": 31
     },
     {
       "file": "crates/ts_goport/src/project/snapshotfs.rs",
@@ -11105,10 +11003,9 @@
       "missing_features": [
         "core.std_basics",
         "ext.rustc_hash",
-        "panic.recovery",
         "std.cow"
       ],
-      "findings": 8
+      "findings": 6
     },
     {
       "file": "crates/ts_goport/src/transformers/chain.rs",
@@ -11629,7 +11526,7 @@
         "core.std_basics",
         "ext.rustc_hash"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/util_prelude.rs",
@@ -11665,10 +11562,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 5
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/fswatch_linux.rs",
@@ -11678,10 +11574,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/astnav_api/api_encoder.rs",
@@ -11733,10 +11628,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 4
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/astnav_api/jstest.rs",
@@ -11758,10 +11652,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/compiler_runner/child.rs",
@@ -11771,10 +11664,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/compiler_runner/go_regex.rs",
@@ -11798,10 +11690,9 @@
       "missing_features": [
         "core.std_basics",
         "ext.indexmap",
-        "panic.recovery",
         "std.hashmap"
       ],
-      "findings": 8
+      "findings": 7
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/compiler_runner/mod.rs",
@@ -11824,10 +11715,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "panic.recovery",
         "std.hashmap"
       ],
-      "findings": 11
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/compiler_runner/sourcemap_recorder.rs",
@@ -11860,10 +11750,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "panic.recovery",
         "std.hashmap"
       ],
-      "findings": 6
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/compiler_runner/tsbaseline.rs",
@@ -12005,10 +11894,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/api_session_module_resolution_test.rs",
@@ -12235,10 +12123,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "panic.recovery"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/logging_logtree_test.rs",
@@ -12400,10 +12286,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "panic.recovery",
         "std.hashmap"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/mod.rs",
@@ -12423,10 +12308,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.indexmap",
-        "panic.recovery"
+        "ext.indexmap"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/parseahead_test.rs",
@@ -12637,10 +12521,9 @@
       "missing_features": [
         "cinterop.system",
         "ext.indexmap",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 11
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/stringliteralranges_test.rs",
@@ -12726,10 +12609,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/component.rs",
@@ -13056,10 +12938,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/smoke.rs",
@@ -13117,10 +12998,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsctests/build_info_corrupt.rs",
@@ -13261,10 +13141,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "panic.recovery"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsctests/showconfig.rs",
@@ -13511,10 +13389,9 @@
       "missing_features": [
         "core.std_basics",
         "ext.indexmap",
-        "ext.rustc_hash",
-        "panic.recovery"
+        "ext.rustc_hash"
       ],
-      "findings": 6
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/ast_tests.rs",
@@ -13635,10 +13512,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "attrs.unsupported",
-        "panic.recovery"
+        "attrs.unsupported"
       ],
-      "findings": 4
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/outputpaths_tests.rs",
@@ -13716,10 +13592,9 @@
       "missing_features": [
         "attrs.unsupported",
         "core.std_basics",
-        "ext.indexmap",
-        "panic.recovery"
+        "ext.indexmap"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/scanner_parser.rs",
@@ -13809,10 +13684,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "panic.recovery"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/diagnostics.rs",
@@ -13874,10 +13747,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 4
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/fswatch_walkdir.rs",
@@ -13901,10 +13773,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 12
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/jsnum.rs",
@@ -14113,10 +13984,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
-        "panic.recovery"
+        "core.std_basics"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "crates/ts_goport/tests/tsgo_panic_hook.rs",
@@ -14167,10 +14037,9 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "panic.recovery",
         "unsafe.blocks"
       ],
-      "findings": 8
+      "findings": 7
     },
     {
       "file": "tools/ts_ast_codegen/src/ast.rs",
@@ -14481,32 +14350,6 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "panic.recovery",
-      "raw_key": "std.expr.std::panic::catch_unwind",
-      "file": "crates/ts_goport/src/api/session_p1.rs",
-      "byte_start": 83750,
-      "byte_end": 83774,
-      "line": 1908,
-      "column": 23,
-      "snippet": "std::panic::catch_unwind",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "panic.recovery",
-      "raw_key": "std.expr.std::panic::AssertUnwindSafe",
-      "file": "crates/ts_goport/src/api/session_p1.rs",
-      "byte_start": 83775,
-      "byte_end": 83803,
-      "line": 1908,
-      "column": 48,
-      "snippet": "std::panic::AssertUnwindSafe",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "core.std_basics",
       "raw_key": "std.expr.std::mem::take",
       "file": "crates/ts_goport/src/api/session_p2.rs",
@@ -14515,45 +14358,6 @@
       "line": 762,
       "column": 22,
       "snippet": "std::mem::take",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "panic.recovery",
-      "raw_key": "std.expr.std::panic::catch_unwind",
-      "file": "crates/ts_goport/src/api/session_p2.rs",
-      "byte_start": 101113,
-      "byte_end": 101137,
-      "line": 2675,
-      "column": 27,
-      "snippet": "std::panic::catch_unwind",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "panic.recovery",
-      "raw_key": "std.expr.std::panic::AssertUnwindSafe",
-      "file": "crates/ts_goport/src/api/session_p2.rs",
-      "byte_start": 101138,
-      "byte_end": 101166,
-      "line": 2675,
-      "column": 52,
-      "snippet": "std::panic::AssertUnwindSafe",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "panic.recovery",
-      "raw_key": "std.expr.std::panic::resume_unwind",
-      "file": "crates/ts_goport/src/api/session_p2.rs",
-      "byte_start": 101576,
-      "byte_end": 101601,
-      "line": 2683,
-      "column": 29,
-      "snippet": "std::panic::resume_unwind",
       "scope": "active",
       "fix_class": "compiler work",
       "release_safe_rewrite": false
@@ -15235,7 +15039,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 2856,
+  "findings_total": 2576,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],
