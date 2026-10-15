@@ -1,4 +1,4 @@
-// expect: L0643
+// expect: L0720
 // rustc E0034: std's `ToString::to_string` and the user trait's method
 // both apply at the same probe of `String`.
 trait Show {

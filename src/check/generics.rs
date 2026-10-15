@@ -99,6 +99,9 @@ pub struct LangTraits {
     pub borrow: DefId,
     pub borrow_mut: DefId,
     pub to_owned: DefId,
+    /// `alloc::string::ToString`, with core's one blanket impl over
+    /// `T: Display`; calls stay the builtin `to_string`.
+    pub to_string: DefId,
     /// `core::any::Any` (check/any.rs): every `'static` type has it
     /// through one synthetic blanket impl.
     pub any: DefId,
@@ -204,6 +207,7 @@ impl LangTraits {
         let borrow = lang_trait(&["core", "borrow"], "Borrow");
         let borrow_mut = lang_trait(&["core", "borrow"], "BorrowMut");
         let to_owned = lang_trait(&["alloc", "borrow"], "ToOwned");
+        let to_string = to_string_defs().0;
         let hasher = lang_trait(&["core", "hash"], "Hasher");
         let build_hasher = lang_trait(&["core", "hash"], "BuildHasher");
         let from = lang_trait(&["core", "convert"], "From");
@@ -275,6 +279,7 @@ impl LangTraits {
             borrow,
             borrow_mut,
             to_owned,
+            to_string,
             any,
             assoc_owned: lang_assoc(to_owned, "Owned"),
             hasher,
@@ -384,6 +389,7 @@ impl LangTraits {
             "Borrow" => self.borrow,
             "BorrowMut" => self.borrow_mut,
             "ToOwned" => self.to_owned,
+            "ToString" => self.to_string,
             "Hasher" => self.hasher,
             "BuildHasher" => self.build_hasher,
             "From" => self.from,
@@ -547,6 +553,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.borrow, "Borrow", 1, vec![], vec![], &["borrow"]),
         rec(lang.borrow_mut, "BorrowMut", 1, vec![self_pred(tys, lang.borrow, &[1])], vec![], &["borrow_mut"]),
         rec(lang.to_owned, "ToOwned", 0, vec![], vec![(lang.assoc_owned, "Owned")], &["to_owned", "clone_into"]),
+        rec(lang.to_string, "ToString", 0, vec![], vec![], &["to_string"]),
         rec(lang.hasher, "Hasher", 0, vec![], vec![], &crate::check::hashmap::HASHER_METHODS),
         rec(lang.build_hasher, "BuildHasher", 0, vec![], vec![(lang.assoc_hasher, "Hasher")], &["build_hasher", "hash_one"]),
         rec(lang.from, "From", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["from"]),
@@ -1047,6 +1054,9 @@ pub fn lang_method_sigs(
                 (d, "build_hasher") if d == lang.build_hasher => {
                     let h = proj(tys, lang.assoc_hasher, &[p0]);
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: h, ret_borrows_from: None }
+                }
+                (d, "to_string") if d == lang.to_string => {
+                    LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: STRING, ret_borrows_from: None }
                 }
                 (d, "to_owned") if d == lang.to_owned => {
                     let owned = proj(tys, lang.assoc_owned, &[p0]);
@@ -7310,6 +7320,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
         // `T: Sized`, which keeps `[T]` and `str` out of it.
         g1.predicates.extend(pred_on_p0(p, lang.sized));
         insert_synthetic(p, &mut ordinal, lang.to_owned, p0, &[], g1, vec![(lang.assoc_owned, p0)], Synthetic::Lang, false, span);
+        // `impl<T: Display + ?Sized> ToString for T`.
+        let mut g1 = one.clone();
+        g1.predicates = pred_on_p0(p, lang.display);
+        insert_synthetic(p, &mut ordinal, lang.to_string, p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
     }
     // Iterator for the builtin iterator structs (ty/iter.rs, W-STD-A):
     // selection and `Item` normalization only; `next` and the
@@ -8189,6 +8203,10 @@ fn add_trait_method_stubs(p: &mut Program) {
     // trait definition are not elaborated), so stub it too.
     if bound.contains(&p.gx.lang.into_iterator) && !bound.contains(&p.gx.lang.iterator) {
         bound.push(p.gx.lang.iterator);
+    }
+    // `T: Display` gives `t.to_string()` through core's blanket ToString.
+    if bound.contains(&p.gx.lang.display) && !bound.contains(&p.gx.lang.to_string) {
+        bound.push(p.gx.lang.to_string);
     }
     let mut methods: Vec<(DefId, DefId, Sym)> = Vec::new();
     for traits in p.gx.traits_by_method.values() {

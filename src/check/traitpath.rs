@@ -342,6 +342,10 @@ impl<'p> Ctx<'p> {
                 || p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(&p.interner, p.interner.intern("ToString")) == Some(tr.def))
             && (has_display(p, &self.tys, self_ty) || self.display_in_env(self_ty))
         {
+            // `str` is unsized: its `to_string` copies the bytes the `&str` names.
+            if self.kind(self_ty) == TyKind::Str {
+                return TraitFnRes::Builtin(Builtin::StrToString);
+            }
             return TraitFnRes::Builtin(Builtin::ToString);
         }
         TraitFnRes::Failed

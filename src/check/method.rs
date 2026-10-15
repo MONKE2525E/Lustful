@@ -147,6 +147,7 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.as_ref,
         lang.as_mut,
         lang.to_owned,
+        lang.to_string,
         lang.deref,
         lang.deref_mut,
         lang.index,
@@ -611,7 +612,20 @@ pub(super) fn trait_probe_for(
                             } else {
                                 None
                             };
-                            bridged.or_else(|| {
+                            // `ToString` at a generic Self: core's blanket over
+                            // `T: Display` holds through the bounds, and the call
+                            // is the method's stub, as for an env predicate. A
+                            // concrete Self misses here: the builtin answers.
+                            let generic_self = matches!(cx.tys.kind(cx.resolve(step)), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..));
+                            let to_string_stub = (trait_def == p.gx.lang.to_string && generic_self)
+                                .then(|| p.gx.trait_method_stubs.get(&method_def).copied())
+                                .flatten()
+                                .map(|stub| {
+                                    let args: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
+                                    let args = args.into_iter().map(|g| if let GenericArg::Ty(t) = g { GenericArg::Ty(cx.deep(t)) } else { g }).collect();
+                                    (stub, args, None)
+                                });
+                            bridged.or(to_string_stub).or_else(|| {
                                 // The trait default body, as a template.
                                 p.local_def(method_def.hash).map(|l| {
                                     let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
