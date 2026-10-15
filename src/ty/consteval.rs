@@ -1528,7 +1528,24 @@ impl Evaluator {
         let (mut lv, mut lt) = self.value(cx, env, lhs, lhs_exp)?;
         let (mut rv, mut rt) = self.value(cx, env, rhs, Some(lt))?;
         let both_int = matches!(lv, ConstValue::Int(_)) && matches!(rv, ConstValue::Int(_));
-        if both_int && lt != rt && self.int_ty_of(cx, lt).is_some() && self.int_ty_of(cx, rt).is_some() {
+        // A shift's operands have independent types in Rust: the
+        // amount's type never pins the shifted value's (`4 << S`
+        // with `S: u32` in a u64 context computes in u64). So the
+        // re-pinning below skips shifts; a flex left side with no
+        // pinning type at all falls back to i32, as inference does.
+        if both_int && matches!(op, BinOp::Shl | BinOp::Shr) && flex_int_expr(cx.ast(), lhs) && self.int_ty_of(cx, lt).is_none() {
+            let pin = match lhs_exp {
+                Some(t) if self.int_ty_of(cx, t).is_some() => t,
+                _ => super::I32,
+            };
+            (lv, lt) = self.value(cx, env, lhs, Some(pin))?;
+        }
+        if both_int
+            && !matches!(op, BinOp::Shl | BinOp::Shr)
+            && lt != rt
+            && self.int_ty_of(cx, lt).is_some()
+            && self.int_ty_of(cx, rt).is_some()
+        {
             if flex_int_expr(cx.ast(), lhs) && !flex_int_expr(cx.ast(), rhs) {
                 (lv, lt) = self.value(cx, env, lhs, Some(rt))?;
             } else if flex_int_expr(cx.ast(), rhs) && !flex_int_expr(cx.ast(), lhs) {
