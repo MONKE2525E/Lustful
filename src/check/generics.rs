@@ -10019,6 +10019,33 @@ fn prove_trait_ref(
             return true;
         }
     }
+    // The derive family's container impls have no solver records
+    // (`Vec<X>: Debug` from `X: Debug` in an impl's obligations,
+    // where X is a projection the env bounds): decompose one-arg
+    // Debug, Clone, Copy, and Hash goals over the containers std
+    // forwards them through.
+    if (tr.def == lang.debug || tr.def == lang.clone || tr.def == lang.copy || tr.def == lang.hash)
+        && cx.tys.args(tr.args).len() == 1
+        && let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty())
+    {
+        let parts: Option<Vec<Ty>> = match cx.tys.kind(t) {
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => Some(vec![e]),
+            TyKind::Tuple(ts) => Some(cx.tys.tys_of(ts).to_vec()),
+            _ => {
+                if let Some(e) = cx.tys.vec_elem(t).or_else(|| cx.tys.option_elem(t)).or_else(|| cx.tys.smart_elem(t)) {
+                    Some(vec![e])
+                } else {
+                    cx.tys.result_args(t).map(|(a, b)| vec![a, b])
+                }
+            }
+        };
+        if let Some(parts) = parts {
+            return parts.into_iter().all(|e| {
+                let args = cx.tys.intern_args(&[GenericArg::Ty(e)]);
+                prove_trait_ref(p, solver, cx, env, TraitRef { def: tr.def, args, bindings: EMPTY_BINDINGS }, depth + 1)
+            });
+        }
+    }
     match solver.select(cx, index, env, tr) {
         Selection::Impl { nested, .. } => nested.iter().all(|pred| match pred {
             Predicate::Trait(b) if b.count == 0 => prove_trait_ref(p, solver, cx, env, b.value, depth + 1),
