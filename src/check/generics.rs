@@ -4107,7 +4107,7 @@ pub struct GenTables {
     /// type): the `ByNext` expansion calls them, as it calls the
     /// plain fns of a non-generic impl (check/iter.rs `by_next_fns`;
     /// iface: lower/iter.rs reads this through it).
-    pub iter_methods: FxMap<AdtId, (LocalDefId, Option<LocalDefId>, Option<LocalDefId>, Option<Ty>)>,
+    pub iter_methods: FxMap<AdtId, (LocalDefId, Option<LocalDefId>, Option<LocalDefId>, Option<Ty>, bool)>,
     /// The written `Hash::hash` template of a non-generic impl on a
     /// non-generic local Adt (no `hash_slice` of its own), and its
     /// instances by hasher type: the hash glue calls one for a value of
@@ -7023,11 +7023,15 @@ pub fn add_synthetic_impls(p: &mut Program) {
     // rejects instead of proving).
     {
         use crate::ty::iter::{IterKind as K, mk_iter};
-        for k in [K::SliceIter, K::SliceIterMut, K::VecIntoIter, K::VecDrain, K::Range, K::RangeInclusive] {
+        for k in [K::SliceIter, K::SliceIterMut, K::VecIntoIter, K::VecDrain, K::Range] {
             let self_pat = mk_iter(&mut p.tys, k, &[p0]);
             insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
             insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
+        // `RangeInclusive` is double-ended but not exact size in
+        // std (its length can overflow `usize`).
+        let ri = mk_iter(&mut p.tys, K::RangeInclusive, &[p0]);
+        insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, ri, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         let sd = mk_iter(&mut p.tys, K::StringDrain, &[]);
         insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, sd, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, CHARS, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
@@ -8830,7 +8834,15 @@ fn ensure_iter_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
         let local = rec.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "next_back"))?;
         Some(iter_fn_instance(p, local, &args, queue))
     });
-    p.gx.iter_methods.insert(adt, (next, size_hint, next_back, item));
+    // An `ExactSizeIterator` impl with no `len` override, like
+    // `by_next_fns` reads it: `len()` runs the trait default.
+    let exact = size_hint.is_some()
+        && select(p, lang.exact_size_iterator).is_some_and(|(id, _)| {
+            let rec = p.gx.index.get(id);
+            rec.synthetic == Synthetic::None
+                && !rec.items.iter().any(|d| p.local_def(d.hash).is_some_and(|l| p.name(p.fn_info(l).name) == "len"))
+        });
+    p.gx.iter_methods.insert(adt, (next, size_hint, next_back, item, exact));
 }
 
 /// True when a written fmt impl's where clauses hold for its selected

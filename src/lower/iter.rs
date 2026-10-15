@@ -629,8 +629,29 @@ impl Ex<'_, '_> {
             B::IterLen => {
                 let r = arg()?;
                 let (itp, ty) = self.deref_arg(r)?;
+                let (itp, ty) = self.user_iter(itp, ty)?;
                 let (lo, hi) = self.hint(itp, ty)?;
-                let _ = hi;
+                // std's default `ExactSizeIterator::len` asserts the
+                // hint is exact. The builtin kinds are exact by
+                // construction; a user iterator's `size_hint` need
+                // not be, so a `ByNext` at the core gets the assert.
+                if self.len_asserts(ty) {
+                    let ou = self.body.tys.mk_option(USIZE);
+                    let right = self.local(ou);
+                    self.some(&Place::local(right), ou, Operand::Copy(Place::local(lo)));
+                    let (some_b, none_b) = self.switch_opt(&Place::local(hi));
+                    let join = self.block();
+                    self.cur = none_b;
+                    self.exact_len_panic(hi, right, ou);
+                    self.cur = some_b;
+                    let eq = self.cmp(crate::ast::BinOp::Eq, Operand::Copy(Self::payload(&Place::local(hi))), Operand::Copy(Place::local(lo)));
+                    let (good, bad) = self.branch(eq);
+                    self.cur = bad;
+                    self.exact_len_panic(hi, right, ou);
+                    self.cur = good;
+                    self.goto(join);
+                    self.cur = join;
+                }
                 self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(lo))));
             }
             // `array::IntoIter::as_slice` and `as_mut_slice`
@@ -3195,6 +3216,36 @@ impl Ex<'_, '_> {
             _ => return Err("iterator expansion: size of a non-random-access iterator".into()),
         }
         Ok(Operand::Copy(Place::local(out)))
+    }
+
+    /// True when `len()` on `ty` runs std's exact-size assert over a
+    /// user `size_hint`: a `ByNext` core under the adapters whose
+    /// own `len` delegates to their inner iterator's.
+    fn len_asserts(&self, ty: Ty) -> bool {
+        use IterKind as K;
+        match self.kind_args(ty) {
+            Some((K::ByNext, _)) => true,
+            Some((K::Map | K::Enumerate | K::Rev | K::Copied | K::Cloned | K::Peekable | K::Inspect, a)) => self.len_asserts(a[0]),
+            _ => false,
+        }
+    }
+
+    /// The `assert_eq!(upper, Some(lower))` panic of std's default
+    /// `ExactSizeIterator::len` (core's exact_size.rs), with the
+    /// hint's upper bound on the left and `Some(lower)` on the right.
+    fn exact_len_panic(&mut self, hi: Local, right: Local, ou: Ty) {
+        let dbg = crate::ast::FmtSpec { kind: crate::ast::FmtKind::Debug, ..crate::ast::FmtSpec::default() };
+        let lref = self.ref_to(false, Place::local(hi), ou);
+        let rref = self.ref_to(false, Place::local(right), ou);
+        let parts = vec![
+            FmtPart::Lit("assertion `left == right` failed".into()),
+            FmtPart::Lit("\n  left: ".into()),
+            FmtPart::Arg { value: Operand::Copy(Place::local(lref)), ty: ou, debug: true, spec: dbg },
+            FmtPart::Lit("\n right: ".into()),
+            FmtPart::Arg { value: Operand::Copy(Place::local(rref)), ty: ou, debug: true, spec: dbg },
+        ];
+        self.term(Terminator::Panic(parts));
+        self.body.blocks[self.cur.0 as usize].term_span = Span::std_site(13, 122, 9);
     }
 
     // ---------- size_hint ----------

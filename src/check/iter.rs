@@ -203,7 +203,7 @@ impl<'p> Ctx<'p> {
             // call takes it by reference, also through `&I` or `&mut I`,
             // and the expansion wraps the reference (lower/iter.rs
             // `user_iter`). The rest move it into the wrapper.
-            let borrowing = matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "position" | "size_hint");
+            let borrowing = matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "position" | "size_hint" | "len");
             if (derefs > 0 && !borrowing) || n == "next" || !ITER_METHODS.contains(&n.as_str()) {
                 return None;
             }
@@ -1556,13 +1556,25 @@ impl<'p> Ctx<'p> {
         if self.tys.is_chars_ty(t) {
             return false;
         }
-        let Some((k, a)) = it::iter_parts(&self.tys, t) else { return false };
+        let Some((k, a)) = it::iter_parts(&self.tys, t) else {
+            // A bound-only iterator (`I: ExactSizeIterator`): the env
+            // proves it, as `param_iter` proves `Iterator`.
+            let t = self.deep(t);
+            if !matches!(self.kind(t), TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..)) {
+                return false;
+            }
+            let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
+            let tr = TraitRef { def: self.p.gx.lang.exact_size_iterator, args: args_id, bindings: EMPTY_BINDINGS };
+            let snap = self.snapshot_vars();
+            let ok = matches!(self.select_obligation(tr), Selection::ParamEvidence(_));
+            self.rollback_vars(snap);
+            return ok;
+        };
         match k {
             K::SliceIter
             | K::SliceIterMut
             | K::VecIntoIter
             | K::Range
-            | K::RangeInclusive
             | K::VecDrain
             | K::ArrayIntoIter
             | K::RepeatN
@@ -1586,7 +1598,18 @@ impl<'p> Ctx<'p> {
             K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::StepBy | K::Copied | K::Cloned | K::Peekable | K::Inspect => {
                 self.exact_size(a[0])
             }
-            K::Chain | K::Zip => self.exact_size(a[0]) && self.exact_size(a[1]),
+            // `Chain` is not `ExactSizeIterator` in std, even over
+            // exact iterators; `Zip` is, over two exact ones. Neither
+            // is `RangeInclusive` (its length can overflow `usize`).
+            K::Zip => self.exact_size(a[0]) && self.exact_size(a[1]),
+            // A user iterator through its `next`: exact when its
+            // written `ExactSizeIterator` impl takes the default
+            // `len` over an honest `size_hint` (`ByNextFns::exact`),
+            // or when the held type is bound-only exact evidence.
+            K::ByNext => match by_next_fns(self.p, &self.tys, a[0]) {
+                Ok(f) => f.exact,
+                Err(_) => self.exact_size(a[0]),
+            },
             _ => false,
         }
     }
@@ -2163,6 +2186,7 @@ const ITER_METHODS: &[&str] = &[
     "sum",
     "product",
     "size_hint",
+    "len",
 ];
 
 /// The user fns a `ByNext` iterator calls: `next`, and `size_hint`
@@ -2180,6 +2204,10 @@ pub struct ByNextFns {
     pub next_back: Option<LocalDefId>,
     /// The impl's `type Item`.
     pub item: Option<Ty>,
+    /// The type has a written `ExactSizeIterator` impl with no
+    /// `len` override and a `size_hint`: `len()` is std's default,
+    /// which the expansion computes from that hint.
+    pub exact: bool,
 }
 
 /// The `next` and `size_hint` items of one written `Iterator` impl,
@@ -2286,9 +2314,9 @@ fn match_arg_pat(p: &Program, src: &dyn crate::ty::TyIntern, pat: GenericArg, t:
 pub fn by_next_fns(p: &Program, src: &dyn crate::ty::TyIntern, t: Ty) -> Result<ByNextFns, &'static str> {
     let lang = p.gx.lang;
     if let Some(a) = src.local_adt(t)
-        && let Some(&(next, size_hint, next_back, item)) = p.gx.iter_methods.get(&a)
+        && let Some(&(next, size_hint, next_back, item, exact)) = p.gx.iter_methods.get(&a)
     {
-        return Ok(ByNextFns { next, size_hint, next_back, item });
+        return Ok(ByNextFns { next, size_hint, next_back, item, exact });
     }
     let mut found = None;
     for &id in p.gx.index.impls_of_trait(lang.iterator) {
@@ -2323,5 +2351,18 @@ pub fn by_next_fns(p: &Program, src: &dyn crate::ty::TyIntern, t: Ty) -> Result<
             r.synthetic == crate::traits::index::Synthetic::None && match_self_pat(p, src, r.self_ty(&p.tys), t, &mut Vec::new())
         })
         .and_then(|r| r.items.iter().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "next_back")));
-    Ok(ByNextFns { next, size_hint, next_back, item })
+    // An `ExactSizeIterator` impl for the same Self, with no `len`
+    // override: `len()` is the trait default over `size_hint`.
+    let exact = size_hint.is_some()
+        && p.gx
+            .index
+            .impls_of_trait(lang.exact_size_iterator)
+            .iter()
+            .map(|&id| p.gx.index.get(id))
+            .any(|r| {
+                r.synthetic == crate::traits::index::Synthetic::None
+                    && match_self_pat(p, src, r.self_ty(&p.tys), t, &mut Vec::new())
+                    && !r.items.iter().any(|d| p.local_def(d.hash).is_some_and(|l| p.name(p.fn_info(l).name) == "len"))
+            });
+    Ok(ByNextFns { next, size_hint, next_back, item, exact })
 }
