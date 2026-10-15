@@ -1,64 +1,81 @@
 # Adapter: tikv-jemalloc-ctl 0.7.0
 
-Lust adapter crate (docs/ARCH.md section 3.6) for the by-name
-mallctl form ts-rust uses. Gate:
+Lust adapter crate (docs/ARCH.md section 3.6). Gate:
 `scripts/test-adapters.sh tikv-jemalloc-ctl`.
+
+This adapter keeps only the items whose output matches the
+real crate in every program lust accepts. The w-cinterop3
+audit probed the real crate on boat (fresh processes, with
+and without `_RJEM_MALLOC_CONF`) and read upstream 0.7.0
+source item by item. Anything that cannot match is absent,
+so a program that uses it rejects at compile time.
 
 ## Implemented, same results as upstream
 
-- `Name`, `AsName` (for `[u8]` and `str`, with upstream's
-  empty and non-null-terminated panics), `Name::value_type_str`,
-  `Name::as_bytes`, Debug and Display of `Name`.
-- `Access<T> for Name` for `u32`, `u64`, `usize`, `isize`,
-  `bool`, `&'static [u8]`, and `&'static str`, with upstream's
-  size rules: a key read or written at the wrong size is
-  `EINVAL`, an unknown key is `ENOENT`, a write to a read-only
-  key is `EPERM`, and an arena index that does not exist is
-  `EFAULT`. `Error` Debug and Display texts are upstream's.
-- Keys: `version` (the exact jemalloc 5.3.1 string of
-  tikv-jemalloc-sys 0.7.1, trailing null included), `epoch`
-  (starts at 1, each write or update advances it and update
-  returns the new value), `thread.tcache.enabled` (a per-thread
-  bool, initially true), `thread.arena`, and `opt.narenas`.
-- The `epoch` and `version` modules (`read`, `write`, `update`,
-  `epoch::advance`). Features `default`, `use_std`, and
+- `Name`, `AsName` for `[u8]` and `str`, `Name::value_type_str`,
+  `Name::as_bytes`, and Debug and Display of `Name`: pure
+  functions of the key bytes. The empty and non-null-terminated
+  panic messages and the `value_type_str` key list are
+  upstream's, copied from its source. Upstream's `as_bytes`
+  returns `&'static [u8]`; this one ties the borrow to `&self`,
+  so a program that needs the `'static` form rejects in lust
+  (a false reject, never a different value).
+- `Error` and `Result`: Debug and Display texts are upstream's.
+  No kept item can construct an `Error` value (`epoch` and
+  `version` reads do not fail in either build), so there is no
+  error output to match. Upstream derives `Copy`, `Clone`,
+  and `PartialEq` (no `Eq`); so does this adapter.
+- `epoch` (`read`, `write`, `update`, `advance`): a fresh real
+  process reads 1 first, each advance adds exactly one, and
+  `update` returns the new value. That held across repeated
+  runs and with `_RJEM_MALLOC_CONF` set. Nothing else in this
+  adapter can move the counter, and the by-name forms that
+  could move the real one are absent.
+- `version::read`: the exact string
+  `5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8\0` of
+  tikv-jemalloc-sys 0.7.1, the sys crate the pinned ctl 0.7.0
+  resolves to. The driver checks this adapter's version
+  against the resolved package, so the string cannot drift.
+- The `Access` trait declaration, with no impls for `Name`
+  (see below). Features `default`, `use_std`, and
   `disable_initial_exec_tls`.
 
-## Known differences (output that cannot match)
+## Removed in w-cinterop3: values that cannot match
 
-Real jemalloc answers depend on its build, `MALLOC_CONF`, and
-the machine, so no adapter over a different allocator can match
-them in general. The lust runtime has one allocator arena:
+The old adapter modeled one arena: `opt.narenas` read 1 and
+every `thread.arena` read 0. The real crate on a 16-core box
+reads `opt.narenas` 64 (4 per CPU) and a spawned thread's
+`thread.arena` 1; with `narenas:2` in the conf it reads 2.
+`thread.tcache.enabled` reads false under `tcache:false`;
+the adapter read true. Those values depend on the machine,
+the build, and `_RJEM_MALLOC_CONF`, so no adapter over a
+different allocator can return them exactly. Removed:
 
-- `opt.narenas` reads 1 (jemalloc defaults to 4 per CPU;
-  ts-rust's bins set 4). A program that prints it prints a
-  different number under lust.
-- Every thread's `thread.arena` reads 0 and only the write of
-  0 succeeds. Jemalloc gives new threads later arenas in turn.
-  Programs that read an arena and write it back on another
-  thread (the ts-rust use) behave the same; a program that
-  prints the arena of a spawned thread can differ.
+- Every `Access<T> for Name` impl (`u32`, `u64`, `usize`,
+  `isize`, `bool`, `&'static [u8]`, `&'static str`). The
+  by-name form cannot reject one key at compile time and keep
+  another, so all by-name key reads and writes reject,
+  including `epoch` and `version` by name. Use the typed
+  `epoch` and `version` modules above.
+- With them go `thread.arena`, `opt.narenas`,
+  `thread.tcache.enabled`, the string keys
+  (`config.malloc_conf` reads the build's conf string), and
+  every `stats.*` and `arenas.*` count.
 
-## Adapter-only form
+ts-rust impact: `program.rs` reads `thread.arena` by name and
+writes the value back on its checker threads, and
+`jemalloc_layout.rs` walks `0..opt.narenas`. Their own output
+does not depend on the values, but the same API in another
+program prints them, so the API cannot stay. Those files
+reject in lust now, and the `ext.tikv_jemalloc_ctl` port
+feature tracks that form.
 
-- `AsName` is also implemented for `[u8; N]`, because lust's
-  method probe does not yet unsized-autoderef a byte array to
-  `[u8]` for trait methods. Upstream has only the `[u8]` impl;
-  the array impl forwards to it, so every call upstream accepts
-  behaves the same. A UFCS call that names the array impl
-  directly (`<[u8; 3] as AsName>::name(..)`) is accepted here
-  and rejected upstream. That is a known false accept in this
-  adapter until the checker learns the autoderef step.
+## Rejected (lust error, never a different answer)
 
-## Rejected or in error (never a fake count)
-
-- Accounting keys (`stats.*`, `arenas.*`, and kin) answer
-  `ENOENT` by name. With no `stats` feature, upstream's
-  jemalloc build also has no `stats.allocated`; other stats
-  keys exist upstream and do not here.
 - The typed key modules other than `epoch` and `version`
   (`opt`, `thread`, `stats`, `arenas`, `config`, `raw`,
-  `stats_print`, `profiling`), `Mib` and `MibStr`, and layout
-  queries on `Error` and `Name` reject in lust.
+  `stats_print`, `profiling`), `Mib` and `MibStr`, the `mib`
+  forms of `epoch` and `version`, and layout queries on
+  `Error` and `Name`.
 - The `stats` and `profiling` features reject at resolve
   (L0508).

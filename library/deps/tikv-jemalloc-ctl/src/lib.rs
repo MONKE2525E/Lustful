@@ -1,21 +1,41 @@
 // Lust adapter for tikv-jemalloc-ctl 0.7.0 (docs/ARCH.md section
-// 3.6): the `Name` / `AsName` / `Access` surface over a one-arena
-// model of the lust runtime allocator, plus `Error`, `version`,
-// and `epoch`. This is the form ts-rust uses (`thread.arena` and
-// `opt.narenas` by name in program.rs and jemalloc_layout.rs).
+// 3.6): only the items whose output is the same as the real
+// crate's in every program lust accepts (rule zero; BRIEF.md
+// "Adapters and shims must reject what they cannot match").
 //
-// Honest limits (see README.md): lust has one allocator arena, so
-// `opt.narenas` reads 1 and every thread's `thread.arena` reads
-// 0. Real jemalloc answers depend on its build, its
-// `MALLOC_CONF`, and the CPU count, so a program that prints
-// those values can print a different number under lust; programs
-// that only move threads between arenas they read (the ts-rust
-// use) behave the same. Keys with allocator-accounting values
-// (`stats.*` and kin) and the typed key modules other than
-// `version` and `epoch` are not here: the by-name form answers
-// `ENOENT`, and the typed forms do not exist, so such code
-// rejects or errors, never silently answers with a fake count.
-// The `stats` and `profiling` features are not implemented.
+// Kept, and why each one matches (see README.md for the audit):
+// - `Name`, `AsName` (for `[u8]` and `str`), and `Error`: pure
+//   values. The panic messages, the `value_type_str` key list,
+//   and the error texts are upstream's, copied from its source.
+// - `epoch`: a fresh real jemalloc process reads 1 first and
+//   each advance, write, or update adds exactly one, with update
+//   returning the new value (probed against the real crate on
+//   boat, repeated runs and with `_RJEM_MALLOC_CONF` set). No
+//   other item in this adapter can move the counter, and the
+//   items that could move the real one are absent below.
+// - `version`: the exact string of tikv-jemalloc-sys 0.7.1, the
+//   sys crate the pinned 0.7.0 ctl resolves to (the driver
+//   checks the adapter version against the resolved package).
+//
+// Removed in w-cinterop3 because their values depend on the
+// jemalloc build, the machine, or `_RJEM_MALLOC_CONF`, so no
+// adapter over a different allocator can return them exactly:
+// every `Access<T> for Name` impl (the by-name keys
+// `thread.arena`, `opt.narenas`, `thread.tcache.enabled`, the
+// string keys other than the typed `version` below, and every
+// `stats.*` / `arenas.*` count). A real build on a 16-core box
+// reads `opt.narenas` 64, a spawned thread's `thread.arena` 1,
+// and `thread.tcache.enabled` false under `tcache:false`; the
+// one-arena model read 1, 0, and true. The `Access` trait stays
+// declared (upstream has it) with no impls for `Name`, so a
+// program that reads a key by name rejects at compile time. That
+// includes ts-rust's `program.rs` thread-arena form and
+// `jemalloc_layout.rs`: their output happens not to depend on
+// the values, but the same API in another program prints them,
+// so the API cannot stay. The typed key modules other than
+// `epoch` and `version`, `Mib`, and `MibStr` are absent for the
+// same reason. The `stats` and `profiling` features are not
+// implemented.
 
 use core::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +47,7 @@ const EFAULT: i32 = 14;
 const EINVAL: i32 = 22;
 
 /// Errors of the mallctl family: a non-zero errno code, as upstream.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq)]
 pub struct Error(i32);
 
 /// Result type, as upstream.
@@ -155,119 +175,12 @@ impl fmt::Display for Name {
     }
 }
 
-/// The epoch counter. Real jemalloc starts at 1 and each advance
-/// adds one; stats reads do not exist here, so the epoch only
-/// counts its own advances, as upstream's tests observe it.
-static EPOCH: AtomicU64 = AtomicU64::new(1);
-
-std::thread_local! {
-    /// This thread's tcache switch (`thread.tcache.enabled`,
-    /// initially on, as upstream). Lust's allocator has no
-    /// thread cache to switch; the value is kept so reads after
-    /// writes agree, and nothing else observes it.
-    static TCACHE_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
-}
-
-/// The jemalloc version string of tikv-jemalloc-sys 0.7.1, with
-/// its trailing null, as `version` reads it upstream.
-const VERSION: &[u8] = b"5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8\0";
-
-/// Advances the epoch and returns its new value.
-fn advance_epoch() -> u64 {
-    EPOCH.fetch_add(1, Ordering::SeqCst) + 1
-}
-
-/// Reads a 4-byte key (`thread.arena`, `opt.narenas`).
-fn read_u32(key: &[u8]) -> Result<u32> {
-    match key {
-        b"thread.arena" => Ok(0),
-        b"opt.narenas" => Ok(1),
-        b"epoch" | b"version" | b"thread.tcache.enabled" => Err(Error(EINVAL)),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Writes a 4-byte key.
-fn write_u32(key: &[u8], value: u32) -> Result<()> {
-    match key {
-        // One arena: 0 is the only valid index, as a one-arena
-        // jemalloc also answers EFAULT for any other index.
-        b"thread.arena" => {
-            if value == 0 {
-                Ok(())
-            } else {
-                Err(Error(EFAULT))
-            }
-        }
-        b"opt.narenas" => Err(Error(EPERM)),
-        b"epoch" | b"version" | b"thread.tcache.enabled" => Err(Error(EINVAL)),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Reads an 8-byte key (`epoch`).
-fn read_u64(key: &[u8]) -> Result<u64> {
-    match key {
-        b"epoch" => Ok(EPOCH.load(Ordering::SeqCst)),
-        b"thread.arena" | b"opt.narenas" | b"version" | b"thread.tcache.enabled" => Err(Error(EINVAL)),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Writes an 8-byte key. A write to `epoch` advances it and
-/// ignores the value, as upstream.
-fn write_u64(key: &[u8], _value: u64) -> Result<()> {
-    match key {
-        b"epoch" => {
-            advance_epoch();
-            Ok(())
-        }
-        b"version" => Err(Error(EPERM)),
-        b"thread.arena" | b"opt.narenas" | b"thread.tcache.enabled" => Err(Error(EINVAL)),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Reads the one bool key (`thread.tcache.enabled`).
-fn read_bool(key: &[u8]) -> Result<bool> {
-    match key {
-        b"thread.tcache.enabled" => Ok(TCACHE_ENABLED.with(|c| c.get())),
-        b"thread.arena" | b"opt.narenas" | b"epoch" | b"version" => Err(Error(EINVAL)),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Writes the one bool key.
-fn write_bool(key: &[u8], value: bool) -> Result<()> {
-    match key {
-        b"thread.tcache.enabled" => {
-            TCACHE_ENABLED.with(|c| c.set(value));
-            Ok(())
-        }
-        b"thread.arena" | b"opt.narenas" | b"epoch" | b"version" => Err(Error(EINVAL)),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Reads a string key. The caller asserted `value_type_str`.
-fn read_str_key(key: &[u8]) -> Result<&'static [u8]> {
-    match key {
-        b"version" => Ok(VERSION),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Writes a string key. The caller asserted `value_type_str`.
-fn write_str_key(key: &[u8], value: &'static [u8]) -> Result<()> {
-    assert!(!value.is_empty(), "value cannot be empty");
-    assert_eq!(*value.last().unwrap(), b'\0');
-    match key {
-        b"version" => Err(Error(EPERM)),
-        _ => Err(Error(ENOENT)),
-    }
-}
-
-/// Safe read access to the mallctl namespace.
+/// Safe read access to the mallctl namespace, as upstream
+/// declares it. This adapter has no impls of it for `Name`:
+/// every by-name key's value depends on the jemalloc build or
+/// the machine (see the file comment), so a call through this
+/// trait on a `Name` is a compile-time reject in lust, never an
+/// answer with a different value.
 pub trait Access<T> {
     /// Read the key at `self`.
     fn read(&self) -> Result<T>;
@@ -277,131 +190,33 @@ pub trait Access<T> {
     fn update(&self, value: T) -> Result<T>;
 }
 
-impl Access<u32> for Name {
-    fn read(&self) -> Result<u32> {
-        read_u32(self.key())
-    }
-    fn write(&self, value: u32) -> Result<()> {
-        write_u32(self.key(), value)
-    }
-    fn update(&self, value: u32) -> Result<u32> {
-        let old = self.read()?;
-        self.write(value)?;
-        Ok(old)
-    }
-}
-
-impl Access<u64> for Name {
-    fn read(&self) -> Result<u64> {
-        read_u64(self.key())
-    }
-    fn write(&self, value: u64) -> Result<()> {
-        write_u64(self.key(), value)
-    }
-    fn update(&self, value: u64) -> Result<u64> {
-        // `epoch` is the one key whose update returns the new
-        // value, as upstream's docs state.
-        if matches!(self.key(), b"epoch") {
-            return Ok(advance_epoch());
-        }
-        let old = self.read()?;
-        self.write(value)?;
-        Ok(old)
-    }
-}
-
-impl Access<usize> for Name {
-    fn read(&self) -> Result<usize> {
-        read_u64(self.key()).map(|v| v as usize)
-    }
-    fn write(&self, value: usize) -> Result<()> {
-        write_u64(self.key(), value as u64)
-    }
-    fn update(&self, value: usize) -> Result<usize> {
-        Access::<u64>::update(self, value as u64).map(|v| v as usize)
-    }
-}
-
-impl Access<isize> for Name {
-    fn read(&self) -> Result<isize> {
-        read_u64(self.key()).map(|v| v as isize)
-    }
-    fn write(&self, value: isize) -> Result<()> {
-        write_u64(self.key(), value as u64)
-    }
-    fn update(&self, value: isize) -> Result<isize> {
-        Access::<u64>::update(self, value as u64).map(|v| v as isize)
-    }
-}
-
-impl Access<bool> for Name {
-    fn read(&self) -> Result<bool> {
-        read_bool(self.key())
-    }
-    fn write(&self, value: bool) -> Result<()> {
-        write_bool(self.key(), value)
-    }
-    fn update(&self, value: bool) -> Result<bool> {
-        let old = self.read()?;
-        self.write(value)?;
-        Ok(old)
-    }
-}
-
-impl Access<&'static [u8]> for Name {
-    fn read(&self) -> Result<&'static [u8]> {
-        assert!(self.value_type_str(), "the name \"{:?}\" does not refer to a byte string", self);
-        read_str_key(self.key())
-    }
-    fn write(&self, value: &'static [u8]) -> Result<()> {
-        assert!(self.value_type_str(), "the name \"{:?}\" does not refer to a byte string", self);
-        write_str_key(self.key(), value)
-    }
-    fn update(&self, value: &'static [u8]) -> Result<&'static [u8]> {
-        assert!(self.value_type_str(), "the name \"{:?}\" does not refer to a byte string", self);
-        let old = read_str_key(self.key())?;
-        write_str_key(self.key(), value)?;
-        Ok(old)
-    }
-}
-
-impl Access<&'static str> for Name {
-    fn read(&self) -> Result<&'static str> {
-        assert!(self.value_type_str(), "the name \"{:?}\" does not refer to a byte string", self);
-        let s = read_str_key(self.key())?;
-        Ok(core::str::from_utf8(s).unwrap())
-    }
-    fn write(&self, value: &'static str) -> Result<()> {
-        assert!(self.value_type_str(), "the name \"{:?}\" does not refer to a byte string", self);
-        write_str_key(self.key(), value.as_bytes())
-    }
-    fn update(&self, value: &'static str) -> Result<&'static str> {
-        assert!(self.value_type_str(), "the name \"{:?}\" does not refer to a byte string", self);
-        let old = read_str_key(self.key())?;
-        write_str_key(self.key(), value.as_bytes())?;
-        Ok(core::str::from_utf8(old).unwrap())
-    }
-}
+/// The epoch counter. Real jemalloc starts at 1 and each advance
+/// adds one; nothing else in this adapter can move it, so the
+/// counts a program prints are the real crate's counts.
+static EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// The `epoch` key: many statistics are cached and refresh when
-/// the epoch advances. Here it only counts, as upstream's own
-/// tests observe it.
+/// the epoch advances. Here it only counts, as a fresh real
+/// process observes it (first read 1, each advance adds one).
 pub mod epoch {
-    use super::{Access, AsName, Result};
+    use super::{EPOCH, Result};
+    use std::sync::atomic::Ordering;
 
     /// Reads the epoch.
     pub fn read() -> Result<u64> {
-        Access::<u64>::read(b"epoch\0".name())
+        Ok(EPOCH.load(Ordering::SeqCst))
     }
 
     /// Advances the epoch, ignoring `value`, as upstream.
-    pub fn write(value: u64) -> Result<()> {
-        Access::<u64>::write(b"epoch\0".name(), value)
+    pub fn write(_value: u64) -> Result<()> {
+        EPOCH.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
-    /// Advances the epoch and returns its new value.
-    pub fn update(value: u64) -> Result<u64> {
-        Access::<u64>::update(b"epoch\0".name(), value)
+    /// Advances the epoch and returns its new value, as
+    /// upstream's docs state for this key.
+    pub fn update(_value: u64) -> Result<u64> {
+        Ok(EPOCH.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
     /// Advances the epoch returning its latest value.
@@ -410,13 +225,17 @@ pub mod epoch {
     }
 }
 
+/// The jemalloc version string of tikv-jemalloc-sys 0.7.1, with
+/// its trailing null, as `version` reads it upstream.
+const VERSION: &str = "5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8\0";
+
 /// The `version` key: the jemalloc version string.
 pub mod version {
-    use super::{Access, AsName, Result};
+    use super::{Result, VERSION};
 
     /// Reads the version string (with its trailing null, as
     /// upstream returns it).
     pub fn read() -> Result<&'static str> {
-        b"version\0".name().read()
+        Ok(VERSION)
     }
 }

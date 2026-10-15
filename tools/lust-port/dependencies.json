@@ -114,7 +114,7 @@
    "name": "tikv-jemalloc-ctl",
    "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Adapter in library/deps: Name/Access over a one-arena model (thread.arena, opt.narenas, epoch, version, thread.tcache.enabled) with upstream error texts. Arena counts a program prints cannot match a jemalloc build; see the adapter README. Stats and typed modules beyond epoch/version are absent."
+   "notes": "Adapter in library/deps: Name/AsName/Error, epoch, and version only (the items whose output matches the real crate exactly; w-cinterop3 audit). All by-name Access impls are removed because arena counts, tcache, and stats values depend on the jemalloc build and machine and cannot match; programs that use them reject at compile time. See the adapter README."
   },
   {
    "name": "nix",

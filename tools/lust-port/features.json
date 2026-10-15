@@ -1125,7 +1125,7 @@
   },
   {
    "id": "ext.tikv_jemalloc_ctl",
-   "title": "Adapter crate tikv-jemalloc-ctl 0.7.0: Name/Access arena keys, epoch, version",
+   "title": "Adapter crate tikv-jemalloc-ctl 0.7.0: Name/AsName, epoch, version (by-name Access arena keys removed, cannot match)",
    "status": "supported",
    "milestone": 0,
    "inventory_step": "10",
@@ -1133,7 +1133,7 @@
    "fix_class": "adapter",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh tikv-jemalloc-ctl (2 cases match the real crate). One-arena model: opt.narenas reads 1 and thread.arena 0, so a program that prints those values can differ from a jemalloc build (adapter README lists every such output); ts-rust only reads an arena and writes it back. Stats keys answer ENOENT and typed modules beyond epoch/version are absent. Split from cinterop.system. See dependencies.json.",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh tikv-jemalloc-ctl (epoch_version matches the real crate; arena_reject and by_name_reject must reject). w-cinterop3 audit: the one-arena by-name model printed values a real jemalloc build does not (opt.narenas 1 vs 4 per CPU, spawned thread arena 0 vs 1, tcache under MALLOC_CONF), so every Access impl for Name is removed and by-name key access rejects at compile time. Kept because they match exactly: Name/AsName/Error (pure), epoch (first read 1, +1 per advance, probed against the real crate), version (the pinned sys 0.7.1 string). ts-rust program.rs and jemalloc_layout.rs use the removed arena form, so this feature (the ts-rust form, per its probe) is unsupported again. Split from cinterop.system. See dependencies.json.",
    "primary_keys": [
     "ext.type.tikv_jemalloc_ctl::*"
    ],
