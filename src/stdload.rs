@@ -351,7 +351,7 @@ fn module_splice(m: &crate::stdmods::StdModule, text: &str) -> Result<String, St
 fn resolve_lang_items(files: &[CheckedFile], marks: &[(usize, String, u32)]) -> Result<LangItems, String> {
     // Any checked file's program carries the same builtin defs (they are
     // stable path hashes); rebuild a throwaway store to read them.
-    let builtins = crate::ty::GlobalTys::new().builtins();
+    let builtins = *crate::ty::GlobalTys::new().builtins();
     let mut items = LangItems::from_builtins(builtins);
     for &(fi, ref name, at) in marks {
         let file = &files[fi];

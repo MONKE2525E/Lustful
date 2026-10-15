@@ -1874,7 +1874,7 @@ mod tests {
     #[test]
     fn lang_items_resolve_builtins() {
         let g = GlobalTys::new();
-        let b = g.builtins();
+        let b = *g.builtins();
         let items = LangItems::from_builtins(b);
         assert_eq!(items.get(LangItem::Option), Some(b.option));
         assert_eq!(items.get(LangItem::Result), Some(b.result));

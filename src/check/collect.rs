@@ -2394,7 +2394,7 @@ pub fn collect_reuse<'a>(
     // one, so `Generics` queries answer for builtins and user types alike. Their
     // code paths stay builtin until source std lands (ARCH 2.1, 9.3).
     {
-        let b = p.tys.builtins();
+        let b = *p.tys.builtins();
         let dummy = Span::default();
         let one_ty_param = || Generics {
             parent: None,

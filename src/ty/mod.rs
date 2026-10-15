@@ -616,9 +616,12 @@ pub struct BuiltinDefs {
 }
 
 impl BuiltinDefs {
-    /// Which builtin a def is, if it is one of these.
-    pub fn kind_of(self, def: DefId) -> Option<BuiltinTy> {
-        if def == self.string {
+    /// Which builtin a def is, if it is one of these. Every builtin def
+    /// is in `BUILTIN_CRATE`, so a user def answers after one compare.
+    pub fn kind_of(&self, def: DefId) -> Option<BuiltinTy> {
+        if def.krate != BUILTIN_CRATE {
+            None
+        } else if def == self.string {
             Some(BuiltinTy::String)
         } else if def == self.vec {
             Some(BuiltinTy::Vec)
@@ -634,8 +637,6 @@ impl BuiltinDefs {
             Some(BuiltinTy::Chars)
         } else if def == self.args {
             Some(BuiltinTy::Args)
-        } else if def.krate != BUILTIN_CRATE {
-            None
         } else if let Some(i) = self.fmt_tys.iter().position(|&d| d == def) {
             Some(BuiltinTy::Fmt(fmt::FmtTy::ALL[i]))
         } else if def == self.weak {
@@ -654,8 +655,6 @@ impl BuiltinDefs {
             Some(BuiltinTy::Sync(sync::SyncTy::ALL[i]))
         } else if let Some(i) = self.hash_tys.iter().position(|&d| d == def) {
             Some(BuiltinTy::Hash(hash::HashTy::ALL[i]))
-        } else if def.krate != BUILTIN_CRATE {
-            None
         } else if def == self.local_key {
             Some(BuiltinTy::LocalKey)
         } else if def == self.access_error {
@@ -770,7 +769,9 @@ pub trait TyIntern {
     fn intern_bindings(&mut self, b: &[(DefId, GenericArg)]) -> BindingsId;
     fn bindings(&self, id: BindingsId) -> &[(DefId, GenericArg)];
     /// The builtin Adt defs this store's global table was built with.
-    fn builtins(&self) -> BuiltinDefs;
+    /// By reference: the table holds about a hundred defs, and the type
+    /// queries below (`builtin_of`) run on every hot path.
+    fn builtins(&self) -> &BuiltinDefs;
     /// The param env of the body this store belongs to: empty for the
     /// global store and concrete bodies (see `Tys::env`).
     fn param_env(&self) -> &[Predicate] {
@@ -965,7 +966,7 @@ pub trait TyIntern {
     }
     /// One of the one-arg builtin Adts by its def field.
     fn mk_builtin1(&mut self, which: fn(&BuiltinDefs) -> DefId, elem: Ty) -> Ty {
-        let def = which(&self.builtins());
+        let def = which(self.builtins());
         self.mk_adt(def, &[GenericArg::Ty(elem)])
     }
     /// The `(T, E)` type arguments of a `Result<T, E>`.
@@ -1316,8 +1317,8 @@ impl TyIntern for GlobalTys {
     fn bindings(&self, id: BindingsId) -> &[(DefId, GenericArg)] {
         &self.bindings_a.items[id.0 as usize]
     }
-    fn builtins(&self) -> BuiltinDefs {
-        self.builtins
+    fn builtins(&self) -> &BuiltinDefs {
+        &self.builtins
     }
     fn mk_vec(&mut self, elem: Ty) -> Ty {
         let def = self.builtins.vec;
@@ -1509,8 +1510,8 @@ impl TyIntern for Tys<'_> {
         let g = self.global.bindings_a.len();
         if id.0 < g { &self.global.bindings_a.items[id.0 as usize] } else { &self.bindings_a.items[(id.0 - g) as usize] }
     }
-    fn builtins(&self) -> BuiltinDefs {
-        self.global.builtins
+    fn builtins(&self) -> &BuiltinDefs {
+        &self.global.builtins
     }
     fn param_env(&self) -> &[Predicate] {
         self.env
