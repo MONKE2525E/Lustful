@@ -84,7 +84,8 @@ pub(crate) struct PatchBase {
     shadowed: bool,
     tables: Arc<ResolvedTables>,
     /// The crate's cfg environment and name, for expanding a body alone,
-    /// when no user or dependency macro can take a builtin's name.
+    /// when no user or dependency macro can take a builtin's name (no
+    /// dependency crate, and no file `shadows_builtin`).
     expand: Option<(crate::resolve::cfg::CfgEnv, String)>,
     /// `ResolvedTables::local_named_set`, built on the first patch.
     local_names: Option<FxMap<Sym, u8>>,
@@ -144,15 +145,35 @@ pub(super) fn inputs_fingerprint(parts: &dyn std::fmt::Debug) -> u64 {
 /// A text scan: a match in a comment or string only costs the patch for
 /// bodies that call parser macros.
 fn shadows_parser_macro(text: &str) -> bool {
+    shadows(text, &|name| crate::expand::builtin::is_passthrough(name))
+}
+
+/// `shadows_parser_macro` for every builtin macro (parser and expander
+/// owned), and for a macro whose name a macro supplies
+/// (`macro_rules! $name`, read as an empty name).
+fn shadows_builtin(text: &str) -> bool {
+    use crate::expand::builtin::{is_passthrough, is_token_builtin};
+    shadows(text, &|name| name.is_empty() || is_passthrough(name) || is_token_builtin(name))
+}
+
+/// True when `text` may define a macro whose name `named` takes, or
+/// import one under such a name (`as name` that ends a use tree: then
+/// `;`, `,`, or `}`). `as $name` is a cast in a macro, not an import.
+fn shadows(text: &str, named: &dyn Fn(&str) -> bool) -> bool {
     let ident_after = |rest: &str| -> String { rest.trim_start().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect() };
     let word_before = |i: usize| i == 0 || !text.as_bytes()[i - 1].is_ascii_alphanumeric() && text.as_bytes()[i - 1] != b'_';
     let defines = text.match_indices("macro_rules").any(|(i, m)| {
         let rest = text[i + m.len()..].trim_start();
-        rest.strip_prefix('!').is_some_and(|r| crate::expand::builtin::is_passthrough(&ident_after(r)))
+        rest.strip_prefix('!').is_some_and(|r| named(&ident_after(r)))
     });
     let renames = text.match_indices("as").any(|(i, m)| {
         let rest = &text[i + m.len()..];
-        word_before(i) && rest.starts_with(char::is_whitespace) && crate::expand::builtin::is_passthrough(&ident_after(rest))
+        if !word_before(i) || !rest.starts_with(char::is_whitespace) {
+            return false;
+        }
+        let rest = rest.trim_start();
+        let name = ident_after(rest);
+        !name.is_empty() && rest[name.len()..].trim_start().starts_with([';', ',', '}']) && named(&name)
     });
     defines || renames
 }
@@ -199,6 +220,7 @@ impl PatchBase {
             .collect();
         let user_macros = texts.iter().any(|(_, t)| t.contains("macro_rules"));
         let shadowed = user_macros && texts.iter().any(|(_, t)| shadows_parser_macro(t));
+        let expand = expand.filter(|_| !user_macros || !texts.iter().any(|(_, t)| shadows_builtin(t)));
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
         let mut fns_by_file: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -235,7 +257,7 @@ impl PatchBase {
             stamps,
             user_macros,
             shadowed,
-            expand: expand.filter(|_| !user_macros),
+            expand,
             tables,
             local_names: None,
             std_ranges: std_out.0.to_vec(),
@@ -813,7 +835,10 @@ fn find_inactive_edit(front: &Front, text: &str, edit: Edit) -> Result<(), Optio
     }
     let hint = if node.item { crate::parser::CfgSyntaxHint::Item } else { crate::parser::CfgSyntaxHint::Node };
     crate::parser::check_cfg_syntax(nt, &new_lexed.strings, &front.interner, &front.known, hint).map_err(|_| Some("inactive syntax"))?;
-    if old.contains("macro_rules") != text.contains("macro_rules") || shadows_parser_macro(old) != shadows_parser_macro(text) {
+    if old.contains("macro_rules") != text.contains("macro_rules")
+        || shadows_parser_macro(old) != shadows_parser_macro(text)
+        || shadows_builtin(old) != shadows_builtin(text)
+    {
         return Err(Some("inactive text"));
     }
     Ok(())
@@ -1947,6 +1972,16 @@ pub fn run() -> i64 {
         }
         let v = warm_equals_cold(&mut warm, &root, &m1, "    s\n}", "    let t = matches!(s.len(), 1 | 2);\n    if t { s } else { String::new() }\n}");
         assert_eq!(field(&v, "path"), "patch", "{v}");
+        // A user macro of another name: bodies that call builtins patch.
+        let dbl = "macro_rules! dbl {\n    ($e:expr) => {\n        $e * 2\n    };\n}\n\npub fn d() -> i64 {\n    dbl!(1)\n}\n\n";
+        warm_equals_cold(&mut warm, &root, &m1, "pub fn is_b(", &format!("{dbl}pub fn is_b("));
+        let v = warm_equals_cold(&mut warm, &root, &m1, "    matches!(k, K::B(_))\n", "    matches!(k, K::B(1))\n");
+        assert_eq!(field(&v, "path"), "patch", "{v}");
+        // A user macro named like a builtin: the expander may pick it.
+        let own = "macro_rules! matches {\n    ($($t:tt)*) => {\n        false\n    };\n}\n\n";
+        warm_equals_cold(&mut warm, &root, &m1, "pub fn d()", &format!("{own}pub fn d()"));
+        let v = warm_equals_cold(&mut warm, &root, &m1, "    matches!(k, K::B(1))\n", "    matches!(k, K::B(2))\n");
+        assert_eq!(field(&v, "path"), "resolve", "{v}");
         assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
         let bin = root.with_extension("bin");
         let out = run_bin(&bin);
@@ -2009,5 +2044,21 @@ pub fn run() -> i64 {
         assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
         assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shadow scans: a macro defined or imported under a builtin's
+    /// name counts; prose and casts do not.
+    #[test]
+    fn shadow_scans() {
+        use super::{shadows_builtin, shadows_parser_macro};
+        assert!(shadows_parser_macro("use a::m as vec;"));
+        assert!(shadows_parser_macro("macro_rules! println { () => {} }"));
+        assert!(shadows_builtin("use a::{m as matches, n};"));
+        assert!(shadows_builtin("macro_rules! write { () => {} }"));
+        assert!(shadows_builtin("macro_rules! $name { () => {} }"));
+        assert!(!shadows_builtin("($value as $repr);"));
+        assert!(!shadows_builtin("// treated as line terminators."));
+        assert!(!shadows_builtin("let x = y as u8;"));
+        assert!(!shadows_builtin("macro_rules! dbl { () => {} }"));
     }
 }

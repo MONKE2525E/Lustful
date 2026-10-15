@@ -1821,6 +1821,12 @@ pub fn run() -> i64 {
 
 PATCHSEQ_SEED["macs.rs"] = """use std::fmt::Write;
 
+macro_rules! dbl {
+    ($e:expr) => {
+        $e * 2
+    };
+}
+
 #[derive(Clone, Copy)]
 pub enum K {
     A,
@@ -1842,7 +1848,7 @@ pub fn show(k: K) -> String {
 pub fn run() -> i64 {
     debug_assert!(is_b(K::B(1)));
     // @m3
-    show(K::A).len() as i64 + is_b(K::B(2)) as i64
+    show(K::A).len() as i64 + is_b(K::B(2)) as i64 + dbl!(1)
 }
 """
 
