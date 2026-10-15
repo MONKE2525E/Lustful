@@ -230,6 +230,14 @@ impl<'p> Lower<'p> {
         self.scopes.last_mut().unwrap().push(l);
         l
     }
+    /// A promoted temporary: the backing storage of a const
+    /// reference value. It is in no scope, so it is never dropped,
+    /// as a promoted constant is not.
+    fn promoted_temp(&mut self, ty: Ty) -> Local {
+        let l = self.new_local(ty, true, None);
+        self.body.promoted.push(l);
+        l
+    }
     /// Evaluates `e` (through its coercion unless `raw`) into a new
     /// temporary of type `ty`. As rustc's `as_temp` schedules a
     /// temporary's drop after evaluating its expression, the temporary
@@ -2194,7 +2202,15 @@ impl<'p> Lower<'p> {
                     return;
                 }
                 if n == 0 {
-                    // Rust does not evaluate the element for a zero repeat.
+                    // A zero repeat still evaluates its operand once
+                    // and drops it (and moves a local in): materialize
+                    // it into a statement temporary, which the scope
+                    // drops at the end of the statement.
+                    let elem = match self.kind(ty) {
+                        TyKind::Array(el, _) => el,
+                        _ => self.ty(*value),
+                    };
+                    let _ = self.materialize(*value, elem, false);
                     self.set_or_temp(dest, Rvalue::ArrayAgg(ty, Vec::new()), ty, span);
                 } else if n == 1 {
                     let o = self.operand(*value);
@@ -5873,7 +5889,9 @@ impl<'p> Lower<'p> {
             };
             let c = self.body.tys.intern_const(ConstKind::Int(n));
             let at = self.body.tys.intern(TyKind::Array(elem, c));
-            let t = self.temp(at);
+            // The backing array is promoted with the reference:
+            // never dropped, even for a drop element type.
+            let t = self.promoted_temp(at);
             self.const_into(v, at, &Place::local(t), span);
             self.assign(dest.clone(), Rvalue::SliceOf(Place::local(t)), span);
             return;
@@ -5939,7 +5957,9 @@ impl<'p> Lower<'p> {
                     TyKind::Ref(_, _, it) => it,
                     _ => ERROR,
                 };
-                let t = self.temp(inner_ty);
+                // A const reference's pointee is promoted: never
+                // dropped, even for a drop type.
+                let t = self.promoted_temp(inner_ty);
                 self.const_into(inner, inner_ty, &Place::local(t), span);
                 let mutable = matches!(self.kind(ty), TyKind::Ref(_, Mut::Mut, _));
                 self.assign(dest.clone(), Rvalue::Ref(mutable, Place::local(t)), span);
