@@ -573,12 +573,26 @@ pub fn package_cargo_env(pkg: &PackageInfo, target: &TargetInfo) -> Vec<(String,
     env
 }
 
+/// Cargo's build dir for `manifest` (`build_directory` of `cargo metadata`,
+/// else `target_directory` for a Cargo without build-dir): the probe of
+/// `resolve::probe` needs its deps dir. None when the call fails.
+pub fn build_dir(manifest: &Path) -> Option<PathBuf> {
+    let mut cmd = Command::new("cargo");
+    if let Some(dir) = manifest.parent() {
+        cmd.current_dir(dir);
+    }
+    let out = cmd.args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"]).arg(manifest).output().ok()?;
+    let root = parse_json(&String::from_utf8_lossy(&out.stdout)).ok()?;
+    let dir = root.get("build_directory").or_else(|| root.get("target_directory"))?.as_str()?;
+    (out.status.success() && !dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
 /// The per-unit feature sets from one `cargo check --message-format=json`
 /// run for the same request (section 1.1), keyed by (package id repr,
-/// target name). Cached per graph key in this process, and on disk (see
-/// `features_disk_path`): the run compiles the whole package with rustc
-/// (ts_goport: about 16 minutes of CPU), and its answer does not depend on
-/// the sources. Returns None when the run fails; the caller then falls back
+/// target name). The run is the cheap probe of `resolve::probe`: rustc
+/// runs only for build scripts and proc macros. Cached per graph key in
+/// this process, and on disk (see `features_disk_path`): its answer does
+/// not depend on the sources. Returns None when the run fails; the caller then falls back
 /// to resolve-node features and the session still works for single-package
 /// graphs.
 fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
@@ -594,11 +608,7 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         cache.lock().unwrap().insert(key, map.clone());
         return Some(map);
     }
-    let mut cmd = Command::new("cargo");
-    if let Some(dir) = req.manifest_path.parent() {
-        cmd.current_dir(dir);
-    }
-    cmd.args(["check", "--message-format=json", "--manifest-path"]).arg(&req.manifest_path);
+    let mut cmd = crate::resolve::probe::check_command(&req.manifest_path, &req.target_triple);
     if let Some(pkg) = &req.package {
         cmd.args(["-p", pkg]);
     }
@@ -610,9 +620,6 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
     }
     if req.all_features {
         cmd.arg("--all-features");
-    }
-    if !req.target_triple.is_empty() {
-        cmd.args(["--target", &req.target_triple]);
     }
     cmd.args(req.cargo_net.args());
     let out = cmd.output().ok()?;

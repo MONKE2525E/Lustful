@@ -88,7 +88,12 @@ graph key. `cargo metadata` alone unifies features over the whole
 workspace, which can differ from a `-p ts_goport --bin tsgo`
 build. So the feature set of each selected unit comes from one
 cached `cargo check --message-format=json` dry run for the same
-request. Lust reads: packages (name, version, manifest path,
+request. The dry run has lust-core as its RUSTC_WRAPPER: build
+scripts, proc macros, and their dependencies compile for real, and
+every check unit gets an empty dep-info file and no `.rmeta`, so a
+later real check rebuilds it (`src/resolve/probe.rs`). Cargo still
+picks the units and their features, so the messages are the same as
+a full check. Lust reads: packages (name, version, manifest path,
 features, dependencies with kind, rename, and target cfg),
 targets (kind, name, `src_path`, edition, `crate_types`), and
 per-unit features. Dependency kinds and target cfgs filter edges:

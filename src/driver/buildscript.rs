@@ -337,7 +337,8 @@ pub fn outputs(manifest_dir: &Path, cache_dir: &Path) -> Result<Option<Outputs>,
 /// Runs the build script through Cargo and builds a fresh record.
 /// `cargo check` already runs build scripts; its JSON messages name
 /// the OUT_DIR, and the script's stdout sits in the sibling `output`
-/// file Cargo keeps next to it.
+/// file Cargo keeps next to it. The run is the cheap probe of
+/// `resolve::probe` (rustc runs only for build scripts and proc macros).
 fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, String> {
     // Cargo decides script freshness by mtime; an input edited within
     // the same filesystem timestamp tick as the last run can look
@@ -348,9 +349,8 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
     if let Ok(bytes) = std::fs::read(script) {
         let _ = std::fs::write(script, bytes);
     }
-    let out = std::process::Command::new("cargo")
-        .args(["check", "--offline", "--message-format=json"])
-        .current_dir(manifest_dir)
+    let out = crate::resolve::probe::check_command(&manifest_dir.join("Cargo.toml"), "")
+        .arg("--offline")
         .env("CARGO_TERM_COLOR", "never")
         .output()
         .map_err(|e| format!("cannot run cargo: {e}"))?;

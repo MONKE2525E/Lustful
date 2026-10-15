@@ -101,6 +101,10 @@ fn raise_stack_limit() {
 const BIG_FILE: u64 = 256 << 10;
 
 fn main() {
+    // Cargo runs lust-core as its RUSTC_WRAPPER during the feature probe.
+    if let Some(code) = resolve::probe::wrapper_main() {
+        std::process::exit(code);
+    }
     #[cfg(unix)]
     raise_stack_limit();
     tcc::use_mimalloc();
