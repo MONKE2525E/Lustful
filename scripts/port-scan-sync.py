@@ -81,10 +81,10 @@ OWNER_BY_CAUSE = {
 }
 
 
-def run(cmd, timeout, env=None):
+def run(cmd, timeout, env=None, cwd=None):
     """Run one command; return (exit_code, stdout, stderr). Exit 124 on timeout."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
@@ -148,7 +148,8 @@ def probe_one(path, lust, tmp, env):
     if ccode != 0:
         res["verdict"] = "reject"
         return res
-    lcode, lout, lerr = run([str(lust), "run", *mode, str(path)], COMPILE_TIMEOUT, env)
+    # `lust run` drops its binary in the working directory; keep it in tmp.
+    lcode, lout, lerr = run([str(lust), "run", *mode, str(path)], COMPILE_TIMEOUT, env, cwd=str(tmp))
     res["lust_stdout"] = lout
     res["lust_exit"] = lcode
     if lust_only:
@@ -279,11 +280,44 @@ def curve(files, feats):
     return rows
 
 
-def do_coverage(args):
-    scanner = Path(os.environ.get("LUST_PORT", ROOT / "tools/lust-port/target/release/lust-port"))
-    ts_rust = Path(os.environ.get("TS_RUST", "/home/theo/.t3/projects/ts-rust"))
+def ensure_scanner():
+    """The lust-port scanner binary, never a stale one.
+
+    The scanner embeds features.json and dependencies.json at build
+    time (`include_str!` in tools/lust-port/src), so a binary built
+    before the last edit of either silently scans with the old
+    table. With no LUST_PORT override, rebuild it (cargo is a no-op
+    when fresh); with an override, refuse a binary older than any
+    input it embeds or compiles.
+    """
+    port_dir = ROOT / "tools/lust-port"
+    build = ["cargo", "build", "--release", "--manifest-path", str(port_dir / "Cargo.toml")]
+    custom = os.environ.get("LUST_PORT")
+    if custom:
+        scanner = Path(custom)
+        if not scanner.exists():
+            sys.exit(f"scanner not found: {scanner} (build with {' '.join(build)})")
+        inputs = [FEATURES_JSON, port_dir / "dependencies.json", port_dir / "Cargo.toml", port_dir / "Cargo.lock"]
+        inputs += [p for p in (port_dir / "src").rglob("*") if p.is_file()]
+        stale = max(inputs, key=lambda p: p.stat().st_mtime)
+        if scanner.stat().st_mtime < stale.stat().st_mtime:
+            sys.exit(
+                f"scanner is stale: {scanner} is older than {stale}, which it embeds or compiles; "
+                f"rebuild with {' '.join(build)} or unset LUST_PORT to rebuild here"
+            )
+        return scanner
+    scanner = port_dir / "target/release/lust-port"
+    code, _, err = run(build, 1200)
+    if code != 0:
+        sys.exit(f"scanner build failed: {err[-500:]}")
     if not scanner.exists():
-        sys.exit(f"scanner not found: {scanner} (build with cargo build --release --manifest-path tools/lust-port/Cargo.toml)")
+        sys.exit(f"scanner not found after build: {scanner}")
+    return scanner
+
+
+def do_coverage(args):
+    scanner = ensure_scanner()
+    ts_rust = Path(os.environ.get("TS_RUST", "/home/theo/.t3/projects/ts-rust"))
     manifest = ts_rust / "Cargo.toml"
     code, out, err = run(
         [str(scanner), "scan", "--manifest-path", str(manifest), "--target", "x86_64-unknown-linux-gnu", "--json", "--summary"],
