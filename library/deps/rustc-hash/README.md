@@ -12,9 +12,13 @@ reads written out. Gate: `scripts/test-adapters.sh rustc-hash`.
   `std`). Checked with rustc against the real crate on 20,000 random
   hasher cases; hash values are upstream's test vectors.
 - `FxHasher`, `FxBuildHasher`, and `FxSeededState` are exact-layout.
-- Maps and sets with these hashers print the same iteration order and
-  capacity as the real crate (tests/adapters/crates/rustc-hash,
-  maps_typed).
+- Maps and sets with these hashers print the same iteration order,
+  capacity, and hash values as the real crate, built through the aliases
+  as ts-rust writes them (`FxHashMap::default()`,
+  `with_capacity_and_hasher(n, Default::default())`, `with_hasher`) and
+  hashing values with a written `Hash` impl
+  (tests/adapters/crates/rustc-hash: layout, maps, maps_typed,
+  hash_values).
 - Two spellings differ from upstream with the same meaning: `write`
   calls the 64-bit body of `write_u64` directly, and the multiplier is
   named `MULTIPLIER`, not `K` (private; with `K`, lust resolves the
@@ -23,10 +27,9 @@ reads written out. Gate: `scripts/test-adapters.sh rustc-hash`.
 
 ## Not usable through lust yet (lust rejects)
 
-- An associated fn called through an alias, such as
-  `FxHashMap::default()` (L0101; W-CHECK-G). `HashMap::default()` with
-  the alias as the type works.
-- Hashing a value whose `Hash` impl is written by hand (L0640; W-STD-B).
+- `FxHashMap::from_iter(..)` and `FxHashSet::from_iter(..)` by path
+  (L0104): lust has no `from_iter` by path on any std type yet.
+  `.collect()` works.
 
 ## Rejected (lust error, never a different answer)
 
