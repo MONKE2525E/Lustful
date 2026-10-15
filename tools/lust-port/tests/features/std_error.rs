@@ -8,7 +8,7 @@ impl fmt::Display for Boom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "boom {}", self.0) }
 }
 impl Error for Boom {}
-fn show<E: Error>(e: &E) -> String { e.to_string() }
+fn show<E: Error>(e: &E) -> String { format!("{e}") }
 fn main() {
     println!("{} {:?}", show(&Boom(3)), Boom(4));
 }
