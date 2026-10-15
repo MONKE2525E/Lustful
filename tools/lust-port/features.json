@@ -857,14 +857,14 @@
   {
    "id": "std.cow",
    "title": "Cow (borrowed or owned strings and slices)",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/std_cow.rs fails (L0102): Cow<'_, str> returns, as in ts-rust normalize_slashes_cow. Split from std.rc_refcell, which held every std::borrow path.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_cow.rs and std_cow_b.rs pass: Cow<'_, str> returns as in ts-rust normalize_slashes_cow (char patterns included), Cow in structs and hashed keys, Cow<[u8]>, Cow<Path>, a sized Cow through its Deref, From conversions, and from_utf8_lossy. Split from std.rc_refcell, which held every std::borrow path.",
    "primary_keys": [
     "std.type.std::borrow::Cow"
    ],
