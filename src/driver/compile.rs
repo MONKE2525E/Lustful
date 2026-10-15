@@ -192,10 +192,13 @@ impl Stats {
 /// `scanned`: items rescanned structurally. `slot_fns`: fns the slot
 /// update compared. `collect`: items and fns collect walked.
 /// `discovery`: bodies instance discovery checked or replayed.
-/// `checked`: bodies checked.
+/// `checked`: bodies checked. `why`: on a full resolve, the condition
+/// that stopped the body patch (`no_base` on a first compile).
 #[derive(Default)]
 struct Visits {
     path: &'static str,
+    /// Why a resolver-path request did not patch (`patch::try_patch`).
+    why: &'static str,
     files: usize,
     nodes: usize,
     spans: usize,
@@ -210,9 +213,30 @@ impl Visits {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-visits: path={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={}",
-            self.path, self.files, self.nodes, self.spans, self.scanned, self.slot_fns, self.collect, self.discovery, self.checked
+            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={}",
+            self.path,
+            if self.why.is_empty() { "-".to_string() } else { self.why.replace(' ', "_") },
+            self.files,
+            self.nodes,
+            self.spans,
+            self.scanned,
+            self.slot_fns,
+            self.collect,
+            self.discovery,
+            self.checked
         );
+    }
+}
+
+/// Appends one `lust-visits:` line to the file `LUST_VISITS_LOG` names,
+/// when set: how a test or fuzz run measures which warm requests took
+/// the body patch without changing any compile's output.
+fn log_visits(line: &str) {
+    if let Some(path) = std::env::var_os("LUST_VISITS_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -1646,22 +1670,24 @@ fn resolved_setup(
         &front.client,
         key.krate.test,
     ));
-    if let Some(p) = super::patch::try_patch(front, caches, inputs, &root_text, request_start) {
-        (*std_ranges, *std_routes, *std_methods) = (p.std_ranges, p.std_routes, p.std_methods);
-        front.resolved_crate_ids = Some(crate_ids);
-        *visits = Visits {
-            path: "patch",
-            files: p.files,
-            nodes: p.nodes,
-            spans: p.spans,
-            scanned: p.bodies,
-            slot_fns: p.fn_count,
-            ..Default::default()
-        };
-        t.lap("body patch");
-        return Ok((p.map, p.changed, Vec::new(), false, p.fn_count, "bodies", p.fn_lines, p.body_hashes, Some(p.tables)));
+    match super::patch::try_patch(front, caches, inputs, &root_text, request_start) {
+        Ok(p) => {
+            (*std_ranges, *std_routes, *std_methods) = (p.std_ranges, p.std_routes, p.std_methods);
+            front.resolved_crate_ids = Some(crate_ids);
+            *visits = Visits {
+                path: "patch",
+                files: p.files,
+                nodes: p.nodes,
+                spans: p.spans,
+                scanned: p.bodies,
+                slot_fns: p.fn_count,
+                ..Default::default()
+            };
+            t.lap("body patch");
+            return Ok((p.map, p.changed, Vec::new(), false, p.fn_count, "bodies", p.fn_lines, p.body_hashes, Some(p.tables)));
+        }
+        Err(why) => visits.why = why,
     }
-    front.patch = None;
     // Std splice, in the root file text, exactly as the single-file path
     // (user spans do not move). A second resolve runs when another file
     // names std source the root file does not: the splice then serves
@@ -1745,6 +1771,9 @@ fn resolved_setup(
     // A large old Ast drops on a side thread in a daemon session. A
     // one-shot session drops it here: its process may fork for an
     // in-memory run, and no other thread may live at the fork (tcc.rs).
+    // The patch base describes the Ast being replaced. (A resolve error
+    // above leaves both in place, so the request after it can patch.)
+    front.patch = None;
     let old_ast = std::mem::replace(&mut front.ast, ast);
     if old_ast.exprs.len() > 20_000 && caches.persistent {
         // Nested token trees in the Ast drop recursively; use the
@@ -1844,6 +1873,7 @@ fn resolved_setup(
     let tables = std::sync::Arc::new(tables);
     *visits = Visits {
         path: "resolve",
+        why: visits.why,
         files: map.file_count(),
         nodes: ast_nodes(&front.ast),
         scanned: front.ast.items.len(),
@@ -3051,6 +3081,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         if stats_on() {
             resp.stderr.push_str(&front.last_visits);
         }
+        log_visits(&front.last_visits);
         if req.timings {
             let _ = writeln!(
                 resp.stderr,
@@ -3687,6 +3718,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if stats_on() {
         resp.stderr.push_str(&front.last_visits);
     }
+    log_visits(&front.last_visits);
     if req.timings {
         let kb = units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;
         let _ = writeln!(

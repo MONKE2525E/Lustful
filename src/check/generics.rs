@@ -8457,9 +8457,17 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 reuse.discovery_checked += 1;
                 let (checked, discarded) = crate::check::check_fn(p, fid);
                 let closures_owned = snapshot_closures(&checked).unwrap_or_default();
+                // Each type once, in first-seen order: a body names the
+                // same Adt type at many expressions, and every stored
+                // copy is rebuilt on each discovery replay (driver
+                // session reuse), while `ensure_global_adt_instances`
+                // makes an instance only the first time.
                 let mut adt_tys: Vec<OwnedTy> = Vec::new();
+                let mut seen: crate::intern::FxMap<Ty, ()> = crate::intern::FxMap::default();
                 for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
-                    if let Some(o) = snapshot_ty(&checked.tys, t) {
+                    if seen.insert(t, ()).is_none()
+                        && let Some(o) = snapshot_ty(&checked.tys, t)
+                    {
                         adt_tys.push(o);
                     }
                 }
