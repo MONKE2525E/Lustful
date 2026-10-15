@@ -16293,8 +16293,22 @@ impl<'p> Ctx<'p> {
         // Names bound from here on belong to this one pattern
         // (see the duplicate-name check in `bind_pattern_local`).
         self.pat_marks.push(self.scopes.len());
+        let err_mark = self.errs.len();
         self.pattern_mode(pat, t, BindMode::Move, in_match);
         self.pat_marks.pop();
+        // A literal or const subpattern in a `let` records a
+        // "refutable patterns here" reject while it is checked,
+        // before the whole pattern is known to match every
+        // value (`let (true | false) = b;`). When it does, that
+        // reject is not real: drop it.
+        if !in_match && self.pat_always_matches(pat) {
+            let kept: Vec<Diag> = self
+                .errs
+                .drain(err_mark..)
+                .filter(|d| !(d.code == "L9001" && d.message.starts_with("refutable patterns here")))
+                .collect();
+            self.errs.extend(kept);
+        }
     }
 
     fn pattern_mode(&mut self, pat: PatId, t: Ty, mode: BindMode, in_match: bool) {
@@ -17125,6 +17139,12 @@ impl<'p> Ctx<'p> {
     /// reject a match that Rust accepts (lust is a subset).
     fn exhaustive(&mut self, scrut_ty: Ty, arms: &[ast::Arm], span: Span) {
         let p = self.p;
+        // A scrutinee of an uninhabited type needs no arm at all
+        // (`match v {}` on an empty enum).
+        let scrut_deep = self.deep(scrut_ty);
+        if self.ty_uninhabited(scrut_deep, &[], 0) {
+            return;
+        }
         let pats: Vec<PatId> = arms.iter().filter(|a| a.guard.is_none()).map(|a| a.pat).collect();
         if self.covers(&pats) {
             return;
@@ -17224,25 +17244,15 @@ impl<'p> Ctx<'p> {
     }
 
     /// True when a checked pattern matches every value of its
-    /// type: the syntactic `irrefutable` test, or, for a pattern
-    /// that contains an or-pattern, the exhaustiveness test
-    /// (`A(x) | B(x)` over a two-variant enum always matches, as
-    /// in Rust).
+    /// type: the syntactic `irrefutable` test, or the
+    /// exhaustiveness test (`A(x) | B(x)` over a two-variant
+    /// enum, a range over the whole type, and `Ok(x)` over
+    /// `Result<_, Void>` always match, as in Rust).
     fn pat_always_matches(&self, pat: PatId) -> bool {
         if self.irrefutable(pat) {
             return true;
         }
-        fn has_or(p: &Program, pat: PatId) -> bool {
-            match p.ast.pat(pat) {
-                Pat::Or(_) => true,
-                Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) => elems.iter().any(|&e| has_or(p, e)),
-                Pat::Struct { fields, .. } => fields.iter().any(|&(_, s)| has_or(p, s)),
-                Pat::Slice { prefix, middle, suffix } => prefix.iter().chain(suffix.iter()).chain(middle.iter()).any(|&s| has_or(p, s)),
-                Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => has_or(p, *inner),
-                _ => false,
-            }
-        }
-        has_or(self.p, pat) && self.covers(&[pat])
+        self.covers(&[pat])
     }
 
     /// True when a guarded arm's pattern binds a slice

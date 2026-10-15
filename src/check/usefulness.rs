@@ -29,10 +29,12 @@ type Bound = (u8, u128);
 /// The constructors of a column's type.
 enum Col {
     /// A fixed list of constructors, by index, with each one's field
-    /// count: enum variants, `Option` (`None`, `Some`), `Result` (`Ok`,
-    /// `Err`), `bool` (`false`, `true`), and the one constructor of a
-    /// tuple or struct.
-    Ctors(Vec<usize>),
+    /// count and whether the constructor is empty (a field of an
+    /// uninhabited type, so no value uses it): enum variants,
+    /// `Option` (`None`, `Some`), `Result` (`Ok`, `Err`), `bool`
+    /// (`false`, `true`), and the one constructor of a tuple or
+    /// struct.
+    Ctors(Vec<(usize, bool)>),
     /// Integers or chars: the domain segments and the largest key.
     Ints(Vec<(Bound, Bound)>, u128),
     /// Slices (`None`) or arrays of a known length.
@@ -156,6 +158,52 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True when no value of type `t` exists, as far as
+    /// exhaustiveness can tell: `!`, an enum whose every variant
+    /// has an uninhabited field (or none at all), a struct,
+    /// tuple, or non-empty array with an uninhabited part, and
+    /// `Result` with both sides uninhabited. References, raw
+    /// pointers, and foreign types such as `Box<_>` are never
+    /// uninhabited here, as in rustc. `args` substitutes the
+    /// type parameters of the Adt a field type came from.
+    pub(super) fn ty_uninhabited(&self, t: Ty, args: &[GenericArg], depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match self.kind(t) {
+            TyKind::Never => true,
+            TyKind::Param(p) => match args.get(p.0 as usize).and_then(|g| g.as_ty()) {
+                Some(inner) => self.ty_uninhabited(inner, &[], depth + 1),
+                None => false,
+            },
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.ty_uninhabited(e, args, depth + 1)),
+            TyKind::Array(elem, c) => match self.tys.const_kind(c) {
+                ConstKind::Int(n) => n > 0 && self.ty_uninhabited(elem, args, depth + 1),
+                _ => false,
+            },
+            TyKind::Adt(..) => {
+                if self.tys.option_elem(t).is_some() {
+                    return false;
+                }
+                if let Some((ok, err)) = self.tys.result_args(t) {
+                    return self.ty_uninhabited(ok, args, depth + 1) && self.ty_uninhabited(err, args, depth + 1);
+                }
+                let Some(a) = self.tys.local_adt(t) else { return false };
+                let own: Vec<GenericArg> = match self.tys.adt_parts(t) {
+                    Some((_, aa)) => self.tys.args(aa).to_vec(),
+                    None => Vec::new(),
+                };
+                let adt = self.p.adt(a);
+                if adt.is_enum {
+                    adt.variants.iter().all(|v| v.fields.iter().any(|f| self.ty_uninhabited(f.ty, &own, depth + 1)))
+                } else {
+                    adt.variants[0].fields.iter().any(|f| self.ty_uninhabited(f.ty, &own, depth + 1))
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// The constructors of type `t`, seen through references.
     fn column(&self, t: Ty) -> Col {
         let mut t = self.resolve(t);
@@ -163,9 +211,13 @@ impl<'p> Ctx<'p> {
             t = self.resolve(inner);
         }
         match self.kind(t) {
-            TyKind::Bool => Col::Ctors(vec![0, 0]),
-            TyKind::Unit => Col::Ctors(vec![0]),
-            TyKind::Tuple(ts) => Col::Ctors(vec![self.tys.tys_of(ts).len()]),
+            TyKind::Bool => Col::Ctors(vec![(0, false), (0, false)]),
+            TyKind::Unit => Col::Ctors(vec![(0, false)]),
+            TyKind::Tuple(ts) => {
+                let elems: Vec<Ty> = self.tys.tys_of(ts).to_vec();
+                let empty = elems.iter().any(|&e| self.ty_uninhabited(e, &[], 0));
+                Col::Ctors(vec![(elems.len(), empty)])
+            }
             TyKind::Int(it) => {
                 let max = if it.bits() >= 128 { u128::MAX } else { (1u128 << it.bits()) - 1 };
                 let dom = match it {
@@ -183,10 +235,10 @@ impl<'p> Ctx<'p> {
                 _ => Col::Open,
             },
             TyKind::Adt(..) => {
-                if self.tys.option_elem(t).is_some() {
-                    Col::Ctors(vec![0, 1])
-                } else if self.tys.result_args(t).is_some() {
-                    Col::Ctors(vec![1, 1])
+                if let Some(elem) = self.tys.option_elem(t) {
+                    Col::Ctors(vec![(0, false), (1, self.ty_uninhabited(elem, &[], 0))])
+                } else if let Some((ok, err)) = self.tys.result_args(t) {
+                    Col::Ctors(vec![(1, self.ty_uninhabited(ok, &[], 0)), (1, self.ty_uninhabited(err, &[], 0))])
                 } else if let Some(a) = self.tys.local_adt(t) {
                     // A `#[non_exhaustive]` enum needs a wildcard
                     // outside its defining crate (rustc E0004); std's
@@ -197,7 +249,18 @@ impl<'p> Ctx<'p> {
                     {
                         return Col::Open;
                     }
-                    Col::Ctors(self.p.adt(a).variants.iter().map(|v| v.fields.len()).collect())
+                    let args: Vec<GenericArg> = match self.tys.adt_parts(t) {
+                        Some((_, aa)) => self.tys.args(aa).to_vec(),
+                        None => Vec::new(),
+                    };
+                    Col::Ctors(
+                        self.p
+                            .adt(a)
+                            .variants
+                            .iter()
+                            .map(|v| (v.fields.len(), v.fields.iter().any(|f| self.ty_uninhabited(f.ty, &args, 0))))
+                            .collect(),
+                    )
                 } else {
                     Col::Open
                 }
@@ -237,7 +300,7 @@ impl<'p> Ctx<'p> {
         // A scalar point (bool, integer, or char) as a head.
         let point = |v: Option<i128>| -> Head {
             match (col, v) {
-                (Col::Ctors(c), Some(v @ (0 | 1))) if c.len() == 2 && c[0] == 0 && c[1] == 0 => Head::Ctor(v as u32, Vec::new()),
+                (Col::Ctors(c), Some(v @ (0 | 1))) if c.len() == 2 && c[0].0 == 0 && c[1].0 == 0 => Head::Ctor(v as u32, Vec::new()),
                 (Col::Ints(_, max), Some(v)) => match self.int_key(v, pat) {
                     Some(k) => Head::Range((1, k), next_bound((1, k), *max)),
                     None => Head::Opaque,
@@ -267,7 +330,7 @@ impl<'p> Ctx<'p> {
         };
         let arity = |i: u32| -> Option<usize> {
             match col {
-                Col::Ctors(c) => c.get(i as usize).copied(),
+                Col::Ctors(c) => c.get(i as usize).map(|&(n, _)| n),
                 _ => None,
             }
         };
@@ -358,9 +421,23 @@ impl<'p> Ctx<'p> {
     fn split(&self, col: &Col, heads: &[Head]) -> Option<Vec<Split>> {
         match col {
             Col::Open => None,
-            Col::Ctors(arities) => (0..arities.len() as u32)
-                .map(|i| heads.iter().any(|h| matches!(h, Head::Ctor(j, _) if *j == i)).then_some(Split::Ctor(i, arities[i as usize])))
-                .collect(),
+            Col::Ctors(ctors) => {
+                // An empty constructor matches no value, so it
+                // needs no row and no split (rustc's
+                // `min_exhaustive_patterns`).
+                let mut out = Vec::new();
+                for (i, &(n, empty)) in ctors.iter().enumerate() {
+                    if empty {
+                        continue;
+                    }
+                    let i = i as u32;
+                    if !heads.iter().any(|h| matches!(h, Head::Ctor(j, _) if *j == i)) {
+                        return None;
+                    }
+                    out.push(Split::Ctor(i, n));
+                }
+                Some(out)
+            }
             Col::Ints(dom, _) => {
                 let mut cuts: Vec<Bound> = dom.iter().flat_map(|&(a, b)| [a, b]).collect();
                 for h in heads {
