@@ -11835,28 +11835,34 @@ impl<'p> Ctx<'p> {
                             && let Some(seg) = segs.last()
                             && let ast::GenericArgs::Angle(written) = &seg.args
                         {
-                            let mut types = written.iter().filter_map(|g| match g {
-                                ast::GenericArg::Type(t) => Some(*t),
-                                _ => None,
-                            });
-                            if let Some(t) = types.next() {
-                                elem = Some(self.resolve_written(t));
-                            }
-                            // The second type, when written, is `F`, the
-                            // callable's own type.
-                            f_written = types.next().map(|t| self.resolve_written(t));
-                            if types.next().is_some() {
-                                self.err("L0107", span, "this function takes at most 2 type arguments", "Write `from_fn::<T, N, F>(..)`.");
-                            }
-                            if let Some(e) = written.iter().find_map(|g| match g {
-                                ast::GenericArg::Const(e) => Some(*e),
-                                _ => None,
-                            }) {
-                                let scope = self.body_scope.clone();
-                                match generics::resolve_const_arg(&p.ast, &p.interner, &p.known, &mut self.tys, &scope, e, span) {
-                                    Ok(c) => len_c = Some(c),
-                                    Err(d) => self.errs.push(d),
+                            // By position, as the parameters run
+                            // `T`, `N`, `F`: a `_` at `N` parses as a
+                            // type, so counting types alone miscounts.
+                            let mut pos = 0usize;
+                            for g in written {
+                                match (pos, g) {
+                                    (_, ast::GenericArg::Lifetime(_)) => {
+                                        self.err("L0107", span, "this function takes no lifetime arguments", "Write `from_fn::<T, N, F>(..)`.");
+                                    }
+                                    (0, ast::GenericArg::Type(t)) => elem = Some(self.resolve_written(*t)),
+                                    (1, ast::GenericArg::Const(e)) => {
+                                        let scope = self.body_scope.clone();
+                                        match generics::resolve_const_arg(&p.ast, &p.interner, &p.known, &mut self.tys, &scope, *e, span) {
+                                            Ok(c) => len_c = Some(c),
+                                            Err(d) => self.errs.push(d),
+                                        }
+                                    }
+                                    // A written type at the const slot is
+                                    // the inferred length (`_`).
+                                    (1, ast::GenericArg::Type(t)) => {
+                                        let _ = self.resolve_written(*t);
+                                    }
+                                    (2, ast::GenericArg::Type(t)) => f_written = Some(self.resolve_written(*t)),
+                                    _ => {
+                                        self.err("L0107", span, "this function takes at most 3 generic arguments", "Write `from_fn::<T, N, F>(..)`.");
+                                    }
                                 }
+                                pos += 1;
                             }
                         }
                         if (elem.is_none() || len_c.is_none())

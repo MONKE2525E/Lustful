@@ -2742,50 +2742,6 @@ impl Evaluator {
                 _ => Err(outside_err()),
             };
         }
-        // The carrying forms take two or three arguments and
-        // return a tuple; the wide arithmetic runs on the host
-        // u128, exact at every supported width below 128.
-        if matches!(name, "carrying_add" | "borrowing_sub" | "carrying_mul" | "carrying_mul_add") && !signed && width < 128 {
-            let tup = |cx: &mut C, vals: Vec<ConstValue>, ts: &[Ty]| {
-                let ids = cx.tys().intern_tys(ts);
-                Ok((ConstValue::Aggregate(vals), cx.tys().intern(TyKind::Tuple(ids))))
-            };
-            let y = self.int_arg(cx, env, args.first().copied().ok_or_else(outside_err)?, rt, span)?;
-            let yb = int_bits(y, it);
-            return match name {
-                "carrying_add" | "borrowing_sub" if args.len() == 2 => {
-                    let (cv, _) = self.value(cx, env, args[1], Some(BOOL))?;
-                    let ConstValue::Bool(cin) = cv else { return Err(outside_err()) };
-                    let (r, out) = if name == "carrying_add" {
-                        let full = xb + yb + cin as u128;
-                        (full & mask, full > mask)
-                    } else {
-                        (xb.wrapping_sub(yb).wrapping_sub(cin as u128) & mask, xb < yb + cin as u128)
-                    };
-                    tup(cx, vec![ConstValue::Int(int_from_bits(r, it)), ConstValue::Bool(out)], &[rt, BOOL])
-                }
-                "carrying_mul" if args.len() == 2 => {
-                    let carry = int_bits(self.int_arg(cx, env, args[1], rt, span)?, it);
-                    let full = xb * yb + carry;
-                    tup(
-                        cx,
-                        vec![ConstValue::Int(int_from_bits(full & mask, it)), ConstValue::Int(int_from_bits((full >> width) & mask, it))],
-                        &[rt, rt],
-                    )
-                }
-                "carrying_mul_add" if args.len() == 3 => {
-                    let carry = int_bits(self.int_arg(cx, env, args[1], rt, span)?, it);
-                    let add = int_bits(self.int_arg(cx, env, args[2], rt, span)?, it);
-                    let full = xb * yb + carry + add;
-                    tup(
-                        cx,
-                        vec![ConstValue::Int(int_from_bits(full & mask, it)), ConstValue::Int(int_from_bits((full >> width) & mask, it))],
-                        &[rt, rt],
-                    )
-                }
-                _ => Err(outside_err()),
-            };
-        }
         if args.len() != 1 {
             return Err(outside_err());
         }
