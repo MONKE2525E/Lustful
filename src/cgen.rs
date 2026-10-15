@@ -8081,6 +8081,10 @@ fn glue_def_value(
         | Glue::HashDrop
         | Glue::HashOne => {
             types.extend(hash::glue_hasher(p, g, t));
+            // A glue body that hashes through `Hasher::write` (a
+            // `str` or byte key) declares a `&[u8]` local; its slice
+            // type is in no signature the unit otherwise needs.
+            types.extend([CTy::Slice(Box::new(CTy::Int(crate::ty::IntTy::U8)))]);
             let (sig, body) = hash::glue(p, slots, g, t, &mut need);
             let _ = writeln!(protos, "{sig};");
             let _ = writeln!(defs, "{sig} {{\n{body}}}\n");
