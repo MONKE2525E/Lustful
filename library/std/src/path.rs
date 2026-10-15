@@ -1180,6 +1180,30 @@ impl PartialEq<&OsStr> for PathBuf {
     }
 }
 
+impl PartialEq<Path> for OsStr {
+    fn eq(&self, other: &Path) -> bool {
+        Path::new(self) == other
+    }
+}
+
+impl PartialEq<PathBuf> for OsStr {
+    fn eq(&self, other: &PathBuf) -> bool {
+        Path::new(self) == other.as_path()
+    }
+}
+
+impl PartialEq<Path> for OsString {
+    fn eq(&self, other: &Path) -> bool {
+        Path::new(self) == other
+    }
+}
+
+impl PartialEq<PathBuf> for OsString {
+    fn eq(&self, other: &PathBuf) -> bool {
+        Path::new(self) == other.as_path()
+    }
+}
+
 impl PartialOrd<PathBuf> for Path {
     fn partial_cmp(&self, other: &PathBuf) -> Option<Ordering> {
         Some(self.cmp(other.as_path()))
