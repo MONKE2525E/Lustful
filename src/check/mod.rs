@@ -19686,6 +19686,15 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
     fn is_enum(&self, adt: AdtId) -> bool {
         adt.0 < u32::MAX - 1 && self.cx.p.adt(adt).is_enum
     }
+    fn needs_drop(&self, t: Ty) -> bool {
+        crate::check::collect::needs_drop_const(self.cx.p, &self.cx.tys, t)
+    }
+    fn interior_mut(&self, t: Ty) -> bool {
+        crate::check::collect::interior_mut(self.cx.p, &self.cx.tys, t)
+    }
+    fn ty_text(&self, t: Ty) -> String {
+        crate::check::collect::ty_name(self.cx.p, &self.cx.tys, t)
+    }
     fn named_field_private(&mut self, adt: AdtId, field: Sym) -> bool {
         // A privacy answer inside body const evaluation (a `const`
         // block the checker does not walk) depends on the Adt's

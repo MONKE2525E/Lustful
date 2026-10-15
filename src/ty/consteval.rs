@@ -195,6 +195,22 @@ pub trait ConstCx<'a> {
     fn ne_pat_what(&mut self, _adt: AdtId, _variant: u32, _rest: bool) -> Option<&'static str> {
         None
     }
+    /// True when destroying a value of this type would run a
+    /// destructor (rustc E0493 in a const context). Exact for
+    /// concrete types; unresolved generic types answer false (the
+    /// static const-fn check judges those under template rules).
+    fn needs_drop(&self, _t: Ty) -> bool {
+        false
+    }
+    /// True when values of this type can be mutated through a
+    /// shared reference (rustc E0492 for a promoted temporary).
+    fn interior_mut(&self, _t: Ty) -> bool {
+        false
+    }
+    /// A short display name of a type, for drop diagnostics.
+    fn ty_text(&self, _t: Ty) -> String {
+        "this type".to_string()
+    }
 }
 
 /// Why evaluation left a block early.
@@ -205,7 +221,9 @@ enum Flow {
     Return(TypedValue),
 }
 
-type Env = Vec<(Sym, TypedValue, bool)>;
+/// One local: its name, value, `mut`, and whether it was moved out
+/// (the E0493 drop check reads the last one at scope end).
+type Env = Vec<(Sym, TypedValue, bool, bool)>;
 
 /// The value of a local `e` names (a one-segment path bound in `env`), by
 /// reference.
@@ -214,7 +232,42 @@ fn local_value<'e, 'a, C: ConstCx<'a>>(cx: &C, env: &'e Env, e: ExprId) -> Optio
     if segs.len() != 1 || segs[0].has_args() {
         return None;
     }
-    env.iter().rev().find(|(n, _, _)| *n == segs[0].name).map(|(_, v, _)| v)
+    env.iter().rev().find(|(n, _, _, _)| *n == segs[0].name).map(|(_, v, _, _)| v)
+}
+
+/// True when a pattern looks inside its value (a tuple, struct,
+/// variant, or slice shape), as opposed to binding or comparing
+/// the whole value.
+fn pat_destructures(ast: &Ast, p: PatId) -> bool {
+    match ast.pat(p) {
+        Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Tuple(_) | Pat::Slice { .. } => true,
+        Pat::Or(alts) => alts.iter().any(|&a| pat_destructures(ast, a)),
+        Pat::Ref { inner, .. } | Pat::At { inner, .. } | Pat::Paren(inner) => pat_destructures(ast, *inner),
+        _ => false,
+    }
+}
+
+/// True when a pattern binds its whole value to one name (so a
+/// drop value moves into the binding instead of being destroyed
+/// by the destructuring).
+pub fn pat_is_whole_binding(ast: &Ast, p: PatId) -> bool {
+    match ast.pat(p) {
+        Pat::Binding { by_ref, .. } => !by_ref,
+        Pat::Paren(inner) => pat_is_whole_binding(ast, *inner),
+        Pat::At { inner, by_ref, .. } => !by_ref && (matches!(ast.pat(*inner), Pat::Wild) || pat_is_whole_binding(ast, *inner)),
+        _ => false,
+    }
+}
+
+/// True when `e` reads an existing place instead of making a new
+/// value. The drop check uses it to tell a temporary (dropped at
+/// the end of its statement) from a local (dropped at scope end,
+/// judged there).
+fn is_place_expr(ast: &Ast, e: ExprId) -> bool {
+    matches!(
+        ast.expr(e),
+        Expr::Path(_) | Expr::SelfValue | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Deref(_) | Expr::Index { .. } | Expr::QPath { .. }
+    )
 }
 
 fn outside(span: Span, what: &str) -> Diag {
@@ -592,11 +645,23 @@ pub fn flex_int_expr(ast: &Ast, e: ExprId) -> bool {
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
     check_macro_forms(cx.ast(), e)?;
-    let mut ev = Evaluator { steps: 0, extra_cap: 0, call_depth: 0 };
+    let mut ev = Evaluator { steps: 0, extra_cap: 0, call_depth: 0, move_read: false, ref_drop_temps: Vec::new() };
     let mut env: Env = Vec::new();
+    let span = cx.ast().expr_span(e);
     match ev.expr(cx, &mut env, e, expected)? {
-        Flow::Val(v) => Ok(v),
-        _ => Err(outside(cx.ast().expr_span(e), "control flow out of a const expression")),
+        Flow::Val(v) => {
+            // The final value stands for the item's whole life: a
+            // borrow of a temporary inside it must be promotable
+            // (E0492/E0764), and every borrowed drop temporary the
+            // evaluation made must have ended up in it (else that
+            // temporary was dropped, E0493).
+            check_final_refs(cx, &v.0, v.1, span)?;
+            if ev.ref_drop_temps.len() as u32 > count_ref_drops(cx, &v.0, v.1) {
+                return Err(drop_diag(cx, ev.ref_drop_temps[0], span));
+            }
+            Ok(v)
+        }
+        _ => Err(outside(span, "control flow out of a const expression")),
     }
 }
 
@@ -620,6 +685,14 @@ struct Evaluator {
     /// privacy asks run only at depth 0: a called const fn's body is
     /// written in its own module and checked there.
     call_depth: u32,
+    /// True while evaluating an expression whose value moves into
+    /// its parent (a call argument, an aggregate element, a tail):
+    /// a local read at its leaf is a move (the E0493 check).
+    move_read: bool,
+    /// The types of the drop-type temporaries this evaluation
+    /// borrowed. Each one must end up in the final value, promoted;
+    /// one that does not was dropped at its statement's end.
+    ref_drop_temps: Vec<Ty>,
 }
 
 /// Steps one blob byte grants. A hash loop body (index, xor or
@@ -794,7 +867,7 @@ impl Evaluator {
                 let mut vals = Vec::new();
                 let mut tys = Vec::new();
                 for (i, &el) in elems.iter().enumerate() {
-                    let (v, t) = self.value(cx, env, el, exp.get(i).copied().flatten())?;
+                    let (v, t) = self.value_moved(cx, env, el, exp.get(i).copied().flatten())?;
                     vals.push(v);
                     tys.push(t);
                 }
@@ -809,7 +882,7 @@ impl Evaluator {
                 let mut vals = Vec::new();
                 let mut elem_ty = exp_elem;
                 for &el in elems {
-                    let (v, t) = self.value(cx, env, el, elem_ty)?;
+                    let (v, t) = self.value_moved(cx, env, el, elem_ty)?;
                     elem_ty = Some(t);
                     vals.push(v);
                 }
@@ -826,11 +899,18 @@ impl Evaluator {
                     _ => None,
                 });
                 if n == 0 {
-                    let elem = exp_elem.unwrap_or(ERROR);
+                    // A zero repeat still evaluates its operand once
+                    // and drops it, so a drop operand is E0493 here
+                    // and a local operand is moved in.
+                    let (_, t) = self.value_moved(cx, env, *value, exp_elem)?;
+                    if cx.needs_drop(t) {
+                        return Err(drop_diag(cx, t, span));
+                    }
+                    let elem = exp_elem.unwrap_or(t);
                     let c = cx.tys().intern_const(super::ConstKind::Int(0));
                     (ConstValue::Aggregate(Vec::new()), cx.tys().intern(TyKind::Array(elem, c)))
                 } else {
-                    let (v, t) = self.value(cx, env, *value, exp_elem)?;
+                    let (v, t) = self.value_moved(cx, env, *value, exp_elem)?;
                     let c = cx.tys().intern_const(super::ConstKind::Int(n as u128));
                     (ConstValue::Repeat(Box::new(v), n), cx.tys().intern(TyKind::Array(t, c)))
                 }
@@ -936,7 +1016,14 @@ impl Evaluator {
                     TyKind::Ref(_, _, inner) if !matches!(cx.tys_ref().kind(inner), TyKind::Slice(_)) => Some(inner),
                     _ => None,
                 });
-                let (v, t) = self.value(cx, env, *expr, inner_expected)?;
+                let (v, t) = self.value_place(cx, env, *expr, inner_expected)?;
+                // A borrow of a drop temporary must be promoted into
+                // the item's final value; counted here, judged in
+                // `eval` (a borrow of a place drops with its owner,
+                // judged at that scope's end instead).
+                if !is_place_expr(cx.ast(), *expr) && cx.needs_drop(t) {
+                    self.ref_drop_temps.push(t);
+                }
                 if let ConstValue::Str(_) = v {
                     (v, t)
                 } else if let Some(et) = expected
@@ -952,7 +1039,7 @@ impl Evaluator {
                 }
             }
             Expr::Deref(inner) => {
-                let (v, t) = self.value(cx, env, *inner, None)?;
+                let (v, t) = self.value_place(cx, env, *inner, None)?;
                 match v {
                     ConstValue::Ref(inner_v) => {
                         let inner_ty = match cx.tys_ref().kind(t) {
@@ -966,7 +1053,8 @@ impl Evaluator {
                 }
             }
             Expr::Field { base, name } => {
-                let (v, t) = self.value(cx, env, *base, None)?;
+                let (v, t) = self.value_place(cx, env, *base, None)?;
+                self.check_temp_drop(cx, *base, t, span)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 let Some(adt) = cx.tys_ref().local_adt(t) else { return Err(outside(span, "this field access")) };
                 self.check_named_field(cx, adt, *name, span)?;
@@ -980,7 +1068,8 @@ impl Evaluator {
                 }
             }
             Expr::TupleField { base, index } => {
-                let (v, t) = self.value(cx, env, *base, None)?;
+                let (v, t) = self.value_place(cx, env, *base, None)?;
+                self.check_temp_drop(cx, *base, t, span)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 if !matches!(cx.tys_ref().kind(t), TyKind::Tuple(_))
                     && let Some(adt) = cx.tys_ref().local_adt(t)
@@ -1009,7 +1098,8 @@ impl Evaluator {
                 if let Some(got) = self.index_local(cx, env, *base, *index, span)? {
                     return Ok(Flow::Val(got));
                 }
-                let (v, t) = self.value(cx, env, *base, None)?;
+                let (v, t) = self.value_place(cx, env, *base, None)?;
+                self.check_temp_drop(cx, *base, t, span)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 let (iv, _) = self.value(cx, env, *index, Some(USIZE))?;
                 let ConstValue::Int(i) = iv else { return Err(outside(span, "this index")) };
@@ -1077,14 +1167,14 @@ impl Evaluator {
                     let Some(i) = field_defs.iter().position(|(n, _)| *n == fname) else {
                         return Err(outside(span, "this struct literal"));
                     };
-                    let (v, vt) = self.value(cx, env, fe, Some(field_defs[i].1))?;
+                    let (v, vt) = self.value_moved(cx, env, fe, Some(field_defs[i].1))?;
                     if !const_ty_compatible(cx.tys_ref(), vt, field_defs[i].1) {
                         return Err(const_ty_mismatch(cx.ast().expr_span(fe), "this struct literal field"));
                     }
                     vals[i] = Some(v);
                 }
                 if let Some(u) = update {
-                    let (bv, _) = self.value(cx, env, *u, Some(ty))?;
+                    let (bv, _) = self.value_moved(cx, env, *u, Some(ty))?;
                     let bvals = match bv {
                         ConstValue::Aggregate(bvals) => Some(bvals),
                         ConstValue::Variant(_, bvals) => Some(bvals),
@@ -1172,12 +1262,18 @@ impl Evaluator {
                 // the then block only.
                 if let Expr::Let { pat, scrut } = cx.ast().expr(*cond) {
                     let (pat, scrut) = (*pat, *scrut);
-                    let (sv, st) = self.value(cx, env, scrut, None)?;
+                    let (sv, st) = self.value_moved(cx, env, scrut, None)?;
+                    if cx.needs_drop(st) && pat_destructures(cx.ast(), pat) {
+                        return Err(drop_diag(cx, st, span));
+                    }
                     let mut binds = Vec::new();
                     if self.match_pat(cx, env, pat, &sv, st, true, &mut binds)? {
                         let saved = env.len();
                         env.extend(binds);
                         let r = self.block(cx, env, *then, expected);
+                        if r.is_ok() {
+                            self.check_scope_drops(cx, env, saved, span)?;
+                        }
                         env.truncate(saved);
                         return r;
                     }
@@ -1206,7 +1302,10 @@ impl Evaluator {
                     let saved = env.len();
                     let go = if let Expr::Let { pat, scrut } = cx.ast().expr(*cond) {
                         let (pat, scrut) = (*pat, *scrut);
-                        let (sv, st) = self.value(cx, env, scrut, None)?;
+                        let (sv, st) = self.value_moved(cx, env, scrut, None)?;
+                        if cx.needs_drop(st) && pat_destructures(cx.ast(), pat) {
+                            return Err(drop_diag(cx, st, span));
+                        }
                         let mut binds = Vec::new();
                         let m = self.match_pat(cx, env, pat, &sv, st, true, &mut binds)?;
                         if m {
@@ -1223,6 +1322,9 @@ impl Evaluator {
                         break;
                     }
                     let flow = self.block(cx, env, *body, Some(UNIT));
+                    if flow.is_ok() {
+                        self.check_scope_drops(cx, env, saved, span)?;
+                    }
                     env.truncate(saved);
                     match flow? {
                         Flow::Val(_) => {}
@@ -1246,7 +1348,7 @@ impl Evaluator {
             },
             Expr::Break { label, value } => {
                 let v = match value {
-                    Some(v) => Some(self.value(cx, env, *v, None)?),
+                    Some(v) => Some(self.value_moved(cx, env, *v, None)?),
                     None => None,
                 };
                 return Ok(Flow::Break(v, label.map(|l| l.name)));
@@ -1254,13 +1356,13 @@ impl Evaluator {
             Expr::Continue(label) => return Ok(Flow::Continue(label.map(|l| l.name))),
             Expr::Return(v) => {
                 let v = match v {
-                    Some(v) => self.value(cx, env, *v, None)?,
+                    Some(v) => self.value_moved(cx, env, *v, None)?,
                     None => (ConstValue::Unit, UNIT),
                 };
                 return Ok(Flow::Return(v));
             }
             Expr::Assign { lhs, rhs } => {
-                let (v, _) = self.value(cx, env, *rhs, None)?;
+                let (v, _) = self.value_moved(cx, env, *rhs, None)?;
                 self.assign_place(cx, env, *lhs, v, span)?;
                 (ConstValue::Unit, UNIT)
             }
@@ -1281,6 +1383,48 @@ impl Evaluator {
             _ => return Err(outside(span, "this expression")),
         };
         Ok(Flow::Val(v))
+    }
+
+    /// Evaluates an expression whose value moves into its parent
+    /// (a call argument, an aggregate element, a `let` initializer):
+    /// a local read inside it marks that local moved.
+    fn value_moved<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
+        let prev = self.move_read;
+        self.move_read = true;
+        let r = self.value(cx, env, e, expected);
+        self.move_read = prev;
+        r
+    }
+
+    /// Evaluates a place read (a field or index base, a borrow's
+    /// operand): never a move, whatever the parent does.
+    fn value_place<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
+        let prev = self.move_read;
+        self.move_read = false;
+        let r = self.value(cx, env, e, expected);
+        self.move_read = prev;
+        r
+    }
+
+    /// The E0493 check at a scope's end: a local of a drop type
+    /// that was not moved out is destroyed here.
+    fn check_scope_drops<'a, C: ConstCx<'a>>(&self, cx: &C, env: &Env, saved: usize, span: Span) -> Result<(), Diag> {
+        for (_, v, _, moved) in &env[saved..] {
+            if !moved && cx.needs_drop(v.1) {
+                return Err(drop_diag(cx, v.1, span));
+            }
+        }
+        Ok(())
+    }
+
+    /// The E0493 check for a projected or borrowed temporary: a
+    /// new value of a drop type used as a field, index, or method
+    /// base is destroyed when its statement ends.
+    fn check_temp_drop<'a, C: ConstCx<'a>>(&self, cx: &C, base: ExprId, base_ty: Ty, span: Span) -> Result<(), Diag> {
+        if !is_place_expr(cx.ast(), base) && cx.needs_drop(base_ty) {
+            return Err(drop_diag(cx, base_ty, span));
+        }
+        Ok(())
     }
 
     /// Evaluates to a plain value (any control-flow escape is an error here).
@@ -1314,23 +1458,38 @@ impl Evaluator {
                 ast::Stmt::Let { pat, ty, init, els, .. } => {
                     let Some(init) = init else { return Err(outside(cx.ast().pat_span(*pat), "an uninitialized binding")) };
                     let exp = ty.map(|t| cx.resolve_ty(t));
-                    let v = self.value(cx, env, *init, exp)?;
+                    let v = self.value_moved(cx, env, *init, exp)?;
+                    // A drop value that is not bound whole is
+                    // destroyed by the binding itself: a `_` pattern
+                    // drops it at once, and a destructuring pattern
+                    // drops what it does not move out (E0493).
+                    if cx.needs_drop(v.1) && !pat_is_whole_binding(cx.ast(), *pat) {
+                        return Err(drop_diag(cx, v.1, cx.ast().pat_span(*pat)));
+                    }
                     let mut binds = Vec::new();
                     if !self.match_pat(cx, env, *pat, &v.0.clone(), v.1, true, &mut binds)? {
                         // A let-else runs its (diverging) else block
                         // instead; its flow is the block's flow.
                         if let Some(els_b) = els {
-                            let flow = self.block(cx, env, *els_b, None)?;
+                            let flow = self.block(cx, env, *els_b, None);
+                            self.check_scope_drops(cx, env, saved, cx.ast().pat_span(*pat))?;
                             env.truncate(saved);
-                            return Ok(flow);
+                            return flow;
                         }
                         return Err(outside(cx.ast().pat_span(*pat), "a refutable pattern"));
                     }
                     env.extend(binds);
                 }
                 ast::Stmt::Expr { expr, .. } => match self.expr(cx, env, *expr, None)? {
-                    Flow::Val(_) => {}
+                    // A statement value of a drop type is destroyed
+                    // at the end of the statement (E0493).
+                    Flow::Val(v) => {
+                        if cx.needs_drop(v.1) {
+                            return Err(drop_diag(cx, v.1, cx.ast().expr_span(*expr)));
+                        }
+                    }
                     other => {
+                        self.check_scope_drops(cx, env, saved, cx.ast().expr_span(*expr))?;
                         env.truncate(saved);
                         return Ok(other);
                     }
@@ -1341,14 +1500,23 @@ impl Evaluator {
             }
         }
         if let Some(tail) = block.tail {
-            match self.expr(cx, env, tail, expected)? {
+            // The tail value moves out of the block; its own drop
+            // is judged by the block's parent, the locals it leaves
+            // behind by the scope check below.
+            let prev = self.move_read;
+            self.move_read = true;
+            let tail_flow = self.expr(cx, env, tail, expected);
+            self.move_read = prev;
+            match tail_flow? {
                 Flow::Val(v) => out = v,
                 other => {
+                    self.check_scope_drops(cx, env, saved, cx.ast().expr_span(tail))?;
                     env.truncate(saved);
                     return Ok(other);
                 }
             }
         }
+        self.check_scope_drops(cx, env, saved, block.span)?;
         env.truncate(saved);
         Ok(Flow::Val(out))
     }
@@ -1363,8 +1531,11 @@ impl Evaluator {
     ) -> Result<TypedValue, Diag> {
         if segs.len() == 1 {
             let name = segs[0].name;
-            if let Some((_, v, _)) = env.iter().rev().find(|(n, _, _)| *n == name) {
-                return Ok(v.clone());
+            if let Some(slot) = env.iter_mut().rev().find(|(n, _, _, _)| *n == name) {
+                if self.move_read {
+                    slot.3 = true;
+                }
+                return Ok(slot.1.clone());
             }
             if let Some(v) = cx.const_item(name, span) {
                 return Ok(v);
@@ -1876,7 +2047,7 @@ impl Evaluator {
         // to an item of the same name instead.
         if let Expr::Path(segs) = cx.ast().expr(callee)
             && segs.len() == 1
-            && env.iter().any(|(n, _, _)| *n == segs[0].name)
+            && env.iter().any(|(n, _, _, _)| *n == segs[0].name)
         {
             return Err(outside(span, "a call through a fn pointer"));
         }
@@ -2014,7 +2185,7 @@ impl Evaluator {
                     };
                     Some(if variant == 0 { ok } else { err })
                 };
-                let (v, vt) = self.value(cx, env, *a, want)?;
+                let (v, vt) = self.value_moved(cx, env, *a, want)?;
                 if let Some(want) = want
                     && !const_ty_compatible(cx.tys_ref(), vt, want)
                 {
@@ -2086,7 +2257,7 @@ impl Evaluator {
                 let mut vals = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
                     let want = fields.get(i).copied();
-                    let (v, vt) = self.value(cx, env, a, want)?;
+                    let (v, vt) = self.value_moved(cx, env, a, want)?;
                     if let Some(want) = want
                         && !const_ty_compatible(cx.tys_ref(), vt, want)
                     {
@@ -2124,7 +2295,7 @@ impl Evaluator {
                 for (i, &a) in args.iter().enumerate() {
                     let want = body.param_tys.get(i).copied();
                     let want_now = if generic { want.map(|w| subst_binds(cx.tys(), w, &binds)) } else { want };
-                    let (v0, vt) = self.value(cx, env, a, want_now)?;
+                    let (v0, vt) = self.value_moved(cx, env, a, want_now)?;
                     if let Some(want) = want {
                         let ok = if generic { bind_params(cx.tys(), want, vt, &mut binds) } else { const_ty_compatible(cx.tys_ref(), vt, want) };
                         if !ok {
@@ -2156,6 +2327,12 @@ impl Evaluator {
                     let (name, mutable, pat) = body.params[i];
                     match pat {
                         Some(pat) => {
+                            // Destructuring a drop parameter destroys
+                            // what it does not move out (E0493).
+                            if cx.needs_drop(v.1) && !pat_is_whole_binding(cx.ast(), pat) {
+                                bind_err = Some(drop_diag(cx, v.1, span));
+                                break;
+                            }
                             let mut binds = Vec::new();
                             match self.match_pat(cx, &mut fenv, pat, &v.0.clone(), v.1, true, &mut binds) {
                                 Ok(true) => fenv.extend(binds),
@@ -2169,7 +2346,7 @@ impl Evaluator {
                                 }
                             }
                         }
-                        None => fenv.push((name, v, mutable)),
+                        None => fenv.push((name, v, mutable, false)),
                     }
                 }
                 // Every type arg must be known, and the lazy
@@ -2211,6 +2388,11 @@ impl Evaluator {
                 };
                 cx.exit_const_fn();
                 self.call_depth -= 1;
+                // A parameter of a drop type that the body did not
+                // move out is destroyed by the call (E0493).
+                if flow.is_ok() {
+                    self.check_scope_drops(cx, &fenv, 0, span)?;
+                }
                 match flow? {
                     // The fn body is type-checked as a fn; its value has the
                     // declared return type here. A wide (unsuffixed-literal)
@@ -2366,7 +2548,8 @@ impl Evaluator {
         {
             return Ok((ConstValue::Int(n as i128), USIZE));
         }
-        let (rv, rt) = self.value(cx, env, recv_e, None)?;
+        let (rv, rt) = self.value_place(cx, env, recv_e, None)?;
+        self.check_temp_drop(cx, recv_e, rt, span)?;
         // An inherent integer method on an unpinned receiver is
         // ambiguous (rustc E0689), even where the surroundings
         // would pin the type later: the body checker reports the
@@ -3279,7 +3462,12 @@ impl Evaluator {
         expected: Option<Ty>,
         span: Span,
     ) -> Result<Flow, Diag> {
-        let (sv, st) = self.value(cx, env, scrut, None)?;
+        let (sv, st) = self.value_moved(cx, env, scrut, None)?;
+        // Destructuring a drop scrutinee destroys what the pattern
+        // does not move out (E0493), even out of a place.
+        if cx.needs_drop(st) && arms.iter().any(|arm| pat_destructures(cx.ast(), arm.pat)) {
+            return Err(drop_diag(cx, st, span));
+        }
         for arm in arms {
             let mut binds = Vec::new();
             if self.match_pat(cx, env, arm.pat, &sv, st, true, &mut binds)? {
@@ -3293,7 +3481,13 @@ impl Evaluator {
                     }
                 };
                 if guard_ok {
+                    let prev = self.move_read;
+                    self.move_read = true;
                     let r = self.expr(cx, env, arm.body, expected);
+                    self.move_read = prev;
+                    if r.is_ok() {
+                        self.check_scope_drops(cx, env, saved, span)?;
+                    }
                     env.truncate(saved);
                     return r;
                 }
@@ -3314,7 +3508,7 @@ impl Evaluator {
         v: &ConstValue,
         t: Ty,
         _in_match: bool,
-        binds: &mut Vec<(Sym, TypedValue, bool)>,
+        binds: &mut Vec<(Sym, TypedValue, bool, bool)>,
     ) -> Result<bool, Diag> {
         let span = cx.ast().pat_span(pat);
         match cx.ast().pat(pat) {
@@ -3326,7 +3520,7 @@ impl Evaluator {
                 // A plain name that resolves to a const item compares
                 // against it, as the checker resolves it; a unit
                 // struct name matches its only value.
-                if !mutable && !env.iter().any(|(n, _, _)| n == name) {
+                if !mutable && !env.iter().any(|(n, _, _, _)| n == name) {
                     if let Some((cv, _)) = cx.const_item(*name, span) {
                         return Ok(values_eq(v, &cv));
                     }
@@ -3336,7 +3530,7 @@ impl Evaluator {
                             || matches!(v, ConstValue::Aggregate(_)));
                     }
                 }
-                binds.push((*name, (v.clone(), t), *mutable));
+                binds.push((*name, (v.clone(), t), *mutable, false));
                 Ok(true)
             }
             Pat::At { name, mutable, by_ref, inner } => {
@@ -3344,7 +3538,7 @@ impl Evaluator {
                     return Err(outside(span, "`ref` bindings in const"));
                 }
                 if self.match_pat(cx, env, *inner, v, t, _in_match, binds)? {
-                    binds.push((*name, (v.clone(), t), *mutable));
+                    binds.push((*name, (v.clone(), t), *mutable, false));
                     Ok(true)
                 } else {
                     Ok(false)
@@ -3703,7 +3897,7 @@ impl Evaluator {
     /// The type of a place expression, for field assignment.
     fn place_ty<'a, C: ConstCx<'a>>(&self, cx: &C, env: &Env, e: ExprId) -> Option<Ty> {
         match cx.ast().expr(e) {
-            Expr::Path(segs) if segs.len() == 1 => env.iter().rev().find(|(n, _, _)| *n == segs[0].name).map(|(_, v, _)| v.1),
+            Expr::Path(segs) if segs.len() == 1 => env.iter().rev().find(|(n, _, _, _)| *n == segs[0].name).map(|(_, v, _, _)| v.1),
             Expr::Field { base, name } => {
                 let bt = self.place_ty(cx, env, *base)?;
                 let bt = match cx.tys_ref().kind(bt) {
@@ -3782,15 +3976,28 @@ impl Evaluator {
     /// Assigns `v` into the place `e` denotes in the environment.
     fn assign_place<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId, v: ConstValue, span: Span) -> Result<(), Diag> {
         self.check_place_fields(cx, env, e, span)?;
+        // Assigning over a live drop value destroys the old one
+        // (E0493). A whole local that was moved out holds nothing,
+        // so it alone may be assigned over.
+        if !matches!(cx.ast().expr(e), Expr::Path(segs) if segs.len() == 1)
+            && let Some(pt) = self.place_ty(cx, env, e)
+            && cx.needs_drop(pt)
+        {
+            return Err(drop_diag(cx, pt, span));
+        }
         match cx.ast().expr(e) {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;
-                match env.iter_mut().rev().find(|(n, _, _)| *n == name) {
+                match env.iter_mut().rev().find(|(n, _, _, _)| *n == name) {
                     Some(slot) => {
                         if !slot.2 {
                             return Err(outside(span, "assignment to an immutable binding"));
                         }
+                        if !slot.3 && cx.needs_drop(slot.1.1) {
+                            return Err(drop_diag(cx, slot.1.1, span));
+                        }
                         slot.1.0 = v;
+                        slot.3 = false;
                         Ok(())
                     }
                     None => Err(outside(span, "this assignment")),
@@ -3891,7 +4098,7 @@ impl Evaluator {
         match cx.ast().expr(e) {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;
-                env.iter_mut().rev().find(|(n, _, _)| *n == name).map(|slot| &mut slot.1.0).ok_or_else(|| outside(span, "this assignment"))
+                env.iter_mut().rev().find(|(n, _, _, _)| *n == name).map(|slot| &mut slot.1.0).ok_or_else(|| outside(span, "this assignment"))
             }
             Expr::TupleField { base, index } => {
                 let slot = self.place_slot(cx, env, *base, span)?;
@@ -4322,6 +4529,181 @@ fn check_macro_forms(ast: &Ast, e: ExprId) -> Result<(), Diag> {
         | Expr::MacroCall(_)
         | Expr::OffsetOf { .. }
         | Expr::Closure { .. } => Ok(()),
+    }
+}
+
+/// The E0493 error for a destructor that would run during const
+/// evaluation.
+fn drop_diag<'a, C: ConstCx<'a>>(cx: &C, t: Ty, span: Span) -> Diag {
+    Diag::new(
+        C_NONCONST,
+        span,
+        format!("destructor of `{}` cannot be evaluated at compile-time", cx.ty_text(t)),
+        "Move the value out of the const context whole, or use a type without a destructor there.",
+    )
+}
+
+/// The field types to walk a const aggregate or variant value at
+/// type `t`: a tuple's elements, an array's element repeated, an
+/// Adt variant's fields read through the instance's args, or an
+/// `Option`/`Result` payload. None when the value's parts have no
+/// known types here (a builtin aggregate the walk cannot see into).
+fn part_tys<'a, C: ConstCx<'a>>(cx: &mut C, t: Ty, variant: u32, n: usize) -> Option<Vec<Ty>> {
+    let tys = cx.tys_ref();
+    match tys.kind(t) {
+        TyKind::Tuple(ts) => Some(tys.tys_of(ts).to_vec()),
+        TyKind::Array(elem, _) => Some(vec![elem; n]),
+        _ => {
+            if let Some(elem) = tys.option_elem(t) {
+                return Some(vec![elem; n]);
+            }
+            if let Some((ok, err)) = tys.result_args(t) {
+                return Some(vec![if variant == 0 { ok } else { err }; n]);
+            }
+            let adt = tys.local_adt(t)?;
+            let args: Vec<super::GenericArg> = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+            let fields = cx.variant_fields(adt, variant);
+            Some(fields.iter().map(|f| if args.is_empty() { f.1 } else { super::subst(cx.tys(), f.1, &args) }).collect())
+        }
+    }
+}
+
+/// The E0492/E0764 check on a const item's final value: a borrow
+/// of a temporary inside it is promoted to `'static`, which rustc
+/// allows only for a shared borrow of a type without interior
+/// mutability. A borrow of a static (`StaticRef`) is not a
+/// temporary and always passes.
+fn check_final_refs<'a, C: ConstCx<'a>>(cx: &mut C, v: &ConstValue, t: Ty, span: Span) -> Result<(), Diag> {
+    match v {
+        ConstValue::Ref(inner) => {
+            let (mutable, inner_ty) = match cx.tys_ref().kind(t) {
+                TyKind::Ref(_, m, it) => (m.is_mut(), it),
+                _ => return Ok(()),
+            };
+            if mutable {
+                return Err(Diag::new(
+                    C_NONCONST,
+                    span,
+                    "mutable borrows of temporaries that have their lifetime extended until the end of the program are not allowed",
+                    "Borrow a `static` item instead, or make the item's type the value itself.",
+                ));
+            }
+            if cx.interior_mut(inner_ty) {
+                return Err(Diag::new(
+                    C_NONCONST,
+                    span,
+                    "interior mutable shared borrows of temporaries that have their lifetime extended until the end of the program are not allowed",
+                    "Put the value in a `static` item and borrow that instead.",
+                ));
+            }
+            check_final_refs(cx, inner, inner_ty, span)
+        }
+        ConstValue::Aggregate(..) | ConstValue::Repeat(..) | ConstValue::Bytes(_)
+            if matches!(cx.tys_ref().kind(t), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_))) =>
+        {
+            // A slice over a promoted backing array: the backing is
+            // the temporary the borrow keeps alive.
+            let (mutable, elem) = match cx.tys_ref().kind(t) {
+                TyKind::Ref(_, m, s) => match cx.tys_ref().kind(s) {
+                    TyKind::Slice(elem) => (m.is_mut(), elem),
+                    _ => return Ok(()),
+                },
+                _ => return Ok(()),
+            };
+            if mutable {
+                return Err(Diag::new(
+                    C_NONCONST,
+                    span,
+                    "mutable borrows of temporaries that have their lifetime extended until the end of the program are not allowed",
+                    "Borrow a `static` item instead, or make the item's type the value itself.",
+                ));
+            }
+            if cx.interior_mut(elem) {
+                return Err(Diag::new(
+                    C_NONCONST,
+                    span,
+                    "interior mutable shared borrows of temporaries that have their lifetime extended until the end of the program are not allowed",
+                    "Put the value in a `static` item and borrow that instead.",
+                ));
+            }
+            match v {
+                ConstValue::Aggregate(vals) => {
+                    for x in vals {
+                        check_final_refs(cx, x, elem, span)?;
+                    }
+                    Ok(())
+                }
+                ConstValue::Repeat(x, _) => check_final_refs(cx, x, elem, span),
+                _ => Ok(()),
+            }
+        }
+        ConstValue::Aggregate(vals) => match part_tys(cx, t, 0, vals.len()) {
+            Some(ftys) => {
+                for (x, ft) in vals.iter().zip(ftys) {
+                    check_final_refs(cx, x, ft, span)?;
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        },
+        ConstValue::Variant(variant, vals) => match part_tys(cx, t, *variant, vals.len()) {
+            Some(ftys) => {
+                for (x, ft) in vals.iter().zip(ftys) {
+                    check_final_refs(cx, x, ft, span)?;
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        },
+        ConstValue::Repeat(x, _) => match cx.tys_ref().kind(t) {
+            TyKind::Array(elem, _) => check_final_refs(cx, x, elem, span),
+            _ => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// How many borrows of drop-type temporaries a final const value
+/// holds, counted the way `Evaluator::ref_drop_temps` counts the
+/// borrows an evaluation made: one per promoted temporary, a
+/// repeated element once.
+fn count_ref_drops<'a, C: ConstCx<'a>>(cx: &mut C, v: &ConstValue, t: Ty) -> u32 {
+    match v {
+        ConstValue::Ref(inner) => match cx.tys_ref().kind(t) {
+            TyKind::Ref(_, _, it) => u32::from(cx.needs_drop(it)) + count_ref_drops(cx, inner, it),
+            _ => 0,
+        },
+        ConstValue::Aggregate(..) | ConstValue::Repeat(..) | ConstValue::Bytes(_)
+            if matches!(cx.tys_ref().kind(t), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_))) =>
+        {
+            let elem = match cx.tys_ref().kind(t) {
+                TyKind::Ref(_, _, s) => match cx.tys_ref().kind(s) {
+                    TyKind::Slice(elem) => elem,
+                    _ => return 0,
+                },
+                _ => return 0,
+            };
+            let backing = u32::from(cx.needs_drop(elem));
+            backing
+                + match v {
+                    ConstValue::Aggregate(vals) => vals.iter().map(|x| count_ref_drops(cx, x, elem)).sum(),
+                    ConstValue::Repeat(x, _) => count_ref_drops(cx, x, elem),
+                    _ => 0,
+                }
+        }
+        ConstValue::Aggregate(vals) => match part_tys(cx, t, 0, vals.len()) {
+            Some(ftys) => vals.iter().zip(ftys).map(|(x, ft)| count_ref_drops(cx, x, ft)).sum(),
+            None => 0,
+        },
+        ConstValue::Variant(variant, vals) => match part_tys(cx, t, *variant, vals.len()) {
+            Some(ftys) => vals.iter().zip(ftys).map(|(x, ft)| count_ref_drops(cx, x, ft)).sum(),
+            None => 0,
+        },
+        ConstValue::Repeat(x, _) => match cx.tys_ref().kind(t) {
+            TyKind::Array(elem, _) => count_ref_drops(cx, x, elem),
+            _ => 0,
+        },
+        _ => 0,
     }
 }
 

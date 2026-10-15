@@ -273,6 +273,11 @@ pub struct Program {
     /// the sibling items its body may name.
     pub fn_siblings: HashMap<LocalDefId, Vec<u32>>,
     pub type_names: HashMap<Sym, AdtId>,
+    /// Adts with a written `Drop` impl, by written name. Const items
+    /// evaluate before the impl index and `gx.drop_methods` exist;
+    /// the const evaluator's drop check (`needs_drop_const`) reads
+    /// this set instead. Filled in `collect` before const items run.
+    pub drop_adts: std::collections::HashSet<AdtId>,
     /// Non-generic type aliases by (flat) name, fully resolved.
     pub aliases: HashMap<Sym, Ty>,
     pub fn_names: HashMap<Sym, LocalDefId>,
@@ -2540,6 +2545,7 @@ pub fn collect_reuse(
         scope_of_stmt: HashMap::default(),
         fn_siblings: HashMap::default(),
         type_names: HashMap::default(),
+        drop_adts: Default::default(),
         aliases: HashMap::default(),
         fn_names: HashMap::default(),
         methods: HashMap::default(),
@@ -4341,6 +4347,33 @@ pub fn collect_reuse(
             }
         }
     }
+    // Adts with a written `Drop` impl, for the const evaluator's
+    // drop check: it runs next, before the impl index exists, so
+    // the scan reads the written impl heads by name (a same-named
+    // Adt in another module is counted too; the check only ever
+    // over-rejects a const drop, never miscompiles).
+    for item in &ast.items {
+        let ItemKind::Impl(imp) = &item.kind else { continue };
+        if imp.is_negative {
+            continue;
+        }
+        let Some(tr) = &imp.trait_ref else { continue };
+        if tr.path.last().is_none_or(|s| interner.get(s.name) != "Drop") {
+            continue;
+        }
+        let TyExpr::Path(segs) = ast.ty(imp.self_ty) else { continue };
+        let Some(name) = segs.last().map(|s| s.name) else { continue };
+        if let Some(&a) = p.type_names.get(&name) {
+            p.drop_adts.insert(a);
+        } else {
+            let text = interner.get(name);
+            for (i, adt) in p.adts.iter().enumerate() {
+                if crate::intern::source_name(interner.get(adt.name)) == text {
+                    p.drop_adts.insert(AdtId(i as u32));
+                }
+            }
+        }
+    }
     // Const and static items: register names first, then evaluate with the
     // bounded evaluator (ARCH 2.13). A failed item keeps a placeholder value
     // so one bad item reports once; collection fails anyway on the error.
@@ -5794,6 +5827,15 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
     fn is_enum(&self, adt: AdtId) -> bool {
         adt.0 < u32::MAX - 1 && self.p.adt(adt).is_enum
     }
+    fn needs_drop(&self, t: Ty) -> bool {
+        needs_drop_const(self.p, &self.p.tys, t)
+    }
+    fn interior_mut(&self, t: Ty) -> bool {
+        interior_mut(self.p, &self.p.tys, t)
+    }
+    fn ty_text(&self, t: Ty) -> String {
+        ty_name(self.p, &self.p.tys, t)
+    }
     fn named_field_private(&mut self, adt: AdtId, field: Sym) -> bool {
         match self.module {
             Some(m) => named_field_is_private(self.p, adt, field, m),
@@ -6966,11 +7008,54 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// True if values of this type own heap memory and need a drop call.
 /// A `Param` or projection type may (rustc's drop check assumes so).
 pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    needs_drop_sub(p, tys, t, &[], false)
+}
+
+/// `needs_drop` for the const evaluator: exact where the type is
+/// concrete (a generic Adt's fields read through its written args),
+/// and false for a type the evaluator cannot resolve (an unbound
+/// `Param`, a projection, an inference var). A generic `const fn`
+/// body is judged by the static const-fn check under template
+/// rules; the evaluator only ever sees concrete calls, and saying
+/// "may drop" there would reject valid const items.
+pub fn needs_drop_const(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    needs_drop_sub(p, tys, t, &[], true)
+}
+
+/// Resolves a written generic argument through the enclosing Adt's
+/// args, for `needs_drop_sub` and `interior_mut_sub`: a direct
+/// `Param(i)` becomes `args[i]`; anything else stays as written
+/// (a `Param` nested deeper keeps the caller's frame index, which
+/// the next Adt's args then resolve the same way).
+fn resolve_arg(tys: &impl TyIntern, t: Ty, args: &[GenericArg]) -> Ty {
     match tys.kind(t) {
-        TyKind::Param(_) | TyKind::Projection(..) => return true,
-        TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| needs_drop(p, tys, e)),
-        TyKind::Closure(_, a) => return closure_fields(tys, a).iter().any(|&e| needs_drop(p, tys, e)),
-        TyKind::Array(e, _) => return needs_drop(p, tys, e),
+        TyKind::Param(i) => args.get(i.0 as usize).and_then(|g| g.as_ty()).unwrap_or(t),
+        _ => t,
+    }
+}
+
+/// The `needs_drop` walk. `args` are the written args of the Adt
+/// whose fields are being read (empty at the top). With `exact`
+/// false this is `needs_drop` exactly: an Adt's fields keep their
+/// template types and an unresolved `Param` may drop. With `exact`
+/// true, fields read through the Adt's args and an unresolved
+/// `Param` or projection does not drop (see `needs_drop_const`).
+fn needs_drop_sub(p: &Program, tys: &impl TyIntern, t: Ty, args: &[GenericArg], exact: bool) -> bool {
+    match tys.kind(t) {
+        TyKind::Param(i) => {
+            return if exact {
+                match args.get(i.0 as usize).and_then(|g| g.as_ty()) {
+                    Some(u) => needs_drop_sub(p, tys, u, &[], exact),
+                    None => false,
+                }
+            } else {
+                true
+            };
+        }
+        TyKind::Projection(..) => return !exact,
+        TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| needs_drop_sub(p, tys, e, args, exact)),
+        TyKind::Closure(_, a) => return closure_fields(tys, a).iter().any(|&e| needs_drop_sub(p, tys, e, args, exact)),
+        TyKind::Array(e, _) => return needs_drop_sub(p, tys, e, args, exact),
         _ => {}
     }
     if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
@@ -6995,20 +7080,20 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             .then(|| tys.adt_first_ty_arg(t))
             .flatten()
     }) {
-        return needs_drop(p, tys, e);
+        return needs_drop_sub(p, tys, e, args, exact);
     }
     if let Some(e) = tys.option_elem(t) {
-        return needs_drop(p, tys, e);
+        return needs_drop_sub(p, tys, e, args, exact);
     }
     if let Some((a, b)) = tys.result_args(t) {
-        return needs_drop(p, tys, a) || needs_drop(p, tys, b);
+        return needs_drop_sub(p, tys, a, args, exact) || needs_drop_sub(p, tys, b, args, exact);
     }
     // The hash tables own their buckets; an Entry its key (W-STD-B).
     if let Some((k, a)) = crate::ty::hash::hash_parts(tys, t) {
         use crate::ty::hash::HashTy;
         return match k {
             HashTy::HashMap | HashTy::HashSet => true,
-            HashTy::Entry => a.first().is_some_and(|&e| needs_drop(p, tys, e)),
+            HashTy::Entry => a.first().is_some_and(|&e| needs_drop_sub(p, tys, e, args, exact)),
             _ => false,
         };
     }
@@ -7026,11 +7111,103 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                 | crate::ty::iter::IterKind::RecvIntoIter
                 | crate::ty::iter::IterKind::VecDrain
                 | crate::ty::iter::IterKind::StringDrain
-        ) || a.iter().any(|&e| needs_drop(p, tys, e));
+        ) || a.iter().any(|&e| needs_drop_sub(p, tys, e, args, exact));
     }
     match tys.local_adt(t) {
         Some(a) => {
-            p.gx.drop_methods.contains_key(&a) || p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty)))
+            if p.gx.drop_methods.contains_key(&a) || (exact && p.drop_adts.contains(&a)) {
+                return true;
+            }
+            if exact {
+                // Read the fields through this instance's written
+                // args, resolved through the enclosing frame first.
+                let own: Vec<GenericArg> = match tys.adt_parts(t) {
+                    Some((_, aargs)) => tys
+                        .args(aargs)
+                        .iter()
+                        .map(|g| match g {
+                            GenericArg::Ty(u) => GenericArg::Ty(resolve_arg(tys, *u, args)),
+                            other => *other,
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop_sub(p, &p.tys, f.ty, &own, exact)))
+            } else {
+                p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop_sub(p, &p.tys, f.ty, &[], exact)))
+            }
+        }
+        None => false,
+    }
+}
+
+/// True if values of this type can be mutated through a shared
+/// reference (they contain an `UnsafeCell`, not behind a pointer):
+/// the E0492 question for a borrow of a temporary that a `const`
+/// or `static` item would promote to `'static`. Heap pointer types
+/// (`Box`, `Vec`, `Rc`) answer by their own cell, never by their
+/// element: the element lives on the heap, not in the promoted
+/// memory. An unresolved `Param` answers false, as in
+/// `needs_drop_const`.
+pub fn interior_mut(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    interior_mut_sub(p, tys, t, &[])
+}
+
+fn interior_mut_sub(p: &Program, tys: &impl TyIntern, t: Ty, args: &[GenericArg]) -> bool {
+    match tys.kind(t) {
+        TyKind::Param(i) => {
+            return match args.get(i.0 as usize).and_then(|g| g.as_ty()) {
+                Some(u) => interior_mut_sub(p, tys, u, &[]),
+                None => false,
+            };
+        }
+        TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| interior_mut_sub(p, tys, e, args)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => return interior_mut_sub(p, tys, e, args),
+        TyKind::Closure(_, a) => return closure_fields(tys, a).iter().any(|&e| interior_mut_sub(p, tys, e, args)),
+        // Behind a reference or pointer the cell is not in this value.
+        TyKind::Ref(..) | TyKind::RawPtr(..) => return false,
+        _ => {}
+    }
+    if tys.cell_elem(t).is_some()
+        || tys.refcell_elem(t).is_some()
+        || tys.lock_elem(t).is_some()
+        || crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::OnceLock)
+    {
+        return true;
+    }
+    if crate::ty::sync::atomic_of(tys, t).is_some() {
+        return true;
+    }
+    if let Some(e) = tys.option_elem(t) {
+        return interior_mut_sub(p, tys, e, args);
+    }
+    if let Some((a, b)) = tys.result_args(t) {
+        return interior_mut_sub(p, tys, a, args) || interior_mut_sub(p, tys, b, args);
+    }
+    match tys.local_adt(t) {
+        Some(a) => {
+            // `UnsafeCell` itself is a shipped-core Adt whose one
+            // field is its element; the name is the marker. The
+            // std once/lazy types are the same: their lust models
+            // hold the value without an `UnsafeCell` field to find.
+            if matches!(
+                crate::intern::source_name(p.interner.get(p.adt(a).name)),
+                "UnsafeCell" | "Once" | "OnceLock" | "OnceCell" | "LazyLock" | "LazyCell"
+            ) {
+                return true;
+            }
+            let own: Vec<GenericArg> = match tys.adt_parts(t) {
+                Some((_, aargs)) => tys
+                    .args(aargs)
+                    .iter()
+                    .map(|g| match g {
+                        GenericArg::Ty(u) => GenericArg::Ty(resolve_arg(tys, *u, args)),
+                        other => *other,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            p.adt(a).variants.iter().any(|v| v.fields.iter().any(|f| interior_mut_sub(p, &p.tys, f.ty, &own)))
         }
         None => false,
     }

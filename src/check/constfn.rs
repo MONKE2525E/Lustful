@@ -339,10 +339,14 @@ impl Walk<'_, '_> {
                     self.pat_bindings(*pat, depth);
                     self.pat_exprs(*pat, depth);
                     if let Some(init) = init {
-                        // The bindings own the initializer's value, so
-                        // its drop is judged by the binding rule, not
-                        // the temporary rule.
-                        self.expr(*init, false, depth, true);
+                        // A whole-value binding owns the initializer's
+                        // value, so its drop is judged by the binding
+                        // rule, not the temporary rule. Any other
+                        // pattern (`_`, a destructuring) destroys what
+                        // it does not move out, so the temporary rule
+                        // judges the initializer.
+                        let held = crate::ty::consteval::pat_is_whole_binding(&self.p.ast, *pat);
+                        self.expr(*init, false, depth, held);
                     }
                     if let Some(els) = els {
                         self.block(*els, false, depth + 1);
