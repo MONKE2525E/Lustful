@@ -1,6 +1,6 @@
-// expect: L0630
-// rustc E0277: `String: Copy` does not hold. The const evaluator has no
-// trait solver, so a bounded generic const fn call is outside it.
+// expect: L0612
+// rustc E0277: `String: Copy` does not hold. A bounded generic const fn
+// call in a static proves its bounds after collect.
 struct W<T>(Option<T>);
 impl<T: Copy> W<T> {
     const fn mk() -> W<T> {

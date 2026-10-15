@@ -1,4 +1,3 @@
-// expect: L0630
 struct P(u32);
 impl P {
     const fn get(self) -> u32 {
