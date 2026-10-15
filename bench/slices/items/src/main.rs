@@ -106,6 +106,25 @@ fn mods(list: &[Item], file: &Path, dir: &Path, inline: bool, out: &mut Vec<Path
     }
 }
 
+/// Name of an item-position macro call: the first identifier of its input after any
+/// attributes and item keywords (`handle!(/// doc\n TypeId)` gives `TypeId`), so prune logs name what the call
+/// defines. `-` when there is none.
+fn call_name(mac: &syn::Macro) -> String {
+    const KEYWORDS: &[&str] = &["pub", "static", "const", "enum", "struct", "fn", "type", "mut", "unsafe", "impl", "trait"];
+    let mut toks = mac.tokens.clone().into_iter().peekable();
+    while let Some(t) = toks.next() {
+        match t {
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == '#' => {
+                toks.next();
+            }
+            proc_macro2::TokenTree::Ident(i) if !KEYWORDS.contains(&i.to_string().as_str()) => return i.to_string(),
+            proc_macro2::TokenTree::Ident(_) | proc_macro2::TokenTree::Group(_) => {}
+            _ => return "-".into(),
+        }
+    }
+    "-".into()
+}
+
 /// First line of an item: its first attribute (doc comments are attributes) or the item.
 fn start(attrs: &[syn::Attribute], item: Span) -> usize {
     attrs.iter().map(|a| a.span().start().line).chain([item.start().line]).min().unwrap()
@@ -130,7 +149,7 @@ fn items(list: &[Item], depth: usize, out: &mut String) {
             Item::Use(u) => (&u.attrs, "use", "-".into()),
             Item::Mod(m) => (&m.attrs, if m.content.is_some() { "mod" } else { "moddecl" }, m.ident.to_string()),
             Item::Impl(i) => (&i.attrs, if i.trait_.is_some() { "traitimpl" } else { "impl" }, "-".into()),
-            Item::Macro(m) => (&m.attrs, "macro", m.ident.as_ref().map(|i| i.to_string()).unwrap_or("-".into())),
+            Item::Macro(m) => (&m.attrs, "macro", m.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| call_name(&m.mac))),
             Item::ExternCrate(e) => (&e.attrs, "extern", e.ident.to_string()),
             Item::ForeignMod(f) => (&f.attrs, "foreign", "-".into()),
             _ => (&[], "other", "-".into()),
