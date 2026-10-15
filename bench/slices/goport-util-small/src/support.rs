@@ -4,14 +4,15 @@
 //! in bench/slices have no dependencies). Changes from the kernel copy: no
 //! `unported!` (the slice has ts-rust's own), and `&IndexMap` iterates
 //! through a named `Iter` type, not a `Map` over a fn pointer type with a
-//! lifetime (lust L0203), and `FxHasher` is std's `DefaultHasher`. Replacements, with the ts-rust pinned version:
+//! lifetime (lust L0203), and `FxHasher::write` reads bytes without
+//! `try_into` on slices. Replacements, with the ts-rust pinned version:
 //!
 //! - `memchr` 2.8: naive byte search, same API and results. Speed does
 //!   not matter for a fixture; positions do, and they match by definition.
-//! - `rustc-hash` 2.1 (`FxHashMap`, `FxHashSet`, `FxBuildHasher`): std's
-//!   `DefaultHasher` over `std::collections` maps (a lust bug workaround;
-//!   see `FxHasher`). Membership behaves as in the real crate; iteration
-//!   order differs from it, but lust and rustc agree on it.
+//! - `rustc-hash` 2.1 (`FxHashMap`, `FxHashSet`, `FxBuildHasher`): the
+//!   FxHash algorithm (rotate-left 5, xor, multiply by the Fx seed) over
+//!   `std::collections` maps. Kernel drivers never print map iteration
+//!   order, so only membership behavior is load-bearing here.
 //! - `indexmap` 2.14 (`IndexMap`, `IndexSet`): insertion-ordered map over
 //!   a `Vec` with linear search. Iteration order matches the real crate
 //!   (insertion order), which the JSON kernel output does depend on.
@@ -98,16 +99,91 @@ pub mod memchr {
     }
 }
 
-/// Stand-in for the `rustc-hash` crate (std maps with a fixed hasher).
+/// Stand-in for the `rustc-hash` crate (FxHash over std maps).
 pub mod rustc_hash {
-    use std::hash::BuildHasher;
+    use std::hash::{BuildHasher, Hasher};
 
-    /// `rustc_hash::FxHasher`. Bench workaround: std's `DefaultHasher` (SipHash with
-    /// fixed keys, so both compilers' binaries agree), not the FxHash algorithm. With a
-    /// user Hasher struct, `lust build` fails in tcc ('A<n>' undeclared: the map's hash
-    /// glue lands in C units without the hasher's typedef; lust bug, reported by
-    /// W-BENCH2). Put the FxHash struct back (git history) when that is fixed.
-    pub type FxHasher = std::hash::DefaultHasher;
+    /// The FxHash seed constant (rustc-hash 2.x).
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+    /// `rustc_hash::FxHasher`: rotate, xor, multiply per chunk.
+    #[derive(Default)]
+    pub struct FxHasher {
+        hash: u64,
+    }
+
+    impl FxHasher {
+        fn add(&mut self, word: u64) {
+            self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
+        }
+    }
+
+    /// Little-endian value of up to 8 bytes.
+    fn le(b: &[u8]) -> u64 {
+        let mut v = 0u64;
+        for (k, x) in b.iter().enumerate() {
+            v |= u64::from(*x) << (8 * k);
+        }
+        v
+    }
+
+    impl Hasher for FxHasher {
+        fn finish(&self) -> u64 {
+            self.hash
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            // Same chunks as the kernel copy (8, 4, 2, 1 bytes, little endian),
+            // read without `try_into` on slices (lust L0104).
+            let mut i = 0;
+            while i + 8 <= bytes.len() {
+                self.add(le(&bytes[i..i + 8]));
+                i += 8;
+            }
+            if i + 4 <= bytes.len() {
+                self.add(le(&bytes[i..i + 4]));
+                i += 4;
+            }
+            if i + 2 <= bytes.len() {
+                self.add(le(&bytes[i..i + 2]));
+                i += 2;
+            }
+            if i < bytes.len() {
+                self.add(u64::from(bytes[i]));
+            }
+        }
+
+        fn write_u8(&mut self, n: u8) {
+            self.add(u64::from(n));
+        }
+        fn write_u16(&mut self, n: u16) {
+            self.add(u64::from(n));
+        }
+        fn write_u32(&mut self, n: u32) {
+            self.add(u64::from(n));
+        }
+        fn write_u64(&mut self, n: u64) {
+            self.add(n);
+        }
+        fn write_usize(&mut self, n: usize) {
+            self.add(n as u64);
+        }
+        fn write_i8(&mut self, n: i8) {
+            self.add(n as u64);
+        }
+        fn write_i16(&mut self, n: i16) {
+            self.add(n as u64);
+        }
+        fn write_i32(&mut self, n: i32) {
+            self.add(n as u64);
+        }
+        fn write_i64(&mut self, n: i64) {
+            self.add(n as u64);
+        }
+        fn write_isize(&mut self, n: isize) {
+            self.add(n as u64);
+        }
+    }
 
     /// `rustc_hash::FxBuildHasher`: a unit struct in the real crate,
     /// passed by value to with_hasher.

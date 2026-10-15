@@ -1,0 +1,986 @@
+//! Port of internal/ipc/conn_async.go (internal/api/conn_async.go before
+//! tsgo#4712).
+//!
+//! PORT: Go handles each incoming request in its own goroutine, and `Call`
+//! waits on a response channel that the `Run` goroutine fills. The API
+//! session and project state live on the dispatch thread, so here `Run`
+//! handles each request and notification inline, and `Call` reads messages
+//! itself until its response arrives. Responses delivered this way keep
+//! their IDs. A request or notification that `Call` reads while it waits is
+//! handled inline at once, as the sync connection does: a client callback
+//! may make a nested API request and wait for its answer before it answers
+//! the call (ts#64299), which Go's goroutines allow. So the responses can
+//! come in a different order than in Go.
+//!
+//! PORT: the reads in `Call` are Go's `Run` reads. When one fails, the read
+//! loop ends there, as Go's `Run` would: `closePendingCalls` sets
+//! `terminal` (tsgo#4712), the call returns it, and a later `run` returns
+//! what Go's `Run` returned. A panic in one of these reads is a panic in
+//! Go's `Run`, which the handler that made the call does not recover: the
+//! deferred function of `Run` closes the pending calls, the call returns
+//! `terminal`, and the panic leaves `run` once that handler returns (Go's
+//! deferred function waits for the handlers).
+
+use crate::ipc::prelude::*;
+
+use crate::frontend::json_ext::{AnyValue, JsonValue};
+use crate::gostd::{GoError, context, errors};
+use crate::ipc::conn::{recovered_value};
+use crate::ipc::protocol::{};
+use crate::ipc::transport::ReadWriteCloser;
+use crate::jsonrpc;
+use std::any::Any;
+use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::Arc;
+use std::time::Instant;
+
+
+// Go: ipc/conn_async.go:20 AsyncConn
+// AsyncConn manages bidirectional JSON-RPC communication with async request handling.
+// Each incoming request is handled in its own goroutine, allowing concurrent processing.
+// This is the standard implementation for LSP-style JSON-RPC protocols.
+
+// Go: ipc/conn_async.go:41 NewAsyncConn
+// NewAsyncConn creates a new async connection with the given transport and handler.
+// It uses JSONRPCProtocol (LSP-style Content-Length framing) by default.
+
+// Go: ipc/conn_async.go:46 NewAsyncConnWithProtocol
+// NewAsyncConnWithProtocol creates a new async connection with a custom protocol.
+
+// PORT: the Go methods are inherent methods; `impl Conn` below forwards to
+// them, so callers need not import `Conn`.
+
+
+
+
+
+
+
+// Go: ipc/conn_async_test.go (tsgo#4712)
+// PORT: Go `net.Pipe` is a `UnixStream` pair. Go runs `Run` and `Call` in
+// goroutines, and each request and notification handler in a goroutine of
+// its own. The port handles them inline (see the file header), so:
+// - `Call` reads its own response. The tests run `run` and `call` in turn
+//   on one thread, and the peer runs on a thread when it must act while
+//   `call` blocks.
+// - A test that waits for a handler while `Run` runs makes the connection
+//   on a thread of its own (the connection is not `Send`), and sends back
+//   the texts of the errors that it asserts on.
+// - A second handler starts only after the first one returns.
+#[cfg(all(test, unix))]
+pub(crate) mod tests {
+    use super::*;
+    use crate::gostd::context;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+    use std::time::Duration;
+
+    // Go: ipc/conn_async_test.go:19 noOpHandler
+    pub(crate) struct NoOpHandler;
+
+    impl Handler for NoOpHandler {
+        fn handle_request(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+            Ok(None)
+        }
+
+        fn handle_notification(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    /// Go `nil` for the `io.ReadWriteCloser` of a connection.
+    // PORT: the Rust transport is always set (see `dispatch`). The protocol
+    // of these tests never uses it, and Go skips `Close` on nil, so `close`
+    // does nothing.
+    pub(crate) struct NilTransport;
+
+    impl ReadWriteCloser for NilTransport {
+        fn read(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("runtime error: invalid memory address or nil pointer dereference")
+        }
+
+        fn write(&self, _buf: &[u8]) -> std::io::Result<usize> {
+            panic!("runtime error: invalid memory address or nil pointer dereference")
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            panic!("runtime error: invalid memory address or nil pointer dereference")
+        }
+
+        fn close(&self) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    /// Go `errors.New("response write failed")`.
+    pub(crate) fn response_write_failed() -> GoError {
+        errors::new("response write failed")
+    }
+
+    /// Go `&ipc.Message{ID: id, Method: method}`.
+    pub(crate) fn message(id: Option<jsonrpc::ID>, method: &str) -> Message {
+        Message {
+            id,
+            method: method.to_string(),
+            ..Default::default()
+        }
+    }
+
+    // Go: ipc/conn_async_test.go:29 queuedProtocol
+    struct QueuedProtocol {
+        messages: Vec<Message>,
+        response_err: Option<GoError>,
+    }
+
+    impl Protocol for QueuedProtocol {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            if self.messages.is_empty() {
+                return Err(errors::EOF.clone());
+            }
+            Ok(self.messages.remove(0))
+        }
+
+        fn write_request(
+            &mut self,
+            _id: Option<&jsonrpc::ID>,
+            _method: &str,
+            _params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+
+        fn write_notification(
+            &mut self,
+            _method: &str,
+            _params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+
+        fn write_response(
+            &mut self,
+            _id: Option<&jsonrpc::ID>,
+            _result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.response_err.clone().map_or(Ok(()), Err)
+        }
+
+        fn write_error(
+            &mut self,
+            _id: Option<&jsonrpc::ID>,
+            _err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            self.response_err.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    // Go: ipc/conn_async_test.go:59 blockingHandler
+    // PORT: Go `started` is a buffered channel. Go `<-h.release` returns when
+    // the test closes `release`; here the test drops the sender, and `recv`
+    // returns.
+    struct BlockingHandler {
+        started: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Handler for BlockingHandler {
+        fn handle_request(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+            self.started.send(()).expect("started");
+            let _ = self.release.recv();
+            Ok(None)
+        }
+
+        fn handle_notification(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<(), GoError> {
+            self.started.send(()).expect("started");
+            let _ = self.release.recv();
+            Ok(())
+        }
+    }
+
+    // Go: ipc/conn_async_test.go:76 contextHandler
+    // PORT: Go waits for the handler context to be done and returns its
+    // error. The Rust handler runs inline, before `run` reads the EOF that
+    // cancels the context, so a wait would never end. The handler keeps its
+    // context instead, and the test checks it after `run` returns.
+    struct ContextHandler {
+        contexts: Sender<Context>,
+    }
+
+    impl Handler for ContextHandler {
+        fn handle_request(
+            &self,
+            ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+            self.contexts.send(ctx.clone()).expect("contexts");
+            ctx.err().map_or(Ok(None), Err)
+        }
+
+        fn handle_notification(
+            &self,
+            ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<(), GoError> {
+            self.contexts.send(ctx.clone()).expect("contexts");
+            ctx.err().map_or(Ok(()), Err)
+        }
+    }
+
+    // Go: ipc/conn_async_test.go:88 TestAsyncConnRunWaitsForHandlers
+    // PORT: Go receives both `started` signals before it checks `Run`. Here
+    // the notification handler starts only after the request handler
+    // returns, so the test checks `Run` after the first signal and receives
+    // the second one after it closes `release`.
+    #[test]
+    fn test_async_conn_run_waits_for_handlers() {
+        let (started, started_rx) = mpsc::sync_channel(2);
+        let (release, release_rx) = mpsc::channel::<()>();
+        let (run_done, run_done_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let protocol = QueuedProtocol {
+                messages: vec![
+                    message(Some(jsonrpc::new_id_string("1")), "request"),
+                    message(None, "notification"),
+                ],
+                response_err: None,
+            };
+            let handler = BlockingHandler {
+                started,
+                release: release_rx,
+            };
+            let conn = new_async_conn_with_protocol(
+                Arc::new(NilTransport),
+                Box::new(protocol),
+                Rc::new(handler),
+            );
+            let result = conn.run(&context::background());
+            run_done
+                .send(result.map_err(|err| err.error()))
+                .expect("runDone");
+        });
+
+        started_rx.recv().expect("<-handler.started");
+        let run_returned = run_done_rx.try_recv().is_ok();
+        assert!(!run_returned, "Run returned while handlers were active");
+
+        drop(release);
+        started_rx.recv().expect("<-handler.started");
+        let result = run_done_rx.recv().expect("<-runDone");
+        assert!(result.is_ok(), "{result:?}");
+        runner.join().expect("run thread");
+    }
+
+    // Go: ipc/conn_async_test.go:120 TestAsyncConnRunCancelsHandlersOnEOF
+    // PORT: see `ContextHandler`. Go's handler returns once `Run` cancels its
+    // context at EOF; here the test checks that `run` returned nil within the
+    // same limit and cancelled the context that the handler got.
+    #[test]
+    fn test_async_conn_run_cancels_handlers_on_eof() {
+        let (contexts, contexts_rx) = mpsc::channel();
+        let (run_done, run_done_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let protocol = QueuedProtocol {
+                messages: vec![message(Some(jsonrpc::new_id_string("1")), "request")],
+                response_err: None,
+            };
+            let conn = new_async_conn_with_protocol(
+                Arc::new(NilTransport),
+                Box::new(protocol),
+                Rc::new(ContextHandler { contexts }),
+            );
+            let result = conn.run(&context::background());
+            run_done
+                .send(result.map_err(|err| err.error()))
+                .expect("runDone");
+        });
+
+        match run_done_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => assert!(result.is_ok(), "{result:?}"),
+            Err(_) => panic!("Run did not cancel active handlers after EOF"),
+        }
+        runner.join().expect("run thread");
+        let handler_ctx = contexts_rx.recv().expect("the handler ran");
+        let err = handler_ctx
+            .err()
+            .expect("Run did not cancel active handlers after EOF");
+        assert!(
+            errors::is(&err, &context::CANCELED),
+            "expected context.Canceled, got {}",
+            err.error()
+        );
+    }
+
+    /// A `QueuedProtocol` whose read panics when the queue is empty.
+    struct PanicAtEndProtocol(QueuedProtocol);
+
+    impl Protocol for PanicAtEndProtocol {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            if self.0.messages.is_empty() {
+                panic!("read panicked");
+            }
+            self.0.read_message()
+        }
+
+        fn write_request(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.0.write_request(id, method, params)
+        }
+
+        fn write_notification(
+            &mut self,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.0.write_notification(method, params)
+        }
+
+        fn write_response(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.0.write_response(id, result)
+        }
+
+        fn write_error(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            self.0.write_error(id, err)
+        }
+    }
+
+    // PORT: no Go test. Go's deferred function in `Run` also runs while a
+    // panic unwinds. When the loop panics, `run` must still close the
+    // pending calls and cancel the context that a handler kept.
+    #[test]
+    fn test_async_conn_run_cancels_handlers_on_panic() {
+        let (contexts, contexts_rx) = mpsc::channel();
+        let protocol = PanicAtEndProtocol(QueuedProtocol {
+            messages: vec![message(Some(jsonrpc::new_id_string("1")), "request")],
+            response_err: None,
+        });
+        let conn = new_async_conn_with_protocol(
+            Arc::new(NilTransport),
+            Box::new(protocol),
+            Rc::new(ContextHandler { contexts }),
+        );
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.run(&context::background())));
+        assert!(outcome.is_err(), "run did not panic");
+
+        let handler_ctx = contexts_rx.recv().expect("the handler ran");
+        let err = handler_ctx
+            .err()
+            .expect("Run did not cancel active handlers after a panic");
+        assert!(
+            errors::is(&err, &context::CANCELED),
+            "expected context.Canceled, got {}",
+            err.error()
+        );
+        let err = conn
+            .notify(&context::background(), "after", None)
+            .expect_err("Run did not close the pending calls after a panic");
+        assert!(
+            errors::is(&err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            err.error()
+        );
+    }
+
+    // Go: ipc/conn_async_test.go:138 TestAsyncConnResponseWriteFailureWithNilTransport
+    #[test]
+    fn test_async_conn_response_write_failure_with_nil_transport() {
+        let response_err = response_write_failed();
+        let protocol = QueuedProtocol {
+            messages: vec![message(Some(jsonrpc::new_id_string("1")), "request")],
+            response_err: Some(response_err.clone()),
+        };
+        let conn = new_async_conn_with_protocol(
+            Arc::new(NilTransport),
+            Box::new(protocol),
+            Rc::new(NoOpHandler),
+        );
+
+        let err = conn
+            .run(&context::background())
+            .expect_err("run returns the response write error");
+        assert!(
+            errors::is(&err, &response_err),
+            "expected response write error, got {}",
+            err.error()
+        );
+    }
+
+    // Go: ipc/conn_async_test.go:153 closeSignal
+    // PORT: Go closes the `closed` channel once; here `close` drops the
+    // sender once, and the receiver's `recv` returns.
+    struct CloseSignal {
+        closed: Mutex<Option<Sender<()>>>,
+    }
+
+    impl ReadWriteCloser for CloseSignal {
+        fn read(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            // Go returns io.EOF.
+            Ok(0)
+        }
+
+        fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> Result<(), GoError> {
+            self.closed.lock().expect("closed").take();
+            Ok(())
+        }
+    }
+
+    // Go: ipc/conn_async_test.go:171 failingResponseProtocol
+    struct FailingResponseProtocol {
+        closed: Receiver<()>,
+        request_read: bool,
+        response_err: GoError,
+    }
+
+    impl Protocol for FailingResponseProtocol {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            if !self.request_read {
+                self.request_read = true;
+                return Ok(message(Some(jsonrpc::new_id_int(1)), "transform"));
+            }
+            let _ = self.closed.recv();
+            // Go: io.ErrClosedPipe
+            Err(errors::new("io: read/write on closed pipe"))
+        }
+
+        fn write_request(
+            &mut self,
+            _id: Option<&jsonrpc::ID>,
+            _method: &str,
+            _params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+
+        fn write_notification(
+            &mut self,
+            _method: &str,
+            _params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+
+        fn write_response(
+            &mut self,
+            _id: Option<&jsonrpc::ID>,
+            _result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            Err(self.response_err.clone())
+        }
+
+        fn write_error(
+            &mut self,
+            _id: Option<&jsonrpc::ID>,
+            _err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            Err(self.response_err.clone())
+        }
+    }
+
+    /// One end of Go `net.Pipe()`.
+    ///
+    /// PORT: Go's Close ends both directions of both ends: the peer reads
+    /// EOF and its writes fail. `close` shuts the socket down, which wakes a
+    /// blocked read, and then closes it. A shutdown alone is not enough on
+    /// macOS, where the peer can still write to a socket that only shut
+    /// down.
+    struct PipeEnd(std::sync::RwLock<Option<UnixStream>>);
+
+    impl PipeEnd {
+        fn new(stream: UnixStream) -> Self {
+            PipeEnd(std::sync::RwLock::new(Some(stream)))
+        }
+
+        fn with_stream<R>(
+            &self,
+            f: impl FnOnce(&UnixStream) -> std::io::Result<R>,
+        ) -> std::io::Result<R> {
+            match &*self.0.read().unwrap() {
+                Some(stream) => f(stream),
+                None => Err(std::io::ErrorKind::NotConnected.into()),
+            }
+        }
+    }
+
+    impl ReadWriteCloser for PipeEnd {
+        fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.with_stream(|mut stream| stream.read(buf))
+        }
+
+        fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+            self.with_stream(|mut stream| stream.write(buf))
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            self.with_stream(|mut stream| stream.flush())
+        }
+
+        fn close(&self) -> Result<(), GoError> {
+            let _ = self.with_stream(|stream| stream.shutdown(std::net::Shutdown::Both));
+            self.0.write().unwrap().take();
+            Ok(())
+        }
+    }
+
+    // Go: ipc/conn_async_test.go:202 TestAsyncConnCallReturnsWhenPeerCloses
+    #[test]
+    fn test_async_conn_call_returns_when_peer_closes() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let client: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd::new(client));
+        let conn = new_async_conn(client.clone(), Rc::new(NoOpHandler));
+        let ctx = context::background();
+
+        // The peer reads the request and closes its end.
+        let peer = std::thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            let read = (&server).read(&mut buffer);
+            drop(server);
+            read.map(|_| ())
+        });
+
+        let call_err = conn
+            .call(&ctx, "transform", None)
+            .expect_err("call fails when the peer closes");
+        peer.join().expect("peer thread").expect("server read");
+        assert!(conn.run(&ctx).is_ok());
+        assert!(
+            errors::is(&call_err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            call_err.error()
+        );
+        client.close().expect("client close");
+    }
+
+    /// Answers every request with `true`.
+    struct TrueHandler;
+
+    impl Handler for TrueHandler {
+        fn handle_request(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+            Ok(Some(Box::new(true)))
+        }
+
+        fn handle_notification(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    /// Reads one message with its `Content-Length` header.
+    fn read_framed(stream: &UnixStream) -> String {
+        let mut header = Vec::new();
+        let mut byte = [0u8; 1];
+        while !header.ends_with(b"\r\n\r\n") {
+            (&*stream).read_exact(&mut byte).expect("header byte");
+            header.push(byte[0]);
+        }
+        let header = String::from_utf8(header).expect("utf-8 header");
+        let length: usize = header
+            .trim()
+            .strip_prefix("Content-Length: ")
+            .and_then(|length| length.parse().ok())
+            .expect("Content-Length header");
+        let mut body = vec![0u8; length];
+        (&*stream).read_exact(&mut body).expect("body");
+        String::from_utf8(body).expect("utf-8 body")
+    }
+
+    fn write_framed(stream: &UnixStream, body: &str) {
+        write!(&*stream, "Content-Length: {}\r\n\r\n{body}", body.len()).expect("write");
+    }
+
+    // PORT: not in Go, whose goroutines handle the request below while
+    // `Call` waits. A client callback may answer a call only after its own
+    // request returns (ts#64299), so the call handles that request inline.
+    #[test]
+    fn test_async_conn_call_handles_a_nested_request() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let conn = new_async_conn(Arc::new(PipeEnd::new(client)), Rc::new(TrueHandler));
+        let peer = std::thread::spawn(move || {
+            let call = read_framed(&server);
+            write_framed(&server, r#"{"jsonrpc":"2.0","id":"n1","method":"nested"}"#);
+            let nested = read_framed(&server);
+            write_framed(&server, r#"{"jsonrpc":"2.0","id":"api1","result":1}"#);
+            (call, nested)
+        });
+        let result = conn
+            .call(&context::background(), "resolve", None)
+            .expect("the call returns");
+        let (call, nested) = peer.join().expect("peer thread");
+        assert!(call.contains(r#""method":"resolve""#), "{call}");
+        assert!(
+            nested.contains(r#""id":"n1""#) && nested.contains(r#""result":true"#),
+            "{nested}"
+        );
+        assert_eq!(result.0, b"1");
+    }
+
+    // Go: ipc/conn_async_test.go:224 TestAsyncConnCallAfterReadLoopFailureReturnsImmediately
+    #[test]
+    fn test_async_conn_call_after_read_loop_failure_returns_immediately() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let conn = new_async_conn(Arc::new(PipeEnd::new(client)), Rc::new(NoOpHandler));
+        let background = context::background();
+
+        (&server).write_all(b"oops\n").expect("server write");
+        let run_err = conn.run(&background).expect_err("run fails");
+        assert!(
+            run_err.error().contains("invalid header"),
+            "{}",
+            run_err.error()
+        );
+        // PORT: Go drains the server end (`io.Copy(io.Discard, server)`) so a
+        // write cannot block on `net.Pipe`; the socket buffer covers that here.
+
+        let (ctx, cancel) = context::with_timeout(&background, Duration::from_secs(1));
+        let err = conn
+            .call(&ctx, "transform", None)
+            .expect_err("call fails after the read loop ended");
+        assert!(
+            errors::is(&err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            err.error()
+        );
+        assert!(
+            !errors::is(&err, &context::DEADLINE_EXCEEDED),
+            "call waited for its context deadline: {}",
+            err.error()
+        );
+        let err = conn
+            .notify(&ctx, "changed", None)
+            .expect_err("notify fails after the read loop ended");
+        assert!(
+            errors::is(&err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            err.error()
+        );
+        cancel();
+        drop(server);
+    }
+
+    // Go: ipc/conn_async_test.go:247 TestAsyncConnTerminalErrorIncludesResponseWriteFailure
+    #[test]
+    fn test_async_conn_terminal_error_includes_response_write_failure() {
+        let response_err = response_write_failed();
+        let (closed, closed_rx) = mpsc::channel::<()>();
+        let rwc = Arc::new(CloseSignal {
+            closed: Mutex::new(Some(closed)),
+        });
+        let protocol = FailingResponseProtocol {
+            closed: closed_rx,
+            request_read: false,
+            response_err: response_err.clone(),
+        };
+        let conn = new_async_conn_with_protocol(rwc, Box::new(protocol), Rc::new(NoOpHandler));
+        let ctx = context::background();
+
+        let err = conn
+            .run(&ctx)
+            .expect_err("run returns the response write error");
+        assert!(
+            errors::is(&err, &response_err),
+            "expected response write error, got {}",
+            err.error()
+        );
+        let err = conn
+            .call(&ctx, "transform", None)
+            .expect_err("call returns the terminal error");
+        assert!(
+            errors::is(&err, &response_err),
+            "expected terminal response write error, got {}",
+            err.error()
+        );
+        assert_eq!(err.error().matches(&response_err.error()).count(), 1);
+    }
+
+    // Go: ipc/conn_async_test.go:264 TestAsyncConnRunWaitsForRequestAfterPeerCloses
+    #[test]
+    fn test_async_conn_run_waits_for_request_after_peer_closes() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let (started, started_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::channel::<()>();
+        let (run_done, run_done_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let handler = BlockingHandler {
+                started,
+                release: release_rx,
+            };
+            let conn = new_async_conn(Arc::new(PipeEnd::new(server)), Rc::new(handler));
+            let ctx = context::background();
+            let run = conn.run(&ctx).err().map(|err| err.error());
+            // Go calls these after `Run` returns.
+            let call = conn
+                .call(&ctx, "transform", None)
+                .err()
+                .map(|err| err.error());
+            let notify = conn
+                .notify(&ctx, "changed", None)
+                .err()
+                .map(|err| err.error());
+            run_done.send((run, call, notify)).expect("runDone");
+        });
+
+        let client: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd::new(client));
+        let mut client_protocol = new_jsonrpc_protocol(client.clone());
+        client_protocol
+            .write_request(Some(&jsonrpc::new_id_int(1)), "transform", None)
+            .expect("assert.NilError");
+        if started_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            panic!("request handler did not start");
+        }
+        client.close().expect("assert.NilError");
+
+        let handler_blocked = match run_done_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok((run, _, _)) => {
+                panic!("connection stopped while request handler was blocked: {run:?}")
+            }
+            Err(RecvTimeoutError::Timeout) => true,
+            Err(RecvTimeoutError::Disconnected) => panic!("the run thread ended"),
+        };
+        assert!(handler_blocked);
+
+        drop(release);
+        let Ok((run, call, notify)) = run_done_rx.recv_timeout(Duration::from_secs(1)) else {
+            panic!("connection did not stop after request handler completed");
+        };
+        for err in [run, call, notify] {
+            let err = err.expect("assert.ErrorContains: nil error");
+            assert!(err.contains("ipc: failed to write response"), "{err}");
+        }
+        runner.join().expect("run thread");
+    }
+
+    /// A `QueuedProtocol` whose read panics when its queue is empty and
+    /// whose `write_request` panics when `write_request_panics` is set. It
+    /// keeps the message of each error response it writes.
+    struct PanickingProtocol {
+        queued: QueuedProtocol,
+        write_request_panics: bool,
+        error_messages: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Protocol for PanickingProtocol {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            if self.queued.messages.is_empty() {
+                panic!("read panicked");
+            }
+            self.queued.read_message()
+        }
+
+        fn write_request(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            if self.write_request_panics {
+                panic!("write request panicked");
+            }
+            self.queued.write_request(id, method, params)
+        }
+
+        fn write_notification(
+            &mut self,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.queued.write_notification(method, params)
+        }
+
+        fn write_response(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.queued.write_response(id, result)
+        }
+
+        fn write_error(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            self.error_messages.borrow_mut().push(err.message.clone());
+            self.queued.write_error(id, err)
+        }
+    }
+
+    fn panicking_conn(
+        messages: Vec<Message>,
+        write_request_panics: bool,
+        handler: Rc<dyn Handler>,
+    ) -> (Rc<AsyncConn>, Rc<RefCell<Vec<String>>>) {
+        let error_messages = Rc::new(RefCell::new(Vec::new()));
+        let protocol = PanickingProtocol {
+            queued: QueuedProtocol {
+                messages,
+                response_err: None,
+            },
+            write_request_panics,
+            error_messages: error_messages.clone(),
+        };
+        let conn =
+            new_async_conn_with_protocol(Arc::new(NilTransport), Box::new(protocol), handler);
+        (conn, error_messages)
+    }
+
+    // PORT: no Go test. Go's deferred function in `Call` deletes the pending
+    // entry also when `WriteRequest` panics. The read loop does not end.
+    // PORT: Go locks `writeMu` around `WriteRequest` with no defer
+    // (conn_async.go:281-283), so after this panic Go keeps `writeMu`
+    // locked and a later `Notify` (:315) blocks forever. The port does not
+    // port that deadlock: its write lock is the `protocol` RefCell borrow,
+    // which the unwind releases, so the `notify` below succeeds.
+    #[test]
+    fn test_async_conn_call_deletes_pending_entry_when_write_request_panics() {
+        let (conn, _) = panicking_conn(Vec::new(), true, Rc::new(NoOpHandler));
+        let ctx = context::background();
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.call(&ctx, "callback", None)));
+        assert!(outcome.is_err(), "call did not panic");
+        assert!(conn.pending.borrow().is_empty(), "the pending entry stays");
+        assert!(conn.notify(&ctx, "after", None).is_ok());
+    }
+
+    /// Makes a call while it handles a request, and keeps the call's error.
+    struct CallingHandler {
+        conn: std::cell::OnceCell<std::rc::Weak<AsyncConn>>,
+        call_err: RefCell<Option<GoError>>,
+    }
+
+    impl Handler for CallingHandler {
+        fn handle_request(
+            &self,
+            ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+            let conn = self.conn.get().and_then(std::rc::Weak::upgrade);
+            let conn = conn.expect("the connection is set");
+            let err = conn
+                .call(ctx, "callback", None)
+                .expect_err("the call fails");
+            *self.call_err.borrow_mut() = Some(err.clone());
+            Err(err)
+        }
+
+        fn handle_notification(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    // PORT: no Go test. A read in `call` is a read of Go's `Run`. When it
+    // panics, Go's deferred function in `Run` closes the pending call, the
+    // call returns ErrConnClosed, the handler's response is written, and
+    // then the panic leaves `Run`.
+    #[test]
+    fn test_async_conn_call_read_panic_leaves_run() {
+        let handler = Rc::new(CallingHandler {
+            conn: std::cell::OnceCell::new(),
+            call_err: RefCell::new(None),
+        });
+        let (conn, error_messages) = panicking_conn(
+            vec![message(Some(jsonrpc::new_id_string("1")), "request")],
+            false,
+            handler.clone(),
+        );
+        let _ = handler.conn.set(Rc::downgrade(&conn));
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.run(&context::background())));
+        let payload = outcome.expect_err("run did not panic");
+        assert_eq!(recovered_value(payload.as_ref()), "read panicked");
+        let call_err = handler.call_err.borrow().clone().expect("the handler ran");
+        assert!(
+            errors::is(&call_err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            call_err.error()
+        );
+        assert!(conn.pending.borrow().is_empty(), "the pending entry stays");
+        assert_eq!(*error_messages.borrow(), vec![call_err.error()]);
+    }
+
+    // PORT: no Go test. With no `run`, the panic of a read in `call` leaves
+    // the call after Go's deferred function in `Run` closed the pending
+    // calls. The read loop ended: a later `run` does not read again.
+    #[test]
+    fn test_async_conn_call_read_panic_without_run() {
+        let (conn, _) = panicking_conn(Vec::new(), false, Rc::new(NoOpHandler));
+        let ctx = context::background();
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.call(&ctx, "callback", None)));
+        let payload = outcome.expect_err("call did not panic");
+        assert_eq!(recovered_value(payload.as_ref()), "read panicked");
+        assert!(conn.pending.borrow().is_empty(), "the pending entry stays");
+        let err = conn
+            .notify(&ctx, "after", None)
+            .expect_err("the read loop ended");
+        assert!(
+            errors::is(&err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            err.error()
+        );
+        // The protocol's queue is empty, so a second read would panic again.
+        let run = catch_unwind(AssertUnwindSafe(|| conn.run(&ctx)));
+        assert!(
+            matches!(run, Ok(Ok(()))),
+            "a later run read again or failed"
+        );
+    }
+}

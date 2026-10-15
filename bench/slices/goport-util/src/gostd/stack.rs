@@ -31,6 +31,14 @@ const MIN_STACK_SIZE: usize = 8 << 20;
 const LIMIT_SHARE: u64 = 64;
 
 
+/// The stack size under the address space limit `limit` (`None`: no limit).
+fn stack_size_for(limit: Option<u64>) -> usize {
+    limit.map_or(MAX_STACK_SIZE, |limit| {
+        usize::try_from(limit / LIMIT_SHARE)
+            .unwrap_or(MAX_STACK_SIZE)
+            .clamp(MIN_STACK_SIZE, MAX_STACK_SIZE)
+    })
+}
 
 
 

@@ -9,9 +9,11 @@ and `lust build` builds it.
 
 | Slice | Lines (code) | From |
 |---|---|---|
-| `goport-util-lsp` | 50,597 (34,236) | ts-rust `goport_util` + `goport_lsproto` merged into one crate (146,877 lines) |
-| `goport-util` | 35,038 (26,468) | ts-rust `goport_util` (87,178 lines in its module tree) |
-| `goport-util-small` | 7,253 (4,223) | the same crate without gostd, locale, fswatch, astdata |
+| `tsrust-full` | 150,147 (91,879) | all of ts_goport (`lib.rs`) with both part crates mounted (670,906 lines copied) |
+| `tsrust-nochecker` | 107,084 (67,850) | ts_goport `lib.rs` with both part crates, without checker, ls, lsp, project, api, execute, cmd (406,266 lines copied) |
+| `goport-util-lsp` | 53,918 (36,890) | ts-rust `goport_util` + `goport_lsproto` merged into one crate (147,484 lines) |
+| `goport-util` | 37,897 (28,695) | ts-rust `goport_util` (87,785 lines in its module tree) |
+| `goport-util-small` | 8,337 (5,014) | the same crate without gostd, locale, fswatch, astdata |
 
 ## How a slice is made
 

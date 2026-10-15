@@ -1,6 +1,6 @@
 {
  "tsrust_commit": "b11b618aedde90c10c184869b208f1c3c0badea9",
- "lust_commit": "885e1c30fb645e1668c5901bfe3c09d748e29395",
+ "lust_commit": "23fffb0bde44bf39d3582eb3a42d078273030710",
  "spec": {
   "name": "goport-util-small",
   "about": "A quick-run slice: goport_util without gostd, locale, fswatch, and astdata, pruned to what lust accepts",
@@ -35,12 +35,12 @@
    ]
   ]
  },
- "lines_before": 41759,
- "lines": 8261,
- "code_lines": 4945,
+ "lines_before": 41835,
+ "lines": 8337,
+ "code_lines": 5014,
  "unloaded_lines_dropped": 96,
  "rounds": 52,
- "prune_seconds": 13,
+ "prune_seconds": 9,
  "lines_by_module": {
   "diag": [
    2751,
@@ -79,8 +79,8 @@
    67
   ],
   "support": [
-   403,
-   403
+   479,
+   479
   ],
   "util_prelude": [
    13,
@@ -90,19 +90,10 @@
  "removed_items": 2751,
  "removed_by_rustc": [],
  "removed_by_lust_build": [],
- "unlocated_errors": [
-  {
-   "code": "L0102",
-   "message": "unknown trait `TryFrom`",
-   "found_in": [
-    "frontend/json_ext.rs:787",
-    "frontend/json_ext.rs:799"
-   ]
-  }
- ],
+ "unlocated_errors": [],
  "removed_lines_by_oracle_and_code": {
-  "lust L0102": 25273,
-  "lust L0101": 2931,
+  "lust L0102": 25251,
+  "lust L0101": 2953,
   "lust L0104": 2699,
   "lust L0110": 472,
   "lust L0610": 322,
@@ -163,12 +154,6 @@
   {"file": "frontend/vfs/osvfs.rs", "kind": "traitimpl", "name": "-", "lines": 118, "by": "lust", "code": "L0102", "message": "cannot find type `Timespec` in this scope"},
   {"file": "frontend/vfs/osvfs.rs", "kind": "fn", "name": "os_path", "lines": 8, "by": "lust", "code": "L0510", "message": "`from_vec` is private"},
   {"file": "frontend/nativepath.rs", "kind": "use-leaf", "name": "os_path", "lines": 0, "by": "lust", "code": "L0506", "message": "unresolved import `crate::frontend::vfs::osvfs::os_path`"},
-  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_any_interface", "lines": 21, "by": "lust", "code": "L0702", "message": "`dyn frontend$json_ext$AnyValue` with the std supertrait `Debug` is not supported yet"},
-  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_int_as", "lines": 11, "by": "lust", "code": "L0102", "message": "unlocated: unknown trait `TryFrom`"},
-  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_uint_as", "lines": 11, "by": "lust", "code": "L0102", "message": "unlocated: unknown trait `TryFrom`"},
-  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_json_method", "lines": 31, "by": "lust", "code": "L0505", "message": "module paths in types is not supported yet"},
-  {"file": "frontend/json_ext.rs", "kind": "enum", "name": "LspAny", "lines": 13, "by": "lust", "code": "L0112", "message": "cannot derive PartialEq: field type `support::indexmap::IndexMap` does not implement PartialEq"},
-  {"file": "frontend/json_ext.rs", "kind": "impl", "name": "-", "lines": 6, "by": "lust", "code": "L0702", "message": "`dyn frontend$json_ext$AnyValue` with the std supertrait `Debug` is not supported yet"},
   {"file": "gopanic.rs", "kind": "fn", "name": "builder", "lines": 10, "by": "lust", "code": "L0102", "message": "unknown type `Builder`"},
   {"file": "gopanic.rs", "kind": "fn", "name": "start", "lines": 21, "by": "lust", "code": "L0203", "message": "a bound like `T: 'a` on a named lifetime is not supported yet"},
   {"file": "gopanic.rs", "kind": "fn", "name": "spawn_scoped", "lines": 18, "by": "lust", "code": "L0203", "message": "a bound like `T: 'a` on a named lifetime is not supported yet"},
@@ -185,11 +170,15 @@
   {"file": "frontend/core_workgroup.rs", "kind": "struct", "name": "ThrottleGroup", "lines": 4, "by": "lust", "code": "L0102", "message": "unknown type `GoError`"},
   {"file": "frontend/core_workgroup.rs", "kind": "fn", "name": "new_work_group", "lines": 7, "by": "lust", "code": "L0203", "message": "lifetimes in the trait arguments of a `dyn` type are not supported yet"},
   {"file": "frontend/json.rs", "kind": "fn", "name": "go_consume_value", "lines": 163, "by": "lust", "code": "L0820", "message": "type items inside function bodies is not supported yet"},
+  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_any_interface", "lines": 21, "by": "lust", "code": "L0702", "message": "`dyn frontend$json_ext$AnyValue` with the std supertrait `Debug` is not supported yet"},
+  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_json_method", "lines": 31, "by": "lust", "code": "L0505", "message": "module paths in types is not supported yet"},
+  {"file": "frontend/json_ext.rs", "kind": "enum", "name": "LspAny", "lines": 13, "by": "lust", "code": "L0112", "message": "cannot derive PartialEq: field type `support::indexmap::IndexMap` does not implement PartialEq"},
+  {"file": "frontend/json_ext.rs", "kind": "impl", "name": "-", "lines": 6, "by": "lust", "code": "L0702", "message": "`dyn frontend$json_ext$AnyValue` with the std supertrait `Debug` is not supported yet"},
   {"file": "frontend/nativepath.rs", "kind": "const", "name": "O_PATH", "lines": 2, "by": "lust", "code": "L0630", "message": "this path is outside the bounded const evaluator"},
   {"file": "frontend/vfs/mod_impl.rs", "kind": "enum", "name": "DirEntryInfo", "lines": 6, "by": "lust", "code": "L0641", "message": "an Rc of an unsized type is not supported yet"},
   {"file": "frontend/vfs/osvfs.rs", "kind": "fn", "name": "read_dir_entries", "lines": 8, "by": "lust", "code": "L0641", "message": "an Rc of an unsized type is not supported yet"},
   {"file": "frontend/vfs/osvfs.rs", "kind": "struct", "name": "OsOverride", "lines": 11, "by": "lust", "code": "L0641", "message": "an Arc of an unsized type is not supported yet"},
-  {"file": "frontend/bundled/embed.rs", "kind": "macro", "name": "-", "lines": 5, "by": "lust", "code": "L0702", "message": "a `dyn` type in a const or static item is not supported yet"},
+  {"file": "frontend/bundled/embed.rs", "kind": "macro", "name": "WRAPPED_OS_FS", "lines": 5, "by": "lust", "code": "L0702", "message": "a `dyn` type in a const or static item is not supported yet"},
   {"file": "jsonrpc/baseproto.rs", "kind": "fn", "name": "write", "lines": 9, "by": "lust", "code": "L0102", "message": "unknown type `GoError`"},
   {"file": "jsonrpc/baseproto.rs", "kind": "struct", "name": "Writer", "lines": 4, "by": "lust", "code": "L0612", "message": "a type here does not satisfy the `std::io::Write` bound its definition requires"},
   {"file": "jsonrpc/baseproto.rs", "kind": "fn", "name": "read_full", "lines": 18, "by": "lust", "code": "L0102", "message": "unknown type `GoError`"},
@@ -2787,6 +2776,8 @@
   {"file": "frontend/tspath/path.rs", "kind": "fn", "name": "get_string_equality_comparer", "lines": 6, "by": "lust", "code": "L0101", "message": "cannot find value `equate_string_case_insensitive` in this scope"},
   {"file": "frontend/tspath/path.rs", "kind": "fn", "name": "get_equality_comparer", "lines": 3, "by": "lust", "code": "L0101", "message": "cannot find value `get_string_equality_comparer` in this scope"},
   {"file": "frontend/json.rs", "kind": "fn", "name": "invalid_character", "lines": 8, "by": "lust", "code": "L0101", "message": "cannot find function `go_decode_rune_len`"},
+  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_int_as", "lines": 11, "by": "lust", "code": "L0101", "message": "cannot find function `unmarshal_int`"},
+  {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_uint_as", "lines": 11, "by": "lust", "code": "L0101", "message": "cannot find function `unmarshal_uint`"},
   {"file": "frontend/json_ext.rs", "kind": "fn", "name": "method", "lines": 17, "by": "lust", "code": "L0104", "message": "no method `into_json_error` on type `frontend::json_ext::SemanticError`"},
   {"file": "frontend/tspath/path.rs", "kind": "fn", "name": "for_each_ancestor_directory", "lines": 19, "by": "lust", "code": "L0101", "message": "cannot find function `get_directory_path`"},
   {"file": "frontend/tspath/path.rs", "kind": "fn", "name": "for_each_ancestor_directory", "lines": 6, "by": "lust", "code": "L0610", "message": "type annotations needed: the receiver type must be known here"},
