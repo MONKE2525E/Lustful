@@ -374,6 +374,14 @@ fn holds_from_view(p: &Program, fid: LocalDefId, view: &Checked, ck: &mut Checke
         errs.push(not_yet("L0602", span, "an `impl Trait` binding whose hidden type is `Copy` when its bounds are not, here"));
     }
     ck.local_moves = if same && local_moves.contains(&true) { local_moves } else { Vec::new() };
+    // A closure the view makes `FnOnce` (it calls an `impl FnOnce` or
+    // moves an opaque value out) keeps that kind, though the revealed
+    // check copies the value: rustc's closure is consumed by its call.
+    for c in ck.closures.iter_mut() {
+        if let Some(vc) = view.closures.iter().find(|v| v.def == c.def) {
+            c.kind = c.kind.max(vc.kind);
+        }
+    }
     // A closure the view makes take a value it moves (by value) but the
     // revealed check lets borrow it (its hidden type is `Copy`): rustc's
     // closure owns the value, lust's would not.

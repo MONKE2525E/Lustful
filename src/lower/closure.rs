@@ -222,8 +222,10 @@ impl<'p> Lower<'p> {
         let Some(entry) = self.p.gx.closures.get(&def) else { return };
         let (target, kind) = (entry.body_fn, entry.kind);
         let mut owned: Option<Local> = None;
-        // A callee rustc moves where it is `Copy` here (`view_moved`).
-        let moved = derefs == 0 && self.view_moved(callee);
+        // A callee rustc moves where it is `Copy` here (`view_moved`). An
+        // `FnOnce` call through a reference moves out of it (rustc E0507
+        // on `let r = &h; r()` for an `impl FnOnce`).
+        let moved = if derefs == 0 { self.view_moved(callee) } else { mode == ClosureKind::FnOnce };
         let env = match (kind, mode) {
             (ClosureKind::FnOnce, _) if moved => Operand::Move(place),
             (ClosureKind::FnOnce, _) => self.operand_from(place, cty),
