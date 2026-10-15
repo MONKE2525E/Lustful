@@ -199,7 +199,8 @@ impl Stats {
 /// `scanned`: items rescanned structurally. `slot_fns`: fns the slot
 /// update compared. `collect`: items and fns collect walked.
 /// `discovery`: bodies instance discovery checked or replayed.
-/// `checked`: bodies checked. `why`: on a full resolve, the condition
+/// `checked`: bodies checked. `reads`: unchanged files the body patch
+/// read from disk because it could not trust their stat. `why`: on a full resolve, the condition
 /// that stopped the body patch (`no_base` on a first compile). `kept`:
 /// `reuse` when a kept program stood in for collect (W-INCR3), else
 /// why not; `prog_spans`: its spans moved. Error answers record the
@@ -222,13 +223,14 @@ struct Visits {
     collect: usize,
     discovery: usize,
     checked: usize,
+    reads: usize,
 }
 
 impl Visits {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={}",
+            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={} reads={}",
             self.path,
             if self.why.is_empty() { "-".to_string() } else { self.why.replace(' ', "_") },
             self.files,
@@ -240,7 +242,8 @@ impl Visits {
             self.discovery,
             self.checked,
             if self.kept.is_empty() { "-".to_string() } else { self.kept.replace(' ', "_") },
-            self.prog_spans
+            self.prog_spans,
+            self.reads
         );
     }
 }
@@ -1687,6 +1690,7 @@ fn resolved_setup(
                 spans: p.spans,
                 scanned: p.bodies,
                 slot_fns: p.fn_count,
+                reads: p.reads,
                 ..Default::default()
             };
             t.lap("body patch");
@@ -2662,14 +2666,24 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     front.slots_renumbered = false;
     caches.gen_reuse.on = caches.persistent && gen_env.is_some();
     caches.gen_reuse.env = gen_env.unwrap_or(0);
-    caches.gen_reuse.ast_src = (0..fn_count)
-        .map(|i| {
-            let head = front.fn_slot.get(i).and_then(|&s| front.slot_head.get(s as usize)).copied().unwrap_or(0);
-            let mut h = crate::intern::FxHasher::default();
-            std::hash::Hash::hash(&(body_hashes_all[i], head), &mut h);
-            std::hash::Hasher::finish(&h)
-        })
-        .collect();
+    // On a body patch, slot heads stand and only the changed fns' body
+    // hashes moved (the slot update lists exactly those), so the last
+    // request's fingerprints stand for every other fn.
+    let ast_src_of = |front: &Front, i: usize| {
+        let head = front.fn_slot.get(i).and_then(|&s| front.slot_head.get(s as usize)).copied().unwrap_or(0);
+        let mut h = crate::intern::FxHasher::default();
+        std::hash::Hash::hash(&(body_hashes_all[i], head), &mut h);
+        std::hash::Hasher::finish(&h)
+    };
+    if visits.path == "patch" && caches.gen_reuse.ast_src.len() == fn_count {
+        for &i in &changed {
+            if let Some(slot) = caches.gen_reuse.ast_src.get_mut(i) {
+                *slot = ast_src_of(front, i);
+            }
+        }
+    } else {
+        caches.gen_reuse.ast_src = (0..fn_count).map(|i| ast_src_of(front, i)).collect();
+    }
     // The resolver tables enter here, before collect's own body
     // checks (mono's template checks) run, so every body checks
     // with the visibility tables attached (see `Program::resolved`).

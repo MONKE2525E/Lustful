@@ -94,6 +94,13 @@ pub(crate) struct PatchBase {
     /// also visit (`span_shift::ExtraNodes`); None until probed, and
     /// never when the resolve could prove ranges on its own.
     extras: Option<Vec<span_shift::ExtraNodes>>,
+    /// Per map file, the fns whose name span is in it (`Front::fn_loc`
+    /// indexes): an edit that adds lines renumbers only its own file's.
+    fns_by_file: Vec<Vec<u32>>,
+    /// True per slot an AST fn of this resolve holds, for the slot
+    /// update's dead-slot rule. Slot assignment does not move while a
+    /// base lives, so this is built once here, not per patch.
+    live_slots: Vec<bool>,
 }
 
 /// The crate selection inputs a patch must see unchanged: anything that
@@ -165,6 +172,22 @@ impl PatchBase {
         let shadowed = user_macros && texts.iter().any(|(_, t)| shadows_parser_macro(t));
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
+        let mut fns_by_file: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (i, &(item, sub)) in front.fn_loc.iter().enumerate() {
+            if item == usize::MAX || item >= front.ast.items.len() {
+                continue;
+            }
+            let file = fn_def_at(&front.ast, item, sub).name_span.file;
+            if let Some(v) = fns_by_file.get_mut(file.0 as usize) {
+                v.push(i as u32);
+            }
+        }
+        let mut live_slots = vec![false; front.slot_of.len()];
+        for &s in front.fn_slot.iter().take(front.ast_fn_count) {
+            if let Some(l) = live_slots.get_mut(s as usize) {
+                *l = true;
+            }
+        }
         PatchBase {
             inputs,
             root_unspliced,
@@ -183,6 +206,8 @@ impl PatchBase {
             arena_base: front.ast.exprs.len(),
             ranges,
             extras: None,
+            fns_by_file,
+            live_slots,
         }
     }
 }
@@ -204,6 +229,9 @@ pub(super) struct Patched {
     pub nodes: usize,
     pub bodies: usize,
     pub spans: usize,
+    /// Files read from disk to prove unchanged (a stat the patch could
+    /// not trust), beyond the changed ones.
+    pub reads: usize,
 }
 
 /// One edit proven to sit inside one fn body (`find_body_edit`).
@@ -282,7 +310,7 @@ pub(super) fn try_patch(
     root: &str,
     request_start: SystemTime,
 ) -> Result<Patched, &'static str> {
-    let edits = find_edits(front, inputs, root, request_start)?;
+    let (edits, reads) = find_edits(front, inputs, root, request_start)?;
     let edits_in: Vec<KeptEdit> =
         edits.iter().map(|e| KeptEdit { edit: e.edit, ctxts: FxMap::default(), fn_index: e.fn_index, plain: e.plain, old_exprs: e.old_exprs }).collect();
     // Everything above only read; from here the front state changes, and
@@ -306,7 +334,7 @@ pub(super) fn try_patch(
         }
     }
     let mut ctxts: Vec<FxMap<u32, CtxtId>> = Vec::new();
-    let out = apply(front, caches, edits, &mut ctxts);
+    let out = apply(front, caches, edits, reads, &mut ctxts);
     if out.is_err() {
         front.patch = None;
     } else {
@@ -321,9 +349,10 @@ pub(super) fn try_patch(
     out
 }
 
-/// The changed files and the body each edit sits in, or why some edit
-/// is not a provable body edit. Reads only.
-fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemTime) -> Result<Vec<BodyEdit>, &'static str> {
+/// The changed files and the body each edit sits in, with the number of
+/// unchanged files read from disk because their stat was not trusted,
+/// or why some edit is not a provable body edit. Reads only.
+fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemTime) -> Result<(Vec<BodyEdit>, usize), &'static str> {
     let base = front.patch.as_ref().ok_or("no base")?;
     if base.inputs != inputs {
         return Err("inputs");
@@ -348,6 +377,7 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         changed.push((FileId(0), root.to_string()));
     }
     let mut fresh_stamps: Vec<(usize, Option<Stamp>)> = Vec::new();
+    let mut reads = 0usize;
     for k in 1..front.map.file_count() {
         let file = FileId(k as u32);
         let path = front.map.path(file);
@@ -362,6 +392,7 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         }
         let text = std::fs::read_to_string(path).map_err(|_| "file gone")?;
         if front.map.text(file) == Some(text.as_str()) {
+            reads += 1;
             fresh_stamps.push((k, stamp_of(path, request_start)));
             continue;
         }
@@ -378,25 +409,27 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         edits.push(find_body_edit(front, file, text)?);
     }
     // The std splice and the platform crate follow every file's needs;
-    // they stand when the union over files does.
+    // they stand when the union over files does. The new union folds
+    // the edits over the base needs in place, no copy of the table.
     let base = front.patch.as_ref().ok_or("no base")?;
-    let union = |needs: &[(StdNeeds, bool)]| {
-        needs.iter().fold((StdNeeds::default(), false), |(a, p), (n, q)| {
-            (StdNeeds { fns: a.fns || n.fns, methods: a.methods || n.methods, modules: a.modules | n.modules }, p || *q)
-        })
+    let fold = |(a, p): (StdNeeds, bool), (n, q): (StdNeeds, bool)| {
+        (StdNeeds { fns: a.fns || n.fns, methods: a.methods || n.methods, modules: a.modules | n.modules }, p || q)
     };
-    let mut needs = base.needs.clone();
-    for e in &edits {
-        needs[e.file.0 as usize] = e.needs;
-    }
-    if union(&needs) != union(&base.needs) {
+    let old_union = base.needs.iter().copied().fold((StdNeeds::default(), false), fold);
+    let new_union = base
+        .needs
+        .iter()
+        .enumerate()
+        .map(|(k, &n)| edits.iter().find(|e| e.file.0 as usize == k).map_or(n, |e| e.needs))
+        .fold((StdNeeds::default(), false), fold);
+    if new_union != old_union {
         return Err("std needs");
     }
     let base = front.patch.as_mut().ok_or("no base")?;
     for (k, st) in fresh_stamps {
         base.stamps[k] = st;
     }
-    Ok(edits)
+    Ok((edits, reads))
 }
 
 /// Proves that the edit from the map's text of `file` to `text` sits
@@ -566,7 +599,7 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
 
 /// Applies the proven edits to the front state and runs the slot update.
 /// `ctxts` gets each edit's fresh expansion contexts, in edit order.
-fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, ctxts: &mut Vec<FxMap<u32, CtxtId>>) -> Result<Patched, &'static str> {
+fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads: usize, ctxts: &mut Vec<FxMap<u32, CtxtId>>) -> Result<Patched, &'static str> {
     let mut base = front.patch.take().ok_or("no base")?;
     let (mut spans, files) = (0usize, edits.len());
     let nodes_before = super::compile::ast_nodes(&front.ast);
@@ -659,14 +692,21 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, ctxts
         *chunk.scan.body_idents.get_mut(e.fn_index).ok_or("state")? = idents;
     }
     // Fn lines in the edited files: an edit that adds or drops lines
-    // moves every fn after it.
-    for (j, &(item, sub)) in front.fn_loc.iter().enumerate() {
-        let span = fn_def_at(&front.ast, item, sub).name_span;
-        if edits.iter().any(|e| e.file == span.file && span.lo >= (e.edit.b as i64 + e.edit.d) as u32) {
-            base.fn_lines[j] = front.map.line_col(span).0;
+    // moves every fn after it in that file, and no fn in any other.
+    for e in &edits {
+        let after = (e.edit.b as i64 + e.edit.d) as u32;
+        if let Some(fns) = base.fns_by_file.get(e.file.0 as usize) {
+            for &j in fns {
+                let (item, sub) = front.fn_loc[j as usize];
+                let span = fn_def_at(&front.ast, item, sub).name_span;
+                if span.lo >= after {
+                    base.fn_lines[j as usize] = front.map.line_col(span).0;
+                }
+            }
         }
     }
-    let changed = slot_update(front, caches, &base.body_hashes);
+    let edited: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
+    let changed = slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots);
     let edits_len = edits.len();
     let out = Patched {
         map: front.map.clone(),
@@ -682,6 +722,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, ctxts
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
         bodies: edits_len,
         spans,
+        reads,
     };
     front.patch = Some(base);
     Ok(out)
@@ -826,16 +867,26 @@ pub(super) fn fn_def_at_mut(ast: &mut Ast, item: usize, sub: Option<usize>) -> &
 /// rules as `compile::slot_update` in bodies mode: a fn rechecks when
 /// its body hash moved, its last check failed, or its C names a dead
 /// slot. Returns the fns to check.
-fn slot_update(front: &mut Front, caches: &mut Caches, hashes: &[u64]) -> Vec<usize> {
+///
+/// The dead-slot rule (the only part that walks per-fn state) runs for
+/// the edited fns only. For any other fn it was settled by the last
+/// request's slot update, and nothing since then can flip it: slot
+/// assignment and the fn's own `slot_used` change only when that fn is
+/// regenerated, instance slots only grow, and the compile tail's work
+/// preparation re-evaluates the same rule for builds before it reuses
+/// any C. The hash and ok scan stays: two word compares per fn, and
+/// the ok flags are written by the tail, so no smaller exact set of
+/// failed fns exists here.
+fn slot_update(front: &mut Front, caches: &mut Caches, hashes: &[u64], edited: &[usize], live: &[bool]) -> Vec<usize> {
     let n = front.ast_fn_count;
-    let mut live = vec![false; front.slot_of.len()];
-    for &s in &front.fn_slot[..n] {
-        live[s as usize] = true;
-    }
     let mut changed = Vec::new();
     for (i, &hash) in hashes.iter().enumerate().take(n) {
         let slot = front.fn_slot[i] as usize;
-        if caches.slot_used[slot].iter().any(|&u| live.get(u as usize) == Some(&false) && !front.inst_slot[u as usize]) {
+        if edited.contains(&i)
+            && caches.slot_used[slot]
+                .iter()
+                .any(|&u| !live.get(u as usize).copied().unwrap_or(false) && !front.inst_slot.get(u as usize).copied().unwrap_or(false))
+        {
             caches.ok[slot] = false;
         }
         if front.slot_hash[slot] != hash || !caches.ok[slot] {
