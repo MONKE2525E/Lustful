@@ -6685,8 +6685,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
         }
     }
     // The conversion traits (W-STD-B, check/convert.rs), as core and
-    // alloc declare them for the types lust has. Arrays answer by
-    // structure in the method probe (no const-param records yet).
+    // alloc declare them for the types lust has. Arrays also answer
+    // by structure in the method probe.
     {
         let tp = |p: &mut Program, tr: DefId, s: Ty, r: Ty| {
             let a = p.tys.intern_args(&[GenericArg::Ty(s), GenericArg::Ty(r)]);
@@ -6719,6 +6719,23 @@ pub fn add_synthetic_impls(p: &mut Program) {
         }
         for (s, t) in [(slice_p0, slice_p0), (vec_p0, slice_p0), (vec_p0, vec_p0), (box_p0, p0), (rc_p0, p0)] {
             insert_synthetic(p, &mut ordinal, lang.as_ref, s, &[t], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        // `[T; N]` to `[T]` for every conversion trait (core's array
+        // impls): a const-param record, so a generic bound such as
+        // `B: AsRef<[u8]>` holds for an array argument, as the method
+        // probe already answers for a direct `as_ref()` call.
+        let arr_g = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("N"), kind: ParamKind::Const(USIZE), span },
+            ],
+            predicates: Vec::new(),
+        };
+        let n_param = p.tys.intern_const(ConstKind::Param(1));
+        let arr_p0 = p.tys.intern(TyKind::Array(p0, n_param));
+        for tr in [lang.as_ref, lang.as_mut, lang.borrow, lang.borrow_mut] {
+            insert_synthetic(p, &mut ordinal, tr, arr_p0, &[slice_p0], arr_g.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         // AsMut: through &mut, str and String to str, [T] and Vec<T>
         // to [T], Vec<T> to itself, Box to T.
