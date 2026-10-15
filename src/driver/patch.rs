@@ -345,8 +345,8 @@ struct KeptEdit {
     /// for an edit inside cfg-disabled code.
     fn_index: Option<usize>,
     plain: bool,
-    /// The body holds items: collect runs again (see `reuse_kept`).
-    items: bool,
+    /// The body's items (`stmt_items` indexes; see `reuse_kept`).
+    items: Vec<u32>,
     /// The old body's expression range (a template's picks key on it).
     old_exprs: (u32, u32),
 }
@@ -376,7 +376,7 @@ pub(super) fn try_patch(
             ctxts: FxMap::default(),
             fn_index: e.body.as_ref().map(|b| b.fn_index),
             plain: e.body.as_ref().is_none_or(|b| b.plain),
-            items: e.body.as_ref().is_some_and(|b| !b.items.is_empty()),
+            items: e.body.as_ref().map_or_else(Vec::new, |b| b.items.clone()),
             old_exprs: e.body.as_ref().map_or((0, 0), |b| b.old_exprs),
         })
         .collect();
@@ -1151,10 +1151,18 @@ pub(super) fn reuse_kept(
         if !e.plain && !p.gx.user_generics {
             return Err("body scan");
         }
-        // The program's body item tables (statics, consts, item blocks,
-        // nested fns) hold the old item nodes and spans.
-        if e.items {
-            return Err("body items");
+        // Body items keep their indexes, text, and blocks (`same_items`),
+        // so the program's statics, consts, item blocks, and nested fn
+        // signatures stand. Closure and template tables key on Ast nodes,
+        // which are new: a nested fn must be a plain fn with no closure.
+        for &i in &e.items {
+            if let Some(crate::check::collect::BodyItem::Fn(f)) = p.body_items.get(&i).copied() {
+                let def = p.fn_def(f);
+                let closure = p.ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|x| matches!(x, crate::ast::Expr::Closure { .. }));
+                if closure || p.gx.fn_class.get(f.0 as usize) != Some(&FnClass::Plain) {
+                    return Err("body items");
+                }
+            }
         }
         // A template checks again below, in a check only: a build's
         // instances replay its picks.
@@ -1860,6 +1868,16 @@ pub fn run() -> i64 {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
             if fast {
                 assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            }
+            // Plain nested fns with no closure: the kept program stands,
+            // and its spans are a fresh collect's.
+            if new.contains("inner(3)") || new.contains("let n = TABLE.len()") {
+                assert_eq!(field(&v, "kept"), "reuse", "{new:?}: {v}");
+                let mut fresh = Session::new(dir.join("obj-fresh"), true, SessionKey::synthetic(&root, false));
+                assert_eq!(check(&mut fresh, &root).0, 0);
+                let (a, b) = (warm.front.kept[0].as_mut().unwrap(), fresh.front.kept[0].as_mut().unwrap());
+                assert_eq!(program_spans(&mut a.program), program_spans(&mut b.program), "kept and fresh program spans");
+                let _ = std::fs::remove_dir_all(dir.join("obj-fresh"));
             }
         }
         warm_equals_cold(&mut warm, &root, &m1, "    {\n        static MODE: OnceLock<u32> = OnceLock::new();\n    }\n    7\n", "    static MODE: OnceLock<u32> = OnceLock::new();\n    *MODE.get_or_init(|| 7)\n");
