@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `` (the scanned tree, landed on `next`). ts-rust: `unknown`.
+lust commit: `6fbf29d17` (the scanned tree, landed on `next`). ts-rust: `unknown`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 383 files, 372249 lines (94.3% of files, 95.3% of lines).
+Core: 406 files, 390709 lines. Compiles today: 385 files, 372553 lines (94.8% of files, 95.4% of lines).
 
-All active prod files: 741 of 773 files compile today (95.4% of lines).
+All active prod files: 746 of 773 files compile today (96.9% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,10 +31,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `cinterop.system` | unsupported | 7 | wave C (shims) | 14 | 9266 | 13 | 8917 |
-| 2 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
-| 3 | `ext.serde_json` | unsupported | none | wave D | 3 | 2484 | 1 | 1248 |
-| 4 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
+| 1 | `cinterop.system` | unsupported | 7 | wave C (shims) | 9 | 7482 | 6 | 4630 |
+| 2 | `ext.tikv_jemalloc_ctl` | unsupported | 0 | W-DEPS | 2 | 5769 | 2 | 5769 |
+| 3 | `ext.rustix` | unsupported | 0 | W-DEPS | 8 | 4636 | 5 | 1784 |
+| 4 | `ext.serde_json` | unsupported | none | wave D | 3 | 2484 | 1 | 1248 |
 | 5 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
 | 6 | `ext.serde` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
 | 7 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
@@ -44,10 +44,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 383 | 94.3 | 95.3 |
-| milestone 4 | 383 | 94.3 | 95.3 |
-| milestone 5 | 383 | 94.3 | 95.3 |
-| milestone 6 | 387 | 95.3 | 96.8 |
+| supported today | 392 | 96.6 | 97.3 |
+| milestone 4 | 392 | 96.6 | 97.3 |
+| milestone 5 | 392 | 96.6 | 97.3 |
+| milestone 6 | 392 | 96.6 | 97.3 |
 | milestone 7 | 403 | 99.3 | 99.4 |
 | milestone 8 | 403 | 99.3 | 99.4 |
 
@@ -55,10 +55,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 741 | 95.9 | 95.4 |
-| milestone 4 | 741 | 95.9 | 95.4 |
-| milestone 5 | 741 | 95.9 | 95.4 |
-| milestone 6 | 748 | 96.8 | 96.6 |
+| supported today | 753 | 97.4 | 96.9 |
+| milestone 4 | 753 | 97.4 | 96.9 |
+| milestone 5 | 753 | 97.4 | 96.9 |
+| milestone 6 | 753 | 97.4 | 96.9 |
 | milestone 7 | 768 | 99.4 | 98.6 |
 | milestone 8 | 770 | 99.6 | 99.6 |
 
