@@ -219,6 +219,20 @@ pub struct ResolvedTables {
     /// import of the name replaces one; a glob binding of another item
     /// makes the name ambiguous (`insert_glob_std_alias`).
     pub std_glob_aliases: FxMap<(ModuleId, u8, Sym), ModuleId>,
+    /// The source module a glob-bound name was copied from, keyed like
+    /// `std_glob_aliases`. A glob copies the source module's current
+    /// binding, and that binding can still upgrade (a glob binding in
+    /// the source is replaced by its explicit import, which may name
+    /// a different item): a later copy from the same source then
+    /// replaces this binding instead of making the name ambiguous, as
+    /// rustc resolves the name through the source's final binding.
+    /// Fixpoint state only; the final answer stays in `maps`.
+    pub glob_src: FxMap<(ModuleId, u8, Sym), ModuleId>,
+    /// Macros a module already re-exported with the self `use` idiom
+    /// (`macro_rules! m` then `pub(crate) use m;` in one module):
+    /// rustc allows that one `use` even though the macro definition
+    /// binds the name in the same module, and rejects a second one.
+    pub macro_self_uses: FxMap<(ModuleId, Sym), ()>,
     /// The adapter crates of the session (ARCH 3.6) and the files each
     /// one read. Check reads it for intrinsic privilege and to keep
     /// layout queries off adapter types whose layout is not exact.
@@ -338,6 +352,8 @@ impl ResolvedTables {
             crate_magic: FxMap::default(),
             std_aliases: BTreeMap::new(),
             std_glob_aliases: FxMap::default(),
+            glob_src: FxMap::default(),
+            macro_self_uses: FxMap::default(),
             adapters: Vec::new(),
             std_globs: Vec::new(),
             std_platform: None,
@@ -673,6 +689,33 @@ impl ResolvedTables {
                 }
             }
         }
+    }
+
+    /// Inserts one glob copy from source module `src` (see `glob_src`).
+    /// A binding this same source put here earlier, with a different
+    /// target, follows the source's upgrade: it is replaced, not made
+    /// ambiguous. A copy from any other source keeps the plain rules.
+    pub fn insert_glob(&mut self, module: ModuleId, ns: Namespace, name: Sym, bind: Bind, src: ModuleId) -> InsertOut {
+        let key = (module, ns_index(ns) as u8, name);
+        let stale = matches!(self.lookup(module, ns, name), Some(BindState::One(old)) if old.rank <= 1 && old.target != bind.target)
+            && self.glob_src.get(&key) == Some(&src)
+            && !self.std_glob_aliases.contains_key(&key);
+        if stale {
+            self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
+            return InsertOut::Changed;
+        }
+        let out = self.insert(module, ns, name, bind);
+        match self.lookup(module, ns, name) {
+            Some(BindState::One(_)) => {
+                if out == InsertOut::Changed {
+                    self.glob_src.insert(key, src);
+                }
+            }
+            _ => {
+                self.glob_src.remove(&key);
+            }
+        }
+        out
     }
 
     /// One name's binding, without prelude or flat-name fallback. This is
@@ -1707,7 +1750,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             }
                         }
                         for (ns, name, bind) in entries {
-                            if tables.insert(imp.module, ns, name, bind) == InsertOut::Changed {
+                            if tables.insert_glob(imp.module, ns, name, bind, src) == InsertOut::Changed {
                                 changed = true;
                             }
                         }
@@ -2027,6 +2070,22 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     let mut dup_reported = false;
                     for (ns, bind) in found {
                         let bind_name = import_bind_name(*name, bind.target, interner);
+                        // The macro self re-export idiom: `macro_rules! m`
+                        // plus one `use m;` in the defining module is one
+                        // binding in rustc, and the `use` sets how far the
+                        // macro name reaches. It replaces the definition's
+                        // private binding instead of duplicating it.
+                        let is_macro_self_use = ns == Namespace::Macro
+                            && bind_name == *name
+                            && matches!(bind.target, Target::Def(d) if tables.def_info.get(&d).is_some_and(|i| i.kind == ResKind::Macro && i.module == imp.module))
+                            && !tables.macro_self_uses.contains_key(&(imp.module, bind_name));
+                        if is_macro_self_use {
+                            tables.macro_self_uses.insert((imp.module, bind_name), ());
+                            let changed_now = !matches!(tables.lookup(imp.module, ns, bind_name), Some(BindState::One(old)) if old.vis == bind.vis && old.target == bind.target);
+                            tables.maps[imp.module.0 as usize][ns_index(ns)].insert(bind_name, BindState::One(bind));
+                            changed |= changed_now;
+                            continue;
+                        }
                         // An earlier std alias of the same name in the
                         // same namespace is an explicit binding too.
                         let dup = explicit_exists(tables, imp, ns, bind_name)
