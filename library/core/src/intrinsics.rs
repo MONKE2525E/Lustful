@@ -34,6 +34,7 @@
 //     pub fn sys_net_tcp_bind(rec: &[u8], out: &mut Vec<u8>) -> i32;
 //     pub fn sys_net_udp_bind(rec: &[u8], out: &mut Vec<u8>) -> i32;
 //     pub fn sys_net_tcp_connect(rec: &[u8], out: &mut Vec<u8>) -> i32;
+//     pub fn sys_net_tcp_connect_timeout(rec: &[u8], timeout_us: i64, out: &mut Vec<u8>) -> i32;  // -10000 = poll timeout
 //     pub fn sys_net_connect_fd(fd: i32, rec: &[u8]) -> i32;
 //     pub fn sys_net_accept(fd: i32, out: &mut Vec<u8>) -> i32;
 //     pub fn sys_net_addr_of(fd: i32, peer: i32, out: &mut Vec<u8>) -> i32;

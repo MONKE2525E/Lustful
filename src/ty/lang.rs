@@ -1145,6 +1145,16 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // connect with a timeout in microseconds: the fd, -errno, or
+    // -10000 when the poll timed out.
+    IntrinsicDef {
+        name: "sys_net_tcp_connect_timeout",
+        c_symbol: "lust_sys_net_tcp_connect_timeout",
+        params: &[S::Bytes, S::I64, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // connect of an existing fd: 0 or errno.
     IntrinsicDef { name: "sys_net_connect_fd", c_symbol: "lust_sys_net_connect_fd", params: &[S::I32, S::Bytes], ret: S::I32, allowed: ONLY_STD, implemented: true },
     // accept: the new fd or -errno, the peer record out.
@@ -1176,6 +1186,15 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // Unix domain sockets (w-cinterop2, sysnet.c unix section):
+    // pair returns the first fd and appends the second; bind and
+    // connect take path bytes plus an abstract flag; accept and
+    // addr append an address record (kind u64, then name bytes).
+    IntrinsicDef { name: "sys_net_unix_pair", c_symbol: "lust_sys_net_unix_pair", params: &[S::VecU8Mut], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef { name: "sys_net_unix_bind", c_symbol: "lust_sys_net_unix_bind", params: &[S::Bytes, S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef { name: "sys_net_unix_connect", c_symbol: "lust_sys_net_unix_connect", params: &[S::Bytes, S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef { name: "sys_net_unix_accept", c_symbol: "lust_sys_net_unix_accept", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef { name: "sys_net_unix_addr", c_symbol: "lust_sys_net_unix_addr", params: &[S::I32, S::I32, S::VecU8Mut], ret: S::I32, allowed: ONLY_STD, implemented: true },
     // The Unix calls behind the rustix adapter (w-cinterop2,
     // src/runtime/sysx.c). Errors are errno, or -errno where the
     // value is an fd or flags (sysx.h has each contract).

@@ -1,5 +1,7 @@
 /* Bodies of the socket intrinsics declared in sysnet.h
    (w-cinterop). */
+#include <poll.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -7,6 +9,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 /* Appends `n` bytes to a Vec<u8> (the sysio.c shape). */
@@ -189,6 +192,69 @@ int32_t lust_sys_net_tcp_connect(const uint8_t *rec, uint64_t len, lust_Vec *out
     return fd;
 }
 
+/* connect with a timeout in microseconds: a nonblocking connect
+   and a poll, as std's connect_timeout does. Returns the fd in
+   blocking mode, -errno, or -10000 when the poll itself timed
+   out (std reports that as its own TimedOut error, not an OS
+   error). EINTR in poll gives back the time left. */
+int32_t lust_sys_net_tcp_connect_timeout(const uint8_t *rec, uint64_t len, int64_t timeout_us, lust_Vec *out) {
+    int fam = lust_sysnet_family(rec, len);
+    if (fam < 0) return -EINVAL;
+    int fd = socket(fam, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return -errno;
+    struct sockaddr_storage ss;
+    socklen_t sl = lust_sysnet_read_addr(rec, len, &ss);
+    if (connect(fd, (struct sockaddr *)&ss, sl) != 0) {
+        if (errno != EINPROGRESS) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        int64_t left = timeout_us;
+        for (;;) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int ms = left >= 1000 ? (int)((left + 999) / 1000 > INT32_MAX ? INT32_MAX : (left + 999) / 1000) : 1;
+            int r = poll(&pfd, 1, ms);
+            if (r > 0) break;
+            if (r == 0) {
+                close(fd);
+                return -10000;
+            }
+            if (errno != EINTR) {
+                int e = errno;
+                close(fd);
+                return -e;
+            }
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t used = (int64_t)(now.tv_sec - start.tv_sec) * 1000000 + (now.tv_nsec - start.tv_nsec) / 1000;
+            if (used >= timeout_us) {
+                close(fd);
+                return -10000;
+            }
+            left = timeout_us - used;
+        }
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) err = errno;
+        if (err != 0) {
+            close(fd);
+            return -err;
+        }
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    struct sockaddr_storage local;
+    socklen_t ll = sizeof local;
+    if (getsockname(fd, (struct sockaddr *)&local, &ll) == 0) lust_sysnet_push_addr(out, (struct sockaddr *)&local);
+    return fd;
+}
+
 int32_t lust_sys_net_connect_fd(int32_t fd, const uint8_t *rec, uint64_t len) {
     struct sockaddr_storage ss;
     socklen_t sl = lust_sysnet_read_addr(rec, len, &ss);
@@ -237,6 +303,13 @@ int32_t lust_sys_net_setopt(int32_t fd, int32_t opt, int64_t val) {
             if (flags < 0) return errno;
             return fcntl(fd, F_SETFL, val ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) == 0 ? 0 : errno;
         }
+        case 4:
+        case 5: {
+            struct timeval tv;
+            tv.tv_sec = (time_t)(val / 1000000);
+            tv.tv_usec = (suseconds_t)(val % 1000000);
+            return setsockopt(fd, SOL_SOCKET, opt == 4 ? SO_RCVTIMEO : SO_SNDTIMEO, &tv, sizeof tv) == 0 ? 0 : errno;
+        }
         default: return EINVAL;
     }
 }
@@ -257,6 +330,13 @@ int64_t lust_sys_net_getopt(int32_t fd, int32_t opt) {
         case 3: {
             int flags = fcntl(fd, F_GETFL, 0);
             return flags < 0 ? -(int64_t)errno : (flags & O_NONBLOCK) != 0;
+        }
+        case 4:
+        case 5: {
+            struct timeval tv;
+            socklen_t tl = sizeof tv;
+            if (getsockopt(fd, SOL_SOCKET, opt == 4 ? SO_RCVTIMEO : SO_SNDTIMEO, &tv, &tl) != 0) return -(int64_t)errno;
+            return (int64_t)tv.tv_sec * 1000000 + (int64_t)tv.tv_usec;
         }
         default: return -(int64_t)EINVAL;
     }
@@ -291,4 +371,93 @@ int64_t lust_sys_net_recvfrom(int32_t fd, uint64_t max, int32_t flags, lust_Vec 
     free(tmp);
     lust_sysnet_push_addr(addrout, (struct sockaddr *)&ss);
     return (int64_t)n;
+}
+
+/* ---- Unix domain sockets (sysnet.h has the record forms) ---- */
+
+/* One sockaddr_un and its length from path bytes + abstract flag.
+   The Rust side checked the SUN_LEN limits. */
+static socklen_t lust_sysnet_unix_addr(const uint8_t *p, uint64_t len, int32_t abstract, struct sockaddr_un *un) {
+    memset(un, 0, sizeof *un);
+    un->sun_family = AF_UNIX;
+    if (abstract) {
+        memcpy(un->sun_path + 1, p, (size_t)len);
+        return (socklen_t)(sizeof(sa_family_t) + 1 + len);
+    }
+    memcpy(un->sun_path, p, (size_t)len);
+    return (socklen_t)(sizeof(sa_family_t) + len + 1);
+}
+
+/* One unix address record out: kind u64 then the name bytes. */
+static void lust_sysnet_push_unix_addr(lust_Vec *out, const struct sockaddr_un *un, socklen_t ll) {
+    uint64_t off = sizeof(sa_family_t);
+    if (ll <= off) {
+        lust_sysnet_put64(out, 0);
+        return;
+    }
+    uint64_t n = ll - off;
+    if (un->sun_path[0] == 0) {
+        if (n <= 1) {
+            lust_sysnet_put64(out, 0);
+            return;
+        }
+        lust_sysnet_put64(out, 2);
+        lust_sysnet_push(out, un->sun_path + 1, n - 1);
+        return;
+    }
+    uint64_t sl = 0;
+    while (sl < n && un->sun_path[sl] != 0) sl++;
+    lust_sysnet_put64(out, 1);
+    lust_sysnet_push(out, un->sun_path, sl);
+}
+
+int32_t lust_sys_net_unix_pair(lust_Vec *out) {
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) != 0) return -errno;
+    lust_sysnet_put64(out, (uint64_t)(uint32_t)fds[1]);
+    return fds[0];
+}
+
+int32_t lust_sys_net_unix_bind(const uint8_t *p, uint64_t len, int32_t abstract) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+    struct sockaddr_un un;
+    socklen_t sl = lust_sysnet_unix_addr(p, len, abstract, &un);
+    if (bind(fd, (struct sockaddr *)&un, sl) != 0 || listen(fd, 128) != 0) {
+        int e = errno;
+        close(fd);
+        return -e;
+    }
+    return fd;
+}
+
+int32_t lust_sys_net_unix_connect(const uint8_t *p, uint64_t len, int32_t abstract) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+    struct sockaddr_un un;
+    socklen_t sl = lust_sysnet_unix_addr(p, len, abstract, &un);
+    if (connect(fd, (struct sockaddr *)&un, sl) != 0) {
+        int e = errno;
+        close(fd);
+        return -e;
+    }
+    return fd;
+}
+
+int32_t lust_sys_net_unix_accept(int32_t fd, lust_Vec *out) {
+    struct sockaddr_un un;
+    socklen_t ll = sizeof un;
+    int n = accept4(fd, (struct sockaddr *)&un, &ll, SOCK_CLOEXEC);
+    if (n < 0) return -errno;
+    lust_sysnet_push_unix_addr(out, &un, ll);
+    return n;
+}
+
+int32_t lust_sys_net_unix_addr(int32_t fd, int32_t peer, lust_Vec *out) {
+    struct sockaddr_un un;
+    socklen_t ll = sizeof un;
+    int rc = peer ? getpeername(fd, (struct sockaddr *)&un, &ll) : getsockname(fd, (struct sockaddr *)&un, &ll);
+    if (rc != 0) return errno;
+    lust_sysnet_push_unix_addr(out, &un, ll);
+    return 0;
 }

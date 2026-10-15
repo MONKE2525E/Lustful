@@ -932,8 +932,8 @@
   {
    "id": "ext.memchr",
    "title": "Adapter crate memchr 2.8.2: memchr/memrchr, memchr_iter, memmem::Finder",
-   "status": "supported",
-   "milestone": 0,
+   "status": "partial",
+   "milestone": 5,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
@@ -1152,6 +1152,36 @@
     "ext.type.rustix::*",
     "ext.expr.rustix::*",
     "ext.use.rustix::*"
+   ]
+  },
+  {
+   "id": "std.unix_net",
+   "title": "Unix domain sockets (UnixStream, UnixListener, SocketAddr)",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "10",
+   "root_cause": "std-runtime",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from std.runtime (w-cinterop2), which claimed std::os::* supported before any form worked. Probe: std_unix_net.rs (a UnixStream pair). Overlay in library/std/src/unix_net.rs over sys_net_unix intrinsics, with the SocketAddrExt abstract-name trait. UnixDatagram and the std::os::fd conversions are not here.",
+   "primary_keys": [
+    "std.type.std::os::unix::net::UnixStream",
+    "std.type.std::os::unix::net::UnixListener"
+   ],
+   "keys": [
+    "std.type.std::os::unix::net::UnixStream*",
+    "std.expr.std::os::unix::net::UnixStream*",
+    "std.use.std::os::unix::net::UnixStream*",
+    "std.type.std::os::unix::net::UnixListener*",
+    "std.expr.std::os::unix::net::UnixListener*",
+    "std.use.std::os::unix::net::UnixListener*",
+    "std.type.std::os::unix::net::SocketAddr*",
+    "std.expr.std::os::unix::net::SocketAddr*",
+    "std.use.std::os::unix::net::SocketAddr*",
+    "std.type.std::os::linux::net::SocketAddrExt*",
+    "std.expr.std::os::linux::net::SocketAddrExt*",
+    "std.use.std::os::linux::net::SocketAddrExt*"
    ]
   },
   {
@@ -1782,7 +1812,7 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Split from std.other (W-STD-C phase 2 scan). Owner: W-SHIM-P2 (system io, with io/fs/process). Probe: std_net.rs (loopback listener). The address types are std.net_addr.",
+   "notes": "Split from std.other (W-STD-C phase 2 scan). Owner: W-SHIM-P2 (system io, with io/fs/process). Probes: std_net.rs (loopback listener) and std_net_b.rs (socket timeouts and connect_timeout, w-cinterop2). The address types are std.net_addr.",
    "primary_keys": [
     "std.type.std::net::TcpStream",
     "std.type.std::net::TcpListener",

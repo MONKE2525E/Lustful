@@ -1172,6 +1172,45 @@ fn net_status(code: i32) -> io::Result<()> {
     if code == 0 { Ok(()) } else { Err(os_err(code)) }
 }
 
+/// std's error for a zero duration timeout.
+fn zero_timeout_err() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "cannot set a 0 duration timeout")
+}
+
+/// A timeout duration in whole microseconds for the sys_net
+/// options: sub-microsecond values round up to one, as std's
+/// timeval conversion keeps a non-zero timeout non-zero.
+fn timeout_us(d: core::time::Duration) -> i64 {
+    let us = d.as_secs() as i64 * 1_000_000 + (d.subsec_nanos() / 1000) as i64;
+    if us == 0 { 1 } else { us }
+}
+
+/// Sets one socket timeout option (4 read, 5 write).
+fn set_timeout(fd: i32, opt: i32, timeout: Option<core::time::Duration>) -> io::Result<()> {
+    let us = match timeout {
+        None => 0,
+        Some(d) => {
+            if d == core::time::Duration::ZERO {
+                return Err(zero_timeout_err());
+            }
+            timeout_us(d)
+        }
+    };
+    net_status(core::intrinsics::sys_net_setopt(fd, opt, us))
+}
+
+/// Reads one socket timeout option (4 read, 5 write).
+fn get_timeout(fd: i32, opt: i32) -> io::Result<Option<core::time::Duration>> {
+    let v = core::intrinsics::sys_net_getopt(fd, opt);
+    if v < 0 {
+        Err(os_err((-v) as i32))
+    } else if v == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(core::time::Duration::from_micros(v as u64)))
+    }
+}
+
 /// The local or peer address of a socket.
 fn addr_of(fd: i32, peer: bool) -> io::Result<SocketAddr> {
     let mut raw: Vec<u8> = Vec::new();
@@ -1460,6 +1499,42 @@ impl TcpStream {
             let fd = core::intrinsics::sys_net_tcp_connect(&pack_addr(a), &mut raw);
             if fd < 0 { Err(os_err(-fd)) } else { Ok(TcpStream { fd }) }
         })
+    }
+
+    /// Connects to one socket address with a timeout.
+    pub fn connect_timeout(addr: &SocketAddr, timeout: core::time::Duration) -> io::Result<TcpStream> {
+        if timeout == core::time::Duration::ZERO {
+            return Err(zero_timeout_err());
+        }
+        let mut raw: Vec<u8> = Vec::new();
+        let fd = core::intrinsics::sys_net_tcp_connect_timeout(&pack_addr(addr), timeout_us(timeout), &mut raw);
+        if fd == -10000 {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        } else if fd < 0 {
+            Err(os_err(-fd))
+        } else {
+            Ok(TcpStream { fd })
+        }
+    }
+
+    /// Sets the read timeout (SO_RCVTIMEO).
+    pub fn set_read_timeout(&self, timeout: Option<core::time::Duration>) -> io::Result<()> {
+        set_timeout(self.fd, 4, timeout)
+    }
+
+    /// The read timeout.
+    pub fn read_timeout(&self) -> io::Result<Option<core::time::Duration>> {
+        get_timeout(self.fd, 4)
+    }
+
+    /// Sets the write timeout (SO_SNDTIMEO).
+    pub fn set_write_timeout(&self, timeout: Option<core::time::Duration>) -> io::Result<()> {
+        set_timeout(self.fd, 5, timeout)
+    }
+
+    /// The write timeout.
+    pub fn write_timeout(&self) -> io::Result<Option<core::time::Duration>> {
+        get_timeout(self.fd, 5)
     }
 
     /// Returns the socket address of the remote peer.
@@ -1814,6 +1889,26 @@ impl UdpSocket {
     pub fn broadcast(&self) -> io::Result<bool> {
         let v = core::intrinsics::sys_net_getopt(self.fd, 2);
         if v < 0 { Err(os_err((-v) as i32)) } else { Ok(v != 0) }
+    }
+
+    /// Sets the read timeout (SO_RCVTIMEO).
+    pub fn set_read_timeout(&self, timeout: Option<core::time::Duration>) -> io::Result<()> {
+        set_timeout(self.fd, 4, timeout)
+    }
+
+    /// The read timeout.
+    pub fn read_timeout(&self) -> io::Result<Option<core::time::Duration>> {
+        get_timeout(self.fd, 4)
+    }
+
+    /// Sets the write timeout (SO_SNDTIMEO).
+    pub fn set_write_timeout(&self, timeout: Option<core::time::Duration>) -> io::Result<()> {
+        set_timeout(self.fd, 5, timeout)
+    }
+
+    /// The write timeout.
+    pub fn write_timeout(&self) -> io::Result<Option<core::time::Duration>> {
+        get_timeout(self.fd, 5)
     }
 
     /// Sets the time-to-live.

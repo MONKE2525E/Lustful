@@ -1134,6 +1134,40 @@ impl ResolvedTables {
         self.lookup(m, ns, n).is_some().then_some(m)
     }
 
+    /// A deep std source module (`std::os::unix::net`): a row whose
+    /// path has more than one segment, matched against the whole
+    /// remaining path `segs`, so sibling paths under the same
+    /// first segment (`std::os::unix::fs`) stay the compiler's.
+    /// Returns the hidden module and how many segments it eats.
+    /// An overlay row matches only when the segment after the deep
+    /// path (when there is one) is defined in it.
+    pub fn std_deep_module(&self, i: u32, segs: &[Sym], interner: &Interner) -> Option<(ModuleId, usize)> {
+        let e = &self.externs[i as usize];
+        if !e.is_std_lib || self.std_modules.is_empty() {
+            return None;
+        }
+        for row in crate::stdmods::STD_MODULES {
+            for (k, s) in row.paths {
+                if *k != e.name || !s.contains("::") {
+                    continue;
+                }
+                let parts: Vec<&str> = s.split("::").collect();
+                if segs.len() < parts.len() || !parts.iter().zip(segs.iter()).all(|(p, g)| interner.get(*g) == *p) {
+                    continue;
+                }
+                let m = self.std_modules.iter().find(|(n, _)| interner.get(*n) == row.name).map(|(_, m)| *m)?;
+                if !row.full
+                    && let Some(next) = segs.get(parts.len())
+                    && ![Namespace::Type, Namespace::Value, Namespace::Macro].iter().any(|&ns| self.lookup(m, ns, *next).is_some())
+                {
+                    continue;
+                }
+                return Some((m, parts.len()));
+            }
+        }
+        None
+    }
+
     /// The path target an extern prelude entry resolves to: the
     /// dependency crate's root module when lust compiles it from
     /// source in this session, else the extern root itself.
@@ -1281,6 +1315,19 @@ impl ResolvedTables {
                         && self.std_platform_has(&segs[idx..], from, interner) =>
                 {
                     cur = Target::Module(self.std_platform.map(|(root, _)| root).unwrap_or(ModuleId(0)));
+                    continue;
+                }
+                // Deep std source modules (`std::os::unix::net`) eat
+                // their whole remaining path at the extern (W-CINTEROP2).
+                Target::Extern(i)
+                    if seg_ns == Namespace::Type
+                        && let Some((m, eaten)) = self.std_deep_module(i, &segs[idx..], interner) =>
+                {
+                    cur = Target::Module(m);
+                    idx += eaten;
+                    if idx >= segs.len() {
+                        return PathRes::Done(cur);
+                    }
                     continue;
                 }
                 // `std::time` and the other std source modules walk into

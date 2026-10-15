@@ -114,6 +114,14 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["System"],
     },
     StdModule {
+        name: "__lust_std_unix_net",
+        rel: "std/src/unix_net.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "os::unix::net"), ("std", "os::linux::net")],
+        full: false,
+        triggers: &["UnixStream", "UnixListener", "UnixDatagram", "SocketAddrExt"],
+    },
+    StdModule {
         name: "__lust_alloc_collections",
         rel: "alloc/src/collections.rs",
         krate: ShippedCrate::Alloc,

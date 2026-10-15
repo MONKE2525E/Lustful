@@ -73,6 +73,7 @@ fn builtin_text(rel: &str) -> Option<&'static str> {
         "core/src/error.rs" => include_str!("../library/core/src/error.rs"),
         "std/src/net.rs" => include_str!("../library/std/src/net.rs"),
         "std/src/alloc.rs" => include_str!("../library/std/src/alloc.rs"),
+        "std/src/unix_net.rs" => include_str!("../library/std/src/unix_net.rs"),
         _ => return None,
     })
 }
