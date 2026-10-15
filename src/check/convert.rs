@@ -161,12 +161,6 @@ enum Conv {
 }
 
 impl<'p> Ctx<'p> {
-    /// True when a lang trait is in scope by the std `use` rule, or as
-    /// the trait of the impl this body is in.
-    fn lang_trait_imported(&self, trait_def: DefId, module: &str, name: &str) -> bool {
-        self.std_trait_imported(module, name) || self.enclosing_impl_trait_pub() == Some(trait_def)
-    }
-
     /// `as_ref`, `as_mut`, `borrow`, `borrow_mut`, and `to_owned` on a
     /// builtin receiver (user Adts and parameters resolve their impls
     /// in the generic method search first). None when the call is not
@@ -226,8 +220,22 @@ impl<'p> Ctx<'p> {
         let conv = match n {
             "as_ref" => Conv::AsRef,
             "as_mut" => Conv::AsMut,
-            "borrow" if self.lang_trait_imported(lang.borrow, "borrow", "Borrow") && plain(self, self_ty) => Conv::Borrow,
-            "borrow_mut" if self.lang_trait_imported(lang.borrow_mut, "borrow", "BorrowMut") && plain(self, self_ty) => Conv::BorrowMut,
+            // A trait named in the fn's bounds is in scope in its body
+            // (rustc's rule, method.rs `trait_in_scope`): an instance
+            // of a `K: Borrow<Q>` body calling `k.borrow()` on a
+            // builtin key lands here, with no `use` in the module.
+            "borrow"
+                if (super::method::trait_in_scope_pub(self, lang.borrow) || self.enclosing_impl_trait_pub() == Some(lang.borrow))
+                    && plain(self, self_ty) =>
+            {
+                Conv::Borrow
+            }
+            "borrow_mut"
+                if (super::method::trait_in_scope_pub(self, lang.borrow_mut) || self.enclosing_impl_trait_pub() == Some(lang.borrow_mut))
+                    && plain(self, self_ty) =>
+            {
+                Conv::BorrowMut
+            }
             "to_owned" => return self.to_owned_call(e, recv, rt, self_ty, self_derefs, name_span),
             _ => return None,
         };
