@@ -9736,7 +9736,13 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 // recursion limit) are a build's, as in rustc. Closure
                 // body fns are not requests: `register_closures` makes
                 // them in both modes, so every closure body is checked.
-                if !p.gx.walk_instances {
+                // A program with generic associated consts is the
+                // exception: their per-instance values are evaluated only
+                // in instance checks (`assoc_eval`), and an instance whose
+                // value overflows is an error (rustc E0080) that `lust
+                // check` must report as `lust build` does, so check walks
+                // the instances then.
+                if !p.gx.walk_instances && p.gx.assoc_const_tmpls.is_empty() {
                     continue;
                 }
                 if depth + 1 > crate::mono::MAX_INSTANCE_DEPTH {

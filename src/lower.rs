@@ -233,9 +233,10 @@ impl<'p> Lower<'p> {
         self.scopes.last_mut().unwrap().push(l);
         l
     }
-    /// A promoted temporary: the backing storage of a const
-    /// reference value. It is in no scope, so it is never dropped,
-    /// as a promoted constant is not.
+    /// A promoted temporary: the storage of a value borrowed for
+    /// `'static` (a const reference's pointee, `&5`, `&[]`). It is in
+    /// no scope, so it is never dropped, and cgen gives it static
+    /// storage, so a reference to it may escape its function.
     fn promoted_temp(&mut self, ty: Ty) -> Local {
         let l = self.new_local(ty, true, None);
         self.body.promoted.push(l);
@@ -2014,9 +2015,8 @@ impl<'p> Lower<'p> {
                     _ => false,
                 } {
                     let at = self.ty(*expr);
-                    let t = self.new_local(at, true, None);
+                    let t = self.promoted_temp(at);
                     self.assign(Place::local(t), Rvalue::ArrayAgg(at, Vec::new()), span);
-                    self.body.promoted.push(t);
                     if let Some(d) = dest {
                         self.assign(d.clone(), Rvalue::Ref(*mutable, Place::local(t)), span);
                     }
@@ -2030,9 +2030,8 @@ impl<'p> Lower<'p> {
                     && self.ck.closures.iter().any(|c| c.expr == *expr && c.captures.is_empty())
                 {
                     let ct = self.ty(*expr);
-                    let t = self.new_local(ct, true, None);
+                    let t = self.promoted_temp(ct);
                     self.closure_value(*expr, Some(&Place::local(t)), span);
-                    self.body.promoted.push(t);
                     if let Some(d) = dest {
                         self.assign(d.clone(), Rvalue::Ref(false, Place::local(t)), span);
                     }
@@ -2050,9 +2049,8 @@ impl<'p> Lower<'p> {
                 // storage in cgen) and holds the same constant each time.
                 if !*mutable && self.promotable(*expr) {
                     let at = self.ty(*expr);
-                    let t = self.new_local(at, true, None);
+                    let t = self.promoted_temp(at);
                     self.expr_into(*expr, Some(&Place::local(t)));
-                    self.body.promoted.push(t);
                     if let Some(d) = dest {
                         self.assign(d.clone(), Rvalue::Ref(false, Place::local(t)), span);
                     }

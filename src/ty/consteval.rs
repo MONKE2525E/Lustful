@@ -280,6 +280,15 @@ fn is_place_expr(ast: &Ast, e: ExprId) -> bool {
     )
 }
 
+/// The value a borrowed place projects from: `&C.1` borrows into
+/// the temporary `C`, `&(D(1), 4).1` into the tuple temporary.
+fn projection_root(ast: &Ast, mut e: ExprId) -> ExprId {
+    while let Expr::Field { base, .. } | Expr::TupleField { base, .. } = ast.expr(e) {
+        e = *base;
+    }
+    e
+}
+
 fn outside(span: Span, what: &str) -> Diag {
     Diag::new(
         C_OUTSIDE,
@@ -781,13 +790,15 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
         extra_cap: 0,
         call_depth: 0,
         move_read: false,
-        dead: 0,
-        ref_drop_temps: Vec::new(),
+        extending: std::collections::HashSet::new(),
+        ext_roots: std::collections::HashSet::new(),
+        dead_seen: std::collections::HashSet::new(),
         flex_debt: Vec::new(),
         local_debt: Vec::new(),
     };
     let mut env: Env = Vec::new();
     let span = cx.ast().expr_span(e);
+    ev.mark_extending(cx, e);
     match ev.expr(cx, &mut env, e, expected)? {
         Flow::Val(v) => {
             // An unpinned literal that no context ever pinned falls back
@@ -799,13 +810,8 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
             }
             // The final value stands for the item's whole life: a
             // borrow of a temporary inside it must be promotable
-            // (E0492/E0764), and every borrowed drop temporary the
-            // evaluation made must have ended up in it (else that
-            // temporary was dropped, E0493).
+            // (E0492/E0764).
             check_final_refs(cx, &v.0, v.1, span)?;
-            if ev.ref_drop_temps.len() as u32 > count_ref_drops(cx, &v.0, v.1) {
-                return Err(drop_diag(cx, ev.ref_drop_temps[0], span));
-            }
             Ok(v)
         }
         _ => Err(outside(span, "control flow out of a const expression")),
@@ -836,14 +842,18 @@ struct Evaluator {
     /// its parent (a call argument, an aggregate element, a tail):
     /// a local read at its leaf is a move (the E0493 check).
     move_read: bool,
-    /// The types of the drop-type temporaries this evaluation
-    /// borrowed. Each one must end up in the final value, promoted;
-    /// one that does not was dropped at its statement's end.
-    ref_drop_temps: Vec<Ty>,
-    /// Depth of dead-branch scans (`scan_dead_block`): a scan does
-    /// not start another scan, so nested dead branches cost one
-    /// pass each, not an exponential one.
-    dead: u32,
+    /// The extending borrows of the item (rustc's temporary lifetime
+    /// extension, see `mark_extending`): their temporaries live in
+    /// the final value and are never dropped. A borrowed drop
+    /// temporary anywhere else is dropped inside the evaluation (E0493).
+    extending: std::collections::HashSet<ExprId>,
+    /// The temporaries extended by an extending borrow of a projection
+    /// (`&C.1`, `&(D(1), 4).1`): the root value of the projection.
+    ext_roots: std::collections::HashSet<ExprId>,
+    /// The dead branches already scanned: the drop check is static, so
+    /// one scan per branch is enough, also in a loop, and nested dead
+    /// branches cost one pass each, not an exponential one.
+    dead_seen: std::collections::HashSet<(bool, u32)>,
     /// Unsuffixed literals evaluated wide (no pinning type) whose
     /// magnitude does not fit i32, by expression. Evaluating the
     /// same expression at a pinning type, or reading a local it
@@ -1049,6 +1059,9 @@ impl Evaluator {
             }
             Expr::Block(b) => return self.block(cx, env, *b, expected),
             Expr::ConstBlock(b) => {
+                // An inline const is an item of its own: its tail
+                // borrows extend into its value.
+                self.mark_extending(cx, e);
                 // An inline const with no expected type pins its own
                 // literals: Rust falls back to i32 there, not i128.
                 if expected.is_none() && flex_int_expr(cx.ast(), e) {
@@ -1270,13 +1283,19 @@ impl Evaluator {
                     TyKind::Ref(_, _, inner) if !matches!(cx.tys_ref().kind(inner), TyKind::Slice(_)) => Some(inner),
                     _ => None,
                 });
+                // A borrow of a drop temporary lives on only when the
+                // borrow is extending: then the temporary (for a
+                // projection, its root value) is part of the final
+                // value. Any other one is dropped at its statement's
+                // end (E0493). A borrow of a place drops with its
+                // owner, judged at that scope's end instead.
+                let extended = self.extending.contains(&e);
+                if extended {
+                    self.ext_roots.insert(projection_root(cx.ast(), *expr));
+                }
                 let (v, t) = self.value_place(cx, env, *expr, inner_expected)?;
-                // A borrow of a drop temporary must be promoted into
-                // the item's final value; counted here, judged in
-                // `eval` (a borrow of a place drops with its owner,
-                // judged at that scope's end instead).
-                if !is_place_expr(cx.ast(), *expr) && cx.needs_drop(t) {
-                    self.ref_drop_temps.push(t);
+                if !extended && !self.is_place(cx, env, *expr) && cx.needs_drop(t) {
+                    return Err(drop_diag(cx, t, span));
                 }
                 if let ConstValue::Str(_) = v {
                     (v, t)
@@ -1308,7 +1327,7 @@ impl Evaluator {
             }
             Expr::Field { base, name } => {
                 let (v, t) = self.value_place(cx, env, *base, None)?;
-                self.check_temp_drop(cx, *base, t, span)?;
+                self.check_temp_drop(cx, env, *base, t, span)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 let Some(adt) = cx.tys_ref().local_adt(t) else { return Err(outside(span, "this field access")) };
                 self.check_named_field(cx, adt, *name, span)?;
@@ -1323,7 +1342,7 @@ impl Evaluator {
             }
             Expr::TupleField { base, index } => {
                 let (v, t) = self.value_place(cx, env, *base, None)?;
-                self.check_temp_drop(cx, *base, t, span)?;
+                self.check_temp_drop(cx, env, *base, t, span)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 if !matches!(cx.tys_ref().kind(t), TyKind::Tuple(_))
                     && let Some(adt) = cx.tys_ref().local_adt(t)
@@ -1353,7 +1372,7 @@ impl Evaluator {
                     return Ok(Flow::Val(got));
                 }
                 let (v, t) = self.value_place(cx, env, *base, None)?;
-                self.check_temp_drop(cx, *base, t, span)?;
+                self.check_temp_drop(cx, env, *base, t, span)?;
                 let (v, t) = self.deref_value(cx, v, t);
                 let (iv, _) = self.value(cx, env, *index, Some(USIZE))?;
                 let ConstValue::Int(i) = iv else { return Err(outside(span, "this index")) };
@@ -1536,7 +1555,8 @@ impl Evaluator {
                         }
                         return r;
                     }
-                    self.scan_dead_block(cx, env, *then)?;
+                    let denv = self.dead_env(cx, env, pat, st);
+                    self.scan_dead_block(cx, &denv, *then)?;
                     match els {
                         Some(els) => return self.expr(cx, env, *els, expected),
                         None => (ConstValue::Unit, UNIT),
@@ -1576,6 +1596,7 @@ impl Evaluator {
                     // `while let pat = scrut { .. }`: bindings are
                     // fresh per iteration and live in the body.
                     let saved = env.len();
+                    let mut dead_pat = None;
                     let go = if let Expr::Let { pat, scrut } = cx.ast().expr(*cond) {
                         let (pat, scrut) = (*pat, *scrut);
                         let (sv, st) = self.value_moved(cx, env, scrut, None)?;
@@ -1587,6 +1608,7 @@ impl Evaluator {
                         if m {
                             env.extend(binds);
                         }
+                        dead_pat = Some((pat, st));
                         m
                     } else {
                         let (cv, _) = self.value(cx, env, *cond, Some(BOOL))?;
@@ -1598,7 +1620,13 @@ impl Evaluator {
                         // A body that never runs still drops its
                         // locals in rustc's static check.
                         if first {
-                            self.scan_dead_block(cx, env, *body)?;
+                            match dead_pat {
+                                Some((pat, st)) => {
+                                    let denv = self.dead_env(cx, env, pat, st);
+                                    self.scan_dead_block(cx, &denv, *body)?;
+                                }
+                                None => self.scan_dead_block(cx, env, *body)?,
+                            }
                         }
                         break;
                     }
@@ -1701,12 +1729,81 @@ impl Evaluator {
 
     /// The E0493 check for a projected or borrowed temporary: a
     /// new value of a drop type used as a field, index, or method
-    /// base is destroyed when its statement ends.
-    fn check_temp_drop<'a, C: ConstCx<'a>>(&self, cx: &C, base: ExprId, base_ty: Ty, span: Span) -> Result<(), Diag> {
-        if !is_place_expr(cx.ast(), base) && cx.needs_drop(base_ty) {
+    /// base is destroyed when its statement ends, unless an
+    /// extending borrow keeps it (`ext_roots`).
+    fn check_temp_drop<'a, C: ConstCx<'a>>(&self, cx: &mut C, env: &Env, base: ExprId, base_ty: Ty, span: Span) -> Result<(), Diag> {
+        if !self.ext_roots.contains(&base) && !self.is_place(cx, env, base) && cx.needs_drop(base_ty) {
             return Err(drop_diag(cx, base_ty, span));
         }
         Ok(())
+    }
+
+    /// True when `e` names an existing value (a local, a static, or a
+    /// projection) instead of making a temporary. A const item path is
+    /// a value: each use makes a fresh copy of the const.
+    fn is_place<'a, C: ConstCx<'a>>(&self, cx: &mut C, env: &Env, e: ExprId) -> bool {
+        match cx.ast().expr(e) {
+            Expr::Path(segs) => {
+                let [seg] = segs.as_slice() else { return false };
+                let name = seg.name;
+                env.iter().any(|(n, _, _, _)| *n == name) || cx.static_item(name, cx.ast().expr_span(e)).is_some()
+            }
+            Expr::QPath { .. } => false,
+            _ => is_place_expr(cx.ast(), e),
+        }
+    }
+
+    /// Marks the extending borrows of a const item or inline const
+    /// whose value is `e` (rustc's temporary lifetime extension): the
+    /// value itself, the operand of an extending borrow or cast, the
+    /// elements of a tuple, array, struct literal, or tuple
+    /// constructor call, a block's tail, and `if` and `match` arm
+    /// values. A `let` inside the item does not extend to the item.
+    fn mark_extending<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, e: ExprId) {
+        let ast = cx.ast();
+        match ast.expr(e).clone() {
+            Expr::Ref { raw: false, expr, .. } => {
+                self.extending.insert(e);
+                self.mark_extending(cx, expr);
+            }
+            Expr::Cast { expr, .. } => self.mark_extending(cx, expr),
+            Expr::Tuple(es) | Expr::Array(es) => {
+                for x in es {
+                    self.mark_extending(cx, x);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, _, x) in fields {
+                    self.mark_extending(cx, x);
+                }
+            }
+            Expr::Call { callee, args } => {
+                if matches!(cx.call_target(callee), CallTarget::VariantCtor { .. }) {
+                    for x in args {
+                        self.mark_extending(cx, x);
+                    }
+                }
+            }
+            Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => {
+                if let Some(t) = ast.block(b).tail {
+                    self.mark_extending(cx, t);
+                }
+            }
+            Expr::If { then, els, .. } => {
+                if let Some(t) = ast.block(then).tail {
+                    self.mark_extending(cx, t);
+                }
+                if let Some(x) = els {
+                    self.mark_extending(cx, x);
+                }
+            }
+            Expr::Match { arms, .. } => {
+                for arm in arms {
+                    self.mark_extending(cx, arm.body);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Evaluates a branch the live path did not take, only to
@@ -1715,18 +1812,15 @@ impl Evaluator {
     /// its panics and overflows do not. The environment, step
     /// count, and drop-temporary count are restored afterwards.
     fn scan_dead_block<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &Env, b: ast::BlockId) -> Result<(), Diag> {
-        if self.dead > 0 {
+        if !self.dead_seen.insert((true, b.0)) {
             return Ok(());
         }
-        self.dead += 1;
-        let (steps, temps, flex, local) = (self.steps, self.ref_drop_temps.len(), self.flex_debt.len(), self.local_debt.len());
+        let (steps, flex, local) = (self.steps, self.flex_debt.len(), self.local_debt.len());
         let depth = self.call_depth;
         let mut env2 = env.clone();
         let r = self.block(cx, &mut env2, b, None);
-        self.dead -= 1;
         self.steps = steps;
         self.call_depth = depth;
-        self.ref_drop_temps.truncate(temps);
         self.flex_debt.truncate(flex);
         self.local_debt.truncate(local);
         match r {
@@ -1737,23 +1831,118 @@ impl Evaluator {
 
     /// `scan_dead_block` for one expression (an `else` arm).
     fn scan_dead_expr<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &Env, e: ExprId) -> Result<(), Diag> {
-        if self.dead > 0 {
+        if !self.dead_seen.insert((false, e.0)) {
             return Ok(());
         }
-        self.dead += 1;
-        let (steps, temps, flex, local) = (self.steps, self.ref_drop_temps.len(), self.flex_debt.len(), self.local_debt.len());
+        let (steps, flex, local) = (self.steps, self.flex_debt.len(), self.local_debt.len());
         let depth = self.call_depth;
         let mut env2 = env.clone();
         let r = self.expr(cx, &mut env2, e, None);
-        self.dead -= 1;
         self.steps = steps;
         self.call_depth = depth;
-        self.ref_drop_temps.truncate(temps);
         self.flex_debt.truncate(flex);
         self.local_debt.truncate(local);
         match r {
             Err(d) if is_drop_diag(&d) => Err(d),
             _ => Ok(()),
+        }
+    }
+
+    /// The environment a dead branch is scanned in: `env` plus the
+    /// bindings of `pat` (matched against a value of type `t`), each
+    /// bound to a zero value of its type. A name the walk cannot type
+    /// stays unbound, so a read of it ends the scan there.
+    fn dead_env<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &Env, pat: PatId, t: Ty) -> Env {
+        let mut out = env.clone();
+        self.dead_binds(cx, pat, t, &mut out, 0);
+        out
+    }
+
+    fn dead_binds<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, pat: PatId, t: Ty, out: &mut Env, depth: u32) {
+        if depth > 16 {
+            return;
+        }
+        // A type the walk cannot see (an elided `None::<T>` argument)
+        // binds an integer zero: integer uses go on.
+        let bind = |cx: &mut C, out: &mut Env, name: Sym, mutable: bool, t: Ty| {
+            let v = if t == ERROR { Some(ConstValue::Int(0)) } else { zero_value(cx, t, 0) };
+            if let Some(v) = v {
+                out.push((name, (v, t), mutable, false));
+            }
+        };
+        // Positional sub-patterns against their types; a `..` element
+        // maps the elements after it from the end.
+        let positional = |this: &mut Self, cx: &mut C, out: &mut Env, elems: &[PatId], tys: &[Ty]| {
+            let rest = elems.iter().position(|&p| matches!(cx.ast().pat(p), Pat::Rest));
+            for (i, &p) in elems.iter().enumerate() {
+                let ti = match rest {
+                    Some(r) if i > r => tys.len().checked_sub(elems.len() - i),
+                    _ => Some(i),
+                };
+                if let Some(&et) = ti.and_then(|ti| tys.get(ti)) {
+                    this.dead_binds(cx, p, et, out, depth + 1);
+                }
+            }
+        };
+        match cx.ast().pat(pat).clone() {
+            Pat::Binding { name, mutable, by_ref: false } => bind(cx, out, name, mutable, t),
+            Pat::At { name, mutable, by_ref: false, inner } => {
+                bind(cx, out, name, mutable, t);
+                self.dead_binds(cx, inner, t, out, depth + 1);
+            }
+            Pat::Paren(p) => self.dead_binds(cx, p, t, out, depth + 1),
+            Pat::Or(ps) => {
+                if let Some(&p) = ps.first() {
+                    self.dead_binds(cx, p, t, out, depth + 1);
+                }
+            }
+            Pat::Ref { inner, .. } => {
+                let it = match cx.tys_ref().kind(t) {
+                    TyKind::Ref(_, _, it) => it,
+                    _ => ERROR,
+                };
+                self.dead_binds(cx, inner, it, out, depth + 1);
+            }
+            Pat::Tuple(elems) => {
+                let tys = match cx.tys_ref().kind(t) {
+                    TyKind::Tuple(ts) => cx.tys_ref().tys_of(ts).to_vec(),
+                    _ => vec![ERROR; elems.len()],
+                };
+                positional(self, cx, out, &elems, &tys);
+            }
+            Pat::TupleStruct { path, elems } => {
+                let variant = if cx.tys_ref().option_elem(t).is_some() || cx.tys_ref().result_args(t).is_some() {
+                    match path.last().map(|s| cx.sym_text(s.name)) {
+                        Some("Some" | "Ok") => Some(if cx.tys_ref().option_elem(t).is_some() { 1 } else { 0 }),
+                        Some("Err") => Some(1),
+                        _ => None,
+                    }
+                } else {
+                    cx.pattern_variant(&path).map(|(_, v)| v)
+                };
+                let tys = variant.and_then(|v| part_tys(cx, t, v, elems.len())).unwrap_or_else(|| vec![ERROR; elems.len()]);
+                positional(self, cx, out, &elems, &tys);
+            }
+            Pat::Struct { path, fields, .. } => {
+                let typed = cx.pattern_variant(&path).and_then(|(adt, v)| {
+                    let names = cx.variant_fields(adt, v);
+                    part_tys(cx, t, v, names.len()).map(|tys| (names, tys))
+                });
+                for (fname, fp) in fields {
+                    let ft = typed.as_ref().and_then(|(names, tys)| names.iter().position(|(n, _)| *n == fname).map(|i| tys[i]));
+                    self.dead_binds(cx, fp, ft.unwrap_or(ERROR), out, depth + 1);
+                }
+            }
+            Pat::Slice { prefix, suffix, .. } => {
+                let el = match cx.tys_ref().kind(t) {
+                    TyKind::Array(el, _) | TyKind::Slice(el) => el,
+                    _ => ERROR,
+                };
+                for p in prefix.into_iter().chain(suffix) {
+                    self.dead_binds(cx, p, el, out, depth + 1);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2290,6 +2479,18 @@ impl Evaluator {
             if (ty_name == "Vec" && b == Some(super::BuiltinTy::Vec)) || (ty_name == "String" && b == Some(super::BuiltinTy::String)) {
                 return Ok((ConstValue::Aggregate(Vec::new()), want));
             }
+        }
+        // `String::new()` names its type without an expected one
+        // (`let s = String::new();`).
+        if args.is_empty()
+            && expected.is_none()
+            && let Expr::Path(segs) = cx.ast().expr(callee)
+            && let [ty_seg, f] = segs.as_slice()
+            && cx.sym_text(ty_seg.name) == "String"
+            && cx.sym_text(f.name) == "new"
+            && f.type_args().is_empty()
+        {
+            return Ok((ConstValue::Aggregate(Vec::new()), super::STRING));
         }
         // `AtomicUsize::new(v)` and the other atomics' `new` are const fns
         // (W-THREADS): the value is the atomic's (its C form is the value).
@@ -2915,7 +3116,7 @@ impl Evaluator {
             return Ok((ConstValue::Int(n as i128), USIZE));
         }
         let (rv, rt) = self.value_place(cx, env, recv_e, None)?;
-        self.check_temp_drop(cx, recv_e, rt, span)?;
+        self.check_temp_drop(cx, env, recv_e, rt, span)?;
         // An inherent integer method on an unpinned receiver is
         // ambiguous (rustc E0689), even where the surroundings
         // would pin the type later: the body checker reports the
@@ -3855,6 +4056,19 @@ impl Evaluator {
                         self.check_scope_drops(cx, env, saved, span)?;
                     }
                     env.truncate(saved);
+                    if r.is_ok() {
+                        // The other arms are dead here, but rustc's
+                        // drop check is static: scan them too.
+                        for other in arms {
+                            if !std::ptr::eq(other, arm) {
+                                let denv = self.dead_env(cx, env, other.pat, st);
+                                if let Some(g) = other.guard {
+                                    self.scan_dead_expr(cx, &denv, g)?;
+                                }
+                                self.scan_dead_expr(cx, &denv, other.body)?;
+                            }
+                        }
+                    }
                     return r;
                 }
                 env.truncate(saved);
@@ -4150,10 +4364,16 @@ impl Evaluator {
                     other => (other.clone(), t),
                 };
                 // Option patterns by name, as the checker resolves them.
+                // `Some(..)` against `None` (and `None` against `Some`)
+                // does not match.
                 if let ConstValue::Variant(variant, fields) = &v
                     && cx.tys_ref().option_elem(t).is_some()
+                    && matches!(cx.sym_text(segs[segs.len() - 1].name), "Some" | "None")
                 {
                     let want_some = matches!(cx.ast().pat(pat), Pat::TupleStruct { .. });
+                    if (want_some && *variant == 0) || (!want_some && *variant == 1) {
+                        return Ok(false);
+                    }
                     if (want_some && *variant == 1) || (!want_some && *variant == 0) {
                         if let Pat::TupleStruct { elems, .. } = cx.ast().pat(pat)
                             && elems.len() == 1
@@ -4920,6 +5140,46 @@ fn drop_diag<'a, C: ConstCx<'a>>(cx: &C, t: Ty, span: Span) -> Diag {
 /// Adt variant's fields read through the instance's args, or an
 /// `Option`/`Result` payload. None when the value's parts have no
 /// known types here (a builtin aggregate the walk cannot see into).
+/// A value of type `t` for a dead-branch scan's placeholder
+/// bindings (`Evaluator::dead_env`): zero scalars, `None`, empty
+/// `Vec`/`String`, and aggregates of those. None when the type has no
+/// value the evaluator can make up.
+fn zero_value<'a, C: ConstCx<'a>>(cx: &mut C, t: Ty, depth: u32) -> Option<ConstValue> {
+    if depth > 8 {
+        return None;
+    }
+    let tys = cx.tys_ref();
+    match tys.kind(t) {
+        TyKind::Int(_) => Some(ConstValue::Int(0)),
+        TyKind::Float(f) => Some(ConstValue::Float(0, f)),
+        TyKind::Bool => Some(ConstValue::Bool(false)),
+        TyKind::Char => Some(ConstValue::Char('\0')),
+        TyKind::Ref(_, _, it) => Some(ConstValue::Ref(Box::new(zero_value(cx, it, depth + 1)?))),
+        TyKind::Array(el, n) => match tys.const_kind(n) {
+            super::ConstKind::Int(n) => Some(ConstValue::Repeat(Box::new(zero_value(cx, el, depth + 1)?), u64::try_from(n).ok()?)),
+            _ => None,
+        },
+        TyKind::Tuple(ts) => {
+            let parts = tys.tys_of(ts).to_vec();
+            parts.into_iter().map(|p| zero_value(cx, p, depth + 1)).collect::<Option<Vec<_>>>().map(ConstValue::Aggregate)
+        }
+        _ if t == UNIT => Some(ConstValue::Unit),
+        _ => {
+            if tys.option_elem(t).is_some() {
+                return Some(ConstValue::Variant(0, Vec::new()));
+            }
+            if matches!(tys.builtin_of(t), Some(super::BuiltinTy::Vec | super::BuiltinTy::String)) {
+                return Some(ConstValue::Aggregate(Vec::new()));
+            }
+            let adt = tys.local_adt(t)?;
+            let n = cx.variant_fields(adt, 0).len();
+            let parts = part_tys(cx, t, 0, n)?;
+            let vals = parts.into_iter().map(|p| zero_value(cx, p, depth + 1)).collect::<Option<Vec<_>>>()?;
+            Some(if cx.is_enum(adt) { ConstValue::Variant(0, vals) } else { ConstValue::Aggregate(vals) })
+        }
+    }
+}
+
 fn part_tys<'a, C: ConstCx<'a>>(cx: &mut C, t: Ty, variant: u32, n: usize) -> Option<Vec<Ty>> {
     let tys = cx.tys_ref();
     match tys.kind(t) {
@@ -5032,50 +5292,6 @@ fn check_final_refs<'a, C: ConstCx<'a>>(cx: &mut C, v: &ConstValue, t: Ty, span:
             _ => Ok(()),
         },
         _ => Ok(()),
-    }
-}
-
-/// How many borrows of drop-type temporaries a final const value
-/// holds, counted the way `Evaluator::ref_drop_temps` counts the
-/// borrows an evaluation made: one per promoted temporary, a
-/// repeated element once.
-fn count_ref_drops<'a, C: ConstCx<'a>>(cx: &mut C, v: &ConstValue, t: Ty) -> u32 {
-    match v {
-        ConstValue::Ref(inner) => match cx.tys_ref().kind(t) {
-            TyKind::Ref(_, _, it) => u32::from(cx.needs_drop(it)) + count_ref_drops(cx, inner, it),
-            _ => 0,
-        },
-        ConstValue::Aggregate(..) | ConstValue::Repeat(..) | ConstValue::Bytes(_)
-            if matches!(cx.tys_ref().kind(t), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_))) =>
-        {
-            let elem = match cx.tys_ref().kind(t) {
-                TyKind::Ref(_, _, s) => match cx.tys_ref().kind(s) {
-                    TyKind::Slice(elem) => elem,
-                    _ => return 0,
-                },
-                _ => return 0,
-            };
-            let backing = u32::from(cx.needs_drop(elem));
-            backing
-                + match v {
-                    ConstValue::Aggregate(vals) => vals.iter().map(|x| count_ref_drops(cx, x, elem)).sum(),
-                    ConstValue::Repeat(x, _) => count_ref_drops(cx, x, elem),
-                    _ => 0,
-                }
-        }
-        ConstValue::Aggregate(vals) => match part_tys(cx, t, 0, vals.len()) {
-            Some(ftys) => vals.iter().zip(ftys).map(|(x, ft)| count_ref_drops(cx, x, ft)).sum(),
-            None => 0,
-        },
-        ConstValue::Variant(variant, vals) => match part_tys(cx, t, *variant, vals.len()) {
-            Some(ftys) => vals.iter().zip(ftys).map(|(x, ft)| count_ref_drops(cx, x, ft)).sum(),
-            None => 0,
-        },
-        ConstValue::Repeat(x, _) => match cx.tys_ref().kind(t) {
-            TyKind::Array(elem, _) => count_ref_drops(cx, x, elem),
-            _ => 0,
-        },
-        _ => 0,
     }
 }
 

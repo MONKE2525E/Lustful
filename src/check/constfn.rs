@@ -365,10 +365,15 @@ impl Walk<'_, '_> {
     }
 
     /// True when evaluation of `e` as a place reads an existing value
-    /// instead of making a new one.
-    fn is_place(e: &Expr) -> bool {
+    /// instead of making a new one. A const item path is a value: each
+    /// use makes a fresh copy of the const.
+    fn is_place(&self, e: ExprId) -> bool {
+        let ex = self.p.ast.expr(e);
+        if matches!(ex, Expr::Path(_) | Expr::QPath { .. }) && self.ck.const_value(e).is_some() {
+            return false;
+        }
         matches!(
-            e,
+            ex,
             Expr::Path(_)
                 | Expr::SelfValue
                 | Expr::Field { .. }
@@ -765,7 +770,7 @@ impl Walk<'_, '_> {
         }
         // The temporary rule (E0493): a new value of a drop type that
         // does not move out is destroyed inside the function.
-        if !consumed && !held && !Self::is_place(ex) && needs_drop(self.p, &self.ck.tys, self.ty(e)) {
+        if !consumed && !held && !self.is_place(e) && needs_drop(self.p, &self.ck.tys, self.ty(e)) {
             let tn = ty_name(self.p, &self.ck.tys, self.ty(e));
             self.err(
                 self.p.ast.expr_span(e),

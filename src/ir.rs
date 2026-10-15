@@ -282,10 +282,11 @@ pub struct Body<'g> {
     /// borrow-checked again).
     pub annotations: Vec<(Local, Ty)>,
     /// Promoted temporaries (W-BORROW): the storage of a `&[]`, `&mut
-    /// []`, or `&|..| ..` with no captures, which rustc promotes to
-    /// `'static`, and the backing storage of a const reference value
-    /// materialized in a body. Such a local never dies and its
-    /// borrows make no loan.
+    /// []`, `&|..| ..` with no captures, or a constant (`&5`, `&CONST`),
+    /// which rustc promotes to `'static`, and the backing storage of a
+    /// const reference value materialized in a body. Such a local never
+    /// dies, its borrows make no loan, and cgen gives it C `static`
+    /// storage, so a reference to it may outlive the function.
     pub promoted: Vec<Local>,
     /// The index temporaries of `a[i]` expressions. Borrowck never treats
     /// them as constant indexes (rustc's `Index`, not `ConstantIndex`):
