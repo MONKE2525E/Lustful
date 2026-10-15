@@ -6791,9 +6791,28 @@ fn validate_method_sig(
                 })
                 .collect();
             let goal = TraitRef { def: b.value.def, args: p.tys.intern_args(&goal_args), bindings: b.value.bindings };
-            // A bound that holds outright (`where u8: Copy`) needs
-            // no implication from the trait.
-            if !prove_goal(p, &env, goal) && !prove_goal(p, &[], goal) {
+            // A bound over concrete types only that holds outright
+            // (`where u8: Copy`) needs no implication from the
+            // trait. The pure solver has no records for the derive
+            // family's scalar impls, so those answer by structure.
+            let concrete = goal_args.iter().all(|g| match g {
+                GenericArg::Ty(t) => !p.tys.flags(*t).contains_param() && !p.tys.flags(*t).contains_infer(),
+                _ => true,
+            });
+            let outright = concrete
+                && goal_args.first().and_then(|g| g.as_ty()).is_some_and(|t| {
+                    let lang = &p.gx.lang;
+                    if goal.def == lang.copy {
+                        crate::check::collect::is_copy(p, &p.tys, t)
+                    } else if goal.def == lang.clone {
+                        crate::check::collect::has_clone(p, &p.tys, t)
+                    } else if goal.def == lang.debug {
+                        crate::check::collect::has_debug(p, &p.tys, t)
+                    } else {
+                        false
+                    }
+                });
+            if !outright && !prove_goal(p, &env, goal) && !prove_goal(p, &[], goal) {
                 let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
                 errs.push(Diag::new(
                     "L0110",
