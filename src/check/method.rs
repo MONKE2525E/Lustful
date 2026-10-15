@@ -228,6 +228,21 @@ fn confirm_method(
     let err_len = cx.errs.len();
     let mut full_explicit: Vec<Option<GenericArg>> = prefix.iter().map(|&g| Some(g)).collect();
     full_explicit.extend_from_slice(explicit);
+    // A written method turbofish must supply every own param
+    // (rustc E0107). With a selection prefix the written args are
+    // `explicit`; on the inherent path they are `explicit` after
+    // the impl-param padding (`method_explicit`).
+    {
+        let (offset, written) = if prefix.is_empty() {
+            let parent_n = cx.inherent_parent_n(template);
+            (parent_n, &explicit[parent_n.min(explicit.len())..])
+        } else {
+            (prefix.len(), explicit)
+        };
+        let supplied = if written.is_empty() { None } else { Some(written.iter().filter(|x| x.is_some()).count()) };
+        let generics = generics.clone();
+        cx.check_turbofish_min(&generics, offset, supplied, name_span);
+    }
     let (mut params, ret, _) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
     let want_recv = *params.first()?;
     if !cx.unify(want_recv, probe.recv_ty) {

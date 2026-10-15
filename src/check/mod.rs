@@ -2900,6 +2900,7 @@ impl<'p> Ctx<'p> {
                 return ERROR;
             }
             let explicit = self.explicit_path_args(e, f);
+            self.check_path_turbofish(e, f, &tmpl.generics, span);
             let (_, _, args) = self.instantiate_template(e, f, &tmpl.generics, &explicit, span);
             self.unify_written_self(e, f, &args, span);
             let args = self.tys.intern_args(&args);
@@ -2949,6 +2950,8 @@ impl<'p> Ctx<'p> {
                 explicit.push(Some(GenericArg::Ty(self.resolve_written(t))));
             }
         }
+        let supplied = self.path_supplied(e);
+        self.check_turbofish_min(&tmpl.generics.clone(), prefix.len(), supplied, span);
         let (_, _, args) = self.instantiate_template(e, f, &tmpl.generics, &explicit, span);
         let args = self.tys.intern_args(&args);
         self.tys.intern(TyKind::FnDef(self.p.def_id(f), args))
@@ -6618,6 +6621,55 @@ impl<'p> Ctx<'p> {
         let ast::Expr::Path(segs) = p.ast.expr(callee) else { return Vec::new() };
         let Some(seg) = segs.last() else { return Vec::new() };
         self.explicit_seg_args(seg)
+    }
+
+    /// How many leading template params belong to the parent impl
+    /// of an inherent fn (0 for a plain fn).
+    pub(super) fn inherent_parent_n(&self, f: LocalDefId) -> usize {
+        self.p.gx.inherent_self_pats.get(&f).map_or(0, |(_, g)| g.params.len())
+    }
+
+    /// The non-lifetime args written in one segment's angle list, or
+    /// None when the segment writes no angle list.
+    fn seg_supplied(seg: &ast::PathSeg) -> Option<usize> {
+        match &seg.args {
+            ast::GenericArgs::Angle(a) => Some(a.iter().filter(|x| !matches!(x, ast::GenericArg::Lifetime(_))).count()),
+            _ => None,
+        }
+    }
+
+    /// The non-lifetime args written on the last segment of a path
+    /// expression, or None when it writes no turbofish.
+    fn path_supplied(&self, callee: ExprId) -> Option<usize> {
+        match self.p.ast.expr(callee) {
+            ast::Expr::Path(segs) | ast::Expr::QPath { segs, .. } => segs.last().and_then(Self::seg_supplied),
+            _ => None,
+        }
+    }
+
+    /// rustc E0107: a written turbofish must supply every parameter
+    /// of its segment (the params after `offset`, synthetic `impl#N`
+    /// params excluded). `supplied` is None when no turbofish is
+    /// written.
+    pub(super) fn check_turbofish_min(&mut self, generics: &Generics, offset: usize, supplied: Option<usize>, span: Span) {
+        let Some(supplied) = supplied else { return };
+        let required = generics.params.iter().skip(offset).filter(|g| !self.name(g.name).starts_with("impl#")).count();
+        if supplied < required {
+            self.err(
+                "L0107",
+                span,
+                format!("this item takes {required} generic argument(s) but {supplied} were supplied"),
+                "Supply every generic argument, or remove the `::<...>` to let them be inferred.",
+            );
+        }
+    }
+
+    /// `check_turbofish_min` for a fn named by a path: the last
+    /// segment's turbofish fills only the fn's own params.
+    fn check_path_turbofish(&mut self, callee: ExprId, f: LocalDefId, generics: &Generics, span: Span) {
+        let supplied = self.path_supplied(callee);
+        let offset = self.inherent_parent_n(f);
+        self.check_turbofish_min(generics, offset, supplied, span);
     }
 
     /// The explicit args of an inherent fn named by a path
@@ -11684,6 +11736,7 @@ impl<'p> Ctx<'p> {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
                 if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned() {
                     let explicit = self.explicit_path_args(callee, f);
+                    self.check_path_turbofish(callee, f, &tmpl.generics, span);
                     let (mut params, ret, inst_args) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
                     self.unify_written_self(callee, f, &inst_args, span);
                     self.normalize_params(&mut params, span);
