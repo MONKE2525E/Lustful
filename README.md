@@ -130,6 +130,7 @@ scripts/test-crates.sh          # Cargo package fixtures built by Cargo and by l
 scripts/testtest.sh             # compare `lust test` with `rustc --test`
 scripts/check-explain.sh        # check every `lust explain` example against lust and rustc
 scripts/agentkit-test.sh        # JSON diagnostics, explain, capabilities, test edges
+scripts/tsrust-full.sh          # the whole ts-rust fork (third_party/ts-rust): cargo, lust check/build, root causes (--boat, --parity)
 ```
 
 - `tests/pass`: lust and rustc must give the same stdout and exit status.
