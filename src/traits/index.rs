@@ -869,11 +869,17 @@ impl ImplIndex {
         by_construction: &[DefId],
         is_local: &dyn Fn(DefId) -> bool,
     ) -> bool {
+        let clause = apply_pattern_subst_ref(tys, map, clause, n_vars);
+        let self_ty = tys.args(clause.args)[0].as_ty().unwrap_or(ERROR);
+        // `Sized` (and the traits that need it, `Clone` and kin) never
+        // holds for an unsized type: the implicit `T: Sized` of `impl<T>
+        // Tr for T` keeps it off `str`, `[u8]`, and `dyn Fn()`.
+        if self.sized_only.contains(&clause.def) && matches!(tys.kind(self_ty), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) {
+            return true;
+        }
         if by_construction.contains(&clause.def) {
             return false;
         }
-        let clause = apply_pattern_subst_ref(tys, map, clause, n_vars);
-        let self_ty = tys.args(clause.args)[0].as_ty().unwrap_or(ERROR);
         let empty: FxMap<ParamId, Ty> = FxMap::default();
         let base = strip_fundamental(tys, &empty, self_ty, fundamental);
         // A bare parameter Self can gain any impl downstream. An
