@@ -30,6 +30,9 @@ pub(super) enum TraitFnRes {
     /// A comparison trait method at a type whose comparison is builtin
     /// (`PartialEq::eq(&a, &b)` at `u8`): the method form's `PrimCmp`.
     PrimCmp(PrimCmpKind),
+    /// `Ord::max`, `min`, or `clamp` at a type compared by structure
+    /// (`Ord::max(a, b)` at a tuple): the method form's `OrdPick`.
+    OrdPick(OrdPickKind),
     /// Nothing lust can call; already reported, or to report.
     Failed,
 }
@@ -354,7 +357,38 @@ impl<'p> Ctx<'p> {
         if let Some(kind) = self.prim_cmp_path(tr.def, name, &targs) {
             return TraitFnRes::PrimCmp(kind);
         }
+        if let Some(r) = self.ord_pick_path(tr.def, name, self_ty) {
+            return r;
+        }
         TraitFnRes::Failed
+    }
+
+    /// `Ord::max`, `min`, or `clamp` named through the trait at a Self
+    /// type whose order builds in: the `cmp::max` builtin at an integer,
+    /// `char`, or `bool`, else core's default bodies by structure, as
+    /// the method form (`ord_pick_method`) runs them.
+    fn ord_pick_path(&mut self, tdef: DefId, name: Sym, self_ty: Ty) -> Option<TraitFnRes> {
+        let p = self.p;
+        if tdef != p.gx.lang.ord || self.tys.flags(self_ty).contains_infer() || self.tys.flags(self_ty).contains_param() {
+            return None;
+        }
+        let kind = match self.name(name) {
+            "max" => OrdPickKind::Max,
+            "min" => OrdPickKind::Min,
+            "clamp" => OrdPickKind::Clamp,
+            _ => return None,
+        };
+        if matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Char | TyKind::Bool) {
+            return match kind {
+                OrdPickKind::Max => Some(TraitFnRes::Builtin(Builtin::CmpMax)),
+                OrdPickKind::Min => Some(TraitFnRes::Builtin(Builtin::CmpMin)),
+                OrdPickKind::Clamp => None,
+            };
+        }
+        (has_ord(p, &self.tys, self_ty) && has_total_ord(p, &self.tys, self_ty)).then(|| {
+            self.record_glue_reads(p.gx.lang.partial_ord, self_ty);
+            TraitFnRes::OrdPick(kind)
+        })
     }
 
     /// A `PartialEq`, `PartialOrd`, or `Ord` comparison method named
@@ -437,7 +471,7 @@ impl<'p> Ctx<'p> {
                 TraitFnRes::Default => {
                     self.finish_marker_value(e, Res::Builtin(Builtin::DefaultGlue), tr, name, span);
                 }
-                TraitFnRes::PrimCmp(_) | TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, true),
+                TraitFnRes::PrimCmp(_) | TraitFnRes::OrdPick(_) | TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, true),
             }
         }
     }
@@ -478,6 +512,7 @@ impl<'p> Ctx<'p> {
                 TraitFnRes::Default => self.set_res(e, Res::DefaultVal),
                 // The first argument is `&Self`: one deref to the value.
                 TraitFnRes::PrimCmp(kind) => self.set_res(e, Res::PrimCmp { kind, derefs: 1 }),
+                TraitFnRes::OrdPick(kind) => self.set_res(e, Res::OrdPick { kind, f: None, via: CmpVia::Partial(BinOp::Lt) }),
                 TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, false),
             }
         }

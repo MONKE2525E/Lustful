@@ -1760,26 +1760,46 @@ impl<'p> Lower<'p> {
                     self.prim_cmp_into(e, *recv, rest, dest, span, kind, derefs);
                     return;
                 }
+                // `Ord::max(a, b)` and kin by structure: the method form.
+                if let Res::OrdPick { kind, f, via } = res
+                    && let [recv, rest @ ..] = args.as_slice()
+                {
+                    let f = f.map(|f| self.resolve_generic_fn(e, f));
+                    self.ord_pick_into(e, *recv, rest, dest, span, kind, f, via);
+                    return;
+                }
                 // An indirect call reads the callee value before the
                 // arguments run, as Rust evaluates the callee first.
                 let indirect_local = if res == Res::Indirect {
                     let ct = self.ty(*callee);
                     let op = self.operand(*callee);
                     match op {
-                        Operand::Copy(pl) | Operand::Move(pl) if pl.proj.is_empty() && !matches!(self.kind(ct), TyKind::Ref(..)) => {
+                        Operand::Copy(pl) | Operand::Move(pl) if pl.proj.is_empty() && matches!(self.kind(ct), TyKind::FnPtr(_)) => {
                             Some(pl.local)
                         }
                         Operand::Copy(pl) | Operand::Move(pl) => {
-                            // A callee behind a reference loads through
-                            // it first, so the call local holds the fn
-                            // pointer itself.
-                            let (vt, pl) = match self.kind(ct) {
-                                TyKind::Ref(_, _, inner) => (inner, pl.deref()),
-                                _ => (ct, pl),
-                            };
+                            // A callee behind references or smart pointers
+                            // (`&&f`, `Box<fn()>`) loads through them first,
+                            // so the call local holds the fn pointer itself.
+                            let (mut vt, mut fp) = (ct, pl.clone());
+                            while !matches!(self.kind(vt), TyKind::FnPtr(_)) {
+                                match self.kind(vt) {
+                                    TyKind::Ref(_, _, inner) => vt = inner,
+                                    _ => match self.body.tys.smart_elem(vt) {
+                                        Some(inner) => vt = inner,
+                                        None => break,
+                                    },
+                                }
+                                fp = fp.deref();
+                            }
                             let t = self.temp(vt);
-                            let op2 = self.operand_from(pl, vt);
+                            let op2 = self.operand_from(fp, vt);
                             self.assign(Place::local(t), Rvalue::Use(op2), span);
+                            // A temporary smart pointer callee (`Box::new(f)()`)
+                            // is dropped once the pointer is read.
+                            if pl.proj.is_empty() && !self.is_place_expr(*callee) && needs_drop(self.p, &self.body.tys, ct) {
+                                self.push(StmtKind::Drop(pl.local), span);
+                            }
                             Some(t)
                         }
                         Operand::Const(_) => None,
@@ -1787,6 +1807,37 @@ impl<'p> Lower<'p> {
                 } else {
                     None
                 };
+                // A fn item called through a value behind references or
+                // smart pointers (`(&mut f)()`, `w()` with `w: Box<&&F>`):
+                // the call does not read it, but rustc borrows it to
+                // autoderef, so borrowck must see that use. A temporary
+                // callee drops at once (it holds no destructor of note).
+                if matches!(res, Res::Fn(_) | Res::Variant(..) | Res::Builtin(_) | Res::Intrinsic(_)) {
+                    let ct = self.ty(*callee);
+                    if matches!(self.kind(ct), TyKind::Ref(..)) || self.body.tys.smart_elem(ct).is_some() {
+                        if self.is_place_expr(*callee) {
+                            // A `Copy` callee (`&&f`) is read, which a
+                            // closure body can do to a captured reference;
+                            // an owned one (`Box<&f>`, `&mut f`) is borrowed.
+                            let pl = self.place(*callee);
+                            if is_copy(self.p, &self.body.tys, ct) {
+                                let t = self.temp(ct);
+                                self.assign(Place::local(t), Rvalue::Use(Operand::Copy(pl)), span);
+                            } else {
+                                let rt = self.ref_ty(false, ct);
+                                let t = self.temp(rt);
+                                self.assign(Place::local(t), Rvalue::Ref(false, pl), span);
+                            }
+                        } else {
+                            let op = self.operand(*callee);
+                            let t = self.temp(ct);
+                            self.assign(Place::local(t), Rvalue::Use(op), span);
+                            if needs_drop(self.p, &self.body.tys, ct) {
+                                self.push(StmtKind::Drop(t), span);
+                            }
+                        }
+                    }
+                }
                 let ops: Vec<Operand> = args.iter().map(|&a| self.operand(a)).collect();
                 match res {
                     Res::Fn(f) => {

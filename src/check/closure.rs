@@ -1206,6 +1206,18 @@ impl<'p> Ctx<'p> {
                     Res::Method { derefs, autoref, .. } | Res::DynMethod { derefs, autoref, .. } => {
                         self.cap_receiver(*callee, derefs, autoref, w)
                     }
+                    // A fn item or pointer behind a smart pointer or a
+                    // `&mut` (`w()` with `w: Box<&F>` or `&mut &F`): the
+                    // call autoderefs through a borrow.
+                    Res::Fn(_) | Res::Variant(..) | Res::Builtin(_) | Res::Intrinsic(_) | Res::Indirect
+                        if {
+                        let ct = self.out.expr_ty[self.ei(*callee)];
+                        let ct = self.resolve(ct);
+                        self.tys.smart_elem(ct).is_some() || matches!(self.kind(ct), TyKind::Ref(_, Mut::Mut, _))
+                    } =>
+                    {
+                        self.cap_receiver(*callee, 0, Autoref::Ref, w)
+                    }
                     _ => self.cap_consume(*callee, w),
                 }
                 for &a in args {
@@ -1724,6 +1736,10 @@ impl<'p> Ctx<'p> {
         if let TyKind::Ref(_, _, inner) = self.kind(peeled) {
             peeled = self.resolve(inner);
         }
+        // Deeper layers (`&&f`, `Box<fn()>`, `&mut &f`) autoderef to the
+        // fn too, as rustc's callee autoderef does; lowering loads the
+        // pointer through them.
+        let deep = self.peel_to_fn(peeled);
         // A call through a trait fn value (`Into::into` in a local,
         // check/traitpath.rs): typed by the trait method's
         // signature, selected at body end.
@@ -1746,7 +1762,7 @@ impl<'p> Ctx<'p> {
             self.check_args(&params, args, span);
             return ret;
         }
-        if let Some(r) = self.callable_res(peeled) {
+        if let Some((r, peeled)) = self.callable_res(peeled).map(|r| (r, peeled)).or_else(|| self.callable_res(deep).map(|r| (r, deep))) {
             if let Res::Variant(a, _) = r
                 && !self.p.adt(a).is_enum
             {
@@ -1771,7 +1787,7 @@ impl<'p> Ctx<'p> {
         // Smart pointers peeled on the way (`Box<F>`, `Rc<F>`): calls
         // go through the pointee, as `impl Fn for Box<F>` and the
         // callee autoderef do in rustc.
-        let (mut via_box, mut via_rc, mut box_by_value, mut via_ref) = (false, false, false, false);
+        let (mut via_box, mut via_rc, mut box_by_value, mut via_ref, mut via_shared) = (false, false, false, false, false);
         loop {
             match self.kind(t) {
                 TyKind::Closure(def, _) => {
@@ -1783,7 +1799,11 @@ impl<'p> Ctx<'p> {
                     // rustc picks `Fn for Box<F>` first, so a boxed FnMut or
                     // FnOnce closure is E0525 (`(*b)()` works), and an `Rc`
                     // gives only shared access (E0596).
-                    if (via_box || via_rc) && kind != ClosureKind::Fn {
+                    // In an instance the template's bound already holds
+                    // (`impl FnMut for Box<F>`), so an owned box calls
+                    // its FnMut or FnOnce closure.
+                    let instance_box = via_box && !via_rc && !via_shared && self.template_call_mode(e).is_some();
+                    if (via_box || via_rc) && kind != ClosureKind::Fn && !instance_box {
                         for &a in args {
                             self.expr(a, None);
                         }
@@ -1798,10 +1818,11 @@ impl<'p> Ctx<'p> {
                     // In an instance, a call keeps the Fn trait the
                     // template resolved it through (FnOnce consumes the
                     // closure even when it is Fn), as rustc's generic body.
-                    // Behind a shared reference (`F = Box<&C>`) only `Fn`
-                    // reaches the closure: `&C: FnOnce` calls `C` by `Fn`.
-                    let mode = if via_ref && kind == ClosureKind::Fn && box_by_value {
-                        ClosureKind::Fn
+                    // Behind a reference (`F = Box<&C>`, `&&C`, `Box<&mut C>`)
+                    // the closure is called in place by its own kind:
+                    // `&C: FnOnce` calls `C` by `Fn`, `&mut C` by `FnMut`.
+                    let mode = if via_ref {
+                        kind
                     } else {
                         self.template_call_mode(e).or_else(|| self.view_calls.get(&e).copied()).unwrap_or(kind)
                     };
@@ -1810,9 +1831,10 @@ impl<'p> Ctx<'p> {
                     self.check_args(&inputs, args, span);
                     return output;
                 }
-                TyKind::Ref(_, _, inner) if derefs < 8 => {
+                TyKind::Ref(_, m, inner) if derefs < 8 => {
                     derefs += 1;
                     via_ref = true;
+                    via_shared |= m == Mut::Shared;
                     t = self.resolve(inner);
                 }
                 TyKind::Adt(..) if derefs < 8 && self.tys.smart_elem(t).is_some_and(|e| self.reaches_closure(e)) => {
@@ -1911,15 +1933,15 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// True when `t`, through shared references and smart pointers, is
-    /// a closure or a trait object: what a smart pointer to it calls
-    /// (`Box<F>`, `Box<&F>`, and `Box<&Box<F>>` implement `Fn` when `F`
-    /// does).
+    /// True when `t`, through references and smart pointers, is a
+    /// closure or a trait object: what a smart pointer to it calls
+    /// (`Box<F>`, `Box<&F>`, `Box<&mut F>`, and `Box<&Box<F>>` implement
+    /// the Fn traits `F` gives them).
     fn reaches_closure(&self, mut t: Ty) -> bool {
         for _ in 0..8 {
             match self.kind(t) {
                 TyKind::Closure(..) | TyKind::Dyn(..) => return true,
-                TyKind::Ref(_, Mut::Shared, inner) => t = inner,
+                TyKind::Ref(_, _, inner) => t = inner,
                 _ => match self.tys.smart_elem(t) {
                     Some(e) => t = e,
                     None => return false,
@@ -1927,6 +1949,23 @@ impl<'p> Ctx<'p> {
             }
         }
         false
+    }
+
+    /// `t` through references and smart pointers down to a fn pointer
+    /// or fn item; `t` itself when it does not reach one.
+    fn peel_to_fn(&self, t: Ty) -> Ty {
+        let mut d = t;
+        for _ in 0..8 {
+            d = match self.kind(d) {
+                TyKind::FnPtr(_) | TyKind::FnDef(..) => return d,
+                TyKind::Ref(_, _, inner) => self.resolve(inner),
+                _ => match self.tys.smart_elem(d) {
+                    Some(e) => self.resolve(e),
+                    None => return t,
+                },
+            };
+        }
+        t
     }
 
     /// The call mode a template's abstract check recorded for this call.
