@@ -33,7 +33,11 @@ reported in their own rows; they are not the promise.
   worst. Phase times come from `lust check --timings`. Peak RSS: the daemon's
   VmHWM; for cargo, the largest process in its tree.
 - Host: one boat sandbox per run (16 vCPU, nothing else running).
-- The slice's `main` is empty, so there is no run row yet.
+- The slice's empty `main` calls `bench/slices/driver.rs` in the benchmark
+  copy: it calls kept ts-rust tspath fns and prints the results. After every
+  build, the lust binary and each rustc binary run, and stdout, stderr, and exit
+  code must match. That gives the run and build+run rows. The run row is tiny
+  work; it is there for exactness, not speed.
 
 Reproduce:
 

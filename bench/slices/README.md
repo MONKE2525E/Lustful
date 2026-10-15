@@ -26,6 +26,9 @@ removed item with the oracle and error code that removed it. That list is a
 ranked to-do list for lust coverage.
 
 `items/` is a small syn tool that lists items, fn bodies, and the module tree.
+`driver.rs` is the bench `main` body (tspath calls with printed results); the
+benchmark mounts it in its work copy so build rows can compare program output
+with rustc. Keep the fns it calls in every slice, or update it.
 
 Bench-owned text, not ts-rust code:
 

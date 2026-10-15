@@ -31,8 +31,10 @@ code). Every `--cold-every` states, and on every non-body edit, a cold one-shot
 lust check runs on the same state; its stdout, stderr (timing lines removed),
 and exit code must equal the warm daemon answer. A mismatch stops the run.
 
-The slice's `main` is empty today, so build rows measure the build of the
-whole crate's reachable code, and there is no run row.
+The slice's empty `main` is replaced by a call to bench/slices/driver.rs (it
+calls kept ts-rust tspath fns and prints the results). After every build, the
+lust binary and each rustc binary run; stdout, stderr, and exit code must match.
+That gives the run row and the build+run rows (--no-driver turns it off).
 """
 import json
 import os
@@ -117,6 +119,16 @@ class Bench:
         shutil.copytree(self.slice_dir / "src", self.crate / "src")
         root = self.manifest["spec"]["root"]
         self.root = self.crate / "src" / root
+        # The shared driver gives the program output to compare (see driver.rs).
+        driver = self.slice_dir.parent / "driver.rs"
+        self.driver = driver.exists() and not opts["no_driver"]
+        if self.driver:
+            text = self.root.read_text()
+            if text.count("fn main() {}") != 1:
+                sys.exit(f"{self.root}: expected one `fn main() {{}}` to replace with the driver call")
+            self.root.write_text(text.replace("fn main() {}", "mod bench_driver;\n\nfn main() {\n    bench_driver::run();\n}"))
+            shutil.copy(driver, self.crate / "src" / "bench_driver.rs")
+        self.runs_compared = 0
         (self.crate / "Cargo.toml").write_text(
             f'[package]\nname = "slice"\nversion = "0.0.0"\nedition = "2024"\n\n'
             f'[[bin]]\nname = "slice"\npath = "src/{root}"\n\n[profile.dev]\ndebug = 0\n\n[workspace]\n')
@@ -238,11 +250,26 @@ class Bench:
             rec[cfg].append(cms)
             if cr.returncode != 0:
                 self.fail(f"{name}: cargo build ({cfg}) failed\n{cr.stderr[-1500:]}")
-        lr = subprocess.run([str(self.work / "prog")], capture_output=True, text=True)
-        if self.rustc_cfgs:
-            rr = subprocess.run([str(self.work / f"target-{self.rustc_cfgs[0]}/debug/slice")], capture_output=True, text=True)
-            if (lr.returncode, lr.stdout) != (rr.returncode, rr.stdout):
-                self.fail(f"{name}: program output differs (lust exit {lr.returncode}, rustc exit {rr.returncode})")
+        self.run_programs(name, ms, {cfg: rec[cfg][-1] for cfg in self.rustc_cfgs})
+
+    def run_programs(self, build_row, lust_build_ms, rustc_build_ms):
+        """Run the lust and rustc binaries of the current state: outputs must match.
+        Records the run row and a build+run row (this build plus its run)."""
+        if not self.driver:
+            return
+        lms, lr = self.run([str(self.work / "prog")])
+        run_rec = self.row("run (built program)")
+        both = self.row(build_row.replace("build", "build+run", 1))
+        run_rec["lust"].append(lms)
+        both["lust"].append(lust_build_ms + lms)
+        for cfg in self.rustc_cfgs:
+            rms, rr = self.run([str(self.work / f"target-{cfg}/debug/slice")])
+            if (lr.returncode, lr.stdout, lr.stderr) != (rr.returncode, rr.stdout, rr.stderr):
+                self.fail(f"{build_row}: program output differs from rustc's ({cfg}): lust exit {lr.returncode}, "
+                          f"rustc exit {rr.returncode}\nlust: {lr.stdout[-400:]}\nrustc: {rr.stdout[-400:]}")
+            run_rec[cfg].append(rms)
+            both[cfg].append(rustc_build_ms[cfg] + rms)
+        self.runs_compared += 1
 
     def fail(self, msg):
         self.kill_daemon()
@@ -322,6 +349,8 @@ class Bench:
                     if cr.returncode != 0:
                         self.fail(f"cold cargo {verb} ({cfg}) failed\n{cr.stderr[-1500:]}")
                     rec[cfg].append(cms)
+                if verb == "build":
+                    self.run_programs("cold build", ms, {cfg: rec[cfg][-1] for cfg in self.rustc_cfgs})
         # One-shot peak RSS (a child process tree each).
         rss["lust_cold_check_kb"] = self.cold_rss("check")
         for cfg in self.rustc_cfgs:
@@ -407,7 +436,7 @@ class Bench:
             "slice": self.slice_dir.name, "lines": lines, "code_lines": self.manifest.get("code_lines"),
             "tsrust_commit": self.manifest["tsrust_commit"], "lust_commit": lust_commit, "rustc": rustc_v,
             "host": {"nproc": os.cpu_count(), "load_at_end": os.getloadavg()[0]},
-            "opts": self.opts, "states_checked": self.states,
+            "opts": self.opts, "states_checked": self.states, "program_runs_compared": self.runs_compared,
             "body_edit_targets": [f"{p.relative_to(self.crate / 'src')}:{ol}" for p, ol in targets],
             "peak_rss": rss, "rows": rows,
         }
@@ -482,7 +511,7 @@ def main(argv):
         write_md(argv[1], [json.loads(Path(p).read_text()) for p in argv[2:]])
         return
     opts = {"edits": 120, "reps": 5, "cycles": 5, "units": 24, "build_samples": 12, "cold_every": 10,
-            "no_rustc": False}
+            "no_rustc": False, "no_driver": False}
     slice_dir = None
     json_out = None
     args = list(argv)
@@ -496,6 +525,8 @@ def main(argv):
             opts.update(edits=20, reps=3, cycles=1, build_samples=2, cold_every=10)
         elif a == "--no-rustc":
             opts["no_rustc"] = True
+        elif a == "--no-driver":
+            opts["no_driver"] = True
         elif a.startswith("--") and a[2:].replace("-", "_") in opts:
             opts[a[2:].replace("-", "_")] = int(args.pop(0))
         else:
