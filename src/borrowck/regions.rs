@@ -6590,10 +6590,11 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
 fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
     use crate::check::Builtin as B;
     matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey))
+        || b.is_some_and(sort_by_builtin)
 }
 
-/// `sort_by(f)`, `sort_by_key(f)`, and their unstable forms: `f` runs
-/// during the call only.
+/// `sort_by(f)`, `sort_by_key(f)`, and their unstable forms: `f` takes
+/// higher-ranked `&T` arguments and runs during the call only.
 fn sort_by_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
     matches!(b, B::SliceSortBy | B::SliceSortUnstableBy | B::SliceSortByKey | B::SliceSortUnstableByKey)

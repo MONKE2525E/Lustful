@@ -675,7 +675,9 @@ impl<'p> Ctx<'p> {
                 (if n == "sort" { B::SliceSort } else { B::SliceSortUnstable }, Autoref::RefMut, vec![], UNIT)
             }
             "sort_by" | "sort_unstable_by" => {
-                let f = self.fn_mut_param(&[r_el, r_el], ord, span);
+                // `F: FnMut(&T, &T) -> Ordering`: both references are
+                // higher-ranked, so an element reference cannot escape.
+                let f = self.fn_mut_param_ref(&[r_el, r_el], ord, span);
                 (if n == "sort_by" { B::SliceSortBy } else { B::SliceSortUnstableBy }, Autoref::RefMut, vec![f], UNIT)
             }
             "sort_by_key" | "sort_unstable_by_key" => {
