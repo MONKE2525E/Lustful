@@ -12,10 +12,14 @@ Gate: `scripts/test-adapters.sh rustix`.
   `IntoRawFd`, `FromRawFd`, `RawFd`, re-exported as upstream
   does with the `std` feature (lust std has `std::os::fd`).
 - `fs`: `OFlags`, `Mode`, `AtFlags`, `Access`, `StatxFlags`,
-  `CWD`, `FileType`, `Stat`, `Statx`, `StatxTimestamp`,
-  `Timespec`, `Timestamps`, `UTIME_NOW`, `UTIME_OMIT`, `open`,
-  `openat`, `fstat`, `statat`, `statx`, `accessat`, `utimensat`,
-  `mknodat`, `fcntl_getfl`, `fcntl_setfl`.
+  `StatVfsMountFlags`, `CWD`, `FileType`, `Stat`, `Statx`,
+  `StatxTimestamp`, `StatVfs`, `Timespec`, `Timestamps`,
+  `UTIME_NOW`, `UTIME_OMIT`, `open`, `openat`, `fstat`,
+  `statat`, `statx`, `statvfs`, `fstatvfs`, `accessat`,
+  `utimensat`, `mknodat`, `fcntl_getfl`, `fcntl_setfl`.
+- `fs::inotify`: `CreateFlags`, `WatchFlags`, `ReadFlags`,
+  `init`, `add_watch`, `remove_watch`. Events are read with
+  `io::read` on the fd, as ts-rust does.
 - `process`: `Pid`, `RawPid`, `Signal` (named consts,
   `from_named_raw`, upstream's quoted Debug forms), `getpid`,
   `getppid`, `kill_process`, `test_kill_process`,
@@ -50,9 +54,12 @@ Gate: `scripts/test-adapters.sh rustix`.
 
 ## Rejected (lust error, never a different answer)
 
-- `RawDir` and its entry type,
-  every other module (`net`, `mount`, `thread`, `time`,
-  `io_uring`, `pty`, `rand`, `shm`, `system`, `fs::inotify`
-  and fanotify, and the rest), the `fs` and `process` items
+- `RawDir`, its entry type, and `fs::inotify::Reader`: their
+  buffer type is `core::mem::MaybeUninit`, which lust does
+  not have yet (the layout engine knows its size only). The
+  `sys_x_getdents` intrinsic RawDir needs is in place.
+  Every other module (`net`, `mount`, `thread`, `time`,
+  `io_uring`, `pty`, `rand`, `shm`, `system`, and the rest),
+  the `fs` and `process` items
   beyond the lists above (wait and exec forms included), and
   layout queries on every adapter type.

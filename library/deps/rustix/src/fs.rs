@@ -526,3 +526,322 @@ pub fn fcntl_setfl<Fd: AsFd>(fd: Fd, flags: OFlags) -> Result<()> {
     }
     Ok(())
 }
+
+/// Mount flags of a `StatVfs` (`ST_*`, Linux values).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct StatVfsMountFlags(u64);
+
+impl StatVfsMountFlags {
+    /// `ST_RDONLY`
+    pub const RDONLY: StatVfsMountFlags = StatVfsMountFlags(1);
+    /// `ST_NOSUID`
+    pub const NOSUID: StatVfsMountFlags = StatVfsMountFlags(2);
+    /// `ST_NODEV`
+    pub const NODEV: StatVfsMountFlags = StatVfsMountFlags(4);
+    /// `ST_NOEXEC`
+    pub const NOEXEC: StatVfsMountFlags = StatVfsMountFlags(8);
+    /// `ST_SYNCHRONOUS`
+    pub const SYNCHRONOUS: StatVfsMountFlags = StatVfsMountFlags(16);
+    /// `ST_MANDLOCK`
+    pub const MANDLOCK: StatVfsMountFlags = StatVfsMountFlags(64);
+    /// `ST_NOATIME`
+    pub const NOATIME: StatVfsMountFlags = StatVfsMountFlags(1024);
+    /// `ST_NODIRATIME`
+    pub const NODIRATIME: StatVfsMountFlags = StatVfsMountFlags(2048);
+    /// `ST_RELATIME`
+    pub const RELATIME: StatVfsMountFlags = StatVfsMountFlags(4096);
+
+    /// No flags.
+    pub const fn empty() -> StatVfsMountFlags { StatVfsMountFlags(0) }
+    /// The raw bits.
+    pub const fn bits(self) -> u64 { self.0 }
+    /// Flags from raw bits, keeping unknown bits.
+    pub const fn from_bits_retain(bits: u64) -> StatVfsMountFlags { StatVfsMountFlags(bits) }
+    /// True when every bit of `other` is set in `self`.
+    pub const fn contains(self, other: StatVfsMountFlags) -> bool { self.0 & other.0 == other.0 }
+    /// True when no bit is set.
+    pub const fn is_empty(self) -> bool { self.0 == 0 }
+}
+
+impl core::ops::BitOr for StatVfsMountFlags {
+    type Output = StatVfsMountFlags;
+    fn bitor(self, other: StatVfsMountFlags) -> StatVfsMountFlags { StatVfsMountFlags(self.0 | other.0) }
+}
+
+impl core::ops::BitOrAssign for StatVfsMountFlags {
+    fn bitor_assign(&mut self, other: StatVfsMountFlags) { self.0 |= other.0; }
+}
+
+impl core::ops::BitAnd for StatVfsMountFlags {
+    type Output = StatVfsMountFlags;
+    fn bitand(self, other: StatVfsMountFlags) -> StatVfsMountFlags { StatVfsMountFlags(self.0 & other.0) }
+}
+
+/// The result of `statvfs` and `fstatvfs` (no derives, as upstream).
+pub struct StatVfs {
+    pub f_bsize: u64,
+    pub f_frsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_favail: u64,
+    pub f_fsid: u64,
+    pub f_flag: StatVfsMountFlags,
+    pub f_namemax: u64,
+}
+
+/// Decodes one sysx statvfs record.
+fn statvfs_of(rec: &[u8]) -> StatVfs {
+    StatVfs {
+        f_bsize: rec_u64(rec, 0),
+        f_frsize: rec_u64(rec, 1),
+        f_blocks: rec_u64(rec, 2),
+        f_bfree: rec_u64(rec, 3),
+        f_bavail: rec_u64(rec, 4),
+        f_files: rec_u64(rec, 5),
+        f_ffree: rec_u64(rec, 6),
+        f_favail: rec_u64(rec, 7),
+        f_fsid: rec_u64(rec, 8),
+        f_flag: StatVfsMountFlags::from_bits_retain(rec_u64(rec, 9)),
+        f_namemax: rec_u64(rec, 10),
+    }
+}
+
+/// `statvfs(path)`.
+pub fn statvfs<P: Arg>(path: P) -> Result<StatVfs> {
+    let bytes = path_bytes(&path)?;
+    let mut rec: Vec<u8> = Vec::new();
+    let e = core::intrinsics::sys_x_statvfs(&bytes, &mut rec);
+    if e != 0 {
+        return Err(Errno::from_raw_os_error(e));
+    }
+    Ok(statvfs_of(&rec))
+}
+
+/// `fstatvfs(fd)`.
+pub fn fstatvfs<Fd: AsFd>(fd: Fd) -> Result<StatVfs> {
+    let mut rec: Vec<u8> = Vec::new();
+    let e = core::intrinsics::sys_x_fstatvfs(fd.as_fd().as_raw_fd(), &mut rec);
+    if e != 0 {
+        return Err(Errno::from_raw_os_error(e));
+    }
+    Ok(statvfs_of(&rec))
+}
+
+/// `rustix::fs::inotify`: inotify creation and watches, over
+/// sysx. Events are read with `rustix::io::read` on the fd, as
+/// ts-rust does. The `Reader` iterator is not here: its buffer
+/// type is `core::mem::MaybeUninit`, which lust does not have
+/// yet (README).
+pub mod inotify {
+    use crate::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use crate::fs::path_bytes;
+    use crate::io::{Errno, Result};
+    use crate::path::Arg;
+
+/// `inotify_init1` flags.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct CreateFlags(u32);
+
+impl CreateFlags {
+    /// `IN_CLOEXEC`
+    pub const CLOEXEC: CreateFlags = CreateFlags(0o2000000);
+    /// `IN_NONBLOCK`
+    pub const NONBLOCK: CreateFlags = CreateFlags(0o4000);
+
+    /// No flags.
+    pub const fn empty() -> CreateFlags { CreateFlags(0) }
+    /// The raw bits.
+    pub const fn bits(self) -> u32 { self.0 }
+    /// Flags from raw bits, keeping unknown bits.
+    pub const fn from_bits_retain(bits: u32) -> CreateFlags { CreateFlags(bits) }
+    /// True when every bit of `other` is set in `self`.
+    pub const fn contains(self, other: CreateFlags) -> bool { self.0 & other.0 == other.0 }
+    /// True when no bit is set.
+    pub const fn is_empty(self) -> bool { self.0 == 0 }
+}
+
+impl core::ops::BitOr for CreateFlags {
+    type Output = CreateFlags;
+    fn bitor(self, other: CreateFlags) -> CreateFlags { CreateFlags(self.0 | other.0) }
+}
+
+impl core::ops::BitOrAssign for CreateFlags {
+    fn bitor_assign(&mut self, other: CreateFlags) { self.0 |= other.0; }
+}
+
+impl core::ops::BitAnd for CreateFlags {
+    type Output = CreateFlags;
+    fn bitand(self, other: CreateFlags) -> CreateFlags { CreateFlags(self.0 & other.0) }
+}
+
+/// `inotify_add_watch` mask bits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct WatchFlags(u32);
+
+impl WatchFlags {
+    /// `IN_ACCESS`
+    pub const ACCESS: WatchFlags = WatchFlags(0x0000_0001);
+    /// `IN_MODIFY`
+    pub const MODIFY: WatchFlags = WatchFlags(0x0000_0002);
+    /// `IN_ATTRIB`
+    pub const ATTRIB: WatchFlags = WatchFlags(0x0000_0004);
+    /// `IN_CLOSE_WRITE`
+    pub const CLOSE_WRITE: WatchFlags = WatchFlags(0x0000_0008);
+    /// `IN_CLOSE_NOWRITE`
+    pub const CLOSE_NOWRITE: WatchFlags = WatchFlags(0x0000_0010);
+    /// `IN_OPEN`
+    pub const OPEN: WatchFlags = WatchFlags(0x0000_0020);
+    /// `IN_MOVED_FROM`
+    pub const MOVED_FROM: WatchFlags = WatchFlags(0x0000_0040);
+    /// `IN_MOVED_TO`
+    pub const MOVED_TO: WatchFlags = WatchFlags(0x0000_0080);
+    /// `IN_CREATE`
+    pub const CREATE: WatchFlags = WatchFlags(0x0000_0100);
+    /// `IN_DELETE`
+    pub const DELETE: WatchFlags = WatchFlags(0x0000_0200);
+    /// `IN_DELETE_SELF`
+    pub const DELETE_SELF: WatchFlags = WatchFlags(0x0000_0400);
+    /// `IN_MOVE_SELF`
+    pub const MOVE_SELF: WatchFlags = WatchFlags(0x0000_0800);
+    /// `IN_CLOSE`
+    pub const CLOSE: WatchFlags = WatchFlags(0x0000_0018);
+    /// `IN_MOVE`
+    pub const MOVE: WatchFlags = WatchFlags(0x0000_00c0);
+    /// `IN_ALL_EVENTS`
+    pub const ALL_EVENTS: WatchFlags = WatchFlags(0x0000_0fff);
+    /// `IN_ONLYDIR`
+    pub const ONLYDIR: WatchFlags = WatchFlags(0x0100_0000);
+    /// `IN_DONT_FOLLOW`
+    pub const DONT_FOLLOW: WatchFlags = WatchFlags(0x0400_0000);
+    /// `IN_EXCL_UNLINK`
+    pub const EXCL_UNLINK: WatchFlags = WatchFlags(0x0800_0000);
+    /// `IN_MASK_CREATE`
+    pub const MASK_CREATE: WatchFlags = WatchFlags(0x1000_0000);
+    /// `IN_MASK_ADD`
+    pub const MASK_ADD: WatchFlags = WatchFlags(0x2000_0000);
+    /// `IN_ONESHOT`
+    pub const ONESHOT: WatchFlags = WatchFlags(0x8000_0000);
+
+    /// No flags.
+    pub const fn empty() -> WatchFlags { WatchFlags(0) }
+    /// The raw bits.
+    pub const fn bits(self) -> u32 { self.0 }
+    /// Flags from raw bits, keeping unknown bits.
+    pub const fn from_bits_retain(bits: u32) -> WatchFlags { WatchFlags(bits) }
+    /// True when every bit of `other` is set in `self`.
+    pub const fn contains(self, other: WatchFlags) -> bool { self.0 & other.0 == other.0 }
+    /// True when no bit is set.
+    pub const fn is_empty(self) -> bool { self.0 == 0 }
+}
+
+impl core::ops::BitOr for WatchFlags {
+    type Output = WatchFlags;
+    fn bitor(self, other: WatchFlags) -> WatchFlags { WatchFlags(self.0 | other.0) }
+}
+
+impl core::ops::BitOrAssign for WatchFlags {
+    fn bitor_assign(&mut self, other: WatchFlags) { self.0 |= other.0; }
+}
+
+impl core::ops::BitAnd for WatchFlags {
+    type Output = WatchFlags;
+    fn bitand(self, other: WatchFlags) -> WatchFlags { WatchFlags(self.0 & other.0) }
+}
+
+/// inotify event mask bits, as read from an event record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct ReadFlags(u32);
+
+impl ReadFlags {
+    /// `IN_ACCESS`
+    pub const ACCESS: ReadFlags = ReadFlags(0x0000_0001);
+    /// `IN_MODIFY`
+    pub const MODIFY: ReadFlags = ReadFlags(0x0000_0002);
+    /// `IN_ATTRIB`
+    pub const ATTRIB: ReadFlags = ReadFlags(0x0000_0004);
+    /// `IN_CLOSE_WRITE`
+    pub const CLOSE_WRITE: ReadFlags = ReadFlags(0x0000_0008);
+    /// `IN_CLOSE_NOWRITE`
+    pub const CLOSE_NOWRITE: ReadFlags = ReadFlags(0x0000_0010);
+    /// `IN_OPEN`
+    pub const OPEN: ReadFlags = ReadFlags(0x0000_0020);
+    /// `IN_MOVED_FROM`
+    pub const MOVED_FROM: ReadFlags = ReadFlags(0x0000_0040);
+    /// `IN_MOVED_TO`
+    pub const MOVED_TO: ReadFlags = ReadFlags(0x0000_0080);
+    /// `IN_CREATE`
+    pub const CREATE: ReadFlags = ReadFlags(0x0000_0100);
+    /// `IN_DELETE`
+    pub const DELETE: ReadFlags = ReadFlags(0x0000_0200);
+    /// `IN_DELETE_SELF`
+    pub const DELETE_SELF: ReadFlags = ReadFlags(0x0000_0400);
+    /// `IN_MOVE_SELF`
+    pub const MOVE_SELF: ReadFlags = ReadFlags(0x0000_0800);
+    /// `IN_UNMOUNT`
+    pub const UNMOUNT: ReadFlags = ReadFlags(0x0000_2000);
+    /// `IN_Q_OVERFLOW`
+    pub const QUEUE_OVERFLOW: ReadFlags = ReadFlags(0x0000_4000);
+    /// `IN_IGNORED`
+    pub const IGNORED: ReadFlags = ReadFlags(0x0000_8000);
+    /// `IN_ISDIR`
+    pub const ISDIR: ReadFlags = ReadFlags(0x4000_0000);
+
+    /// No flags.
+    pub const fn empty() -> ReadFlags { ReadFlags(0) }
+    /// The raw bits.
+    pub const fn bits(self) -> u32 { self.0 }
+    /// Flags from raw bits, keeping unknown bits.
+    pub const fn from_bits_retain(bits: u32) -> ReadFlags { ReadFlags(bits) }
+    /// True when every bit of `other` is set in `self`.
+    pub const fn contains(self, other: ReadFlags) -> bool { self.0 & other.0 == other.0 }
+    /// True when no bit is set.
+    pub const fn is_empty(self) -> bool { self.0 == 0 }
+}
+
+impl core::ops::BitOr for ReadFlags {
+    type Output = ReadFlags;
+    fn bitor(self, other: ReadFlags) -> ReadFlags { ReadFlags(self.0 | other.0) }
+}
+
+impl core::ops::BitOrAssign for ReadFlags {
+    fn bitor_assign(&mut self, other: ReadFlags) { self.0 |= other.0; }
+}
+
+impl core::ops::BitAnd for ReadFlags {
+    type Output = ReadFlags;
+    fn bitand(self, other: ReadFlags) -> ReadFlags { ReadFlags(self.0 & other.0) }
+}
+
+    /// `inotify_init1(flags)`.
+    pub fn init(flags: CreateFlags) -> Result<OwnedFd> {
+        let fd = core::intrinsics::sys_x_inotify_init1(flags.bits() as i32);
+        if fd < 0 {
+            Err(Errno::from_raw_os_error(-fd))
+        } else {
+            Ok(OwnedFd::from_raw_fd(fd))
+        }
+    }
+
+    /// `inotify_add_watch(fd, path, flags)`: the watch descriptor.
+    pub fn add_watch<Fd: AsFd, P: Arg>(fd: Fd, path: P, flags: WatchFlags) -> Result<i32> {
+        let bytes = path_bytes(&path)?;
+        let wd = core::intrinsics::sys_x_inotify_add_watch(fd.as_fd().as_raw_fd(), &bytes, flags.bits());
+        if wd < 0 {
+            Err(Errno::from_raw_os_error(-wd))
+        } else {
+            Ok(wd)
+        }
+    }
+
+    /// `inotify_rm_watch(fd, wd)`.
+    pub fn remove_watch<Fd: AsFd>(fd: Fd, wd: i32) -> Result<()> {
+        let e = core::intrinsics::sys_x_inotify_rm_watch(fd.as_fd().as_raw_fd(), wd);
+        if e != 0 {
+            return Err(Errno::from_raw_os_error(e));
+        }
+        Ok(())
+    }
+}

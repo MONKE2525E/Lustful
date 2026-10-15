@@ -88,6 +88,21 @@ int32_t lust_sys_x_dup2(int32_t oldfd, int32_t newfd);
    back in place. Returns the ready count or -errno. A timeout
    of (sec, nsec) with sec<0 waits without a limit. */
 int32_t lust_sys_x_poll(lust_Vec *recs, int64_t sec, int64_t nsec);
+/* inotify_init1(2) with the raw Linux flags: the fd or -errno. */
+int32_t lust_sys_x_inotify_init1(int32_t flags);
+/* inotify_add_watch(2): the watch descriptor or -errno. */
+int32_t lust_sys_x_inotify_add_watch(int32_t fd, const uint8_t *p, uint64_t len, uint32_t mask);
+/* inotify_rm_watch(2): 0 or errno. */
+int32_t lust_sys_x_inotify_rm_watch(int32_t fd, int32_t wd);
+/* One getdents64 call of at most `max` bytes: the raw records
+   are appended to `out`; the byte count or -errno. */
+int64_t lust_sys_x_getdents(int32_t fd, uint64_t max, lust_Vec *out);
+/* statvfs(2): appends the 11-field statvfs record (bsize,
+   frsize, blocks, bfree, bavail, files, ffree, favail, fsid,
+   flag, namemax) as u64s; 0 or errno. */
+int32_t lust_sys_x_statvfs(const uint8_t *p, uint64_t len, lust_Vec *out);
+/* fstatvfs(2): the same record for an fd; 0 or errno. */
+int32_t lust_sys_x_fstatvfs(int32_t fd, lust_Vec *out);
 
 #ifdef LUST_IMPL
 #include "sysx.c"

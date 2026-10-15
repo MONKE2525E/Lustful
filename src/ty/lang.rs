@@ -1229,6 +1229,18 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     IntrinsicDef { name: "sys_x_pipe", c_symbol: "lust_sys_x_pipe", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
     IntrinsicDef { name: "sys_x_dup2", c_symbol: "lust_sys_x_dup2", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
     IntrinsicDef { name: "sys_x_poll", c_symbol: "lust_sys_x_poll", params: &[S::VecU8Mut, S::I64, S::I64], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    // inotify and directory reading for the rustix adapter
+    // (tf-adapters F1, sysx.c): fds and watch descriptors come
+    // back with -errno for errors, rm_watch with 0 or errno.
+    IntrinsicDef { name: "sys_x_inotify_init1", c_symbol: "lust_sys_x_inotify_init1", params: &[S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_inotify_add_watch", c_symbol: "lust_sys_x_inotify_add_watch", params: &[S::I32, S::Bytes, S::U32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_inotify_rm_watch", c_symbol: "lust_sys_x_inotify_rm_watch", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    // One getdents64 of at most `max` bytes into the Vec: the
+    // byte count or -errno.
+    IntrinsicDef { name: "sys_x_getdents", c_symbol: "lust_sys_x_getdents", params: &[S::I32, S::U64, S::VecU8Mut], ret: S::I64, allowed: &[C::Rustix], implemented: true },
+    // statvfs and fstatvfs: the 11-u64 record out, 0 or errno.
+    IntrinsicDef { name: "sys_x_statvfs", c_symbol: "lust_sys_x_statvfs", params: &[S::Bytes, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_fstatvfs", c_symbol: "lust_sys_x_fstatvfs", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
     // prctl THP disable for the nix adapter: mode 0 get (0/1 or
     // -errno), mode 1 set (0 or -errno).
     IntrinsicDef { name: "sys_x_prctl_thp", c_symbol: "lust_sys_x_prctl_thp", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Nix], implemented: true },

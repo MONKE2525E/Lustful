@@ -4,8 +4,10 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <poll.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/statvfs.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -507,4 +509,66 @@ void lust_sys_sig_exit(int32_t status) {
 
 void lust_sys_sig_abort(void) {
     abort();
+}
+
+int32_t lust_sys_x_inotify_init1(int32_t flags) {
+    int fd = inotify_init1(flags);
+    return fd < 0 ? -errno : fd;
+}
+
+int32_t lust_sys_x_inotify_add_watch(int32_t fd, const uint8_t *p, uint64_t len, uint32_t mask) {
+    char *s = lust_sysx_path(p, len);
+    if (!s) return -ENOMEM;
+    int wd = inotify_add_watch(fd, s, mask);
+    int e = errno;
+    free(s);
+    return wd < 0 ? -e : wd;
+}
+
+int32_t lust_sys_x_inotify_rm_watch(int32_t fd, int32_t wd) {
+    return inotify_rm_watch(fd, wd) == 0 ? 0 : errno;
+}
+
+int64_t lust_sys_x_getdents(int32_t fd, uint64_t max, lust_Vec *out) {
+    if (max == 0) {
+        /* The kernel answers EINVAL for a zero-size buffer. */
+        long r = syscall(SYS_getdents64, fd, (void *)0, (size_t)0);
+        return r < 0 ? -errno : (int64_t)r;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)max);
+    if (!buf) return -ENOMEM;
+    long r = syscall(SYS_getdents64, fd, buf, (size_t)max);
+    int e = errno;
+    if (r > 0) lust_sysx_push(out, buf, (uint64_t)r);
+    free(buf);
+    return r < 0 ? -e : (int64_t)r;
+}
+
+/* The 11-field statvfs record: bsize, frsize, blocks, bfree,
+   bavail, files, ffree, favail, fsid, flag, namemax. */
+static void lust_sysx_statvfs_rec(lust_Vec *out, const struct statvfs *st) {
+    uint64_t f[11] = {(uint64_t)st->f_bsize, (uint64_t)st->f_frsize, (uint64_t)st->f_blocks,
+                      (uint64_t)st->f_bfree, (uint64_t)st->f_bavail, (uint64_t)st->f_files,
+                      (uint64_t)st->f_ffree, (uint64_t)st->f_favail, (uint64_t)st->f_fsid,
+                      (uint64_t)st->f_flag, (uint64_t)st->f_namemax};
+    for (int i = 0; i < 11; i++) lust_sysx_u64(out, f[i]);
+}
+
+int32_t lust_sys_x_statvfs(const uint8_t *p, uint64_t len, lust_Vec *out) {
+    char *s = lust_sysx_path(p, len);
+    if (!s) return ENOMEM;
+    struct statvfs st;
+    int r = statvfs(s, &st);
+    int e = errno;
+    free(s);
+    if (r != 0) return e;
+    lust_sysx_statvfs_rec(out, &st);
+    return 0;
+}
+
+int32_t lust_sys_x_fstatvfs(int32_t fd, lust_Vec *out) {
+    struct statvfs st;
+    if (fstatvfs(fd, &st) != 0) return errno;
+    lust_sysx_statvfs_rec(out, &st);
+    return 0;
 }

@@ -64,6 +64,12 @@
 //     pub fn sys_x_fcntl_getfl(fd: i32) -> i32;
 //     pub fn sys_x_fcntl_setfl(fd: i32, flags: i32) -> i32;
 //     pub fn sys_x_winsize(fd: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_inotify_init1(flags: i32) -> i32;             // fd or -errno
+//     pub fn sys_x_inotify_add_watch(fd: i32, path: &[u8], mask: u32) -> i32;  // wd or -errno
+//     pub fn sys_x_inotify_rm_watch(fd: i32, wd: i32) -> i32;    // 0 or errno
+//     pub fn sys_x_getdents(fd: i32, max: u64, out: &mut Vec<u8>) -> i64;      // for RawDir, not yet called
+//     pub fn sys_x_statvfs(path: &[u8], out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_fstatvfs(fd: i32, out: &mut Vec<u8>) -> i32;
 //
 // Every other row of the section 3.2 table is registered with its
 // signature and privilege list, but has no body yet: a privileged call
