@@ -1620,6 +1620,19 @@ impl OwnSig {
         };
         let mut env_caps: Vec<Univ> = Vec::new();
         let mut roles: Vec<(bool, bool)> = Vec::new();
+        let inputs: Vec<Ty> = (2..=body.arg_count).map(|l| body.locals[l].ty).collect();
+        let entry = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d));
+        let arg_roles: Vec<Option<(bool, bool)>> = match entry.map(|c| closure_arg_slots(sc, c)) {
+            Some(Ok(slots)) => slots.into_iter().map(|(r, _)| r).collect(),
+            // Unpaired annotations are the creator's error; every slot is
+            // higher-ranked here.
+            _ => {
+                let mut v = Vec::new();
+                closure_arg_roles(sc, &inputs, free.as_deref(), &mut v);
+                v
+            }
+        };
+        let mut arg_at = 0usize;
         for l in 0..=body.arg_count {
             let t = body.locals[l].ty;
             let n = sc.slots(t) as usize;
@@ -1631,9 +1644,15 @@ impl OwnSig {
                 let paired = entry
                     .and_then(|c| c.output_region)
                     .is_some_and(|r| regioned_slots(sc, r, t, &mut named) && named.len() == n);
+                // So are the slots the inferred return type keeps as
+                // `'static` (a `Box<dyn Fn()>` read from a field): the
+                // body's locals of that type are `'static` there (`build`).
+                let mut kept: Vec<Region> = Vec::new();
+                sc.slot_regions(t, &mut kept);
                 for k in 0..n {
                     match named.get(k) {
                         Some(Region::Static) if paired => out.push(0),
+                        _ if !paired && kept.get(k) == Some(&Region::Static) => out.push(0),
                         _ => out.push(fresh(self, "the closure's return lifetime")),
                     }
                 }
@@ -1654,9 +1673,20 @@ impl OwnSig {
                     out.push(u);
                 }
             } else {
-                for _ in 0..n {
-                    out.push(fresh(self, "a closure argument's lifetime"));
+                // A slot the argument's type keeps as `'static` (`&Rc<dyn Tr>`
+                // from a `'static` type) is `'static`, unless the body can
+                // store into it (a sink: the contract would assume it).
+                let mut kept: Vec<Region> = Vec::new();
+                sc.slot_regions(t, &mut kept);
+                for k in 0..n {
+                    let snk = arg_roles.get(arg_at + k).copied().flatten().is_some_and(|(_, snk)| snk);
+                    if kept.get(k) == Some(&Region::Static) && !snk && kept.len() == n {
+                        out.push(0);
+                    } else {
+                        out.push(fresh(self, "a closure argument's lifetime"));
+                    }
                 }
+                arg_at += n;
             }
             self.slots.push(out);
         }
@@ -1664,18 +1694,6 @@ impl OwnSig {
         // slot) outlives every other sink (a captured one, a free argument
         // slot behind `&mut`, the output). Higher-ranked argument slots
         // take no part.
-        let inputs: Vec<Ty> = (2..=body.arg_count).map(|l| body.locals[l].ty).collect();
-        let entry = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d));
-        let arg_roles: Vec<Option<(bool, bool)>> = match entry.map(|c| closure_arg_slots(sc, c)) {
-            Some(Ok(slots)) => slots.into_iter().map(|(r, _)| r).collect(),
-            // Unpaired annotations are the creator's error; every slot is
-            // higher-ranked here.
-            _ => {
-                let mut v = Vec::new();
-                closure_arg_roles(sc, &inputs, free.as_deref(), &mut v);
-                v
-            }
-        };
         let args: Vec<Univ> = self.slots.iter().skip(2).flatten().copied().collect();
         let mut cap_srcs: Vec<Univ> = Vec::new();
         // Output slots pinned to `'static` (a return annotation) take no
@@ -1694,7 +1712,9 @@ impl OwnSig {
         let mut arg_srcs: Vec<Univ> = Vec::new();
         let mut arg_snks: Vec<Univ> = Vec::new();
         for (i, r) in arg_roles.iter().enumerate() {
-            if let (Some((src, snk)), Some(&u)) = (r, args.get(i)) {
+            if let (Some((src, snk)), Some(&u)) = (r, args.get(i))
+                && u != 0
+            {
                 if *src {
                     arg_srcs.push(u);
                 }
@@ -1744,6 +1764,7 @@ impl OwnSig {
         for (j, r) in arg_roles.iter().enumerate() {
             if r.is_some()
                 && let Some(&u) = args.get(j)
+                && u != 0
             {
                 self.ends[u as usize] = Some(End::Arg(j as u32));
             }
@@ -1754,7 +1775,7 @@ impl OwnSig {
         // higher-ranked one) outlives those output slots.
         if let Some(bo) = entry.and_then(|c| c.bound_output) {
             let mut named: Vec<Region> = Vec::new();
-            let hr: Vec<usize> = (0..args.len()).filter(|&i| arg_roles.get(i).is_none_or(|r| r.is_none())).collect();
+            let hr: Vec<usize> = (0..args.len()).filter(|&i| args[i] != 0 && arg_roles.get(i).is_none_or(|r| r.is_none())).collect();
             if regioned_slots(sc, bo, body.locals[0].ty, &mut named)
                 && let [j] = hr[..]
             {
