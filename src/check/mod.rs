@@ -11279,8 +11279,10 @@ impl<'p> Ctx<'p> {
                         return t;
                     }
                     // The written trait ref with no impl fn behind it
-                    // (`<T as Clone>::clone(t)` at `T = i32`).
-                    if let Some(tr) = hint
+                    // (`<T as Clone>::clone(t)` at `T = i32`), or with no
+                    // trait written, the one trait in scope whose item it
+                    // is and that holds for the type (`<&T>::clone(&t)`).
+                    if let Some(tr) = hint.or_else(|| self.unique_item_trait(base, segs[0].name))
                         && let Some(t) = self.trait_ref_call(e, tr, segs[0].name, args, span)
                     {
                         return t;
@@ -16015,6 +16017,47 @@ impl<'p> Ctx<'p> {
     /// fresh variables otherwise, as in `trait_assoc_base`). A
     /// `None` span (body const evaluation) reports no argument
     /// errors: the path's own check reports them.
+    /// The one in-scope trait with a method `name` that holds for `base`
+    /// (selection finds an impl, an env predicate, or a builtin answer),
+    /// as its trait ref with fresh inputs. None when no trait or several
+    /// do (rustc E0599, E0034).
+    fn unique_item_trait(&mut self, base: Ty, name: Sym) -> Option<TraitRef> {
+        let p = self.p;
+        let traits = p.gx.traits_by_method.get(&name)?.clone();
+        let mut found: Option<DefId> = None;
+        for trait_def in traits {
+            if !method::trait_in_scope_pub(self, trait_def) {
+                continue;
+            }
+            let n_inputs = p.gx.index.trait_record(trait_def)?.generics.params.len().saturating_sub(1);
+            let snap = self.snapshot_vars();
+            let obl_len = self.obl_len();
+            let tr = self.fresh_trait_ref(trait_def, base, n_inputs);
+            let holds = matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_) | Selection::Builtin);
+            self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
+            if holds {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(trait_def);
+            }
+        }
+        let trait_def = found?;
+        let n_inputs = p.gx.index.trait_record(trait_def)?.generics.params.len().saturating_sub(1);
+        Some(self.fresh_trait_ref(trait_def, base, n_inputs))
+    }
+
+    /// `trait_def` at Self `base` with fresh variables for its inputs.
+    fn fresh_trait_ref(&mut self, trait_def: DefId, base: Ty, n_inputs: usize) -> TraitRef {
+        let mut a = vec![GenericArg::Ty(base)];
+        for _ in 0..n_inputs {
+            a.push(GenericArg::Ty(self.new_var(false)));
+        }
+        let args = self.tys.intern_args(&a);
+        TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS }
+    }
+
     /// A trait associated const of a concrete Self type, for body const
     /// evaluation (`[0; <S as Tr>::N]`): the one non-generic impl for
     /// `self_ty` (of `trait_def` when written, else of a trait in scope)
