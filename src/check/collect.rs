@@ -1012,7 +1012,7 @@ fn ty_mentions(ast: &Ast, id: ast::TyId, name: Sym) -> bool {
         TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => ty_mentions(ast, *inner, name),
         TyExpr::Tuple(elems) => elems.iter().any(|&e| ty_mentions(ast, e, name)),
         TyExpr::FnPtr { inputs, ret, .. } => inputs.iter().any(|i| ty_mentions(ast, i.ty, name)) || ret.is_some_and(|r| ty_mentions(ast, r, name)),
-        TyExpr::Dyn { bounds: bs, .. } | TyExpr::ImplTrait { bounds: bs } => bounds(bs),
+        TyExpr::Dyn { bounds: bs, .. } | TyExpr::ImplTrait { bounds: bs, .. } => bounds(bs),
         TyExpr::QPath { self_ty, trait_path, segs } => ty_mentions(ast, *self_ty, name) || trait_path.iter().any(seg_args) || segs.iter().any(seg_args),
         _ => false,
     }
@@ -3739,7 +3739,11 @@ pub fn collect_reuse(
                 rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
                 rs.trait_bounds.extend(generics::trait_lts_of(ast, interner, known, &cx, &scope, g, w));
             }
-            p.regions.fns.insert(id, rs);
+            if rs.opaque_caps.is_some() {
+                p.regions.opaque_sigs.insert(id, rs);
+            } else {
+                p.regions.fns.insert(id, rs);
+            }
         }
         let def_id = DefId { krate: p.krate, hash };
         p.fn_defs.push(def_id);

@@ -356,7 +356,7 @@ fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
     let of_instance = |g: LocalDefId| p.gx.fn_class.get(g.0 as usize) == Some(&FnClass::Instance);
     let check = class != FnClass::Instance
         && !(closure && p.gx.closure_fns.get(&f).and_then(|d| p.gx.closures.get(d)).is_some_and(|c| of_instance(c.parent)));
-    let sig = p.regions.body_sig(p, f);
+    let sig = p.regions.body_sig(p, f).or_else(|| p.regions.opaque_sig(p, f));
     regions::OwnSig::build(p, body, sig, closure, check)
 }
 
@@ -1085,7 +1085,7 @@ impl<'b, 'p> Ck<'b, 'p> {
         // (E0506 on `it = None; c.n = 1;` after `it = Some(f(&c))`). A
         // value the write itself moves out first (`it = g(it)`) drops
         // nothing.
-        let opaque = &body.opaque_locals;
+        let opaque: Vec<Local> = body.opaque_locals.iter().copied().filter(|l| !body.opaque_nodrop.contains(l)).collect();
         let overwrites = |st: &State, dest: &Place, ops: &[&Operand]| {
             let l = dest.local;
             dest.proj.is_empty()

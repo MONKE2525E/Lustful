@@ -113,6 +113,10 @@ pub struct RegionSig {
     /// its trait's, and `impl Tr<'a>` arguments) for traits with lifetime
     /// params, with the written lifetime args (see `TraitLts`).
     pub trait_bounds: Vec<TraitLts>,
+    /// The universals (`Region::Param` indices) a return-position `impl
+    /// Trait` with a `use<..>` list captures (check/use_caps.rs); None
+    /// when it captures every one.
+    pub opaque_caps: Option<Vec<u32>>,
 }
 
 /// A bound `T: Tr<'a, ..>` on type param `param` for a trait with lifetime
@@ -164,6 +168,12 @@ pub struct RegionTables {
     pub fns: FxMap<LocalDefId, RegionSig>,
     /// Trait method signatures by method def (the stubs' callee signatures).
     pub trait_methods: FxMap<DefId, RegionSig>,
+    /// Fns whose return-position `impl Trait` has a `use<..>` list, by
+    /// local def: their region signature (`RegionSig::opaque_caps`; the
+    /// return is a placeholder). Only the opaque rules read it (the
+    /// definer's own signature, `captured_args`); calls keep the opaque
+    /// rule, as for any `impl Trait` fn (`fns` has none of them).
+    pub opaque_sigs: FxMap<LocalDefId, RegionSig>,
     /// Regioned field types of each user Adt template, by def: per variant,
     /// per field, with the Adt's lifetime params as `Region::Param(i)`.
     pub adt_fields: FxMap<DefId, Vec<Vec<Ty>>>,
@@ -240,6 +250,11 @@ impl RegionTables {
                 .or_else(|| self.stub_method(p, g).and_then(|m| self.trait_methods.get(&m)))
         };
         of(f).or_else(|| of(p.gx.instances.get(&f)?.template_local?))
+    }
+
+    /// `opaque_sigs` for `f`, or for the template of instance `f`.
+    pub fn opaque_sig(&self, p: &Program, f: LocalDefId) -> Option<&RegionSig> {
+        self.opaque_sigs.get(&f).or_else(|| self.opaque_sigs.get(&p.gx.instances.get(&f)?.template_local?))
     }
 
     fn stub_method(&self, p: &Program, f: LocalDefId) -> Option<DefId> {
@@ -1204,11 +1219,17 @@ impl OwnSig {
         if opaque_static_ret(p, p.ret_view(body.fn_id)) && !own.slots.is_empty() {
             own.slots[0].fill(0);
         } else if crate::check::opaque::mentions_opaque(&p.tys, p.ret_view(body.fn_id), None) && !own.slots.is_empty() {
+            // A `use<..>` list captures only its universals: the returned
+            // value may not hold another (rustc E0700).
+            let caps = sig.and_then(|s| s.opaque_caps.as_ref());
             let ret: Vec<Univ> = own.slots[0].clone();
             let n = own.n_univ;
             for &r in &ret {
+                if caps.is_some() && r > sig.map_or(0, |s| s.n_univ) {
+                    own.names[r as usize] = "the lifetimes the returned `impl Trait` captures (its `use<..>` list)".into();
+                }
                 for u in 1..=n {
-                    if !ret.contains(&u) {
+                    if !ret.contains(&u) && caps.is_none_or(|c| c.contains(&(u - 1))) {
                         own.facts.push((u, r));
                     }
                 }
@@ -1886,6 +1907,12 @@ pub(super) struct Builder<'b, 'p> {
     /// the revealed hidden type may have no slot for (`String` behind
     /// `impl Display`). Owned by the local and drop-live (`cap_flow`).
     cap_var: FxMap<Local, u32>,
+    /// The capture vars of the opaque locals the body borrows (`&v`,
+    /// `&mut v`, a slice of one): a callee or a write through the borrow
+    /// may store an opaque value in them (`v.push(f(&c))`), so the
+    /// captures of a value a call takes by value, or one written through
+    /// a deref, reach all of them (`cap_reach`).
+    borrowed_caps: Vec<u32>,
 }
 
 impl<'b, 'p> Builder<'b, 'p> {
@@ -1915,6 +1942,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             root_check: None,
             bind_tys: FxMap::default(),
             cap_var: FxMap::default(),
+            borrowed_caps: Vec::new(),
         };
         // Vars 0..=n_univ: 'static and the universals.
         for _ in 0..=b.own.n_univ {
@@ -1927,7 +1955,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             let base = b.owner.len() as u32;
             b.local_base.push(base);
             let mut dl = vec![false; n as usize];
-            if body.opaque_locals.contains(&(l as Local)) {
+            let opaque = body.opaque_locals.contains(&(l as Local));
+            let opaque_drop = opaque && !body.opaque_nodrop.contains(&(l as Local));
+            if opaque_drop {
                 // An `impl Trait` value's unknown destructor may use every
                 // region it captures (W-CHECK-G3, `Body::opaque_locals`).
                 dl = vec![true; n as usize];
@@ -1938,15 +1968,26 @@ impl<'b, 'p> Builder<'b, 'p> {
                 b.owner.push(l as u32 + 1);
                 b.drop_slot.push(dl[i]);
             }
-            if body.opaque_locals.contains(&(l as Local)) {
+            if opaque {
                 b.cap_var.insert(l as Local, b.owner.len() as u32);
                 b.owner.push(l as u32 + 1);
-                b.drop_slot.push(true);
+                b.drop_slot.push(opaque_drop);
             }
         }
         for _ in 0..n_loans {
             let v = b.fresh();
             b.loan_var.push(v);
+        }
+        if !b.cap_var.is_empty() {
+            for s in body.blocks.iter().flat_map(|bl| &bl.stmts) {
+                if let StmtKind::Assign(_, Rvalue::Ref(_, pl) | Rvalue::SliceOf(pl)) = &s.kind
+                    && !pl.proj.contains(&Proj::Deref)
+                    && let Some(&c) = b.cap_var.get(&pl.local)
+                    && !b.borrowed_caps.contains(&c)
+                {
+                    b.borrowed_caps.push(c);
+                }
+            }
         }
         b
     }
@@ -2479,6 +2520,19 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.cap_into(&caps, dest);
     }
 
+    /// Makes the vars `caps`, and the captures of every borrowed opaque
+    /// local, outlive each borrowed opaque local's capture var
+    /// (`borrowed_caps`): what one of them holds may move to another
+    /// through the borrows (`mem::swap(&mut a, &mut b)`).
+    fn cap_reach(&mut self, caps: &[u32]) {
+        if self.borrowed_caps.is_empty() {
+            return;
+        }
+        let to = self.borrowed_caps.clone();
+        let from: Vec<u32> = caps.iter().chain(&to).copied().collect();
+        self.flow_all(&from, &to);
+    }
+
     /// The capture vars of the opaque locals the operands read.
     fn caps_of<'o>(&self, ops: impl Iterator<Item = &'o Operand>) -> Vec<u32> {
         ops.filter_map(|o| match o {
@@ -2489,9 +2543,13 @@ impl<'b, 'p> Builder<'b, 'p> {
     }
 
     /// Makes the vars `caps` outlive what `dest` captures (`cap_flow`).
+    /// A write through a deref may land in any borrowed opaque local.
     fn cap_into(&mut self, caps: &[u32], dest: &Place) {
         if caps.is_empty() {
             return;
+        }
+        if dest.proj.contains(&Proj::Deref) {
+            self.cap_reach(caps);
         }
         if let Some(&dc) = self.cap_var.get(&dest.local) {
             self.flow_all(caps, &[dc]);
@@ -2927,17 +2985,32 @@ impl<'b, 'p> Builder<'b, 'p> {
         let dt = self.place(dest, &mut dv, &mut d);
         // A call of an `impl Trait` fn: its value captures every argument
         // region. Any call carries the captures of the opaque values it
-        // takes by value to an opaque result (`cap_var`).
-        if let Some(&dc) = self.cap_var.get(&dest.local) {
-            // A template callee (`lust check` makes no instances) keeps
-            // its opaque return in `FnInfo::ret`.
-            if let CallTarget::Fn(f) = target
-                && (self.p.gx.opaque_ret_of.contains_key(&f) || crate::check::opaque::mentions_opaque(&self.p.tys, self.p.fn_info(f).ret, None))
-            {
-                let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-                self.flow_all(&all, &[dc]);
+        // takes by value to an opaque result (`cap_var`). A callee that
+        // takes a `&mut` (or a shared borrow of a cell) may store what it
+        // takes in a borrowed opaque local (`v.push(f(&c))`,
+        // `cap_reach`), and so may a call whose result is written through
+        // a deref.
+        // A template callee (`lust check` makes no instances) keeps its
+        // opaque return in `FnInfo::ret`.
+        let all: Vec<u32> = match target {
+            CallTarget::Fn(f) if self.returns_opaque(f) => self.captured_vars(f, &avs),
+            _ => Vec::new(),
+        };
+        let caps = self.caps_of(args.iter());
+        if !self.borrowed_caps.is_empty() {
+            let mut reach = Vec::new();
+            let tys = &self.body.tys;
+            if avs.iter().any(|&(t, _)| has_mut_ref(tys, t) || has_interior(tys, t)) {
+                reach.extend(&caps);
             }
-            let caps = self.caps_of(args.iter());
+            if dest.proj.contains(&Proj::Deref) {
+                reach.extend(&caps);
+                reach.extend(&all);
+            }
+            self.cap_reach(&reach);
+        }
+        if let Some(&dc) = self.cap_var.get(&dest.local) {
+            self.flow_all(&all, &[dc]);
             self.flow_all(&caps, &[dc]);
         }
         // Free closure arguments first: a closure with no captures has no
@@ -3144,7 +3217,11 @@ impl<'b, 'p> Builder<'b, 'p> {
                         self.closure_sources(*t, v, &mut 0, &mut srcs);
                     }
                     self.flow_all(&srcs, &dv);
-                    self.call_opaque(&avs, dt, &dv);
+                    if self.returns_opaque(f) {
+                        self.call_opaque_from(&avs, &all, dt, &dv);
+                    } else {
+                        self.call_opaque(&avs, dt, &dv);
+                    }
                     self.link_closure_args(&avs, None, &[]);
                 }
                 self.trait_view(f, &avs, dt, &dv);
@@ -3335,7 +3412,10 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if let CallTarget::Builtin(b) = target
                 && self.call_tls(b, &avs, dt, &dv) => {}
             _ => {
-                self.call_opaque(&avs, dt, &dv);
+                match target {
+                    CallTarget::Fn(f) if self.returns_opaque(f) => self.call_opaque_from(&avs, &all, dt, &dv),
+                    _ => self.call_opaque(&avs, dt, &dv),
+                }
                 if matches!(target, CallTarget::Fn(_)) {
                     self.link_closure_args(&avs, None, &[]);
                 }
@@ -4677,8 +4757,100 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// The conservative call rule: the result may hold any argument's
     /// regions (equal to them when it holds a `&mut`), and each `&mut`
     /// argument's target may receive every other argument's regions.
+    /// True when `f` returns an `impl Trait` value. A template callee
+    /// (`lust check` makes no instances) keeps its opaque return in
+    /// `FnInfo::ret`.
+    fn returns_opaque(&self, f: LocalDefId) -> bool {
+        self.p.gx.opaque_ret_of.contains_key(&f) || crate::check::opaque::mentions_opaque(&self.p.tys, self.p.fn_info(f).ret, None)
+    }
+
+    /// The vars of a call of `f` that its `impl Trait` value captures:
+    /// every argument region, or with a `use<..>` list
+    /// (`RegionSig::opaque_caps`) the call's vars for the universals the
+    /// list names and for every type param (all of which it captures).
+    /// The signature is instantiated as in `call_sig_with`: arguments
+    /// flow into fresh universals, related by the callee's facts and by
+    /// the bounds its param types imply (`&'a &'b u8`: `'b: 'a`), so a
+    /// captured universal holds what the hidden type may hold shortened
+    /// to it. All argument regions when the signature does not pair.
+    fn captured_vars(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)]) -> Vec<u32> {
+        let all = || avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        let p = self.p;
+        let info = p.fn_info(f);
+        let Some(sig) = p.regions.opaque_sig(p, f).filter(|s| s.params.len() == avs.len() && info.params.len() == avs.len()) else {
+            return all();
+        };
+        let Some(caps) = &sig.opaque_caps else { return all() };
+        let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
+        let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
+        self.bind_tys.clear();
+        for (i, (at, av)) in avs.iter().enumerate() {
+            let et = if p.tys.flags(info.params[i]).contains_param() { *at } else { info.params[i] };
+            let mut pv = Vec::new();
+            if !self.inst(sig.params[i], et, &univ, &mut binds, &mut pv) || (!av.is_empty() && !self.relate(*at, av, et, &pv, Variance::Co)) {
+                return all();
+            }
+            self.sig_implied_edges(sig.params[i], &univ);
+        }
+        for &(a, b) in &sig.facts {
+            let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
+            self.edge(x, y);
+        }
+        let mut out: Vec<u32> = caps.iter().filter_map(|&k| univ.get(k as usize).copied()).collect();
+        for vs in binds.values() {
+            out.extend(vs);
+        }
+        out
+    }
+
+    /// The outlives bounds a regioned signature type implies, as edges
+    /// between the call's universals `univ`: what a reference points at
+    /// outlives it, and (conservatively) an Adt's regions outlive each
+    /// other, for the bounds its fields would imply.
+    fn sig_implied_edges(&mut self, t: Ty, univ: &[u32]) {
+        let tys = &self.p.tys;
+        let var = |r: Region| match r {
+            Region::Param(k) => univ.get(k as usize).copied(),
+            _ => None,
+        };
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut stack = vec![t];
+        while let Some(t) = stack.pop() {
+            match tys.kind(t) {
+                TyKind::Ref(r, _, inner) => {
+                    let mut rs = Vec::new();
+                    regions_of(tys, inner, &mut rs);
+                    if let Some(y) = var(r) {
+                        pairs.extend(rs.iter().filter_map(|&x| var(x)).map(|x| (x, y)));
+                    }
+                    stack.push(inner);
+                }
+                TyKind::Adt(..) => {
+                    let mut rs = Vec::new();
+                    regions_of(tys, t, &mut rs);
+                    let vs: Vec<u32> = rs.iter().filter_map(|&x| var(x)).collect();
+                    pairs.extend(vs.iter().flat_map(|&x| vs.iter().map(move |&y| (x, y))).filter(|(x, y)| x != y));
+                }
+                TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => stack.push(e),
+                TyKind::Tuple(ts) => stack.extend(tys.tys_of(ts).iter().copied()),
+                _ => {}
+            }
+        }
+        for (x, y) in pairs {
+            self.edge(x, y);
+        }
+    }
+
     fn call_opaque(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) {
         let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        self.call_opaque_from(avs, &all, dt, dv);
+    }
+
+    /// `call_opaque` where only the vars `into_dest` reach the result
+    /// (`captured_vars`); a `&mut` argument may still take any
+    /// argument's regions.
+    fn call_opaque_from(&mut self, avs: &[(Ty, Vec<u32>)], into_dest: &[u32], dt: Ty, dv: &[u32]) {
+        let all = into_dest;
         if has_mut_ref(&self.body.tys, dt) || has_interior(&self.body.tys, dt) {
             self.equate_all(&all, dv);
         } else {

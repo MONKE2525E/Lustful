@@ -37,6 +37,7 @@ pub mod tryfrom;
 pub mod usefulness;
 pub mod sync;
 pub mod unwind;
+mod use_caps;
 pub mod variance;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};

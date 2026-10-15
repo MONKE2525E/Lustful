@@ -291,6 +291,23 @@ pub enum TraitBound {
     Lifetime(Lifetime),
 }
 
+/// A `use<..>` precise-capturing list on an `impl Trait`: the generic
+/// params its hidden type may name. Without one, edition 2024 captures
+/// every param in scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UseCaps {
+    pub args: Vec<UseArg>,
+    pub span: Span,
+}
+
+/// One entry of a `use<..>` list: a lifetime (`'a`, `'_`), or a type or
+/// const param (or `Self`) by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UseArg {
+    Lifetime(Lifetime),
+    Param(Sym, Span),
+}
+
 /// A trait reference as written in a bound or an impl header: a path whose
 /// last segment may use parenthesized sugar (`Fn(A) -> B`) or angle bindings
 /// (`Iterator<Item = u8>`).
@@ -759,9 +776,11 @@ pub enum TyExpr {
         bounds: Vec<TraitBound>,
         lifetime: Option<Lifetime>,
     },
-    /// `impl Bounds` in argument, return, or associated position.
+    /// `impl Bounds` in argument, return, or associated position, with
+    /// its `use<..>` precise-capturing list when written.
     ImplTrait {
         bounds: Vec<TraitBound>,
+        captures: Option<UseCaps>,
     },
     /// A qualified path: `<SelfTy as Trait>::Segs`.
     QPath {
@@ -1770,7 +1789,7 @@ impl Ast {
                     *ret = ret.map(|x| sh.t(x));
                 }
                 TyExpr::Dyn { bounds, .. } => sh.bounds(bounds),
-                TyExpr::ImplTrait { bounds } => sh.bounds(bounds),
+                TyExpr::ImplTrait { bounds, .. } => sh.bounds(bounds),
                 TyExpr::QPath { self_ty, trait_path, segs } => {
                     *self_ty = sh.t(*self_ty);
                     sh.path(trait_path);

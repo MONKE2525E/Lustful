@@ -5070,7 +5070,7 @@ impl Rewrite<'_> {
                 let taken = std::mem::replace(&mut ast.tys[id.0 as usize], TyExpr::Unit);
                 let mut taken = taken;
                 match &mut taken {
-                    TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds } => self.bounds(ast, bounds, span, module),
+                    TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds, .. } => self.bounds(ast, bounds, span, module),
                     _ => unreachable!(),
                 }
                 ast.tys[id.0 as usize] = taken;

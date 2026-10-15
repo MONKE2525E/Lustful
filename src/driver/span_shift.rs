@@ -749,7 +749,18 @@ impl Walk {
                     self.lt(l);
                 }
             }
-            TyExpr::ImplTrait { bounds } => self.bounds(bounds),
+            TyExpr::ImplTrait { bounds, captures } => {
+                self.bounds(bounds);
+                if let Some(c) = captures {
+                    self.sp(&mut c.span);
+                    for a in &mut c.args {
+                        match a {
+                            UseArg::Lifetime(l) => self.lt(l),
+                            UseArg::Param(_, s) => self.sp(s),
+                        }
+                    }
+                }
+            }
             TyExpr::QPath { trait_path, segs, .. } => {
                 self.path(trait_path);
                 self.path(segs);

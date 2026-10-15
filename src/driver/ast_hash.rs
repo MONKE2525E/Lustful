@@ -482,9 +482,22 @@ impl Walker<'_> {
                     None => 0u8.hash(h),
                 }
             }
-            TyExpr::ImplTrait { bounds } => {
+            TyExpr::ImplTrait { bounds, captures } => {
                 9u8.hash(h);
                 self.bounds(h, bounds);
+                captures.as_ref().map(|c| c.args.len()).hash(h);
+                for a in captures.iter().flat_map(|c| &c.args) {
+                    match a {
+                        UseArg::Lifetime(lt) => {
+                            0u8.hash(h);
+                            self.lifetime(h, lt);
+                        }
+                        UseArg::Param(n, _) => {
+                            1u8.hash(h);
+                            self.sym(h, *n);
+                        }
+                    }
+                }
             }
             TyExpr::QPath { self_ty, trait_path, segs } => {
                 10u8.hash(h);

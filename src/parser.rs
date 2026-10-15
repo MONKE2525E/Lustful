@@ -1396,7 +1396,7 @@ impl<'a> Parser<'a> {
                     m = m.max(self.td(*r));
                 }
             }
-            TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds } => m = self.bounds_depth(bounds),
+            TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds, .. } => m = self.bounds_depth(bounds),
             TyExpr::QPath { self_ty, trait_path, segs } => {
                 m = m.max(self.td(*self_ty)).max(self.path_depth(trait_path)).max(self.path_depth(segs))
             }
@@ -2415,6 +2415,62 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
+    /// An `impl Trait`'s bound list: `bounds`, where one entry may be a
+    /// `use<..>` precise-capturing list (rustc rejects a second one, and
+    /// one anywhere but an `impl Trait`, which `trait_bound` cannot read).
+    fn impl_bounds(&mut self) -> PResult<(Vec<TraitBound>, Option<UseCaps>)> {
+        let (mut out, mut captures) = (Vec::new(), None);
+        loop {
+            if self.peek() == Tok::Use {
+                let c = self.use_caps()?;
+                if captures.is_some() {
+                    return Err(syntax(c.span, "duplicate `use<...>` precise capturing syntax"));
+                }
+                captures = Some(c);
+            } else {
+                out.push(self.trait_bound()?);
+            }
+            if !self.eat(Tok::Plus) {
+                break;
+            }
+            if matches!(self.peek(), Tok::Comma | Tok::Gt | Tok::LBrace | Tok::Semi | Tok::RParen | Tok::Eq) {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err(syntax(self.prev_span(), "at least one trait must be specified"));
+        }
+        Ok((out, captures))
+    }
+
+    /// `use<'a, T, ..>`: lifetimes (`'_` included) and type or const
+    /// param names (`Self` too), comma separated. `'static` is not a param.
+    fn use_caps(&mut self) -> PResult<UseCaps> {
+        let start = self.expect(Tok::Use, "`use`")?;
+        self.expect(Tok::Lt, "`<`")?;
+        let mut args = Vec::new();
+        while self.peek() != Tok::Gt {
+            match self.peek() {
+                Tok::Lifetime(_) => {
+                    let lt = self.lifetime_here()?;
+                    if self.interner.get(lt.name) == "static" {
+                        return Err(syntax(lt.span, "expected lifetime parameter in `use<...>` precise captures list, found `'static`"));
+                    }
+                    args.push(UseArg::Lifetime(lt));
+                }
+                _ => {
+                    let (name, span) = self.ident()?;
+                    args.push(UseArg::Param(name, span));
+                }
+            }
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::Gt, "`>`")?;
+        Ok(UseCaps { args, span: start.to(self.prev_span()) })
+    }
+
     /// A `where` clause as written, or empty when absent.
     fn where_clause(&mut self) -> PResult<WhereClause> {
         let start = self.span();
@@ -2968,7 +3024,7 @@ impl<'a> Parser<'a> {
                 if bare_bounds {
                     let n = match self.ast.ty(inner) {
                         TyExpr::Dyn { bounds, lifetime, .. } => bounds.len() + usize::from(lifetime.is_some()),
-                        TyExpr::ImplTrait { bounds } => bounds.len(),
+                        TyExpr::ImplTrait { bounds, captures } => bounds.len() + usize::from(captures.is_some()),
                         _ => 1,
                     };
                     if n > 1 {
@@ -3012,8 +3068,8 @@ impl<'a> Parser<'a> {
             }
             Tok::Impl => {
                 self.bump();
-                let bounds = self.bounds()?;
-                Ok(self.push_ty(TyExpr::ImplTrait { bounds }, start.to(self.prev_span())))
+                let (bounds, captures) = self.impl_bounds()?;
+                Ok(self.push_ty(TyExpr::ImplTrait { bounds, captures }, start.to(self.prev_span())))
             }
             Tok::Dyn => {
                 self.bump();

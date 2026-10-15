@@ -759,6 +759,7 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
         hash_region(h, b);
     }
     rs.early.hash(h);
+    rs.opaque_caps.hash(h);
     (rs.fn_bounds.len() as u64).hash(h);
     for b in &rs.fn_bounds {
         b.param.hash(h);
@@ -1159,6 +1160,7 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // `fn f(x: &str)` and `fn f(x: &'static str)` erase alike;
         // callers' borrow checks read the region signature (W-BORROW).
         hash_region_sig(&mut h, p, p.regions.fns.get(&local));
+        hash_region_sig(&mut h, p, p.regions.opaque_sigs.get(&local));
         // Callers of a trait impl method see the trait's signature too
         // (`trait_view`): a trait-only region edit moves the impl's.
         if let Some(m) = crate::borrowck::impl_trait_method(p, local) {

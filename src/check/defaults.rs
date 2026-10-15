@@ -391,7 +391,7 @@ impl Names<'_> {
                     self.ty(*r);
                 }
             }
-            TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds } => self.bounds(bounds),
+            TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds, .. } => self.bounds(bounds),
             TyExpr::QPath { self_ty, trait_path, segs } => {
                 self.ty(*self_ty);
                 self.seg_name(trait_path);

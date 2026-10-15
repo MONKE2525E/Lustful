@@ -4541,7 +4541,15 @@ pub fn resolve_fn_sig(
     // `impl Trait` in argument position is a fresh type parameter with
     // those bounds (section 2.11), also nested in an argument's type.
     for param in &def.params {
-        if let TyExpr::ImplTrait { bounds } = ast.ty(param.ty) {
+        if let Some(span) = super::use_caps::in_arg_type(ast, param.ty) {
+            errs.push(Diag::new(
+                "L0110",
+                span,
+                "`use<...>` precise capturing syntax not allowed in argument-position `impl Trait`",
+                "Remove the `use<..>` list: an `impl Trait` argument captures nothing itself.",
+            ));
+        }
+        if let TyExpr::ImplTrait { bounds, .. } = ast.ty(param.ty) {
             let lhs = apit_param(ast, interner, known, cx, tys, &mut generics, &mut scope, bounds, param.span, errs);
             params.push(lhs);
             continue;
@@ -4549,7 +4557,7 @@ pub fn resolve_fn_sig(
         let mut nested: Vec<ast::TyId> = Vec::new();
         nested_impl_traits(ast, param.ty, &mut nested);
         for n in nested {
-            let TyExpr::ImplTrait { bounds } = ast.ty(n) else { continue };
+            let TyExpr::ImplTrait { bounds, .. } = ast.ty(n) else { continue };
             let lhs = apit_param(ast, interner, known, cx, tys, &mut generics, &mut scope, bounds, ast.ty_span(n), errs);
             scope.apit.push((n, lhs));
         }
@@ -4571,7 +4579,7 @@ pub fn resolve_fn_sig(
     let ret = match (def.ret, owner) {
         (None, _) => UNIT,
         (Some(t), owner) if matches!(ast.ty(t), TyExpr::ImplTrait { .. }) => {
-            let TyExpr::ImplTrait { bounds } = ast.ty(t) else { unreachable!() };
+            let TyExpr::ImplTrait { bounds, .. } = ast.ty(t) else { unreachable!() };
             match owner {
                 None => {
                     errs.push(not_yet("L0602", ast.ty_span(t), "`impl Trait` in a trait method's return type"));
@@ -4609,6 +4617,9 @@ pub fn resolve_fn_sig(
                             "at least one trait must be specified in an `impl Trait` type",
                             "Write the trait the returned value implements, such as `impl Iterator<Item = u8>`.",
                         ));
+                    }
+                    if let TyExpr::ImplTrait { captures: Some(c), .. } = ast.ty(t) {
+                        super::use_caps::check_list(interner, &generics, c, errs);
                     }
                     opaque = Some((od, OpaqueInfo { owner, bounds: preds }));
                     oty
@@ -4673,7 +4684,7 @@ fn apit_param(
                 let mut nested: Vec<ast::TyId> = Vec::new();
                 nested_impl_traits(ast, *t, &mut nested);
                 for n in nested {
-                    let TyExpr::ImplTrait { bounds: inner } = ast.ty(n) else { continue };
+                    let TyExpr::ImplTrait { bounds: inner, .. } = ast.ty(n) else { continue };
                     let p = apit_param(ast, interner, known, cx, tys, generics, scope, inner, ast.ty_span(n), errs);
                     scope.apit.push((n, p));
                 }
@@ -4851,8 +4862,13 @@ fn region_sig(
         errs.push(d);
         return None;
     }
+    let opaque_caps = super::use_caps::captured_regions(interner, &rs, ast, def.ret, errs);
     let rret = match def.ret {
         None => UNIT,
+        // An `impl Trait` with a `use<..>` list: its region signature
+        // goes to `RegionTables::opaque_sigs`, whose rules never read
+        // the return.
+        Some(_) if opaque_caps.is_some() => UNIT,
         Some(t) => match resolve_scoped(ast, interner, known, cx, tys, t, &rs) {
             Ok(t) => t,
             Err(d) => {
@@ -4884,7 +4900,7 @@ fn region_sig(
     let mut bounded = param_bounds(ast, scope, &def.generics, &def.where_clause);
     let top = def.params.iter().zip(params.get(skip..).unwrap_or_default()).map(|(p, &t)| (p.ty, t));
     for (n, t) in top.chain(scope.apit.iter().copied()) {
-        if let TyExpr::ImplTrait { bounds } = ast.ty(n)
+        if let TyExpr::ImplTrait { bounds, .. } = ast.ty(n)
             && let TyKind::Param(j) = tys.kind(t)
         {
             bounded.push((j.0, bounds));
@@ -4892,7 +4908,7 @@ fn region_sig(
     }
     let fn_bounds = fn_bounds_in(ast, interner, known, tys, cx, scope, &bounded);
     let trait_bounds = trait_lts_in(interner, known, cx, scope, &bounded);
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds })
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds, opaque_caps })
 }
 
 /// The lifetime args of one written trait ref, for a trait with lifetime
@@ -5011,7 +5027,7 @@ fn opaque_elision(
     nested_impl_traits(ast, ret, &mut nodes);
     let lhs = tys.intern(TyKind::Param(ParamId(u32::MAX)));
     for n in nodes {
-        let TyExpr::ImplTrait { bounds } = ast.ty(n) else { continue };
+        let TyExpr::ImplTrait { bounds, .. } = ast.ty(n) else { continue };
         for b in bounds {
             if let TraitBound::Lifetime(lt) = b
                 && interner.get(lt.name) == "_"
