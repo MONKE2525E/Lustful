@@ -560,6 +560,9 @@ pub enum Builtin {
     /// the iterator values, built by the expansion (lower/iter.rs).
     IterArrayIntoIter,
     IterRepeatN,
+    /// `std::array::from_fn(f)` (fx-defaults): `[f(0), .., f(N - 1)]`,
+    /// expanded as an array aggregate (lower/iter.rs).
+    ArrayFromFn,
     /// The hashed collections (W-STD-B, check/hashmap.rs, cgen/hash.rs):
     /// constructors (the result type tells map, set, or hasher), table
     /// queries, map and set methods, and the Entry methods.
@@ -9319,6 +9322,7 @@ impl<'p> Ctx<'p> {
                 ("cmp", "min") => Some(Builtin::CmpMin),
                 ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
                 ("iter", "repeat_n") => Some(Builtin::IterRepeatN),
+                ("array", "from_fn") => Some(Builtin::ArrayFromFn),
                 ("slice", "from_ref") | ("slice", "from_mut") => Some(Builtin::SliceFromRef),
                 ("ptr", "from_ref") | ("ptr", "from_mut") => Some(Builtin::PtrFromRef),
                 ("ptr", "null") | ("ptr", "null_mut") => Some(Builtin::PtrNull),
@@ -11683,6 +11687,59 @@ impl<'p> Ctx<'p> {
                         let t = self.callee_turbo_ty(callee, span);
                         self.deferred_copy.push((t, span));
                         (vec![t, USIZE], crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::RepeatN, &[t]))
+                    }
+                    // `std::array::from_fn::<T, N, F>(f) -> [T; N]` with
+                    // `F: FnMut(usize) -> T`: the written turbofish names
+                    // `T` and `N` first, then the expected array type,
+                    // then fresh variables unified by the call's uses.
+                    Builtin::ArrayFromFn => {
+                        let (mut elem, mut len_c): (Option<Ty>, Option<ConstId>) = (None, None);
+                        let mut f_written: Option<Ty> = None;
+                        if let Expr::Path(segs) = p.ast.expr(callee)
+                            && let Some(seg) = segs.last()
+                            && let ast::GenericArgs::Angle(written) = &seg.args
+                        {
+                            let mut types = written.iter().filter_map(|g| match g {
+                                ast::GenericArg::Type(t) => Some(*t),
+                                _ => None,
+                            });
+                            if let Some(t) = types.next() {
+                                elem = Some(self.resolve_written(t));
+                            }
+                            // The second type, when written, is `F`, the
+                            // callable's own type.
+                            f_written = types.next().map(|t| self.resolve_written(t));
+                            if types.next().is_some() {
+                                self.err("L0107", span, "this function takes at most 2 type arguments", "Write `from_fn::<T, N, F>(..)`.");
+                            }
+                            if let Some(e) = written.iter().find_map(|g| match g {
+                                ast::GenericArg::Const(e) => Some(*e),
+                                _ => None,
+                            }) {
+                                let scope = self.body_scope.clone();
+                                match generics::resolve_const_arg(&p.ast, &p.interner, &p.known, &mut self.tys, &scope, e, span) {
+                                    Ok(c) => len_c = Some(c),
+                                    Err(d) => self.errs.push(d),
+                                }
+                            }
+                        }
+                        if (elem.is_none() || len_c.is_none())
+                            && let Some(want) = expected
+                            && let TyKind::Array(e, n) = self.kind(self.resolve(want))
+                        {
+                            elem.get_or_insert(self.resolve(e));
+                            len_c.get_or_insert(n);
+                        }
+                        let elem = elem.unwrap_or_else(|| self.new_var(false));
+                        let len_c = len_c.unwrap_or_else(|| self.fresh_const_var());
+                        let arr = self.tys.intern(TyKind::Array(elem, len_c));
+                        let f = self.fn_mut_param(&[USIZE], elem, span);
+                        if let Some(fw) = f_written
+                            && !self.unify(f, fw)
+                        {
+                            self.mismatch(span, fw, f);
+                        }
+                        (vec![f], arr)
                     }
                     _ => unreachable!(),
                 };

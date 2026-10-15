@@ -110,6 +110,7 @@ fn expands(b: Builtin) -> bool {
             | B::IterArrayIntoIter
             | B::ArrayIterAsSlice
             | B::IterRepeatN
+            | B::ArrayFromFn
             | B::IterOptRes
             | B::IterLen
             | B::ConvInto
@@ -1004,6 +1005,55 @@ impl Ex<'_, '_> {
             B::IterRepeatN => {
                 let (x, n) = (arg()?, arg()?);
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![x, n]));
+            }
+            // `std::array::from_fn(f)`: push each `f(i)` into a
+            // `Vec` in order, then pop them back out into the array
+            // aggregate. A panic in one call drops the `Vec`'s
+            // built prefix front to back, as core's buffer guard
+            // does, then `f`; call temps of a plain array aggregate
+            // would drop back to front. The pops cannot panic (the
+            // length is known), and the emptied `Vec` then drops
+            // only its buffer.
+            B::ArrayFromFn => {
+                let f = arg()?;
+                let f_ty = self.op_ty(&f)?;
+                let fl = self.local(f_ty);
+                self.assign(Place::local(fl), Rvalue::Use(f));
+                let f_place = Place::local(fl);
+                let (elem, n) = match self.body.tys.kind(dest_ty) {
+                    TyKind::Array(e, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => (e, n as u64),
+                        _ => return Err("iterator expansion: `from_fn` with an unknown array length".into()),
+                    },
+                    _ => return Err("iterator expansion: `from_fn` into a non-array".into()),
+                };
+                if n == 0 {
+                    self.assign(dest.clone(), Rvalue::ArrayAgg(dest_ty, Vec::new()));
+                } else {
+                    let vec_ty = self.body.tys.mk_vec(elem);
+                    let v = self.local(vec_ty);
+                    self.assign(Place::local(v), Rvalue::VecLit(elem, Vec::new()));
+                    for i in 0..n {
+                        let t = self.local(elem);
+                        self.call_fn(f_ty, f_place.clone(), vec![Self::usize_c(i)], Place::local(t))?;
+                        let rv = self.ref_to(true, Place::local(v), vec_ty);
+                        let u = self.local(UNIT);
+                        let at = self.take(Place::local(t), elem);
+                        self.call_builtin(Builtin::VecPush, vec![Operand::Move(Place::local(rv)), at], Place::local(u));
+                    }
+                    let opt_ty = self.body.tys.mk_option(elem);
+                    let mut ops = Vec::new();
+                    for _ in 0..n {
+                        let o = self.local(opt_ty);
+                        let rv = self.ref_to(true, Place::local(v), vec_ty);
+                        self.call_builtin(Builtin::VecPop, vec![Operand::Move(Place::local(rv))], Place::local(o));
+                        ops.push(Operand::Move(Self::payload(&Place::local(o))));
+                    }
+                    ops.reverse();
+                    self.assign(dest.clone(), Rvalue::ArrayAgg(dest_ty, ops));
+                    self.drop_local(v);
+                }
+                self.drop_local(fl);
             }
             B::VecExtend | B::StringExtend => {
                 // `v.extend(src)` (W-STD-B): `src` through `IntoIterator`.

@@ -1795,6 +1795,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/mem/swap",
     "core/iter/repeat_n",
     "std/iter/repeat_n",
+    "core/array/from_fn",
+    "std/array/from_fn",
     "core/mem/replace",
     "std/mem/replace",
     "core/mem/take",

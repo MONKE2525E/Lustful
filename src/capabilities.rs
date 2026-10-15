@@ -454,6 +454,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::StringExtend,
     Builtin::IterArrayIntoIter,
     Builtin::IterRepeatN,
+    Builtin::ArrayFromFn,
     Builtin::VecDrain,
     Builtin::StringDrain,
     Builtin::VecDrainNext,
@@ -890,6 +891,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::VecExtend => (&["Vec<T>"], vec![i.intern("extend")], Call::Method),
         B::IterArrayIntoIter => (&["[T; N]"], vec![i.intern("into_iter")], Call::Method),
         B::IterRepeatN => (&["std::iter"], vec![i.intern("repeat_n")], Call::Function),
+        B::ArrayFromFn => (&["std::array"], vec![i.intern("from_fn")], Call::Function),
         B::StringExtend => (&["String"], vec![i.intern("extend")], Call::Method),
         B::CowIntoOwned | B::CowToMut | B::CowDeref => (
             &["Cow<'a, B>"],

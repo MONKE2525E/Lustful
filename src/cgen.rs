@@ -3744,7 +3744,7 @@ impl FnGen<'_, '_> {
             B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce => {
                 unreachable!("split builtins emit in cgen/split.rs")
             }
-            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice => {
+            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice | B::ArrayFromFn => {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
             B::ConvInto => unreachable!("expanded per conversion (lower/iter.rs)"),
