@@ -63,6 +63,14 @@ pub fn rustc_depth(name: &str, inner: &[Tt]) -> (u32, u32) {
     }
 }
 
+/// True for a macro name std puts in the macro prelude of a std-aware
+/// crate (its `#[macro_export]` macros lust expands by name). Macro
+/// resolution reads it as the outer binding a glob-brought macro of
+/// the same name is ambiguous with (rustc E0659).
+pub fn is_std_macro_name(name: &str) -> bool {
+    is_token_builtin(name) || is_passthrough(name)
+}
+
 /// Macros this file expands at token level.
 pub fn is_token_builtin(name: &str) -> bool {
     matches!(

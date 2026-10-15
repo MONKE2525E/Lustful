@@ -950,10 +950,30 @@ pub struct Expander<'a> {
     strings: Vec<String>,
     defs: Vec<Arc<MacroDef>>,
     /// Textually visible macros, in definition order. Lookups scan in
-    /// reverse, so a later definition shadows an earlier one.
-    textual: Vec<(Sym, u32)>,
+    /// reverse, so a later definition shadows an earlier one. The
+    /// third field is the lexical depth (`scope_depth`) the entry
+    /// was made at: macro resolution compares depths, because a
+    /// glob-brought macro in an inner block does not shadow a
+    /// different macro of an outer scope (rustc E0659), where a
+    /// textual definition or an explicit import does.
+    textual: Vec<(Sym, u32, u32)>,
     /// Names brought in by `use` in scope here, same order rule.
-    imports: Vec<(Sym, u32)>,
+    imports: Vec<(Sym, u32, u32)>,
+    /// Macro names glob imports in blocks brought into scope
+    /// here: (name, def, depth), or a `u32::MAX` def when the
+    /// glob's own source name is ambiguous there.
+    glob_macros: Vec<(Sym, u32, u32)>,
+    /// Type-namespace names those globs may bring (a submodule of
+    /// the glob's target that macros are addressable through):
+    /// (name, the module path it names, depth). A macro call
+    /// path through such a name resolves it in the type namespace
+    /// under the same no-shadow rule.
+    glob_type_names: Vec<(Sym, Vec<Sym>, u32)>,
+    /// Depth of delimiter-group nesting at the walk point (0 at a
+    /// file's item list). `use` items and `macro_rules!` only
+    /// appear at statement positions, so group depth orders the
+    /// lexical scopes macro resolution compares.
+    scope_depth: u32,
     /// `use std::vec as v;` style renames of builtin macros seen
     /// during the walk: bound name to canonical macro name.
     builtin_imports: Vec<(Sym, Sym)>,
@@ -1024,6 +1044,16 @@ const STACK_HOP_ROOM: usize = 48 << 20;
 /// rejected (L0801) instead of growing without bound.
 const STACK_TOTAL: usize = 1 << 30;
 
+/// The answer of `Expander::plain_macro` for one plain macro
+/// call name.
+enum PlainMacro {
+    Found(u32),
+    /// Layers name different macros and none shadows (L0507).
+    Ambiguous,
+    /// No lexical layer binds the name: use the module tables.
+    Fallthrough,
+}
+
 /// The address of a local: how deep the current thread's stack is.
 fn stack_addr() -> usize {
     let marker = 0u8;
@@ -1038,6 +1068,9 @@ impl<'a> Expander<'a> {
             defs: Vec::new(),
             textual: Vec::new(),
             imports: Vec::new(),
+            glob_macros: Vec::new(),
+            glob_type_names: Vec::new(),
+            scope_depth: 0,
             builtin_imports: Vec::new(),
             module_builtin_alias: FxMap::default(),
             exported: FxMap::default(),
@@ -1841,10 +1874,138 @@ impl<'a> Expander<'a> {
             self.exported.insert(def.name, idx);
         }
         if textual {
-            self.textual.push((def.name, idx));
+            self.textual.push((def.name, idx, self.scope_depth));
         }
         self.defs.push(def);
         idx
+    }
+
+    /// Resolves a plain (one-segment) macro call name over the
+    /// lexical candidates of this walk point: textual definitions,
+    /// explicit `use`s, and block glob imports, each with its
+    /// depth. Rustc's macro resolution, reduced to these layers:
+    /// a textual definition at the innermost depth wins over both
+    /// others at its depth; an explicit import wins over a glob
+    /// at its depth or outside it, but is ambiguous with a
+    /// different textual definition of an outer scope; a
+    /// glob-brought name in the innermost layer is ambiguous with
+    /// any different binding outside it (an outer scope, the
+    /// module's imports, an exported root macro, or a std macro
+    /// of the same name). The same macro by any two layers is
+    /// never ambiguous. `Fallthrough` leaves the name to the
+    /// module tables in `lookup_macro`.
+    /// True when two def indices are the same macro definition:
+    /// the same `macro_rules!` compiled more than once (a textual
+    /// walk and a worklist seed) keeps its name span, so defs
+    /// compare by it, not by index.
+    fn same_macro(&self, a: u32, b: u32) -> bool {
+        a == b
+            || (a != u32::MAX
+                && b != u32::MAX
+                && self.defs.get(a as usize).zip(self.defs.get(b as usize)).is_some_and(|(x, y)| x.name_span == y.name_span))
+    }
+
+    fn plain_macro(&self, name: Sym, name_text: &str) -> PlainMacro {
+        // Stack order is source order and scopes nest, so the
+        // latest live entry of each kind is its innermost one.
+        let textual = self.textual.iter().rev().find(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d));
+        let explicit = self.imports.iter().rev().find(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d));
+        let globs: Vec<(u32, u32)> = self.glob_macros.iter().filter(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d)).collect();
+        let gdepth = globs.iter().map(|&(_, d)| d).max();
+        if let Some((tidx, dt)) = textual
+            && explicit.is_none_or(|(_, de)| dt >= de)
+            && gdepth.is_none_or(|dg| dt >= dg)
+        {
+            return PlainMacro::Found(tidx);
+        }
+        if let Some((eidx, de)) = explicit
+            && gdepth.is_none_or(|dg| de >= dg)
+        {
+            // A textual definition outside this import's scope is
+            // not shadowed by it (the equal-depth case took the
+            // textual branch above).
+            if textual.is_some_and(|(tidx, _)| !self.same_macro(tidx, eidx)) {
+                return PlainMacro::Ambiguous;
+            }
+            return PlainMacro::Found(eidx);
+        }
+        let Some(dg) = gdepth else { return PlainMacro::Fallthrough };
+        let mut at: Vec<u32> = Vec::new();
+        for &(i, d) in globs.iter().filter(|&&(_, d)| d == dg) {
+            if !at.iter().any(|&j| self.same_macro(i, j)) {
+                at.push(i);
+            }
+        }
+        if at.len() != 1 || at[0] == u32::MAX {
+            return PlainMacro::Ambiguous;
+        }
+        let gidx = at[0];
+        let module_idx = self
+            .module_imports
+            .get(&(self.module.clone(), name))
+            .copied()
+            .or_else(|| if self.module.is_empty() { self.exported.get(&name).copied() } else { None });
+        // Any different binding outside the innermost glob layer
+        // counts, not only the nearest one of each kind.
+        let outer_diff = self.textual.iter().any(|(n, i, d)| *n == name && *d < dg && !self.same_macro(*i, gidx))
+            || self.imports.iter().any(|(n, i, d)| *n == name && *d < dg && !self.same_macro(*i, gidx))
+            || globs.iter().any(|&(i, d)| d < dg && !self.same_macro(i, gidx))
+            || module_idx.is_some_and(|i| !self.same_macro(i, gidx))
+            || (module_idx.is_none() && self.ambiguous_imports.contains_key(&(self.module.clone(), name)))
+            || builtin::is_std_macro_name(name_text);
+        if outer_diff {
+            PlainMacro::Ambiguous
+        } else {
+            PlainMacro::Found(gidx)
+        }
+    }
+
+    /// True when a plain call of this name is the L0507 glob
+    /// ambiguity: the lexical layers conflict (`plain_macro`), or
+    /// globs of the module left the name ambiguous with no
+    /// explicit or std-rename winner. The parser-owned builtin
+    /// fast path reads this too, so an ambiguous `assert!` is
+    /// never read as the std macro.
+    fn plain_call_ambiguous(&self, seg: &Seg) -> bool {
+        match self.plain_macro(seg.sym, &seg.text) {
+            PlainMacro::Ambiguous => true,
+            PlainMacro::Found(_) => false,
+            PlainMacro::Fallthrough => {
+                self.ambiguous_imports.contains_key(&(self.module.clone(), seg.sym))
+                    && !self.module_imports.contains_key(&(self.module.clone(), seg.sym))
+                    && self.builtin_alias_of(seg.sym).is_none()
+            }
+        }
+    }
+
+    /// The ambiguity check of a macro call path (`q::z!()`): the
+    /// first segment resolves in the type namespace under macro
+    /// resolution, so a block glob that brings a module `q` does
+    /// not shadow a different module `q` reachable from here.
+    /// Errors when the module this call would walk from differs
+    /// from a glob-brought one that also addresses the macro.
+    fn check_macro_path_first(&self, call: &Call) -> Result<(), Diag> {
+        let first = &call.segs[0];
+        if matches!(first.text.as_str(), "crate" | "self" | "super") {
+            return Ok(());
+        }
+        let last = call.segs[call.segs.len() - 1].sym;
+        let middle: Vec<Sym> = call.segs[..call.segs.len() - 1].iter().map(|s| s.sym).collect();
+        let mut from_here = self.module.clone();
+        from_here.extend_from_slice(&middle);
+        let chosen = [from_here, middle.clone()].into_iter().find(|m| self.by_path.contains_key(&(m.clone(), last)));
+        let Some(chosen) = chosen else { return Ok(()) };
+        for (name, gpath, _) in &self.glob_type_names {
+            if *name != first.sym {
+                continue;
+            }
+            let mut cand = gpath.clone();
+            cand.extend_from_slice(&middle[1.min(middle.len())..]);
+            if cand != chosen {
+                return Err(crate::resolve::imports::ambiguous_diag(&first.text, call.span));
+            }
+        }
+        Ok(())
     }
 
     /// Resolves a macro call path to a definition index. This is the
@@ -1864,11 +2025,10 @@ impl<'a> Expander<'a> {
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
         let by_module = |module: &[Sym]| -> Option<u32> { self.by_path.get(&(module.to_vec(), last)).copied() };
         if !leading_colon && segs.len() == 1 {
-            if let Some(&(_, idx)) = self.imports.iter().rev().find(|(n, _)| *n == last) {
-                return Some(idx);
-            }
-            if let Some(&(_, idx)) = self.textual.iter().rev().find(|(n, _)| *n == last) {
-                return Some(idx);
+            match self.plain_macro(last, texts[0]) {
+                PlainMacro::Found(idx) => return Some(idx),
+                PlainMacro::Ambiguous => return None,
+                PlainMacro::Fallthrough => {}
             }
             if let Some(idx) = self.module_imports.get(&(self.module.clone(), last)).copied() {
                 return Some(idx);
@@ -1910,6 +2070,7 @@ impl<'a> Expander<'a> {
                 module.extend_from_slice(&middle);
                 by_module(&module)
                     .or_else(|| by_module(&middle))
+                    .or_else(|| self.glob_path_lookup(segs))
                     .or_else(|| if middle.is_empty() { self.exported.get(&last).copied() } else { None })
             }
         }
@@ -2522,19 +2683,28 @@ impl<'a> Expander<'a> {
                 let Tt::Delim(_, inner, gspan) = group else { unreachable!() };
                 let textual_len = self.textual.len();
                 let imports_len = self.imports.len();
+                let glob_len = self.glob_macros.len();
+                let glob_ty_len = self.glob_type_names.len();
                 if let Some(sym) = name_sym {
                     self.module.push(sym);
                 }
+                self.scope_depth += 1;
                 let expanded = self.expand_list(inner, depth, true, false, nest + 1);
+                self.scope_depth -= 1;
                 if name_sym.is_some() {
                     self.module.pop();
                 }
                 let inner = expanded?;
-                let added: Vec<(Sym, u32)> = self.textual[textual_len..].to_vec();
+                let added: Vec<(Sym, u32, u32)> = self.textual[textual_len..].to_vec();
                 self.textual.truncate(textual_len);
                 self.imports.truncate(imports_len);
+                self.glob_macros.truncate(glob_len);
+                self.glob_type_names.truncate(glob_ty_len);
                 if pending_macro_use {
-                    self.textual.extend(added);
+                    // The definitions join this scope from here on,
+                    // at this depth (see `plain_macro`).
+                    let depth = self.scope_depth;
+                    self.textual.extend(added.into_iter().map(|(n, i, _)| (n, i, depth)));
                 }
                 pending_macro_use = false;
                 out.push(take(&mut trees, i));
@@ -2559,6 +2729,7 @@ impl<'a> Expander<'a> {
             // same call as new output would never finish.
             if let Some((segs, leading_colon, group_idx)) = path_call_at(&trees, i, self.ctx.interner)
                 && self.lookup_macro(&segs, leading_colon).is_none()
+                && !(segs.len() == 1 && !leading_colon && self.plain_call_ambiguous(&segs[0]))
                 && (segs.len() == 1 || matches!(segs.first().map(|s| s.text.as_str()), Some("std" | "core" | "alloc")))
                 && builtin::is_passthrough(segs.last().map_or("", |s| &s.text))
             {
@@ -2717,9 +2888,15 @@ impl<'a> Expander<'a> {
                 let Tt::Delim(d, inner, gspan) = tree else { unreachable!() };
                 let textual_len = self.textual.len();
                 let imports_len = self.imports.len();
+                let glob_len = self.glob_macros.len();
+                let glob_ty_len = self.glob_type_names.len();
+                self.scope_depth += 1;
                 let expanded = self.expand_list(inner, depth, false, d == Delim::Brace, nest + 1);
+                self.scope_depth -= 1;
                 self.textual.truncate(textual_len);
                 self.imports.truncate(imports_len);
+                self.glob_macros.truncate(glob_len);
+                self.glob_type_names.truncate(glob_ty_len);
                 out.push(Tt::Delim(d, expanded?, gspan));
                 i += 1;
                 pending_macro_use = false;
@@ -2979,7 +3156,7 @@ impl<'a> Expander<'a> {
             && let Some(&idx) = self.exported.get(&def.name)
             && self.defs[idx as usize].name_span == def.name_span
         {
-            self.textual.push((def.name, idx));
+            self.textual.push((def.name, idx, self.scope_depth));
             return Ok(());
         }
         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
@@ -2994,6 +3171,17 @@ impl<'a> Expander<'a> {
         let (public, content, end) = use_span_at(trees, i)?;
         for (segs, leading, alias) in collect_use_sites(&trees[content..end - 1], &[], self.ctx.interner) {
             self.import_macro(&segs, leading, alias, public && item_list);
+        }
+        // A glob in a block brings the target module's macros into
+        // this lexical scope (module-level globs are seeded by the
+        // worklist instead; registering them again at file depth
+        // would double-count). A glob at item-list level of a
+        // module in this file is module scope, so only a `use`
+        // below an item list (a fn body or block) registers here.
+        if !item_list {
+            for (segs, leading) in collect_use_globs(&trees[content..end - 1], &[], self.ctx.interner) {
+                self.import_glob_macros(&segs, leading);
+            }
         }
         Some(end)
     }
@@ -3019,15 +3207,126 @@ impl<'a> Expander<'a> {
         self.module_builtin_alias.get(&(self.module.clone(), name)).copied()
     }
 
+    /// Registers the macros one block glob import (`use a::*;` in
+    /// a body) brings into this lexical scope, at the current
+    /// depth. The target module is read from the path tables the
+    /// prescan and the worklist seeds built (`by_path` for public
+    /// re-exports, `module_imports` for a module's own imports,
+    /// which is where a module-level glob into that module lands).
+    /// Textual `macro_rules!` definitions of the target are not
+    /// glob-importable, so `module_defs` does not contribute. The
+    /// submodule names macros are addressable through go to
+    /// `glob_type_names` for macro call paths.
+    fn import_glob_macros(&mut self, segs: &[Seg], leading_colon: bool) {
+        if segs.is_empty() {
+            return;
+        }
+        let syms: Vec<Sym> = segs.iter().map(|s| s.sym).collect();
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        let has = |m: &[Sym]| {
+            let under = |k: &Vec<Sym>| k == m || (k.len() > m.len() && k[..m.len()] == *m);
+            self.by_path.keys().any(|(k, _)| under(k)) || self.module_imports.keys().any(|(k, _)| under(k))
+        };
+        let target: Vec<Sym> = match texts[0] {
+            "crate" => syms[1..].to_vec(),
+            "self" => {
+                let mut m = self.module.clone();
+                m.extend_from_slice(&syms[1..]);
+                m
+            }
+            "super" => {
+                let supers = texts.iter().take_while(|&&t| t == "super").count();
+                let keep = self.module.len().saturating_sub(supers);
+                let mut m: Vec<Sym> = self.module[..keep].to_vec();
+                m.extend_from_slice(&syms[supers.min(syms.len())..]);
+                m
+            }
+            _ if leading_colon => syms.clone(),
+            _ => {
+                let mut m = self.module.clone();
+                m.extend_from_slice(&syms);
+                if has(&syms) {
+                    syms.clone()
+                } else if has(&m) {
+                    m
+                } else {
+                    syms.clone()
+                }
+            }
+        };
+        let depth = self.scope_depth;
+        let mut names: Vec<Sym> = Vec::new();
+        for (m, name) in self.by_path.keys().chain(self.module_imports.keys()) {
+            if *m == target && !names.contains(name) {
+                names.push(*name);
+            }
+        }
+        names.sort_by(|a, b| self.ctx.interner.get(*a).cmp(self.ctx.interner.get(*b)));
+        for name in names {
+            // A public re-export (`by_path`) is what a glob of the
+            // target sees from outside; the target's own private
+            // imports (`module_imports`) only count for a glob in
+            // a body of that same module.
+            let own = if target == self.module { self.module_imports.get(&(target.clone(), name)).copied() } else { None };
+            let idx = match self.by_path.get(&(target.clone(), name)).copied().or(own) {
+                Some(i) => i,
+                None if self.ambiguous_imports.contains_key(&(target.clone(), name)) => u32::MAX,
+                None => continue,
+            };
+            self.glob_macros.push((name, idx, depth));
+        }
+        let mut subs: Vec<Vec<Sym>> = Vec::new();
+        for m in self.by_path.keys().map(|(m, _)| m).chain(self.module_imports.keys().map(|(m, _)| m)) {
+            if m.len() == target.len() + 1 && m[..target.len()] == target[..] && !subs.contains(m) {
+                subs.push(m.clone());
+            }
+        }
+        subs.sort();
+        for sub in subs {
+            let name = *sub.last().unwrap();
+            self.glob_type_names.push((name, sub, depth));
+        }
+    }
+
+    /// A macro addressed by a path whose first segment a block
+    /// glob brought in as a module name (`use m::*; use q::z;`
+    /// or a `q::z!()` call): the module the glob binding names,
+    /// with the rest of the path walked from it.
+    fn glob_path_lookup(&self, segs: &[Seg]) -> Option<u32> {
+        if segs.len() < 2 {
+            return None;
+        }
+        let last = segs[segs.len() - 1].sym;
+        let middle: Vec<Sym> = segs[1..segs.len() - 1].iter().map(|s| s.sym).collect();
+        let mut found: Option<(Vec<Sym>, u32)> = None;
+        for (name, gpath, _) in self.glob_type_names.iter().rev() {
+            if *name != segs[0].sym {
+                continue;
+            }
+            let mut cand = gpath.clone();
+            cand.extend_from_slice(&middle);
+            if let Some(&idx) = self.by_path.get(&(cand.clone(), last)) {
+                match &found {
+                    Some((m, _)) if *m != cand => return None,
+                    _ => found = Some((cand, idx)),
+                }
+            }
+        }
+        found.map(|(_, i)| i)
+    }
+
     /// Records `alias` for the macro `segs` names, if it names one.
     fn import_macro(&mut self, segs: &[Seg], leading_colon: bool, alias: Sym, public: bool) {
         if segs.is_empty() {
             return;
         }
         let module = self.module.clone();
-        let found = self.lookup_macro(segs, leading_colon).or_else(|| self.resolve_for_use(segs, leading_colon, &module));
+        let found = self
+            .lookup_macro(segs, leading_colon)
+            .or_else(|| self.resolve_for_use(segs, leading_colon, &module))
+            .or_else(|| if leading_colon { None } else { self.glob_path_lookup(segs) });
         if let Some(idx) = found {
-            self.imports.push((alias, idx));
+            self.imports.push((alias, idx, self.scope_depth));
             if public {
                 self.by_path.insert((self.module.clone(), alias), idx);
             }
@@ -3043,6 +3342,17 @@ impl<'a> Expander<'a> {
     /// unchanged with its arguments expanded.
     pub fn expand_call(&mut self, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
         self.check_depth(depth, 0, call.span, || call.path_text())?;
+        // A glob-brought name that does not shadow an outer macro
+        // is the L0507 ambiguity error, not a missing macro.
+        if !call.leading_colon && call.segs.len() == 1 {
+            let seg = &call.segs[0];
+            if self.plain_call_ambiguous(seg) {
+                return Err(crate::resolve::imports::ambiguous_diag(&seg.text, call.span));
+            }
+        }
+        if !call.leading_colon && call.segs.len() > 1 {
+            self.check_macro_path_first(call)?;
+        }
         if let Some(idx) = self.lookup_macro(&call.segs, call.leading_colon) {
             let def = self.defs[idx as usize].clone();
             return self.transcribe_call(&def, call, depth);
@@ -3285,6 +3595,50 @@ fn use_span_at(trees: &[Tt], i: usize) -> Option<(bool, usize, usize)> {
     }
     let end = (j..trees.len()).find(|&k| matches!(&trees[k], Tt::Tok(t) if t.tok == Tok::Semi))? + 1;
     Some((public, j + 1, end))
+}
+
+/// Every (glob target path, leading-colon flag) one `use` tree
+/// glob-imports, groups included. `prefix` carries the path of an
+/// enclosing group, as in `collect_use_sites`.
+fn collect_use_globs(trees: &[Tt], prefix: &[Seg], interner: &Interner) -> Vec<(Vec<Seg>, bool)> {
+    let mut out = Vec::new();
+    let mut segs: Vec<Seg> = prefix.to_vec();
+    let mut i = 0;
+    let leading_colon = prefix.is_empty() && tok_at(trees, i).map(|t| t.tok) == Some(Tok::PathSep);
+    if leading_colon {
+        i += 1;
+    }
+    while i < trees.len() {
+        match &trees[i] {
+            Tt::Delim(Delim::Brace, group, _) => {
+                let mut start = 0;
+                for k in 0..=group.len() {
+                    if k == group.len() || matches!(&group[k], Tt::Tok(t) if t.tok == Tok::Comma) {
+                        if start < k {
+                            out.extend(collect_use_globs(&group[start..k], &segs, interner));
+                        }
+                        start = k + 1;
+                    }
+                }
+                return out;
+            }
+            Tt::Tok(t) if t.tok == Tok::Star => {
+                out.push((segs, leading_colon));
+                return out;
+            }
+            Tt::Tok(t) if is_seg_tok(t.tok) => {
+                let (Some(sym), Some(text)) = (seg_sym(t.tok, interner), seg_text(t.tok, interner)) else { return out };
+                if text == "self" {
+                    return out;
+                }
+                segs.push(Seg { sym, text, span: t.span });
+                i += 1;
+            }
+            Tt::Tok(t) if t.tok == Tok::PathSep => i += 1,
+            _ => return out,
+        }
+    }
+    out
 }
 
 /// Every (target path, leading-colon flag, imported name) one `use`
