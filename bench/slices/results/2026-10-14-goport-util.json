@@ -1,13 +1,13 @@
 {
  "slice": "goport-util",
- "lines": 35038,
+ "lines": 35080,
  "code_lines": 26468,
  "tsrust_commit": "b11b618aedde90c10c184869b208f1c3c0badea9",
- "lust_commit": "83c9e328",
+ "lust_commit": "62738dad",
  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
  "host": {
   "nproc": 16,
-  "load_at_end": 1.8037109375
+  "load_at_end": 2.7158203125
  },
  "opts": {
   "edits": 120,
@@ -16,9 +16,11 @@
   "units": 24,
   "build_samples": 12,
   "cold_every": 10,
-  "no_rustc": false
+  "no_rustc": false,
+  "no_driver": false
  },
  "states_checked": 171,
+ "program_runs_compared": 17,
  "body_edit_targets": [
   "gostd/unicode_tables.rs:66",
   "locale.rs:133",
@@ -46,58 +48,58 @@
   "fswatch/watcher.rs:122"
  ],
  "peak_rss": {
-  "lust_cold_check_kb": 484444,
-  "cargo_cold_check_kb_default": 292784,
-  "cargo_cold_check_kb_threads8": 431880,
-  "lust_daemon_hwm_kb": 868952
+  "lust_cold_check_kb": 246712,
+  "cargo_cold_check_kb_default": 254668,
+  "cargo_cold_check_kb_threads8": 349724,
+  "lust_daemon_hwm_kb": 841568
  },
  "rows": [
   {
    "row": "cold check",
    "lust": {
     "n": 5,
-    "median": 245.8,
-    "p95": 308.49,
-    "worst": 322.16
+    "median": 237.24,
+    "p95": 273.93,
+    "worst": 282.35
    },
    "rustc": {
     "default": {
      "n": 5,
-     "median": 704.65,
-     "p95": 907.54,
-     "worst": 939.57
+     "median": 810.32,
+     "p95": 858.99,
+     "worst": 869.16
     },
     "threads8": {
      "n": 5,
-     "median": 376.91,
-     "p95": 435.98,
-     "worst": 444.01
+     "median": 402.23,
+     "p95": 476.01,
+     "worst": 491.99
     }
    },
    "rustc_best": {
     "config": "threads8",
     "n": 5,
-    "median": 376.91,
-    "p95": 435.98,
-    "worst": 444.01
+    "median": 402.23,
+    "p95": 476.01,
+    "worst": 491.99
    },
-   "ratio": 1.5,
+   "ratio": 1.7,
    "lust_phases_median_ms": {
-    "read": 0.38,
-    "route": 0.02,
-    "std load+splice": 99.08,
-    "resolve: discovery": 10.41,
-    "resolve: expand+parse": 18.67,
-    "resolve: strip+register": 5.71,
+    "read": 0.33,
+    "route": 0.03,
+    "std load+splice": 81.34,
+    "resolve: discovery": 9.43,
+    "resolve: expand+parse": 19.08,
+    "resolve: strip+register": 5.05,
     "resolve: epoch": 0.14,
-    "resolve: rewrite": 1.75,
-    "resolve: flatten": 0.52,
-    "resolve: chunk scan+concat": 2.24,
-    "ast scan": 0.45,
-    "parse (par)": 1.19,
-    "collect": 54.33,
-    "check+borrowck (par)": 4.43,
-    "total": 239.24
+    "resolve: rewrite": 1.81,
+    "resolve: flatten": 0.54,
+    "resolve: chunk scan+concat": 3.41,
+    "ast scan": 0.51,
+    "parse (par)": 1.25,
+    "collect": 48.16,
+    "check+borrowck (par)": 4.14,
+    "total": 218.31
    },
    "build_stats_median": {},
    "cold_compares": 0
@@ -106,107 +108,175 @@
    "row": "cold build",
    "lust": {
     "n": 5,
-    "median": 298.65,
-    "p95": 384.68,
-    "worst": 393.62
+    "median": 323.01,
+    "p95": 427.62,
+    "worst": 451.24
    },
    "rustc": {
     "default": {
      "n": 5,
-     "median": 774.15,
-     "p95": 936.31,
-     "worst": 965.22
+     "median": 872.52,
+     "p95": 1220.41,
+     "worst": 1297.25
     },
     "threads8": {
      "n": 5,
-     "median": 437.63,
-     "p95": 476.85,
-     "worst": 482.55
+     "median": 487.32,
+     "p95": 509.93,
+     "worst": 511.35
     }
    },
    "rustc_best": {
     "config": "threads8",
     "n": 5,
-    "median": 437.63,
-    "p95": 476.85,
-    "worst": 482.55
+    "median": 487.32,
+    "p95": 509.93,
+    "worst": 511.35
    },
    "ratio": 1.5,
    "lust_phases_median_ms": {
-    "read": 0.39,
-    "route": 0.02,
-    "std load+splice": 93.99,
-    "resolve: discovery": 9.77,
-    "resolve: expand+parse": 17.1,
-    "resolve: strip+register": 5.39,
-    "resolve: epoch": 0.18,
-    "resolve: rewrite": 1.79,
-    "resolve: flatten": 0.52,
-    "resolve: chunk scan+concat": 2.39,
+    "read": 0.37,
+    "route": 0.03,
+    "std load+splice": 83.27,
+    "resolve: discovery": 9.14,
+    "resolve: expand+parse": 20.23,
+    "resolve: strip+register": 5.23,
+    "resolve: epoch": 0.14,
+    "resolve: rewrite": 1.88,
+    "resolve: flatten": 0.53,
+    "resolve: chunk scan+concat": 2.68,
     "ast scan": 0.47,
-    "parse (par)": 1.18,
-    "collect": 53.91,
-    "check+borrowck (par)": 5.74,
-    "codegen (par)": 27.36,
-    "assemble C units (par)": 8.33,
-    "tcc compile": 21.17,
-    "link": 3.53,
-    "total": 291.8
+    "parse (par)": 1.21,
+    "collect": 53.43,
+    "check+borrowck (par)": 5.86,
+    "codegen (par)": 29.07,
+    "assemble C units (par)": 9.8,
+    "tcc compile": 23.54,
+    "link": 4.72,
+    "total": 299.05
    },
    "build_stats_median": {
-    "c_bytes": 7973096,
+    "c_bytes": 7968800,
     "units_compiled": 24,
     "unit_cache_hits": 0,
-    "link_ms": 3.53
+    "link_ms": 4.72
    },
+   "cold_compares": 0
+  },
+  {
+   "row": "run (built program)",
+   "lust": {
+    "n": 17,
+    "median": 1.26,
+    "p95": 1.82,
+    "worst": 3.27
+   },
+   "rustc": {
+    "default": {
+     "n": 17,
+     "median": 0.68,
+     "p95": 0.98,
+     "worst": 1.32
+    },
+    "threads8": {
+     "n": 17,
+     "median": 0.66,
+     "p95": 0.95,
+     "worst": 1.03
+    }
+   },
+   "rustc_best": {
+    "config": "threads8",
+    "n": 17,
+    "median": 0.66,
+    "p95": 0.95,
+    "worst": 1.03
+   },
+   "ratio": 0.52,
+   "lust_phases_median_ms": {},
+   "build_stats_median": {},
+   "cold_compares": 0
+  },
+  {
+   "row": "cold build+run",
+   "lust": {
+    "n": 5,
+    "median": 323.89,
+    "p95": 430.52,
+    "worst": 454.5
+   },
+   "rustc": {
+    "default": {
+     "n": 5,
+     "median": 873.18,
+     "p95": 1221.6,
+     "worst": 1298.57
+    },
+    "threads8": {
+     "n": 5,
+     "median": 488.13,
+     "p95": 510.79,
+     "worst": 512.28
+    }
+   },
+   "rustc_best": {
+    "config": "threads8",
+    "n": 5,
+    "median": 488.13,
+    "p95": 510.79,
+    "worst": 512.28
+   },
+   "ratio": 1.5,
+   "lust_phases_median_ms": {},
+   "build_stats_median": {},
    "cold_compares": 0
   },
   {
    "row": "daemon first check (new session, empty cache)",
    "lust": {
     "n": 1,
-    "median": 284.72,
-    "p95": 284.72,
-    "worst": 284.72
+    "median": 339.26,
+    "p95": 339.26,
+    "worst": 339.26
    },
    "rustc": {
     "default": {
      "n": 1,
-     "median": 11.3,
-     "p95": 11.3,
-     "worst": 11.3
+     "median": 13.9,
+     "p95": 13.9,
+     "worst": 13.9
     },
     "threads8": {
      "n": 1,
-     "median": 12.8,
-     "p95": 12.8,
-     "worst": 12.8
+     "median": 11.52,
+     "p95": 11.52,
+     "worst": 11.52
     }
    },
    "rustc_best": {
-    "config": "default",
+    "config": "threads8",
     "n": 1,
-    "median": 11.3,
-    "p95": 11.3,
-    "worst": 11.3
+    "median": 11.52,
+    "p95": 11.52,
+    "worst": 11.52
    },
-   "ratio": 0.04,
+   "ratio": 0.03,
    "lust_phases_median_ms": {
-    "read": 0.68,
-    "route": 0.1,
-    "std load+splice": 115.69,
-    "resolve: discovery": 11.17,
-    "resolve: expand+parse": 19.91,
-    "resolve: strip+register": 4.87,
-    "resolve: epoch": 0.6,
-    "resolve: rewrite": 1.37,
-    "resolve: flatten": 0.52,
-    "resolve: chunk scan+concat": 5.34,
-    "ast scan": 0.38,
-    "parse (par)": 1.01,
-    "collect": 58.92,
-    "check+borrowck (par)": 10.72,
-    "total": 279.89
+    "read": 1.83,
+    "route": 0.11,
+    "std load+splice": 170.83,
+    "resolve: discovery": 12.78,
+    "resolve: expand+parse": 22.73,
+    "resolve: strip+register": 4.11,
+    "resolve: epoch": 0.55,
+    "resolve: rewrite": 0.9,
+    "resolve: flatten": 0.48,
+    "resolve: chunk scan+concat": 6.52,
+    "ast scan": 0.39,
+    "parse (par)": 0.95,
+    "collect": 43.61,
+    "check+borrowck (par)": 16.83,
+    "total": 333.49
    },
    "build_stats_median": {},
    "cold_compares": 0
@@ -215,48 +285,48 @@
    "row": "no-op check (warm daemon)",
    "lust": {
     "n": 5,
-    "median": 242.95,
-    "p95": 247.06,
-    "worst": 247.53
+    "median": 208.07,
+    "p95": 221.68,
+    "worst": 222.97
    },
    "rustc": {
     "default": {
      "n": 5,
-     "median": 10.94,
-     "p95": 12.87,
-     "worst": 13.13
+     "median": 10.47,
+     "p95": 11.91,
+     "worst": 12.15
     },
     "threads8": {
      "n": 5,
-     "median": 10.62,
-     "p95": 11.72,
-     "worst": 11.89
+     "median": 9.34,
+     "p95": 10.06,
+     "worst": 10.23
     }
    },
    "rustc_best": {
     "config": "threads8",
     "n": 5,
-    "median": 10.62,
-    "p95": 11.72,
-    "worst": 11.89
+    "median": 9.34,
+    "p95": 10.06,
+    "worst": 10.23
    },
    "ratio": 0.04,
    "lust_phases_median_ms": {
     "read": 0.02,
     "route": 0.04,
-    "std load+splice": 78.79,
-    "resolve: discovery": 6.54,
-    "resolve: expand+parse": 19.8,
-    "resolve: strip+register": 5.5,
-    "resolve: epoch": 2.69,
-    "resolve: rewrite": 1.16,
-    "resolve: flatten": 1.01,
-    "resolve: chunk scan+concat": 4.52,
-    "ast scan": 0.54,
-    "parse (par)": 1.41,
-    "collect": 57.39,
-    "check changed fns (par)": 9.27,
-    "total": 238.85
+    "std load+splice": 65.61,
+    "resolve: discovery": 4.0,
+    "resolve: expand+parse": 18.36,
+    "resolve: strip+register": 4.21,
+    "resolve: epoch": 2.13,
+    "resolve: rewrite": 1.15,
+    "resolve: flatten": 0.8,
+    "resolve: chunk scan+concat": 3.87,
+    "ast scan": 0.5,
+    "parse (par)": 1.18,
+    "collect": 44.38,
+    "check changed fns (par)": 8.19,
+    "total": 204.63
    },
    "build_stats_median": {},
    "cold_compares": 0
@@ -265,48 +335,48 @@
    "row": "cached restart check (new daemon, disk cache)",
    "lust": {
     "n": 5,
-    "median": 264.69,
-    "p95": 300.22,
-    "worst": 306.18
+    "median": 251.3,
+    "p95": 259.53,
+    "worst": 260.68
    },
    "rustc": {
     "default": {
      "n": 5,
-     "median": 12.1,
-     "p95": 12.61,
-     "worst": 12.71
+     "median": 11.0,
+     "p95": 11.17,
+     "worst": 11.18
     },
     "threads8": {
      "n": 5,
-     "median": 11.08,
-     "p95": 12.3,
-     "worst": 12.61
+     "median": 9.51,
+     "p95": 10.08,
+     "worst": 10.15
     }
    },
    "rustc_best": {
     "config": "threads8",
     "n": 5,
-    "median": 11.08,
-    "p95": 12.3,
-    "worst": 12.61
+    "median": 9.51,
+    "p95": 10.08,
+    "worst": 10.15
    },
    "ratio": 0.04,
    "lust_phases_median_ms": {
-    "read": 1.12,
+    "read": 0.97,
     "route": 0.11,
-    "std load+splice": 109.21,
-    "resolve: discovery": 9.55,
-    "resolve: expand+parse": 19.97,
-    "resolve: strip+register": 4.35,
-    "resolve: epoch": 0.62,
-    "resolve: rewrite": 1.02,
-    "resolve: flatten": 0.5,
-    "resolve: chunk scan+concat": 4.85,
-    "ast scan": 0.46,
-    "parse (par)": 1.03,
-    "collect": 51.57,
-    "check+borrowck (par)": 8.88,
-    "total": 259.74
+    "std load+splice": 102.44,
+    "resolve: discovery": 7.44,
+    "resolve: expand+parse": 19.98,
+    "resolve: strip+register": 4.55,
+    "resolve: epoch": 0.63,
+    "resolve: rewrite": 1.13,
+    "resolve: flatten": 0.54,
+    "resolve: chunk scan+concat": 5.12,
+    "ast scan": 0.42,
+    "parse (par)": 0.92,
+    "collect": 46.56,
+    "check+borrowck (par)": 8.67,
+    "total": 247.32
    },
    "build_stats_median": {},
    "cold_compares": 1
@@ -315,48 +385,48 @@
    "row": "body edit check (one fn)",
    "lust": {
     "n": 120,
-    "median": 278.39,
-    "p95": 344.68,
-    "worst": 401.25
+    "median": 280.45,
+    "p95": 334.48,
+    "worst": 367.89
    },
    "rustc": {
     "default": {
      "n": 120,
-     "median": 242.32,
-     "p95": 292.25,
-     "worst": 364.83
+     "median": 276.73,
+     "p95": 331.47,
+     "worst": 350.01
     },
     "threads8": {
      "n": 120,
-     "median": 255.65,
-     "p95": 314.48,
-     "worst": 368.16
+     "median": 298.37,
+     "p95": 352.99,
+     "worst": 402.67
     }
    },
    "rustc_best": {
     "config": "default",
     "n": 120,
-    "median": 242.32,
-    "p95": 292.25,
-    "worst": 364.83
+    "median": 276.73,
+    "p95": 331.47,
+    "worst": 350.01
    },
-   "ratio": 0.87,
+   "ratio": 0.99,
    "lust_phases_median_ms": {
     "read": 0.02,
-    "route": 0.04,
-    "std load+splice": 97.46,
-    "resolve: discovery": 7.25,
-    "resolve: expand+parse": 22.55,
-    "resolve: strip+register": 5.5,
-    "resolve: epoch": 3.81,
-    "resolve: rewrite": 1.67,
-    "resolve: flatten": 1.42,
-    "resolve: chunk scan+concat": 5.77,
-    "ast scan": 0.52,
-    "parse (par)": 1.24,
-    "collect": 57.37,
-    "check changed fns (par)": 9.48,
-    "total": 272.81
+    "route": 0.05,
+    "std load+splice": 98.69,
+    "resolve: discovery": 5.51,
+    "resolve: expand+parse": 23.88,
+    "resolve: strip+register": 5.76,
+    "resolve: epoch": 3.9,
+    "resolve: rewrite": 1.78,
+    "resolve: flatten": 1.5,
+    "resolve: chunk scan+concat": 6.41,
+    "ast scan": 0.54,
+    "parse (par)": 1.3,
+    "collect": 55.67,
+    "check changed fns (par)": 9.77,
+    "total": 275.6
    },
    "build_stats_median": {},
    "cold_compares": 12
@@ -365,105 +435,139 @@
    "row": "body edit build (one fn)",
    "lust": {
     "n": 12,
-    "median": 357.52,
-    "p95": 406.79,
-    "worst": 435.11
+    "median": 330.5,
+    "p95": 382.98,
+    "worst": 392.43
    },
    "rustc": {
     "default": {
      "n": 12,
-     "median": 295.77,
-     "p95": 463.26,
-     "worst": 580.34
+     "median": 328.13,
+     "p95": 447.17,
+     "worst": 493.36
     },
     "threads8": {
      "n": 12,
-     "median": 306.83,
-     "p95": 386.37,
-     "worst": 446.45
+     "median": 348.24,
+     "p95": 377.35,
+     "worst": 395.06
     }
    },
    "rustc_best": {
     "config": "default",
     "n": 12,
-    "median": 295.77,
-    "p95": 463.26,
-    "worst": 580.34
+    "median": 328.13,
+    "p95": 447.17,
+    "worst": 493.36
    },
-   "ratio": 0.83,
+   "ratio": 0.99,
    "lust_phases_median_ms": {
-    "read": 0.02,
-    "route": 0.04,
-    "std load+splice": 104.03,
-    "resolve: discovery": 7.38,
-    "resolve: expand+parse": 25.26,
-    "resolve: strip+register": 5.94,
-    "resolve: epoch": 4.28,
-    "resolve: rewrite": 1.9,
-    "resolve: flatten": 1.83,
-    "resolve: chunk scan+concat": 6.27,
-    "ast scan": 0.51,
-    "parse (par)": 1.2,
-    "collect": 61.49,
-    "check changed fns (par)": 11.98,
-    "codegen (par)": 32.53,
-    "assemble C units (par)": 4.21,
-    "tcc compile": 12.25,
-    "link libbase.so": 5.01,
-    "link": 1.25,
-    "total": 348.34
+    "read": 0.03,
+    "route": 0.05,
+    "std load+splice": 94.66,
+    "resolve: discovery": 5.35,
+    "resolve: expand+parse": 24.25,
+    "resolve: strip+register": 5.79,
+    "resolve: epoch": 4.05,
+    "resolve: rewrite": 1.71,
+    "resolve: flatten": 1.47,
+    "resolve: chunk scan+concat": 6.12,
+    "ast scan": 0.55,
+    "parse (par)": 1.27,
+    "collect": 56.78,
+    "check changed fns (par)": 10.69,
+    "codegen (par)": 29.24,
+    "assemble C units (par)": 4.05,
+    "tcc compile": 12.24,
+    "link libbase.so": 5.21,
+    "link": 1.38,
+    "total": 325.12
    },
    "build_stats_median": {
-    "link_ms": 1.245
+    "link_ms": 1.38
    },
+   "cold_compares": 0
+  },
+  {
+   "row": "body edit build+run (one fn)",
+   "lust": {
+    "n": 12,
+    "median": 331.7,
+    "p95": 384.34,
+    "worst": 393.88
+   },
+   "rustc": {
+    "default": {
+     "n": 12,
+     "median": 328.82,
+     "p95": 447.89,
+     "worst": 494.11
+    },
+    "threads8": {
+     "n": 12,
+     "median": 348.87,
+     "p95": 378.08,
+     "worst": 395.66
+    }
+   },
+   "rustc_best": {
+    "config": "default",
+    "n": 12,
+    "median": 328.82,
+    "p95": 447.89,
+    "worst": 494.11
+   },
+   "ratio": 0.99,
+   "lust_phases_median_ms": {},
+   "build_stats_median": {},
    "cold_compares": 0
   },
   {
    "row": "signature edit check",
    "lust": {
     "n": 10,
-    "median": 301.34,
-    "p95": 353.32,
-    "worst": 383.27
+    "median": 284.7,
+    "p95": 297.71,
+    "worst": 301.15
    },
    "rustc": {
     "default": {
      "n": 10,
-     "median": 262.56,
-     "p95": 304.05,
-     "worst": 309.8
+     "median": 274.85,
+     "p95": 291.17,
+     "worst": 296.69
     },
     "threads8": {
      "n": 10,
-     "median": 272.21,
-     "p95": 302.85,
-     "worst": 308.28
+     "median": 286.47,
+     "p95": 315.58,
+     "worst": 315.7
     }
    },
    "rustc_best": {
     "config": "default",
     "n": 10,
-    "median": 262.56,
-    "p95": 304.05,
-    "worst": 309.8
+    "median": 274.85,
+    "p95": 291.17,
+    "worst": 296.69
    },
-   "ratio": 0.87,
+   "ratio": 0.97,
    "lust_phases_median_ms": {
     "read": 0.02,
     "route": 0.04,
-    "std load+splice": 107.39,
-    "resolve: discovery": 8.0,
-    "resolve: expand+parse": 25.82,
-    "resolve: strip+register": 5.69,
-    "resolve: epoch": 4.25,
-    "resolve: rewrite": 1.99,
-    "resolve: flatten": 1.46,
-    "resolve: chunk scan+concat": 6.44,
-    "ast scan": 0.51,
-    "parse changed chunks": 1.33,
-    "collect": 60.96,
-    "check changed fns (par)": 10.45,
-    "total": 295.91
+    "std load+splice": 100.56,
+    "resolve: discovery": 5.99,
+    "resolve: expand+parse": 24.38,
+    "resolve: strip+register": 5.85,
+    "resolve: epoch": 4.39,
+    "resolve: rewrite": 1.62,
+    "resolve: flatten": 1.43,
+    "resolve: chunk scan+concat": 6.38,
+    "ast scan": 0.5,
+    "parse changed chunks": 1.35,
+    "collect": 55.73,
+    "check changed fns (par)": 10.16,
+    "total": 279.91
    },
    "build_stats_median": {},
    "cold_compares": 10
@@ -472,49 +576,49 @@
    "row": "type edit check",
    "lust": {
     "n": 10,
-    "median": 312.08,
-    "p95": 394.86,
-    "worst": 414.5
+    "median": 294.01,
+    "p95": 316.44,
+    "worst": 325.87
    },
    "rustc": {
     "default": {
      "n": 10,
-     "median": 302.63,
-     "p95": 427.19,
-     "worst": 431.82
+     "median": 336.37,
+     "p95": 369.12,
+     "worst": 375.42
     },
     "threads8": {
      "n": 10,
-     "median": 288.65,
-     "p95": 386.38,
-     "worst": 409.08
+     "median": 312.92,
+     "p95": 330.54,
+     "worst": 330.87
     }
    },
    "rustc_best": {
     "config": "threads8",
     "n": 10,
-    "median": 288.65,
-    "p95": 386.38,
-    "worst": 409.08
+    "median": 312.92,
+    "p95": 330.54,
+    "worst": 330.87
    },
-   "ratio": 0.92,
+   "ratio": 1.1,
    "lust_phases_median_ms": {
     "read": 0.02,
     "route": 0.04,
-    "std load+splice": 112.71,
-    "resolve: discovery": 7.67,
-    "resolve: expand+parse": 24.63,
-    "resolve: strip+register": 5.85,
-    "resolve: epoch": 1.02,
-    "resolve: rewrite": 2.34,
-    "resolve: flatten": 0.85,
-    "resolve: chunk scan+concat": 11.68,
-    "ast scan": 0.56,
-    "parse (par)": 1.35,
-    "collect": 61.94,
-    "reads dirty walk": 6.63,
-    "check+borrowck (par)": 10.35,
-    "total": 307.35
+    "std load+splice": 103.84,
+    "resolve: discovery": 5.25,
+    "resolve: expand+parse": 24.27,
+    "resolve: strip+register": 5.62,
+    "resolve: epoch": 0.96,
+    "resolve: rewrite": 1.91,
+    "resolve: flatten": 0.65,
+    "resolve: chunk scan+concat": 10.39,
+    "ast scan": 0.5,
+    "parse (par)": 1.22,
+    "collect": 52.76,
+    "reads dirty walk": 6.35,
+    "check+borrowck (par)": 9.69,
+    "total": 289.13
    },
    "build_stats_median": {},
    "cold_compares": 10
@@ -523,49 +627,49 @@
    "row": "impl edit check",
    "lust": {
     "n": 10,
-    "median": 311.03,
-    "p95": 398.87,
-    "worst": 417.25
+    "median": 286.77,
+    "p95": 314.42,
+    "worst": 318.13
    },
    "rustc": {
     "default": {
      "n": 10,
-     "median": 308.44,
-     "p95": 374.89,
-     "worst": 383.36
+     "median": 280.52,
+     "p95": 324.44,
+     "worst": 330.38
     },
     "threads8": {
      "n": 10,
-     "median": 281.94,
-     "p95": 376.54,
-     "worst": 395.15
+     "median": 274.01,
+     "p95": 304.85,
+     "worst": 314.03
     }
    },
    "rustc_best": {
     "config": "threads8",
     "n": 10,
-    "median": 281.94,
-    "p95": 376.54,
-    "worst": 395.15
+    "median": 274.01,
+    "p95": 304.85,
+    "worst": 314.03
    },
-   "ratio": 0.91,
+   "ratio": 0.96,
    "lust_phases_median_ms": {
-    "read": 0.03,
-    "route": 0.04,
-    "std load+splice": 107.5,
-    "resolve: discovery": 7.74,
-    "resolve: expand+parse": 24.76,
-    "resolve: strip+register": 6.03,
-    "resolve: epoch": 1.01,
-    "resolve: rewrite": 1.94,
-    "resolve: flatten": 0.79,
-    "resolve: chunk scan+concat": 10.96,
-    "ast scan": 0.52,
-    "parse (par)": 1.28,
-    "collect": 61.88,
-    "reads dirty walk": 6.99,
-    "check+borrowck (par)": 11.3,
-    "total": 303.08
+    "read": 0.02,
+    "route": 0.05,
+    "std load+splice": 103.07,
+    "resolve: discovery": 5.56,
+    "resolve: expand+parse": 24.25,
+    "resolve: strip+register": 5.93,
+    "resolve: epoch": 0.97,
+    "resolve: rewrite": 2.17,
+    "resolve: flatten": 0.65,
+    "resolve: chunk scan+concat": 10.09,
+    "ast scan": 0.54,
+    "parse (par)": 1.38,
+    "collect": 52.97,
+    "reads dirty walk": 6.08,
+    "check+borrowck (par)": 8.88,
+    "total": 280.33
    },
    "build_stats_median": {},
    "cold_compares": 10
@@ -574,32 +678,32 @@
    "row": "error edit check (both reject)",
    "lust": {
     "n": 5,
-    "median": 282.82,
-    "p95": 358.28,
-    "worst": 377.04
+    "median": 246.34,
+    "p95": 254.88,
+    "worst": 256.12
    },
    "rustc": {
     "default": {
      "n": 5,
-     "median": 249.18,
-     "p95": 295.93,
-     "worst": 296.96
+     "median": 232.74,
+     "p95": 244.22,
+     "worst": 244.79
     },
     "threads8": {
      "n": 5,
-     "median": 193.21,
-     "p95": 259.31,
-     "worst": 261.59
+     "median": 205.17,
+     "p95": 212.61,
+     "worst": 212.76
     }
    },
    "rustc_best": {
     "config": "threads8",
     "n": 5,
-    "median": 193.21,
-    "p95": 259.31,
-    "worst": 261.59
+    "median": 205.17,
+    "p95": 212.61,
+    "worst": 212.76
    },
-   "ratio": 0.68,
+   "ratio": 0.83,
    "lust_phases_median_ms": {},
    "build_stats_median": {},
    "cold_compares": 5
@@ -608,48 +712,48 @@
    "row": "fix edit check",
    "lust": {
     "n": 5,
-    "median": 320.6,
-    "p95": 401.24,
-    "worst": 406.88
+    "median": 286.02,
+    "p95": 303.55,
+    "worst": 307.36
    },
    "rustc": {
     "default": {
      "n": 5,
-     "median": 235.56,
-     "p95": 308.36,
-     "worst": 311.96
+     "median": 245.13,
+     "p95": 268.62,
+     "worst": 272.42
     },
     "threads8": {
      "n": 5,
-     "median": 249.8,
-     "p95": 317.32,
-     "worst": 326.16
+     "median": 268.71,
+     "p95": 293.34,
+     "worst": 297.72
     }
    },
    "rustc_best": {
     "config": "default",
     "n": 5,
-    "median": 235.56,
-    "p95": 308.36,
-    "worst": 311.96
+    "median": 245.13,
+    "p95": 268.62,
+    "worst": 272.42
    },
-   "ratio": 0.73,
+   "ratio": 0.86,
    "lust_phases_median_ms": {
     "read": 0.02,
-    "route": 0.04,
-    "std load+splice": 122.87,
-    "resolve: discovery": 9.74,
-    "resolve: expand+parse": 27.32,
-    "resolve: strip+register": 5.51,
-    "resolve: epoch": 2.89,
-    "resolve: rewrite": 1.6,
+    "route": 0.05,
+    "std load+splice": 98.39,
+    "resolve: discovery": 7.24,
+    "resolve: expand+parse": 25.47,
+    "resolve: strip+register": 5.5,
+    "resolve: epoch": 2.93,
+    "resolve: rewrite": 1.66,
     "resolve: flatten": 1.17,
-    "resolve: chunk scan+concat": 7.69,
-    "ast scan": 0.52,
-    "parse (par)": 1.3,
-    "collect": 61.19,
-    "check changed fns (par)": 10.14,
-    "total": 315.99
+    "resolve: chunk scan+concat": 7.18,
+    "ast scan": 0.55,
+    "parse (par)": 1.26,
+    "collect": 54.45,
+    "check changed fns (par)": 9.04,
+    "total": 281.85
    },
    "build_stats_median": {},
    "cold_compares": 5
