@@ -372,8 +372,12 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     if req.all_features {
         cmd.arg("--all-features");
     }
-    if !req.target_triple.is_empty() {
-        cmd.args(["--filter-platform", &req.target_triple]);
+    // Empty means the host (SessionKey): filter to it, so metadata
+    // never downloads platform crates lust cannot target anyway
+    // (a windows-only dependency of rustix broke offline resolves).
+    let filter = if req.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.target_triple };
+    if !filter.is_empty() {
+        cmd.args(["--filter-platform", filter]);
     }
     let out = cmd.output().map_err(|e| format!("cannot run `cargo metadata`: {e}"))?;
     if !out.status.success() {
