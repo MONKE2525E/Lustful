@@ -6603,6 +6603,7 @@ impl<'p> Ctx<'p> {
                 self.run_obligations(false);
                 let bt = self.deep(bt);
                 let (mut derefs, mut inner) = self.autoderef_smart(bt);
+                let mut cow_step = false;
                 for step in 0..=4 {
                     if let Some(a) = self.tys.local_adt(inner) {
                         let adt = p.adt(a);
@@ -6632,8 +6633,40 @@ impl<'p> Ctx<'p> {
                     }
                     // rustc's autoderef goes on through a user `Deref`
                     // impl (`info.file_index` on a type that derefs to
-                    // the struct holding it).
+                    // the struct holding it), and through a Cow's
+                    // `Deref` as the first step (check/cow.rs).
                     if step == 4 {
+                        break;
+                    }
+                    if let Some(b) = crate::check::collect::cow_arg(&self.tys, inner) {
+                        if step == 0 && !cow_step && self.cow_place_step(*base, inner, derefs).is_some() {
+                            cow_step = true;
+                            let view = self.tys.mk_ref(false, b);
+                            (derefs, inner) = self.autoderef_smart(view);
+                            continue;
+                        }
+                        if self.cow_view_has_field(b, *name) {
+                            let tn = self.tn(b);
+                            self.err(
+                                "L0640",
+                                span,
+                                format!("a field of `{tn}` through this `Cow` is not implemented yet"),
+                                format!("Bind the view first: `let v: &{tn} = &cow;`, then read `v.{}`.", self.name(*name)),
+                            );
+                            return ERROR;
+                        }
+                        break;
+                    }
+                    if cow_step {
+                        if self.probe_user_deref(inner, span) {
+                            self.err(
+                                "L0640",
+                                span,
+                                "a field through a `Cow` and a user `Deref` is not implemented yet".to_string(),
+                                "Bind the view first: `let v = &*cow;`, then read the field.",
+                            );
+                            return ERROR;
+                        }
                         break;
                     }
                     let Some(target) = self.record_place_deref(e, inner, derefs, span) else { break };
@@ -6653,7 +6686,11 @@ impl<'p> Ctx<'p> {
                 self.run_obligations(false);
                 let (mut derefs, mut inner) = self.autoderef_smart(bt);
                 // A user type indexes through its `Deref` impls (a wrapper
-                // over a Vec or slice), as rustc's index autoderef.
+                // over a Vec or slice), as rustc's index autoderef, and a
+                // Cow indexes through its view as the first step
+                // (check/cow.rs).
+                let mut cow_step = false;
+                let mut first_step = true;
                 for _ in 0..4 {
                     let indexable = matches!(self.kind(inner), TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Error)
                         || self.tys.vec_elem(inner).is_some()
@@ -6665,6 +6702,44 @@ impl<'p> Ctx<'p> {
                     if indexable || self.has_user_index_impl(inner) {
                         break;
                     }
+                    if let Some(b) = crate::check::collect::cow_arg(&self.tys, inner) {
+                        if first_step && !cow_step && self.cow_place_step(*base, inner, derefs).is_some() {
+                            cow_step = true;
+                            first_step = false;
+                            let view = self.tys.mk_ref(false, b);
+                            (derefs, inner) = self.autoderef_smart(view);
+                            continue;
+                        }
+                        if self.cow_view_indexable(b) {
+                            self.err(
+                                "L0640",
+                                span,
+                                "indexing through this `Cow` is not implemented yet".to_string(),
+                                "Bind the view first: `let v = &*cow;`, then index `v`.",
+                            );
+                            if !matches!(p.ast.expr(*index), Expr::Range { .. }) {
+                                self.expr(*index, None);
+                            }
+                            return ERROR;
+                        }
+                        break;
+                    }
+                    if cow_step {
+                        if self.probe_user_deref(inner, span) {
+                            self.err(
+                                "L0640",
+                                span,
+                                "indexing through a `Cow` and a user `Deref` is not implemented yet".to_string(),
+                                "Bind the view first: `let v = &*cow;`, then index `v`.",
+                            );
+                            if !matches!(p.ast.expr(*index), Expr::Range { .. }) {
+                                self.expr(*index, None);
+                            }
+                            return ERROR;
+                        }
+                        break;
+                    }
+                    first_step = false;
                     let Some(target) = self.record_place_deref(e, inner, derefs, span) else { break };
                     let tref = self.tys.mk_ref(false, target);
                     (derefs, inner) = self.autoderef_smart(tref);

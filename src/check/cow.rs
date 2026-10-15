@@ -103,10 +103,13 @@ impl<'p> Ctx<'p> {
     /// A method of `B` on a `Cow<B>` receiver, through the Cow's `Deref`
     /// (rustc's next autoderef step, taken once every Cow method
     /// missed): the receiver becomes the `&B` view, from which the
-    /// method's own derefs and autoref start (`Coerce::CowRecv`). Only
-    /// B's builtin methods resolve this way so far; a user method of B
-    /// is L0640. None for other receivers and for the names in
-    /// `COW_OWN`.
+    /// method's own derefs and autoref start (`Coerce::CowRecv`). B's
+    /// builtin, inherent, and trait methods resolve this way: lowering
+    /// substitutes the view for the receiver operand and place, and
+    /// the borrow checker sees the call on the view local, so a
+    /// `&mut` method or a by-value move out of the view rejects as it
+    /// does behind any shared reference. None for other receivers and
+    /// for the names in `COW_OWN`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn cow_deref_method(
         &mut self,
@@ -129,17 +132,61 @@ impl<'p> Ctx<'p> {
         let i = self.ei(recv);
         self.out.coerce[i] = Coerce::CowRecv(derefs, view);
         let ret = self.method_call_at(e, recv, view, name, name_span, args, turbofish, expected);
-        let i = self.ei(e);
-        if ret != ERROR && !matches!(self.out.expr_res[i], Res::BuiltinMethod { b, .. } if b != Builtin::FmtWriteFmt) {
-            let tn = self.tn(b);
-            self.err(
-                "L0640",
-                name_span,
-                format!("calling the `{tn}` method `{n}` through a `Cow` is not implemented yet"),
-                format!("Bind the view first: `let v: &{tn} = &cow;`, then call `v.{n}(..)`."),
-            );
-            return Some(ERROR);
-        }
         Some(ret)
+    }
+
+    /// One Cow `Deref` step of a field or index place base: records
+    /// `Coerce::CowRecv` on the base expression (lowering's `place`
+    /// then gives the `&B` view local for it) and returns `B`. None
+    /// when `inner` is no Cow. Only the first autoderef step of a
+    /// place takes it: a Cow reached through a user `Deref`, or a
+    /// user `Deref` past the view, is L0640 (the callers decide).
+    pub(super) fn cow_place_step(&mut self, base: ExprId, inner: Ty, derefs: u8) -> Option<Ty> {
+        let b = crate::check::collect::cow_arg(&self.tys, inner)?;
+        let view = self.tys.mk_ref(false, b);
+        let i = self.ei(base);
+        self.out.coerce[i] = Coerce::CowRecv(derefs, view);
+        Some(b)
+    }
+
+    /// Does `inner` have a written `Deref` impl? A probe only: every
+    /// binding and obligation it makes is rolled back.
+    pub(super) fn probe_user_deref(&mut self, inner: Ty, span: Span) -> bool {
+        if self.tys.local_adt(inner).is_none() {
+            return false;
+        }
+        let snap = self.snapshot_vars();
+        let obl = self.obl_len();
+        let has = self.user_deref_fn(self.p.gx.lang.deref, inner, "deref", span).is_some();
+        self.rollback_vars(snap);
+        self.obl_truncate(obl);
+        has
+    }
+
+    /// The struct field `name` exists on `b` behind the builtin
+    /// autoderef of `&b` (the look-ahead that keeps a Cow place step
+    /// lust cannot lower at L0640 instead of a wrong no-field error).
+    pub(super) fn cow_view_has_field(&mut self, b: Ty, name: Sym) -> bool {
+        let view = self.tys.mk_ref(false, b);
+        let (_, inner) = self.autoderef_smart(view);
+        let p = self.p;
+        match self.tys.local_adt(inner) {
+            Some(a) => {
+                let adt = p.adt(a);
+                !adt.is_enum && adt.variants[0].fields.iter().any(|f| f.name == name)
+            }
+            None => self.range_field(inner, name).is_some(),
+        }
+    }
+
+    /// `b` behind `&b` is directly indexable (the index look-ahead
+    /// twin of `cow_view_has_field`).
+    pub(super) fn cow_view_indexable(&mut self, b: Ty) -> bool {
+        let view = self.tys.mk_ref(false, b);
+        let (_, inner) = self.autoderef_smart(view);
+        matches!(self.kind(inner), TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str)
+            || self.tys.vec_elem(inner).is_some()
+            || self.tys.is_string_ty(inner)
+            || self.has_user_index_impl(inner)
     }
 }

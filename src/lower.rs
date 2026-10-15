@@ -38,6 +38,11 @@ struct Lower<'p> {
     /// type of the value made from it, which `place`, `operand`, and
     /// `ty` give for it while the method call lowers.
     cow_view: Option<(ExprId, Local, Ty)>,
+    /// The Cow expression `cow_view_of` is currently lowering: `place`
+    /// and `ty` answer for that Cow itself, not its view (any other
+    /// expression still answers with its view, so nested Cow places
+    /// work).
+    making_cow_view: Option<ExprId>,
     /// `needs_drop` answers per body type: every scope exit asks for each of
     /// its locals, and the answer walks Adt fields.
     drop_ty: crate::intern::FxMap<Ty, bool>,
@@ -137,6 +142,7 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         local_map: Vec::new(),
         mut_index: 0,
         cow_view: None,
+        making_cow_view: None,
         drop_ty: Default::default(),
         upvars: None,
         guard_places: Vec::new(),
@@ -505,6 +511,14 @@ impl<'p> Lower<'p> {
         self.assign(Place::local(i), Rvalue::Use(Operand::Copy(Place::local(i))), at);
     }
     fn ty(&self, e: ExprId) -> Ty {
+        // A `CowRecv` expression lowers as its `&B` view (a method
+        // receiver, a field or index base, a `*cow`): its type here
+        // is the view's, except inside `cow_view_of` itself.
+        if self.making_cow_view != Some(e)
+            && let Coerce::CowRecv(_, view) = self.ck.coerce(e)
+        {
+            return view;
+        }
         match self.cow_view {
             Some((x, _, t)) if x == e => t,
             _ => self.ck.ty(e),
@@ -617,6 +631,15 @@ impl<'p> Lower<'p> {
         if let Some((x, v, _)) = self.cow_view
             && x == e
         {
+            return Place::local(v);
+        }
+        // A field or index base through a Cow's `Deref` (the method
+        // receiver case is the `cow_view` above): the place is the
+        // `&B` view local, and the recorded derefs count from it.
+        if self.making_cow_view != Some(e)
+            && let Coerce::CowRecv(n, view) = self.ck.coerce(e)
+        {
+            let v = self.cow_view_of(e, n, view);
             return Place::local(v);
         }
         if let Some(pl) = self.take_prelowered(e) {
@@ -3336,8 +3359,12 @@ impl<'p> Lower<'p> {
     /// (W-STD-B): a shared borrow of the Cow, then its `Deref` builtin.
     fn cow_view_of(&mut self, e: ExprId, n: u8, view: Ty) -> Local {
         let span = self.span(e);
+        // Lower the Cow expression itself, not its view (the guard
+        // also stops `place(e)` here from recursing into this fn).
+        let saved = std::mem::replace(&mut self.making_cow_view, Some(e));
         let pl = Self::derefs(self.place(e), n);
         let cow = self.peel(self.ty(e), n);
+        self.making_cow_view = saved;
         let rt = self.ref_ty(false, cow);
         let r = self.temp(rt);
         self.assign(Place::local(r), Rvalue::Ref(false, pl), span);
