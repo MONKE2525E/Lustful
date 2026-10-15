@@ -25,7 +25,8 @@
 #              Its stdout and exit status must match the plain lust build's.
 #              The gcc build uses -Werror=incompatible-pointer-types, so a
 #              miscompile that passes a pointer of the wrong type (which
-#              tcc accepts silently) fails loudly here.
+#              tcc accepts silently) fails loudly here. A unit whose sanitized
+#              build passes SAN_CC_LIMIT seconds (default 20) is built at -O0.
 #   CASE_TIMEOUT seconds per compile (default 30), RUN_TIMEOUT per run
 #   (default 10). A missing or empty fixture dir fails the run, as does
 #   a filter that matches no case (ARCH 9.3: no silent skips).
@@ -77,6 +78,16 @@ san_flags=(-O1 -w -Werror=incompatible-pointer-types -fno-sanitize-recover=undef
 # distinct unit compiles once per run. Not kept across runs.
 san_obj=$work/san-obj
 mkdir -p "$san_obj"
+# san_cc <unit.c> <obj> <errfile>: the sanitized gcc build of one unit. ASAN's use-after-scope
+# instrumentation at -O1 is superlinear in a long function: one 5166-line main (iter_flatten)
+# took 185 s, and 0.5 s without that check. A unit that takes longer than SAN_CC_LIMIT seconds
+# (default 20) is built again at -O0, which keeps every check (8 s for that unit).
+san_cc() {
+  timeout "${SAN_CC_LIMIT:-20}" gcc "${san_flags[@]}" -c -o "$2" "$1" 2>>"$3"
+  local st=$?
+  [ $st -eq 124 ] || return $st
+  gcc "${san_flags[@]}" -O0 -c -o "$2" "$1" 2>>"$3"
+}
 
 sanitize_case() {
   # $1 fixture, $2 name, $3 expected-stdout file, $4 expected exit status (the unsanitized
@@ -90,10 +101,11 @@ sanitize_case() {
     objs+=("$o")
     (
       flock 9
-      [ -f "$o" ] || { gcc "${san_flags[@]}" -c -o "$o.tmp" "$c" 2>>"$name.san.err" && mv "$o.tmp" "$o"; }
+      [ -f "$o" ] || { san_cc "$c" "$o.tmp" "$name.san.err" && mv "$o.tmp" "$o"; }
     ) 9>"$o.lock"
   done
-  if ! gcc "${san_flags[@]}" -o "$name.san" "${objs[@]}" 2>>"$name.san.err"; then
+  # -lm: an -O0 unit (san_cc) calls libm functions that -O1 builds inline.
+  if ! gcc "${san_flags[@]}" -o "$name.san" "${objs[@]}" -lm 2>>"$name.san.err"; then
     echo "gcc could not build the generated C: $(head -3 "$name.san.err")"
     return 1
   fi
