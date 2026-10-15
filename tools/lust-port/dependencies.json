@@ -130,9 +130,9 @@
   },
   {
    "name": "same-file",
-   "decision": "c-shim",
+   "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Windows file identity. Later target gate."
+   "notes": "Adapter in library/deps: is_same_file and Handle over dev/ino identity (std::os::unix::fs::MetadataExt), the same calls as upstream unix.rs. Std stream handles and fd trait impls are absent until lust std has a from-raw-fd File form."
   },
   {
    "name": "same_file",

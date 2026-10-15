@@ -254,7 +254,7 @@ pub struct ResolvedTables {
 /// `std::<module>::<item>` path resolves into that crate when the
 /// crate defines the item. Other std paths keep the std compat
 /// handling of collect and check.
-pub const STD_PLATFORM_MODULES: &[&str] = &["io", "fs", "env", "path", "process", "ffi"];
+pub const STD_PLATFORM_MODULES: &[&str] = &["io", "fs", "env", "path", "process", "ffi", "os"];
 
 /// The platform modules the compiler has no std handling for at all:
 /// every `std::<module>::<name>` path resolves in the platform crate,

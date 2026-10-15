@@ -22,5 +22,6 @@ pub mod ffi;
 pub mod path;
 pub mod env;
 pub mod fs;
+pub mod os;
 #[path = "process_os.rs"]
 pub mod process;

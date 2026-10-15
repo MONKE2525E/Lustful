@@ -1,0 +1,15 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package same-file 1.0.6; release builds
+# use the real crate through Cargo. The driver checks `version` against
+# the resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "same-file"
+version = "1.0.6"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# Upstream has no optional features (the winapi-util dependency is
+# Windows-only); the `default` set is the whole crate on Unix.
+features = ["default"]

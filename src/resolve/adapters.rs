@@ -53,6 +53,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "nix",
     "signal-hook",
     "flate2",
+    "same-file",
 ];
 
 /// One adapter crate, read from its manifest.

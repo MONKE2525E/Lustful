@@ -67,11 +67,11 @@ int64_t lust_sys_fd_seek(int32_t fd, int64_t off, int32_t whence) {
 int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out) {
     struct stat st;
     if (fstat(fd, &st) != 0) return errno;
-    uint64_t f[15] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec, st.st_uid, st.st_gid,
+    uint64_t f[16] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec, st.st_uid, st.st_gid,
                       (uint64_t)st.st_nlink, (uint64_t)st.st_ino, (uint64_t)st.st_dev, (uint64_t)st.st_atim.tv_sec,
                       (uint64_t)st.st_atim.tv_nsec, (uint64_t)st.st_ctim.tv_sec, (uint64_t)st.st_ctim.tv_nsec, (uint64_t)st.st_blocks,
-                      (uint64_t)st.st_blksize};
-    for (int i = 0; i < 15; i++) {
+                      (uint64_t)st.st_blksize, (uint64_t)st.st_rdev};
+    for (int i = 0; i < 16; i++) {
         uint8_t b[8];
         for (int k = 0; k < 8; k++) b[k] = (uint8_t)(f[i] >> (8 * k));
         lust_sysio_push(out, b, 8);

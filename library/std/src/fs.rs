@@ -554,11 +554,27 @@ impl fmt::Debug for FilePerm {
     }
 }
 
-/// Metadata of a file: its type, length, and permissions.
+/// Metadata of a file: its type, length, and permissions. The
+/// Unix identity and ownership fields ride along for
+/// `std::os::unix::fs::MetadataExt` (std/src/os.rs).
 #[derive(Clone)]
 pub struct Metadata {
-    mode: u64,
+    pub(crate) mode: u64,
     len: u64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) nlink: u64,
+    pub(crate) ino: u64,
+    pub(crate) dev: u64,
+    pub(crate) atime: i64,
+    pub(crate) atime_nsec: i64,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_nsec: i64,
+    pub(crate) blocks: u64,
+    pub(crate) blksize: u64,
+    pub(crate) rdev: u64,
 }
 
 impl Metadata {
@@ -593,7 +609,9 @@ impl Metadata {
     }
 }
 
-/// The metadata from the runtime's 8-byte stat fields.
+/// The metadata from the runtime's 8-byte stat fields (sys.c
+/// `lust_sys_stat`): mode, size, mtime, uid, gid, nlink, ino,
+/// dev, atime, ctime, blocks, blksize, rdev.
 fn metadata_from_raw(raw: &[u8]) -> Metadata {
     let field = |i: usize| {
         let mut v: u64 = 0;
@@ -602,7 +620,24 @@ fn metadata_from_raw(raw: &[u8]) -> Metadata {
         }
         v
     };
-    Metadata { mode: field(0), len: field(1) }
+    Metadata {
+        mode: field(0),
+        len: field(1),
+        mtime: field(2) as i64,
+        mtime_nsec: field(3) as i64,
+        uid: field(4) as u32,
+        gid: field(5) as u32,
+        nlink: field(6),
+        ino: field(7),
+        dev: field(8),
+        atime: field(9) as i64,
+        atime_nsec: field(10) as i64,
+        ctime: field(11) as i64,
+        ctime_nsec: field(12) as i64,
+        blocks: field(13),
+        blksize: field(14),
+        rdev: field(15),
+    }
 }
 
 /// stat (follow) or lstat of a path.

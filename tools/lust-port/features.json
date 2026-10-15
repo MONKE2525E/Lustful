@@ -563,9 +563,6 @@
     "ext.type.miow::*",
     "ext.expr.miow::*",
     "ext.use.miow::*",
-    "ext.type.same_file::*",
-    "ext.expr.same_file::*",
-    "ext.use.same_file::*",
     "ext.type.unicode_normalization::*",
     "ext.expr.unicode_normalization::*",
     "ext.use.unicode_normalization::*",
@@ -1251,6 +1248,26 @@
     "ext.type.flate2::*",
     "ext.expr.flate2::*",
     "ext.use.flate2::*"
+   ]
+  },
+  {
+   "id": "ext.same_file",
+   "title": "Adapter crate same-file 1.0.6: is_same_file and Handle over dev/ino",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh same-file (2 cases match the real crate, 1 must reject). The same calls in the same order as upstream unix.rs (open read-only, stat the open file, dev/ino equality) over std::os::unix::fs::MetadataExt, added to lust std with this adapter. Handle::stdin/stdout/stderr and the AsRawFd/IntoRawFd impls are absent (no from-raw-fd File form in lust std yet), as the adapter README lists. Split from cinterop.system. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.same_file::*"
+   ],
+   "keys": [
+    "ext.type.same_file::*",
+    "ext.expr.same_file::*",
+    "ext.use.same_file::*"
    ]
   },
   {
