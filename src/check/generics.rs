@@ -3786,6 +3786,11 @@ pub(crate) fn bound_predicates(
                 }
                 if let TyKind::Param(p) = tys.kind(lhs) {
                     relaxed.push(p.0);
+                } else {
+                    // A non-parameter left side (an associated type
+                    // projection): the caller reads this marker as
+                    // "the implicit Sized bound was relaxed".
+                    relaxed.push(u32::MAX);
                 }
                 return;
             }
@@ -5705,6 +5710,17 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 let mut preds: Vec<Predicate> = Vec::new();
                 for b in &at_bounds {
                     bound_predicates(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &scope, proj, b, &mut preds, &mut relaxed, errs);
+                }
+                // An associated type has an implicit `Sized` bound
+                // unless the trait writes `type A: ?Sized` (rustc
+                // E0277 on an unsized binding at the impl).
+                let has_sized = preds.iter().any(|pred| {
+                    matches!(pred, Predicate::Trait(b) if b.value.def == cx.lang.sized
+                        && p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(proj))
+                });
+                if !relaxed.contains(&u32::MAX) && !has_sized {
+                    let args = p.tys.intern_args(&[GenericArg::Ty(proj)]);
+                    preds.push(Predicate::Trait(Binder::plain(TraitRef { def: cx.lang.sized, args, bindings: EMPTY_BINDINGS })));
                 }
                 generics.predicates.extend(preds);
                 let _ = at_where;
@@ -10708,7 +10724,24 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         items.push((vec![*ty], Vec::new(), generics.clone(), *span));
     }
     for rec in p.gx.trait_names.values().filter_map(|&d| p.gx.index.trait_record(d)).cloned().collect::<Vec<_>>() {
-        items.push((Vec::new(), Vec::new(), rec.generics.clone(), rec.span));
+        // The trait's own definition assumes `Self: Trait<..>` (as
+        // its methods do, `own_trait_pred`): a bound on an
+        // associated type (`type Out: Copy;`) names the projection,
+        // whose well-formedness goal is that own predicate.
+        let mut generics = rec.generics.clone();
+        let own: Vec<GenericArg> = generics
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d.kind {
+                ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
+                ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+                ParamKind::Type => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
+            })
+            .collect();
+        let args = p.tys.intern_args(&own);
+        generics.predicates.push(Predicate::Trait(Binder::plain(TraitRef { def: rec.def, args, bindings: EMPTY_BINDINGS })));
+        items.push((Vec::new(), Vec::new(), generics, rec.span));
     }
     let adt_idx = adt_first_index(p);
     check_default_wf(p, &adt_idx, errs);
