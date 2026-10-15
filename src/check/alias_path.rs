@@ -206,9 +206,11 @@ impl<'p> Ctx<'p> {
 
     /// The Self type of a builtin type path with no item of the called
     /// name (`String::default`, `Vec::<u8>::default`): the written Self,
-    /// or the type itself when it takes no args. None otherwise
-    /// (`Vec::default()` would need inferred args).
-    pub(super) fn builtin_path_base(&mut self, segs: &[ast::PathSeg], span: Span) -> Option<Ty> {
+    /// or the type itself when it takes no args. With no written args
+    /// on a generic builtin (`let b: Box<L> = Box::default()`), the
+    /// expected type names the Self when it is that same builtin.
+    /// None otherwise (the args stay unknown here).
+    pub(super) fn builtin_path_base(&mut self, segs: &[ast::PathSeg], span: Span, expected: Option<Ty>) -> Option<Ty> {
         let n = segs.len();
         if n < 2 {
             return None;
@@ -219,8 +221,26 @@ impl<'p> Ctx<'p> {
         let p = self.p;
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let scope = self.body_scope.clone();
-        let t = generics::resolve_path_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, &scope, &segs[..n - 1], span).ok()?;
-        builtin_std_path(&self.tys, t).is_some().then_some(t)
+        if let Ok(t) = generics::resolve_path_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, &scope, &segs[..n - 1], span) {
+            return builtin_std_path(&self.tys, t).is_some().then_some(t);
+        }
+        // The written type needs args it does not write: take them
+        // from the expected type when it applies the same builtin
+        // the path names (never when a user type of the name is the
+        // binding here, which the trait probe above already tried).
+        let want = self.resolve(expected?);
+        let (def, _) = self.tys.adt_parts(want)?;
+        if builtin_std_path(&self.tys, want).is_none() {
+            return None;
+        }
+        let ty_name = segs[n - 2].name;
+        if n == 2 && matches!(self.binding(Namespace::Type, ty_name), BindingRes::Def(d) if d != def) {
+            return None;
+        }
+        let path: Vec<&str> = segs[..n - 1].iter().map(|s| self.name(s.name)).collect();
+        let named = builtin_std_path(&self.tys, want)?;
+        let same = if n == 2 { named.last() == path.last() } else { named == path };
+        same.then_some(want)
     }
 
     /// The `n` type args of a written builtin Self type (`Option<u8>`

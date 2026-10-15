@@ -4887,8 +4887,9 @@ impl Ex<'_, '_> {
         }
     }
 
-    /// `collect` into `Vec<T>` (Rust's `SpecFromIter` capacity rules)
-    /// or `String` (the `FromIterator` impl per item type).
+    /// `collect` into `Vec<T>` (Rust's `SpecFromIter` capacity rules),
+    /// `Box<[T]>` (a `Vec` collect boxed at the end), or `String`
+    /// (the `FromIterator` impl per item type).
     fn collect(&mut self, itp: Place, ty: Ty, dest: Place, dest_ty: Ty) -> R {
         use crate::ast::BinOp::*;
         let item = self.item(ty)?;
@@ -4955,14 +4956,21 @@ impl Ex<'_, '_> {
         }
         // A `VecDeque` destination collects into a `Vec` first and
         // wraps it at the end: std's deque collect capacity is the
-        // `Vec` one's (W-STD-C phase 2).
+        // `Vec` one's (W-STD-C phase 2). A `Box<[T]>` destination
+        // does the same: alloc's `FromIterator for Box<[T]>` is a
+        // `Vec` collect turned into a boxed slice.
         let deque = self.body.tys.local_adt(dest_ty).filter(|&a| self.p.is_vec_deque_adt(a));
-        let (Some(elem), vec_ty) = (match deque {
-            Some(_) => self.body.tys.adt_first_ty_arg(dest_ty),
-            None => self.body.tys.vec_elem(dest_ty),
-        }, match deque {
-            Some(_) => self.body.tys.mk_vec(self.body.tys.adt_first_ty_arg(dest_ty).unwrap_or(ERROR)),
-            None => dest_ty,
+        let boxed = self.body.tys.boxed_slice_elem(dest_ty);
+        let wrapped = deque.is_some() || boxed.is_some();
+        let (Some(elem), vec_ty) = (match (deque, boxed) {
+            (Some(_), _) => self.body.tys.adt_first_ty_arg(dest_ty),
+            (None, Some(e)) => Some(e),
+            (None, None) => self.body.tys.vec_elem(dest_ty),
+        }, if wrapped {
+            let e = boxed.or_else(|| self.body.tys.adt_first_ty_arg(dest_ty)).unwrap_or(ERROR);
+            self.body.tys.mk_vec(e)
+        } else {
+            dest_ty
         }) else { return Err("iterator expansion: collect into an unsupported type".into()) };
         let v = self.local(vec_ty);
         let with_capacity = |this: &mut Self, cap: Operand| {
@@ -5035,9 +5043,10 @@ impl Ex<'_, '_> {
             })?;
             self.goto(join);
             self.cur = join;
-            match deque {
-                Some(a) => self.assign(dest, Rvalue::Aggregate(a, 0, vec![Operand::Move(Place::local(v))])),
-                None => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v)))),
+            match (deque, boxed) {
+                (Some(a), _) => self.assign(dest, Rvalue::Aggregate(a, 0, vec![Operand::Move(Place::local(v))])),
+                (None, Some(_)) => self.call_builtin(Builtin::VecIntoBoxedSlice, vec![Operand::Move(Place::local(v))], dest),
+                (None, None) => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v)))),
             }
             return Ok(());
         }
@@ -5097,9 +5106,10 @@ impl Ex<'_, '_> {
             self.goto(join);
         }
         self.cur = join;
-        match deque {
-            Some(a) => self.assign(dest, Rvalue::Aggregate(a, 0, vec![Operand::Move(Place::local(v))])),
-            None => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v)))),
+        match (deque, boxed) {
+            (Some(a), _) => self.assign(dest, Rvalue::Aggregate(a, 0, vec![Operand::Move(Place::local(v))])),
+            (None, Some(_)) => self.call_builtin(Builtin::VecIntoBoxedSlice, vec![Operand::Move(Place::local(v))], dest),
+            (None, None) => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v)))),
         }
         Ok(())
     }

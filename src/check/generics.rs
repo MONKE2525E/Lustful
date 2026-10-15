@@ -6633,6 +6633,13 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 span,
             );
         }
+        // alloc's separate `impl<T> Default for Box<[T]>`: the empty
+        // boxed slice, with no bound on `T` (a slice itself has no
+        // `Default`, so the `Box<T: Default>` impl above never
+        // applies to it).
+        let slice_p0 = p.tys.intern(TyKind::Slice(p0));
+        let box_slice_p0 = p.tys.mk_boxed(slice_p0);
+        insert_synthetic(p, &mut ordinal, lang.default, box_slice_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
     // RefCell<T> and Cell<T>: core's `impl<T: Default> Default` and
     // Debug (`RefCell<T: Debug>`, `Cell<T: Copy + Debug>`); the guards

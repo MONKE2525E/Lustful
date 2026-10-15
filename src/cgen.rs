@@ -8062,7 +8062,10 @@ fn glue_def_value(
                     let _ = writeln!(body, "  return {};", variant_lit(p, t, 0, &[]));
                 }
                 CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  return ((lust_str){(uint8_t*)\"\", 0});\n"),
-                CTy::Slice(e) => {
+                // An empty slice view, or alloc's empty `Box<[T]>`:
+                // a dangling aligned pointer at length 0 (the drop
+                // glue frees nothing at size 0).
+                CTy::Slice(e) | CTy::BoxSlice(e) => {
                     let et = ctype(e);
                     let _ = writeln!(body, "  {ct} r; r.ptr = ({et}*)(uintptr_t)_Alignof({et}); r.len = 0;\n  return r;");
                 }

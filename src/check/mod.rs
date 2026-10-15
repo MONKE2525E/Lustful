@@ -11003,7 +11003,7 @@ impl<'p> Ctx<'p> {
                         // `String::default()`: no builtin item of that
                         // name, so a std trait's (as for aliases above).
                         if self.errs[mark..].iter().all(|d| matches!(d.code, "L0101" | "L0104"))
-                            && let Some(base) = self.builtin_path_base(segs, cs)
+                            && let Some(base) = self.builtin_path_base(segs, cs, expected)
                         {
                             let saved = self.errs.split_off(mark);
                             if let Some(t) = self.std_trait_assoc_call(e, callee, base, segs[segs.len() - 1].name, args, span) {

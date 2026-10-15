@@ -1554,10 +1554,23 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// `collect` into `Vec<Item>` or `String` (from `char`, `&char`,
-    /// `&str`, or `String` items): the targets lust builds.
+    /// `collect` into `Vec<Item>`, `Box<[Item]>`, or `String` (from
+    /// `char`, `&char`, `&str`, or `String` items): the targets lust
+    /// builds.
     fn collect_target_ok(&mut self, target: Ty, item: Ty, span: Span) -> bool {
         let t = self.resolve(target);
+        // alloc's `FromIterator<T> for Box<[T]>` collects a `Vec`
+        // and boxes it (lowering mirrors that). The deep form: a
+        // `Box::from_iter` target's element is a variable the
+        // expected type already bound to a slice.
+        let dt = self.deep(t);
+        if let Some(el) = self.tys.boxed_slice_elem(dt) {
+            if !self.unify(el, item) {
+                self.mismatch(span, el, item);
+                return false;
+            }
+            return true;
+        }
         if let Some(el) = self.tys.vec_elem(t) {
             if !self.unify(el, item) {
                 let want = self.tys.mk_vec(item);
@@ -1970,7 +1983,8 @@ impl<'p> Ctx<'p> {
     /// errors. `Unsupported` is a rustc impl lust has no build for.
     fn from_iter_class(&mut self, t: Ty) -> Option<FromIterClass> {
         let t = self.resolve(t);
-        if self.tys.vec_elem(t).is_some() || self.tys.is_string_ty(t) {
+        let dt = self.deep(t);
+        if self.tys.vec_elem(t).is_some() || self.tys.boxed_slice_elem(dt).is_some() || self.tys.is_string_ty(t) {
             return Some(FromIterClass::Collect);
         }
         if let Some((hk, _)) = crate::ty::hash::hash_parts(&self.tys, t) {
@@ -2002,9 +2016,10 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// `Box<[T]>`, `Box<str>`, and their Rc forms have rustc
-    /// `FromIterator` impls lust does not build yet; a sized element
-    /// has none (the ordinary flow's L0104).
+    /// `Box<str>` and the Rc unsized forms have rustc `FromIterator`
+    /// impls lust does not build yet (`Box<[T]>` is the `Collect`
+    /// arm above); a sized element has none (the ordinary flow's
+    /// L0104).
     fn unsized_from_iter(&self, e: Ty) -> Option<FromIterClass> {
         let e = self.resolve(e);
         matches!(self.kind(e), TyKind::Slice(_) | TyKind::Str).then_some(FromIterClass::Unsupported)

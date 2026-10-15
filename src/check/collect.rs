@@ -6523,6 +6523,12 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
             if tys.guard_elem(t).is_some() {
                 return false;
             }
+            // alloc's `impl<T> Default for Box<[T]>` is the empty
+            // boxed slice: no bound on `T` (the `smart_elem` step
+            // below would ask `[T]: Default`, which never holds).
+            if tys.boxed_slice_elem(t).is_some() {
+                return true;
+            }
             if let Some(e) = tys.smart_elem(t) {
                 return glue_default(p, tys, e, seen);
             }
