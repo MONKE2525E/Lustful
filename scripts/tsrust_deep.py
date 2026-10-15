@@ -120,6 +120,7 @@ def main():
                 r["cause"] = list(parent or key)
                 r["target"] = name
                 cause_of_name.setdefault(r["name"], tuple(r["cause"]))
+            (work / "deep.json").write_text(json.dumps({"status": status, "removed": removed}, indent=0))  # partial, each round
             print(f"tsrust-deep: {name} round {rnd}: {len(errs)} errors, {len(removed) - before} items removed", flush=True)
         else:
             status[name] = f"stopped: {a.max_rounds} rounds"
