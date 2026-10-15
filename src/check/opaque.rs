@@ -210,7 +210,10 @@ impl Ctx<'_> {
     pub(super) fn build_closure_map(&mut self) {
         let p = self.p;
         let mut found: Vec<Ty> = Vec::new();
+        // A literal's var (`mk(5)`) takes its default now, as the zonk
+        // right after would: mono made the instance at that type.
         for t in std::mem::take(&mut self.opaque_calls) {
+            self.default_literal_vars(t);
             let t = self.deep(t);
             collect_opaques(&self.tys, t, &mut found);
         }
