@@ -340,34 +340,32 @@ impl<T: Hash + Eq, S1: BuildHasher, S2: BuildHasher> PartialEq<IndexSet<T, S2>> 
 
 impl<T: Hash + Eq, S: BuildHasher> Eq for IndexSet<T, S> {}
 
-/// `(x, ())` pairs for the map's Extend, with the same size hint.
-struct Unit<I> {
-    inner: I,
-}
-
-impl<I: Iterator> Iterator for Unit<I> {
-    type Item = (I::Item, ());
-
-    fn next(&mut self) -> Option<(I::Item, ())> {
-        match self.inner.next() {
-            Some(x) => Some((x, ())),
-            None => None,
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
 impl<T: Hash + Eq, S: BuildHasher> Extend<T> for IndexSet<T, S> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iterable: I) {
-        self.map.extend(Unit { inner: iterable.into_iter() });
+        // Upstream runs the map's Extend over `(x, ())` pairs; its
+        // reserve (the hint when empty, else half) is written here,
+        // because a generic `extend` call over an adapter iterator
+        // type does not resolve in lust yet.
+        let iter = iterable.into_iter();
+        let lower = iter.size_hint().0;
+        let reserve = if self.map.is_empty() { lower } else { (lower + 1) / 2 };
+        self.map.reserve(reserve);
+        for x in iter {
+            self.map.insert(x, ());
+        }
     }
 }
 
 impl<T: Hash + Eq, S: BuildHasher + Default> FromIterator<T> for IndexSet<T, S> {
     fn from_iter<I: IntoIterator<Item = T>>(iterable: I) -> Self {
-        IndexSet { map: IndexMap::from_iter(Unit { inner: iterable.into_iter() }) }
+        // The map's from_iter over `(x, ())` pairs, inlined as in
+        // `extend` above.
+        let iter = iterable.into_iter();
+        let lower = iter.size_hint().0;
+        let mut map = IndexMap::with_capacity_and_hasher(lower, S::default());
+        for x in iter {
+            map.insert(x, ());
+        }
+        IndexSet { map }
     }
 }

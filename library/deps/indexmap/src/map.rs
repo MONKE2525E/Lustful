@@ -843,10 +843,16 @@ impl<K: Hash + Eq, V, S: BuildHasher> Extend<(K, V)> for IndexMap<K, V, S> {
 
 impl<K: Hash + Eq, V, S: BuildHasher + Default> FromIterator<(K, V)> for IndexMap<K, V, S> {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iterable: I) -> Self {
+        // Upstream calls `map.extend(iter)`; on a fresh map with
+        // capacity `lower` that reserve is a no-op, so the loop is
+        // the same, and a generic `extend` call whose argument is
+        // an `IntoIter` projection does not resolve in lust yet.
         let iter = iterable.into_iter();
         let lower = iter.size_hint().0;
         let mut map = IndexMap::with_capacity_and_hasher(lower, S::default());
-        map.extend(iter);
+        for (k, v) in iter {
+            map.insert(k, v);
+        }
         map
     }
 }

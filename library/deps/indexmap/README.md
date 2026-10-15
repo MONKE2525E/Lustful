@@ -1,23 +1,40 @@
-# Adapter: indexmap 2.14.0 (pending)
+# Adapter: indexmap 2.14.0
 
-The adapter is written and checked against the real crate with rustc
-(pending/README.md), but lust cannot compile it yet. Until then it waits
-in `pending/`, and a dependency on indexmap is L0508 ("no lust adapter
-yet"). The corpus is tests/adapters/crates/indexmap (UNSUPPORTED today).
+Lust adapter crate (docs/ARCH.md section 3.6). Gate:
+`scripts/test-adapters.sh indexmap`.
 
-Blocked on: `Iterator::size_hint` overrides, `DoubleEndedIterator`,
-`ExactSizeIterator`, `Extend`, `BuildHasher::hash_one` in generic
-code, and `RandomState` (W-STD-B, in its queue); a user `Index` impl
-as the `map[&key]` operator (L0113 on next 8028b54b).
+## Implemented, same results as upstream
 
-Working on next: generic parameter defaults, the std iterator type
-names, and `into_iter()` on a generic `I: IntoIterator` (W-TRAITS2
-d8d322eb). On next, `lust check` of this crate stops only at the
-W-STD-B items above. The corpus cases then also need std adapters
-over a user iterator with a generic `Iterator` impl (L0640) and one
-inference fix (L0111).
+- `IndexMap<K, V, S = RandomState>`: `new`, `with_capacity`,
+  `with_hasher`, `with_capacity_and_hasher`, `capacity`, `hasher`,
+  `len`, `is_empty`, `iter`, `keys`, `values`, `clear`, `truncate`,
+  `split_off`, `reserve`, `reserve_exact`, `shrink_to_fit`, `shrink_to`,
+  `insert`, `insert_full`, `entry` (`or_insert`, `or_insert_with`,
+  `or_default`, `and_modify`, `key`, `index`, occupied `get`,
+  `get_mut`, `into_mut`, `insert`, `swap_remove`, `shift_remove`,
+  vacant `insert`), `contains_key`, `get`, `get_key_value`, `get_full`,
+  `get_index_of`, `get_mut`, `iter_mut`, `values_mut`, `into_keys`,
+  `into_values`, `remove` (deprecated, swap), `swap_remove`,
+  `swap_remove_entry`, `swap_remove_full`, `shift_remove`,
+  `shift_remove_entry`, `shift_remove_full`, `pop`, `retain`,
+  `sort_keys`, `sort_by`, `sort_by_key`, `sort_unstable_keys`,
+  `sort_unstable_by`, `sort_unstable_by_key`, `reverse`, `get_index`,
+  `get_index_mut`, `first`, `last`, `first_mut`, `last_mut`,
+  `swap_remove_index`, `shift_remove_index`, `move_index`,
+  `swap_indices`; `IntoIterator`, `Extend`, `FromIterator`, `Index`,
+  `Clone`, `Default`, `Debug`, `PartialEq`, `Eq`.
+- `IndexSet<T, S = RandomState>` over `IndexMap<T, (), S>`, as upstream.
+- The hash index is hashbrown 0.17.1's table logic for usize slots and
+  the core is upstream's src/inner.rs, so order, capacity, and the Hash
+  and Eq calls a key sees match upstream for the same hasher. Checked
+  with rustc against the real crate: 133,010 index steps vs hashbrown,
+  93,446 core steps, 23,279 map and 23,575 set API steps with exact
+  Hash/Eq call counts.
 
-To activate: move `pending/Cargo.toml` and `pending/src` here, update
-tests/crates/adapter-missing and docs/errors/L0508.md (both use indexmap
-as the crate with no adapter), then run
-`LUST=target/release/lust scripts/test-adapters.sh indexmap`.
+## Rejected (lust error, never a different answer)
+
+- `Equivalent` (lookups take `K: Borrow<Q>`, as std maps do), slices,
+  `drain`, `splice`, `extract_if`, raw entries, sorted inserts,
+  `insert_before`, `shift_insert`, `replace_index`, `get_disjoint_mut`,
+  the `indexmap!`/`indexset!` macros, and the rayon, serde, borsh,
+  arbitrary, quickcheck, and sval features. Layout queries reject.

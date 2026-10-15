@@ -1,3 +1,3 @@
 fn main() {
-    println!("{}", indexmap::make());
+    println!("{}", hashbrown::make());
 }

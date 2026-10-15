@@ -41,7 +41,7 @@ the upstream features it implements, and its exact-layout types.
 | alloc | Skeleton: lib.rs only. String/Vec stay builtin. | W-STD |
 | std | `process::exit` in source, over the `exit` intrinsic. The platform crate (`platform.rs` root, below). | W-STD, W-SHIM |
 | deps/rustc-hash | Adapter for 2.1.2: `FxHasher`, `FxBuildHasher`, `FxSeededState`, and the map and set aliases over std's maps (deps/rustc-hash/README.md). | W-DEPS |
-| deps/indexmap | Pending for 2.14.0: written and checked with rustc, waits in `pending/` for compiler and std features (deps/indexmap/README.md). | W-DEPS |
+| deps/indexmap | Adapter for 2.14.0: `IndexMap` and `IndexSet` in source over the hashbrown 0.17 table (deps/indexmap/README.md). | W-DEPS |
 | deps/smallvec | Adapter for 1.15.1: `SmallVec<A>` over a Vec with upstream's logical capacity and drop order (deps/smallvec/README.md). | W-DEPS |
 | deps/memchr | Adapter for 2.8.2: byte and substring search in source (deps/memchr/README.md). | W-DEPS |
 | deps/xxhash-rust | Adapter for 0.8.15: `xxh3` over the C core (deps/xxhash-rust/README.md). | W-DEPS |
