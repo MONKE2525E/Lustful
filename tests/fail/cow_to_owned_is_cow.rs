@@ -1,4 +1,4 @@
-// expect: L0104
+// expect: L0110
 // rustc E0308: to_owned on a Cow is the Cow's own (a Cow, not a String).
 use std::borrow::Cow;
 

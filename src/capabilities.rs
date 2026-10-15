@@ -448,6 +448,8 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::CowIntoOwned,
     Builtin::CowToMut,
     Builtin::CowDeref,
+    Builtin::CowAddStr,
+    Builtin::CowAddAssignStr,
     Builtin::VecExtend,
     Builtin::StringExtend,
     Builtin::IterArrayIntoIter,
@@ -894,6 +896,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
             vec![i.intern("into_owned"), i.intern("to_mut"), i.intern("as_ref"), i.intern("borrow"), i.intern("deref")],
             Call::Method,
         ),
+        B::CowAddStr | B::CowAddAssignStr => (&["Cow<'a, str>"], vec![i.intern("add"), i.intern("add_assign")], Call::Method),
         B::HashExtend | B::HashExtendReserve | B::HashReserve => {
             (&["HashMap<K, V, S>", "HashSet<T, S>"], vec![i.intern("extend"), i.intern("reserve")], Call::Method)
         }

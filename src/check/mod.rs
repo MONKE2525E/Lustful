@@ -547,6 +547,10 @@ pub enum Builtin {
     CowIntoOwned,
     CowToMut,
     CowDeref,
+    /// `Cow<str>` addition (check/cow.rs): `add` by value and
+    /// `add_assign` in place, both through `to_mut` and a push.
+    CowAddStr,
+    CowAddAssignStr,
     /// `vec.extend(iter)` and `string.extend(iter)` (check/extend.rs):
     /// expanded with the iterator (lower/iter.rs).
     VecExtend,
@@ -7060,6 +7064,14 @@ impl<'p> Ctx<'p> {
                 let lk = self.kind(lt);
                 if self.tys.is_string_ty(self.resolve(lt)) && *op == BinOp::Add {
                     self.coerce_expr(*rhs, rt, REF_STR);
+                    self.set_res(e, Res::Bin { ld: 0, rd: 0 });
+                    return UNIT;
+                }
+                if crate::check::collect::cow_arg(&self.tys, self.resolve(lt)) == Some(STR) && *op == BinOp::Add {
+                    let rt_deep = self.deep(rt);
+                    if crate::check::collect::cow_arg(&self.tys, rt_deep) != Some(STR) {
+                        self.coerce_expr(*rhs, rt, REF_STR);
+                    }
                     self.set_res(e, Res::Bin { ld: 0, rd: 0 });
                     return UNIT;
                 }
@@ -13929,6 +13941,17 @@ impl<'p> Ctx<'p> {
             self.coerce_expr(rhs, rt, REF_STR);
             self.set_res(e, Res::Bin { ld: 0, rd: 0 });
             return STRING;
+        }
+        // Cow<str> + &str (a Cow right side stays a Cow: the
+        // separate `Add<Cow>` impl reads its view at lowering).
+        let lt_deep = self.deep(lt);
+        if op == Add && crate::check::collect::cow_arg(&self.tys, lt_deep) == Some(STR) {
+            let rt_deep = self.deep(rt);
+            if crate::check::collect::cow_arg(&self.tys, rt_deep) != Some(STR) {
+                self.coerce_expr(rhs, rt, REF_STR);
+            }
+            self.set_res(e, Res::Bin { ld: 0, rd: 0 });
+            return self.deep(lt);
         }
         // Arithmetic and bit operations exist for `&T` operands, but not for `&mut T`.
         if matches!(lk, TyKind::Ref(_, Mut::Mut, _)) || matches!(rk, TyKind::Ref(_, Mut::Mut, _)) {

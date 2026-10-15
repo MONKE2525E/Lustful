@@ -7138,6 +7138,19 @@ pub fn add_synthetic_impls(p: &mut Program) {
             g.predicates = vec![pred_on(p, lang.default, owned_p0)];
             insert_synthetic(p, &mut ordinal, lang.default, cow_p0, &[], g, Vec::new(), Synthetic::Lang, false, span);
         }
+        // `Add` and `AddAssign` for `Cow<str>`, with a `&str` or a
+        // Cow right side: selection only, the calls are the Cow
+        // addition builtins (check/cow.rs).
+        {
+            let cow_str = p.tys.mk_adt(cow_def(), &[GenericArg::Ty(STR)]);
+            let ref_str = p.tys.mk_ref(false, STR);
+            if let Some(out) = lang.output_of(lang.add) {
+                for rhs in [ref_str, cow_str] {
+                    insert_synthetic(p, &mut ordinal, lang.add, cow_str, &[rhs], g0.clone(), vec![(out, cow_str)], Synthetic::Lang, false, span);
+                    insert_synthetic(p, &mut ordinal, lang.add_assign, cow_str, &[rhs], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+                }
+            }
+        }
         // `Borrow<B>` (map lookups of `Cow<str>` keys by `&str`),
         // `AsRef<B>`, and `Deref` to `B`: selection only, the calls
         // are `Builtin::CowDeref` (check/cow.rs).

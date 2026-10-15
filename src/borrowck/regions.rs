@@ -3294,6 +3294,14 @@ impl<'b, 'p> Builder<'b, 'p> {
                 && self.call_hash_entry(b, &avs, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashExtend)) && self.call_hash_extend(&avs) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowToMut)) && self.call_cow_to_mut(&avs, &dv) => {}
+            // Cow addition copies the right side's bytes into an
+            // Owned result (in place for `add_assign`): the right
+            // side's regions reach neither the result nor the
+            // receiver, as with `push_str`; the by-value form's
+            // result keeps the left Cow's lifetime slot.
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowAddAssignStr)) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowAddStr))
+                && avs.first().is_some_and(|(t0, v0)| !v0.is_empty() && self.relate(*t0, v0, dt, &dv, Variance::Co)) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {

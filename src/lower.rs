@@ -1928,6 +1928,19 @@ impl<'p> Lower<'p> {
                         Place::local(u),
                         span,
                     );
+                } else if crate::check::collect::cow_arg(&self.body.tys, lt).is_some() {
+                    let pl = self.place_for_mut(*lhs);
+                    let r = self.cow_add_rhs(*rhs, span);
+                    let mt = self.ref_ty(true, lt);
+                    let t = self.temp(mt);
+                    self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+                    let u = self.temp(UNIT);
+                    self.call_into(
+                        CallTarget::Builtin(Builtin::CowAddAssignStr),
+                        vec![Operand::Move(Place::local(t)), r],
+                        Place::local(u),
+                        span,
+                    );
                 } else {
                     let rd = match self.ck.res(e) {
                         Res::Bin { rd, .. } => rd,
@@ -3355,6 +3368,26 @@ impl<'p> Lower<'p> {
         }
     }
 
+    /// The `&str` operand a Cow addition reads: the operand itself
+    /// for a `&str` right side, or the view of a Cow right side
+    /// (moved into a temp that drops at scope end, as the consumed
+    /// `Add<Cow>` argument does).
+    fn cow_add_rhs(&mut self, rhs: ExprId, span: Span) -> Operand {
+        let rt = self.ty(rhs);
+        if crate::check::collect::cow_arg(&self.body.tys, rt).is_none() {
+            return self.operand(rhs);
+        }
+        let a = self.operand(rhs);
+        let t = self.temp(rt);
+        self.assign(Place::local(t), Rvalue::Use(a), span);
+        let rt_ref = self.ref_ty(false, rt);
+        let r = self.temp(rt_ref);
+        self.assign(Place::local(r), Rvalue::Ref(false, Place::local(t)), span);
+        let v = self.temp(REF_STR);
+        self.call_into(CallTarget::Builtin(Builtin::CowDeref), vec![Operand::Copy(Place::local(r))], Place::local(v), span);
+        Operand::Copy(Place::local(v))
+    }
+
     /// The `&B` view of the `Cow<B>` that `n` derefs of `e` reach
     /// (W-STD-B): a shared borrow of the Cow, then its `Deref` builtin.
     fn cow_view_of(&mut self, e: ExprId, n: u8, view: Ty) -> Local {
@@ -3725,6 +3758,25 @@ impl<'p> Lower<'p> {
             let a = self.operand(lhs);
             let b = self.operand(rhs);
             Rvalue::StringAdd(a, b)
+        } else if crate::check::collect::cow_arg(&self.body.tys, lt).is_some() {
+            // `Cow<str> + &str`: move the Cow into a temp, then the
+            // add-assign builtin makes it owned and pushes.
+            let a = self.operand(lhs);
+            let b = self.cow_add_rhs(rhs, span);
+            let t = self.temp(lt);
+            self.assign(Place::local(t), Rvalue::Use(a), span);
+            let mt = self.ref_ty(true, lt);
+            let r = self.temp(mt);
+            self.assign(Place::local(r), Rvalue::Ref(true, Place::local(t)), span);
+            let u = self.temp(UNIT);
+            self.call_into(
+                CallTarget::Builtin(Builtin::CowAddAssignStr),
+                vec![Operand::Move(Place::local(r)), b],
+                Place::local(u),
+                span,
+            );
+            self.assign(out, Rvalue::Use(Operand::Move(Place::local(t))), span);
+            return;
         } else {
             let a = self.operand_derefs(lhs, ld);
             let b = self.operand_derefs(rhs, rd);

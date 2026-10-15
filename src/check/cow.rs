@@ -86,7 +86,49 @@ impl<'p> Ctx<'p> {
             let pr = cx.tys.intern(TyKind::Projection(AssocId(cx.p.gx.lang.assoc_owned), a));
             cx.normalize_here(pr)
         };
-        let (bt, autoref, ret) = match n.as_str() {
+        // `Add` and `AddAssign` for `Cow<str>` take a `&str` or a
+        // Cow right side (two impls in std, one builtin here: the
+        // Cow form's view is read in codegen). Checked here, ahead
+        // of the shared shape below, because the right side's type
+        // picks whether it coerces to `&str`.
+        if (n == "add" || n == "add_assign") && b == STR {
+            if n == "add" && derefs > 0 {
+                self.err(
+                    "L0640",
+                    name_span,
+                    "`add` through a reference is not implemented yet",
+                    "Call it on the Cow value itself.",
+                );
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
+            let (bt, autoref, ret) = if n == "add" {
+                (Builtin::CowAddStr, Autoref::None, base)
+            } else {
+                (Builtin::CowAddAssignStr, Autoref::RefMut, UNIT)
+            };
+            if autoref != Autoref::None {
+                self.check_packed_borrow(recv, name_span);
+            }
+            self.set_res(e, Res::BuiltinMethod { b: bt, derefs, autoref });
+            if args.len() != 1 {
+                self.check_args(&[REF_STR], args, name_span);
+                return Some(ret);
+            }
+            // The Cow right side's type comes from the receiver
+            // (std's `Add<Cow<str>>` for `Cow<str>`), as the
+            // expected type of its constructor.
+            let at = self.expr(args[0], Some(base));
+            self.run_obligations(false);
+            let at_deep = self.deep(at);
+            if crate::check::collect::cow_arg(&self.tys, at_deep) != Some(STR) {
+                self.coerce_expr(args[0], at, REF_STR);
+            }
+            return Some(ret);
+        }
+        let (bt, autoref, ret, params) = match n.as_str() {
             "into_owned" => {
                 if derefs > 0 {
                     self.err(
@@ -100,18 +142,20 @@ impl<'p> Ctx<'p> {
                     }
                     return Some(ERROR);
                 }
-                (Builtin::CowIntoOwned, Autoref::None, owned(self))
+                (Builtin::CowIntoOwned, Autoref::None, owned(self), Vec::new())
             }
             "to_mut" => {
                 let o = owned(self);
-                (Builtin::CowToMut, Autoref::RefMut, self.tys.mk_ref(true, o))
+                (Builtin::CowToMut, Autoref::RefMut, self.tys.mk_ref(true, o), Vec::new())
             }
-            "as_ref" => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b)),
-            "borrow" if self.std_trait_imported("borrow", "Borrow") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b)),
-            "deref" if self.std_trait_imported("ops", "Deref") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b)),
+            "as_ref" => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b), Vec::new()),
+            "borrow" if self.std_trait_imported("borrow", "Borrow") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b), Vec::new()),
+            "deref" if self.std_trait_imported("ops", "Deref") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b), Vec::new()),
             // The blanket `ToOwned` of a Clone type: a Cow's own
             // `to_owned` is its clone (a Borrowed stays Borrowed).
-            "to_owned" => (Builtin::Clone, Autoref::Ref, base),
+            "to_owned" => (Builtin::Clone, Autoref::Ref, base, Vec::new()),
+            // `Add` and `AddAssign` for `Cow<str>` are checked
+            // above, ahead of this match.
             // `Clone::clone_from` (and with it the blanket
             // `clone_into`) has no lust form yet, on any type.
             "clone_from" | "clone_into" => {
@@ -132,7 +176,7 @@ impl<'p> Ctx<'p> {
             self.check_packed_borrow(recv, name_span);
         }
         self.set_res(e, Res::BuiltinMethod { b: bt, derefs, autoref });
-        self.check_args(&[], args, name_span);
+        self.check_args(&params, args, name_span);
         Some(ret)
     }
 

@@ -851,6 +851,47 @@ impl FnGen<'_, '_> {
                     format!("(&{f1})")
                 }
             }
+            // `Cow<str>` addition (check/cow.rs): make the Cow owned
+            // as `to_mut` does, then push the right-hand `&str`. The
+            // by-value form's Cow operand was copied into the temp
+            // `ptr` names, exactly as `CowIntoOwned` copies it.
+            B::CowAddStr | B::CowAddAssignStr => {
+                let (cow, ptr, val) = match &tys[0] {
+                    CTy::Ref(inner) => ((**inner).clone(), vals[0].clone(), String::new()),
+                    t => {
+                        let c = self.tmp();
+                        let _ = writeln!(self.out, "    {} {c} = {};", ctype(t), vals[0]);
+                        (t.clone(), format!("(&{c})"), c)
+                    }
+                };
+                let CTy::Adt(a) = &cow else { return None };
+                let oc = cty(&self.p.tys, self.p.adt(*a).variants[1].fields[0].ty);
+                let (_, view) = cow_view_expr(self.p, &cow, &ptr)?;
+                let disc = disc_call(self.p, &cow, &ptr);
+                let f1 = variant_field(self.p, &cow, &format!("(*{ptr})"), 1, 0);
+                let o = self.tmp();
+                let set = self.make_variant(&cow, 1, &[o.clone()]);
+                // A Cow right side (the method forms; lowering of the
+                // operators already took its view) reads through its
+                // own view and drops after the push, as the consumed
+                // argument of std's `Add<Cow>` impl does.
+                let (rhs, drop_rhs) = match &tys[1] {
+                    CTy::Adt(_) => {
+                        let rc = self.tmp();
+                        let _ = writeln!(self.out, "    {} {rc} = {};", ctype(&tys[1]), vals[1]);
+                        let (_, v) = cow_view_expr(self.p, &tys[1].clone(), &format!("(&{rc})"))?;
+                        self.want(Glue::Drop, &tys[1].clone());
+                        (v, format!("\n    drop_{}(&{rc});", mangle(&tys[1])))
+                    }
+                    _ => (vals[1].clone(), String::new()),
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    if (!({disc})) {{\n    {} {o} = lust_string_from({view});\n    *{ptr} = {set}; }}\n    lust_string_push_str(&{f1}, {rhs});{drop_rhs}",
+                    ctype(&oc)
+                );
+                if b == B::CowAddStr { val } else { "((lust_Unit){})".into() }
+            }
             // Conversion trait methods (check/convert.rs).
             B::ConvIdent => vals[0].clone(),
             B::ConvDeref => format!("(*{})", vals[0]),

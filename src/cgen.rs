@@ -3659,6 +3659,8 @@ impl FnGen<'_, '_> {
             | B::ConvRcInner
             | B::CowIntoOwned
             | B::CowToMut
+            | B::CowAddStr
+            | B::CowAddAssignStr
             | B::CowDeref => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
             // The operand was moved into the call: no drop ever runs.
             B::MemForget => "((lust_Unit){})".into(),
