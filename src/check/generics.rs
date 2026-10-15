@@ -8253,7 +8253,9 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
             let hidden = std::mem::take(&mut p.gx.opaque_hidden);
             let r = crate::check::opaque::reveal(&hidden, &mut p.tys, o, 0);
             p.gx.opaque_hidden = hidden;
-            r
+            // A hidden type can name a projection of the params
+            // (`I::IntoIter`), which the args now decide.
+            normalize_global(p, r)
         }
         None => ret,
     };
