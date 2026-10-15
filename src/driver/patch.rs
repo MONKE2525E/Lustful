@@ -101,6 +101,11 @@ pub(crate) struct PatchBase {
     /// update's dead-slot rule. Slot assignment does not move while a
     /// base lives, so this is built once here, not per patch.
     live_slots: Vec<bool>,
+    /// Per item index, its fns' raw body hashes from the item's last
+    /// full rescan in a patch (which also proved no method of the item
+    /// holds a body item): a later edit in the same impl rescans only
+    /// the edited method and reuses these for the rest.
+    item_scans: FxMap<usize, Vec<u64>>,
 }
 
 /// The crate selection inputs a patch must see unchanged: anything that
@@ -208,6 +213,7 @@ impl PatchBase {
             extras: None,
             fns_by_file,
             live_slots,
+            item_scans: FxMap::default(),
         }
     }
 }
@@ -678,11 +684,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
                 x.stmt_items.extend(p.stmt_items);
             }
         }
-        let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, &front.ast.items[e.item]);
-        if front.items.get(e.item) != Some(&scan) || !inner.is_empty() {
-            return Err("item scan");
-        }
-        let (hash, idents) = bodies.into_iter().nth(e.sub.unwrap_or(0)).ok_or("item scan")?;
+        let (hash, idents) = rescan_edited(front, &mut base, e)?;
         let def = fn_def_at(&front.ast, e.item, e.sub);
         let line = front.map.line_col(def.name_span).0;
         let h = fn_text_hash(&front.ast, &front.map, def, line, hash);
@@ -726,6 +728,35 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     };
     front.patch = Some(base);
     Ok(out)
+}
+
+/// Rescans the edited fn's item after its new body landed: the item
+/// scan must stand (the edit changed no head) and no method of the item
+/// may hold a body item (a nested fn's hash folds its outer item in, so
+/// the patch would owe it a new hash too). Returns the edited fn's raw
+/// body hash and idents. The first edit in an impl scans every method
+/// and stores their hashes in the base; later edits in that impl scan
+/// only the edited method, because a body hash reads structure only
+/// (never spans), so unchanged methods keep theirs.
+fn rescan_edited(front: &Front, base: &mut PatchBase, e: &BodyEdit) -> Result<(u64, Vec<Sym>), &'static str> {
+    let item = &front.ast.items[e.item];
+    if let (Some(sub), Some(stored)) = (e.sub, base.item_scans.get(&e.item).cloned()) {
+        let (hash, idents, inner) = super::ast_hash::scan_body(&front.ast, fn_def_at(&front.ast, e.item, e.sub));
+        let mut hashes = stored;
+        *hashes.get_mut(sub).ok_or("item scan")? = hash;
+        let scan = super::ast_hash::scan_item_reuse(&front.ast, item, &hashes);
+        if front.items.get(e.item) != Some(&scan) || !inner.is_empty() {
+            return Err("item scan");
+        }
+        base.item_scans.insert(e.item, hashes);
+        return Ok((hash, idents));
+    }
+    let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, item);
+    if front.items.get(e.item) != Some(&scan) || !inner.is_empty() {
+        return Err("item scan");
+    }
+    base.item_scans.insert(e.item, bodies.iter().map(|b| b.0).collect());
+    bodies.into_iter().nth(e.sub.unwrap_or(0)).ok_or("item scan")
 }
 
 /// Takes the kept program in place of a fresh collect, with the number
@@ -1078,6 +1109,42 @@ pub fn run() -> i64 {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert_eq!(per_size[0], per_size[1], "patch work (nodes, spans) with macros for 3 and 12 modules: {per_size:?}");
+    }
+
+    /// The second body edit in one impl rescans only the edited method
+    /// and reuses the other methods' stored body hashes, one of which
+    /// returns `impl Trait` (its body hash folds into the item scan).
+    /// Every warm answer matches a cold session.
+    #[test]
+    fn second_edit_in_an_impl_rescans_one_method() {
+        let dir = std::env::temp_dir().join(format!("lust-patch-impl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("m.rs"),
+            "pub struct Acc {\n    pub v: i64,\n    pub xs: Vec<i64>,\n}\n\nimpl Acc {\n    pub fn add(&mut self, x: i64) {\n        self.v += x;\n    }\n    pub fn get(&self) -> i64 {\n        self.v\n    }\n    pub fn vals(&self) -> impl Iterator<Item = &i64> {\n        self.xs.iter()\n    }\n}\n\npub fn run() -> i64 {\n    let mut a = Acc { v: 0, xs: vec![1] };\n    a.add(3);\n    a.get() + a.vals().count() as i64\n}\n",
+        )
+        .unwrap();
+        let root = dir.join("main.rs");
+        std::fs::write(&root, "mod m;\n\nfn main() {\n    println!(\"{}\", m::run());\n}\n").unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let m = dir.join("m.rs");
+        let mut cold_n = 0;
+        for (old, new) in [
+            ("        self.v += x;\n", "        let y = x + 1;\n        self.v += y - 1;\n"),
+            ("        self.v\n", "        self.v + 0\n"),
+            ("        self.v += y - 1;\n", "        self.v += y - 2;\n        self.v += 1;\n"),
+            ("        self.v + 0\n", "        self.v + true\n"),
+        ] {
+            edit(&m, old, new);
+            let (code, err) = check(&mut warm, &root);
+            assert_eq!(field(&warm.front.last_visits, "path"), "patch", "{}", warm.front.last_visits);
+            cold_n += 1;
+            let mut cold = Session::new(dir.join(format!("obj-cold{cold_n}")), false, SessionKey::synthetic(&root, false));
+            assert_eq!((code, err), check(&mut cold, &root), "warm and cold agree after editing {old:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A module with most kinds of span a collected program keeps: Adts

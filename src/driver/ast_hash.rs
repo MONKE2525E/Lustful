@@ -27,33 +27,63 @@ pub struct AstScans {
 /// indexes) at any depth inside it.
 pub(crate) type ItemScans = (scan::ItemScan, Vec<(u64, Vec<Sym>)>, Vec<u32>);
 
-/// One item's scan and its fns' body scans (see `ItemScans`).
-pub(crate) fn scan_item(ast: &Ast, item: &Item) -> ItemScans {
-    let mut inner = Vec::new();
-    let mut w = Walker { ast, idents: None, inner: Some(&mut inner) };
+/// The fns of one item in scan order (a fn item's fn, an impl's methods).
+fn item_fns<'a>(item: &'a Item) -> Vec<&'a FnDef> {
+    match &item.kind {
+        ItemKind::Fn(f) => vec![f],
+        ItemKind::Impl(imp) => imp.fns.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One item's scan from its head walk and its fns' body hashes: a fn
+/// returning `impl Trait` folds its body hash in, because the body
+/// decides the hidden type callers generate code for
+/// (check/opaque.rs), so it is part of the item, not a body-only edit
+/// (as in `scan::scan`).
+fn item_scan(ast: &Ast, item: &Item, body_hashes: &[u64], inner: Option<&mut Vec<u32>>) -> scan::ItemScan {
+    let mut w = Walker { ast, idents: None, inner };
     let mut h = FxHasher::default();
     w.item(&mut h, item, false);
-    // A fn returning `impl Trait`: its body decides the hidden type
-    // callers generate code for (check/opaque.rs), so the body is part
-    // of the item, not a body-only edit (as in `scan::scan`).
     let rpit = |f: &FnDef| f.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. }));
     let fn_name = match &item.kind {
         ItemKind::Fn(f) if !rpit(f) => Some(f.name),
         _ => None,
     };
-    let fns: Vec<&FnDef> = match &item.kind {
-        ItemKind::Fn(f) => vec![f],
-        ItemKind::Impl(imp) => imp.fns.iter().collect(),
-        _ => Vec::new(),
-    };
-    let bodies: Vec<(u64, Vec<Sym>)> = fns.iter().map(|f| body_scan(ast, f, Some(&mut inner))).collect();
-    for (f, b) in fns.iter().zip(&bodies) {
+    for (f, b) in item_fns(item).iter().zip(body_hashes) {
         if rpit(f) {
-            b.0.hash(&mut h);
+            b.hash(&mut h);
         }
     }
-    let scan = scan::ItemScan { hash: h.finish(), fn_name };
+    scan::ItemScan { hash: h.finish(), fn_name }
+}
+
+/// One item's scan and its fns' body scans (see `ItemScans`).
+pub(crate) fn scan_item(ast: &Ast, item: &Item) -> ItemScans {
+    let mut inner = Vec::new();
+    let bodies: Vec<(u64, Vec<Sym>)> = item_fns(item).iter().map(|f| body_scan(ast, f, Some(&mut inner))).collect();
+    let hashes: Vec<u64> = bodies.iter().map(|b| b.0).collect();
+    // The head walk also records body items (`inner`), as the scan the
+    // worklist caches per file does.
+    let scan = item_scan(ast, item, &hashes, Some(&mut inner));
     (scan, bodies, inner)
+}
+
+/// One fn's body scan (hash, idents, and the body items inside it), for
+/// the body patch's one-method rescan of an impl.
+pub(crate) fn scan_body(ast: &Ast, f: &FnDef) -> (u64, Vec<Sym>, Vec<u32>) {
+    let mut inner = Vec::new();
+    let (hash, idents) = body_scan(ast, f, Some(&mut inner));
+    (hash, idents, inner)
+}
+
+/// One item's scan reusing stored body hashes for all but one fn (the
+/// body patch's rescan after a body edit in an impl): `body_hashes` is
+/// the item's fn body hashes in scan order, with the edited fn's entry
+/// already replaced. The same scan `scan_item` computes when the stored
+/// hashes are the bodies' current hashes.
+pub(crate) fn scan_item_reuse(ast: &Ast, item: &Item, body_hashes: &[u64]) -> scan::ItemScan {
+    item_scan(ast, item, body_hashes, None)
 }
 
 fn assemble(ast: &Ast, per_item: Vec<ItemScans>) -> AstScans {
