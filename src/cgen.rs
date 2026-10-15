@@ -7575,7 +7575,13 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
             CTy::ArrayIter(e, n) => by_value_deps(&CTy::Array(e.clone(), *n), &mut deps),
-            CTy::Slice(e) => by_value_deps(e, &mut deps),
+            // A slice holds `e*` only: every struct type has a forward
+            // typedef above, so only a fn pointer typedef must come
+            // first. Counting `e` itself made a false cycle for a
+            // recursive `enum A { P(Arc<[A]>) }`, and the DFS start
+            // order (ADT ids, which follow the file name) then decided
+            // which side was incomplete.
+            CTy::Slice(e) => by_value_deps(&CTy::Ref(e.clone()), &mut deps),
             CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
             CTy::Sync(k, e) if k.is_cell_struct() => by_value_deps(e, &mut deps),
             CTy::FnPtr(ps, r) => {
