@@ -875,6 +875,10 @@ struct FnGen<'b, 'p> {
     /// emitted now.
     cleanup: Vec<bool>,
     stmt_unw: HashMap<(u32, u32), u32>,
+    /// Per local, the one byte string blob it only holds
+    /// (`ir::byte_blob_locals`): declared `static const` and never
+    /// assigned, so a borrow of it has static storage.
+    byte_blobs: Vec<Option<crate::ast::ByteBlob>>,
     unw: Option<Unw>,
     /// The value being assigned comes from a `Call` terminator.
     unw_call: bool,
@@ -1570,6 +1574,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         prelude: String::new(),
         adapters: 0,
         cleanup: if p.unwind { unwind::cleanup_blocks(body) } else { Vec::new() },
+        byte_blobs: crate::ir::byte_blob_locals(body),
         stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
         unw: None,
         unw_call: false,
@@ -1688,6 +1693,10 @@ impl FnGen<'_, '_> {
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
         let mut flags = Vec::new();
         for (i, t) in self.local_cty.iter().enumerate() {
+            // A byte string temp gets static storage below, not a frame local.
+            if self.byte_blobs.get(i).is_some_and(|b| b.is_some()) {
+                continue;
+            }
             let is_param = i >= 1 && i <= self.body.arg_count;
             // A dropped parameter (see `param_dropped`) has no `p{i}`; its
             // local is the one possible value of a zero-sized type.
@@ -1716,6 +1725,15 @@ impl FnGen<'_, '_> {
             let stars = &ct[base.len()..];
             let decls: Vec<String> = names.iter().map(|n| format!("{stars}{n}")).collect();
             let _ = writeln!(self.out, "  {base} {};", decls.join(", "));
+        }
+        // Byte string temps: static storage, initialized once, never
+        // assigned (the matching assignments are skipped in `stmt`).
+        for (i, b) in self.byte_blobs.iter().enumerate() {
+            if let Some(b) = b {
+                let ct = ctype(&self.local_cty[i]);
+                let init = if b.is_empty() { "{0}".to_string() } else { format!("{{ .v = {} }}", c_bytes_lit(b.as_slice())) };
+                let _ = writeln!(self.out, "  static {ct} l{i} = {init};");
+            }
         }
         if !flags.is_empty() {
             let _ = writeln!(self.out, "  uint8_t {};", flags.join(", "));
@@ -2386,6 +2404,13 @@ impl FnGen<'_, '_> {
     fn stmt(&mut self, s: &StmtKind, span: Span) {
         let loc = self.loc(span);
         match s {
+            // A byte string temp is a static initialized at its
+            // declaration: its one blob assignment never runs.
+            StmtKind::Assign(dest, Rvalue::Use(Operand::Const(Const::Bytes(b))))
+                if dest.proj.is_empty()
+                    && self.byte_blobs.get(dest.local as usize).is_some_and(|x| x.as_ref().is_some_and(|x| x.as_slice() == b.as_slice())) =>
+            {
+            }
             StmtKind::Assign(dest, rv) => {
                 let mentions = rvalue_mentions(rv, dest.local);
                 let dest_cty = self.place(dest, &loc).1;

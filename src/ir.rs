@@ -321,3 +321,54 @@ impl Body<'_> {
         &self.blocks[b.0 as usize]
     }
 }
+
+/// Per local, the one byte string blob a temporary only ever holds:
+/// an unnamed, non-parameter local whose every whole-local write is
+/// that same `Const::Bytes`, which nothing writes through a
+/// projection, a call result, or a mutable borrow. Borrowck treats
+/// such a local's storage as never ending (a byte string literal is
+/// `&'static [u8; N]` in Rust), and codegen gives it static storage,
+/// so a borrow of it may escape the function (`-> &'static [u8]`).
+pub fn byte_blob_locals(body: &Body) -> Vec<Option<crate::ast::ByteBlob>> {
+    let n = body.locals.len();
+    let mut blob: Vec<Option<crate::ast::ByteBlob>> = vec![None; n];
+    let mut bad = vec![false; n];
+    for (i, l) in body.locals.iter().enumerate() {
+        if i <= body.arg_count || l.name.is_some() {
+            bad[i] = true;
+        }
+    }
+    let mut scan_rv = |rv: &Rvalue, bad: &mut Vec<bool>| match rv {
+        Rvalue::Ref(true, p) => bad[p.local as usize] = true,
+        Rvalue::Subslice { base, mutable: true, .. } => bad[base.local as usize] = true,
+        _ => {}
+    };
+    for b in &body.blocks {
+        for s in &b.stmts {
+            if let StmtKind::Assign(dest, rv) = &s.kind {
+                scan_rv(rv, &mut bad);
+                let i = dest.local as usize;
+                if dest.proj.is_empty()
+                    && let Rvalue::Use(Operand::Const(Const::Bytes(bytes))) = rv
+                {
+                    match &blob[i] {
+                        None => blob[i] = Some(bytes.clone()),
+                        Some(prev) if prev.as_slice() == bytes.as_slice() => {}
+                        Some(_) => bad[i] = true,
+                    }
+                } else {
+                    bad[i] = true;
+                }
+            }
+        }
+        if let Terminator::Call { dest, .. } = &b.term {
+            bad[dest.local as usize] = true;
+        }
+    }
+    for i in 0..n {
+        if bad[i] {
+            blob[i] = None;
+        }
+    }
+    blob
+}

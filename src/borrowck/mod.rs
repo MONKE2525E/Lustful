@@ -306,11 +306,11 @@ struct Ck<'b, 'p> {
     /// The two-phase receiver loan of the call being checked, while its
     /// arguments are: until the call activates it, it is a shared borrow.
     reserved: Option<usize>,
-    /// Per local: it holds only a byte string literal's bytes (a
-    /// const blob with static storage in the generated C), so its
-    /// storage ending drops nothing a borrow of it reads. Returning
-    /// such a borrow still rejects (`check_return`): the compound
-    /// literal's storage is the frame's, not the program's.
+    /// Per local: it holds only one byte string literal's bytes
+    /// (`ir::byte_blob_locals`), so its storage ending drops
+    /// nothing a borrow of it reads. Codegen gives such a local
+    /// static storage, so a borrow of it may escape the function,
+    /// as a byte string literal is `&'static [u8; N]` in Rust.
     promoted: Vec<bool>,
 }
 
@@ -424,36 +424,7 @@ impl<'b, 'p> Ck<'b, 'p> {
             mpath_at: Vec::new(),
             ops_buf: Vec::new(),
             reserved: None,
-            promoted: {
-                // A local whose every whole-local assignment is a byte
-                // string const: only the literal temp qualifies (a
-                // user variable assigned a literal once and other
-                // values later does not).
-                let mut v = vec![false; body.locals.len()];
-                let mut other = vec![false; body.locals.len()];
-                for b in &body.blocks {
-                    for s in &b.stmts {
-                        if let StmtKind::Assign(dest, rv) = &s.kind
-                            && dest.proj.is_empty()
-                        {
-                            if matches!(rv, Rvalue::Use(Operand::Const(Const::Bytes(_)))) {
-                                v[dest.local as usize] = true;
-                            } else {
-                                other[dest.local as usize] = true;
-                            }
-                        }
-                    }
-                    if let Terminator::Call { dest, .. } = &b.term
-                        && dest.proj.is_empty()
-                    {
-                        other[dest.local as usize] = true;
-                    }
-                }
-                for i in 0..v.len() {
-                    v[i] &= !other[i];
-                }
-                v
-            },
+            promoted: crate::ir::byte_blob_locals(body).iter().map(|b| b.is_some()).collect(),
         }
     }
 }
