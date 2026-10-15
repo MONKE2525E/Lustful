@@ -216,7 +216,7 @@ pub fn graph_key(session: &SessionKey) -> u64 {
         let mut dir = manifest.parent();
         let mut lock_found = false;
         while let Some(d) = dir {
-            for name in [".cargo/config.toml", ".cargo/config"] {
+            for name in [".cargo/config.toml", ".cargo/config", ".lust.toml"] {
                 if let Ok(bytes) = std::fs::read(d.join(name)) {
                     h = hash_bytes(h, &[name.as_bytes(), &bytes]);
                 }
@@ -351,6 +351,163 @@ impl CrateFlags {
     }
 }
 
+/// Project dev feature config (docs/dev-features.md). `dev-features` is the
+/// exact feature list for lust dev builds. `dev-exclude-features` names
+/// entries to remove from the package `default` list. Release builds via
+/// Cargo never read this config.
+#[derive(Clone, Debug, Default)]
+struct LustConfig {
+    dev_features: Option<Vec<String>>,
+    dev_exclude_features: Option<Vec<String>>,
+}
+
+impl LustConfig {
+    fn any(&self) -> bool {
+        self.dev_features.is_some() || self.dev_exclude_features.is_some()
+    }
+}
+
+/// Quoted strings in one TOML array value. The value may span lines up to
+/// the closing `]`. Comments have no quotes in the configs we read.
+fn toml_str_array(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' || c == '\'' {
+            let mut s = String::new();
+            for d in chars.by_ref() {
+                if d == c {
+                    break;
+                }
+                s.push(d);
+            }
+            out.push(s);
+        }
+        if c == ']' {
+            break;
+        }
+    }
+    out
+}
+
+/// One array key under one TOML section (`""` means top level, for
+/// `.lust.toml`). Section-gated like `parse_manifest`.
+fn toml_array_in(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
+    let mut cur = "";
+    let mut lines = text.lines().peekable();
+    while let Some(raw) = lines.next() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            cur = line.trim_matches(|c| c == '[' || c == ']');
+            continue;
+        }
+        if cur != section || line.split('=').next().is_none_or(|k| k.trim() != key) {
+            continue;
+        }
+        let mut value = line.split_once('=').map_or("", |(_, v)| v).to_string();
+        while !value.contains(']') {
+            match lines.next() {
+                Some(next) => {
+                    value.push(' ');
+                    value.push_str(next.trim());
+                }
+                None => break,
+            }
+        }
+        return Some(toml_str_array(&value));
+    }
+    None
+}
+
+/// The lust config in one TOML text: `package.metadata.lust`, then
+/// `workspace.metadata.lust`, then top-level keys (a `.lust.toml` file).
+fn lust_config_in(text: &str) -> LustConfig {
+    for section in ["package.metadata.lust", "workspace.metadata.lust", ""] {
+        let cfg = LustConfig {
+            dev_features: toml_array_in(text, section, "dev-features"),
+            dev_exclude_features: toml_array_in(text, section, "dev-exclude-features"),
+        };
+        if cfg.any() {
+            return cfg;
+        }
+    }
+    LustConfig::default()
+}
+
+/// Finds the project lust config for one crate: the crate manifest, then
+/// ancestor manifests (a workspace root holds `workspace.metadata.lust`),
+/// then the nearest `.lust.toml` at or above the manifest directory (or
+/// the file directory when no manifest names the crate). Returns the
+/// config and the manifest text that owns the `[features]` table, when
+/// one was read.
+fn find_lust_config(file: &Path, key: &SessionKey) -> (LustConfig, Option<String>) {
+    let manifest = key.krate.manifest_path.clone().or_else(|| find_manifest(file).map(|m| m.path));
+    let mut own_text = None;
+    if let Some(mp) = &manifest {
+        if let Ok(text) = std::fs::read_to_string(mp) {
+            own_text = Some(text.clone());
+            let cfg = lust_config_in(&text);
+            if cfg.any() {
+                return (cfg, own_text);
+            }
+        }
+        for anc in ancestor_manifests(mp) {
+            if let Ok(text) = std::fs::read_to_string(&anc) {
+                let cfg = lust_config_in(&text);
+                if cfg.any() {
+                    return (cfg, own_text);
+                }
+            }
+        }
+    }
+    let start = manifest.as_deref().and_then(|p| p.parent()).or_else(|| file.parent());
+    let mut dir = start;
+    while let Some(d) = dir {
+        if let Ok(text) = std::fs::read_to_string(d.join(".lust.toml")) {
+            let cfg = lust_config_in(&text);
+            if cfg.any() {
+                return (cfg, own_text);
+            }
+        }
+        dir = d.parent();
+    }
+    (LustConfig::default(), own_text)
+}
+
+/// Cargo.toml files above `manifest` (not including it), nearest first.
+fn ancestor_manifests(manifest: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dir = manifest.parent().and_then(|d| d.parent());
+    while let Some(d) = dir {
+        let cand = d.join("Cargo.toml");
+        if cand.exists() {
+            out.push(cand);
+        }
+        dir = d.parent();
+    }
+    out
+}
+
+/// Applies the project dev config to a session key. Skipped when the
+/// command line named a feature selection: flags always win. The result
+/// is stored as the effective selection itself (`features` plus
+/// `default_features = false`), so the daemon session key, `describe`,
+/// and every cache key carry the effective features.
+fn apply_dev_config(key: &mut SessionKey, file: &Path) {
+    let (cfg, manifest_text) = find_lust_config(file, key);
+    if let Some(list) = cfg.dev_features {
+        key.features = list;
+    } else if let Some(exclude) = cfg.dev_exclude_features {
+        let defaults = manifest_text.as_deref().and_then(|t| toml_array_in(t, "features", "default")).unwrap_or_default();
+        key.features = defaults.into_iter().filter(|f| !exclude.contains(f)).collect();
+    } else {
+        return;
+    }
+    sort_features(&mut key.features);
+    key.default_features = false;
+    key.all_features = false;
+}
+
 /// Builds the session key for a dev request from the crate flags. With no
 /// manifest or package flag the crate is synthetic (one file). With one, the
 /// package identity comes from the manifest text (`find_manifest` below)
@@ -364,7 +521,13 @@ fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey 
     key.default_features = !flags.no_default_features;
     key.all_features = flags.all_features;
     key.target_triple = flags.target_triple.unwrap_or_default();
+    // Project dev config fills the feature selection only when the
+    // command line named none of its own.
+    let had_feature_selection = !key.features.is_empty() || flags.no_default_features || flags.all_features;
     if flags.manifest_path.is_none() && flags.package.is_none() && flags.bin.is_none() && !flags.lib {
+        if !had_feature_selection {
+            apply_dev_config(&mut key, file);
+        }
         return key;
     }
     // Only a crate session runs Cargo, so only it carries the network mode.
@@ -393,6 +556,9 @@ fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey 
     } else {
         key.krate.target_kind = "bin".into();
         key.krate.target_name = flags.bin.or_else(|| manifest.as_ref().and_then(|m| selected_bin(m, file))).unwrap_or(package);
+    }
+    if !had_feature_selection {
+        apply_dev_config(&mut key, file);
     }
     key
 }
@@ -1148,5 +1314,46 @@ mod tests {
         // A truncated wire form never reads as a request.
         let bytes = encode(&req);
         assert!(read_request(&mut std::io::Cursor::new(&bytes[..bytes.len() - 3])).is_none());
+    }
+
+    /// Project dev config: `dev-exclude-features` turns the package
+    /// default list into the effective selection in the session key, CLI
+    /// flags win over the config, and `.lust.toml` at the workspace root
+    /// works when the manifest carries no lust table.
+    #[test]
+    fn dev_config_sets_effective_features() {
+        let dir = std::env::temp_dir().join(format!("lust-devfeat-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("crate/src")).unwrap();
+        std::fs::write(
+            dir.join("crate/Cargo.toml"),
+            "[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[package.metadata.lust]\ndev-exclude-features = [\n  \"jemalloc\",\n]\n\n[features]\ndefault = [\"jemalloc\", \"fast\"]\njemalloc = []\nfast = []\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("crate/src/lib.rs"), "").unwrap();
+        let lib = dir.join("crate/src/lib.rs");
+        let mp = dir.join("crate/Cargo.toml");
+        let req = compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib"]);
+        assert_eq!(req.session.features, ["fast"], "default minus jemalloc");
+        assert!(!req.session.default_features && !req.session.all_features);
+        assert!(req.session.describe().contains("features=[fast] default_features=0"), "{}", req.session.describe());
+        let plain = compile_req(&["check", lib.to_str().unwrap()]);
+        assert_eq!(plain.session.features, ["fast"], "synthetic file check uses the same config");
+        // CLI selection wins over config.
+        let cli =
+            compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib", "--features", "jemalloc"]);
+        assert_eq!(cli.session.features, ["jemalloc"]);
+        assert!(cli.session.default_features);
+        // `.lust.toml` with an exact list, in a crate whose manifest has none.
+        std::fs::write(dir.join("crate/Cargo.toml"), "[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n").unwrap();
+        std::fs::write(dir.join(".lust.toml"), "dev-features = [\"noembed\"]\n").unwrap();
+        let req = compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib"]);
+        assert_eq!(req.session.features, ["noembed"]);
+        assert!(!req.session.default_features);
+        // No config at all keeps the old default selection.
+        std::fs::remove_file(dir.join(".lust.toml")).unwrap();
+        let req = compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib"]);
+        assert!(req.session.features.is_empty() && req.session.default_features);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

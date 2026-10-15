@@ -12,6 +12,10 @@
 #                     root (default: Cargo.toml). Workspace fixtures name
 #                     the bin package's manifest here.
 #   features=<a,b>    passed to cargo and to lust as --features
+#   dev-config=1      the fixture's [package.metadata.lust] config drives
+#                     the lust selection (no feature flags to lust); the
+#                     Cargo oracle gets --no-default-features plus
+#                     `features=` as the same effective list
 #   target=<triple>   passed to cargo and to lust as --target; the value
 #                     `host` means the rustc host triple. No line = no flag.
 #   args=<words>      program arguments (split on spaces; no quoting)
@@ -81,6 +85,7 @@ for dir in "$fixtures"/*/; do
   manifest=Cargo.toml
   root_file=src/main.rs
   features=""
+  dev_config=""
   target=""
   expect=""
   cargo_pass=""
@@ -93,6 +98,7 @@ for dir in "$fixtures"/*/; do
         root) root_file=$v ;;
         manifest) manifest=$v ;;
         features) features=$v ;;
+        dev-config) dev_config=$v ;;
         target) target=$v ;;
         expect) expect=$v ;;
         cargo) cargo_pass=$v ;;
@@ -109,7 +115,12 @@ for dir in "$fixtures"/*/; do
   cargo_args=(build --manifest-path "$case_dir/proj/$manifest" --bin "$bin")
   lust_args=(build "$case_dir/proj/$root_file" -o "$case_dir/lust.bin"
     --manifest-path "$case_dir/proj/$manifest" --bin "$bin")
-  if [ -n "$features" ]; then
+  if [ -n "$dev_config" ]; then
+    cargo_args+=(--no-default-features)
+    if [ -n "$features" ]; then
+      cargo_args+=(--features "$features")
+    fi
+  elif [ -n "$features" ]; then
     cargo_args+=(--features "$features")
     lust_args+=(--features "$features")
   fi

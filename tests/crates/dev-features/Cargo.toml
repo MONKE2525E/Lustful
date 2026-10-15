@@ -1,0 +1,17 @@
+# Project dev config: lust dev builds drop `heavy` from the default list
+# (fixture.txt `dev-config=1` makes the Cargo oracle use the same
+# effective selection: --no-default-features --features fast).
+[package]
+name = "dev-features"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[package.metadata.lust]
+dev-exclude-features = ["heavy"]
+
+[features]
+default = ["heavy", "fast"]
+heavy = []
+fast = []
