@@ -141,25 +141,37 @@ pub fn needs_resolve(root_text: &str, interner: &Interner) -> bool {
 /// single-file crate root. The driver seeds the resolve cache with it
 /// (`ResolveCache::seed_root`), so the root is not lexed twice.
 pub fn route_root(root_text: &str, interner: &Interner) -> (bool, Option<lexer::Lexed>) {
+    let (yes, _, lexed) = route_root_std(root_text, interner, false);
+    (yes, lexed)
+}
+
+/// `route_root`, plus `stdmods::needs(root_text)` when `std` is set
+/// (else false), found in the same parallel pass: each piece ends right
+/// after a newline, so no word crosses a cut and the file's answer is
+/// any piece's answer.
+pub fn route_root_std(root_text: &str, interner: &Interner, std: bool) -> (bool, bool, Option<lexer::Lexed>) {
     if let Some(pieces) = route_pieces(root_text) {
         let answers = par_map(&pieces, |&(a, b)| {
             let lexed = lexer::lex(&root_text[a..b], FileId(0), a as u32, interner).ok()?;
-            piece_cut_ok(&lexed, b, root_text.len()).then(|| (route_keywords(&lexed, interner), lexed))
+            let std_mods = std && crate::stdmods::needs(&root_text[a..b]);
+            piece_cut_ok(&lexed, b, root_text.len()).then(|| (route_keywords(&lexed, interner), std_mods, lexed))
         });
-        if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, lexer::Lexed)>>>() {
+        if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, bool, lexer::Lexed)>>>() {
+            let std_mods = answers.iter().any(|a| a.1);
             // The brace scan needs the whole file in order: each piece but
             // the last ends in an end-of-input token that `join_lexed` drops.
             let last = answers.len() - 1;
-            let yes = answers.iter().any(|(y, _)| *y) || {
+            let yes = answers.iter().any(|a| a.0) || {
                 let mut scan = NestedFnScan::default();
-                answers.iter().enumerate().any(|(k, (_, l))| scan.feed(&l.tokens[..l.tokens.len() - usize::from(k < last)]))
+                answers.iter().enumerate().any(|(k, a)| scan.feed(&a.2.tokens[..a.2.tokens.len() - usize::from(k < last)]))
             };
-            return (yes, yes.then(|| join_lexed(answers.into_iter().map(|(_, l)| l).collect())));
+            return (yes, std_mods, yes.then(|| join_lexed(answers.into_iter().map(|a| a.2).collect())));
         }
     }
-    let Ok(lexed) = lexer::lex(root_text, FileId(0), 0, interner) else { return (false, None) };
+    let std_mods = std && crate::stdmods::needs(root_text);
+    let Ok(lexed) = lexer::lex(root_text, FileId(0), 0, interner) else { return (false, std_mods, None) };
     let yes = needs_resolve_lexed(&lexed, interner);
-    (yes, yes.then_some(lexed))
+    (yes, std_mods, yes.then_some(lexed))
 }
 
 /// Cut points for lexing a big file in parallel: about four pieces per
@@ -6119,6 +6131,32 @@ mod tests {
         }
         let answers: Vec<bool> = cases.iter().map(|t| serial(t)).collect();
         assert_eq!(answers, [false, true, true, false, false, true, true]);
+    }
+
+    /// The std source module scan that routing does per piece answers as
+    /// `stdmods::needs` on the whole file: a trigger word in any piece,
+    /// at a piece's first or last line, counts; a trigger inside a longer
+    /// word does not.
+    #[test]
+    fn parallel_std_scan_matches_serial() {
+        let filler: String = (0..3000).map(|i| format!("fn f{i}() -> i64 {{ {i} }}\nstruct S{i};\n")).collect();
+        let pieces = route_pieces(&filler).unwrap();
+        let (a, b) = pieces[1];
+        let cases = [
+            filler.clone(),
+            format!("{}fn t() {{ let _ = time; }}\n{}", &filler[..a], &filler[a..]),
+            format!("{}fn t() {{ let _ = runtime; }}\n{}", &filler[..b], &filler[b..]),
+            format!("{}// a LazyLock in a comment\n", filler),
+            format!("{}fn t() {{ let _ = PhantomData_x; }}\n", filler),
+        ];
+        for (k, text) in cases.iter().enumerate() {
+            let i = Interner::default();
+            let (_, std_mods, _) = route_root_std(text, &i, true);
+            assert_eq!(std_mods, crate::stdmods::needs(text), "case {k}");
+            assert!(!route_root_std(text, &i, false).1, "case {k}");
+        }
+        let answers: Vec<bool> = cases.iter().map(|t| crate::stdmods::needs(t)).collect();
+        assert_eq!(answers, [false, true, false, true, false]);
     }
 
     /// A big file lexed in parallel pieces joins into exactly the serial

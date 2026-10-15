@@ -97,24 +97,30 @@ fn trigger_words() -> impl Iterator<Item = &'static str> {
 
 /// True if `src` can mention a std source module: a row's trigger
 /// (its module segment, or for an overlay the item names) appears as a
-/// whole identifier-like word. A plain byte scan (it runs on every
-/// compile); a hit only costs the splice, and a real use always names
-/// a trigger.
+/// whole identifier-like word. It runs on every compile, so each trigger
+/// is first a `contains` test (a vectorized scan), and only a hit looks
+/// for a whole-word match. A hit only costs the splice, and a real use
+/// always names a trigger.
 pub fn needs(src: &str) -> bool {
+    let words: Vec<&str> = trigger_words().collect();
+    words.iter().enumerate().any(|(k, w)| !words[..k].contains(w) && src.contains(w) && has_word(src, w))
+}
+
+/// True if `w` occurs in `src` with no identifier-like byte (ASCII
+/// alphanumeric, `_`, or any byte of a non-ASCII char) on either side.
+fn has_word(src: &str, w: &str) -> bool {
     let b = src.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
-    trigger_words().any(|w| {
-        let mut from = 0;
-        while let Some(at) = src[from..].find(w) {
-            let lo = from + at;
-            let hi = lo + w.len();
-            if (lo == 0 || !ident(b[lo - 1])) && (hi == b.len() || !ident(b[hi])) {
-                return true;
-            }
-            from = hi;
+    let mut from = 0;
+    while let Some(at) = src[from..].find(w) {
+        let lo = from + at;
+        let hi = lo + w.len();
+        if (lo == 0 || !ident(b[lo - 1])) && (hi == b.len() || !ident(b[hi])) {
+            return true;
         }
-        false
-    })
+        from = hi;
+    }
+    false
 }
 
 /// The row whose hidden module has this name.

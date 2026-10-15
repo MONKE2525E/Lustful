@@ -1328,6 +1328,12 @@ impl StdNeeds {
 /// this runs on every compile. A miss (a name only a macro builds)
 /// costs a "no method" reject, never a wrong accept.
 pub fn std_needs(src: &str) -> StdNeeds {
+    std_needs_known(src, crate::stdmods::needs(src))
+}
+
+/// `std_needs` for a caller that knows `stdmods::needs(src)` already:
+/// routing finds it in its parallel pass (`route_root_std`).
+pub fn std_needs_known(src: &str, modules: bool) -> StdNeeds {
     // Bit n of FIRST[c]: some method name starts with byte c and has
     // length n. It turns away almost every other name (`push`, `len`)
     // before a search, which keeps the scan near memory speed.
@@ -1360,7 +1366,7 @@ pub fn std_needs(src: &str) -> StdNeeds {
     // faster than a byte loop (or a two-byte `"::"` search).
     let methods = src.match_indices('.').any(|(i, _)| named_at(i + 1))
         || src.match_indices(':').any(|(i, _)| b.get(i + 1) == Some(&b':') && named_at(i + 2));
-    StdNeeds { fns: STD_FNS.iter().any(|d| d.implemented && src.contains(d.trigger)), methods, modules: crate::stdmods::needs(src) }
+    StdNeeds { fns: STD_FNS.iter().any(|d| d.implemented && src.contains(d.trigger)), methods, modules }
 }
 
 /// True if `src` can mention an implemented source std fn or a std

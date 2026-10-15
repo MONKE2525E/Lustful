@@ -1847,14 +1847,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // AST, synthetic chunk, spliced source): the chunk path must never
     // reuse it, and with `env_hash` cleared the request rebuilds in full
     // mode, which resets the caches in `slot_update`.
-    let (wants_resolver, root_lexed) = if req.session.krate.manifest_path.is_some() {
-        (true, None)
-    } else {
-        crate::resolve::worklist::route_root(&src, &front.interner)
-    };
     // A std source module splices as an inline `mod` (src/stdmods.rs),
-    // which only the resolver front end understands (W-STD-C).
-    let wants_resolver = wants_resolver || crate::stdmods::needs(&src);
+    // which only the resolver front end understands (W-STD-C). Routing
+    // finds that word scan in its own parallel pass.
+    let (wants_resolver, std_mods, root_lexed) = if req.session.krate.manifest_path.is_some() {
+        (true, false, None)
+    } else {
+        crate::resolve::worklist::route_root_std(&src, &front.interner, true)
+    };
+    let wants_resolver = wants_resolver || std_mods;
     if front.resolved_crate && !wants_resolver {
         front.ast = Ast::default();
         front.env_hash = None;
@@ -1885,8 +1886,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut std_ranges: Vec<(u32, u32, crate::ty::lang::ShippedCrate)> = Vec::new();
     let mut std_routes: Vec<&'static crate::ty::lang::StdFnDef> = Vec::new();
     let mut std_methods = (0u32, 0u32);
-    let needs = crate::ty::lang::std_needs(&src);
-    if !use_resolver && needs.any() {
+    // Off the resolver only: the resolver path scans its own root text.
+    // Routing found `stdmods::needs` already (false off the resolver).
+    let needs = if use_resolver { crate::ty::lang::StdNeeds::default() } else { crate::ty::lang::std_needs_known(&src, std_mods) };
+    if needs.any() {
         match splice_std(&mut src, std_cache, needs) {
             Ok(sp) => (std_ranges, std_routes, std_methods) = (sp.ranges, sp.routes, sp.methods),
             Err(resp) => return resp,
