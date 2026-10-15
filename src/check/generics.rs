@@ -10109,7 +10109,7 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
             continue;
         }
         for goal in goals {
-            if !prove_goal(p, &env, goal) {
+            if !prove_wf_goal(p, &env, goal) {
                 let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
                 errs.push(Diag::new(
                     "L0612",
@@ -10121,6 +10121,33 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
             }
         }
     }
+}
+
+/// One bound goal of a written type (check_written_wf). core's
+/// structural `Default` impls have no impl record for the pure
+/// solver: `[T; N]` (N <= 32, any T at N = 0), tuples of at most 12
+/// elements, `&str` and `&[T]`. A `Default` goal on those decomposes
+/// to its elements (`LinkStore<K, [SymbolTable; 2]>` with `V: Default`).
+fn prove_wf_goal(p: &mut Program, env: &[Predicate], goal: TraitRef) -> bool {
+    let &[GenericArg::Ty(t)] = p.tys.args(goal.args) else { return prove_goal(p, env, goal) };
+    if goal.def != p.gx.lang.default {
+        return prove_goal(p, env, goal);
+    }
+    let elems: Vec<Ty> = match p.tys.kind(t) {
+        TyKind::Array(e, n) => match p.tys.const_kind(n) {
+            ConstKind::Int(0) => vec![],
+            ConstKind::Int(k) if k <= 32 => vec![e],
+            _ => return false,
+        },
+        TyKind::Tuple(ts) if p.tys.tys_of(ts).len() <= 12 => p.tys.tys_of(ts).to_vec(),
+        TyKind::Tuple(_) => return false,
+        TyKind::Ref(_, _, e) if matches!(p.tys.kind(e), TyKind::Str | TyKind::Slice(_)) => vec![],
+        _ => return prove_goal(p, env, goal),
+    };
+    elems.into_iter().all(|e| {
+        let args = p.tys.intern_args(&[GenericArg::Ty(e)]);
+        prove_wf_goal(p, env, TraitRef { args, ..goal })
+    })
 }
 
 /// Param defaults (rustc's wfcheck): a default that names no param
