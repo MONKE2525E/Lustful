@@ -12,6 +12,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+/* glibc exposes accept4 only under _GNU_SOURCE, which this unit does not set (as with
+   pipe2 in sysio.c). gcc 14 makes the implicit declaration an error. */
+int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags);
+
 /* Appends `n` bytes to a Vec<u8> (the sysio.c shape). */
 static void lust_sysnet_push(lust_Vec *out, const void *p, uint64_t n) {
     if (n == 0) return;
