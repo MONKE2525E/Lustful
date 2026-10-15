@@ -16,56 +16,33 @@
 mod protocol;
 
 use protocol::Invocation;
-use std::io::Write as _;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 unsafe extern "C" {
     fn setsid() -> i32;
-    fn kill(pid: i32, sig: i32) -> i32;
+    fn flock(fd: i32, operation: i32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
 }
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+const F_SETFD: i32 = 2;
 
 /// True when an env flag is set to a value other than "" or "0".
 fn env_on(name: &str) -> bool {
     matches!(std::env::var(name), Ok(v) if !v.is_empty() && v != "0")
 }
 
-/// True when a process with this pid exists (signal 0 sends nothing).
-fn pid_alive(pid: i32) -> bool {
-    pid > 0 && unsafe { kill(pid, 0) } == 0
-}
-
-/// The pid written in a lock file, if it parses.
-fn lock_pid(lock: &Path) -> Option<i32> {
-    std::fs::read_to_string(lock).ok()?.trim().parse().ok()
-}
-
-/// Claims the right to start the daemon by creating the lock file. A lock whose pid is
-/// dead is stale (a crashed starter or an exited daemon): remove it and try once more.
-/// The daemon later replaces this file's pid with its own and holds an flock on it, so
-/// a lock with a live pid always means "a daemon owns this socket".
-fn claim_start(lock: &Path) -> bool {
-    for _ in 0..2 {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(lock) {
-            Ok(mut f) => {
-                let _ = write!(f, "{}", std::process::id());
-                return true;
-            }
-            Err(_) => match lock_pid(lock) {
-                Some(pid) if pid_alive(pid) => return false,
-                _ => {
-                    // The starter may sit between create and write. Wait a moment, then
-                    // re-read: a live starter's pid appears; a dead one's lock is stale.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if lock_pid(lock).is_some_and(pid_alive) {
-                        return false;
-                    }
-                    let _ = std::fs::remove_file(lock);
-                }
-            },
-        }
-    }
-    false
+/// Claims the right to start the daemon: an exclusive flock on the lock file. None when
+/// a daemon (or a client that is starting one) holds it. The caller hands the locked fd
+/// to the daemon it spawns, so the lock is held without a gap from here to the daemon's
+/// exit, and a crash releases it. The file is never deleted: removing a file that a live
+/// daemon holds a lock on would let a second daemon lock a new file at the same path.
+fn claim_start(lock: &Path) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(lock).ok()?;
+    // SAFETY: flock on the live fd of `f`. LOCK_NB: fail at once when the lock is taken.
+    (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
 }
 
 /// The cache dir for daemon logs. The same rule as the disk cache (src/driver/cache.rs).
@@ -83,10 +60,8 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
     if env_on("LUST_NO_DAEMON") {
         return;
     }
-    let lock = protocol::daemon_lock_path(sock);
-    if !claim_start(&lock) {
-        return;
-    }
+    let Some(lock) = claim_start(&protocol::daemon_lock_path(sock)) else { return };
+    let lock_fd = lock.as_raw_fd();
     let dir = log_dir(file);
     let _ = std::fs::create_dir_all(&dir);
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log"));
@@ -97,6 +72,7 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
     cmd.arg("daemon")
         .env("LUST_DAEMON_PREWARM", file)
         .env("LUST_DAEMON_PREWARM_AFTER", std::process::id().to_string())
+        .env("LUST_DAEMON_LOCK_FD", lock_fd.to_string())
         .stdin(std::process::Stdio::null());
     if let Ok(f) = log {
         if let Ok(f2) = f.try_clone() {
@@ -104,19 +80,20 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
         }
     }
     // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
-    // session, so it outlives this client and its terminal. It calls no Rust code.
+    // session, so it outlives this client and its terminal. Clearing close-on-exec on
+    // the lock fd (in the child only) passes the held flock to the daemon. Both are
+    // plain syscalls; no Rust code runs.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             setsid();
+            fcntl(lock_fd, F_SETFD, 0);
             Ok(())
         });
     }
-    match cmd.spawn() {
-        Ok(_child) => {} // Not waited on: the daemon is reparented and serves in the background.
-        Err(e) => {
-            let _ = std::fs::remove_file(&lock);
-            eprintln!("note: could not start a background daemon: {e}");
-        }
+    // Not waited on: the daemon is reparented and serves in the background. This
+    // process's copy of the lock fd closes on its own exec; the daemon's copy stays.
+    if let Err(e) = cmd.spawn() {
+        eprintln!("note: could not start a background daemon: {e}");
     }
 }
 

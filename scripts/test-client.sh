@@ -3,7 +3,8 @@
 # handoff to Cargo/rustc. Run after `cargo build --release`.
 #   autostart: fresh dir, first build cold and standalone, second build served
 #              by the daemon (its binary loads libbase.so). Plus LUST_NO_DAEMON,
-#              a 4-way start race, and the idle timeout.
+#              a 4-way start race, a held daemon lock (no second daemon), and the
+#              idle timeout.
 #   temp:      the daemon temp dir dies with the daemon (SIGTERM, SIGINT, socket
 #              removal, idle), a startup sweep removes SIGKILL leftovers, and
 #              kept binaries still run.
@@ -53,6 +54,11 @@ loads_base() { local out; out=$(ldd "$1" 2>/dev/null) && [[ $out == *libbase* ]]
 wait_socket() { # wait_socket <dir> : true when the daemon socket appears
   local i
   for i in $(seq 1 100); do [ -S "$(sock "$1")" ] && return 0; sleep 0.05; done
+  return 1
+}
+wait_socket_path() { # wait_socket_path <socket> : true when that socket appears
+  local i
+  for i in $(seq 1 100); do [ -S "$1" ] && return 0; sleep 0.05; done
   return 1
 }
 fresh() { # fresh <name> : a new dir with a hello.rs, prints its path
@@ -120,6 +126,28 @@ check "race: one daemon socket serves after" wait_socket "$d"
 (cd "$d" && "$lust" build hello.rs -o h) >/dev/null 2>&1
 if loads_base "$d/h"; then ok "race: warm build after the race"; else bad "race: warm build after the race" "no libbase.so"; fi
 stop_daemon "$d"; sleep 0.3
+
+# The lock file is the single-daemon guarantee: whoever holds its flock owns the socket.
+# This is the race window frozen: a daemon holds the lock but its pid is not written yet
+# (the file still names the exited client that started it). A client must not replace the
+# file or start a second daemon: two daemons on two lock files would remove each other's socket.
+d=$(fresh lockheld); s=$d/s.sock
+sh -c 'exit 0' & dead=$!; wait $dead
+printf '%s' "$dead" >"$s.lock"
+# One process holds the lock: the subshell execs into sleep with fd 9, so killing it frees the lock.
+( exec 9>>"$s.lock"; flock 9; exec sleep 30 ) & holder=$!
+for i in $(seq 1 100); do flock -n "$s.lock" true || break; sleep 0.05; done
+ino=$(stat -c %i "$s.lock")
+(cd "$d" && LUST_DAEMON_SOCKET=$s LUST_DAEMON_IDLE=5 "$lust" check hello.rs) >/dev/null 2>&1
+check "lockheld: client answers cold" test $? -eq 0
+check "lockheld: a held lock file is never replaced" test "$(stat -c %i "$s.lock")" = "$ino"
+sleep 0.5
+check "lockheld: no second daemon starts" test ! -S "$s"
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+# Once the holder is gone, the leftover file (stale pid, no flock) does not block a start.
+(cd "$d" && LUST_DAEMON_SOCKET=$s LUST_DAEMON_IDLE=5 "$lust" check hello.rs) >/dev/null 2>&1
+check "lockheld: a free stale lock file allows a start" wait_socket_path "$s"
+kill "$(cat "$s.lock" 2>/dev/null)" 2>/dev/null; sleep 0.3
 
 d=$(fresh idle); daemon_dirs+=("$d")
 (cd "$d" && LUST_DAEMON_IDLE=1 "$lust" check hello.rs) >/dev/null 2>&1

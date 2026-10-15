@@ -4,7 +4,9 @@
 // guard checks (below) compile in their own sessions on their own threads.
 // One daemon per socket: it holds an flock on `<socket>.lock` (which holds its pid) for its
 // whole life. A second daemon sees the lock taken and exits without touching the socket, so
-// a stale socket file can always be removed safely by the lock holder.
+// a stale socket file can always be removed safely by the lock holder. An autostarting
+// client takes the same flock first and passes the locked fd to the daemon it spawns
+// (`LUST_DAEMON_LOCK_FD`). Nothing deletes the lock file: a crash releases the flock.
 // The daemon exits on its own after an idle span (`LUST_DAEMON_IDLE`, default 30 minutes;
 // see protocol::daemon_idle) and removes its socket on the way out. SIGTERM, SIGINT, and
 // removal of the socket file take the same controlled exit. Signals use a flag plus a
@@ -37,7 +39,7 @@ use std::ffi::CString;
 use std::io::{BufReader, Seek, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -602,11 +604,24 @@ pub fn serve(sock: &Path) -> ! {
     sweep_stale_temp_dirs();
     // Single instance, decided before anything touches the socket.
     let lock_path = protocol::daemon_lock_path(sock);
-    let mut lock_file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).unwrap_or_else(|e| {
-        eprintln!("error: cannot open {}: {e}", lock_path.display());
-        std::process::exit(2);
-    });
+    // An autostarting client passes its already locked fd (see client.rs `claim_start`), so
+    // the lock has no gap between that client and this daemon. The fcntl both checks the
+    // fd is open and sets close-on-exec again, so no child of the daemon inherits it.
+    let inherited = std::env::var("LUST_DAEMON_LOCK_FD")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        // SAFETY: fcntl F_SETFD on an fd number; it fails harmlessly when the fd is not open.
+        .filter(|&fd| unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } == 0);
+    let mut lock_file = match inherited {
+        // SAFETY: the fd is open (checked above) and nothing else in this process owns it.
+        Some(fd) => unsafe { std::fs::File::from_raw_fd(fd) },
+        None => std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).unwrap_or_else(|e| {
+            eprintln!("error: cannot open {}: {e}", lock_path.display());
+            std::process::exit(2);
+        }),
+    };
     // SAFETY: flock on a live fd. LOCK_EX | LOCK_NB: fail at once when another daemon holds it.
+    // On an inherited fd this process already holds the lock, so the call succeeds.
     if unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
         eprintln!("lust daemon: another daemon already serves {}", sock.display());
         std::process::exit(0);
