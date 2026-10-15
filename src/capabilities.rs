@@ -703,7 +703,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::VecFirst => (&["Vec<T>"], vec![k.first], Call::Method),
         B::VecLast => (&["Vec<T>"], vec![k.last], Call::Method),
         B::VecContains => (&["Vec<T>"], vec![k.contains], Call::Method),
-        B::VecSwap => (&["Vec<T>"], vec![k.swap], Call::Method),
+        B::VecSwap => (&["Vec<T>", "[T]", "[T; n]"], vec![k.swap], Call::Method),
         B::VecClear => (&["Vec<T>"], vec![k.clear], Call::Method),
         B::VecInsert => (&["Vec<T>"], vec![k.insert], Call::Method),
         B::VecRemove => (&["Vec<T>"], vec![k.remove], Call::Method),

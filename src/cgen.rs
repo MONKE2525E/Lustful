@@ -4962,13 +4962,14 @@ impl FnGen<'_, '_> {
                 t
             }
             B::VecSwap => {
-                let CTy::Ref(v) = &tys[0] else { unreachable!() };
-                let CTy::Vec(e) = &**v else { unreachable!() };
-                let (et, t) = (ctype(e), self.tmp());
-                let (vv, a, bb) = (&vals[0], &vals[1], &vals[2]);
+                // `Vec::swap` and `[T]::swap` share the builtin:
+                // `slice_like` reads either receiver form.
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (et, t) = (ctype(&e), self.tmp());
+                let (a, bb) = (&vals[1], &vals[2]);
                 let _ = writeln!(
                     self.out,
-                    "    lust_bounds({a}, {vv}->len, {loc}); lust_bounds({bb}, {vv}->len, {loc});\n    {et} {t} = (({et}*){vv}->ptr)[{a}]; (({et}*){vv}->ptr)[{a}] = (({et}*){vv}->ptr)[{bb}]; (({et}*){vv}->ptr)[{bb}] = {t};"
+                    "    lust_bounds({a}, {len}, {loc}); lust_bounds({bb}, {len}, {loc});\n    {et} {t} = {ptr}[{a}]; {ptr}[{a}] = {ptr}[{bb}]; {ptr}[{bb}] = {t};"
                 );
                 "((lust_Unit){})".into()
             }

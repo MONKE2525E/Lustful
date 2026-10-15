@@ -13603,6 +13603,8 @@ impl<'p> Ctx<'p> {
                     Some((B::SliceToVec, Autoref::Ref, vec![], v))
                 } else if name == k.reverse {
                     Some((B::VecReverse, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.swap {
+                    Some((B::VecSwap, Autoref::RefMut, vec![USIZE, USIZE], UNIT))
                 } else if name == k.first {
                     let r = self.tys.mk_ref(false, elem);
                     let opt_ref = self.tys.mk_option(r);
