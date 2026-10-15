@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 12433,
+  "elapsed_ms": 14602,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -58,18 +58,19 @@
     {
       "root_cause": "external-crates",
       "findings": 27,
-      "files": 7,
+      "files": 10,
       "features": [
         "ext.serde",
         "ext.jiff",
         "ext.serde_json",
-        "ext.lzma_rust2"
+        "ext.lzma_rust2",
+        "ext.tikv_jemalloc_ctl"
       ]
     },
     {
       "root_cause": "c-interop",
       "findings": 5,
-      "files": 8,
+      "files": 7,
       "features": [
         "cinterop.extern",
         "cinterop.system"
@@ -286,7 +287,7 @@
       "fix_class": "adapter",
       "release_safe_rewrite": false,
       "release_impact": "unchanged",
-      "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs Timestamp::try_from(SystemTime), TimeZone::tzif (a TZif v1-v3 parser plus POSIX footer rule evaluation after the last transition), try_system, and civil date conversion, all exact at DST edges. That is its own adapter slice with a transition corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+      "notes": "Gap recorded by w-cinterop2, re-sized by w-cinterop3: not exact-matchable as a small adapter. The ts-rust form needs Timestamp::try_from(SystemTime), TimeZone::tzif, TimeZone::UTC, try_system (Windows cfg only in ts-rust), and to_datetime civil fields. Upstream jiff-core 0.1.1 implements that as a 1,361-line TZif parser plus a 3,758-line POSIX footer rule engine plus civil date math; every parse and range error also has its own jiff Error text a program can print. Reimplementing that exactly at DST edges (spring/fall transitions, past the last transition, footer-only zones) in the lust subset is its own package with a transition corpus against the real crate (fixed zone files as bytes). Split from cinterop.system so the count is visible. See dependencies.json.",
       "findings": 6,
       "raw_uses": 6,
       "prod_uses": 6,
@@ -526,7 +527,7 @@
       "fix_class": "adapter",
       "release_safe_rewrite": false,
       "release_impact": "unchanged",
-      "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs an LZMA1 range decoder (embed.rs LzmaReader over the packed libs) and, for the build script, a byte-exact LzmaWriter. That is its own adapter slice with a stream corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+      "notes": "Gap recorded by w-cinterop2, re-sized by w-cinterop3: not small and not byte-exactable in this slice. All ts-rust uses are wasm-only (embed.rs LzmaReader over the packed libs, and parts/goport_util/build.rs LzmaWriter with Bt4/EncodeMode::Normal options whose output bytes must match upstream exactly). A decode-only adapter still needs a full LZMA1 range decoder; the writer needs upstream's match finder and price model. Its own slice with a stream corpus against the real crate. Split from cinterop.system so the count is visible. See dependencies.json.",
       "findings": 1,
       "raw_uses": 1,
       "prod_uses": 1,
@@ -588,7 +589,7 @@
       "findings": 0,
       "raw_uses": 0,
       "prod_uses": 0,
-      "files": 6,
+      "files": 5,
       "prod_files": 0,
       "prod_fns": 0,
       "scopes": {},
@@ -631,6 +632,27 @@
       "raw_uses": 0,
       "prod_uses": 0,
       "files": 0,
+      "prod_files": 0,
+      "prod_fns": 0,
+      "scopes": {},
+      "samples": []
+    },
+    {
+      "id": "ext.tikv_jemalloc_ctl",
+      "title": "Adapter crate tikv-jemalloc-ctl 0.7.0: Name/AsName, epoch, version (by-name Access arena keys removed, cannot match)",
+      "status": "unsupported",
+      "milestone": 0,
+      "milestone_label": "milestone 0: supported today",
+      "inventory_step": "10",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh tikv-jemalloc-ctl (epoch_version matches the real crate; arena_reject and by_name_reject must reject). w-cinterop3 audit: the one-arena by-name model printed values a real jemalloc build does not (opt.narenas 1 vs 4 per CPU, spawned thread arena 0 vs 1, tcache under MALLOC_CONF), so every Access impl for Name is removed and by-name key access rejects at compile time. Kept because they match exactly: Name/AsName/Error (pure), epoch (first read 1, +1 per advance, probed against the real crate), version (the pinned sys 0.7.1 string). ts-rust program.rs and jemalloc_layout.rs use the removed arena form, so this feature (the ts-rust form, per its probe) is unsupported again. Split from cinterop.system. See dependencies.json.",
+      "findings": 0,
+      "raw_uses": 0,
+      "prod_uses": 0,
+      "files": 3,
       "prod_files": 0,
       "prod_fns": 0,
       "scopes": {},
@@ -1120,9 +1142,9 @@
       "used_by": [
         "ts_goport"
       ],
-      "decision": "c-shim",
+      "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Windows file identity. Later target gate."
+      "notes": "Adapter in library/deps: is_same_file and Handle over dev/ino identity (std::os::unix::fs::MetadataExt), the same calls as upstream unix.rs. Std stream handles and fd trait impls are absent until lust std has a from-raw-fd File form."
     },
     {
       "name": "serde",
@@ -1201,7 +1223,7 @@
       ],
       "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Adapter in library/deps: Name/Access over a one-arena model (thread.arena, opt.narenas, epoch, version, thread.tcache.enabled) with upstream error texts. Arena counts a program prints cannot match a jemalloc build; see the adapter README. Stats and typed modules beyond epoch/version are absent."
+      "notes": "Adapter in library/deps: Name/AsName/Error, epoch, and version only (the items whose output matches the real crate exactly; w-cinterop3 audit). All by-name Access impls are removed because arena counts, tcache, and stats values depend on the jemalloc build and machine and cannot match; programs that use them reject at compile time. See the adapter README."
     },
     {
       "name": "tikv-jemallocator",
@@ -1285,39 +1307,39 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 759,
+    "supported_today_files": 758,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 759,
-        "lines": 557699,
-        "files_pct": 98.2,
-        "lines_pct": 97.6
+        "files": 760,
+        "lines": 559147,
+        "files_pct": 98.3,
+        "lines_pct": 97.9
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 759,
-        "lines": 557699,
-        "files_pct": 98.2,
-        "lines_pct": 97.6
+        "files": 760,
+        "lines": 559147,
+        "files_pct": 98.3,
+        "lines_pct": 97.9
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 759,
-        "lines": 557699,
-        "files_pct": 98.2,
-        "lines_pct": 97.6
+        "files": 760,
+        "lines": 559147,
+        "files_pct": 98.3,
+        "lines_pct": 97.9
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 759,
-        "lines": 557699,
-        "files_pct": 98.2,
-        "lines_pct": 97.6
+        "files": 760,
+        "lines": 559147,
+        "files_pct": 98.3,
+        "lines_pct": 97.9
       },
       {
         "id": "7",
@@ -1340,90 +1362,90 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 761,
-        "lines": 563108,
-        "files_pct": 98.4,
-        "lines_pct": 98.6
+        "files": 760,
+        "lines": 558787,
+        "files_pct": 98.3,
+        "lines_pct": 97.8
       },
       {
         "id": "10",
@@ -1526,10 +1548,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 9,
-        "lines": 5700,
-        "files_pct": 1.2,
-        "lines_pct": 1.0
+        "files": 10,
+        "lines": 10021,
+        "files_pct": 1.3,
+        "lines_pct": 1.8
       }
     ]
   },
@@ -1537,39 +1559,39 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 762,
+    "supported_today_files": 761,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 762,
-        "lines": 559166,
-        "files_pct": 97.9,
-        "lines_pct": 97.5
+        "files": 763,
+        "lines": 560614,
+        "files_pct": 98.1,
+        "lines_pct": 97.7
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 762,
-        "lines": 559166,
-        "files_pct": 97.9,
-        "lines_pct": 97.5
+        "files": 763,
+        "lines": 560614,
+        "files_pct": 98.1,
+        "lines_pct": 97.7
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 762,
-        "lines": 559166,
-        "files_pct": 97.9,
-        "lines_pct": 97.5
+        "files": 763,
+        "lines": 560614,
+        "files_pct": 98.1,
+        "lines_pct": 97.7
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 762,
-        "lines": 559166,
-        "files_pct": 97.9,
-        "lines_pct": 97.5
+        "files": 763,
+        "lines": 560614,
+        "files_pct": 98.1,
+        "lines_pct": 97.7
       },
       {
         "id": "7",
@@ -1592,90 +1614,90 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 764,
-        "lines": 564575,
-        "files_pct": 98.2,
-        "lines_pct": 98.4
+        "files": 763,
+        "lines": 560254,
+        "files_pct": 98.1,
+        "lines_pct": 97.6
       },
       {
         "id": "10",
@@ -1778,10 +1800,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 11,
-        "lines": 6721,
-        "files_pct": 1.4,
-        "lines_pct": 1.2
+        "files": 12,
+        "lines": 11042,
+        "files_pct": 1.5,
+        "lines_pct": 1.9
       }
     ]
   },
@@ -5655,9 +5677,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7361,7 +7381,9 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [],
+      "missing_features": [
+        "ext.tikv_jemalloc_ctl"
+      ],
       "findings": 0
     },
     {
@@ -8771,7 +8793,9 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [],
+      "missing_features": [
+        "ext.tikv_jemalloc_ctl"
+      ],
       "findings": 0
     },
     {
@@ -12047,7 +12071,9 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [],
+      "missing_features": [
+        "ext.tikv_jemalloc_ctl"
+      ],
       "findings": 0
     },
     {

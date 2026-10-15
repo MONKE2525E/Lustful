@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `b156feeb7` (the scanned tree, landed on `next`). ts-rust: `unknown`.
+lust commit: `c4b252902` (the scanned tree, landed on `next`). ts-rust: `unknown`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 398 files, 384216 lines (98.0% of files, 98.3% of lines).
+Core: 406 files, 390709 lines. Compiles today: 397 files, 379895 lines (97.8% of files, 97.2% of lines).
 
-All active prod files: 759 of 773 files compile today (97.6% of lines).
+All active prod files: 758 of 773 files compile today (97.9% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,8 +31,8 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `ext.serde_json` | unsupported | none | wave D | 3 | 2484 | 1 | 1248 |
-| 2 | `cinterop.system` | unsupported | 7 | wave C (shims) | 1 | 1448 | 1 | 1448 |
+| 1 | `ext.tikv_jemalloc_ctl` | unsupported | 0 | W-DEPS | 2 | 5769 | 2 | 5769 |
+| 2 | `ext.serde_json` | unsupported | none | wave D | 3 | 2484 | 1 | 1248 |
 | 3 | `ext.jiff` | unsupported | 7 | W-DEPS | 1 | 1403 | 1 | 1403 |
 | 4 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
 | 5 | `ext.serde` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
@@ -44,10 +44,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 398 | 98.0 | 98.3 |
-| milestone 4 | 398 | 98.0 | 98.3 |
-| milestone 5 | 398 | 98.0 | 98.3 |
-| milestone 6 | 398 | 98.0 | 98.3 |
+| supported today | 399 | 98.3 | 98.7 |
+| milestone 4 | 399 | 98.3 | 98.7 |
+| milestone 5 | 399 | 98.3 | 98.7 |
+| milestone 6 | 399 | 98.3 | 98.7 |
 | milestone 7 | 403 | 99.3 | 99.4 |
 | milestone 8 | 403 | 99.3 | 99.4 |
 
@@ -55,10 +55,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 759 | 98.2 | 97.6 |
-| milestone 4 | 759 | 98.2 | 97.6 |
-| milestone 5 | 759 | 98.2 | 97.6 |
-| milestone 6 | 759 | 98.2 | 97.6 |
+| supported today | 760 | 98.3 | 97.9 |
+| milestone 4 | 760 | 98.3 | 97.9 |
+| milestone 5 | 760 | 98.3 | 97.9 |
+| milestone 6 | 760 | 98.3 | 97.9 |
 | milestone 7 | 768 | 99.4 | 98.6 |
 | milestone 8 | 770 | 99.6 | 99.6 |
 
