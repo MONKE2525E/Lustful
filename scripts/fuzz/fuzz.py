@@ -1843,9 +1843,16 @@ fn wrap<T: Name + Clone>(x: T) -> Vec<T> {
     v
 }
 
+// A template whose body holds a closure (W-PATCH-MISS2).
+fn twice<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 {
+    // @t4
+    let g = |y: i64| f(f(y));
+    g(x)
+}
+
 pub fn run() -> i64 {
     let n = if 5u8.as_any().is::<u8>() { 1 } else { 0 };
-    n + wrap(3i32).len() as i64 + show(&1i32).len() as i64
+    n + wrap(3i32).len() as i64 + show(&1i32).len() as i64 + twice(|v| v + 1, 1)
 }
 """,
 }
