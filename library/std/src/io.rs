@@ -394,9 +394,12 @@ pub trait Write {
     /// Writes a formatted string into this writer (`write!` and
     /// `writeln!`). In lust a `fmt::Arguments` value already holds its
     /// text, so this is one `write_all`; for std's writers that is the
-    /// same output as std's piece-by-piece writes. A user type that
-    /// relies on this default is rejected when a build instantiates it
-    /// (L0641), since std would call its `write` once per piece.
+    /// same output as std's piece-by-piece writes. The compiler
+    /// streams `write!` on `Stdout`, `Stderr`, and their locks piece
+    /// by piece instead of calling this default, so a print inside a
+    /// fmt impl stays in order there. A user type that relies on this
+    /// default is rejected when a build instantiates it (L0641),
+    /// since std would call its `write` once per piece.
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
         let bytes = core::intrinsics::sys_fmt_arguments_bytes(args);
         self.write_all(&bytes)
@@ -424,6 +427,24 @@ impl Write for Vec<u8> {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+impl<W: Write + ?Sized> Write for Box<W> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (**self).write(buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        (**self).write_all(buf)
+    }
+
+    fn write_fmt(&mut self, fmt: fmt::Arguments<'_>) -> Result<()> {
+        (**self).write_fmt(fmt)
     }
 }
 
