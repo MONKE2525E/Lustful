@@ -474,9 +474,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>) -> Re
         // The old body's nodes stay in the arenas, unreachable; blank them,
         // because some passes scan whole arenas (closures, `dyn`, `Cow`).
         let ranges = base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize));
-        span_shift::blank_nodes(&mut front.ast, e.file, e.old_body, ranges);
+        span_shift::blank_nodes(Arc::make_mut(&mut front.ast), e.file, e.old_body, ranges);
         // Spans next: the new body is lexed at the new positions.
-        spans += span_shift::shift_ast(&mut front.ast, e.edit, base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize)));
+        spans += span_shift::shift_ast(Arc::make_mut(&mut front.ast), e.edit, base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize)));
         let tables = Arc::get_mut(&mut base.tables).ok_or("state")?;
         shift_table_spans(tables, e.edit);
         let lines = front.map.lines(e.file).splice(&e.text, e.edit.a as usize, e.edit.b as usize, (e.edit.b as i64 + e.edit.d) as usize);
@@ -493,8 +493,8 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>) -> Re
         let ast = &front.ast;
         let before = (ast.exprs.len(), ast.pats.len(), ast.tys.len(), ast.blocks.len(), ast.stmt_items.len());
         let stmt_base = before.4 as u32;
-        let _ = front.ast.append_chunk(std::mem::take(&mut e.body_ast), stmt_base);
-        let def = fn_def_at_mut(&mut front.ast, e.item, e.sub);
+        let _ = Arc::make_mut(&mut front.ast).append_chunk(std::mem::take(&mut e.body_ast), stmt_base);
+        let def = fn_def_at_mut(Arc::make_mut(&mut front.ast), e.item, e.sub);
         def.body = Some(BlockId(e.body.0 + before.3 as u32));
         def.exprs = (e.exprs.0 + before.0 as u32, e.exprs.1 + before.0 as u32);
         def.pats = (e.pats.0 + before.1 as u32, e.pats.1 + before.1 as u32);

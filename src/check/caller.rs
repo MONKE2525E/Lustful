@@ -31,7 +31,7 @@ pub fn is_track_caller(p: &Program, f: LocalDefId) -> bool {
         return false;
     }
     let info = p.fn_info(f);
-    info.def.attrs.iter().any(|a| a.path.len() == 1 && p.name(a.path[0].name) == "track_caller")
+    info.def(&p.ast).attrs.iter().any(|a| a.path.len() == 1 && p.name(a.path[0].name) == "track_caller")
 }
 
 /// The rejects for `#[track_caller]` uses lust does not support, and
@@ -46,10 +46,10 @@ pub fn check_attrs(p: &Program, errs: &mut Vec<Diag>) {
         }
         // A trait method declaration (a default body) is a dyn entry too.
         if p.gx.trait_methods.contains_key(&p.def_id(f)) {
-            errs.push(generics::dyn_not_yet(p.fn_info(f).def.name_span, "`#[track_caller]` on a trait method"));
+            errs.push(generics::dyn_not_yet(p.fn_def(f).name_span, "`#[track_caller]` on a trait method"));
             continue;
         }
-        let def = p.fn_info(f).def;
+        let def = p.fn_def(f);
         if p.name(def.name) == "main" && p.fn_info(f).owner.is_none() && def.self_param.is_none() && p.fn_names.get(&def.name) == Some(&f) {
             errs.push(Diag::new("L0110", def.name_span, "`main` function is not allowed to be `#[track_caller]`", "Remove the attribute."));
             continue;
@@ -60,7 +60,7 @@ pub fn check_attrs(p: &Program, errs: &mut Vec<Diag>) {
     }
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// Rejects a `#[track_caller]` fn used as a value (L0702): its calls
     /// would not pass the caller's location.
     pub(super) fn reject_track_caller_value(&mut self, f: LocalDefId, span: Span) {

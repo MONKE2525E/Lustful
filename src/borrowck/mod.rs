@@ -253,8 +253,8 @@ enum Access {
     Dead,
 }
 
-struct Ck<'b, 'p, 'a> {
-    p: &'p Program<'a>,
+struct Ck<'b, 'p> {
+    p: &'p Program,
     body: &'b Body<'p>,
     loans: Vec<Loan>,
     /// The index of a block's first statement in body-wide statement order.
@@ -388,8 +388,8 @@ fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, r
     )
 }
 
-impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
-    fn new(p: &'p Program<'a>, body: &'b Body<'p>) -> Self {
+impl<'b, 'p> Ck<'b, 'p> {
+    fn new(p: &'p Program, body: &'b Body<'p>) -> Self {
         let drop_heads = drop_heads(p);
         Ck {
             p,
@@ -471,7 +471,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
         let _ = l;
         return vec![Diag::new(
             "L0602",
-            p.fn_info(body.fn_id).def.name_span,
+            p.fn_def(body.fn_id).name_span,
             "the borrow checker does not track `impl Trait` values yet",
             "Return a named type instead of `impl Trait`.",
         )];
@@ -599,7 +599,7 @@ fn overlap(a: &Place, b: &Place, consts: &std::collections::HashMap<Local, u64>)
     true
 }
 
-impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
+impl<'b, 'p> Ck<'b, 'p> {
     /// Prints the body, its loans, and their scopes (LUST_BCK_DEBUG).
     fn debug_dump(&self) {
         eprintln!("== borrowck {}", self.p.display_name(self.p.fn_info(self.body.fn_id).name));

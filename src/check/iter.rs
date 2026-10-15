@@ -78,7 +78,7 @@ enum FromIterClass {
     Unsupported,
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// `iter`, `iter_mut`, and `into_iter` on Vec, slices, and arrays,
     /// and every iterator method on a builtin iterator or `Chars`
     /// receiver. Returns None when the call is none of these, so the
@@ -1951,7 +1951,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return FromIterProbe::Miss;
             }
         }
-        let (k, ty_name) = (p.known, ty_seg.name);
+        let (k, ty_name) = (&*p.known, ty_seg.name);
         if ty_name == k.Vec {
             let el = self.new_var(false);
             return FromIterProbe::Found(self.tys.mk_vec(el));

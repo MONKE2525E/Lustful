@@ -30,7 +30,7 @@ pub fn user_write_fmt_instance(p: &Program, inst: LocalDefId) -> Option<Diag> {
     if matches!(p.tys.kind(writer), TyKind::Ref(..)) {
         return None;
     }
-    user_writer_diag(p, &p.tys, writer, f.def.name_span)
+    user_writer_diag(p, &p.tys, writer, f.def(&p.ast).name_span)
 }
 
 /// The same rule at a `write!` call `lust check` sees, for a receiver
@@ -48,7 +48,7 @@ pub fn user_write_fmt_call(p: &Program, tys: &impl TyIntern, f: LocalDefId, writ
 /// the `&mut W` forwarder, or one of their instances).
 pub(crate) fn is_platform_write_fmt(p: &Program, f: LocalDefId) -> bool {
     let info = p.fn_info(f);
-    p.name(info.name) == "write_fmt" && p.shipped_crate_at(info.def.name_span) == Some(ShippedCrate::Std)
+    p.name(info.name) == "write_fmt" && p.shipped_crate_at(info.def(&p.ast).name_span) == Some(ShippedCrate::Std)
 }
 
 /// L0641 unless `writer` is a std writer: `Vec<u8>` or a type the
@@ -70,7 +70,7 @@ fn user_writer_diag(p: &Program, tys: &impl TyIntern, writer: Ty, fallback: Span
     ))
 }
 
-impl Ctx<'_, '_> {
+impl Ctx<'_> {
     /// True, after an L0104 error, when user code names a hidden variant
     /// of an enum a shipped crate defines: std's unstable `io::ErrorKind`
     /// kinds carry a `__` prefix in lust's source, and rustc has no such

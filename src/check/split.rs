@@ -35,7 +35,7 @@ fn pattern_ok(tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The split family on a `str` or `String` receiver; None for other
     /// methods and receivers.
     pub(super) fn str_split_method(&mut self, e: ExprId, base: Ty, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {

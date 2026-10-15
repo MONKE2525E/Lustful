@@ -1153,12 +1153,12 @@ fn main() {
 ";
 
     fn lowered(src: &str, run: impl FnOnce(&Program, &SourceMap, Vec<Body>)) {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         let mut map = SourceMap::default();
         map.add_file("test.rs", src);
         let bodies = (0..program.fns.len())
@@ -1222,7 +1222,7 @@ fn main() {
                 out = bodies
                     .iter()
                     .map(|b| {
-                        let line = map.line_col(p.fn_info(b.fn_id).def.name_span).0;
+                        let line = map.line_col(p.fn_def(b.fn_id).name_span).0;
                         ir_fingerprint(p, b, map, line)
                     })
                     .collect();
@@ -1250,7 +1250,7 @@ fn main() {
                 out = bodies
                     .iter()
                     .map(|b| {
-                        let def = &p.fn_info(b.fn_id).def;
+                        let def = &p.fn_def(b.fn_id);
                         (p.name(def.name).to_string(), ir_fingerprint(p, b, map, map.line_col(def.name_span).0))
                     })
                     .collect();

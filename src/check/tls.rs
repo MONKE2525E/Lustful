@@ -59,7 +59,7 @@ pub fn init_fn(p: &Program, value: ast::ExprId, stmt_idx: Option<u32>) -> Option
 /// `LocalKey<RefCell<T>>` only.
 const KEY_METHODS: &[&str] = &["with", "try_with", "with_borrow", "with_borrow_mut", "set", "get", "take", "replace"];
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The `thread_local!` static a method receiver names directly
     /// (`KEY.with(..)`), by static index. A key reached any other way
     /// (a `&'static LocalKey<T>` value) is not supported yet: lowering
@@ -206,7 +206,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return;
         }
         // The init fn body is `{ { .. } }`: its tail is the const block.
-        let def = self.p.fn_info(fid).def;
+        let def = self.p.fn_def(fid);
         if let Some(b) = def.body
             && let Some(t) = self.p.ast.block(b).tail
         {

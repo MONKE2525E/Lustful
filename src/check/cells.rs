@@ -6,7 +6,7 @@
 // (`TyIntern::smart_elem`), and their drop gives the borrow back.
 use super::*;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The associated fns `Rc::downgrade`, `Rc::ptr_eq`, `Weak::new`,
     /// `Weak::ptr_eq`, `RefCell::new`, and `Cell::new`. None when
     /// `ty_name::item` is none of these (the caller goes on); a known

@@ -21,8 +21,8 @@ struct LoopInfo {
     is_block: bool,
 }
 
-struct Lower<'p, 'a> {
-    p: &'p Program<'a>,
+struct Lower<'p> {
+    p: &'p Program,
     ck: Checked<'p>,
     body: Body<'p>,
     cur: Bb,
@@ -102,7 +102,7 @@ struct Lower<'p, 'a> {
 }
 
 /// Lowers one checked function body to IR.
-pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
+pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
     if p.gx.closure_fns.contains_key(&fid) {
         return closure::lower_closure(p, fid, ck);
     }
@@ -175,9 +175,9 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     // of the arguments they did not move drop with the locals
     // above, as in a destructuring `let`.
     {
-        let skip = usize::from(f.def.self_param.is_some());
+        let skip = usize::from(f.def(&p.ast).self_param.is_some());
         let param_pats: Vec<(ast::PatId, Local)> = f
-            .def
+            .def(&p.ast)
             .params
             .iter()
             .zip(lw.ck.param_locals.iter().skip(skip))
@@ -190,7 +190,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     // A declaration shape (a trait method with no body) lowers to an
     // empty return so this can never panic; cgen refuses to generate
     // it or any call to it (`cgen::has_generated_body`).
-    let (span, body) = match f.def.body {
+    let (span, body) = match f.def(&p.ast).body {
         Some(b) => (p.ast.block(b).span, Some(b)),
         None => (Span::default(), None),
     };
@@ -204,7 +204,7 @@ pub fn lower<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -
     lw.body
 }
 
-impl<'p, 'a> Lower<'p, 'a> {
+impl<'p> Lower<'p> {
     // ---------- Building blocks ----------
 
     fn new_local(&mut self, ty: Ty, mutable: bool, name: Option<String>) -> Local {
@@ -4705,7 +4705,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     TyKind::Tuple(ts) => self.body.tys.tys_of(ts).len(),
                     _ => elems.len(),
                 };
-                if let Some(mapped) = crate::check::map_tuple_elems(p.ast, elems, n) {
+                if let Some(mapped) = crate::check::map_tuple_elems(&p.ast, elems, n) {
                     for (i, sub) in mapped {
                         self.bind_pat_guard(sub, place.project(Proj::Field(i as u32)), bound);
                     }
@@ -5109,7 +5109,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     TyKind::Tuple(ts) => self.body.tys.tys_of(ts).len(),
                     _ => elems.len(),
                 };
-                if let Some(mapped) = crate::check::map_tuple_elems(p.ast, elems, n) {
+                if let Some(mapped) = crate::check::map_tuple_elems(&p.ast, elems, n) {
                     for (i, sub) in mapped {
                         self.test_pat(sub, place.project(Proj::Field(i as u32)), fail);
                     }
@@ -5130,7 +5130,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         match p.ast.pat(pat) {
             Pat::TupleStruct { elems, .. } => {
                 let n = p.adt(a).variants[v as usize].fields.len();
-                crate::check::map_tuple_elems(p.ast, elems, n).unwrap_or_default().into_iter().map(|(i, s)| (i as u32, s)).collect()
+                crate::check::map_tuple_elems(&p.ast, elems, n).unwrap_or_default().into_iter().map(|(i, s)| (i as u32, s)).collect()
             }
             Pat::Struct { fields, .. } => {
                 let vf = &p.adt(a).variants[v as usize].fields;
@@ -5251,7 +5251,7 @@ impl<'p, 'a> Lower<'p, 'a> {
                     TyKind::Tuple(ts) => self.body.tys.tys_of(ts).len(),
                     _ => elems.len(),
                 };
-                if let Some(mapped) = crate::check::map_tuple_elems(p.ast, elems, n) {
+                if let Some(mapped) = crate::check::map_tuple_elems(&p.ast, elems, n) {
                     for (i, sub) in mapped {
                         self.bind_pat(sub, place.project(Proj::Field(i as u32)));
                     }
@@ -5880,12 +5880,12 @@ mod tests {
             .stack_size(crate::pool::STACK_SIZE)
             .spawn(move || {
                 let src = format!("fn main() {{ println!(\"{{}}\", 5i64{}); }}\n", ".abs()".repeat(links));
-                let interner = Interner::default();
-                let known = Known::new(&interner);
+                let interner = std::sync::Arc::new(Interner::default());
+                let known = std::sync::Arc::new(Known::new(&interner));
                 let lexed = lexer::lex(&src, FileId(0), 0, &interner).unwrap();
                 let ast = parser::parse(&lexed, &interner, &known).unwrap();
                 let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-                let program = crate::check::collect::collect(&ast, &interner, &known, ids).unwrap();
+                let program = crate::check::collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
                 let main = program.main.unwrap();
                 let (ck, errs) = crate::check::check_fn(&program, main);
                 assert!(errs.is_empty(), "{errs:?}");

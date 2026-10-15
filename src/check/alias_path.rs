@@ -7,7 +7,7 @@
 // must agree with the builtin's signature, as one check for all of them.
 use super::*;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The type an alias on a value path's type segment names: a plain
     /// alias's type (`type V4 = Vec<u8>`), or a generic alias's body
     /// under the segment's type args (fresh variables when none are
@@ -64,7 +64,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let t = match (written.get(i), default) {
                 (Some(&w), _) => self.resolve_written(w),
                 _ if written.is_empty() => self.new_var(false),
-                (None, Some(d)) => generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, d, &body).ok()?,
+                (None, Some(d)) => generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, d, &body).ok()?,
                 (None, None) => {
                     self.err(
                         "L0107",
@@ -77,7 +77,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             };
             body.param_tys.push((name, t));
         }
-        generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, la.ty, &body).ok()
+        generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, la.ty, &body).ok()
     }
 
     /// The builtin type a two-segment value path's alias names
@@ -122,7 +122,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// `str`): the primitive's own path, which the primitive items and
     /// trait calls match by name. None for other paths.
     pub(super) fn primitive_alias_segs(&mut self, segs: &[ast::PathSeg], span: Span) -> Option<Vec<ast::PathSeg>> {
-        let k = self.p.known;
+        let k = &*self.p.known;
         if segs.len() != 2 || k.int_ty(segs[0].name).is_some() {
             return None;
         }
@@ -157,7 +157,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             _ => return None,
         };
         let t = self.builtin_alias_ty(path, span, true)?;
-        let (k, item) = (p.known, path.get(1)?.name);
+        let (k, item) = (&p.known, path.get(1)?.name);
         let found = match (self.tys.builtin_of(t)?, elems) {
             (BuiltinTy::Option, Some(1)) if item == k.Some => (true, true),
             (BuiltinTy::Option, None) if item == k.None => (true, false),
@@ -219,7 +219,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let scope = self.body_scope.clone();
-        let t = generics::resolve_path_ty(p.ast, p.interner, p.known, &cx, &mut self.tys, &scope, &segs[..n - 1], span).ok()?;
+        let t = generics::resolve_path_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, &scope, &segs[..n - 1], span).ok()?;
         builtin_std_path(&self.tys, t).is_some().then_some(t)
     }
 
@@ -287,7 +287,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let scope = self.body_scope.clone();
-        match generics::resolve_path_ty(p.ast, p.interner, p.known, &cx, &mut self.tys, &scope, &segs[..n - 1], span) {
+        match generics::resolve_path_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, &scope, &segs[..n - 1], span) {
             Ok(t) => Some(self.instantiate_infers(t)),
             Err(d) => {
                 self.errs.push(d);

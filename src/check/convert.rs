@@ -160,7 +160,7 @@ enum Conv {
     BorrowMut,
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// True when a lang trait is in scope by the std `use` rule, or as
     /// the trait of the impl this body is in.
     fn lang_trait_imported(&self, trait_def: DefId, module: &str, name: &str) -> bool {

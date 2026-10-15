@@ -97,8 +97,8 @@ struct CheckedFile {
     /// The source with `#[lust_lang]` lines blanked (same byte length,
     /// so spans into this text stay exact).
     clean: String,
-    interner: Interner,
-    ast: Ast,
+    interner: std::sync::Arc<Interner>,
+    ast: std::sync::Arc<Ast>,
 }
 
 /// What a session needs from one std load. Most compiles only need
@@ -545,11 +545,12 @@ fn check_file(file: &SourceFile, text: &str, validate: bool) -> Result<(CheckedF
     if is_lang_method_file(file.krate, file.module) {
         ast.lang_methods = (0, clean.len() as u32);
     }
+    let (ast, interner) = (std::sync::Arc::new(ast), std::sync::Arc::new(interner));
     if !validate {
         return Ok((CheckedFile { krate: file.krate, module: file.module, rel: file.rel, clean, interner, ast }, marks));
     }
     let ids = CrateIds { local: LOCAL_CRATE, stable: file.krate.stable_hash() };
-    let mut program = collect::collect(&ast, &interner, &known, ids)
+    let mut program = collect::collect(ast.clone(), interner.clone(), std::sync::Arc::new(known), ids)
         .map_err(|ds| format!("lust std load failed: {}", ds.iter().map(|d| diag_line(file.rel, d)).collect::<Vec<_>>().join("; ")))?;
     // Collect ran mono: templates were checked (and borrow-checked)
     // against their param envs there, as in the driver, except the lang
@@ -712,8 +713,8 @@ fn resolve_lang_items(files: &[CheckedFile], marks: &[(usize, String, u32)]) -> 
             ));
         };
         let ids = CrateIds { local: LOCAL_CRATE, stable: file.krate.stable_hash() };
-        let known = Known::new(&file.interner);
-        let program = collect::collect(&file.ast, &file.interner, &known, ids)
+        let known = std::sync::Arc::new(Known::new(&file.interner));
+        let program = collect::collect(file.ast.clone(), file.interner.clone(), known, ids)
             .map_err(|ds| format!("lust std load failed: {}", ds.iter().map(|d| diag_line(file.rel, d)).collect::<Vec<_>>().join("; ")))?;
         let def = match &found.kind {
             ItemKind::Fn(_) => program.fn_names.get(&item_name).map(|&f| program.def_id(f)),

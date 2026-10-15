@@ -146,15 +146,15 @@ fn field_tys(p: &Program, id: AdtId) -> Vec<Ty> {
 /// One walk of a field type: the params it uses under the current
 /// `used` tables of the other Adts. With empty tables it lists every
 /// param that occurs at all (the "only used recursively" test).
-struct Mark<'x, 'p> {
-    p: &'x Program<'p>,
+struct Mark<'x> {
+    p: &'x Program,
     slot: &'x crate::intern::FxMap<AdtId, usize>,
     used: &'x [Used],
     tys: Vec<u32>,
     lts: Vec<u32>,
 }
 
-impl Mark<'_, '_> {
+impl Mark<'_> {
     fn region(&mut self, r: Region) {
         if let Region::Param(i) = r {
             self.lts.push(i);

@@ -14,7 +14,7 @@
 // binding in the env).
 use super::*;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// Substitutes generic args into one signature or field type and
     /// normalizes it at this use (`normalize_use`).
     pub(super) fn subst_norm(&mut self, t: Ty, args: &[GenericArg], span: Span) -> Ty {

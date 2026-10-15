@@ -52,7 +52,7 @@ pub fn mentions_local_adt(tys: &impl TyIntern, t: Ty) -> bool {
 /// the probe tries them: Display, Debug.
 const FMT_TRAITS: [FmtKind; 2] = [FmtKind::Display, FmtKind::Debug];
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// `fmt::Result`.
     pub(super) fn fmt_result_ty(&mut self) -> Ty {
         generics::fmt_result_ty(&mut self.tys)
@@ -485,7 +485,7 @@ pub fn check_fmt_impl(p: &mut Program, imp: &ast::ImplDef, tr: TraitRef, self_pa
     if !ok {
         errs.push(Diag::new(
             "L0110",
-            info.def.name_span,
+            info.def(&p.ast).name_span,
             "method `fmt` has an incompatible type for the trait",
             "Write `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result`.",
         ));

@@ -28,7 +28,7 @@ pub(super) enum UnwindCheck {
     PanicAny(Ty, Span),
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// `Box<dyn Any + Send>`: the payload type of `catch_unwind`'s `Err`
     /// and of `resume_unwind`.
     pub(super) fn box_any_send(&mut self) -> Ty {

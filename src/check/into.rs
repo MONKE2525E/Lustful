@@ -11,7 +11,7 @@
 // expected type; with neither the call stays unresolved (rustc E0282).
 use super::*;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// `into()` to a target std converts the receiver to without a
     /// user body. None when the call is not one of these.
     pub(super) fn builtin_into_method(

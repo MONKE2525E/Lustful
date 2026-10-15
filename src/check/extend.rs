@@ -7,7 +7,7 @@
 // exact reserve and push sequence. Maps and sets: check/hashmap.rs.
 use super::*;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// `extend` on a Vec or String receiver, or None for other receivers.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn seq_extend(

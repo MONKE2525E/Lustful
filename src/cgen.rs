@@ -794,8 +794,8 @@ pub struct FnOut {
     pub error: Option<String>,
 }
 
-struct FnGen<'b, 'p, 'a> {
-    p: &'p Program<'a>,
+struct FnGen<'b, 'p> {
+    p: &'p Program,
     body: &'b Body<'p>,
     out: String,
     glue: HashSet<(Glue, CTy)>,
@@ -1364,7 +1364,7 @@ fn param_dropped(p: &Program, t: &CTy) -> bool {
 fn has_generated_body(p: &Program, f: LocalDefId) -> bool {
     use crate::check::generics::FnClass;
     let concrete = matches!(p.gx.fn_class.get(f.0 as usize), None | Some(FnClass::Plain | FnClass::Instance | FnClass::Closure));
-    concrete && p.fn_info(f).def.body.is_some()
+    concrete && p.fn_def(f).body.is_some()
 }
 
 /// The driver-facing message for `FnGen::bad_callee`: `f` (the body
@@ -1609,7 +1609,7 @@ fn index_spans(body: &Body) -> Vec<Option<Span>> {
     out
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// The packed panic location of index local `l`, else `loc`.
     fn index_loc(&self, l: Local, loc: &str) -> String {
         match self.index_spans.get(l as usize).copied().flatten() {
@@ -6059,7 +6059,7 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
         .iter()
         .position(|f| {
             p.interner.get(f.name).ends_with("__lust_run_hook")
-                && p.std_source_span(f.def.name_span)
+                && p.std_source_span(f.def(&p.ast).name_span)
                 && p.display_path(f.name) == "std::panic::__lust_run_hook"
         })
         .map(|i| slot_of(LocalDefId(i as u32)));
@@ -8141,12 +8141,12 @@ mod tests {
     #[test]
     fn float_and_fnptr_ir_runs() {
         let src = "fn add1(x: i64) -> i64 { x + 1 }\nfn main() { println!(\"{}\", add1(41)); }\n";
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         let mut map = SourceMap::default();
         map.add_file("test.rs", src);
         let main = program.main.unwrap();
@@ -8200,12 +8200,12 @@ mod tests {
     #[test]
     fn bad_move_path_is_an_error_not_a_panic() {
         let src = "fn main() { println!(\"hi\"); }\n";
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         let mut map = SourceMap::default();
         map.add_file("test.rs", src);
         let main = program.main.unwrap();
@@ -8245,12 +8245,12 @@ mod tests {
     fn call_to_fn_without_body_is_an_error() {
         let src = "trait Tr { fn go(&self) -> i32; fn dflt(&self) -> i32 { 100 } }\nstruct A;\n\
                    impl Tr for A { fn go(&self) -> i32 { 1 } }\nfn main() { println!(\"{}\", A.go()); }\n";
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         let mut map = SourceMap::default();
         map.add_file("test.rs", src);
         let main = program.main.unwrap();
@@ -8297,12 +8297,12 @@ mod tests {
     #[test]
     fn glue_refresh_regenerates_on_field_type_edit() {
         fn with_program<R>(src: &str, f: impl FnOnce(&Interner, &crate::check::collect::Program) -> R) -> R {
-            let interner = Interner::default();
-            let known = Known::new(&interner);
+            let interner = std::sync::Arc::new(Interner::default());
+            let known = std::sync::Arc::new(Known::new(&interner));
             let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
             let ast = parser::parse(&lexed, &interner, &known).unwrap();
             let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
             f(&interner, &program)
         }
         let v1 = "#[derive(Debug)]\nstruct S { b: u8 }\nfn main() { let s = S { b: 0 }; println!(\"{:?}\", s); }\n";
@@ -8451,7 +8451,7 @@ fn tls_glue(p: &Program, g: &Glue, c: &CTy, protos: &mut String, defs: &mut Stri
     );
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// `TlsAccess(key, init) -> &T`, `TlsTryAccess(key, init) ->
     /// Option<&T>`, and `TlsInitWith(key, value) -> Option<T>`
     /// (lower/tls.rs), over the runtime's per-thread cells. The common

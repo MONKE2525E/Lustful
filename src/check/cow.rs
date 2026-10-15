@@ -46,7 +46,7 @@ const COW_OWN: &[&str] = &[
     "type_id",
 ];
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// A method on a `Cow<B>` receiver, or None for other receivers and
     /// names (the other dispatch then runs).
     #[allow(clippy::too_many_arguments)]

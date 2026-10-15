@@ -194,7 +194,7 @@ fn is_downcast_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     b.principal.is_some_and(|pr| pr.value.def == p.gx.lang.any) && !b.auto.unpin && (b.auto.send || !b.auto.sync)
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The `core::any` methods (see the file comment). None when the call
     /// is not one of them, or when a user method of the name could apply
     /// (then the ordinary probes answer).
@@ -466,7 +466,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
             return true;
         }
-        let named = written.is_some_and(|w| generics::names_lifetime(p.ast, p.interner, w));
+        let named = written.is_some_and(|w| generics::names_lifetime(&p.ast, &p.interner, w));
         if named || (!refs_ok && contains_ref(&self.tys, t)) {
             let tn = self.tn(t);
             self.err(

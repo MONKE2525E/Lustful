@@ -144,12 +144,12 @@ mod tests {
 
     /// Checks main of one sample file: (queue work count, error codes).
     fn check_main(src: &str) -> (usize, Vec<&'static str>) {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         let (ck, errs) = check::check_fn(&program, program.main.unwrap());
         (ck.queue_work, errs.iter().map(|d| d.code).collect())
     }

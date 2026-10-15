@@ -26,7 +26,7 @@ impl Unw {
     }
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// `catch_unwind(f)` (lowered with no cleanup successor, lower/unwind.rs):
     /// calls `f`; under panic=unwind a panic in it comes back here and
     /// becomes `Err(payload)`, with `f`'s value dropped as `call_once`

@@ -188,7 +188,7 @@ impl GenReuse {
         calls: &[(ExprId, ClosureKind)],
         shapes: &[(ExprId, ClosureKind, Vec<CaptureShape>)],
     ) {
-        let lo = p.fn_info(t).def.exprs.0;
+        let lo = p.fn_def(t).exprs.0;
         let off = |e: ExprId| e.0.wrapping_sub(lo);
         let mut picks: Vec<(u32, u64, u8, u8, Option<u32>)> = picks
             .iter()
@@ -280,7 +280,7 @@ impl GenReuse {
             return None;
         }
         let src = self.src_of(p, t)?;
-        let (lo, hi) = p.fn_info(t).def.exprs;
+        let (lo, hi) = p.fn_def(t).exprs;
         let e = self.templates.get_mut(&p.def_id(t))?;
         if e.src != src || e.n_exprs != hi - lo || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
             return None;
@@ -299,7 +299,7 @@ impl GenReuse {
             return;
         }
         let Some(src) = self.src_of(p, t) else { return };
-        let (lo, hi) = p.fn_info(t).def.exprs;
+        let (lo, hi) = p.fn_def(t).exprs;
         let inside = |e: ExprId| e.0 >= lo && e.0 < hi;
         if !picks.iter().all(|(e, _)| inside(*e)) || !calls.iter().all(|(e, _)| inside(*e)) {
             return;
@@ -385,7 +385,7 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> u64 {
             ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(user_trait) => continue,
             ItemKind::Impl(imp) if plain_inherent(imp) => continue,
             ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Type(_) | ItemKind::Const(_) => {
-                (0u8, crate::driver::ast_hash::item_hash(p.ast, item)).hash(&mut h);
+                (0u8, crate::driver::ast_hash::item_hash(&p.ast, item)).hash(&mut h);
                 continue;
             }
             ItemKind::Struct(s) => (s.name, &s.derives),

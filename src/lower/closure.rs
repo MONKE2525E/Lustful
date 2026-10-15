@@ -37,7 +37,7 @@ impl Upvars {
 
 /// Lowers a closure body fn (`fid` is registered in `p.gx.closure_fns`)
 /// from its parent's checked body.
-pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
+pub fn lower_closure<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
     let f = p.fn_info(fid);
     let def = p.gx.closure_fns[&fid];
     let tys = lift_to_owned(std::mem::replace(&mut ck.tys, Tys::new(&p.tys)));
@@ -156,7 +156,7 @@ pub fn lower_closure<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId, mut ck: Checke
     lw.body
 }
 
-impl<'p, 'a> Lower<'p, 'a> {
+impl<'p> Lower<'p> {
     /// The closure value of one closure expression: a tuple of its
     /// captures, borrowed or moved per capture mode.
     pub(super) fn closure_value(&mut self, e: ExprId, dest: Option<&Place>, span: Span) {

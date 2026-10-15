@@ -652,7 +652,7 @@ pub(super) fn iter_drop_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &C
     body
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// One HashMap, HashSet, or Entry builtin call (check/hashmap.rs) as
     /// hashbrown runs it, or None for every other builtin. `dest` is the
     /// call's result type, which the constructors build.

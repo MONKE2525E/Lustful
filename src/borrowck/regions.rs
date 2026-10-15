@@ -644,14 +644,14 @@ fn drops_guard(tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 /// Type facts the region walks need, over one type store.
-pub(super) struct SlotCx<'t, 'p, 'a, T: TyIntern> {
+pub(super) struct SlotCx<'t, 'p, T: TyIntern> {
     pub tys: &'t T,
-    pub p: &'p Program<'a>,
+    pub p: &'p Program,
     memo: FxMap<Ty, u32>,
 }
 
-impl<'t, 'p, 'a, T: TyIntern> SlotCx<'t, 'p, 'a, T> {
-    pub fn new(tys: &'t T, p: &'p Program<'a>) -> Self {
+impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
+    pub fn new(tys: &'t T, p: &'p Program) -> Self {
         SlotCx { tys, p, memo: FxMap::default() }
     }
 
@@ -1063,7 +1063,7 @@ impl FnSides {
         FnSides { item, early: FxMap::default(), n: 0 }
     }
 
-    fn side(&mut self, b: &mut Builder<'_, '_, '_>, r: Region, out: bool) -> Side {
+    fn side(&mut self, b: &mut Builder<'_, '_>, r: Region, out: bool) -> Side {
         match (r, &self.item) {
             (Region::Static, _) => Side::Tie(0),
             (Region::Param(k), None) => Side::Tie(k + 1),
@@ -1156,7 +1156,7 @@ impl OwnSig {
     /// any; `closure` marks a closure body (env first). Slots `sig` cannot
     /// pair with the erased local types get fresh, unrelated universals:
     /// conservative inside the body, and callers use the same signature.
-    pub fn build<'p, 'a>(p: &'p Program<'a>, body: &Body<'p>, sig: Option<&RegionSig>, closure: bool, check: bool) -> OwnSig {
+    pub fn build<'p>(p: &'p Program, body: &Body<'p>, sig: Option<&RegionSig>, closure: bool, check: bool) -> OwnSig {
         let mut sc = SlotCx::new(&body.tys, p);
         let mut own = OwnSig { n_univ: 0, slots: Vec::new(), facts: Vec::new(), names: vec!["'static".into()], check, closure, ends: Vec::new() };
         if closure {
@@ -1226,7 +1226,14 @@ impl OwnSig {
 
     /// Pairs regioned signature type `r` with erased local type `e`, pushing
     /// the universal of each slot. False when the shapes differ.
-    fn pair<T: TyIntern>(&mut self, sc: &mut SlotCx<'_, '_, '_, T>, r: Ty, e: Ty, binds: &mut FxMap<u32, Vec<Univ>>, out: &mut Vec<Univ>) -> bool {
+    fn pair<T: TyIntern>(
+        &mut self,
+        sc: &mut SlotCx<'_, '_, T>,
+        r: Ty,
+        e: Ty,
+        binds: &mut FxMap<u32, Vec<Univ>>,
+        out: &mut Vec<Univ>,
+    ) -> bool {
         let tys = sc.tys;
         match (tys.kind(r), tys.kind(e)) {
             (TyKind::Param(j), _) => {
@@ -1320,7 +1327,7 @@ impl OwnSig {
     /// slots, the free argument slots, and `'static` are not errors here:
     /// the creator adds what the body needs of them (`ends`,
     /// `closure_requirements`). Higher-ranked argument slots take no part.
-    fn closure_sig<T: TyIntern>(&mut self, p: &Program, body: &Body, sc: &mut SlotCx<'_, '_, '_, T>) {
+    fn closure_sig<T: TyIntern>(&mut self, p: &Program, body: &Body, sc: &mut SlotCx<'_, '_, T>) {
         let free = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d)).and_then(|c| c.free_args.clone());
         let fresh = |own: &mut OwnSig, name: &str| -> Univ {
             own.n_univ += 1;
@@ -1481,7 +1488,7 @@ impl OwnSig {
     /// Adds the implied bounds of the parameter and return types (rustc's
     /// implied outlives bounds): `&'a T` gives `T: 'a`, so every region
     /// inside a reference outlives the reference's own region.
-    fn implied<T: TyIntern>(&mut self, sc: &mut SlotCx<'_, '_, '_, T>, body: &Body) {
+    fn implied<T: TyIntern>(&mut self, sc: &mut SlotCx<'_, '_, T>, body: &Body) {
         for l in 0..=body.arg_count.min(self.slots.len().saturating_sub(1)) {
             let t = body.locals[l].ty;
             let us = self.slots[l].clone();
@@ -1530,7 +1537,7 @@ impl OwnSig {
 /// outlive any sink and its output; the creator adds what the body needs
 /// of that (`closure_reqs`), or every source-to-sink edge when the body
 /// does not solve, and a call's result holds what the body returns.
-pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, args: ArgsId, out: &mut Vec<(bool, bool)>) {
+pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, T>, args: ArgsId, out: &mut Vec<(bool, bool)>) {
     for f in closure_fields(sc.tys, args) {
         match sc.tys.kind(f) {
             TyKind::Ref(_, m, inner) => {
@@ -1557,7 +1564,12 @@ pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, args: A
 /// arguments are items: free, except the outer reference of an `&item`
 /// argument; every free slot is a source, and one behind a `&mut` is a
 /// sink too. Without it every argument region is higher-ranked.
-pub(super) fn closure_arg_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, inputs: &[Ty], free: Option<&[bool]>, out: &mut Vec<Option<(bool, bool)>>) {
+pub(super) fn closure_arg_roles<T: TyIntern>(
+    sc: &mut SlotCx<'_, '_, T>,
+    inputs: &[Ty],
+    free: Option<&[bool]>,
+    out: &mut Vec<Option<(bool, bool)>>,
+) {
     for (i, &t) in inputs.iter().enumerate() {
         let Some(flags) = free else {
             let n = sc.slots(t) as usize;
@@ -1582,7 +1594,7 @@ pub(super) fn closure_arg_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, inp
 /// is higher-ranked. `Err` when an annotated type does not pair with the
 /// argument's erased type.
 pub(super) fn closure_arg_slots<T: TyIntern>(
-    sc: &mut SlotCx<'_, '_, '_, T>,
+    sc: &mut SlotCx<'_, '_, T>,
     c: &crate::check::generics::ClosureEntry,
 ) -> Result<Vec<(Option<(bool, bool)>, Option<Region>)>, ()> {
     let mut roles = Vec::new();
@@ -1642,7 +1654,7 @@ fn names_region(tys: &impl TyIntern, r: Ty) -> bool {
 /// The region a regioned type `r` gives each slot of erased type `e`, in
 /// slot order (`Erased` where `r` names none). False when they differ in
 /// shape.
-fn regioned_slots<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, r: Ty, e: Ty, out: &mut Vec<Region>) -> bool {
+fn regioned_slots<T: TyIntern>(sc: &mut SlotCx<'_, '_, T>, r: Ty, e: Ty, out: &mut Vec<Region>) -> bool {
     let tys = sc.tys;
     match (tys.kind(r), tys.kind(e)) {
         (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
@@ -1684,7 +1696,7 @@ fn regioned_slots<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, r: Ty, e: Ty, out
     }
 }
 
-fn arg_slot_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, under_mut: bool, out: &mut Vec<Option<(bool, bool)>>) {
+fn arg_slot_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, T>, t: Ty, under_mut: bool, out: &mut Vec<Option<(bool, bool)>>) {
     match sc.tys.kind(t) {
         TyKind::Ref(_, m, inner) => {
             out.push(Some((true, under_mut)));
@@ -1714,7 +1726,14 @@ fn arg_slot_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, under_mut:
 
 /// Walks erased type `t` with slot universals `us` from `*at`, pushing a
 /// fact `inner: outer` for every slot inside each enclosing reference.
-fn implied_walk<T: TyIntern>(sc: &mut SlotCx<'_, '_, '_, T>, t: Ty, us: &[Univ], at: &mut usize, outer: &mut Vec<Univ>, facts: &mut Vec<(Univ, Univ)>) {
+fn implied_walk<T: TyIntern>(
+    sc: &mut SlotCx<'_, '_, T>,
+    t: Ty,
+    us: &[Univ],
+    at: &mut usize,
+    outer: &mut Vec<Univ>,
+    facts: &mut Vec<(Univ, Univ)>,
+) {
     let each = |u: Univ, facts: &mut Vec<(Univ, Univ)>, outer: &Vec<Univ>| {
         for &o in outer {
             facts.push((u, o));
@@ -1815,10 +1834,10 @@ impl Solution {
 }
 
 /// Builds the region constraints of one body and solves them.
-pub(super) struct Builder<'b, 'p, 'a> {
-    p: &'p Program<'a>,
+pub(super) struct Builder<'b, 'p> {
+    p: &'p Program,
     body: &'b Body<'p>,
-    sc: SlotCx<'b, 'p, 'a, Tys<'p>>,
+    sc: SlotCx<'b, 'p, Tys<'p>>,
     own: OwnSig,
     local_base: Vec<u32>,
     /// Per var: owning local + 1, or 0.
@@ -1869,8 +1888,8 @@ pub(super) struct Builder<'b, 'p, 'a> {
     cap_var: FxMap<Local, u32>,
 }
 
-impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
-    pub fn new(p: &'p Program<'a>, body: &'b Body<'p>, own: OwnSig, n_loans: usize, loan_at: &'b [u32], stmt_base: &'b [usize]) -> Self {
+impl<'b, 'p> Builder<'b, 'p> {
+    pub fn new(p: &'p Program, body: &'b Body<'p>, own: OwnSig, n_loans: usize, loan_at: &'b [u32], stmt_base: &'b [usize]) -> Self {
         let mut b = Builder {
             p,
             body,
@@ -2299,7 +2318,7 @@ enum Callee<'s> {
     Opaque,
 }
 
-impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
+impl<'b, 'p> Builder<'b, 'p> {
     /// The region of each slot of erased type `e` under its regioned
     /// annotation `r` (`Erased` where the annotation left it free). False
     /// when the two shapes differ.
@@ -2401,7 +2420,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             if !ok {
                 self.errs.push(Diag::new(
                     "L0203",
-                    self.p.fn_info(self.body.fn_id).def.name_span,
+                    self.p.fn_def(self.body.fn_id).name_span,
                     "an explicit lifetime in a `let` annotation here is not supported yet",
                     "Drop the lifetime from the annotation, or write `'_`.",
                 ));
@@ -2414,7 +2433,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                         let _ = k;
                         self.errs.push(Diag::new(
                             "L0203",
-                            self.p.fn_info(self.body.fn_id).def.name_span,
+                            self.p.fn_def(self.body.fn_id).name_span,
                             "a named lifetime in a `let` annotation inside a closure is not supported yet",
                             "Drop the lifetime from the annotation, or write `'_`.",
                         ));
@@ -6091,7 +6110,7 @@ fn has_mut_ref(tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
-impl Builder<'_, '_, '_> {
+impl Builder<'_, '_> {
     /// Solves the constraints: strongly connected components of the
     /// outlives graph, then per component (sinks first) the locals,
     /// drop-live locals, and universals it reaches.
@@ -6253,7 +6272,7 @@ impl Builder<'_, '_, '_> {
             }
             v = u;
         }
-        if best == Span::default() { self.p.fn_info(self.body.fn_id).def.name_span } else { best }
+        if best == Span::default() { self.p.fn_def(self.body.fn_id).name_span } else { best }
     }
 }
 
@@ -6414,7 +6433,7 @@ pub(super) fn impl_contract(p: &Program, f: LocalDefId) -> Option<Diag> {
             if q != pl && seen[q] && !known[pl * w + q] {
                 return Some(Diag::new(
                     "L0734",
-                    info.def.name_span,
+                    info.def(&p.ast).name_span,
                     format!("lifetime mismatch: method `{}` does not fit the lifetimes of the trait's signature", p.display_name(info.name)),
                     "Match the trait method's signature: return at least what it promises, and take at least what it accepts.",
                 ));
@@ -6425,8 +6444,8 @@ pub(super) fn impl_contract(p: &Program, f: LocalDefId) -> Option<Diag> {
 }
 
 /// The edge walk of `impl_contract` over two regioned types.
-struct Contract<'p, 'a> {
-    p: &'p Program<'a>,
+struct Contract<'p> {
+    p: &'p Program,
     /// Trait universal count: node 0 is `'static`, `1..=nt` the trait's,
     /// the impl's after them.
     nt: usize,
@@ -6435,7 +6454,7 @@ struct Contract<'p, 'a> {
     edges: Vec<(usize, usize)>,
 }
 
-impl Contract<'_, '_> {
+impl Contract<'_> {
     /// The node of region `r` on the trait side or the impl side.
     fn node(&self, r: Region, trait_side: bool) -> Option<usize> {
         match r {

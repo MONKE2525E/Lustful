@@ -382,7 +382,7 @@ fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &[u32], this: &str
     })
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// True for an unsized format argument (`str`, `[T]`, or an unsized
     /// newtype such as `Path`): it arrives as its fat value, and the
     /// formatters take a pointer to it.
@@ -467,7 +467,7 @@ pub(super) fn estimated_capacity(parts: &[FmtPart]) -> usize {
     }
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// Emits the formatting of `parts` into a new String temp (with
     /// Rust's capacity for `format!`) and returns the temp's name. A
     /// fmt impl error panics with the message of `what` (see
@@ -580,7 +580,7 @@ fn signed_digits(i: IntTy) -> u32 {
     }
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// `ToString::to_string` of the value `v` points at (Self type `t`),
     /// with Rust 1.99's capacity rules: signed integers preallocate
     /// their widest decimal form, unsigned integers, `char`, `bool`,
@@ -640,7 +640,7 @@ fn fmt_result_cty(p: &Program) -> CTy {
     CTy::Result(Box::new(CTy::Unit), Box::new(e))
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// The `fmt::Result` value of a runtime result int.
     fn fmt_result_of(&mut self, e: &str) -> String {
         let t = fmt_result_cty(self.p);

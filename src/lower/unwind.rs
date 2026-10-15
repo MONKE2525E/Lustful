@@ -11,7 +11,7 @@
 use super::*;
 use crate::check::sync::SyncOp;
 
-impl<'p, 'a> Lower<'p, 'a> {
+impl<'p> Lower<'p> {
     /// Lowers one `std::panic` builtin call with lowered arguments `ops`.
     pub(super) fn unwind_call(&mut self, op: SyncOp, args: &[ExprId], mut ops: Vec<Operand>, dest: Option<&Place>, ty: Ty, span: Span) {
         let target = CallTarget::Builtin(Builtin::Sync(op));

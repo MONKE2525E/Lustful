@@ -4,7 +4,7 @@
 // keeps as a `uint8_t`; `main` may return it (collect.rs).
 use super::*;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// True when `segs` is `ExitCode::item`: the bare type name when
     /// no user type takes it, or the canonical std path.
     fn exit_code_path(&self, segs: &[ast::PathSeg]) -> bool {

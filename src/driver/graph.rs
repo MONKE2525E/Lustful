@@ -1123,13 +1123,13 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         // names and patterns are not: they bind only the body's own
         // locals, and the driver guards those with its per-slot head
         // hash, so a param rename reuses callers.
-        (f.def.qual.is_const, f.def.qual.is_async, f.def.qual.is_unsafe, f.def.variadic).hash(&mut h);
+        (f.def(&p.ast).qual.is_const, f.def(&p.ast).qual.is_async, f.def(&p.ast).qual.is_unsafe, f.def(&p.ast).variadic).hash(&mut h);
         // The written visibility and the defining module: a caller of an
         // `impl dyn Tr` method checks access against them at the call
         // (`Ctx::check_dyn_method_vis`). Methods have no `def_info`
         // entry, so `hash_vis_facts` does not cover them.
         if let Some(t) = &p.resolved {
-            hash_vis(&mut h, p, &crate::resolve::imports::vis_from_ast(&f.def.vis, p.interner));
+            hash_vis(&mut h, p, &crate::resolve::imports::vis_from_ast(&f.def(&p.ast).vis, &p.interner));
             if let Some(&m) = t.fn_module.get(local.0 as usize) {
                 hash_module_path(&mut h, p, t, m);
             }
@@ -1289,14 +1289,14 @@ pub(crate) fn statics_fingerprint(p: &Program) -> u64 {
 /// only door to them that records a read. Other defs answer with their
 /// `Defs` record until their payloads land.
 #[allow(dead_code)] // The `Other` payload is read when non-fn/Adt payloads land.
-pub enum SigOf<'p, 'a> {
-    Fn(&'p FnInfo<'a>),
+pub enum SigOf<'p> {
+    Fn(&'p FnInfo),
     Adt(&'p AdtDef),
     Other(&'p DefData),
     Missing,
 }
 
-impl<'a> Program<'a> {
+impl<'a> Program {
     /// Resolves one module name in one namespace and records the `Binding`
     /// read. This is the frozen binding query wave A codes against: callers
     /// get a `DefId` and turn it into a session-local index through
@@ -1468,7 +1468,7 @@ impl<'a> Program<'a> {
     /// One def's resolved signature. Callers that only need identity facts
     /// (kind, parent, generics, param env) use `Defs` queries, which read
     /// this same `Sig` node per section 2.1; `sig_of` is for the payload.
-    pub fn sig_of(&self, reads: &mut Reads, def: DefId) -> SigOf<'_, 'a> {
+    pub fn sig_of(&self, reads: &mut Reads, def: DefId) -> SigOf<'_> {
         let (out, failed) = if let Some(local) = self.local_def(def.hash).filter(|l| self.def_id(*l) == def) {
             (SigOf::Fn(self.fn_info(local)), false)
         } else if let Some(a) = self.adt_by_def(def) {
@@ -1657,7 +1657,7 @@ impl InstanceKeyHash {
     }
 }
 
-impl<'a> Program<'a> {
+impl<'a> Program {
     /// The instance key of one of today's non-generic functions.
     #[allow(dead_code)] // First caller is mono (wave B); the slot manifest tests use it now.
     pub fn instance_key(&self, f: LocalDefId) -> InstanceKey {
@@ -1911,12 +1911,12 @@ mod tests {
 
     /// Parses and collects one sample file, then runs `run` on the program.
     fn with_program(src: &str, run: impl FnOnce(&Interner, &mut Program)) {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let mut program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let mut program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         run(&interner, &mut program);
     }
 
@@ -2211,22 +2211,22 @@ fn main() {}
     /// dropped; reads hold only stable keys (`Sym` in the shared
     /// interner, path-hash `DefId`s), so they replay against the next
     /// program built on the same interner.
-    fn main_reads(interner: &Interner, known: &Known, src: &str) -> Reads {
+    fn main_reads(interner: &std::sync::Arc<Interner>, known: &std::sync::Arc<Known>, src: &str) -> Reads {
         let lexed = lexer::lex(src, FileId(0), 0, interner).unwrap();
         let ast = parser::parse(&lexed, interner, known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, interner, known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         let (ck, _) = check_fn(&program, program.main.unwrap());
         ck.reads
     }
 
     /// Dirty counts of `reads` replayed against a fresh collect of `src`
     /// on the same interner. See `main_reads`.
-    fn dirty_in(interner: &Interner, known: &Known, src: &str, reads: &Reads) -> usize {
+    fn dirty_in(interner: &std::sync::Arc<Interner>, known: &std::sync::Arc<Known>, src: &str, reads: &Reads) -> usize {
         let lexed = lexer::lex(src, FileId(0), 0, interner).unwrap();
         let ast = parser::parse(&lexed, interner, known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, interner, known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         program.reads_dirty(reads)
     }
 
@@ -2236,8 +2236,8 @@ fn main() {}
     /// read them (8.2 rule 3).
     #[test]
     fn dirty_walk_replays_reads_against_new_program() {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let reads = main_reads(&interner, &known, SAMPLE);
         // Same program: clean by construction.
         assert_eq!(dirty_in(&interner, &known, SAMPLE, &reads), 0, "unchanged program");
@@ -2268,8 +2268,8 @@ fn main() {}
     /// walk run in full mode (type edits), not only on signature text.
     #[test]
     fn dirty_walk_covers_type_edits_through_deep_sigs() {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let src = "\
 struct Inner { x: i64 }
 struct Outer { f: Inner }
@@ -2293,12 +2293,12 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
     #[test]
     fn layout_fingerprint_tracks_layout_not_methods() {
         fn layout_of_src(src: &str) -> Fingerprint {
-            let interner = Interner::default();
-            let known = Known::new(&interner);
+            let interner = std::sync::Arc::new(Interner::default());
+            let known = std::sync::Arc::new(Known::new(&interner));
             let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
             let ast = parser::parse(&lexed, &interner, &known).unwrap();
             let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
             let a = program.type_names[&interner.intern("Foo")];
             layout_fingerprint(&program, program.def_of_adt(a))
         }
@@ -2371,12 +2371,12 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
     #[test]
     fn const_sig_fingerprint_tracks_the_value() {
         fn const_fp(src: &str) -> Fingerprint {
-            let interner = Interner::default();
-            let known = Known::new(&interner);
+            let interner = std::sync::Arc::new(Interner::default());
+            let known = std::sync::Arc::new(Known::new(&interner));
             let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
             let ast = parser::parse(&lexed, &interner, &known).unwrap();
             let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
             let hash = crate::def::item_hash(ids.stable, &[], crate::def::DefKind::Const, "MAX", 0);
             sig_fingerprint(&program, DefId { krate: ids.local, hash })
         }
@@ -2393,8 +2393,8 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
     /// with no recorded read, so a warm daemon kept the old value.)
     #[test]
     fn pattern_const_read_dirties_on_value_edit() {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let src = "const K: i64 = 3;\nconst U: i64 = 9;\nfn main() { let x: i64 = 3; println!(\"{}\", match x { K => 1, _ => 0 }); }\n";
         let reads = main_reads(&interner, &known, src);
         assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
@@ -2411,8 +2411,8 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
     /// const fn bodies it evaluates (review B1, body-local half).
     #[test]
     fn const_block_call_records_checked_read() {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let src = "const fn k() -> i64 { 3 }\nfn main() { let x = const { k() }; println!(\"{}\", x); }\n";
         let reads = main_reads(&interner, &known, src);
         assert!(reads.keys().any(|k| matches!(k, ReadKey::Checked(_))), "a Checked read is recorded");
@@ -2424,8 +2424,8 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
     /// written type's outermost path is not the Adt.
     #[test]
     fn size_of_compound_type_records_layout_read() {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let src = "struct S { a: u8 }\nfn main() { println!(\"{}\", std::mem::size_of::<[S; 2]>()); }\n";
         let reads = main_reads(&interner, &known, src);
         assert!(reads.keys().any(|k| matches!(k, ReadKey::Layout(_))), "a Layout read is recorded");

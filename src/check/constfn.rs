@@ -38,19 +38,19 @@ use crate::ty::{Ty, TyIntern, TyKind};
 /// `prior_errs` is true when the body already failed type checking:
 /// unresolved calls then stay silent instead of adding a cascade.
 pub fn check_const_fn(p: &Program, ck: &Checked, f: &FnInfo, prior_errs: bool) -> Vec<Diag> {
-    let Some(body) = f.def.body else { return Vec::new() };
+    let Some(body) = f.def(&p.ast).body else { return Vec::new() };
     let mut w = Walk { p, ck, errs: Vec::new(), drop_locals: Vec::new(), moved_out: Vec::new(), loop_consumed: Vec::new(), prior_errs };
     // Parameters by value are locals the function may drop. A pattern
     // parameter's argument local only feeds the pattern, so the
     // pattern bindings stand in for it.
     let mut pi = 0;
-    if f.def.self_param.is_some() {
+    if f.def(&p.ast).self_param.is_some() {
         if let Some(&l) = ck.param_locals.first() {
             w.note_local(l, 0);
         }
         pi = 1;
     }
-    for param in &f.def.params {
+    for param in &f.def(&p.ast).params {
         match param.pat {
             Some(pat) => w.pat_bindings(pat, 0),
             None => {
@@ -224,8 +224,8 @@ fn builtin_is_const(b: Builtin) -> bool {
     )
 }
 
-struct Walk<'p, 'a, 'c> {
-    p: &'p Program<'a>,
+struct Walk<'p, 'c> {
+    p: &'p Program,
     ck: &'c Checked<'c>,
     errs: Vec<Diag>,
     /// Locals of a drop type, with the conditional depth of the binding.
@@ -237,7 +237,7 @@ struct Walk<'p, 'a, 'c> {
     prior_errs: bool,
 }
 
-impl Walk<'_, '_, '_> {
+impl Walk<'_, '_> {
     fn err(&mut self, span: Span, msg: impl Into<String>, fix: &'static str) {
         self.errs.push(Diag::new(C_NONCONST, span, msg.into(), fix));
     }

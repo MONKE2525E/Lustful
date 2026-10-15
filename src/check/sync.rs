@@ -486,7 +486,7 @@ pub fn sync_free_fn(path: &[&str]) -> Option<SyncOp> {
     }
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The associated fns of the sync types (`AtomicUsize::new`). None
     /// when the path's type is none of these (the caller goes on); a
     /// known type with an item lust lacks rejects here. A user type of

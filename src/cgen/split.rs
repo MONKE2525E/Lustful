@@ -7,7 +7,7 @@
 use super::*;
 use crate::ty::iter::{self as it, SplitMode};
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// One split builtin as the runtime runs it, or None for every other
     /// builtin. `StrSplit` itself is expanded in lower/iter.rs.
     pub(super) fn split_builtin(&mut self, b: Builtin, ops: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> Option<String> {

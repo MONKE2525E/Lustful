@@ -7,6 +7,7 @@ use crate::def::{CrateIds, DiskDefId};
 use crate::diag::{CtxtId, Diag, Span, not_yet};
 use crate::intern::FxMap as HashMap;
 use crate::intern::{Interner, Known, Sym};
+use std::sync::Arc;
 use crate::ty::defs::{DefKind as DefsKind, Vis};
 use crate::ty::lang::ShippedCrate;
 use crate::ty::*;
@@ -155,9 +156,50 @@ pub struct StaticItem {
     pub tls: Option<super::tls::TlsKey>,
 }
 
-pub struct FnInfo<'a> {
+/// Where a fn's `FnDef` sits in the Ast. `Program` names defs by
+/// location, not by reference, so it can outlive one request: the
+/// daemon keeps it while the body patch edits a def in place (W-INCR3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum FnLoc {
+    /// `ast.items[i]`, a fn item.
+    Item(u32),
+    /// Method `k` of the impl at `ast.items[i]`.
+    Impl(u32, u32),
+    /// Method `k` of the trait at `ast.items[i]`.
+    Trait(u32, u32),
+    /// `ast.stmt_items[i]`, a fn nested in a body.
+    Nested(u32),
+}
+
+impl FnLoc {
+    /// The def at this location.
+    pub fn def(self, ast: &Ast) -> &ast::FnDef {
+        let def = match self {
+            FnLoc::Item(i) => match &ast.items[i as usize].kind {
+                ItemKind::Fn(d) => Some(d),
+                _ => None,
+            },
+            FnLoc::Impl(i, k) => match &ast.items[i as usize].kind {
+                ItemKind::Impl(imp) => imp.fns.get(k as usize),
+                _ => None,
+            },
+            FnLoc::Trait(i, k) => match &ast.items[i as usize].kind {
+                ItemKind::Trait(t) => t.fns.get(k as usize),
+                _ => None,
+            },
+            FnLoc::Nested(i) => match &ast.stmt_items[i as usize].kind {
+                ItemKind::Fn(d) => Some(d),
+                _ => None,
+            },
+        };
+        def.expect("a fn location names a fn of its Ast")
+    }
+}
+
+pub struct FnInfo {
     pub name: Sym,
-    pub def: &'a ast::FnDef,
+    /// Where the def sits: `def` reads it.
+    pub loc: FnLoc,
     pub owner: Option<AdtId>,
     pub self_kind: Option<SelfKind>,
     /// Parameter types, including `self` first when present.
@@ -169,22 +211,31 @@ pub struct FnInfo<'a> {
     pub is_const: bool,
 }
 
+impl FnInfo {
+    /// The def this fn's location names in `ast` (the program's Ast).
+    pub fn def<'x>(&self, ast: &'x Ast) -> &'x ast::FnDef {
+        self.loc.def(ast)
+    }
+}
+
 /// The old name for the session-local function index. New code uses
 /// `LocalDefId` (src/def.rs); the alias stays while S3b edits this file in
 /// parallel, then goes.
 #[allow(dead_code)]
 pub type FnId = LocalDefId;
 
-pub struct Program<'a> {
-    pub ast: &'a Ast,
-    pub interner: &'a Interner,
-    pub known: &'a Known,
+/// The collected program. It owns its inputs (shared with the driver
+/// session), so the daemon can keep it across requests (W-INCR3).
+pub struct Program {
+    pub ast: Arc<Ast>,
+    pub interner: Arc<Interner>,
+    pub known: Arc<Known>,
     pub tys: GlobalTys,
     /// The definition table (ARCH 2.2): kinds, parents, generics, and param envs by
     /// `DefId`, plus the bridge to the session-local `AdtId` compat tables below.
     pub defs: Defs,
     pub adts: Vec<AdtDef>,
-    pub fns: Vec<FnInfo<'a>>,
+    pub fns: Vec<FnInfo>,
     /// Evaluated const items, and name to index (ARCH 2.13).
     pub consts: Vec<ConstItem>,
     pub const_names: HashMap<Sym, u32>,
@@ -262,7 +313,7 @@ pub struct Program<'a> {
     pub resolved: Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>,
     /// The generic tables (traits, templates, instances) built by
     /// `check::generics` during collection and finished by mono.
-    pub gx: GenTables<'a>,
+    pub gx: GenTables,
     /// False when no later request replays body read sets (a one-shot
     /// process): body checks then use a sink that records nothing. Set by
     /// the driver after collection.
@@ -277,7 +328,7 @@ pub struct Program<'a> {
     pub regions: crate::borrowck::RegionTables,
 }
 
-impl<'a> Program<'a> {
+impl Program {
     pub fn name(&self, s: Sym) -> &str {
         self.interner.get(s)
     }
@@ -304,8 +355,12 @@ impl<'a> Program<'a> {
     pub fn adt(&self, id: AdtId) -> &AdtDef {
         &self.adts[id.0 as usize]
     }
-    pub fn fn_info(&self, id: LocalDefId) -> &FnInfo<'a> {
+    pub fn fn_info(&self, id: LocalDefId) -> &FnInfo {
         &self.fns[id.0 as usize]
+    }
+    /// The Ast def of fn `id` (an instance's or closure's is its source fn's).
+    pub fn fn_def(&self, id: LocalDefId) -> &ast::FnDef {
+        self.fns[id.0 as usize].loc.def(&self.ast)
     }
     /// The return type a caller (or the fn's own body) checks against:
     /// `FnInfo::ret`, except that a plain fn whose `impl Trait` return
@@ -468,7 +523,7 @@ impl<'a> Program<'a> {
     /// (spliced std) fn. Codegen runs its intrinsic privilege check
     /// against this, as the second line behind check (section 3.2).
     pub fn fn_shipped_crate(&self, f: LocalDefId) -> Option<ShippedCrate> {
-        self.shipped_crate_at(self.fn_info(f).def.name_span)
+        self.shipped_crate_at(self.fn_def(f).name_span)
     }
     /// True when `lust check` neither checks nor walks fn `f`: a fn in
     /// shipped core, alloc, or std source (the std splice and the std
@@ -480,7 +535,7 @@ impl<'a> Program<'a> {
     pub fn check_skips(&self, f: LocalDefId) -> bool {
         !self.gx.walk_instances
             && matches!(
-                self.shipped_crate_at(self.fn_info(f).def.name_span),
+                self.shipped_crate_at(self.fn_def(f).name_span),
                 Some(ShippedCrate::Core | ShippedCrate::Alloc | ShippedCrate::Std)
             )
     }
@@ -494,7 +549,7 @@ impl<'a> Program<'a> {
     /// True for a std method of a lang enum (`Option::map`), its
     /// instances included; closure bodies inside one are not.
     pub fn is_lang_method(&self, f: LocalDefId) -> bool {
-        !self.gx.closure_fns.contains_key(&f) && self.in_lang_methods(self.fn_info(f).def.name_span)
+        !self.gx.closure_fns.contains_key(&f) && self.in_lang_methods(self.fn_def(f).name_span)
     }
     /// Marks the program generic, from an item at `span`: code other
     /// than the lang enum methods also sets `user_generics` (see
@@ -656,7 +711,7 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
 /// `struct S<'a>`) is rustc E0726. A named impl lifetime that only an
 /// associated type uses is unconstrained (rustc E0207).
 fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mut generics::Scope, errs: &mut Vec<Diag>) {
-    let (ast, interner, known) = (p.ast, p.interner, p.known);
+    let (ast, interner, known) = (&p.ast, &p.interner, &p.known);
     // Std source names no user type (`resolve_cx_in`), so the hidden
     // lifetime test (which reads the user type table) does not apply.
     let std = p.in_lang_methods(imp.span);
@@ -763,7 +818,7 @@ fn resolve_generic_alias(p: &mut Program, a: &ast::TypeAliasDef) -> Result<Ty, D
             }
             ast::GenericParam::Const { name, ty, span, .. } => {
                 // The declared type, for the const typing of its uses.
-                let t = generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, *ty, &generics::Scope::default())?;
+                let t = generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, *ty, &generics::Scope::default())?;
                 if generics::ConstScalar::of(&p.tys, t).is_none() {
                     return Err(Diag::new(
                         "L0110",
@@ -778,7 +833,7 @@ fn resolve_generic_alias(p: &mut Program, a: &ast::TypeAliasDef) -> Result<Ty, D
             ast::GenericParam::Lifetime { lt, .. } => scope.lifetimes.push((lt.name, 0)),
         }
     }
-    generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut p.tys, a.ty, &scope)
+    generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, a.ty, &scope)
 }
 
 /// The rules on generic aliases once their targets resolve: the param
@@ -786,7 +841,7 @@ fn resolve_generic_alias(p: &mut Program, a: &ast::TypeAliasDef) -> Result<Ty, D
 /// in the target (rustc E0091). Their resolved defaults join
 /// `param_defaults` under the alias def.
 fn check_generic_aliases(p: &mut Program, errs: &mut Vec<Diag>) {
-    let (ast, interner, known) = (p.ast, p.interner, p.known);
+    let (ast, interner, known) = (&p.ast, &p.interner, &p.known);
     for item in &ast.items {
         let ItemKind::Type(a) = &item.kind else { continue };
         if !a.generics.params.iter().any(|g| !matches!(g, ast::GenericParam::Lifetime { .. })) {
@@ -828,7 +883,7 @@ fn check_generic_aliases(p: &mut Program, errs: &mut Vec<Diag>) {
 /// resolver, else the scoped one (a generic alias with its args and
 /// defaults, a generic Adt applied to args).
 fn resolve_item_ty(p: &mut Program, id: ast::TyId, self_ty: Option<Ty>) -> Result<Ty, Diag> {
-    let (ast, interner, known) = (p.ast, p.interner, p.known);
+    let (ast, interner, known) = (&p.ast, &p.interner, &p.known);
     // The plain resolver does not know lazy aliases (W-BORROW's generic
     // aliases): their errors (arity, defaults) come from the scoped one.
     let lazy_alias = p.gx.generic_aliases.keys().any(|&n| ty_mentions(ast, id, n));
@@ -2319,34 +2374,34 @@ pub(crate) fn stable_ranks_preview(order: &[crate::def::DefPathHash], hashes: &[
 
 /// Builds the program tables. `crate_ids` names the crate for stable def
 /// identity (docs/ARCH.md section 1.7). Returns all collection errors.
-pub fn collect<'a>(ast: &'a Ast, interner: &'a Interner, known: &'a Known, crate_ids: CrateIds) -> Result<Program<'a>, Vec<Diag>> {
+pub fn collect(ast: Arc<Ast>, interner: Arc<Interner>, known: Arc<Known>, crate_ids: CrateIds) -> Result<Program, Vec<Diag>> {
     collect_mode(ast, interner, known, crate_ids, true)
 }
 
 /// `collect` for one command: a build walks every reachable generic
 /// instance (mono); `lust check` passes `walk_instances` false and
 /// stops at the template checks, like rustc check (ARCH 4.1).
-pub fn collect_mode<'a>(
-    ast: &'a Ast,
-    interner: &'a Interner,
-    known: &'a Known,
+pub fn collect_mode(
+    ast: Arc<Ast>,
+    interner: Arc<Interner>,
+    known: Arc<Known>,
     crate_ids: CrateIds,
     walk_instances: bool,
-) -> Result<Program<'a>, Vec<Diag>> {
+) -> Result<Program, Vec<Diag>> {
     collect_with_order(ast, interner, known, crate_ids, walk_instances, &mut DefOrder::default())
 }
 
 /// `collect_mode` with a caller-kept `DefOrder` (the driver session
 /// holds one across requests, so Adt and static indices survive
 /// edits that add or reorder defs).
-pub fn collect_with_order<'a>(
-    ast: &'a Ast,
-    interner: &'a Interner,
-    known: &'a Known,
+pub fn collect_with_order(
+    ast: Arc<Ast>,
+    interner: Arc<Interner>,
+    known: Arc<Known>,
     crate_ids: CrateIds,
     walk_instances: bool,
     def_order: &mut DefOrder,
-) -> Result<Program<'a>, Vec<Diag>> {
+) -> Result<Program, Vec<Diag>> {
     collect_with_order_resolved(ast, interner, known, crate_ids, walk_instances, def_order, None)
 }
 
@@ -2356,15 +2411,15 @@ pub fn collect_with_order<'a>(
 /// `finish_collect`): every checked body reads its defining module
 /// and the visibility tables from `Program::resolved`.
 #[allow(clippy::too_many_arguments)]
-pub fn collect_with_order_resolved<'a>(
-    ast: &'a Ast,
-    interner: &'a Interner,
-    known: &'a Known,
+pub fn collect_with_order_resolved(
+    ast: Arc<Ast>,
+    interner: Arc<Interner>,
+    known: Arc<Known>,
     crate_ids: CrateIds,
     walk_instances: bool,
     def_order: &mut DefOrder,
     resolved: Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>,
-) -> Result<Program<'a>, Vec<Diag>> {
+) -> Result<Program, Vec<Diag>> {
     collect_reuse(ast, interner, known, crate_ids, walk_instances, def_order, resolved, &mut Default::default(), &[])
 }
 
@@ -2374,21 +2429,21 @@ pub fn collect_with_order_resolved<'a>(
 /// discovery skip bodies whose stored results still hold, and it goes
 /// back to the caller on every return, with what this collect stored.
 #[allow(clippy::too_many_arguments)]
-pub fn collect_reuse<'a>(
-    ast: &'a Ast,
-    interner: &'a Interner,
-    known: &'a Known,
+pub fn collect_reuse(
+    ast: Arc<Ast>,
+    interner: Arc<Interner>,
+    known: Arc<Known>,
     crate_ids: CrateIds,
     walk_instances: bool,
     def_order: &mut DefOrder,
     resolved: Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>,
     reuse: &mut crate::driver::gen_reuse::GenReuse,
     std_routes: &[&'static crate::ty::lang::StdFnDef],
-) -> Result<Program<'a>, Vec<Diag>> {
+) -> Result<Program, Vec<Diag>> {
     let mut p = Program {
-        ast,
-        interner,
-        known,
+        ast: ast.clone(),
+        interner: interner.clone(),
+        known: known.clone(),
         tys: GlobalTys::new(),
         defs: Defs::new(),
         adts: Vec::new(),
@@ -2423,6 +2478,7 @@ pub fn collect_reuse<'a>(
         unwind: false,
         regions: Default::default(),
     };
+    let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;
     p.gx.reuse = std::mem::take(reuse);
     p.gx.inst_order = std::mem::take(&mut def_order.instances);
@@ -2438,7 +2494,7 @@ pub fn collect_reuse<'a>(
             params: vec![ParamDef { name: interner.intern("T"), kind: ParamKind::Type, span: dummy }],
             predicates: Vec::new(),
         };
-        let insert_builtin = |p: &mut Program<'a>, def: DefId, kind: DefsKind, name: Sym, generics: Generics| {
+        let insert_builtin = |p: &mut Program, def: DefId, kind: DefsKind, name: Sym, generics: Generics| {
             let mut data = DefData::skeleton(kind, None, name, Vis::Pub, dummy);
             data.generics = generics;
             p.defs.insert(def, data);
@@ -3567,8 +3623,9 @@ pub fn collect_reuse<'a>(
         ast_generics: Option<(&'g ast::Generics, &'g ast::WhereClause)>,
     }
     let plain_parent = || ParentGen { generics: Generics::default(), scope: generics::Scope::default(), ast_generics: None };
-    let add_fn = |p: &mut Program<'a>,
-                  def: &'a ast::FnDef,
+    let add_fn = |p: &mut Program,
+                  def: &ast::FnDef,
+                  loc: FnLoc,
                   owner: Option<AdtId>,
                   self_ty: Option<Ty>,
                   parent: Option<DefId>,
@@ -3667,7 +3724,7 @@ pub fn collect_reuse<'a>(
         p.defs.insert(def_id, data);
         p.fns.push(FnInfo {
             name: def.name,
-            def,
+            loc,
             owner,
             self_kind: def.self_param.as_ref().map(|s| s.kind),
             params,
@@ -3737,7 +3794,7 @@ pub fn collect_reuse<'a>(
                 if let Some(b) = def.body {
                     top_hashes.insert(b, hash);
                 }
-                let id = add_fn(&mut p, def, None, None, None, &plain_parent(), hash, &mut errs);
+                let id = add_fn(&mut p, def, FnLoc::Item(item_idx as u32), None, None, None, &plain_parent(), hash, &mut errs);
                 // The first value of a name owns it. A unit or tuple struct
                 // constructor is a value of the struct's name too, so a fn
                 // of that name is a duplicate; a braced struct is not.
@@ -3980,7 +4037,7 @@ pub fn collect_reuse<'a>(
                 let parent_gen =
                     ParentGen { generics: impl_generics.clone(), scope: impl_scope, ast_generics: Some((&imp.generics, &imp.where_clause)) };
                 let mut method_ids: Vec<LocalDefId> = Vec::new();
-                for def in &imp.fns {
+                for (k, def) in imp.fns.iter().enumerate() {
                     // Functions in trait impls cannot be declared const
                     // (rustc E0379); inherent impl methods can.
                     if trait_ref.is_some() && def.qual.is_const {
@@ -3992,7 +4049,17 @@ pub fn collect_reuse<'a>(
                         ));
                     }
                     let hash = crate::def::method_hash(parent, interner.get(def.name));
-                    let id = add_fn(&mut p, def, owner, Some(self_pat), Some(impl_def), &parent_gen, hash, &mut errs);
+                    let id = add_fn(
+                        &mut p,
+                        def,
+                        FnLoc::Impl(item_idx as u32, k as u32),
+                        owner,
+                        Some(self_pat),
+                        Some(impl_def),
+                        &parent_gen,
+                        hash,
+                        &mut errs,
+                    );
                     method_ids.push(id);
                     if static_dyn {
                         p.gx.static_dyn_fns.push(id);
@@ -4055,7 +4122,7 @@ pub fn collect_reuse<'a>(
         match &item.kind {
             ItemKind::Fn(def) => {
                 let hash = nested_hashes[idx].expect("every nested fn has an identity");
-                let id = add_fn(&mut p, def, None, None, None, &plain_parent(), hash, &mut errs);
+                let id = add_fn(&mut p, def, FnLoc::Nested(idx as u32), None, None, None, &plain_parent(), hash, &mut errs);
                 p.body_items.insert(idx as u32, BodyItem::Fn(id));
             }
             ItemKind::Use(_) => {}
@@ -4162,7 +4229,7 @@ pub fn collect_reuse<'a>(
         if !f.params.is_empty() || !ret_ok {
             errs.push(Diag::new(
                 "L0110",
-                f.def.name_span,
+                f.def(&p.ast).name_span,
                 "`main` must take no parameters and return (), ExitCode, or Result<T, E> with T one of those and E: Debug",
                 "Write `fn main() { ... }` or `fn main() -> Result<(), E> { ... }`.",
             ));
@@ -4219,13 +4286,14 @@ enum PendingState {
 /// Static indices come from the session `DefOrder` (see `collect`):
 /// top-level statics rank by def hash history, nested statics keep
 /// stmt order after them.
-fn eval_const_items<'a>(
-    p: &mut Program<'a>,
+fn eval_const_items(
+    p: &mut Program,
     errs: &mut Vec<Diag>,
     static_order: &mut Vec<crate::def::DefPathHash>,
     scope_of_stmt: &HashMap<u32, Vec<u32>>,
 ) {
-    let ast = p.ast;
+    let ast_arc = p.ast.clone();
+    let ast = &*ast_arc;
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
     let mut by_name: HashMap<Sym, usize> = HashMap::default();
     let mut static_count = 0u32;
@@ -4237,7 +4305,7 @@ fn eval_const_items<'a>(
             _ => continue,
         };
         let Some(value) = value else { continue };
-        let tls = if is_static.is_some() { super::tls::key_form(&item.attrs, p.interner) } else { None };
+        let tls = if is_static.is_some() { super::tls::key_form(&item.attrs, &p.interner) } else { None };
         let ty = match resolve_item_ty(p, ty_id, None) {
             Ok(t) => generics::normalize_item_ty(p, t),
             Err(d) => {
@@ -4349,6 +4417,7 @@ fn eval_const_items<'a>(
     let by_stmt: HashMap<u32, usize> = pending.iter().enumerate().filter_map(|(i, (it, _))| it.stmt_idx.map(|si| (si, i))).collect();
     let mut cx = CollectCx {
         p,
+        ast,
         pending,
         by_name,
         by_stmt,
@@ -4489,12 +4558,12 @@ fn eval_const_items<'a>(
 /// same-name statics of that fn). The parent is the innermost fn whose
 /// body holds the item; edits elsewhere in the file do not move it.
 fn nested_static_hash(p: &Program, sidx: u32, name: Sym) -> crate::def::DefPathHash {
-    let ast = p.ast;
+    let ast = &*p.ast;
     let at = ast.stmt_items[sidx as usize].span;
     let parent = |span: Span| {
         let mut best: Option<(u32, usize)> = None;
         for (i, f) in p.fns.iter().enumerate() {
-            let Some(b) = f.def.body else { continue };
+            let Some(b) = f.def(&p.ast).body else { continue };
             let s = ast.block(b).span;
             if s.file == span.file && s.lo <= span.lo && span.hi <= s.hi && best.is_none_or(|(w, _)| s.hi - s.lo < w) {
                 best = Some((s.hi - s.lo, i));
@@ -4526,13 +4595,14 @@ fn nested_static_hash(p: &Program, sidx: u32, name: Sym) -> crate::def::DefPathH
 /// Impl ordinals must match the fn pass exactly (same
 /// iteration, same owner test), so child hashes name the same
 /// impl.
-fn register_assoc_consts<'a>(
-    p: &mut Program<'a>,
+fn register_assoc_consts(
+    p: &mut Program,
     errs: &mut Vec<Diag>,
     pending: &mut Vec<(PendingConst, PendingState)>,
     assoc_by_key: &mut HashMap<(Sym, Sym), Vec<usize>>,
 ) {
-    let ast = p.ast;
+    let ast_arc = p.ast.clone();
+    let ast = &*ast_arc;
     let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
     let mut inherent_seen: Vec<(DefId, Sym)> = Vec::new();
     for item in &ast.items {
@@ -4826,7 +4896,7 @@ pub(crate) fn named_field_is_private(p: &Program, adt: AdtId, field: Sym, from: 
     let Some(tables) = &p.resolved else { return false };
     let Some(def) = p.defs.def_of_adt(adt) else { return false };
     match tables.field_vis.get(&def) {
-        Some((def_mod, fields)) => fields.get(&field).is_some_and(|vis| !tables.visible(vis, *def_mod, from, p.interner)),
+        Some((def_mod, fields)) => fields.get(&field).is_some_and(|vis| !tables.visible(vis, *def_mod, from, &p.interner)),
         None => false,
     }
 }
@@ -4836,7 +4906,7 @@ pub(crate) fn tuple_field_is_private(p: &Program, adt: AdtId, index: u32, from: 
     let Some(tables) = &p.resolved else { return false };
     let Some(def) = p.defs.def_of_adt(adt) else { return false };
     match tables.tuple_field_vis.get(&def) {
-        Some((def_mod, fields)) => fields.get(index as usize).is_some_and(|vis| !tables.visible(vis, *def_mod, from, p.interner)),
+        Some((def_mod, fields)) => fields.get(index as usize).is_some_and(|vis| !tables.visible(vis, *def_mod, from, &p.interner)),
         None => false,
     }
 }
@@ -4851,8 +4921,11 @@ enum ScopeItem {
 }
 
 /// The const evaluator's context over the collected tables.
-struct CollectCx<'x, 'a> {
-    p: &'x mut Program<'a>,
+struct CollectCx<'x> {
+    p: &'x mut Program,
+    /// The program's Ast, borrowed apart from `p` (const evaluation reads
+    /// it while it writes the program's type store).
+    ast: &'x Ast,
     pending: Vec<(PendingConst, PendingState)>,
     /// Module-level pending consts and statics by (flat) name.
     /// Nested items never enter it: only an initializer whose
@@ -4891,7 +4964,7 @@ struct CollectCx<'x, 'a> {
     errs: &'x mut Vec<Diag>,
 }
 
-impl CollectCx<'_, '_> {
+impl CollectCx<'_> {
     /// The type instance a written `Type<...>` path head names,
     /// for picking among same-name inherent associated consts.
     /// `None` when the arguments are not all written (the pick
@@ -4910,9 +4983,9 @@ impl CollectCx<'_, '_> {
                 ast::GenericArg::Type(t) => {
                     let cx = self.p.gx.resolve_cx(&self.p.type_names, &self.p.aliases);
                     let ty = crate::check::generics::resolve_scoped(
-                        self.p.ast,
-                        self.p.interner,
-                        self.p.known,
+                        &self.p.ast,
+                        &self.p.interner,
+                        &self.p.known,
                         &cx,
                         &mut self.p.tys,
                         *t,
@@ -4922,7 +4995,7 @@ impl CollectCx<'_, '_> {
                     args.push(crate::ty::GenericArg::Ty(ty));
                 }
                 ast::GenericArg::Const(e) => {
-                    let v = eval_array_len(self.p.ast, self.p.interner, self.p.known, *e)?;
+                    let v = eval_array_len(&self.p.ast, &self.p.interner, &self.p.known, *e)?;
                     args.push(crate::ty::GenericArg::Const(self.p.tys.intern_const(crate::ty::ConstKind::Int(v))));
                 }
                 _ => {}
@@ -4950,7 +5023,7 @@ impl CollectCx<'_, '_> {
         }
         let mut best: Option<(u32, crate::ty::defs::ModuleId)> = None;
         for (i, f) in self.p.fns.iter().enumerate() {
-            let (lo, hi) = f.def.exprs;
+            let (lo, hi) = f.def(&self.p.ast).exprs;
             if it.expr.0 >= lo && it.expr.0 < hi {
                 let size = hi - lo;
                 if best.is_none_or(|(b, _)| size < b)
@@ -4994,7 +5067,7 @@ impl CollectCx<'_, '_> {
     /// span (`stmt_item_in_blocks`). This covers blocks inside the
     /// initializer itself, whose items are in no pending scope.
     fn span_lookup(&self, name: Sym, at: Span) -> Option<ScopeItem> {
-        let si = stmt_item_in_blocks(self.p.ast, &self.p.item_blocks, name, at)?;
+        let si = stmt_item_in_blocks(&self.p.ast, &self.p.item_blocks, name, at)?;
         Some(match self.p.body_items.get(&si) {
             Some(BodyItem::Fn(f)) => ScopeItem::Fn(*f),
             _ => match self.by_stmt.get(&si) {
@@ -5147,7 +5220,7 @@ fn static_form(p: &Program, v: &crate::ty::consteval::ConstValue, ty: Ty) -> boo
 /// `None` variant, whose type the evaluator cannot name before the declared
 /// `Option` type is known.
 fn coerce_const_value(
-    cx: &mut CollectCx<'_, '_>,
+    cx: &mut CollectCx<'_>,
     v: crate::ty::consteval::ConstValue,
     vt: Ty,
     ty: Ty,
@@ -5180,7 +5253,7 @@ pub fn const_generic_kind(p: &Program, f: LocalDefId) -> crate::ty::consteval::C
         return ConstGeneric::Free;
     }
     let info = p.fn_info(f);
-    let lazy = p.std_source_span(info.def.name_span)
+    let lazy = p.std_source_span(info.def(&p.ast).name_span)
         && p.interner.get(info.name) == "new"
         && info.owner.is_some_and(|a| matches!(p.display_path(p.adt(a).name).as_str(), "std::sync::LazyLock" | "core::cell::LazyCell"));
     if lazy { ConstGeneric::LazyCtor } else { ConstGeneric::Bounded }
@@ -5202,7 +5275,7 @@ fn region_free(tys: &GlobalTys, t: Ty) -> bool {
     }
 }
 
-impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
+impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
     type Tys = GlobalTys;
 
     fn tys(&mut self) -> &mut GlobalTys {
@@ -5212,7 +5285,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         &self.p.tys
     }
     fn ast(&self) -> &'a Ast {
-        self.p.ast
+        self.ast
     }
     fn sym_text(&self, s: Sym) -> &str {
         self.p.interner.get(s)
@@ -5310,11 +5383,17 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             None => *self.p.fn_names.get(&seg.name)?,
         };
         let info = self.p.fn_info(f);
-        let q = &info.def.qual;
-        if info.owner.is_some() || info.self_kind.is_some() || q.is_async || q.is_unsafe || q.abi.is_some() || info.def.variadic {
+        let q = &info.def(&self.p.ast).qual;
+        if info.owner.is_some()
+            || info.self_kind.is_some()
+            || q.is_async
+            || q.is_unsafe
+            || q.abi.is_some()
+            || info.def(&self.p.ast).variadic
+        {
             return None;
         }
-        if !info.def.generics.params.is_empty() || !info.def.where_clause.preds.is_empty() {
+        if !info.def(&self.p.ast).generics.params.is_empty() || !info.def(&self.p.ast).where_clause.preds.is_empty() {
             return None;
         }
         let (params, ret) = (info.params.clone(), info.ret);
@@ -5345,9 +5424,9 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
                     // context has no params in scope here.
                     let cx = self.p.gx.resolve_cx(&self.p.type_names, &self.p.aliases);
                     let t = crate::check::generics::resolve_scoped(
-                        self.p.ast,
-                        self.p.interner,
-                        self.p.known,
+                        &self.p.ast,
+                        &self.p.interner,
+                        &self.p.known,
                         &cx,
                         &mut self.p.tys,
                         args[0],
@@ -5393,12 +5472,13 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
             if !info.is_const {
                 return CallTarget::NonConst;
             }
-            let Some(body) = info.def.body else { return CallTarget::NonConst };
+            let Some(body) = info.def(&self.p.ast).body else { return CallTarget::NonConst };
             let skip = if info.self_kind.is_some() { 1 } else { 0 };
             if skip == 1 {
                 return CallTarget::Unknown;
             }
-            let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
+            let params: Vec<(Sym, bool, Option<ast::PatId>)> =
+                info.def(&self.p.ast).params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
             let owner = info.owner.map(|a| self.p.adt(a).name);
             let generic = const_generic_kind(self.p, f);
             // Written type args on a generic call are not matched yet.
@@ -5468,11 +5548,11 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
         self.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
     }
     fn resolve_ty(&mut self, t: ast::TyId) -> Ty {
-        resolve_ty(self.p.ast, self.p.interner, self.p.known, &self.p.type_names, &self.p.aliases, &mut self.p.tys, t, None)
+        resolve_ty(&self.p.ast, &self.p.interner, &self.p.known, &self.p.type_names, &self.p.aliases, &mut self.p.tys, t, None)
             .unwrap_or(ERROR)
     }
     fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
-        let p: &Program<'_> = self.p;
+        let p: &Program = self.p;
         crate::ty::layout::layout_of_ty(&p.tys, &UserLayout(p), t).ok()
     }
     fn adt_repr(&self, adt: AdtId) -> crate::ty::layout::Repr {
@@ -5507,7 +5587,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'_, 'a> {
     }
 }
 
-impl CollectCx<'_, '_> {
+impl CollectCx<'_> {
     /// A tuple variant constructor path, for calls in const position.
     fn variant_ctor(&self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
         let (adt, variant) = self.variant_of(segs)?;
@@ -6398,9 +6478,9 @@ pub fn needs_drop(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// manifest does not list it as exact-layout (ARCH 3.6) has none, so
 /// the query rejects with L0652 instead of answering with a size the
 /// real crate does not have. Codegen keeps using `Program` itself.
-pub struct UserLayout<'p, 'a>(pub &'p Program<'a>);
+pub struct UserLayout<'p>(pub &'p Program);
 
-impl crate::ty::layout::AdtShapes for UserLayout<'_, '_> {
+impl crate::ty::layout::AdtShapes for UserLayout<'_> {
     fn adt_shape(&self, id: AdtId) -> Option<crate::ty::layout::AdtShape> {
         let p = self.0;
         let adt = p.adts.get(id.0 as usize)?;
@@ -6421,7 +6501,7 @@ impl crate::ty::layout::AdtShapes for UserLayout<'_, '_> {
 }
 
 /// Layout shapes for the engine in `ty::layout`, read from the collected tables.
-impl crate::ty::layout::AdtShapes for Program<'_> {
+impl crate::ty::layout::AdtShapes for Program {
     fn adt_shape(&self, id: AdtId) -> Option<crate::ty::layout::AdtShape> {
         let adt = self.adts.get(id.0 as usize)?;
         Some(crate::ty::layout::AdtShape {

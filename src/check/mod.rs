@@ -1239,9 +1239,9 @@ struct LoopCtx {
     label: Option<(Sym, Span)>,
 }
 
-struct Ctx<'p, 'a> {
-    p: &'p Program<'a>,
-    f: &'p FnInfo<'a>,
+struct Ctx<'p> {
+    p: &'p Program,
+    f: &'p FnInfo,
     /// The module this fn is defined in (root without the resolver),
     /// for field visibility checks (ARCH 1.5).
     module: crate::ty::defs::ModuleId,
@@ -1508,7 +1508,7 @@ fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
     let root = crate::ty::defs::ROOT_MODULE;
     // The lang enum methods (their instances and closure bodies share
     // their def) see no user names.
-    if p.in_lang_methods(p.fn_info(fid).def.name_span) {
+    if p.in_lang_methods(p.fn_def(fid).name_span) {
         return crate::ty::defs::STD_MODULE;
     }
     let Some(tables) = &p.resolved else { return root };
@@ -1552,7 +1552,7 @@ fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
 /// parent fn (closures share their parent's inference); the parent's
 /// own entry reports any errors, so the closure fn reports none and
 /// marks the result poisoned instead.
-pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
+pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
     if let Some(def) = p.gx.closure_fns.get(&fid)
         && let Some(entry) = p.gx.closures.get(def)
     {
@@ -1565,14 +1565,9 @@ pub fn check_fn<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Ve
 
 /// One check of one fn body under an `impl Trait` mode, with the picks
 /// its opaque view recorded when `mode` is `Revealed` (check/opaque.rs).
-fn check_fn_mode<'p, 'a>(
-    p: &'p Program<'a>,
-    fid: LocalDefId,
-    mode: opaque::OpaqueMode,
-    view: opaque::ViewOut,
-) -> (Checked<'p>, Vec<Diag>) {
+fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, view: opaque::ViewOut) -> (Checked<'p>, Vec<Diag>) {
     let f = p.fn_info(fid);
-    let def = f.def;
+    let def = f.def(&p.ast);
     let n_exprs = (def.exprs.1 - def.exprs.0) as usize;
     let n_pats = (def.pats.1 - def.pats.0) as usize;
     let mut cx = Ctx {
@@ -2006,7 +2001,7 @@ enum StrKind {
     Cow,
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     fn err(&mut self, code: &'static str, span: Span, msg: impl Into<String>, fix: impl Into<String>) {
         self.errs.push(Diag::new(code, span, msg, fix));
     }
@@ -2029,7 +2024,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if !t.std_modules.iter().any(|&(n, _)| p.interner.get(n) == "__lust_alloc_collections") {
             return;
         }
-        if p.std_source_span(p.fn_info(self.fid).def.name_span) {
+        if p.std_source_span(p.fn_def(self.fid).name_span) {
             return;
         }
         for i in 0..self.out.expr_ty.len() {
@@ -2194,7 +2189,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// with no generics does (`GenTables::user_generics`).
     fn generic_mode(&self) -> bool {
         let p = self.p;
-        p.gx.has_generics && (p.gx.user_generics || p.in_lang_methods(p.fn_info(self.fid).def.name_span))
+        p.gx.has_generics && (p.gx.user_generics || p.in_lang_methods(p.fn_def(self.fid).name_span))
     }
 
     fn binding(&mut self, ns: Namespace, name: Sym) -> BindingRes {
@@ -2247,7 +2242,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// E0530): plain `None` is a path pattern, and every other form
     /// (`Some`, `mut None`, `ref Ok`, a parameter) is an error.
     fn prelude_variant(&mut self, name: Sym, ctxt: CtxtId) -> bool {
-        let k = self.p.known;
+        let k = &*self.p.known;
         [k.None, k.Some, k.Ok, k.Err].contains(&name)
             && self.lookup(name, ctxt).is_none()
             && self.body_item_of(name).is_none()
@@ -2397,7 +2392,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let _ = p.sig_of(&mut self.out.reads, def);
         if let Some((def_mod, fields)) = tables.field_vis.get(&def)
             && let Some(vis) = fields.get(&field)
-            && !tables.visible(vis, *def_mod, self.module, p.interner)
+            && !tables.visible(vis, *def_mod, self.module, &p.interner)
         {
             let name = self.name(field).to_string();
             self.err(
@@ -2429,7 +2424,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let _ = p.sig_of(&mut self.out.reads, def);
         if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
             && let Some(vis) = fields.get(index as usize)
-            && !tables.visible(vis, *def_mod, self.module, p.interner)
+            && !tables.visible(vis, *def_mod, self.module, &p.interner)
         {
             self.err(
                 "L0510",
@@ -2459,7 +2454,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
         if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
-            && fields.iter().any(|vis| !tables.visible(vis, *def_mod, self.module, p.interner))
+            && fields.iter().any(|vis| !tables.visible(vis, *def_mod, self.module, &p.interner))
         {
             let name = p.display_path(p.adt(a).name);
             self.err(
@@ -2539,7 +2534,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let _ = p.sig_of(&mut self.out.reads, def);
         if let Some(items) = tables.assoc_vis.get(&def)
             && let Some((vis, def_mod)) = items.get(&name)
-            && !tables.visible(vis, *def_mod, self.module, p.interner)
+            && !tables.visible(vis, *def_mod, self.module, &p.interner)
         {
             self.err(
                 "L0510",
@@ -2558,8 +2553,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let Some(tables) = &p.resolved else { return };
         let _ = p.sig_of(&mut self.out.reads, p.def_id(f));
         let info = p.fn_info(f);
-        let vis = crate::resolve::imports::vis_from_ast(&info.def.vis, p.interner);
-        if !tables.visible(&vis, defining_module(p, f), self.module, p.interner) {
+        let vis = crate::resolve::imports::vis_from_ast(&info.def(&p.ast).vis, &p.interner);
+        if !tables.visible(&vis, defining_module(p, f), self.module, &p.interner) {
             self.err(
                 "L0510",
                 span,
@@ -3096,9 +3091,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     {
                         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                         let typed = generics::check_const_expr_ty(
-                            p.ast,
-                            p.interner,
-                            p.known,
+                            &p.ast,
+                            &p.interner,
+                            &p.known,
                             &cx,
                             &mut self.tys,
                             &self.body_scope,
@@ -3131,7 +3126,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     }
                     ast::TyExpr::Path(ps) if ps.len() == 1 => match self.const_param(ps[0].name) {
                         Some((pi, _, val)) => Some(GenericArg::Const(self.tys.intern_const(val.unwrap_or(ConstKind::Param(pi))))),
-                        None => crate::check::collect::named_const_kind(p.ast, p.interner, p.known, ps[0].name, span)
+                        None => crate::check::collect::named_const_kind(&p.ast, &p.interner, &p.known, ps[0].name, span)
                             .map(|k| GenericArg::Const(self.tys.intern_const(k))),
                     },
                     _ => None,
@@ -3152,7 +3147,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-        let g_ast = crate::check::defaults::type_generics(p.ast, &cx, p.adt(a).name);
+        let g_ast = crate::check::defaults::type_generics(&p.ast, &cx, p.adt(a).name);
         let min = g_ast.map_or(generics.params.len(), crate::check::defaults::required);
         if args.len() < min || args.len() > generics.params.len() {
             self.err(
@@ -3170,9 +3165,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if let Some(g) = g_ast
             && let Err(d) = crate::check::defaults::fill(
-                p.ast,
-                p.interner,
-                p.known,
+                &p.ast,
+                &p.interner,
+                &p.known,
                 &cx,
                 &mut self.tys,
                 &generics::Scope::default(),
@@ -3910,7 +3905,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if spans.iter().any(|&s| s != Span::default()) {
             spans.retain(|&s| s != Span::default());
         } else {
-            spans = vec![self.f.def.name_span];
+            spans = vec![self.f.def(&self.p.ast).name_span];
         }
         spans.dedup();
         for span in spans {
@@ -3934,7 +3929,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if self.dyn_borrow_src {
             return false;
         }
-        let skip_self = usize::from(self.f.def.self_param.is_some() && p.gx.static_dyn_fns.contains(&self.fid));
+        let skip_self = usize::from(self.f.def(&self.p.ast).self_param.is_some() && p.gx.static_dyn_fns.contains(&self.fid));
         if self.f.params.iter().skip(skip_self).any(|&t| object::has_erased_dyn(p, &p.tys, t)) {
             return false;
         }
@@ -5586,7 +5581,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             match stmt {
                 Stmt::Let { pat, ty, init, els, .. } => {
                     let ty_ann = ty;
-                    let annotated = ty.filter(|&t| generics::names_lifetime(self.p.ast, self.p.interner, t));
+                    let annotated = ty.filter(|&t| generics::names_lifetime(&self.p.ast, &self.p.interner, t));
                     let declared = ty.map(|t| if annotated.is_some() { self.resolve_annotation(t) } else { self.resolve_written(t) });
                     let ty = match (declared, init) {
                         (Some(d), Some(init)) => {
@@ -5773,7 +5768,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         sc.annotation = true;
         sc.infer_cell = None;
         sc.regions = generics::RegionMode::Keep { next: None, elided: Some(elided) };
-        match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &sc) {
+        match generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, t, &sc) {
             Ok(r) => Some(r),
             Err(_) if !report => None,
             Err(_) => {
@@ -5830,7 +5825,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let span = p.ast.ty_span(t);
-        match generics::resolve_scoped(p.ast, p.interner, p.known, &cx, &mut self.tys, t, &self.body_scope.clone()) {
+        match generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, t, &self.body_scope.clone()) {
             Ok(t) => {
                 let t = self.instantiate_infers(t);
                 if let Some(d) = object::dyn_type_diag(p, &self.tys, t, span) {
@@ -6091,7 +6086,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             {
                 Some(val.unwrap_or(ConstKind::Param(i)))
             }
-            _ => crate::check::collect::eval_const_int(p.ast, p.interner, p.known, inner).map(|v| ConstKind::Int(v as u128)),
+            _ => crate::check::collect::eval_const_int(&p.ast, &p.interner, &p.known, inner).map(|v| ConstKind::Int(v as u128)),
         }
     }
 
@@ -6134,13 +6129,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         continue;
                     }
                     let scope = &self.body_scope;
-                    generics::check_const_expr_ty(p.ast, p.interner, p.known, &cx, &mut self.tys, scope, *x, *c, want, span, "").is_ok()
+                    generics::check_const_expr_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, scope, *x, *c, want, span, "").is_ok()
                 }
                 // A bare name in a const position (`f::<L>`).
                 ast::GenericArg::Type(t) => match p.ast.ty(*t) {
                     ast::TyExpr::Path(segs) if segs.len() == 1 => {
                         let scope = &self.body_scope;
-                        generics::const_name_ty(p.ast, p.interner, p.known, &cx, &mut self.tys, scope, segs[0].name).is_none_or(|s| s == want)
+                        generics::const_name_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, scope, segs[0].name)
+                            .is_none_or(|s| s == want)
                     }
                     _ => true,
                 },
@@ -6745,7 +6741,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // An unsuffixed literal takes its type from the cast
                 // target: `300 as u8` is a u8 literal out of range,
                 // and `3000000000 as u64` needs no i32 fit first.
-                let exp = if crate::ty::consteval::is_unsuffixed_lit(p.ast, *expr) { Some(target) } else { None };
+                let exp = if crate::ty::consteval::is_unsuffixed_lit(&p.ast, *expr) { Some(target) } else { None };
                 let t = self.expr(*expr, exp);
                 // A cast to a dyn reference is a coercion cast: rustc
                 // allows any coercion through `as` (ARCH 2.8).
@@ -7202,7 +7198,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // The scalar subset first; then the full bounded
                 // evaluator, so size_of calls, const items, and const
                 // fn calls all give lengths in expression position.
-                let n = crate::check::collect::eval_array_len(p.ast, p.interner, p.known, *len).or_else(|| {
+                let n = crate::check::collect::eval_array_len(&p.ast, &p.interner, &p.known, *len).or_else(|| {
                     if self.errs.len() != errs_before {
                         return None;
                     }
@@ -8573,7 +8569,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // The prelude's `Some`, `Ok`, and `Err` as values
             // (`.map(Some)`), when no binding takes the name.
             if matches!(bound, BindingRes::Absent) {
-                let k = p.known;
+                let k = &*p.known;
                 let r = [(k.Some, Res::OptSome), (k.Ok, Res::ResOk), (k.Err, Res::ResErr)].into_iter().find(|&(n, _)| n == name);
                 if let Some((_, r)) = r {
                     return self.builtin_item_value(e, r, segs, span);
@@ -8844,7 +8840,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Resolves `Type::item` and `std::env::args`. Reports an error and returns None on failure.
     fn resolve_assoc(&mut self, segs: &[ast::PathSeg], span: Span) -> Option<Res> {
         let p = self.p;
-        let k = p.known;
+        let k = &*p.known;
         // `Alias::item` through an alias of a builtin type is the item of
         // the type the alias names, by its canonical std path
         // (check/alias_path.rs); the alias's args are the written Self.
@@ -9232,7 +9228,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // A std path names std's type, never a user type of the same
         // name (std's `Ordering` is the one std Adt here).
         if std_ty && !generics::is_std_adt(&p.tys, a) {
-            self.errs.push(collect::std_path_shadowed(p.interner, ty_name, span));
+            self.errs.push(collect::std_path_shadowed(&p.interner, ty_name, span));
             return None;
         }
         // The variant and associated-item tables of the Adt are part of its
@@ -9399,7 +9395,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let t = self.resolve_written(args[0]);
         let t = self.deep(t);
-        let p: &Program<'_> = self.p;
+        let p: &Program = self.p;
         p.record_layout_reads(&mut self.out.reads, &self.tys, t);
         if self.is_template_check() && self.tys.flags(t).contains_param() {
             return Res::ConstBool(false);
@@ -9432,7 +9428,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Res::ConstUsize(0);
         }
         let t = self.resolve_written(args[0]);
-        let p: &Program<'_> = self.p;
+        let p: &Program = self.p;
         let t = self.deep(t);
         // The answer is baked into this body as a constant. Record a
         // layout read for every Adt in the type: the written-type
@@ -10165,7 +10161,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return None;
         }
         let lang = &p.gx.lang;
-        let tdef = p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(p.interner, segs[0].name)?;
+        let tdef = p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(&p.interner, segs[0].name)?;
         let rec = p.gx.index.trait_record(tdef)?;
         let lang_fn = match self.name(segs[1].name) {
             "default" => tdef == lang.default && args.is_empty(),
@@ -10281,7 +10277,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn written_trait_ref(&mut self, base: Ty, tref: &ast::TraitRefExpr, span: Span) -> Result<TraitRef, Diag> {
         let p = self.p;
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-        let tr = generics::resolve_trait_ref(p.ast, p.interner, p.known, &cx, &mut self.tys, &self.body_scope.clone(), base, tref, span)?;
+        let tr =
+            generics::resolve_trait_ref(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, &self.body_scope.clone(), base, tref, span)?;
         let old: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
         let new: Vec<GenericArg> = old
             .into_iter()
@@ -10666,7 +10663,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // assoc call itself).
                 if segs.len() == 2 && !args.is_empty() {
                     let cxr = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                    if let Some(tdef) = cxr.trait_by_bare_name(p.interner, segs[0].name)
+                    if let Some(tdef) = cxr.trait_by_bare_name(&p.interner, segs[0].name)
                         && let Some(rec) = p.gx.index.trait_record(tdef).cloned()
                         && rec.method_by_name(segs[1].name).is_some()
                     {
@@ -11912,7 +11909,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         expected: Option<Ty>,
     ) -> Ty {
         let p = self.p;
-        let k = p.known;
+        let k = &*p.known;
         // `Box` is a builtin deref step for method calls, as in
         // Rust. Its own `clone` is found before the step (it is
         // the one Box method this wave resolves at step zero),
@@ -12719,7 +12716,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// implemented yet and answer None, like a missing method.
     fn int_method(&mut self, name: Sym, t: Ty, i: IntTy) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
         use Builtin as B;
-        let k = self.p.known;
+        let k = &*self.p.known;
         let s = i.signed();
         let w128 = i.bits() >= 128;
         let u32t = int(IntTy::U32);
@@ -12938,7 +12935,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// literal), `f` its width when known (f64 for a variable).
     fn float_method(&mut self, name: Sym, t: Ty, f: FloatTy) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
         use Builtin as B;
-        let k = self.p.known;
+        let k = &*self.p.known;
         let un = |b: Builtin| Some((b, Autoref::None, vec![], t));
         let n = name;
         if n == k.sqrt {
@@ -13088,7 +13085,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
     fn str_method(&mut self, name: Sym) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
         use Builtin as B;
-        let k = self.p.known;
+        let k = &*self.p.known;
         let chars = CHARS;
         let opt_str = self.tys.mk_option(REF_STR);
         let bytes = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
@@ -15511,7 +15508,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                             self.check_ctor_vis(a, span);
                         }
                         self.check_ne_ctor(a, v, span);
-                        let Some(mapped) = map_tuple_elems(p.ast, elems, variant.fields.len()) else {
+                        let Some(mapped) = map_tuple_elems(&p.ast, elems, variant.fields.len()) else {
                             self.err(
                                 "L0110",
                                 span,
@@ -15629,7 +15626,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 };
                 match known {
                     Some(kt) => {
-                        let Some(mapped) = map_tuple_elems(p.ast, elems, kt.len()) else {
+                        let Some(mapped) = map_tuple_elems(&p.ast, elems, kt.len()) else {
                             self.err(
                                 "L0110",
                                 span,
@@ -15778,7 +15775,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     fn option_pattern(&self, pat: PatId) -> Option<bool> {
-        let k = self.p.known;
+        let k = &*self.p.known;
         match self.p.ast.pat(pat) {
             Pat::Binding { name, mutable: false, by_ref: false } if *name == k.None => Some(false),
             Pat::Path(segs) if self.std_parent_path(segs, k.Option, k.None) => Some(false),
@@ -15794,7 +15791,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// `Ok(..)` as `Some(true)`, `Err(..)` as `Some(false)`, in the
     /// prelude spelling and the qualified `Result::Ok(..)` spelling.
     fn result_pattern(&self, pat: PatId) -> Option<bool> {
-        let k = self.p.known;
+        let k = &*self.p.known;
         match self.p.ast.pat(pat) {
             Pat::TupleStruct { path, elems } if elems.len() == 1 => {
                 let last = path.last().map(|s| s.name)?;
@@ -16063,12 +16060,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// (`a = a + 1`, `a += 1`) does not fire.
     fn overflow_lint(&mut self) {
         let p = self.p;
-        let allow_arith = self.f.def.attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "arithmetic_overflow"));
-        let allow_panic = self.f.def.attrs.iter().any(|a| crate::check::allow_attr(a, p.interner, "unconditional_panic"));
+        let allow_arith = self.f.def(&self.p.ast).attrs.iter().any(|a| crate::check::allow_attr(a, &p.interner, "arithmetic_overflow"));
+        let allow_panic = self.f.def(&self.p.ast).attrs.iter().any(|a| crate::check::allow_attr(a, &p.interner, "unconditional_panic"));
         if allow_arith && allow_panic {
             return;
         }
-        let Some(body) = self.f.def.body else { return };
+        let Some(body) = self.f.def(&self.p.ast).body else { return };
         let mut lint = KLint {
             addressed: vec![false; self.out.locals.len()],
             frames: Vec::new(),
@@ -16376,7 +16373,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             Pat::Tuple(elems) => {
                 if let Some(KVal::Agg(items)) = v
-                    && let Some(map) = map_tuple_elems(p.ast, elems, items.len())
+                    && let Some(map) = map_tuple_elems(&p.ast, elems, items.len())
                 {
                     for (idx, sub) in map {
                         self.k_bind_pat(sub, &items[idx].clone(), env, lint);
@@ -16393,7 +16390,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     _ => None,
                 };
                 match &struct_val {
-                    Some(KVal::Agg(items)) => match map_tuple_elems(p.ast, elems, items.len()) {
+                    Some(KVal::Agg(items)) => match map_tuple_elems(&p.ast, elems, items.len()) {
                         Some(map) => {
                             for (idx, sub) in map {
                                 self.k_bind_pat(sub, &items[idx].clone(), env, lint);
@@ -16476,8 +16473,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Pushes statement-level `#[allow(..)]` counters for `attrs`;
     /// returns which counters rose, for `k_allow_pop`.
     fn k_allow_push(&self, attrs: &[ast::Attr], lint: &mut KLint) -> (bool, bool) {
-        let arith = attrs.iter().any(|a| crate::check::allow_attr(a, self.p.interner, "arithmetic_overflow"));
-        let panic_ = attrs.iter().any(|a| crate::check::allow_attr(a, self.p.interner, "unconditional_panic"));
+        let arith = attrs.iter().any(|a| crate::check::allow_attr(a, &self.p.interner, "arithmetic_overflow"));
+        let panic_ = attrs.iter().any(|a| crate::check::allow_attr(a, &self.p.interner, "unconditional_panic"));
         lint.stmt_allow_arith += u32::from(arith);
         lint.stmt_allow_panic += u32::from(panic_);
         (arith, panic_)
@@ -18090,8 +18087,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
 
 /// The const evaluator's context over a body being checked: names resolve
 /// through the program tables and the Binding query, as in body checking.
-struct CheckCx<'x, 'p, 'a> {
-    cx: &'x mut Ctx<'p, 'a>,
+struct CheckCx<'x, 'p> {
+    cx: &'x mut Ctx<'p>,
 }
 
 /// rustc's `needs_drop::<T>()` for a concrete type: a written `Drop`
@@ -18140,7 +18137,7 @@ fn needs_drop_answer(p: &Program, tys: &mut impl TyIntern, drop_defs: &[DefId], 
     Some(r)
 }
 
-impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
+impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
     type Tys = Tys<'p>;
 
     fn enter_const_fn(&mut self, owner: Option<Sym>) {
@@ -18186,8 +18183,9 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     fn tys_ref(&self) -> &Tys<'p> {
         &self.cx.tys
     }
-    fn ast(&self) -> &'a ast::Ast {
-        self.cx.p.ast
+    fn ast(&self) -> &'p ast::Ast {
+        let p: &'p Program = self.cx.p;
+        &p.ast
     }
     fn sym_text(&self, s: Sym) -> &str {
         self.cx.name(s)
@@ -18200,7 +18198,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         // form covers blocks inside the const expression itself,
         // which the evaluator walks without the checker's scopes.
         let body = self.cx.body_item_of(name).or_else(|| {
-            crate::check::collect::stmt_item_in_blocks(self.cx.p.ast, &self.cx.p.item_blocks, name, at)
+            crate::check::collect::stmt_item_in_blocks(&self.cx.p.ast, &self.cx.p.item_blocks, name, at)
                 .and_then(|si| self.cx.p.body_items.get(&si).copied())
         });
         match body {
@@ -18242,7 +18240,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
     }
     fn static_item(&mut self, name: Sym, at: Span) -> Option<(u32, Ty)> {
         let body = self.cx.body_item_of(name).or_else(|| {
-            crate::check::collect::stmt_item_in_blocks(self.cx.p.ast, &self.cx.p.item_blocks, name, at)
+            crate::check::collect::stmt_item_in_blocks(&self.cx.p.ast, &self.cx.p.item_blocks, name, at)
                 .and_then(|si| self.cx.p.body_items.get(&si).copied())
         });
         match body {
@@ -18317,7 +18315,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
             if !info.is_const {
                 return CallTarget::NonConst;
             }
-            let Some(body) = info.def.body else { return CallTarget::NonConst };
+            let Some(body) = info.def(&p.ast).body else { return CallTarget::NonConst };
             // The evaluator is about to run this const fn's body and bake
             // the result into the body being checked: that body depends
             // on the const fn's body, not only its signature. A `Checked`
@@ -18329,7 +18327,8 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
             if info.self_kind.is_some() {
                 return CallTarget::Unknown;
             }
-            let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
+            let params: Vec<(Sym, bool, Option<ast::PatId>)> =
+                info.def(&p.ast).params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
             let owner = info.owner.map(|a| p.adt(a).name);
             let generic = crate::check::collect::const_generic_kind(p, f);
             if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
@@ -18386,7 +18385,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
         self.cx.resolve_written(t)
     }
     fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
-        let p: &Program<'_> = self.cx.p;
+        let p: &Program = self.cx.p;
         let t = self.cx.deep(t);
         // A layout answer inside body const evaluation (`size_of` in a
         // const block or array length) is baked into the body: record
@@ -18440,7 +18439,7 @@ impl<'a, 'p> crate::ty::consteval::ConstCx<'a> for CheckCx<'_, 'p, 'a> {
 }
 
 /// The (Adt, variant) a path denotes in the compat tables.
-fn variant_of(p: &Program<'_>, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+fn variant_of(p: &Program, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
     // `std::borrow::Cow::Borrowed` and `Owned` (W-STD-B).
     if segs.len() == 4
         && matches!(p.interner.get(segs[0].name), "std" | "alloc")
@@ -18474,7 +18473,7 @@ fn variant_of(p: &Program<'_>, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
 /// The solver over one body's inference state (see
 /// `traits::solve::SolveCx`): probes bind body variables and roll
 /// back through the trail `bind_var` records.
-impl<'p> SolveCx for Ctx<'p, '_> {
+impl<'p> SolveCx for Ctx<'p> {
     type Snapshot = usize;
     type Store = Tys<'p>;
 

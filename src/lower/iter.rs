@@ -155,8 +155,8 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
     Ok(Some(ex.body))
 }
 
-struct Ex<'b, 'p, 'g> {
-    p: &'b Program<'p>,
+struct Ex<'b, 'g> {
+    p: &'b Program,
     body: Body<'g>,
     cur: Bb,
     span: Span,
@@ -171,7 +171,7 @@ struct Ex<'b, 'p, 'g> {
     unw: Option<Bb>,
 }
 
-impl Ex<'_, '_, '_> {
+impl Ex<'_, '_> {
     // ---------- IR building ----------
 
     fn local(&mut self, ty: Ty) -> Local {

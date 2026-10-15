@@ -72,7 +72,7 @@ enum Split {
 /// that runs out answers "not covered": a reject, never a wrong accept.
 const FUEL: u32 = 200_000;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// True when `pats`, all matching values of one type, together
     /// match every value (rustc's usefulness of a wildcard row).
     pub(super) fn covers(&self, pats: &[PatId]) -> bool {

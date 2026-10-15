@@ -478,7 +478,7 @@ fn ord(p: &Program, v: &str, t: &CTy) -> String {
     disc_call(p, t, &format!("(&{v})"))
 }
 
-impl FnGen<'_, '_, '_> {
+impl FnGen<'_, '_> {
     /// One sync builtin call: C statements to `self.out`, and the C
     /// expression of its value.
     pub(super) fn sync_builtin(&mut self, op: SyncOp, vals: &[String], tys: &[CTy], loc: &str) -> String {

@@ -9,7 +9,7 @@ use super::*;
 use crate::check::any::{AnyOp, type_id_words};
 use crate::check::object;
 
-impl<'p, 'a> Lower<'p, 'a> {
+impl<'p> Lower<'p> {
     /// A `Res::Any` method call (`recv.type_id()`, `is`, the downcasts)
     /// into `dest`.
     #[allow(clippy::too_many_arguments)]

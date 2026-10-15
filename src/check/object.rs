@@ -290,7 +290,7 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
     let n_preds = rec.generics.predicates.len();
     for &(mdef, mname) in &rec.methods {
         let Some(tm) = p.gx.trait_methods.get(&mdef) else { continue };
-        let span = tm.def.name_span;
+        let span = tm.def(&p.ast).name_span;
         let mn = p.name(mname).to_string();
         let own_preds = tm.generics.predicates.get(n_preds..).unwrap_or(&[]);
         let exempt = own_preds.iter().any(|pred| match pred {
@@ -365,7 +365,7 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
         }
         match recv {
             Some(recv) => {
-                let needs_static = where_self_static(p, &tm.def.where_clause);
+                let needs_static = where_self_static(p, &tm.def(&p.ast).where_clause);
                 info.methods.push(DynMethod { def: mdef, name: mname, recv, needs_static })
             }
             None if tm.self_kind.is_some() => {
@@ -563,12 +563,12 @@ pub fn check_signatures(p: &Program, errs: &mut Vec<Diag>) {
         if !matches!(class, FnClass::Plain | FnClass::Template) || p.gx.trait_methods.contains_key(&p.fn_defs[i]) {
             continue;
         }
-        sig_diag(&f.params, f.ret, f.def, &mut push);
+        sig_diag(&f.params, f.ret, f.def(&p.ast), &mut push);
     }
     let mut methods: Vec<_> = p.gx.trait_methods.values().collect();
-    methods.sort_by_key(|m| m.def.name_span.lo);
+    methods.sort_by_key(|m| m.def(&p.ast).name_span.lo);
     for tm in methods {
-        sig_diag(&tm.params, tm.ret, tm.def, &mut push);
+        sig_diag(&tm.params, tm.ret, tm.def(&p.ast), &mut push);
     }
     for (a, adt) in p.adts.iter().enumerate() {
         if p.gx.adt_instance_of.get(a).is_some_and(|i| i.is_some()) {
@@ -612,7 +612,7 @@ pub fn check_signatures(p: &Program, errs: &mut Vec<Diag>) {
             crate::ast::ItemKind::Static(s) => s.ty,
             _ => continue,
         };
-        if ast_has_dyn(p.ast, ty) {
+        if ast_has_dyn(&p.ast, ty) {
             push(Some(crate::check::generics::dyn_not_yet(p.ast.ty_span(ty), "a `dyn` type in a const or static item")));
         }
     }

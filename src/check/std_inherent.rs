@@ -88,7 +88,7 @@ pub(super) enum StdShadow {
     Reject,
 }
 
-impl Ctx<'_, '_> {
+impl Ctx<'_> {
     /// True when trait `d` is from outside std: the user's crates and the
     /// dependency adapters. Lang traits and std source traits are std.
     pub(super) fn is_user_trait(&self, d: DefId) -> bool {

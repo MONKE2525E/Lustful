@@ -54,7 +54,7 @@ fn scalar_kind(k: TyKind) -> bool {
     matches!(k, TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The `Error` type of one scalar pair sort.
     pub(super) fn try_err_ty(&mut self, sort: TryErr) -> Ty {
         match sort {

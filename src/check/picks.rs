@@ -54,7 +54,7 @@ pub struct TraitPick {
     pub env_pred: Option<u32>,
 }
 
-impl Ctx<'_, '_> {
+impl Ctx<'_> {
     /// True when this body is a template check, whose picks are
     /// recorded rather than replayed.
     pub(super) fn is_template_check(&self) -> bool {
@@ -331,12 +331,12 @@ mod tests {
     /// Collects one sample file in build (`walk` true) or check mode,
     /// then runs `run` on the program.
     fn with_mode(src: &str, walk: bool, run: impl FnOnce(&Interner, &Program)) {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect_mode(&ast, &interner, &known, ids, walk).unwrap();
+        let program = collect::collect_mode(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids, walk).unwrap();
         run(&interner, &program);
     }
 

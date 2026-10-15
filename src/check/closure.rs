@@ -151,14 +151,14 @@ impl CapWalk {
     }
 }
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// The stable def of one closure expression in this body: the
     /// parent's def hash plus the closure's ordinal in token order
     /// (ARCH 1.7). Instances and abstract instances have their own
     /// parent defs, so their closures get their own types.
     fn closure_def(&mut self, e: ExprId) -> DefId {
         if self.closure_order.is_none() {
-            let (lo, hi) = self.f.def.exprs;
+            let (lo, hi) = self.f.def(&self.p.ast).exprs;
             let mut order: Vec<ExprId> = (lo..hi).map(ExprId).filter(|&x| matches!(self.p.ast.expr(x), Expr::Closure { .. })).collect();
             order.sort_by_key(|&x| (self.p.ast.expr_span(x).lo, x.0));
             self.closure_order = Some(order);
@@ -375,7 +375,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut input_regions: Vec<Option<Ty>> = Vec::with_capacity(params.len());
         for (i, prm) in params.iter().enumerate() {
             let exp = expected_inputs.as_ref().and_then(|v| v.get(i).copied());
-            let named = prm.ty.is_some_and(|w| generics::names_lifetime(self.p.ast, self.p.interner, w));
+            let named = prm.ty.is_some_and(|w| generics::names_lifetime(&self.p.ast, &self.p.interner, w));
             // An unnamed annotation that does not resolve here (`Vec<_>`)
             // counts as unannotated: free, as rustc infers `_`.
             let elided = if no_sig { Region::Bound(0) } else { Region::Erased };
@@ -410,7 +410,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let mut output_region: Option<Ty> = None;
         let output = match (ret, sig.and_then(|s| s.1)) {
             (Some(w), exp) => {
-                let named = generics::names_lifetime(self.p.ast, self.p.interner, w);
+                let named = generics::names_lifetime(&self.p.ast, &self.p.interner, w);
                 if named {
                     output_region = self.regioned_annotation(w, Region::Erased, true);
                     let mut rs = Vec::new();
@@ -1596,7 +1596,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let subs: Vec<(u32, PatId)> = match p.ast.pat(pat) {
                     Pat::TupleStruct { elems, .. } => {
                         let n = p.adt(a).variants[v as usize].fields.len();
-                        map_tuple_elems(p.ast, elems, n).unwrap_or_default().into_iter().map(|(i, s)| (i as u32, s)).collect()
+                        map_tuple_elems(&p.ast, elems, n).unwrap_or_default().into_iter().map(|(i, s)| (i as u32, s)).collect()
                     }
                     Pat::Struct { fields, .. } => {
                         let vf = &p.adt(a).variants[v as usize].fields;
@@ -1616,7 +1616,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     TyKind::Tuple(ts) => self.tys.tys_of(ts).len(),
                     _ => elems.len(),
                 };
-                for (i, s) in map_tuple_elems(p.ast, elems, n).unwrap_or_default() {
+                for (i, s) in map_tuple_elems(&p.ast, elems, n).unwrap_or_default() {
                     let ft = self.out.pat_ty[(s.0 - self.out.pat_base) as usize];
                     let mut sub = place.clone();
                     sub.push(CProj::Field(i as u32), ft);
@@ -2008,7 +2008,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if let TyKind::FnDef(def, _) = self.kind(t)
             && self.is_fn_item(t)
-            && self.p.local_def(def.hash).is_some_and(|f| self.p.fn_info(f).def.qual.is_unsafe)
+            && self.p.local_def(def.hash).is_some_and(|f| self.p.fn_def(f).qual.is_unsafe)
         {
             return None;
         }

@@ -37,6 +37,7 @@ use crate::scan;
 use crate::{borrowck, check, ir, lower, parser};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// The session's one source file in its source map. A crate is one file today, so every
@@ -839,7 +840,7 @@ fn shift_ast_spans(front: &mut Front, a: usize, b: usize, delta: i64) {
         return;
     }
     let edit = span_shift::Edit { file: ROOT_FILE, a: a.min(b) as u32, b: b as u32, d: delta };
-    span_shift::shift_ast(&mut front.ast, edit, None);
+    span_shift::shift_ast(Arc::make_mut(&mut front.ast), edit, None);
 }
 
 /// True when a column-0 line starts an outer doc comment, which the lexer
@@ -1774,7 +1775,7 @@ fn resolved_setup(
     // The patch base describes the Ast being replaced. (A resolve error
     // above leaves both in place, so the request after it can patch.)
     front.patch = None;
-    let old_ast = std::mem::replace(&mut front.ast, ast);
+    let old_ast = std::mem::replace(&mut front.ast, Arc::new(ast));
     if old_ast.exprs.len() > 20_000 && caches.persistent {
         // Nested token trees in the Ast drop recursively; use the
         // compiler stack size like every other compiler thread.
@@ -1994,7 +1995,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let wants_resolver = wants_resolver || std_mods != 0;
     let route_std_mods = req.session.krate.manifest_path.is_none().then_some(std_mods);
     if front.resolved_crate && !wants_resolver {
-        front.ast = Ast::default();
+        front.ast = Arc::default();
         front.env_hash = None;
         front.prev_adt_ids.clear();
         front.prev_static_ids.clear();
@@ -2368,7 +2369,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 let (item, sub) = front.fn_loc[i];
                 if let Some(b) = fn_def_at(&front.ast, item, sub).body {
                     let sp = front.ast.block(b).span;
-                    span_shift::blank_nodes(&mut front.ast, sp.file, (sp.lo, sp.hi), None);
+                    span_shift::blank_nodes(Arc::make_mut(&mut front.ast), sp.file, (sp.lo, sp.hi), None);
                 }
             }
             shift_ast_spans(front, edit.0, edit.1, delta);
@@ -2386,9 +2387,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             for (&i, (body_ast, body, exprs, pats)) in changed.iter().zip(parsed) {
                 let before = (front.ast.exprs.len() as u32, front.ast.pats.len() as u32, front.ast.blocks.len() as u32);
                 let stmt_base = front.ast.stmt_items.len() as u32;
-                let _ = front.ast.append_chunk(body_ast, stmt_base);
+                let _ = Arc::make_mut(&mut front.ast).append_chunk(body_ast, stmt_base);
                 let (item, sub) = front.fn_loc[i];
-                let def = fn_def_at_mut(&mut front.ast, item, sub);
+                let def = fn_def_at_mut(Arc::make_mut(&mut front.ast), item, sub);
                 def.body = Some(crate::ast::BlockId(body.0 + before.2));
                 // `bodies_mode_ok` proved no node sits between the
                 // parameters and the body, so these are the cold ranges.
@@ -2445,7 +2446,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
             }
             for (lo, hi) in gone {
-                span_shift::blank_nodes(&mut front.ast, ROOT_FILE, (lo as u32, hi as u32), None);
+                span_shift::blank_nodes(Arc::make_mut(&mut front.ast), ROOT_FILE, (lo as u32, hi as u32), None);
             }
             shift_ast_spans(front, edit.0, edit.1, delta);
         }
@@ -2462,11 +2463,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // panic in the build re-emit loop). Arena nodes stay append-only
         // in `append_chunk`; only these enumerated lists are rebuilt.
         let old_block_count = front.ast.blocks.len();
-        let mut old_items: Vec<Option<crate::ast::Item>> = std::mem::take(&mut front.ast.items).into_iter().map(Some).collect();
+        let mut old_items: Vec<Option<crate::ast::Item>> = std::mem::take(&mut Arc::make_mut(&mut front.ast).items).into_iter().map(Some).collect();
         let mut old_stmt_items: Vec<Option<crate::ast::Item>> =
-            std::mem::take(&mut front.ast.stmt_items).into_iter().map(Some).collect();
+            std::mem::take(&mut Arc::make_mut(&mut front.ast).stmt_items).into_iter().map(Some).collect();
         let mut old_inner_attrs: Vec<Option<crate::ast::Attr>> =
-            std::mem::take(&mut front.ast.inner_attrs).into_iter().map(Some).collect();
+            std::mem::take(&mut Arc::make_mut(&mut front.ast).inner_attrs).into_iter().map(Some).collect();
         // Old body-item index to new index, for the blocks that already
         // exist. A replaced chunk's old entries map to the new entry at
         // the same offset when one exists (their blocks are orphans of
@@ -2481,7 +2482,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let inner_start = inner_attrs.len();
             match new_asts.remove(&c) {
                 Some(ast) => {
-                    let (its, sis, ias) = front.ast.append_chunk(ast, stmt_start as u32);
+                    let (its, sis, ias) = Arc::make_mut(&mut front.ast).append_chunk(ast, stmt_start as u32);
                     if let Some(old_range) = front.chunks[c].stmt_items.clone() {
                         for (k, old_idx) in old_range.enumerate() {
                             if k < sis.len() {
@@ -2509,7 +2510,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // Blocks from before the splice still hold old body-item
         // indexes; blocks the re-parsed chunks appended already hold
         // new ones (`append_chunk` shifted them to the splice base).
-        for b in &mut front.ast.blocks[..old_block_count] {
+        for b in &mut Arc::make_mut(&mut front.ast).blocks[..old_block_count] {
             b.stmts.retain_mut(|st| match st {
                 crate::ast::Stmt::Item(i) => match stmt_remap.get(*i as usize).copied().flatten() {
                     Some(n) => {
@@ -2521,9 +2522,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 _ => true,
             });
         }
-        front.ast.items = items;
-        front.ast.stmt_items = stmt_items;
-        front.ast.inner_attrs = inner_attrs;
+        Arc::make_mut(&mut front.ast).items = items;
+        Arc::make_mut(&mut front.ast).stmt_items = stmt_items;
+        Arc::make_mut(&mut front.ast).inner_attrs = inner_attrs;
         match slot_update(front, caches, item_scans, env, changed_names, &fn_at, crate_ids, &scan_of, &mut t) {
             Ok(c) => c,
             Err(e) => {
@@ -2573,7 +2574,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
             }
         };
-        front.ast = ast;
+        front.ast = Arc::new(ast);
         match slot_update(front, caches, item_scans, env, None, &fn_at, crate_ids, &scan_of, &mut t) {
             Ok(c) => c,
             Err(e) => {
@@ -2652,12 +2653,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The resolver tables enter here, before collect's own body
     // checks (mono's template checks) run, so every body checks
     // with the visibility tables attached (see `Program::resolved`).
-    front.ast.shipped = std_ranges.clone();
-    front.ast.lang_methods = std_methods;
+    Arc::make_mut(&mut front.ast).shipped = std_ranges.clone();
+    Arc::make_mut(&mut front.ast).lang_methods = std_methods;
     let mut program = match collect::collect_reuse(
-        &front.ast,
-        &front.interner,
-        &front.known,
+        front.ast.clone(),
+        front.interner.clone(),
+        front.known.clone(),
         crate_ids,
         req.cmd == Cmd::Build,
         &mut front.def_order,
@@ -2897,7 +2898,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if !moved {
                 continue;
             }
-            let file = program.fn_info(LocalDefId(i as u32)).def.name_span.file;
+            let file = program.fn_def(LocalDefId(i as u32)).name_span.file;
             let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
             let rebuilt = if fh == cached.file_hash {
                 super::ir_cache::rebuild(&program, cached, LocalDefId(i as u32))
@@ -3145,7 +3146,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let line_bases: Vec<u32> = (0..program.fns.len())
         .map(|i| match caches.gen_reuse.source(&program, LocalDefId(i as u32)) {
             Some(s) if (s.0 as usize) < fn_count => scan_of(front, s.0 as usize).1,
-            Some(s) => map.line_col(map.call_site(program.fn_info(s).def.name_span)).0,
+            Some(s) => map.line_col(map.call_site(program.fn_def(s).name_span)).0,
             None => 0,
         })
         .collect();
@@ -3154,7 +3155,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // file. An instance takes its source fn's file, as it takes its line.
     let fn_files: Vec<u32> = (0..program.fns.len())
         .map(|i| match caches.gen_reuse.source(&program, LocalDefId(i as u32)) {
-            Some(s) => map.call_site(program.fn_info(s).def.name_span).file.0,
+            Some(s) => map.call_site(program.fn_def(s).name_span).file.0,
             None => ROOT_FILE.0,
         })
         .collect();
@@ -3202,7 +3203,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         if let Some(used) = caches.slot_used.get_mut(s) {
             *used = used_slots;
         }
-        let file = program.fn_info(LocalDefId(*i as u32)).def.name_span.file;
+        let file = program.fn_def(LocalDefId(*i as u32)).name_span.file;
         let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
         if let Some(slot_ir) = caches.slot_ir.get_mut(s) {
             *slot_ir = Some(super::ir_cache::cache_body(&program, body, fh, s as u32, used_pairs, fp));
@@ -3930,8 +3931,8 @@ struct F;
     #[test]
     fn seeded_chunk_keeps_crate_allows() {
         let whole = "#![allow(arithmetic_overflow)]\nfn a() {}\nfn b() -> u8 { 1 }\n";
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(whole, ROOT_FILE, 0, &interner).unwrap();
         let seed = parser::leading_allows(&lexed, &interner, &known);
         assert_eq!(seed.len(), 1);
@@ -3957,12 +3958,13 @@ impl Foo { fn get(&self) -> i64 { self.x } }
 fn main() { println!(\"{}\", helper()); }
 impl Foo { fn set(&mut self, v: i64) { self.x = v; } }
 ";
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+        let program = collect::collect(std::sync::Arc::new(ast.clone()), interner.clone(), known.clone(), ids).unwrap();
+        let keys = fn_keys(&ast, &fn_locations(&ast), &interner, ids.stable);
         let keys = fn_keys(&ast, &fn_locations(&ast), &interner, ids.stable);
         assert_eq!(keys.len(), program.fns.len());
         assert_eq!(program.krate, def::LOCAL_CRATE);
@@ -4000,13 +4002,14 @@ fn k() -> i32 {
 fn main() { println!(\"{}\", f() + k() + S.m()); }
 ";
         let b = a.replace("    fn g() -> i32 { 1 }\n", "    fn h() {}\n    fn g() -> i32 { 1 }\n");
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
         let keys_of = |src: &str| {
             let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
             let ast = parser::parse(&lexed, &interner, &known).unwrap();
-            let program = collect::collect(&ast, &interner, &known, ids).unwrap();
+            let program = collect::collect(std::sync::Arc::new(ast.clone()), interner.clone(), known.clone(), ids).unwrap();
+            let keys = fn_keys(&ast, &fn_locations(&ast), &interner, ids.stable);
             let keys = fn_keys(&ast, &fn_locations(&ast), &interner, ids.stable);
             assert_eq!(keys.len(), program.fns.len());
             for (i, k) in keys.iter().enumerate() {
@@ -4043,8 +4046,8 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
     /// driver's predicted indices match collect's assignment.
     #[test]
     fn adt_and_static_indices_are_stable() {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
         // Collects one source and returns its Adt and static indices
         // by name (Program borrows the Ast, so it stays inside).
@@ -4052,7 +4055,7 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
             let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
             let ast = parser::parse(&lexed, &interner, &known).unwrap();
             let (adts, statics, _) = predicted_def_ids(&ast, &interner, ids.stable, order);
-            let program = collect::collect_with_order(&ast, &interner, &known, ids, true, order).unwrap();
+            let program = collect::collect_with_order(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids, true, order).unwrap();
             for (hash, &id) in &adts {
                 // A synthetic std Adt carries its builtin def, not a
                 // local-crate one (check/collect.rs).
@@ -4102,13 +4105,13 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
     /// names `A<id>` keeps its meaning.
     #[test]
     fn instance_adt_ids_are_stable() {
-        let interner = Interner::default();
-        let known = Known::new(&interner);
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
         let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
         let inst_ids = |src: &str, order: &mut collect::DefOrder| -> FxMap<u64, u32> {
             let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
             let ast = parser::parse(&lexed, &interner, &known).unwrap();
-            let program = collect::collect_with_order(&ast, &interner, &known, ids, true, order).unwrap();
+            let program = collect::collect_with_order(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids, true, order).unwrap();
             inst_adt_ids(&program).into_iter().map(|(id, key)| (key, id)).collect()
         };
         let base = "struct W<T> { a: T }\nfn f() -> u8 { W { a: 1u8 }.a }\nfn g() -> u16 { W { a: 2u16 }.a }\n\

@@ -6,7 +6,7 @@
 // Display and the methods are builtins (cgen.rs).
 use super::*;
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// std's `FromUtf8Error` (`from`) or `Utf8Error` type: always
     /// registered (check/collect.rs), even where a user type takes the
     /// flat name.

@@ -52,7 +52,7 @@ pub fn takes_no_args(b: Builtin) -> bool {
     matches!(b, Builtin::TlsGet | Builtin::TlsTryGet | Builtin::TlsCloneRc | Builtin::TlsTake)
 }
 
-impl Lower<'_, '_> {
+impl Lower<'_> {
     /// The extra operands of a key method call: the init fn of the
     /// `thread_local!` static its receiver names (the checker allows no
     /// other receiver), as an `fn() -> T` pointer value, then the key's
@@ -110,8 +110,8 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
     Ok(Some(ex.body))
 }
 
-struct Ex<'b, 'p, 'g> {
-    p: &'b Program<'p>,
+struct Ex<'b, 'g> {
+    p: &'b Program,
     body: Body<'g>,
     cur: Bb,
     span: Span,
@@ -122,7 +122,7 @@ struct Ex<'b, 'p, 'g> {
     unw: Option<Bb>,
 }
 
-impl Ex<'_, '_, '_> {
+impl Ex<'_, '_> {
     // ---------- IR building ----------
 
     fn local(&mut self, ty: Ty) -> Local {

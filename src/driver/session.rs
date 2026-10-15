@@ -12,12 +12,16 @@ use crate::lexer::Lexed;
 use crate::protocol::SessionKey;
 use crate::scan;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Parsed program state. Owned separately from the caches so both can be borrowed at once.
 pub(crate) struct Front {
-    pub(crate) interner: Interner,
-    pub(crate) known: Known,
-    pub(crate) ast: Ast,
+    /// Shared with the request's `Program` (it owns its inputs).
+    pub(crate) interner: Arc<Interner>,
+    pub(crate) known: Arc<Known>,
+    /// The merged Ast. A collected `Program` holds another reference;
+    /// writers (`Arc::make_mut`) run when none does.
+    pub(crate) ast: Arc<Ast>,
     /// `None` until the first successful parse.
     pub(crate) env_hash: Option<u64>,
     /// Session-stable Adt and static numbering state, kept across
@@ -335,9 +339,9 @@ impl Session {
         Session {
             key,
             front: Front {
-                interner,
-                known,
-                ast: Ast::default(),
+                interner: Arc::new(interner),
+                known: Arc::new(known),
+                ast: Arc::default(),
                 env_hash: None,
                 def_order: crate::check::collect::DefOrder::default(),
                 client: crate::expand::ClientView::default(),

@@ -36,7 +36,7 @@
 use super::*;
 use crate::intern::FxMap;
 
-impl Ctx<'_, '_> {
+impl Ctx<'_> {
     /// The return type a body checks against: the fn's return type, with
     /// its own `impl Trait` as a fresh variable the returns decide.
     pub(super) fn defining_ret(&mut self) -> Ty {
@@ -119,7 +119,7 @@ impl Ctx<'_, '_> {
             return;
         }
         if self.opaque_copy_hazard {
-            let span = p.fn_info(self.fid).def.name_span;
+            let span = p.fn_def(self.fid).name_span;
             self.errs.push(not_yet("L0602", span, "using an `impl Trait` value whose hidden type is `Copy` when its bounds are not"));
             return;
         }
@@ -232,7 +232,7 @@ impl Ctx<'_, '_> {
                 continue;
             }
             if met.iter().any(|(d, _, c)| *d == od && c.iter().any(|t| cts.contains(t))) {
-                let span = p.fn_info(self.fid).def.name_span;
+                let span = p.fn_def(self.fid).name_span;
                 self.errs.push(not_yet(
                     "L0602",
                     span,
@@ -311,7 +311,7 @@ pub enum OpaqueMode {
 /// `check_fn` for a body that is not a closure body: the opaque view,
 /// then, for a body that gets code and uses an opaque value, the revealed
 /// check that replays the view's picks. An instance checks revealed.
-pub(super) fn check_fn_opaque<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
+pub(super) fn check_fn_opaque<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
     use generics::FnClass;
     if p.gx.opaques.is_empty() {
         return check_fn_mode(p, fid, OpaqueMode::View, ViewOut::default());
@@ -334,7 +334,7 @@ pub(super) fn check_fn_opaque<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (C
 
 /// `check_fn` in the opaque view only: the hidden types of the body's
 /// own opaques, before any caller is revealed (`reveal_plain`).
-pub(crate) fn check_fn_view<'p, 'a>(p: &'p Program<'a>, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
+pub(crate) fn check_fn_view<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
     check_fn_mode(p, fid, OpaqueMode::View, ViewOut::default())
 }
 

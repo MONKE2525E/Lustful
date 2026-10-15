@@ -64,7 +64,7 @@ const DECLARED_ONLY: &[&str] = &[
     "get_or_insert_with",
 ];
 
-impl<'p, 'a> Ctx<'p, 'a> {
+impl<'p> Ctx<'p> {
     /// Pushes `t: trait_def` (one-parameter traits) to the queue.
     fn require(&mut self, trait_def: DefId, t: Ty, span: Span) {
         let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
