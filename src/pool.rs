@@ -20,7 +20,7 @@
 // code that is not a C or libc call; the SAFETY comment there is the proof.
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 
@@ -309,6 +309,45 @@ pub fn stop() -> Stopped {
     stopped
 }
 
+/// Set by a one-shot compile (`small_pages_in_parallel`): parallel regions
+/// run without transparent huge pages, serial code keeps them.
+static SMALL_PAGES: AtomicBool = AtomicBool::new(false);
+/// Parallel regions open now (nested `par_map` calls count too).
+static PARALLEL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Makes every later `par_map` run with transparent huge pages off and
+/// turn them on again when it ends. Pool threads touch fresh memory
+/// sparsely, so a huge page costs a 2 MB zeroing per first touch, under
+/// contention; serial phases touch memory densely and gain from them
+/// (see `tcc::set_huge_pages`).
+pub fn small_pages_in_parallel() {
+    SMALL_PAGES.store(true, Ordering::Relaxed);
+}
+
+/// Open while one parallel region runs: the first one in turns huge pages
+/// off, the last one out turns them on.
+struct SmallPages;
+
+impl SmallPages {
+    fn enter() -> Option<SmallPages> {
+        if !SMALL_PAGES.load(Ordering::Relaxed) {
+            return None;
+        }
+        if PARALLEL_DEPTH.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::tcc::set_huge_pages(false);
+        }
+        Some(SmallPages)
+    }
+}
+
+impl Drop for SmallPages {
+    fn drop(&mut self) {
+        if PARALLEL_DEPTH.fetch_sub(1, Ordering::AcqRel) == 1 {
+            crate::tcc::set_huge_pages(true);
+        }
+    }
+}
+
 /// Runs `f` for each item on `threads()` threads. Results keep the input
 /// order. Items are taken in small batches from one atomic counter, so
 /// uneven items still spread over every thread. A panic in `f` resumes in
@@ -318,6 +357,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     if n <= 1 {
         return items.iter().map(f).collect();
     }
+    let _pages = SmallPages::enter();
     let next = AtomicUsize::new(0);
     // Batches amortize the atomic counter, but stay small enough to keep every thread busy.
     let batch = (items.len() / (n * 8)).clamp(1, 16);

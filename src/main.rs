@@ -94,6 +94,12 @@ fn raise_stack_limit() {
     }
 }
 
+/// The root file size from which a one-shot compile keeps transparent
+/// huge pages in its serial phases (see `main`). On boat, realish40
+/// (940 KB) and plain1600 (1.2 MB) gain from them there, realish20
+/// (470 KB) is even, and fmt40 (54 KB) and a trivial program lose.
+const BIG_FILE: u64 = 256 << 10;
+
 fn main() {
     #[cfg(unix)]
     raise_stack_limit();
@@ -125,6 +131,18 @@ fn main() {
             {
                 protocol::finish(resp, run, &req.out, &args);
             }
+            // Transparent huge pages cost a 2 MB zeroing per first touch. Pool
+            // threads touch memory sparsely, so parallel phases always run
+            // without them. A big file's serial phases (collect over every
+            // item) touch memory densely and gain from them; a small program
+            // touches little and loses, so it runs without them throughout,
+            // with them on again before `finish` runs the program.
+            let small = std::fs::metadata(&req.file).map_or(true, |m| m.len() < BIG_FILE);
+            if small {
+                tcc::set_huge_pages(false);
+            } else {
+                pool::small_pages_in_parallel();
+            }
             let dir = std::env::temp_dir().join(format!("lust-{}", std::process::id()));
             let mut session = driver::Session::new(dir, false, req.session.clone());
             // A panicking compile must not leave its temp dir behind:
@@ -138,6 +156,9 @@ fn main() {
                 }
             };
             remove_obj_dir(session.obj_dir());
+            if small {
+                tcc::set_huge_pages(true);
+            }
             if let (Some(cache), Some(src)) = (&cache, &src) {
                 cache.store(&req, src, &resp);
             }

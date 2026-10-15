@@ -36,6 +36,7 @@ unsafe extern "C" {
 
 // POSIX calls used by `run_in_memory` (linked from libc, always present).
 unsafe extern "C" {
+    fn prctl(option: c_int, arg2: std::ffi::c_ulong, arg3: std::ffi::c_ulong, arg4: std::ffi::c_ulong, arg5: std::ffi::c_ulong) -> c_int;
     fn fork() -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn _exit(code: c_int) -> !;
@@ -60,6 +61,28 @@ extern "C" fn tcc_realloc(p: *mut c_void, size: std::ffi::c_ulong) -> *mut c_voi
 pub fn use_mimalloc() {
     // SAFETY: sets a global function pointer before any libtcc state exists.
     unsafe { tcc_set_realloc(tcc_realloc) }
+}
+
+/// Linux `PR_SET_THP_DISABLE`.
+#[cfg(target_os = "linux")]
+const PR_SET_THP_DISABLE: c_int = 41;
+
+/// Turns transparent huge pages on or off for this process (Linux; a
+/// no-op elsewhere). A cold one-shot compile turns them off where they
+/// cost (`main`, `pool::small_pages_in_parallel`): its threads touch
+/// fresh memory sparsely, and the kernel then zeroes a whole 2 MB page
+/// for each first touch, under contention in the parallel phases
+/// (realish40 touched 320 MB instead of 90 MB). The flag is inherited
+/// across fork and exec, so it is on again before user code runs
+/// (`protocol::finish`, `run_in_memory`'s child).
+pub fn set_huge_pages(on: bool) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl with PR_SET_THP_DISABLE only sets a flag on this process; it reads no memory.
+    unsafe {
+        prctl(PR_SET_THP_DISABLE, if on { 0 } else { 1 }, 0, 0, 0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = on;
 }
 
 const TCC_OUTPUT_MEMORY: c_int = 1;
@@ -322,6 +345,8 @@ pub fn run_in_memory(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[St
         let pid = unsafe { fork() };
         if pid == 0 {
             // Child. Do not return, drop, or panic: call user code, flush, _exit.
+            // User code gets the system's huge page default back.
+            set_huge_pages(true);
             // SAFETY: main_sym was relocated before the fork; cargv outlives the call.
             unsafe {
                 let code = main_sym(cargs.len() as c_int, cargv.as_mut_ptr());
@@ -375,6 +400,24 @@ fn lone_thread() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// `set_huge_pages` flips the process flag Linux reports as
+    /// `THP_enabled` in /proc/self/status, and back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn huge_pages_switch() {
+        let read = || {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            status.lines().find_map(|l| l.strip_prefix("THP_enabled:")).map(|v| v.trim().to_string())
+        };
+        if read().is_none() {
+            return; // a kernel without the field
+        }
+        super::set_huge_pages(false);
+        assert_eq!(read().as_deref(), Some("0"));
+        super::set_huge_pages(true);
+        assert_eq!(read().as_deref(), Some("1"));
+    }
+
     /// `lone_thread` counts every thread the OS lists, not only pool threads:
     /// a parked thread makes it false. The other side, one thread at the
     /// fork of a one-shot `lust run`, is what scripts/runtest.sh checks:
