@@ -6149,7 +6149,10 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
         TyKind::Float(_) => !total,
         TyKind::Infer(v) => v.is_int() || (v.is_float() && !total),
         TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_cmp_mode(p, tys, e, total, seen, pcmp),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_cmp_mode(p, tys, e, total, seen, pcmp)),
+        // core's tuple impls of the derive family (`PartialOrd`
+        // here, and `Eq`, `Hash`, `Default`, `Debug` below) stop
+        // at 12 elements; `Clone` and `Copy` hold at every arity.
+        TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_cmp_mode(p, tys, e, total, seen, pcmp)),
         _ => {
             if tys.is_string_ty(t) {
                 return true;
@@ -6434,7 +6437,7 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> boo
         TyKind::RawPtr(..) => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_hash(p, tys, e, seen),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_hash(p, tys, e, seen)),
+        TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_hash(p, tys, e, seen)),
         _ => {
             if tys.is_string_ty(t) {
                 return true;
@@ -6490,7 +6493,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => matches!(tys.kind(e), TyKind::Str | TyKind::Slice(_)),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_default(p, tys, e, seen)),
+        TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_default(p, tys, e, seen)),
         TyKind::Array(e, n) => match tys.const_kind(n) {
             ConstKind::Int(0) => true,
             ConstKind::Int(k) if k <= 32 => glue_default(p, tys, e, seen),
@@ -6571,7 +6574,7 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) ->
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) => glue_total_eq(p, tys, e, seen),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_total_eq(p, tys, e, seen)),
+        TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_total_eq(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_total_eq(p, tys, e, seen),
         _ => {
             if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
@@ -6624,7 +6627,7 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => glue_eq(p, tys, e, seen),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_eq(p, tys, e, seen)),
+        TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_eq(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_eq(p, tys, e, seen),
         _ => {
             if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
@@ -6685,7 +6688,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error | TyKind::Never => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => glue_debug(p, tys, e, seen),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_debug(p, tys, e, seen)),
+        TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_debug(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_debug(p, tys, e, seen),
         // std's `impl Debug for dyn Any (+ Send (+ Sync))`: `Any { .. }`.
         TyKind::Dyn(b, _) => {

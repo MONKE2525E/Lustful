@@ -9380,7 +9380,10 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
     match p.tys.kind(ty) {
         TyKind::Tuple(ts) => {
             let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
-            elems.iter().all(|&e| prove_field_trait(p, env, trait_def, e))
+            // core's tuple impls of the derive family stop at 12
+            // elements (`Clone` and `Copy` hold at every arity).
+            let limited = [lang.debug, lang.partial_eq, lang.eq, lang.partial_ord, lang.ord, lang.hash, lang.default].contains(&trait_def);
+            (!limited || elems.len() <= 12) && elems.iter().all(|&e| prove_field_trait(p, env, trait_def, e))
         }
         // core's `Default` impls: arrays of up to 32 elements (any
         // element type at length 0), `&str` and `&[T]`; no others.
