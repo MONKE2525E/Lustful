@@ -64,24 +64,65 @@
 #      a lang trait impl edit still takes it.
 #  21. plain inherent impl edits leave it too (MethodSet reads); an
 #      inherent impl with an associated const still takes it.
+# Program stderr is compared with the OS thread id masked
+# (mask_stderr, as in scripts/case-pool.sh): rustc 1.99 and lust
+# print `thread 'main' (<os tid>) panicked at ...`, and the tid
+# differs on every run, even of one binary. File, line, column, and
+# message stay exact.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
-import glob, os, re, shutil, subprocess, sys, tempfile, time
+# The gate runs scripts/test-driver.sh, a thin wrapper over this file.
+import errno, glob, os, re, shutil, subprocess, sys, tempfile, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUST = os.path.join(ROOT, "target/release/lust")
 failures = []
+passed = 0
 
 
 def check(name, cond, detail=""):
-    print(f"{'ok' if cond else 'FAIL'} {name}" + (f": {detail}" if detail and not cond else ""))
-    if not cond:
+    global passed
+    print(f"{'ok' if cond else 'FAIL'} {name}" + (f": {detail}" if detail and not cond else ""), flush=True)
+    if cond:
+        passed += 1
+    else:
         failures.append(name)
+
+
+# mask_stderr <text>: program stderr without the per-run OS thread id
+# in the panic header (see the file header). Same mask as
+# scripts/case-pool.sh, which difftest and runtest compare through.
+def mask_stderr(text):
+    return re.sub(r"^thread '([^']*)' \([0-9]+\) ", r"thread '\1' (TID) ", text, flags=re.M)
+
+
+# run_prog <path>: run a built program and return the completed
+# process. A just-linked binary can still be open for writing for a
+# moment after the build returns, and exec then fails with ETXTBSY
+# (seen on boat in case 18, where it aborted the whole suite): wait
+# a short time and try again. A program still busy after 5 s, or one
+# that does not end in 60 s, fails its case instead of hanging it.
+def run_prog(path):
+    for i in range(50):
+        try:
+            return subprocess.run([path], capture_output=True, text=True, timeout=60)
+        except OSError as e:
+            if e.errno != errno.ETXTBSY or i == 49:
+                raise
+            time.sleep(0.1)
 
 
 class Daemon:
     def __init__(self, work):
         self.work = work
-        self.env = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(work, "s.sock"),
+        # No inherited LUST_* settings (the list scripts/test-client.sh
+        # unsets, plus LUST_STATS): a caller or a gate lane may set
+        # them for another suite, and this one needs its own daemon,
+        # cache, and stats.
+        drop = ("LUST_DAEMON_SOCKET", "LUST_CACHE_DIR", "LUST_NO_DAEMON", "LUST_NO_CACHE",
+                "LUST_CACHE_COMPILER_ID", "LUST_CACHE_MAX_BYTES", "LUST_DAEMON_IDLE",
+                "LUST_THREADS", "LUST_STATS")
+        self.env = {k: v for k, v in os.environ.items() if k not in drop}
+        self.env.update(LUST_DAEMON_SOCKET=os.path.join(work, "s.sock"),
                         LUST_CACHE_DIR=os.path.join(work, "cache"), LUST_STATS="1",
                         LUST_DAEMON_IDLE="120s")
         self.proc = None
@@ -89,11 +130,15 @@ class Daemon:
     def start(self):
         self.proc = subprocess.Popen([LUST, "daemon"], cwd=self.work, env=self.env,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        for _ in range(300):
+        # 30 s, not 6: gate lanes load the box, and a slow start is
+        # not a failure. A daemon that exits at once fails fast.
+        for _ in range(1500):
             if os.path.exists(os.path.join(self.work, "s.sock")):
                 return
+            if self.proc.poll() is not None:
+                break
             time.sleep(0.02)
-        raise SystemExit("daemon did not start")
+        raise RuntimeError("daemon did not start")
 
     def kill(self):
         err = ""
@@ -109,7 +154,9 @@ class Daemon:
         return err
 
     def run(self, args, expect=0):
-        r = subprocess.run([LUST] + args, cwd=self.work, env=self.env, capture_output=True, text=True)
+        # A hung client or daemon fails its case in 300 s (well over a
+        # loaded gate lane's build), not at the gate's step limit.
+        r = subprocess.run([LUST] + args, cwd=self.work, env=self.env, capture_output=True, text=True, timeout=300)
         if expect is not None:
             assert r.returncode == expect, f"{args}: exit {r.returncode}\n{r.stderr[-600:]}"
         return r
@@ -122,7 +169,7 @@ class Daemon:
                 for kv in line.split(":", 1)[1].split():
                     k, _, v = kv.partition("=")
                     stats[k] = int(v) if v.isdigit() else v
-        prog = subprocess.run([out], capture_output=True, text=True)
+        prog = run_prog(out)
         return stats, prog
 
 
@@ -248,7 +295,7 @@ def case_graph_refresh_and_std():
     d.start()
     for tag in ("first", "second"):
         d.build(ex, out)
-        prog = subprocess.run([out], capture_output=True, text=True)
+        prog = run_prog(out)
         check(f"std source fn via daemon ({tag})",
               prog.returncode == 3 and prog.stdout.strip() == "before-exit",
               f"exit {prog.returncode} out {prog.stdout!r}")
@@ -436,7 +483,7 @@ def case_empty_units_restart():
     d.start()
     r = d.run(["build", src, "-o", out], expect=None)
     check("empty units restart build", r.returncode == 0, r.stderr[-300:])
-    prog = subprocess.run([out], capture_output=True, text=True)
+    prog = run_prog(out)
     check("empty units restart output", prog.stdout.strip() == "780", prog.stdout)
     d.kill()
 
@@ -461,8 +508,8 @@ def case_positions():
     def cold(src):
         env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold{len(os.listdir(work))}"))
         cout = os.path.join(work, "xc")
-        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True)
-        return subprocess.run([cout], capture_output=True, text=True).stderr
+        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True, timeout=300)
+        return run_prog(cout).stderr
 
     d.start()
     for src, path, old, new in [(single, single, "    let r = a + 9;", "    let r =     a + 9;"),
@@ -471,7 +518,7 @@ def case_positions():
         d.build(src, out)
         edit(path, old, new)
         _, prog = d.build(src, out)
-        check(f"positions after {new.strip()!r}: warm panic equals cold", prog.stderr == cold(src), prog.stderr)
+        check(f"positions after {new.strip()!r}: warm panic equals cold", mask_stderr(prog.stderr) == mask_stderr(cold(src)), prog.stderr)
     d.kill()
 
 
@@ -494,9 +541,9 @@ def case_generic_reuse():
     def cold():
         env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold{len(os.listdir(work))}"))
         cout = os.path.join(work, "xc")
-        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True)
-        r = subprocess.run([cout], capture_output=True, text=True)
-        return r.returncode, r.stdout, r.stderr
+        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True, timeout=300)
+        r = run_prog(cout)
+        return r.returncode, r.stdout, mask_stderr(r.stderr)
 
     def edit(old, new):
         text = open(src).read()
@@ -504,7 +551,7 @@ def case_generic_reuse():
         open(src, "w").write(text.replace(old, new, 1))
 
     def same(name, st, prog):
-        check(f"generic {name}: warm equals cold", (prog.returncode, prog.stdout, prog.stderr) == cold(),
+        check(f"generic {name}: warm equals cold", (prog.returncode, prog.stdout, mask_stderr(prog.stderr)) == cold(),
               f"{prog.stdout}{prog.stderr} {st}")
 
     d.start()
@@ -558,7 +605,7 @@ def case_generic_reuse():
     edit("fn total<T: Score + Sized>(", "fn total<T: Score + Copy>(")
     r, _ = check_stats()
     env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold-reject"))
-    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True)
+    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True, timeout=300)
     strip = lambda t: "\n".join(l for l in t.splitlines() if not l.startswith("lust-stats:"))
     check("generic unmet bound rejects warm as cold", (r.returncode, strip(r.stderr)) == (c.returncode, strip(c.stderr)) and r.returncode != 0,
           f"warm {r.returncode} {r.stderr[-300:]} cold {c.returncode} {c.stderr[-300:]}")
@@ -568,7 +615,7 @@ def case_generic_reuse():
     d.run(["check", src], expect=None)
     edit("        s += x.twice() + 1;", "        s += x.twice() + true;")
     r, _ = check_stats()
-    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True)
+    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True, timeout=300)
     check("generic template body error rejects warm as cold", (r.returncode, strip(r.stderr)) == (c.returncode, strip(c.stderr)) and r.returncode != 0,
           f"warm {r.returncode} {r.stderr[-300:]} cold {c.returncode} {c.stderr[-300:]}")
     edit("        s += x.twice() + true;", "        s += x.twice() + 1;")
@@ -600,8 +647,8 @@ def case_moved_instance_ids():
                                       "    let _ = format!(\"{:?}\", z);\n", 1))
     _, prog = d.build(src, out)
     env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold"))
-    subprocess.run([LUST, "build", src, "-o", out + "c"], cwd=work, env=env, capture_output=True)
-    cold = subprocess.run([out + "c"], capture_output=True, text=True)
+    subprocess.run([LUST, "build", src, "-o", out + "c"], cwd=work, env=env, capture_output=True, timeout=300)
+    cold = run_prog(out + "c")
     check("moved instance ids: warm equals cold", prog.stdout == cold.stdout and prog.returncode == cold.returncode,
           f"warm {prog.stdout[-60:]!r} cold {cold.stdout[-60:]!r}")
     d.kill()
@@ -620,7 +667,7 @@ def case_new_empty_unit():
     d.build(src, out)
     open(src, "a").write("fn g<T: Copy>(t: T) -> T {\n    t\n}\n")
     r = d.run(["build", src, "-o", out], expect=None)
-    prog = subprocess.run([out], capture_output=True, text=True)
+    prog = run_prog(out)
     check("new template-only unit links", r.returncode == 0 and prog.stdout.strip() == "105", r.stderr[-200:] + prog.stdout)
     d.kill()
 
@@ -661,7 +708,7 @@ def case_nested_items():
             open(src, "w").write(body)
             c = d.run(["check", src], expect=None)
             b = d.run(["build", src, "-o", out], expect=None)
-            prog = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+            prog = run_prog(out) if b.returncode == 0 else None
             got = prog.stdout.strip() if prog else b.stderr[-200:]
             check(f"nested items, {step}", c.returncode == 0 and got == expect, f"check {c.returncode}: {got!r}")
     err = d.kill()
@@ -703,7 +750,7 @@ def case_moved_and_revived_slots():
     for name, text, want in (("moved nested slots: base", tree([]), "60"), ("moved nested slots", tree([7]), "67")):
         open(src, "w").write(text)
         r = d.run(["build", src, "-o", out], expect=None)
-        prog = subprocess.run([out], capture_output=True, text=True) if r.returncode == 0 else None
+        prog = run_prog(out) if r.returncode == 0 else None
         got = (prog.returncode, prog.stdout.strip()) if prog else r.stderr[-200:]
         check(name, got == (0, want), str(got))
     d.kill()
@@ -743,7 +790,7 @@ def case_instance_calls_moved_slot():
         open(src, "w").write(text)
         emit = os.path.join(work, name.replace(" ", "-"))
         r = d.run(["build", src, "-o", out, "--emit-c", emit], expect=None)
-        prog = subprocess.run([out], capture_output=True, text=True) if r.returncode == 0 else None
+        prog = run_prog(out) if r.returncode == 0 else None
         got = (prog.returncode, prog.stdout.strip()) if prog else r.stderr[-200:]
         check(f"instance calls moved slot, {name}", got == (0, "28") and not undefined_calls(emit), f"{got} undefined {undefined_calls(emit)}")
     d.kill()
@@ -793,7 +840,7 @@ def case_nested_identity_and_shadowing():
             out = os.path.join(work, "x")
             c = d.run(["check", entry], expect=None)
             b = d.run(["build", entry, "-o", out], expect=None)
-            prog = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+            prog = run_prog(out) if b.returncode == 0 else None
             got = (c.returncode, prog.stdout.strip() if prog else None)
             check(f"nested shadowing, {kind}, {step}", got == ((0, want) if want else (1, None)), str(got))
     d.kill()
@@ -826,8 +873,8 @@ def case_stable_instance_ids():
         csrc = os.path.join(cw, "x.rs")
         open(csrc, "w").write(text)
         env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
-        subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
-        r = subprocess.run([os.path.join(cw, "x")], capture_output=True, text=True)
+        subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True, timeout=300)
+        r = run_prog(os.path.join(cw, "x"))
         shutil.rmtree(cw, ignore_errors=True)
         return r.stdout
 
@@ -880,9 +927,9 @@ def case_user_trait_impl_edits():
         csrc = os.path.join(cw, "x.rs")
         open(csrc, "w").write(text)
         env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
-        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True)
-        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
-        r = subprocess.run([os.path.join(cw, "x")], capture_output=True, text=True) if b.returncode == 0 else None
+        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True, timeout=300)
+        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True, timeout=300)
+        r = run_prog(os.path.join(cw, "x")) if b.returncode == 0 else None
         shutil.rmtree(cw, ignore_errors=True)
         return (c.returncode, r.stdout if r else None)
 
@@ -892,7 +939,7 @@ def case_user_trait_impl_edits():
         c = d.run(["check", src], expect=None)
         st = parse_stats(c.stderr)
         b = d.run(["build", src, "-o", out], expect=None)
-        r = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+        r = run_prog(out) if b.returncode == 0 else None
         check(f"user trait impls, {name}: warm equals cold", (c.returncode, r.stdout if r else None) == cold(text), c.stderr[-200:])
         if expect == "few":
             check(f"user trait impls, {name}: no template check, little discovery",
@@ -938,9 +985,9 @@ def case_inherent_impl_edits():
         csrc = os.path.join(cw, "x.rs")
         open(csrc, "w").write(text)
         env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
-        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True)
-        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
-        r = subprocess.run([os.path.join(cw, "x")], capture_output=True, text=True) if b.returncode == 0 else None
+        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True, timeout=300)
+        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True, timeout=300)
+        r = run_prog(os.path.join(cw, "x")) if b.returncode == 0 else None
         shutil.rmtree(cw, ignore_errors=True)
         return (c.returncode, r.stdout if r else None)
 
@@ -950,7 +997,7 @@ def case_inherent_impl_edits():
         c = d.run(["check", src], expect=None)
         st = parse_stats(c.stderr)
         b = d.run(["build", src, "-o", out], expect=None)
-        r = subprocess.run([out], capture_output=True, text=True) if b.returncode == 0 else None
+        r = run_prog(out) if b.returncode == 0 else None
         check(f"inherent impls, {name}: warm equals cold", (c.returncode, r.stdout if r else None) == cold(text), c.stderr[-200:])
         if expect == "few":
             check(f"inherent impls, {name}: no template check, little discovery",
@@ -963,25 +1010,27 @@ def case_inherent_impl_edits():
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
-    case_slots_and_reuse()
-    case_reads_reuse()
-    case_graph_refresh_and_std()
-    case_multi_incremental()
-    case_compaction_reemit()
-    case_restart_add_file()
-    case_empty_units_restart()
-    case_positions()
-    case_generic_reuse()
-    case_moved_instance_ids()
-    case_new_empty_unit()
-    case_nested_items()
-    case_moved_and_revived_slots()
-    case_instance_calls_moved_slot()
-    case_nested_identity_and_shadowing()
-    case_stable_instance_ids()
-    case_user_trait_impl_edits()
-    case_inherent_impl_edits()
-    print(f"test-driver: {'all passed' if not failures else str(len(failures)) + ' FAILED: ' + ', '.join(failures)}")
+    cases = (case_slots_and_reuse, case_reads_reuse, case_graph_refresh_and_std,
+             case_multi_incremental, case_compaction_reemit, case_restart_add_file,
+             case_empty_units_restart, case_positions, case_generic_reuse,
+             case_moved_instance_ids, case_new_empty_unit, case_nested_items,
+             case_moved_and_revived_slots, case_instance_calls_moved_slot,
+             case_nested_identity_and_shadowing, case_stable_instance_ids,
+             case_user_trait_impl_edits, case_inherent_impl_edits)
+    # One case that raises (a failed assert, a timeout, an OS error)
+    # fails that case only: the rest still run, and the summary line
+    # below is always the last line, as the gate's need_ok requires.
+    # Each case uses its own temp dir and daemon socket, so a daemon
+    # left by a failed case cannot serve or block the next one.
+    for case in cases:
+        try:
+            case()
+        except Exception:
+            print(f"FAIL {case.__name__}: raised\n{traceback.format_exc()}", flush=True)
+            failures.append(case.__name__)
+    if failures:
+        print("failed: " + ", ".join(failures))
+    print(f"test-driver: {passed} passed, {len(failures)} failed")
     sys.exit(1 if failures else 0)
 
 
