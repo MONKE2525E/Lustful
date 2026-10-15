@@ -173,6 +173,13 @@ pub trait ConstCx<'a> {
     fn adt_instance(&mut self, _adt: AdtId, _binds: &[Option<Ty>]) -> Option<Ty> {
         None
     }
+    /// False when `name` (the head of a `Type::item` path) names no
+    /// type, alias, trait, or primitive here: the path's error is then
+    /// the unknown type (rustc E0433). Contexts that cannot tell say
+    /// true.
+    fn names_type(&mut self, _name: Sym) -> bool {
+        true
+    }
     /// A path used as a value: a unit variant, if it names one.
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)>;
     /// A static item by name at a use site: its index and type.
@@ -327,6 +334,12 @@ fn projection_root(ast: &Ast, mut e: ExprId) -> ExprId {
 /// and readers find the item an error names by its backticked path.
 fn path_text<'a, C: ConstCx<'a>>(cx: &C, segs: &[ast::PathSeg]) -> String {
     segs.iter().map(|s| crate::intern::source_name(cx.sym_text(s.name))).collect::<Vec<_>>().join("::")
+}
+
+/// The L0102 for a `Type::item` path whose head names no type.
+fn unknown_type<'a, C: ConstCx<'a>>(cx: &C, head: &ast::PathSeg, span: Span) -> Diag {
+    let n = crate::intern::source_name(cx.sym_text(head.name));
+    Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type.")
 }
 
 fn outside(span: Span, what: &str) -> Diag {
@@ -2232,6 +2245,11 @@ impl Evaluator {
         if let Some(v) = cx.fn_item(segs, span) {
             return Ok(v);
         }
+        if let [head, _] = segs
+            && !cx.names_type(head.name)
+        {
+            return Err(unknown_type(cx, head, span));
+        }
         Err(outside(span, &format!("the path `{}`", path_text(cx, segs))))
     }
 
@@ -2906,6 +2924,7 @@ impl Evaluator {
             CallTarget::ConstFn(body) => self.run_const_fn(cx, env, body, None, args, span, expected),
             CallTarget::NonConst => Err(nonconst(span, "this function")),
             CallTarget::Unknown => match cx.ast().expr(callee) {
+                Expr::Path(segs) if segs.len() == 2 && !cx.names_type(segs[0].name) => Err(unknown_type(cx, &segs[0], span)),
                 Expr::Path(segs) => Err(outside(span, &format!("the call of `{}`", path_text(cx, segs)))),
                 _ => Err(outside(span, "this call")),
             },

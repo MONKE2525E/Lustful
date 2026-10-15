@@ -6730,6 +6730,18 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
         let (def, args) = const_adt_args(self.p, adt, binds)?;
         Some(self.p.tys.mk_adt(def, &args))
     }
+    fn names_type(&mut self, name: Sym) -> bool {
+        let p = &*self.p;
+        name == p.known.self_type
+            || p.type_names.contains_key(&name)
+            || p.aliases.contains_key(&name)
+            || p.gx.generic_aliases.contains_key(&name)
+            || p.gx.trait_names.contains_key(&name)
+            || matches!(
+                p.interner.get(name),
+                "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "f32" | "f64" | "bool" | "char" | "str"
+            )
+    }
     fn enter_const_fn(&mut self, owner: Option<Sym>) {
         self.self_stack.push((self.self_name, self.self_pat));
         self.self_name = owner;
