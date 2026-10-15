@@ -1689,6 +1689,28 @@ impl<'p> Ctx<'p> {
         if let TyKind::Ref(_, _, inner) = self.kind(peeled) {
             peeled = self.resolve(inner);
         }
+        // A call through a trait fn value (`Into::into` in a local,
+        // check/traitpath.rs): typed by the trait method's
+        // signature, selected at body end.
+        if let TyKind::FnDef(def, fargs) = self.kind(peeled)
+            && self.is_trait_method_def(def)
+            && let Some(tdef) = self.p.gx.index.trait_of_method(def).or_else(|| (def == generics::to_string_defs().1).then_some(generics::to_string_defs().0))
+        {
+            let Some((params, ret)) = self.callable_sig(peeled) else { return ERROR };
+            let rec = self.p.gx.index.trait_record(tdef);
+            let (name, n_trait) = match rec {
+                Some(r) => (r.methods.iter().find(|(d, _)| *d == def).map(|(_, n)| *n), r.generics.params.len()),
+                None if def == generics::to_string_defs().1 => (Some(self.p.interner.intern("to_string")), 1),
+                None => (None, 0),
+            };
+            let Some(name) = name else { return ERROR };
+            let full: Vec<GenericArg> = self.tys.args(fargs).to_vec();
+            let tr_args = self.tys.intern_args(&full[..n_trait.min(full.len())]);
+            let tr = TraitRef { def: tdef, args: tr_args, bindings: EMPTY_BINDINGS };
+            self.deferred_trait_fn_calls.push((e, tr, name, full[n_trait.min(full.len())..].to_vec(), span));
+            self.check_args(&params, args, span);
+            return ret;
+        }
         if let Some(r) = self.callable_res(peeled) {
             if let Res::Variant(a, _) = r
                 && !self.p.adt(a).is_enum

@@ -418,6 +418,48 @@ impl Ex<'_, '_> {
                     self.assign(dest, Rvalue::Aggregate(a, v, args));
                     return Ok(());
                 }
+                // A trait fn value check left as a builtin marker
+                // (check/traitpath.rs): the FnDef names the trait
+                // method, and the call expands by the trait.
+                if def == crate::check::generics::to_string_defs().1 {
+                    self.call(CallTarget::Builtin(Builtin::ToString), args, dest);
+                    return Ok(());
+                }
+                if let Some(tdef) = self.p.gx.index.trait_of_method(def) {
+                    let lang = &self.p.gx.lang;
+                    if tdef == lang.from || tdef == lang.into {
+                        let dest_ty = self.place_ty(&dest)?;
+                        let x = args.into_iter().next().ok_or("iterator expansion: a conversion takes one argument")?;
+                        let src = self.op_ty(&x)?;
+                        return if crate::check::convert::std_from(self.p, &self.body.tys, dest_ty, src).is_some() {
+                            self.conv(x, dest, dest_ty)
+                        } else {
+                            // A numeric widening `From`: a cast.
+                            self.assign(dest, Rvalue::Cast(x, dest_ty));
+                            Ok(())
+                        };
+                    }
+                    if tdef == lang.clone {
+                        self.call(CallTarget::Builtin(Builtin::Clone), args, dest);
+                        return Ok(());
+                    }
+                    if tdef == lang.default {
+                        let dest_ty = self.place_ty(&dest)?;
+                        match self.body.tys.kind(dest_ty) {
+                            TyKind::Int(it) => self.assign(dest, Rvalue::Use(Operand::Const(Const::Int(0, it)))),
+                            TyKind::Bool => self.assign(dest, Rvalue::Use(Operand::Const(Const::Bool(false)))),
+                            TyKind::Char => self.assign(dest, Rvalue::Use(Operand::Const(Const::Char('\0')))),
+                            TyKind::Unit => self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit))),
+                            TyKind::Float(f) => self.assign(dest, Rvalue::Use(Operand::Const(Const::Float(0, f)))),
+                            _ => self.call(CallTarget::Builtin(Builtin::DefaultGlue), Vec::new(), dest),
+                        }
+                        return Ok(());
+                    }
+                    if self.p.gx.index.trait_record(tdef).is_some_and(|r| self.p.interner.get(r.name) == "ToString") {
+                        self.call(CallTarget::Builtin(Builtin::ToString), args, dest);
+                        return Ok(());
+                    }
+                }
                 let f = self.p.local_def(def.hash).ok_or("iterator expansion: fn item not found")?;
                 let gargs: Vec<GenericArg> = self.body.tys.args(fargs).to_vec();
                 let f = if gargs.is_empty() {

@@ -32,6 +32,7 @@ pub mod sized;
 pub mod stdtypes;
 pub mod std_inherent;
 pub mod tls;
+pub mod traitpath;
 pub mod tryfrom;
 pub mod usefulness;
 pub mod sync;
@@ -1355,6 +1356,11 @@ struct Ctx<'p> {
     /// finish: lust must be able to print rustc's exact string for
     /// each (`any::type_name_of`), else the call is a reject.
     deferred_type_names: Vec<(Ty, Span)>,
+    /// Trait fn values (`Into::into` in `.map(..)`, check/traitpath.rs)
+    /// and calls through them: body end selects what each calls
+    /// (`finish_trait_fn_values`, `finish_trait_fn_calls`).
+    deferred_trait_fn_values: Vec<(ExprId, TraitRef, Sym, Vec<GenericArg>, Span)>,
+    deferred_trait_fn_calls: Vec<(ExprId, TraitRef, Sym, Vec<GenericArg>, Span)>,
     /// `Some`, `Ok`, `Err`, `Box::new`, or `Rc::new` passed as a call
     /// argument (`keep(Some, &x)` under `F: Fn(T) -> R`): borrowck does
     /// not relate a fn item's signature at a generic Fn bound yet
@@ -1657,6 +1663,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_clone: Vec::new(),
         deferred_string_from: Vec::new(),
         deferred_type_names: Vec::new(),
+        deferred_trait_fn_values: Vec::new(),
+        deferred_trait_fn_calls: Vec::new(),
         deferred_item_args: Vec::new(),
         deferred_eq: Vec::new(),
         deferred_copy: Vec::new(),
@@ -2804,6 +2812,13 @@ impl<'p> Ctx<'p> {
             TyKind::FnDef(def, args) => {
                 if let Some((_, params, ret)) = self.builtin_item_res(def, args) {
                     return Some((params, ret));
+                }
+                // A trait method as a value (`Into::into`,
+                // check/traitpath.rs): the trait method's own
+                // signature under the item's arguments.
+                if self.is_trait_method_def(def) {
+                    let fargs: Vec<GenericArg> = self.tys.args(args).to_vec();
+                    return self.trait_method_sig(def, &fargs);
                 }
                 if let Some(a) = p.adt_by_def(def) {
                     let v = self.ctor_variant(args);
@@ -8730,6 +8745,11 @@ impl<'p> Ctx<'p> {
             }
             return t;
         }
+        // A trait's function as a value through the trait name
+        // (`Into::into`, check/traitpath.rs).
+        if let Some(t) = self.trait_path_fn_value(e, segs, span) {
+            return t;
+        }
         if let Some(r) = self.resolve_assoc(segs, span) {
             self.set_res(e, r);
             if r == Res::OptNone {
@@ -10676,6 +10696,13 @@ impl<'p> Ctx<'p> {
                     if let Some(tdef) = cxr.trait_by_bare_name(&p.interner, segs[0].name)
                         && let Some(rec) = p.gx.index.trait_record(tdef).cloned()
                         && rec.method_by_name(segs[1].name).is_some()
+                        // A method with no `self` (`From::from`) takes
+                        // no receiver: its Self is the output type,
+                        // never the first argument's. The deferred
+                        // trait path below types those instead.
+                        && !rec.method_by_name(segs[1].name).is_some_and(|m| {
+                            p.gx.trait_methods.get(&m).map(|t| t.self_kind).or_else(|| p.gx.lang_method_sigs.get(&m).map(|s| s.self_kind)).is_some_and(|k| k.is_none())
+                        })
                     {
                         let snap = self.snapshot_vars();
                         let obl_len = self.obl_len();
@@ -10770,6 +10797,12 @@ impl<'p> Ctx<'p> {
                     && let Some(base) = self.trait_assoc_base(segs, self.replay_pick(e).is_some(), span)
                     && let Some(t) = self.assoc_call(e, callee, base, None, segs[1].name, args, span)
                 {
+                    return t;
+                }
+                // `Into::into(x)` and kin the assoc paths above had
+                // no answer for: typed by the trait method's
+                // signature and deferred (check/traitpath.rs).
+                if let Some(t) = self.trait_path_call(e, callee, segs, args, span) {
                     return t;
                 }
                 let cs = self.span(callee);
@@ -17663,6 +17696,8 @@ impl<'p> Ctx<'p> {
         // Anything left there is an annotation error, never a silent default.
         self.run_obligations(true);
         method::finish_deferred_methods(self);
+        self.finish_trait_fn_values();
+        self.finish_trait_fn_calls();
         // `?` conversions deferred on a projection error type:
         // it normalizes now its types are known (fx-tryfrom).
         for (e, err_t, ret_err, span) in std::mem::take(&mut self.deferred_try) {
