@@ -1,0 +1,18 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package tikv-jemallocator 0.7.0; release
+# builds use the real crate through Cargo. The driver checks `version`
+# against the resolved package and the metadata against
+# src/resolve/adapters.rs.
+[package]
+name = "tikv-jemallocator"
+version = "0.7.0"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# The default feature set; the flags only change the jemalloc build,
+# not the API. `alloc_trait`, `profiling`, and kin are not here.
+features = ["default", "background_threads_runtime_support"]
+# A unit struct in both crates: same size, align, and niche.
+exact-layout = ["tikv_jemallocator::Jemalloc"]

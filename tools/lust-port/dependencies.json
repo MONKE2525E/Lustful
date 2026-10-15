@@ -106,9 +106,9 @@
   },
   {
    "name": "tikv-jemallocator",
-   "decision": "c-shim",
+   "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Shared allocator bridge. Lust needs a size and alignment API, not only malloc."
+   "notes": "Adapter in library/deps: the Jemalloc unit struct for #[global_allocator] statics. Dev keeps the lust runtime allocator; allocation strategy does not change output. The unsafe GlobalAlloc surface is not in the adapter."
   },
   {
    "name": "tikv-jemalloc-ctl",

@@ -31,7 +31,7 @@ pub(super) fn check_input(name: &str, attr: &Attr, interner: &Interner) -> PResu
             }
             _ => false,
         },
-        "cold" | "test" | "non_exhaustive" => matches!(attr.input, AttrInput::None),
+        "cold" | "test" | "non_exhaustive" | "global_allocator" => matches!(attr.input, AttrInput::None),
         "must_use" => matches!(&attr.input, AttrInput::None) || eq_str(&attr.input),
         // `ignore` and `ignore = "reason"` are the only forms (probed).
         "ignore" => matches!(attr.input, AttrInput::None) || eq_str(&attr.input),
@@ -67,6 +67,7 @@ pub(super) const T_VARIANT: u8 = 4;
 pub(super) const T_FIELD: u8 = 8;
 pub(super) const T_PARAM: u8 = 16;
 pub(super) const T_UNION: u8 = 32;
+pub(super) const T_STATIC: u8 = 64;
 
 /// Rejects a built-in attribute on a target rustc rejects it on.
 /// `what` names the target in rustc's words ("structs", "constants").
@@ -90,6 +91,8 @@ pub(super) fn check_target(attrs: &[Attr], what: &str, flags: u8, interner: &Int
             "ignore" | "should_panic" => flags & T_PARAM != 0,
             "repr" => flags & (T_ADT | T_UNION) == 0,
             "non_exhaustive" => flags & (T_ADT | T_VARIANT | T_FIELD) == 0,
+            // rustc: allocators must be statics.
+            "global_allocator" => flags & T_STATIC == 0,
             _ => false,
         };
         if bad {

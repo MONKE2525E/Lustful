@@ -501,6 +501,18 @@ impl Program {
             tys.args(args).iter().copied().filter(|g| !matches!(g, crate::ty::GenericArg::Lifetime(_))).collect();
         Some(crate::ty::subst(tys, field_ty, &value_args))
     }
+    /// True when Adt `a` is a known global allocator type: std's
+    /// `System` or the `tikv-jemallocator` adapter's `Jemalloc`.
+    /// A `#[global_allocator]` static of one of these types is
+    /// accepted and the runtime keeps its allocator; any other
+    /// type would need a user `GlobalAlloc` impl, which takes
+    /// `unsafe` code lust does not support.
+    pub fn is_known_allocator_adt(&self, a: AdtId) -> bool {
+        let Some(adt) = self.adts.get(a.0 as usize) else { return false };
+        let path = self.display_path(adt.name);
+        (self.is_std_adt(a) && path == "std::alloc::System")
+            || (path.rsplit("::").next() == Some("Jemalloc") && self.adapter_at(adt.span).is_some_and(|x| x.name == "tikv_jemallocator"))
+    }
     /// True when Adt `a` is std's `core::marker::PhantomData` (std
     /// source, W-STD-C): zero-sized, yet it acts as if it held its `T`
     /// for unused-parameter checks and auto traits.
@@ -4308,6 +4320,7 @@ fn eval_const_items(
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
     let mut by_name: HashMap<Sym, usize> = HashMap::default();
     let mut static_count = 0u32;
+    let mut global_allocs = 0u32;
     for (item, stmt_idx) in ast.items.iter().map(|i| (i, None)).chain(ast.stmt_items.iter().enumerate().map(|(i, it)| (it, Some(i as u32))))
     {
         let (name, ty_id, value, span, is_static) = match &item.kind {
@@ -4332,6 +4345,45 @@ fn eval_const_items(
                 "Put the value behind a reference, such as `&[T]` or `&str`.",
             ));
             continue;
+        }
+        // `#[global_allocator]`: rustc takes one static whose type
+        // implements `GlobalAlloc`. Lust takes the known allocator
+        // types (std `System`, the jemallocator adapter's
+        // `Jemalloc`) and keeps its runtime allocator; a user
+        // `GlobalAlloc` impl needs `unsafe`, which lust rejects.
+        if item.attrs.iter().any(|a| a.path.len() == 1 && p.interner.get(a.path[0].name) == "global_allocator") {
+            if is_static.is_none() {
+                errs.push(Diag::new(
+                    "L0524",
+                    span,
+                    "the `global_allocator` attribute cannot be used on constants",
+                    "Move the `#[global_allocator]` attribute to a static.",
+                ));
+                continue;
+            }
+            global_allocs += 1;
+            if global_allocs > 1 {
+                errs.push(Diag::new(
+                    "L0524",
+                    span,
+                    "cannot define multiple global allocators",
+                    "Keep one `#[global_allocator]` static and remove the others.",
+                ));
+                continue;
+            }
+            let known = match crate::ty::Tys::new(&p.tys).local_adt(ty) {
+                Some(a) => p.is_known_allocator_adt(a),
+                None => false,
+            };
+            if !known {
+                errs.push(Diag::new(
+                    "L0112",
+                    span,
+                    format!("`{}` does not implement `GlobalAlloc`", ty_name(p, &p.tys, ty)),
+                    "Use `std::alloc::System` or an allocator adapter crate such as `tikv_jemallocator::Jemalloc`.",
+                ));
+                continue;
+            }
         }
         // A `thread_local!` static's own type is `LocalKey<T>`. Every
         // region in a static's type is `'static`; the key's value type
@@ -6497,8 +6549,9 @@ impl crate::ty::layout::AdtShapes for UserLayout<'_> {
         let adt = p.adts.get(id.0 as usize)?;
         // Std source module types (W-STD-C) keep std's niches out of
         // their source form, so no layout query may see them; the
-        // field-less `PhantomData` (size 0, align 1) is exact.
-        if p.std_source_span(adt.span) && !p.is_phantom_adt(id) {
+        // field-less `PhantomData` (size 0, align 1) is exact, and
+        // so is the unit-struct `System` allocator (size 0, align 1).
+        if p.std_source_span(adt.span) && !p.is_phantom_adt(id) && !p.is_known_allocator_adt(id) {
             return None;
         }
         if let Some(a) = p.adapter_at(adt.span) {

@@ -106,6 +106,14 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["Ipv4Addr", "Ipv6Addr", "IpAddr", "SocketAddr", "SocketAddrV4", "SocketAddrV6", "AddrParseError", "TcpListener", "TcpStream", "UdpSocket", "ToSocketAddrs", "Shutdown"],
     },
     StdModule {
+        name: "__lust_std_alloc",
+        rel: "std/src/alloc.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "alloc")],
+        full: false,
+        triggers: &["System"],
+    },
+    StdModule {
         name: "__lust_alloc_collections",
         rel: "alloc/src/collections.rs",
         krate: ShippedCrate::Alloc,

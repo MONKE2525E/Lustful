@@ -37,8 +37,18 @@ pub const ADAPTER_FORMAT: u32 = 1;
 
 /// Registry packages that have (or will have) a lust adapter crate. A name
 /// here with no `library/deps/<name>/src/lib.rs` is "no adapter yet".
-pub const ADAPTER_PACKAGES: &[&str] =
-    &["rustc-hash", "indexmap", "smallvec", "memchr", "bumpalo", "xxhash-rust", "ryu-js", "num-bigint", "num-traits"];
+pub const ADAPTER_PACKAGES: &[&str] = &[
+    "rustc-hash",
+    "indexmap",
+    "smallvec",
+    "memchr",
+    "bumpalo",
+    "xxhash-rust",
+    "ryu-js",
+    "num-bigint",
+    "num-traits",
+    "tikv-jemallocator",
+];
 
 /// One adapter crate, read from its manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -296,7 +296,6 @@ const KNOWN_ATTRS: &[&str] = &[
     "deprecated",
     "doc",
     "bench",
-    "global_allocator",
     "default",
     "target_feature",
     "link_section",
@@ -1738,6 +1737,11 @@ impl<'a> Parser<'a> {
                 // collect records it on the Adt; the checker enforces
                 // it across crate borders.
                 _ if name_text == "non_exhaustive" => {}
+                // `#[global_allocator]` on a static: collect checks
+                // the type is a known allocator and that there is
+                // only one; the lust runtime keeps its allocator
+                // (allocation strategy does not change output).
+                _ if name_text == "global_allocator" && !inner => {}
                 // `#[default]` marks the `Default` variant of a derived enum.
                 _ if variant && !inner && name_text == "default" && matches!(attr.input, AttrInput::None) => {}
                 _ if KNOWN_ATTRS.contains(&name_text.as_str()) => {
@@ -2022,6 +2026,7 @@ impl<'a> Parser<'a> {
                 ItemKind::Fn(_) => attrs::T_FN,
                 ItemKind::Struct(_) | ItemKind::Enum(_) => attrs::T_ADT,
                 ItemKind::Union(_) => attrs::T_UNION,
+                ItemKind::Static(_) => attrs::T_STATIC,
                 _ => 0,
             },
             self.interner,

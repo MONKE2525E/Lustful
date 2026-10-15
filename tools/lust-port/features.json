@@ -500,14 +500,14 @@
   {
    "id": "cinterop.global_allocator",
    "title": "#[global_allocator] statics",
-   "status": "unsupported",
-   "milestone": 7,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "10",
    "root_cause": "c-interop",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Split from cinterop.system (w-cinterop). Probe: cinterop_global_allocator.rs with std::alloc::System. ts-rust's bins name tikv_jemallocator::Jemalloc, which also needs that adapter crate.",
+   "notes": "Split from cinterop.system (w-cinterop). Probe: cinterop_global_allocator.rs with std::alloc::System. One static of a known allocator type (std System, the tikv-jemallocator adapter's Jemalloc) is accepted and the lust runtime keeps its allocator; other types reject (a user GlobalAlloc impl needs unsafe). See ext.tikv_jemallocator.",
    "primary_keys": [
     "attr.global_allocator"
    ],
@@ -540,9 +540,6 @@
     "ext.type.signal_hook::*",
     "ext.expr.signal_hook::*",
     "ext.use.signal_hook::*",
-    "ext.type.tikv_jemallocator::*",
-    "ext.expr.tikv_jemallocator::*",
-    "ext.use.tikv_jemallocator::*",
     "ext.type.tikv_jemalloc_ctl::*",
     "ext.expr.tikv_jemalloc_ctl::*",
     "ext.use.tikv_jemalloc_ctl::*",
@@ -1057,6 +1054,26 @@
     "ext.type.ryu_js::*",
     "ext.expr.ryu_js::*",
     "ext.use.ryu_js::*"
+   ]
+  },
+  {
+   "id": "ext.tikv_jemallocator",
+   "title": "Adapter crate tikv-jemallocator 0.7.0: Jemalloc as #[global_allocator]",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh tikv-jemallocator (2 cases match the real crate). The Jemalloc unit struct only; a #[global_allocator] static of it keeps the lust runtime allocator. Split from cinterop.system. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.tikv_jemallocator::*"
+   ],
+   "keys": [
+    "ext.type.tikv_jemallocator::*",
+    "ext.expr.tikv_jemallocator::*",
+    "ext.use.tikv_jemallocator::*"
    ]
   },
   {
