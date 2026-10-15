@@ -488,11 +488,14 @@ pub(super) fn trait_probe_for(
             // hold there), so an autoref `&S` is never their Self. The
             // blanket needs `T: Sized`, so an unsized place (`v[1..]`,
             // `*s`) skips that step and its Self is the autoref `&S`
-            // (which may always hold, so never `&mut S`).
+            // (which may always hold, so never `&mut S`, and never at a
+            // later step: `(&mut v[1..]).into()` stops at `&mut [T]`).
             if (trait_def == p.gx.lang.into || trait_def == p.gx.lang.try_into)
                 && probe.autoref != Autoref::None
                 && probe.self_ty == probe.recv_ty
-                && !(probe.autoref == Autoref::Ref && matches!(cx.kind(probe.self_ty), TyKind::Ref(_, _, s) if cx.into_self(s).1 != Autoref::None))
+                && !(derefs == 0
+                    && probe.autoref == Autoref::Ref
+                    && matches!(cx.kind(probe.self_ty), TyKind::Ref(_, _, s) if cx.into_self(s).1 != Autoref::None))
             {
                 continue;
             }

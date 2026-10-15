@@ -7081,10 +7081,15 @@ impl<'p> Ctx<'p> {
                 if let Expr::Path(segs) = p.ast.expr(*callee) {
                     self.lifetime_turbofish(segs);
                 }
-                if let Some(t) = self.self_from_expected_call(e, *callee, args, expected, span) {
-                    return t;
+                let t = match self.self_from_expected_call(e, *callee, args, expected, span) {
+                    Some(t) => t,
+                    None => self.call(e, *callee, args, span, expected),
+                };
+                // Every call path (variant ctors like `Some(v[1..])` too).
+                for &a in args.iter() {
+                    self.reject_unsized_value(a);
                 }
-                self.call(e, *callee, args, span, expected)
+                t
             }
             Expr::MethodCall { recv, name, name_span, generic_args, args } => {
                 self.method_chain(e, *recv, *name, *name_span, args, generic_args, expected)
@@ -7807,6 +7812,9 @@ impl<'p> Ctx<'p> {
                         out.push(self.expr(el, want));
                     }
                 }
+                for &el in elems.iter() {
+                    self.reject_unsized_value(el);
+                }
                 let ts = self.tys.intern_tys(&out);
                 self.tys.intern(TyKind::Tuple(ts))
             }
@@ -7816,6 +7824,9 @@ impl<'p> Ctx<'p> {
                     _ => None,
                 });
                 let elem = self.array_elems(elems, exp_elem);
+                for &el in elems.iter() {
+                    self.reject_unsized_value(el);
+                }
                 let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
                 self.tys.intern(TyKind::Array(elem, c))
             }
@@ -7825,6 +7836,7 @@ impl<'p> Ctx<'p> {
                     _ => None,
                 });
                 let elem = self.expr(*value, exp_elem);
+                self.reject_unsized_value(*value);
                 let errs_before = self.errs.len();
                 self.expect_expr(*len, USIZE);
                 // A const param length (`[x; N]`): symbolic in the template
@@ -12468,17 +12480,22 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// An argument moves its value, which needs a statically known size
-    /// (rustc E0277): `drop(*b)` for `b: Box<dyn Tr>`.
-    fn reject_unsized_value(&mut self, a: ExprId) {
+    /// An argument, tuple or array element, struct literal field, or
+    /// closure body moves its value, which needs a statically known size
+    /// (rustc E0277/E0161): `drop(*b)` for `b: Box<dyn Tr>`, `Some(v[1..])`.
+    /// Reports once per expression.
+    pub(super) fn reject_unsized_value(&mut self, a: ExprId) {
         let t = self.deep(self.out.expr_ty[self.ei(a)]);
         if self.out.coerce[self.ei(a)] == Coerce::None && matches!(self.kind(t), TyKind::Dyn(..) | TyKind::Str | TyKind::Slice(_)) {
             let (tn, span) = (self.tn(t), self.span(a));
+            if self.errs.iter().any(|d| d.code == "L0110" && d.span == span) {
+                return;
+            }
             self.err(
                 "L0110",
                 span,
-                format!("the size for values of type `{tn}` cannot be known, so it cannot be passed by value"),
-                "Pass a reference instead: `&*b`.",
+                format!("the size for values of type `{tn}` cannot be known, so it cannot be used by value"),
+                "Use a reference instead: `&*b`.",
             );
         }
     }
@@ -12840,6 +12857,7 @@ impl<'p> Ctx<'p> {
         }
         let writes: Vec<(ExprId, ExprId, Span)> =
             spine.iter().filter(|s| p.interner.get(s.2) == "write_fmt").map(|s| (s.0, s.1, s.3)).collect();
+        let calls: Vec<(ExprId, ExprId)> = spine.iter().map(|s| (s.0, s.1)).collect();
         let rt = if spine.len() == 1 {
             self.method_call(e, recv, name, name_span, args, generic_args, expected)
         } else {
@@ -12854,6 +12872,13 @@ impl<'p> Ctx<'p> {
             }
             rt
         };
+        // A by-value `self` moves the receiver: an unsized place
+        // (`v[1..].into()` under `where [T]: Into<U>`) is rustc E0508/E0161.
+        for (node, r) in calls {
+            if let Res::Method { derefs: 0, autoref: Autoref::None, .. } = self.out.res(node) {
+                self.reject_unsized_value(r);
+            }
+        }
         // `write!` into a user `io::Write` type (W-SHIM, check/platform.rs).
         for (node, r, ns) in writes {
             if let Res::Method { f, .. } = self.out.res(node) {
@@ -15122,6 +15147,7 @@ impl<'p> Ctx<'p> {
                     self.check_field_vis(a, fname, fspan);
                     let want = if gen_args.is_empty() { variant.fields[i].ty } else { self.subst_norm(variant.fields[i].ty, &gen_args, fspan) };
                     self.expect_expr(fe, want);
+                    self.reject_unsized_value(fe);
                 }
                 None => {
                     self.expr(fe, None);

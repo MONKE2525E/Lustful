@@ -459,6 +459,7 @@ impl<'p> Ctx<'p> {
             self.unify(output, NEVER);
         }
         self.coerce_expr(body, bt, output);
+        self.reject_unsized_value(body);
         self.closure_rets.pop();
         self.loops = saved_loops;
         self.scopes.truncate(scope_len);
