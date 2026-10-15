@@ -126,6 +126,9 @@ pub(crate) struct Front {
     /// `Sig` fingerprint covers.
     pub(crate) slot_head: Vec<u64>,
     /// Lexed and scanned chunks from the last request, reused when their text is unchanged.
+    /// The Expr arena length right after the last fresh parse (the full
+    /// parse or a resolve): `ast_bloated` in compile.rs compares against it.
+    pub(crate) fresh_exprs: usize,
     pub(crate) chunks: Vec<Chunk>,
     /// The source text of the last request, to find what an edit changed.
     pub(crate) src: String,
@@ -377,6 +380,7 @@ impl Session {
                 ast_fn_count: 0,
                 slots_renumbered: false,
                 slot_head: Vec::new(),
+                fresh_exprs: 0,
                 chunks: Vec::new(),
                 src: String::new(),
                 map: SourceMap::default(),

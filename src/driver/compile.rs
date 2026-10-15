@@ -1759,7 +1759,9 @@ fn resolved_setup(
     // What a later patch needs to expand a body alone (no dependency
     // crate can export a macro).
     let patch_expand = externs.is_empty().then(|| (env.clone(), crate_name.clone()));
-    match super::patch::try_patch(front, caches, inputs, &root_text, request_start) {
+    let patched =
+        if ast_bloated(front) { Err("ast compaction") } else { super::patch::try_patch(front, caches, inputs, &root_text, request_start) };
+    match patched {
         // Nothing changed since the last check of this same request:
         // its answer stands (`check_fingerprint`).
         Ok(p) if p.files == 0 && reusable.is_some() => {
@@ -1913,6 +1915,7 @@ fn resolved_setup(
     front.patch = None;
     let old_kept = std::mem::take(&mut front.kept);
     let old_ast = std::mem::replace(&mut front.ast, Arc::new(ast));
+    front.fresh_exprs = front.ast.exprs.len();
     if (old_ast.exprs.len() > 20_000 || old_kept.iter().any(Option::is_some)) && caches.persistent {
         // Nested token trees in the Ast drop recursively; use the
         // compiler stack size like every other compiler thread.
@@ -2437,8 +2440,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // guard stays as the driver's rule until reuse there is proven.)
     // Bodies mode parses no chunk, so it needs an Ast with live nodes for
     // every item (`Front::chunks_blanked`).
+    // A bloated arena (`ast_bloated`) takes the full parse too: it
+    // builds the Ast fresh and drops the replaced nodes.
+    let compact = ast_bloated(front);
     let splice = front.ast.stmt_items.is_empty();
-    let bodies_only = splice && !front.chunks_blanked && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
+    let bodies_only = splice && !compact && !front.chunks_blanked && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
     // The edit window in old coordinates: old bytes `edit.0..edit.1`
     // changed; everything before and after is the same text.
     let edit = (prefix, old_len - suffix);
@@ -2457,7 +2463,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         })
         .filter(|changed| bodies_mode_ok(&front.ast, &front.fn_loc, changed, edit, delta));
     let changed_names =
-        if bodies_changed.is_some() || !splice || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
+        if bodies_changed.is_some() || !splice || compact || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
     let mut mode = if bodies_changed.is_some() {
         "bodies"
     } else if changed_names.is_some() {
@@ -2719,6 +2725,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         };
         front.ast = Arc::new(ast);
+        front.fresh_exprs = front.ast.exprs.len();
         match slot_update(front, caches, item_scans, env, None, &fn_at, crate_ids, &scan_of, &mut t) {
             Ok(c) => c,
             Err(e) => {
