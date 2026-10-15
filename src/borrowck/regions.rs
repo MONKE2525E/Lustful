@@ -2153,6 +2153,10 @@ pub(super) struct Builder<'b, 'p> {
     /// (`call_fn_bound`): the one fresh var its elided (higher-ranked)
     /// lifetime takes, so an output elided like an input ties to it.
     bound_var: Option<u32>,
+    /// While `call_fn_bound` instantiates a bound's inputs: each elided
+    /// lifetime there is its own late-bound region, so each takes a fresh
+    /// var, collected here (`Fn(&mut Dec<'_>)` has two).
+    bound_each: Option<Vec<u32>>,
     /// The argument slot vars of each closure created here whose
     /// arguments are free (`ClosureEntry::free_args`), by closure def.
     closure_args: FxMap<DefId, Vec<u32>>,
@@ -2205,6 +2209,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             errs: Vec::new(),
             proj: None,
             bound_var: None,
+            bound_each: None,
             closure_args: FxMap::default(),
             closure_reqs: FxMap::default(),
             bound_linked: Vec::new(),
@@ -5635,11 +5640,12 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
         }
         let univ: Vec<u32> = if self.own.closure { Vec::new() } else { (1..=sig.n_univ).collect() };
-        let bv = self.fresh();
-        self.bound_var = Some(bv);
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
         self.bind_tys.clear();
         let mut ok = true;
+        // Each elided input lifetime is its own higher-ranked region, as in
+        // rustc: one var each at this call.
+        self.bound_each = Some(Vec::new());
         for (i, &it) in b.inputs.iter().enumerate() {
             let (at, av) = &avs[i + 1];
             let mut pv = Vec::new();
@@ -5648,6 +5654,28 @@ impl<'b, 'p> Builder<'b, 'p> {
                 ok &= self.relate(*at, av, *at, &pv, Variance::Co);
             }
         }
+        // An elided output lifetime is the one elided input lifetime
+        // (`sugar_elision` rejects the other cases; if one gets here, all
+        // input ones are tied together, which only restricts the call).
+        let each = self.bound_each.take().unwrap_or_default();
+        let out_elided = b.output.is_some_and(|o| {
+            let mut rs = Vec::new();
+            regions_of(&p.tys, o, &mut rs);
+            rs.iter().any(|r| matches!(r, Region::Bound(_)))
+        });
+        let bv = match each[..] {
+            [v] => v,
+            _ if !out_elided => self.fresh(),
+            _ => {
+                let v = self.fresh();
+                for &x in &each {
+                    self.edge(x, v);
+                    self.edge(v, x);
+                }
+                v
+            }
+        };
+        self.bound_var = Some(bv);
         if let Some(ot) = b.output {
             let mut rv = Vec::new();
             ok &= self.inst(ot, dt, &univ, &mut binds, &mut rv);
@@ -6304,6 +6332,11 @@ impl<'b, 'p> Builder<'b, 'p> {
         match r {
             Region::Static => 0,
             Region::Param(k) => univ.get(k as usize).copied().unwrap_or_else(|| self.fresh()),
+            Region::Bound(_) if self.bound_each.is_some() => {
+                let v = self.fresh();
+                self.bound_each.as_mut().unwrap().push(v);
+                v
+            }
             Region::Bound(_) if let Some(v) = self.bound_var => v,
             _ => self.fresh(),
         }
