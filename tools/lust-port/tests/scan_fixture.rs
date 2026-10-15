@@ -25,13 +25,13 @@ fn fixture(name: &str) -> PathBuf {
     write(
         &root,
         "src/lib.rs",
-        "pub mod sub;\n#[path = \"elsewhere.rs\"]\npub mod elsewhere;\n#[cfg(windows)]\npub mod win_only;\n#[cfg(feature = \"x\")]\npub mod feat;\npub mod broken;\n#[cfg(test)]\npub mod tests_only;\npub fn f() -> usize { let m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new(); m.len() }\npub fn h(cb: for<'a> fn(&'a i32) -> i32) -> i32 { cb(&1) }\n",
+        "pub mod sub;\n#[path = \"elsewhere.rs\"]\npub mod elsewhere;\n#[cfg(windows)]\npub mod win_only;\n#[cfg(feature = \"x\")]\npub mod feat;\npub mod broken;\n#[cfg(test)]\npub mod tests_only;\npub fn f() -> usize { let m: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(x); m.len() }\npub fn h(cb: for<'a> fn(&'a i32) -> i32) -> i32 { cb(&1) }\n",
     );
     write(&root, "src/sub/mod.rs", "pub fn h() -> Box<dyn Fn(i32) -> i32> { Box::new(|x| x) }\n");
     write(&root, "src/elsewhere.rs", "pub const N: usize = 1;\n");
-    write(&root, "src/win_only.rs", "pub fn w() { let _m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new(); }\n");
+    write(&root, "src/win_only.rs", "pub fn w() { let _m: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(x); }\n");
     write(&root, "src/feat.rs", "pub fn q() {}\n");
-    write(&root, "src/tests_only.rs", "pub fn t() { let _m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new(); }\n");
+    write(&root, "src/tests_only.rs", "pub fn t() { let _m: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(x); }\n");
     write(&root, "src/broken.rs", "pub fn broken( {\n");
     root
 }
@@ -69,9 +69,9 @@ fn scan_reports_gaps_and_survives_bad_files() {
     let has = |feature: &str, file: &str, scope: &str| {
         findings.iter().any(|f| f["feature"] == feature && f["file"] == file && f["scope"] == scope)
     };
-    assert!(has("std.hashmap", "src/lib.rs", "active"));
-    assert!(has("std.hashmap", "src/win_only.rs", "target-specific"));
-    assert!(has("std.hashmap", "src/tests_only.rs", "test-only"));
+    assert!(has("std.cow", "src/lib.rs", "active"));
+    assert!(has("std.cow", "src/win_only.rs", "target-specific"));
+    assert!(has("std.cow", "src/tests_only.rs", "test-only"));
     // Box<dyn Fn> in sub/mod.rs is supported today (dyn.fn and
     // dyn.boxed are supported rows), so it makes no finding.
     assert!(!has("dyn.fn", "src/sub/mod.rs", "active"));
@@ -124,10 +124,10 @@ fn human_output_groups_findings() {
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Gaps by root cause"), "{text}");
-    assert!(text.contains("std.hashmap"));
+    assert!(text.contains("std.cow"));
     // Grouped, not one line per finding: only 2 samples per feature.
-    let map_samples = text.matches("std.hashmap").count();
-    assert!(map_samples <= 3, "too many hashmap lines: {map_samples}");
+    let cow_samples = text.matches("std.cow").count();
+    assert!(cow_samples <= 3, "too many cow lines: {cow_samples}");
 }
 
 #[test]
