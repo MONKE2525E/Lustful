@@ -11,14 +11,35 @@ const SURROGATE_HIGH_START: u32 = 0xD800;
 /// Go `SurrogateLowStart`.
 pub const SURROGATE_LOW_START: u32 = 0xDC00;
 
+/// Go `utf16.IsSurrogate`.
+fn utf16_is_surrogate(ch: u32) -> bool {
+    (0xD800..0xE000).contains(&ch)
+}
 
 // Go: stringutil/util.go:280 IsHighSurrogate
+pub fn is_high_surrogate(ch: u32) -> bool {
+    utf16_is_surrogate(ch) && ch < SURROGATE_LOW_START
+}
 
 // Go: stringutil/util.go:284 IsLowSurrogate
+pub fn is_low_surrogate(ch: u32) -> bool {
+    utf16_is_surrogate(ch) && ch >= SURROGATE_LOW_START
+}
 
 // Go: stringutil/util.go:288 IsSurrogate
+pub fn is_surrogate(ch: u32) -> bool {
+    utf16_is_surrogate(ch)
+}
 
 // Go: stringutil/util.go:292 SurrogatePairToCodePoint
+pub fn surrogate_pair_to_code_point(high: u32, low: u32) -> u32 {
+    // Go utf16.DecodeRune returns U+FFFD for an invalid pair.
+    if (0xD800..0xDC00).contains(&high) && (0xDC00..0xE000).contains(&low) {
+        (((high - 0xD800) << 10) | (low - 0xDC00)) + 0x10000
+    } else {
+        0xFFFD
+    }
+}
 
 // PORT: a Go string is a byte string. Two kinds of Go bytes are not valid
 // UTF-8, so a Rust `String` cannot hold them:
@@ -134,9 +155,32 @@ impl GoUnit {
 
 // Go: stringutil/util.go:334 DecodeJSStringRune
 
+/// Appends the port form of the Go rune `ch` (see `GO_STRING_MARKER`) to
+/// `out`.
+pub fn push_js_string_rune(out: &mut String, ch: u32) {
+    if is_surrogate(ch) {
+        out.push(GO_STRING_MARKER);
+        // The unit base maps the surrogate range onto valid chars.
+        out.push(
+            char::from_u32(LONE_SURROGATE_UNIT_BASE + (ch - SURROGATE_HIGH_START))
+                .unwrap_or(char::REPLACEMENT_CHARACTER),
+        );
+        return;
+    }
+    let c = char::from_u32(ch).unwrap_or(char::REPLACEMENT_CHARACTER);
+    if c == GO_STRING_MARKER {
+        out.push(GO_STRING_MARKER);
+    }
+    out.push(c);
+}
 
 // Go: stringutil/util.go:323 EncodeJSStringRune
 // PORT: writes the port form (see GO_STRING_MARKER), not WTF-8.
+pub fn encode_js_string_rune(ch: u32) -> String {
+    let mut out = String::with_capacity(8);
+    push_js_string_rune(&mut out, ch);
+    out
+}
 
 // Go: stringutil/util.go:334 DecodeJSStringRune
 // PORT: returns the Go `rune` as `u32`, because a lone surrogate is not a

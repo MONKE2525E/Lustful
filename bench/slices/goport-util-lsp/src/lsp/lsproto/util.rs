@@ -47,6 +47,25 @@ impl IntegerOrString {
 // Go: util.go:69 diagnosticCodesEqual
 // PORT: a nil `*IntegerOrString` is a Go nil pointer dereference where Go
 // reads it: `code1` first, `code2` only after a `code1` field is set.
+fn diagnostic_codes_equal(
+    code1: Option<&IntegerOrString>,
+    code2: Option<&IntegerOrString>,
+) -> bool {
+    let code1 = code1.unwrap_or_else(|| crate::core::go_nil_dereference());
+    if let Some(s1) = &code1.string {
+        let code2 = code2.unwrap_or_else(|| crate::core::go_nil_dereference());
+        if let Some(s2) = &code2.string {
+            return s1 == s2;
+        }
+    }
+    if let Some(i1) = code1.integer {
+        let code2 = code2.unwrap_or_else(|| crate::core::go_nil_dereference());
+        if let Some(i2) = code2.integer {
+            return i1 == i2;
+        }
+    }
+    false
+}
 
 // Go: util.go:79 diagnosticMessagesEqual
 

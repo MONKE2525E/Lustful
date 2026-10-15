@@ -13,6 +13,14 @@ use crate::lsp::lsproto::prelude::*;
 pub struct DocumentLinkData {}
 
 
+impl MarshalerTo for DocumentLinkData {
+    // PORT: Go marshals DocumentLinkData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for DocumentLinkData {
     // PORT: Go reflect.Value.IsZero (omitzero).
@@ -26,6 +34,14 @@ impl IsZero for DocumentLinkData {
 pub struct DiagnosticData {}
 
 
+impl MarshalerTo for DiagnosticData {
+    // PORT: Go marshals DiagnosticData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for DiagnosticData {
     // PORT: Go reflect.Value.IsZero (omitzero).
@@ -39,6 +55,14 @@ impl IsZero for DiagnosticData {
 pub struct CompletionItemDefaultsData {}
 
 
+impl MarshalerTo for CompletionItemDefaultsData {
+    // PORT: Go marshals CompletionItemDefaultsData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for CompletionItemDefaultsData {
     // PORT: Go reflect.Value.IsZero (omitzero).

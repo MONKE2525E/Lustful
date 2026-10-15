@@ -10,6 +10,15 @@
 
 use crate::jsonrpc::prelude::*;
 
+use crate::frontend::json::{
+    JsonDecoder, JsonError, MarshalerTo, UnmarshalerFrom, json_marshal, 
+    
+};
+use crate::frontend::json_ext::{
+    AnyValue, JsonValue, 
+    write_object_end, write_object_start,
+    
+};
 use std::sync::LazyLock;
 
 // Go: jsonrpc.go:14 JSONRPCVersion

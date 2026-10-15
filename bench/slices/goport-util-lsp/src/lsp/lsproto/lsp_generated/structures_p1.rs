@@ -1962,6 +1962,14 @@ impl IsZero for InitializeError {
 pub struct InitializedParams {}
 
 
+impl MarshalerTo for InitializedParams {
+    // PORT: Go marshals InitializedParams with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for InitializedParams {
     // PORT: Go reflect.Value.IsZero (omitzero).

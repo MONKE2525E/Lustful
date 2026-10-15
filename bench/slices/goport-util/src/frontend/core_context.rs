@@ -3,6 +3,7 @@
 
 use crate::frontend::prelude::*;
 
+use crate::gostd::context::{self, ContextKey};
 
 // Go: core/context.go:7 key
 // Go: core/context.go:10 requestIDKey

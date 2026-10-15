@@ -10,6 +10,7 @@ pub mod text;
 
 pub use ast_generated::*;
 pub use flow::*;
+pub use js_string::{};
 pub use syntax_kind::SyntaxKind;
 
 

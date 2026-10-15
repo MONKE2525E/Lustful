@@ -13,6 +13,9 @@
 
 use crate::prelude::*;
 
+#[path = "strconv_isprint.rs"]
+mod isprint;
+use isprint::{IS_GRAPHIC, IS_NOT_PRINT16, IS_NOT_PRINT32, IS_PRINT16, IS_PRINT32};
 
 const LOWERHEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -67,10 +70,77 @@ fn bsearch<E: Ord + Copy>(s: &[E], v: E) -> (usize, bool) {
 }
 
 // Go: strconv/quote.go:518 IsPrint
+/// IsPrint reports whether the rune is defined as printable by Go, with
+/// the same definition as [unicode.IsPrint]: letters, numbers, punctuation,
+/// symbols and ASCII space.
+pub fn is_print(r: char) -> bool {
+    let r = r as u32;
+    // Fast check for Latin-1
+    if r <= 0xFF {
+        if 0x20 <= r && r <= 0x7E {
+            // All the ASCII is printable from space through DEL-1.
+            return true;
+        }
+        if 0xA1 <= r && r <= 0xFF {
+            // Similarly for ¡ through ÿ...
+            return r != 0xAD; // ...except for the bizarre soft hyphen.
+        }
+        return false;
+    }
+
+    // Same algorithm, either on uint16 or uint32 value.
+    // First, find first i such that isPrint[i] >= x.
+    // This is the index of either the start or end of a pair that might span x.
+    // The start is even (isPrint[i&^1]) and the end is odd (isPrint[i|1]).
+    // If we find x in a range, make sure x is not in isNotPrint list.
+
+    if r < 1 << 16 {
+        let (rr, is_print, is_not_print) = (r as u16, &IS_PRINT16[..], &IS_NOT_PRINT16[..]);
+        let (i, _) = bsearch(is_print, rr);
+        if i >= is_print.len() || rr < is_print[i & !1] || is_print[i | 1] < rr {
+            return false;
+        }
+        let (_, found) = bsearch(is_not_print, rr);
+        return !found;
+    }
+
+    let (rr, is_print, is_not_print) = (r, &IS_PRINT32[..], &IS_NOT_PRINT32[..]);
+    let (i, _) = bsearch(is_print, rr);
+    if i >= is_print.len() || rr < is_print[i & !1] || is_print[i | 1] < rr {
+        return false;
+    }
+    if r >= 0x20000 {
+        return true;
+    }
+    let r = r - 0x10000;
+    let (_, found) = bsearch(is_not_print, r as u16);
+    !found
+}
 
 // Go: strconv/quote.go:564 IsGraphic
+/// IsGraphic reports whether the rune is defined as a Graphic by Unicode. Such
+/// characters include letters, marks, numbers, punctuation, symbols, and
+/// spaces, from categories L, M, N, P, S, and Zs.
+pub fn is_graphic(r: char) -> bool {
+    if is_print(r) {
+        return true;
+    }
+    is_in_graphic_list(r)
+}
 
 // Go: strconv/quote.go:574 isInGraphicList
+/// isInGraphicList reports whether the rune is in the isGraphic list. This separation
+/// from IsGraphic allows quoteWith to avoid two calls to IsPrint.
+/// Should be called only if IsPrint fails.
+fn is_in_graphic_list(r: char) -> bool {
+    // We know r must fit in 16 bits - see makeisprint.go.
+    let r = r as u32;
+    if r > 0xFFFF {
+        return false;
+    }
+    let (_, found) = bsearch(&IS_GRAPHIC[..], r as u16);
+    found
+}
 
 #[cfg(test)]
 mod tests {

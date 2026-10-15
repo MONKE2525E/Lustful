@@ -22,6 +22,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use crate::frontend::vfs::osvfs::{};
 use crate::fswatch::pathcompare::{ComparisonCache, ComparisonPath, PathComparer};
 use crate::fswatch::syscall;
 use crate::gostd::{errors, strconv};
@@ -68,7 +69,19 @@ pub struct RecursiveOption;
 // Go: watcher.go:166 WithRecursive
 
 // Go: watcher.go:172 Watch
+/// Watch represents a live watch. Close stops watching
+/// and releases resources. It is idempotent.
+///
+/// PORT: Go `io.Closer` users (watchmanager, lspwatcher) hold a
+/// `Box<dyn Watch>`.
+pub trait Watch: Send + Sync {
+    fn close(&self) -> Result<(), GoError>;
+    fn unexported(&self);
+}
 
+/// PORT: Go `error` in the callback. Plan decision D-CTX: one error type,
+/// `GoError`; test sentinels with `errors::is(&err, &ERR_OVERFLOW)`.
+pub type WatchError = GoError;
 
 // Go: watcher.go:185 WatchCallback
 

@@ -204,6 +204,49 @@ fn new_lazy_flag(r1: Rune, r2: Rune) -> LazyFlag {
 
 impl LazyFlag {
     // Go: regexp/exec.go:128 match
+    fn match_(self, mut op: EmptyOp) -> bool {
+        if op == 0 {
+            return true;
+        }
+        let r1 = (self.0 >> 32) as u32 as Rune;
+        if op & syntax::EMPTY_BEGIN_LINE != 0 {
+            if r1 != '\n' as Rune && r1 >= 0 {
+                return false;
+            }
+            op &= !syntax::EMPTY_BEGIN_LINE;
+        }
+        if op & syntax::EMPTY_BEGIN_TEXT != 0 {
+            if r1 >= 0 {
+                return false;
+            }
+            op &= !syntax::EMPTY_BEGIN_TEXT;
+        }
+        if op == 0 {
+            return true;
+        }
+        let r2 = self.0 as u32 as Rune;
+        if op & syntax::EMPTY_END_LINE != 0 {
+            if r2 != '\n' as Rune && r2 >= 0 {
+                return false;
+            }
+            op &= !syntax::EMPTY_END_LINE;
+        }
+        if op & syntax::EMPTY_END_TEXT != 0 {
+            if r2 >= 0 {
+                return false;
+            }
+            op &= !syntax::EMPTY_END_TEXT;
+        }
+        if op == 0 {
+            return true;
+        }
+        if syntax::is_word_char(r1) != syntax::is_word_char(r2) {
+            op &= !syntax::EMPTY_WORD_BOUNDARY;
+        } else {
+            op &= !syntax::EMPTY_NO_WORD_BOUNDARY;
+        }
+        op == 0
+    }
 }
 
 impl<'a> Machine<'a> {
@@ -230,8 +273,107 @@ impl<'a> Machine<'a> {
     // Go: regexp/exec.go:175 match
 
     // Go: regexp/exec.go:260 step
+    /// step executes one step of the machine, running each of the threads
+    /// on runq and appending new threads to nextq.
+    /// The step processes the rune c (which may be endOfText),
+    /// which starts at position pos and ends at nextPos.
+    /// nextCond gives the setting for the empty-width flags after c.
+    fn step(
+        &mut self,
+        runq: &mut Queue,
+        nextq: &mut Queue,
+        _pos: usize,
+        next_pos: usize,
+        c: Rune,
+        next_cond: LazyFlag,
+    ) {
+        let longest = self.re.longest;
+        let p = self.p;
+        let mut j = 0;
+        while j < runq.dense.len() {
+            let d = runq.dense[j];
+            j += 1;
+            if !d.t {
+                continue;
+            }
+            // PORT: the `longest` thread cut needs capture slots, which
+            // MatchString does not have.
+            let i = &p.inst[d.pc as usize];
+            let mut add = false;
+            match i.op {
+                syntax::INST_MATCH => {
+                    if !longest {
+                        // First-match mode: cut off all lower-priority threads.
+                        runq.dense.clear();
+                    }
+                    self.matched = true;
+                }
+                syntax::INST_RUNE => add = i.match_rune(c),
+                syntax::INST_RUNE1 => add = c == i.rune[0],
+                syntax::INST_RUNE_ANY => add = true,
+                syntax::INST_RUNE_ANY_NOT_NL => add = c != '\n' as Rune,
+                _ => panic!("bad inst"),
+            }
+            if add {
+                self.add(nextq, i.out, next_pos, next_cond);
+            }
+        }
+        runq.dense.clear();
+    }
 
     // Go: regexp/exec.go:317 add
+    /// add adds an entry to q for pc, unless the q already has such an entry.
+    /// It also recursively adds an entry for all instructions reachable from pc by following
+    /// empty-width conditions satisfied by cond.  pos gives the current position
+    /// in the input.
+    // PORT: no capture slots, so InstCapture always follows Out, and the
+    // thread passed back to the caller for reuse is dropped.
+    fn add(&self, q: &mut Queue, mut pc: u32, pos: usize, cond: LazyFlag) {
+        loop {
+            if pc == 0 {
+                return;
+            }
+            let j = q.sparse[pc as usize];
+            if (j as usize) < q.dense.len() && q.dense[j as usize].pc == pc {
+                return;
+            }
+
+            let j = q.dense.len();
+            q.dense.push(Entry { pc, t: false });
+            q.sparse[pc as usize] = j as u32;
+
+            let i = &self.p.inst[pc as usize];
+            match i.op {
+                syntax::INST_FAIL => {
+                    // nothing
+                }
+                syntax::INST_ALT | syntax::INST_ALT_MATCH => {
+                    self.add(q, i.out, pos, cond);
+                    pc = i.arg;
+                    continue;
+                }
+                syntax::INST_EMPTY_WIDTH => {
+                    if cond.match_(i.arg as EmptyOp) {
+                        pc = i.out;
+                        continue;
+                    }
+                }
+                syntax::INST_NOP | syntax::INST_CAPTURE => {
+                    pc = i.out;
+                    continue;
+                }
+                syntax::INST_MATCH
+                | syntax::INST_RUNE
+                | syntax::INST_RUNE1
+                | syntax::INST_RUNE_ANY
+                | syntax::INST_RUNE_ANY_NOT_NL => {
+                    q.dense[j].t = true;
+                }
+                _ => panic!("unhandled"),
+            }
+            return;
+        }
+    }
 }
 
 /// Go `regexp/syntax`.
@@ -701,6 +843,54 @@ pub mod syntax {
         // Parse stack manipulation.
 
         // Go: regexp/syntax/parse.go:293 push
+        /// push pushes the regexp re onto the parse stack and returns the regexp.
+        /// It returns None when re was merged into the literal on top of the stack.
+        fn push(&mut self, re: usize) -> Result<Option<usize>, Error> {
+            self.num_runes += self.nodes[re].rune.len();
+            let node = &self.nodes[re];
+            let rune = &node.rune;
+            if node.op == OP_CHAR_CLASS && rune.len() == 2 && rune[0] == rune[1] {
+                // Single rune.
+                let r0 = rune[0];
+                if self.maybe_concat(r0, self.flags & !FOLD_CASE) {
+                    return Ok(None);
+                }
+                let node = &mut self.nodes[re];
+                node.op = OP_LITERAL;
+                node.rune.truncate(1);
+                node.flags = self.flags & !FOLD_CASE;
+            } else if node.op == OP_CHAR_CLASS
+                && rune.len() == 4
+                && rune[0] == rune[1]
+                && rune[2] == rune[3]
+                && unicode::simple_fold(rune[0]) == rune[2]
+                && unicode::simple_fold(rune[2]) == rune[0]
+                || node.op == OP_CHAR_CLASS
+                    && rune.len() == 2
+                    && rune[0] + 1 == rune[1]
+                    && unicode::simple_fold(rune[0]) == rune[1]
+                    && unicode::simple_fold(rune[1]) == rune[0]
+            {
+                // Case-insensitive rune like [Aa] or [Δδ].
+                let r0 = rune[0];
+                if self.maybe_concat(r0, self.flags | FOLD_CASE) {
+                    return Ok(None);
+                }
+
+                // Rewrite as (case-insensitive) literal.
+                let node = &mut self.nodes[re];
+                node.op = OP_LITERAL;
+                node.rune.truncate(1);
+                node.flags = self.flags | FOLD_CASE;
+            } else {
+                // Incremental concatenation.
+                self.maybe_concat(-1, 0);
+            }
+
+            self.stack.push(re);
+            self.check_limits(re)?;
+            Ok(Some(re))
+        }
 
         // Go: regexp/syntax/parse.go:339 maybeConcat
         /// maybeConcat implements incremental concatenation
@@ -744,8 +934,27 @@ pub mod syntax {
         }
 
         // Go: regexp/syntax/parse.go:368 literal
+        /// literal pushes a literal regexp for the rune r on the stack.
+        fn literal(&mut self, mut r: Rune) -> Result<(), Error> {
+            let re = self.new_regexp(OP_LITERAL);
+            self.nodes[re].flags = self.flags;
+            if self.flags & FOLD_CASE != 0 {
+                r = min_fold_rune(r);
+            }
+            self.nodes[re].rune = vec![r];
+            self.push(re)?;
+            Ok(())
+        }
 
         // Go: regexp/syntax/parse.go:394 op
+        /// op pushes a regexp with the given op onto the stack
+        /// and returns that regexp.
+        fn op(&mut self, op: Op) -> Result<usize, Error> {
+            let re = self.new_regexp(op);
+            self.nodes[re].flags = self.flags;
+            // PORT: push returns nil only for a char class, which op never gets.
+            Ok(self.push(re)?.expect("op pushes a non-class regexp"))
+        }
 
         // Go: regexp/syntax/parse.go:404 repeat
         /// repeat replaces the top stack element with itself repeated according to op, min, max.
@@ -838,6 +1047,43 @@ pub mod syntax {
         }
 
         // Go: regexp/syntax/parse.go:790 removeLeadingString
+        /// removeLeadingString removes the first n leading runes
+        /// from the beginning of re. It returns the replacement for re.
+        fn remove_leading_string(&mut self, mut re: usize, n: usize) -> usize {
+            if self.nodes[re].op == OP_CONCAT && !self.nodes[re].sub.is_empty() {
+                // Removing a leading string in a concatenation
+                // might simplify the concatenation.
+                let sub = self.remove_leading_string(self.nodes[re].sub[0], n);
+                self.nodes[re].sub[0] = sub;
+                if self.nodes[sub].op == OP_EMPTY_MATCH {
+                    self.reuse(sub);
+                    match self.nodes[re].sub.len() {
+                        0 | 1 => {
+                            // Impossible but handle.
+                            self.nodes[re].op = OP_EMPTY_MATCH;
+                            self.nodes[re].sub = Vec::new();
+                        }
+                        2 => {
+                            let old = re;
+                            re = self.nodes[re].sub[1];
+                            self.reuse(old);
+                        }
+                        _ => {
+                            self.nodes[re].sub.remove(0);
+                        }
+                    }
+                }
+                return re;
+            }
+
+            if self.nodes[re].op == OP_LITERAL {
+                self.nodes[re].rune.drain(..n);
+                if self.nodes[re].rune.is_empty() {
+                    self.nodes[re].op = OP_EMPTY_MATCH;
+                }
+            }
+            re
+        }
 
         // Go: regexp/syntax/parse.go:827 leadingRegexp
         /// leadingRegexp returns the leading regexp that re begins with.
@@ -1040,6 +1286,20 @@ pub mod syntax {
     }
 
     // Go: regexp/syntax/parse.go:380 minFoldRune
+    /// minFoldRune returns the minimum rune fold-equivalent to r.
+    fn min_fold_rune(r: Rune) -> Rune {
+        if !(MIN_FOLD..=MAX_FOLD).contains(&r) {
+            return r;
+        }
+        let mut m = r;
+        let r0 = r;
+        let mut r = unicode::simple_fold(r);
+        while r != r0 {
+            m = m.min(r);
+            r = unicode::simple_fold(r);
+        }
+        m
+    }
 
     // Go: regexp/syntax/parse.go:452 repeatIsValid
     /// repeatIsValid reports whether the repetition re is valid.
@@ -1203,6 +1463,14 @@ pub mod syntax {
     // Go: regexp/syntax/parse.go:1932 cleanClass
 
     // Go: regexp/syntax/parse.go:1979 appendLiteral
+    /// appendLiteral appends the literal x to the class r.
+    fn append_literal(r: &mut Vec<Rune>, x: Rune, flags: Flags) {
+        if flags & FOLD_CASE != 0 {
+            append_folded_range(r, x, x);
+        } else {
+            append_range(r, x, x);
+        }
+    }
 
     // Go: regexp/syntax/parse.go:1987 appendRange
     /// appendRange appends the range lo-hi to the class r.
@@ -1238,6 +1506,41 @@ pub mod syntax {
     const MAX_FOLD: Rune = 0x1e943;
 
     // Go: regexp/syntax/parse.go:2020 appendFoldedRange
+    /// appendFoldedRange appends the range lo-hi
+    /// and its case folding-equivalent runes to the class r.
+    fn append_folded_range(r: &mut Vec<Rune>, mut lo: Rune, mut hi: Rune) {
+        // Optimizations.
+        if lo <= MIN_FOLD && hi >= MAX_FOLD {
+            // Range is full: folding can't add more.
+            append_range(r, lo, hi);
+            return;
+        }
+        if hi < MIN_FOLD || lo > MAX_FOLD {
+            // Range is outside folding possibilities.
+            append_range(r, lo, hi);
+            return;
+        }
+        if lo < MIN_FOLD {
+            // [lo, minFold-1] needs no folding.
+            append_range(r, lo, MIN_FOLD - 1);
+            lo = MIN_FOLD;
+        }
+        if hi > MAX_FOLD {
+            // [maxFold+1, hi] needs no folding.
+            append_range(r, MAX_FOLD + 1, hi);
+            hi = MAX_FOLD;
+        }
+
+        // Brute force. Depend on appendRange to coalesce ranges on the fly.
+        for c in lo..=hi {
+            append_range(r, c, c);
+            let mut f = unicode::simple_fold(c);
+            while f != c {
+                append_range(r, f, f);
+                f = unicode::simple_fold(f);
+            }
+        }
+    }
 
     // Go: regexp/syntax/parse.go:2055 appendClass
 
@@ -1452,6 +1755,17 @@ pub mod syntax {
     pub const EMPTY_NO_WORD_BOUNDARY: EmptyOp = 1 << 5;
 
     // Go: regexp/syntax/prog.go:108 IsWordChar
+    /// IsWordChar reports whether r is considered a “word character”
+    /// during the evaluation of the \b and \B zero-width assertions.
+    /// These assertions are ASCII-only: the word characters are [A-Za-z0-9_].
+    pub fn is_word_char(r: Rune) -> bool {
+        // Test for lowercase letters first, as these occur more
+        // frequently than uppercase letters in common cases.
+        ('a' as Rune..='z' as Rune).contains(&r)
+            || ('A' as Rune..='Z' as Rune).contains(&r)
+            || ('0' as Rune..='9' as Rune).contains(&r)
+            || r == '_' as Rune
+    }
 
     // Go: regexp/syntax/prog.go:114 Inst
     /// An Inst is a single instruction in a regular expression program.
@@ -1539,8 +1853,85 @@ pub mod syntax {
         }
 
         // Go: regexp/syntax/prog.go:195 MatchRune
+        /// MatchRune reports whether the instruction matches (and consumes) r.
+        /// It should only be called when i.Op == [InstRune].
+        pub fn match_rune(&self, r: Rune) -> bool {
+            self.match_rune_pos(r) != NO_MATCH
+        }
 
         // Go: regexp/syntax/prog.go:204 MatchRunePos
+        /// MatchRunePos checks whether the instruction matches (and consumes) r.
+        /// If so, MatchRunePos returns the index of the matching rune pair
+        /// (or, when len(i.Rune) == 1, rune singleton).
+        /// If not, MatchRunePos returns -1.
+        /// MatchRunePos should only be called when i.Op == [InstRune].
+        pub fn match_rune_pos(&self, r: Rune) -> i32 {
+            let rune = &self.rune;
+
+            match rune.len() {
+                0 => return NO_MATCH,
+
+                1 => {
+                    // Special case: single-rune slice is from literal string, not char class.
+                    let r0 = rune[0];
+                    if r == r0 {
+                        return 0;
+                    }
+                    if (self.arg as Flags) & FOLD_CASE != 0 {
+                        let mut r1 = unicode::simple_fold(r0);
+                        while r1 != r0 {
+                            if r == r1 {
+                                return 0;
+                            }
+                            r1 = unicode::simple_fold(r1);
+                        }
+                    }
+                    return NO_MATCH;
+                }
+
+                2 => {
+                    if r >= rune[0] && r <= rune[1] {
+                        return 0;
+                    }
+                    return NO_MATCH;
+                }
+
+                4 | 6 | 8 => {
+                    // Linear search for a few pairs.
+                    // Should handle ASCII well.
+                    let mut j = 0;
+                    while j < rune.len() {
+                        if r < rune[j] {
+                            return NO_MATCH;
+                        }
+                        if r <= rune[j + 1] {
+                            return (j / 2) as i32;
+                        }
+                        j += 2;
+                    }
+                    return NO_MATCH;
+                }
+
+                _ => {}
+            }
+
+            // Otherwise binary search.
+            let mut lo = 0;
+            let mut hi = rune.len() / 2;
+            while lo < hi {
+                let m = (lo + hi) >> 1;
+                let c = rune[2 * m];
+                if c <= r {
+                    if r <= rune[2 * m + 1] {
+                        return m as i32;
+                    }
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
+            }
+            NO_MATCH
+        }
     }
 
     // Go: regexp/syntax/compile.go:20 patchList
@@ -1622,6 +2013,17 @@ pub mod syntax {
     }
 
     // Go: regexp/syntax/compile.go:71 Compile
+    /// Compile compiles the regexp into a program to be executed.
+    /// The regexp should have been simplified already (returned from re.Simplify).
+    // PORT: Go also returns an error, which is always nil.
+    pub fn compile(nodes: &[Regexp], re: usize) -> Prog {
+        let mut c = Compiler::init(nodes);
+        let f = c.compile(re);
+        let m = c.inst(INST_MATCH).i;
+        f.out.patch(&mut c.p, m);
+        c.p.start = f.i as usize;
+        c.p
+    }
 
     /// anyRuneNotNL and anyRune.
     const ANY_RUNE_NOT_NL: [Rune; 4] = [0, '\n' as Rune - 1, '\n' as Rune + 1, MAX_RUNE];
@@ -1643,6 +2045,81 @@ pub mod syntax {
         }
 
         // Go: regexp/syntax/compile.go:89 compile
+        fn compile(&mut self, re: usize) -> Frag {
+            let nodes = self.nodes;
+            let node = &nodes[re];
+            match node.op {
+                OP_NO_MATCH => self.fail(),
+                OP_EMPTY_MATCH => self.nop(),
+                OP_LITERAL => {
+                    if node.rune.is_empty() {
+                        return self.nop();
+                    }
+                    let mut f = Frag::default();
+                    for j in 0..node.rune.len() {
+                        let f1 = self.rune(&node.rune[j..=j], node.flags);
+                        if j == 0 {
+                            f = f1;
+                        } else {
+                            f = self.cat(f, f1);
+                        }
+                    }
+                    f
+                }
+                OP_CHAR_CLASS => self.rune(&node.rune, node.flags),
+                OP_ANY_CHAR_NOT_NL => self.rune(&ANY_RUNE_NOT_NL, 0),
+                OP_ANY_CHAR => self.rune(&ANY_RUNE, 0),
+                OP_BEGIN_LINE => self.empty(EMPTY_BEGIN_LINE),
+                OP_END_LINE => self.empty(EMPTY_END_LINE),
+                OP_BEGIN_TEXT => self.empty(EMPTY_BEGIN_TEXT),
+                OP_END_TEXT => self.empty(EMPTY_END_TEXT),
+                OP_WORD_BOUNDARY => self.empty(EMPTY_WORD_BOUNDARY),
+                OP_NO_WORD_BOUNDARY => self.empty(EMPTY_NO_WORD_BOUNDARY),
+                OP_CAPTURE => {
+                    let bra = self.cap((node.cap << 1) as u32);
+                    let sub = self.compile(node.sub[0]);
+                    let ket = self.cap((node.cap << 1 | 1) as u32);
+                    let f = self.cat(bra, sub);
+                    self.cat(f, ket)
+                }
+                OP_STAR => {
+                    let f = self.compile(node.sub[0]);
+                    self.star(f, node.flags & NON_GREEDY != 0)
+                }
+                OP_PLUS => {
+                    let f = self.compile(node.sub[0]);
+                    self.plus(f, node.flags & NON_GREEDY != 0)
+                }
+                OP_QUEST => {
+                    let f = self.compile(node.sub[0]);
+                    self.quest(f, node.flags & NON_GREEDY != 0)
+                }
+                OP_CONCAT => {
+                    if node.sub.is_empty() {
+                        return self.nop();
+                    }
+                    let mut f = Frag::default();
+                    for (i, &sub) in node.sub.iter().enumerate() {
+                        if i == 0 {
+                            f = self.compile(sub);
+                        } else {
+                            let f2 = self.compile(sub);
+                            f = self.cat(f, f2);
+                        }
+                    }
+                    f
+                }
+                OP_ALTERNATE => {
+                    let mut f = Frag::default();
+                    for &sub in &node.sub {
+                        let f2 = self.compile(sub);
+                        f = self.alt(f, f2);
+                    }
+                    f
+                }
+                _ => panic!("regexp: unhandled case in compile"),
+            }
+        }
 
         // Go: regexp/syntax/compile.go:161 inst
         fn inst(&mut self, op: InstOp) -> Frag {
@@ -1783,6 +2260,35 @@ pub mod syntax {
         }
 
         // Go: regexp/syntax/compile.go:272 rune
+        fn rune(&mut self, r: &[Rune], flags: Flags) -> Frag {
+            let mut f = self.inst(INST_RUNE);
+            f.nullable = false;
+            let i = &mut self.p.inst[f.i as usize];
+            i.rune = r.to_vec();
+            let mut flags = flags & FOLD_CASE; // only relevant flag is FoldCase
+            if r.len() != 1 || unicode::simple_fold(r[0]) == r[0] {
+                // and sometimes not even that
+                flags &= !FOLD_CASE;
+            }
+            i.arg = u32::from(flags);
+            f.out = make_patch_list(f.i << 1);
+
+            // Special cases for exec machine.
+            if flags & FOLD_CASE == 0 && (r.len() == 1 || r.len() == 2 && r[0] == r[1]) {
+                i.op = INST_RUNE1;
+            } else if r.len() == 2 && r[0] == 0 && r[1] == MAX_RUNE {
+                i.op = INST_RUNE_ANY;
+            } else if r.len() == 4
+                && r[0] == 0
+                && r[1] == '\n' as Rune - 1
+                && r[2] == '\n' as Rune + 1
+                && r[3] == MAX_RUNE
+            {
+                i.op = INST_RUNE_ANY_NOT_NL;
+            }
+
+            f
+        }
     }
 }
 
@@ -1800,6 +2306,47 @@ mod unicode {
     const MAX_ASCII: Rune = 0x7F;
 
     // Go: unicode/letter.go:354 SimpleFold
+    /// SimpleFold iterates over Unicode code points equivalent under
+    /// the Unicode-defined simple case folding. Among the code points
+    /// equivalent to rune (including rune itself), SimpleFold returns the
+    /// smallest rune > r if one exists, or else the smallest rune >= 0.
+    /// If r is not a valid Unicode code point, SimpleFold(r) returns r.
+    pub fn simple_fold(r: Rune) -> Rune {
+        if !(0..=MAX_RUNE).contains(&r) {
+            return r;
+        }
+
+        if r <= MAX_ASCII {
+            return Rune::from(ASCII_FOLD[r as usize]);
+        }
+
+        // Consult caseOrbit table for special cases.
+        let mut lo = 0;
+        let mut hi = CASE_ORBIT.len();
+        while lo < hi {
+            let m = (lo + hi) >> 1;
+            if Rune::from(CASE_ORBIT[m].0) < r {
+                lo = m + 1;
+            } else {
+                hi = m;
+            }
+        }
+        if lo < CASE_ORBIT.len() && Rune::from(CASE_ORBIT[lo].0) == r {
+            return Rune::from(CASE_ORBIT[lo].1);
+        }
+
+        // No folding specified. This is a one- or two-element
+        // equivalence class containing rune and ToLower(rune)
+        // and ToUpper(rune) if they are different from rune.
+        if let Some(cr) = lookup_case_range(r, CASE_RANGES) {
+            let l = convert_case(LOWER_CASE, r, cr);
+            if l != r {
+                return l;
+            }
+            return convert_case(UPPER_CASE, r, cr);
+        }
+        r
+    }
 
     // Go: unicode/letter.go:211 lookupCaseRange
     /// lookupCaseRange returns the CaseRange mapping for rune r or None if no

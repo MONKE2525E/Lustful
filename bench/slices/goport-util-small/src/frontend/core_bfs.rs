@@ -33,15 +33,53 @@ pub struct BreadthFirstSearchResult<N> {
 }
 
 // Go: core/bfs.go:16 breadthFirstSearchJob
+pub struct BreadthFirstSearchJob<N> {
+    pub node: N,
+    pub parent: Option<Rc<BreadthFirstSearchJob<N>>>,
+}
 
 // Go: core/bfs.go:21 BreadthFirstSearchLevel
 // PORT: Go holds a pointer to the level's `OrderedMap`. The port moves the
 // map in for the `PreprocessLevel` call and back out after it. `RefCell`
 // lets a `Range` callback call `Delete` on the same level, as Go does.
+pub struct BreadthFirstSearchLevel<K, N> {
+    pub jobs: RefCell<IndexMap<K, Rc<BreadthFirstSearchJob<N>>>>,
+}
 
+impl<K: Eq + Hash, N: Clone> BreadthFirstSearchLevel<K, N> {
+    // Go: core/bfs.go:25 Has
+    pub fn has(&self, key: &K) -> bool {
+        self.jobs.borrow().contains_key(key)
+    }
+
+    // Go: core/bfs.go:29 Delete
+    pub fn delete(&self, key: &K) {
+        // PORT: Go OrderedMap.Delete keeps the order of the other keys.
+        self.jobs.borrow_mut().shift_remove(key);
+    }
+
+    // Go: core/bfs.go:33 Range
+}
 
 // Go: core/bfs.go:41 BreadthFirstSearchOptions
+pub struct BreadthFirstSearchOptions<'a, K, N> {
+    // Visited is a set of nodes that have already been visited.
+    // If nil, a new set will be created.
+    // PORT: Go `*collections.SyncSet[K]`.
+    pub visited: Option<&'a RefCell<FxHashSet<K>>>,
+    // PreprocessLevel is a function that, if provided, will be called
+    // before each level, giving the caller an opportunity to remove nodes.
+    pub preprocess_level: Option<&'a mut dyn FnMut(&BreadthFirstSearchLevel<K, N>)>,
+}
 
+impl<K, N> Default for BreadthFirstSearchOptions<'_, K, N> {
+    fn default() -> Self {
+        BreadthFirstSearchOptions {
+            visited: None,
+            preprocess_level: None,
+        }
+    }
+}
 
 // Go: core/bfs.go:53 BreadthFirstSearchParallel
 // BreadthFirstSearchParallel performs a breadth-first search on a graph
@@ -49,6 +87,11 @@ pub struct BreadthFirstSearchResult<N> {
 // from the first node that satisfies the `visit` function back to the start node.
 
 // Go: core/bfs.go:76 result (local type of BreadthFirstSearchParallelEx)
+struct ProcessLevelResult<K, N> {
+    stop: bool,
+    job: Option<Rc<BreadthFirstSearchJob<N>>>,
+    next: Option<IndexMap<K, Rc<BreadthFirstSearchJob<N>>>>,
+}
 
 // Go: core/bfs.go:64 BreadthFirstSearchParallelEx
 // BreadthFirstSearchParallelEx is an extension of BreadthFirstSearchParallel that allows
@@ -63,6 +106,15 @@ pub struct BreadthFirstSearchResult<N> {
 // goroutines run serially in queue order.
 
 // Go: core/bfs.go:169 createPath (closure in BreadthFirstSearchParallelEx)
+fn create_path<N: Clone>(job: Option<Rc<BreadthFirstSearchJob<N>>>) -> Vec<N> {
+    let mut path = Vec::new();
+    let mut job = job;
+    while let Some(j) = job {
+        path.push(j.node.clone());
+        job = j.parent.clone();
+    }
+    path
+}
 
 // Go: core/bfs.go:196 updateMin
 // updateMin updates the atomic integer `a` to the candidate value if it is less than the current value.

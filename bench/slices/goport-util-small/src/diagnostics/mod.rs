@@ -51,6 +51,7 @@ impl fmt::Display for FormatError {
     }
 }
 
+impl Error for FormatError {}
 
 
 /// The first Effect diagnostic code. Effect messages (377000 to 377999) are

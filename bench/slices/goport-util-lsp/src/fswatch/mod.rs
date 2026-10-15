@@ -74,5 +74,6 @@ pub mod prelude {
     )))]
     pub use super::canonicalize_other::*;
     pub use super::{canonicalize_darwin::*, debounce::*, event::*, walkdir::*, watcher::*};
+    pub use crate::gostd::{self, GoError};
     pub use crate::prelude::*;
 }

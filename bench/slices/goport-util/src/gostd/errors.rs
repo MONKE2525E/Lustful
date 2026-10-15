@@ -136,6 +136,7 @@ impl fmt::Debug for GoError {
     }
 }
 
+impl std::error::Error for GoError {}
 
 // Go: errors/errors.go:64 New
 /// Go `errors.New(text)`. Each call makes a distinct error, even if the

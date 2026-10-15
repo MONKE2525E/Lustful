@@ -83,6 +83,11 @@ impl IsZero for ErrorCode {
     }
 }
 
+impl MarshalerTo for ErrorCode {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _ERROR_CODE_NAME: &str = "RequestFailedServerCancelledContentModifiedRequestCancelledParseErrorInternalErrorInvalidParamsMethodNotFoundInvalidRequestServerNotInitializedUnknownErrorCode";
@@ -131,6 +136,7 @@ impl ErrorCode {
     }
 }
 
+impl std::error::Error for ErrorCode {}
 
 // A set of predefined range kinds.
 
@@ -177,6 +183,11 @@ impl IsZero for SymbolKind {
     }
 }
 
+impl MarshalerTo for SymbolKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _SYMBOL_KIND_NAME: &str = "FileModuleNamespacePackageClassMethodPropertyFieldConstructorEnumInterfaceFunctionVariableConstantStringNumberBooleanArrayObjectKeyNullEnumMemberStructEventOperatorTypeParameter";
@@ -221,6 +232,11 @@ impl IsZero for SymbolTag {
     }
 }
 
+impl MarshalerTo for SymbolTag {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _SYMBOL_TAG_NAME: &str = "Deprecated";
@@ -280,6 +296,11 @@ impl IsZero for InlayHintKind {
     }
 }
 
+impl MarshalerTo for InlayHintKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _INLAY_HINT_KIND_NAME: &str = "TypeParameter";
@@ -330,6 +351,11 @@ impl IsZero for MessageType {
     }
 }
 
+impl MarshalerTo for MessageType {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _MESSAGE_TYPE_NAME: &str = "ErrorWarningInfoLogDebug";
@@ -377,6 +403,11 @@ impl IsZero for TextDocumentSyncKind {
     }
 }
 
+impl MarshalerTo for TextDocumentSyncKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _TEXT_DOCUMENT_SYNC_KIND_NAME: &str = "NoneFullIncremental";
@@ -422,6 +453,11 @@ impl IsZero for TextDocumentSaveReason {
     }
 }
 
+impl MarshalerTo for TextDocumentSaveReason {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _TEXT_DOCUMENT_SAVE_REASON_NAME: &str = "ManualAfterDelayFocusOut";
@@ -485,6 +521,11 @@ impl IsZero for CompletionItemKind {
     }
 }
 
+impl MarshalerTo for CompletionItemKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _COMPLETION_ITEM_KIND_NAME: &str = "TextMethodFunctionConstructorFieldVariableClassInterfaceModulePropertyUnitValueEnumKeywordSnippetColorFileReferenceFolderEnumMemberConstantStructEventOperatorTypeParameter";
@@ -531,6 +572,11 @@ impl IsZero for CompletionItemTag {
     }
 }
 
+impl MarshalerTo for CompletionItemTag {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _COMPLETION_ITEM_TAG_NAME: &str = "Deprecated";
@@ -581,6 +627,11 @@ impl IsZero for InsertTextFormat {
     }
 }
 
+impl MarshalerTo for InsertTextFormat {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _INSERT_TEXT_FORMAT_NAME: &str = "PlainTextSnippet";
@@ -636,6 +687,11 @@ impl IsZero for InsertTextMode {
     }
 }
 
+impl MarshalerTo for InsertTextMode {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _INSERT_TEXT_MODE_NAME: &str = "asIsadjustIndentation";
@@ -680,6 +736,11 @@ impl IsZero for DocumentHighlightKind {
     }
 }
 
+impl MarshalerTo for DocumentHighlightKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _DOCUMENT_HIGHLIGHT_KIND_NAME: &str = "TextReadWrite";
@@ -728,6 +789,11 @@ impl IsZero for CodeActionTag {
     }
 }
 
+impl MarshalerTo for CodeActionTag {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _CODE_ACTION_TAG_NAME: &str = "LLMGenerated";
@@ -795,6 +861,11 @@ impl IsZero for InlineCompletionTriggerKind {
     }
 }
 
+impl MarshalerTo for InlineCompletionTriggerKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _INLINE_COMPLETION_TRIGGER_KIND_NAME: &str = "InvokedAutomatic";
@@ -847,6 +918,11 @@ impl IsZero for FileChangeType {
     }
 }
 
+impl MarshalerTo for FileChangeType {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _FILE_CHANGE_TYPE_NAME: &str = "CreatedChangedDeleted";
@@ -890,6 +966,11 @@ impl IsZero for WatchKind {
     }
 }
 
+impl MarshalerTo for WatchKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _WATCH_KIND_NAME: &str = "CreateChangeDelete";
@@ -921,6 +1002,11 @@ impl IsZero for DiagnosticSeverity {
     }
 }
 
+impl MarshalerTo for DiagnosticSeverity {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _DIAGNOSTIC_SEVERITY_NAME: &str = "ErrorWarningInformationHint";
@@ -970,6 +1056,11 @@ impl IsZero for DiagnosticTag {
     }
 }
 
+impl MarshalerTo for DiagnosticTag {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _DIAGNOSTIC_TAG_NAME: &str = "UnnecessaryDeprecated";
@@ -1016,6 +1107,11 @@ impl IsZero for CompletionTriggerKind {
     }
 }
 
+impl MarshalerTo for CompletionTriggerKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _COMPLETION_TRIGGER_KIND_NAME: &str =
@@ -1066,6 +1162,11 @@ impl IsZero for ApplyKind {
     }
 }
 
+impl MarshalerTo for ApplyKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _APPLY_KIND_NAME: &str = "ReplaceMerge";
@@ -1111,6 +1212,11 @@ impl IsZero for SignatureHelpTriggerKind {
     }
 }
 
+impl MarshalerTo for SignatureHelpTriggerKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _SIGNATURE_HELP_TRIGGER_KIND_NAME: &str = "InvokedTriggerCharacterContentChange";
@@ -1158,6 +1264,11 @@ impl IsZero for CodeActionTriggerKind {
     }
 }
 
+impl MarshalerTo for CodeActionTriggerKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _CODE_ACTION_TRIGGER_KIND_NAME: &str = "InvokedAutomatic";
@@ -1217,6 +1328,11 @@ impl IsZero for PrepareSupportDefaultBehavior {
     }
 }
 
+impl MarshalerTo for PrepareSupportDefaultBehavior {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _PREPARE_SUPPORT_DEFAULT_BEHAVIOR_NAME: &str = "Identifier";
@@ -1264,6 +1380,11 @@ impl IsZero for VSContainerElementStyle {
     }
 }
 
+impl MarshalerTo for VSContainerElementStyle {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _VS_CONTAINER_ELEMENT_STYLE_NAME: &str = "WrappedStacked";
@@ -1314,6 +1435,11 @@ impl IsZero for LogVerbosity {
     }
 }
 
+impl MarshalerTo for LogVerbosity {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _LOG_VERBOSITY_NAME: &str = "OffTraceDebugInfoWarningError";
@@ -1357,6 +1483,11 @@ impl IsZero for DiagnosticFlakeLogLevel {
     }
 }
 
+impl MarshalerTo for DiagnosticFlakeLogLevel {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _DIAGNOSTIC_FLAKE_LOG_LEVEL_NAME: &str = "OffLogPanic";
@@ -1412,6 +1543,11 @@ impl IsZero for VSReferenceKind {
     }
 }
 
+impl MarshalerTo for VSReferenceKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _VS_REFERENCE_KIND_NAME: &str = "InactiveCommentStringReadWriteReferenceNameQualifiedTypeArgumentTypeConstraintBaseTypeConstructorDestructorImportDeclarationAddressOfNotReferenceUnknown";
@@ -1466,6 +1602,11 @@ impl IsZero for AutoImportFixKind {
     }
 }
 
+impl MarshalerTo for AutoImportFixKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _AUTO_IMPORT_FIX_KIND_NAME: &str =
@@ -1512,6 +1653,11 @@ impl IsZero for ImportKind {
     }
 }
 
+impl MarshalerTo for ImportKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _IMPORT_KIND_NAME: &str = "NamedDefaultNamespaceCommonJS";
@@ -1554,6 +1700,11 @@ impl IsZero for AddAsTypeOnly {
     }
 }
 
+impl MarshalerTo for AddAsTypeOnly {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
 
 
 const _ADD_AS_TYPE_ONLY_NAME: &str = "AllowedRequiredNotAllowed";

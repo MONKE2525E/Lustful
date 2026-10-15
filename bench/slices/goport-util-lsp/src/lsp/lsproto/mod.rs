@@ -25,8 +25,14 @@ pub use util::*;
 /// `FormattingOptions` and `Message`, and lsproto defines the same names.
 pub mod prelude {
     pub use super::{baseproto::*, jsonrpc::*, lsp::*, lsp_generated::*, util::*};
+    pub use crate::frontend::json::{
+        JsonDecoder, JsonError, JsonOption, JsonToken, MarshalerTo, UnmarshalerFrom, json_marshal,
+        json_new_decoder, 
+    };
     pub use crate::frontend::json_ext::{self, *};
     pub use crate::frontend::tspath;
+    pub use crate::gostd::{self, GoError};
+    pub use crate::unported;
     pub use crate::indexmap::IndexMap;
     pub use crate::rustc_hash::FxHashMap;
     pub use std::borrow::Cow;

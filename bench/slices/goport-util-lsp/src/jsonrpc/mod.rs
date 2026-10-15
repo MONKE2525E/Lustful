@@ -9,5 +9,11 @@ pub use jsonrpc::*;
 /// Glob import for jsonrpc files: `use crate::jsonrpc::prelude::*;`.
 pub mod prelude {
     pub use super::{baseproto::*, jsonrpc::*};
+    pub use crate::frontend::json::{
+        JsonDecoder, JsonError, JsonOption, JsonToken, MarshalerTo, UnmarshalerFrom, json_marshal,
+        json_new_decoder, 
+    };
+    pub use crate::frontend::json_ext::{self, };
+    pub use crate::gostd::{self, GoError};
     pub use crate::prelude::*;
 }

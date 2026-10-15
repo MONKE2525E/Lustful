@@ -40,12 +40,72 @@ impl Drop for DoneOnDrop<'_> {
 // PORT: never made (see `new_work_group`). Go `wg.Go(fn)` starts a
 // goroutine; here the function waits in a first-in first-out list, and
 // RunAndWait (Go `wg.Wait()`) runs the list in start order.
+pub struct ParallelWorkGroup<'a> {
+    pub done: Cell<bool>,
+    pub wg: RefCell<VecDeque<Box<dyn FnOnce() + 'a>>>,
+}
 
+impl<'a> WorkGroup<'a> for ParallelWorkGroup<'a> {
+    // Go: core/workgroup.go:34 Queue
+    fn queue(&self, fn_: Box<dyn FnOnce() + 'a>) {
+        if self.done.get() {
+            panic!("Queue called after RunAndWait returned");
+        }
+
+        // Go: w.wg.Go(func() { fn() })
+        self.wg.borrow_mut().push_back(fn_);
+    }
+
+    // Go: core/workgroup.go:44 RunAndWait
+    fn run_and_wait(&self) {
+        let _done = DoneOnDrop(&self.done);
+        // Go: w.wg.Wait()
+        loop {
+            let fn_ = self.wg.borrow_mut().pop_front();
+            let Some(fn_) = fn_ else {
+                return;
+            };
+            fn_();
+        }
+    }
+}
 
 // Go: core/workgroup.go:49 singleThreadedWorkGroup
 // PORT: `fnsMu` is dropped (one thread).
+pub struct SingleThreadedWorkGroup<'a> {
+    pub done: Cell<bool>,
+    pub fns: RefCell<Vec<Box<dyn FnOnce() + 'a>>>,
+}
 
+impl<'a> WorkGroup<'a> for SingleThreadedWorkGroup<'a> {
+    // Go: core/workgroup.go:57 Queue
+    fn queue(&self, fn_: Box<dyn FnOnce() + 'a>) {
+        if self.done.get() {
+            panic!("Queue called after RunAndWait returned");
+        }
 
+        self.fns.borrow_mut().push(fn_);
+    }
+
+    // Go: core/workgroup.go:67 RunAndWait
+    fn run_and_wait(&self) {
+        let _done = DoneOnDrop(&self.done);
+        loop {
+            let Some(fn_) = self.pop() else {
+                return;
+            };
+            fn_();
+        }
+    }
+}
+
+impl<'a> SingleThreadedWorkGroup<'a> {
+    // Go: core/workgroup.go:78 pop
+    pub fn pop(&self) -> Option<Box<dyn FnOnce() + 'a>> {
+        // Go: take the last function and clear its slot (Allow GC).
+        self.fns.borrow_mut().pop()
+    }
+}
 
 // Go: core/workgroup.go:92 ThrottleGroup
 // ThrottleGroup is like errgroup.Group but with global concurrency limiting via a semaphore.

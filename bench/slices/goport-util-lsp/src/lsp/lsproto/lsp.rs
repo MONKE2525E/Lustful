@@ -12,6 +12,7 @@
 use crate::lsp::lsproto::prelude::*;
 
 use crate::frontend::bundled::is_bundled;
+use crate::frontend::json_indexmap::JsonMapKey;
 use std::marker::PhantomData;
 
 // Go: lsp.go:17 DocumentUri
@@ -123,8 +124,18 @@ pub fn bool_to_int(b: bool) -> i32 {
 // Generated methods return it after they read the value.
 
 // Go: lsp.go:111 assertOnlyOne
+pub fn assert_only_one(message: &str, count: i32) {
+    if count != 1 {
+        crate::core::go_panic(message.to_string());
+    }
+}
 
 // Go: lsp.go:117 assertAtMostOne
+pub fn assert_at_most_one(message: &str, count: i32) {
+    if count > 1 {
+        crate::core::go_panic(message.to_string());
+    }
+}
 
 // Go: lsp.go:124 jsonKeyCheck
 // jsonKeyCheck compares a raw JSON key token (including quotes) against a Go string.
@@ -202,6 +213,12 @@ pub struct Null;
 // Go: lsp.go:271 (Null) UnmarshalJSONFrom
 
 // Go: lsp.go:282 (Null) MarshalJSONTo
+impl MarshalerTo for Null {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("null");
+        Ok(())
+    }
+}
 
 // Go reflect: an empty struct is always zero.
 impl IsZero for Null {
@@ -235,6 +252,13 @@ impl IsZero for NoParams {
 }
 
 // Go v2 default struct arshaler for `struct{}`: `{}`.
+impl MarshalerTo for NoParams {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 // Go v2 default struct arshaler for `struct{}`: null or an object (members
 // skipped); any other kind is an error.

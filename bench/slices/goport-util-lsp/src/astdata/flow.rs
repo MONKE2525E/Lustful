@@ -1,5 +1,6 @@
 use std::ops::{BitOr, BitOrAssign};
 
+use crate::astdata::{FileId, FlowNodeId, };
 
 /// Control-flow node flags.
 ///

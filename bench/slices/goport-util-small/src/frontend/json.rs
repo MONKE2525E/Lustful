@@ -376,10 +376,46 @@ fn invalid_escape(what: &[u8]) -> SyntaxErr {
 // start a valid rune.
 
 // Go: utf8.FullRune
+fn go_full_rune(b: &[u8]) -> bool {
+    let Some(&c) = b.first() else {
+        return false;
+    };
+    let (need, lo, hi) = match c {
+        0xC2..=0xDF => (2, 0x80, 0xBF),
+        0xE0 => (3, 0xA0, 0xBF),
+        0xE1..=0xEC | 0xEE..=0xEF => (3, 0x80, 0xBF),
+        0xED => (3, 0x80, 0x9F),
+        0xF0 => (4, 0x90, 0xBF),
+        0xF1..=0xF3 => (4, 0x80, 0xBF),
+        0xF4 => (4, 0x80, 0x8F),
+        // ASCII, or a byte that cannot start a rune.
+        _ => return true,
+    };
+    if b.len() >= need {
+        return true;
+    }
+    // Short or invalid.
+    (b.len() > 1 && !(lo..=hi).contains(&b[1])) || (b.len() > 2 && !(0x80..=0xBF).contains(&b[2]))
+}
 
 // Go: jsonwire/wire.go:62 QuoteRune
 
 // Go: jsonwire/decode.go:299 hasEscapedUTF16Prefix
+fn has_escaped_utf16_prefix(b: &[u8], lower_surrogate_half: bool) -> bool {
+    for (i, &c) in b.iter().enumerate() {
+        let ok = match i {
+            0 => c == b'\\',
+            1 => c == b'u',
+            2 if lower_surrogate_half => c == b'd' || c == b'D',
+            3 if lower_surrogate_half => matches!(c, b'c'..=b'f' | b'C'..=b'F'),
+            _ => true,
+        };
+        if !ok || ((2..6).contains(&i) && hex_val(c).is_none()) {
+            return false;
+        }
+    }
+    true
+}
 
 // Go: jsonwire parseHexUint16
 

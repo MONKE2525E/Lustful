@@ -27,3 +27,8 @@ pub fn canonicalize_path(p: &str) -> String {
 
 
 // Go: canonicalize_other.go:22 PathComparerForPath (ts#64210)
+/// PathComparerForPath returns exact comparison on platforms without native
+/// Darwin watch aliases. It does not inspect the host filesystem.
+pub fn path_comparer_for_path(_path: &str) -> Result<PathComparerExported, GoError> {
+    Ok(PathComparerExported::default())
+}

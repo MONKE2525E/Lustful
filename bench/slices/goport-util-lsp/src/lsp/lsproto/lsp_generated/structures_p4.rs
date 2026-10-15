@@ -2029,6 +2029,14 @@ impl IsZero for VSContainerElement {
 pub struct CallHierarchyItemData {}
 
 
+impl MarshalerTo for CallHierarchyItemData {
+    // PORT: Go marshals CallHierarchyItemData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for CallHierarchyItemData {
     // PORT: Go reflect.Value.IsZero (omitzero).
@@ -2042,6 +2050,14 @@ impl IsZero for CallHierarchyItemData {
 pub struct TypeHierarchyItemData {}
 
 
+impl MarshalerTo for TypeHierarchyItemData {
+    // PORT: Go marshals TypeHierarchyItemData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for TypeHierarchyItemData {
     // PORT: Go reflect.Value.IsZero (omitzero).
@@ -2055,6 +2071,14 @@ impl IsZero for TypeHierarchyItemData {
 pub struct InlayHintData {}
 
 
+impl MarshalerTo for InlayHintData {
+    // PORT: Go marshals InlayHintData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for InlayHintData {
     // PORT: Go reflect.Value.IsZero (omitzero).
@@ -2068,6 +2092,14 @@ impl IsZero for InlayHintData {
 pub struct CodeActionData {}
 
 
+impl MarshalerTo for CodeActionData {
+    // PORT: Go marshals CodeActionData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for CodeActionData {
     // PORT: Go reflect.Value.IsZero (omitzero).
@@ -2081,6 +2113,14 @@ impl IsZero for CodeActionData {
 pub struct WorkspaceSymbolData {}
 
 
+impl MarshalerTo for WorkspaceSymbolData {
+    // PORT: Go marshals WorkspaceSymbolData with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 impl IsZero for WorkspaceSymbolData {
     // PORT: Go reflect.Value.IsZero (omitzero).

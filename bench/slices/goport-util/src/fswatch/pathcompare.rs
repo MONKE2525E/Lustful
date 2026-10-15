@@ -39,10 +39,40 @@ pub type ComparisonCache = FxHashMap<String, String>;
 
 impl PathComparer {
     // Go: pathcompare.go:25 pathComparer.prepare
+    pub fn prepare(&self, path: &str) -> ComparisonPath<'static> {
+        let mut p = ComparisonPath {
+            path: path.to_string(),
+            ..Default::default()
+        };
+        if self.ignore_case && NATIVE_PATH_FOLDING {
+            p.fold();
+        }
+        p
+    }
 }
 
 impl ComparisonPath<'_> {
     // Go: pathcompare.go:33 comparisonPath.fold
+    pub fn fold(&mut self) -> String {
+        if !self.ready {
+            if let Some(cache) = self.cache {
+                if let Some(folded) = cache.lock().unwrap().get(&self.path) {
+                    self.folded = folded.clone();
+                    self.ready = true;
+                    return self.folded.clone();
+                }
+            }
+            self.folded = fold_native_path(&self.path);
+            self.ready = true;
+            if let Some(cache) = self.cache {
+                cache
+                    .lock()
+                    .unwrap()
+                    .insert(self.path.clone(), self.folded.clone());
+            }
+        }
+        self.folded.clone()
+    }
 }
 
 impl PathComparer {

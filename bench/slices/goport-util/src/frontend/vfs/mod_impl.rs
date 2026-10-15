@@ -16,6 +16,62 @@ use std::time::SystemTime;
 // `&self`. Implementations that cache use interior mutability. Go
 // `time.Time` parameters are `Option<SystemTime>`; `None` is the Go zero
 // time.
+pub trait Fs {
+    // UseCaseSensitiveFileNames returns true if the file system is case-sensitive.
+    fn use_case_sensitive_file_names(&self) -> bool;
+
+    // FileExists returns true if the file exists.
+    fn file_exists(&self, path: &str) -> bool;
+
+    // ReadFile reads the file specified by path and returns the content.
+    // If the file fails to be read, ok will be false.
+    fn read_file(&self, path: &str) -> (String, bool);
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError>;
+
+    // AppendFile appends data to the file at path, creating it if it does not exist.
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError>;
+
+    // Removes `path` and all its contents. Will return the first error it encounters.
+    fn remove(&self, path: &str) -> Result<(), FsError>;
+
+    // Chtimes changes the access and modification times of the named
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<SystemTime>,
+        m_time: Option<SystemTime>,
+    ) -> Result<(), FsError>;
+
+    // DirectoryExists returns true if the path is a directory.
+    fn directory_exists(&self, path: &str) -> bool;
+
+    // GetAccessibleEntries returns the files/directories in the specified directory.
+    // If any entry is a symlink, it will be followed.
+    fn get_accessible_entries(&self, path: &str) -> Entries;
+
+    // PORT: Go returns a nil `fs.FileInfo` interface when the path cannot be
+    // read; that is `None`.
+    fn stat(&self, path: &str) -> Option<FileInfo>;
+
+    // Realpath returns the "real path" of the specified path,
+    // following symlinks and correcting filename casing.
+    fn realpath(&self, path: &str) -> String;
+
+    /// PORT: Go type assertions of a `vfs.FS` value to the language service
+    /// file system layers (ts#64291): the project package's
+    /// `FileHandleSource`, `LayeredFileSystem`, `RebasableFileSystem`,
+    /// `FileChangeExpander` and `*overlayFS`, and the api's
+    /// `*requestFileSystem`. This crate (`goport_util`) cannot name those
+    /// types, so a layer returns itself as `Any` and
+    /// `project::as_fs_layer` downcasts it to its concrete type. Every other
+    /// file system keeps this default (the assertion fails). Wrappers that
+    /// forward to another `Fs` (`CachedFs`, `TrackingFs`, `wrapvfs`) must not
+    /// forward it: Go asserts on the wrapper's own type.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+}
 
 // Go: vfs.go:47 Entries
 #[derive(Clone, Debug, Default)]
@@ -151,7 +207,41 @@ impl FileInfo {
 // PORT: Go `error` values become one enum. `Path` is `*os.PathError`
 // (the OS error is shared so the value can be cloned). `Other` is an
 // `errors.New` message.
+#[derive(Clone, Debug)]
+pub enum FsError {
+    Invalid,
+    Permission,
+    Exist,
+    NotExist,
+    Closed,
+    SkipAll,
+    SkipDir,
+    Path {
+        op: &'static str,
+        path: String,
+        err: Rc<io::Error>,
+    },
+    Other(String),
+}
 
+impl FsError {
+    // PORT: builds a Go `*os.PathError`.
+    pub fn path(op: &'static str, path: &str, err: io::Error) -> FsError {
+        FsError::Path {
+            op,
+            path: path.to_string(),
+            err: Rc::new(err),
+        }
+    }
+
+    pub fn is_skip_all(&self) -> bool {
+        matches!(self, FsError::SkipAll)
+    }
+
+    pub fn is_skip_dir(&self) -> bool {
+        matches!(self, FsError::SkipDir)
+    }
+}
 
 // Go: io/fs/walk.go WalkDirFunc (Go vfs.WalkDirFunc until ts#64277)
 // PORT: Go passes a nil `DirEntry` and a nil `error` as `None`.

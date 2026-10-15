@@ -270,7 +270,21 @@ struct MatcherPrefixStates {
 }
 
 // Go: vfs/vfsmatch/vfsmatch.go:579 globVisitor
+/// Traverses directories matching files against glob patterns.
+/// PORT: Go `vfs.FS` is a borrowed `&dyn Fs` for the length of the walk.
+struct GlobVisitor<'a> {
+    host: &'a dyn Fs,
+    file_matcher: GlobMatcher,
+    directory_matcher: GlobMatcher,
+    extensions: Vec<&'a str>,
+    use_case_sensitive_file_names: bool,
+    visited: FxHashSet<String>,
+    results: Vec<Vec<String>>,
+}
 
+impl GlobVisitor<'_> {
+    // Go: vfs/vfsmatch/vfsmatch.go:594 (*globVisitor).visit
+}
 
 // Go: vfs/vfsmatch/vfsmatch.go:647 matchFiles
 

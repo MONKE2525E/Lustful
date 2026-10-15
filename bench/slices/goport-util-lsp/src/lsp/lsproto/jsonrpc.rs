@@ -18,6 +18,16 @@ use crate::lsp::lsproto::prelude::*;
 // This wrapper exists because lsproto has its own IntegerOrString type.
 // PORT: Go returns `*jsonrpc.ID`; it is never nil, so the Rust result is
 // the value.
+pub fn new_id(raw_value: &IntegerOrString) -> crate::jsonrpc::ID {
+    if let Some(s) = &raw_value.string {
+        return crate::jsonrpc::new_id_string(s);
+    }
+    crate::jsonrpc::new_id_int(
+        raw_value
+            .integer
+            .unwrap_or_else(|| crate::core::go_nil_dereference()),
+    )
+}
 
 // Go: jsonrpc.go:19 Message
 

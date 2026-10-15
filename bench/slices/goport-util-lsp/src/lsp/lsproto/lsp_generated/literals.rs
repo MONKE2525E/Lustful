@@ -12,6 +12,13 @@ use crate::lsp::lsproto::prelude::*;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralBegin;
 
+impl MarshalerTo for StringLiteralBegin {
+    // Go: (o StringLiteralBegin) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"begin\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralBegin {
@@ -25,6 +32,13 @@ impl IsZero for StringLiteralBegin {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralReport;
 
+impl MarshalerTo for StringLiteralReport {
+    // Go: (o StringLiteralReport) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"report\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralReport {
@@ -38,6 +52,13 @@ impl IsZero for StringLiteralReport {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralEnd;
 
+impl MarshalerTo for StringLiteralEnd {
+    // Go: (o StringLiteralEnd) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"end\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralEnd {
@@ -51,6 +72,13 @@ impl IsZero for StringLiteralEnd {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralCreate;
 
+impl MarshalerTo for StringLiteralCreate {
+    // Go: (o StringLiteralCreate) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"create\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralCreate {
@@ -64,6 +92,13 @@ impl IsZero for StringLiteralCreate {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralRename;
 
+impl MarshalerTo for StringLiteralRename {
+    // Go: (o StringLiteralRename) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"rename\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralRename {
@@ -77,6 +112,13 @@ impl IsZero for StringLiteralRename {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralDelete;
 
+impl MarshalerTo for StringLiteralDelete {
+    // Go: (o StringLiteralDelete) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"delete\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralDelete {
@@ -90,6 +132,13 @@ impl IsZero for StringLiteralDelete {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralFull;
 
+impl MarshalerTo for StringLiteralFull {
+    // Go: (o StringLiteralFull) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"full\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralFull {
@@ -103,6 +152,13 @@ impl IsZero for StringLiteralFull {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralUnchanged;
 
+impl MarshalerTo for StringLiteralUnchanged {
+    // Go: (o StringLiteralUnchanged) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"unchanged\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralUnchanged {
@@ -116,6 +172,13 @@ impl IsZero for StringLiteralUnchanged {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralSnippet;
 
+impl MarshalerTo for StringLiteralSnippet {
+    // Go: (o StringLiteralSnippet) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"snippet\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralSnippet {
@@ -129,6 +192,13 @@ impl IsZero for StringLiteralSnippet {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralLanguageServerErrorResponse;
 
+impl MarshalerTo for StringLiteralLanguageServerErrorResponse {
+    // Go: (o StringLiteralLanguageServerErrorResponse) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"languageServer.errorResponse\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralLanguageServerErrorResponse {
@@ -142,6 +212,13 @@ impl IsZero for StringLiteralLanguageServerErrorResponse {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralError;
 
+impl MarshalerTo for StringLiteralError {
+    // Go: (o StringLiteralError) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"error\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralError {
@@ -155,6 +232,13 @@ impl IsZero for StringLiteralError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralLanguageServerPerformanceStats;
 
+impl MarshalerTo for StringLiteralLanguageServerPerformanceStats {
+    // Go: (o StringLiteralLanguageServerPerformanceStats) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"languageServer.performanceStats\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralLanguageServerPerformanceStats {
@@ -168,6 +252,13 @@ impl IsZero for StringLiteralLanguageServerPerformanceStats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralUsage;
 
+impl MarshalerTo for StringLiteralUsage {
+    // Go: (o StringLiteralUsage) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"usage\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralUsage {
@@ -181,6 +272,13 @@ impl IsZero for StringLiteralUsage {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralLanguageServerProjectInfo;
 
+impl MarshalerTo for StringLiteralLanguageServerProjectInfo {
+    // Go: (o StringLiteralLanguageServerProjectInfo) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"languageServer.projectInfo\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralLanguageServerProjectInfo {
@@ -194,6 +292,13 @@ impl IsZero for StringLiteralLanguageServerProjectInfo {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralClassifiedTextRun;
 
+impl MarshalerTo for StringLiteralClassifiedTextRun {
+    // Go: (o StringLiteralClassifiedTextRun) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"ClassifiedTextRun\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralClassifiedTextRun {
@@ -207,6 +312,13 @@ impl IsZero for StringLiteralClassifiedTextRun {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralClassifiedTextElement;
 
+impl MarshalerTo for StringLiteralClassifiedTextElement {
+    // Go: (o StringLiteralClassifiedTextElement) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"ClassifiedTextElement\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralClassifiedTextElement {
@@ -220,6 +332,13 @@ impl IsZero for StringLiteralClassifiedTextElement {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralImageId;
 
+impl MarshalerTo for StringLiteralImageId {
+    // Go: (o StringLiteralImageId) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"ImageId\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralImageId {
@@ -233,6 +352,13 @@ impl IsZero for StringLiteralImageId {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralImageElement;
 
+impl MarshalerTo for StringLiteralImageElement {
+    // Go: (o StringLiteralImageElement) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"ImageElement\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralImageElement {
@@ -246,6 +372,13 @@ impl IsZero for StringLiteralImageElement {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringLiteralContainerElement;
 
+impl MarshalerTo for StringLiteralContainerElement {
+    // Go: (o StringLiteralContainerElement) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str("\"ContainerElement\"");
+        Ok(())
+    }
+}
 
 
 impl IsZero for StringLiteralContainerElement {
@@ -259,6 +392,14 @@ impl IsZero for StringLiteralContainerElement {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EmptyObject;
 
+impl MarshalerTo for EmptyObject {
+    // PORT: Go marshals struct{} with the JSON v2 default struct arshaler.
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 
 impl IsZero for EmptyObject {

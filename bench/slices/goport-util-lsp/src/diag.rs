@@ -3,6 +3,7 @@
 //! Go `diagnostics.Name` messages. Use them as `diag::Name`.
 #![allow(non_upper_case_globals)]
 
+use crate::diagnostics::{};
 
 
 // Go: diagnostics/diagnostics.go keyToMessage

@@ -43,6 +43,23 @@ pub struct BooleanOrEmptyObject {
     pub empty_object: Option<EmptyObject>,
 }
 
+impl MarshalerTo for BooleanOrEmptyObject {
+    // Go: (o *BooleanOrEmptyObject) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        assert_only_one(
+            "exactly one element of BooleanOrEmptyObject should be set",
+            bool_to_int(self.boolean.is_some()) + bool_to_int(self.empty_object.is_some()),
+        );
+
+        if let Some(v) = &self.boolean {
+            return v.marshal_json_to(enc);
+        }
+        if let Some(v) = &self.empty_object {
+            return v.marshal_json_to(enc);
+        }
+        panic!("unreachable")
+    }
+}
 
 
 impl IsZero for BooleanOrEmptyObject {
@@ -119,6 +136,17 @@ pub struct IntegerOrNull {
     pub integer: Option<i32>,
 }
 
+impl MarshalerTo for IntegerOrNull {
+    // Go: (o *IntegerOrNull) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        if let Some(v) = &self.integer {
+            return v.marshal_json_to(enc);
+        }
+        // Go: enc.WriteToken(json.Null)
+        enc.push_str("null");
+        Ok(())
+    }
+}
 
 
 impl IsZero for IntegerOrNull {
@@ -228,6 +256,17 @@ pub struct UintegerOrNull {
     pub uinteger: Option<u32>,
 }
 
+impl MarshalerTo for UintegerOrNull {
+    // Go: (o *UintegerOrNull) MarshalJSONTo
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        if let Some(v) = &self.uinteger {
+            return v.marshal_json_to(enc);
+        }
+        // Go: enc.WriteToken(json.Null)
+        enc.push_str("null");
+        Ok(())
+    }
+}
 
 
 impl IsZero for UintegerOrNull {

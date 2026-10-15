@@ -40,6 +40,9 @@ impl std::fmt::Debug for NodeArenaRevision {
 impl NodeArenaRevision {
     const INITIAL: Self = Self(0);
 
+    fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]

@@ -11,6 +11,8 @@
 //! stream up to each lib on its first read. The names and texts do not
 //! change.
 
+#[cfg(not(target_family = "wasm"))]
+use super::{SNAPSHOT_TEXT_MIN, };
 use crate::frontend::prelude::*;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::OnceLock;
@@ -71,6 +73,9 @@ pub fn bundled_lib_name(path: &str) -> Option<&str> {
 // copying to []byte and back.
 
 // Go: embed.go:35 wrappedFS
+struct WrappedFs {
+    fs: Rc<dyn Fs>,
+}
 
 
 // Go: embed.go:41 wrapFS

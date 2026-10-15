@@ -5,6 +5,8 @@
 //! OS path helpers that osvfs and fswatch share. Paths are OS paths in the
 //! port form (see `vfs::osvfs::os_path`).
 
+use crate::frontend::vfs::FsError;
+use crate::frontend::vfs::osvfs::{};
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;

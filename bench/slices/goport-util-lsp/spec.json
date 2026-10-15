@@ -13,12 +13,6 @@
     "indexmap",
     "memchr"
   ],
-  "root_replace": [
-    [
-      "#[path = \"gopanic.rs\"]\npub mod core;\n",
-      "// bench slice: `core` (gopanic.rs) is not mounted; a user `mod core` breaks lust's std paths (lust bug).\n"
-    ]
-  ],
   "rewrite_to": {
     "goport_util": "crate"
   }

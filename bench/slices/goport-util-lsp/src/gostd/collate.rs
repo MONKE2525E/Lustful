@@ -393,7 +393,54 @@ const RARE_UNIFIED_OFFSET: i32 = 0x20000; // largest rune in common is U+FAFF
 const OTHER_OFFSET: i32 = 0x50000; // largest rune in rare is U+2FA1D
 
 // Go: internal/colltab/collelem.go:360 implicitPrimary
+/// implicitPrimary returns the primary weight for the given rune
+/// for which there is no entry for the rune in the collation table.
+/// We take a different approach from the one specified in
+/// https://unicode.org/reports/tr10/#Implicit_Weights,
+/// but preserve the resulting relative ordering of the runes.
+fn implicit_primary(r: u32) -> i32 {
+    if unicode_is_ideographic(r) {
+        if (MIN_UNIFIED..=MAX_UNIFIED).contains(&r) {
+            // The most common case for CJK.
+            return r as i32 + COMMON_UNIFIED_OFFSET;
+        }
+        if (MIN_COMPATIBILITY..=MAX_COMPATIBILITY).contains(&r) {
+            // This will typically not hit. The DUCET explicitly specifies mappings
+            // for all characters that do not decompose.
+            return r as i32 + COMMON_UNIFIED_OFFSET;
+        }
+        return r as i32 + RARE_UNIFIED_OFFSET;
+    }
+    r as i32 + OTHER_OFFSET
+}
 
+/// Go `unicode.Is(unicode.Ideographic, r)` (Go 1.26, Unicode 15.0.0; no
+/// caller now, see the module note).
+fn unicode_is_ideographic(r: u32) -> bool {
+    const IDEOGRAPHIC: [(u32, u32); 20] = [
+        (0x3006, 0x3007),
+        (0x3021, 0x3029),
+        (0x3038, 0x303a),
+        (0x3400, 0x4dbf),
+        (0x4e00, 0x9fff),
+        (0xf900, 0xfa6d),
+        (0xfa70, 0xfad9),
+        (0x16fe4, 0x16fe4),
+        (0x17000, 0x187f7),
+        (0x18800, 0x18cd5),
+        (0x18d00, 0x18d08),
+        (0x1b170, 0x1b2fb),
+        (0x20000, 0x2a6df),
+        (0x2a700, 0x2b739),
+        (0x2b740, 0x2b81d),
+        (0x2b820, 0x2cea1),
+        (0x2ceb0, 0x2ebe0),
+        (0x2f800, 0x2fa1d),
+        (0x30000, 0x3134a),
+        (0x31350, 0x323af),
+    ];
+    IDEOGRAPHIC.iter().any(|&(lo, hi)| (lo..=hi).contains(&r))
+}
 
 // ---------------------------------------------------------------------------
 // internal/colltab/weighter.go
@@ -605,10 +652,85 @@ impl Table {
 // ---------------------------------------------------------------------------
 
 // Go: internal/colltab/iter.go:10 Iter
+/// An Iter incrementally converts chunks of the input text to collation
+/// elements, while ensuring that the collation elements are in normalized order
+/// (that is, they are in the order as if the input text were normalized first).
+/// PORT: Go keeps the input string; this keeps a reused copy of its bytes.
+pub struct Iter {
+    pub weighter: Rc<dyn Weighter>,
+    pub elems: Vec<Elem>,
+    /// N is the number of elements in Elems that will not be reordered on
+    /// subsequent iterations, N <= len(Elems).
+    pub n: usize,
+
+    str: Vec<u8>,
+    // Because the Elems buffer may contain collation elements that are needed
+    // for look-ahead, we need two positions in the text (bytes or str): one for
+    // the end position in the text for the current iteration and one for the
+    // start of the next call to appendNext.
+    /// end position in text corresponding to N.
+    p_end: usize,
+    /// pEnd <= pNext.
+    p_next: usize,
+}
 
 // Go: internal/colltab/iter.go:163 maxCombiningCharacters
 const MAX_COMBINING_CHARACTERS: usize = 30;
 
+impl Iter {
+    fn new(weighter: Rc<dyn Weighter>) -> Iter {
+        Iter {
+            weighter,
+            elems: Vec::with_capacity(512),
+            n: 0,
+            str: Vec::new(),
+            p_end: 0,
+            p_next: 0,
+        }
+    }
+
+    // Go: internal/colltab/iter.go:29 (*Iter).Reset
+    /// Reset sets the position in the current input text to p and discards any
+    /// results obtained so far.
+    pub fn reset(&mut self, p: usize) {
+        self.elems.clear();
+        self.n = 0;
+        self.p_end = p;
+        self.p_next = p;
+    }
+
+    // Go: internal/colltab/iter.go:66 (*Iter).SetInputString
+    /// SetInputString resets i to input s.
+    pub fn set_input_string(&mut self, s: &str) {
+        self.str.clear();
+        self.str.extend_from_slice(s.as_bytes());
+        self.reset(0);
+    }
+
+    // Go: internal/colltab/iter.go:72 (*Iter).done
+    fn done(&self) -> bool {
+        self.p_next >= self.str.len()
+    }
+
+    // Go: internal/colltab/iter.go:76 (*Iter).appendNext
+    fn append_next(&mut self) -> bool {
+        if self.done() {
+            return false;
+        }
+        let elems = std::mem::take(&mut self.elems);
+        let (elems, mut sz) = self.weighter.append_next(elems, &self.str[self.p_next..]);
+        self.elems = elems;
+        if sz == 0 {
+            sz = 1;
+        }
+        self.p_next += sz;
+        true
+    }
+
+    // Go: internal/colltab/iter.go:98 (*Iter).Next
+
+    // Go: internal/colltab/iter.go:170 (*Iter).doNorm
+}
 
 // ---------------------------------------------------------------------------
 // internal/colltab/numeric.go
@@ -617,12 +739,66 @@ const MAX_COMBINING_CHARACTERS: usize = 30;
 // Go: internal/colltab/numeric.go:18 NewNumericWeighter
 
 // Go: internal/colltab/numeric.go:48 numericWeighter
+/// A numericWeighter translates a stream of digits into a stream of weights
+/// representing the numeric value.
+struct NumericWeighter {
+    weighter: Rc<dyn Weighter>,
+
+    // The Elems below all demarcate boundaries of specific ranges. With the
+    // current element encoding digits are in two ranges: normal (default
+    // tertiary value) and special. For most languages, digits have collation
+    // elements in the normal range.
+    //
+    // Note: the range tests are very specific for the element encoding used by
+    // this implementation. The tests in collate_test.go are designed to fail
+    // if this code is not updated when an encoding has changed.
+    /// normal digit zero
+    zero: Elem,
+    /// special digit zero, low tertiary value
+    zero_special_lo: Elem,
+    /// special digit zero, high tertiary value
+    zero_special_hi: Elem,
+    /// normal digit nine
+    nine: Elem,
+    /// special digit nine
+    nine_special_hi: Elem,
+    number_start: Elem,
+}
 
 
 // Go: internal/colltab/numeric.go:119 numberConverter
+struct NumberConverter<'a> {
+    w: &'a NumericWeighter,
+
+    elems: Vec<Elem>,
+    n_digits: i32,
+    len_index: usize,
+
+    /// PORT: Go `s` and `b`; the input bytes.
+    s: &'a [u8],
+}
 
 // Go: internal/colltab/numeric.go:215 maxDigits
 
+impl NumberConverter<'_> {
+    // Go: internal/colltab/numeric.go:132 (*numberConverter).init
+
+    // Go: internal/colltab/numeric.go:151 (*numberConverter).checkNextDigit
+
+    // Go: internal/colltab/numeric.go:197 (*numberConverter).isDigit
+
+    // Go: internal/colltab/numeric.go:217 (*numberConverter).update
+
+    // Go: internal/colltab/numeric.go:232 (*numberConverter).result
+    /// result fills in the length element for the digit sequence and returns the
+    /// completed collation elements.
+    fn result(mut self) -> Vec<Elem> {
+        let e =
+            make_elem(self.n_digits, DEFAULT_SECONDARY, DEFAULT_TERTIARY, 0).unwrap_or_default();
+        self.elems[self.len_index] = e;
+        self.elems
+    }
+}
 
 // ---------------------------------------------------------------------------
 // internal/colltab/colltab.go
@@ -682,11 +858,75 @@ enum AlternateHandling {
 }
 
 // Go: collate/option.go:37 Option
+/// An Option is used to change the behavior of a Collator. Options override the
+/// settings passed through the locale identifier.
+/// PORT: Go `collate.Option`; renamed so it does not shadow Rust `Option`.
+#[derive(Clone, Copy)]
+pub struct CollateOption {
+    priority: i32,
+    f: fn(&mut Options),
+}
 
 // Go: collate/option.go:56 options
+pub struct Options {
+    /// ignore specifies which levels to ignore.
+    ignore: [bool; NUM_LEVELS],
+
+    /// caseLevel is true if there is an additional level of case matching
+    /// between the secondary and tertiary levels.
+    case_level: bool,
+
+    /// backwards specifies the order of sorting at the secondary level.
+    /// This option exists predominantly to support reverse sorting of accents in French.
+    backwards: bool,
+
+    /// numeric specifies whether any sequence of decimal digits (category is Nd)
+    /// is sorted at a primary level with its numeric value.
+    /// For example, "A-21" < "A-123".
+    /// This option is set by wrapping the main Weighter with NewNumericWeighter.
+    numeric: bool,
+
+    /// alternate specifies an alternative handling of variables.
+    alternate: AlternateHandling,
+
+    /// variableTop is the largest primary value that is considered to be
+    /// variable.
+    #[allow(dead_code)]
+    variable_top: u32,
+
+    t: Rc<dyn Weighter>,
+    // PORT: Go `f norm.Form` (always `norm.NFD`) is not read by
+    // `CompareString`; it is not ported.
+}
 
 // Go: collate/option.go:16 newCollator
+/// newCollator creates a new collator with default options configured.
+fn new_collator(t: Rc<dyn Weighter>) -> Collator {
+    // Initialize a collator with default options.
+    let mut ignore = [false; NUM_LEVELS];
+    ignore[QUATERNARY] = true;
+    ignore[IDENTITY] = true;
+    // TODO: store vt in tags or remove.
+    let variable_top = t.top();
+    Collator {
+        options: Options {
+            ignore,
+            case_level: false,
+            backwards: false,
+            numeric: false,
+            alternate: AlternateHandling::NonIgnorable,
+            variable_top,
+            t: t.clone(),
+        },
+        iter: [CollIter::new(t.clone()), CollIter::new(t)],
+    }
+}
 
+impl Options {
+    // Go: collate/option.go:86 (*options).setOptions
+
+    // Go: collate/option.go:102 (*options).setFromTag
+}
 
 // Go: collate/option.go:143 ldmlBool
 
@@ -698,16 +938,38 @@ enum AlternateHandling {
 
 
 // Go: collate/option.go:181 ignoreWidthF
+fn ignore_width_f(o: &mut Options) {
+    o.ignore[TERTIARY] = true;
+    o.case_level = true;
+}
 
 // Go: collate/option.go:186 ignoreDiacriticsF
+fn ignore_diacritics_f(o: &mut Options) {
+    o.ignore[SECONDARY] = true;
+}
 
 // Go: collate/option.go:190 ignoreCaseF
+fn ignore_case_f(o: &mut Options) {
+    o.ignore[TERTIARY] = true;
+    o.case_level = false;
+}
 
 // Go: collate/option.go:195 looseF
+fn loose_f(o: &mut Options) {
+    ignore_width_f(o);
+    ignore_diacritics_f(o);
+    ignore_case_f(o);
+}
 
 // Go: collate/option.go:201 forceF
+fn force_f(o: &mut Options) {
+    o.ignore[IDENTITY] = false;
+}
 
 // Go: collate/option.go:205 numericF
+fn numeric_f(o: &mut Options) {
+    o.numeric = true;
+}
 
 // ---------------------------------------------------------------------------
 // collate/collate.go
@@ -716,14 +978,120 @@ enum AlternateHandling {
 // Go: collate/collate.go:53 tags
 
 // Go: collate/collate.go:23 Collator
+/// Collator provides functionality for comparing strings for a given
+/// collation order.
+/// PORT: Go `sorter` is only used by `Sort` and `SortStrings`, which are not
+/// ported.
+pub struct Collator {
+    options: Options,
+
+    iter: [CollIter; 2],
+}
 
 // Go: collate/collate.go:56 New
 
+impl Collator {
+    // Go: collate/collate.go:78 (*Collator).init
+
+    // Go: collate/collate.go:121 (*Collator).CompareString
+
+    // Go: collate/collate.go:157 (*Collator).compare
+}
 
 // Go: collate/collate.go:139 compareLevel
+fn compare_level(f: fn(&mut CollIter) -> i32, a: &mut CollIter, b: &mut CollIter) -> i32 {
+    a.pce = 0;
+    b.pce = 0;
+    loop {
+        let va = f(a);
+        let vb = f(b);
+        if va != vb {
+            if va < vb {
+                return -1;
+            }
+            return 1;
+        } else if va == 0 {
+            break;
+        }
+    }
+    0
+}
 
 // Go: collate/collate.go:234 iter
+/// PORT: Go embeds `colltab.Iter`; here it is the field `it`.
+struct CollIter {
+    it: Iter,
+    pce: usize,
+}
 
+impl CollIter {
+    fn new(t: Rc<dyn Weighter>) -> CollIter {
+        CollIter {
+            it: Iter::new(t),
+            pce: 0,
+        }
+    }
+
+    // Go: collate/collate.go:241 (*iter).init
+    fn init(&mut self, t: Rc<dyn Weighter>) {
+        self.it.weighter = t;
+        self.it.elems.clear();
+    }
+
+    // Go: collate/collate.go:246 (*iter).nextPrimary
+
+    // Go: collate/collate.go:260 (*iter).nextSecondary
+    fn next_secondary(&mut self) -> i32 {
+        while self.pce < self.it.elems.len() {
+            let v = self.it.elems[self.pce].secondary();
+            if v != 0 {
+                self.pce += 1;
+                return v;
+            }
+            self.pce += 1;
+        }
+        0
+    }
+
+    // Go: collate/collate.go:270 (*iter).prevSecondary
+    fn prev_secondary(&mut self) -> i32 {
+        while self.pce < self.it.elems.len() {
+            let v = self.it.elems[self.it.elems.len() - self.pce - 1].secondary();
+            if v != 0 {
+                self.pce += 1;
+                return v;
+            }
+            self.pce += 1;
+        }
+        0
+    }
+
+    // Go: collate/collate.go:280 (*iter).nextTertiary
+    fn next_tertiary(&mut self) -> i32 {
+        while self.pce < self.it.elems.len() {
+            let v = self.it.elems[self.pce].tertiary();
+            if v != 0 {
+                self.pce += 1;
+                return i32::from(v);
+            }
+            self.pce += 1;
+        }
+        0
+    }
+
+    // Go: collate/collate.go:290 (*iter).nextQuaternary
+    fn next_quaternary(&mut self) -> i32 {
+        while self.pce < self.it.elems.len() {
+            let v = self.it.elems[self.pce].quaternary();
+            if v != 0 {
+                self.pce += 1;
+                return v;
+            }
+            self.pce += 1;
+        }
+        0
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Go standard library and golang.org/x/text/unicode/norm helpers

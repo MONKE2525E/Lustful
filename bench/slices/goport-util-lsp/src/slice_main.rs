@@ -23,7 +23,8 @@
 )]
 
 pub mod astdata;
-// bench slice: `core` (gopanic.rs) is not mounted; a user `mod core` breaks lust's std paths (lust bug).
+#[path = "gopanic.rs"]
+pub mod core;
 pub mod diag;
 pub mod diagnostics;
 mod flags_macros;

@@ -5,4 +5,5 @@
 //! Go merges them into its generated catalog; here they are a second table
 //! that `message_by_code` and `message_by_key` also search.
 
+use super::{Category, };
 

@@ -3,11 +3,42 @@
 //! `collections.OrderedMap`, and the `JsonMapKey` bridge for map key types
 //! of the crates above.
 
+use crate::frontend::json::{
+    JsonDecoder, JsonError, MarshalerTo, UnmarshalerFrom, 
+};
 use crate::indexmap::IndexMap;
 
 // Go: collections/ordered_map.go:263 (*OrderedMap).UnmarshalJSONFrom
 // PORT: Go `collections.OrderedMap` is `IndexMap`. `IndexMap::insert` keeps
 // the first position and replaces the value, like `OrderedMap.Set`.
 
+/// A map key type of a crate above `goport_util` whose `IndexMap<K, V>` has
+/// its own JSON methods (lsproto `DocumentUri`, Go `map[DocumentUri]V`).
+/// PORT: the orphan rule stops that crate from implementing `MarshalerTo`
+/// and `UnmarshalerFrom` for `IndexMap<K, V>`. It implements this trait on
+/// the key, and the two impls below call it.
+pub trait JsonMapKey: Sized {
+    /// `MarshalerTo::marshal_json_to` of `map`.
+    fn marshal_map<V: MarshalerTo>(
+        map: &IndexMap<Self, V>,
+        enc: &mut String,
+    ) -> Result<(), JsonError>;
 
+    /// `UnmarshalerFrom::unmarshal_json_from` of `map`.
+    fn unmarshal_map<V: UnmarshalerFrom + Default + Clone>(
+        map: &mut IndexMap<Self, V>,
+        dec: &mut JsonDecoder<'_>,
+    ) -> Result<(), JsonError>;
+}
 
+impl<K: JsonMapKey, V: MarshalerTo> MarshalerTo for IndexMap<K, V> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        K::marshal_map(self, enc)
+    }
+}
+
+impl<K: JsonMapKey, V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for IndexMap<K, V> {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        K::unmarshal_map(self, dec)
+    }
+}

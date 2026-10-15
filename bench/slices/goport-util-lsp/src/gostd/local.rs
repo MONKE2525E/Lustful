@@ -81,9 +81,39 @@ struct Timers {
 }
 
 impl Timers {
+    /// Arms timer `id` for `when`. Returns whether it was armed before.
+    fn arm(&mut self, id: u64, when: Instant) -> bool {
+        let old = self.when.insert(id, when);
+        if let Some(old) = old {
+            self.due.remove(&(old, id));
+        }
+        self.due.insert((when, id));
+        old.is_some()
+    }
 
+    /// Disarms timer `id`. Returns whether it was armed.
+    fn disarm(&mut self, id: u64) -> bool {
+        let old = self.when.remove(&id);
+        if let Some(old) = old {
+            self.due.remove(&(old, id));
+        }
+        old.is_some()
+    }
 
+    /// Whether timer `id` is neither armed nor queued.
+    fn idle(&self, id: u64) -> bool {
+        !self.when.contains_key(&id) && !self.queued.contains_key(&id)
+    }
 
+    /// Counts one run of a due entry of timer `id`.
+    fn unqueue(&mut self, id: u64) {
+        if let Some(count) = self.queued.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                self.queued.remove(&id);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

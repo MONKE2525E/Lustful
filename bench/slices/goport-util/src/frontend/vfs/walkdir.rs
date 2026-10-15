@@ -19,6 +19,12 @@ use crate::frontend::prelude::*;
 
 
 // Go: vfs/walkdir.go:143 normalizeWalkDirError
+fn normalize_walk_dir_error(err: Result<(), FsError>) -> Result<(), FsError> {
+    match err {
+        Err(err) if err.is_skip_dir() || err.is_skip_all() => Ok(()),
+        err => err,
+    }
+}
 
 // Go: vfs/walkdir.go:150 walkDirEntry
 // PORT: a `DirEntry` value. `Info` (Go walkdir.go:165): a symbolic link has
