@@ -20,3 +20,16 @@ opt-level = 3
 codegen-units = 1
 lto = "thin"
 debug = "line-tables-only"
+
+# Fast-to-build profile for correctness work: the gate's test boxes and local test runs
+# (`scripts/build.sh`). Measured on boat xlarge (build-speed): bins build in 22 s (release:
+# 126 s), a one-line edit rebuilds in 4 s (release: 119 s), and difftest, SANITIZE difftest,
+# runtest, and the fuzz lanes run as fast as with release. Not for timing lust: perfcheck and
+# real releases use [profile.release].
+[profile.gate]
+inherits = "release"
+opt-level = 1
+codegen-units = 256
+lto = "off"
+debug = false
+incremental = true

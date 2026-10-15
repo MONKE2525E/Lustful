@@ -68,6 +68,7 @@ The daemon keeps one session per crate selection: the crate (package and target)
 ```sh
 scripts/build-tcc.sh      # builds the pinned tinycc into third_party/tcc
 cargo build --release     # builds `lust` (client) and `lust-core` (compiler)
+scripts/build.sh          # same binaries, fast profile [profile.gate], for test runs (22 s vs 126 s)
 ```
 
 ## Use
