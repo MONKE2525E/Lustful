@@ -61,6 +61,10 @@ pub(crate) struct Front {
     /// program are session places that growth does not move; builds
     /// check them (`Caches::inst_ids`).
     pub(crate) prev_order_fragile: bool,
+    /// The last collected program's static ids in index order
+    /// (`Program::static_defs`): while a full resolve leaves them equal,
+    /// nested statics kept their indexes and generic reuse holds.
+    pub(crate) prev_static_defs: Option<Vec<crate::def::DefId>>,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
     /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
@@ -354,6 +358,7 @@ impl Session {
                 prev_adt_ids: FxMap::default(),
                 prev_static_ids: FxMap::default(),
                 prev_order_fragile: false,
+                prev_static_defs: None,
                 items: Vec::new(),
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),

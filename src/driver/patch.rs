@@ -1955,4 +1955,59 @@ pub fn run() -> i64 {
         assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A module with nested statics in two fns and a generic fn.
+    const STATICS: &str = "use std::sync::atomic::{AtomicI64, Ordering};
+
+pub fn bump() -> i64 {
+    static N: AtomicI64 = AtomicI64::new(10);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn twice<T: Copy>(x: T) -> (T, T) {
+    (x, x)
+}
+
+pub fn base() -> i64 {
+    static B: AtomicI64 = AtomicI64::new(5);
+    B.load(Ordering::Relaxed)
+}
+
+pub fn run() -> i64 {
+    let (a, b) = twice(bump());
+    a + b + base()
+}
+";
+
+    /// A full resolve (a signature edit) in a crate whose fns hold statics
+    /// keeps generic reuse while the statics keep their indexes: few
+    /// bodies check. A new static before the others moves their indexes:
+    /// collect runs again without reuse, and a build prints what a cold
+    /// build prints.
+    #[test]
+    fn full_resolve_keeps_reuse_while_statics_stand() {
+        let dir = std::env::temp_dir().join(format!("lust-statics-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, STATICS).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let all: usize = field(&warm.front.last_visits, "checked").parse().unwrap();
+        let v = warm_equals_cold(&mut warm, &root, &m1, "pub fn base() -> i64 {", "pub fn base() -> i64 {\n    let _k = 1;");
+        assert_eq!(field(&v, "path"), "patch", "{v}");
+        let v = warm_equals_cold(&mut warm, &root, &m1, "pub fn twice<T: Copy>(x: T) -> (T, T) {", "pub fn twice<T: Copy + Clone>(x: T) -> (T, T) {");
+        assert_eq!(field(&v, "path"), "resolve", "{v}");
+        let checked: usize = field(&v, "checked").parse().unwrap();
+        assert!(checked < all, "a signature edit checks {checked} of {all} bodies: {v}");
+        // A static before the others, in a new fn.
+        warm_equals_cold(&mut warm, &root, &m1, "pub fn bump() -> i64 {", "pub fn first() -> i64 {\n    static F: AtomicI64 = AtomicI64::new(100);\n    F.load(Ordering::Relaxed)\n}\n\npub fn bump() -> i64 {");
+        warm_equals_cold(&mut warm, &root, &m1, "    a + b + base()\n", "    a + b + base() + first()\n");
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

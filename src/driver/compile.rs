@@ -2028,6 +2028,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.prev_adt_ids.clear();
         front.prev_static_ids.clear();
         front.prev_order_fragile = false;
+        front.prev_static_defs = None;
         front.items.clear();
         front.fn_loc.clear();
         front.fn_slot.clear();
@@ -2661,18 +2662,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // a const fn body edit (const values move), a nested static (its
     // index can move), or a slot compaction (cached C carries slot
     // numbers). The source key of an AST fn is its body and head hash.
-    // A body patch moves no static (its bodies hold no item), so on that
-    // path nested statics keep their indices and the cache holds; it
-    // also stores entries on the other paths, after the drop, for the
-    // patches that follow.
+    // A body patch moves no static (body items keep their indexes), so
+    // on that path nested statics keep their indices and the cache holds.
+    // A full resolve keeps it too once a program's static ids are known:
+    // after collect, they must equal the last program's (below).
     let gen_env = front.env_hash.map(|env| {
         let mut h = crate::intern::FxHasher::default();
         std::hash::Hash::hash(&(env, fn_count), &mut h);
         std::hash::Hasher::finish(&h)
     });
-    let statics_may_move = visits.path != "patch" && front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
+    let nested_statics = visits.path != "patch" && front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
+    let statics_may_move = nested_statics && front.prev_static_defs.is_none();
     // The trait-system half of this joins after collect (`gen_ok`).
-    let gen_ok_here = caches.persistent && gen_env.is_some() && !const_fn_changed && !statics_may_move && !front.slots_renumbered;
+    let mut gen_ok_here = caches.persistent && gen_env.is_some() && !const_fn_changed && !statics_may_move && !front.slots_renumbered;
     if !gen_ok_here {
         caches.gen_reuse.clear();
     }
@@ -2743,20 +2745,37 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     };
     // Template check errors from the kept program are collect's errors
     // (`gen_reuse.template_errors` counts them).
-    let collected = match kept {
-        Some(r) => r,
-        None => collect::collect_reuse(
+    let collect = |front: &mut Front, caches: &mut Caches| {
+        collect::collect_reuse(
             front.ast.clone(),
             front.interner.clone(),
             front.known.clone(),
             crate_ids,
             req.cmd == Cmd::Build,
             &mut front.def_order,
-            resolved_tables,
+            resolved_tables.clone(),
             &mut caches.gen_reuse,
             &std_routes,
-        ),
+        )
     };
+    let collected = match kept {
+        Some(r) => r,
+        None => match collect(front, caches) {
+            // Nested statics moved after all (another static count or
+            // order): their indexes did too, so generic reuse goes and
+            // collect runs again without it.
+            Ok(p) if nested_statics && gen_ok_here && front.prev_static_defs.as_ref() != Some(&p.static_defs) => {
+                drop(p);
+                caches.gen_reuse.clear();
+                gen_ok_here = false;
+                collect(front, caches)
+            }
+            c => c,
+        },
+    };
+    if let Ok(p) = &collected {
+        front.prev_static_defs = Some(p.static_defs.clone());
+    }
     let mut program = match collected {
         Ok(p) => p,
         Err(mut ds) => {
@@ -2766,6 +2785,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // and the next edit (usually the fix) stays a body edit.
             if caches.gen_reuse.template_errors != ds.len() {
                 front.env_hash = None;
+            }
+            // Its static ids are unknown, and generic reuse may hold
+            // entries made under them: the next full resolve drops it.
+            if nested_statics {
+                front.prev_static_defs = None;
             }
             front.last_visits.clear();
             visits.render(&mut front.last_visits);
