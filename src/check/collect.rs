@@ -6359,6 +6359,30 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
                 seen.push((trait_def, t));
                 return auto_structural(p, tys, env, trait_def, e, seen);
             }
+            // `Cow<B>` has an auto trait when `&B` and its Owned type
+            // do (std's auto impls for Cow): str and slices by their
+            // Owned shapes, a sized `B` by itself, and any other `B`
+            // by the concrete Owned field of its instance.
+            if let Some(b) = cow_arg(tys, t) {
+                seen.push((trait_def, t));
+                let rb = tys.mk_ref(false, b);
+                let owned = match tys.kind(b) {
+                    TyKind::Str => Some(STRING),
+                    TyKind::Slice(e) => Some(tys.mk_vec(e)),
+                    _ if is_sized_ty(tys, b) && has_clone(p, tys, b) => Some(b),
+                    _ => match tys.local_adt(t) {
+                        Some(a) => match p.adt(a).variants.get(1).and_then(|v| v.fields.first()) {
+                            Some(f) if !matches!(tys.kind(f.ty), TyKind::Projection(..)) => Some(f.ty),
+                            _ => None,
+                        },
+                        None => None,
+                    },
+                };
+                return match owned {
+                    Some(o) => all(tys, vec![rb, o], seen),
+                    None => None,
+                };
+            }
             if let Some((a, b)) = tys.result_args(t) {
                 seen.push((trait_def, t));
                 return all(tys, vec![a, b], seen);

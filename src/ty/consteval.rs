@@ -1909,8 +1909,48 @@ impl Evaluator {
             }
             CallTarget::VariantCtor { adt, variant, ty } => {
                 // A user variant knows its field types; check each argument
-                // against them.
-                let fields: Vec<Ty> = if adt.0 >= u32::MAX - 1 { Vec::new() } else { cx.variant_fields(adt, variant).iter().map(|f| f.1).collect() };
+                // against them. A generic Adt's fields are the template's:
+                // substitute the instance's args, from the expected type
+                // (`const C: Cow<str> = Cow::Borrowed(..)`) or from type
+                // arguments written on the path (`Cow::<str>::Borrowed`),
+                // as the struct literal form above does.
+                let ty_def = cx.tys_ref().adt_parts(ty).map(|(d, _)| d);
+                let (ty, inst) = match expected {
+                    Some(t) if ty_def.is_some() && cx.tys_ref().adt_parts(t).map(|(d, _)| d) == ty_def => {
+                        let args = cx.tys_ref().adt_parts(t).map(|(_, a)| cx.tys_ref().args(a).to_vec()).unwrap_or_default();
+                        (t, Some(args))
+                    }
+                    _ => {
+                        let written: Vec<super::GenericArg> = match cx.ast().expr(callee) {
+                            Expr::Path(segs) => segs
+                                .iter()
+                                .flat_map(|s| s.type_args())
+                                .map(|t| super::GenericArg::Ty(cx.resolve_ty(t)))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        if written.is_empty() {
+                            (ty, None)
+                        } else {
+                            let ty = match ty_def {
+                                Some(d) => cx.tys().mk_adt(d, &written),
+                                None => ty,
+                            };
+                            (ty, Some(written))
+                        }
+                    }
+                };
+                let fields: Vec<Ty> = if adt.0 >= u32::MAX - 1 {
+                    Vec::new()
+                } else {
+                    cx.variant_fields(adt, variant)
+                        .iter()
+                        .map(|f| match &inst {
+                            Some(args) => super::subst(cx.tys(), f.1, args),
+                            None => f.1,
+                        })
+                        .collect()
+                };
                 // A tuple struct constructor is private when any field
                 // is; enum variant fields take the enum's visibility.
                 if adt.0 < u32::MAX - 1 && !cx.is_enum(adt) {
