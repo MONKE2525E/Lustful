@@ -1858,10 +1858,10 @@ impl<'p> Lower<'p> {
                     }
                 }
                 let ops: Vec<Operand> = match (res, args.as_slice()) {
-                    (Res::Fn(_), [a0, rest @ ..]) if !rest.is_empty() && self.ck.coerce(*a0) == Coerce::Reborrow && self.is_place_expr(*a0) => {
+                    (Res::Fn(_) | Res::Indirect, [a0, rest @ ..]) if !rest.is_empty() && self.ck.coerce(*a0) == Coerce::Reborrow && self.is_place_expr(*a0) => {
                         self.two_phase_reborrow_args(*a0, rest, span)
                     }
-                    _ => args.iter().map(|&a| self.operand(a)).collect(),
+                    _ => self.ordered_operands(args),
                 };
                 match res {
                     Res::Fn(f) => {
@@ -2382,11 +2382,11 @@ impl<'p> Lower<'p> {
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_into(e, *kind, args, fmt, *repeat, dest, ty, span),
             Expr::Tuple(elems) => {
-                let ops: Vec<Operand> = elems.iter().map(|&el| self.operand(el)).collect();
+                let ops: Vec<Operand> = self.ordered_operands(elems);
                 self.set_or_temp(dest, Rvalue::TupleAgg(ty, ops), ty, span);
             }
             Expr::Array(elems) => {
-                let ops: Vec<Operand> = elems.iter().map(|&el| self.operand(el)).collect();
+                let ops: Vec<Operand> = self.ordered_operands(elems);
                 self.set_or_temp(dest, Rvalue::ArrayAgg(ty, ops), ty, span);
             }
             Expr::ArrayRepeat { value, .. } => {
@@ -3898,6 +3898,44 @@ impl<'p> Lower<'p> {
         v
     }
 
+    /// The operands of a list of expressions evaluated left to right (call
+    /// arguments, tuple and array elements, `vec!`): a place operand is
+    /// copied or moved into a temporary where it is evaluated when a later
+    /// operand can write or move it (`(x, { x += 1; x })` is `(1, 2)`, and
+    /// `f(r, r.len())` uses `r` after the move: rustc E0382). Struct
+    /// literals do the same for their fields.
+    pub(super) fn ordered_operands(&mut self, es: &[ExprId]) -> Vec<Operand> {
+        (0..es.len()).map(|i| self.ordered_operand(es, i)).collect()
+    }
+
+    /// Operand `i` of `es` under the `ordered_operands` rule.
+    fn ordered_operand(&mut self, es: &[ExprId], i: usize) -> Operand {
+        let e = es[i];
+        let o = self.operand(e);
+        let later_effects = es[i + 1..].iter().any(|&x| !self.inert_expr(x));
+        match o {
+            Operand::Copy(ref pl) | Operand::Move(ref pl)
+                if later_effects && !(pl.proj.is_empty() && self.body.locals[pl.local as usize].name.is_none()) =>
+            {
+                let ft = self.coerced_ty(e);
+                let t = self.temp(ft);
+                let span = self.span(e);
+                self.assign(Place::local(t), Rvalue::Use(o), span);
+                self.operand_from(Place::local(t), ft)
+            }
+            o => o,
+        }
+    }
+
+    /// True when evaluating `e` cannot write or move a place: a literal or
+    /// a plain path (`ordered_operands`).
+    fn inert_expr(&self, e: ExprId) -> bool {
+        matches!(
+            self.p.ast.expr(e),
+            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::ByteStr(_) | Expr::Unit | Expr::Path(_) | Expr::SelfValue
+        )
+    }
+
     /// The operands of a fn call whose first argument is a `&mut` place
     /// reborrowed by coercion (`f(nodes, nodes.len())`): rustc's argument
     /// coercion reborrow is two-phase, so it is lowered as a method
@@ -3909,7 +3947,7 @@ impl<'p> Lower<'p> {
         let st = self.ref_ty(false, inner);
         let reserve = self.temp(st);
         self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
-        let rest_ops: Vec<Operand> = rest.iter().map(|&a| self.operand(a)).collect();
+        let rest_ops: Vec<Operand> = self.ordered_operands(rest);
         self.push(StmtKind::FakeRead(reserve), span);
         let mt = self.ref_ty(true, inner);
         let t = self.temp(mt);
@@ -4074,8 +4112,8 @@ impl<'p> Lower<'p> {
                     None => self.operand_derefs(recv, derefs),
                 };
                 ops.push(o);
-                for &a in args {
-                    let o = self.operand(a);
+                for (ai, &a) in args.iter().enumerate() {
+                    let o = self.ordered_operand(args, ai);
                     ops.push(o);
                 }
             }
@@ -4095,8 +4133,8 @@ impl<'p> Lower<'p> {
                     }
                 };
                 ops.push(Operand::Copy(Place::local(t)));
-                for &a in args {
-                    let o = self.operand(a);
+                for (ai, &a) in args.iter().enumerate() {
+                    let o = self.ordered_operand(args, ai);
                     ops.push(o);
                 }
             }
@@ -4132,8 +4170,8 @@ impl<'p> Lower<'p> {
                     t
                 };
                 ops.push(if m { Operand::Move(Place::local(t)) } else { Operand::Copy(Place::local(t)) });
-                for &a in args {
-                    let o = self.operand(a);
+                for (ai, &a) in args.iter().enumerate() {
+                    let o = self.ordered_operand(args, ai);
                     // As in the `RefMut` unsize path: a direct place
                     // read in an argument has no statement of its
                     // own, so read it into a temporary first when
@@ -4162,8 +4200,8 @@ impl<'p> Lower<'p> {
             }
             Autoref::RefMut if let Some(t) = self.slice_index_recv_ref(recv, root.is_none() && derefs == 0, true, recv_ty, span) => {
                 ops.push(Operand::Move(Place::local(t)));
-                for &a in args {
-                    let o = self.operand(a);
+                for (ai, &a) in args.iter().enumerate() {
+                    let o = self.ordered_operand(args, ai);
                     ops.push(o);
                 }
             }
@@ -4183,8 +4221,8 @@ impl<'p> Lower<'p> {
                     let t = self.temp(mt);
                     self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
                     ops.push(Operand::Move(Place::local(t)));
-                    for &a in args {
-                        let o = self.operand(a);
+                    for (ai, &a) in args.iter().enumerate() {
+                        let o = self.ordered_operand(args, ai);
                         // A direct place read in an argument (`v[0][0]`) has no statement
                         // of its own, so the borrow checker would only see it at the call,
                         // after the `&mut` above is dead. Read it into a temporary first.
@@ -4215,8 +4253,8 @@ impl<'p> Lower<'p> {
                     let reserve = self.temp(st);
                     self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
                     let mut arg_ops = Vec::new();
-                    for &a in args {
-                        let o = self.operand(a);
+                    for (ai, &a) in args.iter().enumerate() {
+                        let o = self.ordered_operand(args, ai);
                         arg_ops.push(o);
                     }
                     self.push(StmtKind::FakeRead(reserve), span);
@@ -6250,7 +6288,7 @@ impl<'p> Lower<'p> {
                     let n = self.operand(args[1]);
                     Rvalue::VecRepeat(elem, x, n)
                 } else {
-                    let ops = args.iter().map(|&a| self.operand(a)).collect();
+                    let ops = self.ordered_operands(args);
                     Rvalue::VecLit(elem, ops)
                 };
                 self.set_or_temp(dest, rv, ty, span);
