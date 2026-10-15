@@ -1289,6 +1289,63 @@ impl<'p> Ctx<'p> {
         Some(wrapped)
     }
 
+    /// An `IntoIterator` argument (`extend`, `from_iter`) of type `t`:
+    /// an iterator through its own `next` (`by_next_arg`), else a value
+    /// through a written or bound `IntoIterator` impl, moved by its
+    /// `into_iter` call (`Coerce::IntoIterCall`) into the final iterator
+    /// type. The `for` head's conversion (`for_trait_iter`) for a plain
+    /// argument: a template bound answers with a stub instance, and an
+    /// instance check re-selects with the concrete type.
+    pub(super) fn into_iterator_arg(&mut self, a: ExprId, t: Ty) -> Option<Ty> {
+        if let Some(x) = self.by_next_arg(a, t) {
+            return Some(x);
+        }
+        if !self.generic_mode() || it::is_iter(&self.tys, t) {
+            return None;
+        }
+        self.run_obligations(false);
+        let t = self.deep(t);
+        if matches!(self.kind(t), TyKind::Error) {
+            return None;
+        }
+        let p = self.p;
+        let lang = p.gx.lang;
+        let span = self.span(a);
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        let tr = TraitRef { def: lang.into_iterator, args: args_id, bindings: EMPTY_BINDINGS };
+        let into_local = match self.select_obligation(tr) {
+            Selection::Impl { id, args: impl_args, .. } => {
+                // A synthetic impl (the `Iterator` blanket, a builtin
+                // collection) has no `into_iter` body to call: the
+                // builtin routes above already cover those types.
+                if p.gx.index.get(id).items.is_empty() {
+                    return None;
+                }
+                self.method_instance_for_impl(a, id, tr, impl_args, "into_iter", span)?.0
+            }
+            Selection::ParamEvidence(_) => self.stub_instance(a, tr, p.interner.intern("into_iter"), span)?.0,
+            _ => return None,
+        };
+        let iter_proj = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_iter), args_id));
+        let iter_ty = self.normalize_here(iter_proj);
+        let iter_ty = self.deep(iter_ty);
+        // The final iterator: a builtin iterator as itself, else
+        // through its `next` in the `ByNext` wrapper.
+        let wrapped = if it::is_iter(&self.tys, iter_ty) {
+            iter_ty
+        } else {
+            let item = self.by_next_item(iter_ty, span)?;
+            if item == ERROR {
+                return Some(ERROR);
+            }
+            it::mk_iter(&mut self.tys, IterKind::ByNext, &[iter_ty, item])
+        };
+        let i = self.ei(a);
+        self.out.coerce[i] = Coerce::IntoIterCall(wrapped);
+        self.out.into_iter_calls.push((a, into_local));
+        Some(wrapped)
+    }
+
     /// The item type of `base` as an iterator through its own `next`
     /// (`IterKind::ByNext`, W-STD-B), or None when it is not one. A type
     /// parameter, projection, or opaque type needs an `Iterator` bound
@@ -1807,7 +1864,7 @@ impl<'p> Ctx<'p> {
             .p
             .collection_iter_inner(&mut self.tys, at)
             .or_else(|| it::as_iter_ty(&mut self.tys, at))
-            .or_else(|| self.by_next_arg(*a, at));
+            .or_else(|| self.into_iterator_arg(*a, at));
         let Some(it) = it else {
             let tn = self.tn(at);
             self.err("L0640", aspan, format!("`from_iter` from `{tn}` is not implemented yet"), "Pass an iterator, a Vec, or a slice.");

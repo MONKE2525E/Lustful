@@ -1056,6 +1056,11 @@ pub enum Coerce {
     /// (the payload's type, W-STD-B check/iter.rs): adapters over a
     /// user iterator call its `next`.
     ByNext(Ty),
+    /// An `IntoIterator` argument (`extend`, `from_iter`) moved through
+    /// its `into_iter` call (the method instance is in
+    /// `Checked::into_iter_calls`): the payload is the final iterator
+    /// type, a `ByNext` wrap when the iterator runs through `next`.
+    IntoIterCall(Ty),
     /// A value of a fn item type that is not a plain path to the fn (a
     /// local, a field, an index, a call result) to a fn pointer: the
     /// zero-sized value is evaluated, then the trampoline of the item
@@ -1157,6 +1162,9 @@ pub struct Checked<'g> {
     pub deref_recv: Vec<(ExprId, DerefRecv)>,
     /// The range form of each `drain` call, by expression.
     pub drain_ranges: Vec<(ExprId, DrainRange)>,
+    /// The `into_iter` method instance of each `Coerce::IntoIterCall`
+    /// (an `extend` or `from_iter` argument), by coerced expression.
+    pub into_iter_calls: Vec<(ExprId, LocalDefId)>,
     /// The steps of each `Coerce::UserDeref`, by coerced expression,
     /// outermost first.
     pub deref_coerce: Vec<(ExprId, DerefRecv)>,
@@ -1223,6 +1231,10 @@ impl Checked<'_> {
     /// The range form of a `drain` call (check/iter.rs).
     pub fn drain_range(&self, e: ExprId) -> Option<DrainRange> {
         self.drain_ranges.iter().find(|(x, _)| *x == e).map(|(_, d)| *d)
+    }
+    /// The `into_iter` instance of a `Coerce::IntoIterCall` on `e`.
+    pub fn into_iter_call(&self, e: ExprId) -> Option<LocalDefId> {
+        self.into_iter_calls.iter().find(|(x, _)| *x == e).map(|(_, d)| *d)
     }
     pub fn coerce(&self, e: ExprId) -> Coerce {
         self.coerce[(e.0 - self.expr_base) as usize]
@@ -1687,6 +1699,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             vtable_requests: Vec::new(),
             deref_recv: Vec::new(),
             drain_ranges: Vec::new(),
+            into_iter_calls: Vec::new(),
             deref_coerce: Vec::new(),
             index_recv: Vec::new(),
             locals: Vec::new(),
@@ -18264,6 +18277,7 @@ impl<'p> Ctx<'p> {
                 Coerce::CowDeref(n, t) => self.out.coerce[i] = Coerce::CowDeref(n, self.zonk(t)),
                 Coerce::CowRecv(n, t) => self.out.coerce[i] = Coerce::CowRecv(n, self.zonk(t)),
                 Coerce::ByNext(t) => self.out.coerce[i] = Coerce::ByNext(self.zonk(t)),
+                Coerce::IntoIterCall(t) => self.out.coerce[i] = Coerce::IntoIterCall(self.zonk(t)),
                 Coerce::ReifyFn(t) => self.out.coerce[i] = Coerce::ReifyFn(self.zonk(t)),
                 _ => {}
             }

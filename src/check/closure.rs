@@ -1018,7 +1018,7 @@ impl<'p> Ctx<'p> {
             // Builtin derefs down to the Cow, whose `Deref` borrows it.
             Coerce::CowDeref(n, _) => (n as usize, CaptureMode::Ref),
             // A method receiver: `cap_receiver` covers it.
-            Coerce::CowRecv(..) | Coerce::ByNext(_) => return false,
+            Coerce::CowRecv(..) | Coerce::ByNext(_) | Coerce::IntoIterCall(_) => return false,
             // A dyn coercion reborrows the source at the target's
             // mutability before it builds the fat pointer.
             Coerce::Unsize(t) => (1, if matches!(self.kind(t), TyKind::Ref(_, m, _) if m.is_mut()) { CaptureMode::MutRef } else { CaptureMode::Ref }),

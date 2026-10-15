@@ -1003,6 +1003,24 @@ impl<'p> Lower<'p> {
                 self.assign(Place::local(v), Rvalue::TupleAgg(w, vec![op]), span);
                 Operand::Move(Place::local(v))
             }
+            // An `IntoIterator` argument through its `into_iter` call
+            // (check/iter.rs `into_iterator_arg`): the call's result is
+            // the iterator, wrapped in `ByNext` when the final type is.
+            Coerce::IntoIterCall(w) => {
+                let Some(local) = self.ck.into_iter_call(e) else { return op };
+                let f = self.resolve_generic_fn(e, local);
+                let iter_ty = self.p.fn_info(f).ret;
+                let it = self.temp(iter_ty);
+                self.call_into(CallTarget::Fn(f), vec![op], Place::local(it), span);
+                let is_wrap = matches!(crate::ty::iter::iter_parts(&self.body.tys, w), Some((crate::ty::iter::IterKind::ByNext, _)));
+                if is_wrap {
+                    let v = self.temp(w);
+                    self.assign(Place::local(v), Rvalue::TupleAgg(w, vec![Operand::Move(Place::local(it))]), span);
+                    Operand::Move(Place::local(v))
+                } else {
+                    Operand::Move(Place::local(it))
+                }
+            }
             Coerce::CowDeref(n, target) => {
                 // Down to the `&Cow`, then the Cow's `&B` view (W-STD-B).
                 let place = self.op_place(op, ty, span);
@@ -1042,7 +1060,7 @@ impl<'p> Lower<'p> {
             Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) | Coerce::ReifyFn(t) | Coerce::RefToPtr(t) => t,
             // A receiver-only coercion: `operand` leaves the value as is.
             Coerce::CowRecv(..) => ty,
-            Coerce::ByNext(w) => w,
+            Coerce::ByNext(w) | Coerce::IntoIterCall(w) => w,
             Coerce::Deref(n) => self.peel(ty, n),
             Coerce::BoxToRef(n, m) => {
                 let elem = self.peel(ty, n);
