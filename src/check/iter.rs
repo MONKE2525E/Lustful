@@ -58,7 +58,6 @@ const DECLARED_ONLY: &[&str] = &[
     "rfold",
     "rfind",
     "nth_back",
-    "len",
     "max_by",
     "min_by",
 ];
@@ -116,6 +115,53 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return Some(self.seq_sort(e, recv, el, derefs, n, name_span, args));
             }
             return self.iter_source(e, rt, base, el, derefs, n, name_span, args);
+        }
+        // `iter`, `iter_mut`, and `into_iter` on an `Option` or
+        // `Result` receiver (fx-option-rest, ty/iter.rs): core's
+        // six one-item iterators. Other names fall through.
+        if self.tys.option_elem(base).is_some() || self.tys.result_args(base).is_some() {
+            let is_opt = self.tys.option_elem(base).is_some();
+            let el = if is_opt { self.tys.option_elem(base).unwrap_or(ERROR) } else { self.tys.result_args(base).map_or(ERROR, |(t, _)| t) };
+            let (kind_iter, kind_iter_mut) = if is_opt {
+                (IterKind::OptionIter, IterKind::OptionIterMut)
+            } else {
+                (IterKind::ResultIter, IterKind::ResultIterMut)
+            };
+            let (autoref, d, ret) = match self.name(name) {
+                "iter" => (Autoref::Ref, derefs, it::mk_iter(&mut self.tys, kind_iter, &[el])),
+                "iter_mut" => (Autoref::RefMut, derefs, it::mk_iter(&mut self.tys, kind_iter_mut, &[el])),
+                "into_iter" => {
+                    // Rust's probe, as in `iter_source`: the first
+                    // autoderef step with an `IntoIterator` impl.
+                    let mut t = self.resolve(rt);
+                    let mut found = None;
+                    for j in 0..=derefs {
+                        if let Some(it) = it::opt_res_iter(&mut self.tys, t) {
+                            found = Some((j, it));
+                            break;
+                        }
+                        match self.kind(t) {
+                            TyKind::Ref(_, _, inner) => t = self.resolve(inner),
+                            _ => break,
+                        }
+                    }
+                    // No step in the reference chain fits (the enum
+                    // sits behind a smart pointer): not yet.
+                    let Some((j, ret)) = found else {
+                        self.err("L0640", name_span, "`into_iter` on this receiver is not implemented yet", "Iterate with `.iter()` instead.");
+                        return Some(self.iter_bail(args));
+                    };
+                    (Autoref::None, j, ret)
+                }
+                _ => return None,
+            };
+            if !turbofish.is_empty() {
+                self.errs.push(not_yet("L0721", name_span, "turbofish on this iterator method"));
+                return Some(self.iter_bail(args));
+            }
+            self.set_res(e, Res::BuiltinMethod { b: Builtin::IterOptRes, derefs: d, autoref });
+            self.check_args(&[], args, name_span);
+            return Some(ret);
         }
         if !it::is_iter(&self.tys, base) && !self.param_iter(base) {
             // A std source collection iterator struct (its one field
@@ -1323,6 +1369,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if it::is_iter(&self.tys, t) || self.param_iter(t) {
             return Some(t);
         }
+        if let Some(t2) = it::opt_res_iter(&mut self.tys, t) {
+            return Some(t2);
+        }
         if let Some(el) = self.tys.vec_elem(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::VecIntoIter, &[el]));
         }
@@ -1375,6 +1424,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         use IterKind as K;
         match it::iter_parts(&self.tys, t) {
             Some((K::SliceIter | K::SliceIterMut | K::ArrayIntoIter | K::Windows, _)) => true,
+            Some((k, _)) if it::is_opt_res(k) => true,
             Some((K::Map | K::Copied | K::Cloned, a)) => self.rposition_ok(a[0]),
             _ => false,
         }
@@ -1420,7 +1470,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             K::ByNext => by_next_fns(self.p, a[0]).is_ok_and(|f| f.next_back.is_some()),
             // Forward only in lust so far.
             K::Flatten => false,
-            K::OptionIntoIter => true,
+            K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => true,
             // The str splits (W-STD-B): by mode, and over a pattern whose
             // searcher is double-ended (char, char sets, predicates; not
             // `&str`), as std's `DoubleEndedSearcher` impls.
@@ -1442,8 +1492,34 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         let Some((k, a)) = it::iter_parts(&self.tys, t) else { return false };
         match k {
-            K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => true,
-            K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::Copied | K::Cloned | K::Peekable | K::Inspect => self.exact_size(a[0]),
+            K::SliceIter
+            | K::SliceIterMut
+            | K::VecIntoIter
+            | K::Range
+            | K::RangeInclusive
+            | K::VecDrain
+            | K::ArrayIntoIter
+            | K::RepeatN
+            | K::Windows
+            | K::OptionIter
+            | K::OptionIterMut
+            | K::OptionIntoIter
+            | K::ResultIter
+            | K::ResultIterMut
+            | K::ResultIntoIter
+            | K::MapIter
+            | K::MapIterMut
+            | K::MapKeys
+            | K::MapValues
+            | K::MapValuesMut
+            | K::MapIntoIter
+            | K::MapIntoKeys
+            | K::MapIntoValues
+            | K::SetIter
+            | K::SetIntoIter => true,
+            K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::StepBy | K::Copied | K::Cloned | K::Peekable | K::Inspect => {
+                self.exact_size(a[0])
+            }
             K::Chain | K::Zip => self.exact_size(a[0]) && self.exact_size(a[1]),
             _ => false,
         }

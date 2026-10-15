@@ -587,7 +587,11 @@ fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
                 | IterKind::Windows
                 | IterKind::CharIndices
                 | IterKind::VecDrain
-                | IterKind::StringDrain,
+                | IterKind::StringDrain
+                | IterKind::OptionIter
+                | IterKind::OptionIterMut
+                | IterKind::ResultIter
+                | IterKind::ResultIterMut,
             )
             | BuiltinTy::Iter(IterKind::StrSplit)
             | BuiltinTy::RefGuard
@@ -3256,6 +3260,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 && !av.is_empty()
                 && self.relate(inner, &av[1..], dt, &dv, Variance::Co) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashIterNew)) && self.call_hash_iter(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterOptRes)) && self.call_opt_res(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::SliceFromRef)) && self.call_from_ref(&avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(b) = target
                 && entry_builtin(b)
                 && self.call_hash_entry(b, &avs, &dv) => {}
@@ -3739,6 +3745,59 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
     /// the map's (the values invariantly for `iter_mut` and
     /// `values_mut`, which hand out `&mut V`). False (nothing added) for
     /// the by-value forms, which take the opaque rule.
+    /// An `option` or `result` iterator construction (fx-option-rest):
+    /// from `&'a Option<T>` or `&'a Result<T, E>` the `Iter` holds the
+    /// loan and `T`'s regions (invariantly for `IterMut`, whose items
+    /// can write through); by value the `IntoIter` owns `T`'s regions
+    /// and an `Err`'s regions end at the call.
+    fn call_opt_res(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        use crate::ty::iter::IterKind as K;
+        let Some((t0, v0)) = avs.first() else { return false };
+        let Some((ik, iargs)) = crate::ty::iter::iter_parts(&self.body.tys, dt) else { return false };
+        let t = iargs[0];
+        let n = self.sc.slots(t) as usize;
+        match self.body.tys.kind(*t0) {
+            TyKind::Ref(_, _, _) => {
+                let (Some((&r, mv)), Some((&i, iv))) = (v0.split_first(), dv.split_first()) else { return false };
+                if mv.len() < n || iv.len() < n {
+                    return false;
+                }
+                self.edge(r, i);
+                let var = if matches!(ik, K::OptionIterMut | K::ResultIterMut) { Variance::Inv } else { Variance::Co };
+                let (a, b) = (mv[..n].to_vec(), iv[..n].to_vec());
+                self.relate(t, &a, t, &b, var);
+                true
+            }
+            _ => {
+                if v0.len() < n || dv.len() < n {
+                    return false;
+                }
+                let (a, b) = (v0[..n].to_vec(), dv[..n].to_vec());
+                self.relate(t, &a, t, &b, Variance::Co);
+                true
+            }
+        }
+    }
+
+    /// `slice::from_ref(&'a T) -> &'a [T]` and `from_mut`
+    /// (fx-option-rest): the slice's region is the argument's, and
+    /// `T`'s own regions flow through (invariantly for `from_mut`,
+    /// which can write a `T` back).
+    fn call_from_ref(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, m, t) = self.body.tys.kind(*t0) else { return false };
+        let (Some((&r, av)), Some((&d, rest))) = (v0.split_first(), dv.split_first()) else { return false };
+        let n = self.sc.slots(t) as usize;
+        if av.len() < n || rest.len() < n {
+            return false;
+        }
+        self.edge(r, d);
+        let var = if m.is_mut() { Variance::Inv } else { Variance::Co };
+        let (a, b) = (av[..n].to_vec(), rest[..n].to_vec());
+        self.relate(t, &a, t, &b, var);
+        true
+    }
+
     fn call_hash_iter(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         use crate::ty::iter::IterKind as K;
         let Some((t0, v0)) = avs.first() else { return false };
@@ -3914,7 +3973,9 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let cat = |parts: &[&[u32]]| parts.concat();
         Some(match k {
-            K::SliceIter | K::SliceIterMut | K::Windows => cat(&[&own, &args[0]]),
+            K::SliceIter | K::SliceIterMut | K::Windows | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut => {
+                cat(&[&own, &args[0]])
+            }
             K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => args[0].clone(),
             K::Map | K::FilterMap => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
@@ -3938,7 +3999,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             // Range kinds that are `RangeBounds` values here, not iterators.
             K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
             K::Flatten => self.item_slots(a[1], &args[1])?,
-            K::OptionIntoIter => args[0].clone(),
+            K::OptionIntoIter | K::ResultIntoIter => args[0].clone(),
             // `&'a str` of the haystack (W-STD-B).
             K::StrSplit => own,
             // An mpsc receiver's items are its `T` values (W-THREADS).
@@ -4246,7 +4307,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         let n0 = self.sc.slots(a0) as usize;
         match k {
             // The item `&'a T` is the iterator's own slots, in order.
-            K::SliceIter | K::SliceIterMut => {
+            K::SliceIter | K::SliceIterMut | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut => {
                 if vars.len() != 1 + n0 {
                     return false;
                 }
@@ -4382,7 +4443,8 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             | K::Windows
             | K::CharIndices
             | K::Flatten
-            | K::OptionIntoIter => false,
+            | K::OptionIntoIter
+            | K::ResultIntoIter => false,
         }
     }
 
@@ -5857,6 +5919,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::VecAsSlice
             | B::VecAsMutSlice
             | B::StringAsStr
+            | B::StringAsMutStr
             | B::StrTrim
             | B::StrTrimStart
             | B::StrTrimEnd

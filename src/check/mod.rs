@@ -71,6 +71,8 @@ pub enum Builtin {
     StringPushStr,
     StringPush,
     StringAsStr,
+    /// `String::as_mut_str` (fx-option-rest): `as_str`, mutable.
+    StringAsMutStr,
     VecLen,
     VecIsEmpty,
     VecPush,
@@ -345,6 +347,14 @@ pub enum Builtin {
     VecIterCap,
     VecIterFront,
     VecIterLen,
+    /// `iter`, `iter_mut`, and `into_iter` on `Option` and `Result`
+    /// (fx-option-rest): makes the dest kind's one-field iterator
+    /// from the receiver (a reference for `Iter`/`IterMut`, the
+    /// value for `IntoIter`); expanded in lower/iter.rs.
+    IterOptRes,
+    /// `core::slice::from_ref(&T) -> &[T]` and `from_mut`
+    /// (fx-option-rest): a one-element slice of the argument.
+    SliceFromRef,
     CharsBytesLeft,
     CharsNextBack,
     /// `Default::default()` of a type whose default is built by
@@ -1217,6 +1227,10 @@ struct Ctx<'p, 'a> {
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
     deferred_methods: Vec<method::DeferredMethod>,
+    /// `as_deref` calls on an `Option` or `Result` whose payload is
+    /// still open at the call; the impl is picked at finish
+    /// (`method::DeferredLangMethod`, fx-option-rest).
+    deferred_lang_methods: Vec<method::DeferredLangMethod>,
     /// Method calls where rustc picks a std inherent item before any user
     /// trait's method (check/std_inherent.rs): the trait probe skips user
     /// traits for them.
@@ -1546,6 +1560,7 @@ fn check_fn_mode<'p, 'a>(
         const_fn_items_saved: Vec::new(),
         next_const_fn_sibs: None,
         deferred_methods: Vec::new(),
+        deferred_lang_methods: Vec::new(),
         std_first: Vec::new(),
         user_deref_call: None,
         last_pick: None,
@@ -2480,7 +2495,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.errs.push(not_yet("L0614", span, "generic functions as values through a qualified path"));
                 return ERROR;
             }
-            let explicit = self.explicit_call_args(e);
+            let explicit = self.explicit_path_args(e, f);
             let (_, _, args) = self.instantiate_template(e, f, &tmpl.generics, &explicit, span);
             self.unify_written_self(e, f, &args, span);
             let args = self.tys.intern_args(&args);
@@ -5938,6 +5953,39 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let p = self.p;
         let ast::Expr::Path(segs) = p.ast.expr(callee) else { return Vec::new() };
         let Some(seg) = segs.last() else { return Vec::new() };
+        self.explicit_seg_args(seg)
+    }
+
+    /// The explicit args of an inherent fn named by a path
+    /// (`Type::<A>::name::<B>`, fx-option-rest): the type segment's
+    /// args fill the impl's params first, the name segment's
+    /// turbofish fills only the fn's own (rustc E0107 otherwise, via
+    /// `instantiate_template`'s arity check on the aligned list).
+    /// For a plain fn this is `explicit_call_args`.
+    fn explicit_path_args(&mut self, callee: ExprId, f: LocalDefId) -> Vec<Option<GenericArg>> {
+        let p = self.p;
+        let Some((_, impl_g)) = p.gx.inherent_self_pats.get(&f) else { return self.explicit_call_args(callee) };
+        let parent_n = impl_g.params.len();
+        if parent_n == 0 {
+            return self.explicit_call_args(callee);
+        }
+        let ast::Expr::Path(segs) = p.ast.expr(callee) else { return self.explicit_call_args(callee) };
+        if segs.len() < 2 {
+            return self.explicit_call_args(callee);
+        }
+        let mut out: Vec<Option<GenericArg>> = vec![None; parent_n];
+        for (i, a) in self.explicit_seg_args(&segs[segs.len() - 2]).into_iter().enumerate() {
+            if let Some(slot) = out.get_mut(i) {
+                *slot = a;
+            }
+        }
+        out.extend(self.explicit_seg_args(&segs[segs.len() - 1]));
+        out
+    }
+
+    /// The explicit generic args written on one path segment.
+    fn explicit_seg_args(&mut self, seg: &ast::PathSeg) -> Vec<Option<GenericArg>> {
+        let p = self.p;
         let ast::GenericArgs::Angle(written) = &seg.args else { return Vec::new() };
         let mut out = Vec::new();
         for a in written {
@@ -8695,6 +8743,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ("cmp", "min") => Some(Builtin::CmpMin),
                 ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
                 ("iter", "repeat_n") => Some(Builtin::IterRepeatN),
+                ("slice", "from_ref") | ("slice", "from_mut") => Some(Builtin::SliceFromRef),
                 _ => None,
             };
             if let Some(b) = b {
@@ -8856,6 +8905,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if ty_name == k.Result && item == k.Err && lang_ty {
             return Some(Res::ResErr);
+        }
+        // The std source methods of the lang enums as path calls and
+        // fn values (`Option::map(x, f)`, `.filter(Option::is_some)`,
+        // fx-option-rest): the impl templates collect keyed on the
+        // builtin def (`inherent_methods`), as a user Adt's do below.
+        // `iter`, `iter_mut`, and `into_iter` are builtin, not source:
+        // they answer as `Builtin::IterOptRes` calls.
+        if lang_ty && (ty_name == k.Option || ty_name == k.Result) {
+            if matches!(self.name(item), "iter" | "iter_mut" | "into_iter") {
+                return Some(Res::Builtin(Builtin::IterOptRes));
+            }
+            let def = if ty_name == k.Option { self.tys.builtins().option } else { self.tys.builtins().result };
+            p.inherent_reads(&mut self.out.reads, def, item);
+            if let Some(fs) = p.gx.inherent_methods.get(&(def, item)).filter(|fs| !fs.is_empty()) {
+                let fs = fs.clone();
+                let written: Vec<LocalDefId> = fs.iter().copied().filter(|f| !p.gx.instances.contains_key(f)).collect();
+                let f = match written.as_slice() {
+                    [] => fs[0],
+                    &[f] => f,
+                    _ => self.lang_fn_by_self(def, &written, segs, span)?,
+                };
+                return Some(Res::Fn(f));
+            }
+            let tn = self.name(ty_name).to_string();
+            self.err("L0104", span, format!("no variant or associated function `{}` on `{tn}`", self.name(item)), "Check the name.");
+            return None;
         }
         // In an instance `Self` names a materialized Adt; its items are
         // the template's (a fn of another impl block has no instance yet).
@@ -9295,6 +9370,66 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
             })
         })
+    }
+
+    /// `inherent_fn_by_self` for a lang enum (`Option::copied` lives
+    /// on both `Option<&T>` and `Option<&mut T>`): the written Self
+    /// type comes from the type segment's args (`Option::<&i32>`);
+    /// with none written every param is fresh, so several fits report
+    /// the ambiguity rustc reports (E0034).
+    fn lang_fn_by_self(&mut self, def: crate::def::DefId, fs: &[LocalDefId], segs: &[ast::PathSeg], span: Span) -> Option<LocalDefId> {
+        let p = self.p;
+        let n_params = if def == self.tys.builtins().option { 1 } else { 2 };
+        let mut args: Vec<GenericArg> = Vec::new();
+        if let Some(seg) = segs.get(segs.len().saturating_sub(2))
+            && let ast::GenericArgs::Angle(written) = &seg.args
+        {
+            for w in written.iter().filter(|w| !matches!(w, ast::GenericArg::Lifetime(_))) {
+                match w {
+                    ast::GenericArg::Type(t) => args.push(GenericArg::Ty(self.resolve_written(*t))),
+                    _ => args.push(GenericArg::Ty(self.new_var(false))),
+                }
+            }
+        }
+        while args.len() < n_params {
+            args.push(GenericArg::Ty(self.new_var(false)));
+        }
+        args.truncate(n_params);
+        let written = self.tys.mk_adt(def, &args);
+        let mut found = Vec::new();
+        for &f in fs {
+            let Some(self_tmpl) = p.gx.fn_scopes.get(f.0 as usize).and_then(|s| s.scope.self_ty) else { continue };
+            let self_ty = match p.gx.fn_templates.get(f.0 as usize) {
+                Some(Some(tmpl)) => {
+                    let args = self.fresh_args(&tmpl.generics.clone());
+                    subst(&mut self.tys, self_tmpl, &args)
+                }
+                _ => self_tmpl,
+            };
+            let snap = self.snapshot_vars();
+            if self.unify(self_ty, written) {
+                found.push(f);
+            }
+            self.rollback_vars(snap);
+        }
+        let item = self.name(segs[segs.len() - 1].name).to_string();
+        match found.as_slice() {
+            &[f] => Some(f),
+            [] => {
+                let tn = self.tn(written);
+                self.err("L0104", span, format!("no associated function `{item}` for `{tn}`"), "Check the type's arguments.");
+                None
+            }
+            _ => {
+                self.err(
+                    "L0720",
+                    span,
+                    format!("multiple applicable items named `{item}` are in scope"),
+                    "Write the type's arguments, such as `Option::<&u8>::name`.",
+                );
+                None
+            }
+        }
     }
 
     /// One of several inherent fns of one name, each in its own impl
@@ -10446,7 +10581,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             Res::Fn(f) => {
                 // Path calls such as `Type::method(x)` pass `self` explicitly, so all params apply.
                 if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned() {
-                    let explicit = self.explicit_call_args(callee);
+                    let explicit = self.explicit_path_args(callee, f);
                     let (mut params, ret, inst_args) = self.instantiate_template(e, f, &tmpl.generics.clone(), &explicit, span);
                     self.unify_written_self(callee, f, &inst_args, span);
                     self.normalize_params(&mut params, span);
@@ -10789,6 +10924,51 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Builtin::CmpMax | Builtin::CmpMin => {
                         let t = self.callee_turbo_ty(callee, span);
                         (vec![t, t], t)
+                    }
+                    // `slice::from_ref(&T) -> &[T]`, `from_mut(&mut T)
+                    // -> &mut [T]` (fx-option-rest): the written name
+                    // gives the mutability.
+                    Builtin::SliceFromRef => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        self.deferred_sized.push((t, span));
+                        let m = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs.last().is_some_and(|s| self.name(s.name) == "from_mut"),
+                            _ => false,
+                        };
+                        let sl = self.tys.intern(TyKind::Slice(t));
+                        (vec![self.tys.mk_ref(m, t)], self.tys.mk_ref(m, sl))
+                    }
+                    // `Option::iter(&o)`, `Result::into_iter(r)`, and
+                    // kin (fx-option-rest): a method in path form, so
+                    // the receiver is the one argument. The expansion
+                    // keys on the result iterator kind.
+                    Builtin::IterOptRes => {
+                        use crate::ty::iter::{IterKind as IK, mk_iter};
+                        let (is_opt, item_name, written_tys) = match p.ast.expr(callee) {
+                            Expr::Path(segs) if segs.len() >= 2 => {
+                                let ty_seg = &segs[segs.len() - 2];
+                                let tys: Vec<Ty> = ty_seg.type_args().into_iter().map(|t| self.resolve_written(t)).collect();
+                                (self.name(ty_seg.name) == "Option", self.name(segs[segs.len() - 1].name).to_string(), tys)
+                            }
+                            _ => (true, String::new(), Vec::new()),
+                        };
+                        let t = written_tys.first().copied().unwrap_or_else(|| self.new_var(false));
+                        let e = written_tys.get(1).copied().unwrap_or_else(|| self.new_var(false));
+                        let self_ty = if is_opt { self.tys.mk_option(t) } else { self.tys.mk_result(t, e) };
+                        match item_name.as_str() {
+                            "iter_mut" => {
+                                let k = if is_opt { IK::OptionIterMut } else { IK::ResultIterMut };
+                                (vec![self.tys.mk_ref(true, self_ty)], mk_iter(&mut self.tys, k, &[t]))
+                            }
+                            "into_iter" => {
+                                let k = if is_opt { IK::OptionIntoIter } else { IK::ResultIntoIter };
+                                (vec![self_ty], mk_iter(&mut self.tys, k, &[t]))
+                            }
+                            _ => {
+                                let k = if is_opt { IK::OptionIter } else { IK::ResultIter };
+                                (vec![self.tys.mk_ref(false, self_ty)], mk_iter(&mut self.tys, k, &[t]))
+                            }
+                        }
                     }
                     // `repeat_n(x, n)`: Copy `T` only (W-STD-B, ty/iter.rs).
                     Builtin::IterRepeatN => {
@@ -11537,6 +11717,40 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 if p.gx.inherent_methods.get(&(def, name)).is_some_and(|ts| ts.len() > 1)
                     && method::inherent_template_fits(self, e, probe, name, name_span) > 1
                 {
+                    // `as_deref` on a still-open payload defers to body
+                    // end instead (fx-option-rest): core has one impl
+                    // over `T: Deref`, so rustc has no ambiguity to
+                    // report here; lust's per-type impls pick at finish.
+                    if matches!(self.name(name), "as_deref" | "as_deref_mut") {
+                        if probe.autoref != Autoref::None {
+                            self.check_packed_borrow(recv, name_span);
+                        }
+                        self.check_args(&[], args, name_span);
+                        // Typed as the method's result shape over a
+                        // fresh target, so a chained call can type
+                        // and can itself fix the target.
+                        let mutable = self.name(name) == "as_deref_mut";
+                        let target = self.new_var(false);
+                        let rt = self.tys.mk_ref(mutable, target);
+                        let ret = if matches!(self.tys.builtin_of(base), Some(BuiltinTy::Option)) {
+                            self.tys.mk_option(rt)
+                        } else {
+                            let e_ty = self.tys.result_args(base).map_or(ERROR, |(_, e2)| e2);
+                            let re = self.tys.mk_ref(mutable, e_ty);
+                            self.tys.mk_result(rt, re)
+                        };
+                        self.deferred_lang_methods.push(method::DeferredLangMethod {
+                            e,
+                            base,
+                            form,
+                            derefs,
+                            name,
+                            name_span,
+                            ret,
+                            explicit: explicit.clone(),
+                        });
+                        return ret;
+                    }
                     self.err(
                         "L0610",
                         name_span,
@@ -11802,6 +12016,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     Some((B::StringPush, Autoref::RefMut, vec![CHAR], UNIT))
                 } else if name == k.as_str {
                     Some((B::StringAsStr, Autoref::Ref, vec![], REF_STR))
+                } else if self.name(name) == "as_mut_str" {
+                    let r = self.tys.mk_ref(true, STR);
+                    Some((B::StringAsMutStr, Autoref::RefMut, vec![], r))
                 } else if name == k.to_string {
                     Some((B::ToString, Autoref::Ref, vec![], STRING))
                 } else if name == k.capacity {
@@ -13353,6 +13570,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return lt;
         }
         let t = self.expr(iter, None);
+        // An `Option` or `Result`, by value or by reference
+        // (fx-option-rest): the loop runs its one-item iterator
+        // (`opt_res_iter`).
+        let dt0 = self.deep(t);
+        if let Some(it) = crate::ty::iter::opt_res_iter(&mut self.tys, dt0) {
+            return crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR);
+        }
         // A map or set, by value or by reference (W-STD-B): the loop
         // runs its hash iterator (`hash_for_iter`).
         let dt = self.deep(t);
@@ -17037,6 +17261,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // selects with i32 or f64, the types body end defaults to.
         self.run_obligations(false);
         self.literal_fallback_in_obligations();
+        // A deferred `as_deref` pick can bind type variables other
+        // sites wait on, so it runs before the uninferred check.
+        method::finish_deferred_lang_methods(self);
         self.uninferred_site_args();
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.

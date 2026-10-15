@@ -6583,7 +6583,9 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     p.tys.intern(TyKind::Tuple(ts))
                 }
                 K::Flatten => proj(p, ps[1]),
-                K::OptionIntoIter => ps[0],
+                K::OptionIntoIter | K::ResultIntoIter => ps[0],
+                K::OptionIter | K::ResultIter => p.tys.mk_ref(false, ps[0]),
+                K::OptionIterMut | K::ResultIterMut => p.tys.mk_ref(true, ps[0]),
                 K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => ps[0],
                 K::StringDrain => CHAR,
                 K::Map | K::FilterMap => ps[2],
@@ -6617,7 +6619,62 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 _ => proj(p, ps[0]),
             };
             let g = Generics { parent: None, params, predicates: Vec::new() };
-            insert_synthetic(p, &mut ordinal, lang.iterator, self_pat, &[], g, vec![(lang.assoc_item, item)], Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, lang.iterator, self_pat, &[], g.clone(), vec![(lang.assoc_item, item)], Synthetic::Lang, false, span);
+            // `ExactSizeIterator` and `DoubleEndedIterator` for the
+            // kinds core marks so (fx-option-rest; the same sets as
+            // check/iter.rs `exact_size` and `double_ended`).
+            // Selection only: `len` and `next_back` stay builtin calls.
+            let exact: Option<Vec<Predicate>> = match k {
+                K::ArrayIntoIter
+                | K::RepeatN
+                | K::Windows
+                | K::OptionIter
+                | K::OptionIterMut
+                | K::OptionIntoIter
+                | K::ResultIter
+                | K::ResultIterMut
+                | K::ResultIntoIter
+                | K::MapIter
+                | K::MapIterMut
+                | K::MapKeys
+                | K::MapValues
+                | K::MapValuesMut
+                | K::MapIntoIter
+                | K::MapIntoKeys
+                | K::MapIntoValues
+                | K::SetIter
+                | K::SetIntoIter => Some(Vec::new()),
+                K::Map | K::Copied | K::Cloned | K::Rev | K::Enumerate | K::Inspect | K::Take | K::Skip | K::StepBy | K::Peekable => {
+                    Some(vec![pred_on(p, lang.exact_size_iterator, ps[0])])
+                }
+                K::Zip => Some(vec![pred_on(p, lang.exact_size_iterator, ps[0]), pred_on(p, lang.exact_size_iterator, ps[1])]),
+                _ => None,
+            };
+            if let Some(predicates) = exact {
+                let ge = Generics { parent: None, params: g.params.clone(), predicates };
+                insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], ge, Vec::new(), Synthetic::Lang, false, span);
+            }
+            let double_ended: Option<Vec<Predicate>> = match k {
+                K::Windows
+                | K::CharIndices
+                | K::ArrayIntoIter
+                | K::RepeatN
+                | K::OptionIter
+                | K::OptionIterMut
+                | K::OptionIntoIter
+                | K::ResultIter
+                | K::ResultIterMut
+                | K::ResultIntoIter => Some(Vec::new()),
+                K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => {
+                    Some(vec![pred_on(p, lang.double_ended_iterator, ps[0])])
+                }
+                K::Chain => Some(vec![pred_on(p, lang.double_ended_iterator, ps[0]), pred_on(p, lang.double_ended_iterator, ps[1])]),
+                _ => None,
+            };
+            if let Some(predicates) = double_ended {
+                let gd = Generics { parent: None, params: g.params.clone(), predicates };
+                insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, self_pat, &[], gd, Vec::new(), Synthetic::Lang, false, span);
+            }
         }
         let chars = CHARS;
         insert_synthetic(p, &mut ordinal, lang.iterator, chars, &[], g0.clone(), vec![(lang.assoc_item, CHAR)], Synthetic::Lang, false, span);
@@ -6683,6 +6740,46 @@ pub fn add_synthetic_impls(p: &mut Program) {
         for (self_pat, it, item) in entries {
             let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, it)];
             insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g1.clone(), assoc, Synthetic::Lang, false, span);
+        }
+    }
+    // `IntoIterator` for `Option` and `Result` and their references
+    // (fx-option-rest), as core declares it: by value the `IntoIter`
+    // (item `T`), by `&` the `Iter` (item `&T`), by `&mut` the
+    // `IterMut` (item `&mut T`). Selection and Item/IntoIter only;
+    // `into_iter` and `for` stay builtin.
+    {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        let t = p.tys.intern(TyKind::Param(ParamId(0)));
+        let e = p.tys.intern(TyKind::Param(ParamId(1)));
+        let (ref_t, mut_t) = (p.tys.mk_ref(false, t), p.tys.mk_ref(true, t));
+        let g1 = Generics { parent: None, params: vec![ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span }], predicates: Vec::new() };
+        let g2 = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("E"), kind: ParamKind::Type, span },
+            ],
+            predicates: Vec::new(),
+        };
+        let opt_t = p.tys.mk_option(t);
+        let opts = [
+            (opt_t, mk_iter(&mut p.tys, K::OptionIntoIter, &[t]), t),
+            (p.tys.mk_ref(false, opt_t), mk_iter(&mut p.tys, K::OptionIter, &[t]), ref_t),
+            (p.tys.mk_ref(true, opt_t), mk_iter(&mut p.tys, K::OptionIterMut, &[t]), mut_t),
+        ];
+        for (self_pat, it, item) in opts {
+            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, it)];
+            insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g1.clone(), assoc, Synthetic::Lang, false, span);
+        }
+        let res_t = p.tys.mk_result(t, e);
+        let ress = [
+            (res_t, mk_iter(&mut p.tys, K::ResultIntoIter, &[t]), t),
+            (p.tys.mk_ref(false, res_t), mk_iter(&mut p.tys, K::ResultIter, &[t]), ref_t),
+            (p.tys.mk_ref(true, res_t), mk_iter(&mut p.tys, K::ResultIterMut, &[t]), mut_t),
+        ];
+        for (self_pat, it, item) in ress {
+            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, it)];
+            insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g2.clone(), assoc, Synthetic::Lang, false, span);
         }
     }
     // `Cow<'_, B>` (W-STD-B): Clone for every B (the Owned value clones

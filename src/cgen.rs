@@ -296,6 +296,7 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
             Field::Usize => CTy::Int(IntTy::Usize),
             Field::Bool => CTy::Bool,
             Field::OptArg(i) => CTy::Option(Box::new(cty(tys, arg(i)))),
+            Field::OptRef(i, _) => CTy::Option(Box::new(CTy::Ref(Box::new(cty(tys, arg(i)))))),
             Field::SliceRef(i, _) => CTy::Slice(Box::new(cty(tys, arg(i)))),
             Field::VecArg(i) => CTy::Vec(Box::new(cty(tys, arg(i)))),
             Field::VecRefMut(i) => CTy::Ref(Box::new(CTy::Vec(Box::new(cty(tys, arg(i)))))),
@@ -3949,7 +3950,7 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    lust_string_push_char({}, {});", vals[0], vals[1]);
                 "((lust_Unit){})".into()
             }
-            B::StringAsStr => format!("lust_string_as_str({})", vals[0]),
+            B::StringAsStr | B::StringAsMutStr => format!("lust_string_as_str({})", vals[0]),
             B::StringCapacity => format!("({})->cap", vals[0]),
             B::StringReserve | B::StringReserveExact | B::StringShrinkToFit | B::StringShrinkTo => {
                 let vv = &vals[0];
@@ -4596,7 +4597,8 @@ impl FnGen<'_, '_, '_> {
             | B::IterMaxByKey
             | B::IterCollect
             | B::IterSum
-            | B::IterProduct => unreachable!("iterator builtins are expanded before codegen (lower/iter.rs)"),
+            | B::IterProduct
+            | B::IterOptRes => unreachable!("iterator builtins are expanded before codegen (lower/iter.rs)"),
             B::VecPop | B::VecGet | B::VecFirst | B::VecLast | B::VecGetMut | B::VecFirstMut | B::VecLastMut => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let (opt, r) = if b == B::VecPop {
@@ -4828,6 +4830,17 @@ impl FnGen<'_, '_, '_> {
                     "    for (uint64_t {i} = 0; {i} < {len} / 2; {i}++) {{ {et} {t} = {ptr}[{i}]; {ptr}[{i}] = {ptr}[{len} - 1 - {i}]; {ptr}[{len} - 1 - {i}] = {t}; }}"
                 );
                 "((lust_Unit){})".into()
+            }
+            // `slice::from_ref(&T)` and `from_mut` (fx-option-rest):
+            // a one-element slice at the reference itself.
+            B::SliceFromRef => {
+                let CTy::Ref(e) = &tys[0] else { unreachable!() };
+                let et = ctype(e);
+                let sl = CTy::Slice(e.clone());
+                let (st, t) = (ctype(&sl), self.tmp());
+                let vv = &vals[0];
+                let _ = writeln!(self.out, "    {st} {t} = {{ ({et}*){vv}, 1 }};");
+                t
             }
             B::VecAsSlice | B::VecAsMutSlice => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };

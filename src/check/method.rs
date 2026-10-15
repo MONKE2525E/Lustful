@@ -869,6 +869,121 @@ pub(super) fn trait_probe_for(
     }
 }
 
+/// An `as_deref` or `as_deref_mut` call on an `Option` or `Result`
+/// whose payload type is still open at the call (fx-option-rest):
+/// core has one impl over `T: Deref`, so rustc fixes the payload
+/// later in the body; lust's per-type impls all fit an open payload,
+/// so the pick waits for body end (`finish_deferred_lang_methods`).
+pub(super) struct DeferredLangMethod {
+    pub e: ExprId,
+    /// The receiver's Self type at the call (its vars may bind later).
+    pub base: Ty,
+    pub form: crate::driver::graph::ReceiverForm,
+    pub derefs: u8,
+    pub name: Sym,
+    pub name_span: Span,
+    /// The fresh return-type variable the call was typed with.
+    pub ret: Ty,
+    pub explicit: Vec<Option<GenericArg>>,
+}
+
+/// Body end for `DeferredLangMethod` calls: with the payload type
+/// settled (by the body or by the call's expected result type), pick
+/// the one per-type impl that fits, as the call-site probe would.
+/// Still-open or still-ambiguous calls keep the L0610 the call site
+/// would have reported; a settled payload with no fitting impl is
+/// L0104, as for a payload known at the call.
+pub(super) fn finish_deferred_lang_methods(cx: &mut Ctx) {
+    let p = cx.p;
+    for d in std::mem::take(&mut cx.deferred_lang_methods) {
+        let base = cx.deep(d.base);
+        let probe = RcvProbe::at(cx, base, d.form);
+        let fits = inherent_template_fits(cx, d.e, probe, d.name, d.name_span);
+        if fits == 1 {
+            let hit = match inherent_template_probe(cx, d.e, probe, d.derefs, d.name, d.name_span, &[], &d.explicit) {
+                Probe::Miss => lang_plain_probe(cx, d.e, probe, d.derefs, d.name, d.name_span, &[]),
+                other => other,
+            };
+            match hit {
+                Probe::Hit(ret) => {
+                    if !cx.unify(ret, d.ret) {
+                        cx.mismatch(d.name_span, d.ret, ret);
+                    }
+                }
+                Probe::Failed => {}
+                Probe::Miss => {
+                    cx.err("L0104", d.name_span, format!("no method `{}` on this receiver", cx.name(d.name)), "Check the method name.");
+                }
+            }
+            continue;
+        }
+        // The expected result type can fix the payload (`let s:
+        // Option<&str> = x.as_deref()` picks the String impl): try
+        // each candidate against receiver and result together.
+        let Some((def, _)) = cx.tys.adt_parts(base) else { continue };
+        let Some(cands) = p.gx.inherent_methods.get(&(def, d.name)).cloned() else { continue };
+        let mut winners: Vec<LocalDefId> = Vec::new();
+        for cand in cands {
+            let snap_vars = cx.snapshot_vars();
+            let obl_len = cx.obl_len();
+            let sites_len = cx.generic_sites.len();
+            let err_len = cx.errs.len();
+            let (params, ret) = match p.gx.fn_templates.get(cand.0 as usize).cloned() {
+                Some(Some(tmpl)) => {
+                    let (params, ret, _) = cx.instantiate_template(d.e, cand, &tmpl.generics, &d.explicit, d.name_span);
+                    (params, ret)
+                }
+                _ => (p.fn_info(cand).params.clone(), p.ret_view(cand)),
+            };
+            let want_ret = cx.deep(d.ret);
+            if params.first().is_some_and(|&want| cx.unify(want, probe.recv_ty)) && cx.unify(ret, want_ret) {
+                winners.push(cand);
+            }
+            cx.rollback_vars(snap_vars);
+            cx.obl_truncate(obl_len);
+            cx.generic_sites.truncate(sites_len);
+            cx.errs.truncate(err_len);
+        }
+        if let [cand] = winners.as_slice() {
+            let cand = *cand;
+            let hit = match p.gx.fn_templates.get(cand.0 as usize).cloned() {
+                Some(Some(tmpl)) => confirm_method(cx, d.e, cand, &tmpl.generics.clone(), &[], &d.explicit, probe, d.derefs, &[], d.name_span),
+                _ => {
+                    let params = p.fn_info(cand).params.clone();
+                    if params.first().is_some_and(|&want| cx.unify(want, probe.recv_ty)) {
+                        cx.set_res(d.e, Res::Method { f: cand, derefs: d.derefs + probe.extra_derefs, autoref: probe.autoref });
+                        Some(p.ret_view(cand))
+                    } else {
+                        None
+                    }
+                }
+            };
+            match hit {
+                Some(ret) => {
+                    if !cx.unify(ret, d.ret) {
+                        cx.mismatch(d.name_span, d.ret, ret);
+                    }
+                }
+                None => {
+                    cx.err("L0104", d.name_span, format!("no method `{}` on this receiver", cx.name(d.name)), "Check the method name.");
+                }
+            }
+            continue;
+        }
+        if cx.has_unbound_var(base) || !winners.is_empty() {
+            cx.err(
+                "L0610",
+                d.name_span,
+                format!("type annotations needed: more than one `{}` method fits this receiver", cx.name(d.name)),
+                "Annotate the receiver's type, for example `let x: Option<&i32> = ..`.",
+            );
+        } else {
+            let tn = cx.tn(base);
+            cx.err("L0104", d.name_span, format!("no method `{}` on type `{tn}`", cx.name(d.name)), "Check the method name.");
+        }
+    }
+}
+
 /// A trait method call whose impl selection was still ambiguous at
 /// the call: body end selects the impl and sets the resolution.
 pub(super) struct DeferredMethod {

@@ -8,9 +8,10 @@
 // `unsafe` (`unwrap_unchecked` becomes a plain match), and `Pin`.
 // `#[track_caller]` sits where core has it.
 //
-// Not here yet (a call rejects): as_pin_ref, as_pin_mut, as_slice,
-// as_mut_slice, unwrap_unchecked, iter, iter_mut, and `as_deref` on a
-// user `Deref` type.
+// Not here yet (a call rejects): as_pin_ref, as_pin_mut,
+// unwrap_unchecked, and `as_deref` on a user `Deref` type. `iter`,
+// `iter_mut`, and `into_iter` are builtin (check/iter.rs), like the
+// Vec forms.
 
 impl<T> Option<T> {
     pub const fn is_some(&self) -> bool {
@@ -49,6 +50,20 @@ impl<T> Option<T> {
         match *self {
             Some(ref mut x) => Some(x),
             None => None,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        match *self {
+            Some(ref x) => core::slice::from_ref(x),
+            None => &[],
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        match *self {
+            Some(ref mut x) => core::slice::from_mut(x),
+            None => &mut [],
         }
     }
 
@@ -286,6 +301,13 @@ impl Option<String> {
     pub fn as_deref(&self) -> Option<&str> {
         match *self {
             Some(ref t) => Some(t.as_str()),
+            None => None,
+        }
+    }
+
+    pub fn as_deref_mut(&mut self) -> Option<&mut str> {
+        match *self {
+            Some(ref mut t) => Some(t.as_mut_str()),
             None => None,
         }
     }

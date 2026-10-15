@@ -72,7 +72,19 @@ pub fn resolve_iter_path(
             return Err(Diag::new("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments."));
         }
     }
-    let borrows = matches!(kind, None | Some(IterKind::SliceIter | IterKind::SliceIterMut | IterKind::VecDrain | IterKind::StringDrain));
+    let borrows = matches!(
+        kind,
+        None | Some(
+            IterKind::SliceIter
+                | IterKind::SliceIterMut
+                | IterKind::VecDrain
+                | IterKind::StringDrain
+                | IterKind::OptionIter
+                | IterKind::OptionIterMut
+                | IterKind::ResultIter
+                | IterKind::ResultIterMut,
+        )
+    );
     let n_lts = usize::from(borrows);
     if lts.len() > n_lts {
         return Err(Diag::new(
@@ -125,6 +137,12 @@ pub fn resolve_iter_path(
                     | IterKind::RangeTo
                     | IterKind::RangeFull
                     | IterKind::RangeToInclusive
+                    | IterKind::OptionIter
+                    | IterKind::OptionIterMut
+                    | IterKind::OptionIntoIter
+                    | IterKind::ResultIter
+                    | IterKind::ResultIterMut
+                    | IterKind::ResultIntoIter
             ) && !crate::ty::iter::is_iter(tys, erased_args[0])
             {
                 return Err(unsupported("over a type that is not a std iterator lust knows"));

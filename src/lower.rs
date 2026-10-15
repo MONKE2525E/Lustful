@@ -3815,7 +3815,8 @@ impl<'p, 'a> Lower<'p, 'a> {
         } else if let Some(hash_it) = {
             let ity = self.ty(iter);
             let h = crate::ty::iter::hash_for_iter(&mut self.body.tys, ity).flatten();
-            h.or_else(|| {
+            let o = crate::ty::iter::opt_res_iter(&mut self.body.tys, ity);
+            h.or(o).or_else(|| {
                 (crate::ty::iter::is_iter(&self.body.tys, ity) || self.body.tys.boxed_slice_elem(ity).is_some() || self.recv_iterable(ity).is_some())
                     .then_some(ERROR)
             })
@@ -3826,6 +3827,15 @@ impl<'p, 'a> Lower<'p, 'a> {
             // boxed slice by value iterates its `vec::IntoIter` (Rust 2024).
             let recv = self.recv_iterable(self.ty(iter));
             let (it_ty, it) = match self.body.tys.boxed_slice_elem(self.ty(iter)) {
+                // An `Option` or `Result` (fx-option-rest): first
+                // make its one-item iterator.
+                _ if crate::ty::iter::iter_parts(&self.body.tys, hash_it).is_some_and(|(k, _)| crate::ty::iter::is_opt_res(k)) => {
+                    let it = self.temp(hash_it);
+                    let src = self.temp(self.ty(iter));
+                    self.expr_into(iter, Some(&Place::local(src)));
+                    self.call_into(CallTarget::Builtin(Builtin::IterOptRes), vec![Operand::Move(Place::local(src))], Place::local(it), span);
+                    (hash_it, it)
+                }
                 _ if hash_it != ERROR => {
                     let it = self.temp(hash_it);
                     let src = self.temp(self.ty(iter));

@@ -108,6 +108,8 @@ fn expands(b: Builtin) -> bool {
             | B::StringExtend
             | B::IterArrayIntoIter
             | B::IterRepeatN
+            | B::IterOptRes
+            | B::IterLen
             | B::ConvInto
     )
 }
@@ -565,6 +567,13 @@ impl Ex<'_, '_, '_> {
                 let (itp, ty) = self.user_iter(itp, ty)?;
                 let (lo, hi) = self.hint(itp, ty)?;
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Copy(Place::local(lo)), Operand::Move(Place::local(hi))]));
+            }
+            // `iter`, `iter_mut`, and `into_iter` on `Option` and
+            // `Result` (fx-option-rest): the dest kind drives the
+            // conversion (`make_opt_res`).
+            B::IterOptRes => {
+                let r = arg()?;
+                self.make_opt_res(r, dest_ty, dest)?;
             }
             B::IterNext | B::IterNextBack => {
                 let r = arg()?;
@@ -1212,6 +1221,68 @@ impl Ex<'_, '_, '_> {
         Ok((l, ty))
     }
 
+    /// Makes an `option` or `result` iterator (`dest_ty`) from its
+    /// source operand (fx-option-rest): a reference to the enum for
+    /// `Iter` and `IterMut` (the field borrows the payload), the enum
+    /// by value for `IntoIter`. A `Result`'s `Err` payload drops
+    /// here, at conversion, as core's `self.ok()` does.
+    fn make_opt_res(&mut self, o: Operand, dest_ty: Ty, dest: Place) -> R {
+        use IterKind as K;
+        let (k, a) = self.kind_args(dest_ty).ok_or("iterator expansion: bad option/result iterator")?;
+        let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad option/result iterator")?;
+        let ft = fields[0];
+        match k {
+            K::OptionIntoIter => self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![o])),
+            K::ResultIntoIter => {
+                let ot = self.op_ty(&o)?;
+                let l = self.local(ot);
+                self.assign(Place::local(l), Rvalue::Use(o));
+                let fl = self.local(ft);
+                let d = self.local(int(IntTy::U32));
+                self.assign(Place::local(d), Rvalue::Discriminant(Place::local(l)));
+                let (ok, err) = (self.block(), self.block());
+                self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, ok)], err));
+                let join = self.block();
+                self.cur = ok;
+                let pl = Place::local(l).project(Proj::Downcast(0)).project(Proj::Field(0));
+                let v = self.take(pl, a[0]);
+                self.some(&Place::local(fl), ft, v);
+                self.goto(join);
+                self.cur = err;
+                self.none(&Place::local(fl), ft);
+                self.drop_local(l);
+                self.goto(join);
+                self.cur = join;
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(fl))]));
+            }
+            K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut => {
+                let mutable = matches!(k, K::OptionIterMut | K::ResultIterMut);
+                let variant = if matches!(k, K::OptionIter | K::OptionIterMut) { 1 } else { 0 };
+                let ot = self.op_ty(&o)?;
+                let rp = self.op_place(o, ot);
+                let base = rp.deref();
+                let fl = self.local(ft);
+                let d = self.local(int(IntTy::U32));
+                self.assign(Place::local(d), Rvalue::Discriminant(base.clone()));
+                let (some_b, none_b) = (self.block(), self.block());
+                self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(variant, some_b)], none_b));
+                let join = self.block();
+                self.cur = some_b;
+                let pl = base.project(Proj::Downcast(variant)).project(Proj::Field(0));
+                let r = self.ref_to(mutable, pl, a[0]);
+                self.some(&Place::local(fl), ft, Operand::Move(Place::local(r)));
+                self.goto(join);
+                self.cur = none_b;
+                self.none(&Place::local(fl), ft);
+                self.goto(join);
+                self.cur = join;
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(fl))]));
+            }
+            _ => return Err("iterator expansion: bad option/result iterator".into()),
+        }
+        Ok(())
+    }
+
     /// An `IntoIterator` argument of `chain` or `zip` as the iterator
     /// type `want` (check/iter.rs `into_iter_ty`).
     fn into_iter(&mut self, o: Operand, want: Ty) -> Result<Operand, String> {
@@ -1247,9 +1318,11 @@ impl Ex<'_, '_, '_> {
                 self.assign(Place::local(s), Rvalue::SliceOf(pl.deref()));
                 self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![Operand::Move(Place::local(s))]));
             }
-            // Another iterator (W-STD-B): moved into its `next` wrapper; an
-            // Option into its `option::IntoIter`.
-            IterKind::ByNext | IterKind::OptionIntoIter => self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![o])),
+            // Another iterator (W-STD-B): moved into its `next` wrapper.
+            IterKind::ByNext => self.assign(Place::local(l), Rvalue::TupleAgg(want, vec![o])),
+            // An Option or Result (or a reference to one) into its
+            // one-item iterator (fx-option-rest).
+            k if it::is_opt_res(k) => self.make_opt_res(o, want, Place::local(l))?,
             _ => return Err("iterator expansion: bad IntoIterator argument".into()),
         }
         Ok(Operand::Move(Place::local(l)))
@@ -1465,8 +1538,9 @@ impl Ex<'_, '_, '_> {
                 self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
-            // `option::IntoIter` (W-STD-B): `self.inner.take()`, from either end.
-            K::OptionIntoIter => {
+            // The `option` and `result` iterators (W-STD-B,
+            // fx-option-rest): `self.inner.take()`, from either end.
+            K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
                 let ot = self.place_ty(&f(0))?;
                 let r = self.ref_to(true, f(0), ot);
                 let nl = self.local(ot);
@@ -3021,6 +3095,18 @@ impl Ex<'_, '_, '_> {
                 self.goto(join);
                 self.cur = join;
             }
+            // The `option` and `result` iterators: 0 or 1.
+            K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
+                let (s, n) = self.switch_opt(&f(0));
+                let join = self.block();
+                self.cur = s;
+                self.assign(Place::local(out), Rvalue::Use(Self::usize_c(1)));
+                self.goto(join);
+                self.cur = n;
+                self.assign(Place::local(out), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = join;
+            }
             _ => return Err("iterator expansion: size of a non-random-access iterator".into()),
         }
         Ok(Operand::Copy(Place::local(out)))
@@ -3249,8 +3335,8 @@ impl Ex<'_, '_, '_> {
                     self.none(&Place::local(hi), ou);
                 }
             }
-            // `option::IntoIter`: exact, 0 or 1.
-            K::OptionIntoIter => {
+            // The `option` and `result` iterators: exact, 0 or 1.
+            K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
                 let (s, n) = self.switch_opt(&f(0));
                 let j2 = self.block();
                 self.cur = s;
@@ -3606,7 +3692,9 @@ impl Ex<'_, '_, '_> {
             // A user iterator may implement the unstable TrustedLen only
             // in std itself.
             K::ByNext | K::CharIndices | K::StrSplit => false,
-            K::Windows | K::OptionIntoIter => true,
+            K::Windows | K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
+                true
+            }
             // std's impls: an outer TrustedLen over arrays (or references
             // to arrays) of a fixed size.
             K::Flatten => self.trusted_len(a[0]) && self.item_const_size(a[0]).is_some(),

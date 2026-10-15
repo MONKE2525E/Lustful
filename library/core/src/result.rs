@@ -3,8 +3,9 @@
 // see option.rs in this crate for how the splice works and what is
 // left out of core's forms.
 //
-// Not here yet (a call rejects): iter, iter_mut, unwrap_unchecked,
+// Not here yet (a call rejects): unwrap_unchecked,
 // unwrap_err_unchecked, and `as_deref` on a user `Deref` type.
+// `iter`, `iter_mut`, and `into_iter` are builtin (check/iter.rs).
 
 impl<T, E> Result<T, E> {
     pub const fn is_ok(&self) -> bool {
@@ -254,6 +255,13 @@ impl<E> Result<String, E> {
         match *self {
             Ok(ref t) => Ok(t.as_str()),
             Err(ref e) => Err(e),
+        }
+    }
+
+    pub fn as_deref_mut(&mut self) -> Result<&mut str, &mut E> {
+        match *self {
+            Ok(ref mut t) => Ok(t.as_mut_str()),
+            Err(ref mut e) => Err(e),
         }
     }
 }

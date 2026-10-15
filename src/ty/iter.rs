@@ -121,6 +121,18 @@ pub enum IterKind {
     Flatten,
     /// `option::IntoIter<T>` (W-STD-B): args `[T]`, the option itself.
     OptionIntoIter,
+    /// `option::Iter<T>` (fx-option-rest): args `[T]`, item `&T`;
+    /// the field is `Option<&T>`, as core stores it.
+    OptionIter,
+    /// `option::IterMut<T>`: args `[T]`, item `&mut T`.
+    OptionIterMut,
+    /// `result::Iter<T>`: args `[T]`, item `&T` (the `Ok` value).
+    ResultIter,
+    /// `result::IterMut<T>`: args `[T]`, item `&mut T`.
+    ResultIterMut,
+    /// `result::IntoIter<T>`: args `[T]`, item `T`; the field is the
+    /// `Ok` value as an `Option<T>` (an `Err` drops at conversion).
+    ResultIntoIter,
     /// The `str` split iterators (W-STD-B): `Split`, `RSplit`,
     /// `SplitTerminator`, `RSplitTerminator`, `SplitN`, `RSplitN`,
     /// `SplitInclusive`, `SplitWhitespace`, `SplitAsciiWhitespace`, and
@@ -203,6 +215,9 @@ pub enum Field {
     Bool,
     /// `Option<arg>`.
     OptArg(u8),
+    /// `Option<&arg>`, or `Option<&mut arg>` when the flag is set
+    /// (the `option` and `result` borrowing iterators).
+    OptRef(u8, bool),
     /// `&[arg]`, or `&mut [arg]` when the flag is set.
     SliceRef(u8, bool),
     /// `Vec<arg>`.
@@ -223,7 +238,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 48] = [
+    pub const ALL: [IterKind; 53] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -265,6 +280,11 @@ impl IterKind {
         IterKind::CharIndices,
         IterKind::Flatten,
         IterKind::OptionIntoIter,
+        IterKind::OptionIter,
+        IterKind::OptionIterMut,
+        IterKind::ResultIter,
+        IterKind::ResultIterMut,
+        IterKind::ResultIntoIter,
         IterKind::StrSplit,
         IterKind::VecDrain,
         IterKind::StringDrain,
@@ -334,6 +354,11 @@ impl IterKind {
             K::CharIndices => (&["core", "str"], "CharIndices"),
             K::Flatten => (ADAPT, "Flatten"),
             K::OptionIntoIter => (&["core", "option"], "IntoIter"),
+            K::OptionIter => (&["core", "option"], "Iter"),
+            K::OptionIterMut => (&["core", "option"], "IterMut"),
+            K::ResultIter => (&["core", "result"], "Iter"),
+            K::ResultIterMut => (&["core", "result"], "IterMut"),
+            K::ResultIntoIter => (&["core", "result"], "IntoIter"),
             K::StrSplit => (&["core", "str", "iter"], "Split"),
             K::VecDrain => (&["alloc", "vec"], "Drain"),
             K::StringDrain => (&["alloc", "string"], "Drain"),
@@ -433,6 +458,11 @@ impl IterKind {
             K::CharIndices => "std::str::CharIndices",
             K::Flatten => "std::iter::Flatten",
             K::OptionIntoIter => "std::option::IntoIter",
+            K::OptionIter => "std::option::Iter",
+            K::OptionIterMut => "std::option::IterMut",
+            K::ResultIter => "std::result::Iter",
+            K::ResultIterMut => "std::result::IterMut",
+            K::ResultIntoIter => "std::result::IntoIter",
             K::StrSplit => "std::str::Split",
             K::VecDrain => "std::vec::Drain",
             K::StringDrain => "std::string::Drain",
@@ -495,7 +525,9 @@ impl IterKind {
             K::Windows => &[F::SliceRef(0, false), F::Usize],
             K::CharIndices => &[F::Chars, F::Usize],
             K::Flatten => &[F::OptArg(0), F::OptArg(1), F::OptArg(1)],
-            K::OptionIntoIter => &[F::OptArg(0)],
+            K::OptionIntoIter | K::ResultIntoIter => &[F::OptArg(0)],
+            K::OptionIter | K::ResultIter => &[F::OptRef(0, false)],
+            K::OptionIterMut | K::ResultIterMut => &[F::OptRef(0, true)],
             K::StrSplit => &[F::Str, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Arg(0)],
             // The drains: the borrowed container, then start, front,
             // back, tail start, and tail length, as indexes into the
@@ -598,7 +630,9 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
             tys.intern(TyKind::Tuple(ts))
         }
         K::Flatten => item_ty(tys, a[1])?,
-        K::OptionIntoIter => a[0],
+        K::OptionIntoIter | K::ResultIntoIter => a[0],
+        K::OptionIter | K::ResultIter => tys.mk_ref(false, a[0]),
+        K::OptionIterMut | K::ResultIterMut => tys.mk_ref(true, a[0]),
         K::StrSplit => REF_STR,
     })
 }
@@ -626,20 +660,57 @@ pub fn hash_for_iter(tys: &mut impl TyIntern, t: Ty) -> Option<Option<Ty>> {
     Some(Some(mk_iter(tys, kind, &args)))
 }
 
-/// The owning std iterator a full std type path names (W-STD-B):
-/// `vec::IntoIter<T>` and the hash `IntoIter`, `IntoKeys`, and
-/// `IntoValues`. The borrowing iterators (`slice::Iter<'a, T>`) carry a
-/// lifetime the region signatures do not model yet, so they stay
-/// unknown types.
+/// The std iterator a full std type path names (W-STD-B):
+/// `vec::IntoIter<T>`, the hash `IntoIter`, `IntoKeys`, and
+/// `IntoValues`, and the `option` and `result` iterators (their one
+/// lifetime is erased, as `Cow`'s is). The other borrowing iterators
+/// (`slice::Iter<'a, T>`) stay unknown types.
 pub fn owning_by_path(path: &[&str]) -> Option<IterKind> {
     Some(match path {
         ["std" | "alloc", "vec", "IntoIter"] => IterKind::VecIntoIter,
+        ["std" | "core", "option", "Iter"] => IterKind::OptionIter,
+        ["std" | "core", "option", "IterMut"] => IterKind::OptionIterMut,
+        ["std" | "core", "option", "IntoIter"] => IterKind::OptionIntoIter,
+        ["std" | "core", "result", "Iter"] => IterKind::ResultIter,
+        ["std" | "core", "result", "IterMut"] => IterKind::ResultIterMut,
+        ["std" | "core", "result", "IntoIter"] => IterKind::ResultIntoIter,
         ["std", "collections", "hash_map", "IntoIter"] => IterKind::MapIntoIter,
         ["std", "collections", "hash_map", "IntoKeys"] => IterKind::MapIntoKeys,
         ["std", "collections", "hash_map", "IntoValues"] => IterKind::MapIntoValues,
         ["std", "collections", "hash_set", "IntoIter"] => IterKind::SetIntoIter,
         _ => return None,
     })
+}
+
+/// The iterator an `Option` or `Result` turns into through
+/// `IntoIterator` (fx-option-rest): by value its `IntoIter`, by
+/// `&` its `Iter`, by `&mut` its `IterMut`. None for other types.
+pub fn opt_res_iter(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
+    let (m, inner) = match tys.kind(t) {
+        TyKind::Ref(_, m, inner) => (Some(m.is_mut()), inner),
+        _ => (None, t),
+    };
+    let (k, el) = if let Some(el) = tys.option_elem(inner) {
+        (match m { None => IterKind::OptionIntoIter, Some(false) => IterKind::OptionIter, Some(true) => IterKind::OptionIterMut }, el)
+    } else if let Some((el, _)) = tys.result_args(inner) {
+        (match m { None => IterKind::ResultIntoIter, Some(false) => IterKind::ResultIter, Some(true) => IterKind::ResultIterMut }, el)
+    } else {
+        return None;
+    };
+    Some(mk_iter(tys, k, &[el]))
+}
+
+/// True when `k` is one of the six `option` and `result` iterators.
+pub fn is_opt_res(k: IterKind) -> bool {
+    matches!(
+        k,
+        IterKind::OptionIter
+            | IterKind::OptionIterMut
+            | IterKind::OptionIntoIter
+            | IterKind::ResultIter
+            | IterKind::ResultIterMut
+            | IterKind::ResultIntoIter
+    )
 }
 
 /// The iterator an `IntoIterator` argument (`extend`) turns into: a
@@ -657,6 +728,9 @@ pub fn as_iter_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
     }
     if let Some(it) = hash_for_iter(tys, t) {
         return it;
+    }
+    if let Some(it) = opt_res_iter(tys, t) {
+        return Some(it);
     }
     if let Some(el) = tys.vec_elem(t) {
         return Some(mk_iter(tys, IterKind::VecIntoIter, &[el]));
@@ -676,6 +750,10 @@ pub fn field_ty(tys: &mut impl TyIntern, f: Field, args: &[Ty]) -> Ty {
         Field::Usize => USIZE,
         Field::Bool => BOOL,
         Field::OptArg(i) => tys.mk_option(args[i as usize]),
+        Field::OptRef(i, m) => {
+            let r = tys.mk_ref(m, args[i as usize]);
+            tys.mk_option(r)
+        }
         Field::SliceRef(i, m) => {
             let s = tys.intern(TyKind::Slice(args[i as usize]));
             tys.mk_ref(m, s)
@@ -725,5 +803,9 @@ pub fn iter_holds_ref(k: IterKind, args: &[Ty], arg_holds: &dyn Fn(Ty) -> bool) 
             | IterKind::SetIter
             | IterKind::VecDrain
             | IterKind::StringDrain
+            | IterKind::OptionIter
+            | IterKind::OptionIterMut
+            | IterKind::ResultIter
+            | IterKind::ResultIterMut
     ) || args.iter().any(|&a| arg_holds(a))
 }
