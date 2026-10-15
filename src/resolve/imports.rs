@@ -471,6 +471,15 @@ impl ResolvedTables {
         e.is_std_lib && e.name == "std"
     }
 
+    /// True when the first segment `root` (`std`, `core`, `alloc`) of a
+    /// path written in `from` names a std extern (nothing shadows it).
+    fn std_root_is_extern(&self, from: ModuleId, root: Sym, interner: &Interner) -> bool {
+        match self.first_segment(from, root, Namespace::Type, PathMode::Use, interner) {
+            PathRes::Done(Target::Extern(i)) => self.externs[i as usize].is_std_lib,
+            _ => false,
+        }
+    }
+
     /// Adds a module under a parent and returns its id.
     pub fn add_module(&mut self, parent: ModuleId, name: Sym, vis: VisKind, span: Span) -> ModuleId {
         let mut path = self.modules[parent.0 as usize].path.clone();
@@ -1663,12 +1672,21 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
         if resolved[*i] {
             continue;
         }
-        let what = match &imp.kind {
-            ImportKind::Single { path, .. }
-            | ImportKind::Glob { path }
-            | ImportKind::CheckPath { path }
-            | ImportKind::BadLeading { path } => path.iter().map(|s| interner.get(*s)).collect::<Vec<_>>().join("::"),
+        let (path, glob) = match &imp.kind {
+            ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::BadLeading { path } => (path, false),
+            ImportKind::Glob { path } => (path, true),
         };
+        let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+        // A std path the shipped std source or platform crate lacks
+        // (`std::os::unix::fs::OpenOptionsExt`) exists in std all the same.
+        if matches!(strs.first(), Some(&("std" | "core" | "alloc")))
+            && (imp.leading_colon || tables.std_root_is_extern(imp.module, path[0], interner))
+            && crate::resolve::stdpaths::std_has(&strs).is_some()
+        {
+            diags.push(std_missing_diag(&strs, glob, imp.span));
+            continue;
+        }
+        let what = strs.join("::");
         diags.push(Diag::new(
             "L0506",
             imp.span,
@@ -1712,6 +1730,60 @@ pub fn std_import_namespaces(interner: &Interner, path: &[Sym]) -> Option<Vec<Na
     Some(out)
 }
 
+/// The reject for a std import (`glob`: a glob) that binds nothing in
+/// lust's std tables, or None when std 1.99 has the path (a module or
+/// enum for a glob). An import of a real std item lust does not model
+/// stays accepted: it is valid Rust, and a use of the name still
+/// rejects where lust lacks it (ts-rust imports `std::alloc::Layout`).
+/// Module-level and fn-body imports both call it.
+pub fn std_unbound_diag(path: &[Sym], glob: bool, span: Span, interner: &Interner) -> Option<Diag> {
+    use crate::resolve::stdpaths::{StdHas, std_has};
+    use crate::ty::lang::{std_enum_variants, std_is_module_path};
+    let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+    if glob && (std_is_module_path(&strs) || !std_enum_variants(&strs).is_empty()) {
+        return None;
+    }
+    match std_has(&strs) {
+        Some(StdHas::Module | StdHas::Enum) => None,
+        Some(_) if !glob => None,
+        _ => Some(std_missing_diag(&strs, glob, span)),
+    }
+}
+
+/// The reject for a std path as the parent of an empty group or of
+/// `{self}` (`use std::x::{};`, `use std::cmp::Ord::{self};`): std must
+/// have a module, enum, or trait there (rustc E0432 otherwise).
+pub fn std_group_parent_diag(path: &[Sym], span: Span, interner: &Interner) -> Option<Diag> {
+    use crate::resolve::stdpaths::{StdHas, std_has};
+    let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+    if matches!(std_has(&strs), Some(StdHas::Module | StdHas::Enum | StdHas::Trait)) {
+        return None;
+    }
+    std_unbound_diag(path, true, span, interner)
+}
+
+/// The reject for a std import path lust has no binding for: L0505
+/// when std 1.99 has the path (an item a shipped platform module
+/// lacks), L0506 when it does not (rustc E0432; an unused import of a
+/// missing path is an error in rustc too). With `glob`, the path must
+/// be a module or an enum.
+fn std_missing_diag(path: &[&str], glob: bool, span: Span) -> Diag {
+    use crate::resolve::stdpaths::{StdHas, std_has};
+    let full = path.join("::");
+    match std_has(path) {
+        Some(StdHas::Item | StdHas::Trait) if glob => {
+            Diag::new("L0506", span, format!("unresolved import `{full}`: not a module or enum"), "A glob import needs a module or an enum.")
+        }
+        Some(_) => Diag::new(
+            "L0505",
+            span,
+            format!("std path `{full}` is not supported yet"),
+            "lust does not ship this std item yet: build with Cargo, or use a std item lust supports (see README).",
+        ),
+        None => Diag::new("L0506", span, format!("unresolved import `{full}`"), "std 1.99 has no such item: check the path."),
+    }
+}
+
 /// Records one std import alias in the tables, with the same
 /// duplicate rules as a local explicit import: a name already
 /// bound explicitly in the module (a local item, an earlier
@@ -1721,7 +1793,10 @@ pub fn std_import_namespaces(interner: &Interner, path: &[Sym]) -> Option<Vec<Na
 /// duplicate), so a std trait imported that way is in scope for its
 /// methods (`use std::fmt::Write as _;` for `write!` into a String).
 fn record_std_alias(tables: &mut ResolvedTables, imp: &Import, path: &[Sym], name: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> bool {
-    let Some(namespaces) = std_import_namespaces(interner, path) else { return false };
+    let Some(namespaces) = std_import_namespaces(interner, path) else {
+        diags.extend(std_unbound_diag(path, false, imp.span, interner));
+        return false;
+    };
     let anon = interner.get(name) == "_";
     let name = if anon {
         let full: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
@@ -1780,6 +1855,11 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 return TryOut::Done(false);
             }
             match tables.resolve_module_path(imp.module, path, imp.leading_colon, interner) {
+                // `use std::nosuch::{};` still names a module.
+                PathRes::Done(Target::Extern(i)) if tables.externs[i as usize].is_std_lib => {
+                    diags.extend(std_group_parent_diag(path, imp.span, interner));
+                    TryOut::Done(false)
+                }
                 PathRes::Done(_) => TryOut::Done(false),
                 PathRes::Private => {
                     diags.push(private_diag("that module", imp.span));
@@ -1897,6 +1977,13 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 diags.push(std_glob_diag(imp.span));
                                 return TryOut::Done(false);
                             }
+                            // A glob binds nothing here, so a module or
+                            // enum lust does not know (or a missing path)
+                            // would import silently.
+                            if let Some(d) = std_unbound_diag(path, true, imp.span, interner) {
+                                diags.push(d);
+                                return TryOut::Done(false);
+                            }
                             for v in crate::ty::lang::std_enum_variants(&strs) {
                                 let name = interner.intern(v);
                                 let mut full = path.clone();
@@ -2003,6 +2090,12 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         return TryOut::Done(false);
                     }
                     if tables.externs[i as usize].is_std_lib {
+                        // `{self}` needs a module, enum, or trait
+                        // (`use std::rc::Rc::{self};` is rustc E0432).
+                        if let Some(d) = std_group_parent_diag(mod_path, imp.span, interner) {
+                            diags.push(d);
+                            return TryOut::Done(false);
+                        }
                         let bind_name = if *name == self_sym { *mod_path.last().unwrap() } else { *name };
                         return TryOut::Done(record_std_alias(tables, imp, mod_path, bind_name, interner, diags));
                     }

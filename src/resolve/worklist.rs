@@ -5483,6 +5483,12 @@ impl Rewrite<'_> {
                     if path.is_empty() {
                         continue;
                     }
+                    if let PathRes::Done(Target::Extern(i)) = self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner)
+                        && self.tables.externs[i as usize].is_std_lib
+                    {
+                        self.diags.extend(crate::resolve::imports::std_group_parent_diag(&path, span, self.interner));
+                        continue;
+                    }
                     let ok = matches!(
                         self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner),
                         PathRes::Done(_)
@@ -5546,6 +5552,11 @@ impl Rewrite<'_> {
                             && self.tables.externs[i as usize].is_std_lib
                             && self.tables.externs[i as usize].unsupported.is_none()
                         {
+                            // `{self}` needs a module, enum, or trait.
+                            if let Some(d) = crate::resolve::imports::std_group_parent_diag(mod_path, span, self.interner) {
+                                self.diags.push(d);
+                                continue;
+                            }
                             if self.interner.get(bind_name) != "_" && insert_local_std(scopes, bind_name, Namespace::Type, mod_path.to_vec()) {
                                 self.push_local_dup(span, bind_name);
                             }
@@ -5701,17 +5712,21 @@ impl Rewrite<'_> {
                             if self.tables.externs[i as usize].is_std_lib && self.tables.externs[i as usize].unsupported.is_none() {
                                 self.record_use_trait_std(ast, span, &path);
                             }
-                            if self.tables.externs[i as usize].is_std_lib
-                                && self.tables.externs[i as usize].unsupported.is_none()
-                                && self.interner.get(name) != "_"
-                                && let Some(nss) = crate::resolve::imports::std_import_namespaces(self.interner, &path)
-                            {
-                                let mut dup = false;
-                                for ns in nss {
-                                    dup |= insert_local_std(scopes, name, ns, path.clone());
-                                }
-                                if dup {
-                                    self.push_local_dup(span, name);
+                            if self.tables.externs[i as usize].is_std_lib && self.tables.externs[i as usize].unsupported.is_none() {
+                                match crate::resolve::imports::std_import_namespaces(self.interner, &path) {
+                                    Some(nss) if self.interner.get(name) != "_" => {
+                                        let mut dup = false;
+                                        for ns in nss {
+                                            dup |= insert_local_std(scopes, name, ns, path.clone());
+                                        }
+                                        if dup {
+                                            self.push_local_dup(span, name);
+                                        }
+                                    }
+                                    Some(_) => {}
+                                    // Never a silent accept of a std path
+                                    // lust has no binding for.
+                                    None => self.diags.extend(crate::resolve::imports::std_unbound_diag(&path, false, span, self.interner)),
                                 }
                             }
                         }
@@ -5759,6 +5774,10 @@ impl Rewrite<'_> {
                                 let p: Vec<&str> = path.iter().map(|s| self.interner.get(*s)).collect();
                                 if crate::resolve::imports::std_glob_shadows_prelude(&p) {
                                     self.diags.push(crate::resolve::imports::std_glob_diag(span));
+                                    continue;
+                                }
+                                if let Some(d) = crate::resolve::imports::std_unbound_diag(&path, true, span, self.interner) {
+                                    self.diags.push(d);
                                     continue;
                                 }
                                 frame.std_mod_glob |= crate::ty::lang::std_enum_variants(&p).is_empty();
