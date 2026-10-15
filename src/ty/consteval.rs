@@ -2465,6 +2465,30 @@ impl Evaluator {
                     // whatever width the argument literal was written at.
                     arg_vals.push((v0, body.param_tys.get(i).copied().unwrap_or(vt)));
                 }
+                // A `&mut` argument's value is a cloned cell: writes
+                // through the parameter land in the clone, so after
+                // the body they are copied back to the caller's
+                // place (or the caller's own `&mut` cell, for a
+                // reborrow passed on). A write-back target is
+                // (arg index, target expr, target-is-a-place).
+                let mut wb_targets: Vec<(usize, ExprId, bool)> = Vec::new();
+                for (i, &a) in args.iter().enumerate() {
+                    let Some(want) = body.param_tys.get(i).copied() else { continue };
+                    if body.params[i].2.is_some()
+                        || !matches!(cx.tys_ref().kind(want), TyKind::Ref(_, super::Mut::Mut, _))
+                        || !matches!(arg_vals[i].0, ConstValue::Ref(_))
+                    {
+                        continue;
+                    }
+                    match cx.ast().expr(a) {
+                        Expr::Ref { mutable: true, expr: place, .. } => {
+                            if matches!(cx.ast().expr(*place), Expr::Path(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_)) {
+                                wb_targets.push((i, *place, true));
+                            }
+                        }
+                        _ => wb_targets.push((i, a, false)),
+                    }
+                }
                 // Parameter patterns and the body are the callee's
                 // code, checked in its own module: run both below
                 // depth 0 so the privacy hooks stay out.
@@ -2482,6 +2506,7 @@ impl Evaluator {
                 self.call_depth += 1;
                 let mut fenv: Env = Vec::new();
                 let mut bind_err: Option<Diag> = None;
+                let mut param_fenv_idx: Vec<Option<usize>> = Vec::new();
                 for (i, v) in arg_vals.into_iter().enumerate() {
                     let (name, mutable, pat) = body.params[i];
                     match pat {
@@ -2505,9 +2530,28 @@ impl Evaluator {
                                 }
                             }
                         }
-                        None => fenv.push((name, v, mutable, false)),
+                        None => {
+                            param_fenv_idx.push(Some(fenv.len()));
+                            fenv.push((name, v, mutable, false));
+                            continue;
+                        }
                     }
+                    param_fenv_idx.push(None);
                 }
+                // The write-back slots: fenv index, the param cell's
+                // address (a body that reassigns the parameter
+                // itself replaces the cell, and then no write-back
+                // is sound), target expr, target-is-a-place.
+                let wb_slots: Vec<(usize, usize, ExprId, bool)> = wb_targets
+                    .iter()
+                    .filter_map(|&(i, target, is_place)| {
+                        let fidx = param_fenv_idx.get(i).copied().flatten()?;
+                        match &fenv.get(fidx)?.1.0 {
+                            ConstValue::Ref(cell) => Some((fidx, cell.as_ref() as *const ConstValue as usize, target, is_place)),
+                            _ => None,
+                        }
+                    })
+                    .collect();
                 // Every type arg must be known, and the lazy
                 // constructors' `F: FnOnce() -> T` must hold.
                 let call_ret = if generic {
@@ -2552,7 +2596,23 @@ impl Evaluator {
                 if flow.is_ok() {
                     self.check_scope_drops(cx, &fenv, 0, span)?;
                 }
-                match flow? {
+                let flow = flow?;
+                if matches!(flow, Flow::Val(_) | Flow::Return(_)) {
+                    for &(fidx, addr, target, is_place) in &wb_slots {
+                        let new_v = match fenv.get(fidx).map(|s| &s.1.0) {
+                            Some(ConstValue::Ref(cell)) if cell.as_ref() as *const ConstValue as usize == addr => (**cell).clone(),
+                            _ => continue,
+                        };
+                        if is_place {
+                            self.assign_place(cx, env, target, new_v, span)?;
+                        } else if let Ok(slot) = self.place_slot(cx, env, target, span)
+                            && let ConstValue::Ref(cell) = slot
+                        {
+                            **cell = new_v;
+                        }
+                    }
+                }
+                match flow {
                     // The fn body is type-checked as a fn; its value has the
                     // declared return type here. A wide (unsuffixed-literal)
                     // integer result is range-checked against it first:
