@@ -5790,6 +5790,144 @@ fn strip_c_comments(src: &str) -> String {
     out
 }
 
+/// One conditional group in `strip_impl_blocks`.
+enum ImplFrame {
+    /// A conditional that does not decide on `LUST_IMPL`: its lines pass through.
+    Other,
+    /// A conditional decided on `LUST_IMPL` (undefined here): only the
+    /// branch `active` names survives, and no directive lines remain.
+    Impl { active: bool, taken: bool },
+    /// A conditional nested inside a dropped branch: counts depth only.
+    Dropped,
+}
+
+/// Whether the condition of a `#if`/`#ifdef`/`#ifndef`/`#elif` line is
+/// decidable with `LUST_IMPL` undefined. `word` is the directive name,
+/// `rest` what follows it. None when the condition does not mention
+/// `LUST_IMPL`, or mentions it in a shape this does not evaluate: the
+/// caller then leaves the group to the C preprocessor.
+fn impl_cond(word: &str, rest: &str) -> Option<bool> {
+    match word {
+        "ifdef" | "ifndef" => {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            (name == "LUST_IMPL").then_some(word == "ifndef")
+        }
+        "if" | "elif" => {
+            if !rest.contains("LUST_IMPL") {
+                return None;
+            }
+            let expr = rest.replace("defined(LUST_IMPL)", "0").replace("defined LUST_IMPL", "0");
+            let compact: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
+            match compact.as_str() {
+                "0" => Some(false),
+                "!0" => Some(true),
+                c if c.contains("0&&") || c.contains("&&0") => Some(false),
+                c if c.contains("1||") || c.contains("||1") => Some(true),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Removes `#ifdef LUST_IMPL` groups (and the other decidable shapes,
+/// see `impl_cond`) from runtime text, keeping any `#else` branch.
+/// Declaration units never define `LUST_IMPL`, so tcc would skip these
+/// groups line by line in every unit: about two thirds of the shared
+/// header bytes (the runtime bodies and the Unicode tables). Cutting
+/// them here, once, cuts every unit's C bytes and the work tcc does
+/// to skip them. Groups this cannot decide pass through untouched.
+fn strip_impl_blocks(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() / 2);
+    let mut stack: Vec<ImplFrame> = Vec::new();
+    let dropping = |stack: &[ImplFrame]| stack.iter().any(|f| matches!(f, ImplFrame::Dropped | ImplFrame::Impl { active: false, .. }));
+    for line in src.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            if !dropping(&stack) {
+                out.push_str(line);
+            }
+            continue;
+        }
+        let after = trimmed[1..].trim_start();
+        let word_end = after.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(after.len());
+        let (word, rest) = (&after[..word_end], after[word_end..].trim());
+        match word {
+            "if" | "ifdef" | "ifndef" => {
+                if dropping(&stack) {
+                    stack.push(ImplFrame::Dropped);
+                } else if let Some(v) = impl_cond(word, rest) {
+                    stack.push(ImplFrame::Impl { active: v, taken: v });
+                } else {
+                    stack.push(ImplFrame::Other);
+                    out.push_str(line);
+                }
+            }
+            "elif" => {
+                // Decide from a shared borrow first: the undecidable
+                // case rewrites the frame itself.
+                enum Act {
+                    Decided(bool),
+                    ToOther,
+                    Off,
+                    Emit,
+                    Skip,
+                }
+                let act = match stack.last() {
+                    Some(ImplFrame::Impl { taken, .. }) => match impl_cond(word, rest) {
+                        Some(v) => Act::Decided(v),
+                        // No earlier branch was kept, so this `elif` is
+                        // an `if`: hand the rest of the group to the
+                        // preprocessor as one.
+                        None if !taken => Act::ToOther,
+                        None => Act::Off,
+                    },
+                    Some(ImplFrame::Other) => Act::Emit,
+                    _ => Act::Skip,
+                };
+                match act {
+                    Act::Decided(v) => {
+                        if let Some(ImplFrame::Impl { active, taken }) = stack.last_mut() {
+                            *active = v && !*taken;
+                            *taken |= *active;
+                        }
+                    }
+                    Act::ToOther => {
+                        *stack.last_mut().unwrap() = ImplFrame::Other;
+                        out.push_str(&format!("#if {rest}\n"));
+                    }
+                    Act::Off => {
+                        if let Some(ImplFrame::Impl { active, .. }) = stack.last_mut() {
+                            *active = false;
+                        }
+                    }
+                    Act::Emit => out.push_str(line),
+                    Act::Skip => {}
+                }
+            }
+            "else" => match stack.last_mut() {
+                Some(ImplFrame::Impl { active, taken }) => {
+                    *active = !*taken;
+                    *taken = true;
+                }
+                Some(ImplFrame::Other) => out.push_str(line),
+                _ => {}
+            },
+            "endif" => {
+                if matches!(stack.pop(), Some(ImplFrame::Other)) {
+                    out.push_str(line);
+                }
+            }
+            _ => {
+                if !dropping(&stack) {
+                    out.push_str(line);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The runtime without function bodies: `LUST_BODY(...)` regions are cut out once, so units do
 /// not make tcc tokenize code that would expand to nothing.
 fn runtime_decls() -> &'static str {
@@ -5828,6 +5966,7 @@ fn runtime_decls() -> &'static str {
             rest = &rest[end..];
         }
         out.push_str(rest);
+        let out = strip_impl_blocks(&out);
         // Units do not include <stdint.h> or <stddef.h>: tcc spends about 1 ms per unit parsing
         // the system headers behind them. The compiler's predefined types define the same names
         // (tcc and gcc both predefine them; on macOS arm64 tcc's __INT64_TYPE__ is long long,
@@ -6339,11 +6478,41 @@ fn static_defs(p: &Program, slots: &[u32]) -> String {
 
 /// Extern declarations of the statics, for function units.
 fn static_decls(p: &Program) -> String {
+    static_decls_for(p, &HashSet::from_iter(0..p.statics.len()))
+}
+
+/// Extern declarations of the statics at `keep` indices, for function units.
+fn static_decls_for(p: &Program, keep: &HashSet<usize>) -> String {
     let mut out = String::new();
     for (i, st) in p.statics.iter().enumerate() {
-        let _ = writeln!(out, "extern {} {};", ctype(&cty(&p.tys, st.ty)), static_sym(p, i as u32));
+        if keep.contains(&i) {
+            let _ = writeln!(out, "extern {} {};", ctype(&cty(&p.tys, st.ty)), static_sym(p, i as u32));
+        }
     }
     out
+}
+
+/// The indices of the statics whose C symbol any of `texts` names.
+/// Generated C names a static only by its symbol, so a text scan is
+/// exact: a symbol inside a string literal only keeps one extra
+/// declaration. Function units declare (and declare the types of)
+/// only the statics they use, instead of every static in the program
+/// in every unit.
+fn used_statics<'a>(p: &Program, texts: impl Iterator<Item = &'a str>) -> HashSet<usize> {
+    let mut syms: HashSet<&'a str> = HashSet::new();
+    for text in texts {
+        let mut rest = text;
+        while let Some(i) = rest.find("lust_static_") {
+            rest = &rest[i..];
+            let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+            syms.insert(&rest[..end]);
+            rest = &rest[end..];
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+    (0..p.statics.len()).filter(|&i| syms.contains(static_sym(p, i as u32).as_str())).collect()
 }
 
 /// The unit for the slots in `range` (`fns` is indexed by slot; empty slots have no code). Its
@@ -6370,9 +6539,6 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     if let Some((m, _)) = term_main {
         collect_types(&cty(&p.tys, p.fn_info(m).ret), &mut types);
     }
-    for st in &p.statics {
-        collect_types(&cty(&p.tys, st.ty), &mut types);
-    }
     // With a frozen shared set, glue that is not shared is static in this unit: walk its deps
     // too, and stop at shared keys (their deps live in the glue unit). Shared keys still need
     // their prototype, and every reached key needs its C type declared.
@@ -6394,8 +6560,21 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
             }
         }
     }
+    // Only the statics this unit's code (and its local glue) names:
+    // their types and their extern declarations. Every static in
+    // every unit was pure repetition in a program with many statics.
+    let used = used_statics(
+        p,
+        fns[range.clone()]
+            .iter()
+            .map(|f| f.code.as_str())
+            .chain(seen.iter().filter(|k| hybrid && !g.is_shared(k)).map(|k| g.def_map[*k].as_str())),
+    );
+    for &i in &used {
+        collect_types(&cty(&p.tys, p.statics[i].ty), &mut types);
+    }
     type_decls(p, &mut c, &types);
-    c.push_str(&static_decls(p));
+    c.push_str(&static_decls_for(p, &used));
     let mut keys: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
     for k in &keys {
@@ -7878,6 +8057,23 @@ mod tests {
         let groups = group_fns_by_bytes(&sizes, 1_000_000);
         assert_eq!(groups.len(), 2, "the 4096-slot cap splits a run of small slots");
         assert_eq!(groups[0], 0..4096);
+    }
+
+    /// `LUST_IMPL` groups leave the declaration header; `#else`
+    /// branches, nested other conditionals, and undecidable groups
+    /// stay. The runtime's own tables and bodies are impl-only, so
+    /// the built header names none of them but keeps prototypes.
+    #[test]
+    fn strip_impl_blocks_keeps_decl_branches() {
+        let src = "a\n#ifdef LUST_IMPL\nimpl\n#ifdef __APPLE__\nimpl2\n#else\nimpl3\n#endif\n#else\ndecl\n#endif\nb\n\
+                   #ifndef LUST_IMPL\nnodef\n#endif\n#ifdef __x86_64__\narch\n#endif\n\
+                   #if defined(LUST_IMPL) && defined(__linux__)\nguard\n#elif defined(LUST_IMPL)\nempty\n#endif\nc\n";
+        assert_eq!(strip_impl_blocks(src), "a\ndecl\nb\nnodef\n#ifdef __x86_64__\narch\n#endif\nc\n");
+        let decls = runtime_decls();
+        assert!(decls.contains("void lust_rt_init(void)"), "prototypes stay");
+        assert!(!decls.contains("lust_uni_alphabetic_ranges"), "impl-only Unicode tables go");
+        assert!(!decls.contains("lust_alt_stack"), "impl-only bodies go");
+        assert!(decls.len() < runtime_source(false).len() / 2, "the header shrinks: {} bytes", decls.len());
     }
 
     use crate::check::check_fn;
