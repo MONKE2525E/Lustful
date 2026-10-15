@@ -12952,10 +12952,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let (dl, dr) = (self.deep(lt), self.deep(rt));
                 if dl != dr {
                     let snap = self.snapshot_vars();
+                    let obl_len = self.obl_len();
                     if let Some(t) = self.trait_cmp(e, op, dl, dr, 0, 0, span) {
                         return t;
                     }
                     self.rollback_vars(snap);
+                    self.obl_truncate(obl_len);
                 }
             }
             // Equality allows `&T` against `&mut T`; ordering needs the same mutability.
