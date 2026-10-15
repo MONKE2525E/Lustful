@@ -929,11 +929,20 @@ impl FnGen<'_, '_> {
             }
             B::FmtCallDisplay | B::FmtCallDebug => {
                 let kind = if b == B::FmtCallDisplay { FmtKind::Display } else { FmtKind::Debug };
-                let inner = match &tys[0] {
-                    CTy::Ref(inner) => (**inner).clone(),
-                    t => t.clone(),
+                // `fmt_expr` reads its value through a pointer. A sized
+                // receiver is `&T` (a C pointer); a `&str` (`Ref(Str)`,
+                // C `lust_str`), `&[T]`, or `&dyn` receiver is the fat
+                // value itself, so it goes through a pointer to a copy
+                // (`s.as_str().fmt(f)`).
+                let (inner, v) = match &tys[0] {
+                    CTy::Ref(inner) if **inner != CTy::Str => ((**inner).clone(), vals[0].clone()),
+                    t => {
+                        let tmp = self.tmp();
+                        let _ = writeln!(self.out, "    {} {tmp} = {};", ctype(t), vals[0]);
+                        (t.clone(), format!("(&{tmp})"))
+                    }
                 };
-                let e = fmt_expr(&inner, kind, &vals[1], &vals[0], &mut |g, t| want.push((g, t.clone())));
+                let e = fmt_expr(&inner, kind, &vals[1], &v, &mut |g, t| want.push((g, t.clone())));
                 self.fmt_result_of(&e)
             }
             _ => return None,
