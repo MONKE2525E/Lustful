@@ -225,6 +225,7 @@ impl<'p> Lower<'p> {
         // A callee rustc moves where it is `Copy` here (`view_moved`).
         let moved = derefs == 0 && self.view_moved(callee);
         let env = match (kind, mode) {
+            (ClosureKind::FnOnce, _) if moved => Operand::Move(place),
             (ClosureKind::FnOnce, _) => self.operand_from(place, cty),
             (_, ClosureKind::FnOnce) => {
                 let own = self.temp(cty);
@@ -234,6 +235,13 @@ impl<'p> Lower<'p> {
                 self.env_ref(Place::local(own), kind == ClosureKind::FnMut, cty, span)
             }
             (ClosureKind::FnMut, _) => self.env_ref(place, true, cty, span),
+            // An `impl FnMut` call of an `Fn` closure borrows the opaque
+            // value mutably (rustc E0596 on an immutable binding), then
+            // passes the env shared.
+            (ClosureKind::Fn, ClosureKind::FnMut) => {
+                let Operand::Move(m) = self.env_ref(place, true, cty, span) else { unreachable!() };
+                self.env_ref(m.deref(), false, cty, span)
+            }
             (ClosureKind::Fn, _) => self.env_ref(place, false, cty, span),
         };
         let mut ops = vec![env];
