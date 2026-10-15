@@ -11,6 +11,7 @@ mod const_reach;
 pub(crate) mod gen_reuse;
 pub mod graph;
 mod patch;
+mod sig_nodes;
 mod span_shift;
 mod session;
 

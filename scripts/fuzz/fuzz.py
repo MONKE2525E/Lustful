@@ -1677,10 +1677,11 @@ PATCHSEQ_SEED = {
 mod gated;
 mod items;
 mod macs;
+mod sigs;
 mod tmpl;
 
 fn main() {
-    let t = items::run() + gated::run() + consts::run() + tmpl::run() + macs::run();
+    let t = items::run() + gated::run() + consts::run() + tmpl::run() + macs::run() + sigs::run();
     println!("{t}");
 }
 """,
@@ -1841,6 +1842,48 @@ pub fn run() -> i64 {
 """,
 }
 
+# W-PATCH-MISS2: parameter patterns and array lengths in signatures (their
+# nodes move ahead of the new body), and a nested fn's own body.
+PATCHSEQ_SEED["sigs.rs"] = """pub const N: usize = 2;
+
+pub fn skip(_: &str) -> i64 {
+    // @s1
+    1
+}
+
+pub fn pair((a, b): (i64, i64), [c, _]: [i64; N]) -> i64 {
+    // @s2
+    a + b + c
+}
+
+pub fn first(xs: [u8; 4]) -> [u8; N] {
+    // @s3
+    [xs[0], xs[1]]
+}
+
+pub struct S;
+
+impl S {
+    pub fn get(&self, (x, _y): (i64, i64), _: u8) -> i64 {
+        // @s4
+        x
+    }
+}
+
+pub fn outer(k: i64) -> i64 {
+    fn twice(v: i64) -> i64 {
+        // @s5
+        v * 2
+    }
+    // @s6
+    twice(k) + 1
+}
+
+pub fn run() -> i64 {
+    skip("a") + pair((1, 2), [3, 4]) + first([1, 2, 3, 4])[1] as i64 + S.get((5, 6), 7) + outer(3)
+}
+"""
+
 PATCHSEQ_SEED["macs.rs"] = """use std::fmt::Write;
 
 macro_rules! dbl {
@@ -1888,7 +1931,8 @@ PATCHSEQ_VALUES = [("consts.rs", "    4\n}", "    5\n}"), ("consts.rs", "    3\n
                    ("consts.rs", "    x + 1\n", "    x + 2\n"), ("consts.rs", "    2\n}", "    3\n}"),
                    ("consts.rs", "    1\n}", "    5\n}"),
                    ("items.rs", "const K: i64 = 4;", "const K: i64 = 6;"), ("items.rs", "|| 7)", "|| 8)"),
-                   ("items.rs", "vec![1, 2, 3]", "vec![1, 2]")]
+                   ("items.rs", "vec![1, 2, 3]", "vec![1, 2]"), ("sigs.rs", "    v * 2\n", "    v * 3\n"),
+                   ("sigs.rs", "    a + b + c\n", "    a + b * c\n")]
 
 
 def cmd_run_patchseq(a):

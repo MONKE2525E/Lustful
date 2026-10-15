@@ -31,10 +31,11 @@
 //   passes the cfg name check and expands alone, as the resolver checks
 //   and expands its file; the expansion must read nothing outside the
 //   body (no `Dep` but the cfg-disabled nodes it drops);
-// - the fn returns `impl Trait` (its body is part of its item), or has
-//   parameter patterns or expressions in its parameter types (see
-//   `find_body_edit`); a `const fn` patches, but `const` values bake its
-//   body in, so the request then collects and walks reads as a cold
+// - the fn returns `impl Trait` (its body is part of its item), or its
+//   parameter patterns or signature expressions are not provably moved
+//   ahead of the new body (`sig_nodes.rs`); a `const fn` patches, but
+//   `const` values bake its body in, so when a const evaluation may run it
+//   (`const_reach.rs`) the request then collects and walks reads as a cold
 //   resolve of a const fn body edit does (`Patched::const_fn`);
 // - the file's std needs or std platform mention moved;
 // - the new body does not lex, parse, or rewrite cleanly, or its item
@@ -339,10 +340,13 @@ struct NewBody {
     plain: bool,
     /// The old body's expression range (`FnDef::exprs`).
     old_exprs: (u32, u32),
-    /// The fn is a `const fn`.
-    is_const: bool,
     /// The old body's items (`same_items`), where the new body's go.
     items: Vec<u32>,
+    /// The signature nodes copied ahead of the new body (`sig_nodes.rs`).
+    sig: Option<super::sig_nodes::SigNodes>,
+    /// The nested fn whose own body the edit changed (`same_items`), in
+    /// `Front::fn_loc` order.
+    nested: Option<usize>,
 }
 
 /// A collected program kept for later requests (W-INCR3), one per mode
@@ -377,6 +381,8 @@ struct KeptEdit {
     plain: bool,
     /// The body's items (`stmt_items` indexes; see `reuse_kept`).
     items: Vec<u32>,
+    /// The nested fn whose own body changed (`NewBody::nested`).
+    nested: Option<usize>,
     /// The old body's expression range (a template's picks key on it).
     old_exprs: (u32, u32),
 }
@@ -407,6 +413,7 @@ pub(super) fn try_patch(
             fn_index: e.body.as_ref().map(|b| b.fn_index),
             plain: e.body.as_ref().is_none_or(|b| b.plain),
             items: e.body.as_ref().map_or_else(Vec::new, |b| b.items.clone()),
+            nested: e.body.as_ref().and_then(|b| b.nested),
             old_exprs: e.body.as_ref().map_or((0, 0), |b| b.old_exprs),
         })
         .collect();
@@ -422,9 +429,10 @@ pub(super) fn try_patch(
             k.program.ast = Arc::default();
             k.program.resolved = None;
             let edits = k.edits.get_or_insert_with(Vec::new);
-            for e in &edits_in {
-                let Some(fn_index) = e.fn_index else { continue };
-                if !edits.iter().any(|x| x.fn_index == e.fn_index) && !k.bases.iter().any(|b| b.0 == fn_index) {
+            // Each edited fn's discovery output as the program has it, the
+            // nested fn whose body changed too (`reuse_kept` compares).
+            for fn_index in edits_in.iter().flat_map(|e| e.fn_index.into_iter().chain(e.nested)) {
+                if !edits.iter().any(|x| x.fn_index == Some(fn_index) || x.nested == Some(fn_index)) && !k.bases.iter().any(|b| b.0 == fn_index) {
                     let def = k.program.def_id(crate::def::LocalDefId(fn_index as u32));
                     k.bases.push((fn_index, caches.gen_reuse.out_copy(def)));
                 }
@@ -575,18 +583,13 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     }
     let span = ast.blocks[def.body.ok_or("not in a fn body")?.0 as usize].span;
     // A fn's expression and pattern ranges (`FnDef::exprs`, closure
-    // numbering reads them) start at its first parameter: the patch
-    // sets them to the new body's ranges, which is the cold shape only
-    // when no node sits between the parameters and the body.
-    let starts_in_body = |(first, end): (u32, u32), spans: &[crate::diag::Span]| {
-        first == end || spans.get(first as usize).is_some_and(|s| s.file == file && span.lo <= s.lo && s.hi <= span.hi)
-    };
-    if def.params.iter().any(|p| p.pat.is_some())
-        || !starts_in_body(def.exprs, &ast.expr_spans)
-        || !starts_in_body(def.pats, &ast.pat_spans)
-    {
-        return Err("signature nodes");
-    }
+    // numbering reads them) start at its first parameter: parameter
+    // patterns and expressions in the signature's types sit there, before
+    // the body's nodes. They move ahead of the new body (`sig_nodes.rs`),
+    // in the new body's own Ast from index 0, so the ranges keep the cold
+    // shape.
+    let mut body_ast = Ast::default();
+    let sig = super::sig_nodes::copy(ast, def, span, &mut body_ast)?;
     let (lo, hi) = (span.lo as usize, span.hi as usize);
     let new_hi = (hi as i64 + d) as usize;
     let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo as u32, &front.interner).ok()).ok_or("body lex");
@@ -629,12 +632,21 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         _ => crate::expand::lazy::hoist_static_closures(raw, &front.interner),
     };
     let toks = &hoisted.tokens[..hoisted.tokens.len() - 1];
-    let mut body_ast = Ast::default();
-    let (body, exprs, pats) =
+    let (body, mut exprs, mut pats) =
         crate::parser::parse_body(toks, &hoisted.strings, &mut body_ast, &front.interner, &front.known).map_err(|_| "body parse")?;
-    let items = same_items(ast, old, text, span, &body_ast, (&old_body.tokens, &new_body.tokens), edit)?;
+    let (items, nested) = same_items(ast, old, text, span, &body_ast, (&old_body.tokens, &new_body.tokens), edit)?;
+    let nested = match nested {
+        Some(i) => Some(front.fn_loc.iter().position(|&l| l == (usize::MAX, Some(i as usize))).ok_or("body items")?),
+        None => None,
+    };
     let mut scratch = def.clone();
     scratch.body = Some(body);
+    if let Some(sig) = &sig {
+        (exprs.0, pats.0) = (0, 0);
+        for p in &mut scratch.params {
+            p.pat = p.pat.map(|q| sig.pat(q));
+        }
+    }
     let outer = match &ast.items[item].kind {
         ItemKind::Impl(imp) => Some(&imp.generics),
         _ => None,
@@ -659,8 +671,7 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         && plain_body(&old_body, &front.interner)
         && plain_body(&new_body, &front.interner)
         && plain_body(&hoisted, &front.interner);
-    let is_const = def.qual.is_const;
-    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, is_const, items })
+    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, items, sig, nested })
 }
 
 /// The items (`stmt_items` indexes, in parse order) of the old fn body at
@@ -671,6 +682,10 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
 /// item sits in the same block as before and sees the same items and
 /// `use`s. Resolve and collect then make the same defs of them, with the
 /// same indexes once `apply` puts each new item at its old index.
+/// One exception, returned second: an edit strictly inside the body of a
+/// nested fn that holds no item changes that fn's body only (its head
+/// text stands, its end moves by the edit). Braces may change there: no
+/// item sits in that body, and every other item still matches its text.
 fn same_items(
     ast: &Ast,
     old: &str,
@@ -679,30 +694,53 @@ fn same_items(
     body_ast: &Ast,
     toks: (&[lexer::Token], &[lexer::Token]),
     edit: Edit,
-) -> Result<Vec<u32>, &'static str> {
+) -> Result<(Vec<u32>, Option<u32>), &'static str> {
     let inside = |s: crate::diag::Span| s.file == span.file && span.lo <= s.lo && s.hi <= span.hi;
     let olds: Vec<u32> = (0..ast.stmt_items.len() as u32).filter(|&i| inside(ast.stmt_items[i as usize].span)).collect();
     if olds.len() != body_ast.stmt_items.len() {
         return Err("body items");
     }
     if olds.is_empty() {
-        return Ok(olds);
+        return Ok((olds, None));
     }
-    let (pre, post) = token_window(toks.0, toks.1, edit);
-    let (ow, nw) = (&toks.0[pre..toks.0.len() - post], &toks.1[pre..toks.1.len() - post]);
-    if ow.iter().chain(nw).any(|t| matches!(t.tok, Tok::LBrace | Tok::RBrace)) {
-        return Err("body items");
+    let fn_body = |it: &crate::ast::Item, a: &Ast| match &it.kind {
+        ItemKind::Fn(f) => f.body.map(|b| a.blocks[b.0 as usize].span),
+        _ => None,
+    };
+    let nested = olds.iter().position(|&i| fn_body(&ast.stmt_items[i as usize], ast).is_some_and(|b| b.lo < edit.a && edit.b < b.hi));
+    if let Some(k) = nested {
+        let b = fn_body(&ast.stmt_items[olds[k] as usize], ast).ok_or("body items")?;
+        let holds = |s: crate::diag::Span| b.lo <= s.lo && s.hi <= b.hi;
+        if olds.iter().enumerate().any(|(j, &i)| j != k && holds(ast.stmt_items[i as usize].span)) {
+            return Err("body items");
+        }
+    } else {
+        let (pre, post) = token_window(toks.0, toks.1, edit);
+        let (ow, nw) = (&toks.0[pre..toks.0.len() - post], &toks.1[pre..toks.1.len() - post]);
+        if ow.iter().chain(nw).any(|t| matches!(t.tok, Tok::LBrace | Tok::RBrace)) {
+            return Err("body items");
+        }
     }
     // Same text at the same place: span keys of the resolver tables
     // (`const_init_module`) move with the edit.
     let src = |t: &str, s: crate::diag::Span| t.get(s.lo as usize..s.hi as usize).map(str::to_owned);
     for (k, &i) in olds.iter().enumerate() {
         let (o, n) = (ast.stmt_items[i as usize].span, body_ast.stmt_items[k].span);
+        if Some(k) == nested {
+            // The head up to the body's brace stands (the edit is after it).
+            let (b, nb) = (fn_body(&ast.stmt_items[i as usize], ast), fn_body(&body_ast.stmt_items[k], body_ast));
+            let head = b.zip(nb).is_some_and(|(b, nb)| b.lo == nb.lo && src(old, crate::diag::Span { hi: b.lo, ..o }) == src(text, crate::diag::Span { hi: b.lo, ..n }));
+            if edit.plain(o) != n || !head {
+                return Err("body items");
+            }
+            continue;
+        }
         if edit.plain(o) != n || src(old, o).is_none() || src(old, o) != src(text, n) {
             return Err("body items");
         }
     }
-    Ok(olds)
+    let nested = nested.map(|k| olds[k]);
+    Ok((olds, nested))
 }
 
 /// The changed tokens of one edit: how many tokens of `old` (lexed from
@@ -1005,6 +1043,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
                 ast.stmt_items[i as usize] = it;
             }
         }
+        if let Some(sig) = &e.sig {
+            super::sig_nodes::relink(Arc::make_mut(&mut front.ast), e.item, e.sub, sig, (before.0 as u32, before.1 as u32));
+        }
         let def = fn_def_at_mut(Arc::make_mut(&mut front.ast), e.item, e.sub);
         def.body = Some(BlockId(e.body.0 + before.3 as u32));
         def.exprs = (e.exprs.0 + before.0 as u32, e.exprs.1 + before.0 as u32);
@@ -1065,10 +1106,14 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
             }
         }
     }
-    let edited: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref().map(|b| b.fn_index)).collect();
+    let edited: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref()).flat_map(|b| std::iter::once(b.fn_index).chain(b.nested)).collect();
     // A const fn edit is a plain body edit when no const evaluation can
     // run that fn (`const_reach.rs`).
-    let const_edits: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref().filter(|b| b.is_const).map(|b| b.fn_index)).collect();
+    let is_const = |i: usize| {
+        let (item, sub) = front.fn_loc[i];
+        fn_def_at(&front.ast, item, sub).qual.is_const
+    };
+    let const_edits: Vec<usize> = edited.iter().copied().filter(|&i| is_const(i)).collect();
     match &mut base.reach {
         Some(r) => r.update(front, &edited),
         None if !const_edits.is_empty() => base.reach = Some(super::const_reach::ConstReach::build(front)),
@@ -1919,6 +1964,134 @@ pub fn run() -> i64 {
             ("    let a = [0u8; local()];\n", "    let a = [0u8; local()];\n    let _b: [u8; 7] = [0u8; unread(3) as usize];\n", "reuse"),
             ("    x * 2 + 1\n", "    x * 2 + 2\n", "gen_state"),
             ("    x * 2 + 2\n", "    x * 2 + 1\n", "gen_state"),
+        ];
+        for &(old, new, kept) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
+        }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fns whose signatures hold nodes before the body: parameter
+    /// patterns, array lengths in parameter and return types, a method's
+    /// tuple pattern.
+    const SIGS: &str = "pub const N: usize = 2;
+
+pub fn skip(_: &str) -> i64 {
+    1
+}
+
+pub fn pair((a, b): (i64, i64), [c, _]: [i64; N]) -> i64 {
+    a + b + c
+}
+
+pub fn first(xs: [u8; 4]) -> [u8; N] {
+    [xs[0], xs[1]]
+}
+
+pub struct S;
+
+impl S {
+    pub fn get(&self, (x, _y): (i64, i64), _: u8) -> i64 {
+        x
+    }
+}
+
+pub fn run() -> i64 {
+    skip(\"a\") + pair((1, 2), [3, 4]) + first([1, 2, 3, 4])[1] as i64 + S.get((5, 6), 7)
+}
+";
+
+    /// A body edit of a fn whose signature holds patterns or array
+    /// lengths takes the body patch, and the kept program stands. Edit,
+    /// error, fix, undo, and another edit each give the cold answer
+    /// (a name the pattern binds, used and then misspelled, too), and a
+    /// build prints what a cold build prints.
+    #[test]
+    fn signature_nodes_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-sigs-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, SIGS).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str)] = &[
+            ("    a + b + c\n", "    let d = a * b;\n    d + c\n"),
+            ("    d + c\n", "    dd + c\n"),
+            ("    dd + c\n", "    d + c + 1\n"),
+            ("    let d = a * b;\n    d + c + 1\n", "    a + b + c\n"),
+            ("    1\n}\n\npub fn pair", "    let _z: u8 = 3;\n    1\n}\n\npub fn pair"),
+            ("    [xs[0], xs[1]]\n", "    [xs[1], xs[0]]\n"),
+            ("    [xs[1], xs[0]]\n", "    [xs[1], xs[0], 1]\n"),
+            ("    [xs[1], xs[0], 1]\n", "    [xs[1], xs[3]]\n"),
+            ("        x\n", "        x + _y\n"),
+            ("        x + _y\n", "        x + y\n"),
+            ("        x + y\n", "        x * _y\n"),
+        ];
+        for &(old, new) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            assert_eq!(field(&v, "kept"), "reuse", "{new:?}: {v}");
+        }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fn with nested fns and a nested const, and a generic fn.
+    const NESTED: &str = "pub fn outer(k: i64) -> i64 {
+    const B: i64 = 3;
+    fn twice(v: i64) -> i64 {
+        v * 2
+    }
+    fn wrap(v: i64) -> Vec<i64> {
+        vec![v]
+    }
+    twice(k) + wrap(B).len() as i64
+}
+
+pub fn id<T>(x: T) -> T {
+    x
+}
+
+pub fn run() -> i64 {
+    id(outer(4))
+}
+";
+
+    /// An edit inside a nested fn's own body takes the body patch (braces
+    /// may change there), and the kept program stands while the nested
+    /// fn's discovery output does. Edit, error, fix, undo, and another
+    /// edit each give the cold answer; a build prints what a cold build
+    /// prints.
+    #[test]
+    fn nested_fn_body_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-nested-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, NESTED).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        // (old, new, expected kept=)
+        let steps: &[(&str, &str, &str)] = &[
+            ("        v * 2\n", "        let w = v + B;\n        w * 2\n", "reuse"),
+            ("        w * 2\n", "        w * true\n", "reuse"),
+            ("        w * true\n", "        if w > 0 { w * 2 } else { 0 }\n", "reuse"),
+            ("        let w = v + B;\n        if w > 0 { w * 2 } else { 0 }\n", "        v * 2\n", "reuse"),
+            ("        vec![v]\n", "        vec![v, v]\n", "reuse"),
+            ("        vec![v, v]\n", "        let s: Vec<String> = id(Vec::new());\n        vec![v + s.len() as i64]\n", "discovery"),
+            ("        v * 2\n", "        v * 4\n", "reuse"),
         ];
         for &(old, new, kept) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
