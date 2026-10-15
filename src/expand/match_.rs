@@ -2005,7 +2005,14 @@ fn meta_item_end(m: &mut Matcher, input: &[Tt], pos: usize) -> Result<Option<usi
     let Some(end) = path_end else { return Ok(None) };
     match input.get(end) {
         Some(Tt::Delim(..)) => Ok(Some(end + 1)),
-        Some(Tt::Tok(t)) if t.tok == Tok::Eq => fragment_end(m, FragKind::Expr, input, end + 1),
+        Some(Tt::Tok(t)) if t.tok == Tok::Eq => {
+            // A doc comment is `doc = DocStr`: the value is the doc
+            // string itself, which no expression parse takes.
+            if matches!(input.get(end + 1), Some(Tt::Tok(tv)) if matches!(tv.tok, Tok::DocStr(_))) {
+                return Ok(Some(end + 2));
+            }
+            fragment_end(m, FragKind::Expr, input, end + 1)
+        }
         _ => Ok(Some(end)),
     }
 }
