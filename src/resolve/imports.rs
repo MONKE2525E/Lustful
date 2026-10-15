@@ -940,8 +940,8 @@ pub enum PathMode {
     /// Lexical paths in bodies and signatures: the current module only,
     /// then the extern prelude, then the std prelude.
     Lexical,
-    /// `use` paths (2018 uniform paths): the enclosing module chain,
-    /// then the extern prelude.
+    /// `use` paths (2018 uniform paths): the current module, then the
+    /// extern prelude.
     Use,
 }
 
@@ -1062,25 +1062,18 @@ impl ResolvedTables {
     }
 
     /// Looks up one first segment and checks visibility from `from`.
-    /// Checks the module chain for `use` paths, the one module for
-    /// lexical paths, then the extern prelude, then the std prelude.
-    fn first_segment(&self, from: ModuleId, name: Sym, ns: Namespace, mode: PathMode, interner: &Interner) -> PathRes {
-        let mut mods: Vec<ModuleId> = vec![from];
-        if mode == PathMode::Use {
-            let mut cur = self.modules[from.0 as usize].parent;
-            while let Some(m) = cur {
-                mods.push(m);
-                cur = self.modules[m.0 as usize].parent;
+    /// Checks `from` itself, then the extern prelude, then the std
+    /// prelude. Both modes read only `from`: as in rustc, items of a
+    /// parent module are not in scope in a child (`mod a { use x::g; }`
+    /// with `x` at the root is E0432), so a user `mod core` at the root
+    /// does not shadow the `core` crate in any other module.
+    fn first_segment(&self, from: ModuleId, name: Sym, ns: Namespace, _mode: PathMode, interner: &Interner) -> PathRes {
+        match self.lookup(from, ns, name) {
+            Some(BindState::One(b)) => {
+                return if self.visible(&b.vis, b.def_module, from, interner) { PathRes::Done(b.target) } else { PathRes::Private };
             }
-        }
-        for m in mods {
-            match self.lookup(m, ns, name) {
-                Some(BindState::One(b)) => {
-                    return if self.visible(&b.vis, b.def_module, from, interner) { PathRes::Done(b.target) } else { PathRes::Private };
-                }
-                Some(BindState::Ambiguous) => return PathRes::Ambiguous,
-                None => {}
-            }
+            Some(BindState::Ambiguous) => return PathRes::Ambiguous,
+            None => {}
         }
         let name_str = interner.get(name);
         if let Some(i) = self.extern_by_name(from, name_str) {

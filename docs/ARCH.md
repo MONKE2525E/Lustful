@@ -292,12 +292,14 @@ explicit imports of the current module only. It never searches
 outer modules: an unqualified name that only an enclosing
 module defines is not found (rustc E0425). In a `use` path,
 the first segment must be `crate`, `self`, `super`, an extern
-prelude name, or an item or import of an enclosing module
-(the 2018 uniform path rule, which edition 2024 keeps; this
-`use`-path rule is wider than lexical scope and is the only
-place enclosing modules count). A local module can shadow an extern
-name: ts-rust has a local module named `core` at
-`goport_util_root.rs:26`. A generated item that would change a
+prelude name, or an item or import of the current module
+(the 2018 uniform path rule, which edition 2024 keeps; a name
+only an enclosing module has is rustc E0432). A local module can
+shadow an extern name, but only in its own module: ts-rust has a
+local module named `core` at `goport_util_root.rs:26`, and its
+other modules still reach the `core` crate as `core::`. Std
+source spliced at the crate root reads `std`, `core`, and
+`alloc` as if written with `::`. A generated item that would change a
 macro resolution that already ran is an error, as in Rust
 (E0659, "time travel"): the worklist records which bindings each
 expansion used, and a later binding that wins over a used one

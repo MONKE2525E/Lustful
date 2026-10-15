@@ -4836,7 +4836,29 @@ impl Rewrite<'_> {
                 PathRes::Partial(Target::Extern(i), _) | PathRes::Done(Target::Extern(i)) if self.tables.externs[i as usize].is_std_lib => {
                     segs.remove(0);
                 }
+                // An item (`::core::time::Duration::from_millis`): `rest`
+                // counts from after the marker.
+                PathRes::Partial(Target::Def(_), _) => {
+                    segs.remove(0);
+                    self.apply(segs, res, span, module, ns, scopes);
+                }
                 _ => self.apply(segs, res, span, module, ns, scopes),
+            }
+            return;
+        }
+        // Std source spliced at the root (a routed fn such as
+        // `__lust_std_process_exit`) names the std crates, never a user
+        // module of the same name: read it as if it started with `::`.
+        if module == ROOT_MODULE
+            && span.file == crate::diag::FileId(0)
+            && self.std_splice_lo.is_some_and(|lo| span.lo >= lo)
+            && names.first().is_some_and(|n| matches!(self.interner.get(*n), "std" | "core" | "alloc"))
+        {
+            match self.tables.resolve_path(module, &names, ns, PathMode::Lexical, true, self.interner) {
+                res @ (PathRes::Done(Target::Def(_) | Target::Variant(..)) | PathRes::Partial(Target::Def(_), _)) => {
+                    self.apply(segs, res, span, module, ns, scopes)
+                }
+                _ => {}
             }
             return;
         }
