@@ -2264,10 +2264,20 @@ impl MacroEnv {
         let crate_sym = interner.intern("crate");
         let self_sym = interner.intern("self");
         let super_sym = interner.intern("super");
-        let resolve_use = |segs: &[Sym], leading: bool, from: &[Sym], bindings: &FxMap<(Vec<Sym>, Sym), usize>| -> Option<usize> {
+        // An ambiguous binding (see `ambiguous` below) resolves to
+        // nothing, so a use of it never picks one of the globs' macros.
+        let resolve_use = |segs: &[Sym],
+                           leading: bool,
+                           from: &[Sym],
+                           bindings: &FxMap<(Vec<Sym>, Sym), usize>,
+                           ambiguous: &FxMap<(Vec<Sym>, Sym), ()>|
+         -> Option<usize> {
             let last = *segs.last()?;
             let middle = &segs[..segs.len() - 1];
-            let by = |m: &[Sym]| bindings.get(&(m.to_vec(), last)).copied();
+            let by = |m: &[Sym]| {
+                let key = (m.to_vec(), last);
+                if ambiguous.contains_key(&key) { None } else { bindings.get(&key).copied() }
+            };
             let md = |m: &[Sym]| module_defs.get(&(m.to_vec(), last)).copied();
             if segs.len() == 1 && !leading {
                 return md(from).or_else(|| by(from));
@@ -2326,9 +2336,22 @@ impl MacroEnv {
             }
             segs.to_vec()
         };
+        // Which use site wrote each binding (`writer`): a glob only
+        // overwrites a binding it wrote itself, and an explicit use
+        // overwrites a glob's binding but not another explicit one.
+        // Two globs that bring different macros under one name make
+        // that name ambiguous (`ambiguous`, rustc E0659 at a use), and
+        // a glob of an ambiguous name passes the ambiguity on; an
+        // explicit use clears it. Without the writer rule the two
+        // globs overwrote each other every round and the fixpoint
+        // never ended: one such crate hung the daemon for every later
+        // request.
+        let mut writer: FxMap<(Vec<Sym>, Sym), (usize, bool)> = FxMap::default();
+        let mut ambiguous: FxMap<(Vec<Sym>, Sym), ()> = FxMap::default();
+        let mut rounds = 0usize;
         loop {
             let mut changed = false;
-            for site in &sites {
+            for (si, site) in sites.iter().enumerate() {
                 if !site.pubish {
                     continue;
                 }
@@ -2338,17 +2361,39 @@ impl MacroEnv {
                         bindings.iter().filter(|((m, _), _)| *m == target).map(|((_, n), src)| (*n, *src)).collect();
                     for (name, src) in names {
                         let key = (site.module.clone(), name);
-                        if bindings.get(&key) != Some(&src) {
-                            bindings.insert(key, src);
-                            changed = true;
+                        let from_ambiguous = ambiguous.contains_key(&(target.clone(), name));
+                        match writer.get(&key).copied() {
+                            Some((w, other_glob)) if w != si => {
+                                // Another site owns the name. A different
+                                // macro from another glob is a conflict.
+                                if other_glob && bindings.get(&key) != Some(&src) && ambiguous.insert(key, ()).is_none() {
+                                    changed = true;
+                                }
+                            }
+                            _ => {
+                                if bindings.get(&key) != Some(&src) {
+                                    writer.insert(key.clone(), (si, true));
+                                    bindings.insert(key.clone(), src);
+                                    changed = true;
+                                }
+                                if from_ambiguous && ambiguous.insert(key, ()).is_none() {
+                                    changed = true;
+                                }
+                            }
                         }
                     }
                     continue;
                 }
-                if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, &bindings) {
+                if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, &bindings, &ambiguous) {
                     let key = (site.module.clone(), site.alias);
-                    if bindings.get(&key) != Some(&src) {
-                        bindings.insert(key, src);
+                    let may = match writer.get(&key) {
+                        None => true,
+                        Some(&(w, w_glob)) => w == si || w_glob,
+                    };
+                    if may && (bindings.get(&key) != Some(&src) || writer.get(&key) != Some(&(si, false))) {
+                        writer.insert(key.clone(), (si, false));
+                        bindings.insert(key.clone(), src);
+                        ambiguous.remove(&key);
                         changed = true;
                     }
                 }
@@ -2356,6 +2401,11 @@ impl MacroEnv {
             if !changed {
                 break;
             }
+            // Each binding settles once its sources settle, so the
+            // rounds are bounded by the chain depth. A compile that
+            // never ends is worse than an internal error.
+            rounds += 1;
+            assert!(rounds <= 4 * sites.len() + 16, "macro re-export fixpoint did not settle");
         }
         let mut seeds = Vec::with_capacity(bindings.len());
         let mut keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().collect();
@@ -2364,17 +2414,25 @@ impl MacroEnv {
             let pb: Vec<&str> = b.0.iter().map(|s| interner.get(*s)).collect();
             pa.cmp(&pb).then_with(|| interner.get(a.1).cmp(interner.get(b.1)))
         });
-        for key in keys {
+        // An ambiguous name gets no path seed: a path to it finds
+        // nothing, so it is a reject, never a pick of one glob.
+        for key in keys.into_iter().filter(|k| !ambiguous.contains_key(*k)) {
             let src = &owned[bindings[key]];
             let mut tokens = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
             rename_macro_token(&mut tokens, key.1);
-            seeds.push(crate::expand::MacroSeed { path: key.0.clone(), tokens, strings: src.strings.clone(), import_into: None });
+            seeds.push(crate::expand::MacroSeed {
+                path: key.0.clone(),
+                tokens,
+                strings: src.strings.clone(),
+                import_into: None,
+                ambiguous: false,
+            });
         }
         // Macros visible at this crate's root by path (its own
         // `#[macro_export]` definitions plus root re-exports), under
         // their binding names: what dependent crates receive.
         let mut root_sources: Vec<OwnedMacroSource> = Vec::new();
-        let mut root_keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().filter(|(m, _)| m.is_empty()).collect();
+        let mut root_keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().filter(|k| k.0.is_empty() && !ambiguous.contains_key(*k)).collect();
         root_keys.sort_by(|a, b| interner.get(a.1).cmp(interner.get(b.1)));
         for key in root_keys {
             let src = owned[bindings[key]].clone();
@@ -2384,9 +2442,13 @@ impl MacroEnv {
         // path-visible macros into plain-name scope in the importing
         // module (the expander's prescan does not track globs, so the
         // worklist seeds them per file).
+        // A name two globs in one module bring as different macros, or
+        // one glob brings from an ambiguous binding, gets one ambiguous
+        // seed instead: a plain call of it is the L0507 error.
         let mut glob_seeds: Vec<Vec<crate::expand::MacroSeed>> = Vec::with_capacity(discs.len());
         for mine in &sites_by_disc {
-            let mut extra: Vec<crate::expand::MacroSeed> = Vec::new();
+            // (importing module, name) -> (glob target, source, ambiguous), in first-seen order.
+            let mut found: Vec<((Vec<Sym>, Sym), (Vec<Sym>, usize, bool))> = Vec::new();
             for site in mine {
                 if !site.glob {
                     continue;
@@ -2396,16 +2458,26 @@ impl MacroEnv {
                     bindings.iter().filter(|((m, _), _)| *m == target).map(|((_, n), src)| (*n, *src)).collect();
                 names.sort_by(|a, b| interner.get(a.0).cmp(interner.get(b.0)));
                 for (name, src_idx) in names {
-                    let src = &owned[src_idx];
-                    let mut tokens = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
-                    rename_macro_token(&mut tokens, name);
-                    extra.push(crate::expand::MacroSeed {
-                        path: target.clone(),
-                        tokens,
-                        strings: src.strings.clone(),
-                        import_into: Some(site.module.clone()),
-                    });
+                    let amb = ambiguous.contains_key(&(target.clone(), name));
+                    let key = (site.module.clone(), name);
+                    match found.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, (_, s, a))) => *a |= amb || *s != src_idx,
+                        None => found.push((key, (target.clone(), src_idx, amb))),
+                    }
                 }
+            }
+            let mut extra: Vec<crate::expand::MacroSeed> = Vec::new();
+            for ((module, name), (target, src_idx, amb)) in found {
+                let src = &owned[src_idx];
+                let mut tokens = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
+                rename_macro_token(&mut tokens, name);
+                extra.push(crate::expand::MacroSeed {
+                    path: target,
+                    tokens,
+                    strings: src.strings.clone(),
+                    import_into: Some(module),
+                    ambiguous: amb,
+                });
             }
             glob_seeds.push(extra);
         }

@@ -900,6 +900,11 @@ pub fn cache_stats() -> (u64, u64) {
     (CACHE_HITS.load(Ordering::Relaxed), CACHE_MISSES.load(Ordering::Relaxed))
 }
 
+/// How many entries the expansion cache holds (daemon stats lines).
+pub fn cache_len() -> usize {
+    expansion_cache().lock().unwrap().len()
+}
+
 /// True when a flat token list can contain work for the expander: a
 /// `macro_rules` definition, a call to a macro the parser does not own,
 /// a cfg attribute, or a `recursion_limit` the expander reads. A
@@ -965,6 +970,10 @@ pub struct Expander<'a> {
     /// Macro names `use` brings into each module, from the prescan:
     /// imports apply to a whole module, not from a text point.
     module_imports: FxMap<(Vec<Sym>, Sym), u32>,
+    /// Macro names that globs make ambiguous in a module (see
+    /// `MacroSeed::ambiguous`). An explicit import or a textual
+    /// definition still wins.
+    ambiguous_imports: FxMap<(Vec<Sym>, Sym), ()>,
     /// The module path of the code being walked, from the crate root.
     module: Vec<Sym>,
     /// The file `file!` currently refers to (shown form), its filesystem
@@ -1035,6 +1044,7 @@ impl<'a> Expander<'a> {
             by_path: FxMap::default(),
             module_defs: FxMap::default(),
             module_imports: FxMap::default(),
+            ambiguous_imports: FxMap::default(),
             module: ctx.module_path.clone(),
             cur_file: ctx.file_path.clone(),
             cur_real: ctx.real_path.clone(),
@@ -1244,6 +1254,10 @@ pub struct MacroSeed {
     /// macro into that module, which the worklist resolved. Plain
     /// seeds leave it None and stay path-only, as before.
     pub import_into: Option<Vec<Sym>>,
+    /// Set on an `import_into` seed when globs bring different macros
+    /// under this name (rustc E0659): the seed defines nothing, and a
+    /// plain call of the name in that module is the L0507 error.
+    pub ambiguous: bool,
 }
 
 /// The value of a `recursion_limit` attribute from the trees after its
@@ -1779,6 +1793,12 @@ impl<'a> Expander<'a> {
                     Tt::Delim(_, inner, _) => inner.clone(),
                     _ => return Ok(()),
                 };
+                if seed.ambiguous {
+                    if let Some(module) = &seed.import_into {
+                        self.ambiguous_imports.insert((module.clone(), def.name), ());
+                    }
+                    return Ok(());
+                }
                 let at_root = seed.path.is_empty();
                 let compiled = compile_macro(def.name, def.name_span, &body, at_root, def.span, &self.strings, self.ctx.interner)?;
                 let idx = self.register(Arc::new(compiled), at_root, false);
@@ -1852,6 +1872,9 @@ impl<'a> Expander<'a> {
             }
             if let Some(idx) = self.module_imports.get(&(self.module.clone(), last)).copied() {
                 return Some(idx);
+            }
+            if self.ambiguous_imports.contains_key(&(self.module.clone(), last)) {
+                return None;
             }
             // An exported macro lives in the crate root's macro
             // namespace, so a plain call in the root module finds it
@@ -3073,6 +3096,12 @@ impl<'a> Expander<'a> {
                 out.push(Tt::Delim(call.delim, inner, call.group_span));
                 return Ok(out);
             }
+        }
+        if !call.leading_colon
+            && let [seg] = &call.segs[..]
+            && self.ambiguous_imports.contains_key(&(self.module.clone(), seg.sym))
+        {
+            return Err(crate::resolve::imports::ambiguous_diag(&seg.text, call.span));
         }
         Err(err(
             C_UNKNOWN,
