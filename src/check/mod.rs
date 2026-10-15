@@ -6836,7 +6836,7 @@ impl<'p> Ctx<'p> {
                     Some(els) => {
                         let t1 = self.block(*then, expected);
                         self.scopes.truncate(scope);
-                        let t2 = self.expr(*els, expected.or(Some(t1)));
+                        let t2 = self.expr(*els, self.branch_hint(expected, Some(t1)));
                         if let Some(d) = self.dyn_ref_expectation(expected) {
                             self.coerce_block_tail(*then, t1, d);
                             self.coerce_expr(*els, t2, d);
@@ -6875,7 +6875,7 @@ impl<'p> Ctx<'p> {
                     }
                     Some(els) => {
                         let t1 = self.block(*then, expected);
-                        let t2 = self.expr(*els, expected.or(Some(t1)));
+                        let t2 = self.expr(*els, self.branch_hint(expected, Some(t1)));
                         if let Some(d) = self.dyn_ref_expectation(expected) {
                             self.coerce_block_tail(*then, t1, d);
                             self.coerce_expr(*els, t2, d);
@@ -6967,7 +6967,7 @@ impl<'p> Ctx<'p> {
                         }
                         self.expect_expr(g, BOOL);
                     }
-                    let bt = self.expr(arm.body, expected.or(result));
+                    let bt = self.expr(arm.body, self.branch_hint(expected, result));
                     if let Some(d) = self.dyn_ref_expectation(expected) {
                         self.coerce_expr(arm.body, bt, d);
                         result = Some(d);
@@ -8131,6 +8131,15 @@ impl<'p> Ctx<'p> {
             }
             _ => None,
         }
+    }
+
+    /// The expectation for a later branch of an `if` or `match`: the real
+    /// one, else the earlier branches' type as an inference hint. A
+    /// closure or fn item type is no hint: rustc checks each branch on its
+    /// own and then joins them (two closures make a fn pointer), while a
+    /// nested `if` or `match` would coerce its arms to the hint.
+    fn branch_hint(&self, expected: Option<Ty>, prev: Option<Ty>) -> Option<Ty> {
+        expected.or(prev.filter(|&t| !matches!(self.kind(t), TyKind::Closure(..) | TyKind::FnDef(..))))
     }
 
     /// The expected type when it is a fn pointer (see `LoopCtx::want`).
