@@ -2703,10 +2703,10 @@ impl<'a> Parser<'a> {
         self.expect(Tok::Struct, "`struct`")?;
         let (name, name_span) = self.ident()?;
         let generics = self.generics(true)?;
-        // The where clause sits before the fields (named struct)
-        // or before the `;` (unit struct). Tuple structs put it
-        // after the fields; they still reject below.
-        let where_clause = self.where_clause()?;
+        // The where clause sits before the fields (named struct),
+        // before the `;` (unit struct), or after the fields and
+        // before the `;` (tuple struct), as in rustc's grammar.
+        let mut where_clause = self.where_clause()?;
         let fields = match self.peek() {
             Tok::Semi => {
                 self.bump();
@@ -2715,6 +2715,13 @@ impl<'a> Parser<'a> {
             Tok::LParen => {
                 self.bump();
                 let fs = self.tuple_fields()?;
+                let tail = self.where_clause()?;
+                if !tail.preds.is_empty() {
+                    if !where_clause.preds.is_empty() {
+                        return Err(syntax(tail.span, "duplicate `where` clauses on an item"));
+                    }
+                    where_clause = tail;
+                }
                 self.expect(Tok::Semi, "`;`")?;
                 VariantFields::Tuple(fs)
             }

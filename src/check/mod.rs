@@ -3494,6 +3494,23 @@ impl<'p> Ctx<'p> {
         if sel == Selection::NoImpl && self.derive_query_holds(tr.def, self_ty) {
             return Selection::ParamEvidence(usize::MAX);
         }
+        // A structural derive-family answer over a type that still
+        // holds inference variables is not yet a "no": `[?T; 1]:
+        // Default` from a generic field's bound (`Store<[T; 1]>`
+        // built before `T` is named) holds or not by what `?T`
+        // becomes, so the obligation waits for inference instead
+        // of failing here.
+        if sel == Selection::NoImpl
+            && p.gx.index.derive_family.contains(&tr.def)
+            && matches!(
+                self.tys.kind(self_ty),
+                TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..)
+            )
+            && (self.has_unbound_deep(self_ty)
+                || matches!(self.tys.kind(self_ty), TyKind::Array(_, n) if matches!(self.tys.const_kind(n), ConstKind::Infer(_))))
+        {
+            return Selection::Ambiguous;
+        }
         // An impl for a `'static` dyn type (`impl X for dyn Tr`).
         if let Selection::Impl { id, .. } = &sel
             && p.gx.static_dyn_impls.contains(&p.gx.index.get(*id).def)
