@@ -1269,6 +1269,13 @@ struct Ctx<'p> {
     /// below it is declared outside that block, so the block's items
     /// shadow it (`lookup`).
     item_scope_starts: Vec<usize>,
+    /// Traits the `use` items of enclosing blocks bring into scope
+    /// for method calls (`Ast::use_traits`, recorded by the
+    /// resolver), one layer per block, pushed with `item_scopes`:
+    /// crate traits by def, and std traits also by canonical path
+    /// for the by-path queries (`std_trait_imported`).
+    trait_scopes: Vec<Vec<DefId>>,
+    std_trait_scopes: Vec<Vec<Vec<Sym>>>,
     loops: Vec<LoopCtx>,
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
@@ -1302,7 +1309,7 @@ struct Ctx<'p> {
     /// entered: a const fn body names its own sibling items
     /// (`next_const_fn_sibs`, stashed by `call_target`), never the
     /// caller's block items.
-    const_fn_items_saved: Vec<(Vec<Vec<((Sym, CtxtId), u32)>>, Vec<usize>)>,
+    const_fn_items_saved: Vec<(Vec<Vec<((Sym, CtxtId), u32)>>, Vec<usize>, Vec<Vec<DefId>>, Vec<Vec<Vec<Sym>>>)>,
     next_const_fn_sibs: Option<Vec<u32>>,
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
@@ -1563,6 +1570,45 @@ fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
     root
 }
 
+/// The trait scope layers the `use` items among `idxs` (statement
+/// items of one block, or one nested fn's sibling items) bring:
+/// crate traits by def (flat names resolved through `trait_names`)
+/// and std traits by canonical path, from the resolver's records
+/// (`Ast::use_traits`). Empty when the resolver recorded none.
+fn use_item_trait_layers(p: &Program<'_>, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>>) {
+    let (mut defs, mut paths) = (Vec::new(), Vec::new());
+    if p.ast.use_traits.is_empty() {
+        return (defs, paths);
+    }
+    for &idx in idxs {
+        let item = &p.ast.stmt_items[idx as usize];
+        if !matches!(item.kind, ItemKind::Use(_)) {
+            continue;
+        }
+        for (span, ut) in &p.ast.use_traits {
+            if *span != item.span {
+                continue;
+            }
+            match ut {
+                ast::UseTrait::Flat(flat) => {
+                    if let Some(&d) = p.gx.trait_names.get(flat) {
+                        defs.push(d);
+                    }
+                }
+                ast::UseTrait::Std(path) => {
+                    if let Some(last) = path.last()
+                        && let Some(d) = p.gx.lang.by_name(p.interner.get(*last))
+                    {
+                        defs.push(d);
+                    }
+                    paths.push(path.clone());
+                }
+            }
+        }
+    }
+    (defs, paths)
+}
+
 /// Type-checks one function body. A closure body fn checks as its
 /// parent fn (closures share their parent's inference); the parent's
 /// own entry reports any errors, so the closure fn reports none and
@@ -1628,6 +1674,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         scopes: Vec::new(),
         item_scopes: Vec::new(),
         item_scope_starts: Vec::new(),
+        trait_scopes: Vec::new(),
+        std_trait_scopes: Vec::new(),
         loops: Vec::new(),
         errs: Vec::new(),
         negated_lits: Vec::new(),
@@ -1720,6 +1768,9 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             .collect();
         cx.item_scopes.push(layer);
         cx.item_scope_starts.push(cx.scopes.len());
+        let (defs, paths) = use_item_trait_layers(p, sibs);
+        cx.trait_scopes.push(defs);
+        cx.std_trait_scopes.push(paths);
     }
     // A template body keeps its `Param` types: the store answers
     // the structural trait queries on them from the env (`Tys::env`).
@@ -5586,8 +5637,12 @@ impl<'p> Ctx<'p> {
         let scope = self.scopes.len();
         {
             let mut layer: Vec<((Sym, CtxtId), u32)> = Vec::new();
+            let mut use_idxs: Vec<u32> = Vec::new();
             for stmt in &block.stmts {
                 if let Stmt::Item(idx) = stmt {
+                    if matches!(self.p.ast.stmt_items[*idx as usize].kind, ItemKind::Use(_)) {
+                        use_idxs.push(*idx);
+                    }
                     if let Some(name) = match &self.p.ast.stmt_items[*idx as usize].kind {
                         ItemKind::Fn(d) => Some((d.name, d.name_span.ctxt)),
                         ItemKind::Const(c) => c.name.map(|n| (n, c.name_span.ctxt)),
@@ -5600,6 +5655,9 @@ impl<'p> Ctx<'p> {
             }
             self.item_scopes.push(layer);
             self.item_scope_starts.push(self.scopes.len());
+            let (defs, paths) = use_item_trait_layers(self.p, &use_idxs);
+            self.trait_scopes.push(defs);
+            self.std_trait_scopes.push(paths);
         }
         let mut diverges = false;
         for stmt in &block.stmts {
@@ -5748,6 +5806,8 @@ impl<'p> Ctx<'p> {
         self.scopes.truncate(scope);
         self.item_scopes.pop();
         self.item_scope_starts.pop();
+        self.trait_scopes.pop();
+        self.std_trait_scopes.pop();
         t
     }
 
@@ -18244,19 +18304,29 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
                 name.map(|n| (n, si))
             })
             .collect();
-        let saved = (std::mem::take(&mut cx.item_scopes), std::mem::take(&mut cx.item_scope_starts));
+        let (tdefs, tpaths) = use_item_trait_layers(cx.p, &sibs);
+        let saved = (
+            std::mem::take(&mut cx.item_scopes),
+            std::mem::take(&mut cx.item_scope_starts),
+            std::mem::take(&mut cx.trait_scopes),
+            std::mem::take(&mut cx.std_trait_scopes),
+        );
         cx.const_fn_items_saved.push(saved);
         cx.item_scopes.push(layer);
         cx.item_scope_starts.push(0);
+        cx.trait_scopes.push(tdefs);
+        cx.std_trait_scopes.push(tpaths);
     }
     fn exit_const_fn(&mut self) {
         if let Some((o, t)) = self.cx.const_fn_saved.pop() {
             self.cx.const_fn_self = o;
             self.cx.body_scope.self_ty = t;
         }
-        if let Some((scopes, starts)) = self.cx.const_fn_items_saved.pop() {
+        if let Some((scopes, starts, tdefs, tpaths)) = self.cx.const_fn_items_saved.pop() {
             self.cx.item_scopes = scopes;
             self.cx.item_scope_starts = starts;
+            self.cx.trait_scopes = tdefs;
+            self.cx.std_trait_scopes = tpaths;
         }
     }
 

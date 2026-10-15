@@ -51,6 +51,24 @@ pub struct Ast {
     /// (`impl<T> Option<T>` and kin, inside `shipped`): their own scope,
     /// where no user name is visible (`Program::in_lang_methods`).
     pub lang_methods: (u32, u32),
+    /// Traits a function-local `use` brings into scope for method
+    /// calls, filled by the resolver's rewrite (`Rewrite::stmt_item`)
+    /// and keyed by the use item's span: a span survives flattening
+    /// and chunk concatenation, so checker blocks read their own
+    /// items' records. A trait import has no path in the body for
+    /// the rewrite to mark (`use Trait as _;` binds no name), so the
+    /// resolved targets ride here instead (`Ctx::trait_scopes`).
+    pub use_traits: Vec<(Span, UseTrait)>,
+}
+
+/// One trait a function-local `use` resolved to (`Ast::use_traits`).
+#[derive(Clone, Debug)]
+pub enum UseTrait {
+    /// A crate trait, by its flat name (the checker's `trait_names` key).
+    Flat(Sym),
+    /// A std trait by its canonical path (`std::io::Write` segments),
+    /// for names with no spliced source def at resolve time.
+    Std(Vec<Sym>),
 }
 
 /// A byte buffer shared by reference, with a window into it. Cloning
@@ -1538,6 +1556,7 @@ impl Ast {
             blobs: Vec::with_capacity(sh.bl as usize),
             shipped: Vec::new(),
             lang_methods: (0, 0),
+            use_traits: Vec::new(),
         };
         for mut c in chunks {
             out.inner_attrs.append(&mut c.inner_attrs);
@@ -1552,6 +1571,7 @@ impl Ast {
             out.blocks.append(&mut c.blocks);
             out.strings.append(&mut c.strings);
             out.blobs.append(&mut c.blobs);
+            out.use_traits.append(&mut c.use_traits);
         }
         out
     }
@@ -1584,6 +1604,7 @@ impl Ast {
         self.blocks.append(&mut o.blocks);
         self.strings.append(&mut o.strings);
         self.blobs.append(&mut o.blobs);
+        self.use_traits.append(&mut o.use_traits);
         (o.items, o.stmt_items, o.inner_attrs)
     }
 

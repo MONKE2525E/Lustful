@@ -5193,6 +5193,28 @@ impl Rewrite<'_> {
         }
     }
 
+    /// Records one trait target of a function-local `use` for the
+    /// checker (`Ast::use_traits`): a trait in scope makes its
+    /// methods callable in the block, which no path rewrite can
+    /// express. Non-trait targets record nothing.
+    fn record_use_trait_target(&self, ast: &mut Ast, span: Span, target: Target) {
+        if let Target::Def(d) = target
+            && let Some(info) = self.tables.def_info.get(&d)
+            && info.kind == ResKind::Trait
+        {
+            ast.use_traits.push((span, UseTrait::Flat(info.flat)));
+        }
+    }
+
+    /// Records a std trait path of a function-local `use`
+    /// (`Ast::use_traits`), when the canonical path names a trait.
+    fn record_use_trait_std(&self, ast: &mut Ast, span: Span, path: &[Sym]) {
+        let p: Vec<&str> = path.iter().map(|s| self.interner.get(*s)).collect();
+        if crate::ty::lang::std_path_kind(&p) == Some(crate::ty::lang::StdPathKind::Trait) {
+            ast.use_traits.push((span, UseTrait::Std(path.to_vec())));
+        }
+    }
+
     /// Binds one statement item in its block's frame: a nested fn,
     /// const, or static by its value name (`Frame::items`), a `use` by
     /// its imports. `block` runs this for every item of the block
@@ -5344,7 +5366,23 @@ impl Rewrite<'_> {
                         }
                         continue;
                     }
-                    match self.tables.resolve_module_path(module, &path[..path.len() - 1], imp.leading_colon, self.interner) {
+                    // An item of a std source overlay module imports
+                    // from it, as at module level (`try_import` in
+                    // imports.rs): `use std::io::Write;` in a body binds
+                    // the overlay trait, not the std compat tables.
+                    let modres = match self.tables.resolve_module_path(module, &path[..path.len() - 1], imp.leading_colon, self.interner) {
+                        PathRes::Done(Target::Extern(i))
+                            if path.len() == 3
+                                && let Some((m, false)) = self.tables.std_module_at(i, path[1], self.interner)
+                                && [Namespace::Type, Namespace::Value, Namespace::Macro]
+                                    .iter()
+                                    .any(|&ns| self.tables.lookup(m, ns, *path.last().unwrap()).is_some()) =>
+                        {
+                            PathRes::Done(Target::Module(m))
+                        }
+                        other => other,
+                    };
+                    match modres {
                         PathRes::Done(Target::Module(src)) => {
                             let last = *path.last().unwrap();
                             let mut any = false;
@@ -5353,8 +5391,12 @@ impl Rewrite<'_> {
                                 match self.tables.lookup(src, ns, last) {
                                     Some(BindState::One(b)) if self.tables.visible(&b.vis, b.def_module, module, self.interner) => {
                                         any = true;
-                                        let bn = crate::resolve::imports::import_bind_name(name, b.target, self.interner);
-                                        dup |= insert_local(scopes, bn, ns, LocalBind::Target(b.target), 2);
+                                        let target = b.target;
+                                        let bn = crate::resolve::imports::import_bind_name(name, target, self.interner);
+                                        dup |= insert_local(scopes, bn, ns, LocalBind::Target(target), 2);
+                                        if ns == Namespace::Type {
+                                            self.record_use_trait_target(ast, span, target);
+                                        }
                                     }
                                     Some(BindState::Ambiguous) => {
                                         any = true;
@@ -5365,12 +5407,15 @@ impl Rewrite<'_> {
                                     Some(_) => {}
                                     None => {
                                         let key = (src, ns_index(ns) as u8, last);
-                                        if let Some((avis, apath)) = self.tables.std_aliases.get(&key)
-                                            && self.tables.visible(avis, self.tables.std_alias_def_module(key), module, self.interner)
+                                        if let Some((avis, apath)) = self.tables.std_aliases.get(&key).cloned()
+                                            && self.tables.visible(&avis, self.tables.std_alias_def_module(key), module, self.interner)
                                         {
                                             any = true;
+                                            if ns == Namespace::Type {
+                                                self.record_use_trait_std(ast, span, &apath);
+                                            }
                                             if self.interner.get(name) != "_" {
-                                                dup |= insert_local_std(scopes, name, ns, apath.clone());
+                                                dup |= insert_local_std(scopes, name, ns, apath);
                                             }
                                         }
                                     }
@@ -5397,6 +5442,36 @@ impl Rewrite<'_> {
                             }
                         }
                         PathRes::Done(Target::Extern(i)) => {
+                            // An item of the shipped std source (`std::io::Write`)
+                            // resolves through the extern prelude walk to its
+                            // def: bind and record it like a module import
+                            // above. Lang-table items do not resolve this
+                            // way and keep the std compat handling below.
+                            let mut any_def = false;
+                            let mut dup_def = false;
+                            for ns in [Namespace::Type, Namespace::Value] {
+                                if let PathRes::Done(target @ Target::Def(_)) =
+                                    self.tables.resolve_path(module, &path, ns, PathMode::Use, true, self.interner)
+                                {
+                                    any_def = true;
+                                    if ns == Namespace::Type {
+                                        self.record_use_trait_target(ast, span, target);
+                                    }
+                                    let bn = crate::resolve::imports::import_bind_name(name, target, self.interner);
+                                    dup_def |= insert_local(scopes, bn, ns, LocalBind::Target(target), 2);
+                                }
+                            }
+                            if any_def {
+                                if dup_def && self.interner.get(name) != "_" {
+                                    self.push_local_dup(span, name);
+                                }
+                                continue;
+                            }
+                            // A std trait is in scope for method calls
+                            // even when imported as `_` (no name bound).
+                            if self.tables.externs[i as usize].is_std_lib && self.tables.externs[i as usize].unsupported.is_none() {
+                                self.record_use_trait_std(ast, span, &path);
+                            }
                             if self.tables.externs[i as usize].is_std_lib
                                 && self.tables.externs[i as usize].unsupported.is_none()
                                 && self.interner.get(name) != "_"
@@ -5463,6 +5538,7 @@ impl Rewrite<'_> {
                                         let name = self.interner.intern(n);
                                         let mut full = path.clone();
                                         full.push(name);
+                                        self.record_use_trait_std(ast, span, &full);
                                         frame.std_imports.entry((name, ns_index(Namespace::Type))).or_insert(full);
                                     }
                                 }
@@ -5496,9 +5572,17 @@ impl Rewrite<'_> {
                             }
                         }
                         for (name, ns, bind) in entries {
+                            if ns == Namespace::Type
+                                && let LocalBind::Target(target) = bind
+                            {
+                                self.record_use_trait_target(ast, span, target);
+                            }
                             insert_local(scopes, name, ns, bind, 1);
                         }
                         for (ns, name, _, _, path) in self.tables.visible_std_aliases(src, module, self.interner) {
+                            if ns == ns_index(Namespace::Type) as u8 {
+                                self.record_use_trait_std(ast, span, &path);
+                            }
                             insert_glob_local_std(scopes, name, ns as usize, path);
                         }
                         }

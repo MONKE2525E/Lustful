@@ -246,7 +246,7 @@ pub fn shift_ast(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>, ctxts: 
 /// and `extras` changes nothing.
 pub fn shift_ast_extras(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>, extras: &ExtraNodes, ctxts: &mut FxMap<u32, CtxtId>) -> usize {
     let mut w = Walk { edit, ctxts: std::mem::take(ctxts), visited: 0, probe: None };
-    let Ast { inner_attrs, items, stmt_items, exprs, expr_spans, pats, pat_spans, tys, ty_spans, blocks, .. } = ast;
+    let Ast { inner_attrs, items, stmt_items, exprs, expr_spans, pats, pat_spans, tys, ty_spans, blocks, use_traits, .. } = ast;
     let all = |n: usize| vec![0..n];
     let pick = |n: usize, f: fn(&FileRanges) -> &Vec<Range<usize>>| ranges.map_or_else(|| all(n), |r| f(r).clone());
     // The extra nodes of one arena that the picked ranges do not cover.
@@ -281,6 +281,11 @@ pub fn shift_ast_extras(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>, 
     let picked = pick(stmt_items.len(), |r| &r.stmt_items);
     for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.stmt_items)) {
         w.item(&mut stmt_items[i]);
+    }
+    // The resolver's trait records key on use item spans; they move
+    // with the items (`Edit::span` leaves other files alone).
+    for (s, _) in use_traits.iter_mut() {
+        w.sp(s);
     }
     *ctxts = w.ctxts;
     w.visited

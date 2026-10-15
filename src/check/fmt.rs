@@ -74,10 +74,19 @@ impl<'p> Ctx<'p> {
 
     /// True when this module imports the std trait `module::name` by a
     /// `use` of its std path at module level (`use std::fmt::Write;`,
-    /// any rename, `as _`). Globs and imports inside a fn body do not
-    /// count yet, which can only reject.
+    /// any rename, `as _`), or an enclosing block does (`Ast::use_traits`
+    /// paths in `std_trait_scopes`). Module-level globs do not count
+    /// yet, which can only reject.
     pub(super) fn std_trait_imported(&self, module: &str, name: &str) -> bool {
         let p = self.p;
+        if self.std_trait_scopes.iter().flat_map(|layer| layer.iter()).any(|path| {
+            path.len() == 3
+                && matches!(p.interner.get(path[0]), "std" | "core" | "alloc")
+                && p.interner.get(path[1]) == module
+                && p.interner.get(path[2]) == name
+        }) {
+            return true;
+        }
         let Some(res) = &p.resolved else { return false };
         let ns = crate::resolve::imports::ns_index(Namespace::Type) as u8;
         res.std_aliases.iter().any(|(&(m, n, _), (_, path))| {

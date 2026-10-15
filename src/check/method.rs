@@ -89,6 +89,13 @@ pub(super) fn trait_in_scope_pub(cx: &mut Ctx, trait_def: DefId) -> bool {
 }
 
 fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
+    // A `use` in an enclosing block (`use Trait as _;` in a fn body)
+    // brings the trait in for the whole block, nested items and
+    // closures included, as in rustc. The answer depends only on
+    // this body, so no module read is recorded for it.
+    if cx.trait_scopes.iter().any(|layer| layer.contains(&trait_def)) {
+        return true;
+    }
     let p = cx.p;
     // A user trait defined in or imported into this module under any
     // name (including `as _`). The query records a `TraitInScope` read:
