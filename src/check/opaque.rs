@@ -30,9 +30,10 @@
 //   out of reach. Lowering, borrowck, and codegen get this check.
 //
 // Instances check revealed and replay their template's picks. A template
-// that uses an opaque value checks in the view; its borrow check still
-// rejects opaque locals (L0602), so generic callers wait for region slots
-// for opaque values (W-BORROW).
+// that uses an opaque value checks in the view; lowering marks its
+// opaque-holding locals by their view types, so its borrow check tracks
+// the value through the capture var as a revealed body does
+// (fx-bench4-gaps).
 use super::*;
 use crate::intern::FxMap;
 

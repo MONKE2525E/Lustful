@@ -477,11 +477,18 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     if !body.lower_errs.is_empty() {
         return body.lower_errs.clone();
     }
-    // An `impl Trait` value has no region slots in the region engine: it
-    // could hold borrows lust would not see. Reject until it does (iface
-    // for whoever lands `impl Trait` returns; W-BORROW).
-    if let Some(l) = body.locals.iter().find(|l| mentions_opaque(&body.tys, l.ty)) {
-        let _ = l;
+    // An `impl Trait` value in a view body (a template check) is
+    // tracked through `Body::opaque_locals`: its local gets a capture
+    // var for every region the opaque captures, drop-live unless its
+    // bounds say `Copy` (regions.rs `cap_var`). A local that mentions
+    // an opaque without that mark (lowering did not hold it by value)
+    // keeps the reject: its borrows would not be seen.
+    if body
+        .locals
+        .iter()
+        .enumerate()
+        .any(|(i, l)| mentions_opaque(&body.tys, l.ty) && crate::check::opaque::view_hold(p, &body.tys, l.ty) != crate::check::opaque::Hold::None && !body.opaque_locals.contains(&(i as Local)))
+    {
         return vec![Diag::new(
             "L0602",
             p.fn_def(body.fn_id).name_span,

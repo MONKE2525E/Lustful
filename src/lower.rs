@@ -518,7 +518,22 @@ impl<'p> Lower<'p> {
     /// its own view type (`Checked::local_holds`), any other local by
     /// the type match (`type_hold`).
     fn mark_opaque_locals(&mut self) {
+        // A view body (a template check) has no recorded holds: its
+        // locals hold opaque values by their own types, which
+        // `view_hold` reads directly (`type_hold` below then has no
+        // view pairs to match, and answers None for them).
         if self.ck.opaque_holds.is_empty() {
+            for l in 0..self.body.locals.len() {
+                let ty = self.body.locals[l].ty;
+                match crate::check::opaque::view_hold(self.p, &self.body.tys, ty) {
+                    Hold::None => {}
+                    Hold::Copy if !self.needs_drop_ty(ty) => {
+                        self.body.opaque_locals.push(l as Local);
+                        self.body.opaque_nodrop.push(l as Local);
+                    }
+                    _ => self.body.opaque_locals.push(l as Local),
+                }
+            }
             return;
         }
         let mut hold: Vec<Option<Hold>> = vec![None; self.body.locals.len()];
