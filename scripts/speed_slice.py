@@ -2,7 +2,8 @@
 """The speed benchmark on a pinned ts-rust slice (bench/slices/<name>): lust vs cargo.
 
 Entry point: `scripts/scale-gate.py --slice bench/slices/<name> [options]` (this file
-holds the slice mode). The promise it tracks: 100x faster WARM checks after a
+holds the slice mode). `speed_slice.py --render docs/speed.md a.json [b.json ...]`
+rewrites the results section of docs/speed.md from result JSONs. The promise it tracks: 100x faster WARM checks after a
 one-function edit, on identical source. Cold check, build, and restart are
 separate rows.
 
@@ -393,13 +394,14 @@ class Bench:
             rows.append({
                 "row": name, "lust": lust, "rustc": rus,
                 "rustc_best": {"config": best[0], **best[1]} if best else None,
-                "ratio": round(best[1]["median"] / lust["median"], 1) if best and lust["median"] else None,
+                "ratio": ratio(best[1]["median"], lust["median"]) if best and lust["median"] else None,
                 "lust_phases_median_ms": {k: round(statistics.median(v), 2) for k, v in phases.items()},
                 "build_stats_median": {k: statistics.median(v) for k, v in stats.items()},
                 "cold_compares": rec.get("cold_compares", 0),
             })
-        lust_commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
-                                     capture_output=True, text=True).stdout.strip()
+        # A boat copy has no .git: the caller passes LUST_COMMIT.
+        lust_commit = os.environ.get("LUST_COMMIT") or subprocess.run(
+            ["git", "-C", str(ROOT), "describe", "--always", "--dirty"], capture_output=True, text=True).stdout.strip()
         rustc_v = subprocess.run(["rustc", "--version"], capture_output=True, text=True).stdout.strip()
         out = {
             "slice": self.slice_dir.name, "lines": lines, "code_lines": self.manifest.get("code_lines"),
@@ -411,6 +413,12 @@ class Bench:
         }
         shutil.rmtree(self.work, ignore_errors=True)
         return out
+
+
+def ratio(rustc_ms, lust_ms):
+    """rustc / lust, 1 decimal at 1x and above, 2 below (0.04x must not print as 0)."""
+    r = rustc_ms / lust_ms
+    return round(r, 1) if r >= 1 else round(r, 2)
 
 
 def print_table(res):
@@ -426,7 +434,53 @@ def print_table(res):
     print(f"states checked: {res['states_checked']} (lust and cargo agree on every one)")
 
 
+def render_md(results):
+    """The docs/speed.md tables for one or more result JSONs (one section per slice)."""
+    out = []
+    for res in results:
+        rss = res["peak_rss"]
+        out += [f"### `{res['slice']}`: {res['lines']:,} lines ({res['code_lines']:,} code)", "",
+                f"ts-rust `{res['tsrust_commit'][:9]}`, lust `{res['lust_commit']}`, {res['rustc']}, "
+                f"{res['host']['nproc']} vCPU. {res['states_checked']} source states; lust and cargo agree on "
+                f"pass or fail on every one.", "",
+                "| Row | lust median | p95 | worst | n | rustc median (config) | Ratio |",
+                "|---|---:|---:|---:|---:|---:|---:|"]
+        for r in res["rows"]:
+            l, b = r["lust"], r["rustc_best"]
+            rus = f"{b['median']:.0f} ms ({b['config']})" if b else "-"
+            x = f"{ratio(b['median'], l['median'])}x" if b and l["median"] else "-"
+            x = f"**{x}**" if r["row"].startswith("body edit check") else x
+            out.append(f"| {r['row']} | {l['median']:.0f} ms | {l['p95']:.0f} | {l['worst']:.0f} | {l['n']} | {rus} | {x} |")
+        build = next((r for r in res["rows"] if r["row"] == "cold build"), None)
+        if build and build["build_stats_median"]:
+            st = build["build_stats_median"]
+            out += ["", f"Cold build: {st.get('c_bytes', 0) / 1e6:.1f} MB of C, {st.get('units_compiled', 0):.0f} units, "
+                    f"link {st.get('link_ms', 0):.0f} ms."]
+        out += [f"Peak RSS: lust cold check {rss.get('lust_cold_check_kb', 0) / 1024:.0f} MB, lust daemon "
+                f"{(rss.get('lust_daemon_hwm_kb') or 0) / 1024:.0f} MB (VmHWM over the run), cargo cold check "
+                + ", ".join(f"{rss[k] / 1024:.0f} MB ({k.rsplit('_', 1)[1]})" for k in rss if k.startswith("cargo_cold_check_kb_"))
+                + " (largest process in the tree).", ""]
+        body = next((r for r in res["rows"] if r["row"].startswith("body edit check")), None)
+        if body:
+            top = sorted(body["lust_phases_median_ms"].items(), key=lambda kv: -kv[1])[1:6]
+            out += ["lust phases, body edit check (median ms): " + ", ".join(f"{k} {v:.0f}" for k, v in top) + ".", ""]
+    return "\n".join(out)
+
+
+def write_md(path, results):
+    text = Path(path).read_text()
+    a, b = "<!-- speed-table:start -->", "<!-- speed-table:end -->"
+    if a not in text or b not in text:
+        sys.exit(f"{path} lacks the {a} / {b} markers")
+    head, rest = text.split(a, 1)
+    _, tail = rest.split(b, 1)
+    Path(path).write_text(head + a + "\n" + render_md(results) + "\n" + b + tail)
+
+
 def main(argv):
+    if argv[:1] == ["--render"]:
+        write_md(argv[1], [json.loads(Path(p).read_text()) for p in argv[2:]])
+        return
     opts = {"edits": 120, "reps": 5, "cycles": 5, "units": 24, "build_samples": 12, "cold_every": 10,
             "no_rustc": False}
     slice_dir = None
