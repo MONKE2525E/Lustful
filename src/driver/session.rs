@@ -65,6 +65,10 @@ pub(crate) struct Front {
     /// (`Program::static_defs`): while a full resolve leaves them equal,
     /// nested statics kept their indexes and generic reuse holds.
     pub(crate) prev_static_defs: Option<Vec<crate::def::DefId>>,
+    /// Set by a body patch whose const fn edit only const and static values
+    /// can read (`ConstReach::revaluable`): the kept program must evaluate
+    /// them again (`collect::const_values_hold`) before it stands.
+    pub(crate) revalue_consts: bool,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
     /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
@@ -359,6 +363,7 @@ impl Session {
                 prev_static_ids: FxMap::default(),
                 prev_order_fragile: false,
                 prev_static_defs: None,
+                revalue_consts: false,
                 items: Vec::new(),
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),

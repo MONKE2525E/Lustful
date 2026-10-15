@@ -42,6 +42,8 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         body_items: _,
         item_blocks,
         body_consts: _,
+        const_values: _,
+        scope_of_stmt: _,
         fn_siblings: _,
         type_names: _,
         aliases: _,

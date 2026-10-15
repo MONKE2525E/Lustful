@@ -179,71 +179,89 @@ pub(crate) fn body_scan(ast: &Ast, f: &FnDef, inner: Option<&mut Vec<u32>>) -> (
     (hash, idents)
 }
 
+/// What `const_idents` finds: identifiers in the places other than item
+/// values (array lengths, const generic arguments, `const` blocks,
+/// pattern bounds, discriminants, const param defaults), and per const,
+/// static, or associated const item, its name and the identifiers of its
+/// value.
+#[derive(Default)]
+pub(crate) struct ConstRoots {
+    pub scalar: Vec<Sym>,
+    pub values: Vec<(Option<Sym>, Vec<Sym>)>,
+}
+
 /// The const expressions an item holds outside fn bodies, for
 /// `const_idents`: const and static values, discriminants, associated
 /// const values, and const param defaults, in nested modules too. Types
 /// sit in the type arena, which `const_idents` scans on its own.
-fn item_consts(w: &mut Walker, h: &mut FxHasher, item: &Item) {
-    fn generics(w: &mut Walker, h: &mut FxHasher, g: &Generics) {
+fn item_consts(ast: &Ast, item: &Item, out: &mut ConstRoots) {
+    fn walk(ast: &Ast, e: ExprId, idents: &mut Vec<Sym>) {
+        Walker { ast, idents: Some(idents), inner: None }.expr(&mut FxHasher::default(), e);
+    }
+    fn generics(ast: &Ast, g: &Generics, out: &mut ConstRoots) {
         for p in &g.params {
             if let GenericParam::Const { default: Some(e), .. } = p {
-                w.expr(h, *e);
+                walk(ast, *e, &mut out.scalar);
             }
         }
     }
-    fn values(w: &mut Walker, h: &mut FxHasher, es: impl IntoIterator<Item = Option<ExprId>>) {
-        for e in es.into_iter().flatten() {
-            w.expr(h, e);
+    fn value(ast: &Ast, name: Option<Sym>, e: Option<ExprId>, out: &mut ConstRoots) {
+        if let Some(e) = e {
+            let mut idents = Vec::new();
+            walk(ast, e, &mut idents);
+            out.values.push((name, idents));
         }
     }
     match &item.kind {
-        ItemKind::Const(c) => values(w, h, [c.value]),
-        ItemKind::Static(st) => values(w, h, [st.value]),
-        ItemKind::Fn(f) => generics(w, h, &f.generics),
-        ItemKind::Struct(st) => generics(w, h, &st.generics),
-        ItemKind::Type(a) => generics(w, h, &a.generics),
+        ItemKind::Const(c) => value(ast, c.name, c.value, out),
+        ItemKind::Static(st) => value(ast, Some(st.name), st.value, out),
+        ItemKind::Fn(f) => generics(ast, &f.generics, out),
+        ItemKind::Struct(st) => generics(ast, &st.generics, out),
+        ItemKind::Type(a) => generics(ast, &a.generics, out),
+        ItemKind::Union(u) => generics(ast, &u.generics, out),
         ItemKind::Enum(en) => {
-            generics(w, h, &en.generics);
-            values(w, h, en.variants.iter().map(|v| v.discriminant));
+            generics(ast, &en.generics, out);
+            for e in en.variants.iter().filter_map(|v| v.discriminant) {
+                walk(ast, e, &mut out.scalar);
+            }
         }
         ItemKind::Impl(imp) => {
-            generics(w, h, &imp.generics);
-            imp.fns.iter().for_each(|f| generics(w, h, &f.generics));
-            values(w, h, imp.consts.iter().map(|c| c.default));
+            generics(ast, &imp.generics, out);
+            imp.fns.iter().for_each(|f| generics(ast, &f.generics, out));
+            imp.consts.iter().for_each(|c| value(ast, Some(c.name), c.default, out));
         }
         ItemKind::Trait(t) => {
-            generics(w, h, &t.generics);
-            t.fns.iter().for_each(|f| generics(w, h, &f.generics));
-            values(w, h, t.consts.iter().map(|c| c.default));
+            generics(ast, &t.generics, out);
+            t.fns.iter().for_each(|f| generics(ast, &f.generics, out));
+            t.consts.iter().for_each(|c| value(ast, Some(c.name), c.default, out));
         }
-        ItemKind::Mod(m) => m.body.iter().flatten().for_each(|it| item_consts(w, h, it)),
+        ItemKind::Mod(m) => m.body.iter().flatten().for_each(|it| item_consts(ast, it, out)),
         ItemKind::ExternBlock(b) => {
             for it in &b.items {
                 if let ForeignItem::Static(st) = it {
-                    values(w, h, [st.value]);
+                    value(ast, Some(st.name), st.value, out);
                 }
             }
         }
-        ItemKind::Union(u) => generics(w, h, &u.generics),
         ItemKind::Use(_) | ItemKind::MacroRules(_) | ItemKind::ExternCrate(_) | ItemKind::MacroCall(_) => {}
     }
 }
 
-/// Identifiers a const evaluation may read, pushed to `out`
-/// (`driver/const_reach.rs`): those inside every array length, const
-/// generic argument, `const` block, and pattern range bound of the arena
-/// nodes from `from` (expression, type, and pattern arena lengths) to the
-/// end. With `items`, also every identifier outside fn bodies of every
-/// item and body item: const and static values, discriminants, types,
-/// generics, and trait default bodies.
-pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool, out: &mut Vec<Sym>) {
-    let mut w = Walker { ast, idents: Some(out), inner: None };
-    let mut h = FxHasher::default();
+/// Identifiers a const evaluation may read (`driver/const_reach.rs`):
+/// those inside every array length, const generic argument, `const`
+/// block, and pattern range bound of the arena nodes from `from`
+/// (expression, type, and pattern arena lengths) to the end. With
+/// `items`, also those of every item and body item outside fn bodies
+/// (`item_consts`).
+pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool) -> ConstRoots {
+    let mut out = ConstRoots::default();
     if items {
         for it in ast.items.iter().chain(&ast.stmt_items) {
-            item_consts(&mut w, &mut h, it);
+            item_consts(ast, it, &mut out);
         }
     }
+    let mut w = Walker { ast, idents: Some(&mut out.scalar), inner: None };
+    let mut h = FxHasher::default();
     // The const arguments of one path segment's (or turbofish's) angle
     // arguments.
     fn args(w: &mut Walker, h: &mut FxHasher, args: &[GenericArg]) {
@@ -307,6 +325,7 @@ pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool, 
             _ => {}
         }
     }
+    out
 }
 
 struct Walker<'a> {

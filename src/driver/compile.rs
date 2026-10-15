@@ -1710,7 +1710,9 @@ fn resolved_setup(
             // passing body joins as a read-set candidate. One no
             // evaluation can run (`const_reach.rs`) is a plain body edit,
             // unless a stored check ran it anyway (a `Checked` read: a
-            // `thread_local!` const initializer).
+            // `thread_local!` const initializer). One only const and
+            // static values read is a plain body edit once their values
+            // hold (`revalue_consts`, after the kept program).
             let (mut changed, mut mention_only, mut const_fn) = (p.changed, Vec::new(), p.const_fn);
             if !const_fn && !p.const_edits.is_empty() {
                 let defs = local_def_ids(front, &p.const_edits);
@@ -1719,6 +1721,7 @@ fn resolved_setup(
                 };
                 const_fn = caches.slot_reads.iter().any(read) || caches.gen_reuse.reads_checked(&defs);
             }
+            front.revalue_consts = p.revalue && !const_fn;
             if const_fn {
                 mention_only = (0..p.fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !changed.contains(&i)).collect();
                 changed.extend_from_slice(&mention_only);
@@ -2090,7 +2093,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
 
     // Both front ends produce the same locals for the shared tail.
-    let (map, mut changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
+    let (map, mut changed, mut mention_only, mut const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
         match resolved_setup(req, front, caches, std_cache, &src, root_lexed, route_std_mods, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t, &mut visits, reusable) {
             Ok(x) => x,
             Err(resp) => return resp,
@@ -2735,6 +2738,27 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     } else {
         Err("gen state")
     };
+    // A const fn edit that only const and static values read: the kept
+    // program stands when they all evaluate as before. Else (or with no
+    // kept program) the request goes on as a const fn edit that changed
+    // values: no generic reuse, and every unchanged passing body is a
+    // read-set candidate.
+    let mut kept = kept;
+    if std::mem::take(&mut front.revalue_consts) {
+        let hold = match &mut kept {
+            Ok((p, _, _)) => collect::const_values_hold(p, &front.def_order.statics),
+            Err(_) => false,
+        };
+        if !hold {
+            kept = Err("gen state");
+            const_fn_changed = true;
+            gen_ok_here = false;
+            caches.gen_reuse.clear();
+            mention_only = (0..fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !changed.contains(&i)).collect();
+            changed.extend_from_slice(&mention_only);
+            changed.sort_unstable();
+        }
+    }
     let kept = match kept {
         Ok((p, spans, errs)) => {
             visits.kept = "reuse";
@@ -2800,8 +2824,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // A collect error drops the item state, so the next request
             // rebuilds it in full mode. Errors that all come from
             // template checks are body errors: the item state stands,
-            // and the next edit (usually the fix) stays a body edit.
-            if caches.gen_reuse.template_errors != ds.len() {
+            // and the next edit (usually the fix) stays a body edit. So
+            // does a body patch's: its items are the last full resolve's,
+            // and only a body moved (a const fn body that fails const
+            // evaluation, say); the next request collects again.
+            if caches.gen_reuse.template_errors != ds.len() && visits.path != "patch" {
                 front.env_hash = None;
             }
             // Its static ids are unknown, and generic reuse may hold

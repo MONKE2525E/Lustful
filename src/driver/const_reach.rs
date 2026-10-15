@@ -13,12 +13,23 @@
 // fast path. No evaluator runs a method with a `self` parameter (each
 // answers it as outside the bound), so those never count as reached.
 //
-// The set lives in the patch base and only grows: each patch adds what its
+// A reached const fn may still feed only const and static values: then
+// the kept program evaluates every value again and compares
+// (`collect::const_values_hold`). `revaluable` says so when the names
+// that can carry the fn's result (the fn, the const fns that name one of
+// them, and the const and static items whose value names one) meet no
+// other evaluator start: no array length, const argument, `const` block,
+// discriminant, or const param default names one.
+//
+// The sets live in the patch base and only grow: each patch adds what its
 // new nodes and its edited const fns can reach, and never removes what an
-// old body could (a superset stays sound). A full resolve drops it with the
-// base. The one evaluator start outside these places, a `thread_local!`
-// `const { .. }` initializer (its block is a plain fn's body), records a
-// `Checked` read; the driver finds those readers by their reads.
+// old body could (a superset stays sound). Item values are read once: a
+// patch keeps every item outside the edited body, and the items inside it
+// keep their text (`patch::same_items`). A full resolve drops the sets with
+// the base. The one evaluator start outside these places, a
+// `thread_local!` `const { .. }` initializer (its block is a plain fn's
+// body), records a `Checked` read; the driver finds those readers by their
+// reads.
 use super::compile::fn_def_at;
 use super::session::Front;
 use crate::intern::{FxHasher, Sym};
@@ -28,7 +39,13 @@ use std::hash::BuildHasherDefault;
 type FxSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 pub(crate) struct ConstReach {
+    /// The closure over every evaluator start.
     names: FxSet<Sym>,
+    /// Identifiers in the starts other than item values.
+    scalar: FxSet<Sym>,
+    /// Each const, static, and associated const item: name and the
+    /// identifiers of its value.
+    values: Vec<(Option<Sym>, Vec<Sym>)>,
     /// Expression, type, and pattern arena lengths already scanned.
     seen: (usize, usize, usize),
     /// The const fns (`Front::fn_loc` index, name), and whether each one's
@@ -38,10 +55,9 @@ pub(crate) struct ConstReach {
 }
 
 impl ConstReach {
-    /// The set for the front's current Ast.
+    /// The sets for the front's current Ast.
     pub(crate) fn build(front: &Front) -> ConstReach {
-        let mut idents = Vec::new();
-        super::ast_hash::const_idents(&front.ast, (0, 0, 0), true, &mut idents);
+        let roots = super::ast_hash::const_idents(&front.ast, (0, 0, 0), true);
         let consts: Vec<(usize, Sym)> = front
             .fn_loc
             .iter()
@@ -51,9 +67,16 @@ impl ConstReach {
                 (def.qual.is_const && def.self_param.is_none()).then_some((i, def.name))
             })
             .collect();
-        let mut r = ConstReach { names: FxSet::default(), seen: (0, 0, 0), expanded: vec![false; consts.len()], consts };
-        r.names.extend(idents);
-        r.seen = arena_lens(front);
+        let mut r = ConstReach {
+            names: FxSet::default(),
+            scalar: roots.scalar.iter().copied().collect(),
+            values: roots.values,
+            seen: arena_lens(front),
+            expanded: vec![false; consts.len()],
+            consts,
+        };
+        r.names.extend(r.scalar.iter().copied());
+        r.names.extend(r.values.iter().flat_map(|v| v.1.iter().copied()));
         r.close(front);
         r
     }
@@ -62,9 +85,9 @@ impl ConstReach {
     /// nodes, and the new bodies of the edited fns (`Front::fn_loc`
     /// indexes) that are reachable const fns.
     pub(crate) fn update(&mut self, front: &Front, edited: &[usize]) {
-        let mut idents = Vec::new();
-        super::ast_hash::const_idents(&front.ast, self.seen, false, &mut idents);
-        self.names.extend(idents);
+        let roots = super::ast_hash::const_idents(&front.ast, self.seen, false);
+        self.scalar.extend(roots.scalar.iter().copied());
+        self.names.extend(roots.scalar);
         self.seen = arena_lens(front);
         for (k, (i, _)) in self.consts.iter().enumerate() {
             if edited.contains(i) {
@@ -80,6 +103,38 @@ impl ConstReach {
         let (item, sub) = front.fn_loc[i];
         let def = fn_def_at(&front.ast, item, sub);
         def.self_param.is_none() && self.names.contains(&def.name)
+    }
+
+    /// True when the results of fns `fns` (`Front::fn_loc` indexes) can
+    /// reach only const and static values (see the module docs).
+    pub(crate) fn revaluable(&self, front: &Front, fns: &[usize]) -> bool {
+        let idents = &front.chunks[0].scan.body_idents;
+        let mut carry: FxSet<Sym> = fns
+            .iter()
+            .map(|&i| {
+                let (item, sub) = front.fn_loc[i];
+                fn_def_at(&front.ast, item, sub).name
+            })
+            .collect();
+        loop {
+            let before = carry.len();
+            for &(i, name) in &self.consts {
+                if !carry.contains(&name) && idents.get(i).is_some_and(|ids| ids.iter().any(|s| carry.contains(s))) {
+                    carry.insert(name);
+                }
+            }
+            for (name, ids) in &self.values {
+                if let Some(n) = name
+                    && !carry.contains(n)
+                    && ids.iter().any(|s| carry.contains(s))
+                {
+                    carry.insert(*n);
+                }
+            }
+            if carry.len() == before {
+                return carry.iter().all(|s| !self.scalar.contains(s));
+            }
+        }
     }
 
     /// Adds the body identifiers of every const fn whose name is in the

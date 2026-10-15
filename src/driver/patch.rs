@@ -296,6 +296,9 @@ pub(super) struct Patched {
     /// Some edited body is a `const fn`'s that a const evaluation may
     /// run (see the module docs).
     pub const_fn: bool,
+    /// Some edited const fn's result can reach const and static values
+    /// only (`ConstReach::revaluable`): they must evaluate again.
+    pub revalue: bool,
     /// The edited const fns (`Front::fn_loc` indexes).
     pub const_edits: Vec<usize>,
     /// Files whose text changed, Ast nodes the patch built, bodies
@@ -1119,7 +1122,13 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         None if !const_edits.is_empty() => base.reach = Some(super::const_reach::ConstReach::build(front)),
         None => {}
     }
-    let reached = base.reach.as_ref().is_some_and(|r| const_edits.iter().any(|&i| r.reaches(front, i)));
+    // One that only const and static values can read keeps the program
+    // after their values check again (`Patched::revalue`).
+    let reached: Vec<usize> = match &base.reach {
+        Some(r) => const_edits.iter().copied().filter(|&i| r.reaches(front, i)).collect(),
+        None => Vec::new(),
+    };
+    let revalue = !reached.is_empty() && base.reach.as_ref().is_some_and(|r| r.revaluable(front, &reached));
     let changed = slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots);
     let edits_len = edits.iter().filter(|e| e.body.is_some()).count();
     let out = Patched {
@@ -1132,7 +1141,8 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         std_ranges: base.std_ranges.clone(),
         std_routes: base.std_routes.clone(),
         std_methods: base.std_methods,
-        const_fn: reached,
+        const_fn: !reached.is_empty() && !revalue,
+        revalue,
         const_edits,
         files,
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
@@ -2097,6 +2107,80 @@ pub fn run() -> i64 {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
             assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
             assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
+        }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Const fns whose results reach only const and static values
+    /// (`base` through `SCALE`, `pair` through `PAIRS`), a const that
+    /// patterns match on, and one whose result reaches an array length
+    /// (`width`).
+    const VALUES: &str = "pub const fn base() -> i64 {
+    3
+}
+
+pub const fn pair(a: i64) -> (i64, i64) {
+    (a, a + 1)
+}
+
+pub const fn width() -> usize {
+    2
+}
+
+pub const SCALE: i64 = base() * 2;
+pub static PAIRS: [(i64, i64); 2] = [pair(1), pair(SCALE)];
+const W: usize = width();
+
+pub fn run() -> i64 {
+    let a: [u8; W] = [0; W];
+    let k = match PAIRS[1].0 {
+        SCALE => 1,
+        _ => 2,
+    };
+    SCALE + PAIRS[1].1 + k + a.len() as i64
+}
+";
+
+    /// A body edit of a const fn whose result reaches only const and
+    /// static values keeps the program when every value evaluates as
+    /// before (kept=reuse). A new value, a const evaluation error, its
+    /// fix, and the undo collect again (the collect error keeps the item
+    /// state, so the fix patches); one that reaches an array length always
+    /// does. Every answer is the cold one, and a build after a
+    /// changed value prints what a cold build prints.
+    #[test]
+    fn revalued_const_fn_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-revalue-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, VALUES).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        // (old, new, expected kept=; "" for any)
+        let steps: &[(&str, &str, &str)] = &[
+            ("    3\n}\n\npub const fn pair", "    let b = 3;\n    b\n}\n\npub const fn pair", "reuse"),
+            ("    (a, a + 1)\n", "    let n = a + 1;\n    (a, n)\n", "reuse"),
+            ("    let n = a + 1;\n    (a, n)\n", "    (a, a + 2)\n", "gen_state"),
+            ("    (a, a + 2)\n", "    (a, a + 1)\n", "gen_state"),
+            // A collect error (const evaluation overflows) keeps the item
+            // state: the fix patches too.
+            ("    let b = 3;\n    b\n", "    let b: i64 = 9223372036854775807;\n    b + 1\n", "gen_state"),
+            ("    let b: i64 = 9223372036854775807;\n    b + 1\n", "    let b = 4;\n    b\n", "gen_state"),
+            ("    let b = 4;\n    b\n", "    let b = 4;\n    let _c = 1;\n    b\n", "reuse"),
+            ("    2\n}\n\npub const SCALE", "    let w = 2;\n    w\n}\n\npub const SCALE", "gen_state"),
+        ];
+        for &(old, new, kept) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            if !kept.is_empty() {
+                assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+                assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
+            }
         }
         assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
         let bin = root.with_extension("bin");

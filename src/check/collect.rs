@@ -326,6 +326,11 @@ pub struct Program {
     /// Region signatures for the borrow checker (W-BORROW, ARCH 5): the
     /// signatures with their lifetimes kept, beside the erased ones above.
     pub regions: crate::borrowck::RegionTables,
+    /// Every const and static value `eval_const_items` evaluated, in its
+    /// pending order (None: failed), and the body item scopes it read: a
+    /// kept program checks its values again with them (`const_values_hold`).
+    pub const_values: Vec<Option<crate::ty::consteval::ConstValue>>,
+    pub scope_of_stmt: HashMap<u32, Vec<u32>>,
 }
 
 impl Program {
@@ -2531,6 +2536,8 @@ pub fn collect_reuse(
         body_items: HashMap::default(),
         item_blocks: Vec::new(),
         body_consts: Vec::new(),
+        const_values: Vec::new(),
+        scope_of_stmt: HashMap::default(),
         fn_siblings: HashMap::default(),
         type_names: HashMap::default(),
         aliases: HashMap::default(),
@@ -4341,6 +4348,7 @@ pub fn collect_reuse(
     // build, the instance checks in mono) read consts, statics, and assoc
     // consts from these tables, in generic and plain bodies alike.
     eval_const_items(&mut p, &mut errs, &mut def_order.statics, &scope_of_stmt);
+    p.scope_of_stmt = scope_of_stmt;
     // The generic reuse cache holds while the trait system does (W-PERF);
     // the key needs the resolved trait of each impl, and the cache serves
     // the template checks and discovery that `finish_collect` runs.
@@ -4427,6 +4435,46 @@ fn eval_const_items(
     static_order: &mut Vec<crate::def::DefPathHash>,
     scope_of_stmt: &HashMap<u32, Vec<u32>>,
 ) {
+    let Some((pending, static_count)) = eval_pending_items(p, errs, static_order, scope_of_stmt) else { return };
+    p.const_values = pending_values(&pending);
+    install_const_items(p, errs, pending, static_count);
+}
+
+/// The values of evaluated pending items, in order (None: failed).
+fn pending_values(pending: &[(PendingConst, PendingState)]) -> Vec<Option<crate::ty::consteval::ConstValue>> {
+    pending.iter().map(|(_, st)| if let PendingState::Done(v) = st { Some(v.clone()) } else { None }).collect()
+}
+
+/// True when evaluating every const and static item again on `p` (a
+/// kept program whose Ast took a const fn body edit) gives the values
+/// it holds, with no error: collect would build the same tables. The
+/// value tables are set aside meanwhile, as collect has them empty when
+/// it evaluates. `static_order` is the session's (`DefOrder::statics`).
+pub(crate) fn const_values_hold(p: &mut Program, static_order: &[crate::def::DefPathHash]) -> bool {
+    let tables = (
+        std::mem::take(&mut p.consts),
+        std::mem::take(&mut p.const_names),
+        std::mem::take(&mut p.statics),
+        std::mem::take(&mut p.static_names),
+        std::mem::take(&mut p.assoc_const_names),
+    );
+    let scope = std::mem::take(&mut p.scope_of_stmt);
+    let (mut errs, mut order) = (Vec::new(), static_order.to_vec());
+    let values = eval_pending_items(p, &mut errs, &mut order, &scope).map(|(pending, _)| pending_values(&pending)).unwrap_or_default();
+    p.scope_of_stmt = scope;
+    (p.consts, p.const_names, p.statics, p.static_names, p.assoc_const_names) = tables;
+    errs.is_empty() && values == p.const_values
+}
+
+/// Registers and evaluates every const and static item (the first half
+/// of `eval_const_items`): the pending list with each item's state, and
+/// the static count. None when there is no item.
+fn eval_pending_items(
+    p: &mut Program,
+    errs: &mut Vec<Diag>,
+    static_order: &mut Vec<crate::def::DefPathHash>,
+    scope_of_stmt: &HashMap<u32, Vec<u32>>,
+) -> Option<(Vec<(PendingConst, PendingState)>, u32)> {
     let ast_arc = p.ast.clone();
     let ast = &*ast_arc;
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
@@ -4559,7 +4607,7 @@ fn eval_const_items(
     let mut assoc_by_key: HashMap<(Sym, Sym), Vec<usize>> = HashMap::default();
     register_assoc_consts(p, errs, &mut pending, &mut assoc_by_key);
     if pending.is_empty() {
-        return;
+        return None;
     }
     // Assign static indices now that registration is complete:
     // top-level statics by session rank, nested statics in stmt
@@ -4609,8 +4657,12 @@ fn eval_const_items(
     for i in 0..n {
         cx.eval_pending(i);
     }
-    // Move the results into the program tables, in item order.
-    let CollectCx { p, pending, errs, .. } = cx;
+    Some((cx.pending, static_count))
+}
+
+/// Moves evaluated pending items into the program tables, in item order
+/// (the second half of `eval_const_items`).
+fn install_const_items(p: &mut Program, errs: &mut Vec<Diag>, pending: Vec<(PendingConst, PendingState)>, static_count: u32) {
     let mut statics: Vec<Option<StaticItem>> = (0..static_count).map(|_| None).collect();
     for (item, state) in pending {
         let PendingState::Done(value) = state else { continue };
