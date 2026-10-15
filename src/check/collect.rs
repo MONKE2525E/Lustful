@@ -3420,8 +3420,8 @@ pub fn collect_reuse(
                 let scope = p.gx.adt_scopes[id.0 as usize].clone();
                 generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, g_ast, w_ast, &[])
             };
-            let statics = crate::check::outlives::statics_of(&p.gx.adt_generics[id.0 as usize].predicates);
-            let item = crate::check::outlives::Item { implied: fields, required, facts, statics, span: p.adts[id.0 as usize].span };
+            let preds = p.gx.adt_generics[id.0 as usize].predicates.clone();
+            let item = crate::check::outlives::Item { implied: fields, required, facts, preds, span: p.adts[id.0 as usize].span };
             if crate::check::outlives::wanted(&p, &item) {
                 p.regions.outlives_items.push(item);
             }
@@ -3792,7 +3792,7 @@ pub fn collect_reuse(
                     implied,
                     required,
                     facts: scope.region_facts.clone(),
-                    statics: crate::check::outlives::statics_of(&generics.predicates),
+                    preds: generics.predicates.clone(),
                     span: def.name_span,
                 };
                 if crate::check::outlives::wanted(p, &item) {
@@ -3984,7 +3984,7 @@ pub fn collect_reuse(
                         implied: impl_scope.header_regioned.clone(),
                         required,
                         facts: impl_scope.region_facts.clone(),
-                        statics: crate::check::outlives::statics_of(&impl_generics.predicates),
+                        preds: impl_generics.predicates.clone(),
                         span: imp.span,
                     };
                     if crate::check::outlives::wanted(&p, &item) {

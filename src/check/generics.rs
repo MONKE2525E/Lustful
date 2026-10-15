@@ -5525,7 +5525,7 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 implied: Vec::new(),
                 required,
                 facts: scope.region_facts.clone(),
-                statics: crate::check::outlives::statics_of(&generics.predicates),
+                preds: generics.predicates.clone(),
                 span: p.ast.items[item_i].span,
             };
             if crate::check::outlives::wanted(p, &item) {
@@ -5696,7 +5696,7 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                     implied,
                     required,
                     facts: mscope.region_facts.clone(),
-                    statics: crate::check::outlives::statics_of(&combined.predicates),
+                    preds: combined.predicates.clone(),
                     span: fdef.name_span,
                 };
                 if crate::check::outlives::wanted(p, &item) {

@@ -20,8 +20,8 @@
 use crate::check::collect::Program;
 use crate::check::generics::STATIC_FACT;
 use crate::def::DefId;
-use crate::intern::FxMap;
 use crate::diag::{Diag, Span};
+use crate::intern::FxMap;
 use crate::ty::*;
 
 /// What the walks read from the program: the Adt tables and the traits.
@@ -49,19 +49,22 @@ struct Env {
     re: Vec<(Region, Region)>,
     ty: Vec<(Ty, Region)>,
     statics: Vec<Ty>,
+    /// Equality bounds `<P as Tr>::A == X` (assoc, trait args, X): a
+    /// projection they fix outlives what X outlives (rustc normalizes).
+    eqs: Vec<(DefId, ArgsId, Ty)>,
 }
 
 /// One item's types for the check (see the file comment), recorded at
 /// collect (`wanted`) and checked once every Adt has its fields
 /// (`check_all`). `facts` are the declared `'a: 'b` facts by universal
-/// index (`STATIC_FACT` is `'static`), `statics` the type params with a
-/// `T: 'static` bound.
+/// index (`STATIC_FACT` is `'static`), `preds` the item's bounds (its
+/// `T: 'static` and equality bounds count).
 #[derive(Clone, Debug)]
 pub struct Item {
     pub implied: Vec<Ty>,
     pub required: Vec<Ty>,
     pub facts: Vec<(u32, u32)>,
-    pub statics: Vec<Ty>,
+    pub preds: Vec<Predicate>,
     pub span: Span,
 }
 
@@ -93,15 +96,28 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
 
 fn check_item(p: &mut Program, it: &Item) -> Option<Diag> {
     let cx = Cx { regions: &p.regions, index: &p.gx.index };
-    let env = implied_env(&cx, &mut p.tys, &it.implied, &it.facts, &it.statics);
+    let env = implied_env(&cx, &mut p.tys, &it.implied, &it.facts, &it.preds);
     let bad = unmet(&cx, &mut p.tys, &env, &it.required);
-    bad.map(|(g, r)| diag(p, g, r, it.span))
+    bad.map(|(g, r)| diag(&cx, &p.tys, &env, g, r, it.span))
 }
 
 /// The facts an item knows: declared ones, `T: 'static` bounds, and the
 /// requirements of its implied types.
-fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, u32)], statics: &[Ty]) -> Env {
-    let mut env = Env { statics: statics.to_vec(), ..Env::default() };
+fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, u32)], preds: &[Predicate]) -> Env {
+    let mut env = Env { statics: statics_of(preds), ..Env::default() };
+    for q in preds {
+        match q {
+            Predicate::AssocEq(b) if b.count == 0 => env.eqs.push((b.value.assoc, b.value.trait_args, b.value.ty)),
+            Predicate::Trait(b) if b.count == 0 => {
+                for &(d, g) in tys.bindings(b.value.bindings) {
+                    if let GenericArg::Ty(x) = g {
+                        env.eqs.push((d, b.value.args, x));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     for &(a, b) in facts {
         env.re.push((Region::Param(a), if b == STATIC_FACT { Region::Static } else { Region::Param(b) }));
     }
@@ -132,7 +148,14 @@ fn unmet(cx: &Cx, tys: &mut impl TyIntern, env: &Env, required: &[Ty]) -> Option
 /// Checks a type written in the body of a fn with region signature
 /// `sig` (a `let` annotation) under the fn's implied bounds and its
 /// `T: 'static` bounds in `preds`. The error, if a requirement fails.
-pub fn check_body_ty(p: &Program, tys: &mut impl TyIntern, sig: &crate::borrowck::RegionSig, preds: &[Predicate], t: Ty, span: Span) -> Option<Diag> {
+pub fn check_body_ty(
+    p: &Program,
+    tys: &mut impl TyIntern,
+    sig: &crate::borrowck::RegionSig,
+    preds: &[Predicate],
+    t: Ty,
+    span: Span,
+) -> Option<Diag> {
     let mut implied: Vec<Ty> = sig.params.iter().copied().chain([sig.ret]).collect();
     implied.extend(sig.header.iter().copied());
     let facts: Vec<(u32, u32)> = sig
@@ -145,8 +168,8 @@ pub fn check_body_ty(p: &Program, tys: &mut impl TyIntern, sig: &crate::borrowck
         })
         .collect();
     let cx = Cx { regions: &p.regions, index: &p.gx.index };
-    let env = implied_env(&cx, tys, &implied, &facts, &statics_of(preds));
-    unmet(&cx, tys, &env, &[t]).map(|(g, r)| diag_in(p, tys, g, r, span))
+    let env = implied_env(&cx, tys, &implied, &facts, preds);
+    unmet(&cx, tys, &env, &[t]).map(|(g, r)| diag(&cx, tys, &env, g, r, span))
 }
 
 /// The diagnostic for a requirement `g: r` that does not hold.
@@ -175,19 +198,29 @@ pub fn param_bounds(p: &Program, sig: Option<&crate::borrowck::RegionSig>, preds
     out
 }
 
-fn diag(p: &Program, g: GenericArg, r: Region, span: Span) -> Diag {
-    diag_in(p, &p.tys, g, r, span)
-}
-
-fn diag_in(p: &Program, tys: &impl TyIntern, g: GenericArg, r: Region, span: Span) -> Diag {
-    let what = match g {
-        GenericArg::Ty(t) => format!("the type `{}`", crate::check::collect::ty_name(p, tys, t)),
-        _ => "a lifetime in this type".to_string(),
+/// The diagnostic for a requirement `g: r` that does not hold, naming
+/// the part of `g` that fails (`'static` needs E0310 wording).
+fn diag(cx: &Cx, tys: &impl TyIntern, env: &Env, g: GenericArg, r: Region, span: Span) -> Diag {
+    let mut cs = Vec::new();
+    match g {
+        GenericArg::Ty(t) => components(tys, t, &mut cs),
+        GenericArg::Lifetime(x) => cs.push(Comp::Re(x)),
+        GenericArg::Const(_) => {}
+    }
+    let bad = cs.into_iter().find(|&c| match c {
+        Comp::Re(x) => !region_holds(env, x, r),
+        Comp::Param(x) | Comp::Proj(x) => !ty_holds(cx, tys, env, x, r),
+    });
+    let what = match bad {
+        Some(Comp::Param(_)) => "a type parameter",
+        Some(Comp::Proj(_)) => "an associated type",
+        _ => "a lifetime",
     };
-    let (life, fix) = if r == Region::Static {
-        ("`'static`", "Add a `'static` bound to the type parameter, or change the type.")
-    } else {
-        ("a lifetime this type names", "Take a parameter of this type (an implied bound), add a `'a: 'b` bound, or change the type.")
+    let life = if r == Region::Static { "`'static`" } else { "a lifetime this item names" };
+    let fix = match bad {
+        Some(Comp::Re(_)) | None => "Add the `'b: 'a` bound the type needs, or take a parameter of this type (an implied bound).",
+        _ if r == Region::Static => "Add a `'static` bound to the type parameter, or change the type.",
+        _ => "Take a parameter of the type that needs the bound (`&'a T` gives `T: 'a`), or change the type.",
     };
     Diag::new("L0617", span, format!("{what} may not live long enough: a type here needs it to outlive {life}"), fix)
 }
@@ -241,6 +274,9 @@ fn ty_holds(cx: &Cx, tys: &impl TyIntern, env: &Env, t: Ty, r: Region) -> bool {
         Comp::Re(x) => region_holds(env, x, r),
         Comp::Param(x) => env.statics.contains(&x) || env.ty.iter().any(|&(y, s)| y == x && region_holds(env, s, r)),
         Comp::Proj(x) => {
+            if let Some(eq) = fixed_by(tys, env, x) {
+                return ty_holds(cx, tys, env, eq, r);
+            }
             env.ty.iter().any(|&(y, s)| y == x && region_holds(env, s, r))
                 || assoc_is_static(cx, tys, x)
                 || match tys.kind(x) {
@@ -249,6 +285,12 @@ fn ty_holds(cx: &Cx, tys: &impl TyIntern, env: &Env, t: Ty, r: Region) -> bool {
                 }
         }
     })
+}
+
+/// The type an equality bound fixes projection `t` to, if any.
+fn fixed_by(tys: &impl TyIntern, env: &Env, t: Ty) -> Option<Ty> {
+    let TyKind::Projection(assoc, a) = tys.kind(t) else { return None };
+    env.eqs.iter().find(|&&(d, b, _)| d == assoc.0 && (a == b || tys.args(a) == tys.args(b))).map(|&(_, _, x)| x)
 }
 
 /// `<T as Tr>::A` where the trait declares `type A: 'static`.
