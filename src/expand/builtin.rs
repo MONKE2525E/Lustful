@@ -796,7 +796,7 @@ fn write_shape(st: &mut Expander, span: Span, dst: Vec<Tt>, fmt_args: Vec<Tt>) -
     tpl
 }
 
-/// `dbg!` in its rustc shape: print the value with `{:?}` under its
+/// `dbg!` in its rustc shape: print the value with `{:#?}` under its
 /// file, line, column, and source text, then give the value back.
 fn dbg_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
     let span = call.span;
@@ -823,7 +823,7 @@ fn dbg_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
     let value = args.into_iter().next().unwrap();
     let name_text = stringify_trees(st, &value);
     let mut tpl =
-        st.lex_template("match __lust_v { __lust_t => { eprintln!(\"{} {} = {:?}\", __lust_at, __lust_n, &__lust_t); __lust_t } }", span);
+        st.lex_template("match __lust_v { __lust_t => { eprintln!(\"{} {} = {:#?}\", __lust_at, __lust_n, &__lust_t); __lust_t } }", span);
     let name_tree = vec![st.str_tree(&name_text, span)];
     tpl = splice_placeholders(tpl, "__lust_v", &value, st.ctx.interner);
     tpl = splice_placeholders(tpl, "__lust_at", &[prefix], st.ctx.interner);
