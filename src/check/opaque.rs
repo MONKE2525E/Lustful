@@ -217,6 +217,11 @@ impl Ctx<'_> {
         let mut met: Vec<(DefId, ArgsId, Vec<Ty>)> = Vec::new();
         for o in found {
             let TyKind::Opaque(od, args) = self.tys.kind(o) else { continue };
+            // A method probe that lost records a call at vars nothing
+            // decides; the call that stands has its args resolved.
+            if self.tys.flags(o).contains_infer() {
+                continue;
+            }
             let Some(info) = p.gx.opaques.get(&od) else { continue };
             let Some(template) = p.local_def(info.owner.hash) else { continue };
             if p.gx.fn_templates.get(template.0 as usize).is_none_or(|t| t.is_none()) {
