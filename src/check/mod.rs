@@ -33,6 +33,7 @@ pub mod split;
 pub mod project;
 pub mod prog_shift;
 pub mod sized;
+pub mod slice;
 pub mod stdtypes;
 pub mod std_inherent;
 pub mod tls;
@@ -296,6 +297,19 @@ pub enum Builtin {
     VecAsSlice,
     VecAsMutSlice,
     SliceToVec,
+    /// `[T]::starts_with` and `ends_with` (tf-slice): elementwise
+    /// `PartialEq` against a needle slice.
+    SliceStartsWith,
+    SliceEndsWith,
+    /// `[T]::fill` (`T: Clone`): clones into every element but the
+    /// last, which takes the value itself, as core does.
+    SliceFill,
+    /// `[T]::copy_from_slice` (`T: Copy`): an exact-length copy; a
+    /// length mismatch panics with core's text at the call.
+    SliceCopyFromSlice,
+    /// `[T]::copy_within` (`T: Copy`): the range bounds travel as
+    /// drain's four words (check/slice.rs, lower.rs).
+    SliceCopyWithin,
     VecFrom,
     MemDrop,
     /// `mem::forget(v)`: takes ownership and never drops (W-STD-C).
@@ -13301,6 +13315,11 @@ impl<'p> Ctx<'p> {
         // `into()` through std's other `From` impls between builtin
         // types (check/convert.rs, W-STD-B).
         if let Some(ret) = self.std_into_method(e, rt, name, args, turbofish, expected) {
+            return ret;
+        }
+        // Slice inherent methods on slices, arrays, and Vecs
+        // (check/slice.rs).
+        if let Some(ret) = self.slice_method(e, recv, base, derefs, name, name_span, args, turbofish) {
             return ret;
         }
         // `Vec::drain` and `String::drain` (check/iter.rs).

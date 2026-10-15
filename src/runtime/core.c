@@ -513,6 +513,22 @@ lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, 
     return d;
 })
 
+/* `[T]::copy_within` over a byte buffer of `len` elements of `elem`
+   bytes: core checks the range as for drain (`lust_range_bounds_check`,
+   core's own panic sites), then the destination against the space
+   the copied range leaves (`dest is out of bounds` at the caller,
+   core's `#[track_caller]` assert), then moves the bytes, overlap
+   included. */
+void lust_slice_copy_within(void *ptr, uint64_t len, uint64_t elem, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t dest, lust_loc loc) LUST_BODY({
+    uint64_t start, end;
+    lust_range_bounds_check(len, s_tag, s_val, e_tag, e_val, &start, &end);
+    if (dest > len - (end - start)) {
+        lust_panic_cstr("dest is out of bounds", loc);
+        return;
+    }
+    memmove((char *)ptr + dest * elem, (char *)ptr + start * elem, (end - start) * elem);
+})
+
 /* Exact float remainder (Rust `%`, truncating division), computed on the
    mantissa integers so no libm link is needed. The algorithm is the
    standard normalize-and-subtract loop over the exponent difference. */

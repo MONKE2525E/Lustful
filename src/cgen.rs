@@ -4974,6 +4974,77 @@ impl FnGen<'_, '_> {
                 );
                 "((lust_Unit){})".into()
             }
+            B::SliceStartsWith | B::SliceEndsWith => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (_, nptr, nlen) = slice_like(&tys[1], &vals[1]);
+                let (t, i, off) = (self.tmp(), self.tmp(), self.tmp());
+                let elem_a = format!("(&{ptr}[{off} + {i}])");
+                let elem_b = format!("(&{nptr}[{i}])");
+                let eq = self.eq_expr(&e, &elem_a, &elem_b);
+                let off_expr = if b == B::SliceStartsWith { "0".to_string() } else { format!("{len} - {nlen}") };
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {off} = {nlen} <= {len} ? ({off_expr}) : 0;\n    uint8_t {t} = {nlen} <= {len};\n    for (uint64_t {i} = 0; {t} && {i} < {nlen}; {i}++) if (!({eq})) {{ {t} = 0; break; }}"
+                );
+                t
+            }
+            B::SliceFill => {
+                // Core clones into every element but the last, which
+                // takes the value itself; each replaced element drops
+                // after its clone is made, as core's assign does. An
+                // empty slice drops the value.
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let et = ctype(&e);
+                let (tv, i) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    {et} {tv} = {};", vals[1]);
+                if is_copy_c(self.p, &e) {
+                    let _ = writeln!(self.out, "    for (uint64_t {i} = 0; {i} < {len}; {i}++) {ptr}[{i}] = {tv};");
+                } else {
+                    self.want(Glue::Clone, &e);
+                    let tc = self.tmp();
+                    let drop_old = if needs_drop_c(self.p, &e) {
+                        self.want(Glue::Drop, &e);
+                        format!("drop_{}(&{ptr}[{i}]); ", mangle(&e))
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(
+                        self.out,
+                        "    for (uint64_t {i} = 0; {i} + 1 < {len}; {i}++) {{ {et} {tc} = clone_{}(&{tv}); {drop_old}{ptr}[{i}] = {tc}; }}",
+                        mangle(&e)
+                    );
+                    if needs_drop_c(self.p, &e) {
+                        let jm = mangle(&e);
+                        let _ = writeln!(
+                            self.out,
+                            "    if ({len} > 0) {{ drop_{jm}(&{ptr}[{len} - 1]); {ptr}[{len} - 1] = {tv}; }} else {{ drop_{jm}(&{tv}); }}"
+                        );
+                    } else {
+                        let _ = writeln!(self.out, "    if ({len} > 0) {ptr}[{len} - 1] = {tv};");
+                    }
+                }
+                "((lust_Unit){})".into()
+            }
+            B::SliceCopyFromSlice => {
+                let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (_, sptr, slen) = slice_like(&tys[1], &vals[1]);
+                let i = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    if ({slen} != {len}) lust_panic_nn(\"copy_from_slice: source slice length (\", {slen}, \") does not match destination slice length (\", {len}, \")\", {loc});\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) {ptr}[{i}] = {sptr}[{i}];"
+                );
+                "((lust_Unit){})".into()
+            }
+            B::SliceCopyWithin => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let et = ctype(&e);
+                let _ = writeln!(
+                    self.out,
+                    "    lust_slice_copy_within({ptr}, {len}, sizeof({et}), {}, {}, {}, {}, {}, {loc});",
+                    vals[1], vals[2], vals[3], vals[4], vals[5]
+                );
+                "((lust_Unit){})".into()
+            }
             B::VecClear | B::VecTruncate => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };

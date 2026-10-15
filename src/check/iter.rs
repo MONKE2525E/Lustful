@@ -276,7 +276,7 @@ impl<'p> Ctx<'p> {
 
     /// The form of one `drain` argument, after checking it (see
     /// `drain_method`). None when an error already reported.
-    fn drain_range_form(&mut self, e: ExprId, arg: ExprId, span: Span) -> Option<DrainRange> {
+    pub(super) fn drain_range_form(&mut self, e: ExprId, arg: ExprId, span: Span) -> Option<DrainRange> {
         use DrainRange as DR;
         let p = self.p;
         if let Expr::Range { lo, hi, .. } = p.ast.expr(arg) {

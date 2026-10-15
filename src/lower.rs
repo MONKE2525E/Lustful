@@ -3199,6 +3199,54 @@ impl<'p> Lower<'p> {
         self.call_into(CallTarget::Builtin(b), vec![Operand::Move(Place::local(t)), stag, sval, etag, eval], d, span);
     }
 
+    /// `[T]::copy_within`: like `drain_into`, the receiver's `&mut`
+    /// and the range bounds as four words, then the destination
+    /// index. The reservation is two-phase only on a slice place:
+    /// on a Vec or array the method runs through `DerefMut` or an
+    /// unsize, which is not two-phase (as in `method_into`).
+    fn copy_within_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], derefs: u8, dest: Option<&Place>, span: Span) {
+        let Res::BuiltinMethod { b, .. } = self.ck.res(e) else { return };
+        let Some(form) = self.ck.drain_range(e) else { return };
+        let root = self.deref_steps(e, recv, span);
+        let root_ty = match &root {
+            Some(pl) => self.body.locals[pl.local as usize].ty,
+            None => self.ty(recv),
+        };
+        let recv_ty = self.peel(root_ty, derefs);
+        let pl = Self::derefs(
+            match &root {
+                Some(pl) => pl.clone(),
+                None => self.place_for_mut(recv),
+            },
+            derefs,
+        );
+        let mt = self.ref_ty(true, recv_ty);
+        let t = self.temp(mt);
+        let two_phase = root.is_none()
+            && matches!(self.kind(recv_ty), TyKind::Slice(_))
+            && !pl.proj.iter().any(|x| matches!(x, Proj::Index(_)));
+        let (bounds, dest_op) = if two_phase {
+            let st = self.ref_ty(false, recv_ty);
+            let reserve = self.temp(st);
+            self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+            let bounds = self.drain_bounds(e, args[0], form, span);
+            let d = self.temp(USIZE);
+            self.expr_into(args[1], Some(&Place::local(d)));
+            self.push(StmtKind::FakeRead(reserve), span);
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            (bounds, Operand::Copy(Place::local(d)))
+        } else {
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            let bounds = self.drain_bounds(e, args[0], form, span);
+            let d = self.temp(USIZE);
+            self.expr_into(args[1], Some(&Place::local(d)));
+            (bounds, Operand::Copy(Place::local(d)))
+        };
+        let (stag, sval, etag, eval) = bounds;
+        let d = self.call_dest(dest, self.ty(e));
+        self.call_into(CallTarget::Builtin(b), vec![Operand::Move(Place::local(t)), stag, sval, etag, eval, dest_op], d, span);
+    }
+
     /// The four bound words of a `drain` argument, by its form
     /// (check/iter.rs `drain_range_form`).
     fn drain_bounds(&mut self, e: ExprId, arg: ExprId, form: crate::check::DrainRange, span: Span) -> (Operand, Operand, Operand, Operand) {
@@ -3785,6 +3833,10 @@ impl<'p> Lower<'p> {
             self.drain_into(e, recv, args, derefs, dest, span);
             return;
         }
+        if let Res::BuiltinMethod { b: Builtin::SliceCopyWithin, derefs, .. } = self.ck.res(e) {
+            self.copy_within_into(e, recv, args, derefs, dest, span);
+            return;
+        }
         if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
             self.prim_cmp_into(e, recv, args, dest, span, kind, derefs);
             return;
@@ -4050,7 +4102,10 @@ impl<'p> Lower<'p> {
     /// borrow. On a slice place (`s.swap(..)` with `s: &mut [T]`) it is.
     fn slice_method_via_deref(&self, b: Builtin, recv_ty: Ty) -> bool {
         use Builtin as B;
-        matches!(b, B::VecSwap | B::VecReverse | B::VecFirstMut | B::VecLastMut | B::VecGetMut | B::IterIterMut)
+        matches!(
+            b,
+            B::VecSwap | B::VecReverse | B::VecFirstMut | B::VecLastMut | B::VecGetMut | B::IterIterMut | B::SliceFill | B::SliceCopyFromSlice
+        )
             && (self.body.tys.vec_elem(recv_ty).is_some() || matches!(self.kind(recv_ty), TyKind::Array(..)))
     }
 
