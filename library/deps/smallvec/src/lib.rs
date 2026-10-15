@@ -483,8 +483,22 @@ impl<A: Array> Extend<A::Item> for SmallVec<A> {
 
 impl<A: Array> FromIterator<A::Item> for SmallVec<A> {
     fn from_iter<I: IntoIterator<Item = A::Item>>(iterable: I) -> SmallVec<A> {
+        // The Extend body inlined: a generic `extend` call with an
+        // `Item = A::Item` binding does not resolve in lust yet.
         let mut v = SmallVec::new();
-        v.extend(iterable);
+        let mut iter = iterable.into_iter();
+        let lower = iter.size_hint().0;
+        v.reserve(lower);
+        let cap = v.capacity();
+        while v.items.len() < cap {
+            match iter.next() {
+                Some(x) => v.items.push(x),
+                None => return v,
+            }
+        }
+        for x in iter {
+            v.push(x);
+        }
         v
     }
 }
