@@ -470,6 +470,20 @@ impl<'a> Program<'a> {
     pub fn fn_shipped_crate(&self, f: LocalDefId) -> Option<ShippedCrate> {
         self.shipped_crate_at(self.fn_info(f).def.name_span)
     }
+    /// True when `lust check` neither checks nor walks fn `f`: a fn in
+    /// shipped core, alloc, or std source (the std splice and the std
+    /// platform crate; their instances and closures included). Those
+    /// bodies see no user name, so their answer is the same in every
+    /// program, and every `lust build` still checks them. `lust check`
+    /// already walks no instances (ARCH 4.1); this extends that to std's
+    /// own plain bodies, its templates, and the discovery pass over them.
+    pub fn check_skips(&self, f: LocalDefId) -> bool {
+        !self.gx.walk_instances
+            && matches!(
+                self.shipped_crate_at(self.fn_info(f).def.name_span),
+                Some(ShippedCrate::Core | ShippedCrate::Alloc | ShippedCrate::Std)
+            )
+    }
     /// True for a span in the std methods of the lang enums
     /// (`Ast::lang_methods`): std source with its own scope, where no
     /// user name is visible.

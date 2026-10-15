@@ -301,7 +301,7 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     let base = front.patch.as_ref().ok_or("no base")?;
     let union = |needs: &[(StdNeeds, bool)]| {
         needs.iter().fold((StdNeeds::default(), false), |(a, p), (n, q)| {
-            (StdNeeds { fns: a.fns || n.fns, methods: a.methods || n.methods, modules: a.modules || n.modules }, p || *q)
+            (StdNeeds { fns: a.fns || n.fns, methods: a.methods || n.methods, modules: a.modules | n.modules }, p || *q)
         })
     };
     let mut needs = base.needs.clone();

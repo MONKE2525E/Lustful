@@ -3,9 +3,10 @@
 //
 // A row names one shipped file and the std paths that mean it
 // (`std::time` and `core::time` for the time modules). When a compile can
-// mention one (`needs`), the driver routes it through the resolver and
-// the std loader appends `pub mod <name> { <file text> }` after the user
-// text, in the shipped range of the row's crate. The resolver then
+// mention one (`needs`, one bit per row), the driver routes it through
+// the resolver and the std loader appends `pub mod <name> { <file text> }`
+// after the user text, in the shipped range of the row's crate, for that
+// row and for each row the spliced text names in turn. The resolver then
 // (1) never binds `<name>` in the crate root, so user source cannot name
 // it, and (2) walks `std::time` (and the other paths of the row) into
 // that module. From there everything is the normal module machinery:
@@ -114,20 +115,28 @@ pub const STD_MODULES: &[StdModule] = &[
     },
 ];
 
-/// The words whose mention means a compile may need the std modules.
-fn trigger_words() -> impl Iterator<Item = &'static str> {
-    STD_MODULES.iter().flat_map(|m| m.triggers.iter().copied())
-}
+// `needs` gives one bit per row.
+const _: () = assert!(STD_MODULES.len() <= 16);
 
-/// True if `src` can mention a std source module: a row's trigger
-/// (its module segment, or for an overlay the item names) appears as a
-/// whole identifier-like word. It runs on every compile, so each trigger
-/// is first a `contains` test (a vectorized scan), and only a hit looks
-/// for a whole-word match. A hit only costs the splice, and a real use
-/// always names a trigger.
-pub fn needs(src: &str) -> bool {
-    let words: Vec<&str> = trigger_words().collect();
-    words.iter().enumerate().any(|(k, w)| !words[..k].contains(w) && src.contains(w) && has_word(src, w))
+/// The std source modules `src` can mention, one bit per
+/// `STD_MODULES` row: a row's trigger (its module segment, or for an
+/// overlay the item names) appears as a whole identifier-like word. It
+/// runs on every compile, so each trigger is first a `contains` test (a
+/// vectorized scan), and only a hit looks for a whole-word match. A hit
+/// only costs the splice, and a real use always names a trigger.
+pub fn needs(src: &str) -> u16 {
+    let mut mask = 0u16;
+    for (k, m) in STD_MODULES.iter().enumerate() {
+        // Rows with the same triggers (the two time modules) share one scan.
+        let hit = match STD_MODULES[..k].iter().position(|e| e.triggers == m.triggers) {
+            Some(j) => mask & (1 << j) != 0,
+            None => m.triggers.iter().any(|w| src.contains(w) && has_word(src, w)),
+        };
+        if hit {
+            mask |= 1 << k;
+        }
+    }
+    mask
 }
 
 /// True if `w` occurs in `src` with no identifier-like byte (ASCII
@@ -178,11 +187,14 @@ mod tests {
 
     #[test]
     fn needs_matches_whole_words_only() {
-        assert!(needs("use std::time::Duration;"));
-        assert!(needs("use std::{time};"));
-        assert!(needs("fn f() { core::time::Duration::ZERO; }"));
-        assert!(!needs("let runtime = 1; let times = 2; let timer = 3;"));
-        assert!(!needs("fn main() {}"));
+        let time = 0b11; // core::time and std::time share the trigger
+        assert_eq!(needs("use std::time::Duration;"), time);
+        assert_eq!(needs("use std::{time};"), time);
+        assert_eq!(needs("fn f() { core::time::Duration::ZERO; }"), time);
+        assert_eq!(needs("let runtime = 1; let times = 2; let timer = 3;"), 0);
+        assert_eq!(needs("fn main() {}"), 0);
+        let collections = 1 << STD_MODULES.iter().position(|m| m.name == "__lust_alloc_collections").unwrap();
+        assert_eq!(needs("let m: BTreeMap<u8, u8> = BTreeMap::new();"), collections, "only the module named");
     }
 
     #[test]

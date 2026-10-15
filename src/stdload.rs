@@ -111,9 +111,9 @@ pub struct StdLoad {
     /// chunks and instances stay put.
     methods: String,
     rest: std::sync::OnceLock<Result<StdRest, String>>,
-    /// What each splice asks of std itself (`StdLoad::splice_asks`),
-    /// by `StdPlan::needs_index` of the splice's needs.
-    splice_asks: [std::sync::OnceLock<Result<StdPlan, String>>; 8],
+    /// What each splice block asks of std itself (`StdLoad::splice_asks`):
+    /// the lang methods, the `STD_FNS` files, then one per std module.
+    block_asks: Vec<std::sync::OnceLock<StdPlan>>,
 }
 
 /// The std one resolver compile runs with: what the splice carries,
@@ -144,13 +144,9 @@ impl StdPlan {
     pub fn or(self, o: StdPlan) -> StdPlan {
         let (a, b) = (self.needs, o.needs);
         StdPlan {
-            needs: lang::StdNeeds { fns: a.fns || b.fns, methods: a.methods || b.methods, modules: a.modules || b.modules },
+            needs: lang::StdNeeds { fns: a.fns || b.fns, methods: a.methods || b.methods, modules: a.modules | b.modules },
             platform: self.platform || o.platform,
         }
-    }
-
-    fn needs_index(needs: lang::StdNeeds) -> usize {
-        needs.fns as usize | (needs.methods as usize) << 1 | (needs.modules as usize) << 2
     }
 
     /// A new session's first guess at what its user files ask: the root
@@ -416,30 +412,45 @@ impl StdLoad {
     pub fn splice(&self, needs: lang::StdNeeds) -> Result<Splice, String> {
         let mut blocks: Vec<(ShippedCrate, String)> = Vec::new();
         let mut methods_block = None;
-        if needs.methods || needs.modules {
+        if needs.methods || needs.modules != 0 {
             methods_block = Some(0);
             blocks.push((ShippedCrate::Core, self.methods.clone()));
         }
         let mut routes = Vec::new();
-        if needs.fns || needs.modules {
+        if needs.fns || needs.modules != 0 {
             let rest = self.rest()?;
             if needs.fns {
                 blocks.extend(rest.fn_splices.iter().cloned());
                 routes = rest.fns.clone();
             }
-            if needs.modules {
-                blocks.extend(rest.modules.iter().cloned());
-            }
+            // Rows in `STD_MODULES` order, as `load_rest` reads them.
+            let named = rest.modules.iter().enumerate().filter(|(k, _)| needs.modules & (1 << k) != 0);
+            blocks.extend(named.map(|(_, b)| b.clone()));
         }
         Ok(Splice { blocks, methods_block, routes })
     }
 
     /// What the splice for `needs` asks of std itself (its methods call
     /// lang methods, a std module can name a platform module).
+    /// It takes the blocks `splice` takes, each block's asks scanned once.
     fn splice_asks(&self, needs: lang::StdNeeds) -> Result<StdPlan, String> {
-        self.splice_asks[StdPlan::needs_index(needs)]
-            .get_or_init(|| Ok(self.splice(needs)?.blocks.iter().fold(StdPlan::default(), |p, (_, text)| p.or(StdPlan::asks(text)))))
-            .clone()
+        let block = |k: usize, text: &mut dyn Iterator<Item = &String>| {
+            *self.block_asks[k].get_or_init(|| text.fold(StdPlan::default(), |p, t| p.or(StdPlan::asks(t))))
+        };
+        let mut plan = StdPlan::default();
+        if needs.methods || needs.modules != 0 {
+            plan = plan.or(block(0, &mut std::iter::once(&self.methods)));
+        }
+        if needs.fns || needs.modules != 0 {
+            let rest = self.rest()?;
+            if needs.fns {
+                plan = plan.or(block(1, &mut rest.fn_splices.iter().map(|b| &b.1)));
+            }
+            for (k, (_, text)) in rest.modules.iter().enumerate().filter(|(k, _)| needs.modules & (1 << k) != 0) {
+                plan = plan.or(block(2 + k, &mut std::iter::once(text)));
+            }
+        }
+        Ok(plan)
     }
 
     /// The plan of a compile whose user files ask `user` (see
@@ -604,7 +615,8 @@ fn load_std_from(read: &mut dyn FnMut(&str) -> Result<String, String>, validate:
     if validate {
         let _ = rest.set(Ok(load_rest(read, true)?));
     }
-    Ok(StdLoad { methods, rest, splice_asks: Default::default() })
+    let block_asks = (0..2 + crate::stdmods::STD_MODULES.len()).map(|_| std::sync::OnceLock::new()).collect();
+    Ok(StdLoad { methods, rest, block_asks })
 }
 
 /// Loads the shipped files past the lang enum methods: the `STD_FNS`
@@ -885,9 +897,9 @@ mod tests {
         let load = load_std_from(&mut builtin_reader(), false).unwrap();
         let none = StdPlan::default();
         assert_eq!(load.close(none, None).unwrap(), none);
-        let modules = StdPlan { needs: lang::StdNeeds { modules: true, ..Default::default() }, platform: false };
+        let modules = StdPlan { needs: lang::StdNeeds { modules: 1, ..Default::default() }, platform: false };
         let plan = load.close(modules, None).unwrap();
-        assert!(plan.needs.modules);
+        assert!(plan.needs.modules & 1 != 0 && plan.needs.methods, "core::time's bodies call lang methods");
         assert_eq!(load.close(plan, None).unwrap(), plan);
         // The platform files' asks join only a plan that takes the platform crate.
         let methods = StdPlan { needs: lang::StdNeeds { methods: true, ..Default::default() }, platform: false };
@@ -924,7 +936,7 @@ mod tests {
         assert!(plan.needs.methods, "a/sub.rs (through a.rs) is reached");
         assert!(plan.platform, "c/leaf.rs (through c/mod.rs) is reached");
         assert!(plan.needs.fns, "inner/deep.rs (an inline module's child) is reached");
-        assert!(!plan.needs.modules, "a commented or quoted `mod gone;` is skipped");
+        assert_eq!(plan.needs.modules, 0, "a commented or quoted `mod gone;` is skipped");
     }
 
     /// A malformed mark is an installation error, never a silent skip.

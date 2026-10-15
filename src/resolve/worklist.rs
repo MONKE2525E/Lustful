@@ -155,15 +155,15 @@ pub fn route_root(root_text: &str, interner: &Interner) -> (bool, Option<lexer::
 /// (else false), found in the same parallel pass: each piece ends right
 /// after a newline, so no word crosses a cut and the file's answer is
 /// any piece's answer.
-pub fn route_root_std(root_text: &str, interner: &Interner, std: bool) -> (bool, bool, Option<lexer::Lexed>) {
+pub fn route_root_std(root_text: &str, interner: &Interner, std: bool) -> (bool, u16, Option<lexer::Lexed>) {
     if let Some(pieces) = route_pieces(root_text) {
         let answers = par_map(&pieces, |&(a, b)| {
             let lexed = lexer::lex(&root_text[a..b], FileId(0), a as u32, interner).ok()?;
-            let std_mods = std && crate::stdmods::needs(&root_text[a..b]);
+            let std_mods = if std { crate::stdmods::needs(&root_text[a..b]) } else { 0 };
             piece_cut_ok(&lexed, b, root_text.len()).then(|| (route_keywords(&lexed, interner), std_mods, lexed))
         });
-        if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, bool, lexer::Lexed)>>>() {
-            let std_mods = answers.iter().any(|a| a.1);
+        if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, u16, lexer::Lexed)>>>() {
+            let std_mods = answers.iter().fold(0, |m, a| m | a.1);
             // The brace scan needs the whole file in order: each piece but
             // the last ends in an end-of-input token that `join_lexed` drops.
             let last = answers.len() - 1;
@@ -174,7 +174,7 @@ pub fn route_root_std(root_text: &str, interner: &Interner, std: bool) -> (bool,
             return (yes, std_mods, yes.then(|| join_lexed(answers.into_iter().map(|a| a.2).collect())));
         }
     }
-    let std_mods = std && crate::stdmods::needs(root_text);
+    let std_mods = if std { crate::stdmods::needs(root_text) } else { 0 };
     let Ok(lexed) = lexer::lex(root_text, FileId(0), 0, interner) else { return (false, std_mods, None) };
     let yes = needs_resolve_lexed(&lexed, interner);
     (yes, std_mods, yes.then_some(lexed))
@@ -6315,9 +6315,9 @@ mod tests {
             let i = Interner::default();
             let (_, std_mods, _) = route_root_std(text, &i, true);
             assert_eq!(std_mods, crate::stdmods::needs(text), "case {k}");
-            assert!(!route_root_std(text, &i, false).1, "case {k}");
+            assert_eq!(route_root_std(text, &i, false).1, 0, "case {k}");
         }
-        let answers: Vec<bool> = cases.iter().map(|t| crate::stdmods::needs(t)).collect();
+        let answers: Vec<bool> = cases.iter().map(|t| crate::stdmods::needs(t) != 0).collect();
         assert_eq!(answers, [false, true, false, true, false]);
     }
 

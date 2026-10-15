@@ -1336,13 +1336,14 @@ pub struct StdNeeds {
     pub fns: bool,
     /// A `STD_LANG_METHODS` name follows a `.` or a `::`.
     pub methods: bool,
-    /// A std source module can be named (`stdmods::needs`).
-    pub modules: bool,
+    /// The std source modules that can be named, one bit per
+    /// `stdmods::STD_MODULES` row (`stdmods::needs`).
+    pub modules: u16,
 }
 
 impl StdNeeds {
     pub fn any(self) -> bool {
-        self.fns || self.methods || self.modules
+        self.fns || self.methods || self.modules != 0
     }
 }
 
@@ -1357,7 +1358,7 @@ pub fn std_needs(src: &str) -> StdNeeds {
 
 /// `std_needs` for a caller that knows `stdmods::needs(src)` already:
 /// routing finds it in its parallel pass (`route_root_std`).
-pub fn std_needs_known(src: &str, modules: bool) -> StdNeeds {
+pub fn std_needs_known(src: &str, modules: u16) -> StdNeeds {
     // Bit n of FIRST[c]: some method name starts with byte c and has
     // length n. It turns away almost every other name (`push`, `len`)
     // before a search, which keeps the scan near memory speed.

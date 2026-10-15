@@ -7473,6 +7473,11 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
         if p.is_lang_method(t) {
             continue;
         }
+        // A std platform template in `lust check` (`Program::check_skips`),
+        // unless callers need the hidden type of its `impl Trait`.
+        if p.check_skips(t) && !p.gx.opaques.contains_key(&opaque_def(p.def_id(t))) {
+            continue;
+        }
         errs.extend(check_template(p, t, &mut reuse));
     }
     p.gx.reuse = reuse;
@@ -8422,6 +8427,8 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             queue.clear();
         }
     }
+    // Std platform bodies are no roots in `lust check` (`check_skips`).
+    queue.retain(|&f| !p.check_skips(f));
     crate::mono::vtable::eager_vtables(p, &mut queue);
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;

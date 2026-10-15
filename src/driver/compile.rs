@@ -1633,7 +1633,7 @@ fn resolved_setup(
     std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
     user_src: &str,
     root_lexed: Option<lexer::Lexed>,
-    route_std_mods: Option<bool>,
+    route_std_mods: Option<u16>,
     crate_ids_default: CrateIds,
     std_ranges: &mut Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
     std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,
@@ -2044,11 +2044,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // which only the resolver front end understands (W-STD-C). Routing
     // finds that word scan in its own parallel pass.
     let (wants_resolver, std_mods, root_lexed) = if req.session.krate.manifest_path.is_some() {
-        (true, false, None)
+        (true, 0, None)
     } else {
         crate::resolve::worklist::route_root_std(&src, &front.interner, true)
     };
-    let wants_resolver = wants_resolver || std_mods;
+    let wants_resolver = wants_resolver || std_mods != 0;
     let route_std_mods = req.session.krate.manifest_path.is_none().then_some(std_mods);
     if front.resolved_crate && !wants_resolver {
         front.ast = Ast::default();
@@ -3049,6 +3049,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // its worker lets the allocator reuse the memory for the next body,
     // instead of touching fresh pages for every function.
     let keep_bodies = req.cmd == Cmd::Build || caches.persistent;
+    // `lust check` skips std platform bodies (`Program::check_skips`).
+    // A skipped slot keeps its last marks; one that needed a check lost
+    // its C above, so the next build checks it.
+    work.retain(|&i| !program.check_skips(LocalDefId(i as u32)));
     let results = par_map(&work, |&i| {
         let f = LocalDefId(i as u32);
         let (checked, mut errs) = check::check_fn(&program, f);
@@ -4264,6 +4268,32 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
         let cold_build = Request { out: dir.join("nest-cold.bin"), ..build };
         let cold = compile(&cold_build, &mut Session::new(dir.join("obj2"), false, key));
         assert_eq!((warm.code, &warm.stderr), (cold.code, &cold.stderr), "warm and cold answers match");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `lust check` checks no std platform body (`Program::check_skips`),
+    /// and a build in the same session still checks and runs them: the
+    /// build after a check prints what a cold build prints.
+    #[test]
+    fn check_skips_std_platform_bodies() {
+        let dir = std::env::temp_dir().join(format!("lust-platskip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plat.rs");
+        let key = crate::protocol::SessionKey::synthetic(&file, false);
+        let check = req_for(key.clone());
+        let build = Request { cmd: Cmd::Build, out: dir.join("plat.bin"), ..req_for(key.clone()) };
+        std::fs::write(&file, "use std::io::Write;\n\nfn main() {\n    writeln!(std::io::stdout(), \"hi {}\", 1).unwrap();\n}\n").unwrap();
+        let mut s = Session::new(dir.join("obj"), true, key.clone());
+        let r = compile(&check, &mut s);
+        assert_eq!(r.code, 0, "check: {}", r.stderr);
+        let work = |s: &Session| (s.caches.gen_reuse.templates_checked, s.caches.gen_reuse.discovery_checked);
+        assert_eq!(work(&s), (0, 1), "check ran std template or discovery checks (templates, bodies)");
+        let r = compile(&build, &mut s);
+        assert_eq!(r.code, 0, "build after check: {}", r.stderr);
+        assert!(work(&s).0 > 50, "the build checks the std templates: {:?}", work(&s));
+        let out = std::process::Command::new(dir.join("plat.bin")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hi 1\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

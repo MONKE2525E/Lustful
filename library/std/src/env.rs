@@ -126,12 +126,12 @@ fn unicode(s: OsString) -> String {
     }
 }
 
-/// The environment at the time of the call, as `OsString` pairs.
+/// The environment when called, as `OsString` pairs.
 pub fn vars_os() -> VarsOs {
     VarsOs { pairs: env_pairs(), next: 0 }
 }
 
-/// The environment at the time of the call, as `String` pairs.
+/// The environment when called, as `String` pairs.
 pub fn vars() -> Vars {
     Vars { inner: vars_os() }
 }
