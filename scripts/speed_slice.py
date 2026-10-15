@@ -38,6 +38,12 @@ code). Every `--cold-every` states, and on every non-body edit, a cold one-shot
 lust check runs on the same state; its stdout, stderr (timing lines removed),
 and exit code must equal the warm daemon answer. A mismatch stops the run.
 
+Dev features: when prune.json records `dev_features` (the effective
+list prune.py used, docs/dev-features.md), both sides replay it: lust
+gets `--features`, and the generated slice Cargo.toml declares those
+features as its defaults, so cfg(feature = ...) means the same thing
+in both compilers. Old slices without the field keep no features.
+
 The slice's empty `main` is replaced by a call to bench/slices/driver.rs (it
 calls kept ts-rust tspath fns and prints the results). After every build, the
 lust binary and each rustc binary run; stdout, stderr, and exit code must match.
@@ -223,9 +229,14 @@ class Bench:
             self.root.write_text(text.replace("fn main() {}", "mod bench_driver;\n\nfn main() {\n    bench_driver::run();\n}"))
             shutil.copy(driver, self.crate / "src" / "bench_driver.rs")
         self.runs_compared = 0
+        self.dev_features = list(self.manifest.get("dev_features") or [])
+        feats = ""
+        if self.dev_features:
+            names = ", ".join(f'"{f}"' for f in self.dev_features)
+            feats = f"[features]\ndefault = [{names}]\n" + "".join(f"{f} = []\n" for f in self.dev_features) + "\n"
         (self.crate / "Cargo.toml").write_text(
             f'[package]\nname = "slice"\nversion = "0.0.0"\nedition = "2024"\n\n'
-            f'[[bin]]\nname = "slice"\npath = "src/{root}"\n\n[profile.dev]\ndebug = 0\n\n[workspace]\n')
+            f'[[bin]]\nname = "slice"\npath = "src/{root}"\n\n{feats}[profile.dev]\ndebug = 0\n\n[workspace]\n')
         # LUST_STATS on the daemon too: every warm answer then carries the
         # lust-visits: line the per-request records are built from.
         self.env = dict(os.environ, LUST_DAEMON_SOCKET=str(self.work / "s.sock"),
@@ -253,6 +264,8 @@ class Bench:
             self.cold_n += 1
             env = dict(env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(self.work / f"cold-{self.cold_n}"))
         cmd = [str(LUST), verb, "--timings", str(self.root)]
+        if self.dev_features:
+            cmd += ["--features", ",".join(self.dev_features)]
         if verb == "build":
             cmd += ["-o", str(self.work / "prog")]
         ms, r = self.run(cmd, env)

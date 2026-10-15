@@ -17,9 +17,23 @@ them: the slice is closed under its own dependencies by construction. It
 grows by itself when lust supports more: rerun this script on the same spec.
 
 Usage: prune.py <spec.json> <out-dir> [--lust PATH] [--max-rounds N] [--tsrust DIR [--tsrust-commit SHA]] [--lust-commit SHA]
+           [--dev-features a,b | --dev-exclude-features a,b]
 
 --tsrust overrides the spec's tsrust_dir (a copy on a boat sandbox); --tsrust-commit
 records the commit when that copy is not a git checkout.
+
+Dev features (docs/dev-features.md): a slice is one synthetic crate, so
+cfg(feature = ...) in the copied source needs the package's effective
+dev feature list spelled out. Prune reads the project lust config from
+the ts-rust tree ([package.metadata.lust] / [workspace.metadata.lust]
+`dev-features` or `dev-exclude-features`, or a `.lust.toml` file), or
+the --dev-* flags, or $LUST_DEV_FEATURES / $LUST_DEV_EXCLUDE_FEATURES,
+and passes the effective list to lust (--features) and to the rustc
+oracle (--cfg feature="..."). `prune.json` records it as
+`dev_features` with its source. With no config anywhere the old slice
+behavior stands (no features) and the manifest says so. For ts-rust,
+dev builds run with jemalloc off: `--dev-exclude-features jemalloc`
+on a tree that has no lust config yet.
 
 spec.json (see bench/slices/*/spec.json):
   tsrust_dir   ts-rust checkout (read only; default /home/theo/.t3/projects/ts-rust)
@@ -68,6 +82,103 @@ def build_items_tool():
 
 def tsrust_dir(spec):
     return Path(spec.get("tsrust_dir", "/home/theo/.t3/projects/ts-rust"))
+
+
+def _toml(path):
+    import tomllib
+
+    try:
+        return tomllib.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _expand_features(feature_table, selected):
+    """Plain-name expansion through a [features] table (dep: and
+    pkg/feat entries enable no cfg feature of this package)."""
+    out, queue = [], list(selected)
+    while queue:
+        name = queue.pop()
+        if ":" in name or "/" in name or name in out:
+            continue
+        out.append(name)
+        queue += [v for v in feature_table.get(name, []) if ":" not in v and "/" not in v]
+    return sorted(out)
+
+
+def dev_features_for(spec, cli_features=None, cli_exclude=None, env=None):
+    """(effective feature list, source note) for the slice's package.
+
+    Order: CLI flags, env, the ts-rust tree's lust config (package
+    manifest, workspace manifest, then .lust.toml up from src_dir),
+    then the spec's own `features` list, then no features.
+    """
+    env = os.environ if env is None else env
+    split = lambda v: [s for s in re.split(r"[,\s]+", v or "") if s]  # noqa: E731
+    exact = split(cli_features) or split(env.get("LUST_DEV_FEATURES", ""))
+    exclude = split(cli_exclude) or split(env.get("LUST_DEV_EXCLUDE_FEATURES", ""))
+    if exact and exclude:
+        sys.exit("dev features: give only one of exact list and exclude list")
+    src = tsrust_dir(spec) / spec["src_dir"]
+    # The package manifest above src_dir owns the [features] table.
+    pkg, pkg_path = {}, None
+    d = src
+    while d != d.parent:
+        cand = d / "Cargo.toml"
+        data = _toml(cand) if cand.exists() else {}
+        if "package" in data:
+            pkg, pkg_path = data, cand
+            break
+        d = d.parent
+    table = pkg.get("features", {})
+    defaults = [f for f in table.get("default", []) if ":" not in f and "/" not in f]
+    if exact:
+        return _expand_features(table, exact), "flag or env (--dev-features)"
+    if exclude:
+        return _expand_features(table, [f for f in defaults if f not in exclude]), "flag or env (--dev-exclude-features)"
+    cfg = {}
+    where = ""
+    lust = pkg.get("package", {}).get("metadata", {}).get("lust", {})
+    if lust:
+        cfg, where = lust, f"[package.metadata.lust] in {pkg_path}"
+    if not cfg:
+        d = src
+        while d != d.parent and not cfg:
+            data = _toml(d / "Cargo.toml") if (d / "Cargo.toml").exists() else {}
+            lust = data.get("workspace", {}).get("metadata", {}).get("lust", {})
+            if lust:
+                cfg, where = lust, f"[workspace.metadata.lust] in {d / 'Cargo.toml'}"
+            d = d.parent
+    if not cfg:
+        d = src
+        while d != d.parent and not cfg:
+            data = _toml(d / ".lust.toml") if (d / ".lust.toml").exists() else {}
+            if "dev-features" in data or "dev-exclude-features" in data:
+                cfg, where = data, str(d / ".lust.toml")
+            d = d.parent
+    if "dev-features" in cfg:
+        return _expand_features(table, cfg["dev-features"]), where
+    if "dev-exclude-features" in cfg:
+        ex = cfg["dev-exclude-features"]
+        return _expand_features(table, [f for f in defaults if f not in ex]), where
+    if spec.get("features"):
+        return _expand_features(table, spec["features"]), "spec features"
+    return [], "no lust dev config found; no features (old slice behavior)"
+
+
+# Effective dev features of the current prune run, set in main().
+DEV_FEATURES = []
+
+
+def lust_feature_args():
+    return ["--features", ",".join(DEV_FEATURES)] if DEV_FEATURES else []
+
+
+def rustc_feature_args():
+    out = []
+    for f in DEV_FEATURES:
+        out += ["--cfg", f'feature="{f}"']
+    return out
 
 
 def copy_tree(spec, out):
@@ -127,7 +238,7 @@ def copy_tree(spec, out):
 def lust_errors(lust, root, env, strict=True, verb="check"):
     """Located lust errors of `lust <verb>`. A build that fails with no located error
     (a panic) gives one error at line 0, which the caller bisects."""
-    cmd = [lust, verb, str(root), "--json", "--max-errors", "100000"]
+    cmd = [lust, verb, str(root), "--json", "--max-errors", "100000"] + lust_feature_args()
     if verb == "build":
         cmd += ["-o", str(Path(env["LUST_CACHE_DIR"]) / "slice-bin")]
     r = sh(cmd, env=env)
@@ -183,8 +294,8 @@ def located(path, sp):
 
 
 def rustc_errors(root, work):
-    r = sh(["rustc", "--edition", "2024", "--crate-type", "bin", "--emit=metadata", "-A", "warnings",
-            "--error-format=short", "-o", str(work / "slice.rmeta"), str(root)])
+    r = sh(["rustc", "--edition", "2024", "--crate-type", "bin", "--emit=metadata", "-A", "warnings"]
+           + rustc_feature_args() + ["--error-format=short", "-o", str(work / "slice.rmeta"), str(root)])
     errs = []
     for line in r.stderr.splitlines():
         m = re.match(r"^(.+?\.rs):(\d+):(\d+): error(\[E\d+\])?: (.*)$", line)
@@ -403,10 +514,17 @@ def main():
     ap.add_argument("--tsrust", help="ts-rust checkout to copy from (overrides spec tsrust_dir)")
     ap.add_argument("--tsrust-commit", help="ts-rust commit to record when --tsrust is not a git checkout")
     ap.add_argument("--lust-commit", help="lust commit to record when this tree is not a git checkout (boat)")
+    ap.add_argument("--dev-features", help="exact dev feature list (comma separated); overrides the tree config")
+    ap.add_argument("--dev-exclude-features", help="features removed from the package default list (comma separated)")
     a = ap.parse_args()
+    if a.dev_features and a.dev_exclude_features:
+        ap.error("give only one of --dev-features and --dev-exclude-features")
     spec = json.loads(Path(a.spec).read_text())
     if a.tsrust:
         spec["tsrust_dir"] = a.tsrust
+    global DEV_FEATURES
+    DEV_FEATURES, dev_source = dev_features_for(spec, a.dev_features, a.dev_exclude_features)
+    print(f"dev features: {DEV_FEATURES or '[]'} ({dev_source})", flush=True)
     out = Path(a.out).resolve()
     if out.exists():
         shutil.rmtree(out)
@@ -451,8 +569,8 @@ def main():
     # darwin) and unmounted files are not part of the crate. Both compilers must
     # still accept after that.
     dep = out / "slice.d"
-    sh(["rustc", "--edition", "2024", "--crate-type", "bin", "--emit=dep-info", "-A", "warnings",
-        "-o", str(dep), str(root)])
+    sh(["rustc", "--edition", "2024", "--crate-type", "bin", "--emit=dep-info", "-A", "warnings"]
+       + rustc_feature_args() + ["-o", str(dep), str(root)])
     loaded = {str(Path(t).resolve()) for t in re.findall(r"(\S+\.rs):", dep.read_text())}
     dropped = 0
     for p in list(src_root.rglob("*.rs")):
@@ -473,6 +591,7 @@ def main():
     lust_commit = a.lust_commit or sh(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.strip()
     manifest = {
         "tsrust_commit": commit, "lust_commit": lust_commit, "spec": spec,
+        "dev_features": DEV_FEATURES, "dev_features_source": dev_source,
         "lines_before": start_lines, "lines": count_lines(src_root),
         "code_lines": nonblank_lines(src_root), "unloaded_lines_dropped": dropped, "rounds": rounds,
         "prune_seconds": round(time.time() - t0),

@@ -51,7 +51,11 @@ registry cache) as the oracle, and lust builds it from the same
 manifest, which swaps in the lust adapter (docs/ARCH.md 3.6).
 
 Env: LUST (lust binary), LUST_PORT (scanner binary), TS_RUST (ts-rust
-checkout), LUST_TCC_HOME (passed through to lust). Per-step time
+checkout), LUST_TCC_HOME (passed through to lust). For --coverage,
+LUST_DEV_FEATURES (exact comma list) or LUST_DEV_EXCLUDE_FEATURES
+(comma list removed from each package default) override the project
+lust dev config in the scanned tree (docs/dev-features.md); the
+scanner otherwise reads that config itself. Per-step time
 limits in seconds (floats allowed) can be set for tests:
 PORT_SCAN_COMPILE_TIMEOUT, PORT_SCAN_RUN_TIMEOUT,
 PORT_SCAN_CARGO_TIMEOUT, and the retry forms
@@ -625,12 +629,33 @@ def ensure_scanner():
     return scanner
 
 
+def scan_feature_args(env=None):
+    """Scanner feature override flags from the environment.
+
+    The scanner reads the project lust dev config from the scanned
+    tree on its own. These env vars override it for one run, which is
+    how a read-only tree (no `.lust.toml` yet) gets the dev selection:
+    LUST_DEV_EXCLUDE_FEATURES=jemalloc for ts-rust.
+    """
+    env = os.environ if env is None else env
+    exact = env.get("LUST_DEV_FEATURES", "").strip()
+    exclude = env.get("LUST_DEV_EXCLUDE_FEATURES", "").strip()
+    if exact and exclude:
+        sys.exit("set only one of LUST_DEV_FEATURES and LUST_DEV_EXCLUDE_FEATURES")
+    if exact:
+        return ["--cargo-features", exact]
+    if exclude:
+        return ["--cargo-exclude-features", exclude]
+    return []
+
+
 def do_coverage(args):
     scanner = ensure_scanner()
     ts_rust = Path(os.environ.get("TS_RUST", "/home/theo/.t3/projects/ts-rust"))
     manifest = ts_rust / "Cargo.toml"
     code, out, err = run(
-        [str(scanner), "scan", "--manifest-path", str(manifest), "--target", "x86_64-unknown-linux-gnu", "--json", "--summary"],
+        [str(scanner), "scan", "--manifest-path", str(manifest), "--target", "x86_64-unknown-linux-gnu", "--json", "--summary"]
+        + scan_feature_args(),
         600,
     )
     if code != 0:
@@ -694,6 +719,13 @@ def do_coverage(args):
         f"lust commit: `{lust_head}` (the scanned tree, landed on `next`). ts-rust: `{ts_head}`.",
         "`docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.",
         f"scan: {rep['totals']['files']} files, {rep['totals']['lines']} lines, target x86_64-unknown-linux-gnu.",
+        "Dev features (docs/dev-features.md): `cfg(feature = ...)` uses each package's effective dev"
+        " selection. ts-rust dev builds run with `jemalloc` off:"
+        + (
+            " " + ", ".join(f"`{pkg}` = [{', '.join(fs) if fs else 'none'}]" for pkg, fs in sorted(rep.get("cargo_features", {}).items())) + "."
+            if rep.get("cargo_features")
+            else " not recorded by this scanner build."
+        ),
         "",
         "## Core CLI scope today",
         "",
@@ -736,6 +768,9 @@ def do_coverage(args):
         "cargo build --release",
         "cargo build --release --manifest-path tools/lust-port/Cargo.toml",
         "python3 scripts/port-scan-sync.py --write",
+        "# The scanner reads the lust dev config from the ts-rust tree; on a tree without one,",
+        "# pass the dev selection by env (jemalloc off for ts-rust dev builds):",
+        "#   LUST_DEV_EXCLUDE_FEATURES=jemalloc TS_RUST=/path/to/ts-rust python3 scripts/port-scan-sync.py --coverage",
         "python3 scripts/port-scan-sync.py --coverage",
         "```",
         "",

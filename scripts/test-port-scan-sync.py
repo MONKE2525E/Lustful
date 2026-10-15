@@ -215,5 +215,17 @@ check("timeout env bad value uses the default", pss._timeout_env("TEST_TINY", 30
 del os.environ["PORT_SCAN_TEST_TINY"]
 check("timeout detail keeps whole seconds plain", pss.timed_out({}, "lust build", pss.COMPILE_TIMEOUT)["detail"] == "lust build timed out after 30s")
 
+# Coverage scan feature override: env lists become scanner flags, and
+# the two forms do not mix.
+check("no dev env is no override", pss.scan_feature_args({}) == [])
+check(
+    "exclude env becomes the scanner flag",
+    pss.scan_feature_args({"LUST_DEV_EXCLUDE_FEATURES": "jemalloc"}) == ["--cargo-exclude-features", "jemalloc"],
+)
+check(
+    "exact env becomes the scanner flag",
+    pss.scan_feature_args({"LUST_DEV_FEATURES": "fast,noembed"}) == ["--cargo-features", "fast,noembed"],
+)
+
 print(f"test-port-scan-sync: {'FAILED ' + repr(failures) if failures else 'all passed'}")
 raise SystemExit(1 if failures else 0)

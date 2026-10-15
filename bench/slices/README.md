@@ -71,6 +71,18 @@ python3 bench/slices/prune.py bench/slices/goport-util/spec.json /tmp/gu
 rm -rf bench/slices/goport-util/src && cp -r /tmp/gu/src /tmp/gu/prune.json bench/slices/goport-util/
 ```
 
+Dev features: prune.py passes the package's effective dev feature list
+to lust and to its rustc oracle (docs/dev-features.md). It reads the
+lust config from the ts-rust tree, or `--dev-features a,b` /
+`--dev-exclude-features a,b`, or `$LUST_DEV_FEATURES` /
+`$LUST_DEV_EXCLUDE_FEATURES`, and records `dev_features` in prune.json.
+ts-rust dev builds run with jemalloc off, so on a ts-rust tree without
+a lust config pass `--dev-exclude-features jemalloc`. speed_slice.py
+replays the recorded list for both compilers. With jemalloc off,
+`program.rs` keeps its full 5,660 lines in a ts_goport slice (its
+`tikv_jemalloc_ctl` blocks are cfg-off) and `jemalloc_layout.rs`
+drops out as an unloaded file.
+
 When a round stops on a lust error it cannot locate (a build failure outside fn bodies), add the
 item to the spec's `drop` list (`[[file, item, reason]]`; prune.json records it with `"by": "spec"`)
 and run again. On next 71f51f1d4 that is `frontend/module/cache.rs` `AheadCall` (W-BENCH4 repro
