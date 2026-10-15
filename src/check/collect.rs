@@ -5951,7 +5951,7 @@ impl CollectCx<'_> {
     /// several apply (rustc E0599, E0034) or a generic impl would.
     fn trait_assoc_const(&mut self, self_ty: Ty, trait_def: Option<DefId>, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
         let p = &*self.p;
-        let mut hits: Vec<usize> = Vec::new();
+        let mut hits: Vec<(usize, Option<DefId>)> = Vec::new();
         for (_, rec) in p.gx.index.all_impls() {
             if trait_def.is_some_and(|t| t != rec.trait_def) {
                 continue;
@@ -5973,15 +5973,50 @@ impl CollectCx<'_> {
                 continue;
             }
             let own = self.pending.iter().position(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitImpl { impl_def, assoc: a }) if impl_def == rec.def && a == assoc));
-            let dflt = || self.pending.iter().position(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitDefault { assoc: a, .. }) if a == assoc));
-            match own.or_else(dflt) {
-                Some(i) => hits.push(i),
+            let dflt = self.pending.iter().position(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitDefault { assoc: a, .. }) if a == assoc));
+            match (own, dflt) {
+                (Some(i), _) => hits.push((i, None)),
+                (None, Some(d)) => hits.push((d, Some(rec.def))),
+                (None, None) => return None,
+            }
+        }
+        let [(mut i, impl_of_default)] = hits[..] else { return None };
+        // A default that reads `Self` is a per-instance template (its
+        // value here is a placeholder): this impl evaluates its own copy.
+        // A generic impl's own template has no value here.
+        if self.tmpls[i].is_some() {
+            match impl_of_default {
+                Some(impl_def) => i = self.default_copy(i, impl_def),
                 None => return None,
             }
         }
-        let [i] = hits[..] else { return None };
         let ty = self.pending[i].0.ty;
         self.eval_pending(i).map(|v| (v, ty))
+    }
+
+    /// The pending index of trait default `d` evaluated as impl
+    /// `impl_def`'s own const, made once (a copy is no template).
+    fn default_copy(&mut self, d: usize, impl_def: DefId) -> usize {
+        let Some(PendingAssoc::TraitDefault { assoc, .. }) = self.pending[d].0.assoc else { return d };
+        if let Some(i) = self.pending.iter().position(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitImpl { impl_def: x, assoc: a }) if x == impl_def && a == assoc)) {
+            return i;
+        }
+        let it = &self.pending[d].0;
+        let item = PendingConst {
+            name: it.name,
+            ty: it.ty,
+            expr: it.expr,
+            span: it.span,
+            is_static: None,
+            static_idx: 0,
+            stmt_idx: None,
+            assoc: Some(PendingAssoc::TraitImpl { impl_def, assoc }),
+            tls: None,
+            scope: Vec::new(),
+        };
+        self.pending.push((item, PendingState::Todo));
+        self.tmpls.push(None);
+        self.pending.len() - 1
     }
 
     fn eval_pending(&mut self, idx: usize) -> Option<crate::ty::consteval::ConstValue> {
@@ -6037,7 +6072,7 @@ impl CollectCx<'_> {
                     self.p.gx.index.by_def(impl_def).and_then(|(_, r)| self.p.tys.args(r.trait_ref.args).first().and_then(|g| g.as_ty()));
                 match self_ty.and_then(|t| self.p.tys.local_adt(t)) {
                     Some(a) => (Some(self.p.adts[a.0 as usize].name), self_ty),
-                    None => (None, None),
+                    None => (None, self_ty),
                 }
             }
             _ => (None, None),
@@ -6234,6 +6269,12 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
         // already folded into the flat type name where it can.
         let [.., ty_seg, item_seg] = segs else { return None };
         let self_form = ty_seg.name == self.p.known.self_type;
+        if self_form && self.self_name.is_none() {
+            // `Self` of a trait impl for a builtin type, or no Self at all
+            // (a trait default, a per-instance template).
+            let t = self.self_pat?;
+            return self.trait_assoc_const(t, None, item_seg.name);
+        }
         let ty_name = if self_form { self.self_name? } else { ty_seg.name };
         if let Some(cands) = self.assoc_by_key.get(&(ty_name, item_seg.name)).cloned() {
             // Several disjoint impls may define the name: pick
