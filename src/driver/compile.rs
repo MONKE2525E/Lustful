@@ -1824,9 +1824,9 @@ fn resolved_setup(
     // Std splice, in the root file text, exactly as the single-file path
     // (user spans do not move), and the std platform crate: both by the
     // std plan (`StdPlan`). The first pass takes the session's last plan
-    // (a daemon request) or a guess from the root's module files (a new
-    // session); another pass runs only when the plan of the files the
-    // pass saw differs.
+    // (a daemon request) or a guess from the module files of the root
+    // and of every source dependency (a new session); another pass runs
+    // only when the plan of the files the pass saw differs.
     let unspliced_root = std::mem::take(&mut root_text);
     // A single-file root is the routed text: routing scanned it for std
     // source modules already.
@@ -1838,7 +1838,12 @@ fn resolved_setup(
     let mut plan = match front.std_plan {
         Some(p) => p,
         None => {
-            let user = StdPlan::guess_crate(&root_path, &unspliced_root, root_asks);
+            let mut user = StdPlan::guess_crate(&root_path, &unspliced_root, root_asks);
+            for dep in crate::resolve::worklist::dep_roots(&externs) {
+                if let Ok(text) = std::fs::read_to_string(&dep) {
+                    user = user.or(StdPlan::guess_crate(&dep, &text, StdPlan::asks(&text)));
+                }
+            }
             let plan = close_std_plan(std_cache, user, user.platform.then(crate::stdload::guess_platform))?;
             t.lap("std plan guess");
             plan
