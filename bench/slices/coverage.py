@@ -28,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 ITEMS = HERE / "items/target/release/slice-items"
 SRC = "crates/ts_goport/src"
-BENCH_FILES = {"slice_main.rs", "support.rs"}
+BENCH_FILES = {"slice_main.rs", "support.rs", "support_smallvec.rs", "support_xxhash.rs"}
 
 
 def crate_of_files(tsrust):
@@ -80,9 +80,15 @@ EXTERNAL = {"smallvec", "SmallVec", "xxhash_rust", "bumpalo", "flate2", "jiff", 
 UNRESOLVED = re.compile(r"cannot find|unresolved|not found|no method|no field|no associated|unknown|does not exist|failed to resolve")
 
 
-def root_causes(removed):
+def root_causes(removed, item_text=None):
     """Charge each removal's lines to its root cause. Returns the roots (removals that are no
     cascade), each with own_lines, cascade_lines, cascade_items. See the module comment.
+
+    lust names the module, not the item, when a path's last segment is missing (`ata::Gone`
+    gives "cannot find type `ata`"), and a missing item behind a longer path gives L0505
+    "module paths in types is not supported yet". For those, `item_text` (removal -> its
+    ts-rust source text) finds the `name::Item` (or any `::Item`) paths in the removed item,
+    and the first Item that prune.py removed is the parent.
 
     A removal is a cascade when its message says a name does not resolve and names an item that
     prune.py removed (in any round order, as one round removes users and the item together), or a
@@ -94,13 +100,27 @@ def root_causes(removed):
         if r["name"] != "-":
             item_at.setdefault(r["name"], i)
     parent = list(range(len(removed)))
+    # A removed `use` (an import lust rejects) is the root of every later "cannot find" that
+    # names what it imported (`with_data!` after its `pub(crate) use with_data;` went).
     named_first = {}
     for i, r in enumerate(removed):
+        if r["kind"] == "use":
+            for nm in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", r["message"]):
+                named_first.setdefault(nm, i)
+    for i, r in enumerate(removed):
         msg = r["message"]
+        if item_text and msg.startswith("module paths in"):
+            j = next((item_at[x] for x in re.findall(r"::([A-Z]\w*)", item_text(r)) if item_at.get(x, i) != i), None)
+            if j is not None:
+                parent[i] = j
+            continue
         if not UNRESOLVED.search(msg):
             continue
         for nm in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)", msg):
             j = item_at.get(nm)
+            if j is None and item_text and nm[:1].islower():
+                j = next((item_at[x] for x in re.findall(rf"\b{nm}::(?:[a-z_]\w*::)*([A-Z]\w*)", item_text(r))
+                          if item_at.get(x, i) != i), None)
             if j is not None and j != i and removed[j]["name"] != r["name"]:
                 parent[i] = j
                 break
@@ -132,6 +152,19 @@ def root_causes(removed):
             roots[k]["cascade_lines"] += r["lines"]
             roots[k]["cascade_items"] += 1
     return list(roots.values())
+
+
+def item_source(path, kind, name, cache={}):
+    """Source text of the item `kind name` in a ts-rust file (the whole file for an unnamed
+    item, or when slice-items does not list it); "" when the file is gone."""
+    if not path.exists():
+        return ""
+    if path not in cache:
+        r = subprocess.run([str(ITEMS), str(path)], capture_output=True, text=True, check=True)
+        cache[path] = ([l.split() for l in r.stdout.splitlines()], path.read_text().split("\n"))
+    items, lines = cache[path]
+    span = next(((int(a), int(b)) for a, b, _, k, n in items if k == kind and n == name), None)
+    return "\n".join(lines[span[0] - 1:span[1]] if span else lines)
 
 
 def reason_key(r):
@@ -219,7 +252,7 @@ def main():
         md.append(f"| {c} | `{mod}` | {u:,} | {k:,} | {pc(k, u)} | {e:,} | {pc(e, u)} |")
 
     # Root causes over every slice's log would double count; use the main slice's log.
-    roots = root_causes(main_m["removed"])
+    roots = root_causes(main_m["removed"], lambda r: item_source(tsrust / SRC / r["file"], r["kind"], r["name"]))
     groups = defaultdict(lambda: {"roots": 0, "own": 0, "cascade": 0, "items": 0, "examples": []})
     for r in roots:
         g = groups[reason_key(r)]
