@@ -62,6 +62,8 @@ pub(crate) fn add_std_shadow_impls(p: &mut Program) {
     table.push((lang.from, rct, vec![bt], 1, vec![]));
     let names = [p.interner.intern("T"), p.interner.intern("U")];
     for (i, (trait_def, self_pat, inputs, n, clauses)) in table.into_iter().enumerate() {
+        // `Deref for &T` and `&mut T` name `Target = T`.
+        let assoc_tys = if trait_def == lang.deref { vec![(lang.assoc_target, t)] } else { Vec::new() };
         let negative = trait_def == lang.clone && self_pat == mt;
         let trait_ref = mk_ref(p, trait_def, self_pat, &inputs);
         let predicates = clauses.into_iter().map(|(d, s, ins)| Predicate::Trait(Binder::plain(mk_ref(p, d, s, &ins)))).collect();
@@ -76,7 +78,7 @@ pub(crate) fn add_std_shadow_impls(p: &mut Program) {
             trait_def,
             trait_ref,
             generics: Generics { parent: None, params, predicates },
-            assoc_tys: Vec::new(),
+            assoc_tys,
             assoc_consts: Vec::new(),
             items: Vec::new(),
             synthetic: Synthetic::Lang,

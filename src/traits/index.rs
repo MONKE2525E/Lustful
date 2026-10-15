@@ -782,6 +782,20 @@ impl ImplIndex {
             if !unify_pattern_args(tys, &mut map, cand.args, tr.args) {
                 continue;
             }
+            // An associated type binding of the clause must agree with
+            // the impl's (`&Local: Deref<Target = i32>` is dead through
+            // core's `impl Deref for &T` with `Target = T`).
+            let bindings: Vec<(DefId, GenericArg)> = tys.bindings(tr.bindings).to_vec();
+            let binding_clash = bindings.into_iter().any(|(assoc, ga)| match (ga, rec.assoc_ty(assoc)) {
+                (GenericArg::Ty(want), Some(have)) => {
+                    let have = rename_ty(tys, have, n, vars_in_use);
+                    !unify_patterns(tys, &mut map, want, have)
+                }
+                _ => false,
+            });
+            if binding_clash {
+                continue;
+            }
             // A matching header is live unless one of its clauses
             // cannot hold; past the depth cap it counts as live.
             let dead = depth < 4
