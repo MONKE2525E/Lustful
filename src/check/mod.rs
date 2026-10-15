@@ -2112,12 +2112,16 @@ enum KCov {
 }
 
 /// State of the overflow-lint walk: addressed locals, the stack of loop
-/// and labeled-block frames collecting break values, and one operation to
-/// leave alone (the `a = a + 1` form).
+/// and labeled-block frames collecting break values, and the locals
+/// assigned more than once. A multiply-assigned local is only known
+/// inside the MIR basic block that assigns it (rustc const-prop's
+/// `OnlyInsideOwnBlock` mode): a terminator (a call, a checked
+/// operation, a branch) clears its known value, while a local assigned
+/// once keeps its value across blocks.
 struct KLint {
     addressed: Vec<bool>,
+    multi: Vec<bool>,
     frames: Vec<(Option<Sym>, Vec<Option<KVal>>)>,
-    suppress: Option<(ExprId, u32)>,
     /// The current path is known to be unreachable (a known branch that
     /// is taken diverges): the rest of the block is not linted.
     dead: bool,
@@ -17378,10 +17382,18 @@ impl<'p> Ctx<'p> {
     /// is taken anywhere is never tracked, knowledge does not survive a
     /// control-flow join for locals assigned on either side, a write
     /// through a field or index place drops the whole aggregate, reads
-    /// through references and enum payloads are unknown, and an
-    /// operation that stores back into the local it reads
-    /// (`a = a + 1`, `a += 1`) does not fire.
+    /// through references and enum payloads are unknown, and a local
+    /// assigned more than once is only known until the next MIR
+    /// terminator (see `KLint`). A store back into the local it reads
+    /// (`a = a + 1`, `a += 1`) fires like any other operation, but only
+    /// inside that block. The lint never runs on a monomorphized
+    /// instance: rustc runs it before mono, so a value that only a
+    /// substitution makes known (a const param, an associated const)
+    /// must not reject the build.
     fn overflow_lint(&mut self) {
+        if matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
+            return;
+        }
         let p = self.p;
         let allow_arith = self.f.def(&self.p.ast).attrs.iter().any(|a| crate::check::allow_attr(a, &p.interner, "arithmetic_overflow"));
         let allow_panic = self.f.def(&self.p.ast).attrs.iter().any(|a| crate::check::allow_attr(a, &p.interner, "unconditional_panic"));
@@ -17389,10 +17401,63 @@ impl<'p> Ctx<'p> {
             return;
         }
         let Some(body) = self.f.def(&self.p.ast).body else { return };
+        // A local is multiply assigned when an explicit store lands on a
+        // local a pattern already gave a value (a parameter, a `let`
+        // with an initializer), or two explicit stores land on it (a
+        // deferred `let a; a = ..; a = ..;`).
+        let n_locals = self.out.locals.len();
+        let mut multi = vec![false; n_locals];
+        {
+            let mut stores = vec![0u32; n_locals];
+            let mut bound = vec![false; n_locals];
+            let mut blocks: Vec<ast::BlockId> = vec![body];
+            for pr in &self.out.pat_res {
+                if let PatRes::Binding { local, .. } = pr {
+                    bound[*local as usize] = true;
+                }
+            }
+            for &pl in &self.out.param_locals {
+                bound[pl as usize] = true;
+            }
+            for i in 0..self.out.expr_ty.len() {
+                let e = ExprId(self.out.expr_base + i as u32);
+                match p.ast.expr(e) {
+                    Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } => {
+                        let mut roots = Vec::new();
+                        self.k_lhs_roots(*lhs, &mut roots);
+                        for r in roots {
+                            stores[r as usize] += 1;
+                        }
+                    }
+                    Expr::Block(b) | Expr::UnsafeBlock(b) => blocks.push(*b),
+                    Expr::LabeledBlock { body: b, .. } => blocks.push(*b),
+                    Expr::If { then, .. } => blocks.push(*then),
+                    Expr::While { body: b, .. } | Expr::Loop { body: b, .. } | Expr::For { body: b, .. } => blocks.push(*b),
+                    _ => {}
+                }
+            }
+            // A `let a;` without an initializer gives no value, so its
+            // first explicit store is the local's only assignment.
+            let mut deferred = vec![false; n_locals];
+            for b in blocks {
+                for stmt in &p.ast.block(b).stmts {
+                    if let Stmt::Let { pat, init: None, .. } = stmt {
+                        let mut locals = Vec::new();
+                        self.k_pat_locals(*pat, &mut locals);
+                        for l in locals {
+                            deferred[l as usize] = true;
+                        }
+                    }
+                }
+            }
+            for l in 0..n_locals {
+                multi[l] = stores[l] >= 2 || (stores[l] == 1 && bound[l] && !deferred[l]);
+            }
+        }
         let mut lint = KLint {
             addressed: vec![false; self.out.locals.len()],
+            multi,
             frames: Vec::new(),
-            suppress: None,
             dead: false,
             allow_arith,
             allow_panic,
@@ -17461,7 +17526,6 @@ impl<'p> Ctx<'p> {
             let mut env: KEnv = vec![None; self.out.locals.len()];
             lint.frames.clear();
             lint.dead = false;
-            lint.suppress = None;
             self.k_expr(b, &mut env, &mut lint);
         }
     }
@@ -17493,6 +17557,95 @@ impl<'p> Ctx<'p> {
             }
             c.ty = self.zonk(c.ty);
             self.out.closures.push(c);
+        }
+    }
+
+    /// Ends the current MIR basic block for lint purposes: every
+    /// multiply-assigned local stops being known (see `KLint`).
+    fn k_break(env: &mut KEnv, lint: &KLint) {
+        for (i, m) in lint.multi.iter().enumerate() {
+            if *m {
+                env[i] = None;
+            }
+        }
+    }
+
+    /// Collects the root locals an assignment target stores into,
+    /// walking a destructuring target's places.
+    fn k_lhs_roots(&self, e: ExprId, out: &mut Vec<u32>) {
+        match self.p.ast.expr(e) {
+            Expr::Tuple(elems) | Expr::Array(elems) => {
+                for &el in elems {
+                    self.k_lhs_roots(el, out);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for &(_, _, fe) in fields {
+                    self.k_lhs_roots(fe, out);
+                }
+            }
+            _ => {
+                if let Some(r) = self.k_place_root(e) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+
+    /// Collects the binding locals under a pattern.
+    fn k_pat_locals(&self, pat: PatId, out: &mut Vec<u32>) {
+        let p = self.p;
+        if let PatRes::Binding { local, .. } = self.out.pat_res[(pat.0 - self.out.pat_base) as usize] {
+            out.push(local);
+        }
+        match p.ast.pat(pat) {
+            Pat::At { inner, .. } | Pat::Ref { inner, .. } | Pat::Paren(inner) => self.k_pat_locals(*inner, out),
+            Pat::Tuple(elems) | Pat::TupleStruct { elems, .. } | Pat::Or(elems) => {
+                for &s in elems {
+                    self.k_pat_locals(s, out);
+                }
+            }
+            Pat::Struct { fields, .. } => {
+                for &(_, s) in fields {
+                    self.k_pat_locals(s, out);
+                }
+            }
+            Pat::Slice { prefix, middle, suffix } => {
+                for &s in prefix.iter().chain(suffix.iter()) {
+                    self.k_pat_locals(s, out);
+                }
+                if let Some(m) = middle {
+                    self.k_pat_locals(*m, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fires the arithmetic-overflow lint for `a op b` at integer type
+    /// `t` when both operands are known and the result does not fit.
+    fn k_check_arith(&mut self, op: BinOp, a: i128, b: i128, t: Ty, span: Span, lint: &KLint) {
+        if self.k_is_u128(t) {
+            let (au, bu) = (a as u128, b as u128);
+            let r = match op {
+                BinOp::Add => au.checked_add(bu),
+                BinOp::Sub => au.checked_sub(bu),
+                _ => au.checked_mul(bu),
+            };
+            if r.is_none() {
+                self.k_fire(span, lint);
+            }
+            return;
+        }
+        let Some((_, lo, hi)) = self.k_range(t) else { return };
+        let (Some(a), Some(b)) = (self.k_math(a, t), self.k_math(b, t)) else { return };
+        let r = match op {
+            BinOp::Add => a.checked_add(b),
+            BinOp::Sub => a.checked_sub(b),
+            _ => a.checked_mul(b),
+        };
+        if !matches!(r, Some(r) if (lo..=hi).contains(&r)) {
+            self.k_fire(span, lint);
         }
     }
 
@@ -17933,6 +18086,7 @@ impl<'p> Ctx<'p> {
                     // and if it diverges, what follows is unreachable.
                     let saved = lint.dead;
                     lint.dead = false;
+                    Self::k_break(env, lint);
                     let side_span = if b {
                         self.k_block(*then, env, lint);
                         then_span
@@ -17952,6 +18106,7 @@ impl<'p> Ctx<'p> {
                             els.is_some_and(|x| self.tys.kind(self.out.expr_ty[self.ei(x)]) == TyKind::Never)
                         };
                     lint.dead = saved || side_diverges;
+                    Self::k_break(env, lint);
                     if els.is_some() || b {
                         self.k_poison(env, &[side_span]);
                     }
@@ -17960,13 +18115,16 @@ impl<'p> Ctx<'p> {
                 let saved = lint.dead;
                 lint.dead = false;
                 let mut tenv = env.clone();
+                Self::k_break(&mut tenv, lint);
                 self.k_block(*then, &mut tenv, lint);
                 lint.dead = false;
                 if let Some(els) = els {
                     let mut eenv = env.clone();
+                    Self::k_break(&mut eenv, lint);
                     self.k_expr(*els, &mut eenv, lint);
                 }
                 lint.dead = saved;
+                Self::k_break(env, lint);
                 match els_span {
                     Some(es) => self.k_poison(env, &[then_span, es]),
                     None => self.k_poison(env, &[then_span]),
@@ -17980,6 +18138,7 @@ impl<'p> Ctx<'p> {
                 for &r in &poison {
                     lenv[r as usize] = None;
                 }
+                Self::k_break(&mut lenv, lint);
                 let saved = lint.dead;
                 lint.dead = false;
                 let cv = self.k_expr(*cond, &mut lenv, lint);
@@ -17990,16 +18149,25 @@ impl<'p> Ctx<'p> {
                     lint.frames.pop();
                 }
                 lint.dead = saved;
+                Self::k_break(env, lint);
                 for &r in &poison {
                     env[r as usize] = None;
                 }
                 None
             }
             Expr::Loop { label, body } => {
+                // A body that cannot fall through to a second iteration
+                // (it always breaks or diverges at its top level) is
+                // straight-line code in the same block; a body that can
+                // repeat starts a new block at its head.
+                let repeats = !self.k_block_diverges(*body);
                 let poison = self.k_assigned_in(&[p.ast.block(*body).span]);
                 let mut lenv = env.clone();
-                for &r in &poison {
-                    lenv[r as usize] = None;
+                if repeats {
+                    for &r in &poison {
+                        lenv[r as usize] = None;
+                    }
+                    Self::k_break(&mut lenv, lint);
                 }
                 let saved = lint.dead;
                 lint.dead = false;
@@ -18007,6 +18175,9 @@ impl<'p> Ctx<'p> {
                 self.k_block(*body, &mut lenv, lint);
                 let (_, breaks) = lint.frames.pop().unwrap();
                 lint.dead = saved;
+                if repeats {
+                    Self::k_break(env, lint);
+                }
                 for &r in &poison {
                     env[r as usize] = None;
                 }
@@ -18020,6 +18191,7 @@ impl<'p> Ctx<'p> {
                 for &r in &poison {
                     lenv[r as usize] = None;
                 }
+                Self::k_break(&mut lenv, lint);
                 let saved = lint.dead;
                 lint.dead = false;
                 let none = None;
@@ -18028,6 +18200,7 @@ impl<'p> Ctx<'p> {
                 self.k_block(*body, &mut lenv, lint);
                 lint.frames.pop();
                 lint.dead = saved;
+                Self::k_break(env, lint);
                 for &r in &poison {
                     env[r as usize] = None;
                 }
@@ -18043,6 +18216,9 @@ impl<'p> Ctx<'p> {
                     // arm is straight-line code.
                     lint.dead = false;
                     let pushed = self.k_allow_push(&arm.attrs.clone(), lint);
+                    if arms.len() > 1 {
+                        Self::k_break(env, lint);
+                    }
                     self.k_bind_pat(arm.pat, &sv, env, lint);
                     let v = self.k_expr(arm.body, env, lint);
                     self.k_allow_pop(pushed, lint);
@@ -18051,6 +18227,7 @@ impl<'p> Ctx<'p> {
                     if arms.len() == 1 {
                         return v;
                     }
+                    Self::k_break(env, lint);
                     self.k_poison(env, &[self.span(arm.body)]);
                     return None;
                 }
@@ -18059,6 +18236,9 @@ impl<'p> Ctx<'p> {
                 for arm in arms {
                     lint.dead = false;
                     let mut aenv = env.clone();
+                    if arms.len() > 1 {
+                        Self::k_break(&mut aenv, lint);
+                    }
                     let pushed = self.k_allow_push(&arm.attrs.clone(), lint);
                     self.k_bind_pat(arm.pat, &sv, &mut aenv, lint);
                     if let Some(g) = arm.guard {
@@ -18076,6 +18256,7 @@ impl<'p> Ctx<'p> {
                     *env = aenv;
                     return v;
                 }
+                Self::k_break(env, lint);
                 self.k_poison(env, &regions);
                 None
             }
@@ -18105,6 +18286,11 @@ impl<'p> Ctx<'p> {
                 for &a in args {
                     vals.push(self.k_expr(a, env, lint));
                 }
+                // A call is a terminator; a variant or tuple-struct
+                // constructor is an aggregate in the same block.
+                if !matches!(self.out.expr_res[self.ei(*callee)], Res::Variant(..) | Res::OptSome | Res::ConstUsize(_)) {
+                    Self::k_break(env, lint);
+                }
                 match self.out.expr_res[self.ei(e)] {
                     Res::DefaultVal => match self.tys.kind(ety) {
                         TyKind::Int(_) | TyKind::Char => Some(KVal::Int(0)),
@@ -18129,6 +18315,7 @@ impl<'p> Ctx<'p> {
                 for &a in args {
                     self.k_expr(a, env, lint);
                 }
+                Self::k_break(env, lint);
                 None
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
@@ -18142,6 +18329,7 @@ impl<'p> Ctx<'p> {
                 let bv = self.k_expr(*base, env, lint);
                 let iv = self.k_expr(*index, env, lint);
                 self.k_check_index(e, *base, &iv, span, lint);
+                Self::k_break(env, lint);
                 match (bv, iv) {
                     (Some(KVal::Agg(items)), Some(KVal::Int(i))) if i >= 0 => items.get(i as usize).cloned().unwrap_or(None),
                     _ => None,
@@ -18249,6 +18437,7 @@ impl<'p> Ctx<'p> {
                 for &a in args {
                     self.k_expr(a, env, lint);
                 }
+                Self::k_break(env, lint);
                 None
             }
             Expr::Binary { op, lhs, rhs } => self.k_binary(e, *op, *lhs, *rhs, span, env, lint),
@@ -18256,18 +18445,38 @@ impl<'p> Ctx<'p> {
             Expr::Assign { lhs, rhs } => {
                 self.k_place_parts(*lhs, env, lint);
                 let whole = if matches!(p.ast.expr(*lhs), Expr::Path(_)) { self.k_place_root(*lhs) } else { None };
-                if let Some(root) = whole
-                    && matches!(p.ast.expr(*rhs), Expr::Binary { .. } | Expr::Unary { .. })
-                {
-                    lint.suppress = Some((*rhs, root));
-                }
                 let v = self.k_expr(*rhs, env, lint);
-                lint.suppress = None;
                 match whole {
                     Some(root) => Self::k_set(env, lint, root, v),
                     None => {
-                        if let Some(root) = self.k_place_root(*lhs) {
-                            env[root as usize] = None;
+                        // A destructuring target stores a known
+                        // component into each whole-local element.
+                        let mut done = false;
+                        if let Expr::Tuple(elems) = p.ast.expr(*lhs)
+                            && let Some(KVal::Agg(items)) = &v
+                            && items.len() == elems.len()
+                        {
+                            done = true;
+                            for (el, item) in elems.iter().zip(items.iter()) {
+                                if matches!(p.ast.expr(*el), Expr::Path(_))
+                                    && let Some(r) = self.k_place_root(*el)
+                                {
+                                    Self::k_set(env, lint, r, item.clone());
+                                } else if let Some(r) = self.k_place_root(*el) {
+                                    env[r as usize] = None;
+                                }
+                            }
+                        }
+                        if !done {
+                            if let Some(root) = self.k_place_root(*lhs) {
+                                env[root as usize] = None;
+                            } else {
+                                let mut roots = Vec::new();
+                                self.k_lhs_roots(*lhs, &mut roots);
+                                for r in roots {
+                                    env[r as usize] = None;
+                                }
+                            }
                         }
                     }
                 }
@@ -18275,16 +18484,33 @@ impl<'p> Ctx<'p> {
             }
             Expr::AssignOp { op, lhs, rhs } => {
                 let root = self.k_place_root(*lhs);
-                let old = if matches!(p.ast.expr(*lhs), Expr::Path(_)) {
+                let whole = matches!(p.ast.expr(*lhs), Expr::Path(_));
+                if !whole {
+                    self.k_place_parts(*lhs, env, lint);
+                }
+                let rv = self.k_expr(*rhs, env, lint);
+                // The place is read after its own parts and the right
+                // side run, so a terminator in either has already
+                // cleared a multiply-assigned root. A field of a known
+                // aggregate still reads its component; an index or a
+                // deref reads nothing known.
+                let old = if whole {
                     root.and_then(|r| env.get(r as usize).cloned().unwrap_or(None))
                 } else {
-                    self.k_place_parts(*lhs, env, lint);
-                    None
+                    match (root.and_then(|r| env.get(r as usize).cloned().unwrap_or(None)), self.out.expr_res[self.ei(*lhs)]) {
+                        (Some(KVal::Agg(items)), Res::Field { derefs: 0, index }) => {
+                            items.get(index as usize).cloned().unwrap_or(None)
+                        }
+                        _ => None,
+                    }
                 };
-                let rv = self.k_expr(*rhs, env, lint);
-                // A compound assignment does not fire for its own overflow
-                // (probed), but a bad shift amount still does, and a
-                // division or remainder that always panics does too.
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    && let (Some(KVal::Int(a)), Some(KVal::Int(b))) = (&old, &rv)
+                {
+                    let lt = self.out.expr_ty[self.ei(*lhs)];
+                    let (a, b) = (*a, *b);
+                    self.k_check_arith(*op, a, b, lt, span, lint);
+                }
                 if matches!(op, BinOp::Shl | BinOp::Shr)
                     && let Some(KVal::Int(s)) = rv
                 {
@@ -18310,6 +18536,13 @@ impl<'p> Ctx<'p> {
                         }
                     }
                 }
+                // The checked operation ends the block; the store back
+                // starts the next one, so break before recording it.
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr)
+                    && self.k_bits(self.out.expr_ty[self.ei(*lhs)]).is_some()
+                {
+                    Self::k_break(env, lint);
+                }
                 match root {
                     Some(r) if matches!(p.ast.expr(*lhs), Expr::Path(_)) => {
                         let lt = self.out.expr_ty[self.ei(*lhs)];
@@ -18324,7 +18557,11 @@ impl<'p> Ctx<'p> {
                 }
                 None
             }
-            Expr::Try(inner) | Expr::Await(inner) => self.k_expr(*inner, env, lint),
+            Expr::Try(inner) | Expr::Await(inner) => {
+                let v = self.k_expr(*inner, env, lint);
+                Self::k_break(env, lint);
+                v
+            }
             Expr::Closure { params, body, .. } => {
                 // A closure body is its own body for the lints: its
                 // parameters are unknown, captures keep the knowledge
@@ -18353,6 +18590,7 @@ impl<'p> Ctx<'p> {
                 let iv = self.k_expr(*index, env, lint);
                 let span = self.span(e);
                 self.k_check_index(e, *base, &iv, span, lint);
+                Self::k_break(env, lint);
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.k_place_parts(*base, env, lint),
             Expr::Deref(inner) => {
@@ -18589,7 +18827,24 @@ impl<'p> Ctx<'p> {
         self.k_wrap(r, t)
     }
 
+    /// A binary operation, then the terminator it ends the block with:
+    /// a checked integer operation or a short-circuit, or a trait
+    /// operation's call. Comparisons and bit operations stay in the
+    /// block.
     fn k_binary(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
+        let lt = self.out.expr_ty[self.ei(lhs)];
+        let breaker = matches!(self.out.expr_res[self.ei(e)], Res::TraitBin { .. })
+            || matches!(op, BinOp::And | BinOp::Or)
+            || (matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr)
+                && self.k_bits(lt).is_some());
+        let v = self.k_binary_inner(e, op, lhs, rhs, span, env, lint);
+        if breaker {
+            Self::k_break(env, lint);
+        }
+        v
+    }
+
+    fn k_binary_inner(&mut self, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
         let lv = self.k_expr(lhs, env, lint);
         // A known short-circuit skips the right side entirely.
         match (op, &lv) {
@@ -18670,14 +18925,10 @@ impl<'p> Ctx<'p> {
                         BinOp::Sub => au.checked_sub(bu),
                         _ => au.checked_mul(bu),
                     };
-                    let suppressed = lint.suppress == Some((e, u32::MAX))
-                        || matches!(lint.suppress, Some((se, root)) if se == e && (self.k_place_root(lhs) == Some(root) || self.k_place_root(rhs) == Some(root)));
                     return match r {
                         Some(r) => Some(KVal::Int(r as i128)),
                         None => {
-                            if !suppressed {
-                                self.k_fire(span, lint);
-                            }
+                            self.k_fire(span, lint);
                             None
                         }
                     };
@@ -18689,14 +18940,10 @@ impl<'p> Ctx<'p> {
                     BinOp::Sub => a.checked_sub(b),
                     _ => a.checked_mul(b),
                 };
-                let suppressed = lint.suppress == Some((e, u32::MAX))
-                    || matches!(lint.suppress, Some((se, root)) if se == e && (self.k_place_root(lhs) == Some(root) || self.k_place_root(rhs) == Some(root)));
                 match r {
                     Some(r) if (lo..=hi).contains(&r) => Some(KVal::Int(r)),
                     _ => {
-                        if !suppressed {
-                            self.k_fire(span, lint);
-                        }
+                        self.k_fire(span, lint);
                         None
                     }
                 }
@@ -18737,7 +18984,20 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// A unary operation. An integer negation of a non-literal is a
+    /// checked operation, so it ends the block like `k_binary`.
     fn k_unary(&mut self, e: ExprId, op: UnOp, inner: ExprId, span: Span, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
+        let breaker = matches!(op, UnOp::Neg)
+            && self.k_bits(self.out.expr_ty[self.ei(e)]).is_some()
+            && !matches!(self.p.ast.expr(inner), Expr::Int(..));
+        let v = self.k_unary_inner(e, op, inner, span, env, lint);
+        if breaker {
+            Self::k_break(env, lint);
+        }
+        v
+    }
+
+    fn k_unary_inner(&mut self, e: ExprId, op: UnOp, inner: ExprId, span: Span, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
         let v = self.k_expr(inner, env, lint);
         match op {
             UnOp::Neg => {
@@ -18758,10 +19018,7 @@ impl<'p> Ctx<'p> {
                 match r {
                     Some(r) if (lo..=hi).contains(&r) => Some(KVal::Int(r)),
                     _ => {
-                        let suppressed = matches!(lint.suppress, Some((se, root)) if se == e && self.k_place_root(inner) == Some(root));
-                        if !suppressed {
-                            self.k_fire(span, lint);
-                        }
+                        self.k_fire(span, lint);
                         None
                     }
                 }

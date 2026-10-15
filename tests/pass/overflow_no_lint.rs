@@ -1,6 +1,7 @@
 // Known-value shapes the arithmetic_overflow lint does not reject:
-// a value stored back into the local it reads, an operand behind a
-// reference, a value assigned inside a branch, and an allowed overflow.
+// a value stored back into a local whose address is taken later
+// (every value below is printed), an operand behind a reference, a
+// value assigned inside a branch, and an allowed overflow.
 #[allow(arithmetic_overflow)]
 fn allowed() -> u8 {
     let a: u8 = 254;
