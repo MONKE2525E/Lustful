@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `864541655` (the scanned tree, landed on `next`). ts-rust: `unknown`.
+lust commit: `98881448e` (the scanned tree, landed on `next`). ts-rust: `unknown`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 282 files, 229151 lines (69.5% of files, 58.7% of lines).
+Core: 406 files, 390709 lines. Compiles today: 201 files, 123951 lines (49.5% of files, 31.7% of lines).
 
-All active prod files: 584 of 773 files compile today (58.2% of lines).
+All active prod files: 461 of 773 files compile today (62.4% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,27 +31,26 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 51 | 59361 |
-| 2 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 10 | 14775 |
-| 3 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 13 | 23938 |
-| 4 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 6 | 4693 |
-| 5 | `cinterop.system` | unsupported | 7 | wave C (shims) | 20 | 16466 | 9 | 2773 |
+| 1 | `core.std_basics` | partial | 0 | W-SHIM-P2 | 167 | 230863 | 94 | 129138 |
+| 2 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 25 | 20121 |
+| 3 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 4 | 6665 |
+| 4 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 3 | 1915 |
+| 5 | `cinterop.system` | unsupported | 7 | wave C (shims) | 20 | 16466 | 1 | 29 |
 | 6 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
-| 7 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 1 | 1248 |
+| 7 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 0 | 0 |
 | 8 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
 | 9 | `cinterop.global_allocator` | unsupported | 7 | W-CINTEROP | 5 | 2444 | 0 | 0 |
-| 10 | `std.net` | unsupported | 7 | W-SHIM-P2 | 1 | 1448 | 0 | 0 |
-| 11 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
-| 12 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
-| 13 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
-| 14 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
+| 10 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
+| 11 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
+| 12 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
+| 13 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
 
 ## Core CLI curve
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 282 | 69.5 | 58.7 |
-| milestone 4 | 282 | 69.5 | 58.7 |
+| supported today | 295 | 72.7 | 64.8 |
+| milestone 4 | 295 | 72.7 | 64.8 |
 | milestone 5 | 377 | 92.9 | 93.4 |
 | milestone 6 | 381 | 93.8 | 95.0 |
 | milestone 7 | 402 | 99.0 | 99.1 |
@@ -61,10 +60,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 584 | 75.5 | 58.2 |
-| milestone 4 | 584 | 75.5 | 58.2 |
-| milestone 5 | 734 | 95.0 | 94.1 |
-| milestone 6 | 741 | 95.9 | 95.3 |
+| supported today | 598 | 77.4 | 62.4 |
+| milestone 4 | 598 | 77.4 | 62.4 |
+| milestone 5 | 735 | 95.1 | 94.1 |
+| milestone 6 | 742 | 96.0 | 95.3 |
 | milestone 7 | 767 | 99.2 | 98.4 |
 | milestone 8 | 769 | 99.5 | 99.4 |
 

@@ -920,8 +920,8 @@
   {
    "id": "ext.smallvec",
    "title": "Adapter crate smallvec 1.15.1: SmallVec<[T; N]> with inline storage",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
@@ -1427,7 +1427,7 @@
   {
    "id": "core.std_basics",
    "title": "Std basics: mem, env, process, fs, io, path, str, cmp, char, num, slice, HashMap/HashSet",
-   "status": "supported",
+   "status": "partial",
    "milestone": 0,
    "inventory_step": "1",
    "root_cause": "std-runtime",
@@ -1680,8 +1680,8 @@
   {
    "id": "std.net",
    "title": "TCP and UDP sockets (TcpStream, TcpListener, UdpSocket, Shutdown)",
-   "status": "unsupported",
-   "milestone": 7,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
