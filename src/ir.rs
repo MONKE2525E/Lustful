@@ -292,6 +292,27 @@ pub struct Body<'g> {
     /// `arr[1]` reads the whole array for move checks. Only borrowck reads
     /// it; a cached body has none.
     pub index_exprs: Vec<Local>,
+    /// Pattern-created index temporaries that hold `len - k` for a
+    /// slice pattern's suffix element (rustc's `ConstantIndex`
+    /// with `from_end`), as (local, k, minimum length). Borrowck treats two
+    /// different back offsets of one slice as disjoint elements,
+    /// and a back offset inside a pattern subslice's excluded
+    /// suffix as disjoint from that subslice. Only borrowck
+    /// reads it; a cached body has none.
+    pub pat_back_index: Vec<(Local, u64, u64)>,
+    /// Pattern-created index temporaries for a slice pattern's
+    /// prefix elements, as (local, index, minimum length): the
+    /// pattern's length test bounds the slice length below, so
+    /// a prefix index and a suffix back offset of one pattern
+    /// name disjoint elements when they meet the bound. Only
+    /// borrowck reads it; a cached body has none.
+    pub pat_front_index: Vec<(Local, u64, u64)>,
+    /// The destination locals of pattern-created subslices (a
+    /// slice pattern's middle). Borrowck gives such a loan the
+    /// subslice's index range, so the pattern's own prefix and
+    /// suffix element loans beside it are disjoint from it.
+    /// Only borrowck reads it; a cached body has none.
+    pub pat_subslice: Vec<Local>,
     /// Edges only borrowck sees, as rustc's `FalseEdge`: from the point
     /// where a match arm's pattern has matched (before its bindings) to
     /// the next arm's start, so arms after an irrefutable one are still

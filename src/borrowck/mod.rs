@@ -109,9 +109,37 @@ fn bit_iter(w: &[u64]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
+/// A known slice index position: from the front, or `len - k`
+/// from the back (a pattern suffix index).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdxKey {
+    Front(u64),
+    Back(u64),
+}
+
+/// True when index position `a` is at or before `b`: only
+/// same-kind positions compare (a front offset and a back
+/// offset meet only at a known length).
+fn idx_le(a: IdxKey, b: IdxKey) -> Option<bool> {
+    match (a, b) {
+        (IdxKey::Front(x), IdxKey::Front(y)) => Some(x <= y),
+        (IdxKey::Back(x), IdxKey::Back(y)) => Some(x >= y),
+        _ => None,
+    }
+}
+
+/// True when index `i` is outside the range `[lo, hi)`.
+fn idx_outside(i: IdxKey, lo: IdxKey, hi: IdxKey) -> bool {
+    idx_le(i, lo).is_some_and(|le| le && i != lo) || idx_le(hi, i).is_some_and(|le| le)
+}
+
 struct Loan {
     place: Place,
     mutable: bool,
+    /// The index range of a pattern-created subslice loan
+    /// (`Body::pat_subslice`): element places outside it are
+    /// disjoint from this loan.
+    range: Option<(IdxKey, IdxKey)>,
     /// Where the borrow starts. Used as a labeled secondary span in diagnostics.
     span: Span,
     /// The last use of the local that first holds this loan, if it is after the borrow.
@@ -298,6 +326,12 @@ struct Ck<'b, 'p> {
     drop_heads: HashSet<crate::def::DefId>,
     /// Index locals with a known constant value (see `const_index_locals`).
     const_index: std::collections::HashMap<Local, u64>,
+    /// Pattern index locals holding `len - k`, by local to
+    /// (k, minimum length) (`Body::pat_back_index`).
+    back_index: std::collections::HashMap<Local, (u64, u64)>,
+    /// Pattern prefix index locals, by local to (index,
+    /// minimum length) (`Body::pat_front_index`).
+    front_index: std::collections::HashMap<Local, (u64, u64)>,
     /// The layout of every `State` of this body.
     sh: Shape,
     /// Every exact path the body moves out of (see `prefix_of`), as
@@ -425,6 +459,8 @@ impl<'b, 'p> Ck<'b, 'p> {
                 }
                 c
             },
+            back_index: body.pat_back_index.iter().map(|&(l, k, m)| (l, (k, m))).collect(),
+            front_index: body.pat_front_index.iter().map(|&(l, i, m)| (l, (i, m))).collect(),
             sh: Shape { n: 0, wn: 0, wm: 0 },
             mpaths: Vec::new(),
             mpath_at: Vec::new(),
@@ -560,15 +596,31 @@ fn parts_operands<'r>(parts: &'r [FmtPart], f: &mut impl FnMut(&'r Operand)) {
 /// True if two places may refer to overlapping memory.
 /// `consts` are the constant index locals (`Ck::const_index`): two
 /// different constant indexes, which only patterns make, name disjoint
-/// elements, as rustc's `ConstantIndex`.
-fn overlap(a: &Place, b: &Place, consts: &std::collections::HashMap<Local, u64>) -> bool {
+/// elements, as rustc's `ConstantIndex`. Two different back
+/// offsets (`Ck::back_index`) name disjoint elements too; a
+/// front offset and a back offset may still meet.
+fn overlap(
+    a: &Place,
+    b: &Place,
+    consts: &std::collections::HashMap<Local, u64>,
+    fronts: &std::collections::HashMap<Local, (u64, u64)>,
+    backs: &std::collections::HashMap<Local, (u64, u64)>,
+) -> bool {
     if a.local != b.local {
         return false;
     }
+    // A pattern prefix index and a pattern back offset of one
+    // slice are disjoint when they cannot meet at the
+    // pattern's length lower bound or any greater length.
+    let front_back = |i: &Local, j: &Local| {
+        fronts.get(i).is_some_and(|&(c, mf)| backs.get(j).is_some_and(|&(k, mb)| c + k < mf.max(mb)))
+    };
     for (x, y) in a.proj.iter().zip(&b.proj) {
         match (x, y) {
             (Proj::Field(i), Proj::Field(j)) if i != j => return false,
             (Proj::Index(i), Proj::Index(j)) if consts.get(i).is_some_and(|c| consts.get(j).is_some_and(|d| c != d)) => return false,
+            (Proj::Index(i), Proj::Index(j)) if backs.get(i).is_some_and(|(c, _)| backs.get(j).is_some_and(|(d, _)| c != d)) => return false,
+            (Proj::Index(i), Proj::Index(j)) if front_back(i, j) || front_back(j, i) => return false,
             _ => {}
         }
     }
@@ -663,7 +715,11 @@ impl<'b, 'p> Ck<'b, 'p> {
                     self.loan_at[self.stmt_base[bi] + si] = self.loans.len() as u32;
                     let holder = if dest.proj.is_empty() { Some(dest.local) } else { None };
                     holders.push(holder);
-                    self.loans.push(Loan { place: place.clone(), mutable: m, span: s.span, last_use: None, holder });
+                    let range = match &s.kind {
+                        StmtKind::Assign(dest, Rvalue::Subslice { lo, hi, inclusive, .. }) => self.subslice_range(dest, lo, hi, *inclusive),
+                        _ => None,
+                    };
+                    self.loans.push(Loan { place: place.clone(), mutable: m, range, span: s.span, last_use: None, holder });
                 }
             }
         }
@@ -1503,11 +1559,15 @@ impl<'b, 'p> Ck<'b, 'p> {
                         self.check_mutability(place, span, st, true);
                     }
                     let live = self.live_for(q, Some(ops.len()), &carriers);
-                    self.access(place, kind, span, &live);
+                    let p_range = match rv {
+                        Rvalue::Subslice { lo, hi, inclusive, .. } => self.subslice_range(dest, lo, hi, *inclusive),
+                        _ => None,
+                    };
+                    self.access(place, kind, span, &live, p_range);
                 } else if let Rvalue::Discriminant(place) | Rvalue::LenOf(place) = rv {
                     self.check_init(place, span, st);
                     let live = self.live_for(q, Some(ops.len()), &carriers);
-                    self.access(place, Access::Read, span, &live);
+                    self.access(place, Access::Read, span, &live, None);
                 }
                 let live = self.live_for(q, None, &carriers);
                 self.write_dest(dest, span, &live, st);
@@ -1516,7 +1576,7 @@ impl<'b, 'p> Ck<'b, 'p> {
             StmtKind::Drop(l) | StmtKind::StorageDead(l) => {
                 let place = Place::local(*l);
                 let live = self.live_for(q, None, &[]);
-                self.access(&place, Access::Dead, span, &live);
+                self.access(&place, Access::Dead, span, &live, None);
                 let li = *l as usize;
                 bit_unset(st.init_mut(), li);
                 bit_set(st.uninit_mut(), li);
@@ -1554,7 +1614,7 @@ impl<'b, 'p> Ck<'b, 'p> {
                 let name = self.local_name(dest.local);
                 self.err("L0302", span, format!("cannot assign twice to immutable variable {name}"), "Declare it with `let mut`.");
             }
-            self.access(dest, Access::Write, span, live);
+            self.access(dest, Access::Write, span, live, None);
             bit_set(st.init_mut(), l);
             bit_set(st.ever_mut(), l);
             bit_unset(st.uninit_mut(), l);
@@ -1563,7 +1623,7 @@ impl<'b, 'p> Ck<'b, 'p> {
         } else {
             self.check_init_write(dest, span, st);
             self.check_mutability(dest, span, st, false);
-            self.access(dest, Access::Write, span, live);
+            self.access(dest, Access::Write, span, live, None);
             // Writing a field puts back a field that was moved out, and every
             // field below it. Other moved fields stay moved.
             let l = dest.local as usize;
@@ -1640,6 +1700,80 @@ impl<'b, 'p> Ck<'b, 'p> {
         dest.proj.is_empty() && matches!(self.body.tys.kind(self.body.locals[dest.local as usize].ty), TyKind::Ref(_, Mut::Mut, _))
     }
 
+    /// The known position of an index or bound operand: a
+    /// constant, a pattern constant index local, or a pattern
+    /// back-index local.
+    fn idx_key(&self, o: &Operand) -> Option<IdxKey> {
+        match o {
+            Operand::Const(Const::Int(v, _)) if *v <= u64::MAX as u128 => Some(IdxKey::Front(*v as u64)),
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                if let Some(&c) = self.const_index.get(&p.local) {
+                    Some(IdxKey::Front(c))
+                } else {
+                    self.back_index.get(&p.local).map(|&(k, _)| IdxKey::Back(k))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The index range of a pattern-created subslice whose
+    /// result lands in `dest` (`Body::pat_subslice`), when both
+    /// bounds have known positions.
+    fn subslice_range(&self, dest: &Place, lo: &Operand, hi: &Option<Operand>, inclusive: bool) -> Option<(IdxKey, IdxKey)> {
+        if !dest.proj.is_empty() || !self.body.pat_subslice.contains(&dest.local) {
+            return None;
+        }
+        let lo = self.idx_key(lo)?;
+        let hi = match hi {
+            None => IdxKey::Back(0),
+            Some(o) => match (self.idx_key(o)?, inclusive) {
+                (IdxKey::Front(v), true) => IdxKey::Front(v.checked_add(1)?),
+                (k, false) => k,
+                _ => return None,
+            },
+        };
+        Some((lo, hi))
+    }
+
+    /// True when an access to place `p` (with subslice range
+    /// `p_range` when the access creates one) may touch the
+    /// memory of `loan`: `overlap`, plus the disjointness of a
+    /// pattern subslice range and the pattern element places
+    /// outside it.
+    fn overlaps(&self, p: &Place, p_range: Option<(IdxKey, IdxKey)>, loan: &Loan) -> bool {
+        if p.local == loan.place.local {
+            // An element place just below a ranged loan's place.
+            if let Some((lo, hi)) = loan.range
+                && p.proj.len() > loan.place.proj.len()
+                && p.proj[..loan.place.proj.len()] == loan.place.proj[..]
+                && let Proj::Index(l) = p.proj[loan.place.proj.len()]
+                && let Some(k) = self.idx_key(&Operand::Copy(Place::local(l)))
+                && idx_outside(k, lo, hi)
+            {
+                return false;
+            }
+            // A ranged access against an element loan below it.
+            if let Some((lo, hi)) = p_range
+                && loan.place.proj.len() > p.proj.len()
+                && loan.place.proj[..p.proj.len()] == p.proj[..]
+                && let Proj::Index(l) = loan.place.proj[p.proj.len()]
+                && let Some(k) = self.idx_key(&Operand::Copy(Place::local(l)))
+                && idx_outside(k, lo, hi)
+            {
+                return false;
+            }
+            // Two ranged subslices of one place.
+            if let (Some(a), Some(b)) = (p_range, loan.range)
+                && p.proj == loan.place.proj
+                && (idx_le(a.1, b.0) == Some(true) || idx_le(b.1, a.0) == Some(true))
+            {
+                return false;
+            }
+        }
+        overlap(p, &loan.place, &self.const_index, &self.front_index, &self.back_index)
+    }
+
     /// The type one `Field` projection down from `t` (in the variant a
     /// preceding `Downcast` selected), or the error type when unknown.
     fn step_field_ty(&self, t: Ty, variant: u32, i: u32) -> Ty {
@@ -1712,11 +1846,11 @@ impl<'b, 'p> Ck<'b, 'p> {
         match o {
             Operand::Copy(p) => {
                 self.check_init(p, span, st);
-                self.access(p, Access::Read, span, live);
+                self.access(p, Access::Read, span, live, None);
             }
             Operand::Move(p) => {
                 self.check_init(p, span, st);
-                self.access(p, Access::Move, span, live);
+                self.access(p, Access::Move, span, live, None);
                 // A move out of a local, or out of one of its fields. Moving one field is a
                 // partial move: sibling fields stay usable, but the moved field and every
                 // value that contains it do not, until the field is assigned again. Rust
@@ -2140,7 +2274,7 @@ impl<'b, 'p> Ck<'b, 'p> {
     }
 
     /// Checks one access against the loans live after the statement.
-    fn access(&mut self, p: &Place, kind: Access, span: Span, live_loans: &BitSet) {
+    fn access(&mut self, p: &Place, kind: Access, span: Span, live_loans: &BitSet, p_range: Option<(IdxKey, IdxKey)>) {
         if !self.report {
             return;
         }
@@ -2158,8 +2292,8 @@ impl<'b, 'p> Ck<'b, 'p> {
             }
             let mutable = loan.mutable && self.reserved != Some(li);
             let conflict = match kind {
-                Access::Read | Access::BorrowShared => mutable && overlap(p, &loan.place, &self.const_index),
-                Access::Write | Access::Move | Access::BorrowMut => overlap(p, &loan.place, &self.const_index),
+                Access::Read | Access::BorrowShared => mutable && self.overlaps(p, p_range, loan),
+                Access::Write | Access::Move | Access::BorrowMut => self.overlaps(p, p_range, loan),
                 Access::Dead => loan.place.local == p.local && !self.through_ref(&loan.place),
             };
             if !conflict {

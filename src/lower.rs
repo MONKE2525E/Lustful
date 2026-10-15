@@ -132,6 +132,9 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         annotations: Vec::new(),
         promoted: Vec::new(),
         index_exprs: Vec::new(),
+        pat_back_index: Vec::new(),
+        pat_front_index: Vec::new(),
+        pat_subslice: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
         opaque_nodrop: Vec::new(),
@@ -4035,7 +4038,7 @@ impl<'p> Lower<'p> {
                     None => (elems, &[]),
                 };
                 for (i, &el) in prefix.iter().enumerate() {
-                    let idx = self.const_usize(i as u64, span);
+                    let idx = self.pat_front_index(i as u64, (prefix.len() + suffix.len()) as u64, span);
                     self.collect_assign_pattern(el, src.project(Proj::Index(idx)), elem_ty, span, out);
                 }
                 for (j, &el) in suffix.iter().enumerate() {
@@ -4043,7 +4046,7 @@ impl<'p> Lower<'p> {
                         continue;
                     }
                     let back = (suffix.len() - j) as u64;
-                    let idx = self.slice_back_index(&src, back, arr_len, span);
+                    let idx = self.slice_back_index(&src, back, arr_len, (prefix.len() + suffix.len()) as u64, span);
                     self.collect_assign_pattern(el, src.project(Proj::Index(idx)), elem_ty, span, out);
                 }
             }
@@ -4764,6 +4767,7 @@ impl<'p> Lower<'p> {
                     Rvalue::Bin(BinOp::Sub, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(suffix_len as u128, IntTy::Usize))),
                     span,
                 );
+                self.body.pat_back_index.push((t, suffix_len as u64, (lo_n + suffix_len) as u64));
                 Operand::Copy(Place::local(t))
             }
         };
@@ -4774,6 +4778,7 @@ impl<'p> Lower<'p> {
             Rvalue::Subslice { base: place.clone(), lo: Operand::Copy(Place::local(lo)), hi: Some(hi), inclusive: false, mutable },
             span,
         );
+        self.body.pat_subslice.push(t);
         t
     }
 
@@ -4945,24 +4950,35 @@ impl<'p> Lower<'p> {
                     TyKind::Slice(e) => (e, None),
                     _ => (ERROR, None),
                 };
-                for (i, &sub) in prefix.iter().enumerate() {
-                    let idx = self.const_usize(i as u64, span);
-                    self.bind_pat_guard(sub, place.project(Proj::Index(idx)), bound);
-                }
-                for (j, &sub) in suffix.iter().enumerate() {
-                    let back = (suffix.len() - j) as u64;
-                    let idx = self.slice_back_index(&place, back, arr_len, span);
-                    self.bind_pat_guard(sub, place.project(Proj::Index(idx)), bound);
-                }
+                // Index and length temporaries first: a `LenOf`
+                // read between two mutable element borrows of
+                // the same slice would read a mutably borrowed
+                // place (the bindings are disjoint by the
+                // pattern's own length test).
+                let suffix_idx: Vec<Local> = suffix
+                    .iter()
+                    .enumerate()
+                    .map(|(j, _)| self.slice_back_index(&place, (suffix.len() - j) as u64, arr_len, (prefix.len() + suffix.len()) as u64, span))
+                    .collect();
                 // The middle binding reads a shared subslice of
                 // the same place for the guard; the real binding
                 // makes its own (possibly mutable) one later. A
                 // by-value array middle never reaches here (see
                 // `pat_has_slice_middle_move`).
-                if let Some(mid) = middle
-                    && self.pat_has_binding(*mid)
-                {
-                    let t = self.subslice_temp(&place, prefix.len(), suffix.len(), arr_len, elem, false, span);
+                let mid_temp = match middle {
+                    Some(mid) if self.pat_has_binding(*mid) => {
+                        Some(self.subslice_temp(&place, prefix.len(), suffix.len(), arr_len, elem, false, span))
+                    }
+                    _ => None,
+                };
+                for (i, &sub) in prefix.iter().enumerate() {
+                    let idx = self.pat_front_index(i as u64, (prefix.len() + suffix.len()) as u64, span);
+                    self.bind_pat_guard(sub, place.project(Proj::Index(idx)), bound);
+                }
+                for (j, &sub) in suffix.iter().enumerate() {
+                    self.bind_pat_guard(sub, place.project(Proj::Index(suffix_idx[j])), bound);
+                }
+                if let (Some(mid), Some(t)) = (middle, mid_temp) {
                     self.bind_pat_guard(*mid, Place::local(t), bound);
                 }
             }
@@ -5094,9 +5110,18 @@ impl<'p> Lower<'p> {
         t
     }
 
+    /// The index local for a slice pattern's prefix element, recorded
+    /// for borrowck with the pattern's length lower bound.
+    fn pat_front_index(&mut self, i: u64, min_len: u64, span: Span) -> Local {
+        let idx = self.const_usize(i, span);
+        self.body.pat_front_index.push((idx, i, min_len));
+        idx
+    }
+
     /// The index local for an element `back` positions from the end of a
-    /// slice or array place.
-    fn slice_back_index(&mut self, place: &Place, back: u64, arr_len: Option<u64>, span: Span) -> Local {
+    /// slice or array place. `min_len` is the pattern's length lower
+    /// bound for this place (its fixed element count).
+    fn slice_back_index(&mut self, place: &Place, back: u64, arr_len: Option<u64>, min_len: u64, span: Span) -> Local {
         match arr_len {
             Some(n) => self.const_usize(n - back, span),
             None => {
@@ -5108,6 +5133,7 @@ impl<'p> Lower<'p> {
                     Rvalue::Bin(BinOp::Sub, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(back as u128, IntTy::Usize))),
                     span,
                 );
+                self.body.pat_back_index.push((idx, back, min_len));
                 idx
             }
         }
@@ -5270,12 +5296,12 @@ impl<'p> Lower<'p> {
                     );
                 }
                 for (i, &sub) in prefix.iter().enumerate() {
-                    let idx = self.const_usize(i as u64, span);
+                    let idx = self.pat_front_index(i as u64, fixed, span);
                     self.test_pat(sub, place.project(Proj::Index(idx)), fail);
                 }
                 for (j, &sub) in suffix.iter().enumerate() {
                     let back = (suffix.len() - j) as u64;
-                    let idx = self.slice_back_index(&place, back, arr_len, span);
+                    let idx = self.slice_back_index(&place, back, arr_len, fixed, span);
                     self.test_pat(sub, place.project(Proj::Index(idx)), fail);
                 }
             }
@@ -5493,43 +5519,61 @@ impl<'p> Lower<'p> {
                     TyKind::Slice(e) => (e, None),
                     _ => (ERROR, None),
                 };
-                for (i, &sub) in prefix.iter().enumerate() {
-                    let idx = self.const_usize(i as u64, span);
-                    self.bind_pat(sub, place.project(Proj::Index(idx)));
+                // Index and length temporaries first, and the
+                // reference middle's subslice next: a `LenOf`
+                // read between two mutable element borrows of
+                // the same slice would read a mutably borrowed
+                // place (the bindings are disjoint by the
+                // pattern's own length test).
+                let suffix_idx: Vec<Local> = suffix
+                    .iter()
+                    .enumerate()
+                    .map(|(j, _)| self.slice_back_index(&place, (suffix.len() - j) as u64, arr_len, (prefix.len() + suffix.len()) as u64, span))
+                    .collect();
+                enum MidPlan {
+                    OwnedArray(u64),
+                    Ref(Local),
                 }
-                for (j, &sub) in suffix.iter().enumerate() {
-                    let back = (suffix.len() - j) as u64;
-                    let idx = self.slice_back_index(&place, back, arr_len, span);
-                    self.bind_pat(sub, place.project(Proj::Index(idx)));
-                }
-                if let Some(mid) = middle {
-                    match p.ast.pat(*mid) {
-                        Pat::Rest | Pat::Wild => {}
-                        Pat::Binding { .. } | Pat::At { .. } => {
-                            let mid_ty = self.ck.pat_ty(*mid);
-                            if let (Some(n), TyKind::Array(..)) = (arr_len, self.kind(mid_ty)) {
-                                // An owned middle of an array is a smaller array
-                                // built from the element places.
-                                let mut ops = Vec::new();
-                                for i in prefix.len() as u64..(n - suffix.len() as u64) {
-                                    let idx = self.const_usize(i, span);
-                                    ops.push(self.operand_from(place.project(Proj::Index(idx)), elem));
-                                }
-                                let t = self.temp(mid_ty);
-                                self.assign(Place::local(t), Rvalue::ArrayAgg(mid_ty, ops), span);
-                                self.bind_pat(*mid, Place::local(t));
-                            } else {
-                                // A reference middle is a subslice fat value.
+                let mid_plan = match middle {
+                    Some(mid) if matches!(p.ast.pat(*mid), Pat::Binding { .. } | Pat::At { .. }) => {
+                        let mid_ty = self.ck.pat_ty(*mid);
+                        match (arr_len, self.kind(mid_ty)) {
+                            (Some(n), TyKind::Array(..)) => Some(MidPlan::OwnedArray(n)),
+                            _ => {
                                 let mode = match self.ck.pat_res(*mid) {
                                     PatRes::Binding { mode, .. } => mode,
                                     _ => BindMode::Move,
                                 };
                                 let mutable = mode == BindMode::Ref(true);
-                                let t = self.subslice_temp(&place, prefix.len(), suffix.len(), arr_len, elem, mutable, span);
-                                self.bind_pat(*mid, Place::local(t));
+                                Some(MidPlan::Ref(self.subslice_temp(&place, prefix.len(), suffix.len(), arr_len, elem, mutable, span)))
                             }
                         }
-                        _ => {}
+                    }
+                    _ => None,
+                };
+                for (i, &sub) in prefix.iter().enumerate() {
+                    let idx = self.pat_front_index(i as u64, (prefix.len() + suffix.len()) as u64, span);
+                    self.bind_pat(sub, place.project(Proj::Index(idx)));
+                }
+                for (j, &sub) in suffix.iter().enumerate() {
+                    self.bind_pat(sub, place.project(Proj::Index(suffix_idx[j])));
+                }
+                if let (Some(mid), Some(plan)) = (middle, mid_plan) {
+                    match plan {
+                        MidPlan::OwnedArray(n) => {
+                            // An owned middle of an array is a smaller array
+                            // built from the element places.
+                            let mid_ty = self.ck.pat_ty(*mid);
+                            let mut ops = Vec::new();
+                            for i in prefix.len() as u64..(n - suffix.len() as u64) {
+                                let idx = self.const_usize(i, span);
+                                ops.push(self.operand_from(place.project(Proj::Index(idx)), elem));
+                            }
+                            let t = self.temp(mid_ty);
+                            self.assign(Place::local(t), Rvalue::ArrayAgg(mid_ty, ops), span);
+                            self.bind_pat(*mid, Place::local(t));
+                        }
+                        MidPlan::Ref(t) => self.bind_pat(*mid, Place::local(t)),
                     }
                 }
             }
