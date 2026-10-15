@@ -48,6 +48,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "num-bigint",
     "num-traits",
     "tikv-jemallocator",
+    "tikv-jemalloc-ctl",
 ];
 
 /// One adapter crate, read from its manifest.

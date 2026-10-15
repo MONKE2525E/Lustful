@@ -4786,9 +4786,11 @@ impl<'p> Ctx<'p> {
             // of an unsized newtype is a reference to the newtype, as
             // std's pointer casts make it (`&OsStr` to `&Path`, `&[u8]`
             // to `&OsStr`). Both have one C form, so the value stays.
+            // Adapter crates are shipped source too (the jemalloc-ctl
+            // adapter's `Name([u8])` needs the same cast).
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if (!em.is_mut() || fm.is_mut())
-                    && self.p.shipped_crate_at(span) == Some(crate::ty::lang::ShippedCrate::Std)
+                    && (self.p.shipped_crate_at(span) == Some(crate::ty::lang::ShippedCrate::Std) || self.p.adapter_at(span).is_some())
                     && self.newtype_field_of(self.resolve(y), self.resolve(x)) =>
             {
                 if let Some(e) = e {

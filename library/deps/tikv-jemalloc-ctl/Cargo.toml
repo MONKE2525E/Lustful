@@ -1,0 +1,16 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package tikv-jemalloc-ctl 0.7.0; release
+# builds use the real crate through Cargo. The driver checks `version`
+# against the resolved package and the metadata against
+# src/resolve/adapters.rs.
+[package]
+name = "tikv-jemalloc-ctl"
+version = "0.7.0"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# `disable_initial_exec_tls` only changes the jemalloc build. The
+# `stats` and `profiling` features (extra typed modules) are not here.
+features = ["default", "use_std", "disable_initial_exec_tls"]

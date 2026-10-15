@@ -112,9 +112,9 @@
   },
   {
    "name": "tikv-jemalloc-ctl",
-   "decision": "c-shim",
+   "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Typed arena and thread controls. Do not substitute a no-op."
+   "notes": "Adapter in library/deps: Name/Access over a one-arena model (thread.arena, opt.narenas, epoch, version, thread.tcache.enabled) with upstream error texts. Arena counts a program prints cannot match a jemalloc build; see the adapter README. Stats and typed modules beyond epoch/version are absent."
   },
   {
    "name": "nix",

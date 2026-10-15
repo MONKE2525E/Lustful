@@ -1,0 +1,2 @@
+tikv-jemalloc-ctl = "=0.7.0"
+tikv-jemallocator = "=0.7.0"
