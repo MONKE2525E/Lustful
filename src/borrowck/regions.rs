@@ -1238,6 +1238,26 @@ fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region
     }
 }
 
+/// Whether type param `j` outlives universal `Region::Param(i)` of `sig`:
+/// a bound gives it a region that reaches `i` through the declared facts.
+fn outlives_univ(sig: &RegionSig, bounds: &[(u32, Region)], j: u32, i: u32) -> bool {
+    let mut seen: Vec<Region> = bounds.iter().filter(|(k, _)| *k == j).map(|&(_, r)| r).collect();
+    let mut at = 0;
+    while at < seen.len() {
+        let x = seen[at];
+        at += 1;
+        if x == Region::Param(i) || x == Region::Static {
+            return true;
+        }
+        for &(a, b) in &sig.facts {
+            if a == x && !seen.contains(&b) {
+                seen.push(b);
+            }
+        }
+    }
+    false
+}
+
 /// The type params that the dyn coercions of `body` unsize.
 fn dyn_src_params(body: &Body) -> Vec<u32> {
     let mut params: Vec<u32> = Vec::new();
@@ -1414,8 +1434,9 @@ impl OwnSig {
     /// `param_univs` in a closure body. Its universals are its own slots,
     /// not the enclosing fn's lifetimes, so a type param's universal
     /// outlives `'static` when the fn bounds it so, every slot when the
-    /// fn's implied bounds give it any lifetime (coarse), and nothing when
-    /// they give none (a dyn object it makes may then reach no slot).
+    /// fn's bounds make it outlive every universal of the fn (a slot can
+    /// only hold those or local regions), and nothing otherwise (a dyn
+    /// object it makes may then reach no slot).
     fn closure_param_univs(&mut self, p: &Program, body: &Body) {
         let params = dyn_src_params(body);
         if params.is_empty() {
@@ -1433,7 +1454,7 @@ impl OwnSig {
             self.ends.push(None);
             if bounds.contains(&(j, Region::Static)) {
                 self.facts.push((u, 0));
-            } else if bounds.iter().any(|(k, _)| *k == j) {
+            } else if (0..sig.n_univ).all(|i| outlives_univ(sig, &bounds, j, i)) {
                 self.facts.extend((1..=slots).map(|v| (u, v)));
             }
         }
