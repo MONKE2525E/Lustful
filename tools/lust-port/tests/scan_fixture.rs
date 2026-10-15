@@ -25,13 +25,13 @@ fn fixture(name: &str) -> PathBuf {
     write(
         &root,
         "src/lib.rs",
-        "pub mod sub;\n#[path = \"elsewhere.rs\"]\npub mod elsewhere;\n#[cfg(windows)]\npub mod win_only;\n#[cfg(feature = \"x\")]\npub mod feat;\npub mod broken;\n#[cfg(test)]\npub mod tests_only;\npub fn f() -> usize { let m: indexmap::IndexMap<i32, i32> = indexmap::IndexMap::new(); m.len() }\npub fn h(cb: for<'a> fn(&'a i32) -> i32) -> i32 { cb(&1) }\n",
+        "pub mod sub;\n#[path = \"elsewhere.rs\"]\npub mod elsewhere;\n#[cfg(windows)]\npub mod win_only;\n#[cfg(feature = \"x\")]\npub mod feat;\npub mod broken;\n#[cfg(test)]\npub mod tests_only;\npub fn f() -> usize { #[used] static M: usize = 3; M }\npub fn h(cb: for<'a> fn(&'a i32) -> i32) -> i32 { cb(&1) }\n",
     );
     write(&root, "src/sub/mod.rs", "pub fn h() -> Box<dyn Fn(i32) -> i32> { Box::new(|x| x) }\n");
     write(&root, "src/elsewhere.rs", "pub const N: usize = 1;\n");
-    write(&root, "src/win_only.rs", "pub fn w() { let _m: indexmap::IndexMap<i32, i32> = indexmap::IndexMap::new(); }\n");
+    write(&root, "src/win_only.rs", "pub fn w() { #[used] static M: usize = 3; }\n");
     write(&root, "src/feat.rs", "pub fn q() {}\n");
-    write(&root, "src/tests_only.rs", "pub fn t() { let _m: indexmap::IndexMap<i32, i32> = indexmap::IndexMap::new(); }\n");
+    write(&root, "src/tests_only.rs", "pub fn t() { #[used] static M: usize = 3; }\n");
     write(&root, "src/broken.rs", "pub fn broken( {\n");
     root
 }
@@ -69,9 +69,9 @@ fn scan_reports_gaps_and_survives_bad_files() {
     let has = |feature: &str, file: &str, scope: &str| {
         findings.iter().any(|f| f["feature"] == feature && f["file"] == file && f["scope"] == scope)
     };
-    assert!(has("ext.indexmap", "src/lib.rs", "active"));
-    assert!(has("ext.indexmap", "src/win_only.rs", "target-specific"));
-    assert!(has("ext.indexmap", "src/tests_only.rs", "test-only"));
+    assert!(has("attrs.unsupported", "src/lib.rs", "active"));
+    assert!(has("attrs.unsupported", "src/win_only.rs", "target-specific"));
+    assert!(has("attrs.unsupported", "src/tests_only.rs", "test-only"));
     // Box<dyn Fn> in sub/mod.rs is supported today (dyn.fn and
     // dyn.boxed are supported rows), so it makes no finding.
     assert!(!has("dyn.fn", "src/sub/mod.rs", "active"));
@@ -89,7 +89,7 @@ fn scan_reports_gaps_and_survives_bad_files() {
 
     // Findings are grouped by root cause.
     let causes: Vec<&str> = v["root_causes"].as_array().unwrap().iter().map(|g| g["root_cause"].as_str().unwrap()).collect();
-    assert!(causes.contains(&"external-crates"), "causes: {causes:?}");
+    assert!(causes.contains(&"attrs-cfg"), "causes: {causes:?}");
     assert!(causes.contains(&"lifetimes"));
 
     // feat.rs (empty fn), elsewhere.rs (a const), and sub/mod.rs
@@ -124,10 +124,10 @@ fn human_output_groups_findings() {
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Gaps by root cause"), "{text}");
-    assert!(text.contains("ext.indexmap"));
+    assert!(text.contains("attrs.unsupported"));
     // Grouped, not one line per finding: only 2 samples per feature.
-    let map_samples = text.matches("ext.indexmap").count();
-    assert!(map_samples <= 3, "too many indexmap lines: {map_samples}");
+    let attr_samples = text.matches("attrs.unsupported").count();
+    assert!(attr_samples <= 3, "too many attr lines: {attr_samples}");
 }
 
 #[test]
