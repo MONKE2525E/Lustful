@@ -681,7 +681,8 @@ pub fn run() -> i64 {
     /// 12-module crate re-reads one file, builds and moves the same
     /// number of nodes and spans, rescans one item, and checks one body.
     /// The answers match a cold session, and a syntax error in a body
-    /// keeps the base for the fix. A signature edit resolves in full.
+    /// keeps the base for the fix. A no-op check reuses the last answer.
+    /// A signature edit resolves in full.
     /// (Collect still walks the whole crate: `collect` grows.)
     #[test]
     fn body_edit_work_does_not_grow_with_the_crate() {
@@ -717,6 +718,9 @@ pub fn run() -> i64 {
             edit(&m1, "    a.get( +\n", "    a.get()\n");
             assert_eq!(check(&mut warm, &root).0, 0);
             assert_eq!(field(&warm.front.last_visits, "path"), "patch", "{}", warm.front.last_visits);
+            // A no-op check of the same request reuses that answer.
+            assert_eq!(check(&mut warm, &root).0, 0);
+            assert_eq!(field(&warm.front.last_visits, "path"), "reuse");
             // A signature edit: a full resolve again.
             edit(&m1, "pub fn helper(x: i64) -> i64 {", "pub fn helper(x: i64, _k: u8) -> i64 {");
             edit(&m1, "a.add(helper(i));", "a.add(helper(i, 0));");

@@ -240,6 +240,22 @@ fn log_visits(line: &str) {
     }
 }
 
+/// The key under which a successful check's answer may be reused by
+/// the next request when no source changed: every request field that
+/// can change the answer (timings and stats only add lines, which a
+/// reused answer makes fresh). None for requests that must run:
+/// anything but a check, and a check that asks for C output.
+fn check_fingerprint(req: &Request) -> Option<u64> {
+    if req.cmd != Cmd::Check || req.emit_c.is_some() {
+        return None;
+    }
+    let key =
+        format!("{:?}", (&req.session, &req.file, &req.out, req.json, req.debug, req.max_errors, &req.run_args, req.harness, &req.client));
+    let mut h = crate::intern::FxHasher::default();
+    std::hash::Hash::hash(&key, &mut h);
+    Some(std::hash::Hasher::finish(&h))
+}
+
 /// Arena nodes of one Ast (expressions, patterns, types, blocks).
 pub(super) fn ast_nodes(ast: &Ast) -> usize {
     ast.exprs.len() + ast.pats.len() + ast.tys.len() + ast.blocks.len()
@@ -1606,6 +1622,7 @@ fn resolved_setup(
     std_methods: &mut (u32, u32),
     t: &mut Timer,
     visits: &mut Visits,
+    reusable: Option<(u64, Response)>,
 ) -> Result<(SourceMap, Vec<usize>, Vec<usize>, bool, usize, &'static str, Vec<u32>, Vec<u64>, Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>), Response> {
     use crate::resolve::cargo::{self, GraphRequest};
     use crate::resolve::cfg::CfgEnv;
@@ -1666,10 +1683,29 @@ fn resolved_setup(
         &externs,
         &crate_name,
         &front.display_root,
-        &front.client,
+        &front.client.shown_root,
         key.krate.test,
     ));
     match super::patch::try_patch(front, caches, inputs, &root_text, request_start) {
+        // Nothing changed since the last check of this same request:
+        // its answer stands (`check_fingerprint`).
+        Ok(p) if p.files == 0 && reusable.is_some() => {
+            let (fp, mut resp) = reusable.unwrap();
+            front.last_check = Some((fp, resp.clone()));
+            front.last_visits.clear();
+            Visits { path: "reuse", ..Default::default() }.render(&mut front.last_visits);
+            log_visits(&front.last_visits);
+            if stats_on() {
+                Stats { mode: "reuse", fns: p.fn_count, ..Default::default() }.render(&mut resp.stderr);
+                resp.stderr.push_str(&front.last_visits);
+            }
+            if req.timings {
+                t.lap("reuse last answer");
+                let _ = writeln!(resp.stderr, "lust check {}: ok (no change since the last check)", req.file.to_string_lossy());
+                t.render(&mut resp.stderr);
+            }
+            return Err(resp);
+        }
         Ok(p) => {
             (*std_ranges, *std_routes, *std_methods) = (p.std_ranges, p.std_routes, p.std_methods);
             front.resolved_crate_ids = Some(crate_ids);
@@ -1964,6 +2000,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let session_key = session.key.clone();
     session.front.client = client_view(req);
     let Session { front, caches, std_cache, disk_cache, .. } = session;
+    // The last check's answer, kept only for this same request (a no-op
+    // check reuses it on the resolver path; anything else recomputes).
+    let check_fp = check_fingerprint(req);
+    let reusable = front.last_check.take().filter(|(fp, _)| Some(*fp) == check_fp);
     t.lap("read");
 
     // Resolver routing (W-RESOLVE): a manifest-selected crate, or a root
@@ -2033,7 +2073,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Both front ends produce the same locals for the shared tail.
     let (map, mut changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
-        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, route_std_mods, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t, &mut visits) {
+        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, route_std_mods, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t, &mut visits, reusable) {
             Ok(x) => x,
             Err(resp) => return resp,
         }
@@ -3063,6 +3103,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     let mut resp = Response::default();
     if req.cmd == Cmd::Check {
+        // The answer, before the timing and stats lines, for a no-op
+        // check of the same request to reuse.
+        if let Some(fp) = check_fp {
+            front.last_check = Some((fp, resp.clone()));
+        }
         if stats_on() {
             Stats {
                 mode,

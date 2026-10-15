@@ -147,6 +147,10 @@ pub(crate) struct Front {
     /// The last successful compile's `lust-visits:` line (see
     /// `compile::Visits`), kept for tests.
     pub(crate) last_visits: String,
+    /// The last successful check's answer and its request key
+    /// (`compile::check_fingerprint`): a no-op check of the same
+    /// request on the resolver path returns it as is.
+    pub(crate) last_check: Option<(u64, crate::protocol::Response)>,
 }
 
 pub(crate) struct Chunk {
@@ -349,6 +353,7 @@ impl Session {
                 resolve_cache: crate::resolve::worklist::ResolveCache::new(!persistent),
                 patch: None,
                 last_visits: String::new(),
+                last_check: None,
             },
             caches: Caches {
                 ok: Vec::new(),
