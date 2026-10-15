@@ -284,7 +284,11 @@ pub(super) fn replay_method(
         // The template's step unsized an array to a slice.
         match cx.tys.kind(step) {
             TyKind::Array(el, _) => step = cx.tys.intern(TyKind::Slice(el)),
-            _ => ok = false,
+            _ if step == STRING => step = STR,
+            _ => match cx.tys.vec_elem(step) {
+                Some(el) => step = cx.tys.intern(TyKind::Slice(el)),
+                None => ok = false,
+            },
         }
     }
     if ok {

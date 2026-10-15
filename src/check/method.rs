@@ -1509,11 +1509,18 @@ pub(super) fn generic_method_search(
             },
         }
     }
-    if let Some(&(last, derefs, _)) = steps.last()
-        && let TyKind::Array(el, _) = cx.tys.kind(last)
-    {
-        let slice = cx.tys.intern(TyKind::Slice(el));
-        steps.push((slice, derefs, true));
+    // `Vec<T>` derefs to `[T]` and `String` to `str` the same way
+    // (their builtin `Deref` impls), with the slice made from the
+    // place (`SliceOf`, `StringAsStr`).
+    if let Some(&(last, derefs, _)) = steps.last() {
+        let unsized_step = match cx.tys.kind(last) {
+            TyKind::Array(el, _) => Some(cx.tys.intern(TyKind::Slice(el))),
+            _ if last == STRING => Some(STR),
+            _ => cx.tys.vec_elem(last).map(|el| cx.tys.intern(TyKind::Slice(el))),
+        };
+        if let Some(t) = unsized_step {
+            steps.push((t, derefs, true));
+        }
     }
     // Through a user `Deref` (`method_via_user_deref`), `recv_ty` is
     // the `&Target` that `deref()` returns, but rustc's step is the
@@ -1588,7 +1595,9 @@ pub(super) fn generic_method_search(
         // by-value methods (`impl Tr for &S { fn m(self) }`), as in
         // rustc, where any method whose receiver type is `&step` fits.
         let autoref_self = |pr: RcvProbe| RcvProbe { self_ty: pr.recv_ty, filter: ReceiverForm::Value, ..pr };
-        let groups = [by_value, vec![ref_probe, autoref_self(ref_probe)], vec![refmut_probe, autoref_self(refmut_probe)]];
+        // `&mut str` from a `String` place is not lowered: no `&mut` probe there.
+        let refmut_group = if unsize && step == STR { Vec::new() } else { vec![refmut_probe, autoref_self(refmut_probe)] };
+        let groups = [by_value, vec![ref_probe, autoref_self(ref_probe)], refmut_group];
         for group in &groups {
             for &probe in group {
                 match dyn_probe(cx, e, probe, derefs, name, name_span, args, None) {

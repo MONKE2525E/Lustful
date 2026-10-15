@@ -3655,14 +3655,25 @@ impl<'p> Lower<'p> {
                     None => self.place(recv),
                 };
                 let pl = Self::derefs(pl, derefs);
-                let elem = match self.kind(recv_ty) {
-                    TyKind::Array(e, _) => e,
-                    _ => recv_ty,
+                let t = if recv_ty == STRING {
+                    // `String` to `str` (shared only): `as_str` of the place.
+                    let srt = self.ref_ty(false, STRING);
+                    let sr = self.temp(srt);
+                    self.assign(Place::local(sr), Rvalue::Ref(false, pl), span);
+                    let t = self.temp(REF_STR);
+                    self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![Operand::Copy(Place::local(sr))], Place::local(t), span);
+                    t
+                } else {
+                    let elem = match self.kind(recv_ty) {
+                        TyKind::Array(e, _) => e,
+                        _ => self.body.tys.vec_elem(recv_ty).unwrap_or(recv_ty),
+                    };
+                    let slice = self.body.tys.intern(TyKind::Slice(elem));
+                    let rt = self.ref_ty(m, slice);
+                    let t = self.temp(rt);
+                    self.assign(Place::local(t), Rvalue::SliceOf(pl), span);
+                    t
                 };
-                let slice = self.body.tys.intern(TyKind::Slice(elem));
-                let rt = self.ref_ty(m, slice);
-                let t = self.temp(rt);
-                self.assign(Place::local(t), Rvalue::SliceOf(pl), span);
                 ops.push(if m { Operand::Move(Place::local(t)) } else { Operand::Copy(Place::local(t)) });
                 for &a in args {
                     let o = self.operand(a);
