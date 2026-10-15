@@ -528,7 +528,7 @@ type ItemListKey = (usize, Vec<Sym>);
 
 /// The expander cfg environment for one crate session: the resolver
 /// facts of section 1.6 in the expander's fact form.
-fn expand_cfg(env: &CfgEnv) -> crate::expand::builtin::CfgEnv {
+pub(crate) fn expand_cfg(env: &CfgEnv) -> crate::expand::builtin::CfgEnv {
     let mut facts: Vec<(String, Option<String>)> = Vec::new();
     for f in &env.flags {
         facts.push((f.clone(), None));

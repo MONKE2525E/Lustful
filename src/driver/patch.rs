@@ -24,9 +24,12 @@
 //   inside cfg-disabled code the expander dropped (`find_inactive_edit`);
 // - the old or new body holds an attribute, a `$`, an item keyword
 //   other than `fn`, `static`, `const`, and `use`, a macro the expander
-//   owns (anything but the parser's own `println!` family), or a parser
-//   macro while a user macro may take its name; or its items (`stmt_items`)
-//   are not the old ones in the old blocks (`same_items`);
+//   owns, or a parser macro while a user macro may take its name; or its
+//   items (`stmt_items`) are not the old ones in the old blocks
+//   (`same_items`). Of the expander's macros, the pure builtins
+//   (`PURE_MACROS`) patch when no user or dependency macro can take their
+//   names: the new body expands alone, as the resolver expands its file;
+//   the expansion must read nothing outside the body (no `Dep`);
 // - the fn returns `impl Trait` (its body is part of its item), or has
 //   parameter patterns or expressions in its parameter types (see
 //   `find_body_edit`); a `const fn` patches, but `const` values bake its
@@ -80,6 +83,9 @@ pub(crate) struct PatchBase {
     /// user's macro, which the expander owns.
     shadowed: bool,
     tables: Arc<ResolvedTables>,
+    /// The crate's cfg environment and name, for expanding a body alone,
+    /// when no user or dependency macro can take a builtin's name.
+    expand: Option<(crate::resolve::cfg::CfgEnv, String)>,
     /// `ResolvedTables::local_named_set`, built on the first patch.
     local_names: Option<FxMap<Sym, u8>>,
     std_ranges: Vec<(u32, u32, ShippedCrate)>,
@@ -178,6 +184,7 @@ impl PatchBase {
         fn_lines: Vec<u32>,
         body_hashes: Vec<u64>,
         request_start: SystemTime,
+        expand: Option<(crate::resolve::cfg::CfgEnv, String)>,
     ) -> PatchBase {
         let map = &front.map;
         let n = map.file_count();
@@ -228,6 +235,7 @@ impl PatchBase {
             stamps,
             user_macros,
             shadowed,
+            expand: expand.filter(|_| !user_macros),
             tables,
             local_names: None,
             std_ranges: std_out.0.to_vec(),
@@ -553,19 +561,39 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let new_hi = (hi as i64 + d) as usize;
     let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo as u32, &front.interner).ok()).ok_or("body lex");
     let (old_body, new_body) = (lex(old.get(lo..hi))?, lex(text.get(lo..new_hi))?);
-    let old_calls = body_tokens_ok(&old_body, lo, hi, &front.interner)?;
-    let new_calls = body_tokens_ok(&new_body, lo, new_hi, &front.interner)?;
-    if (old_calls || new_calls) && base.shadowed {
+    let (old_calls, old_pure) = body_tokens_ok(&old_body, lo, hi, &front.interner)?;
+    let (new_calls, new_pure) = body_tokens_ok(&new_body, lo, new_hi, &front.interner)?;
+    if (old_calls || new_calls) && base.shadowed || (old_pure || new_pure) && base.expand.is_none() {
         return Err("macro in body");
     }
     // Parse and rewrite the new body on its own: an error there (a
     // half-typed edit) gives up before any state changes, so the base
-    // stands for the next request. A static's init closure hoists into
-    // a hidden fn first, as the resolver's token pass does.
-    let hoisted = crate::expand::lazy::hoist_static_closures(
-        lexer::Lexed { tokens: new_body.tokens.clone(), strings: new_body.strings.clone() },
-        &front.interner,
-    );
+    // stands for the next request. Its pure builtin macros expand first,
+    // and a static's init closure hoists into a hidden fn, as the
+    // resolver's token passes do.
+    let module = *base.tables.fn_module.get(fn_index).ok_or("state")?;
+    let raw = lexer::Lexed { tokens: new_body.tokens.clone(), strings: new_body.strings.clone() };
+    let hoisted = match &base.expand {
+        Some((env, crate_name)) if new_pure => {
+            let path = front.map.path(file);
+            let shown = front.display_root.as_deref().and_then(|r| std::path::Path::new(path).strip_prefix(r).ok());
+            let ctx = crate::expand::ExpandCtx {
+                interner: &front.interner,
+                known: &front.known,
+                file_path: shown.map_or_else(|| path.to_string(), |rel| rel.to_string_lossy().to_string()),
+                src: text,
+                cfg: crate::resolve::worklist::expand_cfg(env),
+                module_path: base.tables.modules[module.0 as usize].path.clone(),
+                crate_name: Some(crate_name.clone()),
+                client: &front.client,
+            };
+            match crate::expand::expand_lexed_seeded_with_deps(raw, &ctx, &[]) {
+                Ok((out, deps)) if deps.is_empty() => out,
+                _ => return Err("body macro"),
+            }
+        }
+        _ => crate::expand::lazy::hoist_static_closures(raw, &front.interner),
+    };
     let toks = &hoisted.tokens[..hoisted.tokens.len() - 1];
     let mut body_ast = Ast::default();
     let (body, exprs, pats) =
@@ -577,7 +605,6 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         ItemKind::Impl(imp) => Some(&imp.generics),
         _ => None,
     };
-    let module = *base.tables.fn_module.get(fn_index).ok_or("state")?;
     let diags = crate::resolve::worklist::rewrite_fn_body(
         &base.tables,
         &front.interner,
@@ -593,7 +620,11 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     }
     let old_closures = ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
     let new_closures = body_ast.exprs.iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
-    let plain = !old_closures && !new_closures && plain_body(&old_body, &front.interner) && plain_body(&new_body, &front.interner);
+    let plain = !old_closures
+        && !new_closures
+        && plain_body(&old_body, &front.interner)
+        && plain_body(&new_body, &front.interner)
+        && plain_body(&hoisted, &front.interner);
     let is_const = def.qual.is_const;
     Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, is_const, items })
 }
@@ -811,9 +842,11 @@ fn plain_body(lexed: &lexer::Lexed, interner: &crate::intern::Interner) -> bool 
 
 /// Checks one lexed body (`{` at `lo` through `}` ending at `hi`, then
 /// `Eof`): one balanced brace group, no attribute, `$`, macro the
-/// expander owns, or item keyword but `fn`, `static`, `const`, `use`. Returns whether it calls a parser macro
-/// (`println!` and kin), or why the body fails a check.
-fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::intern::Interner) -> Result<bool, &'static str> {
+/// expander owns but `PURE_MACROS`, or item keyword but `fn`, `static`,
+/// `const`, `use`. Returns whether it calls a parser macro (`println!`
+/// and kin) and whether it calls a pure builtin, or why the body fails
+/// a check.
+fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::intern::Interner) -> Result<(bool, bool), &'static str> {
     let toks = &lexed.tokens;
     let n = toks.len().checked_sub(1).ok_or("body shape")?;
     if n < 2 || toks[n].tok != Tok::Eof || toks[0].tok != Tok::LBrace || toks[0].span.lo as usize != lo {
@@ -822,12 +855,9 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
     if toks[n - 1].tok != Tok::RBrace || toks[n - 1].span.hi as usize != hi {
         return Err("body shape");
     }
-    if crate::expand::needs_expansion(&toks[..n], interner) {
-        return Err("body macro");
-    }
     let (macro_rules, union) = (interner.intern("macro_rules"), interner.intern("union"));
     let mut depth = 0usize;
-    let mut calls = false;
+    let (mut calls, mut pure) = (false, false);
     for (i, t) in toks[..n].iter().enumerate() {
         match t.tok {
             Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
@@ -842,12 +872,33 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
             Tok::Struct | Tok::Enum | Tok::Impl | Tok::Trait | Tok::Mod | Tok::Extern | Tok::Type => return Err("body item"),
             Tok::Pound | Tok::Dollar | Tok::DocStr(_) => return Err("body attr"),
             Tok::Ident(s) if s == macro_rules || s == union => return Err("body item"),
-            Tok::Bang => calls |= i > 0 && matches!(toks[i - 1].tok, Tok::Ident(_)),
+            // A macro call: `name!`, never path-qualified.
+            Tok::Bang if i > 0 => match toks[i - 1].tok {
+                Tok::Ident(s) if i > 1 && toks[i - 2].tok == Tok::PathSep => return Err("body macro"),
+                Tok::Ident(s) if crate::expand::builtin::is_passthrough(interner.get(s)) => calls = true,
+                Tok::Ident(s) if PURE_MACROS.contains(&interner.get(s)) => pure = true,
+                Tok::Ident(_) | Tok::SelfUpper | Tok::SelfLower | Tok::Crate | Tok::Super => return Err("body macro"),
+                _ => {}
+            },
             _ => {}
         }
     }
-    if depth == 0 { Ok(calls) } else { Err("body shape") }
+    // Anything else the expander acts on is a refused macro.
+    if depth != 0 {
+        return Err("body shape");
+    }
+    if !pure && crate::expand::needs_expansion(&toks[..n], interner) {
+        return Err("body macro");
+    }
+    Ok((calls, pure))
 }
+
+/// Builtin macros the expander owns whose expansion reads only their
+/// own tokens and the crate's cfg: a body that calls them expands alone
+/// to what the resolver's expansion of its file gives (no position, path,
+/// env, file, or item output).
+const PURE_MACROS: &[&str] =
+    &["matches", "write", "writeln", "debug_assert", "debug_assert_eq", "debug_assert_ne", "unimplemented", "stringify", "concat"];
 
 /// Applies the proven edits to the front state and runs the slot update.
 /// `ctxts` gets each edit's fresh expansion contexts, in edit order.
@@ -1813,6 +1864,70 @@ pub fn run() -> i64 {
         }
         warm_equals_cold(&mut warm, &root, &m1, "    {\n        static MODE: OnceLock<u32> = OnceLock::new();\n    }\n    7\n", "    static MODE: OnceLock<u32> = OnceLock::new();\n    *MODE.get_or_init(|| 7)\n");
         let v = warm_equals_cold(&mut warm, &root, &m1, "    inner(3) * K\n", "    inner(4) * K\n");
+        assert_eq!(field(&v, "path"), "patch", "{v}");
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module whose fn bodies call pure builtin macros the expander owns.
+    const MACROS: &str = "use std::fmt::Write;
+
+#[derive(Clone, Copy)]
+pub enum K {
+    A,
+    B(i64),
+}
+
+pub fn is_b(k: K) -> bool {
+    matches!(k, K::B(_))
+}
+
+pub fn show(k: K) -> String {
+    let mut s = String::new();
+    write!(s, \"{}\", is_b(k) as i64).unwrap();
+    s
+}
+
+pub fn run() -> i64 {
+    debug_assert!(is_b(K::B(1)));
+    show(K::A).len() as i64 + is_b(K::B(2)) as i64
+}
+";
+
+    /// A body that calls pure builtin macros (`matches!`, `write!`,
+    /// `debug_assert!`) takes the body patch: it expands alone. Edit,
+    /// error, fix, undo, another edit, and a build all give the cold
+    /// answer. A macro that reads a position (`line!`) resolves in full.
+    #[test]
+    fn pure_macro_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-macros-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, MACROS).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str, bool)] = &[
+            ("    matches!(k, K::B(_))\n", "    let b = matches!(k, K::B(x) if x > 0);\n    b\n", true),
+            ("    b\n", "    b + 1\n", true),
+            ("    b + 1\n", "    b\n", true),
+            ("    let b = matches!(k, K::B(x) if x > 0);\n    b\n", "    matches!(k, K::B(_))\n", true),
+            ("    write!(s, \"{}\", is_b(k) as i64).unwrap();\n", "    writeln!(s, \"{} {}\", is_b(k) as i64, 2).unwrap();\n", true),
+            ("    debug_assert!(is_b(K::B(1)));\n", "    debug_assert_eq!(is_b(K::B(1)), true);\n", true),
+            ("    debug_assert_eq!(is_b(K::B(1)), true);\n", "    debug_assert_eq!(is_b(K::B(1)), true, \"at {}\", line!());\n", false),
+            ("    debug_assert_eq!(is_b(K::B(1)), true, \"at {}\", line!());\n", "    debug_assert_eq!(is_b(K::B(1)), true);\n", false),
+        ];
+        for &(old, new, fast) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            if fast {
+                assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            }
+        }
+        let v = warm_equals_cold(&mut warm, &root, &m1, "    s\n}", "    let t = matches!(s.len(), 1 | 2);\n    if t { s } else { String::new() }\n}");
         assert_eq!(field(&v, "path"), "patch", "{v}");
         assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
         let bin = root.with_extension("bin");

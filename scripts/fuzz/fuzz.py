@@ -15,7 +15,7 @@
 # also requires the full stderr text to match.
 #
 # Usage:
-#   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3 [--modules 40] [--strict]
+#   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3|patchseq [--modules 40] [--strict]
 #   fuzz.py replay --prev A.rs --cur B.rs
 #   fuzz.py shrink --prev A.rs --cur B.rs --out DIR
 # Exit status: 0 = clean, 1 = a failure was found, 2 = setup error.
@@ -1038,6 +1038,8 @@ def save_pair(out, tag, prev, cur):
 
 
 def cmd_run(a):
+    if a.crate == "patchseq":
+        return cmd_run_patchseq(a)
     if a.crate in ("multi", "multi2", "multi3"):
         return cmd_run_multi(a, rename=a.crate in ("multi2", "multi3"),
                              feat3=a.crate == "multi3")
@@ -1655,6 +1657,339 @@ def cmd_run_multi(a, rename=False, feat3=False):
         print(f"RESULT seed={a.seed} crate={a.crate} edits={a.edits} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
+        print("bad:", dict(bad_ops))
+        if a.fail_on_guard and guard > 0:
+            failures += guard
+        return 1 if failures else 0
+    finally:
+        h.close()
+
+
+# Edit-sequence scenarios for the body patch's fast cases (W-PATCH-MISS):
+# fns that hold static/const/fn/use items, cfg-disabled code (a test module,
+# another platform's fn and method), const fns that feed consts, and templates
+# (a blanket impl with a dyn coercion). `// @x` lines mark statement positions.
+PATCHSEQ_SEED = {
+    "main.rs": """mod consts;
+mod gated;
+mod items;
+mod macs;
+mod tmpl;
+
+fn main() {
+    let t = items::run() + gated::run() + consts::run() + tmpl::run() + macs::run();
+    println!("{t}");
+}
+""",
+    "consts.rs": """pub const fn len() -> usize {
+    // @c1
+    4
+}
+
+pub const fn seed() -> i64 {
+    // @c2
+    3
+}
+
+pub const LEN: usize = len();
+pub static TABLE: [i64; 2] = [seed(), seed() + 1];
+
+pub fn run() -> i64 {
+    let a: [u8; 4] = [0; LEN];
+    // @c3
+    a.len() as i64 + TABLE[1]
+}
+""",
+    "gated.rs": """pub fn helper(x: i64) -> i64 {
+    // @g1
+    x * 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doubles() {
+        // @g2
+        assert_eq!(helper(1), 2);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn os_name() -> &'static str {
+    // @g3
+    "other"
+}
+
+pub struct S;
+
+impl S {
+    #[cfg(windows)]
+    fn only_windows(&self) -> i64 {
+        // @g4
+        1
+    }
+
+    pub fn get(&self) -> i64 {
+        // @g5
+        3
+    }
+}
+
+pub fn run() -> i64 {
+    // @g6
+    helper(3) + S.get()
+}
+""",
+    "items.rs": """use std::sync::{LazyLock, OnceLock};
+
+pub fn mode() -> u32 {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    // @i1
+    *MODE.get_or_init(|| 7)
+}
+
+pub fn table() -> u32 {
+    static TABLE: LazyLock<Vec<u32>> = LazyLock::new(|| vec![1, 2, 3]);
+    // @i2
+    TABLE.len() as u32
+}
+
+pub fn nested() -> i64 {
+    const K: i64 = 4;
+    fn inner(x: i64) -> i64 {
+        // @i3
+        x + K
+    }
+    // @i4
+    inner(2)
+}
+
+pub fn uses() -> i64 {
+    use std::collections::HashMap;
+    let mut m: HashMap<i64, i64> = HashMap::new();
+    // @i5
+    m.insert(1, 2);
+    m.len() as i64
+}
+
+pub fn run() -> i64 {
+    mode() as i64 + table() as i64 + nested() + uses()
+}
+""",
+    "tmpl.rs": """use std::any::Any;
+
+pub trait AnyValue: Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> AnyValue for T {
+    fn as_any(&self) -> &dyn Any {
+        // @t1
+        self
+    }
+}
+
+pub trait Name {
+    fn name(&self) -> String;
+}
+
+impl Name for i32 {
+    fn name(&self) -> String {
+        // @t2
+        format!("i32 {self}")
+    }
+}
+
+fn show(x: &dyn Name) -> String {
+    x.name()
+}
+
+fn wrap<T: Name + Clone>(x: T) -> Vec<T> {
+    // @t3
+    let v = vec![x.clone(), x];
+    v
+}
+
+pub fn run() -> i64 {
+    let n = if 5u8.as_any().is::<u8>() { 1 } else { 0 };
+    n + wrap(3i32).len() as i64 + show(&1i32).len() as i64
+}
+""",
+}
+
+PATCHSEQ_SEED["macs.rs"] = """use std::fmt::Write;
+
+#[derive(Clone, Copy)]
+pub enum K {
+    A,
+    B(i64),
+}
+
+pub fn is_b(k: K) -> bool {
+    // @m1
+    matches!(k, K::B(_))
+}
+
+pub fn show(k: K) -> String {
+    let mut s = String::new();
+    // @m2
+    write!(s, "{}", is_b(k) as i64).unwrap();
+    s
+}
+
+pub fn run() -> i64 {
+    debug_assert!(is_b(K::B(1)));
+    // @m3
+    show(K::A).len() as i64 + is_b(K::B(2)) as i64
+}
+"""
+
+# Statements that check in any marked body (a `let` before the tail).
+PATCHSEQ_OK = ["let _v{n}: u32 = {n};", "let _v{n} = {n} as i64 + 1;", "if {n} > 3 {{ let _w{n} = {n}; }}",
+               "let _s{n} = String::from(\"{n}\");", "let _m{n} = matches!({n} % 3, 0 | 1);"]
+# Errors: a type error (none in disabled code), a name error, syntax errors.
+PATCHSEQ_ERR = ["let _e{n}: u32 = \"x\";", "let _e{n} = missing_{n};", "let = ;", "let _e{n}: u32 = {n}"]
+# Edits the fast paths refuse (they resolve in full), and item edits.
+PATCHSEQ_SLOW = ["let _c{n} = cfg!(windows);", "#[allow(unused)] let _a{n} = 1;", "static _X{n}: u32 = 7;",
+                 "const _K{n}: i64 = {n};"]
+PATCHSEQ_VALUES = [("consts.rs", "    4\n}", "    5\n}"), ("consts.rs", "    3\n}", "    9\n}"),
+                   ("items.rs", "const K: i64 = 4;", "const K: i64 = 6;"), ("items.rs", "|| 7)", "|| 8)"),
+                   ("items.rs", "vec![1, 2, 3]", "vec![1, 2]")]
+
+
+def cmd_run_patchseq(a):
+    """Edit sequences on the body patch's fast cases: per iteration, at one
+    marked statement position, an edit, an error, its fix, the undo, and
+    then another edit somewhere else that stays. Every state compares the
+    daemon answer with a cold compile, full stderr included (strict), and
+    the fresh-session guard must never fire. Sometimes a value edit
+    (a const fn body, an item's initializer) or a refused edit joins in;
+    every 8 iterations the files go back to the seed, and a run compares
+    program output."""
+    rng = random.Random(a.seed)
+    Harness.keep_work = a.keep_work
+    h = Harness(a.timeout)
+    # The daemon's `lust-visits:` lines show which path each answer took.
+    visits = os.path.join(h.work, "visits.log")
+    h.env["LUST_VISITS_LOG"] = visits
+    h.kill_daemon()
+    h.start_daemon()
+    base = os.path.join(h.work, "patchseq")
+    h.crate = os.path.join(base, "main.rs")
+    files = dict(PATCHSEQ_SEED)
+    failures, steps = 0, 0
+    ops, bad_ops, paths = Counter(), Counter(), Counter()
+    t0 = time.time()
+
+    def write_all(fs):
+        for rel, text in fs.items():
+            path = os.path.join(base, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+
+    def markers(fs):
+        return [(rel, m.group(0)) for rel in sorted(fs) for m in re.finditer(r"// @\w+\n", fs[rel])]
+
+    def put(fs, at, stmt):
+        rel, mark = at
+        fs = dict(fs)
+        indent = re.search(r"\n( *)" + re.escape(mark), fs[rel]).group(1)
+        fs[rel] = fs[rel].replace(mark, mark + indent + stmt + "\n", 1)
+        return fs
+
+    def swap(fs, rel, old, new):
+        fs = dict(fs)
+        fs[rel] = fs[rel].replace(old, new, 1)
+        return fs
+
+    def step(tag, prev, cur):
+        nonlocal failures, steps
+        write_all(cur)
+        steps += 1
+        ops[tag] += 1
+        mark = os.path.getsize(visits) if os.path.exists(visits) else 0
+        ok, why, da, co = compare(h, "check", True)
+        # The guard's fresh session logs a line of its own after an error
+        # answer: wait for it, and count the warm answer's line only.
+        h.wait_guard_idle()
+        with open(visits) as f:
+            f.seek(mark)
+            warm = (f.read().splitlines() or [""])[0]
+        kv = dict(x.split("=", 1) for x in warm.split()[1:] if "=" in x)
+        paths[kv.get("path", "?") + ("" if kv.get("why", "-") == "-" else ":" + kv["why"])] += 1
+        if os.environ.get("PATCHSEQ_DEBUG"):
+            print(f"{tag:22s} rc={da[0]} {warm[13:110]}", flush=True)
+        if not ok:
+            failures += 1
+            bad_ops[f"{tag} {why}"] += 1
+            d = os.path.join(a.out, f"patchseq-{a.seed}-{steps}")
+            for side, fs in (("prev", prev), ("cur", cur)):
+                for rel, text in fs.items():
+                    path = os.path.join(d, side, rel)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as f:
+                        f.write(text)
+            print(f"FAIL[{why}] step {steps} {tag}\n  daemon={da[0]} {da[2][:300]!r}\n"
+                  f"  cold  ={co[0] if co else '-'} {(co[2][:300] if co else '')!r}\n  saved {d}", flush=True)
+            if why in ("daemon hang", "daemon died"):
+                h.kill_daemon()
+                h.start_daemon()
+        return da[0] == 0
+
+    try:
+        write_all(files)
+        if not step("seed", files, files):
+            print("SEED-CRATE FAILURE on the unedited patchseq crate", flush=True)
+            return 1
+        it = 0
+        while steps < a.edits:
+            n = rng.randint(1, 10**5)
+            fmt = lambda s: s.format(n=n)
+            target = rng.choice(markers(files))
+            ok1, err = fmt(rng.choice(PATCHSEQ_OK)), fmt(rng.choice(PATCHSEQ_ERR))
+            ok2 = fmt(rng.choice(PATCHSEQ_OK)).replace(f"{n}", f"{n + 1}")
+            other = rng.choice(markers(files))
+            seq = [(f"{target[0]}:edit", put(files, target, ok1))]
+            seq.append((f"{target[0]}:error", put(files, target, err)))
+            seq.append((f"{target[0]}:fix", put(files, target, ok2)))
+            seq.append((f"{target[0]}:undo", files))
+            # The other edit stays; a refused edit or a value edit is undone
+            # again, so the crate goes on from a passing state.
+            if rng.random() < 0.2:
+                seq.append((f"{other[0]}:slow", put(files, other, fmt(rng.choice(PATCHSEQ_SLOW)))))
+                seq.append((f"{other[0]}:slow-undo", files))
+            elif rng.random() < 0.2:
+                rel, old, new = rng.choice(PATCHSEQ_VALUES)
+                if old in files[rel]:
+                    seq.append((f"{rel}:value", swap(files, rel, old, new)))
+                    seq.append((f"{rel}:value-undo", files))
+            else:
+                seq.append((f"{other[0]}:another", put(files, other, fmt(rng.choice(PATCHSEQ_OK)))))
+            prev = files
+            for tag, cur in seq:
+                step(tag, prev, cur)
+                prev = cur
+            files = seq[-1][1]
+            it += 1
+            if it % 8 == 0:
+                ok, why, ra, rb = compare(h, "run", True)
+                if not ok and why != "program hang":
+                    failures += 1
+                    bad_ops[f"run {why}"] += 1
+                    print(f"FAIL[run {why}] after step {steps}", flush=True)
+                files = dict(PATCHSEQ_SEED)
+                step("reset", prev, files)
+            if it % 25 == 0:
+                print(f"... {steps}/{a.edits} failures={failures} {time.time() - t0:.0f}s", flush=True)
+        h.wait_guard_idle()
+        guard = h.guard_count()
+        print(f"RESULT seed={a.seed} crate=patchseq edits={steps} failures={failures} "
+              f"guard_fired={guard} wall={time.time() - t0:.0f}s")
+        print("ops:", dict(Counter(k.split(":")[-1] for k in ops.elements())))
+        print("paths:", dict(paths.most_common()))
         print("bad:", dict(bad_ops))
         if a.fail_on_guard and guard > 0:
             failures += guard

@@ -1661,6 +1661,9 @@ fn resolved_setup(
         &front.client.shown_root,
         key.krate.test,
     ));
+    // What a later patch needs to expand a body alone (no dependency
+    // crate can export a macro).
+    let patch_expand = externs.is_empty().then(|| (env.clone(), crate_name.clone()));
     match super::patch::try_patch(front, caches, inputs, &root_text, request_start) {
         // Nothing changed since the last check of this same request:
         // its answer stands (`check_fingerprint`).
@@ -1915,6 +1918,7 @@ fn resolved_setup(
             fn_lines.clone(),
             body_hashes.clone(),
             request_start,
+            patch_expand,
         ));
     }
     Ok((map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines, body_hashes, Some(tables)))
