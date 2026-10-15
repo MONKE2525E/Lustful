@@ -1854,11 +1854,12 @@ pub fn run() -> i64 {
 
 # Statements that check in any marked body (a `let` before the tail).
 PATCHSEQ_OK = ["let _v{n}: u32 = {n};", "let _v{n} = {n} as i64 + 1;", "if {n} > 3 {{ let _w{n} = {n}; }}",
-               "let _s{n} = String::from(\"{n}\");", "let _m{n} = matches!({n} % 3, 0 | 1);"]
+               "let _s{n} = String::from(\"{n}\");", "let _m{n} = matches!({n} % 3, 0 | 1);",
+               "let _c{n} = cfg!(windows);", "#[cfg(test)] let _t{n} = {n};", "#[allow(unused)] let _a{n} = 1;"]
 # Errors: a type error (none in disabled code), a name error, syntax errors.
 PATCHSEQ_ERR = ["let _e{n}: u32 = \"x\";", "let _e{n} = missing_{n};", "let = ;", "let _e{n}: u32 = {n}"]
 # Edits the fast paths refuse (they resolve in full), and item edits.
-PATCHSEQ_SLOW = ["let _c{n} = cfg!(windows);", "#[allow(unused)] let _a{n} = 1;", "static _X{n}: u32 = 7;",
+PATCHSEQ_SLOW = ["let _l{n} = line!();", "let _c{n} = cfg!(lust_no_such_name);", "static _X{n}: u32 = 7;",
                  "const _K{n}: i64 = {n};"]
 PATCHSEQ_VALUES = [("consts.rs", "    4\n}", "    5\n}"), ("consts.rs", "    3\n}", "    9\n}"),
                    ("items.rs", "const K: i64 = 4;", "const K: i64 = 6;"), ("items.rs", "|| 7)", "|| 8)"),

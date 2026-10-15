@@ -549,7 +549,7 @@ pub(crate) fn expand_cfg(env: &CfgEnv) -> crate::expand::builtin::CfgEnv {
 /// name must be caught here or it would silently drop the item.
 /// Macro definition bodies are skipped: their tokens are templates,
 /// not item attributes yet.
-fn check_cfg_names(lexed: &lexer::Lexed, env: &CfgEnv, interner: &Interner) -> Result<(), Diag> {
+pub(crate) fn check_cfg_names(lexed: &lexer::Lexed, env: &CfgEnv, interner: &Interner) -> Result<(), Diag> {
     use crate::lexer::Tok;
     let toks = &lexed.tokens;
     // Symbols, not texts, per token: this scans every token of the crate.
