@@ -3655,6 +3655,12 @@ impl<'p> Ctx<'p> {
             match self.auto_holds(tr.def, self_ty) {
                 Some(true) => return Selection::ParamEvidence(usize::MAX),
                 Some(false) => return Selection::NoImpl,
+                // A non-param self type over a still-open variable
+                // (`Vec<?T>: Send` from a where clause, before the
+                // call's arguments name `?T`) is not yet a "no":
+                // the obligation waits for inference, like a bare
+                // param self type does through the solver.
+                None if self.has_unbound_deep(self_ty) => return Selection::Ambiguous,
                 None => {}
             }
         }
