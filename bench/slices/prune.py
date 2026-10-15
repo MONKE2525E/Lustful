@@ -147,8 +147,14 @@ def lust_errors(lust, root, env, strict=True, verb="check"):
     # A failed build with no located error, or a panic of either verb: one error at line 0,
     # which the caller bisects. Numbers in parens (ids) are dropped so probes compare equal.
     if r.returncode != 0 and not errs and (verb == "build" or "panicked at" in r.stderr):
-        first = next((l for l in r.stderr.splitlines() if l.strip()), "")
-        return [(str(root), 0, "BUILD" if verb == "build" else "PANIC", re.sub(r"\(\d+\)", "", first)[:200])]
+        lines = [l for l in r.stderr.splitlines() if l.strip()]
+        first = re.sub(r"\(\d+\)", "", lines[0] if lines else "")
+        # Every tcc failure has the same first line; add the C error with its file, line, and
+        # generated type numbers dropped, so the bisect tracks this failure and not another one.
+        cerr = next((l for l in lines[1:] if ": error: " in l), "")
+        if cerr:
+            first += " | " + re.sub(r"\d+", "N", cerr.split(": error: ", 1)[1])
+        return [(str(root), 0, "BUILD" if verb == "build" else "PANIC", first[:300])]
     if strict and r.returncode != 0 and not errs:
         tail = (r.stderr or r.stdout)[-1500:]
         sys.exit(f"lust failed with no located error (exit {r.returncode}):\n{other}\n{tail}")
@@ -418,6 +424,8 @@ def main():
                         lambda c, m: bisect(a.lust, root, env, src_root, c, m, verb))
         print(f"round {rounds} ({tool}): {len(errs)} errors, removed {n} items, {count_lines(src_root)} lines left, "
               f"{time.time() - t0:.0f} s", flush=True)
+        # The removals so far, for coverage.py when a later round stops on an error it cannot locate.
+        write_manifest(out / "prune-partial.json", {"rounds": rounds, "removed": removed})
     else:
         sys.exit("prune did not converge")
     # Keep only the files rustc loads on this target: cfg-disabled modules (windows,
@@ -457,6 +465,7 @@ def main():
         "removed": removed,
     }
     write_manifest(out / "prune.json", manifest)
+    (out / "prune-partial.json").unlink(missing_ok=True)
     print(f"slice: {manifest['lines']} lines ({manifest['code_lines']} code) of {start_lines} kept, {len(removed)} items removed "
           f"({len(manifest['removed_by_rustc'])} by rustc), {rounds} rounds")
 
