@@ -880,6 +880,13 @@ fn compute(
             }
             // `Box<[T]>` is a fat pointer, like `&[T]`.
             Some(BuiltinTy::Boxed) if tys.boxed_slice_elem(t).is_some() => Ok(fat_ptr_layout()),
+            // An owned fat pointer to a slice or str (`Box<str>`,
+            // `Rc<[T]>`), as above.
+            Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc)
+                if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str)) =>
+            {
+                Ok(fat_ptr_layout())
+            }
             Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc) => Ok(ptr_layout()),
             Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => struct_layout(
                 &[ptr_layout(), int_layout(IntTy::Usize), cap_layout()],
@@ -899,7 +906,13 @@ fn compute(
             // An atomic: its value's size and alignment, with no niche
             // (`UnsafeCell`), as std lays out `Atomic<T>` (W-THREADS).
             Some(BuiltinTy::Sync(k)) if let Some(v) = k.atomic_value() => Ok(Layout::simple(v.bytes() as u64, v.bytes() as u64, None)),
-            // `Arc<T>` and `sync::Weak<T>`: one non-null pointer.
+            // `Arc<T>` and `sync::Weak<T>`: one non-null pointer, or a
+            // fat one for an unsized `T`.
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak))
+                if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..))) =>
+            {
+                Ok(fat_ptr_layout())
+            }
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => Ok(ptr_layout()),
             Some(_) => Err(()),
             None => {
