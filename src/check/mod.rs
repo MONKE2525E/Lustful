@@ -17718,6 +17718,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // A `thread_local!` `const { .. }` init fn proves its const part (check/tls.rs).
         self.tls_const_init_check();
         self.build_closure_map();
+        // A revealed hidden type is recorded at its call, when a generic
+        // definer's args can still be inference vars; zonk it like every
+        // other output type, or lowering cannot match it to a local's
+        // type and the local loses its drop-live mark
+        // (`Body::opaque_locals`), so borrowck would let the captured
+        // borrow end before the opaque value drops.
+        for i in 0..self.out.revealed.len() {
+            let t = self.out.revealed[i];
+            self.out.revealed[i] = self.zonk(t);
+        }
+        self.out.revealed.dedup();
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);
