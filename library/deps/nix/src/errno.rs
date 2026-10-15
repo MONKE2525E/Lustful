@@ -1,163 +1,451 @@
-// `nix::errno`: the Errno type, as a code-carrying struct with
-// upstream's variant names for the common codes. Display is
-// upstream's form (`EPERM: Operation not permitted`); the text
-// table covers the codes listed, and an unlisted code prints
-// its io::Error text instead (README).
+// `nix::errno`: the Errno type, as upstream's Linux
+// `#[repr(i32)]` enum (tf-adapters F2: ts-rust writes
+// `e as i32`, which only the enum form allows). Variant
+// numbers are the Linux x86_64 errno values; `desc` texts are
+// nix's own table, as upstream prints them. `last`, `set`,
+// `clear`, and `result` are not here (they read and write the
+// C errno; README).
 
 use core::fmt;
 
 /// An error number.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Errno(i32);
-
-impl Errno {
-    pub const EPERM: Errno = Errno(1);
-    pub const ENOENT: Errno = Errno(2);
-    pub const ESRCH: Errno = Errno(3);
-    pub const EINTR: Errno = Errno(4);
-    pub const EIO: Errno = Errno(5);
-    pub const ENXIO: Errno = Errno(6);
-    pub const E2BIG: Errno = Errno(7);
-    pub const ENOEXEC: Errno = Errno(8);
-    pub const EBADF: Errno = Errno(9);
-    pub const ECHILD: Errno = Errno(10);
-    pub const EAGAIN: Errno = Errno(11);
-    pub const ENOMEM: Errno = Errno(12);
-    pub const EACCES: Errno = Errno(13);
-    pub const EFAULT: Errno = Errno(14);
-    pub const EBUSY: Errno = Errno(16);
-    pub const EEXIST: Errno = Errno(17);
-    pub const EXDEV: Errno = Errno(18);
-    pub const ENODEV: Errno = Errno(19);
-    pub const ENOTDIR: Errno = Errno(20);
-    pub const EISDIR: Errno = Errno(21);
-    pub const EINVAL: Errno = Errno(22);
-    pub const ENFILE: Errno = Errno(23);
-    pub const EMFILE: Errno = Errno(24);
-    pub const ENOTTY: Errno = Errno(25);
-    pub const EFBIG: Errno = Errno(27);
-    pub const ENOSPC: Errno = Errno(28);
-    pub const ESPIPE: Errno = Errno(29);
-    pub const EROFS: Errno = Errno(30);
-    pub const EMLINK: Errno = Errno(31);
-    pub const EPIPE: Errno = Errno(32);
-    pub const ERANGE: Errno = Errno(34);
-    pub const ENAMETOOLONG: Errno = Errno(36);
-    pub const ENOSYS: Errno = Errno(38);
-    pub const ENOTEMPTY: Errno = Errno(39);
-    pub const ELOOP: Errno = Errno(40);
-
-    /// The Errno from a raw error number.
-    pub fn from_raw(code: i32) -> Errno {
-        Errno(code)
-    }
-
-    /// The result form of a raw return value: `Ok` for a value
-    /// that is not -1, else the current errno is the caller's
-    /// job here (the adapter's shims already return it).
-    pub fn result<T>(value: T) -> crate::Result<T> {
-        Ok(value)
-    }
-
-    /// The strerror text of this code, for the listed codes.
-    pub fn desc(self) -> &'static str {
-        match self.0 {
-            1 => "Operation not permitted",
-            2 => "No such file or directory",
-            3 => "No such process",
-            4 => "Interrupted system call",
-            5 => "Input/output error",
-            6 => "No such device or address",
-            7 => "Argument list too long",
-            8 => "Exec format error",
-            9 => "Bad file descriptor",
-            10 => "No child processes",
-            11 => "Resource temporarily unavailable",
-            12 => "Cannot allocate memory",
-            13 => "Permission denied",
-            14 => "Bad address",
-            16 => "Device or resource busy",
-            17 => "File exists",
-            18 => "Invalid cross-device link",
-            19 => "No such device",
-            20 => "Not a directory",
-            21 => "Is a directory",
-            22 => "Invalid argument",
-            23 => "Too many open files in system",
-            24 => "Too many open files",
-            25 => "Inappropriate ioctl for device",
-            27 => "File too large",
-            28 => "No space left on device",
-            29 => "Illegal seek",
-            30 => "Read-only file system",
-            31 => "Too many links",
-            32 => "Broken pipe",
-            34 => "Numerical result out of range",
-            36 => "File name too long",
-            38 => "Function not implemented",
-            39 => "Directory not empty",
-            40 => "Too many levels of symbolic links",
-            _ => "Unknown error",
-        }
-    }
-
-    /// The variant name of this code, for Debug.
-    fn name(self) -> &'static str {
-        match self.0 {
-            1 => "EPERM",
-            2 => "ENOENT",
-            3 => "ESRCH",
-            4 => "EINTR",
-            5 => "EIO",
-            6 => "ENXIO",
-            7 => "E2BIG",
-            8 => "ENOEXEC",
-            9 => "EBADF",
-            10 => "ECHILD",
-            11 => "EAGAIN",
-            12 => "ENOMEM",
-            13 => "EACCES",
-            14 => "EFAULT",
-            16 => "EBUSY",
-            17 => "EEXIST",
-            18 => "EXDEV",
-            19 => "ENODEV",
-            20 => "ENOTDIR",
-            21 => "EISDIR",
-            22 => "EINVAL",
-            23 => "ENFILE",
-            24 => "EMFILE",
-            25 => "ENOTTY",
-            27 => "EFBIG",
-            28 => "ENOSPC",
-            29 => "ESPIPE",
-            30 => "EROFS",
-            31 => "EMLINK",
-            32 => "EPIPE",
-            34 => "ERANGE",
-            36 => "ENAMETOOLONG",
-            38 => "ENOSYS",
-            39 => "ENOTEMPTY",
-            40 => "ELOOP",
-            _ => "UnknownErrno",
-        }
-    }
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum Errno {
+    UnknownErrno = 0,
+    EPERM = 1,
+    ENOENT = 2,
+    ESRCH = 3,
+    EINTR = 4,
+    EIO = 5,
+    ENXIO = 6,
+    E2BIG = 7,
+    ENOEXEC = 8,
+    EBADF = 9,
+    ECHILD = 10,
+    EAGAIN = 11,
+    ENOMEM = 12,
+    EACCES = 13,
+    EFAULT = 14,
+    ENOTBLK = 15,
+    EBUSY = 16,
+    EEXIST = 17,
+    EXDEV = 18,
+    ENODEV = 19,
+    ENOTDIR = 20,
+    EISDIR = 21,
+    EINVAL = 22,
+    ENFILE = 23,
+    EMFILE = 24,
+    ENOTTY = 25,
+    ETXTBSY = 26,
+    EFBIG = 27,
+    ENOSPC = 28,
+    ESPIPE = 29,
+    EROFS = 30,
+    EMLINK = 31,
+    EPIPE = 32,
+    EDOM = 33,
+    ERANGE = 34,
+    EDEADLK = 35,
+    ENAMETOOLONG = 36,
+    ENOLCK = 37,
+    ENOSYS = 38,
+    ENOTEMPTY = 39,
+    ELOOP = 40,
+    ENOMSG = 42,
+    EIDRM = 43,
+    ECHRNG = 44,
+    EL2NSYNC = 45,
+    EL3HLT = 46,
+    EL3RST = 47,
+    ELNRNG = 48,
+    EUNATCH = 49,
+    ENOCSI = 50,
+    EL2HLT = 51,
+    EBADE = 52,
+    EBADR = 53,
+    EXFULL = 54,
+    ENOANO = 55,
+    EBADRQC = 56,
+    EBADSLT = 57,
+    EBFONT = 59,
+    ENOSTR = 60,
+    ENODATA = 61,
+    ETIME = 62,
+    ENOSR = 63,
+    ENONET = 64,
+    ENOPKG = 65,
+    EREMOTE = 66,
+    ENOLINK = 67,
+    EADV = 68,
+    ESRMNT = 69,
+    ECOMM = 70,
+    EPROTO = 71,
+    EMULTIHOP = 72,
+    EDOTDOT = 73,
+    EBADMSG = 74,
+    EOVERFLOW = 75,
+    ENOTUNIQ = 76,
+    EBADFD = 77,
+    EREMCHG = 78,
+    ELIBACC = 79,
+    ELIBBAD = 80,
+    ELIBSCN = 81,
+    ELIBMAX = 82,
+    ELIBEXEC = 83,
+    EILSEQ = 84,
+    ERESTART = 85,
+    ESTRPIPE = 86,
+    EUSERS = 87,
+    ENOTSOCK = 88,
+    EDESTADDRREQ = 89,
+    EMSGSIZE = 90,
+    EPROTOTYPE = 91,
+    ENOPROTOOPT = 92,
+    EPROTONOSUPPORT = 93,
+    ESOCKTNOSUPPORT = 94,
+    EOPNOTSUPP = 95,
+    EPFNOSUPPORT = 96,
+    EAFNOSUPPORT = 97,
+    EADDRINUSE = 98,
+    EADDRNOTAVAIL = 99,
+    ENETDOWN = 100,
+    ENETUNREACH = 101,
+    ENETRESET = 102,
+    ECONNABORTED = 103,
+    ECONNRESET = 104,
+    ENOBUFS = 105,
+    EISCONN = 106,
+    ENOTCONN = 107,
+    ESHUTDOWN = 108,
+    ETOOMANYREFS = 109,
+    ETIMEDOUT = 110,
+    ECONNREFUSED = 111,
+    EHOSTDOWN = 112,
+    EHOSTUNREACH = 113,
+    EALREADY = 114,
+    EINPROGRESS = 115,
+    ESTALE = 116,
+    EUCLEAN = 117,
+    ENOTNAM = 118,
+    ENAVAIL = 119,
+    EISNAM = 120,
+    EREMOTEIO = 121,
+    EDQUOT = 122,
+    ENOMEDIUM = 123,
+    EMEDIUMTYPE = 124,
+    ECANCELED = 125,
+    ENOKEY = 126,
+    EKEYEXPIRED = 127,
+    EKEYREVOKED = 128,
+    EKEYREJECTED = 129,
+    EOWNERDEAD = 130,
+    ENOTRECOVERABLE = 131,
+    ERFKILL = 132,
+    EHWPOISON = 133,
 }
 
-impl fmt::Debug for Errno {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+impl Errno {
+    pub const EWOULDBLOCK: Errno = Errno::EAGAIN;
+    pub const EDEADLOCK: Errno = Errno::EDEADLK;
+    pub const ENOTSUP: Errno = Errno::EOPNOTSUPP;
+
+    /// The Errno from a raw error number; an unknown number is
+    /// `UnknownErrno`, as upstream.
+    pub const fn from_raw(code: i32) -> Errno {
+        match code {
+            1 => Errno::EPERM,
+            2 => Errno::ENOENT,
+            3 => Errno::ESRCH,
+            4 => Errno::EINTR,
+            5 => Errno::EIO,
+            6 => Errno::ENXIO,
+            7 => Errno::E2BIG,
+            8 => Errno::ENOEXEC,
+            9 => Errno::EBADF,
+            10 => Errno::ECHILD,
+            11 => Errno::EAGAIN,
+            12 => Errno::ENOMEM,
+            13 => Errno::EACCES,
+            14 => Errno::EFAULT,
+            15 => Errno::ENOTBLK,
+            16 => Errno::EBUSY,
+            17 => Errno::EEXIST,
+            18 => Errno::EXDEV,
+            19 => Errno::ENODEV,
+            20 => Errno::ENOTDIR,
+            21 => Errno::EISDIR,
+            22 => Errno::EINVAL,
+            23 => Errno::ENFILE,
+            24 => Errno::EMFILE,
+            25 => Errno::ENOTTY,
+            26 => Errno::ETXTBSY,
+            27 => Errno::EFBIG,
+            28 => Errno::ENOSPC,
+            29 => Errno::ESPIPE,
+            30 => Errno::EROFS,
+            31 => Errno::EMLINK,
+            32 => Errno::EPIPE,
+            33 => Errno::EDOM,
+            34 => Errno::ERANGE,
+            35 => Errno::EDEADLK,
+            36 => Errno::ENAMETOOLONG,
+            37 => Errno::ENOLCK,
+            38 => Errno::ENOSYS,
+            39 => Errno::ENOTEMPTY,
+            40 => Errno::ELOOP,
+            42 => Errno::ENOMSG,
+            43 => Errno::EIDRM,
+            44 => Errno::ECHRNG,
+            45 => Errno::EL2NSYNC,
+            46 => Errno::EL3HLT,
+            47 => Errno::EL3RST,
+            48 => Errno::ELNRNG,
+            49 => Errno::EUNATCH,
+            50 => Errno::ENOCSI,
+            51 => Errno::EL2HLT,
+            52 => Errno::EBADE,
+            53 => Errno::EBADR,
+            54 => Errno::EXFULL,
+            55 => Errno::ENOANO,
+            56 => Errno::EBADRQC,
+            57 => Errno::EBADSLT,
+            59 => Errno::EBFONT,
+            60 => Errno::ENOSTR,
+            61 => Errno::ENODATA,
+            62 => Errno::ETIME,
+            63 => Errno::ENOSR,
+            64 => Errno::ENONET,
+            65 => Errno::ENOPKG,
+            66 => Errno::EREMOTE,
+            67 => Errno::ENOLINK,
+            68 => Errno::EADV,
+            69 => Errno::ESRMNT,
+            70 => Errno::ECOMM,
+            71 => Errno::EPROTO,
+            72 => Errno::EMULTIHOP,
+            73 => Errno::EDOTDOT,
+            74 => Errno::EBADMSG,
+            75 => Errno::EOVERFLOW,
+            76 => Errno::ENOTUNIQ,
+            77 => Errno::EBADFD,
+            78 => Errno::EREMCHG,
+            79 => Errno::ELIBACC,
+            80 => Errno::ELIBBAD,
+            81 => Errno::ELIBSCN,
+            82 => Errno::ELIBMAX,
+            83 => Errno::ELIBEXEC,
+            84 => Errno::EILSEQ,
+            85 => Errno::ERESTART,
+            86 => Errno::ESTRPIPE,
+            87 => Errno::EUSERS,
+            88 => Errno::ENOTSOCK,
+            89 => Errno::EDESTADDRREQ,
+            90 => Errno::EMSGSIZE,
+            91 => Errno::EPROTOTYPE,
+            92 => Errno::ENOPROTOOPT,
+            93 => Errno::EPROTONOSUPPORT,
+            94 => Errno::ESOCKTNOSUPPORT,
+            95 => Errno::EOPNOTSUPP,
+            96 => Errno::EPFNOSUPPORT,
+            97 => Errno::EAFNOSUPPORT,
+            98 => Errno::EADDRINUSE,
+            99 => Errno::EADDRNOTAVAIL,
+            100 => Errno::ENETDOWN,
+            101 => Errno::ENETUNREACH,
+            102 => Errno::ENETRESET,
+            103 => Errno::ECONNABORTED,
+            104 => Errno::ECONNRESET,
+            105 => Errno::ENOBUFS,
+            106 => Errno::EISCONN,
+            107 => Errno::ENOTCONN,
+            108 => Errno::ESHUTDOWN,
+            109 => Errno::ETOOMANYREFS,
+            110 => Errno::ETIMEDOUT,
+            111 => Errno::ECONNREFUSED,
+            112 => Errno::EHOSTDOWN,
+            113 => Errno::EHOSTUNREACH,
+            114 => Errno::EALREADY,
+            115 => Errno::EINPROGRESS,
+            116 => Errno::ESTALE,
+            117 => Errno::EUCLEAN,
+            118 => Errno::ENOTNAM,
+            119 => Errno::ENAVAIL,
+            120 => Errno::EISNAM,
+            121 => Errno::EREMOTEIO,
+            122 => Errno::EDQUOT,
+            123 => Errno::ENOMEDIUM,
+            124 => Errno::EMEDIUMTYPE,
+            125 => Errno::ECANCELED,
+            126 => Errno::ENOKEY,
+            127 => Errno::EKEYEXPIRED,
+            128 => Errno::EKEYREVOKED,
+            129 => Errno::EKEYREJECTED,
+            130 => Errno::EOWNERDEAD,
+            131 => Errno::ENOTRECOVERABLE,
+            132 => Errno::ERFKILL,
+            133 => Errno::EHWPOISON,
+            _ => Errno::UnknownErrno,
+        }
+    }
+
+    /// The description text of this error, nix's table.
+    pub fn desc(self) -> &'static str {
+        match self {
+            Errno::UnknownErrno => "Unknown errno",
+            Errno::EPERM => "Operation not permitted",
+            Errno::ENOENT => "No such file or directory",
+            Errno::ESRCH => "No such process",
+            Errno::EINTR => "Interrupted system call",
+            Errno::EIO => "I/O error",
+            Errno::ENXIO => "No such device or address",
+            Errno::E2BIG => "Argument list too long",
+            Errno::ENOEXEC => "Exec format error",
+            Errno::EBADF => "Bad file number",
+            Errno::ECHILD => "No child processes",
+            Errno::EAGAIN => "Try again",
+            Errno::ENOMEM => "Out of memory",
+            Errno::EACCES => "Permission denied",
+            Errno::EFAULT => "Bad address",
+            Errno::ENOTBLK => "Block device required",
+            Errno::EBUSY => "Device or resource busy",
+            Errno::EEXIST => "File exists",
+            Errno::EXDEV => "Cross-device link",
+            Errno::ENODEV => "No such device",
+            Errno::ENOTDIR => "Not a directory",
+            Errno::EISDIR => "Is a directory",
+            Errno::EINVAL => "Invalid argument",
+            Errno::ENFILE => "File table overflow",
+            Errno::EMFILE => "Too many open files",
+            Errno::ENOTTY => "Not a typewriter",
+            Errno::ETXTBSY => "Text file busy",
+            Errno::EFBIG => "File too large",
+            Errno::ENOSPC => "No space left on device",
+            Errno::ESPIPE => "Illegal seek",
+            Errno::EROFS => "Read-only file system",
+            Errno::EMLINK => "Too many links",
+            Errno::EPIPE => "Broken pipe",
+            Errno::EDOM => "Math argument out of domain of func",
+            Errno::ERANGE => "Math result not representable",
+            Errno::EDEADLK => "Resource deadlock would occur",
+            Errno::ENAMETOOLONG => "File name too long",
+            Errno::ENOLCK => "No record locks available",
+            Errno::ENOSYS => "Function not implemented",
+            Errno::ENOTEMPTY => "Directory not empty",
+            Errno::ELOOP => "Too many symbolic links encountered",
+            Errno::ENOMSG => "No message of desired type",
+            Errno::EIDRM => "Identifier removed",
+            Errno::ECHRNG => "Channel number out of range",
+            Errno::EL2NSYNC => "Level 2 not synchronized",
+            Errno::EL3HLT => "Level 3 halted",
+            Errno::EL3RST => "Level 3 reset",
+            Errno::ELNRNG => "Link number out of range",
+            Errno::EUNATCH => "Protocol driver not attached",
+            Errno::ENOCSI => "No CSI structure available",
+            Errno::EL2HLT => "Level 2 halted",
+            Errno::EBADE => "Invalid exchange",
+            Errno::EBADR => "Invalid request descriptor",
+            Errno::EXFULL => "Exchange full",
+            Errno::ENOANO => "No anode",
+            Errno::EBADRQC => "Invalid request code",
+            Errno::EBADSLT => "Invalid slot",
+            Errno::EBFONT => "Bad font file format",
+            Errno::ENOSTR => "Not a STREAM",
+            Errno::ENODATA => "No message available on STREAM",
+            Errno::ETIME => "STREAM ioctl timeout",
+            Errno::ENOSR => "No STREAM resources",
+            Errno::ENONET => "Machine is not on the network",
+            Errno::ENOPKG => "Package not installed",
+            Errno::EREMOTE => "Too many levels of remote in path",
+            Errno::ENOLINK => "Reserved",
+            Errno::EADV => "Advertise error",
+            Errno::ESRMNT => "Srmount error",
+            Errno::ECOMM => "Communication error on send",
+            Errno::EPROTO => "Protocol error",
+            Errno::EMULTIHOP => "Reserved",
+            Errno::EDOTDOT => "RFS specific error",
+            Errno::EBADMSG => "Bad message",
+            Errno::EOVERFLOW => "Value too large to be stored in data type",
+            Errno::ENOTUNIQ => "Name not unique on network",
+            Errno::EBADFD => "File descriptor in bad state",
+            Errno::EREMCHG => "Remote address changed",
+            Errno::ELIBACC => "Can not access a needed shared library",
+            Errno::ELIBBAD => "Accessing a corrupted shared library",
+            Errno::ELIBSCN => ".lib section in a.out corrupted",
+            Errno::ELIBMAX => "Attempting to link in too many shared libraries",
+            Errno::ELIBEXEC => "Cannot exec a shared library directly",
+            Errno::EILSEQ => "Illegal byte sequence",
+            Errno::ERESTART => "Interrupted system call should be restarted",
+            Errno::ESTRPIPE => "Streams pipe error",
+            Errno::EUSERS => "Too many users",
+            Errno::ENOTSOCK => "Socket operation on non-socket",
+            Errno::EDESTADDRREQ => "Destination address required",
+            Errno::EMSGSIZE => "Message too long",
+            Errno::EPROTOTYPE => "Protocol wrong type for socket",
+            Errno::ENOPROTOOPT => "Protocol not available",
+            Errno::EPROTONOSUPPORT => "Protocol not supported",
+            Errno::ESOCKTNOSUPPORT => "Socket type not supported",
+            Errno::EOPNOTSUPP => "Operation not supported",
+            Errno::EPFNOSUPPORT => "Protocol family not supported",
+            Errno::EAFNOSUPPORT => "Address family not supported by protocol",
+            Errno::EADDRINUSE => "Address already in use",
+            Errno::EADDRNOTAVAIL => "Cannot assign requested address",
+            Errno::ENETDOWN => "Network is down",
+            Errno::ENETUNREACH => "Network is unreachable",
+            Errno::ENETRESET => "Network dropped connection because of reset",
+            Errno::ECONNABORTED => "Software caused connection abort",
+            Errno::ECONNRESET => "Connection reset by peer",
+            Errno::ENOBUFS => "No buffer space available",
+            Errno::EISCONN => "Transport endpoint is already connected",
+            Errno::ENOTCONN => "Transport endpoint is not connected",
+            Errno::ESHUTDOWN => "Cannot send after transport endpoint shutdown",
+            Errno::ETOOMANYREFS => "Too many references: cannot splice",
+            Errno::ETIMEDOUT => "Connection timed out",
+            Errno::ECONNREFUSED => "Connection refused",
+            Errno::EHOSTDOWN => "Host is down",
+            Errno::EHOSTUNREACH => "No route to host",
+            Errno::EALREADY => "Operation already in progress",
+            Errno::EINPROGRESS => "Operation now in progress",
+            Errno::ESTALE => "Stale NFS file handle",
+            Errno::EUCLEAN => "Structure needs cleaning",
+            Errno::ENOTNAM => "Not a XENIX named type file",
+            Errno::ENAVAIL => "No XENIX semaphores available",
+            Errno::EISNAM => "Is a named type file",
+            Errno::EREMOTEIO => "Remote I/O error",
+            Errno::EDQUOT => "Disc quota exceeded",
+            Errno::ENOMEDIUM => "No medium found",
+            Errno::EMEDIUMTYPE => "Wrong medium type",
+            Errno::ECANCELED => "Operation canceled",
+            Errno::ENOKEY => "Required key not available",
+            Errno::EKEYEXPIRED => "Key has expired",
+            Errno::EKEYREVOKED => "Key has been revoked",
+            Errno::EKEYREJECTED => "Key was rejected by service",
+            Errno::EOWNERDEAD => "Previous owner died",
+            Errno::ENOTRECOVERABLE => "State not recoverable",
+            Errno::ERFKILL => "Operation not possible due to RF-kill",
+            Errno::EHWPOISON => "Memory page has hardware error",
+        }
     }
 }
 
 impl fmt::Display for Errno {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.name(), self.desc())
+        write!(f, "{:?}: {}", self, self.desc())
     }
 }
 
 impl From<Errno> for std::io::Error {
     fn from(err: Errno) -> std::io::Error {
-        std::io::Error::from_raw_os_error(err.0)
+        std::io::Error::from_raw_os_error(err as i32)
     }
 }
+
+impl core::convert::TryFrom<std::io::Error> for Errno {
+    type Error = std::io::Error;
+
+    fn try_from(ioerror: std::io::Error) -> Result<Self, std::io::Error> {
+        ioerror.raw_os_error().map(Errno::from_raw).ok_or(ioerror)
+    }
+}
+

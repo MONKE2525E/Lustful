@@ -70,6 +70,8 @@
 //     pub fn sys_x_getdents(fd: i32, max: u64, out: &mut Vec<u8>) -> i64;      // for RawDir, not yet called
 //     pub fn sys_x_statvfs(path: &[u8], out: &mut Vec<u8>) -> i32;
 //     pub fn sys_x_fstatvfs(fd: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_fanotify_init(flags: u32, event_f_flags: u32) -> i32;  // nix only; fd or -errno
+//     pub fn sys_x_fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, has_path: i32, path: &[u8]) -> i32;  // nix only
 //
 // Every other row of the section 3.2 table is registered with its
 // signature and privilege list, but has no body yet: a privileged call

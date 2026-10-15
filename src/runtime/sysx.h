@@ -103,6 +103,12 @@ int64_t lust_sys_x_getdents(int32_t fd, uint64_t max, lust_Vec *out);
 int32_t lust_sys_x_statvfs(const uint8_t *p, uint64_t len, lust_Vec *out);
 /* fstatvfs(2): the same record for an fd; 0 or errno. */
 int32_t lust_sys_x_fstatvfs(int32_t fd, lust_Vec *out);
+/* fanotify_init(2) with the raw Linux flags (nix adapter):
+   the fd or -errno. */
+int32_t lust_sys_x_fanotify_init(uint32_t flags, uint32_t event_f_flags);
+/* fanotify_mark(2): a path of length 0 with has_path 0 passes
+   NULL as the pathname; 0 or errno. */
+int32_t lust_sys_x_fanotify_mark(int32_t fd, uint32_t flags, uint64_t mask, int32_t dirfd, int32_t has_path, const uint8_t *p, uint64_t len);
 
 #ifdef LUST_IMPL
 #include "sysx.c"

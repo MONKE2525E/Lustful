@@ -1,1 +1,1 @@
-nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }
+nix = { version = "=0.31.3", default-features = false, features = ["fanotify", "process", "signal"] }

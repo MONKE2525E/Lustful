@@ -10,6 +10,7 @@ publish = false
 
 [package.metadata.lust]
 adapter = 1
-# Only the prctl forms of the process feature are implemented; the
-# feature names list what ts-rust's unit resolves to.
-features = ["process", "signal"]
+# Only the prctl forms of the process feature and the fanotify
+# group/mark forms are implemented; the feature names list what
+# ts-rust's units resolve to.
+features = ["fanotify", "process", "signal"]

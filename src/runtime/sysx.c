@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <poll.h>
+#include <sys/fanotify.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
@@ -571,4 +572,21 @@ int32_t lust_sys_x_fstatvfs(int32_t fd, lust_Vec *out) {
     if (fstatvfs(fd, &st) != 0) return errno;
     lust_sysx_statvfs_rec(out, &st);
     return 0;
+}
+
+int32_t lust_sys_x_fanotify_init(uint32_t flags, uint32_t event_f_flags) {
+    int fd = fanotify_init(flags, event_f_flags);
+    return fd < 0 ? -errno : fd;
+}
+
+int32_t lust_sys_x_fanotify_mark(int32_t fd, uint32_t flags, uint64_t mask, int32_t dirfd, int32_t has_path, const uint8_t *p, uint64_t len) {
+    char *s = NULL;
+    if (has_path) {
+        s = lust_sysx_path(p, len);
+        if (!s) return ENOMEM;
+    }
+    int r = fanotify_mark(fd, flags, mask, dirfd, s);
+    int e = errno;
+    free(s);
+    return r != 0 ? e : 0;
 }
