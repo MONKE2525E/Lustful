@@ -14,11 +14,14 @@
 //   [0]  drop glue for the concrete type, or 0 when it needs none
 //   [1]  size of the concrete type (Rust layout)
 //   [2]  align of the concrete type
-//   [3 .. 3+S)  one vtable pointer per direct supertrait that has a
+//   [3]  the concrete type's Debug fmt shim, or 0 when the principal
+//        trait has no `Debug` supertrait (`VT_FMT_DEBUG`)
+//   [4]  the same for Display (`VT_FMT_DISPLAY`)
+//   [5 .. 5+S)  one vtable pointer per direct supertrait that has a
 //               vtable, in declaration order (the `super_N` slots)
-//   [3+S ..)    one entry per vtable method, in declaration order
+//   [5+S ..)    one entry per vtable method, in declaration order
 //
-// A `dyn Any` vtable has no super slots and no methods: words 3 and 4
+// A `dyn Any` vtable has no super slots and no methods: words 5 and 6
 // hold the value's type id instead (`VT_ANY_ID`, check/any.rs).
 //
 // A method entry is a per-vtable shim that forwards through
@@ -33,11 +36,19 @@ use crate::diag::{Diag, Span};
 use crate::intern::{FxMap, Sym};
 use crate::ty::*;
 
-/// Words before the first super slot: drop, size, align.
-pub const VT_HEADER: u32 = 3;
+/// Words before the first super slot: drop, size, align, and the two
+/// fmt shims below.
+pub const VT_HEADER: u32 = 5;
 /// The header words `size_of_val` and `align_of_val` read.
 pub const VT_SIZE: u32 = 1;
 pub const VT_ALIGN: u32 = 2;
+/// The header words that call the concrete type's `Debug::fmt` and
+/// `Display::fmt` glue (`int (void *self, lust_Formatter *f)`), or 0
+/// when the principal trait does not require that fmt trait through a
+/// supertrait. A fixed slot lets the fmt glue dispatch without knowing
+/// the principal trait (cgen/fmt.rs).
+pub const VT_FMT_DEBUG: u32 = 3;
+pub const VT_FMT_DISPLAY: u32 = 4;
 /// The two words of a `dyn Any` vtable that hold the value's type id
 /// (check/any.rs), low word first. `Any` has no super slots and no
 /// vtable methods, so they follow the header.
@@ -82,6 +93,11 @@ pub struct DynInfo {
     /// The trait or a supertrait bounds `Self` by `'static`: every dyn
     /// type with this principal is `'static` (see `dyn_is_static`).
     pub static_bound: bool,
+    /// The trait requires `Debug` (directly or through a supertrait):
+    /// the dyn type implements `Debug` through `VT_FMT_DEBUG`.
+    pub fmt_debug: bool,
+    /// The same for `Display`, through `VT_FMT_DISPLAY`.
+    pub fmt_display: bool,
 }
 
 impl DynInfo {
@@ -256,6 +272,17 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             }
             continue;
         }
+        // The fmt traits are not vtable supertraits: the dyn type
+        // implements them through the fixed header shims, as rustc's
+        // object type implements every supertrait.
+        if sup == lang.debug {
+            info.fmt_debug = true;
+            continue;
+        }
+        if sup == lang.display {
+            info.fmt_display = true;
+            continue;
+        }
         let Some(srec) = p.gx.index.trait_record(sup) else { continue };
         if !srec.local && sup != lang.any {
             info.unsupported.get_or_insert(format!("`dyn {tname}` with the std supertrait `{}`", p.name(srec.name)));
@@ -272,6 +299,8 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             info.auto.send |= si.auto.send;
             info.auto.sync |= si.auto.sync;
             info.auto.unpin |= si.auto.unpin;
+            info.fmt_debug |= si.fmt_debug;
+            info.fmt_display |= si.fmt_display;
         }
         if !info.supers.iter().any(|s| *s == b.value) {
             info.supers.push(b.value);
@@ -396,6 +425,30 @@ pub fn trait_name(p: &Program, def: DefId) -> String {
     p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| p.name(r.name).to_string())
 }
 
+/// True when trait `principal` is `want` or has `want` as a supertrait
+/// (transitively, through trait records only, so it also answers at
+/// collect time, before `dyn_infos` exist). By def only: the fmt traits
+/// it serves take no arguments beyond `Self`.
+pub fn principal_has_supertrait(p: &Program, principal: DefId, want: DefId) -> bool {
+    fn go(p: &Program, cur: DefId, want: DefId, seen: &mut Vec<DefId>) -> bool {
+        if cur == want {
+            return true;
+        }
+        if seen.contains(&cur) {
+            return false;
+        }
+        seen.push(cur);
+        let Some(rec) = p.gx.index.trait_record(cur) else { return false };
+        rec.generics.predicates.iter().any(|pred| match pred {
+            Predicate::Trait(b) if b.count == 0 => {
+                is_self(&p.tys, p.tys.args(b.value.args)[0]) && go(p, b.value.def, want, seen)
+            }
+            _ => false,
+        })
+    }
+    go(p, principal, want, &mut Vec::new())
+}
+
 /// The principal trait ref of a dyn type, if `t` is one.
 pub fn principal_of(tys: &impl TyIntern, t: Ty) -> Option<TraitRef> {
     match tys.kind(t) {
@@ -515,6 +568,13 @@ fn unsized_dyn_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Opti
 /// (by def; the object type implements each of them).
 fn implied_by_principal(p: &Program, principal: DefId, want: DefId, seen: &mut Vec<DefId>) -> bool {
     if principal == want {
+        return true;
+    }
+    // The fmt traits ride the header shims, not the super slots.
+    if seen.is_empty()
+        && ((want == p.gx.lang.debug && principal_has_supertrait(p, principal, want))
+            || (want == p.gx.lang.display && principal_has_supertrait(p, principal, want)))
+    {
         return true;
     }
     if seen.contains(&principal) {

@@ -6912,6 +6912,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Float(_) => true,
         // A raw pointer's Debug is its address (w-cinterop).
         TyKind::RawPtr(..) => true,
+        // Core implements Debug for every fn pointer signature,
+        // higher-ranked ones included (the address, like a raw pointer).
+        TyKind::FnPtr(_) => true,
         // `impl Debug for !` (a `catch_unwind` of a closure that always
         // panics gives `Result<!, _>`).
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error | TyKind::Never => true,
@@ -6920,9 +6923,13 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_debug(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_debug(p, tys, e, seen),
         // std's `impl Debug for dyn Any (+ Send (+ Sync))`: `Any { .. }`.
+        // Any other dyn type is Debug when its principal trait has a
+        // `Debug` supertrait (the vtable's fmt shim, check/object.rs).
         TyKind::Dyn(b, _) => {
             let b = tys.dyn_bounds(b);
-            b.principal.is_some_and(|pr| pr.value.def == p.gx.lang.any) && !b.auto.unpin && (b.auto.send || !b.auto.sync)
+            let Some(pr) = b.principal.map(|pr| pr.value.def) else { return false };
+            (pr == p.gx.lang.any && !b.auto.unpin && (b.auto.send || !b.auto.sync))
+                || crate::check::object::principal_has_supertrait(p, pr, p.gx.lang.debug)
         }
         _ => {
             // `env::Args` prints `Args { inner: [..] }` in Rust; lust has
@@ -6978,6 +6985,11 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, _, e) => has_display(p, tys, e),
+        // A dyn type is Display when its principal trait has a
+        // `Display` supertrait (check/object.rs, as for Debug).
+        TyKind::Dyn(b, _) => {
+            tys.dyn_bounds(b).principal.is_some_and(|pr| crate::check::object::principal_has_supertrait(p, pr.value.def, p.gx.lang.display))
+        }
         _ => {
             tys.is_string_ty(t)
                 || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e))

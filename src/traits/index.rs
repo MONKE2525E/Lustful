@@ -814,7 +814,7 @@ impl ImplIndex {
     /// supertrait of it, transitively) is the goal trait, with
     /// arguments that unify as patterns. The principal's Self
     /// slot is `DYN_SELF`, which unifies with anything.
-    fn dyn_object_impl_holds(&self, tys: &mut impl TyIntern, tr: TraitRef) -> bool {
+    pub(crate) fn dyn_object_impl_holds(&self, tys: &mut impl TyIntern, tr: TraitRef) -> bool {
         let Some(self_ty) = tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
         let TyKind::Dyn(b, _) = tys.kind(self_ty) else { return false };
         let Some(principal) = tys.dyn_bounds(b).principal.map(|p| p.value) else { return false };

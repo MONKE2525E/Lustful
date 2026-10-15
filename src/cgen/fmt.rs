@@ -52,9 +52,25 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
                 crate::ty::sync::AtomicVal::Int(i) => int_expr(i, kind, f, &load),
             }
         }
-        // The only dyn type with Debug is `dyn Any` (`has_debug`): std
+        // A guard over a dyn value keeps the `dyn Any` rendering: std
         // prints `Any { .. }` for every flag set.
-        CTy::Dyn | CTy::BoxDyn | CTy::RcDyn | CTy::DynGuard(_) | CTy::DynLock(true) if debug => format!("lust_f_write_str({f}, {})", lit("Any { .. }")),
+        CTy::DynGuard(_) | CTy::DynLock(true) if debug => format!("lust_f_write_str({f}, {})", lit("Any { .. }")),
+        // A dyn value whose principal trait has a Debug or Display
+        // supertrait formats through the vtable's fmt shim (the
+        // concrete type's own fmt glue). With no shim the only Debug
+        // dyn type left is `dyn Any`: std prints `Any { .. }`.
+        CTy::Dyn | CTy::BoxDyn | CTy::RcDyn => {
+            if kind == FmtKind::Display {
+                let w = crate::check::object::VT_FMT_DISPLAY;
+                format!("((int (*)(void *, lust_Formatter *))((*{v}).vt[{w}]))((*{v}).data, {f})")
+            } else {
+                let w = crate::check::object::VT_FMT_DEBUG;
+                format!(
+                    "((*{v}).vt[{w}] ? ((int (*)(void *, lust_Formatter *))((*{v}).vt[{w}]))((*{v}).data, {f}) : lust_f_write_str({f}, {}))",
+                    lit("Any { .. }")
+                )
+            }
+        }
         _ if debug => {
             need(Glue::Debug, t);
             format!("dbg_{}({f}, {v})", mangle(t))

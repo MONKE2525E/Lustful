@@ -9753,6 +9753,11 @@ fn prove_trait_ref(
         let sized_params = crate::check::sized::env_sized_params(&cx.tys, env, lang.sized);
         return crate::check::sized::is_sized(p, &mut cx.tys, t, &|q| sized_params.contains(&q));
     }
+    // The builtin object impl: `dyn P` implements `P` and every
+    // supertrait of `P` (the fmt traits included), with no impl record.
+    if index.dyn_object_impl_holds(&mut cx.tys, tr) {
+        return true;
+    }
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {
         let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };

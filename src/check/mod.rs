@@ -3631,6 +3631,11 @@ impl<'p> Ctx<'p> {
         // every supertrait of `P`, with no impl behind it; calls go
         // through the vtable.
         if let Some(pr) = object::principal_of(&self.tys, self_ty) {
+            // The fmt traits are supertraits with no super slot (the
+            // vtable header shims in check/object.rs).
+            if (tr.def == lang.debug || tr.def == lang.display) && object::principal_has_supertrait(p, pr.def, tr.def) {
+                return Selection::ParamEvidence(usize::MAX);
+            }
             let want = object::with_self(&mut self.tys, tr, DYN_SELF);
             let want = TraitRef { bindings: EMPTY_BINDINGS, ..want };
             let holds = if pr.def == want.def {
@@ -19882,6 +19887,11 @@ impl<'p> SolveCx for Ctx<'p> {
         // The object candidate (`dyn P` implements `P` and its
         // supertraits) has no impl record, as in `select_obligation`.
         if let Some(pr) = object::principal_of(&self.tys, self_ty) {
+            // The fmt traits are supertraits with no super slot (the
+            // vtable header shims in check/object.rs).
+            if (tr.def == lang.debug || tr.def == lang.display) && object::principal_has_supertrait(p, pr.def, tr.def) {
+                return Some(true);
+            }
             let want = object::with_self(&mut self.tys, tr, DYN_SELF);
             let want = TraitRef { bindings: EMPTY_BINDINGS, ..want };
             let snap = self.snapshot_vars();

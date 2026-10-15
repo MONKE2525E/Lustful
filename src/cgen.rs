@@ -3206,6 +3206,20 @@ impl FnGen<'_, '_> {
             Err(()) => c_size_align(p, &ct),
         };
         let mut words = vec![drop, format!("(void *)(uintptr_t){size}"), format!("(void *)(uintptr_t){align}")];
+        // The fmt header shims (`VT_FMT_DEBUG`, `VT_FMT_DISPLAY` in
+        // check/object.rs): the concrete type's fmt glue behind a
+        // principal with that supertrait, else 0.
+        let info = p.gx.dyn_infos.get(&vt.principal.def);
+        for (has, kind) in
+            [(info.is_some_and(|i| i.fmt_debug), FmtKind::Debug), (info.is_some_and(|i| i.fmt_display), FmtKind::Display)]
+        {
+            if has {
+                let shim = self.vt_fmt_shim(&name, &ct, kind);
+                words.push(format!("(void *){shim}"));
+            } else {
+                words.push("0".to_string());
+            }
+        }
         words.extend(supers.iter().map(|s| format!("(void *){s}")));
         // A `dyn Any` vtable holds the value's type id (`object::VT_ANY_ID`).
         if vt.principal.def == p.gx.lang.any {
@@ -3230,6 +3244,19 @@ impl FnGen<'_, '_> {
         let _ = writeln!(self.prelude, "/* vtable: {} as {tn} */", ty_name(p, &p.tys, vt.self_ty));
         let _ = writeln!(self.prelude, "static const void *const {name}[] = {{ {} }};", words.join(", "));
         self.vtables.insert(vid, name.clone());
+        name
+    }
+
+    /// One fmt header shim: formats the erased value with the concrete
+    /// type's own Debug or Display glue (`fmt_expr` on its C type), in
+    /// the `int (void *self, lust_Formatter *f)` shape the fmt glue
+    /// calls through `VT_FMT_DEBUG` / `VT_FMT_DISPLAY`.
+    fn vt_fmt_shim(&mut self, vt_name: &str, ct: &CTy, kind: FmtKind) -> String {
+        let name = format!("{vt_name}_fmt{}", if kind == FmtKind::Debug { "D" } else { "S" });
+        collect_types(ct, &mut self.sig_types);
+        let v = format!("(({ }*)self)", ctype(ct));
+        let e = fmt::fmt_expr(ct, kind, "f", &v, &mut |g, t| self.want(g, t));
+        let _ = writeln!(self.prelude, "static int {name}(void *self, lust_Formatter *f) {{ return {e}; }}");
         name
     }
 
