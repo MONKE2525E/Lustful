@@ -10358,6 +10358,11 @@ fn prove_trait_ref(
                 seen.push((tr.def, t));
             }
             let all = parts.into_iter().all(|e| {
+                // A derived Adt's field whose type did not resolve: that
+                // error is reported already (as in `prove_field_trait`).
+                if derived_adt && cx.tys.kind(e) == TyKind::Error {
+                    return true;
+                }
                 let args = if two_args {
                     cx.tys.intern_args(&[GenericArg::Ty(e), GenericArg::Ty(e)])
                 } else {
