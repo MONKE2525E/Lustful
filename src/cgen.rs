@@ -82,6 +82,11 @@ pub enum CTy {
     /// A `vec::IntoIter<T>` (W-STD-A): the runtime's `lust_VecIter`,
     /// the moved-in buffer plus the front index of what it still owns.
     VecIter(Box<CTy>),
+    /// An `array::IntoIter<T, N>` (fx-array-iter): a generated struct
+    /// of the array itself and the front and back indexes of what it
+    /// still owns (`f0`, `f1`, `f2`, as the tuple form held them).
+    /// Its own type so drop and clone glue touch only that range.
+    ArrayIter(Box<CTy>, u64),
     /// A `vec::Drain<T>`: the runtime's `lust_VecDrain`, a pointer to
     /// the drained Vec plus its range bookkeeping.
     VecDrain(Box<CTy>),
@@ -282,6 +287,16 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
     if k == IterKind::VecIntoIter {
         return CTy::VecIter(Box::new(cty(tys, arg(0))));
     }
+    if k == IterKind::ArrayIntoIter {
+        let n = match tys.kind(arg(1)) {
+            crate::ty::TyKind::Array(_, c) => match tys.const_kind(c) {
+                crate::ty::ConstKind::Int(n) => n as u64,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        return CTy::ArrayIter(Box::new(cty(tys, arg(0))), n);
+    }
     // The hash iterators' state is the core's (cgen/hash.rs).
     if k.is_hash() {
         return CTy::Hash(crate::ty::hash::HashTy::of_iter(k), args.iter().map(|&a| cty(tys, a)).collect());
@@ -447,6 +462,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Boxed(inner) => format!("{}*", ctype(inner)),
         CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::VecIter(_) => "lust_VecIter".into(),
+        CTy::ArrayIter(..) => format!("AI_{}", mangle(t)),
         CTy::VecDrain(_) | CTy::StrDrain => "lust_VecDrain".into(),
         CTy::Weak(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::RefCell(inner) => format!("RCL_{}", mangle(inner)),
@@ -542,6 +558,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Boxed(e) => tok(s, "Bx", &[e]),
         CTy::Rc(e) => tok(s, "Rc", &[e]),
         CTy::VecIter(e) => tok(s, "VI", &[e]),
+        CTy::ArrayIter(e, n) => tok(s, &format!("AI{n}"), &[e]),
         CTy::VecDrain(e) => tok(s, "VD", &[e]),
         CTy::StrDrain => tok(s, "SDr", &[]),
         CTy::Weak(e) => tok(s, "Wk", &[e]),
@@ -603,6 +620,10 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             collect_types(r, out);
         }
         CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) => collect_types(e, out),
+        CTy::ArrayIter(e, n) => {
+            out.insert(t.clone());
+            collect_types(&CTy::Array(e.clone(), *n), out);
+        }
         CTy::Weak(e) => {
             out.insert(CTy::Rc(e.clone()));
             collect_types(e, out);
@@ -644,7 +665,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
-        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) => {
+        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) | CTy::ArrayIter(..) => {
             out.push(t.clone())
         }
         // `Rc`, `Weak`, and the `RefCell` guards are pointers to forward-
@@ -685,6 +706,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         CTy::Result(a, b) => is_copy_c(p, a) && is_copy_c(p, b),
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
         CTy::Array(e, _) => is_copy_c(p, e),
+        CTy::ArrayIter(e, _) => is_copy_c(p, e),
         CTy::Adt(a) => p.adt(*a).derives.copy,
         _ => false,
     }
@@ -698,7 +720,7 @@ fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
         // Every sync type holds an `UnsafeCell` inline.
         CTy::Sync(..) => false,
         CTy::Tuple(es) => es.iter().all(|e| is_freeze_c(p, e, seen)),
-        CTy::Array(e, _) | CTy::Option(e) => is_freeze_c(p, e, seen),
+        CTy::Array(e, _) | CTy::Option(e) | CTy::ArrayIter(e, _) => is_freeze_c(p, e, seen),
         CTy::Result(a, b) => is_freeze_c(p, a, seen) && is_freeze_c(p, b, seen),
         CTy::Adt(a) => {
             if !seen.insert(*a) {
@@ -724,6 +746,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
         CTy::Array(e, _) => needs_drop_c(p, e),
+        CTy::ArrayIter(e, _) => needs_drop_c(p, e),
         CTy::Adt(a) => {
             p.gx.drop_methods.contains_key(a) || p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty)))
         }
@@ -1011,6 +1034,11 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
                 layout::tuple_layout(&fields?).ok()
             }
+            // As the tuple of its stored fields (array, front, back).
+            CTy::ArrayIter(e, n) => {
+                let arr = go(p, &CTy::Array(e.clone(), *n), seen)?;
+                layout::tuple_layout(&[arr, layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize)]).ok()
+            }
             CTy::Array(e, 0) => Some(plain_layout(0, go(p, e, seen).map_or(1, |l| l.align))),
             CTy::Array(e, n) => layout::array_layout(&go(p, e, seen)?, *n).ok(),
             CTy::Option(e) => {
@@ -1273,6 +1301,11 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let (es, ea) = go(p, e, seen);
                 (es * (*n).max(1), ea)
             }
+            CTy::ArrayIter(e, n) => {
+                let (es, ea) = go(p, e, seen);
+                let align = ea.max(8);
+                (align_up(align_up(es * (*n).max(1), 8) + 16, align), align)
+            }
             CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn | CTy::Unsized(..) => (16, 8),
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
@@ -1339,6 +1372,7 @@ fn has_zero_len_array(p: &Program, t: &CTy) -> bool {
     match t {
         CTy::Array(_, 0) => true,
         CTy::Array(e, _) => has_zero_len_array(p, e),
+        CTy::ArrayIter(e, n) => *n == 0 || has_zero_len_array(p, e),
         CTy::Tuple(es) => es.iter().any(|e| has_zero_len_array(p, e)),
         CTy::Adt(a) => p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| has_zero_len_array(p, &cty(&p.tys, f.ty)))),
         _ => false,
@@ -1875,6 +1909,14 @@ impl FnGen<'_, '_> {
                     e = format!("{e}.f{i}");
                     t = es.get(i as usize)?.clone();
                 }
+                (Step::Field(i), CTy::ArrayIter(el, n)) => {
+                    e = format!("{e}.f{i}");
+                    t = match i {
+                        0 => CTy::Array(el, n),
+                        1 | 2 => CTy::Int(IntTy::Usize),
+                        _ => return None,
+                    };
+                }
                 (Step::Field(_), CTy::Option(inner)) => {
                     variant = None;
                     e = variant_field(self.p, &t, &e, 1, 0);
@@ -2019,6 +2061,14 @@ impl FnGen<'_, '_> {
                     }
                 }
             }
+            // An `array::IntoIter`'s still-owned part is a range, not
+            // a set of move paths: its glue drops exactly that range.
+            CTy::ArrayIter(..) => {
+                if needs_drop_c(self.p, t) {
+                    self.want(Glue::Drop, t);
+                    let _ = write!(out, " drop_{}(&{e});", mangle(t));
+                }
+            }
             CTy::Boxed(inner) => {
                 // Drop the still-owned part behind the pointer,
                 // then free the allocation itself.
@@ -2124,6 +2174,13 @@ impl FnGen<'_, '_> {
                 (Proj::Field(i), CTy::Tuple(es)) => {
                     e = format!("{e}.f{i}");
                     t = es[*i as usize].clone();
+                }
+                (Proj::Field(i), CTy::ArrayIter(el, n)) => {
+                    e = format!("{e}.f{i}");
+                    t = match *i {
+                        0 => CTy::Array(el, n),
+                        _ => CTy::Int(IntTy::Usize),
+                    };
                 }
                 (Proj::Index(l), CTy::Array(el, n)) => {
                     let loc = self.index_loc(*l, loc);
@@ -3657,7 +3714,7 @@ impl FnGen<'_, '_> {
             B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce => {
                 unreachable!("split builtins emit in cgen/split.rs")
             }
-            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN => {
+            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice => {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
             B::ConvInto => unreachable!("expanded per conversion (lower/iter.rs)"),
@@ -6885,6 +6942,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             }
             CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
             CTy::Array(e, _) => collect_types(e, &mut inner),
+            CTy::ArrayIter(e, n) => collect_types(&CTy::Array(e.clone(), *n), &mut inner),
             CTy::Slice(e) => collect_types(e, &mut inner),
             CTy::Rc(e) | CTy::RefCell(e) => collect_types(e, &mut inner),
             CTy::FnPtr(ps, r) => {
@@ -6913,7 +6971,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
         // Every struct-typed C type too: a closure env holds references
         // (`&(captures..)`, `&Result<..>`) that can sit in a type emitted
         // before the referenced type's own definition.
-        if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) = t {
+        if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) | CTy::ArrayIter(..) = t {
             let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
         }
         match t {
@@ -6949,6 +7007,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             }
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
+            CTy::ArrayIter(e, n) => by_value_deps(&CTy::Array(e.clone(), *n), &mut deps),
             CTy::Slice(e) => by_value_deps(e, &mut deps),
             CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
             CTy::Sync(k, e) if k.is_cell_struct() => by_value_deps(e, &mut deps),
@@ -7027,6 +7086,25 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 }
                 None => {
                     let _ = writeln!(out, "typedef struct {0} {{ {1} v[{2}]; }} {0};", ctype(t), ctype(e), (*n).max(1));
+                }
+            },
+            CTy::ArrayIter(e, n) => {
+                let at = CTy::Array(e.clone(), *n);
+                let ct = ctype(t);
+                match c_layout(p, t) {
+                    Some(l) => {
+                        let es = [at.clone(), CTy::Int(IntTy::Usize), CTy::Int(IntTy::Usize)];
+                        let fields: Vec<(String, Layout, u64)> = es
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| (format!("{} f{i}", ctype(e)), field_layout(p, e), l.field_offsets[i]))
+                            .collect();
+                        let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
+                        layout_assert(out, &ct, &l);
+                    }
+                    None => {
+                        let _ = writeln!(out, "typedef struct {ct} {{ {} f0; uint64_t f1; uint64_t f2; }} {ct};", ctype(&at));
+                    }
                 }
             },
             CTy::Slice(e) => {
@@ -7399,6 +7477,15 @@ fn glue_def_value(
                         let _ = writeln!(body, "  for (uint64_t i = 0; i < {n}; i++) drop_{}(&p->v[i]);", mangle(e));
                     }
                 }
+                // `array::IntoIter` (fx-array-iter): what `next` and
+                // `next_back` have not moved out yet, `front..back` in
+                // order, as core's drop runs `for _ in self {}`.
+                CTy::ArrayIter(e, _) => {
+                    if needs_drop_c(p, e) {
+                        need(Glue::Drop, e);
+                        let _ = writeln!(body, "  for (uint64_t i = p->f1; i < p->f2; i++) drop_{}(&p->f0.v[i]);", mangle(e));
+                    }
+                }
                 CTy::Adt(a) => {
                     // A user `Drop` impl runs before the fields drop
                     // (W-TRAITS-CORE through W-CGEN: the glue reads
@@ -7541,6 +7628,17 @@ fn glue_def_value(
                     if !is_copy_c(p, e) {
                         let c = clone_of(e, "p->v[i]", &mut need);
                         let _ = writeln!(body, "  for (uint64_t i = 0; i < {n}; i++) r.v[i] = {c};");
+                    }
+                    body.push_str("  return r;\n");
+                }
+                // `array::IntoIter`'s Clone clones only the elements
+                // it still owns; the moved-out slots keep stale bytes
+                // the clone's own range never drops.
+                CTy::ArrayIter(e, _) => {
+                    let _ = writeln!(body, "  {ct} r = *p;");
+                    if !is_copy_c(p, e) || written(e) {
+                        let c = clone_of(e, "p->f0.v[i]", &mut need);
+                        let _ = writeln!(body, "  for (uint64_t i = p->f1; i < p->f2; i++) r.f0.v[i] = {c};");
                     }
                     body.push_str("  return r;\n");
                 }

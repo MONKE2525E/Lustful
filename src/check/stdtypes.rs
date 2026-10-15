@@ -48,6 +48,9 @@ pub fn resolve_iter_path(
 ) -> Result<Ty, Diag> {
     let shown = crate::intern::source_name(interner.get(seg.name)).to_string();
     let (mut ty_args, mut lts): (Vec<Ty>, Vec<ast::Lifetime>) = (Vec::new(), Vec::new());
+    // `array::IntoIter<T, N>` (fx-array-iter) is the one std iterator
+    // written with a const argument.
+    let mut const_args: Vec<crate::ty::ConstId> = Vec::new();
     match &seg.args {
         GenericArgs::None => {}
         GenericArgs::Angle(args) => {
@@ -57,6 +60,9 @@ pub fn resolve_iter_path(
                         ty_args.push(crate::check::generics::resolve_scoped(ast, interner, known, cx, tys, *t, scope)?)
                     }
                     ast::GenericArg::Lifetime(lt) => lts.push(*lt),
+                    ast::GenericArg::Const(e) if kind == Some(IterKind::ArrayIntoIter) => {
+                        const_args.push(crate::check::generics::resolve_const_arg(ast, interner, known, tys, scope, *e, span)?)
+                    }
                     _ => {
                         return Err(Diag::new(
                             "L0110",
@@ -103,6 +109,14 @@ pub fn resolve_iter_path(
             "Match the number of parameters in the definition.",
         ));
     }
+    if kind == Some(IterKind::ArrayIntoIter) && const_args.len() != 1 {
+        return Err(Diag::new(
+            "L0110",
+            span,
+            format!("`{shown}` takes 1 const argument(s), but {} were given", const_args.len()),
+            "Match the number of parameters in the definition.",
+        ));
+    }
     // In a region signature the written args keep their regions; the
     // checks and the derived item args read their erased forms.
     let keep = matches!(scope.regions, crate::check::generics::RegionMode::Keep { .. });
@@ -137,6 +151,7 @@ pub fn resolve_iter_path(
                     | IterKind::RangeTo
                     | IterKind::RangeFull
                     | IterKind::RangeToInclusive
+                    | IterKind::ArrayIntoIter
                     | IterKind::OptionIter
                     | IterKind::OptionIterMut
                     | IterKind::OptionIntoIter
@@ -155,6 +170,11 @@ pub fn resolve_iter_path(
             }
             let mut extra: Vec<Ty> = Vec::new();
             match k {
+                // The second lust arg is the array type itself.
+                IterKind::ArrayIntoIter => {
+                    let arr = tys.intern(TyKind::Array(erased_args[0], const_args[0]));
+                    extra.push(arr);
+                }
                 IterKind::Map | IterKind::FilterMap => {
                     let TyKind::FnPtr(sig) = tys.kind(erased_args[1]) else {
                         return Err(unsupported("with a function type that is not a fn pointer"));

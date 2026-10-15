@@ -634,6 +634,10 @@ pub enum Builtin {
     VecDrainNextBack,
     VecDrainLen,
     VecDrainAsSlice,
+    /// `array::IntoIter::as_slice` and `as_mut_slice` (fx-array-iter):
+    /// the remaining range as a slice; expanded in lower/iter.rs.
+    /// The result type's mutability tells shared from mutable.
+    ArrayIterAsSlice,
     StrDrainNext,
     StrDrainNextBack,
     StrDrainAsStr,

@@ -6003,6 +6003,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::VecDrain
             | B::StringDrain
             | B::VecDrainAsSlice
+            | B::ArrayIterAsSlice
             | B::StrDrainAsStr
     )
 }

@@ -4071,7 +4071,15 @@ impl<'p> Lower<'p> {
             let ity = self.ty(iter);
             let h = crate::ty::iter::hash_for_iter(&mut self.body.tys, ity).flatten();
             let o = crate::ty::iter::opt_res_iter(&mut self.body.tys, ity);
-            h.or(o).or_else(|| {
+            // An array by value (fx-array-iter): its `array::IntoIter`,
+            // for every element type and length. Its drop gives the
+            // remaining elements front to back on `break`, `return`,
+            // and panic exits, as rustc's desugaring does.
+            let a = match self.kind(ity) {
+                TyKind::Array(el, _) => Some(crate::ty::iter::mk_iter(&mut self.body.tys, crate::ty::iter::IterKind::ArrayIntoIter, &[el, ity])),
+                _ => None,
+            };
+            h.or(o).or(a).or_else(|| {
                 (crate::ty::iter::is_iter(&self.body.tys, ity) || self.body.tys.boxed_slice_elem(ity).is_some() || self.recv_iterable(ity).is_some())
                     .then_some(ERROR)
             })
@@ -4082,6 +4090,15 @@ impl<'p> Lower<'p> {
             // boxed slice by value iterates its `vec::IntoIter` (Rust 2024).
             let recv = self.recv_iterable(self.ty(iter));
             let (it_ty, it) = match self.body.tys.boxed_slice_elem(self.ty(iter)) {
+                // An array by value (fx-array-iter): first make its
+                // `array::IntoIter`.
+                _ if crate::ty::iter::iter_parts(&self.body.tys, hash_it).is_some_and(|(k, _)| k == crate::ty::iter::IterKind::ArrayIntoIter) => {
+                    let it = self.temp(hash_it);
+                    let src = self.temp(self.ty(iter));
+                    self.expr_into(iter, Some(&Place::local(src)));
+                    self.call_into(CallTarget::Builtin(Builtin::IterArrayIntoIter), vec![Operand::Move(Place::local(src))], Place::local(it), span);
+                    (hash_it, it)
+                }
                 // An `Option` or `Result` (fx-option-rest): first
                 // make its one-item iterator.
                 _ if crate::ty::iter::iter_parts(&self.body.tys, hash_it).is_some_and(|(k, _)| crate::ty::iter::is_opt_res(k)) => {
@@ -4177,73 +4194,17 @@ impl<'p> Lower<'p> {
             );
         } else {
             // `for x in &v` / `&mut v`: index loop over a reference held for the whole loop.
+            // An array by value takes the `array::IntoIter` arm above.
             let it_ty = self.ty(iter);
-            let by_value_array = matches!(self.kind(it_ty), TyKind::Array(..));
             let m = matches!(self.kind(it_ty), TyKind::Ref(_, Mut::Mut, _));
             let vref = self.temp(it_ty);
             self.expr_into(iter, Some(&Place::local(vref)));
-            // By-value iteration over an array of non-Copy elements moves
-            // each element out once. A dynamic index loop cannot express
-            // that to the borrow checker, so small arrays unroll: one
-            // copy of the body per element, each moving its own const
-            // index. Larger non-Copy arrays keep the index loop and are
-            // rejected by the borrow checker for now.
-            if by_value_array && !is_copy(self.p, &self.body.tys, item_ty) {
-                let n = match self.kind(it_ty) {
-                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
-                        ConstKind::Int(n) => Some(n as usize),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                if let Some(n) = n.filter(|&n| n <= 32) {
-                    let heads: Vec<Bb> = (0..n).map(|_| self.new_block()).collect();
-                    self.goto(heads.first().copied().unwrap_or(exit), span);
-                    for (i, &hb) in heads.iter().enumerate() {
-                        self.cur = hb;
-                        let idx = self.const_usize(i as u64, span);
-                        let elem = Place::local(vref).project(Proj::Index(idx));
-                        let op = self.operand_from(elem, item_ty);
-                        self.assign(Place::local(item), Rvalue::Use(op), span);
-                        let next = heads.get(i + 1).copied().unwrap_or(exit);
-                        self.scopes.push(Vec::new());
-                        self.bind_pat(pat, Place::local(item));
-                        self.loops.push(LoopInfo {
-                            break_bb: exit,
-                            continue_bb: next,
-                            dest: None,
-                            depth: self.scopes.len() - 1,
-                            label: label.map(|l| (l.name, l.span)),
-                            is_block: false,
-                        });
-                        self.block_into(body, None);
-                        self.loops.pop();
-                        self.pop_scope(span);
-                        self.goto(next, span);
-                    }
-                    self.cur = exit;
-                    self.pop_scope(span);
-                    self.unit(dest, span);
-                    return;
-                }
-            }
             let len = self.temp(USIZE);
-            if by_value_array {
-                let n = match self.kind(it_ty) {
-                    TyKind::Array(_, c) => match self.body.tys.const_kind(c) {
-                        ConstKind::Int(n) => n as u64,
-                        _ => 0,
-                    },
-                    _ => 0,
-                };
-                self.assign(Place::local(len), Rvalue::Use(Operand::Const(Const::Int(n as u128, IntTy::Usize))), span);
-            } else {
-                let shared = self.ref_ty(false, self.peel(it_ty, 1));
-                let sref = self.temp(shared);
-                self.assign(Place::local(sref), Rvalue::Ref(false, Place::local(vref).deref()), span);
-                let len_builtin = if self.body.tys.vec_elem(self.peel(it_ty, 1)).is_some() { Builtin::VecLen } else { Builtin::SliceLen };
-                self.call_into(CallTarget::Builtin(len_builtin), vec![Operand::Copy(Place::local(sref))], Place::local(len), span);
-            }
+            let shared = self.ref_ty(false, self.peel(it_ty, 1));
+            let sref = self.temp(shared);
+            self.assign(Place::local(sref), Rvalue::Ref(false, Place::local(vref).deref()), span);
+            let len_builtin = if self.body.tys.vec_elem(self.peel(it_ty, 1)).is_some() { Builtin::VecLen } else { Builtin::SliceLen };
+            self.call_into(CallTarget::Builtin(len_builtin), vec![Operand::Copy(Place::local(sref))], Place::local(len), span);
             let idx = self.temp(USIZE);
             self.assign(Place::local(idx), Rvalue::Use(Operand::Const(Const::Int(0, IntTy::Usize))), span);
             self.goto(head, span);
@@ -4252,14 +4213,8 @@ impl<'p> Lower<'p> {
             let b = &mut self.body.blocks[self.cur.0 as usize];
             b.term = Terminator::If(Operand::Copy(Place::local(c)), bodyb, exit);
             self.cur = bodyb;
-            if by_value_array {
-                let elem = Place::local(vref).project(Proj::Index(idx));
-                let op = self.operand_from(elem, item_ty);
-                self.assign(Place::local(item), Rvalue::Use(op), span);
-            } else {
-                let elem = Place::local(vref).deref().project(Proj::Index(idx));
-                self.assign(Place::local(item), Rvalue::Ref(m, elem), span);
-            }
+            let elem = Place::local(vref).deref().project(Proj::Index(idx));
+            self.assign(Place::local(item), Rvalue::Ref(m, elem), span);
             self.assign(
                 Place::local(idx),
                 Rvalue::Bin(BinOp::Add, Operand::Copy(Place::local(idx)), Operand::Const(Const::Int(1, IntTy::Usize))),

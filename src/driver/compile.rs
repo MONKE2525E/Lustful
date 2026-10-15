@@ -3654,6 +3654,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     21u8.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::ArrayIter(x, n) => {
+                    (45u8, n).hash(h);
+                    inner(h, p, x);
+                }
                 cgen::CTy::VecDrain(x) => {
                     43u8.hash(h);
                     inner(h, p, x);

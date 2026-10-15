@@ -742,16 +742,9 @@ impl<'p> Ctx<'p> {
                             found = Some((B::IterVecIntoIter, j, it::mk_iter(&mut self.tys, IterKind::VecIntoIter, &[el])));
                             break;
                         }
-                        // An array by value (`array::IntoIter`, W-STD-B):
-                        // Copy elements only (the store has no per-element
-                        // drop state yet).
+                        // An array by value (`array::IntoIter`,
+                        // fx-array-iter): every element type.
                         TyKind::Array(..) if j == 0 => {
-                            if !self.array_iter_elem_ok(el, span) {
-                                for &a in args {
-                                    self.expr(a, None);
-                                }
-                                return Some(ERROR);
-                            }
                             found = Some((B::IterArrayIntoIter, 0, it::mk_iter(&mut self.tys, IterKind::ArrayIntoIter, &[el, t])));
                             break;
                         }
@@ -802,7 +795,7 @@ impl<'p> Ctx<'p> {
         let by_value = !matches!(
             n,
             "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek" | "size_hint" | "len"
-                | "as_slice" | "as_str"
+                | "as_slice" | "as_mut_slice" | "as_str"
         );
         // A by-value method through a reference would use `&mut I:
         // Iterator` (`by_ref`), which lust does not model yet.
@@ -849,11 +842,23 @@ impl<'p> Ctx<'p> {
                 }
                 (B::IterLen, vec![], USIZE)
             }
-            "as_slice" => {
-                let Some((K::VecDrain, a)) = it::iter_parts(&self.tys, base) else { return self.iter_unknown(n, span, base, args) };
-                let sl = self.tys.intern(TyKind::Slice(a[0]));
-                let r = self.tys.mk_ref(false, sl);
-                (B::VecDrainAsSlice, vec![], r)
+            "as_slice" | "as_mut_slice" => {
+                let m = n == "as_mut_slice";
+                match it::iter_parts(&self.tys, base) {
+                    Some((K::VecDrain, a)) if !m => {
+                        let sl = self.tys.intern(TyKind::Slice(a[0]));
+                        let r = self.tys.mk_ref(false, sl);
+                        (B::VecDrainAsSlice, vec![], r)
+                    }
+                    // `array::IntoIter` (fx-array-iter): the slice of
+                    // the elements not yet yielded, as core gives it.
+                    Some((K::ArrayIntoIter, a)) => {
+                        let sl = self.tys.intern(TyKind::Slice(a[0]));
+                        let r = self.tys.mk_ref(m, sl);
+                        (B::ArrayIterAsSlice, vec![], r)
+                    }
+                    _ => return self.iter_unknown(n, span, base, args),
+                }
             }
             "as_str" => {
                 let Some((K::StringDrain, _)) = it::iter_parts(&self.tys, base) else { return self.iter_unknown(n, span, base, args) };
@@ -933,12 +938,6 @@ impl<'p> Ctx<'p> {
                 };
                 if args.len() != 1 {
                     self.err("L0105", span, format!("`{n}` takes 1 argument"), "Pass the other iterator.");
-                }
-                if let Some((IterKind::ArrayIntoIter, ta)) = it::iter_parts(&self.tys, other)
-                    && !it::is_iter(&self.tys, at)
-                    && !self.array_iter_elem_ok(ta[0], self.span(a))
-                {
-                    return self.iter_bail(&args[1..]);
                 }
                 let oi = self.iter_item(other);
                 if n == "chain" && !self.unify(oi, item) {
@@ -1339,29 +1338,6 @@ impl<'p> Ctx<'p> {
         Some(self.normalize_here(item))
     }
 
-    /// True when an array by value can be iterated (`array::IntoIter`,
-    /// W-STD-B): its elements are Copy (no per-element drop state
-    /// yet); an element type still unknown is checked at body end.
-    /// Otherwise reports L0640.
-    pub(super) fn array_iter_elem_ok(&mut self, el: Ty, span: Span) -> bool {
-        let el = self.deep(el);
-        if matches!(self.kind(el), TyKind::Infer(_)) {
-            self.deferred_copy.push((el, span));
-            return true;
-        }
-        if is_copy(self.p, &self.tys, el) || matches!(self.kind(el), TyKind::Error) {
-            return true;
-        }
-        let tn = self.tn(el);
-        self.err(
-            "L0640",
-            span,
-            format!("iterating an array of `{tn}` by value is not implemented yet (only Copy elements)"),
-            "Iterate with `.iter()`, or collect the array into a Vec first.",
-        );
-        false
-    }
-
     /// A fresh closure-argument type with the pending obligations of
     /// `F: FnMut(inputs..) -> output`. The closure's arguments are items
     /// (or `&item`, see `fn_mut_param_ref`): free regions, which the
@@ -1417,8 +1393,7 @@ impl<'p> Ctx<'p> {
         if let Some(el) = self.tys.vec_elem(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::VecIntoIter, &[el]));
         }
-        // An array by value (`array::IntoIter`, W-STD-B); the caller
-        // owes the Copy check on its element.
+        // An array by value (`array::IntoIter`, fx-array-iter).
         if let TyKind::Array(el, _) = self.kind(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::ArrayIntoIter, &[el, t]));
         }
@@ -1434,22 +1409,14 @@ impl<'p> Ctx<'p> {
 
     /// The `IntoIter` of a `flatten` or `flat_map` inner value: what
     /// `zip` takes, or `option::IntoIter` for an Option. Anything else is
-    /// L0612 (an array of non-Copy elements L0640), and None.
+    /// L0612, and None.
     fn flat_inner(&mut self, t: Ty, span: Span) -> Option<Ty> {
         let t = self.deep(t);
         if let Some(el) = self.tys.option_elem(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::OptionIntoIter, &[el]));
         }
         match self.into_iter_ty(t) {
-            Some(u) => {
-                if let Some((IterKind::ArrayIntoIter, ua)) = it::iter_parts(&self.tys, u)
-                    && !it::is_iter(&self.tys, t)
-                    && !self.array_iter_elem_ok(ua[0], span)
-                {
-                    return None;
-                }
-                Some(u)
-            }
+            Some(u) => Some(u),
             None => {
                 if !matches!(self.kind(t), TyKind::Error) {
                     let tn = self.tn(t);
@@ -1834,11 +1801,6 @@ impl<'p> Ctx<'p> {
             return Some(ERROR);
         };
         if it == ERROR {
-            return Some(ERROR);
-        }
-        if let TyKind::Array(el, _) = self.kind(at)
-            && !self.array_iter_elem_ok(el, aspan)
-        {
             return Some(ERROR);
         }
         let item = self.iter_item(it);

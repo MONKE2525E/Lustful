@@ -7011,8 +7011,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
     // IntoIterator for the builtin collections, as alloc and core
     // declare it: Vec<T> by value (vec::IntoIter<T>), &Vec<T> and &[T]
     // (slice::Iter), &mut Vec<T> and &mut [T] (slice::IterMut). Their
-    // `into_iter` stays a builtin call. Arrays wait for const params
-    // in selection.
+    // `into_iter` stays a builtin call.
     {
         use crate::ty::iter::{IterKind as K, mk_iter};
         let t = p.tys.intern(TyKind::Param(ParamId(0)));
@@ -7032,6 +7031,35 @@ pub fn add_synthetic_impls(p: &mut Program) {
         for (self_pat, it, item) in entries {
             let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, it)];
             insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g1.clone(), assoc, Synthetic::Lang, false, span);
+        }
+    }
+    // `IntoIterator` for arrays and their references (fx-array-iter),
+    // as core declares it since edition 2021: `[T; N]` by value is
+    // `array::IntoIter` (item `T`, for every `T`), `&[T; N]` is
+    // `slice::Iter`, `&mut [T; N]` is `slice::IterMut`. Selection and
+    // Item/IntoIter only; `into_iter` and `for` stay builtin.
+    {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        let t = p.tys.intern(TyKind::Param(ParamId(0)));
+        let n = p.tys.intern_const(crate::ty::ConstKind::Param(1));
+        let arr_t = p.tys.intern(TyKind::Array(t, n));
+        let (ref_t, mut_t) = (p.tys.mk_ref(false, t), p.tys.mk_ref(true, t));
+        let g = Generics {
+            parent: None,
+            params: vec![
+                ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span },
+                ParamDef { name: p.interner.intern("N"), kind: ParamKind::Const(USIZE), span },
+            ],
+            predicates: Vec::new(),
+        };
+        let entries = [
+            (arr_t, mk_iter(&mut p.tys, K::ArrayIntoIter, &[t, arr_t]), t),
+            (p.tys.mk_ref(false, arr_t), mk_iter(&mut p.tys, K::SliceIter, &[t]), ref_t),
+            (p.tys.mk_ref(true, arr_t), mk_iter(&mut p.tys, K::SliceIterMut, &[t]), mut_t),
+        ];
+        for (self_pat, it, item) in entries {
+            let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, it)];
+            insert_synthetic(p, &mut ordinal, lang.into_iterator, self_pat, &[], g.clone(), assoc, Synthetic::Lang, false, span);
         }
     }
     // `IntoIterator` for `Option` and `Result` and their references

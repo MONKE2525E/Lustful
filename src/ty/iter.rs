@@ -93,9 +93,10 @@ pub enum IterKind {
     SetIter,
     /// `hash_set::IntoIter<T>`: item `T`.
     SetIntoIter,
-    /// `array::IntoIter<T, N>` (W-STD-B): args `[T, A]` with `A = [T;
-    /// N]`, item `T`; Copy elements only (check/iter.rs), so no element
-    /// of the stored array needs a drop.
+    /// `array::IntoIter<T, N>` (fx-array-iter): args `[T, A]` with
+    /// `A = [T; N]`, item `T`, for every `T`. Its C type
+    /// (`CTy::ArrayIter`) drops only the stored range the indexes
+    /// still span.
     ArrayIntoIter,
     /// `iter::RepeatN<T>` (W-STD-B): args `[T]`, item `T`; Copy `T` only.
     RepeatN,
@@ -721,8 +722,7 @@ pub fn as_iter_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
     if is_iter(tys, t) {
         return Some(t);
     }
-    // An array by value (`array::IntoIter`; the caller checks the
-    // element is Copy).
+    // An array by value (`array::IntoIter`, fx-array-iter).
     if let TyKind::Array(e, _) = tys.kind(t) {
         return Some(mk_iter(tys, IterKind::ArrayIntoIter, &[e, t]));
     }

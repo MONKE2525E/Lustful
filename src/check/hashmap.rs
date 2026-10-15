@@ -647,11 +647,6 @@ impl<'p> Ctx<'p> {
         if it == ERROR {
             return ERROR;
         }
-        if let TyKind::Array(el, _) = self.kind(at)
-            && !self.array_iter_elem_ok(el, self.span(*a))
-        {
-            return ERROR;
-        }
         let item = crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR);
         let (k, s) = (targs[0], *targs.last().unwrap_or(&UNIT));
         let want = if kind == HashTy::HashMap {
@@ -806,9 +801,8 @@ impl<'p> Ctx<'p> {
 
     /// `HashMap::from(array)` and `HashSet::from(array)` at the table type
     /// `t`: std's `From<[(K, V); N]>` and `From<[T; N]>`, which build the
-    /// table with `RandomState` through `from_iter`. The elements must be
-    /// Copy for now (they iterate as `array::IntoIter`), and the keys
-    /// `Hash + Eq`.
+    /// table with `RandomState` through `from_iter` over the array's
+    /// `array::IntoIter`. The keys must be `Hash + Eq`.
     pub(super) fn hash_from_array_sig(&mut self, t: Ty, args: &[ExprId], span: Span) -> (Vec<Ty>, Ty) {
         let Some((kind, targs)) = hash_parts(&self.tys, t) else { return (vec![], ERROR) };
         let at = match args {
@@ -853,9 +847,6 @@ impl<'p> Ctx<'p> {
         };
         if !self.unify(el, want) {
             self.mismatch(span, want, el);
-            return (vec![at], ERROR);
-        }
-        if !self.array_iter_elem_ok(el, span) {
             return (vec![at], ERROR);
         }
         self.require_hash_key(targs[0], s, span);

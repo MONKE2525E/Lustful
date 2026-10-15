@@ -653,6 +653,17 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             }
             Some(BuiltinTy::Iter(k)) => {
                 let a = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+                // `array::IntoIter<T, N>` (fx-array-iter) prints its
+                // length, which lust stores in the array type arg.
+                if k == crate::ty::iter::IterKind::ArrayIntoIter
+                    && let [t0, arr] = a.as_slice()
+                    && let Some(arr) = arr.as_ty()
+                    && let TyKind::Array(_, c) = tys.kind(arr)
+                    && let ConstKind::Int(n) = tys.const_kind(c)
+                {
+                    let e = t0.as_ty().map_or("_".into(), |e| ty_name(p, tys, e));
+                    return format!("{}<{e}, {n}>", k.display());
+                }
                 let shown: Vec<String> = a.iter().take(k.shown_args()).map(|g| g.as_ty().map_or("_".into(), |e| ty_name(p, tys, e))).collect();
                 if shown.is_empty() { k.display().to_string() } else { format!("{}<{}>", k.display(), shown.join(", ")) }
             }

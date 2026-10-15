@@ -327,11 +327,6 @@ impl<'p> Ctx<'p> {
         if it == ERROR {
             return me_mut;
         }
-        if let TyKind::Array(el, _) = self.kind(at)
-            && !self.array_iter_elem_ok(el, span)
-        {
-            return me_mut;
-        }
         let item = crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR);
         let item = self.deep(item);
         let debug = FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };

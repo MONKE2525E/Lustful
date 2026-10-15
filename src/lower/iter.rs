@@ -108,6 +108,7 @@ fn expands(b: Builtin) -> bool {
             | B::VecExtend
             | B::StringExtend
             | B::IterArrayIntoIter
+            | B::ArrayIterAsSlice
             | B::IterRepeatN
             | B::IterOptRes
             | B::IterLen
@@ -587,6 +588,18 @@ impl Ex<'_, '_> {
                 let (lo, hi) = self.hint(itp, ty)?;
                 let _ = hi;
                 self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(lo))));
+            }
+            // `array::IntoIter::as_slice` and `as_mut_slice`
+            // (fx-array-iter): the stored array's remaining range.
+            B::ArrayIterAsSlice => {
+                let r = arg()?;
+                let (itp, _ty) = self.deref_arg(r)?;
+                let m = matches!(self.body.tys.kind(dest_ty), TyKind::Ref(_, Mut::Mut, _));
+                let f = |i: u32| itp.project(Proj::Field(i));
+                self.assign(
+                    dest,
+                    Rvalue::Subslice { base: f(0), lo: Operand::Copy(f(1)), hi: Some(Operand::Copy(f(2))), inclusive: false, mutable: m },
+                );
             }
             B::RangeStartBound | B::RangeEndBound => {
                 let r = arg()?;
@@ -1421,8 +1434,12 @@ impl Ex<'_, '_> {
                 self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
-            // `array::IntoIter` (Copy elements, W-STD-B): the element at
-            // the front (or back) index.
+            // `array::IntoIter` (fx-array-iter): the element at the
+            // front (or back) index. The read is a `Copy` operand on
+            // purpose: a move out of a dynamic index has no move path
+            // for drop elaboration. Ownership moves by the index
+            // change alone, and the iterator's C drop glue drops only
+            // the range the indexes still span.
             K::ArrayIntoIter => {
                 let c = self.cmp(Lt, Operand::Copy(f(1)), Operand::Copy(f(2)));
                 let (s, n) = self.branch(c);
@@ -1957,17 +1974,25 @@ impl Ex<'_, '_> {
                 }
                 let (ia, ib) = (self.item(a[0])?, self.item(a[1])?);
                 if self.tra(a[0]) && self.tra(a[1]) {
+                    // Both sides random access (Rust's `Zip` over two
+                    // `TrustedRandomAccess` sides): the length fixed at
+                    // `zip` creation bounds the pulls, so each side is
+                    // pulled exactly `len` times. Pulling with `next`
+                    // gives the same items and side effects as std's
+                    // indexed reads, and it advances each side, so a
+                    // side that owns its items (an `array::IntoIter`
+                    // of non-`Copy` elements) drops only what it has
+                    // not yielded when the zip drops.
                     let c = self.cmp(Lt, Operand::Copy(f(2)), Operand::Copy(f(3)));
                     let (s, n) = self.branch(c);
                     self.cur = s;
-                    let i = self.local(USIZE);
-                    self.assign(Place::local(i), Rvalue::Use(Operand::Copy(f(2))));
                     self.assign(f(2), Rvalue::Bin(Add, Operand::Copy(f(2)), Self::usize_c(1)));
-                    let (x, y) = (self.local(ia), self.local(ib));
-                    self.get(f(0), a[0], i, Place::local(x))?;
-                    self.get(f(1), a[1], i, Place::local(y))?;
-                    let ax = self.take(Place::local(x), ia);
-                    let ay = self.take(Place::local(y), ib);
+                    let (oa, ob) = (self.body.tys.mk_option(ia), self.body.tys.mk_option(ib));
+                    let (ta, tb) = (self.local(oa), self.local(ob));
+                    self.next(f(0), a[0], Place::local(ta), false)?;
+                    self.next(f(1), a[1], Place::local(tb), false)?;
+                    let ax = self.take(Self::payload(&Place::local(ta)), ia);
+                    let ay = self.take(Self::payload(&Place::local(tb)), ib);
                     let tup = self.local(item);
                     self.assign(Place::local(tup), Rvalue::TupleAgg(item, vec![ax, ay]));
                     let at = self.take(Place::local(tup), item);
@@ -3126,85 +3151,6 @@ impl Ex<'_, '_> {
             _ => return Err("iterator expansion: size of a non-random-access iterator".into()),
         }
         Ok(Operand::Copy(Place::local(out)))
-    }
-
-    /// `dest = itp.__iterator_get_unchecked(i)` for a random-access
-    /// iterator: the item at index `i` from the current position,
-    /// without moving the position (as Rust's `Zip` uses it).
-    fn get(&mut self, itp: Place, ty: Ty, i: Local, dest: Place) -> R {
-        use crate::ast::BinOp::*;
-        use IterKind as K;
-        let (k, a) = self.kind_args(ty).ok_or("iterator expansion: get on a non-iterator")?;
-        let f = |j: u32| itp.project(Proj::Field(j));
-        match k {
-            K::SliceIter | K::SliceIterMut => {
-                let m = k == K::SliceIterMut;
-                let pl = f(0).deref().project(Proj::Index(i));
-                self.assign(dest, Rvalue::Ref(m, pl));
-            }
-            // `Windows`: `&v[i..i + size]` of the slice left.
-            K::Windows => {
-                let hi = self.local(USIZE);
-                self.assign(Place::local(hi), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Operand::Copy(f(1))));
-                self.assign(dest, Rvalue::Subslice { base: f(0).deref(), lo: Operand::Copy(Place::local(i)), hi: Some(Operand::Copy(Place::local(hi))), inclusive: false, mutable: false });
-            }
-            K::Range => {
-                let off = self.local(a[0]);
-                self.assign(Place::local(off), Rvalue::Cast(Operand::Copy(Place::local(i)), a[0]));
-                self.assign(dest, Rvalue::Bin(Add, Operand::Copy(f(0)), Operand::Copy(Place::local(off))));
-            }
-            K::Map => {
-                let ii = self.item(a[0])?;
-                let x = self.local(ii);
-                self.get(f(0), a[0], i, Place::local(x))?;
-                let ax = self.take(Place::local(x), ii);
-                self.call_fn(a[1], f(1), vec![ax], dest)?;
-            }
-            K::Enumerate => {
-                let ii = self.item(a[0])?;
-                let x = self.local(ii);
-                self.get(f(0), a[0], i, Place::local(x))?;
-                let c = self.local(USIZE);
-                self.assign(Place::local(c), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(i))));
-                let item = self.item(ty)?;
-                let ax = self.take(Place::local(x), ii);
-                self.assign(dest, Rvalue::TupleAgg(item, vec![Operand::Copy(Place::local(c)), ax]));
-            }
-            K::Copied | K::Cloned => {
-                let ii = self.item(a[0])?;
-                let r = self.local(ii);
-                self.get(f(0), a[0], i, Place::local(r))?;
-                if k == K::Copied {
-                    self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(r).deref())));
-                } else {
-                    self.call_builtin(Builtin::Clone, vec![Operand::Copy(Place::local(r))], dest);
-                }
-            }
-            K::Skip => {
-                let j = self.local(USIZE);
-                self.assign(Place::local(j), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(i))));
-                self.get(f(0), a[0], j, dest)?;
-            }
-            K::Zip => {
-                let j = self.local(USIZE);
-                self.assign(Place::local(j), Rvalue::Bin(Add, Operand::Copy(f(2)), Operand::Copy(Place::local(i))));
-                let (ia, ib) = (self.item(a[0])?, self.item(a[1])?);
-                let (x, y) = (self.local(ia), self.local(ib));
-                self.get(f(0), a[0], j, Place::local(x))?;
-                self.get(f(1), a[1], j, Place::local(y))?;
-                let item = self.item(ty)?;
-                let ax = self.take(Place::local(x), ia);
-                let ay = self.take(Place::local(y), ib);
-                self.assign(dest, Rvalue::TupleAgg(item, vec![ax, ay]));
-            }
-            K::ArrayIntoIter => {
-                let j = self.local(USIZE);
-                self.assign(Place::local(j), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(i))));
-                self.assign(dest, Rvalue::Use(Operand::Copy(f(0).project(Proj::Index(j)))));
-            }
-            _ => return Err("iterator expansion: get on a non-random-access iterator".into()),
-        }
-        Ok(())
     }
 
     // ---------- size_hint ----------
