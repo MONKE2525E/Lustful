@@ -1670,12 +1670,40 @@ impl<'p> Ctx<'p> {
     /// Facts about a closure type for calls and selection: its kind,
     /// inputs, and output. Closures of this body answer from the
     /// checker's own record; others from the registered program table.
-    pub(super) fn closure_facts(&self, def: DefId) -> Option<(ClosureKind, Vec<Ty>, Ty)> {
+    pub(super) fn closure_facts(&mut self, def: DefId) -> Option<(ClosureKind, Vec<Ty>, Ty)> {
         if let Some(c) = self.closures.iter().find(|c| c.def == def) {
             return Some((c.kind, c.inputs.clone(), c.output));
         }
         let g = self.p.gx.closures.get(&def)?;
-        Some((g.kind, g.inputs.clone(), g.output))
+        let (kind, inputs, output) = (g.kind, g.inputs.clone(), g.output);
+        // A generic definer's hidden closure, revealed at a call: its
+        // signature names the definer's params, which the call's args
+        // give (`opaque_closure_args`).
+        // A lost method probe also revealed the call, at vars nothing
+        // decides: the args that resolve win.
+        let mut found: Option<Vec<GenericArg>> = None;
+        for (d, a) in self.opaque_closure_args.clone() {
+            if d != def {
+                continue;
+            }
+            let args: Vec<GenericArg> = self.tys.args(a).to_vec();
+            let resolved = args.iter().filter_map(|g| g.as_ty()).all(|t| {
+                let t = self.deep(t);
+                !self.tys.flags(t).contains_infer()
+            });
+            if resolved || found.is_none() {
+                found = Some(args);
+            }
+            if resolved {
+                break;
+            }
+        }
+        if let Some(args) = found {
+            let inputs = inputs.into_iter().map(|t| subst(&mut self.tys, t, &args)).collect();
+            let output = subst(&mut self.tys, output, &args);
+            return Some((kind, inputs, output));
+        }
+        Some((kind, inputs, output))
     }
 
     /// A call whose callee is a value, not a fn path: a closure (through
