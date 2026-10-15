@@ -2539,11 +2539,6 @@ pub fn collect_reuse<'a>(
         p.gx.has_generics = true;
         p.gx.user_generics = true;
     }
-    // Same for `Bound` (W-STD-C phase 2).
-    if ast_mentions(ast, interner.intern("Bound")) {
-        p.gx.has_generics = true;
-        p.gx.user_generics = true;
-    }
     let adt_ranks = {
         let hashes: Vec<crate::def::DefPathHash> = adt_srcs.iter().map(|s| s.4).collect();
         stable_ranks(&mut def_order.adts, &hashes)
@@ -2616,46 +2611,6 @@ pub fn collect_reuse<'a>(
             p.gx.adt_envs[id.0 as usize] = vec![to_owned];
             let regioned = p.tys.intern(TyKind::Ref(Region::Param(0), Mut::Shared, b));
             p.regions.adt_fields.insert(def, vec![vec![regioned], vec![owned]]);
-            p.tys.register_adt(def, id);
-            let mut data = DefData::skeleton(DefsKind::Enum, None, name, Vis::Pub, span);
-            data.generics = p.gx.adt_generics[id.0 as usize].clone();
-            p.defs.insert_adt(def, id, data);
-            continue;
-        }
-        // `Bound` is entry 12 of `std_adts`: `enum Bound<T> { Included(T),
-        // Excluded(T), Unbounded }`, as std declares it (W-STD-C phase 2).
-        if item_idx == usize::MAX - 12 {
-            let id = AdtId(adt_base as u32 + rank);
-            let def = generics::bound_def();
-            let t = p.tys.intern(TyKind::Param(ParamId(0)));
-            let zero = interner.intern("0");
-            let variant = |n: &str, ty: Option<Ty>, disc: i128| Variant {
-                name: interner.intern(n),
-                shape: if ty.is_some() { VariantShape::Tuple } else { VariantShape::Unit },
-                fields: ty.map(|ty| vec![Field { name: zero, ty }]).unwrap_or_default(),
-                disc,
-                non_exhaustive: false,
-            };
-            p.adts[id.0 as usize] = AdtDef {
-                name,
-                is_enum: true,
-                variants: vec![variant("Included", Some(t), 0), variant("Excluded", Some(t), 1), variant("Unbounded", None, 2)],
-                derives: Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, ..Derives::default() },
-                span,
-                repr: crate::ty::layout::Repr::default(),
-                non_exhaustive: false,
-            };
-            p.gx.adt_info[id.0 as usize] = (def, 1);
-            let sized = {
-                let a = p.tys.intern_args(&[GenericArg::Ty(t)]);
-                Predicate::Trait(Binder::plain(TraitRef { def: p.gx.lang.sized, args: a, bindings: EMPTY_BINDINGS }))
-            };
-            p.gx.adt_generics[id.0 as usize] = Generics {
-                parent: None,
-                params: vec![ParamDef { name: interner.intern("T"), kind: ParamKind::Type, span }],
-                predicates: vec![sized],
-            };
-            p.gx.adt_envs[id.0 as usize] = vec![sized];
             p.tys.register_adt(def, id);
             let mut data = DefData::skeleton(DefsKind::Enum, None, name, Vis::Pub, span);
             data.generics = p.gx.adt_generics[id.0 as usize].clone();

@@ -587,14 +587,6 @@ pub fn cow_def() -> DefId {
     std_adt_table()[9].2
 }
 
-/// The def of `core::ops::Bound` (W-STD-C phase 2): a synthetic
-/// generic enum collect registers like `Cow`, reached only
-/// through std paths. Its shape matches fx-vec-drain's stated
-/// RangeBounds design, so whichever lands second drops theirs.
-pub fn bound_def() -> DefId {
-    lang_def(&["core", "ops"], crate::def::DefKind::Adt, "Bound")
-}
-
 /// The `core::fmt::Error` type.
 pub fn fmt_error_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(fmt_error_def(), EMPTY_ARGS))
@@ -764,8 +756,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
         ("cell", "BorrowMutError", borrow_mut_error_def()),
-        ("ops", "Bound", bound_def()),
-    ]
+            ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
         .map(|(_, _, d)| d)

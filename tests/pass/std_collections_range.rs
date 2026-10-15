@@ -19,6 +19,6 @@ fn main() {
     let z: Vec<i32> = s.range((Excluded(&1), Included(&5))).copied().collect();
     println!("{z:?}");
     let sm: BTreeMap<String, i32> = vec![("a".to_string(), 1), ("cc".to_string(), 2), ("e".to_string(), 3)].into_iter().collect();
-    let ks: Vec<&String> = sm.range::<str, _>((Included("b"), Excluded("e"))).map(|(k, _)| k).collect();
+    let ks: Vec<&String> = sm.range((Included(String::from("b")), Excluded(String::from("e")))).map(|(k, _)| k).collect();
     println!("{ks:?}");
 }

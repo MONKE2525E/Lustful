@@ -668,13 +668,6 @@ pub enum Res {
     TraitIndex {
         derefs: u8,
     },
-    /// A `map.range(..)` call on a std BTree type, desugared to
-    /// its private `range_between` inherent fn (W-STD-C phase 2):
-    /// the fn and bound forms are in `range_recv`.
-    BTreeRange {
-        derefs: u8,
-        mutable: bool,
-    },
     /// A `core::intrinsics::<name>` call that passed the privilege check.
     /// The payload is the intrinsic's registry id (`ty::lang::INTRINSICS`).
     /// Only spliced shipped-library source can produce this resolution.
@@ -953,36 +946,12 @@ pub struct IndexRecv {
     pub args_mut: Vec<GenericArg>,
 }
 
-/// How one bound of a written range argument is formed in
-/// lowering: its variant tag (0 Included, 1 Excluded,
-/// 2 Unbounded) for a range expression; a tuple of two `Bound`
-/// values is passed through as evaluated.
-#[derive(Clone, Copy, Debug)]
-pub enum RangeForm {
-    /// `(Bound, Bound)` written as one tuple argument.
-    Tuple,
-    /// A range expression: tag and whether the bound expression
-    /// already evaluates to the `&Q` payload.
-    Static { lo_tag: u8, lo_ref: bool, hi_tag: u8, hi_ref: bool },
-}
-
-/// One `range` call on a std BTree type: the private inherent
-/// fn it calls, its generic args (filled per instance), and
-/// the bound forms.
-#[derive(Clone, Debug)]
-pub struct RangeRecv {
-    pub f: LocalDefId,
-    pub args: Vec<GenericArg>,
-    pub form: RangeForm,
-}
-
 /// Which `Checked` table a generic `deref` fn's site fills in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DerefTable {
     Recv,
     Coerce,
     Index,
-    Range,
 }
 
 /// A coercion applied where a value meets an expected type.
@@ -1101,6 +1070,11 @@ pub struct Checked<'g> {
     /// Lowering resolves the template in the call's `Res` plus
     /// these args to a mono instance.
     pub generic_args: Vec<Vec<GenericArg>>,
+    /// Generic sites by (expression index, template): the
+    /// `generic_args` slot of the same expression only keeps
+    /// one site (last write), but a `for` head holds two (its
+    /// own call and the loop's `next`), distinguished here.
+    pub generic_site_args: Vec<(usize, LocalDefId, Vec<GenericArg>)>,
     /// Instance requests found while checking: (template,
     /// zonked args in this body's store). Mono lifts and
     /// materializes them; the driver never reads this.
@@ -1123,8 +1097,6 @@ pub struct Checked<'g> {
     pub deref_coerce: Vec<(ExprId, DerefRecv)>,
     /// Written-`Index` places, by the index expression.
     pub index_recv: Vec<(ExprId, IndexRecv)>,
-    /// BTree `range` calls, by the call expression.
-    pub range_recv: Vec<(ExprId, RangeRecv)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).
     pub param_locals: Vec<u32>,
@@ -1205,10 +1177,6 @@ impl Checked<'_> {
     /// The written-`Index` record of an index expression, if any.
     pub fn index_recv(&self, e: ExprId) -> Option<&IndexRecv> {
         self.index_recv.iter().find(|(x, _)| *x == e).map(|(_, d)| d)
-    }
-    /// The BTree `range` record of a call expression, if any.
-    pub fn range_recv(&self, e: ExprId) -> Option<&RangeRecv> {
-        self.range_recv.iter().find(|(x, _)| *x == e).map(|(_, d)| d)
     }
 }
 
@@ -1578,6 +1546,7 @@ fn check_fn_mode<'p, 'a>(
             pat_const: vec![None; n_pats],
             pat_derefs: vec![0; n_pats],
             generic_args: vec![Vec::new(); n_exprs],
+            generic_site_args: Vec::new(),
             inst_requests: Vec::new(),
             trait_picks: Vec::new(),
             vtable_requests: Vec::new(),
@@ -1585,7 +1554,6 @@ fn check_fn_mode<'p, 'a>(
             drain_ranges: Vec::new(),
             deref_coerce: Vec::new(),
             index_recv: Vec::new(),
-            range_recv: Vec::new(),
             locals: Vec::new(),
             param_locals: Vec::new(),
             reads: if p.record_reads { Reads::new() } else { Reads::off() },
@@ -5390,230 +5358,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             self.deref_sites.push((DerefTable::Index, idx, true, g, args_mut));
         }
         Some(output)
-    }
-
-    /// A `range`/`range_mut` call on a std BTree type, desugared
-    /// to its private `range_between` inherent fn (std source
-    /// cannot name `RangeBounds` yet; fx-vec-drain's trait will
-    /// replace this). Handles range expressions and `(Bound,
-    /// Bound)` tuples; anything else falls through to the normal
-    /// method dispatch (which rejects). Returns the iterator type.
-    fn range_method(
-        &mut self,
-        e: ExprId,
-        base: Ty,
-        derefs: u8,
-        name: Sym,
-        name_span: Span,
-        args: &[ExprId],
-        explicit: &[Option<GenericArg>],
-    ) -> Option<Ty> {
-        let mutable = match self.name(name) {
-            "range" => false,
-            "range_mut" => true,
-            _ => return None,
-        };
-        if args.len() != 1 {
-            return None;
-        }
-        let p = self.p;
-        let a = self.tys.local_adt(base).or_else(|| self.tys.adt_parts(base).and_then(|(d, _)| self.tys.local_adt_of(d)))?;
-        if !p.is_std_adt(a) {
-            return None;
-        }
-        let tname = p.display_path(p.adt(a).name);
-        let last = tname.rsplit("::").next().unwrap_or("");
-        if last != "BTreeMap" && last != "BTreeSet" {
-            return None;
-        }
-        let targs: Vec<Ty> = self.tys.adt_parts(base).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
-        if targs.is_empty() {
-            return None;
-        }
-        let key_ty = targs[0];
-        let span = name_span;
-        // An explicit `::<Q, _>` names the borrowed key type.
-        let q_written = explicit.first().copied().flatten().and_then(|g| g.as_ty());
-        // The bound forms, with the value expressions checked here.
-        let arg = args[0];
-        let mut owned = false;
-        let (form, q) = match self.p.ast.expr(arg) {
-            Expr::Range { lo, hi, inclusive } => {
-                // The range value itself is never built; lowering
-                // reads the bound expressions out of it.
-                self.set(arg, UNIT);
-                // A bound value's query type and whether it already
-                // is the `&Q` payload: a reference to a sized type
-                // queries by that type; anything else (an owned
-                // value, a `&str`) queries by its own type, as the
-                // `RangeBounds` impls for range kinds read.
-                let point = |cx: &mut Self, e: &Option<ExprId>| -> Option<(Ty, bool)> {
-                    let e = (*e)?;
-                    let t = cx.expr(e, None);
-                    match cx.kind(t) {
-                        TyKind::Ref(_, _, inner) if !matches!(cx.kind(inner), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) => {
-                            Some((cx.resolve(inner), true))
-                        }
-                        _ => Some((t, false)),
-                    }
-                };
-                let lo_p = point(self, lo);
-                let hi_p = point(self, hi);
-                let q = match (lo_p, hi_p) {
-                    (Some((q1, _)), Some((q2, _))) => {
-                        if !self.unify(q1, q2) {
-                            self.mismatch(span, q1, q2);
-                            return Some(ERROR);
-                        }
-                        q1
-                    }
-                    (Some((q1, _)), None) => q1,
-                    (None, Some((q2, _))) => q2,
-                    (None, None) => key_ty,
-                };
-                let form = RangeForm::Static {
-                    lo_tag: if lo.is_some() { 0 } else { 2 },
-                    lo_ref: lo_p.is_some_and(|p| p.1),
-                    hi_tag: if hi.is_none() {
-                        2
-                    } else if *inclusive {
-                        0
-                    } else {
-                        1
-                    },
-                    hi_ref: hi_p.is_some_and(|p| p.1),
-                };
-                (form, q)
-            }
-            Expr::Tuple(elems) if elems.len() == 2 => {
-                // (Bound<Q>, Bound<Q>) or (Bound<&Q>, Bound<&Q>):
-                // trial-check the pair against both readings (as
-                // the method probe trials), keeping the one that
-                // checks clean; both clean is ambiguous, as rustc's
-                // pair impls are for `(Unbounded, Unbounded)`.
-                let trial = |cx: &mut Self, owned_form: bool| -> Option<Ty> {
-                    let snap = cx.snapshot_vars();
-                    let obl_len = cx.obl_len();
-                    let err_len = cx.errs.len();
-                    let sites_len = cx.generic_sites.len();
-                    let picks_len = cx.out.trait_picks.len();
-                    let dmeth_len = cx.deferred_methods.len();
-                    let closures_len = cx.closures.len();
-                    let calls_len = cx.out.closure_calls.len();
-                    let locals_len = cx.out.locals.len();
-                    let binops_len = cx.deferred_binops.len();
-                    let open_len = cx.open_binops.len();
-                    let fmt_len = cx.deferred_fmt.len();
-                    let q = q_written.unwrap_or_else(|| cx.new_var(false));
-                    let payload = if owned_form { q } else { cx.tys.mk_ref(false, q) };
-                    let bt = cx.tys.mk_adt(generics::bound_def(), &[GenericArg::Ty(payload)]);
-                    let pair = cx.tys.intern_tys(&[bt, bt]);
-                    let tt = cx.tys.intern(TyKind::Tuple(pair));
-                    let got = cx.expr(arg, Some(tt));
-                    // The reading must also let the key borrow as
-                    // the query type, as the pair impls are told
-                    // apart in rustc (an owned reading usually
-                    // fails there, a reference one passes).
-                    let qd = cx.deep(q);
-                    let bargs = cx.tys.intern_args(&[GenericArg::Ty(key_ty), GenericArg::Ty(qd)]);
-                    let btr = TraitRef { def: p.gx.lang.borrow, args: bargs, bindings: EMPTY_BINDINGS };
-                    let borrowable = matches!(cx.select_obligation(btr), Selection::Impl { .. } | Selection::ParamEvidence(_));
-                    let ok = cx.unify(got, tt) && cx.errs.len() == err_len && borrowable;
-                    let q = cx.deep(q);
-                    cx.rollback_vars(snap);
-                    cx.obl_truncate(obl_len);
-                    cx.errs.truncate(err_len);
-                    cx.generic_sites.truncate(sites_len);
-                    cx.out.trait_picks.truncate(picks_len);
-                    cx.deferred_methods.truncate(dmeth_len);
-                    cx.closures.truncate(closures_len);
-                    cx.out.closure_calls.truncate(calls_len);
-                    cx.out.locals.truncate(locals_len);
-                    cx.deferred_binops.truncate(binops_len);
-                    cx.open_binops.truncate(open_len);
-                    cx.deferred_fmt.truncate(fmt_len);
-                    if ok { Some(q) } else { None }
-                };
-                let as_ref = trial(self, false);
-                let as_owned = trial(self, true);
-                let owned_form = match (as_ref, as_owned) {
-                    (Some(_), None) => false,
-                    (None, Some(_)) => true,
-                    (Some(_), Some(_)) => {
-                        self.err("L0610", span, "type annotations needed: the bound pair is ambiguous", "Annotate one bound, for example `Bound::<&T>::Unbounded`.");
-                        return Some(ERROR);
-                    }
-                    (None, None) => {
-                        // Surface the reference reading's errors.
-                        let q = self.new_var(false);
-                        let rq = self.tys.mk_ref(false, q);
-                        let bt = self.tys.mk_adt(generics::bound_def(), &[GenericArg::Ty(rq)]);
-                        let pair = self.tys.intern_tys(&[bt, bt]);
-                        let tt = self.tys.intern(TyKind::Tuple(pair));
-                        let got = self.expr(arg, Some(tt));
-                        if !self.unify(got, tt) {
-                            self.mismatch(span, tt, got);
-                        }
-                        return Some(ERROR);
-                    }
-                };
-                owned = owned_form;
-                let q = q_written.unwrap_or_else(|| self.new_var(false));
-                let payload = if owned { q } else { self.tys.mk_ref(false, q) };
-                let bt = self.tys.mk_adt(generics::bound_def(), &[GenericArg::Ty(payload)]);
-                let pair = self.tys.intern_tys(&[bt, bt]);
-                let tt = self.tys.intern(TyKind::Tuple(pair));
-                let got = self.expr(arg, Some(tt));
-                if !self.unify(got, tt) {
-                    self.mismatch(span, tt, got);
-                    return Some(ERROR);
-                }
-                (RangeForm::Tuple, self.deep(q))
-            }
-            _ => return None,
-        };
-        if let Some(qw) = q_written
-            && !self.unify(q, qw)
-        {
-            self.mismatch(span, qw, q);
-            return Some(ERROR);
-        }
-        // The private inherent fn on the std Adt template.
-        let fname = self.p.interner.intern(match (mutable, owned) {
-            (false, false) => "range_between",
-            (true, false) => "range_between_mut",
-            (false, true) => "range_between_owned",
-            (true, true) => "range_between_owned_mut",
-        });
-        // The inherent fn, found as the method probes find it
-        // (keyed by head, so an instance receiver works too).
-        let head = Head::of(&self.tys, base);
-        let set = p.method_set(&mut self.out.reads, head, fname, if mutable { ReceiverForm::RefMut } else { ReceiverForm::Ref });
-        let f = set.candidates.iter().find_map(|c| c.receiver.and_then(|_| p.local_def(c.def.hash)))?;
-        // Its obligations, as std's signature writes them.
-        let lang = p.gx.lang;
-        let mut require = |cx: &mut Self, def: DefId, args: &[Ty]| {
-            let args: Vec<GenericArg> = args.iter().map(|&t| GenericArg::Ty(t)).collect();
-            let a = cx.tys.intern_args(&args);
-            cx.obl.push_trait_at(TraitRef { def, args: a, bindings: EMPTY_BINDINGS }, span, 0);
-        };
-        require(self, lang.ord, &[key_ty]);
-        require(self, lang.ord, &[q]);
-        require(self, lang.borrow, &[key_ty, q]);
-        // The call's types: the iterator return from the fn's own
-        // signature after substitution.
-        let mut full: Vec<GenericArg> = targs.iter().map(|&t| GenericArg::Ty(t)).collect();
-        full.push(GenericArg::Ty(q));
-        let info = p.fn_info(f);
-        let ret = subst(&mut self.tys, info.ret, &full);
-        let ret = self.normalize_here(ret);
-        let idx = self.out.range_recv.len();
-        self.out.range_recv.push((e, RangeRecv { f, args: Vec::new(), form }));
-        if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
-            self.deref_sites.push((DerefTable::Range, idx, false, f, full));
-        }
-        self.set_res(e, Res::BTreeRange { derefs, mutable });
-        Some(ret)
     }
 
     fn user_deref_fn(&mut self, trait_def: DefId, base: Ty, fname: &str, span: Span) -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
@@ -14071,15 +13815,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
             {
                 LocalDefId(u32::MAX)
             }
-            Selection::Impl { id: id2, args: impl_args2, .. } => self.method_instance_for_impl(iter, id2, tr2, impl_args2, "next", span)?.0,
-            Selection::ParamEvidence(_) => self.stub_instance(iter, tr2, p.interner.intern("next"), span)?.0,
+            Selection::Impl { id: id2, args: impl_args2, .. } => self.method_instance_for_impl(for_e, id2, tr2, impl_args2, "next", span)?.0,
+            Selection::ParamEvidence(_) => self.stub_instance(for_e, tr2, p.interner.intern("next"), span)?.0,
             // A template bound `T: IntoIterator` proves into_iter from
             // the env, but no env predicate states `Iterator` for the
             // `IntoIter` projection (assoc-type bounds of a trait
             // definition are not elaborated into the env). The bound
             // still proves `next` exists, so the stub answers here;
             // instances re-select with concrete types.
-            _ if into_from_env => self.stub_instance(iter, tr2, p.interner.intern("next"), span)?.0,
+            _ if into_from_env => self.stub_instance(for_e, tr2, p.interner.intern("next"), span)?.0,
             _ => return None,
         };
         self.set_res(for_e, Res::ForTrait { into_iter: into_local, next: next_local });
@@ -17952,17 +17696,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.out.inst_requests.push((template, zargs));
                 continue;
             }
-            if let DerefTable::Range = table {
-                if let Some(entry) = self.out.range_recv.get_mut(idx) {
-                    entry.1.args = zargs.clone();
-                }
-                self.out.inst_requests.push((template, zargs));
-                continue;
-            }
             let entries = match table {
                 DerefTable::Recv => &mut self.out.deref_recv,
                 DerefTable::Coerce => &mut self.out.deref_coerce,
-                DerefTable::Index | DerefTable::Range => unreachable!(),
+                DerefTable::Index => unreachable!(),
             };
             if let Some(entry) = entries.get_mut(idx) {
                 if is_mut {
@@ -17987,6 +17724,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             if ei < self.out.generic_args.len() {
                 self.out.generic_args[ei] = zargs.clone();
             }
+            self.out.generic_site_args.push((ei, template, zargs.clone()));
             self.out.inst_requests.push((template, zargs));
         }
         // A generic Adt constructor names the template Adt; the

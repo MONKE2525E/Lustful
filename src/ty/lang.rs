@@ -1742,12 +1742,6 @@ const STD_VARIANT_PATHS: &[&str] = &[
     "std/sync/atomic/Ordering/SeqCst",
     "std/sync/mpsc/TryRecvError/Empty",
     "std/sync/mpsc/TryRecvError/Disconnected",
-    "core/ops/Bound/Included",
-    "std/ops/Bound/Included",
-    "core/ops/Bound/Excluded",
-    "std/ops/Bound/Excluded",
-    "core/ops/Bound/Unbounded",
-    "std/ops/Bound/Unbounded",
 ];
 
 /// True for a trait of the Rust 2024 prelude (and the prelude's

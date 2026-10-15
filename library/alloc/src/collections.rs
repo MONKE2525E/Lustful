@@ -496,9 +496,7 @@ pub mod btree_map {
             (lo, hi)
         }
 
-        /// `range` with its bounds already split: the checker's
-        /// `range` call desugars to this (std source cannot name
-        /// `RangeBounds` yet).
+        /// `range` with its bounds already split.
         fn range_between<Q: ?Sized + Ord>(&self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> Range<'_, K, V>
         where
             K: Borrow<Q>,
@@ -508,7 +506,7 @@ pub mod btree_map {
             Range { inner: slice.iter().map(pair_ref as fn(&(K, V)) -> (&K, &V)) }
         }
 
-        /// `range_mut`, likewise.
+        /// `range_mut` with its bounds already split.
         fn range_between_mut<Q: ?Sized + Ord>(&mut self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> RangeMut<'_, K, V>
         where
             K: Borrow<Q>,
@@ -520,42 +518,21 @@ pub mod btree_map {
     }
 
     impl<K: Ord, V> BTreeMap<K, V> {
-        /// `range` over owned bounds, by way of the reference form.
-        fn range_between_owned<Q: Ord>(&self, start: core::ops::Bound<Q>, end: core::ops::Bound<Q>) -> Range<'_, K, V>
+    }
+
+    impl<K: Ord, V> BTreeMap<K, V> {
+        pub fn range<Q: ?Sized + Ord, R: core::ops::RangeBounds<Q>>(&self, range: R) -> Range<'_, K, V>
         where
             K: Borrow<Q>,
         {
-            use core::ops::Bound;
-            let start = match &start {
-                Bound::Included(x) => Bound::Included(x),
-                Bound::Excluded(x) => Bound::Excluded(x),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            let end = match &end {
-                Bound::Included(x) => Bound::Included(x),
-                Bound::Excluded(x) => Bound::Excluded(x),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            self.range_between(start, end)
+            self.range_between(range.start_bound(), range.end_bound())
         }
 
-        /// `range_mut` over owned bounds, likewise.
-        fn range_between_owned_mut<Q: Ord>(&mut self, start: core::ops::Bound<Q>, end: core::ops::Bound<Q>) -> RangeMut<'_, K, V>
+        pub fn range_mut<Q: ?Sized + Ord, R: core::ops::RangeBounds<Q>>(&mut self, range: R) -> RangeMut<'_, K, V>
         where
             K: Borrow<Q>,
         {
-            use core::ops::Bound;
-            let start = match &start {
-                Bound::Included(x) => Bound::Included(x),
-                Bound::Excluded(x) => Bound::Excluded(x),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            let end = match &end {
-                Bound::Included(x) => Bound::Included(x),
-                Bound::Excluded(x) => Bound::Excluded(x),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            self.range_between_mut(start, end)
+            self.range_between_mut(range.start_bound(), range.end_bound())
         }
     }
 
@@ -1144,23 +1121,14 @@ pub mod btree_set {
     }
 
     impl<T: Ord> BTreeSet<T> {
-        /// `range` over owned bounds, by way of the reference form.
-        fn range_between_owned<Q: Ord>(&self, start: core::ops::Bound<Q>, end: core::ops::Bound<Q>) -> Range<'_, T>
+    }
+
+    impl<T: Ord> BTreeSet<T> {
+        pub fn range<Q: ?Sized + Ord, R: core::ops::RangeBounds<Q>>(&self, range: R) -> Range<'_, T>
         where
             T: Borrow<Q>,
         {
-            use core::ops::Bound;
-            let start = match &start {
-                Bound::Included(x) => Bound::Included(x),
-                Bound::Excluded(x) => Bound::Excluded(x),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            let end = match &end {
-                Bound::Included(x) => Bound::Included(x),
-                Bound::Excluded(x) => Bound::Excluded(x),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            self.range_between(start, end)
+            self.range_between(range.start_bound(), range.end_bound())
         }
     }
 
