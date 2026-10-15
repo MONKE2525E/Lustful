@@ -1187,10 +1187,15 @@ pub struct Checked<'g> {
     /// The hidden type of each `impl Trait` this body defines
     /// (`check::opaque`), by opaque def.
     pub opaque_hidden: Vec<(DefId, Ty)>,
-    /// The hidden types a revealed check put in place of callee opaque
-    /// types (check/opaque.rs): lowering marks the locals that hold them
+    /// A revealed check's types of the values that hold `impl Trait`
+    /// values in its opaque view, each with how (`opaque::Hold`):
+    /// lowering marks the temporaries whose types hold one
     /// (`Body::opaque_locals`).
-    pub revealed: Vec<Ty>,
+    pub opaque_holds: Vec<(Ty, opaque::Hold)>,
+    /// How each checker local (binding) holds `impl Trait` values in the
+    /// opaque view, which marks its IR local directly; empty when the
+    /// two checks' bindings do not line up (then the type match decides).
+    pub local_holds: Vec<opaque::Hold>,
     /// A revealed call of a generic definer whose hidden type holds
     /// closures, before mono made its instance: the types still name the
     /// template's closures. Mono checks the body again once the instance
@@ -1681,7 +1686,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             annotations: Vec::new(),
             queue_work: 0,
             opaque_hidden: Vec::new(),
-            revealed: Vec::new(),
+            opaque_holds: Vec::new(),
+            local_holds: Vec::new(),
             closure_map_pending: false,
         },
         scopes: Vec::new(),
@@ -18195,19 +18201,6 @@ impl<'p> Ctx<'p> {
         // A `thread_local!` `const { .. }` init fn proves its const part (check/tls.rs).
         self.tls_const_init_check();
         self.build_closure_map();
-        // A revealed hidden type is recorded at its call, when a generic
-        // definer's args can still be inference vars; zonk it like every
-        // other output type, and normalize the projections its args now
-        // decide (`I::IntoIter` at `I = &Vec<u32>` is `slice::Iter`, as
-        // the local's type is). Else lowering cannot match it to a
-        // local's type and the local loses its drop-live mark
-        // (`Body::opaque_locals`), so borrowck would let the captured
-        // borrow end before the opaque value drops.
-        for i in 0..self.out.revealed.len() {
-            let t = self.zonk(self.out.revealed[i]);
-            self.out.revealed[i] = self.normalize_here(t);
-        }
-        self.out.revealed.dedup();
         for i in 0..self.out.expr_ty.len() {
             let t = self.out.expr_ty[i];
             self.out.expr_ty[i] = self.zonk(t);

@@ -189,9 +189,6 @@ impl Ctx<'_> {
                 if crate::check::collect::is_copy(p, &self.tys, h) && !opaque_bound_holds(p, &self.tys, o, p.gx.lang.copy) {
                     self.opaque_copy_hazard = true;
                 }
-                if !self.out.revealed.contains(&h) {
-                    self.out.revealed.push(h);
-                }
             }
         }
         // A generic definer's hidden closures are its template's; the
@@ -248,13 +245,6 @@ impl Ctx<'_> {
             };
             map.extend(instance_closure_map(p, &self.tys, h, template, p.def_id(inst)));
         }
-        if map.is_empty() {
-            return;
-        }
-        for i in 0..self.out.revealed.len() {
-            let h = self.out.revealed[i];
-            self.out.revealed[i] = map_closure_defs(&mut self.tys, h, &map);
-        }
         self.closure_map = map;
     }
 
@@ -301,6 +291,69 @@ pub(super) struct ViewOut {
     pub calls: FxMap<ExprId, closure::ClosureKind>,
 }
 
+/// How a value holds `impl Trait` values, from its type in the opaque
+/// view (`view_hold`). Lowering marks the locals that hold one
+/// (`Body::opaque_locals`): such a local captures every region of its
+/// opaque values, and a `Drop` one also keeps them live to its drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Hold {
+    #[default]
+    None,
+    /// Only opaques whose bounds say `Copy`: rustc knows they have no
+    /// drop glue, so they add nothing to the value's drop.
+    Copy,
+    /// An opaque rustc assumes has a destructor that uses every region
+    /// it captures (its drop check cannot see the hidden type).
+    Drop,
+}
+
+/// How a value of the view type `t` holds opaque values: an opaque type
+/// itself, or one it owns by value (a reference or a `dyn` owns none; a
+/// `dyn` made from one carries its captures in its own region).
+pub(crate) fn view_hold(p: &Program, tys: &impl TyIntern, t: Ty) -> Hold {
+    let in_args = |a: ArgsId| tys.args(a).iter().filter_map(|g| g.as_ty()).map(|e| view_hold(p, tys, e)).max().unwrap_or_default();
+    match tys.kind(t) {
+        TyKind::Opaque(..) if opaque_bound_holds(p, tys, t, p.gx.lang.copy) => Hold::Copy,
+        TyKind::Opaque(..) => Hold::Drop,
+        // A rigid projection of an opaque (`<impl IntoIterator as
+        // IntoIterator>::IntoIter`) may hold what the opaque captures.
+        TyKind::Projection(..) if mentions_opaque(tys, t, None) => Hold::Drop,
+        TyKind::Slice(e) | TyKind::Array(e, _) => view_hold(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().map(|&e| view_hold(p, tys, e)).max().unwrap_or_default(),
+        TyKind::Adt(_, a) | TyKind::Closure(_, a) => in_args(a),
+        _ => Hold::None,
+    }
+}
+
+/// Fills a revealed check's `Checked::opaque_holds` and `local_holds`
+/// from its opaque view's types: each expression, pattern, and binding
+/// that holds an opaque value in the view gives its revealed type (the
+/// type lowering gives the locals that hold its value).
+fn holds_from_view(p: &Program, view: &Checked, ck: &mut Checked) {
+    let mut holds: Vec<(Ty, Hold)> = Vec::new();
+    let mut add = |t: Ty, h: Hold| {
+        if h == Hold::None {
+            return;
+        }
+        match holds.iter_mut().find(|(x, _)| *x == t) {
+            Some(e) => e.1 = e.1.max(h),
+            None => holds.push((t, h)),
+        }
+    };
+    for (&v, &r) in view.expr_ty.iter().zip(&ck.expr_ty).chain(view.pat_ty.iter().zip(&ck.pat_ty)) {
+        add(r, view_hold(p, &view.tys, v));
+    }
+    let local_holds: Vec<Hold> = view.locals.iter().map(|l| view_hold(p, &view.tys, l.ty)).collect();
+    for (h, l) in local_holds.iter().zip(&ck.locals) {
+        add(l.ty, *h);
+    }
+    // Both checks bind the same patterns in the same order; a check
+    // that did not leaves the bindings to the type match.
+    let same = view.locals.len() == ck.locals.len() && view.locals.iter().zip(&ck.locals).all(|(a, b)| a.name == b.name && a.span == b.span);
+    ck.local_holds = if same { local_holds } else { Vec::new() };
+    ck.opaque_holds = holds;
+}
+
 /// How one check sees opaque types (see the file header).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpaqueMode {
@@ -326,8 +379,9 @@ pub(super) fn check_fn_opaque<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'
                 return (view, errs);
             }
             let out = ViewOut { picks: view.trait_picks.iter().copied().collect(), calls: view.closure_calls.iter().copied().collect() };
-            drop(view);
-            check_fn_mode(p, fid, OpaqueMode::Revealed, out)
+            let (mut ck, errs) = check_fn_mode(p, fid, OpaqueMode::Revealed, out);
+            holds_from_view(p, &view, &mut ck);
+            (ck, errs)
         }
     }
 }

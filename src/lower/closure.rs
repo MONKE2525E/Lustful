@@ -56,6 +56,7 @@ pub fn lower_closure<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
+        opaque_nodrop: Vec::new(),
         stmt_unwind: Vec::new(),
     };
     let info = ck.closures.iter().find(|c| c.def == def).cloned();
@@ -86,6 +87,7 @@ pub fn lower_closure<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -
         unwind_end: None,
         unwind_last: None,
         in_cleanup: false,
+        bind_of: Vec::new(),
     };
     let Some(info) = info.filter(|_| !poisoned) else {
         // The parent failed to check and reports why; keep the shape

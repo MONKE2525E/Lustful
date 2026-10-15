@@ -297,11 +297,16 @@ pub struct Body<'g> {
     /// checked. Codegen ignores them; a cached body has none.
     pub false_edges: Vec<(Bb, Bb)>,
     /// Locals that may hold an `impl Trait` value revealed to its hidden
-    /// type (check/opaque.rs): rustc's drop check assumes an opaque type
-    /// has a destructor that uses every region it captures, so borrowck
-    /// keeps all their regions live to the drop, which lowering emits
-    /// even for a hidden type without drop glue (a no-op in codegen).
+    /// type (check/opaque.rs): the value captures every region of its
+    /// defining call. rustc's drop check assumes an opaque type has a
+    /// destructor that uses every region it captures, so borrowck keeps
+    /// all their regions live to the drop, which lowering emits even for
+    /// a hidden type without drop glue (a no-op in codegen).
     pub opaque_locals: Vec<Local>,
+    /// The `opaque_locals` whose drop runs no opaque destructor: every
+    /// opaque they hold is `Copy` by its bounds, and their type has no
+    /// other drop glue (`opaque::Hold::Copy`).
+    pub opaque_nodrop: Vec<Local>,
     /// The cleanup entry of each statement that can unwind, as
     /// (block, statement index, cleanup block), in panic=unwind
     /// builds only (empty under panic=abort). An index equal to the

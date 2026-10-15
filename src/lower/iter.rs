@@ -136,6 +136,7 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
+        opaque_nodrop: Vec::new(),
         stmt_unwind: body.stmt_unwind.clone(),
     };
     let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), fold: false, unw: None };

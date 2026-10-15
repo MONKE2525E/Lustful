@@ -1,6 +1,7 @@
 // Lowering: checked AST to IR. Makes evaluation order, temporaries, moves, borrows, and drops explicit.
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, MacroKind, Pat, PatId, Stmt};
 use crate::check::collect::*;
+use crate::check::opaque::Hold;
 use crate::check::{Autoref, BindMode, Builtin, Checked, CmpVia, Coerce, OrdPickKind, OrderingOpKind, PatRes, PrimCmpKind, PrimOpKind, Res};
 use crate::diag::Span;
 use crate::ir::*;
@@ -104,6 +105,9 @@ struct Lower<'p> {
     /// Set while a cleanup ladder step lowers its drops: those drops
     /// are cleanup themselves and get no cleanup entry.
     in_cleanup: bool,
+    /// Each binding's IR local with its checker local, for its opaque
+    /// mark (`mark_opaque_locals`).
+    bind_of: Vec<(Local, u32)>,
 }
 
 /// Lowers one checked function body to IR.
@@ -130,6 +134,7 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         index_exprs: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
+        opaque_nodrop: Vec::new(),
         stmt_unwind: Vec::new(),
     };
     let mut lw = Lower {
@@ -158,6 +163,7 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         unwind_end: None,
         unwind_last: None,
         in_cleanup: false,
+        bind_of: Vec::new(),
     };
     // A template's own `impl Trait` return is its hidden type here, so the
     // borrow checker sees the returned value's regions (check/opaque.rs).
@@ -174,6 +180,7 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         let (ty, m, name) = (info.ty, info.mutable, p.name(info.name).to_string());
         let l = lw.new_local(ty, m, Some(name));
         lw.local_map[cl as usize] = l;
+        lw.bind_of.push((l, cl));
         lw.scopes[0].push(l);
     }
     // Pattern parameters bind out of their argument locals
@@ -421,31 +428,57 @@ impl<'p> Lower<'p> {
         b.term_span = span;
         self.cur = target;
     }
-    /// Fills `Body::opaque_locals` (see `holds_revealed`).
+    /// Fills `Body::opaque_locals` and `opaque_nodrop` from how each
+    /// local holds `impl Trait` values in the opaque view: a binding by
+    /// its own view type (`Checked::local_holds`), any other local by
+    /// the type match (`type_hold`).
     fn mark_opaque_locals(&mut self) {
-        if self.ck.revealed.is_empty() {
+        if self.ck.opaque_holds.is_empty() {
             return;
         }
-        let marked: Vec<Local> = (0..self.body.locals.len() as Local).filter(|&l| self.holds_revealed(self.body.locals[l as usize].ty)).collect();
-        self.body.opaque_locals = marked;
+        let mut hold: Vec<Option<Hold>> = vec![None; self.body.locals.len()];
+        if !self.ck.local_holds.is_empty() {
+            for &(l, cl) in &self.bind_of {
+                hold[l as usize] = Some(self.ck.local_holds[cl as usize]);
+            }
+        }
+        for l in 0..self.body.locals.len() {
+            let ty = self.body.locals[l].ty;
+            match hold[l].unwrap_or_else(|| self.type_hold(ty)) {
+                Hold::None => {}
+                Hold::Copy if !self.needs_drop_ty(ty) => {
+                    self.body.opaque_locals.push(l as Local);
+                    self.body.opaque_nodrop.push(l as Local);
+                }
+                _ => self.body.opaque_locals.push(l as Local),
+            }
+        }
     }
-    /// True when a value of type `ty` may hold an `impl Trait` value the
-    /// check revealed (`Checked::revealed`): its drop is a use of every
-    /// region it holds (`Body::opaque_locals`). A plain value of the same
-    /// type counts too, which can only make the borrow check stricter.
-    /// A hidden type the check left unresolved (an inference var or a
-    /// projection, which no local's type holds) counts for every local,
-    /// so a missed match is a false reject, never a false accept.
-    fn holds_revealed(&self, ty: Ty) -> bool {
-        self.ck.revealed.iter().any(|&r| {
-            let f = self.body.tys.flags(r);
-            f.contains_infer() || f.contains_projection() || crate::check::opaque::ty_contains(&self.body.tys, ty, r)
-        })
+    /// How a value of type `ty` may hold `impl Trait` values: the most
+    /// of the view holds (`Checked::opaque_holds`) whose revealed types
+    /// it owns. A plain value of the same type counts too, which can
+    /// only make the borrow check stricter. A revealed type the check
+    /// left unresolved (an inference var or a projection, which no
+    /// local's type holds) counts for every local, so a missed match is
+    /// a false reject, never a false accept.
+    fn type_hold(&self, ty: Ty) -> Hold {
+        let tys = &self.body.tys;
+        let of = |&(r, h): &(Ty, Hold)| {
+            let f = tys.flags(r);
+            if f.contains_infer() || f.contains_projection() {
+                Hold::Drop
+            } else if crate::check::opaque::ty_contains(tys, ty, r) {
+                h
+            } else {
+                Hold::None
+            }
+        };
+        self.ck.opaque_holds.iter().map(of).max().unwrap_or_default()
     }
     fn emit_drops(&mut self, locals: &[Local], span: Span) {
         for &l in locals.iter().rev() {
             let ty = self.body.locals[l as usize].ty;
-            if self.needs_drop_ty(ty) || self.holds_revealed(ty) {
+            if self.needs_drop_ty(ty) || self.type_hold(ty) == Hold::Drop {
                 self.push(StmtKind::Drop(l), span);
             }
             self.push(StmtKind::StorageDead(l), span);
@@ -2561,6 +2594,7 @@ impl<'p> Lower<'p> {
         let (ty, m, name) = (info.ty, info.mutable, self.p.name(info.name).to_string());
         let l = self.new_local(ty, m, Some(name));
         self.local_map[local as usize] = l;
+        self.bind_of.push((l, local));
         l
     }
 
@@ -5211,6 +5245,7 @@ impl<'p> Lower<'p> {
                 let (ty, m, name) = (info.ty, info.mutable, self.p.name(info.name).to_string());
                 let l = self.new_local(ty, m, Some(name));
                 self.bind_reuse.push((local, l));
+                self.bind_of.push((l, local));
                 l
             }
         };
