@@ -19,4 +19,5 @@ fn main() {
     println!("desc={}", env!("CARGO_PKG_DESCRIPTION"));
     println!("crate={} bin={}", env!("CARGO_CRATE_NAME"), env!("CARGO_BIN_NAME"));
     println!("manifest_ok={}", env!("CARGO_MANIFEST_PATH") == concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    println!("dep={} {} {}", genlib::dep_pkg(), genlib::deep::dep_out(), genlib::deep::dep_deep());
 }

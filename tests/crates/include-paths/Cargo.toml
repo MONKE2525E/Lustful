@@ -10,4 +10,8 @@ edition = "2024"
 authors = ["Ann A", "Bob B"]
 description = "include path fixture"
 
+[dependencies]
+genlib = { path = "genlib" }
+
 [workspace]
+members = ["genlib"]
