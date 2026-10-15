@@ -1550,7 +1550,14 @@ impl<'p> Lower<'p> {
             self.prelowered.retain(|&(_, _, g)| g != run);
             return;
         }
-        self.expr_into_here(e, dest)
+        self.expr_into_here(e, dest);
+        // A call of type `!` (`fn die() -> !`, `resume_unwind`) does not
+        // return: rustc's MIR call has no return edge, so code after it
+        // is dead (a value moved into the call is not "used after move").
+        if matches!(self.p.ast.expr(e), Expr::Call { .. } | Expr::MethodCall { .. }) && self.diverges(e) {
+            let span = self.span(e);
+            self.terminate(Terminator::Unreachable, span);
+        }
     }
 
     fn expr_into_here(&mut self, e: ExprId, dest: Option<&Place>) {
