@@ -5740,7 +5740,15 @@ pub struct UnwindInit {
 /// The `main_unit` argument for `p` (`slot_of` maps a fn to its slot):
 /// None under panic=abort when no hook can be installed.
 pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<UnwindInit> {
-    let runner = p.fns.iter().position(|f| p.std_source_span(f.def.name_span) && p.display_path(f.name) == "std::panic::__lust_run_hook").map(|i| slot_of(LocalDefId(i as u32)));
+    let runner = p
+        .fns
+        .iter()
+        .position(|f| {
+            p.interner.get(f.name).ends_with("__lust_run_hook")
+                && p.std_source_span(f.def.name_span)
+                && p.display_path(f.name) == "std::panic::__lust_run_hook"
+        })
+        .map(|i| slot_of(LocalDefId(i as u32)));
     if !p.unwind && runner.is_none() {
         return None;
     }
