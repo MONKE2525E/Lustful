@@ -10,6 +10,7 @@
 // The parser works on byte offsets into the path (std uses pointer
 // arithmetic for `set_extension`; offsets give the same answers).
 
+use alloc::borrow::Cow;
 use crate::ffi::{OsStr, OsString, os_str_from_bytes};
 use core::cmp::Ordering;
 use core::fmt;
@@ -591,6 +592,12 @@ impl Path {
     /// The path as `&str` if it is valid Unicode.
     pub fn to_str(&self) -> Option<&str> {
         self.inner.to_str()
+    }
+
+    /// The path as text, borrowed when it is valid Unicode, else
+    /// owned with each invalid sequence replaced by U+FFFD.
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        self.inner.to_string_lossy()
     }
 
     /// An owned copy.

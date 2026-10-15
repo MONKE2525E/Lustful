@@ -3840,6 +3840,39 @@ impl FnGen<'_, '_> {
                 );
                 t
             }
+            B::StringFromUtf8Lossy => {
+                // `Cow::Borrowed` of the bytes as a `str` when they are
+                // valid UTF-8, else `Cow::Owned` of the lossy text in a
+                // String that starts with the input's capacity, as
+                // std's `from_utf8_lossy` allocates (runtime sys.c
+                // appends valid runs and U+FFFD replacements).
+                let p = self.p;
+                let a = p
+                    .gx
+                    .adt_instance_of
+                    .iter()
+                    .position(|o| {
+                        matches!(o, Some((d, args)) if *d == crate::check::generics::cow_def()
+                            && p.tys.args(*args).first().and_then(|g| g.as_ty()) == Some(STR))
+                    })
+                    .expect("from_utf8_lossy type-checks only with the Cow<str> instance");
+                let cow = CTy::Adt(AdtId(a as u32));
+                let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (t, vu, el, s) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let (f0, f1) = (variant_field(p, &cow, &t, 0, 0), variant_field(p, &cow, &t, 1, 0));
+                let (d0, d1) = (disc_set(p, &cow, &t, 0), disc_set(p, &cow, &t, 1));
+                let ct = ctype(&cow);
+                let _ = writeln!(self.out, "    uint64_t {vu} = 0; uint8_t {el} = 0; {ct} {t};");
+                let _ = writeln!(
+                    self.out,
+                    "    if (lust_utf8_check((const uint8_t*){ptr}, {len}, &{vu}, &{el})) {{ {f0} = (lust_str){{ (uint8_t*){ptr}, {len} }}; {d0} }}"
+                );
+                let _ = writeln!(
+                    self.out,
+                    "    else {{ lust_String {s} = lust_string_with_capacity({len}); lust_sys_utf8_lossy((const uint8_t*){ptr}, {len}, &{s}); {f1} = {s}; {d1} }}"
+                );
+                t
+            }
             B::FromUtf8ErrorUtf8Error => format!("(*{}).f1", vals[0]),
             B::FromUtf8ErrorAsBytes => {
                 let sl = ctype(&CTy::Slice(Box::new(CTy::Int(IntTy::U8))));

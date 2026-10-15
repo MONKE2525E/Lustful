@@ -2628,7 +2628,13 @@ pub fn collect_reuse(
         adt_srcs.push((usize::MAX - k, interner.intern(name), Span::default(), is_enum, def.hash));
     }
     // A program that names `Cow` (W-STD-B) instantiates it: mono runs.
-    if ast_mentions(ast, interner.intern("Cow")) {
+    // The lossy decoders name it only in their return types, so their
+    // names count too.
+    let lossy = interner.intern("to_string_lossy");
+    if ast_mentions(ast, interner.intern("Cow"))
+        || ast_mentions(ast, interner.intern("from_utf8_lossy"))
+        || ast.exprs.iter().any(|e| matches!(e, ast::Expr::MethodCall { name, .. } if *name == lossy))
+    {
         p.gx.has_generics = true;
         p.gx.user_generics = true;
     }

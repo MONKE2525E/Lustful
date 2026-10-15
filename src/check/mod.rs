@@ -494,9 +494,11 @@ pub enum Builtin {
     BoxSliceIntoVec,
     BoxSliceIntoIter,
     /// UTF-8 decoding (check/utf8.rs): `String::from_utf8`,
-    /// `str::from_utf8`, and the methods of their errors.
+    /// `str::from_utf8`, `String::from_utf8_lossy` (a `Cow<str>`),
+    /// and the methods of their errors.
     StringFromUtf8,
     StrFromUtf8,
+    StringFromUtf8Lossy,
     FromUtf8ErrorUtf8Error,
     FromUtf8ErrorAsBytes,
     FromUtf8ErrorIntoBytes,
@@ -11389,7 +11391,7 @@ impl<'p> Ctx<'p> {
                     }
                     Builtin::DefaultGlue => self.cell_default_sig(callee, span),
                     Builtin::ExitCodeFrom => (vec![int(IntTy::U8)], self.tys.exit_code_ty()),
-                    Builtin::StringFromUtf8 | Builtin::StrFromUtf8 => self.utf8_call_sig(b),
+                    Builtin::StringFromUtf8 | Builtin::StrFromUtf8 | Builtin::StringFromUtf8Lossy => self.utf8_call_sig(b),
                     Builtin::RcTryUnwrap => {
                         let elem = self.new_var(false);
                         self.deferred_sized.push((elem, span));

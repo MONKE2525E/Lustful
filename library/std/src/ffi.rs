@@ -4,9 +4,8 @@
 // `OsStr` is an unsized newtype over `[u8]` (the compiler lays it out
 // as its field; shipped source may turn `&[u8]` into `&OsStr`).
 // `OsString` reaches the `OsStr` methods through `Deref`, as in std.
-// `to_string_lossy` is missing: std returns `Cow<str>`, which lust does
-// not have yet (W-STD-B).
 
+use alloc::borrow::Cow;
 use core::cmp::Ordering;
 use core::fmt;
 use core::ops::Deref;
@@ -33,8 +32,10 @@ pub(crate) fn bytes_to_str(bytes: &[u8]) -> Option<&str> {
 }
 
 /// The bytes as text, each invalid sequence replaced by U+FFFD.
+/// The buffer starts with the input's capacity, as std's
+/// `from_utf8_lossy` allocates its owned form.
 pub(crate) fn bytes_to_string_lossy(bytes: &[u8]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(bytes.len());
     core::intrinsics::sys_utf8_lossy(bytes, &mut out);
     out
 }
@@ -107,6 +108,15 @@ impl OsStr {
     /// The string as `&str` if it is valid Unicode.
     pub fn to_str(&self) -> Option<&str> {
         bytes_to_str(&self.inner)
+    }
+
+    /// The string as text, borrowed when it is valid Unicode, else
+    /// owned with each invalid sequence replaced by U+FFFD.
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        match bytes_to_str(&self.inner) {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(bytes_to_string_lossy(&self.inner)),
+        }
     }
 
     /// An owned copy.

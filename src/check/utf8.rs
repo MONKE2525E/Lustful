@@ -1,6 +1,7 @@
 // UTF-8 decoding from bytes in body checking (W-STD-A phase 3):
 // `String::from_utf8`, `str::from_utf8` (also `std::str::from_utf8`),
-// and the methods of their errors. `FromUtf8Error` and `Utf8Error` are
+// `String::from_utf8_lossy` (a `Cow<str>`), and the methods of their
+// errors. `FromUtf8Error` and `Utf8Error` are
 // synthetic std struct Adts (collect.rs, `generics::std_adts`), so
 // their derived Debug, Clone, and Eq are the plain struct machinery;
 // Display and the methods are builtins (cgen.rs).
@@ -15,14 +16,19 @@ impl<'p> Ctx<'p> {
         self.tys.intern(TyKind::Adt(def, EMPTY_ARGS))
     }
 
-    /// Parameter and return types of `String::from_utf8` and
-    /// `str::from_utf8`.
+    /// Parameter and return types of `String::from_utf8`,
+    /// `str::from_utf8`, and `String::from_utf8_lossy`.
     pub(super) fn utf8_call_sig(&mut self, b: Builtin) -> (Vec<Ty>, Ty) {
         let bytes = int(IntTy::U8);
         if b == Builtin::StringFromUtf8 {
             let v = self.tys.mk_vec(bytes);
             let e = self.utf8_error_ty(true);
             (vec![v], self.tys.mk_result(STRING, e))
+        } else if b == Builtin::StringFromUtf8Lossy {
+            let sl = self.tys.intern(TyKind::Slice(bytes));
+            let r = self.tys.mk_ref(false, sl);
+            let cow = self.tys.mk_adt(generics::cow_def(), &[GenericArg::Ty(STR)]);
+            (vec![r], cow)
         } else {
             let sl = self.tys.intern(TyKind::Slice(bytes));
             let r = self.tys.mk_ref(false, sl);
@@ -39,8 +45,9 @@ impl<'p> Ctx<'p> {
         let n = self.name(item).to_string();
         match (string, n.as_str()) {
             (true, "from_utf8") => Some(Some(Res::Builtin(Builtin::StringFromUtf8))),
+            (true, "from_utf8_lossy") => Some(Some(Res::Builtin(Builtin::StringFromUtf8Lossy))),
             (false, "from_utf8") => Some(Some(Res::Builtin(Builtin::StrFromUtf8))),
-            (true, "from_utf8_lossy" | "from_utf8_unchecked" | "from_utf16" | "from_utf16_lossy")
+            (true, "from_utf8_unchecked" | "from_utf16" | "from_utf16_lossy")
             | (false, "from_utf8_mut" | "from_utf8_unchecked" | "from_utf8_unchecked_mut") => {
                 let t = if string { "String" } else { "str" };
                 self.err("L0640", span, format!("`{t}::{n}` is not implemented yet"), "Use `from_utf8` and handle its error.");
