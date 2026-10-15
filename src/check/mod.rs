@@ -13475,9 +13475,28 @@ impl<'p> Ctx<'p> {
             }
             (None, TyKind::Int(i)) => self.int_method(name, base, i),
             (None, TyKind::Float(f)) => self.float_method(name, base, f),
-            // A float of unknown width: float-returning methods return
-            // the variable itself, so a later use can still settle it.
-            (None, k2) if k2.is_float_infer() => self.float_method(name, base, FloatTy::F64),
+            // Trait methods work on a float of unknown width; inherent
+            // ones do not (rustc E0689), as with integers below.
+            (None, k2) if k2.is_float_infer() && name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
+            (None, k2) if k2.is_float_infer() => {
+                if self.generic_mode() && !builtin_only {
+                    match method::generic_method_search(self, e, rt, name, name_span, args, &explicit, expected) {
+                        method::Probe::Hit(ret) => return ret,
+                        method::Probe::Failed => return ERROR,
+                        method::Probe::Miss => {}
+                    }
+                }
+                if self.float_method(name, base, FloatTy::F64).is_some() {
+                    self.err(
+                        "L0111",
+                        name_span,
+                        format!("cannot call method `{}` on a float whose type is not known yet", self.name(name)),
+                        "Add a type suffix such as `2.0f32`, or a type annotation on the variable.",
+                    );
+                    return ERROR;
+                }
+                None
+            }
             (None, TyKind::Bool | TyKind::Char) if name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
             (Some(BuiltinTy::Args), _) if name == k.count => Some((B::ArgsCount, Autoref::None, vec![], USIZE)),
             // Trait methods work on an integer of unknown type; inherent ones (pow, abs) do not.
