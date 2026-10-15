@@ -15932,7 +15932,11 @@ impl<'p> Ctx<'p> {
                     return;
                 }
                 if let Some(picked) = self.inherent_assoc_pick(adt, name, base, Some(span)) {
-                    if let Some(idx) = picked {
+                    if let Some((idx, _)) = picked {
+                        if self.p.gx.assoc_const_tmpls.contains_key(&idx) {
+                            self.err("L0630", span, "a generic associated const in a pattern is outside the bounded const evaluator", "Bind the value first and compare in a guard.");
+                            return;
+                        }
                         self.check_assoc_vis(adt, name, "associated constant", span);
                         self.const_item_pat(pi, idx, t, span, in_match);
                     }
@@ -15950,7 +15954,10 @@ impl<'p> Ctx<'p> {
             }
         }
         match self.trait_assoc_const(None, base, hint, name, span) {
-            Some((Some(idx), _)) => self.const_item_pat(pi, idx, t, span, in_match),
+            Some((Some((idx, _)), _)) if self.p.gx.assoc_const_tmpls.contains_key(&idx) => {
+                self.err("L0630", span, "a generic associated const in a pattern is outside the bounded const evaluator", "Bind the value first and compare in a guard.");
+            }
+            Some((Some((idx, _)), _)) => self.const_item_pat(pi, idx, t, span, in_match),
             Some((None, ty)) if self.kind(ty) != TyKind::Error => {
                 self.err(
                     "L0110",
