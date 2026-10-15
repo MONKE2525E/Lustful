@@ -164,10 +164,11 @@ static void lust_default_hook(const uint8_t *msg, uint64_t len, const char *file
 
 /* The type ids of `&'static str` and `String` (check/any.rs) and the
    Box<dyn Any + Send> vtables of the two message payloads (drop, size,
-   align, type id words: check/object.rs). Main sets them when the
-   program unwinds or installs a hook (`lust_unw_init`). */
+   align, the two fmt shims (0 here: `Any` has no fmt supertrait), then
+   the type id words at VT_ANY_ID: check/object.rs). Main sets them
+   when the program unwinds or installs a hook (`lust_unw_init`). */
 static uint64_t lust_any_ids[4];
-static const void *lust_vt_str[5], *lust_vt_string[5];
+static const void *lust_vt_str[7], *lust_vt_string[7];
 
 /* `panic::set_hook` (std source, library/std/src/panic.rs): while a hook
    is installed, a panic calls the std runner with the payload and
@@ -276,7 +277,7 @@ static lust_str lust_exc_text(lust_exc *ex) {
     lust_str r = ex->s;
     if (ex->kind != LUST_EXC_BOX) return r;
     const void *const *vt = ex->box.vt;
-    uint64_t lo = (uint64_t)(uintptr_t)vt[3], hi = (uint64_t)(uintptr_t)vt[4];
+    uint64_t lo = (uint64_t)(uintptr_t)vt[5], hi = (uint64_t)(uintptr_t)vt[6];
     if (lo == lust_any_ids[0] && hi == lust_any_ids[1]) return *(lust_str *)ex->box.data;
     if (lo == lust_any_ids[2] && hi == lust_any_ids[3]) return lust_string_as_str((lust_String *)ex->box.data);
     r.ptr = (uint8_t *)"Box<dyn Any>";
@@ -374,13 +375,17 @@ void lust_unw_init(int32_t unwind, uint64_t str_lo, uint64_t str_hi, uint64_t st
     lust_vt_str[0] = 0;
     lust_vt_str[1] = (const void *)(uintptr_t)sizeof(lust_str);
     lust_vt_str[2] = (const void *)(uintptr_t)8;
-    lust_vt_str[3] = (const void *)(uintptr_t)str_lo;
-    lust_vt_str[4] = (const void *)(uintptr_t)str_hi;
+    lust_vt_str[3] = 0;
+    lust_vt_str[4] = 0;
+    lust_vt_str[5] = (const void *)(uintptr_t)str_lo;
+    lust_vt_str[6] = (const void *)(uintptr_t)str_hi;
     lust_vt_string[0] = (const void *)lust_string_drop;
     lust_vt_string[1] = (const void *)(uintptr_t)sizeof(lust_String);
     lust_vt_string[2] = (const void *)(uintptr_t)8;
-    lust_vt_string[3] = (const void *)(uintptr_t)string_lo;
-    lust_vt_string[4] = (const void *)(uintptr_t)string_hi;
+    lust_vt_string[3] = 0;
+    lust_vt_string[4] = 0;
+    lust_vt_string[5] = (const void *)(uintptr_t)string_lo;
+    lust_vt_string[6] = (const void *)(uintptr_t)string_hi;
 })
 
 #ifdef LUST_IMPL
