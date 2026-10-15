@@ -3183,7 +3183,21 @@ impl<'p, 'a> Lower<'p, 'a> {
             return;
         }
         if let Res::BuiltinMethod { b: Builtin::FmtWriteFmt, derefs, .. } = self.ck.res(e) {
-            self.write_fmt_into(e, recv, args, derefs, dest, span);
+            self.write_fmt_into(e, recv, args, derefs, dest, span, None);
+            return;
+        }
+        // `io::Write::write_fmt` on std's stdout or stderr types (and
+        // their locks): stream the parts through the locked stream as
+        // they format, like `print!`, instead of calling the platform
+        // default with an already formatted `Arguments` text. A print
+        // inside a fmt impl then comes out between the parts around
+        // it, as in rustc. Other writers keep the platform call.
+        if let Res::Method { f, derefs, .. } = self.ck.res(e)
+            && crate::check::platform::is_platform_write_fmt(self.p, f)
+            && let Some(stderr) = self.stream_kind(self.ty(recv))
+            && matches!(args.first().map(|&a| self.p.ast.expr(a)), Some(Expr::Macro { kind: MacroKind::FormatArgs, .. }))
+        {
+            self.write_fmt_into(e, recv, args, derefs, dest, span, Some(stderr));
             return;
         }
         if let Res::BuiltinMethod { b: Builtin::VecDrain | Builtin::StringDrain, derefs, .. } = self.ck.res(e) {
@@ -5199,11 +5213,46 @@ impl<'p, 'a> Lower<'p, 'a> {
         parts
     }
 
+    /// `Some(to_stderr)` when `t` peels through references and smart
+    /// pointers to one of std's stream types (`Stdout`, `StdoutLock`,
+    /// `Stderr`, `StderrLock`): the writers whose `write_fmt` streams
+    /// its parts (see `method_into`).
+    fn stream_kind(&self, mut t: Ty) -> Option<bool> {
+        loop {
+            if let TyKind::Ref(_, _, inner) = self.kind(t) {
+                t = inner;
+            } else if let Some(inner) = self.body.tys.smart_elem(t) {
+                t = inner;
+            } else {
+                break;
+            }
+        }
+        let a = self.body.tys.local_adt(t)?;
+        if self.p.shipped_crate_at(self.p.adt(a).span) != Some(crate::ty::lang::ShippedCrate::Std) {
+            return None;
+        }
+        match self.p.display_path(self.p.adt(a).name).as_str() {
+            "std::io::Stdout" | "std::io::StdoutLock" => Some(false),
+            "std::io::Stderr" | "std::io::StderrLock" => Some(true),
+            _ => None,
+        }
+    }
+
     /// `dst.write_fmt(format_args!(..))` (W-STD-B): a two-phase `&mut`
     /// of the receiver around the borrows of the format arguments, then
     /// one `WriteFmt` rvalue. An argument that borrows the receiver again
     /// is live at the activation, so borrowck rejects it as rustc does.
-    fn write_fmt_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], derefs: u8, dest: Option<&Place>, span: Span) {
+    #[allow(clippy::too_many_arguments)]
+    fn write_fmt_into(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        args: &[ExprId],
+        derefs: u8,
+        dest: Option<&Place>,
+        span: Span,
+        stream: Option<bool>,
+    ) {
         let recv_ty = self.peel(self.ty(recv), derefs);
         let pl = self.place_for_mut(recv);
         let pl = Self::derefs(pl, derefs);
@@ -5219,7 +5268,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         let t = self.temp(mt);
         self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
         let ty = self.ty(e);
-        self.set_or_temp(dest, Rvalue::WriteFmt(Operand::Move(Place::local(t)), parts), ty, span);
+        self.set_or_temp(dest, Rvalue::WriteFmt(Operand::Move(Place::local(t)), parts, stream), ty, span);
     }
 
     /// The text rustc's `format_args!` lowering inlines for a `{}`

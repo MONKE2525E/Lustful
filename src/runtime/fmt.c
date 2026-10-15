@@ -40,6 +40,49 @@ void lust_print_begin(lust_sink *k, int to_stderr) {
 
 void lust_print_end(int to_stderr) { funlockfile(to_stderr ? stderr : stdout); }
 
+/* The `io::Write::write_fmt` sinks: stdout through the soft LineWriter
+   (`lust_stdout_write_soft`, panic.c), stderr unbuffered with
+   `write_all`'s retry on a short or interrupted write. The first
+   failure's errno stays in `err`; later writes fail at once. */
+static int lust_io_stdout_write(lust_sink *k, const uint8_t *p, uint64_t n) {
+    lust_io_sink *io = (lust_io_sink *)k;
+    if (io->err) return 1;
+    io->err = lust_stdout_write_soft(p, n);
+    return io->err != 0;
+}
+
+static int lust_io_stderr_write(lust_sink *k, const uint8_t *p, uint64_t n) {
+    lust_io_sink *io = (lust_io_sink *)k;
+    if (io->err) return 1;
+    while (n) {
+        size_t w = fwrite(p, 1, (size_t)n, stderr);
+        if (!w) {
+            int e = errno;
+            clearerr(stderr);
+            if (e == EINTR) continue;
+            io->err = e ? e : EIO;
+            return 1;
+        }
+        p += w;
+        n -= w;
+    }
+    while (fflush(stderr) != 0) {
+        int e = errno;
+        clearerr(stderr);
+        if (e == EINTR) continue;
+        io->err = e ? e : EIO;
+        return 1;
+    }
+    return 0;
+}
+
+void lust_io_begin(lust_io_sink *k, int to_stderr) {
+    flockfile(to_stderr ? stderr : stdout);
+    k->base.write = to_stderr ? lust_io_stderr_write : lust_io_stdout_write;
+    k->base.direct = NULL;
+    k->err = 0;
+}
+
 /* PadAdapter::write_str: indent at each line start, over
    `s.split_inclusive('\n')`. */
 static int lust_pad_sink_write(lust_sink *k, const uint8_t *p, uint64_t n) {

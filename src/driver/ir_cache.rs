@@ -288,8 +288,8 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
             hash_operand(h, p, tys, ptr, seen);
             ty(h, *t, seen);
         }
-        Rvalue::WriteFmt(dst, parts) => {
-            40u8.hash(h);
+        Rvalue::WriteFmt(dst, parts, stream) => {
+            (40u8, stream).hash(h);
             hash_operand(h, p, tys, dst, seen);
             hash_fmt(h, p, tys, parts, seen);
         }
@@ -595,7 +595,7 @@ enum CachedRvalue {
     DynUpcast(CachedOperand, Vec<u32>),
     DynMeta(CachedOperand, u32),
     DynData(CachedOperand, u32),
-    WriteFmt(CachedOperand, Vec<CachedFmt>),
+    WriteFmt(CachedOperand, Vec<CachedFmt>, Option<bool>),
 }
 
 #[derive(Clone, Debug)]
@@ -906,7 +906,7 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::DynUpcast { ptr, path } => CachedRvalue::DynUpcast(cache_operand(b, p, ptr), path.clone()),
         Rvalue::DynMeta { ptr, word } => CachedRvalue::DynMeta(cache_operand(b, p, ptr), *word),
         Rvalue::DynData { ptr, ty } => CachedRvalue::DynData(cache_operand(b, p, ptr), b.ty(*ty)),
-        Rvalue::WriteFmt(dst, parts) => CachedRvalue::WriteFmt(cache_operand(b, p, dst), cache_fmt(b, p, parts)),
+        Rvalue::WriteFmt(dst, parts, stream) => CachedRvalue::WriteFmt(cache_operand(b, p, dst), cache_fmt(b, p, parts), *stream),
     }
 }
 
@@ -1085,7 +1085,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             CachedRvalue::DynUpcast(o, path) => Rvalue::DynUpcast { ptr: operand(intern, tys, strings, o)?, path: path.clone() },
             CachedRvalue::DynMeta(o, word) => Rvalue::DynMeta { ptr: operand(intern, tys, strings, o)?, word: *word },
             CachedRvalue::DynData(o, t) => Rvalue::DynData { ptr: operand(intern, tys, strings, o)?, ty: intern.ty(tys, *t)? },
-            CachedRvalue::WriteFmt(o, parts) => Rvalue::WriteFmt(operand(intern, tys, strings, o)?, fmt(intern, tys, strings, parts)?),
+            CachedRvalue::WriteFmt(o, parts, stream) => Rvalue::WriteFmt(operand(intern, tys, strings, o)?, fmt(intern, tys, strings, parts)?, *stream),
         })
     }
     let mut blocks = Vec::with_capacity(cached.blocks.len());

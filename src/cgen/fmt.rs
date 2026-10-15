@@ -634,6 +634,31 @@ impl FnGen<'_, '_, '_> {
         format!("(({e}) ? {err} : {ok})")
     }
 
+    /// The `io::Result<()>` value of a stream write whose first write
+    /// error's errno is the C int `code` (0 for none): `Ok(())`, or
+    /// `Err` of an `io::Error` with its `Os` representation, as
+    /// `Error::from_raw_os_error` builds it in the std source.
+    fn io_result_of(&mut self, code: &str) -> String {
+        let p = self.p;
+        let err_a = AdtId(
+            p.adts
+                .iter()
+                .position(|a| {
+                    p.interner.get(a.name).ends_with("$io$Error") && p.display_path(a.name) == "std::io::Error"
+                })
+                .expect("a stream write_fmt only lowers when std::io is loaded") as u32,
+        );
+        let repr_ty = p.adt(err_a).variants[0].fields[0].ty;
+        let repr_cty = cty(&p.tys, repr_ty);
+        let CTy::Adt(repr_a) = repr_cty else { return "0".into() };
+        let os = p.adt(repr_a).variants.iter().position(|v| p.interner.get(v.name) == "Os").expect("io::Error's Repr has an Os variant");
+        let t = CTy::Result(Box::new(CTy::Unit), Box::new(CTy::Adt(err_a)));
+        let repr = self.make_variant(&repr_cty, os, &[code.to_string()]);
+        let err = self.make_variant(&t, 1, &[format!("((A{}){{ .f0 = {repr} }})", err_a.0)]);
+        let ok = self.make_variant(&t, 0, &["((lust_Unit){})".to_string()]);
+        format!("(({code}) ? {err} : {ok})")
+    }
+
     /// One `core::fmt` builtin call (check/fmt.rs) over the operand
     /// values and C types, or None for every other builtin.
     pub(super) fn fmt_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy], loc: &str) -> Option<String> {
@@ -829,11 +854,17 @@ impl FnGen<'_, '_, '_> {
     /// `Rvalue::WriteFmt`: the parts into `dst`'s sink through a fresh
     /// Formatter (Formatter::write_fmt and `<String as fmt::Write>`),
     /// stopping at the first error; the value is the `fmt::Result`.
-    pub(super) fn write_fmt(&mut self, dst: &Operand, parts: &[FmtPart], loc: &str, post: &mut Vec<String>) -> String {
+    /// With `stream` set the sink is the locked stdout or stderr
+    /// stream (the `dst` operand only carries the borrow): a write
+    /// error becomes the `io::Result`'s `Err`, and a fmt impl error
+    /// with no write error panics as std's `io::Write::write_fmt` does.
+    pub(super) fn write_fmt(&mut self, dst: &Operand, parts: &[FmtPart], stream: Option<bool>, loc: &str, post: &mut Vec<String>) -> String {
         let (d, dt) = self.operand(dst, loc, post);
         let s = self.tmp();
-        let on_string = matches!(&dt, CTy::Ref(inner) if **inner == CTy::String);
-        if on_string {
+        if let Some(stderr) = stream {
+            let fd = u8::from(stderr);
+            let _ = writeln!(self.out, "    lust_io_sink {s}k; lust_io_begin(&{s}k, {fd}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k.base); int {s}e = 0;");
+        } else if matches!(&dt, CTy::Ref(inner) if **inner == CTy::String) {
             let _ = writeln!(self.out, "    lust_sink {s}k; lust_sink_string(&{s}k, {d}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); int {s}e = 0;");
         } else {
             let _ = writeln!(self.out, "    lust_Formatter {s}f; lust_f_init(&{s}f, ({d})->buf); int {s}e = 0;");
@@ -862,8 +893,30 @@ impl FnGen<'_, '_, '_> {
                     }
                     let (fill, align, flags, width, prec) = spec_words(spec);
                     let _ = writeln!(self.out, "    if (!{s}e) {{ lust_f_set(&{s}f, {fill}, {align}, {flags}, {width}, {prec}); {s}e = {e}; }}");
+                    // As in `print`: a fmt impl that panicked under
+                    // unwind stops the formatting; the parts before it
+                    // are already on the stream.
+                    if stream.is_some() && self.p.unwind && may_fail(&t) {
+                        let _ = writeln!(self.out, "    if (lust_unw_pending && lust_unw_mine()) {s}e = 1;");
+                    }
                 }
             }
+        }
+        if let Some(stderr) = stream {
+            let fd = u8::from(stderr);
+            // Unlock before the fmt-error panic under unwind, as
+            // `print` does, so cleanup does not keep the stream locked.
+            if self.p.unwind {
+                let _ = writeln!(self.out, "    lust_print_end({fd});");
+            }
+            let _ = writeln!(self.out, "    if ({s}e && !{s}k.err) lust_fmt_failed(2, {loc});");
+            if !self.p.unwind {
+                let _ = writeln!(self.out, "    lust_print_end({fd});");
+            }
+            // Read the sink's errno once, for the result value.
+            let r = self.tmp();
+            let _ = writeln!(self.out, "    int32_t {r}e = {s}k.err;");
+            return self.io_result_of(&format!("{r}e"));
         }
         self.fmt_result_of(&format!("{s}e"))
     }

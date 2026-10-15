@@ -2917,7 +2917,7 @@ impl FnGen<'_, '_, '_> {
                 t
             }
             Rvalue::Format(parts) => self.format(parts, loc, post, 0),
-            Rvalue::WriteFmt(dst, parts) => self.write_fmt(dst, parts, loc, post),
+            Rvalue::WriteFmt(dst, parts, stream) => self.write_fmt(dst, parts, *stream, loc, post),
             Rvalue::Discriminant(pl) => {
                 let (e, t) = self.place(pl, loc);
                 disc_call(self.p, &t, &format!("(&{e})"))
@@ -7816,7 +7816,7 @@ fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: 
                 op(value);
             }
         }),
-        Rvalue::WriteFmt(dst, parts) => {
+        Rvalue::WriteFmt(dst, parts, _) => {
             op(dst);
             parts.iter().for_each(|p| {
                 if let FmtPart::Arg { value, .. } = p {

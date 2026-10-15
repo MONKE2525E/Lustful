@@ -167,8 +167,13 @@ pub enum Rvalue {
     /// `dst.write_fmt(format_args!(..))` (W-STD-B): formats the parts
     /// into `dst` (a `&mut Formatter` or `&mut String`) with a fresh
     /// Formatter over its sink, stopping at the first error; the value
-    /// is the `fmt::Result`.
-    WriteFmt(Operand, Vec<FmtPart>),
+    /// is the `fmt::Result`. With `stream` set (`Some(true)` for
+    /// stderr, `Some(false)` for stdout) the destination is one of
+    /// std's stream types instead: each part goes to the locked stream
+    /// as it is formatted (as `print!` does), a write error is the
+    /// `io::Result`'s `Err`, and a fmt impl error panics as
+    /// `io::Write::write_fmt` does in std.
+    WriteFmt(Operand, Vec<FmtPart>, Option<bool>),
 }
 
 #[derive(Clone, Debug)]

@@ -2,7 +2,9 @@
 // is library/std/src/platform.rs, loaded by the resolver).
 //
 // `io::Write::write_fmt` in lust formats the whole `write!` text first
-// and writes it with one `write_all`. For std's own writers that is the
+// and writes it with one `write_all`, except on the std stream types
+// (`Stdout`, `Stderr`, and their locks), which lowering streams piece
+// by piece. For std's other writers that is the
 // output std gives, but std calls a writer's `write` once per format
 // piece, so a user writer that counts or logs its `write` calls would
 // see a different sequence. Materialize asks `user_write_fmt_instance`
@@ -44,7 +46,7 @@ pub fn user_write_fmt_call(p: &Program, tys: &impl TyIntern, f: LocalDefId, writ
 
 /// True for a `write_fmt` fn of the platform crate (the trait default,
 /// the `&mut W` forwarder, or one of their instances).
-fn is_platform_write_fmt(p: &Program, f: LocalDefId) -> bool {
+pub(crate) fn is_platform_write_fmt(p: &Program, f: LocalDefId) -> bool {
     let info = p.fn_info(f);
     p.name(info.name) == "write_fmt" && p.shipped_crate_at(info.def.name_span) == Some(ShippedCrate::Std)
 }

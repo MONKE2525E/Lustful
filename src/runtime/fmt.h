@@ -110,6 +110,16 @@ void lust_sink_string(lust_sink *k, lust_String *s);
    sink that writes each piece to it. `lust_print_end` unlocks. */
 void lust_print_begin(lust_sink *k, int to_stderr);
 void lust_print_end(int to_stderr);
+/* The sink of `io::Write::write_fmt` on a std stream: like the print
+   sink, but a failed write records its errno in `err` and returns a
+   fmt error instead of panicking, so the caller can build the
+   `io::Error`. `lust_io_begin` locks the stream as `lust_print_begin`
+   does; `lust_print_end` unlocks it. */
+typedef struct {
+    lust_sink base;
+    int32_t err;
+} lust_io_sink;
+void lust_io_begin(lust_io_sink *k, int to_stderr);
 void lust_f_init(lust_Formatter *f, lust_sink *buf);
 /* Sets the options of one placeholder. `width` and `prec` count only
    when their flag bit is set. */

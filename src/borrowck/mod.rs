@@ -517,7 +517,7 @@ fn rvalue_operands<'r>(rv: &'r Rvalue, f: &mut impl FnMut(&'r Operand)) {
                 f(value)
             }
         }),
-        Rvalue::WriteFmt(dst, parts) => {
+        Rvalue::WriteFmt(dst, parts, _) => {
             f(dst);
             parts_operands(parts, f);
         }
