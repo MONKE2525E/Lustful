@@ -6,6 +6,10 @@
 #                        it off, as the landing gate does). Only rustc's side is cached, never
 #                        lust's.
 #   CASE_TIMEOUT seconds per compile (default 30), RUN_TIMEOUT per run (default 10).
+#   DIFFTEST_SHARD       <k>/<n>: run only the matching cases whose index i (0-based, in run_all
+#                        order) has i % n == k. The n shards together run every case once; the
+#                        landing gate runs them on separate machines. $matched counts the cases
+#                        the filter matched before the shard cut.
 case_timeout=${CASE_TIMEOUT:-30}
 run_timeout=${RUN_TIMEOUT:-10}
 run_cc() { timeout "$case_timeout" "$@"; }
@@ -29,9 +33,19 @@ for d in "$root"/tests/{pass,fail,reject,unwind}; do
   dep_hash[$d]=$(cd "$d" && find . -type f ! -regex '\./[^/]*\.rs' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum)
   sib_hash[$d]=$(cd "$d" && find . -maxdepth 1 -type f -name '*.rs' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum)
 done
+shard_k=0
+shard_n=1
+if [ -n "${DIFFTEST_SHARD:-}" ]; then
+  if [[ ! "$DIFFTEST_SHARD" =~ ^([0-9]+)/([1-9][0-9]*)$ ]] || [ "${BASH_REMATCH[1]}" -ge "${BASH_REMATCH[2]}" ]; then
+    echo "FAIL: DIFFTEST_SHARD must be <k>/<n> with k < n, not '$DIFFTEST_SHARD'"
+    exit 1
+  fi
+  shard_k=${BASH_REMATCH[1]} shard_n=${BASH_REMATCH[2]}
+fi
 pass=0
 fail=0
 seen=0
+matched=0
 unsupported=0
 
 # mask_stderr <file>: a program's stderr without what differs per run: the OS thread id in
@@ -90,19 +104,21 @@ rustc_oracle() {
 }
 
 # run_all <case fn> <file...>: runs `<case fn> <name> <file>` for each file whose name
-# matches $filter, $jobs at a time. Case i runs in $work/c/i (its cwd, lust cache dir, and
+# matches $filter (and is in this DIFFTEST_SHARD), $jobs at a time. Case i runs in $work/c/i (its cwd, lust cache dir, and
 # daemon socket path), with its report in c/i/st and its output in c/i/log. Then prints
 # every log in case order, so the output does not depend on the job count, and adds to
 # pass, fail, unsupported, and seen.
 run_all() {
   local fn=$1; shift
-  local f name i=0 running=0 st
+  local f name i=0 m=0 running=0 st
   local names=()
   rm -rf "$work/c"
   for f in "$@"; do
     name=$(basename "$f" .rs)
     [[ "$f" == */unwind/* ]] && name="unwind-$name"
     [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
+    m=$((m + 1))
+    (( (m - 1) % shard_n == shard_k )) || continue
     if [ $running -ge "$jobs" ]; then wait -n; running=$((running - 1)); fi
     mkdir -p "$work/c/$i"
     (
@@ -124,4 +140,5 @@ run_all() {
     esac
   done
   seen=$((seen + ${#names[@]}))
+  matched=$((matched + m))
 }

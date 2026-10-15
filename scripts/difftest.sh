@@ -30,6 +30,8 @@
 #   (default 10). A missing or empty fixture dir fails the run, as does
 #   a filter that matches no case (ARCH 9.3: no silent skips).
 #   DIFFTEST_JOBS cases run at the same time (default nproc), each in its own dir.
+#   DIFFTEST_SHARD=<k>/<n> runs shard k of n (details in scripts/case-pool.sh). The run then
+#   prints "difftest: shard k/n ran <seen> of <matched> cases" before its summary line.
 #   DIFFTEST_RUSTC_CACHE caches rustc's side of each case, never lust's. Details in
 #   scripts/case-pool.sh.
 set -uo pipefail
@@ -51,6 +53,9 @@ fi
 filter=${1:-}
 oracle_args=()
 source "$root/scripts/case-pool.sh"
+
+# shard_line: under DIFFTEST_SHARD, how many cases this shard ran of all that matched.
+shard_line() { [ -z "${DIFFTEST_SHARD:-}" ] || echo "difftest: shard $DIFFTEST_SHARD ran $seen of $matched cases"; }
 
 # A fixture dir this run needs must exist and hold .rs files.
 require_dir() {
@@ -183,6 +188,7 @@ if [ "${PANIC:-abort}" = unwind ]; then
     echo "FAIL: no cases matched filter '${filter}'"
     exit 1
   fi
+  shard_line
   echo "difftest (PANIC=unwind): $pass passed, $fail failed, $unsupported unsupported"
   [ $fail -eq 0 ]
   exit $?
@@ -267,5 +273,6 @@ if [ $seen -eq 0 ]; then
   echo "FAIL: no cases matched filter '${filter}'"
   exit 1
 fi
+shard_line
 echo "difftest: $pass passed, $fail failed"
 [ $fail -eq 0 ]
