@@ -48,6 +48,7 @@ pub enum ShippedCrate {
     Rustix,
     Nix,
     SignalHook,
+    NameToHandleAt,
 }
 
 impl ShippedCrate {
@@ -68,6 +69,7 @@ impl ShippedCrate {
         ShippedCrate::Rustix,
         ShippedCrate::Nix,
         ShippedCrate::SignalHook,
+        ShippedCrate::NameToHandleAt,
     ];
 
     /// The crate name as user code writes it in a path (`std::...`).
@@ -87,6 +89,7 @@ impl ShippedCrate {
             ShippedCrate::Rustix => "rustix",
             ShippedCrate::Nix => "nix",
             ShippedCrate::SignalHook => "signal_hook",
+            ShippedCrate::NameToHandleAt => "name_to_handle_at",
         }
     }
 
@@ -1249,6 +1252,13 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     // has_path flag for the optional pathname.
     IntrinsicDef { name: "sys_x_fanotify_init", c_symbol: "lust_sys_x_fanotify_init", params: &[S::U32, S::U32], ret: S::I32, allowed: &[C::Nix], implemented: true },
     IntrinsicDef { name: "sys_x_fanotify_mark", c_symbol: "lust_sys_x_fanotify_mark", params: &[S::I32, S::U32, S::U64, S::I32, S::I32, S::Bytes], ret: S::I32, allowed: &[C::Nix], implemented: true },
+    // name_to_handle_at for the name-to-handle-at adapter
+    // (tf-adapters F2, sysx.c): the handle record out
+    // (handle_type and the mount id as u64 fields, then the
+    // handle bytes), 0 or errno. open_by_handle_at returns
+    // the fd or -errno.
+    IntrinsicDef { name: "sys_x_name_to_handle_at", c_symbol: "lust_sys_x_name_to_handle_at", params: &[S::I32, S::Bytes, S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::NameToHandleAt], implemented: true },
+    IntrinsicDef { name: "sys_x_open_by_handle_at", c_symbol: "lust_sys_x_open_by_handle_at", params: &[S::I32, S::I32, S::Bytes, S::I32], ret: S::I32, allowed: &[C::NameToHandleAt], implemented: true },
     // The signal registry behind the signal-hook adapter.
     IntrinsicDef { name: "sys_sig_register", c_symbol: "lust_sys_sig_register", params: &[S::I32, S::I32, S::Ptr, S::U64], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
     IntrinsicDef { name: "sys_sig_register_pipe", c_symbol: "lust_sys_sig_register_pipe", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::SignalHook], implemented: true },

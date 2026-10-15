@@ -109,6 +109,14 @@ int32_t lust_sys_x_fanotify_init(uint32_t flags, uint32_t event_f_flags);
 /* fanotify_mark(2): a path of length 0 with has_path 0 passes
    NULL as the pathname; 0 or errno. */
 int32_t lust_sys_x_fanotify_mark(int32_t fd, uint32_t flags, uint64_t mask, int32_t dirfd, int32_t has_path, const uint8_t *p, uint64_t len);
+/* name_to_handle_at(2) with the real crate's sizing loop:
+   appends handle_type and the mount id (a full u64 field,
+   for AT_HANDLE_MNT_ID_UNIQUE) and then the handle bytes;
+   0 or errno. */
+int32_t lust_sys_x_name_to_handle_at(int32_t dirfd, const uint8_t *p, uint64_t len, int32_t flags, lust_Vec *out);
+/* open_by_handle_at(2) over a handle (type, bytes): the fd
+   or -errno. */
+int32_t lust_sys_x_open_by_handle_at(int32_t mount_fd, int32_t handle_type, const uint8_t *p, uint64_t len, int32_t flags);
 
 #ifdef LUST_IMPL
 #include "sysx.c"

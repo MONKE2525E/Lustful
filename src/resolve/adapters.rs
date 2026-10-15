@@ -54,6 +54,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "signal-hook",
     "flate2",
     "same-file",
+    "name-to-handle-at",
 ];
 
 /// One adapter crate, read from its manifest.

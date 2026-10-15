@@ -590,3 +590,66 @@ int32_t lust_sys_x_fanotify_mark(int32_t fd, uint32_t flags, uint64_t mask, int3
     free(s);
     return r != 0 ? e : 0;
 }
+
+/* struct file_handle with a `cap`-byte handle tail. */
+struct lust_sysx_fhandle {
+    uint32_t handle_bytes;
+    int32_t handle_type;
+    uint8_t f_handle[];
+};
+
+int32_t lust_sys_x_name_to_handle_at(int32_t dirfd, const uint8_t *p, uint64_t len, int32_t flags, lust_Vec *out) {
+    char *s = lust_sysx_path(p, len);
+    if (!s) return ENOMEM;
+    struct lust_sysx_fhandle probe;
+    probe.handle_bytes = 0;
+    probe.handle_type = 0;
+    uint64_t mount_id = 0;
+    long r = syscall(SYS_name_to_handle_at, dirfd, s, &probe, &mount_id, flags);
+    int e = errno;
+    if (r == 0 || e != EOVERFLOW || probe.handle_bytes == 0) {
+        free(s);
+        return r == 0 ? EOVERFLOW : e;
+    }
+    uint32_t want = probe.handle_bytes;
+    int32_t handle_type = probe.handle_type;
+    for (;;) {
+        struct lust_sysx_fhandle *h = (struct lust_sysx_fhandle *)calloc(1, sizeof(*h) + want);
+        if (!h) {
+            free(s);
+            return ENOMEM;
+        }
+        h->handle_bytes = want;
+        h->handle_type = handle_type;
+        r = syscall(SYS_name_to_handle_at, dirfd, s, h, &mount_id, flags);
+        e = errno;
+        uint32_t got = h->handle_bytes;
+        handle_type = h->handle_type;
+        if (r == 0) {
+            lust_sysx_u64(out, (uint64_t)(uint32_t)handle_type);
+            lust_sysx_u64(out, mount_id);
+            lust_sysx_push(out, h->f_handle, got);
+            free(h);
+            free(s);
+            return 0;
+        }
+        free(h);
+        if (e != EOVERFLOW) {
+            free(s);
+            return e;
+        }
+        want = got;
+    }
+}
+
+int32_t lust_sys_x_open_by_handle_at(int32_t mount_fd, int32_t handle_type, const uint8_t *p, uint64_t len, int32_t flags) {
+    struct lust_sysx_fhandle *h = (struct lust_sysx_fhandle *)calloc(1, sizeof(*h) + len);
+    if (!h) return -ENOMEM;
+    h->handle_bytes = (uint32_t)len;
+    h->handle_type = handle_type;
+    memcpy(h->f_handle, p, len);
+    long r = syscall(SYS_open_by_handle_at, mount_fd, h, flags);
+    int e = errno;
+    free(h);
+    return r < 0 ? -e : (int32_t)r;
+}
