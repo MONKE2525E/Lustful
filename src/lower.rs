@@ -5185,7 +5185,7 @@ impl<'p> Lower<'p> {
             Expr::Bool(b) => Operand::Const(Const::Bool(*b)),
             Expr::Char(c) => Operand::Const(Const::Char(*c)),
             Expr::Str(s) => Operand::Const(Const::Str(*s)),
-            Expr::Path(_) => self.operand_raw(l),
+            Expr::Path(_) | Expr::QPath { .. } => self.operand_raw(l),
             _ => Operand::Const(Const::Unit),
         }
     }

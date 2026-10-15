@@ -3547,6 +3547,9 @@ impl<'a> Parser<'a> {
                     // Both are parse errors in rustc, so they are here.
                     let bad_scrutinee = match init {
                         None => true,
+                        // A parenthesized block-like scrutinee is
+                        // the wrapped form rustc asks for.
+                        Some(i) if self.paren_lo.contains_key(&i.0) => false,
                         Some(i) => matches!(
                             self.ast.expr(i),
                             Expr::StructLit { .. }
@@ -3705,17 +3708,26 @@ impl<'a> Parser<'a> {
 
     /// True when the next token can start a range pattern bound: a
     /// literal, or a path to a const (`u8::MAX`, `m::LO`, `LO`,
-    /// `crate::m::HI`).
+    /// `crate::m::HI`, `<K>::A`).
     fn at_bound_start(&self) -> bool {
-        self.at_literal_start()
-            || matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep)
+        self.at_bound_start_at(0)
+    }
+
+    /// `at_bound_start` at lookahead `n`.
+    fn at_bound_start_at(&self, n: usize) -> bool {
+        self.at_literal_start_at(n)
+            || matches!(self.peek_at(n), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep | Tok::Lt)
     }
 
     /// Parses one range pattern bound: a literal (possibly negated) or
     /// a path. The checker evaluates it as a const expression.
     fn pattern_bound(&mut self) -> PResult<ExprId> {
         let start = self.span();
-        if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep) {
+        if self.peek() == Tok::Lt {
+            let (self_ty, trait_path, segs) = self.qpath_parts()?;
+            let span = start.to(self.prev_span());
+            Ok(self.push_expr(Expr::QPath { self_ty, trait_path, segs }, span))
+        } else if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep) {
             let path = self.path(false)?;
             let span = start.to(self.prev_span());
             Ok(self.push_expr(Expr::Path(path), span))
@@ -3782,7 +3794,26 @@ impl<'a> Parser<'a> {
             }
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
-                Pat::QPath { self_ty, trait_path, segs }
+                if self.peek() == Tok::DotDotEq || self.peek() == Tok::DotDot {
+                    // A qualified path as a range lower bound
+                    // (`<K>::A..=100`), as for a plain path below.
+                    let lo_span = start.to(self.prev_span());
+                    let lo = self.push_expr(Expr::QPath { self_ty, trait_path, segs }, lo_span);
+                    if self.eat(Tok::DotDotEq) {
+                        let hi = self.pattern_bound()?;
+                        Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: true }
+                    } else {
+                        self.bump();
+                        if self.at_bound_start() {
+                            let hi = self.pattern_bound()?;
+                            Pat::Range { lo: Some(lo), hi: Some(hi), inclusive: false }
+                        } else {
+                            Pat::Range { lo: Some(lo), hi: None, inclusive: false }
+                        }
+                    }
+                } else {
+                    Pat::QPath { self_ty, trait_path, segs }
+                }
             }
             Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
                 self.skip_macro_invocation()?;
@@ -3824,7 +3855,7 @@ impl<'a> Parser<'a> {
                             self.bump();
                             let mut elems = Vec::new();
                             while self.peek() != Tok::RParen {
-                                if self.peek() == Tok::DotDot {
+                                if self.peek() == Tok::DotDot && !self.at_bound_start_at(1) {
                                     let s = self.span();
                                     self.bump();
                                     elems.push(self.push_pat(Pat::Rest, s));
@@ -3888,7 +3919,7 @@ impl<'a> Parser<'a> {
                 let mut elems = Vec::new();
                 let mut tuple = false;
                 while self.peek() != Tok::RParen {
-                    if self.peek() == Tok::DotDot {
+                    if self.peek() == Tok::DotDot && !self.at_bound_start_at(1) {
                         let s = self.span();
                         self.bump();
                         elems.push(self.push_pat(Pat::Rest, s));
@@ -3913,7 +3944,7 @@ impl<'a> Parser<'a> {
                 let mut suffix: Vec<PatId> = Vec::new();
                 let mut seen_rest = false;
                 while self.peek() != Tok::RBracket {
-                    if self.peek() == Tok::DotDot && !self.at_literal_start_at(1) {
+                    if self.peek() == Tok::DotDot && !self.at_bound_start_at(1) {
                         let s = self.span();
                         self.bump();
                         if seen_rest {
