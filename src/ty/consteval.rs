@@ -781,6 +781,7 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
         extra_cap: 0,
         call_depth: 0,
         move_read: false,
+        dead: 0,
         ref_drop_temps: Vec::new(),
         flex_debt: Vec::new(),
         local_debt: Vec::new(),
@@ -839,6 +840,10 @@ struct Evaluator {
     /// borrowed. Each one must end up in the final value, promoted;
     /// one that does not was dropped at its statement's end.
     ref_drop_temps: Vec<Ty>,
+    /// Depth of dead-branch scans (`scan_dead_block`): a scan does
+    /// not start another scan, so nested dead branches cost one
+    /// pass each, not an exponential one.
+    dead: u32,
     /// Unsuffixed literals evaluated wide (no pinning type) whose
     /// magnitude does not fit i32, by expression. Evaluating the
     /// same expression at a pinning type, or reading a local it
@@ -1090,45 +1095,68 @@ impl Evaluator {
                     TyKind::Array(el, _) => Some(el),
                     _ => None,
                 });
+                // Every repeat evaluates its operand once. A const
+                // item or inline const operand is re-evaluated per
+                // element by the compiler, so it is never copied or
+                // dropped here; any other operand materializes one
+                // value that the repeat then copies (above length 1)
+                // or drops (length 0).
+                let (v, t) = self.value_moved(cx, env, *value, exp_elem)?;
+                let operand_local = match cx.ast().expr(*value) {
+                    Expr::Path(segs) if segs.len() == 1 => env.iter().any(|(name, _, _, _)| *name == segs[0].name),
+                    _ => false,
+                };
+                let operand_static = match cx.ast().expr(*value) {
+                    Expr::Path(segs) if segs.len() == 1 && !operand_local => cx.static_item(segs[0].name, span).is_some(),
+                    _ => false,
+                };
+                if operand_static && !cx.is_copy(t) {
+                    return Err(Diag::new(
+                        "L0110",
+                        span,
+                        "cannot move out of a static item",
+                        "A repeat of a non-`Copy` static value would move it; use a const item instead.",
+                    ));
+                }
+                let operand_const = match cx.ast().expr(*value) {
+                    Expr::ConstBlock(_) => true,
+                    Expr::Path(segs) => {
+                        !operand_local
+                            && !operand_static
+                            && match segs.as_slice() {
+                                [s] => cx.const_item(s.name, span).is_some(),
+                                _ => cx.assoc_const_item(segs).is_some(),
+                            }
+                    }
+                    _ => false,
+                };
                 if n == 0 {
-                    // A zero repeat still evaluates its operand once
-                    // and drops it, so a drop operand is E0493 here
-                    // and a local operand is moved in.
-                    let (_, t) = self.value_moved(cx, env, *value, exp_elem)?;
-                    if cx.needs_drop(t) {
+                    // A materialized operand is dropped at once, so
+                    // a drop operand is E0493 here (a const operand
+                    // and a unit variant make no temporary).
+                    let materializes = match cx.ast().expr(*value) {
+                        Expr::ConstBlock(_) => false,
+                        Expr::Path(_) | Expr::QPath { .. } => operand_local,
+                        _ => true,
+                    };
+                    if materializes && cx.needs_drop(t) {
                         return Err(drop_diag(cx, t, span));
                     }
                     let elem = exp_elem.unwrap_or(t);
                     let c = cx.tys().intern_const(super::ConstKind::Int(0));
                     (ConstValue::Aggregate(Vec::new()), cx.tys().intern(TyKind::Array(elem, c)))
                 } else {
-                    let (v, t) = self.value_moved(cx, env, *value, exp_elem)?;
                     // Above length 1 a repeat duplicates its operand:
-                    // it must be `Copy`, or a const item or inline
-                    // const the compiler re-evaluates per element.
+                    // it must be `Copy`, or a const operand as above.
                     // A const fn call makes one value, so it needs
                     // `Copy` like any other operand (rustc E0277).
-                    if n > 1 && !cx.is_copy(t) {
-                        let operand_const = match cx.ast().expr(*value) {
-                            Expr::ConstBlock(_) => true,
-                            Expr::Path(segs) => {
-                                let local = segs.len() == 1 && env.iter().any(|(name, _, _, _)| *name == segs[0].name);
-                                !local
-                                    && match segs.as_slice() {
-                                        [s] => cx.static_item(s.name, span).is_none() && cx.const_item(s.name, span).is_some(),
-                                        _ => cx.assoc_const_item(segs).is_some(),
-                                    }
-                            }
-                            _ => false,
-                        };
-                        if !operand_const {
-                            return Err(Diag::new(
-                                "L0110",
-                                span,
-                                "the trait `Copy` is not implemented for this type",
-                                "Array repeat with a length above 1 needs a Copy element, a const item, or write the elements out.",
-                            ));
-                        }
+                    if n > 1 && !cx.is_copy(t) && !operand_const {
+                        return Err(Diag::new(
+                            "L0110",
+                            span,
+                            "the trait `Copy` is not implemented for this type",
+                            "Array repeat with a length above 1 needs a Copy element, a const item, or write the elements out.",
+                        ));
                     }
                     let c = cx.tys().intern_const(super::ConstKind::Int(n as u128));
                     (ConstValue::Repeat(Box::new(v), n), cx.tys().intern(TyKind::Array(t, c)))
@@ -1501,8 +1529,14 @@ impl Evaluator {
                             self.check_scope_drops(cx, env, saved, span)?;
                         }
                         env.truncate(saved);
+                        if r.is_ok()
+                            && let Some(els) = els
+                        {
+                            self.scan_dead_expr(cx, env, *els)?;
+                        }
                         return r;
                     }
+                    self.scan_dead_block(cx, env, *then)?;
                     match els {
                         Some(els) => return self.expr(cx, env, *els, expected),
                         None => (ConstValue::Unit, UNIT),
@@ -1511,16 +1545,32 @@ impl Evaluator {
                     let (cv, _) = self.value(cx, env, *cond, Some(BOOL))?;
                     let ConstValue::Bool(b) = cv else { return Err(outside(span, "this condition")) };
                     if b {
-                        return self.block(cx, env, *then, expected);
+                        let r = self.block(cx, env, *then, expected);
+                        if r.is_ok()
+                            && let Some(els) = els
+                        {
+                            self.scan_dead_expr(cx, env, *els)?;
+                        }
+                        return r;
                     }
                     match els {
-                        Some(els) => return self.expr(cx, env, *els, expected),
-                        None => (ConstValue::Unit, UNIT),
+                        Some(els) => {
+                            let r = self.expr(cx, env, *els, expected);
+                            if r.is_ok() {
+                                self.scan_dead_block(cx, env, *then)?;
+                            }
+                            return r;
+                        }
+                        None => {
+                            self.scan_dead_block(cx, env, *then)?;
+                            (ConstValue::Unit, UNIT)
+                        }
                     }
                 }
             }
             Expr::Match { scrut, arms } => return self.match_expr(cx, env, *scrut, arms, expected, span),
             Expr::While { label, cond, body } => {
+                let mut first = true;
                 loop {
                     self.step(span)?;
                     // `while let pat = scrut { .. }`: bindings are
@@ -1545,8 +1595,14 @@ impl Evaluator {
                     };
                     if !go {
                         env.truncate(saved);
+                        // A body that never runs still drops its
+                        // locals in rustc's static check.
+                        if first {
+                            self.scan_dead_block(cx, env, *body)?;
+                        }
                         break;
                     }
+                    first = false;
                     let flow = self.block(cx, env, *body, Some(UNIT));
                     if flow.is_ok() {
                         self.check_scope_drops(cx, env, saved, span)?;
@@ -1651,6 +1707,54 @@ impl Evaluator {
             return Err(drop_diag(cx, base_ty, span));
         }
         Ok(())
+    }
+
+    /// Evaluates a branch the live path did not take, only to
+    /// surface its E0493 drops: rustc's const drop check is
+    /// static, so a destructor in dead code still rejects, while
+    /// its panics and overflows do not. The environment, step
+    /// count, and drop-temporary count are restored afterwards.
+    fn scan_dead_block<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &Env, b: ast::BlockId) -> Result<(), Diag> {
+        if self.dead > 0 {
+            return Ok(());
+        }
+        self.dead += 1;
+        let (steps, temps, flex, local) = (self.steps, self.ref_drop_temps.len(), self.flex_debt.len(), self.local_debt.len());
+        let depth = self.call_depth;
+        let mut env2 = env.clone();
+        let r = self.block(cx, &mut env2, b, None);
+        self.dead -= 1;
+        self.steps = steps;
+        self.call_depth = depth;
+        self.ref_drop_temps.truncate(temps);
+        self.flex_debt.truncate(flex);
+        self.local_debt.truncate(local);
+        match r {
+            Err(d) if is_drop_diag(&d) => Err(d),
+            _ => Ok(()),
+        }
+    }
+
+    /// `scan_dead_block` for one expression (an `else` arm).
+    fn scan_dead_expr<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &Env, e: ExprId) -> Result<(), Diag> {
+        if self.dead > 0 {
+            return Ok(());
+        }
+        self.dead += 1;
+        let (steps, temps, flex, local) = (self.steps, self.ref_drop_temps.len(), self.flex_debt.len(), self.local_debt.len());
+        let depth = self.call_depth;
+        let mut env2 = env.clone();
+        let r = self.expr(cx, &mut env2, e, None);
+        self.dead -= 1;
+        self.steps = steps;
+        self.call_depth = depth;
+        self.ref_drop_temps.truncate(temps);
+        self.flex_debt.truncate(flex);
+        self.local_debt.truncate(local);
+        match r {
+            Err(d) if is_drop_diag(&d) => Err(d),
+            _ => Ok(()),
+        }
     }
 
     /// Evaluates to a plain value (any control-flow escape is an error here).
@@ -4792,6 +4896,12 @@ fn check_macro_forms(ast: &Ast, e: ExprId) -> Result<(), Diag> {
         | Expr::OffsetOf { .. }
         | Expr::Closure { .. } => Ok(()),
     }
+}
+
+/// True for an E0493 diagnostic from `drop_diag` (the only errors
+/// a dead-branch scan propagates).
+fn is_drop_diag(d: &Diag) -> bool {
+    d.code == C_NONCONST && d.message.starts_with("destructor of ")
 }
 
 /// The E0493 error for a destructor that would run during const
