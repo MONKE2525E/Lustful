@@ -97,44 +97,190 @@ pub fn ranges_by_file(ast: &Ast, n_files: usize) -> Vec<FileRanges> {
         .collect()
 }
 
+/// Arena nodes a file-limited span walk must visit for an edit in one
+/// file, beyond that file's ranges: a node whose spans (its own, any in
+/// its payload, or any its expansion contexts read) name a file other
+/// than its own span's file is listed under each such file. A node in
+/// no list for the edited file holds only spans of its own file whose
+/// contexts read only that file, so the edit moves none of them and
+/// reshifts no context. Built by `probe_extras` from the same walk that
+/// shifts, so the two cannot disagree about which spans a node holds.
+#[derive(Clone, Default)]
+pub struct ExtraNodes {
+    pub exprs: Vec<usize>,
+    pub pats: Vec<usize>,
+    pub tys: Vec<usize>,
+    pub blocks: Vec<usize>,
+    pub items: Vec<usize>,
+    pub stmt_items: Vec<usize>,
+}
+
+impl ExtraNodes {
+    /// True when no node needs the extra visit.
+    pub fn is_empty(&self) -> bool {
+        self.exprs.is_empty() && self.pats.is_empty() && self.tys.is_empty() && self.blocks.is_empty() && self.items.is_empty() && self.stmt_items.is_empty()
+    }
+}
+
+/// The files one node's spans name, other than its own span's file: the
+/// files of its payload spans and of every span its contexts read
+/// (`diag::ctxt_files`). An empty root-context span at byte 0 is the
+/// dummy span of a synthetic node: it names no source and no body edit
+/// (whose replaced bytes start after a fn head) can move it.
+fn node_other_files(own: Span, spans: &[Span], out: &mut Vec<FileId>) {
+    out.clear();
+    let mut ctxts: Vec<CtxtId> = Vec::new();
+    for s in spans {
+        if s.lo == 0 && s.hi == 0 && s.ctxt == CtxtId::ROOT {
+            continue;
+        }
+        if s.file != own.file && !out.contains(&s.file) {
+            out.push(s.file);
+        }
+        if s.ctxt != CtxtId::ROOT && !ctxts.contains(&s.ctxt) {
+            ctxts.push(s.ctxt);
+            let mut files = Vec::new();
+            crate::diag::ctxt_files(s.ctxt, &mut files);
+            for f in files {
+                if f != own.file && !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+    }
+}
+
+/// Walks `ast` once without moving anything and lists, per file, the
+/// extra nodes an edit in that file must visit (see `ExtraNodes`). The
+/// body patch runs it on its first edit of a crate whose macros or
+/// includes kept `ranges_by_file` off, then walks by ranges plus these.
+pub fn probe_extras(ast: &mut Ast, n_files: usize) -> Vec<ExtraNodes> {
+    let all = FileRanges {
+        exprs: vec![0..ast.exprs.len()],
+        pats: vec![0..ast.pats.len()],
+        tys: vec![0..ast.tys.len()],
+        blocks: vec![0..ast.blocks.len()],
+        items: vec![0..ast.items.len()],
+        stmt_items: vec![0..ast.stmt_items.len()],
+    };
+    probe_extras_in(ast, n_files, &all)
+}
+
+/// `probe_extras` over only the nodes in `only` (nodes a patch just
+/// appended, which the first probe never saw).
+pub fn probe_extras_in(ast: &mut Ast, n_files: usize, only: &FileRanges) -> Vec<ExtraNodes> {
+    let dummy = Edit { file: FileId(u32::MAX - 1), a: 0, b: 0, d: 0 };
+    let mut w = Walk { edit: dummy, ctxts: FxMap::default(), visited: 0, probe: Some(Vec::new()) };
+    let mut extras: Vec<ExtraNodes> = vec![ExtraNodes::default(); n_files];
+    let mut others: Vec<FileId> = Vec::new();
+    // Files outside the map (a dummy span's file, a std site) name no
+    // edit the patch can make, so they list no extra node.
+    let mut list = |extras: &mut Vec<ExtraNodes>, own: Span, spans: &[Span], pick: fn(&mut ExtraNodes) -> &mut Vec<usize>, i: usize, others: &mut Vec<FileId>| {
+        node_other_files(own, spans, others);
+        for f in others.iter() {
+            if let Some(x) = extras.get_mut(f.0 as usize) {
+                pick(x).push(i);
+            }
+        }
+    };
+    let Ast { items, stmt_items, exprs, expr_spans, pats, pat_spans, tys, ty_spans, blocks, .. } = ast;
+    for i in only.exprs.iter().flat_map(|r| r.clone()) {
+        w.probe.as_mut().unwrap().clear();
+        let own = expr_spans[i];
+        w.sp(&mut expr_spans[i]);
+        w.expr(&mut exprs[i]);
+        list(&mut extras, own, w.probe.as_ref().unwrap(), |x| &mut x.exprs, i, &mut others);
+    }
+    for i in only.pats.iter().flat_map(|r| r.clone()) {
+        w.probe.as_mut().unwrap().clear();
+        let own = pat_spans[i];
+        w.sp(&mut pat_spans[i]);
+        w.pat(&mut pats[i]);
+        list(&mut extras, own, w.probe.as_ref().unwrap(), |x| &mut x.pats, i, &mut others);
+    }
+    for i in only.tys.iter().flat_map(|r| r.clone()) {
+        w.probe.as_mut().unwrap().clear();
+        let own = ty_spans[i];
+        w.sp(&mut ty_spans[i]);
+        w.ty(&mut tys[i]);
+        list(&mut extras, own, w.probe.as_ref().unwrap(), |x| &mut x.tys, i, &mut others);
+    }
+    for i in only.blocks.iter().flat_map(|r| r.clone()) {
+        w.probe.as_mut().unwrap().clear();
+        let own = blocks[i].span;
+        w.block(&mut blocks[i]);
+        list(&mut extras, own, w.probe.as_ref().unwrap(), |x| &mut x.blocks, i, &mut others);
+    }
+    for i in only.items.iter().flat_map(|r| r.clone()) {
+        w.probe.as_mut().unwrap().clear();
+        let own = items[i].span;
+        w.item(&mut items[i]);
+        list(&mut extras, own, w.probe.as_ref().unwrap(), |x| &mut x.items, i, &mut others);
+    }
+    for i in only.stmt_items.iter().flat_map(|r| r.clone()) {
+        w.probe.as_mut().unwrap().clear();
+        let own = stmt_items[i].span;
+        w.item(&mut stmt_items[i]);
+        list(&mut extras, own, w.probe.as_ref().unwrap(), |x| &mut x.stmt_items, i, &mut others);
+    }
+    extras
+}
+
+/// True when index `i` lies in one of `ranges`.
+fn in_ranges(ranges: &[Range<usize>], i: usize) -> bool {
+    ranges.iter().any(|r| r.contains(&i))
+}
+
 /// Applies `edit` to every span of `ast`, or, with `ranges`, to the
 /// spans of the nodes in those ranges (see `ranges_by_file`). Returns
 /// the number of spans visited (the patch's work counter). `ctxts`
 /// collects the fresh expansion contexts (`Edit::span`), so a kept
 /// program's spans can move to the same ones (check/prog_shift.rs).
 pub fn shift_ast(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>, ctxts: &mut FxMap<u32, CtxtId>) -> usize {
-    let mut w = Walk { edit, ctxts: std::mem::take(ctxts), visited: 0 };
+    shift_ast_extras(ast, edit, ranges, &ExtraNodes::default(), ctxts)
+}
+
+/// `shift_ast` plus the extra nodes of `probe_extras`, which are visited
+/// whatever file the edit is in (never twice: an extra inside `ranges`
+/// is walked with the ranges). With no `ranges` the whole Ast is walked
+/// and `extras` changes nothing.
+pub fn shift_ast_extras(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>, extras: &ExtraNodes, ctxts: &mut FxMap<u32, CtxtId>) -> usize {
+    let mut w = Walk { edit, ctxts: std::mem::take(ctxts), visited: 0, probe: None };
     let Ast { inner_attrs, items, stmt_items, exprs, expr_spans, pats, pat_spans, tys, ty_spans, blocks, .. } = ast;
     let all = |n: usize| vec![0..n];
     let pick = |n: usize, f: fn(&FileRanges) -> &Vec<Range<usize>>| ranges.map_or_else(|| all(n), |r| f(r).clone());
-    for r in pick(exprs.len(), |r| &r.exprs) {
-        for i in r {
-            w.sp(&mut expr_spans[i]);
-            w.expr(&mut exprs[i]);
-        }
+    // The extra nodes of one arena that the picked ranges do not cover.
+    let extra = |picked: &[Range<usize>], xs: &[usize]| -> Vec<usize> {
+        if ranges.is_none() { Vec::new() } else { xs.iter().copied().filter(|&i| !in_ranges(picked, i)).collect() }
+    };
+    let picked = pick(exprs.len(), |r| &r.exprs);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.exprs)) {
+        w.sp(&mut expr_spans[i]);
+        w.expr(&mut exprs[i]);
     }
-    for r in pick(pats.len(), |r| &r.pats) {
-        for i in r {
-            w.sp(&mut pat_spans[i]);
-            w.pat(&mut pats[i]);
-        }
+    let picked = pick(pats.len(), |r| &r.pats);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.pats)) {
+        w.sp(&mut pat_spans[i]);
+        w.pat(&mut pats[i]);
     }
-    for r in pick(tys.len(), |r| &r.tys) {
-        for i in r {
-            w.sp(&mut ty_spans[i]);
-            w.ty(&mut tys[i]);
-        }
+    let picked = pick(tys.len(), |r| &r.tys);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.tys)) {
+        w.sp(&mut ty_spans[i]);
+        w.ty(&mut tys[i]);
     }
-    for r in pick(blocks.len(), |r| &r.blocks) {
-        blocks[r].iter_mut().for_each(|b| w.block(b));
+    let picked = pick(blocks.len(), |r| &r.blocks);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.blocks)) {
+        w.block(&mut blocks[i]);
     }
     // Inner attributes of every file's chunk merge into one short list.
     w.attrs(inner_attrs);
-    for r in pick(items.len(), |r| &r.items) {
-        items[r].iter_mut().for_each(|it| w.item(it));
+    let picked = pick(items.len(), |r| &r.items);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.items)) {
+        w.item(&mut items[i]);
     }
-    for r in pick(stmt_items.len(), |r| &r.stmt_items) {
-        stmt_items[r].iter_mut().for_each(|it| w.item(it));
+    let picked = pick(stmt_items.len(), |r| &r.stmt_items);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.stmt_items)) {
+        w.item(&mut stmt_items[i]);
     }
     *ctxts = w.ctxts;
     w.visited
@@ -146,29 +292,43 @@ pub fn shift_ast(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>, ctxts: 
 /// more, but passes that scan whole arenas would still see their kinds.
 /// A node a macro expanded counts by its call site: its own span can
 /// name the macro's definition, outside the body that called it.
-pub fn blank_nodes(ast: &mut Ast, file: FileId, (lo, hi): (u32, u32), ranges: Option<&FileRanges>) {
+pub fn blank_nodes(ast: &mut Ast, file: FileId, span: (u32, u32), ranges: Option<&FileRanges>) {
+    blank_nodes_extras(ast, file, span, ranges, &ExtraNodes::default())
+}
+
+/// `blank_nodes` plus the extra nodes of `probe_extras`: a node outside
+/// the file's ranges can still sit inside the replaced body by its call
+/// site, and only an extra node can.
+pub fn blank_nodes_extras(ast: &mut Ast, file: FileId, (lo, hi): (u32, u32), ranges: Option<&FileRanges>, extras: &ExtraNodes) {
     let inside = |s: &Span| {
         let s = if s.ctxt == CtxtId::ROOT { *s } else { crate::diag::call_site_span(*s) };
         s.file == file && lo <= s.lo && s.hi <= hi
     };
     let all = |n: usize| vec![0..n];
     let pick = |n: usize, f: fn(&FileRanges) -> &Vec<Range<usize>>| ranges.map_or_else(|| all(n), |r| f(r).clone());
-    for i in pick(ast.exprs.len(), |r| &r.exprs).into_iter().flatten() {
+    let extra = |picked: &[Range<usize>], xs: &[usize]| -> Vec<usize> {
+        if ranges.is_none() { Vec::new() } else { xs.iter().copied().filter(|&i| !in_ranges(picked, i)).collect() }
+    };
+    let picked = pick(ast.exprs.len(), |r| &r.exprs);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.exprs)) {
         if inside(&ast.expr_spans[i]) {
             ast.exprs[i] = Expr::Unit;
         }
     }
-    for i in pick(ast.pats.len(), |r| &r.pats).into_iter().flatten() {
+    let picked = pick(ast.pats.len(), |r| &r.pats);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.pats)) {
         if inside(&ast.pat_spans[i]) {
             ast.pats[i] = Pat::Wild;
         }
     }
-    for i in pick(ast.tys.len(), |r| &r.tys).into_iter().flatten() {
+    let picked = pick(ast.tys.len(), |r| &r.tys);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.tys)) {
         if inside(&ast.ty_spans[i]) {
             ast.tys[i] = TyExpr::Infer;
         }
     }
-    for i in pick(ast.blocks.len(), |r| &r.blocks).into_iter().flatten() {
+    let picked = pick(ast.blocks.len(), |r| &r.blocks);
+    for i in picked.iter().flat_map(|r| r.clone()).chain(extra(&picked, &extras.blocks)) {
         let b = &mut ast.blocks[i];
         if inside(&b.span) {
             *b = Block { inner_attrs: Vec::new(), stmts: Vec::new(), tail: None, tail_attrs: Vec::new(), span: b.span };
@@ -180,11 +340,17 @@ struct Walk {
     edit: Edit,
     ctxts: FxMap<u32, CtxtId>,
     visited: usize,
+    /// Probe mode (`probe_extras`): collect each span instead of moving it.
+    probe: Option<Vec<Span>>,
 }
 
 impl Walk {
     fn sp(&mut self, s: &mut Span) {
         self.visited += 1;
+        if let Some(spans) = &mut self.probe {
+            spans.push(*s);
+            return;
+        }
         *s = self.edit.span(*s, &mut self.ctxts);
     }
     fn lt(&mut self, l: &mut Lifetime) {
@@ -744,6 +910,50 @@ fn main() {
             let ranges = ranges_by_file(&ranged, 1);
             shift_ast(&mut ranged, edit, Some(&ranges[0]), &mut FxMap::default());
             assert_eq!(dump(&ranged), want, "ranged shift for edit at {a}..{b}");
+        }
+    }
+
+    /// The probed plan (one file's ranges plus the extra nodes) shifts
+    /// exactly what a whole-Ast walk shifts, on an Ast where some nodes
+    /// name a second file: retag a few own spans to file 1, so their
+    /// payloads still name file 0. The probe must list every retagged
+    /// node, and both files' edits must agree with the whole walk.
+    #[test]
+    fn probed_plan_matches_whole_shift() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let retag = |ast: &mut Ast| -> Vec<usize> {
+            let ks: Vec<usize> = (0..ast.exprs.len()).step_by(37).collect();
+            for &k in &ks {
+                ast.expr_spans[k].file = FileId(1);
+            }
+            ks
+        };
+        let mut probed = parse(SRC, &interner, &known);
+        retag(&mut probed);
+        // One cross-file payload span, by hand: a fn item whose name span
+        // names file 1 while the item span names file 0.
+        let (item_k, _) = probed.items.iter_mut().enumerate().find_map(|(k, it)| match &mut it.kind {
+            ItemKind::Fn(def) => Some((k, def)),
+            _ => None,
+        }).unwrap();
+        if let ItemKind::Fn(def) = &mut probed.items[item_k].kind {
+            def.name_span.file = FileId(1);
+        }
+        let extras = probe_extras(&mut probed, 2);
+        assert!(extras[1].items.contains(&item_k), "an item with a file 1 payload span is an extra node for file 1");
+        for file in [FileId(0), FileId(1)] {
+            let edit = Edit { file, a: 10, b: 10, d: 5 };
+            let mut whole = parse(SRC, &interner, &known);
+            retag(&mut whole);
+            shift_ast(&mut whole, edit, None, &mut FxMap::default());
+            let mut ranged = parse(SRC, &interner, &known);
+            retag(&mut ranged);
+            let ranges = ranges_by_file(&ranged, 2);
+            let extras = probe_extras(&mut ranged, 2);
+            shift_ast_extras(&mut ranged, edit, Some(&ranges[file.0 as usize]), &extras[file.0 as usize], &mut FxMap::default());
+            assert_eq!(dump(&ranged), dump(&whole), "probed plan for an edit in file {}", file.0);
+            assert_eq!(call_sites(&ranged), call_sites(&whole), "call sites for an edit in file {}", file.0);
         }
     }
 }

@@ -340,6 +340,36 @@ pub fn ctxt_can_see_local(use_ctxt: CtxtId, binding: Span) -> bool {
     false
 }
 
+/// Adds to `out` every file that reshifting `ctxt` can read: the call
+/// spans and hygiene definition spans of its whole chain (parents and
+/// the contexts those spans themselves carry), exactly the spans
+/// `reshift_ctxt` looks at. The daemon's span probe uses it to prove
+/// that an edit in a file outside `out` cannot move this context.
+/// Files already in `out` are not added again.
+pub fn ctxt_files(ctxt: CtxtId, out: &mut Vec<FileId>) {
+    let mut todo = vec![ctxt];
+    let mut seen: Vec<CtxtId> = Vec::new();
+    while let Some(c) = todo.pop() {
+        if c == CtxtId::ROOT || seen.contains(&c) {
+            continue;
+        }
+        seen.push(c);
+        if let Some(exp) = global_expansion(c) {
+            if !out.contains(&exp.call_span.file) {
+                out.push(exp.call_span.file);
+            }
+            todo.push(exp.call_span.ctxt);
+            todo.push(exp.parent);
+        }
+        if let Some(m) = hygiene_mark(c) {
+            if !out.contains(&m.def_span.file) {
+                out.push(m.def_span.file);
+            }
+            todo.push(m.def_span.ctxt);
+        }
+    }
+}
+
 /// The ordinary-source span an expanded span reports at, through the
 /// process-wide table only. `line!`, `file!`, and `column!` read their
 /// call site through this during expansion (ARCH 6.4).

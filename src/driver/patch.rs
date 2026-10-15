@@ -84,10 +84,16 @@ pub(crate) struct PatchBase {
     body_hashes: Vec<u64>,
     /// Expression arena length after the full resolve.
     arena_base: usize,
-    /// Per map file, where its nodes sit (`span_shift::ranges_by_file`),
-    /// when no macro or include can put a file's spans in another file's
-    /// nodes; None walks the whole Ast for each edit.
+    /// Per map file, where its nodes sit (`span_shift::ranges_by_file`).
+    /// Set at the full resolve when no macro or include can put a file's
+    /// spans in another file's nodes; with macros or includes, the first
+    /// patch probes the Ast (`span_shift::probe_extras`) and sets both
+    /// this and `extras`. None walks the whole Ast for each edit.
     ranges: Option<Vec<FileRanges>>,
+    /// Per map file, the probed extra nodes an edit in that file must
+    /// also visit (`span_shift::ExtraNodes`); None until probed, and
+    /// never when the resolve could prove ranges on its own.
+    extras: Option<Vec<span_shift::ExtraNodes>>,
 }
 
 /// The crate selection inputs a patch must see unchanged: anything that
@@ -176,6 +182,7 @@ impl PatchBase {
             body_hashes,
             arena_base: front.ast.exprs.len(),
             ranges,
+            extras: None,
         }
     }
 }
@@ -563,14 +570,26 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, ctxts
     let mut base = front.patch.take().ok_or("no base")?;
     let (mut spans, files) = (0usize, edits.len());
     let nodes_before = super::compile::ast_nodes(&front.ast);
+    // A crate with user macros or includes got no file ranges at the
+    // resolve, so its span walks would visit the whole Ast per edit.
+    // Probe once, on the first patch: the nodes that can hold another
+    // file's spans (or a context) are few, and the rest walk by file.
+    if base.ranges.is_none() && !edits.is_empty() {
+        let n = front.map.file_count();
+        let ast = Arc::make_mut(&mut front.ast);
+        base.extras = Some(span_shift::probe_extras(ast, n));
+        base.ranges = Some(span_shift::ranges_by_file(ast, n));
+    }
+    let no_extras = span_shift::ExtraNodes::default();
     for e in &edits {
         // The old body's nodes stay in the arenas, unreachable; blank them,
         // because some passes scan whole arenas (closures, `dyn`, `Cow`).
         let ranges = base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize));
-        span_shift::blank_nodes(Arc::make_mut(&mut front.ast), e.file, e.old_body, ranges);
+        let extras = base.extras.as_ref().and_then(|x| x.get(e.file.0 as usize)).unwrap_or(&no_extras);
+        span_shift::blank_nodes_extras(Arc::make_mut(&mut front.ast), e.file, e.old_body, ranges, extras);
         // Spans next: the new body is lexed at the new positions.
         let mut memo = FxMap::default();
-        spans += span_shift::shift_ast(Arc::make_mut(&mut front.ast), e.edit, ranges, &mut memo);
+        spans += span_shift::shift_ast_extras(Arc::make_mut(&mut front.ast), e.edit, ranges, extras, &mut memo);
         ctxts.push(memo);
         let tables = Arc::get_mut(&mut base.tables).ok_or("state")?;
         shift_table_spans(tables, e.edit);
@@ -601,6 +620,30 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, ctxts
             r.tys.push(before.2..ast.tys.len());
             r.blocks.push(before.3..ast.blocks.len());
             r.stmt_items.push(before.4..ast.stmt_items.len());
+        }
+        // Under a probed plan, probe just the appended nodes: the first
+        // probe never saw them, and the body's path rewrite may have
+        // given a node a span from another file.
+        if base.extras.is_some() {
+            let ast = &front.ast;
+            let only = FileRanges {
+                exprs: vec![before.0..ast.exprs.len()],
+                pats: vec![before.1..ast.pats.len()],
+                tys: vec![before.2..ast.tys.len()],
+                blocks: vec![before.3..ast.blocks.len()],
+                items: Vec::new(),
+                stmt_items: vec![before.4..ast.stmt_items.len()],
+            };
+            let n = front.map.file_count();
+            let probed = span_shift::probe_extras_in(Arc::make_mut(&mut front.ast), n, &only);
+            for (x, p) in base.extras.as_mut().unwrap().iter_mut().zip(probed) {
+                x.exprs.extend(p.exprs);
+                x.pats.extend(p.pats);
+                x.tys.extend(p.tys);
+                x.blocks.extend(p.blocks);
+                x.items.extend(p.items);
+                x.stmt_items.extend(p.stmt_items);
+            }
         }
         let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, &front.ast.items[e.item]);
         if front.items.get(e.item) != Some(&scan) || !inner.is_empty() {
@@ -943,6 +986,47 @@ pub fn run() -> i64 {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert_eq!(per_size[0], per_size[1], "patch work (nodes, spans) for 3 and 12 modules");
+    }
+
+    /// A crate with a user macro got no per-file span ranges at the
+    /// resolve, so each patch used to walk the whole Ast. The first
+    /// patch now probes the Ast for the nodes that can hold another
+    /// file's spans, and later patches walk one file plus those nodes:
+    /// the same edit in a 3-module and a 12-module crate moves the
+    /// same number of spans, and the answers match a cold session.
+    #[test]
+    fn body_edit_with_user_macros_still_walks_one_file() {
+        let mut per_size = Vec::new();
+        for n in [3usize, 12] {
+            let dir = std::env::temp_dir().join(format!("lust-patch-macro-test-{}-{n}", std::process::id()));
+            let root = write_crate(&dir, n);
+            edit(&root, "mod m0;\n", "#[macro_export]\nmacro_rules! twice { ($e:expr) => { $e * 2 }; }\n\nmod m0;\n");
+            edit(&root, "    println!(\"{t}\");\n", "    t += twice!(1);\n    println!(\"{t}\");\n");
+            let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+            assert_eq!(check(&mut warm, &root).0, 0);
+            let m1 = dir.join("m1.rs");
+            // Two edits: the first probes, the second walks by the plan.
+            edit(&m1, "        self.v += x;\n", "        let y = x + 1;\n        self.v += y - 1;\n");
+            assert_eq!(check(&mut warm, &root).0, 0);
+            assert_eq!(field(&warm.front.last_visits, "path"), "patch", "{}", warm.front.last_visits);
+            edit(&m1, "        self.v += y - 1;\n", "        self.v += y - 2;\n        self.v += 1;\n");
+            let (code, err) = check(&mut warm, &root);
+            let v = warm.front.last_visits.clone();
+            assert_eq!(field(&v, "path"), "patch", "{v}");
+            assert_eq!((field(&v, "files"), field(&v, "checked")), ("1", "1"), "{v}");
+            per_size.push((field(&v, "nodes").to_string(), field(&v, "spans").to_string()));
+            let mut cold = Session::new(dir.join("obj-cold"), false, SessionKey::synthetic(&root, false));
+            assert_eq!((code, err), check(&mut cold, &root), "warm and cold agree");
+            assert_eq!(code, 0);
+            // An error after the edit reports at the moved position.
+            edit(&m1, "    a.get()\n", "    a.get() + true\n");
+            let (code, err) = check(&mut warm, &root);
+            let mut cold = Session::new(dir.join("obj-cold2"), false, SessionKey::synthetic(&root, false));
+            assert_eq!((code, err), check(&mut cold, &root), "warm and cold agree on the error");
+            assert_ne!(code, 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(per_size[0], per_size[1], "patch work (nodes, spans) with macros for 3 and 12 modules: {per_size:?}");
     }
 
     /// A module with most kinds of span a collected program keeps: Adts
