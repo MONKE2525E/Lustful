@@ -6,9 +6,10 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `c4b252902` (the scanned tree, landed on `next`). ts-rust: `unknown`.
+lust commit: `7f2983a2a` (the scanned tree, landed on `next`). ts-rust: `unknown`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
+Dev features (docs/dev-features.md): `cfg(feature = ...)` uses each package's effective dev selection. ts-rust dev builds run with `jemalloc` off: `goport_lsproto` = [none], `goport_util` = [none], `ts_ast_codegen` = [none], `ts_diagnostics_codegen` = [none], `ts_goport` = [none], `ts_wasm` = [none].
 
 ## Core CLI scope today
 
@@ -20,9 +21,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 397 files, 379895 lines (97.8% of files, 97.2% of lines).
+Core: 404 files, 390504 lines. Compiles today: 400 files, 386617 lines (99.0% of files, 99.0% of lines).
 
-All active prod files: 758 of 773 files compile today (97.9% of lines).
+All active prod files: 762 of 771 files compile today (98.2% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,36 +32,32 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `ext.tikv_jemalloc_ctl` | unsupported | 0 | W-DEPS | 2 | 5769 | 2 | 5769 |
-| 2 | `ext.serde_json` | unsupported | none | wave D | 3 | 2484 | 1 | 1248 |
-| 3 | `ext.jiff` | unsupported | 7 | W-DEPS | 1 | 1403 | 1 | 1403 |
-| 4 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
-| 5 | `ext.serde` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
-| 6 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
-| 7 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
-| 8 | `ext.lzma_rust2` | unsupported | 7 | W-DEPS | 1 | 521 | 1 | 521 |
+| 1 | `ext.serde_json` | unsupported | none | wave D | 3 | 2484 | 1 | 1248 |
+| 2 | `ext.jiff` | unsupported | 7 | W-DEPS | 1 | 1403 | 1 | 1403 |
+| 3 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
+| 4 | `ext.serde` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
 
 ## Core CLI curve
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 399 | 98.3 | 98.7 |
-| milestone 4 | 399 | 98.3 | 98.7 |
-| milestone 5 | 399 | 98.3 | 98.7 |
-| milestone 6 | 399 | 98.3 | 98.7 |
-| milestone 7 | 403 | 99.3 | 99.4 |
-| milestone 8 | 403 | 99.3 | 99.4 |
+| supported today | 400 | 99.0 | 99.0 |
+| milestone 4 | 400 | 99.0 | 99.0 |
+| milestone 5 | 400 | 99.0 | 99.0 |
+| milestone 6 | 400 | 99.0 | 99.0 |
+| milestone 7 | 401 | 99.3 | 99.4 |
+| milestone 8 | 401 | 99.3 | 99.4 |
 
 ## All active prod curve
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 760 | 98.3 | 97.9 |
-| milestone 4 | 760 | 98.3 | 97.9 |
-| milestone 5 | 760 | 98.3 | 97.9 |
-| milestone 6 | 760 | 98.3 | 97.9 |
-| milestone 7 | 768 | 99.4 | 98.6 |
-| milestone 8 | 770 | 99.6 | 99.6 |
+| supported today | 762 | 98.8 | 98.2 |
+| milestone 4 | 762 | 98.8 | 98.2 |
+| milestone 5 | 762 | 98.8 | 98.2 |
+| milestone 6 | 762 | 98.8 | 98.2 |
+| milestone 7 | 766 | 99.4 | 98.6 |
+| milestone 8 | 768 | 99.6 | 99.6 |
 
 ## Reproduce
 
@@ -69,5 +66,8 @@ export LUST_TCC_HOME=/home/theo/.t3/projects/lust-lang/third_party/tcc
 cargo build --release
 cargo build --release --manifest-path tools/lust-port/Cargo.toml
 python3 scripts/port-scan-sync.py --write
+# The scanner reads the lust dev config from the ts-rust tree; on a tree without one,
+# pass the dev selection by env (jemalloc off for ts-rust dev builds):
+#   LUST_DEV_EXCLUDE_FEATURES=jemalloc TS_RUST=/path/to/ts-rust python3 scripts/port-scan-sync.py --coverage
 python3 scripts/port-scan-sync.py --coverage
 ```
