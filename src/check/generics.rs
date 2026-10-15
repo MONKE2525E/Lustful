@@ -6675,7 +6675,179 @@ fn check_lang_method(
     let same = want_params.iter().zip(&got_params).all(|(&w, &g)| norm(w) == norm(g)) && norm(want_ret) == norm(got_ret);
     if !same {
         errs.push(Diag::new("L0110", f_name_span, format!("method `{n}` has an incompatible type for the trait"), fix));
+    } else if elided_ret_takes_self_lifetime(p, local, sig.ret) {
+        errs.push(elided_ret_diag(f_name_span));
+    } else if input_fixes_method_lifetime(p, local, None, &sig.params) {
+        errs.push(fixed_input_diag(f_name_span));
     }
+}
+
+/// rustc's impl method lifetime check for one common shape (`impl`
+/// item signature doesn't match `trait` item signature, E0803,
+/// E0491): a return type that elides a lifetime takes the lifetime of
+/// the `&self` receiver, which is the method's own. Where the trait's
+/// return type has a type from the impl header (`T`, `Self`,
+/// `Self::Item`), the references in it carry the impl's lifetimes,
+/// never the method's, so an elided one there differs from the trait
+/// (`impl AsRef<&L> for Box<L> { fn as_ref(&self) -> &&L }`, or
+/// `type Item = &'a u8; fn next(&mut self) -> Option<&u8>`). `want`
+/// is the trait method's return type before substitution. A receiver
+/// with a written lifetime, or an elision source other than `&self`,
+/// is not judged here.
+fn elided_ret_takes_self_lifetime(p: &Program, local: LocalDefId, want: Ty) -> bool {
+    let def = p.fn_def(local);
+    let Some(sp) = &def.self_param else { return false };
+    if !matches!(sp.kind, ast::SelfKind::Ref | ast::SelfKind::RefMut) || sp.lifetime.is_some() {
+        return false;
+    }
+    def.ret.is_some_and(|ret| header_part_elides(p, want, ret))
+}
+
+/// Walks the trait's return type `want` along the impl's written
+/// return type `got`: true when a part that comes from the impl
+/// header is written with an elided lifetime.
+fn header_part_elides(p: &Program, want: Ty, got: ast::TyId) -> bool {
+    match (p.tys.kind(want), p.ast.ty(got)) {
+        (TyKind::Param(_) | TyKind::Projection(..), _) => writes_elided_lifetime(p, got),
+        (TyKind::Ref(_, _, w), TyExpr::Ref { inner, .. }) => header_part_elides(p, w, *inner),
+        (TyKind::Array(w, _), TyExpr::Array { inner, .. }) | (TyKind::Slice(w), TyExpr::Slice(inner)) => header_part_elides(p, w, *inner),
+        (TyKind::Tuple(ws), TyExpr::Tuple(gs)) => {
+            let ws = p.tys.tys_of(ws);
+            ws.len() == gs.len() && ws.iter().zip(gs).any(|(&w, &g)| header_part_elides(p, w, g))
+        }
+        (TyKind::Adt(_, a), TyExpr::Path(segs)) => {
+            let ws: Vec<Ty> = p.tys.args(a).iter().filter_map(|g| g.as_ty()).collect();
+            let gs = segs.last().map_or(Vec::new(), |s| s.type_args());
+            ws.len() == gs.len() && ws.iter().zip(&gs).any(|(&w, &g)| header_part_elides(p, w, g))
+        }
+        _ => false,
+    }
+}
+
+/// True when the written type has a reference or path lifetime that
+/// is elided or `'_` (fn pointer and trait object types bind their
+/// own).
+fn writes_elided_lifetime(p: &Program, t: ast::TyId) -> bool {
+    let anon = |l: &ast::Lifetime| matches!(p.name(l.name), "'_" | "_");
+    match p.ast.ty(t) {
+        TyExpr::Ref { lifetime, inner, .. } => lifetime.as_ref().is_none_or(anon) || writes_elided_lifetime(p, *inner),
+        TyExpr::Tuple(ts) => ts.iter().any(|&x| writes_elided_lifetime(p, x)),
+        TyExpr::Array { inner, .. } | TyExpr::Slice(inner) | TyExpr::Ptr { inner, .. } => writes_elided_lifetime(p, *inner),
+        TyExpr::Path(segs) => segs.iter().any(|s| match &s.args {
+            ast::GenericArgs::Angle(args) => args.iter().any(|a| match a {
+                ast::GenericArg::Type(x) => writes_elided_lifetime(p, *x),
+                ast::GenericArg::Lifetime(l) => anon(l),
+                _ => false,
+            }),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+/// The other half of that check, for inputs: an impl method must take
+/// every input the trait method takes, so where the trait's reference
+/// has a lifetime of the method (elided, `'_`, or the method's own
+/// parameter), the impl may not fix it to one of the impl's lifetimes
+/// or `'static` (`impl<'a> AsRef<u8> for W<'a> { fn as_ref(&'a self)
+/// -> &u8 }`, rustc E0308 "method not compatible with trait"). User
+/// traits compare the trait method as written (`trait_fn`); a lang
+/// trait's table (`want`, the receiver first) has method lifetimes only.
+fn input_fixes_method_lifetime(p: &Program, local: LocalDefId, trait_fn: Option<&ast::FnDef>, want: &[Ty]) -> bool {
+    let def = p.fn_def(local);
+    let lts = |g: &ast::Generics| -> Vec<Sym> {
+        g.params
+            .iter()
+            .filter_map(|g| match g {
+                ast::GenericParam::Lifetime { lt, .. } => Some(lt.name),
+                _ => None,
+            })
+            .collect()
+    };
+    let anon = |l: &ast::Lifetime| matches!(p.name(l.name), "'_" | "_");
+    let own = lts(&def.generics);
+    let fixed = |l: &ast::Lifetime| !anon(l) && !own.contains(&l.name);
+    let trait_own = trait_fn.map_or(Vec::new(), |f| lts(&f.generics));
+    let method_lt = |l: &Option<ast::Lifetime>| l.as_ref().is_none_or(|l| anon(l) || trait_own.contains(&l.name));
+    if let Some(sp) = &def.self_param
+        && matches!(sp.kind, ast::SelfKind::Ref | ast::SelfKind::RefMut)
+        && sp.lifetime.as_ref().is_some_and(fixed)
+    {
+        let trait_recv_method = match trait_fn {
+            Some(f) => f.self_param.as_ref().is_some_and(|t| matches!(t.kind, ast::SelfKind::Ref | ast::SelfKind::RefMut) && method_lt(&t.lifetime)),
+            None => want.first().is_some_and(|&w| matches!(p.tys.kind(w), TyKind::Ref(..))),
+        };
+        if trait_recv_method {
+            return true;
+        }
+    }
+    match trait_fn {
+        Some(f) => def.params.iter().zip(&f.params).any(|(i, t)| ast_fixes_method_lt(p, t.ty, i.ty, &method_lt, &fixed)),
+        None => {
+            let rest = if def.self_param.is_some() { want.get(1..).unwrap_or(&[]) } else { want };
+            def.params.iter().zip(rest).any(|(prm, &w)| ty_fixes_method_lt(p, w, prm.ty, &fixed))
+        }
+    }
+}
+
+/// `input_fixes_method_lifetime` over a user trait's written type `want`.
+fn ast_fixes_method_lt(
+    p: &Program,
+    want: ast::TyId,
+    got: ast::TyId,
+    method_lt: &dyn Fn(&Option<ast::Lifetime>) -> bool,
+    fixed: &dyn Fn(&ast::Lifetime) -> bool,
+) -> bool {
+    let rec = |w: ast::TyId, g: ast::TyId| ast_fixes_method_lt(p, w, g, method_lt, fixed);
+    match (p.ast.ty(want), p.ast.ty(got)) {
+        (TyExpr::Ref { lifetime: wl, inner: wi, .. }, TyExpr::Ref { lifetime: gl, inner: gi, .. }) => {
+            (method_lt(wl) && gl.as_ref().is_some_and(fixed)) || rec(*wi, *gi)
+        }
+        (TyExpr::Array { inner: w, .. }, TyExpr::Array { inner: g, .. }) | (TyExpr::Slice(w), TyExpr::Slice(g)) => rec(*w, *g),
+        (TyExpr::Tuple(ws), TyExpr::Tuple(gs)) => ws.len() == gs.len() && ws.iter().zip(gs).any(|(&w, &g)| rec(w, g)),
+        (TyExpr::Path(ws), TyExpr::Path(gs)) => {
+            let (wa, ga) = (ws.last().map_or(Vec::new(), |s| s.type_args()), gs.last().map_or(Vec::new(), |s| s.type_args()));
+            wa.len() == ga.len() && wa.iter().zip(&ga).any(|(&w, &g)| rec(w, g))
+        }
+        _ => false,
+    }
+}
+
+/// `input_fixes_method_lifetime` over a lang trait's table type `want`:
+/// its references are the method's own; a parameter is the impl's.
+fn ty_fixes_method_lt(p: &Program, want: Ty, got: ast::TyId, fixed: &dyn Fn(&ast::Lifetime) -> bool) -> bool {
+    match (p.tys.kind(want), p.ast.ty(got)) {
+        (TyKind::Ref(_, _, w), TyExpr::Ref { lifetime, inner, .. }) => lifetime.as_ref().is_some_and(fixed) || ty_fixes_method_lt(p, w, *inner, fixed),
+        (TyKind::Array(w, _), TyExpr::Array { inner, .. }) | (TyKind::Slice(w), TyExpr::Slice(inner)) => ty_fixes_method_lt(p, w, *inner, fixed),
+        (TyKind::Tuple(ws), TyExpr::Tuple(gs)) => {
+            let ws = p.tys.tys_of(ws);
+            ws.len() == gs.len() && ws.iter().zip(gs).any(|(&w, &g)| ty_fixes_method_lt(p, w, g, fixed))
+        }
+        (TyKind::Adt(_, a), TyExpr::Path(segs)) => {
+            let ws: Vec<Ty> = p.tys.args(a).iter().filter_map(|g| g.as_ty()).collect();
+            let gs = segs.last().map_or(Vec::new(), |s| s.type_args());
+            ws.len() == gs.len() && ws.iter().zip(&gs).any(|(&w, &g)| ty_fixes_method_lt(p, w, g, fixed))
+        }
+        _ => false,
+    }
+}
+
+fn fixed_input_diag(span: Span) -> Diag {
+    Diag::new(
+        "L0734",
+        span,
+        "method signature does not match the trait method: an input lifetime is fixed where the trait takes any",
+        "Leave the lifetime elided (`&self`), as the trait method does.",
+    )
+}
+
+fn elided_ret_diag(span: Span) -> Diag {
+    Diag::new(
+        "L0734",
+        span,
+        "method signature does not match the trait method: the elided lifetime in its return type is the `&self` lifetime, not the impl's",
+        "Write the impl's lifetime in the return type (`impl<'a> .. { fn f(&self) -> &&'a T }`), as the trait's signature has it.",
+    )
 }
 
 /// Checks one impl method signature against its trait method
@@ -6876,6 +7048,10 @@ fn validate_method_sig(
             "method signature does not match the trait method",
             "Match the parameter and return types in the trait definition, after associated types are substituted.",
         ));
+    } else if elided_ret_takes_self_lifetime(p, local, tmpl.ret) {
+        errs.push(elided_ret_diag(f_name_span));
+    } else if input_fixes_method_lifetime(p, local, Some(tmpl.def(&p.ast)), &tmpl.params) {
+        errs.push(fixed_input_diag(f_name_span));
     }
     let _ = span;
 }
