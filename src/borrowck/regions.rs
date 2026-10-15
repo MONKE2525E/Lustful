@@ -1007,6 +1007,11 @@ pub(super) struct OwnSig {
     /// (`closure_requirements`), not errors here; the env reference and
     /// higher-ranked argument slots are None.
     pub ends: Vec<Option<End>>,
+    /// An `impl Trait` return: the universal the returned value's
+    /// capture var equals (`Builder::cap_var` of local 0), for the
+    /// captures its hidden type has no slot for. The ret slots' rule
+    /// applies to it: only the captured universals outlive it.
+    pub ret_cap: Option<Univ>,
 }
 
 /// One end of a closure requirement (`closure_requirements`): `'static`,
@@ -1173,7 +1178,7 @@ impl OwnSig {
     /// conservative inside the body, and callers use the same signature.
     pub fn build<'p>(p: &'p Program, body: &Body<'p>, sig: Option<&RegionSig>, closure: bool, check: bool) -> OwnSig {
         let mut sc = SlotCx::new(&body.tys, p);
-        let mut own = OwnSig { n_univ: 0, slots: Vec::new(), facts: Vec::new(), names: vec!["'static".into()], check, closure, ends: Vec::new() };
+        let mut own = OwnSig { n_univ: 0, slots: Vec::new(), facts: Vec::new(), names: vec!["'static".into()], check, closure, ends: Vec::new(), ret_cap: None };
         if closure {
             own.closure_sig(p, body, &mut sc);
             return own;
@@ -1218,12 +1223,17 @@ impl OwnSig {
         // value is `'static` instead.
         if opaque_static_ret(p, p.ret_view(body.fn_id)) && !own.slots.is_empty() {
             own.slots[0].fill(0);
+            own.ret_cap = Some(0);
         } else if crate::check::opaque::mentions_opaque(&p.tys, p.ret_view(body.fn_id), None) && !own.slots.is_empty() {
             // A `use<..>` list captures only its universals: the returned
             // value may not hold another (rustc E0700).
             let caps = sig.and_then(|s| s.opaque_caps.as_ref());
-            let ret: Vec<Univ> = own.slots[0].clone();
+            let mut ret: Vec<Univ> = own.slots[0].clone();
             let n = own.n_univ;
+            let rc = own.fresh_univ(&f.name, p);
+            own.names[rc as usize] = "the lifetimes the returned `impl Trait` captures".into();
+            own.ret_cap = Some(rc);
+            ret.push(rc);
             for &r in &ret {
                 if caps.is_some() && r > sig.map_or(0, |s| s.n_univ) {
                     own.names[r as usize] = "the lifetimes the returned `impl Trait` captures (its `use<..>` list)".into();
@@ -2495,6 +2505,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 self.edge(base + i as u32, u);
                 self.edge(u, base + i as u32);
             }
+        }
+        if let (Some(rc), Some(&c)) = (self.own.ret_cap, self.cap_var.get(&0)) {
+            self.edge(c, rc);
+            self.edge(rc, c);
         }
         let body = self.body;
         for (bi, b) in body.blocks.iter().enumerate() {
