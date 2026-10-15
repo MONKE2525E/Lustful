@@ -3739,6 +3739,10 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowAddAssignStr)) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowAddStr))
                 && avs.first().is_some_and(|(t0, v0)| !v0.is_empty() && self.relate(*t0, v0, dt, &dv, Variance::Co)) => {}
+            // A sort's comparator or key fn runs during the call only:
+            // its captures reach neither the slice nor the unit result,
+            // and `link_closure_args` gave its args the elements.
+            _ if matches!(target, CallTarget::Builtin(b) if sort_by_builtin(b)) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
@@ -6586,6 +6590,13 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
 fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
     use crate::check::Builtin as B;
     matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey))
+}
+
+/// `sort_by(f)`, `sort_by_key(f)`, and their unstable forms: `f` runs
+/// during the call only.
+fn sort_by_builtin(b: crate::check::Builtin) -> bool {
+    use crate::check::Builtin as B;
+    matches!(b, B::SliceSortBy | B::SliceSortUnstableBy | B::SliceSortByKey | B::SliceSortUnstableByKey)
 }
 
 /// The map and set lookups by `&Q` (W-STD-B): the key is not stored or
