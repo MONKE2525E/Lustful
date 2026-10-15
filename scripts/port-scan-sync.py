@@ -104,6 +104,8 @@ OWNER = {
     "lifetimes.named": "W-BORROW",
     "lifetimes.hrtb": "W-BORROW",
     "closures.fn_ptr_lifetime": "W-BORROW",
+    "closures.fn_ptr_lifetime_field": "W-BORROW",
+    "lifetimes.hrtb_general": "W-BORROW",
     "threads.sync": "wave C (threads)",
     "threads.send_sync_bounds": "wave C (threads)",
     "panic.recovery": "wave C (panics)",

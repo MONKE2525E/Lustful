@@ -184,19 +184,43 @@
   {
    "id": "lifetimes.hrtb",
    "title": "Explicit for<'a> higher-ranked binders",
-   "status": "unsupported",
-   "milestone": 6,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "0",
    "root_cause": "lifetimes",
    "fix_class": "compiler",
    "release_safe_rewrite": true,
    "release_impact": "syntax-only",
-   "notes": "Rank-one binders are part of milestone 6. Rare explicit cases can often drop the binder.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/lifetimes_hrtb.rs and _b: explicit for<'a> on fn pointer types, Fn bounds, and dyn Fn that mean what elision means (each binder lifetime once in the inputs; in the output only as the one input lifetime), as in ts-rust ast/synthetic.rs ListSel. lust's parser rewrites them to the elided form (W-BORROW3, src/parser/hrtb.rs). Other binders are lifetimes.hrtb_general.",
    "primary_keys": [
-    "lt.hrtb.*"
+    "lt.hrtb.fn_ptr",
+    "lt.hrtb.bound",
+    "lt.hrtb.dyn"
    ],
    "keys": [
-    "lt.hrtb.*"
+    "lt.hrtb.fn_ptr",
+    "lt.hrtb.bound",
+    "lt.hrtb.dyn"
+   ]
+  },
+  {
+   "id": "lifetimes.hrtb_general",
+   "title": "Explicit for<'a> binders that elision cannot express",
+   "status": "unsupported",
+   "milestone": 6,
+   "inventory_step": "0",
+   "root_cause": "lifetimes",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/lifetimes_hrtb_general.rs fails (L0203): one binder lifetime on two inputs. Also higher-ranked where clauses on types (for<'a> &'a T: IntoIterator). Split from lifetimes.hrtb (W-BORROW3).",
+   "primary_keys": [
+    "lt.hrtb.noncanon",
+    "lt.hrtb.where"
+   ],
+   "keys": [
+    "lt.hrtb.noncanon",
+    "lt.hrtb.where"
    ]
   },
   {
@@ -1117,7 +1141,7 @@
   {
    "id": "ext.tikv_jemalloc_ctl",
    "title": "Adapter crate tikv-jemalloc-ctl 0.7.0: Name/Access arena keys, epoch, version",
-   "status": "supported",
+   "status": "unsupported",
    "milestone": 0,
    "inventory_step": "10",
    "root_cause": "external-crates",
@@ -1137,7 +1161,7 @@
   {
    "id": "ext.rustix",
    "title": "Adapter crate rustix 1.1.5: fs, process, termios, pipe, event, stdio subsets",
-   "status": "supported",
+   "status": "unsupported",
    "milestone": 0,
    "inventory_step": "10",
    "root_cause": "external-crates",
@@ -1261,6 +1285,24 @@
   {
    "id": "closures.fn_ptr_lifetime",
    "title": "Fn pointer types with lifetimes",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "7b",
+   "root_cause": "lifetimes",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Probe evidence: tools/lust-port/tests/features/closures_fn_ptr_lifetime.rs and _b: fn pointer types that name one lifetime of the enclosing fn or impl in fn signatures and let annotations (ts-rust parser_p2.rs fn(&mut Parser<'a>) -> Node), and &'static or '_ in fn pointer aliases (reference_resolver.rs, rule.rs). Struct fields, aliases, two lifetimes, and nested ones are closures.fn_ptr_lifetime_field (W-BORROW3).",
+   "primary_keys": [
+    "type.fn_ptr.lifetime"
+   ],
+   "keys": [
+    "type.fn_ptr.lifetime"
+   ]
+  },
+  {
+   "id": "closures.fn_ptr_lifetime_field",
+   "title": "Fn pointer types with lifetimes in fields, aliases, or nested types",
    "status": "unsupported",
    "milestone": 6,
    "inventory_step": "7b",
@@ -1268,12 +1310,14 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/closures_fn_ptr_lifetime.rs fails (L0203): fn(&'a str) -> &'a str stored in a struct field, as in ts-rust ast/synthetic. The scanner emits type.fn_ptr.lifetime for this form; plain fn pointers pass under closures.general.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/closures_fn_ptr_lifetime_field.rs fails (L0203): fn(&'a str) -> &'a str in a struct field. Also two named lifetimes in one fn pointer type, a named one inside a nested fn pointer or dyn type, and 'static Adt args there (type.fn_ptr.lifetime.complex). Split from closures.fn_ptr_lifetime (W-BORROW3).",
    "primary_keys": [
-    "type.fn_ptr.lifetime"
+    "type.fn_ptr.lifetime.field",
+    "type.fn_ptr.lifetime.complex"
    ],
    "keys": [
-    "type.fn_ptr.lifetime"
+    "type.fn_ptr.lifetime.field",
+    "type.fn_ptr.lifetime.complex"
    ]
   },
   {

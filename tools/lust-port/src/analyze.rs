@@ -473,7 +473,7 @@ impl<'a> V<'a> {
                     return;
                 }
                 if t.lifetimes.is_some() {
-                    self.hit("lt.hrtb.bound", sp);
+                    self.hit(if sugar_binder_canonical(t) { "lt.hrtb.bound" } else { "lt.hrtb.noncanon" }, sp);
                 }
                 let k = self.path_key(&t.path);
                 self.hit(format!("bound.{k}"), sp);
@@ -771,37 +771,187 @@ fn snippet_of(text: &str, start: usize, end: usize) -> String {
 
 /// True when a type mentions a lifetime: a ref lifetime or a lifetime
 /// generic argument, at any depth.
-fn type_has_lifetime(t: &syn::Type) -> bool {
-    match t {
-        syn::Type::Reference(r) => r.lifetime.is_some() || type_has_lifetime(&r.elem),
-        syn::Type::Path(p) => p.path.segments.iter().any(|s| match &s.arguments {
-            syn::PathArguments::AngleBracketed(a) => a.args.iter().any(|arg| match arg {
-                syn::GenericArgument::Lifetime(_) => true,
-                syn::GenericArgument::Type(inner) => type_has_lifetime(inner),
-                syn::GenericArgument::AssocType(b) => type_has_lifetime(&b.ty),
-                _ => false,
-            }),
-            syn::PathArguments::Parenthesized(par) => {
-                par.inputs.iter().any(type_has_lifetime)
-                    || matches!(&par.output, syn::ReturnType::Type(_, o) if type_has_lifetime(o))
-            }
-            syn::PathArguments::None => false,
-        }),
-        syn::Type::Tuple(tt) => tt.elems.iter().any(type_has_lifetime),
-        syn::Type::Slice(s) => type_has_lifetime(&s.elem),
-        syn::Type::Array(a) => type_has_lifetime(&a.elem),
-        syn::Type::Ptr(p) => type_has_lifetime(&p.elem),
-        syn::Type::Paren(p) => type_has_lifetime(&p.elem),
-        syn::Type::Group(g) => type_has_lifetime(&g.elem),
-        syn::Type::BareFn(f) => {
-            f.inputs.iter().any(|a| type_has_lifetime(&a.ty))
-                || matches!(&f.output, syn::ReturnType::Type(_, o) if type_has_lifetime(o))
+/// The lifetime names a `for<..>` binder declares.
+fn binder_names(b: Option<&syn::BoundLifetimes>) -> Vec<String> {
+    b.map(|b| {
+        b.lifetimes
+            .iter()
+            .filter_map(|p| if let syn::GenericParam::Lifetime(l) = p { Some(l.lifetime.ident.to_string()) } else { None })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// A `for<..>` binder on `Fn*` sugar that lust reads as elision.
+fn sugar_binder_canonical(tb: &syn::TraitBound) -> bool {
+    let binder = binder_names(tb.lifetimes.as_ref());
+    match tb.path.segments.last().map(|s| &s.arguments) {
+        Some(syn::PathArguments::Parenthesized(p)) => {
+            let ins: Vec<&syn::Type> = p.inputs.iter().collect();
+            let out = match &p.output {
+                syn::ReturnType::Type(_, t) => Some(&**t),
+                syn::ReturnType::Default => None,
+            };
+            binder_canonical(&binder, &ins, out)
         }
-        syn::Type::TraitObject(o) => o.bounds.iter().any(|b| matches!(b, syn::TypeParamBound::Lifetime(_))),
-        syn::Type::ImplTrait(it) => it.bounds.iter().any(|b| matches!(b, syn::TypeParamBound::Lifetime(_))),
         _ => false,
     }
 }
+
+/// True when a binder's lifetimes say what elision says (lust's
+/// parser/hrtb.rs): each at most once in the inputs, in plain places
+/// (references, lifetime args, through type args), and in the output
+/// only when it is the one input lifetime.
+fn binder_canonical(binder: &[String], ins: &[&syn::Type], out: Option<&syn::Type>) -> bool {
+    let mut si = LtScan::default();
+    for t in ins {
+        lt_scan(t, binder, true, &mut si);
+    }
+    let mut so = LtScan::default();
+    if let Some(t) = out {
+        lt_scan(t, binder, true, &mut so);
+    }
+    if si.complex_binder || so.complex_binder {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    if !si.binder_uses.iter().all(|b| seen.insert(b.clone())) {
+        return false;
+    }
+    so.binder_uses.iter().all(|b| !si.opaque && si.lts == 1 && si.binder_uses.first() == Some(b))
+}
+
+/// What `lt_scan` finds in a fn pointer signature.
+#[derive(Default)]
+struct LtScan {
+    /// Named lifetimes of the enclosing item (not `'static`, `'_`, or a binder's).
+    free: HashSet<String>,
+    /// A form lust cuts: a named lifetime inside a nested fn pointer,
+    /// `dyn`, or `Fn` type, or a `'static` that is not on a reference.
+    complex: bool,
+    /// Binder lifetimes in plain places, in order.
+    binder_uses: Vec<String>,
+    /// A binder lifetime inside a nested type.
+    complex_binder: bool,
+    /// Lifetimes elision counts (references and lifetime args).
+    lts: u32,
+    /// A part elision does not see into the same way.
+    opaque: bool,
+}
+
+/// Scans a type of a fn pointer signature for its lifetimes (`LtScan`).
+fn lt_scan(t: &syn::Type, binder: &[String], plain: bool, s: &mut LtScan) {
+    let mut note = |l: &syn::Lifetime, on_ref: bool, s: &mut LtScan| {
+        let n = l.ident.to_string();
+        if n == "_" {
+            return;
+        }
+        if binder.contains(&n) {
+            if plain {
+                s.binder_uses.push(n);
+            } else {
+                s.complex_binder = true;
+            }
+        } else if n == "static" {
+            if !on_ref {
+                s.complex = true;
+            }
+        } else if plain {
+            s.free.insert(n);
+        } else {
+            s.complex = true;
+        }
+    };
+    match t {
+        syn::Type::Reference(r) => {
+            if plain {
+                s.lts += 1;
+            }
+            if let Some(l) = &r.lifetime {
+                note(l, true, s);
+            }
+            lt_scan(&r.elem, binder, plain, s);
+        }
+        syn::Type::Path(p) => {
+            for seg in &p.path.segments {
+                match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(a) => {
+                        for arg in &a.args {
+                            match arg {
+                                syn::GenericArgument::Lifetime(l) => {
+                                    if plain {
+                                        s.lts += 1;
+                                    }
+                                    note(l, false, s);
+                                }
+                                syn::GenericArgument::Type(inner) => lt_scan(inner, binder, plain, s),
+                                syn::GenericArgument::AssocType(b) => {
+                                    s.opaque = true;
+                                    lt_scan(&b.ty, binder, false, s);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    syn::PathArguments::Parenthesized(par) => {
+                        s.opaque = true;
+                        for i in &par.inputs {
+                            lt_scan(i, binder, false, s);
+                        }
+                        if let syn::ReturnType::Type(_, o) = &par.output {
+                            lt_scan(o, binder, false, s);
+                        }
+                    }
+                    syn::PathArguments::None => {}
+                }
+            }
+        }
+        syn::Type::Tuple(tt) => tt.elems.iter().for_each(|e| lt_scan(e, binder, plain, s)),
+        syn::Type::Slice(x) => lt_scan(&x.elem, binder, plain, s),
+        syn::Type::Array(x) => lt_scan(&x.elem, binder, plain, s),
+        syn::Type::Ptr(x) => lt_scan(&x.elem, binder, plain, s),
+        syn::Type::Paren(x) => lt_scan(&x.elem, binder, plain, s),
+        syn::Type::Group(x) => lt_scan(&x.elem, binder, plain, s),
+        syn::Type::BareFn(f) => {
+            s.opaque = true;
+            for a in &f.inputs {
+                lt_scan(&a.ty, binder, false, s);
+            }
+            if let syn::ReturnType::Type(_, o) = &f.output {
+                lt_scan(o, binder, false, s);
+            }
+        }
+        syn::Type::TraitObject(o) => {
+            s.opaque = true;
+            dyn_bounds_scan(o.bounds.iter(), binder, s, &mut note);
+        }
+        syn::Type::ImplTrait(o) => {
+            s.opaque = true;
+            dyn_bounds_scan(o.bounds.iter(), binder, s, &mut note);
+        }
+        _ => {}
+    }
+}
+
+/// `lt_scan` over the bounds of a `dyn` or `impl` type (never plain).
+fn dyn_bounds_scan<'b>(
+    bounds: impl Iterator<Item = &'b syn::TypeParamBound>,
+    binder: &[String],
+    s: &mut LtScan,
+    note: &mut impl FnMut(&syn::Lifetime, bool, &mut LtScan),
+) {
+    for b in bounds {
+        match b {
+            syn::TypeParamBound::Lifetime(l) => note(l, false, s),
+            syn::TypeParamBound::Trait(tb) => {
+                let ty = syn::Type::Path(syn::TypePath { qself: None, path: tb.path.clone() });
+                lt_scan(&ty, binder, false, s);
+            }
+            _ => {}
+        }
+    }
+}
+
 
 fn short_type(t: &syn::Type) -> String {
     match t {
@@ -1292,17 +1442,31 @@ impl<'ast> Visit<'ast> for V<'_> {
             syn::Type::Macro(_) => self.hit("type.macro", sp),
             syn::Type::BareFn(f) => {
                 self.hit("type.fn_ptr", sp);
-                if f.lifetimes.is_some() {
-                    self.hit("lt.hrtb.fn_ptr", sp);
+                // Lifetimes in the signature (W-BORROW3). Lust reads a
+                // `for<'a>` binder that means what elision means
+                // (`lt.hrtb.fn_ptr`, else `lt.hrtb.noncanon`), keeps
+                // `&'static`, and takes one lifetime of the enclosing item
+                // in fn signatures and `let` types (`type.fn_ptr.lifetime`);
+                // in fields and aliases it is `.field`, two lifetimes, a
+                // nested one, or a `'static` type arg `.complex`.
+                let binder = binder_names(f.lifetimes.as_ref());
+                let ins: Vec<&syn::Type> = f.inputs.iter().map(|a| &a.ty).collect();
+                let out = match &f.output {
+                    syn::ReturnType::Type(_, t) => Some(&**t),
+                    syn::ReturnType::Default => None,
+                };
+                if !binder.is_empty() {
+                    self.hit(if binder_canonical(&binder, &ins, out) { "lt.hrtb.fn_ptr" } else { "lt.hrtb.noncanon" }, sp);
                 }
-                // A lifetime in the signature without a binder, as in
-                // `fn(&'a str) -> &'a str` in a struct field. Lust
-                // rejects this form (L0203) while plain fn pointers
-                // work, so it needs its own key.
-                let has_lt = f.inputs.iter().any(|a| type_has_lifetime(&a.ty))
-                    || matches!(&f.output, syn::ReturnType::Type(_, t) if type_has_lifetime(t));
-                if has_lt {
-                    self.hit("type.fn_ptr.lifetime", sp);
+                let mut sc = LtScan::default();
+                for t in ins.iter().copied().chain(out) {
+                    lt_scan(t, &binder, true, &mut sc);
+                }
+                if sc.complex || sc.free.len() > 1 {
+                    self.hit("type.fn_ptr.lifetime.complex", sp);
+                } else if !sc.free.is_empty() {
+                    let sig_or_let = matches!(self.pos, Pos::Arg | Pos::Ret) || (!self.fns.is_empty() && matches!(self.pos, Pos::Other));
+                    self.hit(if sig_or_let { "type.fn_ptr.lifetime" } else { "type.fn_ptr.lifetime.field" }, sp);
                 }
             }
             syn::Type::ImplTrait(it) => {
@@ -1327,7 +1491,7 @@ impl<'ast> Visit<'ast> for V<'_> {
                             let k = self.path_key(&tb.path);
                             self.hit(format!("dyn.{k}"), sp);
                             if tb.lifetimes.is_some() {
-                                self.hit("lt.hrtb.dyn", sp);
+                                self.hit(if sugar_binder_canonical(tb) { "lt.hrtb.dyn" } else { "lt.hrtb.noncanon" }, sp);
                             }
                         }
                         syn::TypeParamBound::Lifetime(l) => {

@@ -2858,7 +2858,8 @@ The engine is rustc's NLL (`src/borrowck/regions.rs`):
 1. Every region slot of every local's erased type gets a
    region var (a reference: its own region, then its
    pointee's; an Adt: its lifetime params, then its type
-   args; closures: their captures). Var 0 is `'static`,
+   args; closures: their captures; a fn pointer type that
+   names a lifetime of the item: one, 5.6). Var 0 is `'static`,
    vars `1..=n` the fn's universals.
 2. Constraints `'a: 'b` come from relating types with
    variance at assignments, borrows (plus reborrow
@@ -3085,8 +3086,10 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
 - L0203: explicit lifetimes in body types other than a
   `let` annotation on plain names or tuples of names (a
   `let` annotation's regions are kept: the binding's slots
-  equal `'static` or the fn's named lifetime); lifetimes in
-  fn pointer types; lifetimes in a dyn type's trait args;
+  equal `'static` or the fn's named lifetime); a named
+  lifetime in a fn pointer type outside fn signatures and
+  `let` annotations, two in one, or one nested in another
+  fn pointer or `dyn` type; lifetimes in a dyn type's trait args;
   an elided (`'_` or missing) lifetime arg of a trait,
   lifetime args in a trait's own bounds (supertraits,
   `Self` where-clauses), and associated types in a trait
@@ -3106,8 +3109,14 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
   its higher-ranked argument is L0733, as in rustc, except
   where its bound's output is that argument's lifetime
   (`F: Fn(&T) -> &U`).
-- GATs (L0620), higher-ranked binders on bounds (L0203 at
-  the parser), async (milestone 8b), as before.
+- L0203: a `for<..>` binder that elision cannot express (a
+  binder lifetime twice in the inputs, an output one that is
+  not the one input lifetime) and higher-ranked where clauses
+  on types (`for<'a> &'a T: Tr`). The parser rewrites the
+  other binders on fn pointer types, `Fn*` bounds, and `dyn
+  Fn*` to the elided form (`parser/hrtb.rs`); check rejects a
+  binder name that shadows one in scope (E0496).
+- GATs (L0620), async (milestone 8b), as before.
 
 ### 5.6 Negative corpus
 
@@ -3121,8 +3130,8 @@ Each case runs against rustc 1.99 in difftest.
 
 Known gaps: regions of body types other than `let`
 annotations (casts, turbofish, closure params); named
-lifetimes in fn pointer types and a dyn type's trait args
-(L0203; `&'static` there works); closure
+lifetimes in a dyn type's trait args (L0203; `&'static`
+there works) and the fn pointer cuts above; closure
 arguments are higher-ranked outside iterator methods and
 bounds over type params (rustc also frees an unannotated
 closure's arguments); the closure contract's coarser source-to-sink
@@ -3133,12 +3142,19 @@ return annotation (`'static` works); promotion of constants
 other than `&[]` and `&mut []` (they need static storage in
 codegen; `Body::promoted` covers the empty array only).
 
-Fn pointer and `dyn Fn` regions: check rejects named
-lifetimes there (L0203), and keeps a written `&'static` as
-`Region::Static` even in erased types (`Scope::static_refs`;
-an Adt's lifetime arg there stays L0203: erased Adts carry
-none). So every region of such a signature is `'static`
-where written, else elided, so late-bound (an elided output
+Fn pointer and `dyn Fn` regions: check keeps a written
+`&'static` as `Region::Static` even in erased types
+(`Scope::static_refs`; a `'static` Adt lifetime arg there
+stays L0203: erased Adts carry none), and a fn pointer type
+may name one lifetime of the enclosing item (W-BORROW3, in fn
+signatures and `let` annotations, `Scope::fn_ptr_free`):
+`FnSig::free_slots` marks the signature slots it fills (check
+finds them by resolving the signature again with that
+lifetime as a marker), and `FnSig::free_region` is `Erased`
+in check's types and the lifetime in region signatures. A
+value of such a type has one region slot, that free region,
+held invariant. Every other region of the signature is
+`'static` where written, else elided, so late-bound (an elided output
 is the one input lifetime, else L0202, as in `Fn` sugar and
 fn pointer types anywhere); check's own `'static` proof
 (`region_walk`) stays for `&'static dyn Tr` only, and a
@@ -3150,9 +3166,10 @@ the target takes any, no borrowed output where it returns
 - A call through a `dyn Fn*` value or a fn pointer
   (`call_late_bound`) gives each elided input slot a fresh
   region of the call that the argument outlives (a
-  `'static` one is `'static`), and each elided output slot
-  the one input slot's. The receiver lends nothing to the
-  result, and an argument reaches nothing else.
+  `'static` one is `'static`, a free one the pointer's
+  slot), and each elided output slot the one input slot's.
+  The receiver lends nothing to the result beyond its free
+  region, and an argument reaches nothing else.
 - A coercion to `dyn Fn*` (`dyn_fn_coercion`) proves the
   source takes any region there: a closure with a free
   argument slot (a `let` closure, a named annotation) is
@@ -3166,16 +3183,24 @@ the target takes any, no borrowed output where it returns
   `entail_bound`). A coercion to a `'static` object lifetime
   makes the data outlive `'static`; a body annotation's
   object lifetime is inferred when unwritten, as rustc's.
-- Fn items coerce to fn pointers through
-  `fn_item_coercions` (early-bound lifetimes, `'static`
-  inputs where the pointer takes any, and borrowed outputs
-  where the pointer writes `'static` are less general than
-  the pointer).
-
-Named lifetimes there (`fn(&mut Parser<'a>) -> Node`,
-`dyn Fn(&'a T)`) need check's types to say which regions are
-free and which they are: erased types cannot tell them from
-elided ones, and an Adt's lifetime args are dropped there.
+- One proof (`regions/fnptr.rs`, `sub_sigs`) serves a fn
+  item coerced to a fn pointer (`Rvalue::FnValue`), a fn
+  pointer coerced to another (`walk`, when either names a
+  free region; two without one stay check's
+  `sig_static_mismatch`), and a fn pointer passed for an
+  `Fn*` bound or coerced to `dyn Fn*`: the target's binders
+  are placeholders, the source's (a fn's late-bound
+  lifetimes, a pointer's elided ones) existential, early-bound
+  lifetimes and free regions this body's vars. Slots relate by
+  variance for coercions (rustc's subtyping: `fn h<'x>(&'x u8,
+  &'x u8)` is a `fn(&u8, &u8)`, but not under `&mut`) and both
+  ways for trait matching. A placeholder may outlive only
+  itself (L0110 for coercions, L0735 at bounds and `dyn`); a
+  var that must outlive one must be `'static`. A closure or
+  a fn without a region signature coerced to a pointer type
+  with a free region is L0203.
+- In fn pointer types elision does not count lifetimes inside
+  fn pointer params (`elision_regions`, rustc E0106).
 
 ## 6. Macros
 
