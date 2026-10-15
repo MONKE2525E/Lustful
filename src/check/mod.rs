@@ -1575,7 +1575,7 @@ fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
 /// crate traits by def (flat names resolved through `trait_names`)
 /// and std traits by canonical path, from the resolver's records
 /// (`Ast::use_traits`). Empty when the resolver recorded none.
-fn use_item_trait_layers(p: &Program<'_>, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>>) {
+fn use_item_trait_layers(p: &Program, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>>) {
     let (mut defs, mut paths) = (Vec::new(), Vec::new());
     if p.ast.use_traits.is_empty() {
         return (defs, paths);
