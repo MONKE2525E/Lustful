@@ -1,0 +1,13 @@
+# Negative: a source dependency returns a std source type (Duration,
+# from the std::time splice); the root uses it as an integer. Both
+# rustc and lust reject. The std splice must give the dependency the
+# same Duration the root's paths name, not some fallback type.
+[package]
+name = "dep-std-mismatch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clock = { path = "clock" }
+
+[workspace]

@@ -64,6 +64,10 @@
 #      a lang trait impl edit still takes it.
 #  21. plain inherent impl edits leave it too (MethodSet reads); an
 #      inherent impl with an associated const still takes it.
+#  22. std modules in a dependency: edits in a source dependency add
+#      and remove std source modules (std::time, VecDeque, PhantomData,
+#      LazyLock) the root never names; every warm answer equals a cold
+#      one-shot build.
 # Program stderr is compared with the OS thread id masked
 # (mask_stderr, as in scripts/case-pool.sh): rustc 1.99 and lust
 # print `thread 'main' (<os tid>) panicked at ...`, and the tid
@@ -1007,6 +1011,61 @@ def case_inherent_impl_edits():
     d.kill()
 
 
+def case_dep_std_edits():
+    # 22. The std splice sits in the root's file 0, but a dependency
+    # resolves first; its std module paths must still reach the
+    # hidden std modules, in the first daemon request and after an
+    # edit in the dependency changes which std modules the plan holds.
+    work = tempfile.mkdtemp(prefix="lust-driver-depstd-")
+    app = os.path.join(work, "app")
+    os.makedirs(os.path.join(app, "src"))
+    os.makedirs(os.path.join(work, "util", "src"))
+    open(os.path.join(app, "Cargo.toml"), "w").write(
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2024"\n\n'
+        '[dependencies]\nutil = { path = "../util" }\n\n[workspace]\n')
+    open(os.path.join(work, "util", "Cargo.toml"), "w").write(
+        '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2024"\n')
+    main_rs = os.path.join(app, "src", "main.rs")
+    lib_rs = os.path.join(work, "util", "src", "lib.rs")
+    open(main_rs, "w").write('fn main() {\n    println!("{}", util::show());\n}\n')
+    extra = ("--manifest-path", os.path.join(app, "Cargo.toml"), "--bin", "app")
+    versions = [
+        ("no std module", 'pub fn show() -> String {\n    format!("{}", 3)\n}\n', "3"),
+        ("body uses std::time and VecDeque",
+         "use std::collections::VecDeque;\nuse std::time::Duration;\n\n"
+         "pub fn show() -> String {\n    let mut q = VecDeque::new();\n"
+         "    q.push_back(Duration::from_millis(5));\n    format!(\"{:?}\", q)\n}\n", "[5ms]"),
+        ("signature types and statics",
+         "use std::marker::PhantomData;\nuse std::sync::LazyLock;\nuse std::time::Instant;\n\n"
+         "static N: LazyLock<u32> = LazyLock::new(|| 7);\n\n"
+         "pub struct Timer<T> {\n    pub at: Instant,\n    pub tag: PhantomData<T>,\n}\n\n"
+         "pub fn timer() -> Timer<u8> {\n    Timer { at: Instant::now(), tag: PhantomData }\n}\n\n"
+         "pub fn show() -> String {\n    let t = timer();\n"
+         "    format!(\"{} {}\", *N, t.at.elapsed().as_secs() < 60)\n}\n", "7 true"),
+        ("std modules removed again", 'pub fn show() -> String {\n    format!("{}", 4)\n}\n', "4"),
+    ]
+    d = Daemon(work)
+    d.start()
+    out = os.path.join(work, "x")
+    cold_out = os.path.join(work, "c")
+    cold_env = dict(d.env, LUST_NO_DAEMON="1")
+    for i, (what, text, want) in enumerate(versions):
+        open(lib_rs, "w").write(text)
+        # Strictly rising mtimes: the daemon must see each edit.
+        t = time.time() + 2 * (i + 1)
+        os.utime(lib_rs, (t, t))
+        chk = d.run(["check", main_rs, *extra], expect=None)
+        check(f"dep std v{i + 1} ({what}) warm check", chk.returncode == 0, chk.stderr[-400:])
+        _, prog = d.build(main_rs, out, extra)
+        cold = subprocess.run([LUST, "build", main_rs, "-o", cold_out, *extra], cwd=work, env=cold_env,
+                              capture_output=True, text=True, timeout=300)
+        cprog = run_prog(cold_out) if cold.returncode == 0 else None
+        check(f"dep std v{i + 1} ({what}) output", prog.stdout.strip() == want, prog.stdout + prog.stderr[-300:])
+        check(f"dep std v{i + 1} ({what}) warm == cold",
+              cprog is not None and cprog.stdout == prog.stdout, cold.stderr[-300:])
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -1016,7 +1075,7 @@ def main():
              case_moved_instance_ids, case_new_empty_unit, case_nested_items,
              case_moved_and_revived_slots, case_instance_calls_moved_slot,
              case_nested_identity_and_shadowing, case_stable_instance_ids,
-             case_user_trait_impl_edits, case_inherent_impl_edits)
+             case_user_trait_impl_edits, case_inherent_impl_edits, case_dep_std_edits)
     # One case that raises (a failed assert, a timeout, an OS error)
     # fails that case only: the rest still run, and the summary line
     # below is always the last line, as the gate's need_ok requires.

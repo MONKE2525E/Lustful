@@ -1,0 +1,15 @@
+# A diamond of source dependencies (root -> left, right -> base). Each
+# crate uses other std source modules, the root none of its own: base
+# std::time and BTreeMap, left VecDeque and std::error, right
+# PhantomData and LazyLock. Duration and BTreeMap values cross crate
+# edges, so all four crates must see one std splice (one Duration).
+[package]
+name = "dep-std-diamond"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+left = { path = "left" }
+right = { path = "right" }
+
+[workspace]

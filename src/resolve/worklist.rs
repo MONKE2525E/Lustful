@@ -67,6 +67,7 @@ pub struct CrateInput {
 
 /// One crate's own resolve inputs inside a workspace session (the
 /// selected crate or one source dependency).
+#[derive(Clone)]
 struct OneInput {
     root_path: PathBuf,
     root_text: String,
@@ -1059,6 +1060,18 @@ struct CrateJob {
     deps: Vec<(String, Result<usize, String>)>,
     /// The exact-layout list when this crate is an adapter crate.
     adapter: Option<Vec<String>>,
+    /// True for the std splice job (`add_std_splice_job`): it shares
+    /// the root module and file 0 with the selected crate, so its
+    /// per-file cache entries take their own keys.
+    std_splice: bool,
+}
+
+impl CrateJob {
+    /// The per-file cache key of one file of this job: canonical path
+    /// plus module, and a mark for the std splice job.
+    fn file_key(&self, canon: &str, module: ModuleId) -> String {
+        if self.std_splice { format!("{canon}#{}#std", module.0) } else { format!("{canon}#{}", module.0) }
+    }
 }
 
 /// What one resolved crate contributes to the merged program.
@@ -1141,6 +1154,24 @@ fn classify_dep(dep: &super::cargo::DepUnit) -> DepClass {
         return DepClass::Unsupported(format!("dependency crate `{name}` has no lust shim yet"));
     }
     DepClass::Unsupported(format!("dependency crate `{name}` is not a lust source crate, an adapter, or a shim crate yet"))
+}
+
+/// The root files of every source dependency under `deps` (each once,
+/// transitively), for a new session's std plan guess
+/// (`StdPlan::guess_crate`): a dependency's std module asks count as
+/// the selected crate's do.
+pub fn dep_roots(deps: &[super::cargo::DepUnit]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<&super::cargo::DepUnit> = deps.iter().collect();
+    while let Some(d) = stack.pop() {
+        if let DepClass::Source { root, .. } = classify_dep(d)
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+            stack.extend(d.deps.iter());
+        }
+    }
+    roots
 }
 
 /// The `$crate` magic segment name of one crate in a session. Not a
@@ -1276,8 +1307,35 @@ fn add_platform_job(input: &CrateInput, tables: &mut ResolvedTables, jobs: &mut 
         magic,
         deps: Vec::new(),
         adapter: Some(Vec::new()),
+        std_splice: false,
     });
     Ok(jobs.len() - 1)
+}
+
+/// Adds the std splice of the selected root (every byte of file 0 from
+/// `std_splice_lo` on) as a job of its own, which resolves before every
+/// crate but the platform crate (std source names platform items). A
+/// dependency's `std::time` path walks into the hidden std modules the
+/// splice defines (`ResolvedTables::std_modules`), so they must be
+/// registered before any dependency resolves. The job is part of the
+/// selected crate: same root module, flat names, and file 0, whose user
+/// text it sees blanked (newlines kept), so every span and line stays
+/// where the one-job resolve put it. Returns the job index.
+fn add_std_splice_job(input: &CrateInput, lo: u32, jobs: &mut Vec<CrateJob>) -> usize {
+    let lo = lo as usize;
+    let mut text: String = input.root_text.as_bytes()[..lo].iter().map(|&b| if b == b'\n' { '\n' } else { ' ' }).collect();
+    text.push_str(&input.root_text[lo..]);
+    let root = &jobs[0];
+    jobs.push(CrateJob {
+        input: OneInput { root_text: text, ..root.input.clone() },
+        root_module: root.root_module,
+        flat_prefix: root.flat_prefix.clone(),
+        magic: root.magic,
+        deps: Vec::new(),
+        adapter: None,
+        std_splice: true,
+    });
+    jobs.len() - 1
 }
 
 /// `resolve_crate_cached` with the platform crate in or out. The
@@ -1294,10 +1352,16 @@ pub fn resolve_crate_with(
     tables.std_splice_lo = input.std_splice_lo;
     let main_magic = interner.intern(&crate_magic_name(input.crate_ids.stable));
     tables.crate_magic.insert(main_magic, ROOT_MODULE);
+    // With a std splice, the root job resolves only the user text
+    // before it; the splice is its own job (`add_std_splice_job`).
+    let user_text = match input.std_splice_lo {
+        Some(lo) => input.root_text[..lo as usize].to_string(),
+        None => input.root_text.clone(),
+    };
     let mut jobs: Vec<CrateJob> = vec![CrateJob {
         input: OneInput {
             root_path: input.root_path.clone(),
-            root_text: input.root_text.clone(),
+            root_text: user_text,
             env: input.env.clone(),
             crate_ids: input.crate_ids,
             crate_name: input.crate_name.clone(),
@@ -1310,6 +1374,7 @@ pub fn resolve_crate_with(
         magic: main_magic,
         deps: Vec::new(),
         adapter: None,
+        std_splice: false,
     }];
     // The session error map for job-build failures (a dependency root
     // that cannot be read, a non-2024 source dependency): the selected
@@ -1354,6 +1419,9 @@ pub fn resolve_crate_with(
             }
         }
     }
+    // After the extern preludes: the splice job's root module has the
+    // selected crate's prelude already.
+    let std_job = input.std_splice_lo.map(|lo| add_std_splice_job(input, lo, &mut jobs));
     // Dependencies first (a dev-dependency cycle, legal in Cargo test
     // crates, breaks at the back edge: that crate then resolves after
     // its dependent and the dependent's paths into it do not resolve).
@@ -1373,6 +1441,10 @@ pub fn resolve_crate_with(
         order.push(j);
     }
     visit(0, &jobs, &mut state, &mut order);
+    if let Some(sj) = std_job {
+        let at = platform_job.and_then(|p| order.iter().position(|&j| j == p)).map_or(0, |i| i + 1);
+        order.insert(at, sj);
+    }
     let mut shared = SharedFiles::default();
     // The selected crate's root file is FileId(0) even though its
     // dependencies resolve first: the spliced std ranges, the error
@@ -1434,7 +1506,7 @@ pub fn resolve_crate_with(
                     });
                 }
                 add_asks(j, out.std_asks);
-                all_seen.extend(out.seen);
+                all_seen.extend(seen_whole(out.seen, j, std_job, input));
                 fn_lines.extend(out.fn_lines);
                 body_hashes.extend(out.body_hashes);
                 nested_lines.extend(out.nested_lines);
@@ -1463,7 +1535,7 @@ pub fn resolve_crate_with(
             }
             Err(e) => {
                 add_asks(j, e.std_asks);
-                all_seen.extend(e.seen);
+                all_seen.extend(seen_whole(e.seen, j, std_job, input));
                 let (map, all_text) = make_map(&all_seen);
                 return Err(ResolveError { map, all_text, std_asks, platform_asks, diags: e.diags });
             }
@@ -1550,6 +1622,7 @@ fn add_dep_job(
         magic,
         deps: Vec::new(),
         adapter,
+        std_splice: false,
     });
     let mut sub = Vec::new();
     for d in &dep.deps {
@@ -1588,6 +1661,26 @@ struct ParentDecl {
 }
 
 /// The seen list of the discovered files so far, for error maps.
+/// One job's seen files for the session map, with file 0 split between
+/// the root job and the std splice job (`add_std_splice_job`) shown
+/// once, as the whole root text: the splice job resolves first, so it
+/// carries file 0 and the root job drops its copy.
+fn seen_whole(
+    mut seen: Vec<(PathBuf, String, FileId)>,
+    j: usize,
+    std_job: Option<usize>,
+    input: &CrateInput,
+) -> Vec<(PathBuf, String, FileId)> {
+    if std_job == Some(j) {
+        for s in seen.iter_mut().filter(|s| s.2 == FileId(0)) {
+            s.1.clone_from(&input.root_text);
+        }
+    } else if j == 0 && std_job.is_some() {
+        seen.retain(|s| s.2 != FileId(0));
+    }
+    seen
+}
+
 fn seen_of(discs: &[FileDisc]) -> Vec<(PathBuf, String, FileId)> {
     discs.iter().map(|d| (d.path.clone(), d.text.clone(), d.file_id)).collect()
 }
@@ -1789,7 +1882,7 @@ fn process_disc_orig(
     let (text, file_id, module) = (discs[di].text.clone(), discs[di].file_id, discs[di].module);
     // Raw tokens and outline from the per-file cache when the text
     // stands (keyed by canonical path plus module, as in discovery).
-    let file_key = format!("{}#{}", cache.canon(&discs[di].path), module.0);
+    let file_key = job.file_key(&cache.canon(&discs[di].path), module);
     let text_hash = hash_str(&text);
     // The root file's std splice is the driver's, not the user's ask.
     let own = match job.input.std_splice_lo {
@@ -2789,7 +2882,7 @@ fn resolve_one(
     let mut todo: Vec<usize> = Vec::new();
     for (pos, &di) in order.iter().enumerate() {
         let disc = &discs[di];
-        let key = format!("{}#{}", cache.canon(&disc.path), disc.module.0);
+        let key = job.file_key(&cache.canon(&disc.path), disc.module);
         let text_hash = hash_str(&disc.text);
         let outside = reads_outside(&disc.text);
         let hit = if outside { None } else { cache.parsed(&key, text_hash, disc.file_id, exp_hashes[pos]) };
@@ -2847,7 +2940,7 @@ fn resolve_one(
         };
         let outside = reads_outside(&disc.text);
         let store = if outside || !keep { None } else { Some(asts[0].clone()) };
-        let key = format!("{}#{}", modules::canonical_string(&disc.path), disc.module.0);
+        let key = job.file_key(&modules::canonical_string(&disc.path), disc.module);
         let text_hash = hash_str(&disc.text);
         let works = asts
             .into_iter()
