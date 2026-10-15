@@ -360,6 +360,8 @@ fn session_key_for(file: &Path, flags: CrateFlags) -> SessionKey {
         None => format!("pkg:{package} {version}"),
     };
     key.krate.manifest_path = manifest.as_ref().map(|m| m.path.clone()).or(flags.manifest_path);
+    // Cargo's dev profile unwinds unless the workspace sets `panic = "abort"`.
+    key.profile.panic_abort = key.krate.manifest_path.as_deref().is_some_and(dev_profile_aborts);
     if flags.lib {
         key.krate.target_kind = "lib".into();
         key.krate.target_name = package;
@@ -720,6 +722,33 @@ fn toml_value(line: &str) -> Option<String> {
 /// Reads package name, package version, and `[[bin]]` tables from manifest
 /// text. Section-gated on purpose: a `name` in `[dependencies]` or a profile
 /// table must never match.
+/// True when the dev profile that applies to the package at `manifest`
+/// sets `panic = "abort"`. Cargo reads profiles from the workspace root
+/// only: the manifest itself when it has `[workspace]`, else the nearest
+/// manifest above it that has one.
+fn dev_profile_aborts(manifest: &Path) -> bool {
+    let is_root = |t: &str| t.lines().any(|l| l.trim() == "[workspace]");
+    let own = std::fs::read_to_string(manifest).unwrap_or_default();
+    let text = if is_root(&own) {
+        own
+    } else {
+        let above = manifest.parent().into_iter().flat_map(|d| d.ancestors().skip(1));
+        above.filter_map(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok()).find(|t| is_root(t)).unwrap_or(own)
+    };
+    let mut section = "";
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            section = line.trim_matches(|c| c == '[' || c == ']').trim();
+            continue;
+        }
+        if section == "profile.dev" && line.split('=').next().is_some_and(|k| k.trim() == "panic") {
+            return toml_value(line).as_deref() == Some("abort");
+        }
+    }
+    false
+}
+
 fn parse_manifest(text: &str) -> (Option<String>, Option<String>, Vec<(String, Option<String>)>) {
     let mut package = None;
     let mut version = None;

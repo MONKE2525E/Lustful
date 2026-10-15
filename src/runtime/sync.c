@@ -272,6 +272,19 @@ static void lust_futex_wake(uint32_t *p, int n) {
 }
 #endif
 
+/* Poisoning (panic=unwind): the `poison` byte of a Mutex or RwLock. Bit 0
+   is std's poison flag; bit 1 says the write guard that holds the lock was
+   taken while its thread was panicking. A write guard dropped while
+   panicking poisons the lock only when it was not taken that way (std's
+   poison::Guard). */
+void lust_poison_enter(uint8_t *f) LUST_BODY({
+    if (lust_unw_panicking()) *f |= 2;
+    else *f &= (uint8_t)~2;
+})
+void lust_poison_leave(uint8_t *f) LUST_BODY({
+    if (!(*f & 2) && lust_unw_panicking()) *f |= 1;
+})
+
 /* Mutex states: 0 unlocked, 1 locked, 2 locked with waiters (Drepper's
    futex mutex, as std's). */
 void lust_mutex_lock(uint32_t *st) LUST_BODY({
@@ -379,6 +392,7 @@ typedef struct lust_ThreadInfo {
    result dropped, so no scoped thread touches borrowed data after. */
 typedef struct lust_Scope {
     uint32_t live;
+    uint32_t panicked; /* a thread of the scope panicked and nobody joined it */
 } lust_Scope;
 
 typedef struct lust_JoinHdr {
@@ -389,6 +403,8 @@ typedef struct lust_JoinHdr {
     void (*run)(struct lust_JoinHdr *);
     void (*drop_ret)(struct lust_JoinHdr *);
     lust_Scope *scope; /* 0 for thread::spawn */
+    uint32_t panicked; /* the thread ended by a panic; `payload` is its Box<dyn Any + Send> */
+    lust_dyn payload;
 } lust_JoinHdr;
 
 #ifdef LUST_IMPL
@@ -410,12 +426,37 @@ static void lust_thread_info_release(void *p) {
     lust_ThreadInfo *t = (lust_ThreadInfo *)p;
     if (t && t != &lust_main_info && __atomic_sub_fetch(&t->rc, 1, 4) == 0) free(t);
 }
-static void lust_cur_key_init(void) { pthread_key_create(&lust_cur_key, lust_thread_info_release); }
+static int lust_cur_ready;
+static void lust_cur_key_init(void) {
+    pthread_key_create(&lust_cur_key, lust_thread_info_release);
+    int one = 1;
+    __atomic_store(&lust_cur_ready, &one, 3);
+}
+
+/* The calling thread's name for the panic hook: "main", the Builder's
+   name, or "<unnamed>" (panic.c). */
+static void lust_cur_thread_name(const uint8_t **p, uint64_t *n) {
+    int ready;
+    __atomic_load(&lust_cur_ready, &ready, 2);
+    lust_ThreadInfo *t = ready ? (lust_ThreadInfo *)pthread_getspecific(lust_cur_key) : 0;
+    if (!t) t = &lust_main_info;
+    if (t->name) { *p = t->name; *n = t->name_len; }
+    else { *p = (const uint8_t *)"<unnamed>"; *n = 9; }
+}
+
+/* Drops a packet's result: the value, or the payload of a panic. */
+static void lust_packet_drop_result(lust_JoinHdr *h) {
+    if (!h->panicked) { h->drop_ret(h); return; }
+    if (h->payload.vt[0]) ((void (*)(void *))h->payload.vt[0])(h->payload.data);
+    lust_dealloc(h->payload.data, (uint64_t)(uintptr_t)h->payload.vt[1], (uint64_t)(uintptr_t)h->payload.vt[2]);
+}
 
 /* Frees a packet whose result was moved out or dropped; a scoped one
    then counts down its scope. */
 static void lust_packet_free(lust_JoinHdr *h) {
     lust_Scope *sc = h->scope;
+    uint32_t one = 1;
+    if (sc && h->panicked) __atomic_store(&sc->panicked, &one, 5);
     lust_thread_info_release(h->th);
     free(h);
     if (sc && __atomic_sub_fetch(&sc->live, 1, 5) == 0) lust_futex_wake(&sc->live, 0x7fffffff);
@@ -425,10 +466,17 @@ static void *lust_thread_entry(void *p) {
     lust_JoinHdr *h = (lust_JoinHdr *)p;
     pthread_setspecific(lust_cur_key, h->th);
     h->run(h);
+    /* A panic that reached the thread's root ends the thread; its payload
+       is the join's Err (std's spawn wrapper catches it). */
+    lust_exc ex;
+    if (lust_unwind_mode && lust_unw_pending && lust_unw_take(&ex)) {
+        h->payload = lust_exc_box(&ex);
+        h->panicked = 1;
+    }
     uint32_t one = 1;
     __atomic_store(&h->done, &one, 3);
     if (__atomic_sub_fetch(&h->rc, 1, 4) == 0) {
-        h->drop_ret(h);
+        lust_packet_drop_result(h);
         lust_packet_free(h);
     }
     return 0;
@@ -448,6 +496,7 @@ void lust_thread_spawn(lust_JoinHdr *h, lust_loc loc) LUST_BODY({
     h->th = t;
     h->rc = 2;
     h->done = 0;
+    h->panicked = 0;
     if (pthread_create(&h->t, 0, lust_thread_entry, h) != 0) lust_panic_cstr_owned("failed to spawn thread", loc);
 })
 
@@ -461,7 +510,7 @@ void lust_join_free(lust_JoinHdr *h) LUST_BODY({ lust_packet_free(h); })
 void lust_join_drop(lust_JoinHdr *h) LUST_BODY({
     pthread_detach(h->t);
     if (__atomic_sub_fetch(&h->rc, 1, 4) == 0) {
-        h->drop_ret(h);
+        lust_packet_drop_result(h);
         lust_packet_free(h);
     }
 })

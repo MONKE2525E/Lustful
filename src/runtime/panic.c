@@ -1,6 +1,6 @@
 /* ---------- Panics (abort mode) ----------
    Matches rustc 1.99 with -C panic=abort: the default hook prints
-       \nthread 'main' (<os tid>) panicked at <file>:<line>:<col>:\n<msg>\nnote: ...\n
+       \nthread '<name>' (<os tid>) panicked at <file>:<line>:<col>:\n<msg>\nnote: ...\n
    to stderr, then the process aborts (SIGABRT, shell status 134). Stdout
    is Rust's LineWriter (below): an abort loses the bytes it still holds. */
 
@@ -145,9 +145,15 @@ static int32_t lust_first_panic_take(void) {
     return old;
 }
 
+/* The calling thread's name (runtime/sync.c). */
+static void lust_cur_thread_name(const uint8_t **p, uint64_t *n);
+
 /* The default hook's text (std's default_hook) on the current thread. */
 static void lust_default_hook(const uint8_t *msg, uint64_t len, const char *file, uint64_t flen, uint32_t line, uint32_t col, int32_t count) {
-    fprintf(stderr, "\nthread 'main' (%llu) panicked at %.*s:%u:%u:\n%.*s\n", lust_os_tid(), (int)flen, file, (unsigned)line, (unsigned)col, (int)len,
+    const uint8_t *tn;
+    uint64_t tl;
+    lust_cur_thread_name(&tn, &tl);
+    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at %.*s:%u:%u:\n%.*s\n", (int)tl, (const char *)tn, lust_os_tid(), (int)flen, file, (unsigned)line, (unsigned)col, (int)len,
             (const char *)msg);
     /* A panic while panicking prints a full backtrace in Rust; lust has no
        frames to print, only the header. */
@@ -338,8 +344,11 @@ int32_t lust_unw_mine(void) LUST_BODY({
 /* A destructor that cleanup called ended with a new exception: Rust's
    nounwind "panic in a destructor during cleanup", then abort. */
 void lust_unw_cleanup_abort(void) LUST_BODY({
-    fprintf(stderr, "\nthread 'main' (%llu) panicked at " LUST_STD_SRC "core/src/panicking.rs:233:5:\npanic in a destructor during cleanup\nthread caused non-unwinding panic. aborting.\n",
-            lust_os_tid());
+    const uint8_t *tn;
+    uint64_t tl;
+    lust_cur_thread_name(&tn, &tl);
+    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at " LUST_STD_SRC "core/src/panicking.rs:233:5:\npanic in a destructor during cleanup\nthread caused non-unwinding panic. aborting.\n",
+            (int)tl, (const char *)tn, lust_os_tid());
     fflush(stderr);
     abort();
 })
@@ -460,8 +469,11 @@ void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t 
         lust_unw_raise(LUST_EXC_STRING, msg, len, file, line, col);
         return;
     }
-    fprintf(stderr, "\nthread 'main' (%llu) panicked at %s:%u:%u:\n%.*s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
-            lust_os_tid(), file, (unsigned)line, (unsigned)col, (int)len, (const char *)msg);
+    const uint8_t *tn;
+    uint64_t tl;
+    lust_cur_thread_name(&tn, &tl);
+    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at %s:%u:%u:\n%.*s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            (int)tl, (const char *)tn, lust_os_tid(), file, (unsigned)line, (unsigned)col, (int)len, (const char *)msg);
     fflush(stderr);
     abort();
 })
@@ -612,8 +624,11 @@ static void lust_panic_std_kind(uint32_t kind, const char *msg, const char *wher
         lust_unw_raise(kind, (const uint8_t *)msg, strlen(msg), file, (uint32_t)strtoul(c1, 0, 10), (uint32_t)strtoul(c2 + 1, 0, 10));
         return;
     }
-    fprintf(stderr, "\nthread 'main' (%llu) panicked at " LUST_STD_SRC "%s:\n%s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
-            lust_os_tid(), where, msg);
+    const uint8_t *tn;
+    uint64_t tl;
+    lust_cur_thread_name(&tn, &tl);
+    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at " LUST_STD_SRC "%s:\n%s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+            (int)tl, (const char *)tn, lust_os_tid(), where, msg);
     fflush(stderr);
     abort();
 }

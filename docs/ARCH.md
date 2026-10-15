@@ -3692,11 +3692,10 @@ The build follows the plan above: explicit propagation, cleanup
 ladders from lowering, no C TLS, one global load on the fast path.
 These parts differ from the plan, and why:
 
-- Mode. `-C panic=unwind` sets `ProfileFlags::panic_abort` false.
-  Cargo packages follow their profile's `panic` setting once threads
-  unwind (Cargo's dev and release profiles unwind; until then a
-  package builds with panic=abort, and `thread::spawn` under
-  panic=unwind is L0820). The profile is part
+- Mode. `-C panic=unwind` sets `ProfileFlags::panic_abort` false; a
+  Cargo package follows its workspace's `[profile.dev] panic` (Cargo's
+  default unwinds, as ts-rust's dev profile does). A single file
+  without the flag stays panic=abort. The profile is part
   of the session key, so the daemon keeps one session per mode and
   never mixes their IR or C. `Program::unwind` carries the mode to
   lowering and codegen; `cfg(panic)` follows it. Under panic=abort
@@ -3770,6 +3769,21 @@ These parts differ from the plan, and why:
   with one probe per std type; an answer that needs an unknown type
   rejects (L0820) instead of guessing. `catch_unwind` checks its
   closure at body end (L0612, rustc E0277).
+
+- Threads and poisoning (slice 3). A panic that reaches a spawned
+  thread's root ends that thread: the packet keeps the payload and
+  `join` returns `Err(Box<dyn Any + Send>)` (`thread::Result`). An
+  unjoined panicking scoped thread makes `thread::scope` panic ("a
+  scoped thread panicked") at its call after every thread ended. The
+  hook line names the thread ("main", the Builder name, or
+  "<unnamed>"), in both modes. A Mutex or RwLock write guard records
+  whether its thread was panicking when it locked (bit 1 of the lock's
+  `poison` byte) and poisons the lock (bit 0) when it drops during a
+  panic that started later; read guards never poison. `lock`,
+  `get_mut`, and `into_inner` then return `Err(PoisonError(..))`.
+- Iterator expansions (lower/iter.rs) put each droppable local they
+  make (a `vec::IntoIter`, a collected Vec) on the cleanup chain of
+  the expanded call, so its values drop when a closure inside panics.
 
 ### 7.3 Threads, TLS, atomics, sync
 

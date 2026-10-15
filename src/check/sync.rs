@@ -616,11 +616,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // needs the bound here; the borrow checker proves concrete
             // borrows, borrowck/regions.rs).
             SyncOp::ThreadSpawn => {
-                // A thread that panics under panic=unwind ends alone and
-                // its join returns Err: not built yet (W-UNWIND threads).
-                if self.p.unwind {
-                    self.err("L0820", span, "`thread::spawn` under panic=unwind is not supported yet", "Build with panic=abort.");
-                }
                 let ret = self.new_var(false);
                 let f = self.fn_once_param(&[], ret, span);
                 self.require_send(f, span);
@@ -643,9 +638,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // FnOnce(&'scope Scope<'scope, 'env>) -> T`: the closure's
             // `&Scope` is higher-ranked.
             SyncOp::ThreadScope => {
-                if self.p.unwind {
-                    self.err("L0820", span, "`thread::scope` under panic=unwind is not supported yet", "Build with panic=abort.");
-                }
                 let ret = self.new_var(false);
                 let sc = sync_ty(&mut self.tys, SyncTy::Scope, &[]);
                 let sr = self.tys.mk_ref(false, sc);
@@ -870,7 +862,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 }
                 (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle, "join") => {
                     let el = self.tys.adt_first_ty_arg(base).unwrap_or(ERROR);
-                    let err = sync_ty(&mut self.tys, SyncTy::JoinError, &[]);
+                    // `thread::Result<T>`: a panicked thread's payload.
+                    let err = self.box_any_send();
                     (SyncOp::JoinHandleJoin, Autoref::None, self.tys.mk_result(el, err))
                 }
                 (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle, "thread") => {

@@ -386,9 +386,13 @@ fn lock_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, m: &str, ct: &str, pr
             (format!("void drop_{m}({ct} *p)"), inner)
         }
         // A guard gives its lock back (runtime/sync.c).
-        (Glue::Drop, SyncTy::MutexGuard) => (format!("void drop_{m}({ct} *p)"), "lust_mutex_unlock(&(*p)->st);".into()),
+        // A write guard dropped by a panic poisons its lock (runtime/sync.c
+        // `lust_poison_leave`).
+        (Glue::Drop, SyncTy::MutexGuard) => (format!("void drop_{m}({ct} *p)"), "lust_poison_leave(&(*p)->poison); lust_mutex_unlock(&(*p)->st);".into()),
         (Glue::Drop, SyncTy::RwLockReadGuard) => (format!("void drop_{m}({ct} *p)"), "lust_rw_read_unlock(&(*p)->st);".into()),
-        (Glue::Drop, SyncTy::RwLockWriteGuard) => (format!("void drop_{m}({ct} *p)"), "lust_rw_write_unlock(&(*p)->st);".into()),
+        (Glue::Drop, SyncTy::RwLockWriteGuard) => {
+            (format!("void drop_{m}({ct} *p)"), "lust_poison_leave(&(*p)->poison); lust_rw_write_unlock(&(*p)->st);".into())
+        }
         (Glue::Default, SyncTy::Mutex | SyncTy::RwLock) => {
             need(Glue::Default, e);
             (format!("{ct} default_{m}(void)"), format!("{ct} r; {} r.v = default_{}(); return r;", zero_c("r"), mangle(e)))
@@ -407,7 +411,7 @@ fn lock_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, m: &str, ct: &str, pr
                 "lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); \
 if ({try_}(&p->st)) {{ if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, {v}); {unlock}(&p->st); }} \
 else if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, {locked}(w, {})); \
-if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_bool(w, 0)); return lust_dstruct_finish_ne(&b);",
+if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_bool(w, p->poison & 1)); return lust_dstruct_finish_ne(&b);",
                 lit(name),
                 lit("data"),
                 lit("data"),
@@ -593,15 +597,18 @@ impl FnGen<'_, '_, '_> {
                     CTy::Sync(_, e) => (**e).clone(),
                     other => unreachable!("a JoinHandle operand, found {other:?}"),
                 };
-                let res = CTy::Result(Box::new(el.clone()), Box::new(CTy::Sync(SyncTy::JoinError, Box::new(CTy::Unit))));
+                // `Err(payload)` when the thread panicked (W-UNWIND).
+                let res = CTy::Result(Box::new(el.clone()), Box::new(CTy::BoxDyn));
                 collect_types(&res, &mut self.sig_types);
                 let (t, h) = (self.tmp(), self.tmp());
                 let f = variant_field(self.p, &res, &t, 0, 0);
+                let e = variant_field(self.p, &res, &t, 1, 0);
                 let _ = writeln!(
                     self.out,
-                    "    lust_JoinHdr *{h} = {}; lust_thread_join({h}); {} {t}; {} {f} = ((struct {{ lust_JoinHdr h; {} ret; }} *){h})->ret; lust_join_free({h});",
+                    "    lust_JoinHdr *{h} = {}; lust_thread_join({h}); {} {t}; if ({h}->panicked) {{ {} {e} = {h}->payload; {h}->panicked = 0; }} else {{ {} {f} = ((struct {{ lust_JoinHdr h; {} ret; }} *){h})->ret; }} lust_join_free({h});",
                     vals[0],
                     ctype(&res),
+                    disc_set(self.p, &res, &t, 1),
                     disc_set(self.p, &res, &t, 0),
                     ctype(&el)
                 );
@@ -945,11 +952,14 @@ impl FnGen<'_, '_, '_> {
         };
         if op == SyncOp::ThreadScope {
             let (sc, ev) = (self.tmp(), self.tmp());
-            let _ = writeln!(self.out, "    lust_Scope {sc}; {sc}.live = 0; {} {ev} = {env};", ctype(&env_ty));
+            let _ = writeln!(self.out, "    lust_Scope {sc}; {sc}.live = 0; {sc}.panicked = 0; {} {ev} = {env};", ctype(&env_ty));
             let mut call = String::new();
             let v = self.callee_call_c(&mut call, &callee, &ev, &[format!("&{sc}")]);
             drop_env(self, &mut call, &ev);
             let _ = writeln!(call, "  lust_scope_wait(&{sc});");
+            // A scoped thread that panicked and was not joined: the scope
+            // panics after every thread ended, at its call (W-UNWIND).
+            let _ = writeln!(call, "  if ({sc}.panicked) lust_panic_cstr(\"a scoped thread panicked\", {loc});");
             self.out.push_str(&call);
             return v;
         }
@@ -982,8 +992,9 @@ impl FnGen<'_, '_, '_> {
     }
 
     /// The lock calls: `Mutex` and `RwLock` (over the runtime's futex
-    /// locks) and `PoisonError`'s accessors. No lock is ever poisoned
-    /// (a panic aborts), so every `LockResult` is `Ok`.
+    /// locks) and `PoisonError`'s accessors. A lock is poisoned only
+    /// under panic=unwind (a write guard dropped by a panic); a
+    /// `LockResult` is then `Err(PoisonError(..))`.
     fn lock_builtin(&mut self, op: SyncOp, vals: &[String], tys: &[CTy]) -> String {
         use SyncOp as S;
         let (k, elem) = match op {
@@ -1001,6 +1012,22 @@ impl FnGen<'_, '_, '_> {
             let t = this.tmp();
             let f = variant_field(this.p, &res, &t, 0, 0);
             let _ = writeln!(this.out, "    {} {t}; {} {f} = {v};", ctype(&res), disc_set(this.p, &res, &t, 0));
+            t
+        };
+        // `Ok(v)`, or `Err(PoisonError(v))` when the lock at `lock` (a
+        // pointer) is poisoned.
+        let ok_or_poisoned = |this: &mut Self, v_ty: CTy, v: String, lock: &str| -> String {
+            let res = CTy::Result(Box::new(v_ty.clone()), Box::new(CTy::Sync(SyncTy::PoisonError, Box::new(v_ty))));
+            collect_types(&res, &mut this.sig_types);
+            let t = this.tmp();
+            let (f, e) = (variant_field(this.p, &res, &t, 0, 0), variant_field(this.p, &res, &t, 1, 0));
+            let _ = writeln!(
+                this.out,
+                "    {} {t}; if (({lock})->poison & 1) {{ {} {e} = {v}; }} else {{ {} {f} = {v}; }}",
+                ctype(&res),
+                disc_set(this.p, &res, &t, 1),
+                disc_set(this.p, &res, &t, 0)
+            );
             t
         };
         match op {
@@ -1021,16 +1048,17 @@ impl FnGen<'_, '_, '_> {
                 };
                 let g = self.tmp();
                 let guard = CTy::Sync(gk, Box::new(elem.clone()));
-                let _ = writeln!(self.out, "    {} {g} = {}; {call}(&{g}->st);", ctype(&guard), vals[0]);
-                ok(self, guard, g)
+                let enter = if op == S::RwLockRead { String::new() } else { format!(" lust_poison_enter(&{g}->poison);") };
+                let _ = writeln!(self.out, "    {} {g} = {}; {call}(&{g}->st);{enter}", ctype(&guard), vals[0]);
+                ok_or_poisoned(self, guard, g.clone(), &g)
             }
             S::LockGetMut => {
                 let r = CTy::Ref(Box::new(elem.clone()));
-                ok(self, r, format!("(&({})->v)", vals[0]))
+                ok_or_poisoned(self, r, format!("(&({})->v)", vals[0]), &vals[0])
             }
-            S::LockIntoInner => ok(self, elem, format!("({}).v", vals[0])),
-            S::LockIsPoisoned => format!("((void){}, (uint8_t)0)", vals[0]),
-            S::LockClearPoison => format!("((void){}, ((lust_Unit){{}}))", vals[0]),
+            S::LockIntoInner => ok_or_poisoned(self, elem, format!("({}).v", vals[0]), &format!("(&({}))", vals[0])),
+            S::LockIsPoisoned => format!("((uint8_t)(({})->poison & 1))", vals[0]),
+            S::LockClearPoison => format!("((({})->poison &= ~1), ((lust_Unit){{}}))", vals[0]),
             S::PoisonNew => vals[0].clone(),
             S::SyncNew(SyncTy::Barrier) => format!("((lust_Barrier){{0, 0, 0, 0, {}}})", vals[0]),
             S::SyncNew(_) => "((uint32_t)0)".into(),

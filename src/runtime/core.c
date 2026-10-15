@@ -507,7 +507,7 @@ uint64_t lust_bounds(uint64_t i, uint64_t len, lust_loc loc) LUST_BODY({
 T lust_add_##N(T a, T b, lust_loc loc) LUST_BODY({ int64_t r = (int64_t)a + b; if (r < MINV || r > MAXV) LUST_OVF("add"); return (T)r; }) \
 T lust_sub_##N(T a, T b, lust_loc loc) LUST_BODY({ int64_t r = (int64_t)a - b; if (r < MINV || r > MAXV) LUST_OVF("subtract"); return (T)r; }) \
 T lust_mul_##N(T a, T b, lust_loc loc) LUST_BODY({ int64_t r = (int64_t)a * b; if (r < MINV || r > MAXV) LUST_OVF("multiply"); return (T)r; }) \
-T lust_neg_##N(T a, lust_loc loc) LUST_BODY({ if (a == MINV) LUST_OVF("negate"); return (T)-a; }) \
+T lust_neg_##N(T a, lust_loc loc) LUST_BODY({ if (a == MINV) { LUST_OVF("negate"); return a; } return (T)-a; }) \
 T lust_div_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; } if (a == MINV && b == -1) { LUST_OVF("divide"); return 0; } return (T)(a / b); }) \
 T lust_rem_##N(T a, T b, lust_loc loc) LUST_BODY({ if (b == 0) { lust_panic_cstr("attempt to calculate the remainder with a divisor of zero", loc); return 0; } if (a == MINV && b == -1) { LUST_OVF("calculate the remainder"); return 0; } return (T)(a % b); })
 
@@ -542,7 +542,7 @@ int64_t lust_mul_i64(int64_t a, int64_t b, lust_loc loc) LUST_BODY({
     if (r / b != a) LUST_OVF("multiply");
     return r;
 })
-int64_t lust_neg_i64(int64_t a, lust_loc loc) LUST_BODY({ if (a == INT64_MIN) LUST_OVF("negate"); return -a; })
+int64_t lust_neg_i64(int64_t a, lust_loc loc) LUST_BODY({ if (a == INT64_MIN) { LUST_OVF("negate"); return a; } return -a; })
 int64_t lust_div_i64(int64_t a, int64_t b, lust_loc loc) LUST_BODY({
     if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; }
     if (a == INT64_MIN && b == -1) { LUST_OVF("divide"); return 0; }

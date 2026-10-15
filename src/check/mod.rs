@@ -3208,6 +3208,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
             // core's `impl Debug for !` (`catch_unwind` of a closure that
             // always panics gives `Result<!, _>`; W-UNWIND).
             TyKind::Never => return trait_def == lang.debug,
+            // core's `impl Debug for dyn Any (+ Send (+ Sync))` (`Any { .. }`):
+            // `thread::Result`'s Err unwraps with it.
+            TyKind::Dyn(..) if trait_def == lang.debug => return has_debug(p, &self.tys, self_ty),
             _ => return false,
         }
         if trait_def == lang.copy {

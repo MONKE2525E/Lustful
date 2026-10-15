@@ -161,7 +161,20 @@ impl Ex<'_, '_, '_> {
 
     fn local(&mut self, ty: Ty) -> Local {
         self.body.locals.push(LocalDecl { ty, mutable: true, name: None });
-        self.body.locals.len() as Local - 1
+        let l = self.body.locals.len() as Local - 1;
+        // panic=unwind: a local of the expansion that owns droppable data
+        // (a `vec::IntoIter`, a collected Vec) drops in the cleanup of
+        // everything after it, before the expanded call's own cleanup.
+        // The drop is flag-guarded, so it is a no-op until the local holds
+        // a value and after it moved out.
+        if let Some(next) = self.unw.filter(|_| self.p.unwind)
+            && crate::check::collect::needs_drop(self.p, &self.body.tys, ty)
+        {
+            let span = self.span;
+            self.body.blocks.push(BlockData { stmts: vec![Stmt { kind: StmtKind::Drop(l), span }], term: Terminator::Goto(next), term_span: span });
+            self.unw = Some(Bb(self.body.blocks.len() as u32 - 1));
+        }
+        l
     }
     fn block(&mut self) -> Bb {
         self.body.blocks.push(BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: self.span });

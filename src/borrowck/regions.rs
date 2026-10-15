@@ -3017,6 +3017,19 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
             self.equate_all(&tv, &dv);
             return;
         }
+        // `handle.join()`: the result's `Ok` is the thread's `T`; its `Err`
+        // payload is `'static` and borrows nothing (W-UNWIND).
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::JoinHandleJoin)) = target
+            && let Some((ht, hv)) = avs.first()
+            && let Some(t) = self.body.tys.adt_first_ty_arg(*ht)
+        {
+            let k = self.sc.slots(t) as usize;
+            if k <= hv.len() && k <= dv.len() {
+                let hv = hv[hv.len() - k..].to_vec();
+                self.equate_all(&hv, &dv[..k]);
+            }
+            return;
+        }
         // `once.get_or_init(f)`: what `f` returns is the cell's `T`; the
         // result `&T` borrows the cell.
         if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::OnceGetOrInit)) = target

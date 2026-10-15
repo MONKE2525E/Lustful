@@ -6661,7 +6661,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             // `Mutex<T>`: the futex word, the poison flag, the value;
             // `RwLock<T>` adds the waiter count (runtime/sync.c).
             CTy::Sync(k, e) if k.is_cell_struct() => {
-                let words: String = ["st", "wn", "poison"].iter().zip(sync::cell_words(*k)).map(|(n, i)| format!("{} {n}; ", int_c(*i))).collect();
+                // A Mutex has no `wn`: its second word is `poison`.
+                let names: &[&str] = if *k == crate::ty::sync::SyncTy::Mutex { &["st", "poison"] } else { &["st", "wn", "poison"] };
+                let words: String = names.iter().zip(sync::cell_words(*k)).map(|(n, i)| format!("{} {n}; ", int_c(*i))).collect();
                 let _ = writeln!(out, "struct {0} {{ {words}{1} v; }};", ctype(t), ctype(e));
             }
             CTy::FnPtr(ps, r) => {
