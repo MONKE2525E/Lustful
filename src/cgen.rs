@@ -4372,7 +4372,34 @@ impl FnGen<'_, '_> {
             | B::LowestOne
             | B::IsolateHighestOne
             | B::IsolateLowestOne
-            | B::IntMidpoint => self.int_method_c(b, &vals, &tys, loc),
+            | B::IntMidpoint
+            | B::StrictAdd
+            | B::StrictSub
+            | B::StrictMul
+            | B::StrictDiv
+            | B::StrictRem
+            | B::StrictDivEuclid
+            | B::StrictRemEuclid
+            | B::StrictNeg
+            | B::StrictAbs
+            | B::StrictPow
+            | B::StrictShl
+            | B::StrictShr
+            | B::MixedCheckedAdd
+            | B::MixedCheckedSub
+            | B::MixedWrappingAdd
+            | B::MixedWrappingSub
+            | B::MixedSaturatingAdd
+            | B::MixedSaturatingSub
+            | B::MixedOverflowingAdd
+            | B::MixedOverflowingSub
+            | B::MixedStrictAdd
+            | B::MixedStrictSub
+            | B::CheckedSignedDiff
+            | B::CarryingAdd
+            | B::BorrowingSub
+            | B::CarryingMul
+            | B::CarryingMulAdd => self.int_method_c(b, &vals, &tys, loc),
             B::FloatSqrt
             | B::FloatPowi
             | B::FloatPowf
@@ -5391,7 +5418,216 @@ impl FnGen<'_, '_> {
                 };
                 self.int_option_c(&r, &format!("{amt} < {bits}u"), it)
             }
+            B::StrictAdd | B::StrictSub | B::StrictMul | B::StrictDiv | B::StrictRem => {
+                let (op, verb) = match b {
+                    B::StrictAdd => (0, "add"),
+                    B::StrictSub => (1, "subtract"),
+                    B::StrictMul => (2, "multiply"),
+                    B::StrictDiv => (3, "divide"),
+                    _ => (4, "calculate the remainder"),
+                };
+                let (o, rc) = checked_call(self, &ua, &ub, op);
+                let div0msg = if op == 4 {
+                    "attempt to calculate the remainder with a divisor of zero"
+                } else {
+                    "attempt to divide by zero"
+                };
+                let _ = writeln!(self.out, "    if ({rc} < 0) lust_panic_cstr(\"{div0msg}\", {loc});");
+                let _ = writeln!(self.out, "    if ({rc} == 0) lust_panic_cstr(\"attempt to {verb} with overflow\", {loc});");
+                format!("(({ct}){o})")
+            }
+            B::StrictNeg => {
+                let (o, rc) = checked_call(self, "0ull", &ua, 1);
+                let _ = writeln!(self.out, "    if ({rc} == 0) lust_panic_cstr(\"attempt to negate with overflow\", {loc});");
+                format!("(({ct}){o})")
+            }
+            B::StrictAbs => {
+                let x = self.tmp();
+                let _ = writeln!(self.out, "    {ct} {x} = {a};");
+                let (o, rc) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {o}; int {rc} = {x} >= 0 ? ({o} = (uint64_t){x}, 1) : lust_checked_op(0ull, (uint64_t){x}, {bits}, {}, 1, &{o});",
+                    sgn as i32
+                );
+                let _ = writeln!(self.out, "    if ({rc} == 0) lust_panic_cstr(\"attempt to negate with overflow\", {loc});");
+                format!("(({ct}){o})")
+            }
+            B::StrictPow => {
+                let (o, rc) = (self.tmp(), self.tmp());
+                let _ =
+                    writeln!(self.out, "    uint64_t {o}; int {rc} = lust_checked_pow({ua}, {}, {bits}, {}, &{o});", vals[1], sgn as i32);
+                let _ = writeln!(self.out, "    if ({rc} == 0) lust_panic_cstr(\"attempt to exponentiate with overflow\", {loc});");
+                format!("(({ct}){o})")
+            }
+            B::StrictShl | B::StrictShr => {
+                let amt = &vals[1];
+                let (msg, r) = if b == B::StrictShl {
+                    ("attempt to shift left with overflow", format!("(({ct})(({masked_a} << ({amt} & 63u)) & {mask}))"))
+                } else if sgn {
+                    ("attempt to shift right with overflow", format!("(({ct})(((int64_t)({a}) >> ({amt} & 63u)) & (int64_t){mask}))"))
+                } else {
+                    ("attempt to shift right with overflow", format!("(({ct})({masked_a} >> ({amt} & 63u)))"))
+                };
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    if ({amt} >= {bits}u) lust_panic_cstr(\"{msg}\", {loc}); {ct} {t} = {r};");
+                t
+            }
+            B::MixedCheckedAdd
+            | B::MixedCheckedSub
+            | B::MixedWrappingAdd
+            | B::MixedWrappingSub
+            | B::MixedSaturatingAdd
+            | B::MixedSaturatingSub
+            | B::MixedOverflowingAdd
+            | B::MixedOverflowingSub
+            | B::MixedStrictAdd
+            | B::MixedStrictSub => self.mixed_op_c(b, vals, it, loc),
+            B::CheckedSignedDiff => {
+                let masked_b = format!("({ub} & {mask})");
+                let sct = int_c(it.counterpart());
+                let smax = format!("(({sct}){}ll)", if bits >= 64 { i64::MAX } else { (1i64 << (bits - 1)) - 1 });
+                let (x, y) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    uint64_t {x} = {masked_a}, {y} = {masked_b};");
+                let diff = format!("(({sct})(({x} - {y}) & {mask}))");
+                let fits = format!(
+                    "({x} >= {y} ? ({x} - {y}) <= (uint64_t){smax} : ({y} - {x}) <= (uint64_t){smax} + 1ull)"
+                );
+                self.int_option_c(&diff, &fits, it.counterpart())
+            }
+            B::CarryingAdd | B::BorrowingSub => {
+                let masked_b = format!("({ub} & {mask})");
+                let (x, y, t) = (self.tmp(), self.tmp(), self.tmp());
+                let tup = CTy::Tuple(vec![CTy::Int(it), CTy::Bool]);
+                let tt = ctype(&tup);
+                let _ = writeln!(self.out, "    uint64_t {x} = {masked_a}, {y} = {masked_b};");
+                if b == B::CarryingAdd {
+                    let _ = writeln!(
+                        self.out,
+                        "    {tt} {t}; {{ uint64_t s = {x} + {y} + ({} ? 1ull : 0ull); {t}.f0 = ({ct})(s & {mask}); {t}.f1 = s > {mask} || s < {x} || ({} && s == {x} && {y} == {mask}); }}",
+                        vals[2], vals[2]
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "    {tt} {t}; {t}.f0 = ({ct})(({x} - {y} - ({} ? 1ull : 0ull)) & {mask}); {t}.f1 = {x} < {y} || ({} && {x} == {y});",
+                        vals[2],
+                        vals[2]
+                    );
+                }
+                t
+            }
+            B::CarryingMul | B::CarryingMulAdd => {
+                let masked_b = format!("({ub} & {mask})");
+                let (p, t) = (self.tmp(), self.tmp());
+                let tup = CTy::Tuple(vec![CTy::Int(it), CTy::Int(it)]);
+                let tt = ctype(&tup);
+                let add = if b == B::CarryingMulAdd {
+                    format!("lust_u128_add(lust_u128_add({p}, (lust_u128){{{}, 0}}), (lust_u128){{{}, 0}})", format!("({} & {mask})", vals[2]), format!("((uint64_t)({}) & {mask})", vals[3]))
+                } else {
+                    format!("lust_u128_add({p}, (lust_u128){{{}, 0}})", format!("({} & {mask})", vals[2]))
+                };
+                let hi = if bits >= 64 {
+                    format!("{p}.hi")
+                } else {
+                    format!("(({p}.lo >> {bits}) | ({p}.hi << (64 - {bits})))")
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    lust_u128 {p} = lust_u128_mul((lust_u128){{{masked_a}, 0}}, (lust_u128){{{masked_b}, 0}}); {p} = {add}; {tt} {t}; {t}.f0 = ({ct})({p}.lo & {mask}); {t}.f1 = ({ct})({hi} & {mask});",
+                );
+                t
+            }
             _ => self.int_method_c2(b, vals, it, loc),
+        }
+    }
+
+    /// One mixed-sign operation (`checked_add_unsigned` and kin):
+    /// the receiver keeps its type, the argument has the other
+    /// signedness at the same width. Computes the wrapped result
+    /// and the overflow flag on the masked 64-bit forms, then
+    /// shapes them by family: checked -> Option, wrapping -> the
+    /// value, saturating -> clamped, overflowing -> (value, flag),
+    /// strict -> panic on overflow.
+    fn mixed_op_c(&mut self, b: Builtin, vals: &[String], it: IntTy, loc: &str) -> String {
+        use Builtin as B;
+        use std::fmt::Write as _;
+        let bits = it.bits();
+        let sgn = it.signed();
+        let ct = int_c(it);
+        let sub = matches!(b, B::MixedCheckedSub | B::MixedWrappingSub | B::MixedSaturatingSub | B::MixedOverflowingSub | B::MixedStrictSub);
+        let (x, y, r, ovf) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+        let mask: String = if bits >= 64 { "~0ull".into() } else { format!("((1ull << {bits}) - 1ull)") };
+        let max_u = if sgn {
+            if bits >= 64 { "0x7FFFFFFFFFFFFFFFull".to_string() } else { format!("{}ull", (1u128 << (bits - 1)) - 1) }
+        } else {
+            mask.clone()
+        };
+        let min_u = if sgn { format!("(1ull << {})", bits - 1) } else { "0ull".to_string() };
+        let _ = writeln!(self.out, "    {ct} {x} = {}; uint64_t {y} = (uint64_t)({}) & {mask};", vals[0], vals[1]);
+        if sgn {
+            // Signed receiver, unsigned magnitude argument.
+            let (thr, op) = if sub { (format!("((uint64_t){x} - {min_u})"), "-") } else { (format!("({max_u} - (uint64_t){x})"), "+") };
+            let _ = writeln!(self.out, "    uint64_t {r} = ((uint64_t){x} {op} {y}) & {mask}; int {ovf} = {y} > {thr};");
+        } else {
+            // Unsigned receiver, signed argument: its sign decides
+            // which end can overflow. A negative argument's
+            // magnitude is its two's-complement negation.
+            let sct = int_c(it.counterpart());
+            let (neg_room, pos_room) = if sub {
+                (format!("({mask} - ({x} & {mask}))"), format!("({x} & {mask})"))
+            } else {
+                (format!("({x} & {mask})"), format!("({mask} - ({x} & {mask}))"))
+            };
+            let _ = writeln!(
+                self.out,
+                "    uint64_t {r} = (({x} {} {y}) & {mask}); int {ovf} = (({sct}){y} < 0) ? (((0ull - {y}) & {mask}) > {neg_room}) : ({y} > {pos_room});",
+                if sub { "-" } else { "+" }
+            );
+        }
+        let val = format!("(({ct}){r})");
+        match b {
+            B::MixedWrappingAdd | B::MixedWrappingSub => val,
+            B::MixedCheckedAdd | B::MixedCheckedSub => self.int_option_c(&val, &format!("!{ovf}"), it),
+            B::MixedOverflowingAdd | B::MixedOverflowingSub => {
+                let tup = CTy::Tuple(vec![CTy::Int(it), CTy::Bool]);
+                let tt = ctype(&tup);
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {tt} {t}; {t}.f0 = {val}; {t}.f1 = {ovf};");
+                t
+            }
+            B::MixedSaturatingAdd | B::MixedSaturatingSub => {
+                // One overflow direction per form, named by the
+                // argument's sign for an unsigned receiver: adding
+                // or subtracting an unsigned magnitude can only
+                // pass the top (add) or the bottom (sub) end.
+                let t = self.tmp();
+                let hi = format!("(({ct}){max_u})");
+                let lo = if sgn {
+                    if bits >= 64 {
+                        format!("(({ct})(-9223372036854775807ll - 1))")
+                    } else {
+                        format!("(({ct}){}ll)", -(1i128 << (bits - 1)))
+                    }
+                } else {
+                    format!("(({ct})0)")
+                };
+                let clamp = if sgn {
+                    if sub { lo } else { hi }
+                } else if sub {
+                    format!("((({}){} < 0) ? {hi} : {lo})", int_c(it.counterpart()), y)
+                } else {
+                    format!("((({}){} < 0) ? {lo} : {hi})", int_c(it.counterpart()), y)
+                };
+                let _ = writeln!(self.out, "    {ct} {t} = {ovf} ? {clamp} : {val};");
+                t
+            }
+            _ => {
+                let verb = if sub { "subtract" } else { "add" };
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    if ({ovf}) lust_panic_cstr(\"attempt to {verb} with overflow\", {loc}); {ct} {t} = {val};");
+                t
+            }
         }
     }
 
@@ -5572,8 +5808,8 @@ impl FnGen<'_, '_> {
                 );
                 format!("(({ct}){r})")
             }
-            B::DivEuclid => format!("(({ct})lust_div_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
-            B::RemEuclid => format!("(({ct})lust_rem_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
+            B::DivEuclid | B::StrictDivEuclid => format!("(({ct})lust_div_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
+            B::RemEuclid | B::StrictRemEuclid => format!("(({ct})lust_rem_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
             B::Signum => format!("(({ct})(({a} > 0) - ({a} < 0)))"),
             B::IsPositive => format!("({a} > 0)"),
             B::IsNegative => format!("({a} < 0)"),

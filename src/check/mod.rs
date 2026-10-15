@@ -159,6 +159,33 @@ pub enum Builtin {
     IsolateHighestOne,
     IsolateLowestOne,
     IntMidpoint,
+    StrictAdd,
+    StrictSub,
+    StrictMul,
+    StrictDiv,
+    StrictRem,
+    StrictDivEuclid,
+    StrictRemEuclid,
+    StrictNeg,
+    StrictAbs,
+    StrictPow,
+    StrictShl,
+    StrictShr,
+    MixedCheckedAdd,
+    MixedCheckedSub,
+    MixedWrappingAdd,
+    MixedWrappingSub,
+    MixedSaturatingAdd,
+    MixedSaturatingSub,
+    MixedOverflowingAdd,
+    MixedOverflowingSub,
+    MixedStrictAdd,
+    MixedStrictSub,
+    CheckedSignedDiff,
+    CarryingAdd,
+    BorrowingSub,
+    CarryingMul,
+    CarryingMulAdd,
     FloatSqrt,
     FloatPowi,
     FloatPowf,
@@ -13540,6 +13567,112 @@ impl<'p> Ctx<'p> {
             let ts = self.tys.intern_tys(&[t, BOOL]);
             let tt = self.tys.intern(TyKind::Tuple(ts));
             return Some((B::OverflowingShr, Autoref::None, vec![u32t], tt));
+        }
+        // The strict family (1.91): the plain operations with their
+        // overflow panics kept even in release builds.
+        if n == k.strict_add {
+            return bin(B::StrictAdd);
+        }
+        if n == k.strict_sub {
+            return bin(B::StrictSub);
+        }
+        if n == k.strict_mul {
+            return bin(B::StrictMul);
+        }
+        if n == k.strict_div {
+            return bin(B::StrictDiv);
+        }
+        if n == k.strict_rem {
+            return bin(B::StrictRem);
+        }
+        if n == k.strict_div_euclid {
+            return bin(B::StrictDivEuclid);
+        }
+        if n == k.strict_rem_euclid {
+            return bin(B::StrictRemEuclid);
+        }
+        if n == k.strict_neg {
+            return un(B::StrictNeg);
+        }
+        if n == k.strict_abs && s {
+            return un(B::StrictAbs);
+        }
+        if n == k.strict_pow {
+            return sh(B::StrictPow);
+        }
+        if n == k.strict_shl {
+            return sh(B::StrictShl);
+        }
+        if n == k.strict_shr {
+            return sh(B::StrictShr);
+        }
+        // The mixed-sign families: the argument is the same-width
+        // type of the other signedness. `checked`, `saturating`,
+        // `wrapping`, and `overflowing` for both directions, plus
+        // the strict forms (1.90 and 1.91, with their older kin).
+        let other = int(i.counterpart());
+        let mixed = |b: Builtin, kind: u8, cx: &mut Self| -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
+            let ret = match kind {
+                b'c' => cx.tys.mk_option(t),
+                b'o' => {
+                    let ts = cx.tys.intern_tys(&[t, BOOL]);
+                    cx.tys.intern(TyKind::Tuple(ts))
+                }
+                _ => t,
+            };
+            Some((b, Autoref::None, vec![other], ret))
+        };
+        if (s && n == k.checked_add_unsigned) || (!s && n == k.checked_add_signed) {
+            return mixed(B::MixedCheckedAdd, b'c', self);
+        }
+        if (s && n == k.checked_sub_unsigned) || (!s && n == k.checked_sub_signed) {
+            return mixed(B::MixedCheckedSub, b'c', self);
+        }
+        if (s && n == k.wrapping_add_unsigned) || (!s && n == k.wrapping_add_signed) {
+            return mixed(B::MixedWrappingAdd, b'w', self);
+        }
+        if (s && n == k.wrapping_sub_unsigned) || (!s && n == k.wrapping_sub_signed) {
+            return mixed(B::MixedWrappingSub, b'w', self);
+        }
+        if (s && n == k.saturating_add_unsigned) || (!s && n == k.saturating_add_signed) {
+            return mixed(B::MixedSaturatingAdd, b't', self);
+        }
+        if (s && n == k.saturating_sub_unsigned) || (!s && n == k.saturating_sub_signed) {
+            return mixed(B::MixedSaturatingSub, b't', self);
+        }
+        if (s && n == k.overflowing_add_unsigned) || (!s && n == k.overflowing_add_signed) {
+            return mixed(B::MixedOverflowingAdd, b'o', self);
+        }
+        if (s && n == k.overflowing_sub_unsigned) || (!s && n == k.overflowing_sub_signed) {
+            return mixed(B::MixedOverflowingSub, b'o', self);
+        }
+        if (s && n == k.strict_add_unsigned) || (!s && n == k.strict_add_signed) {
+            return mixed(B::MixedStrictAdd, b's', self);
+        }
+        if (s && n == k.strict_sub_unsigned) || (!s && n == k.strict_sub_signed) {
+            return mixed(B::MixedStrictSub, b's', self);
+        }
+        if n == k.checked_signed_diff && !s {
+            let o = self.tys.mk_option(other);
+            return Some((B::CheckedSignedDiff, Autoref::None, vec![t], o));
+        }
+        // The carrying forms (1.91, unsigned): wide add, sub, and
+        // multiply with the carry or borrow in and out.
+        if !s && (n == k.carrying_add || n == k.borrowing_sub) {
+            let b = if n == k.carrying_add { B::CarryingAdd } else { B::BorrowingSub };
+            let ts = self.tys.intern_tys(&[t, BOOL]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((b, Autoref::None, vec![t, BOOL], tt));
+        }
+        if !s && n == k.carrying_mul {
+            let ts = self.tys.intern_tys(&[t, t]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((B::CarryingMul, Autoref::None, vec![t, t], tt));
+        }
+        if !s && n == k.carrying_mul_add {
+            let ts = self.tys.intern_tys(&[t, t]);
+            let tt = self.tys.intern(TyKind::Tuple(ts));
+            return Some((B::CarryingMulAdd, Autoref::None, vec![t, t, t], tt));
         }
         None
     }

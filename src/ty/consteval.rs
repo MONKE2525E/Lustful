@@ -1937,6 +1937,20 @@ impl Evaluator {
                     None => Err(outside(span, "this `from_u32_unchecked` (invalid char)")),
                 };
             }
+            // `{integer}::midpoint(a, b)`, by written name.
+            if names.len() == 2 && names[1] == "midpoint" && args.len() == 2 {
+                if let Some(it) = IntTy::ALL.iter().find(|i| i.name() == names[0].as_str()).copied() {
+                    let t = super::int(it);
+                    let a = self.int_arg(cx, env, args[0], t, span)?;
+                    let b = self.int_arg(cx, env, args[1], t, span)?;
+                    let r = if it.signed() {
+                        truncate_to_int(a, it).midpoint(truncate_to_int(b, it))
+                    } else {
+                        int_from_bits(int_bits(a, it).midpoint(int_bits(b, it)), it)
+                    };
+                    return Ok((ConstValue::Int(r), t));
+                }
+            }
             // Integer byte-order associated fns: `u32::from_be_bytes`,
             // `i64::from_le`, and friends, by written names.
             if names.len() == 2 && args.len() == 1 {
@@ -2640,6 +2654,22 @@ impl Evaluator {
                     }
                 }
                 "wrapping_neg" => bits_v(0u128.wrapping_sub(xb)),
+                "strict_neg" => {
+                    if (signed && xs == lo) || (!signed && xb != 0) {
+                        Err(over())
+                    } else if signed {
+                        int_v(-xs)
+                    } else {
+                        int_v(0)
+                    }
+                }
+                "strict_abs" if signed => {
+                    if xs == lo {
+                        Err(over())
+                    } else {
+                        int_v(xs.abs())
+                    }
+                }
                 "checked_abs" if signed => {
                     let r = if xs == lo { None } else { Some(xs.abs()) };
                     Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
@@ -2712,6 +2742,50 @@ impl Evaluator {
                 _ => Err(outside_err()),
             };
         }
+        // The carrying forms take two or three arguments and
+        // return a tuple; the wide arithmetic runs on the host
+        // u128, exact at every supported width below 128.
+        if matches!(name, "carrying_add" | "borrowing_sub" | "carrying_mul" | "carrying_mul_add") && !signed && width < 128 {
+            let tup = |cx: &mut C, vals: Vec<ConstValue>, ts: &[Ty]| {
+                let ids = cx.tys().intern_tys(ts);
+                Ok((ConstValue::Aggregate(vals), cx.tys().intern(TyKind::Tuple(ids))))
+            };
+            let y = self.int_arg(cx, env, args.first().copied().ok_or_else(outside_err)?, rt, span)?;
+            let yb = int_bits(y, it);
+            return match name {
+                "carrying_add" | "borrowing_sub" if args.len() == 2 => {
+                    let (cv, _) = self.value(cx, env, args[1], Some(BOOL))?;
+                    let ConstValue::Bool(cin) = cv else { return Err(outside_err()) };
+                    let (r, out) = if name == "carrying_add" {
+                        let full = xb + yb + cin as u128;
+                        (full & mask, full > mask)
+                    } else {
+                        (xb.wrapping_sub(yb).wrapping_sub(cin as u128) & mask, xb < yb + cin as u128)
+                    };
+                    tup(cx, vec![ConstValue::Int(int_from_bits(r, it)), ConstValue::Bool(out)], &[rt, BOOL])
+                }
+                "carrying_mul" if args.len() == 2 => {
+                    let carry = int_bits(self.int_arg(cx, env, args[1], rt, span)?, it);
+                    let full = xb * yb + carry;
+                    tup(
+                        cx,
+                        vec![ConstValue::Int(int_from_bits(full & mask, it)), ConstValue::Int(int_from_bits((full >> width) & mask, it))],
+                        &[rt, rt],
+                    )
+                }
+                "carrying_mul_add" if args.len() == 3 => {
+                    let carry = int_bits(self.int_arg(cx, env, args[1], rt, span)?, it);
+                    let add = int_bits(self.int_arg(cx, env, args[2], rt, span)?, it);
+                    let full = xb * yb + carry + add;
+                    tup(
+                        cx,
+                        vec![ConstValue::Int(int_from_bits(full & mask, it)), ConstValue::Int(int_from_bits((full >> width) & mask, it))],
+                        &[rt, rt],
+                    )
+                }
+                _ => Err(outside_err()),
+            };
+        }
         if args.len() != 1 {
             return Err(outside_err());
         }
@@ -2742,11 +2816,64 @@ impl Evaluator {
         let hi_s: i128 = if width >= 128 { i128::MAX } else { (1i128 << (width - 1)) - 1 };
         let int_v = |v: i128| Ok((ConstValue::Int(v), rt));
         let bits_v = |u: u128| Ok((ConstValue::Int(int_from_bits(u & mask, it)), rt));
+        // The mixed-sign families and `checked_signed_diff`: the
+        // argument has the other signedness, and the exact result
+        // runs in i128 (exact below 128-bit widths, where the
+        // checker keeps these). The overflowing forms stay out,
+        // with the plain overflowing family above.
+        let mixed_kind = ["checked_", "wrapping_", "saturating_", "strict_"]
+            .iter()
+            .find(|p| name.starts_with(**p) && (name.ends_with("_unsigned") || name.ends_with("_signed") && name != "checked_signed_diff"));
+        if let Some(kind) = mixed_kind {
+            if width >= 128 {
+                return Err(outside_err());
+            }
+            let sub = name.contains("_sub_");
+            let other = it.counterpart();
+            let y = self.int_arg(cx, env, arg, super::int(other), span)?;
+            let exact: i128 = if signed {
+                let mag = int_bits(y, other) as i128;
+                if sub { xs - mag } else { xs + mag }
+            } else {
+                let sv = truncate_to_int(y, other);
+                if sub { xb as i128 - sv } else { xb as i128 + sv }
+            };
+            let fits = if signed { exact >= lo && exact <= hi_s } else { exact >= 0 && (exact as u128) <= mask };
+            return match *kind {
+                "checked_" => Ok(self.opt_value(cx, rt, fits.then_some(ConstValue::Int(int_from_bits(exact as u128 & mask, it))))),
+                "wrapping_" => bits_v(exact as u128),
+                "saturating_" => {
+                    if signed {
+                        int_v(exact.clamp(lo, hi_s))
+                    } else if exact < 0 {
+                        bits_v(0)
+                    } else {
+                        bits_v((exact as u128).min(mask))
+                    }
+                }
+                _ => {
+                    if fits {
+                        bits_v(exact as u128)
+                    } else {
+                        Err(over())
+                    }
+                }
+            };
+        }
+        if name == "checked_signed_diff" && !signed && width < 128 {
+            let other = it.counterpart();
+            let y = self.int_arg(cx, env, arg, rt, span)?;
+            let exact = xb as i128 - int_bits(y, it) as i128;
+            let slo: i128 = -(1i128 << (width - 1));
+            let shi: i128 = (1i128 << (width - 1)) - 1;
+            let r = (exact >= slo && exact <= shi).then_some(ConstValue::Int(exact));
+            return Ok(self.opt_value(cx, super::int(other), r));
+        }
         // Shifts, rotates, powers, and logarithms take a `u32`.
         if matches!(
             name,
             "pow" | "checked_pow" | "saturating_pow" | "wrapping_pow" | "checked_shl" | "checked_shr" | "wrapping_shl"
-                | "wrapping_shr" | "unbounded_shl" | "unbounded_shr" | "rotate_left" | "rotate_right" | "ilog" | "checked_ilog"
+                | "wrapping_shr" | "unbounded_shl" | "unbounded_shr" | "strict_pow" | "strict_shl" | "strict_shr" | "rotate_left" | "rotate_right" | "ilog" | "checked_ilog"
         ) {
             let a = self.int_arg(cx, env, arg, super::int(IntTy::U32), span)?;
             let amt = u32::try_from(a).map_err(|_| outside_err())?;
@@ -2766,6 +2893,33 @@ impl Evaluator {
                         xb.checked_pow(amt).filter(|&r| r <= mask).map(|r| int_from_bits(r, it))
                     };
                     Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                }
+                "strict_pow" => {
+                    let r = if signed {
+                        xs.checked_pow(amt).filter(|&r| fits(r, it))
+                    } else {
+                        xb.checked_pow(amt).filter(|&r| r <= mask).map(|r| int_from_bits(r, it))
+                    };
+                    match r {
+                        Some(r) => int_v(r),
+                        None => Err(over()),
+                    }
+                }
+                "strict_shl" => {
+                    if amt >= width {
+                        Err(over())
+                    } else {
+                        bits_v(xb << amt)
+                    }
+                }
+                "strict_shr" => {
+                    if amt >= width {
+                        Err(over())
+                    } else if signed {
+                        int_v(xs >> amt)
+                    } else {
+                        bits_v(xb >> amt)
+                    }
                 }
                 "saturating_pow" => {
                     if signed {
@@ -2901,6 +3055,7 @@ impl Evaluator {
                 "checked" => b'c',
                 "saturating" => b't',
                 "wrapping" => b'w',
+                "strict" => b's',
                 _ => return None,
             };
             let o = match op {
@@ -2915,6 +3070,10 @@ impl Evaluator {
         };
         if let Some((kind, op)) = fam(name) {
             return match kind {
+                b's' => match checked(op) {
+                    Some(r) => int_v(r),
+                    None => Err(over()),
+                },
                 b'c' => Ok(self.opt_value(cx, rt, checked(op).map(ConstValue::Int))),
                 b'w' => {
                     match op {
@@ -2970,7 +3129,7 @@ impl Evaluator {
             };
         }
         match name {
-            "div_euclid" | "rem_euclid" | "checked_div_euclid" | "checked_rem_euclid" => {
+            "div_euclid" | "rem_euclid" | "checked_div_euclid" | "checked_rem_euclid" | "strict_div_euclid" | "strict_rem_euclid" => {
                 let r: Option<i128> = if yb == 0 || (signed && xs == lo && ys == -1) {
                     None
                 } else if signed {
