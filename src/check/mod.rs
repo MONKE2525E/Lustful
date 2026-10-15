@@ -282,6 +282,8 @@ pub enum Builtin {
     VecSplitOff,
     VecResize,
     VecDedup,
+    VecRetain,
+    VecRetainMut,
     VecReverse,
     VecFirstMut,
     VecLastMut,
@@ -13531,6 +13533,15 @@ impl<'p> Ctx<'p> {
                 } else if name == k.dedup {
                     self.deferred_eq.push((elem, name_span));
                     Some((B::VecDedup, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.retain {
+                    // `FnMut(&T) -> bool`, the reference higher-ranked.
+                    let r = self.tys.mk_ref(false, elem);
+                    let f = self.fn_mut_param_ref(&[r], BOOL, name_span);
+                    Some((B::VecRetain, Autoref::RefMut, vec![f], UNIT))
+                } else if name == k.retain_mut {
+                    let r = self.tys.mk_ref(true, elem);
+                    let f = self.fn_mut_param_ref(&[r], BOOL, name_span);
+                    Some((B::VecRetainMut, Autoref::RefMut, vec![f], UNIT))
                 } else if name == k.reverse {
                     Some((B::VecReverse, Autoref::RefMut, vec![], UNIT))
                 } else if name == k.first_mut {

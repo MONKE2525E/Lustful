@@ -5149,6 +5149,40 @@ impl FnGen<'_, '_> {
                 );
                 "((lust_Unit){})".into()
             }
+            B::VecRetain | B::VecRetainMut => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!() };
+                let CTy::Vec(e) = &**v else { unreachable!() };
+                let et = ctype(e);
+                let vv = &vals[0];
+                let f = self.closure_arg(&ops[1]);
+                let (w, r, c) = (self.tmp(), self.tmp(), self.tmp());
+                let mut body = String::new();
+                let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
+                let _ = writeln!(body, "    uint64_t {w} = 0;");
+                let _ = writeln!(body, "    for (uint64_t {r} = 0; {r} < {vv}->len; {r}++) {{");
+                let elem_r = format!("(&(({et}*){vv}->ptr)[{r}])");
+                let (keep, _) = self.closure_call_c(&mut body, f, &format!("&{c}"), &[elem_r]);
+                // A removed element drops as soon as it is rejected,
+                // before the predicate sees the next one, as in Rust.
+                let drop_rej = if needs_drop_c(self.p, e) {
+                    self.want(Glue::Drop, e);
+                    format!("drop_{}(&(({et}*){vv}->ptr)[{r}]); ", mangle(e))
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    body,
+                    "      if ({keep}) {{ if ({w} != {r}) (({et}*){vv}->ptr)[{w}] = (({et}*){vv}->ptr)[{r}]; {w}++; }} else {{ {drop_rej}}}"
+                );
+                let _ = writeln!(body, "    }}");
+                let _ = writeln!(body, "    {vv}->len = {w};");
+                if needs_drop_c(self.p, &tys[1]) {
+                    self.want(Glue::Drop, &tys[1]);
+                    let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
+                }
+                let _ = write!(self.out, "{body}");
+                "((lust_Unit){})".into()
+            }
             B::VecReverse => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let et = ctype(&e);

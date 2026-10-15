@@ -6589,7 +6589,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
 /// `fn_mut_param_ref`): its outer reference is higher-ranked.
 fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
     use crate::check::Builtin as B;
-    matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey))
+    matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey | B::VecRetain | B::VecRetainMut))
         || b.is_some_and(sort_by_builtin)
 }
 

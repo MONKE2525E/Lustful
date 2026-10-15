@@ -1407,7 +1407,7 @@ impl<'p> Ctx<'p> {
 
     /// `fn_mut_param` for `F: FnMut(&Self::Item) -> output`: the outer
     /// reference is higher-ranked (Rust's bound writes it).
-    fn fn_mut_param_ref(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
+    pub(super) fn fn_mut_param_ref(&mut self, inputs: &[Ty], output: Ty, span: Span) -> Ty {
         self.fn_mut_param_flags(inputs, &vec![true; inputs.len()], output, span)
     }
 

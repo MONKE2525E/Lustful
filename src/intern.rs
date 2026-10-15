@@ -464,6 +464,8 @@ known_syms!(
     split_off,
     resize,
     dedup,
+    retain,
+    retain_mut,
     reverse,
     first_mut,
     last_mut,
