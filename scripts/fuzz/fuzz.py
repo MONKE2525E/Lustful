@@ -1680,9 +1680,17 @@ mod macs;
 mod sigs;
 mod tmpl;
 
+// The root carries the std splice (`and_then` is a std source method):
+// an edit here moves it (W-PATCH-MISS2).
+fn pick(o: Option<i64>) -> i64 {
+    // @r1
+    o.and_then(|n| n.checked_add(1)).unwrap_or(0)
+}
+
 fn main() {
     let t = items::run() + gated::run() + consts::run() + tmpl::run() + macs::run() + sigs::run();
-    println!("{t}");
+    // @r2
+    println!("{}", t + pick(Some(2)));
 }
 """,
     "consts.rs": """pub const fn len() -> usize {

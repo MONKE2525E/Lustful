@@ -19,7 +19,9 @@
 // resolves in full, which is always correct. It gives up when:
 // - the crate selection inputs, the client view, or an expansion's
 //   outside inputs changed, or an expansion read a position;
-// - the root file changed and carries the std splice;
+// - the root file changed and carries a std splice its text no longer
+//   ends with (the splice moves with an edit in the root text: its byte
+//   ranges in the base, the resolver tables, and the Ast);
 // - an edit is not strictly inside one top-level fn or method body, or
 //   inside cfg-disabled code the expander dropped (`find_inactive_edit`);
 // - the old or new body holds a `$`, an item keyword other than `fn`,
@@ -480,10 +482,15 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     }
     let mut changed: Vec<(FileId, String)> = Vec::new();
     if root != base.root_unspliced {
-        if base.spliced {
-            return Err("spliced root");
-        }
-        changed.push((FileId(0), root.to_string()));
+        // The std splice follows the root text in file 0. It stands while
+        // the std needs do (checked below), so the new file text is the
+        // new root text and the same splice.
+        let text = match splice_of(front, base) {
+            Some(splice) => format!("{root}{splice}"),
+            None if base.spliced => return Err("spliced root"),
+            None => root.to_string(),
+        };
+        changed.push((FileId(0), text));
     }
     let mut fresh_stamps: Vec<(usize, Option<Stamp>)> = Vec::new();
     let mut reads = 0usize;
@@ -528,7 +535,9 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
             }
             Err(why) => return Err(why),
         };
-        edits.push(BodyEdit { file, needs: file_needs(&text), text, edit, body });
+        // The root's own needs: its text before the splice.
+        let own = if file == FileId(0) { splice_of(front, front.patch.as_ref().ok_or("no base")?).map_or(text.len(), |sp| text.len() - sp.len()) } else { text.len() };
+        edits.push(BodyEdit { file, needs: file_needs(&text[..own]), text, edit, body });
     }
     // The std splice and the platform crate follow every file's needs;
     // they stand when the union over files does. The new union folds
@@ -552,6 +561,15 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         base.stamps[k] = st;
     }
     Ok((edits, reads))
+}
+
+/// The std splice text after the root text in file 0, when the base
+/// spliced one and the file still starts with the root text it read.
+fn splice_of<'a>(front: &'a Front, base: &PatchBase) -> Option<&'a str> {
+    if !base.spliced {
+        return None;
+    }
+    front.map.text(FileId(0))?.strip_prefix(base.root_unspliced.as_str())
 }
 
 /// Proves that `edit` (the map's text of its file to `text`) sits
@@ -1009,6 +1027,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         let mut memo = FxMap::default();
         spans += span_shift::shift_ast_extras(Arc::make_mut(&mut front.ast), e.edit, ranges, extras, &mut memo);
         ctxts.push(memo);
+        let splice_len = if e.file == FileId(0) { splice_of(front, &base).map_or(0, str::len) } else { 0 };
         let tables = Arc::get_mut(&mut base.tables).ok_or("state")?;
         shift_table_spans(tables, e.edit);
         let lines = front.map.lines(e.file).splice(&e.text, e.edit.a as usize, e.edit.b as usize, (e.edit.b as i64 + e.edit.d) as usize);
@@ -1016,7 +1035,21 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         if e.file == FileId(0) {
             front.src.clone_from(&e.text);
             front.chunks[0].text.clone_from(&e.text);
-            base.root_unspliced.clone_from(&e.text);
+            base.root_unspliced = e.text[..e.text.len() - splice_len].to_string();
+        }
+        // The splice after the root text moves with the edit: its byte
+        // ranges in file 0 and the lang method range, wherever they sit
+        // (the base, the resolver tables, the Ast).
+        if base.spliced && e.file == FileId(0) {
+            let mv = |x: u32| if x >= e.edit.b { (x as i64 + e.edit.d) as u32 } else { x };
+            let ranges = |rs: &mut Vec<(u32, u32, ShippedCrate)>| rs.iter_mut().for_each(|r| (r.0, r.1) = (mv(r.0), mv(r.1)));
+            ranges(&mut base.std_ranges);
+            base.std_methods = (mv(base.std_methods.0), mv(base.std_methods.1));
+            ranges(&mut tables.std_ranges);
+            tables.std_splice_lo = tables.std_splice_lo.map(mv);
+            let ast = Arc::make_mut(&mut front.ast);
+            ranges(&mut ast.shipped);
+            ast.lang_methods = (mv(ast.lang_methods.0), mv(ast.lang_methods.1));
         }
         base.needs[e.file.0 as usize] = e.needs;
         base.stamps[e.file.0 as usize] = None;
@@ -2182,6 +2215,74 @@ pub fn run() -> i64 {
                 assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
             }
         }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root file that carries a std splice (it calls a std method the
+    /// splice defines, `and_then`) and holds fns of its own.
+    const SPLICED_ROOT: &str = "use std::collections::HashMap;
+
+mod m0;
+mod m1;
+
+fn count(words: &[&str]) -> usize {
+    let mut m: HashMap<&str, usize> = HashMap::new();
+    for w in words {
+        *m.entry(w).or_insert(0) += 1;
+    }
+    m.len()
+}
+
+fn pick(o: Option<usize>) -> usize {
+    o.and_then(|n| n.checked_add(1)).unwrap_or(0)
+}
+
+fn main() {
+    let t = m0::run() + m1::run() + count(&[\"a\", \"b\", \"a\"]) as i64 + pick(Some(2)) as i64;
+    println!(\"{t}\");
+}
+";
+
+    /// An edit in a fn body of a root file that carries the std splice
+    /// takes the body patch: the splice's ranges move with it. Edit,
+    /// error, fix, undo, and another edit (one that adds lines, so every
+    /// std line moves) each give the cold answer, and a build prints what
+    /// a cold build prints.
+    #[test]
+    fn spliced_root_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-spliced-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        std::fs::write(&root, SPLICED_ROOT).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert!(warm.front.patch.as_ref().is_some_and(|b| b.spliced), "the root carries the std splice");
+        let steps: &[(&str, &str)] = &[
+            ("    m.len()\n", "    let n = m.len();\n    n\n"),
+            ("    n\n}", "    n + true\n}"),
+            ("    n + true\n}", "    n + 1\n}"),
+            ("    let n = m.len();\n    n + 1\n", "    m.len()\n"),
+            ("    println!", "    let _u = 1;\n    let _v = 2;\n    println!"),
+            ("    m.len()\n", "    m.len() * 2\n"),
+        ];
+        for &(old, new) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &root, old, new);
+            assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+        }
+        assert_eq!(field(&warm.front.last_visits, "kept"), "reuse", "{}", warm.front.last_visits);
+        // The splice's positions are a fresh resolve's.
+        let mut fresh = Session::new(dir.join("obj-fresh"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut fresh, &root).0, 0);
+        let pos = |s: &Session| {
+            let b = s.front.patch.as_ref().unwrap();
+            (s.front.ast.shipped.clone(), s.front.ast.lang_methods, b.std_ranges.clone(), b.std_methods, b.tables.std_splice_lo, b.tables.std_ranges.clone())
+        };
+        assert!(pos(&warm) == pos(&fresh), "splice positions after the patches");
         assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
         let bin = root.with_extension("bin");
         let out = run_bin(&bin);
