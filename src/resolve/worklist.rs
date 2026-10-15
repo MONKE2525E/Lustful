@@ -5484,7 +5484,26 @@ impl Rewrite<'_> {
                                     "Rename one of the imports with `as`, or remove one.",
                                 ));
                             }
-                            if !any {
+                            if !any
+                                && self.tables.std_platform_compat_fallback(&path, src, module, imp.leading_colon, self.interner)
+                            {
+                                // A std item the shipped platform module
+                                // does not define keeps the std compat
+                                // handling of the extern branch below, as
+                                // at module level (fx-stdos).
+                                self.record_use_trait_std(ast, span, &path);
+                                if self.interner.get(name) != "_"
+                                    && let Some(nss) = crate::resolve::imports::std_import_namespaces(self.interner, &path)
+                                {
+                                    let mut dup = false;
+                                    for ns in nss {
+                                        dup |= insert_local_std(scopes, name, ns, path.clone());
+                                    }
+                                    if dup {
+                                        self.push_local_dup(span, name);
+                                    }
+                                }
+                            } else if !any {
                                 self.diags.push(Diag::new(
                                     "L0506",
                                     span,

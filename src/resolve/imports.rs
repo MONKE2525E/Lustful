@@ -434,6 +434,26 @@ impl ResolvedTables {
         Some(out)
     }
 
+    /// True when an import of the written std `path` fell into the
+    /// shipped platform module `src` but names an item that module
+    /// does not define and the std compat handling serves
+    /// (`std_platform_compat_path`, fx-stdos): the import then
+    /// takes the std alias handling of the extern branch, as it
+    /// did before the platform module existed, instead of an
+    /// unresolved import. Only a written `std::...` path whose
+    /// first segment names the std extern qualifies.
+    pub fn std_platform_compat_fallback(&self, path: &[Sym], src: ModuleId, from: ModuleId, leading_colon: bool, interner: &Interner) -> bool {
+        let Some((root, _)) = self.std_platform else { return false };
+        if self.root_of(src) != root || path.first().is_none_or(|s| interner.get(*s) != "std") {
+            return false;
+        }
+        if !leading_colon && !self.std_is_extern(from, interner) {
+            return false;
+        }
+        let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+        crate::ty::lang::std_platform_compat_path(&strs)
+    }
+
     /// True when the first segment `std` of a path written in `from`
     /// names the std extern (no local item or import shadows it).
     fn std_is_extern(&self, from: ModuleId, interner: &Interner) -> bool {
@@ -2105,6 +2125,15 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         if saw_private {
                             diags.push(private_diag(interner.get(last), imp.span));
                             return TryOut::Done(false);
+                        }
+                        // A std item the shipped platform module does
+                        // not define keeps the std compat handling of
+                        // the extern branch below (fx-stdos): a
+                        // partial platform module (`std::os::unix::fs`
+                        // holds only `MetadataExt`) must not hide the
+                        // items that resolved before it existed.
+                        if tables.std_platform_compat_fallback(path, src, imp.module, imp.leading_colon, interner) {
+                            return TryOut::Done(record_std_alias(tables, imp, path, *name, interner, diags));
                         }
                         return TryOut::Wait;
                     }

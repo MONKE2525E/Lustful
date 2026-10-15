@@ -1987,6 +1987,36 @@ pub fn std_is_module_path(path: &[&str]) -> bool {
         || crate::ty::sync::type_rows().iter().any(|r| prefix_of(r))
 }
 
+/// Canonical std paths under a shipped platform module that the
+/// platform crate does not define, so the compiler's std compat
+/// handling keeps them (fx-stdos): `library/std/src/os.rs` defines
+/// `std::os::unix::fs` with only `MetadataExt`, and before that
+/// module existed every other item of `std::os::unix::fs` resolved
+/// through the std alias path. A platform module must not hide
+/// them: the resolver falls back to the alias handling for a row
+/// here that the platform module lacks. Rows must name real std
+/// items (rustc rejects the rest) and must not name an item the
+/// platform crate defines.
+const STD_PLATFORM_COMPAT_PATHS: &[&str] = &[
+    "std/os/unix/fs/DirBuilderExt",
+    "std/os/unix/fs/DirEntryExt",
+    "std/os/unix/fs/FileExt",
+    "std/os/unix/fs/FileTypeExt",
+    "std/os/unix/fs/OpenOptionsExt",
+    "std/os/unix/fs/PermissionsExt",
+    "std/os/unix/fs/chown",
+    "std/os/unix/fs/fchown",
+    "std/os/unix/fs/lchown",
+    "std/os/unix/fs/symlink",
+];
+
+/// True when `path` is a row of `STD_PLATFORM_COMPAT_PATHS`: a std
+/// item a shipped platform module does not define, which keeps the
+/// std compat handling instead of an unresolved import.
+pub fn std_platform_compat_path(path: &[&str]) -> bool {
+    STD_PLATFORM_COMPAT_PATHS.iter().any(|r| std_row_eq(r, path))
+}
+
 /// True for `std::primitive::u8` style paths: a primitive type
 /// name under the `primitive` module of `std` or `core`.
 pub fn std_is_primitive_path(path: &[&str]) -> bool {
@@ -2111,6 +2141,9 @@ mod tests {
         assert!(std_is_module_path(&["std"]));
         assert!(!std_is_module_path(&["std", "mem", "drop"]));
         assert!(!std_is_module_path(&["std", "nope"]));
+        assert!(std_platform_compat_path(&["std", "os", "unix", "fs", "OpenOptionsExt"]));
+        assert!(!std_platform_compat_path(&["std", "os", "unix", "fs", "MetadataExt"]));
+        assert!(!std_platform_compat_path(&["std", "os", "unix", "fs", "NoSuchThing"]));
     }
 
     /// Registry rows are well formed: unique names, no empty allow list,

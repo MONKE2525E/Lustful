@@ -4,6 +4,10 @@
 // std returns for the same file. Not here: the fd traits
 // (`std::os::fd`, OwnedFd has no lust form yet), the Linux
 // `st_*` spelling of this trait, and the other `*Ext` traits.
+// The items this module does not define stay with the
+// compiler's std compat handling (`std_platform_compat_path`
+// in src/ty/lang.rs, fx-stdos): this partial module must not
+// hide `std::os::unix::fs` items that resolved before it.
 
 pub mod unix {
     /// Operating-system specific extensions.
