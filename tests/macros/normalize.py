@@ -17,6 +17,8 @@ user macro expansion, not pretty-printing:
 - rustc's injected prelude header is dropped.
 - `macro_rules!` definitions are dropped (rustc prints them in the
   expansion, lust consumes them).
+- `#[macro_use]` markers are dropped (lust's expander acts on the
+  marker and consumes it, rustc prints it).
 - rustc's `println!`, `format!`, and list-form `vec!` expansions
   (the `_print`/`_eprint`, alloc format, and alloc boxed forms)
   map back to the written macro calls.
@@ -239,6 +241,20 @@ def drop_macro_rules(toks):
                     j = k - 1
                 del out[j:]
                 i = end + 1 if end < len(toks) and toks[end] == ";" else end
+                continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
+def drop_macro_use_attrs(toks):
+    """Drop each `# [ macro_use ... ]` run (see the header)."""
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i:i + 3] == ["#", "[", "macro_use"]:
+            end = group_end(toks, i + 1)
+            if end is not None:
+                i = end
                 continue
         out.append(toks[i])
         i += 1
@@ -596,6 +612,7 @@ def drop_brace_commas(toks):
 
 def canonicalize(toks):
     toks = strip_prelude(toks)
+    toks = drop_macro_use_attrs(toks)
     toks = drop_macro_rules(toks)
     toks = map_alloc_format(toks)
     toks = map_alloc_vec(toks)
