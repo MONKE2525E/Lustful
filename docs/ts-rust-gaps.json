@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "tool": "lust-port scan",
-  "manifest_path": "/home/theo/lust-scratch/orch/tsrust-copy/Cargo.toml",
-  "workspace_root": "/home/theo/lust-scratch/orch/tsrust-copy",
+  "manifest_path": "/home/user/up/tsrust-copy/Cargo.toml",
+  "workspace_root": "/home/user/up/tsrust-copy",
   "packages": [
     "ts_goport",
     "goport_lsproto",
@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 9737,
+  "elapsed_ms": 4056,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,8 +32,8 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 700,
-    "files_with_findings": 184,
+    "findings": 200,
+    "files_with_findings": 58,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
@@ -41,10 +41,9 @@
   "root_causes": [
     {
       "root_cause": "std-runtime",
-      "findings": 564,
-      "files": 333,
+      "findings": 64,
+      "files": 39,
       "features": [
-        "core.std_basics",
         "std.cow"
       ]
     },
@@ -109,71 +108,6 @@
     }
   ],
   "features": [
-    {
-      "id": "core.std_basics",
-      "title": "Std basics: mem, env, process, fs, io, path, str, cmp, char, num, slice, HashMap/HashSet",
-      "status": "partial",
-      "milestone": 0,
-      "milestone_label": "milestone 0: supported today",
-      "inventory_step": "1",
-      "root_cause": "std-runtime",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/core_std_basics.rs passes: mem::take and swap, cmp helpers, str methods. _b, _c and _d fail: std::fs::metadata path form (L0505), the Path type and io::Write into a Vec (L0101), and primitive From paths such as i64::from (L0101). HashMap is split into std.hashmap.",
-      "findings": 500,
-      "raw_uses": 500,
-      "prod_uses": 401,
-      "files": 330,
-      "prod_files": 121,
-      "prod_fns": 266,
-      "scopes": {
-        "active": 399,
-        "target-specific": 2,
-        "test-only": 99
-      },
-      "samples": [
-        {
-          "feature": "core.std_basics",
-          "raw_key": "std.expr.std::mem::take",
-          "file": "crates/ts_goport/src/api/encoder/decoder.rs",
-          "byte_start": 6493,
-          "byte_end": 6507,
-          "line": 166,
-          "column": 29,
-          "snippet": "std::mem::take",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "core.std_basics",
-          "raw_key": "std.expr.std::mem::drop",
-          "file": "crates/ts_goport/src/api/encoder/encoder.rs",
-          "byte_start": 90106,
-          "byte_end": 90110,
-          "line": 2204,
-          "column": 9,
-          "snippet": "drop",
-          "scope": "test-only",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "core.std_basics",
-          "raw_key": "std.expr.std::mem::take",
-          "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
-          "byte_start": 27511,
-          "byte_end": 27525,
-          "line": 676,
-          "column": 51,
-          "snippet": "std::mem::take",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
     {
       "id": "std.cow",
       "title": "Cow (borrowed or owned strings and slices)",
@@ -1419,7 +1353,7 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 512,
+    "supported_today_files": 700,
     "by_plan_milestone": [
       {
         "id": "0",
@@ -1474,10 +1408,10 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 512,
-        "lines": 229254,
-        "files_pct": 66.2,
-        "lines_pct": 40.1
+        "files": 702,
+        "lines": 476494,
+        "files_pct": 90.8,
+        "lines_pct": 83.4
       },
       {
         "id": "1",
@@ -1580,10 +1514,10 @@
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 247,
-        "lines": 327240,
-        "files_pct": 32.0,
-        "lines_pct": 57.3
+        "files": 0,
+        "lines": 0,
+        "files_pct": 0.0,
+        "lines_pct": 0.0
       },
       {
         "id": "2",
@@ -1671,7 +1605,7 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 513,
+    "supported_today_files": 702,
     "by_plan_milestone": [
       {
         "id": "0",
@@ -1726,10 +1660,10 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 513,
-        "lines": 229269,
-        "files_pct": 65.9,
-        "lines_pct": 40.0
+        "files": 704,
+        "lines": 477519,
+        "files_pct": 90.5,
+        "lines_pct": 83.2
       },
       {
         "id": "1",
@@ -1832,10 +1766,10 @@
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 251,
-        "lines": 329713,
-        "files_pct": 32.3,
-        "lines_pct": 57.5
+        "files": 0,
+        "lines": 0,
+        "files_pct": 0.0,
+        "lines_pct": 0.0
       },
       {
         "id": "2",
@@ -1927,9 +1861,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -1940,8 +1872,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -1972,10 +1903,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/api/encoder/decoder_generated.rs",
@@ -1995,10 +1924,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 3
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/api/encoder/encoder_generated.rs",
@@ -2028,7 +1956,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 0
@@ -2061,7 +1988,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 2
@@ -2073,9 +1999,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2116,10 +2040,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/api/server.rs",
@@ -2128,9 +2051,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2140,9 +2061,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2152,10 +2071,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/api/stringer_generated.rs",
@@ -2164,9 +2081,7 @@
       "scope": "active",
       "generated": true,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2216,10 +2131,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 21
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/misc.rs",
@@ -2229,7 +2142,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 1
@@ -2251,10 +2163,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/source_file_ls.rs",
@@ -2273,10 +2183,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 29
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/synthetic.rs",
@@ -2287,10 +2195,9 @@
       "parse_error": false,
       "missing_features": [
         "closures.fn_ptr_lifetime",
-        "core.std_basics",
         "lifetimes.hrtb"
       ],
-      "findings": 6
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/ast/synthetic/print_pack.rs",
@@ -2299,10 +2206,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/update.rs",
@@ -2321,10 +2226,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 6
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/utilities_p2.rs",
@@ -2385,9 +2288,7 @@
       "scope": "active",
       "generated": true,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2397,9 +2298,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2409,9 +2308,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2441,9 +2338,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2503,9 +2398,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2517,8 +2410,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.global_allocator",
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 1
     },
@@ -2531,8 +2423,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.global_allocator",
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 1
     },
@@ -2545,8 +2436,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.global_allocator",
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 1
     },
@@ -2557,10 +2447,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/bin/goport_multiprog.rs",
@@ -2569,10 +2457,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/bin/goport_typesyms.rs",
@@ -2583,8 +2469,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.global_allocator",
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 1
     },
@@ -2595,9 +2480,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2610,10 +2493,9 @@
       "missing_features": [
         "cinterop.global_allocator",
         "cinterop.system",
-        "core.std_basics",
         "ext.unknown_crate"
       ],
-      "findings": 10
+      "findings": 9
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p1.rs",
@@ -2623,10 +2505,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p2.rs",
@@ -2655,9 +2536,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2689,10 +2568,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p02.rs",
@@ -2761,10 +2638,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p09.rs",
@@ -2783,10 +2658,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p11.rs",
@@ -2795,9 +2668,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2818,7 +2689,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p14.rs",
@@ -2857,9 +2728,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2879,10 +2748,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p20.rs",
@@ -2891,9 +2758,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2904,10 +2769,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p22.rs",
@@ -2926,10 +2790,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p24.rs",
@@ -2939,10 +2801,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 3
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p25.rs",
@@ -2951,9 +2812,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2984,10 +2843,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p29.rs",
@@ -2996,9 +2854,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3040,9 +2896,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3053,7 +2907,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p35.rs",
@@ -3112,10 +2966,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/flow_p1.rs",
@@ -3125,10 +2977,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/checker/flow_p2.rs",
@@ -3138,10 +2989,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/checker/flow_p3.rs",
@@ -3150,9 +3000,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3162,10 +3010,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 6
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/fnfields.rs",
@@ -3216,9 +3062,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3248,9 +3092,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3280,10 +3122,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/mod.rs",
@@ -3312,10 +3152,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder.rs",
@@ -3344,9 +3182,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3376,10 +3212,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/nodebuilder_scopes.rs",
@@ -3408,10 +3242,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/pseudo_type_node_builder.rs",
@@ -3430,10 +3262,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/relater_p2.rs",
@@ -3442,10 +3272,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/relater_p3.rs",
@@ -3455,7 +3283,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 3
@@ -3467,10 +3294,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/relater_p5.rs",
@@ -3519,10 +3344,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 15
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/utilities_p1.rs",
@@ -3531,10 +3354,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/utilities_p2.rs",
@@ -3563,9 +3384,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3597,9 +3416,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3610,8 +3427,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -3653,10 +3469,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 4
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/contentmapper/mod.rs",
@@ -3676,7 +3491,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 5
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/contentmapper/transform.rs",
@@ -3695,10 +3510,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 15
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/core/lib_names.rs",
@@ -3759,9 +3572,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3781,10 +3592,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/declarations/transform_p4.rs",
@@ -3843,9 +3652,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3857,8 +3664,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "closures.fn_ptr_lifetime",
-        "core.std_basics"
+        "closures.fn_ptr_lifetime"
       ],
       "findings": 1
     },
@@ -3899,9 +3705,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3911,9 +3715,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3923,10 +3725,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/effect/keybuilder.rs",
@@ -3935,9 +3735,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3980,8 +3778,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "closures.fn_ptr_lifetime",
-        "core.std_basics"
+        "closures.fn_ptr_lifetime"
       ],
       "findings": 1
     },
@@ -3992,9 +3789,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -4624,10 +4419,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/effect/rules/nested_effect_gen_yield.rs",
@@ -4706,10 +4499,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/effect/rules/outdated_api.rs",
@@ -5148,9 +4939,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -5280,10 +5069,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/effect/typeparser/expected_and_real_type.rs",
@@ -5462,9 +5249,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -5736,10 +5521,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/evaluator.rs",
@@ -5758,10 +5541,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 9
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/build/command_line.rs",
@@ -5780,10 +5561,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 6
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/build/host.rs",
@@ -5792,10 +5571,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/build/mod.rs",
@@ -5814,10 +5591,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/build/orchestrator_watch.rs",
@@ -5826,10 +5601,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/build/parse_cache.rs",
@@ -5848,9 +5621,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -5891,7 +5662,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 1
@@ -5903,9 +5673,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -5916,7 +5684,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/emit_files.rs",
@@ -5925,10 +5693,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/hash.rs",
@@ -5967,10 +5733,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/program_to_snapshot.rs",
@@ -5980,7 +5744,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 1
@@ -6012,9 +5775,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6035,10 +5796,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
@@ -6049,7 +5809,6 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 2
@@ -6061,10 +5820,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/help.rs",
@@ -6073,9 +5830,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6105,10 +5860,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/stdio.rs",
@@ -6118,8 +5871,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 4
     },
@@ -6130,10 +5882,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/watchmanager/mod.rs",
@@ -6162,10 +5912,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/flags.rs",
@@ -6204,9 +5952,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6326,10 +6072,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/format/span.rs",
@@ -6338,10 +6082,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/format/util.rs",
@@ -6370,9 +6112,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6383,8 +6123,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -6415,10 +6154,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 9
+      "missing_features": [],
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/files_parser.rs",
@@ -6427,10 +6164,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 20
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/host.rs",
@@ -6499,10 +6234,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/resolve_ahead.rs",
@@ -6511,10 +6244,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 16
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/verify.rs",
@@ -6533,9 +6264,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6596,7 +6325,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 0
@@ -6619,7 +6347,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 7
@@ -6631,10 +6358,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/json_indexmap.rs",
@@ -6663,10 +6388,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 10
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/module/entrypoints.rs",
@@ -6695,10 +6418,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/module/resolver_p2.rs",
@@ -6750,8 +6471,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -6762,9 +6482,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6784,10 +6502,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/parser/jsdoc.rs",
@@ -6796,10 +6512,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 9
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/parser/lib_parse_snapshot.rs",
@@ -6808,9 +6522,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6830,10 +6542,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/parser/parser_p2.rs",
@@ -6904,10 +6614,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/parser/utilities.rs",
@@ -6956,9 +6664,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6978,10 +6684,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/scanner/scanner_p2.rs",
@@ -6991,7 +6695,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 0
@@ -7013,9 +6716,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7025,9 +6726,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7047,10 +6746,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/content_mappers.rs",
@@ -7109,9 +6806,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7131,9 +6826,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7143,9 +6836,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7155,10 +6846,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/tsoptions/tsconfig_p2.rs",
@@ -7167,9 +6856,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7210,7 +6897,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 3
@@ -7252,9 +6938,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7266,10 +6950,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 6
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/trackingvfs.rs",
@@ -7289,7 +6972,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 2
@@ -7322,8 +7004,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -7344,10 +7025,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/event.rs",
@@ -7366,10 +7045,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/fsevents_darwin.rs",
@@ -7379,10 +7056,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/inotify_linux.rs",
@@ -7401,9 +7077,7 @@
       "scope": "target-specific",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7433,9 +7107,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7445,9 +7117,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7458,10 +7128,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 4
+      "findings": 3
     },
     {
       "file": "crates/ts_goport/src/fswatch/unix_bsd.rs",
@@ -7471,8 +7140,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 4
     },
@@ -7483,9 +7151,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7505,10 +7171,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/windows.rs",
@@ -7518,8 +7182,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -7530,10 +7193,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/goport_lsproto_root.rs",
@@ -7562,10 +7223,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/context.rs",
@@ -7574,10 +7233,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/debug.rs",
@@ -7616,10 +7273,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 6
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/mod.rs",
@@ -7638,9 +7293,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7650,10 +7303,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/regexp.rs",
@@ -7662,10 +7313,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/rlimit.rs",
@@ -7675,8 +7324,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 1
     },
@@ -7687,9 +7335,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7699,9 +7345,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7712,8 +7356,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -7744,9 +7387,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7756,9 +7397,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7789,7 +7428,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 8
@@ -7811,10 +7449,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ipc/conn_sync.rs",
@@ -7853,9 +7489,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7876,10 +7510,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 4
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ipc/transport_unix.rs",
@@ -7888,10 +7521,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/jemalloc_layout.rs",
@@ -7901,8 +7532,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -7913,9 +7543,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7925,9 +7553,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7957,10 +7583,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/lib.rs",
@@ -7979,9 +7603,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8031,9 +7653,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8043,10 +7663,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/autoimport/index.rs",
@@ -8055,9 +7673,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8077,9 +7693,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8099,9 +7713,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8111,9 +7723,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8143,9 +7753,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8165,9 +7773,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8177,10 +7783,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/codeactions.rs",
@@ -8241,10 +7845,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/completions_p1.rs",
@@ -8263,9 +7865,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8285,10 +7885,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/constants.rs",
@@ -8307,10 +7905,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/definition.rs",
@@ -8339,9 +7935,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8382,7 +7976,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 0
@@ -8394,9 +7987,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8426,10 +8017,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/hovericon.rs",
@@ -8448,10 +8037,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/inlay_hints.rs",
@@ -8480,9 +8067,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8512,9 +8097,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8524,9 +8107,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8596,9 +8177,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8619,7 +8198,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 1
@@ -8702,10 +8280,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/signaturehelp.rs",
@@ -8734,9 +8311,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8746,9 +8321,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8758,10 +8331,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 8
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/utilities.rs",
@@ -8771,7 +8342,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 1
@@ -8783,10 +8353,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/lsp/logger.rs",
@@ -8795,9 +8363,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8807,9 +8373,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8819,9 +8383,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9003,10 +8565,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/lsp/lspwatcher/mod.rs",
@@ -9045,10 +8605,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/lsp/stack_sanitizer.rs",
@@ -9098,7 +8656,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/modulespecifiers/mod.rs",
@@ -9117,9 +8675,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9201,9 +8757,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9214,10 +8768,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 6
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/prelude.rs",
@@ -9246,10 +8799,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 8
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/factory.rs",
@@ -9288,9 +8839,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9342,10 +8891,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/semicolon_writer.rs",
@@ -9364,9 +8911,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9386,10 +8931,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/types.rs",
@@ -9408,9 +8951,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9422,10 +8963,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 28
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/program/go_frontend.rs",
@@ -9434,10 +8974,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 7
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/program/ls_program.rs",
@@ -9446,10 +8984,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/api.rs",
@@ -9469,10 +9005,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "async.await",
-        "core.std_basics"
+        "async.await"
       ],
-      "findings": 27
+      "findings": 25
     },
     {
       "file": "crates/ts_goport/src/project/ata/discovertypings.rs",
@@ -9551,10 +9086,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/client.rs",
@@ -9573,10 +9106,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 9
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/configfileregistry.rs",
@@ -9715,9 +9246,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9728,8 +9257,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -9820,9 +9348,7 @@
       "scope": "active",
       "generated": true,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9832,9 +9358,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9844,10 +9368,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/refcountcache.rs",
@@ -9867,10 +9389,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "async.await",
-        "core.std_basics"
+        "async.await"
       ],
-      "findings": 7
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/project/snapshot.rs",
@@ -9879,10 +9400,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/snapshotfs.rs",
@@ -9891,10 +9410,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 6
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/snapshothost.rs",
@@ -9903,10 +9420,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/project/watch.rs",
@@ -9915,9 +9430,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9958,10 +9471,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/scanner_util/js_case_tables.rs",
@@ -9970,9 +9482,7 @@
       "scope": "active",
       "generated": true,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9992,9 +9502,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10004,9 +9512,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10046,10 +9552,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/sourcemap/util.rs",
@@ -10058,9 +9562,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10081,8 +9583,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -10094,10 +9595,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/transformers/chain.rs",
@@ -10116,10 +9616,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/async_.rs",
@@ -10138,10 +9636,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/class_fields_p2.rs",
@@ -10150,10 +9646,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/class_this.rs",
@@ -10182,10 +9676,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/estransforms/es_decorator_p2.rs",
@@ -10364,9 +9856,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10586,10 +10076,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/util_prelude.rs",
@@ -10608,10 +10096,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/emit_pool.rs",
@@ -10620,10 +10106,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/fswatch_linux.rs",
@@ -10632,10 +10116,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/astnav_api/api_encoder.rs",
@@ -10644,9 +10126,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10686,9 +10166,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10698,10 +10176,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/astnav_api/mod.rs",
@@ -10710,9 +10186,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10722,9 +10196,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10734,9 +10206,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10746,9 +10216,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10768,9 +10236,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10802,9 +10268,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10814,10 +10278,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/main.rs",
@@ -10836,9 +10298,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10848,9 +10308,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10930,9 +10388,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10942,9 +10398,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11116,9 +10570,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11198,9 +10650,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11210,9 +10660,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11232,9 +10680,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11294,9 +10740,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11316,9 +10760,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11348,10 +10790,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/project_test.rs",
@@ -11410,9 +10850,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11473,10 +10911,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/project_lsp/selectionranges_test.rs",
@@ -11495,9 +10932,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11607,9 +11042,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11619,10 +11052,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/component.rs",
@@ -11631,9 +11062,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11733,10 +11162,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/mod.rs",
@@ -11775,9 +11202,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11877,9 +11302,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11899,9 +11322,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11921,9 +11342,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11933,9 +11352,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11955,9 +11372,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11968,7 +11383,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "std.cow"
       ],
       "findings": 0
@@ -11980,9 +11394,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -11992,9 +11404,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12004,9 +11414,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12016,9 +11424,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12038,10 +11444,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/tsctests/effect_build_info.rs",
@@ -12050,9 +11454,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12082,9 +11484,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12304,9 +11704,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12366,10 +11764,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/ast_tests.rs",
@@ -12448,9 +11844,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12550,10 +11944,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_emit/scanner_parser.rs",
@@ -12572,9 +11964,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12654,9 +12044,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12696,10 +12084,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/fswatch_walkdir.rs",
@@ -12709,8 +12095,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "closures.fn_ptr_lifetime",
-        "core.std_basics"
+        "closures.fn_ptr_lifetime"
       ],
       "findings": 1
     },
@@ -12721,10 +12106,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 9
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/jsnum.rs",
@@ -12733,9 +12116,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12745,10 +12126,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/mod.rs",
@@ -12757,9 +12136,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12769,9 +12146,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12811,9 +12186,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12823,10 +12196,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/units_platform/tspath.rs",
@@ -12887,10 +12258,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.global_allocator",
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 2
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/tests/multi_program.rs",
@@ -12899,9 +12269,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12911,9 +12279,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12924,10 +12290,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 9
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/tests/tsgo_panic_hook.rs",
@@ -12937,10 +12302,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "core.std_basics"
+        "cinterop.system"
       ],
-      "findings": 5
+      "findings": 0
     },
     {
       "file": "crates/ts_wasm/build.rs",
@@ -12949,9 +12313,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12963,10 +12325,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.extern",
-        "core.std_basics",
         "unsafe.blocks"
       ],
-      "findings": 7
+      "findings": 3
     },
     {
       "file": "crates/ts_wasm/src/lib.rs",
@@ -12977,10 +12338,9 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.extern",
-        "core.std_basics",
         "unsafe.blocks"
       ],
-      "findings": 5
+      "findings": 4
     },
     {
       "file": "tools/ts_ast_codegen/src/ast.rs",
@@ -12990,7 +12350,6 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
         "ext.unknown_crate"
       ],
       "findings": 0
@@ -13004,7 +12363,6 @@
       "parse_error": false,
       "missing_features": [
         "attrs.serde",
-        "core.std_basics",
         "derives.unknown",
         "ext.unknown_crate"
       ],
@@ -13017,9 +12375,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -13031,7 +12387,6 @@
       "parse_error": false,
       "missing_features": [
         "attrs.serde",
-        "core.std_basics",
         "derives.unknown",
         "ext.unknown_crate"
       ],
@@ -13044,26 +12399,11 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "core.std_basics"
-      ],
+      "missing_features": [],
       "findings": 0
     }
   ],
   "findings": [
-    {
-      "feature": "core.std_basics",
-      "raw_key": "std.expr.std::mem::take",
-      "file": "crates/ts_goport/src/api/encoder/decoder.rs",
-      "byte_start": 6493,
-      "byte_end": 6507,
-      "line": 166,
-      "column": 29,
-      "snippet": "std::mem::take",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
     {
       "feature": "std.cow",
       "raw_key": "std.type.std::borrow::Cow",
@@ -13087,19 +12427,6 @@
       "column": 23,
       "snippet": "Cow<'static, PositionMap>",
       "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "core.std_basics",
-      "raw_key": "std.expr.std::mem::drop",
-      "file": "crates/ts_goport/src/api/encoder/encoder.rs",
-      "byte_start": 90106,
-      "byte_end": 90110,
-      "line": 2204,
-      "column": 9,
-      "snippet": "drop",
-      "scope": "test-only",
       "fix_class": "compiler work",
       "release_safe_rewrite": false
     },
@@ -13138,45 +12465,6 @@
       "line": 34,
       "column": 21,
       "snippet": "Cow<'static, str>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "core.std_basics",
-      "raw_key": "std.expr.std::mem::take",
-      "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
-      "byte_start": 27511,
-      "byte_end": 27525,
-      "line": 676,
-      "column": 51,
-      "snippet": "std::mem::take",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "core.std_basics",
-      "raw_key": "std.expr.std::mem::take",
-      "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
-      "byte_start": 27626,
-      "byte_end": 27640,
-      "line": 678,
-      "column": 40,
-      "snippet": "std::mem::take",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "core.std_basics",
-      "raw_key": "std.expr.std::mem::take",
-      "file": "crates/ts_goport/src/api/session_p2.rs",
-      "byte_start": 29530,
-      "byte_end": 29544,
-      "line": 762,
-      "column": 22,
-      "snippet": "std::mem::take",
       "scope": "active",
       "fix_class": "compiler work",
       "release_safe_rewrite": false
@@ -13676,7 +12964,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 700,
+  "findings_total": 200,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],

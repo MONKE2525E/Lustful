@@ -1444,7 +1444,7 @@
   {
    "id": "core.std_basics",
    "title": "Std basics: mem, env, process, fs, io, path, str, cmp, char, num, slice, HashMap/HashSet",
-   "status": "partial",
+   "status": "supported",
    "milestone": 0,
    "inventory_step": "1",
    "root_cause": "std-runtime",

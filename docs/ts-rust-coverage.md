@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `9053c8735` (the scanned tree, landed on `next`). ts-rust: `unknown`.
+lust commit: `` (the scanned tree, landed on `next`). ts-rust: `unknown`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 229 files, 145987 lines (56.4% of files, 37.4% of lines).
+Core: 406 files, 390709 lines. Compiles today: 353 files, 320053 lines (86.9% of files, 81.9% of lines).
 
-All active prod files: 512 of 773 files compile today (82.5% of lines).
+All active prod files: 700 of 773 files compile today (82.5% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,17 +31,16 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `core.std_basics` | partial | 0 | W-SHIM-P2 | 167 | 230863 | 124 | 174066 |
-| 2 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 6 | 10202 |
-| 3 | `cinterop.system` | unsupported | 7 | wave C (shims) | 20 | 16466 | 1 | 29 |
-| 4 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
-| 5 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 0 | 0 |
-| 6 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
-| 7 | `cinterop.global_allocator` | unsupported | 7 | W-CINTEROP | 5 | 2444 | 0 | 0 |
-| 8 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
-| 9 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
-| 10 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
-| 11 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
+| 1 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 24 | 44996 |
+| 2 | `cinterop.system` | unsupported | 7 | wave C (shims) | 20 | 16466 | 11 | 5161 |
+| 3 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
+| 4 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 1 | 1248 |
+| 5 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
+| 6 | `cinterop.global_allocator` | unsupported | 7 | W-CINTEROP | 5 | 2444 | 0 | 0 |
+| 7 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
+| 8 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
+| 9 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
+| 10 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
 
 ## Core CLI curve
 

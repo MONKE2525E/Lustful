@@ -143,7 +143,9 @@ def probe_one(path, lust, tmp, env):
         if code != 0:
             res.update(verdict="rustc-reject", detail=err.strip().splitlines()[-1][:160] if err.strip() else "")
             return res
-        rcode, rout, _ = run([str(rbin)], RUN_TIMEOUT)
+        # Same working directory as the lust run below: probes that touch relative paths
+        # (core_std_basics_b reads Cargo.toml) must see the same files.
+        rcode, rout, _ = run([str(rbin)], RUN_TIMEOUT, cwd=str(tmp))
         res["rustc_stdout"] = rout
         res["rustc_exit"] = rcode
     ccode, _, cerr = run([str(lust), "check", *mode, str(path)], COMPILE_TIMEOUT, env)
