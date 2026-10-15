@@ -118,13 +118,13 @@ impl<'p> Lower<'p> {
         let t = t.expect("check records the named type of every `type_name` call");
         // A template body lowers with its parameters still open:
         // the string is a placeholder there (each instance bakes
-        // its own), as a layout query's zero is.
+        // its own), as a layout query's zero is. So is a rejected
+        // body's (check reported the type; it is never generated).
         let open = self.body.tys.flags(t).contains_param() || self.body.tys.flags(t).contains_projection();
         let s = if open {
             String::new()
         } else {
-            crate::check::any::type_name_of(self.p, &mut self.body.tys, t, false)
-                .expect("check rejected a `type_name` it cannot print")
+            crate::check::any::type_name_of(self.p, &mut self.body.tys, t, false).unwrap_or_default()
         };
         let blob = crate::ast::ByteBlob::new(s.into_bytes());
         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::StrBytes(blob))), ty, span);

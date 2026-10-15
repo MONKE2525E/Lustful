@@ -979,8 +979,38 @@ fn tn_user_args(p: &Program, tys: &mut impl TyIntern, a: AdtId, def: DefId, args
     // stored argument. `value_i` is the entry's index among the
     // type/const params, for the defaults table.
     let mut shown: Vec<(Option<usize>, String)> = Vec::new();
+    // The written generics name the lifetime parameters too, which
+    // the Adt's own generics omit: rustc prints each as `'_` in its
+    // declared position.
+    let ast_params: Option<Vec<bool>> = {
+        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+        crate::check::defaults::type_generics(p.ast, &cx, p.adt(a).name)
+            .map(|g| g.params.iter().map(|x| matches!(x, ast::GenericParam::Lifetime { .. })).collect())
+    };
     let generics = p.gx.adt_generics.get(a.0 as usize);
-    match generics {
+    match ast_params {
+        Some(is_lt) if !is_lt.is_empty() => {
+            let mut ai = 0usize;
+            let mut vi = 0usize;
+            for lt in is_lt {
+                if lt {
+                    if matches!(args.get(ai), Some(GenericArg::Lifetime(_))) {
+                        ai += 1;
+                    }
+                    shown.push((None, "'_".into()));
+                } else {
+                    let g = args.get(ai)?;
+                    ai += 1;
+                    shown.push((Some(vi), tn_arg(p, tys, *g, open, in_sig)?));
+                    vi += 1;
+                }
+            }
+            while ai < args.len() {
+                shown.push((None, tn_arg(p, tys, args[ai], open, in_sig)?));
+                ai += 1;
+            }
+        }
+        _ => match generics {
         Some(g) if !g.params.is_empty() => {
             let mut ai = 0usize;
             let mut vi = 0usize;
@@ -1017,6 +1047,7 @@ fn tn_user_args(p: &Program, tys: &mut impl TyIntern, a: AdtId, def: DefId, args
                 }
             }
         }
+        },
     }
     // Trim trailing arguments equal to their defaults (the default
     // substituted with the arguments before it, compared by their

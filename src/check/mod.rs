@@ -17847,7 +17847,16 @@ impl<'p> Ctx<'p> {
         for (t, span) in std::mem::take(&mut self.deferred_type_names) {
             let t = self.deep(t);
             let t = self.normalize_here(t);
-            if self.has_error_kind(t) || matches!(self.kind(t), TyKind::Infer(_)) {
+            if self.has_error_kind(t) {
+                continue;
+            }
+            if self.tys.flags(t).contains_infer() {
+                self.err(
+                    "L0610",
+                    span,
+                    "type annotations needed: cannot infer the type `type_name` names here",
+                    "Name the type, for example `type_name::<u8>()`.",
+                );
                 continue;
             }
             let open = self.tys.flags(t).contains_param() || self.tys.flags(t).contains_projection();
