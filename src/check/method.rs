@@ -484,9 +484,16 @@ pub(super) fn trait_probe_for(
         let replayed = if only.is_some() { cx.replayed_trait_ref(e, trait_def) } else { None };
         for &probe in probes {
             // rustc picks `into`/`try_into` at the by-value step for any
-            // receiver (core's blanket `Into` for every `T` may hold
-            // there), so an autoref `&S` is never their Self.
-            if (trait_def == p.gx.lang.into || trait_def == p.gx.lang.try_into) && probe.autoref != Autoref::None && probe.self_ty == probe.recv_ty {
+            // sized receiver (core's blanket `Into` for every `T` may
+            // hold there), so an autoref `&S` is never their Self. The
+            // blanket needs `T: Sized`, so an unsized place (`v[1..]`,
+            // `*s`) skips that step and its Self is the autoref `&S`
+            // (which may always hold, so never `&mut S`).
+            if (trait_def == p.gx.lang.into || trait_def == p.gx.lang.try_into)
+                && probe.autoref != Autoref::None
+                && probe.self_ty == probe.recv_ty
+                && !(probe.autoref == Autoref::Ref && matches!(cx.kind(probe.self_ty), TyKind::Ref(_, _, s) if cx.into_self(s).1 != Autoref::None))
+            {
                 continue;
             }
             let step = probe.self_ty;

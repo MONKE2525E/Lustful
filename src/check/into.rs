@@ -6,9 +6,10 @@
 // is the call side, after the user impl search found no `from` body.
 //
 // Self is the receiver as written (the blanket matches at the first
-// autoderef step, by value). The target comes from the template's
-// `T: Into<U>` evidence in an instance of a generic body, else from the
-// expected type; with neither the call stays unresolved (rustc E0282).
+// autoderef step, by value; an unsized place autorefs, see `into_self`).
+// The target comes from the template's `T: Into<U>` evidence in an
+// instance of a generic body, else from the expected type; with neither
+// the call stays unresolved (rustc E0282).
 use super::*;
 
 impl<'p> Ctx<'p> {
@@ -24,6 +25,11 @@ impl<'p> Ctx<'p> {
         expected: Option<Ty>,
     ) -> Option<Ty> {
         if !turbofish.is_empty() || !args.is_empty() || self.name(name) != "into" {
+            return None;
+        }
+        // An unsized receiver place autorefs (`into_self`); the
+        // `&[T]`/`&str` forms are `std_into_method`'s.
+        if self.into_self(rt).1 != Autoref::None {
             return None;
         }
         let into = self.p.gx.lang.into;
@@ -62,6 +68,19 @@ impl<'p> Ctx<'p> {
         };
         self.set_res(e, res);
         Some(dst)
+    }
+
+    /// Self of `x.into()` on a receiver of type `rt`, and the autoref
+    /// that makes it. Core's blanket `Into` impl needs `Self: Sized`, so
+    /// on an unsized place (`v[1..]`, `*s`, `*boxed`) rustc's probe skips
+    /// the by-value step and takes the first autoref step: Self is
+    /// `&[T]` or `&str`, never the unsized value.
+    pub(super) fn into_self(&mut self, rt: Ty) -> (Ty, Autoref) {
+        let t = self.deep(rt);
+        if matches!(self.kind(t), TyKind::Infer(_) | TyKind::Error) || self.sized_ok(t) {
+            return (t, Autoref::None);
+        }
+        (self.tys.mk_ref(false, t), Autoref::Ref)
     }
 
     /// Unifies two types for an `into` impl match, rolling back on a miss.

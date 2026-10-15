@@ -523,7 +523,8 @@ impl<'p> Ctx<'p> {
     /// `x.into()` through one of std's `From` impls between builtin
     /// types (`std_from`). Self is the receiver itself: core's blanket
     /// `impl<T, U: From<T>> Into<U> for T` matches at the first
-    /// autoderef step, so `(&s).into()` converts the reference. The
+    /// autoderef step, so `(&s).into()` converts the reference (an
+    /// unsized place autorefs: `v[1..].into()` converts `&v[1..]`). The
     /// target is the expected type, else (in an instance of a generic
     /// body) the template's `Into<U>` bound. None for other calls.
     #[allow(clippy::too_many_arguments)]
@@ -539,7 +540,7 @@ impl<'p> Ctx<'p> {
         if !turbofish.is_empty() || self.p.interner.get(name) != "into" || !args.is_empty() {
             return None;
         }
-        let src = self.deep(rt);
+        let (src, autoref) = self.into_self(rt);
         // Fully known: no inference variable at all (an integer or float
         // literal's type too) and no error.
         let known = |cx: &Self, t: Ty| !cx.tys.flags(t).contains_infer() && !cx.has_error_kind(t);
@@ -555,7 +556,7 @@ impl<'p> Ctx<'p> {
         // as an `Option<i32>`, `[1, 2].into()` as a `Vec<i32>`).
         let src = if known(self, src) { src } else { self.std_from_literal_src(dst, src)? };
         self.std_from_here(dst, src)?;
-        self.set_res(e, Res::BuiltinMethod { b: Builtin::ConvInto, derefs: 0, autoref: Autoref::None });
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::ConvInto, derefs: 0, autoref });
         Some(dst)
     }
 

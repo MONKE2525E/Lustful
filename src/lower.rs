@@ -3639,6 +3639,25 @@ impl<'p> Lower<'p> {
         v
     }
 
+    /// The autoref of a range-indexed receiver (`v[1..].iter()`,
+    /// `s[2..].into()`, `v[1..].sort()`) when `direct` (no derefs, no
+    /// user `Deref`): a local holding the `&[T]`/`&str` (or `&mut`).
+    /// The slice place is already a fat value in a temporary with its
+    /// loan on the base, so the reference moves that value, as
+    /// `&v[1..]` does; a borrow of the temporary would end at the
+    /// statement. None for every other receiver.
+    fn slice_index_recv_ref(&mut self, recv: ExprId, direct: bool, m: bool, recv_ty: Ty, span: Span) -> Option<Local> {
+        if !direct || !matches!(self.ck.res(recv), Res::SliceIndex { .. }) {
+            return None;
+        }
+        let pl = if m { self.place_for_mut(recv) } else { self.place(recv) };
+        let rt = self.ref_ty(m, recv_ty);
+        let op = self.operand_from(pl, rt);
+        let t = self.temp(rt);
+        self.assign(Place::local(t), Rvalue::Use(op), span);
+        Some(t)
+    }
+
     fn method_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span) {
         // A method call reports caller locations (track_caller builtins
         // such as unwrap and pow) at the method name, as rustc does, not
@@ -3770,14 +3789,20 @@ impl<'p> Lower<'p> {
                 }
             }
             Autoref::Ref => {
-                let pl = match &root {
-                    Some(pl) => pl.clone(),
-                    None => self.place(recv),
+                let t = match self.slice_index_recv_ref(recv, root.is_none() && derefs == 0, false, recv_ty, span) {
+                    Some(t) => t,
+                    None => {
+                        let pl = match &root {
+                            Some(pl) => pl.clone(),
+                            None => self.place(recv),
+                        };
+                        let pl = Self::derefs(pl, derefs);
+                        let rt = self.ref_ty(false, recv_ty);
+                        let t = self.temp(rt);
+                        self.assign(Place::local(t), Rvalue::Ref(false, pl), span);
+                        t
+                    }
                 };
-                let pl = Self::derefs(pl, derefs);
-                let rt = self.ref_ty(false, recv_ty);
-                let t = self.temp(rt);
-                self.assign(Place::local(t), Rvalue::Ref(false, pl), span);
                 ops.push(Operand::Copy(Place::local(t)));
                 for &a in args {
                     let o = self.operand(a);
@@ -3841,6 +3866,13 @@ impl<'p> Lower<'p> {
                         }
                         o => o,
                     };
+                    ops.push(o);
+                }
+            }
+            Autoref::RefMut if let Some(t) = self.slice_index_recv_ref(recv, root.is_none() && derefs == 0, true, recv_ty, span) => {
+                ops.push(Operand::Move(Place::local(t)));
+                for &a in args {
+                    let o = self.operand(a);
                     ops.push(o);
                 }
             }
