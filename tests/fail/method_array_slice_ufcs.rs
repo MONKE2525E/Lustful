@@ -1,4 +1,4 @@
-// expect: L0101
+// expect: L0612
 // rustc E0277: there is no `Probe` impl for the array type; the
 // slice impl is only reached by a method call's autoderef step
 // or by naming the slice impl in the qualified path.

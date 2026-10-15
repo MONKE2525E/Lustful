@@ -11247,6 +11247,13 @@ impl<'p> Ctx<'p> {
                     if let Some(t) = self.std_trait_assoc_call(e, callee, base, segs[0].name, args, span) {
                         return t;
                     }
+                    // The written trait ref with no impl fn behind it
+                    // (`<T as Clone>::clone(t)` at `T = i32`).
+                    if let Some(tr) = hint
+                        && let Some(t) = self.trait_ref_call(e, tr, segs[0].name, args, span)
+                    {
+                        return t;
+                    }
                 }
                 for &a in args {
                     self.expr(a, None);
@@ -11283,6 +11290,14 @@ impl<'p> Ctx<'p> {
                     // ambiguous (`u16: From<{integer}>`).
                     let hint = self.instance_bound_ref(segs[1].name, base);
                     if let Some(t) = self.assoc_call(e, callee, base, hint, segs[1].name, args, span) {
+                        return t;
+                    }
+                    // A std trait's item at a builtin Self (`T::clone(t)`
+                    // at `T = i32`) has no impl fn: the deferred trait
+                    // path picks the builtin, as for `Clone::clone(t)`.
+                    if let Some(tr) = hint
+                        && let Some(t) = self.trait_ref_call(e, tr, segs[1].name, args, span)
+                    {
                         return t;
                     }
                 }

@@ -138,6 +138,37 @@ impl<'p> Ctx<'p> {
         Some(self.normalize_use(ret, span))
     }
 
+    /// `<Self as Trait>::method(args)` with the whole trait ref known
+    /// (an instance's `T::clone(t)` at the template's `T: Clone` bound,
+    /// `T` now `i32`), when the assoc-call paths had no answer: typed by
+    /// the trait method's signature, with the call deferred to body end
+    /// like `trait_path_call`'s (a std builtin or the impl's fn).
+    pub(super) fn trait_ref_call(&mut self, e: ExprId, tr: TraitRef, name: Sym, args: &[ExprId], span: Span) -> Option<Ty> {
+        let p = self.p;
+        let method_def = p.gx.index.trait_record(tr.def)?.method_by_name(name)?;
+        let n_trait = self.tys.args(tr.args).len();
+        let mut full: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+        let (own_kinds, preds): (Vec<ParamKind>, Vec<Predicate>) = match p.gx.trait_methods.get(&method_def) {
+            Some(t) => (t.generics.params.iter().skip(n_trait).map(|x| x.kind).collect(), t.generics.predicates.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        for kind in own_kinds {
+            full.push(match kind {
+                ParamKind::Type => GenericArg::Ty(self.new_var(false)),
+                ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+                ParamKind::Const(_) => GenericArg::Const(self.fresh_const_var()),
+            });
+        }
+        let (mut params, ret) = self.trait_method_sig(method_def, &full)?;
+        self.push_predicates(&preds, &full, span);
+        self.obl.push_trait_at(tr, span, 0);
+        self.record_pick(e, tr.def, 0, ReceiverForm::Value);
+        self.normalize_params(&mut params, span);
+        self.deferred_trait_fn_calls.push((e, tr, name, full[n_trait..].to_vec(), span));
+        self.check_args(&params, args, span);
+        Some(self.normalize_use(ret, span))
+    }
+
     /// The trait ref and full generic arguments (trait, then the
     /// method's own) of a trait path: Self a fresh variable, written
     /// trait arguments honored, the trait obligation queued and the

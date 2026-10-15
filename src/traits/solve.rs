@@ -712,6 +712,19 @@ impl Solver {
         }
         let self_ty = self_ty_of(cx.tys(), &tr);
         let self_deep = cx.deep_resolve(self_ty);
+        // The Fn traits of closures, fn items, fn pointers, and the
+        // forwarding impls are builtin (no records), as in `select`.
+        if matches!(
+            cx.tys().kind(self_deep),
+            TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Dyn(..) | TyKind::Ref(..) | TyKind::Adt(..)
+        ) {
+            let snap = cx.snapshot();
+            let answer = cx.closure_select(tr);
+            cx.rollback(snap);
+            if let Some(ok) = answer {
+                return !ok;
+            }
+        }
         // An integer or float literal variable is one of a closed set
         // of heads, which `candidates` reads all of (`{integer}:
         // Into<S>` is false when no `From` impl of S takes an integer).
