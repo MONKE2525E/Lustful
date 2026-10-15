@@ -379,6 +379,14 @@ impl GenReuse {
         Some((e.adt_tys.clone(), requests, e.closures.clone(), e.vtables.clone()))
     }
 
+    /// True when a stored check read the body of one of `defs`: a
+    /// `Checked` read, which a check records for each const fn its const
+    /// evaluation ran. The driver's const fn edit asks (compile.rs).
+    pub(crate) fn reads_checked(&self, defs: &[DefId]) -> bool {
+        let stored = self.templates.values().map(|e| &e.reads).chain(self.discovery.values().map(|e| &e.reads));
+        stored.into_iter().any(|r| defs.iter().any(|&d| r.contains(&ReadKey::Checked(d))))
+    }
+
     /// A copy of the stored discovery output of the fn with def `def`,
     /// unless its last discovery check stored nothing: what collect used
     /// for that body. The daemon's kept programs take one per edited fn

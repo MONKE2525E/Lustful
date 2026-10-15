@@ -122,6 +122,9 @@ pub(crate) struct PatchBase {
     /// The cfg-disabled nodes the expander dropped (`Dep::Dropped`), by
     /// file and start, with the spans of this text.
     dropped: Vec<Dropped>,
+    /// What const evaluation may reach (`const_reach.rs`), built on the
+    /// first const fn body edit and kept up to date by later patches.
+    reach: Option<super::const_reach::ConstReach>,
 }
 
 /// One cfg-disabled node the last full resolve dropped (`Dep::Dropped`).
@@ -273,6 +276,7 @@ impl PatchBase {
             live_slots,
             item_scans: FxMap::default(),
             dropped,
+            reach: None,
         }
     }
 }
@@ -288,8 +292,11 @@ pub(super) struct Patched {
     pub std_ranges: Vec<(u32, u32, ShippedCrate)>,
     pub std_routes: Vec<&'static StdFnDef>,
     pub std_methods: (u32, u32),
-    /// Some edited body is a `const fn`'s (see the module docs).
+    /// Some edited body is a `const fn`'s that a const evaluation may
+    /// run (see the module docs).
     pub const_fn: bool,
+    /// The edited const fns (`Front::fn_loc` indexes).
+    pub const_edits: Vec<usize>,
     /// Files whose text changed, Ast nodes the patch built, bodies
     /// re-parsed, and spans moved.
     pub files: usize,
@@ -1059,6 +1066,15 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         }
     }
     let edited: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref().map(|b| b.fn_index)).collect();
+    // A const fn edit is a plain body edit when no const evaluation can
+    // run that fn (`const_reach.rs`).
+    let const_edits: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref().filter(|b| b.is_const).map(|b| b.fn_index)).collect();
+    match &mut base.reach {
+        Some(r) => r.update(front, &edited),
+        None if !const_edits.is_empty() => base.reach = Some(super::const_reach::ConstReach::build(front)),
+        None => {}
+    }
+    let reached = base.reach.as_ref().is_some_and(|r| const_edits.iter().any(|&i| r.reaches(front, i)));
     let changed = slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots);
     let edits_len = edits.iter().filter(|e| e.body.is_some()).count();
     let out = Patched {
@@ -1071,7 +1087,8 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         std_ranges: base.std_ranges.clone(),
         std_routes: base.std_routes.clone(),
         std_methods: base.std_methods,
-        const_fn: edits.iter().any(|e| e.body.as_ref().is_some_and(|b| b.is_const)),
+        const_fn: reached,
+        const_edits,
         files,
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
         bodies: edits_len,
@@ -1835,6 +1852,78 @@ pub fn run() -> i64 {
         for (old, new) in [("    4\n", "    5\n"), ("    5\n", "    4\n"), ("    3\n}\n\npub const LEN", "    let x = 7;\n    x\n}\n\npub const LEN")] {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
             assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+        }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Const fns that no const item reads (`unread`), one an array repeat
+    /// length in a body reads (`local`), and one a `thread_local!` const
+    /// initializer reads (`tls_init`).
+    const UNREAD: &str = "use std::cell::Cell;
+
+pub const fn unread(x: u32) -> u32 {
+    x + 1
+}
+
+pub const fn local() -> usize {
+    2
+}
+
+pub const fn tls_init() -> u32 {
+    9
+}
+
+thread_local! {
+    static T: Cell<u32> = const { Cell::new(tls_init()) };
+}
+
+pub fn run() -> i64 {
+    let a = [0u8; local()];
+    (unread(3) + T.with(|t| t.get())) as i64 + a.len() as i64
+}
+";
+
+    /// A body edit of a const fn that no const evaluation can run
+    /// (`const_reach.rs`) is a plain body edit: the kept program stands
+    /// (no collect). Edit, error, fix, undo, and another edit each give
+    /// the cold answer. A const fn a body's array length reads collects
+    /// again; so does `unread` once an edit adds such a reader, and
+    /// `tls_init`, which a stored check ran (a const overflow there is
+    /// the cold error). A build prints what a cold build prints.
+    #[test]
+    fn unreached_const_fn_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-unread-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, UNREAD).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        // (old, new, expected kept=)
+        let steps: &[(&str, &str, &str)] = &[
+            ("    x + 1\n", "    let y = x;\n    y + 1\n", "reuse"),
+            ("    y + 1\n", "    y + true\n", "reuse"),
+            ("    y + true\n", "    y + 1\n", "reuse"),
+            ("    let y = x;\n    y + 1\n", "    x + 1\n", "reuse"),
+            ("    x + 1\n", "    x * 2 + 1\n", "reuse"),
+            ("    2\n}\n\npub const fn tls_init", "    3\n}\n\npub const fn tls_init", "gen_state"),
+            ("    9\n", "    let m: u32 = 4294967295;\n    m + 1\n", "gen_state"),
+            // The failed reader stored no reads: it rechecks as any failed
+            // body does, and collect runs for its discovery.
+            ("    let m: u32 = 4294967295;\n    m + 1\n", "    10\n", "discovery"),
+            ("    let a = [0u8; local()];\n", "    let a = [0u8; local()];\n    let _b: [u8; 7] = [0u8; unread(3) as usize];\n", "reuse"),
+            ("    x * 2 + 1\n", "    x * 2 + 2\n", "gen_state"),
+            ("    x * 2 + 2\n", "    x * 2 + 1\n", "gen_state"),
+        ];
+        for &(old, new, kept) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
         }
         assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
         let bin = root.with_extension("bin");

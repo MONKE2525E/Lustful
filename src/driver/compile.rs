@@ -354,6 +354,13 @@ pub(super) fn fn_def_at(ast: &Ast, item: usize, sub: Option<usize>) -> &crate::a
     }
 }
 
+/// The local `DefId`s of AST fns (`Front::fn_loc` indexes), from their
+/// slots' disk identities.
+fn local_def_ids(front: &Front, fns: &[usize]) -> Vec<def::DefId> {
+    let slots: Vec<u32> = fns.iter().filter_map(|&i| front.fn_slot.get(i).copied()).collect();
+    front.slot_of.iter().filter(|(_, s)| slots.contains(s)).map(|(d, _)| def::DefId { krate: def::LOCAL_CRATE, hash: d.hash }).collect()
+}
+
 /// `fold_fn_text` for a resolver-path fn: `hash` folded with the fn's
 /// text from the start of its name's line to the end of its body, and
 /// with the distance from its base line (`line`, the line of its `fn`
@@ -1698,15 +1705,26 @@ fn resolved_setup(
                 ..Default::default()
             };
             t.lap("body patch");
-            // A const fn body edit: as `slot_update` with `const_fn_changed`,
-            // every unchanged passing body joins as a read-set candidate.
-            let (mut changed, mut mention_only) = (p.changed, Vec::new());
-            if p.const_fn {
+            // A const fn body edit that a const evaluation may run: as
+            // `slot_update` with `const_fn_changed`, every unchanged
+            // passing body joins as a read-set candidate. One no
+            // evaluation can run (`const_reach.rs`) is a plain body edit,
+            // unless a stored check ran it anyway (a `Checked` read: a
+            // `thread_local!` const initializer).
+            let (mut changed, mut mention_only, mut const_fn) = (p.changed, Vec::new(), p.const_fn);
+            if !const_fn && !p.const_edits.is_empty() {
+                let defs = local_def_ids(front, &p.const_edits);
+                let read = |r: &Option<crate::driver::graph::Reads>| {
+                    r.as_ref().is_some_and(|r| defs.iter().any(|&d| r.contains(&crate::driver::graph::ReadKey::Checked(d))))
+                };
+                const_fn = caches.slot_reads.iter().any(read) || caches.gen_reuse.reads_checked(&defs);
+            }
+            if const_fn {
                 mention_only = (0..p.fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !changed.contains(&i)).collect();
                 changed.extend_from_slice(&mention_only);
                 changed.sort_unstable();
             }
-            return Ok((p.map, changed, mention_only, p.const_fn, p.fn_count, "bodies", p.fn_lines, p.body_hashes, Some(p.tables)));
+            return Ok((p.map, changed, mention_only, const_fn, p.fn_count, "bodies", p.fn_lines, p.body_hashes, Some(p.tables)));
         }
         Err(why) => visits.why = why,
     }

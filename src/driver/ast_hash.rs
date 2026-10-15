@@ -179,6 +179,136 @@ pub(crate) fn body_scan(ast: &Ast, f: &FnDef, inner: Option<&mut Vec<u32>>) -> (
     (hash, idents)
 }
 
+/// The const expressions an item holds outside fn bodies, for
+/// `const_idents`: const and static values, discriminants, associated
+/// const values, and const param defaults, in nested modules too. Types
+/// sit in the type arena, which `const_idents` scans on its own.
+fn item_consts(w: &mut Walker, h: &mut FxHasher, item: &Item) {
+    fn generics(w: &mut Walker, h: &mut FxHasher, g: &Generics) {
+        for p in &g.params {
+            if let GenericParam::Const { default: Some(e), .. } = p {
+                w.expr(h, *e);
+            }
+        }
+    }
+    fn values(w: &mut Walker, h: &mut FxHasher, es: impl IntoIterator<Item = Option<ExprId>>) {
+        for e in es.into_iter().flatten() {
+            w.expr(h, e);
+        }
+    }
+    match &item.kind {
+        ItemKind::Const(c) => values(w, h, [c.value]),
+        ItemKind::Static(st) => values(w, h, [st.value]),
+        ItemKind::Fn(f) => generics(w, h, &f.generics),
+        ItemKind::Struct(st) => generics(w, h, &st.generics),
+        ItemKind::Type(a) => generics(w, h, &a.generics),
+        ItemKind::Enum(en) => {
+            generics(w, h, &en.generics);
+            values(w, h, en.variants.iter().map(|v| v.discriminant));
+        }
+        ItemKind::Impl(imp) => {
+            generics(w, h, &imp.generics);
+            imp.fns.iter().for_each(|f| generics(w, h, &f.generics));
+            values(w, h, imp.consts.iter().map(|c| c.default));
+        }
+        ItemKind::Trait(t) => {
+            generics(w, h, &t.generics);
+            t.fns.iter().for_each(|f| generics(w, h, &f.generics));
+            values(w, h, t.consts.iter().map(|c| c.default));
+        }
+        ItemKind::Mod(m) => m.body.iter().flatten().for_each(|it| item_consts(w, h, it)),
+        ItemKind::ExternBlock(b) => {
+            for it in &b.items {
+                if let ForeignItem::Static(st) = it {
+                    values(w, h, [st.value]);
+                }
+            }
+        }
+        ItemKind::Union(u) => generics(w, h, &u.generics),
+        ItemKind::Use(_) | ItemKind::MacroRules(_) | ItemKind::ExternCrate(_) | ItemKind::MacroCall(_) => {}
+    }
+}
+
+/// Identifiers a const evaluation may read, pushed to `out`
+/// (`driver/const_reach.rs`): those inside every array length, const
+/// generic argument, `const` block, and pattern range bound of the arena
+/// nodes from `from` (expression, type, and pattern arena lengths) to the
+/// end. With `items`, also every identifier outside fn bodies of every
+/// item and body item: const and static values, discriminants, types,
+/// generics, and trait default bodies.
+pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool, out: &mut Vec<Sym>) {
+    let mut w = Walker { ast, idents: Some(out), inner: None };
+    let mut h = FxHasher::default();
+    if items {
+        for it in ast.items.iter().chain(&ast.stmt_items) {
+            item_consts(&mut w, &mut h, it);
+        }
+    }
+    // The const arguments of one path segment's (or turbofish's) angle
+    // arguments.
+    fn args(w: &mut Walker, h: &mut FxHasher, args: &[GenericArg]) {
+        for a in args {
+            if let GenericArg::Const(e) | GenericArg::Binding { kind: BindingKind::EqConst(e), .. } = a {
+                w.expr(h, *e);
+            }
+        }
+    }
+    fn segs(w: &mut Walker, h: &mut FxHasher, segs: &[PathSeg]) {
+        for s in segs {
+            if let GenericArgs::Angle(a) = &s.args {
+                args(w, h, a);
+            }
+        }
+    }
+    for e in ast.exprs.get(from.0..).unwrap_or(&[]) {
+        match e {
+            Expr::ArrayRepeat { len, .. } => w.expr(&mut h, *len),
+            Expr::ConstBlock(b) => w.block(&mut h, *b),
+            Expr::Path(p) | Expr::StructLit { path: p, .. } => segs(&mut w, &mut h, p),
+            Expr::QPath { trait_path, segs: p, .. } => {
+                segs(&mut w, &mut h, trait_path);
+                segs(&mut w, &mut h, p);
+            }
+            Expr::MethodCall { generic_args, .. } => args(&mut w, &mut h, generic_args),
+            _ => {}
+        }
+    }
+    for t in ast.tys.get(from.1..).unwrap_or(&[]) {
+        match t {
+            TyExpr::Array { len, .. } => w.expr(&mut h, *len),
+            TyExpr::Path(p) => segs(&mut w, &mut h, p),
+            TyExpr::QPath { trait_path, segs: p, .. } => {
+                segs(&mut w, &mut h, trait_path);
+                segs(&mut w, &mut h, p);
+            }
+            TyExpr::Dyn { bounds, .. } | TyExpr::ImplTrait { bounds, .. } => {
+                for b in bounds {
+                    if let TraitBound::Trait { trait_ref, .. } = b {
+                        segs(&mut w, &mut h, &trait_ref.path);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for p in ast.pats.get(from.2..).unwrap_or(&[]) {
+        match p {
+            Pat::Path(p) | Pat::TupleStruct { path: p, .. } | Pat::Struct { path: p, .. } => segs(&mut w, &mut h, p),
+            Pat::QPath { trait_path, segs: p, .. } => {
+                segs(&mut w, &mut h, trait_path);
+                segs(&mut w, &mut h, p);
+            }
+            Pat::Range { lo, hi, .. } => {
+                for e in lo.iter().chain(hi) {
+                    w.expr(&mut h, *e);
+                }
+            }
+            Pat::Lit(e) => w.expr(&mut h, *e),
+            _ => {}
+        }
+    }
+}
+
 struct Walker<'a> {
     ast: &'a Ast,
     /// When set (body scans), every hashed identifier is also recorded.
