@@ -209,18 +209,22 @@ impl<'p> Lower<'p> {
 
     /// A call of a closure value (`Res::ClosureCall`). The env operand
     /// follows the closure's own kind; the call's trait (`mode`) only
-    /// adds a move: an `FnOnce` call of an `Fn` or `FnMut` closure moves
-    /// it into a temporary and drops that right after the call, as
-    /// `call_once` does.
+    /// adds a move: an `FnOnce` call of an `Fn` or `FnMut` closure value
+    /// (not one behind a reference) moves it into a temporary and drops
+    /// that right after the call, as `call_once` does.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn closure_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], mode: ClosureKind, derefs: u8, dest: Option<&Place>, span: Span) {
         let ty = self.ty(e);
-        let base = if mode == ClosureKind::FnMut { self.place_for_mut(callee) } else { self.place(callee) };
-        let place = Self::derefs(base, derefs);
         let cty = self.peel(self.ty(callee), derefs);
         let TyKind::Closure(def, _) = self.kind(cty) else { return };
         let Some(entry) = self.p.gx.closures.get(&def) else { return };
         let (target, kind) = (entry.body_fn, entry.kind);
+        // Through a reference (`F = &mut C` in an `F: FnOnce` instance),
+        // an `FnOnce` call is core's `impl FnOnce for &F` or `&mut F`,
+        // which calls the closure in place: it is never copied out.
+        let by_ref = derefs > 0 && matches!(self.kind(self.ty(callee)), TyKind::Ref(..));
+        let base = if mode == ClosureKind::FnMut || (by_ref && kind == ClosureKind::FnMut) { self.place_for_mut(callee) } else { self.place(callee) };
+        let place = Self::derefs(base, derefs);
         let mut owned: Option<Local> = None;
         // A callee rustc moves where it is `Copy` here (`view_moved`). An
         // `FnOnce` call through a reference moves out of it (rustc E0507
@@ -229,7 +233,7 @@ impl<'p> Lower<'p> {
         let env = match (kind, mode) {
             (ClosureKind::FnOnce, _) if moved => Operand::Move(place),
             (ClosureKind::FnOnce, _) => self.operand_from(place, cty),
-            (_, ClosureKind::FnOnce) => {
+            (_, ClosureKind::FnOnce) if !by_ref => {
                 let own = self.temp(cty);
                 let op = if moved { Operand::Move(place) } else { self.operand_from(place, cty) };
                 self.assign(Place::local(own), Rvalue::Use(op), span);
