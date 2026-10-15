@@ -23,7 +23,7 @@
 // - an edit is not strictly inside one top-level fn or method body;
 // - the old or new body holds an item keyword, an attribute, a `$`, a
 //   macro the expander owns (anything but the parser's own `println!`
-//   family), or a parser macro while the crate defines macros;
+//   family), or a parser macro while a user macro may take its name;
 // - the fn is a `const fn` or returns `impl Trait` (its body is part of
 //   its item, and `const` values bake it in), or has parameter patterns
 //   or expressions in its parameter types (see `find_body_edit`);
@@ -67,9 +67,13 @@ pub(crate) struct PatchBase {
     needs: Vec<(StdNeeds, bool)>,
     /// Per map file: the stat that proves its text unchanged, if any.
     stamps: Vec<Option<Stamp>>,
-    /// Some file of the session defines a macro (`macro_rules`): a parser
-    /// macro name in a body may then be the user's macro.
+    /// Some file of the session defines a macro (`macro_rules`): tokens
+    /// of one file can then sit in another file's nodes (no `ranges`).
     user_macros: bool,
+    /// Some file can make a user macro answer to a parser macro's name
+    /// (`shadows_parser_macro`): a `println!` in a body may then be the
+    /// user's macro, which the expander owns.
+    shadowed: bool,
     tables: Arc<ResolvedTables>,
     /// `ResolvedTables::local_named_set`, built on the first patch.
     local_names: Option<FxMap<Sym, u8>>,
@@ -92,6 +96,24 @@ pub(super) fn inputs_fingerprint(parts: &dyn std::fmt::Debug) -> u64 {
     let mut h = crate::intern::FxHasher::default();
     std::hash::Hash::hash(&format!("{parts:?}"), &mut h);
     std::hash::Hasher::finish(&h)
+}
+
+/// True when `text` may define a macro named like a parser macro
+/// (`macro_rules! println`) or import one under such a name (`as vec`).
+/// A text scan: a match in a comment or string only costs the patch for
+/// bodies that call parser macros.
+fn shadows_parser_macro(text: &str) -> bool {
+    let ident_after = |rest: &str| -> String { rest.trim_start().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect() };
+    let word_before = |i: usize| i == 0 || !text.as_bytes()[i - 1].is_ascii_alphanumeric() && text.as_bytes()[i - 1] != b'_';
+    let defines = text.match_indices("macro_rules").any(|(i, m)| {
+        let rest = text[i + m.len()..].trim_start();
+        rest.strip_prefix('!').is_some_and(|r| crate::expand::builtin::is_passthrough(&ident_after(r)))
+    });
+    let renames = text.match_indices("as").any(|(i, m)| {
+        let rest = &text[i + m.len()..];
+        word_before(i) && rest.starts_with(char::is_whitespace) && crate::expand::builtin::is_passthrough(&ident_after(rest))
+    });
+    defines || renames
 }
 
 /// The std needs and platform mention of one file's own text.
@@ -134,6 +156,7 @@ impl PatchBase {
             })
             .collect();
         let user_macros = texts.iter().any(|(_, t)| t.contains("macro_rules"));
+        let shadowed = user_macros && texts.iter().any(|(_, t)| shadows_parser_macro(t));
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
         PatchBase {
@@ -143,6 +166,7 @@ impl PatchBase {
             needs,
             stamps,
             user_macros,
+            shadowed,
             tables,
             local_names: None,
             std_ranges: std_out.0.to_vec(),
@@ -344,7 +368,7 @@ fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit,
     let (old_body, new_body) = (lex(old.get(lo..hi))?, lex(text.get(lo..new_hi))?);
     let old_calls = body_tokens_ok(&old_body, lo, hi, &front.interner).ok_or("body tokens")?;
     let new_calls = body_tokens_ok(&new_body, lo, new_hi, &front.interner).ok_or("body tokens")?;
-    if (old_calls || new_calls) && base.user_macros {
+    if (old_calls || new_calls) && base.shadowed {
         return Err("macro in body");
     }
     // Parse and rewrite the new body on its own: an error there (a
