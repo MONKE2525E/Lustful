@@ -218,6 +218,9 @@ struct AdtTables {
     /// variance, and whether dropping the Adt may need it live.
     region_variance: FxMap<DefId, Vec<Variance>>,
     region_drop: FxMap<DefId, Vec<DropMode>>,
+    /// Some Adt's drop may read a param (a `Drop` impl, or a field that
+    /// owns a trait object): bodies must then compute drop-liveness.
+    any_drop: bool,
 }
 
 impl RegionTables {
@@ -367,6 +370,7 @@ impl AdtTables {
                 break;
             }
         }
+        t.any_drop = t.drop.values().chain(t.region_drop.values()).flatten().any(|&m| m == DropMode::All);
         t
     }
 
@@ -674,6 +678,20 @@ fn drops_guard(tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| drops_guard(tys, e)),
         TyKind::Array(e, _) => drops_guard(tys, e),
         TyKind::Closure(_, args) => closure_fields(tys, args).into_iter().any(|e| drops_guard(tys, e)),
+        _ => false,
+    }
+}
+
+/// True when a value of type `t` owns a trait object (`Box<dyn ..>`,
+/// `Rc<dyn ..>`, a closure that captures one), whose unknown destructor
+/// may use every region the object holds (rustc drop check).
+fn owns_dyn(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Dyn(..) => true,
+        TyKind::Adt(_, args) => tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| owns_dyn(tys, e))),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| owns_dyn(tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => owns_dyn(tys, e),
+        TyKind::Closure(_, args) => closure_fields(tys, args).into_iter().any(|e| owns_dyn(tys, e)),
         _ => false,
     }
 }
@@ -2202,7 +2220,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             b.owner.push(0);
             b.drop_slot.push(false);
         }
-        let drops = !super::drop_heads(p).is_empty() || body.locals.iter().any(|d| drops_guard(&body.tys, d.ty));
+        let drops = !super::drop_heads(p).is_empty()
+            || p.regions.adts(p).any_drop
+            || body.locals.iter().any(|d| drops_guard(&body.tys, d.ty) || owns_dyn(&body.tys, d.ty));
         for (l, decl) in body.locals.iter().enumerate() {
             let n = b.local_slots(l as Local);
             let base = b.owner.len() as u32;
