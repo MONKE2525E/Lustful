@@ -142,6 +142,14 @@ def run_tests(exe, cwd, timeout):
     return r.returncode, (tail[-1] if tail else r.stderr[-300:])
 
 
+def put_bin(src, dst):
+    """Copy a bin over `dst` by rename: writing into a bin that just ran can fail with
+    "Text file busy" (ETXTBSY), a rename never does."""
+    tmp = dst.with_name(dst.name + ".parity-tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
 def parity_tests(fork, cargo_bins, lust_bins, deps, timeout):
     """Each test bin with Cargo bins, then with lust bins at the same paths. The Cargo bins are
     restored at the end, also on an error."""
@@ -159,20 +167,20 @@ def parity_tests(fork, cargo_bins, lust_bins, deps, timeout):
                 rows.append((t, "no test bin"))
                 continue
             for b in BINS:
-                shutil.copy2(saved / b, cargo_bins / b)
+                put_bin(saved / b, cargo_bins / b)
             a = run_tests(exe, cwd, timeout)
             missing = [b for b in BINS if not (lust_bins / f"ts_goport-{b}").exists()]
             if missing:
                 rows.append((t, f"cargo bins: {a[1]}; no lust bin for {', '.join(missing)}"))
                 continue
             for b in BINS:
-                shutil.copy2(lust_bins / f"ts_goport-{b}", cargo_bins / b)
+                put_bin(lust_bins / f"ts_goport-{b}", cargo_bins / b)
             l = run_tests(exe, cwd, timeout)
             rows.append((t, "same" if a[0] == l[0] == 0 else f"cargo: {a[0]} {a[1]} | lust: {l[0]} {l[1]}"))
     finally:
         for b in BINS:
             if (saved / b).exists():
-                shutil.copy2(saved / b, cargo_bins / b)
+                put_bin(saved / b, cargo_bins / b)
         shutil.rmtree(saved, ignore_errors=True)
     return rows
 
