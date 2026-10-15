@@ -250,6 +250,17 @@ fn confirm_method(
     Some(cx.normalize_use(ret, name_span))
 }
 
+/// The method-call turbofish args aligned to a template's combined
+/// generics: the impl's params come first in the template, so the
+/// method's own written args follow that many unwritten slots
+/// (rustc binds `x.m::<U>(..)` to the method's params only).
+fn method_explicit(cx: &Ctx, template: LocalDefId, explicit: &[Option<GenericArg>]) -> Vec<Option<GenericArg>> {
+    let parent_n = cx.p.gx.inherent_self_pats.get(&template).map_or(0, |(_, g)| g.params.len());
+    let mut out: Vec<Option<GenericArg>> = vec![None; parent_n];
+    out.extend_from_slice(explicit);
+    out
+}
+
 /// Probes inherent method templates of one probe variant's Self
 /// type. Plain inherent methods are `plain_inherent_probe`;
 /// this covers the generic ones that path would
@@ -283,7 +294,8 @@ pub(super) fn inherent_template_probe(
     let head = Head::of(&cx.tys, probe.self_ty);
     let _ = p.method_set(&mut cx.out.reads, head, name, probe.filter);
     for (template, tmpl) in templates {
-        if let Some(ret) = confirm_method(cx, e, template, &tmpl.generics.clone(), &[], explicit, probe, derefs, args, name_span) {
+        let aligned = method_explicit(cx, template, explicit);
+        if let Some(ret) = confirm_method(cx, e, template, &tmpl.generics.clone(), &[], &aligned, probe, derefs, args, name_span) {
             return Probe::Hit(ret);
         }
     }
@@ -1011,7 +1023,8 @@ pub(super) fn finish_deferred_lang_methods(cx: &mut Ctx) {
             let err_len = cx.errs.len();
             let (params, ret) = match p.gx.fn_templates.get(cand.0 as usize).cloned() {
                 Some(Some(tmpl)) => {
-                    let (params, ret, _) = cx.instantiate_template(d.e, cand, &tmpl.generics, &d.explicit, d.name_span);
+                    let aligned = method_explicit(cx, cand, &d.explicit);
+                    let (params, ret, _) = cx.instantiate_template(d.e, cand, &tmpl.generics, &aligned, d.name_span);
                     (params, ret)
                 }
                 _ => (p.fn_info(cand).params.clone(), p.ret_view(cand)),
@@ -1028,7 +1041,10 @@ pub(super) fn finish_deferred_lang_methods(cx: &mut Ctx) {
         if let [cand] = winners.as_slice() {
             let cand = *cand;
             let hit = match p.gx.fn_templates.get(cand.0 as usize).cloned() {
-                Some(Some(tmpl)) => confirm_method(cx, d.e, cand, &tmpl.generics.clone(), &[], &d.explicit, probe, d.derefs, &[], d.name_span),
+                Some(Some(tmpl)) => {
+                    let aligned = method_explicit(cx, cand, &d.explicit);
+                    confirm_method(cx, d.e, cand, &tmpl.generics.clone(), &[], &aligned, probe, d.derefs, &[], d.name_span)
+                }
                 _ => {
                     let params = p.fn_info(cand).params.clone();
                     if params.first().is_some_and(|&want| cx.unify(want, probe.recv_ty)) {
