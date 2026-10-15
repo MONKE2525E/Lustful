@@ -1126,7 +1126,7 @@
   {
    "id": "ext.tikv_jemalloc_ctl",
    "title": "Adapter crate tikv-jemalloc-ctl 0.7.0: Name/AsName, epoch, version (by-name Access arena keys removed, cannot match)",
-   "status": "supported",
+   "status": "unsupported",
    "milestone": 0,
    "inventory_step": "10",
    "root_cause": "external-crates",
