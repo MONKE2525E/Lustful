@@ -22,6 +22,7 @@ pub mod iter;
 pub mod method;
 pub mod object;
 pub mod obligations;
+pub mod outlives;
 pub mod opaque;
 pub mod picks;
 pub mod platform;
@@ -5918,6 +5919,14 @@ impl<'p> Ctx<'p> {
     fn record_annotation(&mut self, pat: ast::PatId, t: ast::TyId) {
         let p = self.p;
         let Some(r) = self.regioned_annotation(t, Region::Erased, true) else { return };
+        // The annotation must be well-formed under the fn's implied
+        // bounds (`&'a T` needs `T: 'a`, rustc E0309).
+        let env = self.env();
+        if let Some(sig) = p.regions.body_sig(p, self.fid)
+            && let Some(d) = crate::check::outlives::check_body_ty(p, &mut self.tys, sig, env, r, p.ast.ty_span(t))
+        {
+            self.errs.push(d);
+        }
         if !self.annotate_pat(pat, r) {
             let s = p.ast.pat_span(pat);
             self.err(

@@ -121,6 +121,10 @@ pub struct RegionSig {
     /// Trait` with a `use<..>` list captures (check/use_caps.rs); None
     /// when it captures every one.
     pub opaque_caps: Option<Vec<u32>>,
+    /// A method's impl header types (Self and the trait's type args),
+    /// regioned: their outlives requirements are implied bounds of the
+    /// method too (`check::outlives`).
+    pub header: Vec<Ty>,
 }
 
 /// A bound `T: Tr<'a, ..>` on type param `param` for a trait with lifetime
@@ -189,6 +193,12 @@ pub struct RegionTables {
     /// meet them (well-formedness), and a signature that names the type
     /// may assume them (implied bounds).
     pub adt_facts: FxMap<DefId, Vec<(u32, u32)>>,
+    /// Per user Adt, the outlives requirements every use must meet, over
+    /// its own params (`check::outlives::infer_adts`): `(T, 'a)` is `T: 'a`.
+    pub adt_outlives: FxMap<DefId, Vec<(GenericArg, Region)>>,
+    /// Items whose written types `check::outlives::check_all` checks,
+    /// recorded at collect.
+    pub outlives_items: Vec<crate::check::outlives::Item>,
     adts: std::sync::OnceLock<AdtTables>,
     /// The trait method of each trait method stub (the reverse of
     /// `GenTables::trait_method_stubs`), built on first use.
@@ -1054,6 +1064,9 @@ pub(super) struct OwnSig {
     /// captures its hidden type has no slot for. The ret slots' rule
     /// applies to it: only the captured universals outlive it.
     pub ret_cap: Option<Univ>,
+    /// Per type param that a dyn coercion in the body unsizes: its index
+    /// and the universal that stands for it (`param_univs`).
+    pub param_univ: Vec<(u32, Univ)>,
 }
 
 /// One end of a closure requirement (`closure_requirements`): `'static`,
@@ -1225,6 +1238,38 @@ fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region
     }
 }
 
+/// The type params in `t` (also inside projections), by index, once each.
+fn params_in(tys: &impl TyIntern, t: Ty, out: &mut Vec<u32>) {
+    match tys.kind(t) {
+        TyKind::Param(j) => {
+            if !out.contains(&j.0) {
+                out.push(j.0);
+            }
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => params_in(tys, e, out),
+        TyKind::Tuple(ts) => {
+            for e in tys.tys_of(ts).to_vec() {
+                params_in(tys, e, out);
+            }
+        }
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Projection(_, a) | TyKind::Opaque(_, a) => {
+            for g in tys.args(a).to_vec() {
+                if let GenericArg::Ty(e) = g {
+                    params_in(tys, e, out);
+                }
+            }
+        }
+        TyKind::FnPtr(sig) => {
+            let b = tys.sig(sig);
+            for e in tys.tys_of(b.value.inputs).to_vec() {
+                params_in(tys, e, out);
+            }
+            params_in(tys, b.value.output, out);
+        }
+        _ => {}
+    }
+}
+
 /// The universal of a regioned signature region.
 fn univ_of(r: Region, fresh: &mut impl FnMut() -> Univ) -> Univ {
     match r {
@@ -1241,7 +1286,17 @@ impl OwnSig {
     /// conservative inside the body, and callers use the same signature.
     pub fn build<'p>(p: &'p Program, body: &Body<'p>, sig: Option<&RegionSig>, closure: bool, check: bool) -> OwnSig {
         let mut sc = SlotCx::new(&body.tys, p);
-        let mut own = OwnSig { n_univ: 0, slots: Vec::new(), facts: Vec::new(), names: vec!["'static".into()], check, closure, ends: Vec::new(), ret_cap: None };
+        let mut own = OwnSig {
+            n_univ: 0,
+            slots: Vec::new(),
+            facts: Vec::new(),
+            names: vec!["'static".into()],
+            check,
+            closure,
+            ends: Vec::new(),
+            ret_cap: None,
+            param_univ: Vec::new(),
+        };
         if closure {
             own.closure_sig(p, body, &mut sc);
             return own;
@@ -1308,8 +1363,44 @@ impl OwnSig {
                 }
             }
         }
+        own.param_univs(p, body, sig);
         own.implied(&mut sc, body);
         own
+    }
+
+    /// One universal per type param that a dyn coercion in the body
+    /// unsizes (`Box<dyn Tr + 'o>` from `T` needs `T: 'o`, rustc E0309).
+    /// It outlives what the fn's implied bounds and `T: 'static` bounds
+    /// give the param (`check::outlives::param_bounds`); the coercion
+    /// makes it outlive the object lifetime (`Rvalue::MakeDyn`).
+    fn param_univs(&mut self, p: &Program, body: &Body, sig: Option<&RegionSig>) {
+        let mut params: Vec<u32> = Vec::new();
+        for s in body.blocks.iter().flat_map(|b| &b.stmts) {
+            if let StmtKind::Assign(_, Rvalue::MakeDyn { src, .. }) = &s.kind {
+                params_in(&body.tys, *src, &mut params);
+            }
+        }
+        if params.is_empty() {
+            return;
+        }
+        let env = p.gx.fn_scopes.get(body.fn_id.0 as usize).map_or(&[][..], |fs| &fs.env);
+        let bounds = crate::check::outlives::param_bounds(p, sig, env);
+        let names = p.gx.fn_templates.get(body.fn_id.0 as usize).and_then(|t| t.as_ref()).map(|t| &t.generics.params);
+        for j in params {
+            self.n_univ += 1;
+            let u = self.n_univ;
+            let name = names.and_then(|ps| ps.get(j as usize)).map_or_else(|| "?".to_string(), |d| p.display_name(d.name).to_string());
+            self.names.push(format!("the type parameter `{name}`"));
+            for &(k, r) in bounds.iter().filter(|(k, _)| *k == j) {
+                let _ = k;
+                match r {
+                    Region::Static => self.facts.push((u, 0)),
+                    Region::Param(i) => self.facts.push((u, i + 1)),
+                    _ => {}
+                }
+            }
+            self.param_univ.push((j, u));
+        }
     }
 
     fn fresh_univ(&mut self, fname: &crate::intern::Sym, p: &Program) -> Univ {
@@ -2829,6 +2920,16 @@ impl<'b, 'p> Builder<'b, 'p> {
                         }
                     }
                     _ => self.equate_all(&ov, &dv),
+                }
+                if let (Rvalue::MakeDyn { src, .. }, Some(o)) = (rv, obj) {
+                    // A type param's universal outlives the object lifetime.
+                    let mut ps = Vec::new();
+                    params_in(&self.body.tys, *src, &mut ps);
+                    for j in ps {
+                        if let Some(&(_, u)) = self.own.param_univ.iter().find(|(k, _)| *k == j) {
+                            self.edge(u, o);
+                        }
+                    }
                 }
                 if let Rvalue::MakeDyn { src, dyn_ty, .. } = rv {
                     // A `'static` object lifetime (`Box<dyn Tr>` in a

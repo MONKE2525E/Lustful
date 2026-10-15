@@ -793,6 +793,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
     ks.self_ty_regioned = Some(self_r);
     let mut in_header: Vec<Region> = trait_lts;
     crate::borrowck::regions_of(&p.tys, self_r, &mut in_header);
+    scope.header_regioned = vec![self_r];
     if let Some(tref) = &imp.trait_ref {
         for seg in &tref.path {
             if let ast::GenericArgs::Angle(args) = &seg.args {
@@ -801,6 +802,7 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
                         let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                         if let Ok(r) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, *t, &ks) {
                             crate::borrowck::regions_of(&p.tys, r, &mut in_header);
+                            scope.header_regioned.push(r);
                         }
                     }
                 }
@@ -3400,10 +3402,28 @@ pub fn collect_reuse(
                     *slot = r;
                 }
             }
+            let fields: Vec<Ty> = by_variant.iter().flatten().copied().collect();
             p.regions.adt_fields.insert(def, by_variant);
             let facts = p.gx.adt_scopes[id.0 as usize].region_facts.clone();
             if !facts.is_empty() {
-                p.regions.adt_facts.insert(def, facts);
+                p.regions.adt_facts.insert(def, facts.clone());
+            }
+            // The types its bounds name may assume what its fields need
+            // (rustc's inferred outlives).
+            let (g_ast, w_ast) = match &item.kind {
+                ItemKind::Struct(st) => (&st.generics, &st.where_clause),
+                ItemKind::Enum(e) => (&e.generics, &e.where_clause),
+                _ => unreachable!(),
+            };
+            let required = {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                let scope = p.gx.adt_scopes[id.0 as usize].clone();
+                generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, g_ast, w_ast, &[])
+            };
+            let statics = crate::check::outlives::statics_of(&p.gx.adt_generics[id.0 as usize].predicates);
+            let item = crate::check::outlives::Item { implied: fields, required, facts, statics, span: p.adts[id.0 as usize].span };
+            if crate::check::outlives::wanted(&p, &item) {
+                p.regions.outlives_items.push(item);
             }
         }
         let adt = &mut p.adts[id.0 as usize];
@@ -3761,6 +3781,26 @@ pub fn collect_reuse(
         if let Some((od, info)) = opaque {
             p.gx.opaques.insert(od, info);
         }
+        if let Some(rs) = &region_sig {
+            let required = {
+                let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+                let skip = usize::from(def.self_param.is_some());
+                let extra = generics::apit_bounds(ast, def, &params[skip.min(params.len())..], &scope);
+                generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, &def.generics, &def.where_clause, &extra)
+            };
+            let mut implied: Vec<Ty> = rs.params.iter().copied().chain([rs.ret]).collect();
+            implied.extend(rs.header.iter().copied());
+            let item = crate::check::outlives::Item {
+                implied,
+                required,
+                facts: scope.region_facts.clone(),
+                statics: crate::check::outlives::statics_of(&generics.predicates),
+                span: def.name_span,
+            };
+            if crate::check::outlives::wanted(p, &item) {
+                p.regions.outlives_items.push(item);
+            }
+        }
         if def.self_param.is_some() && self_ty.is_none() {
             errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
         }
@@ -3935,6 +3975,23 @@ pub fn collect_reuse(
                 let self_pat = generics::normalize_global(&mut p, self_pat);
                 impl_scope.self_ty = Some(self_pat);
                 impl_regions(&mut p, imp, impl_def, &mut impl_scope, &mut errs);
+                {
+                    let mut required = {
+                        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+                        generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &impl_scope, &imp.generics, &imp.where_clause, &[])
+                    };
+                    required.extend(impl_scope.assoc_regioned.iter().map(|&(_, t)| t));
+                    let item = crate::check::outlives::Item {
+                        implied: impl_scope.header_regioned.clone(),
+                        required,
+                        facts: impl_scope.region_facts.clone(),
+                        statics: crate::check::outlives::statics_of(&impl_generics.predicates),
+                        span: imp.span,
+                    };
+                    if crate::check::outlives::wanted(&p, &item) {
+                p.regions.outlives_items.push(item);
+            }
+                }
                 // The owner template Adt, when the Self pattern is a
                 // local Adt application (inherent and trait impls).
                 let owner: Option<AdtId> = match p.tys.kind(self_pat) {

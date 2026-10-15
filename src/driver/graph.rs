@@ -760,6 +760,10 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
     }
     rs.early.hash(h);
     rs.opaque_caps.hash(h);
+    (rs.header.len() as u64).hash(h);
+    for &t in &rs.header {
+        hash_regions_deep(h, p, t, &mut seen);
+    }
     (rs.fn_bounds.len() as u64).hash(h);
     for b in &rs.fn_bounds {
         b.param.hash(h);

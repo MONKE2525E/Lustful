@@ -1203,6 +1203,10 @@ pub struct Scope {
     /// annotations set it; nested types (`Scope::erased`) and bounds
     /// clear it, so the form is L0203 there.
     pub fn_ptr_free: bool,
+    /// The regioned types of an impl's header (Self and the trait's type
+    /// args): their outlives requirements are implied bounds of the impl
+    /// and its methods (`check::outlives`).
+    pub header_regioned: Vec<Ty>,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -5111,7 +5115,8 @@ fn region_sig(
     }
     let fn_bounds = fn_bounds_in(ast, interner, known, tys, cx, scope, &bounded);
     let trait_bounds = trait_lts_in(interner, known, cx, scope, &bounded);
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds, opaque_caps })
+    let header = scope.header_regioned.clone();
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds, opaque_caps, header })
 }
 
 /// The lifetime args of one written trait ref, for a trait with lifetime
@@ -5162,6 +5167,75 @@ fn trait_lts_in(interner: &Interner, known: &Known, cx: &ResolveCx, scope: &Scop
             {
                 out.push(crate::borrowck::TraitLts { param: j, trait_def, lifetimes });
             }
+        }
+    }
+    out
+}
+
+/// The types the bounds of a generics list, a where clause, and `extra`
+/// bounds (`(Self, bounds)`: supertraits, `impl Trait` args) name, with
+/// regions kept, for `check::outlives`: each bound's trait args (Self
+/// included) and bound types. An elided region is `Region::Bound` (it
+/// puts no requirement); a bound that does not resolve is left out, as
+/// the erased pass reports it.
+#[allow(clippy::too_many_arguments)]
+pub fn regioned_bound_tys(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    generics: &ast::Generics,
+    where_clause: &ast::WhereClause,
+    extra: &[(Ty, &[TraitBound])],
+) -> Vec<Ty> {
+    let mut ks = scope.clone();
+    ks.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    let mut lhs_bounds: Vec<(Ty, &[TraitBound])> = extra.to_vec();
+    for gp in &generics.params {
+        if let ast::GenericParam::Type { name, bounds, .. } = gp
+            && let Some(j) = scope.param_of(*name)
+        {
+            lhs_bounds.push((tys.intern(TyKind::Param(ParamId(j))), bounds));
+        }
+    }
+    let mut out = Vec::new();
+    for pred in &where_clause.preds {
+        if let ast::WherePred::Type { ty, bounds, .. } = pred
+            && let Ok(lhs) = resolve_scoped(ast, interner, known, cx, tys, *ty, &ks)
+        {
+            out.push(lhs);
+            lhs_bounds.push((lhs, bounds));
+        }
+    }
+    let (mut preds, mut relaxed, mut errs) = (Vec::new(), Vec::new(), Vec::new());
+    for (lhs, bounds) in lhs_bounds {
+        for b in bounds {
+            bound_predicates(ast, interner, known, cx, tys, &ks, lhs, b, &mut preds, &mut relaxed, &mut errs);
+        }
+    }
+    for pred in preds {
+        if let Predicate::Trait(b) = pred {
+            crate::check::outlives::trait_ref_wf_tys(tys, b.value, &mut out);
+        }
+    }
+    out
+}
+
+/// The `impl Trait` args of a fn (top-level and nested), as `(param,
+/// bounds)` for `regioned_bound_tys`. `params` are the fn's erased param
+/// types after `self`.
+pub fn apit_bounds<'a>(ast: &'a Ast, def: &ast::FnDef, params: &[Ty], scope: &Scope) -> Vec<(Ty, &'a [TraitBound])> {
+    let mut out: Vec<(Ty, &[TraitBound])> = Vec::new();
+    for (prm, &t) in def.params.iter().zip(params) {
+        if let TyExpr::ImplTrait { bounds, .. } = ast.ty(prm.ty) {
+            out.push((t, bounds));
+        }
+    }
+    for &(n, t) in &scope.apit {
+        if let TyExpr::ImplTrait { bounds, .. } = ast.ty(n) {
+            out.push((t, bounds));
         }
     }
     out
@@ -5394,6 +5468,25 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
             build_trait_generics(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &tdef_generics, &tdef_where, &tdef_bounds, errs)
         };
+        // The types the trait's own bounds name assume nothing.
+        {
+            let self_ty = p.tys.intern(TyKind::Param(ParamId(0)));
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let mut ss = scope.clone();
+            ss.self_ty = Some(self_ty);
+            let required =
+                regioned_bound_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &ss, &tdef_generics, &tdef_where, &[(self_ty, &tdef_bounds)]);
+            let item = crate::check::outlives::Item {
+                implied: Vec::new(),
+                required,
+                facts: scope.region_facts.clone(),
+                statics: crate::check::outlives::statics_of(&generics.predicates),
+                span: p.ast.items[item_i].span,
+            };
+            if crate::check::outlives::wanted(p, &item) {
+                p.regions.outlives_items.push(item);
+            }
+        }
         let defaults = {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
             crate::check::defaults::resolve_all(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &tdef_generics, true, errs)
@@ -5543,6 +5636,24 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(&p.ast, &p.interner, &p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)
             };
+            if let Some(rs) = &region_sig {
+                let required = {
+                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                    let skip = usize::from(fdef.self_param.is_some());
+                    let extra = apit_bounds(&p.ast, fdef, &params[skip.min(params.len())..], &mscope);
+                    regioned_bound_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &mscope, &fdef.generics, &fdef.where_clause, &extra)
+                };
+                let item = crate::check::outlives::Item {
+                    implied: rs.params.iter().copied().chain([rs.ret]).collect(),
+                    required,
+                    facts: mscope.region_facts.clone(),
+                    statics: crate::check::outlives::statics_of(&combined.predicates),
+                    span: fdef.name_span,
+                };
+                if crate::check::outlives::wanted(p, &item) {
+                p.regions.outlives_items.push(item);
+            }
+            }
             if let Some(mut rs) = region_sig {
                 // `F: Fn*` and `T: Tr<'a>` bounds on the trait's own type
                 // params too (W-BORROW).
@@ -10523,6 +10634,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     // Well-formedness reads the written projections (each owes its
     // trait ref, where clauses included); normalization comes after.
     check_written_wf(p, errs);
+    crate::check::outlives::check_all(p, errs);
     normalize_signatures(p);
     let is_local = |d: DefId| d.krate == p.krate;
     let lang = p.gx.lang;
