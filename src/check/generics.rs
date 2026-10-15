@@ -4834,6 +4834,12 @@ fn region_sig(
     let elided = if self_ambiguous { None } else { self_region.or(if inputs.len() == 1 { Some(inputs[0]) } else { None }) };
     let mut rs = scope.clone();
     rs.regions = RegionMode::Keep { next: None, elided };
+    if elided.is_none()
+        && let Some(d) = def.ret.and_then(|t| opaque_elision(ast, interner, known, cx, tys, &rs, t))
+    {
+        errs.push(d);
+        return None;
+    }
     let rret = match def.ret {
         None => UNIT,
         Some(t) => match resolve_scoped(ast, interner, known, cx, tys, t, &rs) {
@@ -4974,6 +4980,47 @@ pub fn fn_bounds_of(
     where_clause: &ast::WhereClause,
 ) -> Vec<crate::borrowck::FnBound> {
     fn_bounds_in(ast, interner, known, tys, cx, scope, &param_bounds(ast, scope, generics, where_clause))
+}
+
+/// rustc E0106 in the bounds of a returned `impl Trait` (`impl
+/// Iterator<Item = &T>`, `impl Sized + '_`) when the output has no
+/// elided lifetime to take (`region_sig`, scope `rs`): the return type
+/// itself resolves to the opaque without its bounds. The L0202 of the
+/// first such bound, if any.
+fn opaque_elision(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    rs: &Scope,
+    ret: ast::TyId,
+) -> Option<Diag> {
+    let mut nodes: Vec<ast::TyId> = Vec::new();
+    nested_impl_traits(ast, ret, &mut nodes);
+    let lhs = tys.intern(TyKind::Param(ParamId(u32::MAX)));
+    for n in nodes {
+        let TyExpr::ImplTrait { bounds } = ast.ty(n) else { continue };
+        for b in bounds {
+            if let TraitBound::Lifetime(lt) = b
+                && interner.get(lt.name) == "_"
+            {
+                return scope_region(interner, rs, Some(*lt), lt.span).err();
+            }
+            // `Fn(&u8) -> &u8` sugar is its own elision scope.
+            if let TraitBound::Trait { trait_ref, .. } = b
+                && trait_ref.path.last().is_some_and(|s| matches!(s.args, GenericArgs::Parenthesized { .. }))
+            {
+                continue;
+            }
+            let (mut preds, mut relaxed, mut errs) = (Vec::new(), Vec::new(), Vec::new());
+            bound_predicates(ast, interner, known, cx, tys, rs, lhs, b, &mut preds, &mut relaxed, &mut errs);
+            if let Some(d) = errs.into_iter().find(|d| d.code == "L0202") {
+                return Some(d);
+            }
+        }
+    }
+    None
 }
 
 /// rustc E0106 inside `Fn` sugar and fn pointer types, which are their
