@@ -46,6 +46,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# loads_base <exe> : true when <exe> loads libbase.so, so a daemon built it. ldd output is
+# captured first: `ldd | grep -q` under pipefail fails when grep exits at the match and ldd
+# takes SIGPIPE on its next line (the `race` flake: the binary was right, the check was not).
+loads_base() { local out; out=$(ldd "$1" 2>/dev/null) && [[ $out == *libbase* ]]; }
 wait_socket() { # wait_socket <dir> : true when the daemon socket appears
   local i
   for i in $(seq 1 100); do [ -S "$(sock "$1")" ] && return 0; sleep 0.05; done
@@ -62,7 +66,7 @@ fresh() { # fresh <name> : a new dir with a hello.rs, prints its path
 d=$(fresh autostart); daemon_dirs+=("$d")
 (cd "$d" && "$lust" build hello.rs -o h1) >/dev/null 2>&1
 check "autostart: first build ok" test -x "$d/h1"
-if ldd "$d/h1" 2>/dev/null | grep -q libbase; then
+if loads_base "$d/h1"; then
   bad "autostart: first build is standalone" "loads libbase.so, so a daemon built it"
 else
   ok "autostart: first build is standalone (cold)"
@@ -70,7 +74,7 @@ fi
 check "autostart: first build runs" test "$("$d/h1")" = "hello 42"
 check "autostart: daemon socket appears" wait_socket "$d"
 (cd "$d" && "$lust" build hello.rs -o h2) >/dev/null 2>&1
-if ldd "$d/h2" 2>/dev/null | grep -q libbase; then
+if loads_base "$d/h2"; then
   ok "autostart: second build served by the daemon"
 else
   bad "autostart: second build served by the daemon" "no libbase.so in ldd output"
@@ -99,7 +103,7 @@ printf two >"$d/data.txt"
 out2=$(cd "$d" && "$lust" run hello.rs 2>&1)
 check "warmedit: warm v2 sees new line and included file" test "$out2" = "3 two"
 (cd "$d" && LUST_NO_DAEMON=1 "$lust" build hello.rs -o hnd) >/dev/null 2>&1
-if ldd "$d/hnd" 2>/dev/null | grep -q libbase; then
+if loads_base "$d/hnd"; then
   bad "LUST_NO_DAEMON: live daemon not used" "loads libbase.so, so the daemon built it"
 else
   ok "LUST_NO_DAEMON: live daemon not used"
@@ -114,7 +118,7 @@ for p in "${pids[@]}"; do wait "$p" || race_rc=1; done
 check "race: 4 concurrent first commands pass" test $race_rc -eq 0
 check "race: one daemon socket serves after" wait_socket "$d"
 (cd "$d" && "$lust" build hello.rs -o h) >/dev/null 2>&1
-if ldd "$d/h" 2>/dev/null | grep -q libbase; then ok "race: warm build after the race"; else bad "race: warm build after the race" "no libbase.so"; fi
+if loads_base "$d/h"; then ok "race: warm build after the race"; else bad "race: warm build after the race" "no libbase.so"; fi
 stop_daemon "$d"; sleep 0.3
 
 d=$(fresh idle); daemon_dirs+=("$d")

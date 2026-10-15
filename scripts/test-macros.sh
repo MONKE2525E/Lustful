@@ -55,7 +55,7 @@ for f in tests/macros/normalize.py tests/macros/ts-rust-names.txt; do
 done
 
 for d in tests/macros/pass tests/macros/reject; do
-  if ! find "$d" -name '*.rs' | grep -q .; then
+  if [ -z "$(find "$d" -name '*.rs' -print -quit)" ]; then
     echo "FAIL fixture dir holds no .rs files: $d"
     exit 1
   fi
