@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 381 files, 366480 lines (93.8% of files, 93.8% of lines).
+Core: 406 files, 390709 lines. Compiles today: 383 files, 372249 lines (94.3% of files, 95.3% of lines).
 
-All active prod files: 739 of 773 files compile today (94.4% of lines).
+All active prod files: 741 of 773 files compile today (95.4% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,12 +31,12 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `cinterop.system` | unsupported | 7 | wave C (shims) | 16 | 15035 | 14 | 13673 |
+| 1 | `cinterop.system` | unsupported | 7 | wave C (shims) | 14 | 9266 | 13 | 8917 |
 | 2 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
-| 3 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 1 | 1248 |
+| 3 | `ext.serde_json` | unsupported | none | wave D | 3 | 2484 | 1 | 1248 |
 | 4 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
 | 5 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
-| 6 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
+| 6 | `ext.serde` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
 | 7 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
 | 8 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
 
@@ -44,23 +44,23 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 381 | 93.8 | 93.8 |
-| milestone 4 | 381 | 93.8 | 93.8 |
-| milestone 5 | 381 | 93.8 | 93.8 |
-| milestone 6 | 385 | 94.8 | 95.4 |
-| milestone 7 | 402 | 99.0 | 99.1 |
-| milestone 8 | 402 | 99.0 | 99.1 |
+| supported today | 383 | 94.3 | 95.3 |
+| milestone 4 | 383 | 94.3 | 95.3 |
+| milestone 5 | 383 | 94.3 | 95.3 |
+| milestone 6 | 387 | 95.3 | 96.8 |
+| milestone 7 | 403 | 99.3 | 99.4 |
+| milestone 8 | 403 | 99.3 | 99.4 |
 
 ## All active prod curve
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 739 | 95.6 | 94.4 |
-| milestone 4 | 739 | 95.6 | 94.4 |
-| milestone 5 | 739 | 95.6 | 94.4 |
-| milestone 6 | 746 | 96.5 | 95.6 |
-| milestone 7 | 767 | 99.2 | 98.4 |
-| milestone 8 | 769 | 99.5 | 99.4 |
+| supported today | 741 | 95.9 | 95.4 |
+| milestone 4 | 741 | 95.9 | 95.4 |
+| milestone 5 | 741 | 95.9 | 95.4 |
+| milestone 6 | 748 | 96.8 | 96.6 |
+| milestone 7 | 768 | 99.4 | 98.6 |
+| milestone 8 | 770 | 99.6 | 99.6 |
 
 ## Reproduce
 

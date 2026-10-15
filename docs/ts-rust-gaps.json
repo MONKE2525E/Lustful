@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 3814,
+  "elapsed_ms": 3668,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,8 +32,8 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 130,
-    "files_with_findings": 24,
+    "findings": 135,
+    "files_with_findings": 25,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
@@ -50,7 +50,7 @@
     {
       "root_cause": "c-interop",
       "findings": 32,
-      "files": 30,
+      "files": 28,
       "features": [
         "cinterop.system",
         "cinterop.extern"
@@ -65,6 +65,15 @@
       ]
     },
     {
+      "root_cause": "external-crates",
+      "findings": 20,
+      "files": 3,
+      "features": [
+        "ext.serde",
+        "ext.serde_json"
+      ]
+    },
+    {
       "root_cause": "lifetimes",
       "findings": 15,
       "files": 10,
@@ -74,27 +83,11 @@
       ]
     },
     {
-      "root_cause": "unsupported",
-      "findings": 15,
-      "files": 2,
-      "features": [
-        "derives.unknown"
-      ]
-    },
-    {
       "root_cause": "unsafe",
       "findings": 2,
       "files": 2,
       "features": [
         "unsafe.blocks"
-      ]
-    },
-    {
-      "root_cause": "external-crates",
-      "findings": 0,
-      "files": 5,
-      "features": [
-        "ext.unknown_crate"
       ]
     }
   ],
@@ -110,7 +103,7 @@
       "fix_class": "compiler work",
       "release_safe_rewrite": false,
       "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/attrs_serde.rs is a lust-only oracle and lust rejects it (L0402). The attribute only has meaning under derive(Serialize) or derive(Deserialize), which lust also rejects (derives.unknown), so accepting and ignoring it would change program behavior. It stays a clean reject.",
+      "notes": "Probe evidence: tools/lust-port/tests/features/attrs_serde.rs is a lust-only oracle and lust rejects it (L0402). The attribute only has meaning under derive(Serialize) or derive(Deserialize), which map to ext.serde (a named gap, w-tail), so accepting and ignoring the helper attribute would change program behavior. It stays a clean reject, and this row stays separate so the helper-attribute count remains visible.",
       "findings": 39,
       "raw_uses": 39,
       "prod_uses": 39,
@@ -241,7 +234,7 @@
       "findings": 27,
       "raw_uses": 27,
       "prod_uses": 22,
-      "files": 28,
+      "files": 26,
       "prod_files": 6,
       "prod_fns": 13,
       "scopes": {
@@ -292,17 +285,17 @@
       ]
     },
     {
-      "id": "derives.unknown",
-      "title": "Derives other than the lust set",
+      "id": "ext.serde",
+      "title": "External crate serde 1.0.228 with derive feature: Deserialize/Serialize derives (proc macros)",
       "status": "unsupported",
       "milestone": null,
       "milestone_label": "no milestone",
       "inventory_step": null,
-      "root_cause": "unsupported",
-      "fix_class": "manual",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
       "release_safe_rewrite": false,
-      "release_impact": "runtime-review",
-      "notes": "May be proc-macro derives from other crates. Proc macros stay out of PLAN.md.",
+      "release_impact": "unchanged",
+      "notes": "Named gap (w-tail). Split from ext.unknown_crate and derives.unknown. In ts-rust, serde is used only by the two codegen tools (tools/ts_ast_codegen, tools/ts_diagnostics_codegen): 15 derive(Deserialize) types fed by serde_json::from_str, with #[serde(default)], rename, rename_all = \"camelCase\", and untagged. The derive output is used, so the derives cannot be ignored. A lust adapter cannot stand in for a proc-macro derive: support needs a compiler built-in derive plus the serde trait framework, which is large. The tools run under Cargo (scripts/verify.sh: cargo run -p ts_ast_codegen) and their output files are committed, so the dev path does not need lust to build them. See dependencies.json (decision cargo-built-tool). Probes: ext_serde.rs (lust-only oracle; the derive is a clean reject, never a silent accept).",
       "findings": 15,
       "raw_uses": 15,
       "prod_uses": 15,
@@ -314,7 +307,7 @@
       },
       "samples": [
         {
-          "feature": "derives.unknown",
+          "feature": "ext.serde",
           "raw_key": "derive.Deserialize",
           "file": "tools/ts_ast_codegen/src/lib.rs",
           "byte_start": 198,
@@ -323,11 +316,11 @@
           "column": 1,
           "snippet": "#[derive(Debug, Deserialize)]",
           "scope": "active",
-          "fix_class": "manual",
+          "fix_class": "adapter",
           "release_safe_rewrite": false
         },
         {
-          "feature": "derives.unknown",
+          "feature": "ext.serde",
           "raw_key": "derive.Deserialize",
           "file": "tools/ts_ast_codegen/src/lib.rs",
           "byte_start": 365,
@@ -336,11 +329,11 @@
           "column": 1,
           "snippet": "#[derive(Debug, Deserialize)]",
           "scope": "active",
-          "fix_class": "manual",
+          "fix_class": "adapter",
           "release_safe_rewrite": false
         },
         {
-          "feature": "derives.unknown",
+          "feature": "ext.serde",
           "raw_key": "derive.Deserialize",
           "file": "tools/ts_ast_codegen/src/lib.rs",
           "byte_start": 539,
@@ -349,7 +342,7 @@
           "column": 1,
           "snippet": "#[derive(Debug, Deserialize)]",
           "scope": "active",
-          "fix_class": "manual",
+          "fix_class": "adapter",
           "release_safe_rewrite": false
         }
       ]
@@ -482,6 +475,70 @@
       ]
     },
     {
+      "id": "ext.serde_json",
+      "title": "External crate serde_json 1.0.150: from_str into Deserialize types",
+      "status": "unsupported",
+      "milestone": null,
+      "milestone_label": "no milestone",
+      "inventory_step": null,
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Named gap (w-tail). Split from ext.unknown_crate. In ts-rust, serde_json::from_str is called 5 times in the two codegen tools, always into a serde Deserialize type (or a String), and its Error reaches output through Display. A correct adapter must match serde_json error text and positions byte for byte and needs ext.serde first, so it is large. The tools run under Cargo and their output files are committed. See dependencies.json (decision cargo-built-tool). Probes: ext_serde_json.rs (lust-only oracle).",
+      "findings": 5,
+      "raw_uses": 5,
+      "prod_uses": 4,
+      "files": 3,
+      "prod_files": 3,
+      "prod_fns": 4,
+      "scopes": {
+        "active": 4,
+        "test-only": 1
+      },
+      "samples": [
+        {
+          "feature": "ext.serde_json",
+          "raw_key": "ext.expr.serde_json::from_str",
+          "file": "tools/ts_ast_codegen/src/ast.rs",
+          "byte_start": 1424,
+          "byte_end": 1444,
+          "line": 55,
+          "column": 26,
+          "snippet": "serde_json::from_str",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.serde_json",
+          "raw_key": "ext.expr.serde_json::from_str",
+          "file": "tools/ts_ast_codegen/src/ast.rs",
+          "byte_start": 41537,
+          "byte_end": 41557,
+          "line": 1210,
+          "column": 30,
+          "snippet": "serde_json::from_str",
+          "scope": "test-only",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.serde_json",
+          "raw_key": "ext.expr.serde_json::from_str",
+          "file": "tools/ts_ast_codegen/src/lib.rs",
+          "byte_start": 3795,
+          "byte_end": 3815,
+          "line": 169,
+          "column": 26,
+          "snippet": "serde_json::from_str",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
       "id": "unsafe.blocks",
       "title": "unsafe blocks and unsafe fns",
       "status": "unsupported",
@@ -590,6 +647,27 @@
       "samples": []
     },
     {
+      "id": "derives.unknown",
+      "title": "Derives other than the lust set",
+      "status": "unsupported",
+      "milestone": null,
+      "milestone_label": "no milestone",
+      "inventory_step": null,
+      "root_cause": "unsupported",
+      "fix_class": "manual",
+      "release_safe_rewrite": false,
+      "release_impact": "runtime-review",
+      "notes": "May be proc-macro derives from other crates. Proc macros stay out of PLAN.md. w-tail: every ts-rust use of this row was serde's derive(Deserialize), now ext.serde; this row stays as the catch-all for any other unknown derive.",
+      "findings": 0,
+      "raw_uses": 0,
+      "prod_uses": 0,
+      "files": 0,
+      "prod_files": 0,
+      "prod_fns": 0,
+      "scopes": {},
+      "samples": []
+    },
+    {
       "id": "ext.unknown_crate",
       "title": "External crate with no adapter decision yet",
       "status": "unsupported",
@@ -600,11 +678,11 @@
       "fix_class": "adapter",
       "release_safe_rewrite": false,
       "release_impact": "runtime-review",
-      "notes": "Add a decision in dependencies.json and a rule here. Only crates in the scanner EXT list produce ext.* keys; other crates show in the dependency report as unknown.",
+      "notes": "Add a decision in dependencies.json and a rule here. Only crates in the scanner EXT list produce ext.* keys; other crates show in the dependency report as unknown. w-tail split out ext.serde and ext.serde_json (the ts-rust codegen tools); bare one-segment paths are locals, not crate roots (analyze.rs resolve), so this row has no ts-rust files left. It stays as the catch-all for the next crate.",
       "findings": 0,
       "raw_uses": 0,
       "prod_uses": 0,
-      "files": 5,
+      "files": 0,
       "prod_files": 0,
       "prod_fns": 0,
       "scopes": {},
@@ -1070,9 +1148,9 @@
         "ts_ast_codegen",
         "ts_diagnostics_codegen"
       ],
-      "decision": "unknown",
+      "decision": "cargo-built-tool",
       "milestone": null,
-      "notes": "No decision yet. Add one to dependencies.json after review."
+      "notes": "Used only by the ts_ast_codegen and ts_diagnostics_codegen tools, which run under Cargo (verify.sh) with committed output. The Deserialize derive is a proc macro; a lust adapter crate cannot replace it, and a compiler built-in derive is large. Named gap: feature ext.serde (w-tail)."
     },
     {
       "name": "serde_json",
@@ -1086,9 +1164,9 @@
         "ts_ast_codegen",
         "ts_diagnostics_codegen"
       ],
-      "decision": "unknown",
+      "decision": "cargo-built-tool",
       "milestone": null,
-      "notes": "No decision yet. Add one to dependencies.json after review."
+      "notes": "Same two codegen tools as serde: from_str into Deserialize types. Needs ext.serde plus byte-exact serde_json error text. Named gap: feature ext.serde_json (w-tail)."
     },
     {
       "name": "signal-hook",
@@ -1131,9 +1209,9 @@
       "used_by": [
         "ts_goport"
       ],
-      "decision": "c-shim",
+      "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Typed arena and thread controls. Do not substitute a no-op."
+      "notes": "Adapter in library/deps: Name/Access over a one-arena model (thread.arena, opt.narenas, epoch, version, thread.tcache.enabled) with upstream error texts. Arena counts a program prints cannot match a jemalloc build; see the adapter README. Stats and typed modules beyond epoch/version are absent."
     },
     {
       "name": "tikv-jemallocator",
@@ -1217,153 +1295,153 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 739,
+    "supported_today_files": 741,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 739,
-        "lines": 539102,
-        "files_pct": 95.6,
-        "lines_pct": 94.4
+        "files": 741,
+        "lines": 544871,
+        "files_pct": 95.9,
+        "lines_pct": 95.4
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 739,
-        "lines": 539102,
-        "files_pct": 95.6,
-        "lines_pct": 94.4
+        "files": 741,
+        "lines": 544871,
+        "files_pct": 95.9,
+        "lines_pct": 95.4
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 739,
-        "lines": 539102,
-        "files_pct": 95.6,
-        "lines_pct": 94.4
+        "files": 741,
+        "lines": 544871,
+        "files_pct": 95.9,
+        "lines_pct": 95.4
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 746,
-        "lines": 546036,
-        "files_pct": 96.5,
-        "lines_pct": 95.6
+        "files": 748,
+        "lines": 551805,
+        "files_pct": 96.8,
+        "lines_pct": 96.6
       },
       {
         "id": "7",
         "label": "milestone 7: Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
-        "files": 767,
-        "lines": 562386,
-        "files_pct": 99.2,
-        "lines_pct": 98.4
+        "files": 768,
+        "lines": 563399,
+        "files_pct": 99.4,
+        "lines_pct": 98.6
       },
       {
         "id": "8",
         "label": "milestone 8: Port ts-rust (checked rewrites, small async state machine for ATA)",
-        "files": 769,
-        "lines": 567795,
-        "files_pct": 99.5,
-        "lines_pct": 99.4
+        "files": 770,
+        "lines": 568808,
+        "files_pct": 99.6,
+        "lines_pct": 99.6
       }
     ],
     "by_inventory_step": [
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 741,
-        "lines": 544511,
-        "files_pct": 95.9,
-        "lines_pct": 95.3
+        "files": 743,
+        "lines": 550280,
+        "files_pct": 96.1,
+        "lines_pct": 96.3
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 750,
+        "lines": 557214,
+        "files_pct": 97.0,
+        "lines_pct": 97.5
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 750,
+        "lines": 557214,
+        "files_pct": 97.0,
+        "lines_pct": 97.5
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 750,
+        "lines": 557214,
+        "files_pct": 97.0,
+        "lines_pct": 97.5
       },
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 769,
-        "lines": 567795,
-        "files_pct": 99.5,
-        "lines_pct": 99.4
+        "files": 770,
+        "lines": 568808,
+        "files_pct": 99.6,
+        "lines_pct": 99.6
       }
     ],
     "files_per_step_use": [
@@ -1458,10 +1536,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 22,
-        "lines": 17363,
-        "files_pct": 2.8,
-        "lines_pct": 3.0
+        "files": 20,
+        "lines": 11594,
+        "files_pct": 2.6,
+        "lines_pct": 2.0
       }
     ]
   },
@@ -1469,153 +1547,153 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 741,
+    "supported_today_files": 743,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 741,
-        "lines": 540127,
-        "files_pct": 95.2,
-        "lines_pct": 94.1
+        "files": 743,
+        "lines": 545896,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 741,
-        "lines": 540127,
-        "files_pct": 95.2,
-        "lines_pct": 94.1
+        "files": 743,
+        "lines": 545896,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 741,
-        "lines": 540127,
-        "files_pct": 95.2,
-        "lines_pct": 94.1
+        "files": 743,
+        "lines": 545896,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 748,
-        "lines": 547061,
-        "files_pct": 96.1,
-        "lines_pct": 95.3
+        "files": 750,
+        "lines": 552830,
+        "files_pct": 96.4,
+        "lines_pct": 96.3
       },
       {
         "id": "7",
         "label": "milestone 7: Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
-        "files": 772,
-        "lines": 564874,
-        "files_pct": 99.2,
-        "lines_pct": 98.4
+        "files": 773,
+        "lines": 565887,
+        "files_pct": 99.4,
+        "lines_pct": 98.6
       },
       {
         "id": "8",
         "label": "milestone 8: Port ts-rust (checked rewrites, small async state machine for ATA)",
-        "files": 774,
-        "lines": 570283,
-        "files_pct": 99.5,
-        "lines_pct": 99.4
+        "files": 775,
+        "lines": 571296,
+        "files_pct": 99.6,
+        "lines_pct": 99.6
       }
     ],
     "by_inventory_step": [
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 743,
-        "lines": 545536,
-        "files_pct": 95.5,
-        "lines_pct": 95.1
+        "files": 745,
+        "lines": 551305,
+        "files_pct": 95.8,
+        "lines_pct": 96.1
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 752,
+        "lines": 558239,
+        "files_pct": 96.7,
+        "lines_pct": 97.3
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 752,
+        "lines": 558239,
+        "files_pct": 96.7,
+        "lines_pct": 97.3
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 752,
+        "lines": 558239,
+        "files_pct": 96.7,
+        "lines_pct": 97.3
       },
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 774,
-        "lines": 570283,
-        "files_pct": 99.5,
-        "lines_pct": 99.4
+        "files": 775,
+        "lines": 571296,
+        "files_pct": 99.6,
+        "lines_pct": 99.6
       }
     ],
     "files_per_step_use": [
@@ -1710,10 +1788,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 25,
-        "lines": 18826,
-        "files_pct": 3.2,
-        "lines_pct": 3.3
+        "files": 23,
+        "lines": 13057,
+        "files_pct": 3.0,
+        "lines_pct": 2.3
       }
     ]
   },
@@ -2331,8 +2409,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "ext.unknown_crate"
+        "cinterop.system"
       ],
       "findings": 8
     },
@@ -7328,9 +7405,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8744,9 +8819,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10196,9 +10269,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.unknown_crate"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12125,9 +12196,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "ext.unknown_crate"
+        "ext.serde_json"
       ],
-      "findings": 0
+      "findings": 2
     },
     {
       "file": "tools/ts_ast_codegen/src/lib.rs",
@@ -12138,10 +12209,10 @@
       "parse_error": false,
       "missing_features": [
         "attrs.serde",
-        "derives.unknown",
-        "ext.unknown_crate"
+        "ext.serde",
+        "ext.serde_json"
       ],
-      "findings": 49
+      "findings": 50
     },
     {
       "file": "tools/ts_ast_codegen/src/main.rs",
@@ -12162,10 +12233,10 @@
       "parse_error": false,
       "missing_features": [
         "attrs.serde",
-        "derives.unknown",
-        "ext.unknown_crate"
+        "ext.serde",
+        "ext.serde_json"
       ],
-      "findings": 5
+      "findings": 7
     },
     {
       "file": "tools/ts_diagnostics_codegen/src/main.rs",
@@ -12479,7 +12550,33 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "derives.unknown",
+      "feature": "ext.serde_json",
+      "raw_key": "ext.expr.serde_json::from_str",
+      "file": "tools/ts_ast_codegen/src/ast.rs",
+      "byte_start": 1424,
+      "byte_end": 1444,
+      "line": 55,
+      "column": 26,
+      "snippet": "serde_json::from_str",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.serde_json",
+      "raw_key": "ext.expr.serde_json::from_str",
+      "file": "tools/ts_ast_codegen/src/ast.rs",
+      "byte_start": 41537,
+      "byte_end": 41557,
+      "line": 1210,
+      "column": 30,
+      "snippet": "serde_json::from_str",
+      "scope": "test-only",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.serde",
       "raw_key": "derive.Deserialize",
       "file": "tools/ts_ast_codegen/src/lib.rs",
       "byte_start": 198,
@@ -12488,7 +12585,7 @@
       "column": 1,
       "snippet": "#[derive(Debug, Deserialize)]",
       "scope": "active",
-      "fix_class": "manual",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
@@ -12518,7 +12615,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "derives.unknown",
+      "feature": "ext.serde",
       "raw_key": "derive.Deserialize",
       "file": "tools/ts_ast_codegen/src/lib.rs",
       "byte_start": 365,
@@ -12527,7 +12624,7 @@
       "column": 1,
       "snippet": "#[derive(Debug, Deserialize)]",
       "scope": "active",
-      "fix_class": "manual",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
@@ -12544,7 +12641,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "derives.unknown",
+      "feature": "ext.serde",
       "raw_key": "derive.Deserialize",
       "file": "tools/ts_ast_codegen/src/lib.rs",
       "byte_start": 539,
@@ -12553,7 +12650,7 @@
       "column": 1,
       "snippet": "#[derive(Debug, Deserialize)]",
       "scope": "active",
-      "fix_class": "manual",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
@@ -12583,7 +12680,7 @@
       "release_safe_rewrite": false
     },
     {
-      "feature": "derives.unknown",
+      "feature": "ext.serde",
       "raw_key": "derive.Deserialize",
       "file": "tools/ts_ast_codegen/src/lib.rs",
       "byte_start": 734,
@@ -12592,11 +12689,11 @@
       "column": 1,
       "snippet": "#[derive(Debug, Default, Deserialize)]",
       "scope": "active",
-      "fix_class": "manual",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
-      "feature": "derives.unknown",
+      "feature": "ext.serde",
       "raw_key": "derive.Deserialize",
       "file": "tools/ts_ast_codegen/src/lib.rs",
       "byte_start": 978,
@@ -12605,11 +12702,50 @@
       "column": 1,
       "snippet": "#[derive(Debug, Deserialize)]",
       "scope": "active",
-      "fix_class": "manual",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.serde_json",
+      "raw_key": "ext.expr.serde_json::from_str",
+      "file": "tools/ts_ast_codegen/src/lib.rs",
+      "byte_start": 3795,
+      "byte_end": 3815,
+      "line": 169,
+      "column": 26,
+      "snippet": "serde_json::from_str",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.serde_json",
+      "raw_key": "ext.expr.serde_json::from_str",
+      "file": "tools/ts_diagnostics_codegen/src/lib.rs",
+      "byte_start": 2138,
+      "byte_end": 2158,
+      "line": 81,
+      "column": 13,
+      "snippet": "serde_json::from_str",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.serde_json",
+      "raw_key": "ext.expr.serde_json::from_str",
+      "file": "tools/ts_diagnostics_codegen/src/lib.rs",
+      "byte_start": 14151,
+      "byte_end": 14171,
+      "line": 396,
+      "column": 5,
+      "snippet": "serde_json::from_str",
+      "scope": "active",
+      "fix_class": "adapter",
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 130,
+  "findings_total": 135,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],
