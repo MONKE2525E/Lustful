@@ -929,6 +929,18 @@ impl Clone for PathBuf {
     }
 }
 
+impl ToOwned for Path {
+    type Owned = PathBuf;
+
+    fn to_owned(&self) -> PathBuf {
+        PathBuf { inner: self.inner.to_os_string() }
+    }
+
+    fn clone_into(&self, target: &mut PathBuf) {
+        self.inner.clone_into(&mut target.inner);
+    }
+}
+
 impl Default for PathBuf {
     fn default() -> PathBuf {
         PathBuf::new()

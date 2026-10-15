@@ -820,6 +820,21 @@ impl FnGen<'_, '_> {
                             ctype(&rb)
                         )
                     }
+                    // An unsized slice newtype (Path, OsStr): an exact
+                    // Vec of the view's elements, wrapped in the Owned
+                    // type's single-field struct chain (PathBuf).
+                    CTy::Unsized(..) => {
+                        let owned_ty = self.p.adt(*a).variants[1].fields[0].ty;
+                        let Some((suffix, e)) = owned_vec_path(self.p, owned_ty) else { return None };
+                        let ec = cty(&self.p.tys, e);
+                        let et = ctype(&ec);
+                        let c = want_clone(self, &ec, "s_.ptr[i_]");
+                        format!(
+                            "    {} {o} = {{0}}; {{ {} s_ = {view}; lust_Vec v_ = lust_vec_with_capacity(s_.len, sizeof({et}), _Alignof({et})); for (uint64_t i_ = 0; i_ < s_.len; i_++) (({et}*)v_.ptr)[i_] = {c}; v_.len = s_.len; {o}{suffix} = v_; }}",
+                            ctype(&oc),
+                            ctype(&rb)
+                        )
+                    }
                     CTy::Ref(inner) => {
                         let c = want_clone(self, inner, &format!("(*{view})"));
                         format!("    {} {o} = {c};", ctype(&oc))
@@ -951,6 +966,51 @@ pub(super) fn cow_view(p: &Program, t: &CTy, ptr: &str, name: &str) -> Option<(C
     Some((rb.clone(), format!("{} {name} = {e};", ctype(&rb))))
 }
 
+/// The slice element type an unsized slice newtype (`Path`,
+/// `OsStr`, a user `struct S { inner: [T] }`) lays out as, following
+/// its unsized fields. None for any other type, and for a generic
+/// newtype whose field still names a parameter.
+pub(super) fn unsized_slice_elem(p: &Program, mut b: Ty) -> Option<Ty> {
+    loop {
+        match p.tys.kind(b) {
+            TyKind::Slice(e) => return Some(e),
+            TyKind::Adt(d, a) => {
+                let f = p.tys.unsized_field(d)?;
+                if !p.tys.args(a).is_empty() && p.tys.flags(f).contains_param() {
+                    return None;
+                }
+                b = f;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The C field path from an Owned value to the `Vec` buffer at its
+/// single-field struct chain's end (`PathBuf` to its `OsString`'s
+/// Vec: ".f0.f0"), and that Vec's element type. None when the chain
+/// is not single-field structs over one Vec.
+pub(super) fn owned_vec_path(p: &Program, mut t: Ty) -> Option<(String, Ty)> {
+    let mut path = String::new();
+    loop {
+        if let Some(e) = p.tys.vec_elem(t) {
+            return Some((path, e));
+        }
+        let a = p.tys.local_adt(t)?;
+        let adt = p.adt(a);
+        if adt.is_enum || adt.variants[0].fields.len() != 1 {
+            return None;
+        }
+        let f = adt.variants[0].fields[0].ty;
+        let (_, args) = p.tys.adt_parts(t)?;
+        if !p.tys.args(args).is_empty() && p.tys.flags(f).contains_param() {
+            return None;
+        }
+        path.push_str(".f0");
+        t = f;
+    }
+}
+
 /// `cow_view` as one C expression (the `&B` value).
 pub(super) fn cow_view_expr(p: &Program, t: &CTy, ptr: &str) -> Option<(CTy, String)> {
     let CTy::Adt(a) = t else { return None };
@@ -966,6 +1026,18 @@ pub(super) fn cow_view_expr(p: &Program, t: &CTy, ptr: &str) -> Option<(CTy, Str
             let sl = CTy::Slice(Box::new(cty(&p.tys, e)));
             let view = format!("(({}){{ ({}*)({f1}).ptr, ({f1}).len }})", ctype(&sl), ctype(&cty(&p.tys, e)));
             (sl, view)
+        }
+        // An unsized slice newtype (`Cow<Path>`, `Cow<OsStr>`): the
+        // view's C type is the newtype's fat slice form, and the
+        // owned value views as the slice of its Vec buffer.
+        TyKind::Adt(..) if unsized_slice_elem(p, b).is_some() => {
+            let e = unsized_slice_elem(p, b)?;
+            let rb = cty(&p.tys, b);
+            let owned_ty = p.adt(*a).variants[1].fields[0].ty;
+            let (suffix, _) = owned_vec_path(p, owned_ty)?;
+            let buf = format!("{f1}{suffix}");
+            let view = format!("(({}){{ ({}*)({buf}).ptr, ({buf}).len }})", ctype(&rb), ctype(&cty(&p.tys, e)));
+            (rb, view)
         }
         _ => (CTy::Ref(Box::new(cty(&p.tys, b))), format!("(&{f1})")),
     };

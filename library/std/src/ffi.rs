@@ -227,6 +227,19 @@ impl OsString {
     }
 }
 
+impl ToOwned for OsStr {
+    type Owned = OsString;
+
+    fn to_owned(&self) -> OsString {
+        self.to_os_string()
+    }
+
+    fn clone_into(&self, target: &mut OsString) {
+        target.clear();
+        target.push(self);
+    }
+}
+
 impl fmt::Debug for OsStr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         debug_bytes(&self.inner, f)

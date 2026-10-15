@@ -11176,8 +11176,11 @@ impl<'p> Ctx<'p> {
                     }
                     Builtin::StringNew => (vec![], STRING),
                     // `Cow::from(x)` (the String and Vec forms pick it in
-                    // their own arms): the argument picks the Cow, as each
-                    // source type has one std impl.
+                    // their own arms): the expected Cow if one is written,
+                    // else the argument picks the Cow: the str and slice
+                    // shapes first (their specific std impls), then the
+                    // two generic impls (`&B` borrows, a sized value is
+                    // its own Owned). Forming the Cow owes `B: ToOwned`.
                     Builtin::ConvInto => {
                         let at = if args.len() == 1 { self.expr(args[0], None) } else { ERROR };
                         let at = self.deep(at);
@@ -11185,15 +11188,52 @@ impl<'p> Ctx<'p> {
                             TyKind::Ref(_, m, i) => (i, Some(m)),
                             _ => (at, None),
                         };
-                        let b = match self.kind(inner) {
+                        let mut cands: Vec<Ty> = Vec::new();
+                        let expected_b = match expected {
+                            Some(t) => {
+                                let t = self.deep(t);
+                                crate::check::collect::cow_arg(&self.tys, t)
+                            }
+                            None => None,
+                        };
+                        if let Some(b) = expected_b {
+                            cands.push(b);
+                        }
+                        let shaped = match self.kind(inner) {
                             TyKind::Str if m.is_some() => Some(STR),
                             TyKind::Slice(_) if m.is_some() => Some(inner),
                             _ if self.tys.is_string_ty(inner) => Some(STR),
                             _ => self.tys.vec_elem(inner).map(|e| self.tys.intern(TyKind::Slice(e))),
                         };
-                        let dst = b.map(|b| self.tys.mk_adt(generics::cow_def(), &[GenericArg::Ty(b)]));
-                        match dst.and_then(|d| self.std_from_arg(d, at).map(|a| (d, a))) {
-                            Some((d, a)) => (vec![a], d),
+                        if let Some(b) = shaped
+                            && !cands.contains(&b)
+                        {
+                            cands.push(b);
+                        }
+                        if m.is_some_and(|mm| !mm.is_mut()) && !cands.contains(&inner) {
+                            cands.push(inner);
+                        }
+                        if m.is_none() && !cands.contains(&at) {
+                            cands.push(at);
+                        }
+                        let mut picked = None;
+                        for b in cands {
+                            let d = self.tys.mk_adt(generics::cow_def(), &[GenericArg::Ty(b)]);
+                            if let Some(a) = self.std_from_arg(d, at) {
+                                picked = Some((d, a, b));
+                                break;
+                            }
+                        }
+                        match picked {
+                            Some((d, a, b)) => {
+                                if let Some(idx) = p.gx.adt_info.iter().position(|&(def, _)| def == generics::cow_def()) {
+                                    let preds = p.gx.adt_generics[idx].predicates.clone();
+                                    if !preds.is_empty() {
+                                        self.push_predicates(&preds, &[GenericArg::Ty(b)], span);
+                                    }
+                                }
+                                (vec![a], d)
+                            }
                             None => {
                                 let tn = self.tn(at);
                                 if !matches!(self.kind(at), TyKind::Error) {
@@ -11201,7 +11241,7 @@ impl<'p> Ctx<'p> {
                                         "L0612",
                                         span,
                                         format!("`Cow` has no `From<{tn}>` impl that lust supports"),
-                                        "Pass `&str`, `String`, `&String`, `&[T]`, `Vec<T>`, or `&Vec<T>`.",
+                                        "Pass `&B` or `<B as ToOwned>::Owned` for some `B: ToOwned`, such as `&str` or `String`.",
                                     );
                                 }
                                 (vec![at], ERROR)

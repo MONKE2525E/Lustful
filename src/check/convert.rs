@@ -129,9 +129,34 @@ pub fn std_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Fr
         return Some(F::RcNew);
     }
     if let Some(b) = crate::check::collect::cow_arg(tys, dst) {
+        // The two generic impls of alloc::borrow, for every
+        // `B: ?Sized + ToOwned`: `From<&B>` is `Borrowed`, and
+        // `From<<B as ToOwned>::Owned>` is `Owned`. The Owned side
+        // answers here for the shapes structure decides (str, slices,
+        // a sized Clone `B` whose Owned is itself, and a mono
+        // instance whose Owned field is already concrete); a written
+        // `ToOwned` of any other shape is the checker's normalized
+        // answer in `std_from_here`.
+        if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && i == b) {
+            if let Some(el) = slice_elem(b)
+                && !has_clone(p, tys, el)
+            {
+                return None;
+            }
+            return Some(F::CowBorrowed);
+        }
+        if src == b && crate::check::collect::is_sized_ty(tys, b) && has_clone(p, tys, b) {
+            return Some(F::CowOwned);
+        }
+        if let Some(a) = tys.local_adt(dst)
+            && let Some(f) = p.adt(a).variants.get(1).and_then(|v| v.fields.first())
+            && f.ty == src
+            && !matches!(tys.kind(src), TyKind::Projection(..))
+        {
+            return Some(F::CowOwned);
+        }
         if tys.kind(b) == TyKind::Str {
             return match () {
-                _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.kind(i) == TyKind::Str) => Some(F::CowBorrowed),
                 _ if tys.is_string_ty(src) => Some(F::CowOwned),
                 _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.is_string_ty(i)) => Some(F::CowBorrowedView),
                 _ => None,
@@ -142,7 +167,6 @@ pub fn std_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Fr
             return None;
         }
         return match () {
-            _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && slice_elem(i) == Some(el)) => Some(F::CowBorrowed),
             _ if tys.vec_elem(src) == Some(el) => Some(F::CowOwned),
             _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.vec_elem(i) == Some(el)) => Some(F::CowBorrowedView),
             _ => None,
@@ -460,7 +484,7 @@ impl<'p> Ctx<'p> {
         // the one std impl that can apply fixes it in rustc (`5.into()`
         // as an `Option<i32>`, `[1, 2].into()` as a `Vec<i32>`).
         let src = if known(self, src) { src } else { self.std_from_literal_src(dst, src)? };
-        std_from(self.p, &self.tys, dst, src)?;
+        self.std_from_here(dst, src)?;
         self.set_res(e, Res::BuiltinMethod { b: Builtin::ConvInto, derefs: 0, autoref: Autoref::None });
         Some(dst)
     }
@@ -516,6 +540,23 @@ impl<'p> Ctx<'p> {
         if self.has_error_kind(at) {
             return None;
         }
-        std_from(self.p, &self.tys, dst, at).map(|_| at)
+        self.std_from_here(dst, at).map(|_| at)
+    }
+
+    /// `std_from` with the checker's normalization for the one shape
+    /// structure cannot decide: `Cow<B>` from `<B as ToOwned>::Owned`
+    /// where `B`'s `ToOwned` is a written impl (Path, OsStr, a user
+    /// unsized type). The projection must normalize to `src` here;
+    /// at lowering the mono instance's concrete Owned field answers
+    /// the same question in `std_from`.
+    fn std_from_here(&mut self, dst: Ty, src: Ty) -> Option<FromConv> {
+        if let Some(f) = std_from(self.p, &self.tys, dst, src) {
+            return Some(f);
+        }
+        let b = crate::check::collect::cow_arg(&self.tys, dst)?;
+        let a = self.tys.intern_args(&[GenericArg::Ty(b)]);
+        let pr = self.tys.intern(TyKind::Projection(AssocId(self.p.gx.lang.assoc_owned), a));
+        let owned = self.normalize_here(pr);
+        (owned != pr && owned == src).then_some(FromConv::CowOwned)
     }
 }

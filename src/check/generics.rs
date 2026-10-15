@@ -6719,15 +6719,27 @@ pub fn add_synthetic_impls(p: &mut Program) {
         for (dst, src) in [(STRING, mut_str), (STRING, cow_str), (bytes, STRING), (bytes, ref_str)] {
             insert_synthetic(p, &mut ordinal, lang.from, dst, &[src], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
-        for (dst, src) in [(cow_str, ref_str), (cow_str, STRING), (cow_str, ref_string)] {
-            insert_synthetic(p, &mut ordinal, lang.from, dst, &[src], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        // alloc::borrow's two generic Cow impls, for every
+        // `B: ?Sized + ToOwned`: `From<&B>` and `From<B::Owned>`.
+        // They cover Cow<str> from &str and String and Cow<[T]> from
+        // &[T] and Vec<T>; the &String and &Vec view impls of alloc
+        // stay specific below.
+        {
+            let cow_p0 = p.tys.mk_adt(cow_def(), &[GenericArg::Ty(p0)]);
+            let ref_p0 = p.tys.mk_ref(false, p0);
+            let a = p.tys.intern_args(&[GenericArg::Ty(p0)]);
+            let owned_p0 = p.tys.intern(TyKind::Projection(AssocId(lang.assoc_owned), a));
+            let mut g = one.clone();
+            g.predicates = pred_on_p0(p, lang.to_owned);
+            for src in [ref_p0, owned_p0] {
+                insert_synthetic(p, &mut ordinal, lang.from, cow_p0, &[src], g.clone(), Vec::new(), Synthetic::Lang, false, span);
+            }
         }
+        insert_synthetic(p, &mut ordinal, lang.from, cow_str, &[ref_string], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         for (dst, src) in [
             (vec_p0, ref_slice),
             (vec_p0, mut_slice),
             (vec_p0, cow_slice),
-            (cow_slice, ref_slice),
-            (cow_slice, vec_p0),
             (cow_slice, ref_vec),
         ] {
             insert_synthetic(p, &mut ordinal, lang.from, dst, &[src], cloned.clone(), Vec::new(), Synthetic::Lang, false, span);
