@@ -1215,6 +1215,87 @@ pub fn in_std_prelude(name: &str, ns: Namespace) -> bool {
     }
 }
 
+/// The canonical path (after the crate root) of one std prelude name:
+/// what `std::prelude` re-exports it from. Import resolution reads
+/// it to tell a glob-brought re-export of the prelude item itself
+/// (`pub use std::option::Option;` globbed in, then `use Option::*;`,
+/// which rustc accepts) from a different item of the same name
+/// (ambiguous with the prelude, rustc E0659).
+pub fn prelude_std_suffix(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "Option" => &["option", "Option"],
+        "Result" => &["result", "Result"],
+        "String" => &["string", "String"],
+        "Vec" => &["vec", "Vec"],
+        "Box" => &["boxed", "Box"],
+        "Copy" => &["marker", "Copy"],
+        "Clone" => &["clone", "Clone"],
+        "Debug" => &["fmt", "Debug"],
+        "Default" => &["default", "Default"],
+        "Eq" => &["cmp", "Eq"],
+        "PartialEq" => &["cmp", "PartialEq"],
+        "PartialOrd" => &["cmp", "PartialOrd"],
+        "Ord" => &["cmp", "Ord"],
+        "Hash" => &["hash", "Hash"],
+        "Iterator" => &["iter", "Iterator"],
+        "IntoIterator" => &["iter", "IntoIterator"],
+        "From" => &["convert", "From"],
+        "Into" => &["convert", "Into"],
+        "Send" => &["marker", "Send"],
+        "Sync" => &["marker", "Sync"],
+        "Sized" => &["marker", "Sized"],
+        "Drop" => &["ops", "Drop"],
+        "Fn" => &["ops", "Fn"],
+        "FnMut" => &["ops", "FnMut"],
+        "FnOnce" => &["ops", "FnOnce"],
+        "ToString" => &["string", "ToString"],
+        "ToOwned" => &["borrow", "ToOwned"],
+        "AsRef" => &["convert", "AsRef"],
+        "AsMut" => &["convert", "AsMut"],
+        "Borrow" => &["borrow", "Borrow"],
+        "BorrowMut" => &["borrow", "BorrowMut"],
+        "Deref" => &["ops", "Deref"],
+        "DerefMut" => &["ops", "DerefMut"],
+        "Unpin" => &["marker", "Unpin"],
+        "Some" => &["option", "Option", "Some"],
+        "None" => &["option", "Option", "None"],
+        "Ok" => &["result", "Result", "Ok"],
+        "Err" => &["result", "Result", "Err"],
+        _ => return None,
+    })
+}
+
+/// What one first segment binds to in one scope, for import and
+/// macro resolution (rustc E0659): ordinary resolution lets the
+/// innermost binding win, but a name a glob import brought into an
+/// inner scope does not shadow a different item of the same name in
+/// an outer scope (an outer block, the module, the std prelude, or
+/// the extern prelude): the two are ambiguous when an import path
+/// or a macro call resolves the name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SegBind {
+    /// Nothing in this scope binds the name.
+    None,
+    /// Two globs of the scope itself bring different items.
+    Ambiguous,
+    Target(Target),
+    /// A std import alias: the canonical std path it stands for.
+    Std(Vec<Sym>),
+    /// A std prelude item of this name (`Option`, `Some`, ...).
+    Prelude(Sym),
+    /// An extern crate root of the extern prelude, by index.
+    Extern(u32),
+}
+
+/// One scope's answer for a first segment: the binding, and whether
+/// it arrived by a glob import (rank 1) instead of a local item or
+/// an explicit import.
+#[derive(Clone, Debug)]
+pub struct SegInfo {
+    pub bind: SegBind,
+    pub glob: bool,
+}
+
 impl ResolvedTables {
     /// The extern prelude index of a crate name in the prelude of the
     /// crate `from` belongs to, if it is one there.
@@ -1346,6 +1427,79 @@ impl ResolvedTables {
             return PathRes::Prelude;
         }
         PathRes::Absent
+    }
+
+    /// The binding one first segment has in module `from` alone
+    /// (its map, its std aliases, then the extern prelude and the
+    /// std prelude), with its glob rank. Import resolution in a fn
+    /// body (`Rewrite::import_seg`) layers block frames over this;
+    /// `run_imports` reads it for module-level imports. A glob
+    /// binding of the module does not shadow a different prelude
+    /// or extern-prelude item here: that pair is `Ambiguous`, as
+    /// rustc reports for an import path through such a name.
+    pub fn module_seg(&self, from: ModuleId, name: Sym, ns: Namespace, interner: &Interner) -> SegInfo {
+        let name_str = interner.get(name);
+        let own: Option<(SegBind, bool)> = match self.lookup(from, ns, name) {
+            Some(BindState::Ambiguous) => return SegInfo { bind: SegBind::Ambiguous, glob: false },
+            Some(BindState::One(b)) if self.visible(&b.vis, b.def_module, from, interner) => {
+                Some((SegBind::Target(b.target), b.rank <= 1))
+            }
+            _ => {
+                let key = (from, ns_index(ns) as u8, name);
+                self.std_aliases.get(&key).map(|(_, p)| (SegBind::Std(p.clone()), self.std_glob_aliases.contains_key(&key)))
+            }
+        };
+        // The outer answers behind the module's own map. A
+        // non-glob binding shadows both; a glob binding of a
+        // different item is ambiguous with either.
+        let outer: Option<SegBind> = if let Some(i) = self.extern_in_scope(from, name_str) {
+            Some(SegBind::Extern(i))
+        } else if !self.modules[from.0 as usize].no_prelude && in_std_prelude(name_str, ns) {
+            Some(SegBind::Prelude(name))
+        } else {
+            None
+        };
+        match (own, outer) {
+            (Some((bind, glob)), Some(out)) => {
+                if glob && !self.same_seg(&bind, &out, interner) {
+                    SegInfo { bind: SegBind::Ambiguous, glob: true }
+                } else {
+                    SegInfo { bind, glob }
+                }
+            }
+            (Some((bind, glob)), None) => SegInfo { bind, glob },
+            (None, Some(out)) => SegInfo { bind: out, glob: false },
+            (None, None) => SegInfo { bind: SegBind::None, glob: false },
+        }
+    }
+
+    /// True when two scopes' bindings name the same item, so a
+    /// glob in one and any binding in the other are not ambiguous
+    /// (the same item reached by two paths never is). An extern
+    /// root equals its `Target` spellings; a std prelude item
+    /// equals a std alias of its canonical path.
+    pub fn same_seg(&self, a: &SegBind, b: &SegBind, interner: &Interner) -> bool {
+        match (a, b) {
+            (SegBind::Target(x), SegBind::Target(y)) => x == y,
+            (SegBind::Std(x), SegBind::Std(y)) => same_std_item(x, y),
+            (SegBind::Prelude(x), SegBind::Prelude(y)) => x == y,
+            (SegBind::Extern(x), SegBind::Extern(y)) => x == y,
+            (SegBind::Extern(i), SegBind::Target(t)) | (SegBind::Target(t), SegBind::Extern(i)) => {
+                *t == Target::Extern(*i) || (*t == self.extern_target(*i))
+            }
+            (SegBind::Extern(i), SegBind::Std(p)) | (SegBind::Std(p), SegBind::Extern(i)) => {
+                p.len() == 1 && interner.get(p[0]) == self.externs[*i as usize].name
+            }
+            (SegBind::Prelude(name), SegBind::Std(p)) | (SegBind::Std(p), SegBind::Prelude(name)) => {
+                match prelude_std_suffix(interner.get(*name)) {
+                    Some(suffix) => {
+                        p.len() > 1 && p[1..].iter().map(|s| interner.get(*s)).collect::<Vec<_>>().as_slice() == suffix
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Resolves one segment inside a module target, with visibility.
@@ -1693,6 +1847,45 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
             format!("unresolved import `{what}`"),
             "Check the path: every segment must name a module or item that is visible here.",
         ));
+    }
+    // Import resolution does not let a glob binding of this module
+    // shadow a different std-prelude or extern-prelude item of the
+    // same name (rustc E0659, e.g. a glob that brings a user `std`
+    // or `Option` next to `use std::vec::Vec;` or `use Option::*;`
+    // in the same module), where an ordinary path picks the glob
+    // binding. `module_seg` already folds that pair to Ambiguous.
+    // The glob's own path counts too: a glob whose first segment
+    // it rebinds from the prelude side is the same error. One
+    // diagnostic per (use item, name).
+    {
+        let mut seen: FxMap<(crate::diag::Span, Sym), ()> = FxMap::default();
+        for imp in imports {
+            if imp.leading_colon {
+                continue;
+            }
+            let path = match &imp.kind {
+                ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } => path,
+                ImportKind::BadLeading { .. } => continue,
+            };
+            let Some(&first) = path.first() else { continue };
+            if matches!(interner.get(first), "crate" | "self" | "super" | "Self") || tables.crate_magic.contains_key(&first) {
+                continue;
+            }
+            let nss: &[Namespace] = if path.len() == 1 && matches!(imp.kind, ImportKind::Single { .. }) {
+                &[Namespace::Type, Namespace::Value, Namespace::Macro]
+            } else {
+                &[Namespace::Type]
+            };
+            for &ns in nss {
+                let info = tables.module_seg(imp.module, first, ns, interner);
+                // Only the glob-vs-prelude pair: plain Ambiguous
+                // (two globs of the module) already errors where
+                // the import binds or stays unresolved.
+                if info.glob && matches!(info.bind, SegBind::Ambiguous) && seen.insert((imp.span, first), ()).is_none() {
+                    diags.push(ambiguous_diag(interner.get(first), imp.span));
+                }
+            }
+        }
     }
     Ok(diags)
 }

@@ -2454,7 +2454,9 @@ impl MacroEnv {
         // worklist seeds them per file).
         // A name two globs in one module bring as different macros, or
         // one glob brings from an ambiguous binding, gets one ambiguous
-        // seed instead: a plain call of it is the L0507 error.
+        // seed instead: a plain call of it is the L0507 error. A glob
+        // that brings a macro whose name std also exports (`assert`)
+        // is ambiguous with the std macro of that name the same way.
         let mut glob_seeds: Vec<Vec<crate::expand::MacroSeed>> = Vec::with_capacity(discs.len());
         for mine in &sites_by_disc {
             // (importing module, name) -> (glob target, source, ambiguous), in first-seen order.
@@ -2468,7 +2470,8 @@ impl MacroEnv {
                     bindings.iter().filter(|((m, _), _)| *m == target).map(|((_, n), src)| (*n, *src)).collect();
                 names.sort_by(|a, b| interner.get(a.0).cmp(interner.get(b.0)));
                 for (name, src_idx) in names {
-                    let amb = ambiguous.contains_key(&(target.clone(), name));
+                    let amb = ambiguous.contains_key(&(target.clone(), name))
+                        || crate::expand::builtin::is_std_macro_name(interner.get(name));
                     let key = (site.module.clone(), name);
                     match found.iter_mut().find(|(k, _)| *k == key) {
                         Some((_, (_, s, a))) => *a |= amb || *s != src_idx,
@@ -4768,6 +4771,198 @@ impl Rewrite<'_> {
         }
     }
 
+    /// One frame's binding of a first segment in one namespace, as
+    /// a `SegInfo`, for import resolution. Block items and explicit
+    /// imports are hard bindings; glob copies are soft. A local
+    /// variable never takes an import path's first segment, so
+    /// locals do not count here.
+    fn frame_seg(frame: &Frame, name: Sym, ns: Namespace) -> Option<SegInfo> {
+        let key = (name, ns_index(ns));
+        if ns == Namespace::Value && frame.items.contains(&name) {
+            // A block item hides any import of the name in its
+            // frame, as in `frame_hit`. Its target is not a
+            // `Target` the tables know; a path through it stays
+            // written, so only its hard rank matters here. The
+            // placeholder def never compares equal to a real one.
+            return Some(SegInfo { bind: SegBind::Target(Target::Def(DefId::PLACEHOLDER)), glob: false });
+        }
+        if let Some(b) = frame.imports.get(&key) {
+            return Some(match b {
+                LocalBind::Ambiguous => SegInfo { bind: SegBind::Ambiguous, glob: true },
+                LocalBind::Target(t) => SegInfo { bind: SegBind::Target(*t), glob: !frame.explicit.contains(&key) },
+            });
+        }
+        if let Some(p) = frame.std_imports.get(&key) {
+            return Some(SegInfo { bind: SegBind::Std(p.clone()), glob: !frame.explicit.contains(&key) });
+        }
+        None
+    }
+
+    /// Resolves a `use` path's first segment under import
+    /// resolution (rustc E0659): unlike ordinary paths (`resolve`),
+    /// a glob binding in an inner frame does not shadow a
+    /// different item in an outer frame, the module, the std
+    /// prelude, or the extern prelude: the pair is ambiguous. An
+    /// explicit import or block item in any frame is a hard
+    /// binding and stops the outward search. The same item by
+    /// two paths is never ambiguous. Returns the binding an
+    /// import through this segment reads, and whether a block
+    /// frame provided it (the caller then walks the rest of the
+    /// path from that binding instead of the module tables).
+    fn import_seg(&self, name: Sym, ns: Namespace, module: ModuleId, scopes: &[Frame]) -> (SegInfo, bool) {
+        let mut soft: Option<SegBind> = None;
+        for frame in scopes.iter().rev() {
+            let Some(info) = Self::frame_seg(frame, name, ns) else { continue };
+            if matches!(info.bind, SegBind::Ambiguous) {
+                return (SegInfo { bind: SegBind::Ambiguous, glob: true }, true);
+            }
+            match &soft {
+                None => {
+                    if info.glob {
+                        soft = Some(info.bind);
+                    } else {
+                        return (info, true);
+                    }
+                }
+                Some(prev) => {
+                    // The search does not stop at an outer binding
+                    // of the same item: a different binding further
+                    // out still makes the inner glob ambiguous (an
+                    // explicit import of `a::q` in an outer block
+                    // does not cover the module `q` behind it).
+                    if !self.tables.same_seg(prev, &info.bind, self.interner) {
+                        return (SegInfo { bind: SegBind::Ambiguous, glob: true }, true);
+                    }
+                }
+            }
+        }
+        let outer = self.tables.module_seg(module, name, ns, self.interner);
+        match soft {
+            None => (outer, false),
+            Some(prev) => {
+                if matches!(outer.bind, SegBind::None) {
+                    (SegInfo { bind: prev, glob: true }, true)
+                } else if matches!(outer.bind, SegBind::Ambiguous) || !self.tables.same_seg(&prev, &outer.bind, self.interner) {
+                    (SegInfo { bind: SegBind::Ambiguous, glob: true }, true)
+                } else {
+                    (SegInfo { bind: prev, glob: true }, true)
+                }
+            }
+        }
+    }
+
+    /// The import-resolution ambiguity check of one block `use`
+    /// item (see `block`): each flattened import's first segment
+    /// must not be ambiguous between a glob binding in scope and
+    /// an outer item. A leading `::` reads the extern prelude
+    /// only, and `crate`/`self`/`super` are keywords, so neither
+    /// can be ambiguous this way.
+    fn check_block_use(&mut self, ast: &Ast, idx: u32, module: ModuleId, scopes: &[Frame]) {
+        let Some(item) = ast.stmt_items.get(idx as usize) else { return };
+        let ItemKind::Use(u) = &item.kind else { return };
+        let span = item.span;
+        let mut flat = Vec::new();
+        flatten_use(&u.tree, module, VisKind::Priv, &mut flat, self.interner);
+        let mut seen: Vec<Sym> = Vec::new();
+        for imp in flat {
+            if imp.leading_colon {
+                continue;
+            }
+            let path: &[Sym] = match &imp.kind {
+                ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } => path,
+                ImportKind::BadLeading { .. } => continue,
+            };
+            let Some(&first) = path.first() else { continue };
+            if matches!(self.interner.get(first), "crate" | "self" | "super" | "Self") || self.tables.crate_magic.contains_key(&first) {
+                continue;
+            }
+            if seen.contains(&first) {
+                continue;
+            }
+            let nss: &[Namespace] = if path.len() == 1 && matches!(imp.kind, ImportKind::Single { .. }) {
+                &[Namespace::Type, Namespace::Value, Namespace::Macro]
+            } else {
+                &[Namespace::Type]
+            };
+            for &ns in nss {
+                let (info, _) = self.import_seg(first, ns, module, scopes);
+                if matches!(info.bind, SegBind::Ambiguous) {
+                    // Ambiguity this name already has in the module
+                    // tables alone (no frame glob over an outer
+                    // item) keeps its existing diagnostics; the
+                    // pair this check adds carries glob rank.
+                    if info.glob {
+                        seen.push(first);
+                        self.diags.push(ambiguous_diag(self.interner.get(first), span));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The resolution a `use` path gets when a block frame binds
+    /// its first segment: the rest of the path walks from that
+    /// binding (`import_seg`), as rustc reads it, instead of
+    /// from the module tables, where a nearer module binding of
+    /// the name may name a different item. None when no frame
+    /// binds the segment as a plain target (std aliases rewire
+    /// their path instead, in `stmt_item`).
+    fn frame_use_target(&self, path: &[Sym], leading: bool, module: ModuleId, scopes: &[Frame]) -> Option<PathRes> {
+        if leading || path.is_empty() {
+            return None;
+        }
+        let first = path[0];
+        if matches!(self.interner.get(first), "crate" | "self" | "super" | "Self") || self.tables.crate_magic.contains_key(&first) {
+            return None;
+        }
+        let (info, from_frame) = self.import_seg(first, Namespace::Type, module, scopes);
+        if !from_frame {
+            return None;
+        }
+        match info.bind {
+            SegBind::Target(t) => Some(match self.tables.walk_from(module, t, &path[1..], Namespace::Type, self.interner) {
+                PathRes::Partial(t2, rest) => PathRes::Partial(t2, rest + 1),
+                other => other,
+            }),
+            SegBind::Ambiguous => Some(PathRes::Ambiguous),
+            _ => None,
+        }
+    }
+
+    /// Binds every visible name of module `src` into the innermost
+    /// frame at glob rank, with the trait records a function-local
+    /// glob makes (`stmt_item`'s glob branch, shared by the
+    /// module-tables path and the frame-binding path).
+    fn glob_from_module(&mut self, ast: &mut Ast, src: ModuleId, module: ModuleId, scopes: &mut [Frame], span: Span) {
+        let mut entries = Vec::new();
+        for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+            for (name, state) in &self.tables.maps[src.0 as usize][ns_index(ns)] {
+                match state {
+                    BindState::One(b) if self.tables.visible(&b.vis, b.def_module, module, self.interner) => {
+                        entries.push((*name, ns, LocalBind::Target(b.target)));
+                    }
+                    BindState::Ambiguous => entries.push((*name, ns, LocalBind::Ambiguous)),
+                    _ => {}
+                }
+            }
+        }
+        for (name, ns, bind) in entries {
+            if ns == Namespace::Type
+                && let LocalBind::Target(target) = bind
+            {
+                self.record_use_trait_target(ast, span, target);
+            }
+            insert_local(scopes, name, ns, bind, 1);
+        }
+        for (ns, name, _, _, path) in self.tables.visible_std_aliases(src, module, self.interner) {
+            if ns == ns_index(Namespace::Type) as u8 {
+                self.record_use_trait_std(ast, span, &path);
+            }
+            insert_glob_local_std(scopes, name, ns as usize, path);
+        }
+    }
+
     /// True when the checker would read the rewritten head `flat` of a
     /// path to `def` as something else at this site. It reads a written
     /// name as a local or block item first (value paths of one segment),
@@ -5321,6 +5516,16 @@ impl Rewrite<'_> {
         for &idx in &items {
             self.stmt_item(ast, idx, module, scopes);
         }
+        // With the block's bindings complete, every `use` of the
+        // block re-reads its first segment under import resolution
+        // (`import_seg`): a glob binding in scope here does not
+        // shadow a different outer item for an import path, not
+        // even for the glob import's own path (rustc E0659). This
+        // second pass makes the check independent of item order,
+        // as the whole-block scope is in rustc.
+        for &idx in &items {
+            self.check_block_use(ast, idx, module, scopes);
+        }
         if !items.is_empty() {
             let outer: Vec<Frame> = scopes.iter().map(|f| Frame { locals: Vec::new(), ..f.clone() }).collect();
             for &idx in &items {
@@ -5470,6 +5675,49 @@ impl Rewrite<'_> {
         let self_ty = self.interner.intern("Self");
         let kw = |s: Sym| s == crate_sym || s == self_sym || s == super_sym;
         for imp in flat {
+            // A first segment a block frame binds to a std path
+            // (`use std::mem; use mem::swap;` in two blocks) reads
+            // as that path, as a written std path does below.
+            let mut imp = imp;
+            if !imp.leading_colon {
+                let first_of = |k: &ImportKind| match k {
+                    ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } => path.first().copied(),
+                    ImportKind::BadLeading { .. } => None,
+                };
+                if let Some(first) = first_of(&imp.kind)
+                    && !matches!(self.interner.get(first), "crate" | "self" | "super" | "Self")
+                    && !self.tables.crate_magic.contains_key(&first)
+                {
+                    let (info, from_frame) = self.import_seg(first, Namespace::Type, module, scopes);
+                    if from_frame
+                        && let SegBind::Std(alias) = info.bind
+                    {
+                        let rewire = |path: &mut Vec<Sym>| {
+                            let mut p = alias.clone();
+                            p.extend_from_slice(&path[1..]);
+                            *path = p;
+                        };
+                        match &mut imp.kind {
+                            ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } => rewire(path),
+                            ImportKind::BadLeading { .. } => {}
+                        }
+                    } else if matches!(imp.kind, ImportKind::Glob { .. })
+                        && matches!(info.bind, SegBind::Prelude(_))
+                        && let Some(suffix) = crate::resolve::imports::prelude_std_suffix(self.interner.get(first))
+                    {
+                        // A glob of a prelude enum by its prelude
+                        // name (`use Option::*;` in a body) reads as
+                        // the canonical std path below.
+                        if let ImportKind::Glob { path } = &mut imp.kind
+                            && path.len() == 1
+                        {
+                            let mut p = vec![self.interner.intern("std")];
+                            p.extend(suffix.iter().map(|s| self.interner.intern(s)));
+                            *path = p;
+                        }
+                    }
+                }
+            }
             match imp.kind {
                 ImportKind::BadLeading { .. } => {
                     self.diags.push(Diag::new(
@@ -5489,13 +5737,15 @@ impl Rewrite<'_> {
                         self.diags.extend(crate::resolve::imports::std_group_parent_diag(&path, span, self.interner));
                         continue;
                     }
-                    let ok = matches!(
-                        self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner),
-                        PathRes::Done(_)
-                    ) || matches!(
-                        self.tables.resolve_path(module, &path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner),
-                        PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt)
-                    );
+                    let ok = matches!(self.frame_use_target(&path, imp.leading_colon, module, scopes), Some(PathRes::Done(_)))
+                        || matches!(
+                            self.tables.resolve_module_path(module, &path, imp.leading_colon, self.interner),
+                            PathRes::Done(_)
+                        )
+                        || matches!(
+                            self.tables.resolve_path(module, &path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner),
+                            PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt)
+                        );
                     if !ok {
                         self.diags.push(Diag::new(
                             "L0506",
@@ -5562,16 +5812,21 @@ impl Rewrite<'_> {
                             }
                             continue;
                         }
-                        let target = match self.tables.resolve_module_path(module, mod_path, imp.leading_colon, self.interner) {
-                            PathRes::Done(t) => Some(t),
-                            _ => match self
-                                .tables
-                                .resolve_path(module, mod_path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner)
-                            {
-                                PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt) => {
-                                    Some(Target::Def(adt))
-                                }
-                                _ => None,
+                        let frame_target = self.frame_use_target(mod_path, imp.leading_colon, module, scopes);
+                        let target = match frame_target {
+                            Some(PathRes::Done(t)) => Some(t),
+                            Some(_) => None,
+                            None => match self.tables.resolve_module_path(module, mod_path, imp.leading_colon, self.interner) {
+                                PathRes::Done(t) => Some(t),
+                                _ => match self
+                                    .tables
+                                    .resolve_path(module, mod_path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner)
+                                {
+                                    PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt) => {
+                                        Some(Target::Def(adt))
+                                    }
+                                    _ => None,
+                                },
                             },
                         };
                         match target {
@@ -5591,17 +5846,20 @@ impl Rewrite<'_> {
                     // from it, as at module level (`try_import` in
                     // imports.rs): `use std::io::Write;` in a body binds
                     // the overlay trait, not the std compat tables.
-                    let modres = match self.tables.resolve_module_path(module, &path[..path.len() - 1], imp.leading_colon, self.interner) {
-                        PathRes::Done(Target::Extern(i))
-                            if path.len() == 3
-                                && let Some((m, false)) = self.tables.std_module_at(i, path[1], self.interner)
-                                && [Namespace::Type, Namespace::Value, Namespace::Macro]
-                                    .iter()
-                                    .any(|&ns| self.tables.lookup(m, ns, *path.last().unwrap()).is_some()) =>
-                        {
-                            PathRes::Done(Target::Module(m))
-                        }
-                        other => other,
+                    let modres = match self.frame_use_target(&path[..path.len() - 1], imp.leading_colon, module, scopes) {
+                        Some(res) => res,
+                        None => match self.tables.resolve_module_path(module, &path[..path.len() - 1], imp.leading_colon, self.interner) {
+                            PathRes::Done(Target::Extern(i))
+                                if path.len() == 3
+                                    && let Some((m, false)) = self.tables.std_module_at(i, path[1], self.interner)
+                                    && [Namespace::Type, Namespace::Value, Namespace::Macro]
+                                        .iter()
+                                        .any(|&ns| self.tables.lookup(m, ns, *path.last().unwrap()).is_some()) =>
+                            {
+                                PathRes::Done(Target::Module(m))
+                            }
+                            other => other,
+                        },
                     };
                     match modres {
                         PathRes::Done(Target::Module(src)) => {
@@ -5753,6 +6011,22 @@ impl Rewrite<'_> {
                         ));
                         continue;
                     }
+                    // A first segment a block frame binds (an outer
+                    // block's import) names the glob's source through
+                    // that binding, not through the module tables.
+                    if let Some(res) = self.frame_use_target(&path, imp.leading_colon, module, scopes) {
+                        match res {
+                            PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt) => {
+                                for v in self.tables.variants[&adt].clone() {
+                                    insert_local(scopes, v, Namespace::Value, LocalBind::Target(Target::Variant(adt, v)), 1);
+                                }
+                            }
+                            PathRes::Done(Target::Module(src)) => self.glob_from_module(ast, src, module, scopes, span),
+                            PathRes::Ambiguous => {}
+                            _ => self.push_unresolved_use(span, &path),
+                        }
+                        continue;
+                    }
                     // `use a::E::*;` in a body imports the variants.
                     if let PathRes::Done(Target::Def(adt)) =
                         self.tables.resolve_path(module, &path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner)
@@ -5804,36 +6078,29 @@ impl Rewrite<'_> {
                                     full.push(name);
                                     frame.std_imports.entry((name, ns_index(Namespace::Value))).or_insert(full);
                                 }
-                            }
-                        }
-                        PathRes::Done(Target::Module(src)) => {
-                        let mut entries = Vec::new();
-                        for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
-                            for (name, state) in &self.tables.maps[src.0 as usize][ns_index(ns)] {
-                                match state {
-                                    BindState::One(b) if self.tables.visible(&b.vis, b.def_module, module, self.interner) => {
-                                        entries.push((*name, ns, LocalBind::Target(b.target)));
+                                // A std glob can bring a module named
+                                // like the glob path's own first segment
+                                // (`alloc::*` brings `alloc::alloc`),
+                                // which lust does not model above:
+                                // record that one name, so import
+                                // resolution reports the glob binding
+                                // as ambiguous with the crate root the
+                                // segment names outside the block
+                                // (rustc E0659), as for user modules.
+                                if let Some(&first) = path.first() {
+                                    let mut cand = path.clone();
+                                    cand.push(first);
+                                    let cs: Vec<&str> = cand.iter().map(|s| self.interner.get(*s)).collect();
+                                    if matches!(
+                                        crate::resolve::stdpaths::std_has(&cs),
+                                        Some(crate::resolve::stdpaths::StdHas::Module | crate::resolve::stdpaths::StdHas::Enum)
+                                    ) {
+                                        frame.std_imports.entry((first, ns_index(Namespace::Type))).or_insert(cand);
                                     }
-                                    BindState::Ambiguous => entries.push((*name, ns, LocalBind::Ambiguous)),
-                                    _ => {}
                                 }
                             }
                         }
-                        for (name, ns, bind) in entries {
-                            if ns == Namespace::Type
-                                && let LocalBind::Target(target) = bind
-                            {
-                                self.record_use_trait_target(ast, span, target);
-                            }
-                            insert_local(scopes, name, ns, bind, 1);
-                        }
-                        for (ns, name, _, _, path) in self.tables.visible_std_aliases(src, module, self.interner) {
-                            if ns == ns_index(Namespace::Type) as u8 {
-                                self.record_use_trait_std(ast, span, &path);
-                            }
-                            insert_glob_local_std(scopes, name, ns as usize, path);
-                        }
-                        }
+                        PathRes::Done(Target::Module(src)) => self.glob_from_module(ast, src, module, scopes, span),
                         _ => self.push_unresolved_use(span, &path),
                     }
                 }
@@ -5896,6 +6163,17 @@ impl Rewrite<'_> {
             {
                 self.push_local_dup(span, name);
             }
+            return;
+        }
+        // A name an enclosing block's `use` binds (glob or
+        // explicit) is in scope for this import too, through the
+        // frames; ambiguity with an outer item is the L0507
+        // `check_block_use` reports, not an unresolved import.
+        if !leading
+            && [Namespace::Type, Namespace::Value, Namespace::Macro]
+                .iter()
+                .any(|&ns| matches!(self.import_seg(seg, ns, module, scopes), (info, true) if !matches!(info.bind, SegBind::None)))
+        {
             return;
         }
         let mut saw_private = false;
