@@ -825,6 +825,16 @@ uint64_t lust_wrapping_pow(uint64_t a, uint32_t e, unsigned bits) LUST_BODY({
 /* Euclid division: the quotient rounds toward negative infinity,
    the remainder is never negative. Both panic exactly as the plain
    operators do for a zero divisor and for MIN / -1. */
+/* Unsigned ceiling division (div_ceil): a / b rounded up. The
+   quotient-plus-remainder form cannot overflow. */
+uint64_t lust_div_ceil(uint64_t a, uint64_t b, unsigned bits, lust_loc loc) LUST_BODY({
+    uint64_t mask = lust_mask64(bits);
+    a &= mask;
+    b &= mask;
+    if (b == 0) { lust_panic_cstr("attempt to divide by zero", loc); return 0; }
+    return a / b + (a % b != 0);
+})
+
 uint64_t lust_div_euclid(uint64_t a, uint64_t b, unsigned bits, int is_signed, lust_loc loc) LUST_BODY({
     uint64_t mask = lust_mask64(bits);
     a &= mask;

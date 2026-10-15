@@ -4407,6 +4407,7 @@ impl FnGen<'_, '_> {
             | B::RotateRight
             | B::SwapBytes
             | B::ReverseBits
+            | B::DivCeil
             | B::DivEuclid
             | B::RemEuclid
             | B::Signum
@@ -5952,6 +5953,7 @@ impl FnGen<'_, '_> {
                 );
                 format!("(({ct}){r})")
             }
+            B::DivCeil => format!("(({ct})lust_div_ceil({ua}, {ub}, {bits}, {loc}))"),
             B::DivEuclid | B::StrictDivEuclid => format!("(({ct})lust_div_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
             B::RemEuclid | B::StrictRemEuclid => format!("(({ct})lust_rem_euclid({ua}, {ub}, {bits}, {}, {loc}))", sgn as i32),
             B::Signum => format!("(({ct})(({a} > 0) - ({a} < 0)))"),

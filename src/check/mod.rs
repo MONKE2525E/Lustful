@@ -142,6 +142,7 @@ pub enum Builtin {
     RotateRight,
     SwapBytes,
     ReverseBits,
+    DivCeil,
     DivEuclid,
     RemEuclid,
     Signum,
@@ -13944,6 +13945,10 @@ impl<'p> Ctx<'p> {
         }
         if n == k.div_euclid && !w128 {
             return bin(B::DivEuclid);
+        }
+        // `div_ceil` is unsigned only (there is no checked form).
+        if n == k.div_ceil && !s && !w128 {
+            return bin(B::DivCeil);
         }
         if n == k.rem_euclid && !w128 {
             return bin(B::RemEuclid);

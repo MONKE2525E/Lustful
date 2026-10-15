@@ -281,6 +281,7 @@ known_syms!(
     rotate_right,
     swap_bytes,
     reverse_bits,
+    div_ceil,
     div_euclid,
     rem_euclid,
     signum,

@@ -3835,6 +3835,12 @@ impl Evaluator {
             };
         }
         match name {
+            "div_ceil" => {
+                if signed || yb == 0 {
+                    return Err(over());
+                }
+                int_v(int_from_bits(xb / yb + u128::from(xb % yb != 0), it))
+            }
             "div_euclid" | "rem_euclid" | "checked_div_euclid" | "checked_rem_euclid" | "strict_div_euclid" | "strict_rem_euclid" => {
                 let r: Option<i128> = if yb == 0 || (signed && xs == lo && ys == -1) {
                     None
