@@ -3769,6 +3769,10 @@ impl<'b, 'p> Builder<'b, 'p> {
             // its captures reach neither the slice nor the unit result,
             // and `link_closure_args` gave its args the elements.
             _ if matches!(target, CallTarget::Builtin(b) if sort_by_builtin(b)) => {}
+            // So does `retain`'s predicate, which takes `&T`: its captures
+            // reach neither the Vec nor the unit result (`retain_mut` hands
+            // out `&mut T` and keeps the conservative rule).
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::VecRetain)) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if let CallTarget::Builtin(b @ (crate::check::Builtin::MapInsert | crate::check::Builtin::MapRemove)) = target
