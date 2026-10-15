@@ -16,9 +16,12 @@
 #      when it has the pinned commit, so no network; else from the fork's remote, with
 #      the reference for objects
 #
+# --deep: run scripts/tsrust_deep.py instead (lines kept out per root cause; its options:
+# --only a,b, --max-rounds N). Results: <out>/deep.json and a ranked table.
 # --boat: run all of this on a boat sandbox (/tmp/lust-wt/boat-run.sh, BOAT_RUN overrides).
 # boat-run.sh does not pack submodule trees, so only this job uploads the fork (one tar of its
-# tracked and untracked files, no target/). Results come back to ./boat-out/tsrust-full/.
+# tracked and untracked files, no target/). Results come back to ./boat-out/tsrust-full/
+# (--deep: ./boat-out/tsrust-full-deep/). TSRUST_BOAT_HOURS sets the time limit (default 3).
 # LUST=<path> runs another lust build (a census of a branch before it lands).
 # Needs: cargo and the fork's crates in the cargo registry (offline), lust built (scripts/build.sh).
 set -uo pipefail
@@ -26,10 +29,11 @@ set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 sub=third_party/ts-rust
-boat=0; out=${TMPDIR:-/tmp}/tsrust-full; args=()
+boat=0; deep=""; out=${TMPDIR:-/tmp}/tsrust-full; args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --boat) boat=1; shift;;
+    --deep) deep=--deep; shift;;
     --out) out=$2; shift 2;;
     *) args+=("$1"); shift;;
   esac
@@ -64,12 +68,13 @@ fork_tree() {
 if [ $boat = 1 ]; then
   fork_tree || exit 2
   W=$(mktemp -d "${TMPDIR:-/tmp}/tsrust-boat.XXXXXX")
-  git -C "$sub" rev-parse HEAD > "$sub/.fork-head" 2>/dev/null
-  (cd "$sub" && { git ls-files -co --exclude-standard -z; printf '.fork-head\0'; } | tar --null -T - -czf "$W/ts-rust.tgz") || exit 2
-  rm -f "$sub/.fork-head"
+  git -C "$sub" rev-parse HEAD > "$W/.fork-head" 2>/dev/null
+  (cd "$sub" && git ls-files -co --exclude-standard -z) > "$W/files" || exit 2
+  tar -czf "$W/ts-rust.tgz" -C "$sub" --null -T "$W/files" -C "$W" .fork-head || exit 2
   q=""; for x in "${args[@]}"; do q+=" $(printf %q "$x")"; done
-  "${BOAT_RUN:-/tmp/lust-wt/boat-run.sh}" --hours 3 --up "$W/ts-rust.tgz" --fetch tsrust-full -- \
-    "scripts/build.sh >/dev/null 2>&1 || { scripts/build.sh 2>&1 | tail -30; exit 8; }; scripts/tsrust-full.sh --out ~/w/tsrust-full$q"
+  name=tsrust-full${deep:+-deep}
+  "${BOAT_RUN:-/tmp/lust-wt/boat-run.sh}" --hours "${TSRUST_BOAT_HOURS:-3}" --up "$W/ts-rust.tgz" --fetch "$name" -- \
+    "scripts/build.sh >/dev/null 2>&1 || { scripts/build.sh 2>&1 | tail -30; exit 8; }; scripts/tsrust-full.sh $deep --out ~/w/$name$q"
   rc=$?; rm -rf "$W"; exit $rc
 fi
 
@@ -78,4 +83,5 @@ lust=${LUST:-$root/target/release/lust}
 [ -x "$lust" ] || { echo "tsrust-full: no $lust; run scripts/build.sh first" >&2; exit 2; }
 export LUST_TCC_HOME=${LUST_TCC_HOME:-/home/theo/.t3/projects/lust-lang/third_party/tcc}
 mkdir -p "$out"
+[ -n "$deep" ] && exec python3 "$root/scripts/tsrust_deep.py" --fork "$root/$sub" --lust "$lust" --work "$out" "${args[@]}"
 exec python3 "$root/scripts/tsrust_full.py" --fork "$root/$sub" --lust "$lust" --out "$out" "${args[@]}"
