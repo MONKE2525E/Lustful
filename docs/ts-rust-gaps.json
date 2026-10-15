@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 9670,
+  "elapsed_ms": 12433,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,24 +32,13 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 120,
-    "files_with_findings": 14,
+    "findings": 100,
+    "files_with_findings": 10,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
   },
   "root_causes": [
-    {
-      "root_cause": "external-crates",
-      "findings": 47,
-      "files": 19,
-      "features": [
-        "ext.rustix",
-        "ext.serde",
-        "ext.serde_json",
-        "ext.tikv_jemalloc_ctl"
-      ]
-    },
     {
       "root_cause": "attrs-cfg",
       "findings": 39,
@@ -67,9 +56,20 @@
       ]
     },
     {
+      "root_cause": "external-crates",
+      "findings": 27,
+      "files": 7,
+      "features": [
+        "ext.serde",
+        "ext.jiff",
+        "ext.serde_json",
+        "ext.lzma_rust2"
+      ]
+    },
+    {
       "root_cause": "c-interop",
       "findings": 5,
-      "files": 20,
+      "files": 8,
       "features": [
         "cinterop.extern",
         "cinterop.system"
@@ -213,71 +213,6 @@
       ]
     },
     {
-      "id": "ext.rustix",
-      "title": "Adapter crate rustix 1.1.5: fs, process, termios, pipe, event, stdio subsets",
-      "status": "unsupported",
-      "milestone": 0,
-      "milestone_label": "milestone 0: supported today",
-      "inventory_step": "10",
-      "root_cause": "external-crates",
-      "fix_class": "adapter",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh rustix (3 cases match the real crate; verified locally, the boat snapshot lacks the windows-link crate file cargo metadata needs). RawDir and std OwnedFd interop are absent, as the adapter README lists. Split from cinterop.system. See dependencies.json.",
-      "findings": 27,
-      "raw_uses": 27,
-      "prod_uses": 22,
-      "files": 14,
-      "prod_files": 6,
-      "prod_fns": 13,
-      "scopes": {
-        "active": 18,
-        "target-specific": 4,
-        "test-only": 5
-      },
-      "samples": [
-        {
-          "feature": "ext.rustix",
-          "raw_key": "ext.type.rustix::process::Pid",
-          "file": "crates/ts_goport/src/bin/tsgo.rs",
-          "byte_start": 3787,
-          "byte_end": 3807,
-          "line": 83,
-          "column": 15,
-          "snippet": "rustix::process::Pid",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "ext.rustix",
-          "raw_key": "ext.type.rustix::process::Pid",
-          "file": "crates/ts_goport/src/bin/tsgo.rs",
-          "byte_start": 16943,
-          "byte_end": 16963,
-          "line": 360,
-          "column": 19,
-          "snippet": "rustix::process::Pid",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "ext.rustix",
-          "raw_key": "ext.type.rustix::process::Pid",
-          "file": "crates/ts_goport/src/bin/tsgo.rs",
-          "byte_start": 22233,
-          "byte_end": 22253,
-          "line": 462,
-          "column": 56,
-          "snippet": "rustix::process::Pid",
-          "scope": "active",
-          "fix_class": "adapter",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
-    {
       "id": "ext.serde",
       "title": "External crate serde 1.0.228 with derive feature: Deserialize/Serialize derives (proc macros)",
       "status": "unsupported",
@@ -334,6 +269,69 @@
           "line": 26,
           "column": 1,
           "snippet": "#[derive(Debug, Deserialize)]",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
+      "id": "ext.jiff",
+      "title": "Adapter crate jiff 0.2: Timestamp and tz::TimeZone (TZif) for local times",
+      "status": "unsupported",
+      "milestone": 7,
+      "milestone_label": "milestone 7: Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
+      "inventory_step": "10",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs Timestamp::try_from(SystemTime), TimeZone::tzif (a TZif v1-v3 parser plus POSIX footer rule evaluation after the last transition), try_system, and civil date conversion, all exact at DST edges. That is its own adapter slice with a transition corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+      "findings": 6,
+      "raw_uses": 6,
+      "prod_uses": 6,
+      "files": 2,
+      "prod_files": 2,
+      "prod_fns": 5,
+      "scopes": {
+        "active": 6
+      },
+      "samples": [
+        {
+          "feature": "ext.jiff",
+          "raw_key": "ext.type.jiff::tz::TimeZone",
+          "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+          "byte_start": 11314,
+          "byte_end": 11332,
+          "line": 319,
+          "column": 28,
+          "snippet": "jiff::tz::TimeZone",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.jiff",
+          "raw_key": "ext.type.jiff::tz::TimeZone",
+          "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+          "byte_start": 11418,
+          "byte_end": 11436,
+          "line": 322,
+          "column": 44,
+          "snippet": "jiff::tz::TimeZone",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "ext.jiff",
+          "raw_key": "ext.type.jiff::tz::TimeZone",
+          "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+          "byte_start": 12012,
+          "byte_end": 12030,
+          "line": 341,
+          "column": 20,
+          "snippet": "jiff::tz::TimeZone",
           "scope": "active",
           "fix_class": "adapter",
           "release_safe_rewrite": false
@@ -518,6 +516,43 @@
       ]
     },
     {
+      "id": "ext.lzma_rust2",
+      "title": "Adapter crate lzma-rust2 0.21: LZMA stream reader and writer",
+      "status": "unsupported",
+      "milestone": 7,
+      "milestone_label": "milestone 7: Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
+      "inventory_step": "10",
+      "root_cause": "external-crates",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs an LZMA1 range decoder (embed.rs LzmaReader over the packed libs) and, for the build script, a byte-exact LzmaWriter. That is its own adapter slice with a stream corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+      "findings": 1,
+      "raw_uses": 1,
+      "prod_uses": 1,
+      "files": 2,
+      "prod_files": 1,
+      "prod_fns": 1,
+      "scopes": {
+        "active": 1
+      },
+      "samples": [
+        {
+          "feature": "ext.lzma_rust2",
+          "raw_key": "ext.type.lzma_rust2::LzmaReader",
+          "file": "crates/ts_goport/src/frontend/bundled/embed.rs",
+          "byte_start": 9714,
+          "byte_end": 9751,
+          "line": 279,
+          "column": 17,
+          "snippet": "lzma_rust2::LzmaReader<&'static [u8]>",
+          "scope": "active",
+          "fix_class": "adapter",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
       "id": "attrs.unsupported",
       "title": "Attribute names lust rejects",
       "status": "unsupported",
@@ -553,7 +588,7 @@
       "findings": 0,
       "raw_uses": 0,
       "prod_uses": 0,
-      "files": 18,
+      "files": 6,
       "prod_files": 0,
       "prod_fns": 0,
       "scopes": {},
@@ -596,27 +631,6 @@
       "raw_uses": 0,
       "prod_uses": 0,
       "files": 0,
-      "prod_files": 0,
-      "prod_fns": 0,
-      "scopes": {},
-      "samples": []
-    },
-    {
-      "id": "ext.tikv_jemalloc_ctl",
-      "title": "Adapter crate tikv-jemalloc-ctl 0.7.0: Name/Access arena keys, epoch, version",
-      "status": "unsupported",
-      "milestone": 0,
-      "milestone_label": "milestone 0: supported today",
-      "inventory_step": "10",
-      "root_cause": "external-crates",
-      "fix_class": "adapter",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh tikv-jemalloc-ctl (2 cases match the real crate). One-arena model: opt.narenas reads 1 and thread.arena 0, so a program that prints those values can differ from a jemalloc build (adapter README lists every such output); ts-rust only reads an arena and writes it back. Stats keys answer ENOENT and typed modules beyond epoch/version are absent. Split from cinterop.system. See dependencies.json.",
-      "findings": 0,
-      "raw_uses": 0,
-      "prod_uses": 0,
-      "files": 3,
       "prod_files": 0,
       "prod_fns": 0,
       "scopes": {},
@@ -755,9 +769,9 @@
       "used_by": [
         "ts_goport"
       ],
-      "decision": "c-shim",
+      "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Gzip encode and decode. Stream state can be opaque. INVENTORY Q4: gzip API over zlib."
+      "notes": "Adapter in library/deps: read side only (GzDecoder, MultiGzDecoder, ZlibDecoder, DeflateDecoder) over a pure-Rust inflate. Encoders absent: byte-exact miniz_oxide compression is not a small adapter, so pprof.rs stays blocked."
     },
     {
       "name": "goport_lsproto",
@@ -822,7 +836,7 @@
       ],
       "decision": "c-shim",
       "milestone": 7,
-      "notes": "Local time zone for diagnostic timestamps. INVENTORY Q4: built-in over localtime_r."
+      "notes": "Gap (w-cinterop2): not small. Needs Timestamp, a TZif parser with POSIX footer rules, try_system, and civil conversion, exact at DST edges. Its own adapter slice with a transition corpus."
     },
     {
       "name": "jiff",
@@ -841,7 +855,7 @@
       ],
       "decision": "c-shim",
       "milestone": 7,
-      "notes": "Local time zone for diagnostic timestamps. INVENTORY Q4: built-in over localtime_r."
+      "notes": "Gap (w-cinterop2): not small. Needs Timestamp, a TZif parser with POSIX footer rules, try_system, and civil conversion, exact at DST edges. Its own adapter slice with a transition corpus."
     },
     {
       "name": "lzma-rust2",
@@ -860,7 +874,7 @@
       ],
       "decision": "c-shim",
       "milestone": 7,
-      "notes": "Build-time use runs with Cargo in preparation. Add a decode shim for wasm."
+      "notes": "Gap (w-cinterop2): not small. Needs an LZMA1 range decoder for embed.rs and a byte-exact writer for the build script. Its own adapter slice with a stream corpus."
     },
     {
       "name": "lzma-rust2",
@@ -877,7 +891,7 @@
       ],
       "decision": "c-shim",
       "milestone": 7,
-      "notes": "Build-time use runs with Cargo in preparation. Add a decode shim for wasm."
+      "notes": "Gap (w-cinterop2): not small. Needs an LZMA1 range decoder for embed.rs and a byte-exact writer for the build script. Its own adapter slice with a stream corpus."
     },
     {
       "name": "memchr",
@@ -938,9 +952,9 @@
       "used_by": [
         "goport_util"
       ],
-      "decision": "c-shim",
+      "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Linux process and signal operations, fanotify, kqueue, prctl."
+      "notes": "Adapter in library/deps: only sys::prctl get/set_thp_disable and Errno over the sysx prctl shim. Everything else in nix is absent."
     },
     {
       "name": "nix",
@@ -957,9 +971,9 @@
         "ts_goport",
         "goport_util"
       ],
-      "decision": "c-shim",
+      "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Linux process and signal operations, fanotify, kqueue, prctl."
+      "notes": "Adapter in library/deps: only sys::prctl get/set_thp_disable and Errno over the sysx prctl shim. Everything else in nix is absent."
     },
     {
       "name": "notify",
@@ -1155,9 +1169,9 @@
       "used_by": [
         "ts_goport"
       ],
-      "decision": "c-shim",
+      "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Signal registration and flags. Handlers cannot call lust closures directly."
+      "notes": "Adapter in library/deps over the sysx signal registry: consts, flag, iterator (Signals over a self-pipe), and low_level raise/exit/abort/emulate_default_handler. No handler chaining; see the adapter README."
     },
     {
       "name": "smallvec",
@@ -1271,39 +1285,39 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 746,
+    "supported_today_files": 759,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 753,
-        "lines": 553589,
-        "files_pct": 97.4,
-        "lines_pct": 96.9
+        "files": 759,
+        "lines": 557699,
+        "files_pct": 98.2,
+        "lines_pct": 97.6
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 753,
-        "lines": 553589,
-        "files_pct": 97.4,
-        "lines_pct": 96.9
+        "files": 759,
+        "lines": 557699,
+        "files_pct": 98.2,
+        "lines_pct": 97.6
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 753,
-        "lines": 553589,
-        "files_pct": 97.4,
-        "lines_pct": 96.9
+        "files": 759,
+        "lines": 557699,
+        "files_pct": 98.2,
+        "lines_pct": 97.6
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 753,
-        "lines": 553589,
-        "files_pct": 97.4,
-        "lines_pct": 96.9
+        "files": 759,
+        "lines": 557699,
+        "files_pct": 98.2,
+        "lines_pct": 97.6
       },
       {
         "id": "7",
@@ -1326,90 +1340,90 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 748,
-        "lines": 551445,
-        "files_pct": 96.8,
-        "lines_pct": 96.5
+        "files": 761,
+        "lines": 563108,
+        "files_pct": 98.4,
+        "lines_pct": 98.6
       },
       {
         "id": "10",
@@ -1512,10 +1526,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 22,
-        "lines": 17363,
-        "files_pct": 2.8,
-        "lines_pct": 3.0
+        "files": 9,
+        "lines": 5700,
+        "files_pct": 1.2,
+        "lines_pct": 1.0
       }
     ]
   },
@@ -1523,39 +1537,39 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 748,
+    "supported_today_files": 762,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 755,
-        "lines": 554614,
-        "files_pct": 97.0,
-        "lines_pct": 96.7
+        "files": 762,
+        "lines": 559166,
+        "files_pct": 97.9,
+        "lines_pct": 97.5
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 755,
-        "lines": 554614,
-        "files_pct": 97.0,
-        "lines_pct": 96.7
+        "files": 762,
+        "lines": 559166,
+        "files_pct": 97.9,
+        "lines_pct": 97.5
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 755,
-        "lines": 554614,
-        "files_pct": 97.0,
-        "lines_pct": 96.7
+        "files": 762,
+        "lines": 559166,
+        "files_pct": 97.9,
+        "lines_pct": 97.5
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 755,
-        "lines": 554614,
-        "files_pct": 97.0,
-        "lines_pct": 96.7
+        "files": 762,
+        "lines": 559166,
+        "files_pct": 97.9,
+        "lines_pct": 97.5
       },
       {
         "id": "7",
@@ -1578,90 +1592,90 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 750,
-        "lines": 552470,
-        "files_pct": 96.4,
-        "lines_pct": 96.3
+        "files": 764,
+        "lines": 564575,
+        "files_pct": 98.2,
+        "lines_pct": 98.4
       },
       {
         "id": "10",
@@ -1764,10 +1778,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 25,
-        "lines": 18826,
-        "files_pct": 3.2,
-        "lines_pct": 3.3
+        "files": 11,
+        "lines": 6721,
+        "files_pct": 1.4,
+        "lines_pct": 1.2
       }
     ]
   },
@@ -1790,7 +1804,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system"
+        "ext.lzma_rust2"
       ],
       "findings": 0
     },
@@ -2381,11 +2395,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system",
-        "ext.rustix"
-      ],
-      "findings": 8
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p1.rs",
@@ -3274,9 +3285,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3296,9 +3305,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -3528,9 +3535,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -5651,8 +5656,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "ext.rustix"
+        "cinterop.system"
       ],
       "findings": 0
     },
@@ -5664,9 +5668,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system"
+        "ext.jiff"
       ],
-      "findings": 0
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/emit.rs",
@@ -5725,11 +5729,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system",
-        "ext.rustix"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/watcher.rs",
@@ -5979,9 +5980,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system"
+        "ext.lzma_rust2"
       ],
-      "findings": 0
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/frontend/bundled/noembed.rs",
@@ -6320,9 +6321,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6792,10 +6791,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/trackingvfs.rs",
@@ -6969,10 +6966,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "ext.rustix"
+        "cinterop.system"
       ],
-      "findings": 3
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/unix_bsd.rs",
@@ -6981,11 +6977,8 @@
       "scope": "target-specific",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system",
-        "ext.rustix"
-      ],
-      "findings": 4
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/fswatch/walkdir.rs",
@@ -7166,10 +7159,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/gostd/runtime.rs",
@@ -7198,9 +7189,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7372,9 +7361,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.tikv_jemalloc_ctl"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8594,9 +8581,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8786,9 +8771,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.tikv_jemalloc_ctl"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9081,9 +9064,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system"
+        "ext.jiff"
       ],
-      "findings": 0
+      "findings": 1
     },
     {
       "file": "crates/ts_goport/src/project/logging/logtree.rs",
@@ -9404,9 +9387,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -10726,9 +10707,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12068,10 +12047,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix",
-        "ext.tikv_jemalloc_ctl"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12101,11 +12077,8 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.system",
-        "ext.rustix"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/tsgo_panic_hook.rs",
@@ -12114,9 +12087,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "ext.rustix"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12218,66 +12189,79 @@
   ],
   "findings": [
     {
-      "feature": "ext.rustix",
-      "raw_key": "ext.type.rustix::process::Pid",
-      "file": "crates/ts_goport/src/bin/tsgo.rs",
-      "byte_start": 3787,
-      "byte_end": 3807,
-      "line": 83,
-      "column": 15,
-      "snippet": "rustix::process::Pid",
+      "feature": "ext.jiff",
+      "raw_key": "ext.type.jiff::tz::TimeZone",
+      "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+      "byte_start": 11314,
+      "byte_end": 11332,
+      "line": 319,
+      "column": 28,
+      "snippet": "jiff::tz::TimeZone",
       "scope": "active",
       "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.rustix",
-      "raw_key": "ext.type.rustix::process::Pid",
-      "file": "crates/ts_goport/src/bin/tsgo.rs",
-      "byte_start": 16943,
-      "byte_end": 16963,
-      "line": 360,
-      "column": 19,
-      "snippet": "rustix::process::Pid",
+      "feature": "ext.jiff",
+      "raw_key": "ext.type.jiff::tz::TimeZone",
+      "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+      "byte_start": 11418,
+      "byte_end": 11436,
+      "line": 322,
+      "column": 44,
+      "snippet": "jiff::tz::TimeZone",
       "scope": "active",
       "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.rustix",
-      "raw_key": "ext.type.rustix::process::Pid",
-      "file": "crates/ts_goport/src/bin/tsgo.rs",
-      "byte_start": 22233,
-      "byte_end": 22253,
-      "line": 462,
-      "column": 56,
-      "snippet": "rustix::process::Pid",
+      "feature": "ext.jiff",
+      "raw_key": "ext.type.jiff::tz::TimeZone",
+      "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+      "byte_start": 12012,
+      "byte_end": 12030,
+      "line": 341,
+      "column": 20,
+      "snippet": "jiff::tz::TimeZone",
       "scope": "active",
       "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.rustix",
-      "raw_key": "ext.type.rustix::process::Signal",
-      "file": "crates/ts_goport/src/bin/tsgo.rs",
-      "byte_start": 23076,
-      "byte_end": 23099,
-      "line": 480,
-      "column": 31,
-      "snippet": "rustix::process::Signal",
+      "feature": "ext.jiff",
+      "raw_key": "ext.type.jiff::tz::TimeZone",
+      "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+      "byte_start": 13963,
+      "byte_end": 13981,
+      "line": 388,
+      "column": 20,
+      "snippet": "jiff::tz::TimeZone",
       "scope": "active",
       "fix_class": "adapter",
       "release_safe_rewrite": false
     },
     {
-      "feature": "ext.rustix",
-      "raw_key": "ext.type.rustix::process::Pid",
-      "file": "crates/ts_goport/src/bin/tsgo.rs",
-      "byte_start": 25698,
-      "byte_end": 25718,
-      "line": 533,
-      "column": 10,
-      "snippet": "rustix::process::Pid",
+      "feature": "ext.jiff",
+      "raw_key": "ext.type.jiff::tz::TimeZone",
+      "file": "crates/ts_goport/src/execute/tsc/diagnostics.rs",
+      "byte_start": 14526,
+      "byte_end": 14544,
+      "line": 399,
+      "column": 59,
+      "snippet": "jiff::tz::TimeZone",
+      "scope": "active",
+      "fix_class": "adapter",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "ext.lzma_rust2",
+      "raw_key": "ext.type.lzma_rust2::LzmaReader",
+      "file": "crates/ts_goport/src/frontend/bundled/embed.rs",
+      "byte_start": 9714,
+      "byte_end": 9751,
+      "line": 279,
+      "column": 17,
+      "snippet": "lzma_rust2::LzmaReader<&'static [u8]>",
       "scope": "active",
       "fix_class": "adapter",
       "release_safe_rewrite": false
@@ -12634,7 +12618,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 120,
+  "findings_total": 100,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],
