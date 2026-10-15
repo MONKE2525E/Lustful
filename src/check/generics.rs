@@ -8587,6 +8587,86 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
     }
 }
 
+/// The written `Clone`, `Default`, `PartialEq`, and `PartialOrd`
+/// method instances of one concrete Adt, for the derive glue
+/// (`gx.glue_methods`, `gx.pcmp_methods`): selection on the Adt's
+/// full type, as in `ensure_fmt_methods`. `compute_glue_methods`
+/// records the non-generic impls in finish_collect; this adds the
+/// generic ones (an `impl<S, S2> PartialEq<M<S2>> for M<S>`, std's
+/// `impl<T: Clone> Clone for OnceCell<T>`), instantiated here where
+/// the concrete Adt is known. An entry is recorded only when the
+/// glue walk also accepts the type (`written_glue_impl` on the
+/// check side, same `ne`/`lt` and Copy guards), so check and cgen
+/// agree on which types compare, clone, and default by glue.
+fn ensure_glue_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) {
+    use crate::traits::index::Synthetic;
+    let Some(self_ty) = p.tys.full_adt_ty(adt) else { return };
+    if p.tys.flags(self_ty).contains_param() {
+        return;
+    }
+    let lang = p.gx.lang;
+    for (trait_def, method) in
+        [(lang.clone, "clone"), (lang.default, "default"), (lang.partial_eq, "eq"), (lang.partial_ord, "partial_cmp")]
+    {
+        if p.gx.glue_methods.contains_key(&(adt, trait_def)) && (trait_def != lang.partial_ord || p.gx.pcmp_methods.contains_key(&(adt, trait_def))) {
+            continue;
+        }
+        let mut a = vec![GenericArg::Ty(self_ty)];
+        if trait_def == lang.partial_eq || trait_def == lang.partial_ord {
+            a.push(GenericArg::Ty(self_ty));
+        }
+        let args_id = p.tys.intern_args(&a);
+        let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
+        let sel = {
+            let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+            let mut solver = Solver::new();
+            solver.select(&mut cx, &p.gx.index, &[], tr)
+        };
+        let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
+        let record = p.gx.index.get(id).clone();
+        if record.synthetic != Synthetic::None {
+            continue;
+        }
+        let has = |p: &Program, n: &str| record.items.iter().any(|&m| p.local_def(m.hash).is_some_and(|l| p.name(p.fn_info(l).name) == n));
+        let Some(local) =
+            record.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == method))
+        else {
+            continue;
+        };
+        let (has_ne, has_rel) = (has(p, "ne"), ["lt", "le", "gt", "ge"].iter().any(|&n| has(p, n)));
+        let has_lt = has(p, "lt");
+        // Which glue maps take this method, on `compute_glue_methods`'
+        // terms, gated on the walk that answers for the same glue.
+        let mut to_glue = false;
+        let mut to_pcmp = false;
+        if trait_def == lang.clone {
+            let copy_args = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
+            to_glue = crate::check::collect::has_clone(p, &p.tys, self_ty)
+                && !prove_goal(p, &[], TraitRef { def: lang.copy, args: copy_args, bindings: EMPTY_BINDINGS });
+        } else if trait_def == lang.default {
+            to_glue = crate::check::collect::has_default(p, &p.tys, self_ty);
+        } else if trait_def == lang.partial_eq {
+            to_glue = !has_ne && crate::check::collect::has_eq(p, &p.tys, self_ty);
+        } else {
+            to_pcmp = !has_lt && crate::check::collect::has_partial_cmp(p, &p.tys, self_ty);
+            let ord_args = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
+            to_glue = !has_rel
+                && !prove_goal(p, &[], TraitRef { def: lang.ord, args: ord_args, bindings: EMPTY_BINDINGS })
+                && crate::check::collect::has_ord(p, &p.tys, self_ty);
+        }
+        if !to_glue && !to_pcmp {
+            continue;
+        }
+        let f = iter_fn_instance(p, local, &impl_args, queue);
+        if to_glue {
+            p.gx.glue_methods.entry((adt, trait_def)).or_insert(f);
+        }
+        if to_pcmp {
+            p.gx.pcmp_methods.entry((adt, trait_def)).or_insert(f);
+        }
+    }
+}
+
 /// One impl method at its concrete instance, for `ensure_iter_methods`:
 /// the plain fn when the impl is not a template, else its instance
 /// (queued for checking when new), as in `ensure_fmt_methods`.
@@ -8980,6 +9060,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             for a in adt_ids {
                 ensure_drop_method(p, a, &mut next_queue);
                 ensure_fmt_methods(p, a, &mut next_queue);
+                ensure_glue_methods(p, a, &mut next_queue);
                 ensure_hash_methods(p, a, &mut next_queue);
                 ensure_iter_methods(p, a, &mut next_queue);
             }
@@ -9431,9 +9512,9 @@ fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
 /// Fills `glue_methods`: the written `Clone`, `Default`, and
 /// `PartialEq` (with `Rhs = Self` and no `ne` of its own) methods
 /// derived glue may call. Only non-generic impls on non-generic
-/// local Adts qualify (their method is a plain fn with a slot); a
-/// field type with any other written impl keeps the derive rejected
-/// where it is used.
+/// local Adts qualify here (their method is a plain fn with a
+/// slot); generic impls join per concrete Adt in
+/// `ensure_glue_methods` during mono.
 fn compute_glue_methods(p: &mut Program) {
     use crate::traits::index::Synthetic;
     let lang = p.gx.lang;

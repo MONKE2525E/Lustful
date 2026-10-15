@@ -5841,6 +5841,176 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
+/// Matches one impl pattern type (in the global store) against a
+/// caller type, recording parameter assignments (`assign[i]` is the
+/// caller type for `Param(i)`). Only shapes a glue impl header can
+/// take in practice match: parameters, Adts, references and raw
+/// pointers, tuples, arrays, slices, and scalars; lifetimes are not
+/// compared, const arguments must be equal values. Anything else
+/// does not match, which can only keep a reject.
+fn match_impl_pat(p: &Program, tys: &impl TyIntern, pat: Ty, t: Ty, assign: &mut Vec<Option<Ty>>) -> bool {
+    match p.tys.kind(pat) {
+        TyKind::Param(id) => {
+            let i = id.0 as usize;
+            if assign.len() <= i {
+                assign.resize(i + 1, None);
+            }
+            match assign[i] {
+                Some(prev) => prev == t,
+                None => {
+                    assign[i] = Some(t);
+                    true
+                }
+            }
+        }
+        TyKind::Adt(def, args) => {
+            let TyKind::Adt(def2, args2) = tys.kind(t) else { return false };
+            if def != def2 {
+                return false;
+            }
+            let (pa, ta): (Vec<GenericArg>, Vec<GenericArg>) = (p.tys.args(args).to_vec(), tys.args(args2).to_vec());
+            pa.len() == ta.len()
+                && pa.iter().zip(&ta).all(|(g, h)| match (g.as_ty(), h.as_ty(), g, h) {
+                    (Some(x), Some(y), _, _) => match_impl_pat(p, tys, x, y, assign),
+                    (_, _, GenericArg::Const(c), GenericArg::Const(d)) => p.tys.const_kind(*c) == tys.const_kind(*d),
+                    (_, _, GenericArg::Lifetime(_), GenericArg::Lifetime(_)) => true,
+                    _ => false,
+                })
+        }
+        TyKind::Ref(_, m, e) => matches!(tys.kind(t), TyKind::Ref(_, m2, e2) if m == m2 && match_impl_pat(p, tys, e, e2, assign)),
+        TyKind::RawPtr(m, e) => matches!(tys.kind(t), TyKind::RawPtr(m2, e2) if m == m2 && match_impl_pat(p, tys, e, e2, assign)),
+        TyKind::Slice(e) => matches!(tys.kind(t), TyKind::Slice(e2) if match_impl_pat(p, tys, e, e2, assign)),
+        TyKind::Array(e, n) => {
+            matches!(tys.kind(t), TyKind::Array(e2, n2) if p.tys.const_kind(n) == tys.const_kind(n2) && match_impl_pat(p, tys, e, e2, assign))
+        }
+        TyKind::Tuple(ts) => match tys.kind(t) {
+            TyKind::Tuple(ts2) => {
+                let (xs, ys): (Vec<Ty>, Vec<Ty>) = (p.tys.tys_of(ts).to_vec(), tys.tys_of(ts2).to_vec());
+                xs.len() == ys.len() && xs.iter().zip(&ys).all(|(&x, &y)| match_impl_pat(p, tys, x, y, assign))
+            }
+            _ => false,
+        },
+        TyKind::Int(i) => tys.kind(t) == TyKind::Int(i),
+        TyKind::Float(f) => tys.kind(t) == TyKind::Float(f),
+        TyKind::Bool => tys.kind(t) == TyKind::Bool,
+        TyKind::Char => tys.kind(t) == TyKind::Char,
+        TyKind::Unit => tys.kind(t) == TyKind::Unit,
+        TyKind::Str => tys.kind(t) == TyKind::Str,
+        TyKind::Never => tys.kind(t) == TyKind::Never,
+        _ => false,
+    }
+}
+
+/// Proves one predicate of a written glue impl after matching:
+/// trait predicates whose Self (and `Rhs`) are single matched
+/// parameters, by the glue walk of their trait. Anything else is
+/// not proven here (the impl then does not count for glue, which
+/// can only keep a reject), except outlives predicates, which do
+/// not change what the glue calls (as in `prove_trait_ref`).
+fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assign: &[Option<Ty>], seen: &mut Vec<Ty>) -> bool {
+    let lang = &p.gx.lang;
+    let arg_ty = |g: &GenericArg| -> Option<Ty> {
+        match g.as_ty().map(|t| p.tys.kind(t)) {
+            Some(TyKind::Param(id)) => assign.get(id.0 as usize).copied().flatten(),
+            _ => None,
+        }
+    };
+    match pred {
+        Predicate::Trait(b) if b.count == 0 => {
+            let args = p.tys.args(b.value.args);
+            let Some(self_ty) = args.first().and_then(arg_ty) else { return false };
+            let rhs = args.get(1).and_then(arg_ty);
+            let d = b.value.def;
+            if d == lang.sized {
+                true
+            } else if d == lang.clone {
+                glue_clone(p, tys, self_ty, seen)
+            } else if d == lang.partial_eq {
+                rhs == Some(self_ty) && glue_eq(p, tys, self_ty, seen)
+            } else if d == lang.partial_ord {
+                rhs == Some(self_ty) && glue_cmp(p, tys, self_ty, false, seen)
+            } else if d == lang.ord {
+                glue_cmp(p, tys, self_ty, true, seen)
+            } else if d == lang.hash {
+                glue_hash(p, tys, self_ty, seen)
+            } else if d == lang.default {
+                glue_default(p, tys, self_ty, seen)
+            } else if d == lang.debug {
+                glue_debug(p, tys, self_ty, seen)
+            } else if d == lang.display {
+                has_display(p, tys, self_ty)
+            } else if d == lang.copy {
+                is_copy(p, tys, self_ty)
+            } else {
+                false
+            }
+        }
+        Predicate::Trait(_) => false,
+        Predicate::Outlives(..) | Predicate::TypeOutlives(..) => true,
+        Predicate::AssocEq(_) => false,
+    }
+}
+
+/// True when a written (not derived) impl of `trait_def` applies to
+/// Adt type `t` and the glue can call its `method`: the impl header
+/// matches `t` (and `rhs` for `PartialEq`/`PartialOrd`, which glue
+/// only ever asks with `Rhs = Self`), its bounds hold by glue
+/// walks, and it carries none of `bad_items` (a written `ne` or
+/// `lt` changes what the glue's one call must mean; see
+/// `compute_glue_methods`). Generic impls count: mono instantiates
+/// the method for each concrete Adt (`ensure_glue_methods`), which
+/// inserts exactly the impls this answer accepts. For `Clone`, a
+/// `Copy` type's written `clone` does not count, as there.
+fn written_glue_impl(
+    p: &Program,
+    tys: &impl TyIntern,
+    t: Ty,
+    trait_def: DefId,
+    method: &str,
+    bad_items: &[&str],
+    seen: &mut Vec<Ty>,
+) -> bool {
+    use crate::traits::index::{SelfHead, Synthetic};
+    if seen.contains(&t) {
+        return true;
+    }
+    let Some((def, _)) = tys.adt_parts(t) else { return false };
+    let lang = &p.gx.lang;
+    if trait_def == lang.clone
+        && p.gx.index.impls_of_trait(lang.copy).iter().any(|&id| {
+            let rec = p.gx.index.get(id);
+            rec.head == SelfHead::Adt(def) && match_impl_pat(p, tys, rec.self_ty(&p.tys), t, &mut Vec::new())
+        })
+    {
+        return false;
+    }
+    let has_item = |rec: &crate::traits::index::ImplRecord, n: &str| {
+        rec.items.iter().any(|&m| p.local_def(m.hash).is_some_and(|l| p.name(p.fn_info(l).name) == n))
+    };
+    p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
+        let rec = p.gx.index.get(id);
+        if rec.synthetic != Synthetic::None || rec.head != SelfHead::Adt(def) {
+            return false;
+        }
+        if !has_item(rec, method) || bad_items.iter().any(|&n| has_item(rec, n)) {
+            return false;
+        }
+        let mut assign: Vec<Option<Ty>> = Vec::new();
+        if !match_impl_pat(p, tys, rec.self_ty(&p.tys), t, &mut assign) {
+            return false;
+        }
+        if (trait_def == lang.partial_eq || trait_def == lang.partial_ord)
+            && !p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty()).is_some_and(|r| match_impl_pat(p, tys, r, t, &mut assign))
+        {
+            return false;
+        }
+        seen.push(t);
+        let ok = rec.generics.predicates.iter().all(|pred| glue_impl_pred_holds(p, tys, pred, &assign, seen));
+        seen.pop();
+        ok
+    })
+}
+
 pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     glue_clone(p, tys, t, &mut Vec::new())
 }
@@ -5902,9 +6072,10 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
             if p.gx.glue_methods.contains_key(&(a, p.gx.lang.clone)) {
                 return true;
             }
-            p.adt(a).derives.clone && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_clone(p, tys, f, seen))
+            (p.adt(a).derives.clone && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
+                || written_glue_impl(p, tys, t, p.gx.lang.clone, "clone", &[], seen)
         }
-        None => is_copy(p, tys, t),
+        None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, "clone", &[], seen),
     }
 }
 
@@ -5980,6 +6151,18 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
             if let Some((a, b)) = tys.result_args(t) {
                 return glue_cmp_mode(p, tys, a, total, seen, pcmp) && glue_cmp_mode(p, tys, b, total, seen, pcmp);
             }
+            // The `Cmp` glue's written method needs no `Ord` impl on
+            // the type (its `partial_cmp` is then every ordering), as
+            // in `compute_glue_methods`.
+            let no_ord = !total
+                && !pcmp
+                && tys.adt_parts(t).is_some_and(|(def, _)| {
+                    !p.gx.index.impls_of_trait(p.gx.lang.ord).iter().any(|&id| {
+                        let rec = p.gx.index.get(id);
+                        rec.head == crate::traits::index::SelfHead::Adt(def)
+                            && match_impl_pat(p, tys, rec.self_ty(&p.tys), t, &mut Vec::new())
+                    })
+                });
             match tys.local_adt(t) {
                 // A written non-generic `PartialOrd` (and no `Ord`): the
                 // glue calls its `partial_cmp`.
@@ -5987,6 +6170,17 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                 // The `PCmp` glue calls a written `partial_cmp` even
                 // when an `Ord` impl also exists.
                 Some(a) if pcmp && !total && p.gx.pcmp_methods.contains_key(&(a, p.gx.lang.partial_ord)) => true,
+                // A written generic `PartialOrd`: as the two arms
+                // above, through `written_glue_impl` (mono makes the
+                // instance `ensure_glue_methods` records).
+                Some(_) if pcmp && !total && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, "partial_cmp", &["lt"], seen) => true,
+                Some(a)
+                    if no_ord
+                        && !p.adt(a).derives.ord
+                        && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, "partial_cmp", &["lt", "le", "gt", "ge"], seen) =>
+                {
+                    true
+                }
                 Some(a) => {
                     let d = p.adt(a).derives;
                     if !(if total { d.ord } else { d.partial_ord }) {
@@ -6284,6 +6478,9 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
                     if p.gx.glue_methods.contains_key(&(a, p.gx.lang.default)) {
                         return true;
                     }
+                    if written_glue_impl(p, tys, t, p.gx.lang.default, "default", &[], seen) {
+                        return true;
+                    }
                     let adt = p.adt(a);
                     if !adt.derives.default {
                         return false;
@@ -6291,7 +6488,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
                     // An enum's default is its unit `#[default]` variant.
                     adt.is_enum || adt_fields_all(p, a, t, seen, &mut |f, seen| glue_default(p, tys, f, seen))
                 }
-                None => false,
+                None => written_glue_impl(p, tys, t, p.gx.lang.default, "default", &[], seen),
             }
         }
     }
@@ -6347,8 +6544,11 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
             match tys.local_adt(t) {
                 // A written non-generic impl: the glue calls its `eq`.
                 Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,
-                Some(a) => p.adt(a).derives.partial_eq && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_eq(p, tys, f, seen)),
-                None => false,
+                Some(a) => {
+                    (p.adt(a).derives.partial_eq && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
+                        || written_glue_impl(p, tys, t, p.gx.lang.partial_eq, "eq", &["ne"], seen)
+                }
+                None => written_glue_impl(p, tys, t, p.gx.lang.partial_eq, "eq", &["ne"], seen),
             }
         }
     }
