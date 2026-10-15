@@ -4966,15 +4966,74 @@ enum PendingState {
 /// Static indices come from the session `DefOrder` (see `collect`):
 /// top-level statics rank by def hash history, nested statics keep
 /// stmt order after them.
+/// True when expression `e` (or a type it writes) names one of
+/// `names` as a path head: a const param read, a type param's
+/// associated item (`T::V`), or `Self::X`. A missed shape only
+/// keeps the eager evaluation (and its reject), never a wrong
+/// value.
+fn expr_names_param(ast: &Ast, e: ast::ExprId, names: &[Sym]) -> bool {
+    use ast::Expr;
+    let seg_names = |segs: &[ast::PathSeg]| segs.first().is_some_and(|s| names.contains(&s.name));
+    let ty_names = |ast: &Ast, t: ast::TyId| -> bool {
+        match ast.ty(t) {
+            ast::TyExpr::Path(segs) => seg_names(segs),
+            _ => false,
+        }
+    };
+    match ast.expr(e) {
+        Expr::Path(segs) => seg_names(segs),
+        Expr::QPath { self_ty, .. } => ty_names(ast, *self_ty),
+        Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } => {
+            expr_names_param(ast, *lhs, names) || expr_names_param(ast, *rhs, names)
+        }
+        Expr::Unary { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Field { base: expr, .. } | Expr::TupleField { base: expr, .. } => {
+            expr_names_param(ast, *expr, names)
+        }
+        Expr::Cast { expr, ty } => expr_names_param(ast, *expr, names) || ty_names(ast, *ty),
+        Expr::Call { callee, args } => expr_names_param(ast, *callee, names) || args.iter().any(|&a| expr_names_param(ast, a, names)),
+        Expr::MethodCall { recv, args, .. } => expr_names_param(ast, *recv, names) || args.iter().any(|&a| expr_names_param(ast, a, names)),
+        Expr::Tuple(es) | Expr::Array(es) => es.iter().any(|&x| expr_names_param(ast, x, names)),
+        Expr::ArrayRepeat { value, len } => expr_names_param(ast, *value, names) || expr_names_param(ast, *len, names),
+        Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => {
+            let b = ast.block(*b);
+            b.stmts.iter().any(|s| match s {
+                ast::Stmt::Let { init: Some(i), .. } => expr_names_param(ast, *i, names),
+                ast::Stmt::Expr { expr: x, .. } => expr_names_param(ast, *x, names),
+                _ => false,
+            }) || b.tail.is_some_and(|t| expr_names_param(ast, t, names))
+        }
+        Expr::If { cond, els, .. } => expr_names_param(ast, *cond, names) || els.is_some_and(|x| expr_names_param(ast, x, names)),
+        Expr::StructLit { path, fields, update } => {
+            seg_names(path) || fields.iter().any(|&(_, _, x)| expr_names_param(ast, x, names)) || update.is_some_and(|x| expr_names_param(ast, x, names))
+        }
+        Expr::Range { lo, hi, .. } => lo.is_some_and(|x| expr_names_param(ast, x, names)) || hi.is_some_and(|x| expr_names_param(ast, x, names)),
+        Expr::Return(x) | Expr::Break { value: x, .. } => x.is_some_and(|x| expr_names_param(ast, x, names)),
+        _ => false,
+    }
+}
+
+/// The zero placeholder value of a generic associated const
+/// template in `Program::consts` (its real value is per instance).
+fn zero_const_value(tys: &crate::ty::GlobalTys, ty: Ty) -> crate::ty::consteval::ConstValue {
+    use crate::ty::consteval::ConstValue as CV;
+    match tys.kind(ty) {
+        TyKind::Bool => CV::Bool(false),
+        TyKind::Char => CV::Char('\0'),
+        TyKind::Float(f) => CV::Float(0, f),
+        TyKind::Unit => CV::Unit,
+        _ => CV::Int(0),
+    }
+}
+
 fn eval_const_items(
     p: &mut Program,
     errs: &mut Vec<Diag>,
     static_order: &mut Vec<crate::def::DefPathHash>,
     scope_of_stmt: &HashMap<u32, Vec<u32>>,
 ) {
-    let Some((pending, static_count)) = eval_pending_items(p, errs, static_order, scope_of_stmt) else { return };
+    let Some((pending, static_count, tmpls)) = eval_pending_items(p, errs, static_order, scope_of_stmt) else { return };
     p.const_values = pending_values(&pending);
-    install_const_items(p, errs, pending, static_count);
+    install_const_items(p, errs, pending, static_count, &tmpls);
 }
 
 /// The values of evaluated pending items, in order (None: failed).
@@ -4997,7 +5056,7 @@ pub(crate) fn const_values_hold(p: &mut Program, static_order: &[crate::def::Def
     );
     let scope = std::mem::take(&mut p.scope_of_stmt);
     let (mut errs, mut order) = (Vec::new(), static_order.to_vec());
-    let values = eval_pending_items(p, &mut errs, &mut order, &scope).map(|(pending, _)| pending_values(&pending)).unwrap_or_default();
+    let values = eval_pending_items(p, &mut errs, &mut order, &scope).map(|(pending, ..)| pending_values(&pending)).unwrap_or_default();
     p.scope_of_stmt = scope;
     (p.consts, p.const_names, p.statics, p.static_names, p.assoc_const_names) = tables;
     errs.is_empty() && values == p.const_values
@@ -5011,7 +5070,7 @@ fn eval_pending_items(
     errs: &mut Vec<Diag>,
     static_order: &mut Vec<crate::def::DefPathHash>,
     scope_of_stmt: &HashMap<u32, Vec<u32>>,
-) -> Option<(Vec<(PendingConst, PendingState)>, u32)> {
+) -> Option<(Vec<(PendingConst, PendingState)>, u32, Vec<Option<Generics>>)> {
     let ast_arc = p.ast.clone();
     let ast = &*ast_arc;
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
@@ -5173,6 +5232,26 @@ fn eval_pending_items(
         }
         static_count = nested;
     }
+    // Generic associated const templates: an initializer that
+    // names a parameter of its impl (or trait) has one value per
+    // instance, not one value here.
+    let tmpls: Vec<Option<Generics>> = pending
+        .iter()
+        .map(|(it, _)| {
+            let generics = match &it.assoc {
+                Some(PendingAssoc::Inherent { generics, .. }) => generics.clone(),
+                Some(PendingAssoc::TraitImpl { impl_def, .. }) => p.gx.index.by_def(*impl_def).map(|(_, r)| r.generics.clone())?,
+                Some(PendingAssoc::TraitDefault { trait_def, .. }) => p.gx.index.trait_record(*trait_def)?.generics.clone(),
+                None => return None,
+            };
+            if generics.params.is_empty() {
+                return None;
+            }
+            let mut names: Vec<Sym> = generics.params.iter().map(|g| g.name).collect();
+            names.push(p.known.self_type);
+            expr_names_param(ast, it.expr, &names).then_some(generics)
+        })
+        .collect();
     let n = pending.len();
     let by_stmt: HashMap<u32, usize> = pending.iter().enumerate().filter_map(|(i, (it, _))| it.stmt_idx.map(|si| (si, i))).collect();
     let mut cx = CollectCx {
@@ -5190,18 +5269,25 @@ fn eval_pending_items(
         next_scope: None,
         module: None,
         errs,
+        tmpls,
     };
     for i in 0..n {
         cx.eval_pending(i);
     }
-    Some((cx.pending, static_count))
+    Some((cx.pending, static_count, cx.tmpls))
 }
 
 /// Moves evaluated pending items into the program tables, in item order
 /// (the second half of `eval_const_items`).
-fn install_const_items(p: &mut Program, errs: &mut Vec<Diag>, pending: Vec<(PendingConst, PendingState)>, static_count: u32) {
+fn install_const_items(
+    p: &mut Program,
+    errs: &mut Vec<Diag>,
+    pending: Vec<(PendingConst, PendingState)>,
+    static_count: u32,
+    tmpls: &[Option<Generics>],
+) {
     let mut statics: Vec<Option<StaticItem>> = (0..static_count).map(|_| None).collect();
-    for (item, state) in pending {
+    for (pi, (item, state)) in pending.into_iter().enumerate() {
         let PendingState::Done(value) = state else { continue };
         if let Some(assoc) = item.assoc {
             // An associated const is a const item with a child def,
@@ -5217,6 +5303,9 @@ fn install_const_items(p: &mut Program, errs: &mut Vec<Diag>, pending: Vec<(Pend
             p.defs.insert(def, DefData::skeleton(DefsKind::Const, Some(parent), name, Vis::Priv, item.span));
             p.const_defs.push(def);
             p.consts.push(ConstItem { name, ty: item.ty, value });
+            if let Some(generics) = &tmpls[pi] {
+                p.gx.assoc_const_tmpls.insert(idx, (item.expr, generics.clone()));
+            }
             match assoc {
                 PendingAssoc::Inherent { owner, self_pat, generics, .. } => {
                     p.assoc_const_names.entry((owner, name)).or_default().push(idx);
@@ -5530,7 +5619,7 @@ fn register_assoc_consts(
 /// direction only (the pattern's parameters are variables, the
 /// written type is ground), for const evaluation picks before
 /// the checker exists.
-fn self_pat_matches(tys: &crate::ty::GlobalTys, pat: Ty, target: Ty, map: &mut Vec<(u32, Ty)>, cmap: &mut Vec<(u32, crate::ty::ConstId)>) -> bool {
+pub fn self_pat_matches(tys: &impl crate::ty::TyIntern, pat: Ty, target: Ty, map: &mut Vec<(u32, Ty)>, cmap: &mut Vec<(u32, crate::ty::ConstId)>) -> bool {
     use crate::ty::TyIntern;
     if let TyKind::Param(p) = tys.kind(pat) {
         return match map.iter().find(|&&(i, _)| i == p.0) {
@@ -5726,6 +5815,14 @@ struct CollectCx<'x> {
     /// tables, or an item the tables do not name): no check then.
     module: Option<crate::ty::defs::ModuleId>,
     errs: &'x mut Vec<Diag>,
+    /// Per pending index: the impl or trait generics when this
+    /// associated const's initializer names one of its parameters
+    /// (a const param, a type param's associated const, `Self::X`
+    /// of a generic impl). Such a const has no single value: it
+    /// evaluates per instance at use sites
+    /// (`check::assoc_eval`), and its `consts` entry holds a zero
+    /// placeholder for template reads.
+    tmpls: Vec<Option<Generics>>,
 }
 
 impl CollectCx<'_> {
@@ -5905,6 +6002,16 @@ impl CollectCx<'_> {
         // the init fn, checked as a body (check/tls.rs).
         if self.pending[idx].0.tls.is_some() {
             let v = crate::ty::consteval::ConstValue::Int(0);
+            self.pending[idx].1 = PendingState::Done(v.clone());
+            return Some(v);
+        }
+        // A generic associated const template: no single value
+        // exists here. The zero placeholder stands in `consts`;
+        // const contexts that read it by name get None from
+        // `const_item`/`assoc_const_item` (outside the evaluator
+        // for now), and body reads evaluate per instance.
+        if self.tmpls[idx].is_some() {
+            let v = zero_const_value(&self.p.tys, self.pending[idx].0.ty);
             self.pending[idx].1 = PendingState::Done(v.clone());
             return Some(v);
         }
@@ -6146,6 +6253,9 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
                 if hits.len() == 1 { Some(hits[0]) } else { None }
             };
             let i = pick?;
+            if self.tmpls[i].is_some() {
+                return None;
+            }
             let ty = self.pending[i].0.ty;
             return self.eval_pending(i).map(|v| (v, ty));
         }

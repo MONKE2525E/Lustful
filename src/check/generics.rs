@@ -4409,6 +4409,12 @@ pub struct GenTables {
     /// generics, and item span, by const index: use sites pick
     /// among same-name consts by their written Self type.
     pub inherent_const_self: FxMap<u32, (Ty, Generics, Span)>,
+    /// Associated consts whose initializer names a generic
+    /// parameter, by const index: the initializer expression and
+    /// the impl (or trait) generics it is over. Their `consts`
+    /// value is a zero placeholder; use sites evaluate the
+    /// initializer per instance (`check::assoc_eval`).
+    pub assoc_const_tmpls: FxMap<u32, (ast::ExprId, Generics)>,
     /// Trait defs that declare a method of this name.
     pub traits_by_method: FxMap<Sym, Vec<DefId>>,
     /// The `Drop::drop` instance to call for one concrete Adt,
@@ -4575,6 +4581,7 @@ impl Default for GenTables {
             inherent_self_pats: FxMap::default(),
             inherent_impl_self: FxMap::default(),
             inherent_const_self: FxMap::default(),
+            assoc_const_tmpls: FxMap::default(),
             traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
             glue_methods: FxMap::default(),

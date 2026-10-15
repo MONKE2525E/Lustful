@@ -113,6 +113,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         inherent_self_pats,
         inherent_impl_self,
         inherent_const_self,
+        assoc_const_tmpls,
         traits_by_method: _,
         drop_methods: _,
         glue_methods: _,
@@ -164,6 +165,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         shift_generics(g, sp);
         sp(s);
     }
+    assoc_const_tmpls.values_mut().for_each(|(_, g)| shift_generics(g, sp));
     deferred_debug_fields.iter_mut().for_each(|(_, s)| sp(s));
     for info in dyn_infos.values_mut() {
         if let Some((_, s)) = &mut info.violation {

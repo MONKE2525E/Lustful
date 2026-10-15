@@ -2,6 +2,7 @@
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
 pub mod alias_path;
+pub mod assoc_eval;
 pub mod any;
 pub mod caller;
 pub mod closure;
@@ -9492,13 +9493,12 @@ impl<'p> Ctx<'p> {
             && let Some(picked) = assoc_base.and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
         {
             return match picked {
-                Some(idx) => {
+                Some((idx, v)) => {
                     if let Some(&def) = p.const_defs.get(idx as usize) {
                         let _ = p.sig_of(&mut self.out.reads, def);
                     }
                     self.check_assoc_vis(adt, item, "associated constant", span);
-                    let c = &p.consts[idx as usize];
-                    let (v, t) = (c.value.clone(), c.ty);
+                    let t = p.consts[idx as usize].ty;
                     let i = self.ei(e);
                     self.out.const_exprs[i] = Some(v);
                     self.deep(t)
@@ -9515,8 +9515,7 @@ impl<'p> Ctx<'p> {
             && let Some(base) = assoc_base
             && let Some((idx, t)) = self.trait_assoc_const(Some(e), base, None, segs[1].name, span)
         {
-            if let Some(idx) = idx {
-                let v = p.consts[idx as usize].value.clone();
+            if let Some((_, v)) = idx {
                 let i = self.ei(e);
                 self.out.const_exprs[i] = Some(v);
             }
@@ -15821,7 +15820,11 @@ impl<'p> Ctx<'p> {
         if let Some((adt, item)) = self.assoc_const_key(segs)
             && let Some(picked) = self.assoc_const_base(segs, Some(span)).and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
         {
-            if let Some(idx) = picked {
+            if let Some((idx, _)) = picked {
+                if self.p.gx.assoc_const_tmpls.contains_key(&idx) {
+                    self.err("L0630", span, "a generic associated const in a pattern is outside the bounded const evaluator", "Bind the value first and compare in a guard.");
+                    return true;
+                }
                 self.check_assoc_vis(adt, item, "associated constant", span);
                 self.const_item_pat(pi, idx, t, span, in_match);
             }
@@ -15839,7 +15842,10 @@ impl<'p> Ctx<'p> {
             && let Some(found) = self.trait_assoc_const(None, base, None, segs[1].name, span)
         {
             match found {
-                (Some(idx), _) => self.const_item_pat(pi, idx, t, span, in_match),
+                (Some((idx, _)), _) if self.p.gx.assoc_const_tmpls.contains_key(&idx) => {
+                    self.err("L0630", span, "a generic associated const in a pattern is outside the bounded const evaluator", "Bind the value first and compare in a guard.");
+                }
+                (Some((idx, _)), _) => self.const_item_pat(pi, idx, t, span, in_match),
                 (None, ty) if self.kind(ty) != TyKind::Error => {
                     self.err(
                         "L0110",
@@ -15996,15 +16002,14 @@ impl<'p> Ctx<'p> {
             && let Some(picked) = self.inherent_assoc_pick(adt, name, base, Some(span))
         {
             return match picked {
-                Some(idx) => {
+                Some((idx, v)) => {
                     // As on a plain `Type::C` path: the value is baked in
                     // (record its `Sig` read) and visibility applies.
                     if let Some(&def) = p.const_defs.get(idx as usize) {
                         let _ = p.sig_of(&mut self.out.reads, def);
                     }
                     self.check_assoc_vis(adt, name, "associated constant", span);
-                    let c = &p.consts[idx as usize];
-                    let (v, t) = (c.value.clone(), c.ty);
+                    let t = p.consts[idx as usize].ty;
                     let i = self.ei(e);
                     self.out.const_exprs[i] = Some(v);
                     self.deep(t)
@@ -16016,8 +16021,7 @@ impl<'p> Ctx<'p> {
             && self.replay_pick(e).is_none()
             && self.tys.local_adt(self.resolve(base)).is_some_and(|adt| self.inherent_value_blocks(adt, name));
         if !blocked && let Some((idx, t)) = self.trait_assoc_const(Some(e), base, hint, name, span) {
-            if let Some(idx) = idx {
-                let v = p.consts[idx as usize].value.clone();
+            if let Some((_, v)) = idx {
                 let i = self.ei(e);
                 self.out.const_exprs[i] = Some(v);
             }
@@ -16072,6 +16076,51 @@ impl<'p> Ctx<'p> {
         p.methods.contains_key(&(template, item)) || (p.adt(adt).is_enum && p.adt(adt).variants.iter().any(|v| v.name == item))
     }
 
+    /// The value of associated const `idx` at one instance: its
+    /// evaluated `consts` value, or a fresh per-instance
+    /// evaluation when the const is generic
+    /// (`gx.assoc_const_tmpls`). None when the instance is still
+    /// abstract (a template check, or an argument inference has
+    /// not named): the caller treats the read as param evidence.
+    fn assoc_const_value(
+        &mut self,
+        idx: u32,
+        generics: &Generics,
+        args: Vec<GenericArg>,
+        self_ty: Ty,
+        trait_def: Option<crate::def::DefId>,
+    ) -> Option<crate::ty::consteval::ConstValue> {
+        let p = self.p;
+        if !p.gx.assoc_const_tmpls.contains_key(&idx) {
+            return Some(p.consts[idx as usize].value.clone());
+        }
+        let args: Vec<GenericArg> = args
+            .into_iter()
+            .map(|g| match g {
+                GenericArg::Ty(t) => GenericArg::Ty(self.deep(t)),
+                GenericArg::Const(c) => GenericArg::Const(self.resolve_const(c)),
+                other => other,
+            })
+            .collect();
+        let abstract_ = self.is_template_check()
+            || args.iter().any(|g| match g {
+                GenericArg::Ty(t) => self.has_unbound_var(*t) || self.tys.flags(*t).contains_param(),
+                GenericArg::Const(c) => matches!(self.tys.const_kind(*c), ConstKind::Param(_) | ConstKind::Infer(_)),
+                GenericArg::Lifetime(_) => false,
+            });
+        if abstract_ {
+            return None;
+        }
+        let env = assoc_eval::AssocEnv { generics: generics.clone(), args, self_ty: self.deep(self_ty), trait_def };
+        match assoc_eval::eval_assoc_const(p, &mut self.tys, idx, env) {
+            Ok((v, _)) => Some(v),
+            Err(d) => {
+                self.errs.push(d);
+                None
+            }
+        }
+    }
+
     /// Resolves a trait associated const read (`Type::C`, `T::C`,
     /// `Self::C`, `<T as Tr>::C`) on self type `base`, like
     /// `assoc_call` resolves a trait method call: a written trait
@@ -16089,7 +16138,7 @@ impl<'p> Ctx<'p> {
         hint: Option<TraitRef>,
         name: Sym,
         span: Span,
-    ) -> Option<(Option<u32>, Ty)> {
+    ) -> Option<(Option<(u32, crate::ty::consteval::ConstValue)>, Ty)> {
         let p = self.p;
         if hint.is_none() && pick_e.and_then(|e| self.replay_pick(e)).is_none() && self.std_shadow_path(base, name, true, span) {
             return Some((None, ERROR));
@@ -16127,7 +16176,7 @@ impl<'p> Ctx<'p> {
             (None, None) if !bound.is_empty() => bound,
             (None, None) => by_name.into_iter().filter(|&d| method::trait_in_scope_pub(self, d)).collect(),
         };
-        let mut hits: Vec<(Option<u32>, Ty)> = Vec::new();
+        let mut hits: Vec<(Option<(u32, crate::ty::consteval::ConstValue)>, Ty)> = Vec::new();
         let mut hit_traits: Vec<DefId> = Vec::new();
         for trait_def in traits {
             let Some(rec) = p.gx.index.trait_record(trait_def).cloned() else { continue };
@@ -16153,13 +16202,28 @@ impl<'p> Ctx<'p> {
                 // the Self type is not known here (a fresh variable
                 // from a missing turbofish): rustc asks for the
                 // annotation, so this is no hit.
-                Selection::Impl { id, ref unbound, .. } if unbound.is_empty() => {
+                Selection::Impl { id, ref unbound, ref args, .. } if unbound.is_empty() => {
                     let impl_def = p.gx.index.get(id).def;
-                    p.impl_assoc_consts
+                    let impl_args = args.clone();
+                    let picked = p
+                        .impl_assoc_consts
                         .get(&(impl_def, assoc))
                         .copied()
-                        .or_else(|| p.trait_assoc_const_values.get(&assoc).copied())
-                        .map(|idx| (Some(idx), self.deep(p.consts[idx as usize].ty)))
+                        .map(|idx| (idx, p.gx.index.get(id).generics.clone(), impl_args))
+                        .or_else(|| {
+                            p.trait_assoc_const_values
+                                .get(&assoc)
+                                .copied()
+                                .map(|idx| (idx, rec.generics.clone(), self.tys.args(tr.args).to_vec()))
+                        });
+                    picked.map(|(idx, gens, args)| {
+                        let ty = subst(&mut self.tys, p.consts[idx as usize].ty, &args);
+                        let ty = self.deep(ty);
+                        match self.assoc_const_value(idx, &gens, args, base, Some(trait_def)) {
+                            Some(v) => (Some((idx, v)), ty),
+                            None => (None, ty),
+                        }
+                    })
                 }
                 Selection::ParamEvidence(_) => {
                     let (declared, _) = p.gx.trait_assoc_consts[&assoc];
@@ -16284,7 +16348,11 @@ impl<'p> Ctx<'p> {
             }
             hit = Some(idx);
         }
-        let c = &p.consts[hit? as usize];
+        let idx = hit?;
+        if p.gx.assoc_const_tmpls.contains_key(&idx) {
+            return None;
+        }
+        let c = &p.consts[idx as usize];
         Some((c.value.clone(), c.ty))
     }
 
@@ -16394,7 +16462,13 @@ impl<'p> Ctx<'p> {
     /// `None` when no candidate applies (the caller keeps
     /// looking), `Some(None)` when several apply (reported
     /// here; the caller must not fall through to a trait item).
-    fn inherent_assoc_pick(&mut self, adt: AdtId, item: Sym, written: Ty, span: Option<Span>) -> Option<Option<u32>> {
+    fn inherent_assoc_pick(
+        &mut self,
+        adt: AdtId,
+        item: Sym,
+        written: Ty,
+        span: Option<Span>,
+    ) -> Option<Option<(u32, crate::ty::consteval::ConstValue)>> {
         let p = self.p;
         let cands: Vec<u32> = p.inherent_assoc_consts(adt, item).to_vec();
         if cands.is_empty() {
@@ -16424,17 +16498,23 @@ impl<'p> Ctx<'p> {
             0 => None,
             1 => {
                 let (idx, entry) = hits.pop().unwrap();
+                let mut value = None;
                 if let Some((pat, gens, _)) = entry {
                     let args = self.fresh_args(&gens);
                     let cand = subst(&mut self.tys, pat, &args);
-                    if self.unify(cand, written)
-                        && let Some(span) = span
-                    {
-                        let preds = gens.predicates.clone();
-                        self.push_predicates(&preds, &args, span);
+                    if self.unify(cand, written) {
+                        if let Some(span) = span {
+                            let preds = gens.predicates.clone();
+                            self.push_predicates(&preds, &args, span);
+                        }
+                        value = self.assoc_const_value(idx, &gens, args, written, None);
                     }
                 }
-                Some(Some(idx))
+                // An abstract instance (a template check) bakes
+                // the placeholder; the instance re-check computes
+                // the real value.
+                let value = value.unwrap_or_else(|| p.consts[idx as usize].value.clone());
+                Some(Some((idx, value)))
             }
             _ => {
                 if let Some(span) = span {
@@ -20093,15 +20173,12 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
         let p = self.cx.p;
         let (adt, item) = self.cx.assoc_const_key(segs)?;
         let picked = self.cx.assoc_const_base(segs, None).and_then(|base| self.cx.inherent_assoc_pick(adt, item, base, None)).flatten();
-        let Some(idx) = picked else {
+        let Some((idx, value)) = picked else {
             // A trait's const for a non-generic Adt (`S::N` in `[0; S::N]`).
             let base = self.cx.assoc_const_base(segs, None)?;
             return self.cx.trait_const_value(base, None, item);
         };
-        let out = {
-            let c = &p.consts[idx as usize];
-            (c.value.clone(), c.ty)
-        };
+        let out = (value, p.consts[idx as usize].ty);
         if let Some(&def) = p.const_defs.get(idx as usize) {
             let _ = p.sig_of(&mut self.cx.out.reads, def);
         }
