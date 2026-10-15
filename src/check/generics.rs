@@ -6034,6 +6034,9 @@ pub fn add_synthetic_impls(p: &mut Program) {
     let lang = p.gx.lang;
     let mut ordinal = 0u32;
     let span = Span::default();
+    // The lang facts alone are about 1300 records (the shift operators
+    // take every int on the right), plus up to 9 derives per Adt.
+    p.gx.index.reserve(1400 + 9 * p.gx.adt_info.len());
     // Derives: one record per (Adt template, derived trait), with
     // a bound per type parameter, as rustc writes them.
     let n_adts = p.gx.adt_info.len();

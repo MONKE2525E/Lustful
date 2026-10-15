@@ -272,6 +272,16 @@ impl ImplIndex {
         self.traits.values().find(|r| r.methods.iter().any(|(d, _)| *d == method)).map(|r| r.def)
     }
 
+    /// Makes room for `n` more impls, so a batch of inserts (the
+    /// synthetic std impls, over a thousand) does not regrow the
+    /// record list and the def map many times.
+    pub fn reserve(&mut self, n: usize) {
+        self.impls.reserve(n);
+        self.by_def.reserve(n);
+        self.by_trait.reserve(n / 8);
+        self.buckets.reserve(n);
+    }
+
     /// Records one impl and returns its id. The record's head and
     /// blanket fields decide its buckets; collect computes them with
     /// `pattern_head`.
@@ -848,11 +858,16 @@ impl ImplIndex {
         // impl pairs against every impl of its trait. Without this,
         // one derived impl per Adt makes coherence quadratic in the
         // Adt count of the crate (thousands of Clone/Debug records).
+        // A pair with no local side is never checked, so it is never
+        // made (the std lang facts fill buckets of a dozen impls each).
         let mut pairs: Vec<(ImplId, ImplId)> = Vec::new();
+        let local = |id: ImplId| self.get(id).local;
         for ids in self.buckets.values() {
             for (i, &a) in ids.iter().enumerate() {
                 for &b in &ids[i + 1..] {
-                    pairs.push(if a.0 < b.0 { (a, b) } else { (b, a) });
+                    if local(a) || local(b) {
+                        pairs.push(if a.0 < b.0 { (a, b) } else { (b, a) });
+                    }
                 }
             }
         }
@@ -860,7 +875,7 @@ impl ImplIndex {
             let Some(ids) = self.by_trait.get(trait_def) else { continue };
             for &b in blanket_ids {
                 for &o in ids {
-                    if o != b {
+                    if o != b && (local(b) || local(o)) {
                         pairs.push(if b.0 < o.0 { (b, o) } else { (o, b) });
                     }
                 }
@@ -871,9 +886,6 @@ impl ImplIndex {
         let mut out = Vec::new();
         for (a, b) in pairs {
             let (ra, rb) = (self.get(a), self.get(b));
-            if !ra.local && !rb.local {
-                continue;
-            }
             if self.pair_overlaps(tys, ra, rb, fundamental, by_construction, is_local) {
                 out.push((a, b));
             }
