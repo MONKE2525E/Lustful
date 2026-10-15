@@ -23,8 +23,8 @@ const B: u32 = {
 };
 static C: u32 = {
     let mut v: u32 = 3;
-    set(&mut v, v);
-    set(&mut v, v);
+    set(&mut v, 3);
+    set(&mut v, 7);
     v
 };
 fn main() {
