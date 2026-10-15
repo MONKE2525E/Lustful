@@ -460,7 +460,7 @@ fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit,
                 })
             }
         })
-        .ok_or("not in a fn body")?;
+        .ok_or_else(|| outside_fn_reason(ast, file, a, b))?;
     let def = fn_def_at(ast, item, sub);
     if def.qual.is_const || def.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. })) {
         return Err("const fn or impl Trait");
@@ -486,8 +486,8 @@ fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit,
     let new_hi = (hi as i64 + d) as usize;
     let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo as u32, &front.interner).ok()).ok_or("body lex");
     let (old_body, new_body) = (lex(old.get(lo..hi))?, lex(text.get(lo..new_hi))?);
-    let old_calls = body_tokens_ok(&old_body, lo, hi, &front.interner).ok_or("body tokens")?;
-    let new_calls = body_tokens_ok(&new_body, lo, new_hi, &front.interner).ok_or("body tokens")?;
+    let old_calls = body_tokens_ok(&old_body, lo, hi, &front.interner)?;
+    let new_calls = body_tokens_ok(&new_body, lo, new_hi, &front.interner)?;
     if (old_calls || new_calls) && base.shadowed {
         return Err("macro in body");
     }
@@ -540,6 +540,14 @@ fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit,
     })
 }
 
+/// Why an edit at `a..b` of `file` is in no top-level fn body: it sits
+/// in some other item of the merged Ast (a nested fn, a trait method, a
+/// const), or in no item at all (cfg-disabled code, or between items).
+fn outside_fn_reason(ast: &Ast, file: FileId, a: usize, b: usize) -> &'static str {
+    let inside = |sp: crate::diag::Span| sp.file == file && (sp.lo as usize) <= a && b <= sp.hi as usize;
+    if ast.items.iter().any(|it| inside(it.span)) { "not in a fn body" } else { "no active item" }
+}
+
 /// True when a lexed body has no token that collect's whole-Ast scans
 /// look for: `dyn` (a `dyn` type turns on the generic machinery) and
 /// the names `ast_mentions` and `ast_uses_bound` scan for. Closure
@@ -556,18 +564,18 @@ fn plain_body(lexed: &lexer::Lexed, interner: &crate::intern::Interner) -> bool 
 /// Checks one lexed body (`{` at `lo` through `}` ending at `hi`, then
 /// `Eof`): one balanced brace group, no item keyword, attribute, `$`,
 /// or macro the expander owns. Returns whether it calls a parser macro
-/// (`println!` and kin), or None when the body fails a check.
-fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::intern::Interner) -> Option<bool> {
+/// (`println!` and kin), or why the body fails a check.
+fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::intern::Interner) -> Result<bool, &'static str> {
     let toks = &lexed.tokens;
-    let n = toks.len().checked_sub(1)?;
+    let n = toks.len().checked_sub(1).ok_or("body shape")?;
     if n < 2 || toks[n].tok != Tok::Eof || toks[0].tok != Tok::LBrace || toks[0].span.lo as usize != lo {
-        return None;
+        return Err("body shape");
     }
     if toks[n - 1].tok != Tok::RBrace || toks[n - 1].span.hi as usize != hi {
-        return None;
+        return Err("body shape");
     }
     if crate::expand::needs_expansion(&toks[..n], interner) {
-        return None;
+        return Err("body macro");
     }
     let (macro_rules, union) = (interner.intern("macro_rules"), interner.intern("union"));
     let mut depth = 0usize;
@@ -576,31 +584,22 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
         match t.tok {
             Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
             Tok::RBrace | Tok::RParen | Tok::RBracket => {
-                depth = depth.checked_sub(1)?;
+                depth = depth.checked_sub(1).ok_or("body shape")?;
                 if depth == 0 && i != n - 1 {
-                    return None;
+                    return Err("body shape");
                 }
             }
-            Tok::Fn
-            | Tok::Struct
-            | Tok::Enum
-            | Tok::Impl
-            | Tok::Trait
-            | Tok::Mod
-            | Tok::Use
-            | Tok::Extern
-            | Tok::Static
-            | Tok::Const
-            | Tok::Type
-            | Tok::Pound
-            | Tok::Dollar
-            | Tok::DocStr(_) => return None,
-            Tok::Ident(s) if s == macro_rules || s == union => return None,
+            Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Trait | Tok::Mod | Tok::Extern | Tok::Type => return Err("body item"),
+            Tok::Use => return Err("body use"),
+            Tok::Static => return Err("body static"),
+            Tok::Const => return Err("body const"),
+            Tok::Pound | Tok::Dollar | Tok::DocStr(_) => return Err("body attr"),
+            Tok::Ident(s) if s == macro_rules || s == union => return Err("body item"),
             Tok::Bang => calls |= i > 0 && matches!(toks[i - 1].tok, Tok::Ident(_)),
             _ => {}
         }
     }
-    (depth == 0).then_some(calls)
+    if depth == 0 { Ok(calls) } else { Err("body shape") }
 }
 
 /// Applies the proven edits to the front state and runs the slot update.
@@ -828,9 +827,11 @@ pub(super) fn reuse_kept(
         p.gx.trait_picks.retain(|x, _| !ranges.iter().any(|r| x.0 >= r.0 && x.0 < r.1));
         p.gx.template_closures.retain(|k, _| k.0 != f);
         p.gx.template_calls.retain(|k, _| k.0 != f);
-        let counts = p.gx.mono_counts;
+        // Collect's template check runs before mono: a coercion of a
+        // type parameter to `dyn` then needs no concrete vtable.
+        let (counts, mono_done) = (p.gx.mono_counts, std::mem::replace(&mut p.gx.mono_done, false));
         template_errs.extend(crate::check::generics::check_template(&mut p, f, &mut caches.gen_reuse));
-        p.gx.mono_counts = counts;
+        (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
     }
     // Discovery checks every plain body when user generics exist; with
     // only the lang enum methods' generics, a build checks the bodies
@@ -1278,5 +1279,37 @@ pub fn run() -> i64 {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert_eq!(per_size[0], per_size[1], "kept program work (discovery, checked) for 3 and 12 modules");
+    }
+
+    /// Edits a crate root, checks it warm, and asserts the warm answer
+    /// is a cold session's; returns the warm `lust-visits:` line.
+    fn warm_equals_cold(warm: &mut Session, root: &Path, old: &str, new: &str) -> String {
+        edit(root, old, new);
+        let got = check(warm, root);
+        let dir = root.parent().unwrap().join(format!("obj-cold-{}", warm.front.last_visits.len()));
+        let mut cold = Session::new(dir.clone(), false, SessionKey::synthetic(root, false));
+        assert_eq!(got, check(&mut cold, root), "warm and cold agree after {new:?}: {}", warm.front.last_visits);
+        let _ = std::fs::remove_dir_all(&dir);
+        warm.front.last_visits.clone()
+    }
+
+    /// A body edit of a blanket impl method whose body coerces a type
+    /// parameter to `dyn` checks the template again on the kept program
+    /// as collect does (before mono, so no concrete vtable is asked for).
+    #[test]
+    fn kept_template_dyn_coercion_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-kept-dyn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("main.rs");
+        let src = "use std::any::Any;\n\ntrait AnyValue: Any {\n    fn as_any(&self) -> &dyn Any;\n}\n\n\
+                   impl<T: Any> AnyValue for T {\n    fn as_any(&self) -> &dyn Any {\n        self\n    }\n}\n\n\
+                   fn main() {\n    println!(\"{}\", 5u8.as_any().is::<u8>());\n}\n";
+        std::fs::write(&root, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root), (0, String::new()));
+        let v = warm_equals_cold(&mut warm, &root, "        self\n", "        let _e: u32 = 1;\n        self\n");
+        assert_eq!((field(&v, "path"), field(&v, "kept")), ("patch", "reuse"), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
