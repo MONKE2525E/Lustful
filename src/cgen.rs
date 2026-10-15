@@ -5289,6 +5289,20 @@ impl FnGen<'_, '_> {
                 );
                 t
             }
+            B::StrFind | B::StrRfind => {
+                let a = str_of(&vals[0], &tys[0]);
+                let f = if b == B::StrFind { "lust_str_find" } else { "lust_str_rfind" };
+                let opt = CTy::Option(Box::new(CTy::Int(IntTy::Usize)));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, idx) = (self.tmp(), self.tmp());
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    int64_t {idx} = {f}({a}, {});", vals[1]);
+                let _ = writeln!(self.out, "    if ({idx} >= 0) {{ {field} = (uint64_t){idx};{some} }}");
+                t
+            }
             B::StrContains | B::StrStartsWith | B::StrEndsWith => {
                 let a = str_of(&vals[0], &tys[0]);
                 let f = match b {

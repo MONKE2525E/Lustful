@@ -1343,6 +1343,25 @@ uint8_t lust_str_contains(lust_str s, lust_str p) LUST_BODY({
     return 0;
 })
 
+/* The byte index of the first (or last) match of `p` in `s`, or -1.
+   An empty pattern matches at 0 for find and at s.len for rfind, as
+   Rust's str::find and str::rfind do. A match of a UTF-8 pattern in
+   a valid UTF-8 haystack always starts on a char boundary. */
+int64_t lust_str_find(lust_str s, lust_str p) LUST_BODY({
+    if (p.len == 0) return 0;
+    for (uint64_t i = 0; i + p.len <= s.len; i++)
+        if (s.ptr[i] == p.ptr[0] && memcmp(s.ptr + i, p.ptr, p.len) == 0) return (int64_t)i;
+    return -1;
+})
+int64_t lust_str_rfind(lust_str s, lust_str p) LUST_BODY({
+    if (p.len == 0) return (int64_t)s.len;
+    if (p.len > s.len) return -1;
+    for (uint64_t i = s.len - p.len;; i--) {
+        if (s.ptr[i] == p.ptr[0] && memcmp(s.ptr + i, p.ptr, p.len) == 0) return (int64_t)i;
+        if (i == 0) return -1;
+    }
+})
+
 /* Unicode White_Space, as used by Rust's char::is_whitespace and the
    str trim methods. The table is generated (unicode_table.h). */
 int lust_is_space(uint32_t c) LUST_BODY({ return LUST_UNI_IN(lust_uni_whitespace_ranges, c); })

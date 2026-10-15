@@ -241,6 +241,8 @@ pub enum Builtin {
     VecRemove,
     VecTruncate,
     StrContains,
+    StrFind,
+    StrRfind,
     StrStartsWith,
     StrEndsWith,
     StrTrim,
@@ -13790,7 +13792,7 @@ impl<'p> Ctx<'p> {
                 // The str search methods take std's `Pattern`: a char
                 // in the pattern position becomes its encoding as a
                 // &str (`Coerce::CharPat`), which searches the same.
-                if matches!(b, B::StrContains | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix | B::StrReplace)
+                if matches!(b, B::StrContains | B::StrFind | B::StrRfind | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix | B::StrReplace)
                     && args.len() == params.len()
                     && !args.is_empty()
                 {
@@ -14419,6 +14421,8 @@ impl<'p> Ctx<'p> {
             // The `&[u8]` view, as `AsRef<[u8]>` gives it (W-STD-B).
             (k.as_bytes, B::ConvStrBytes, vec![], ref_bytes),
             (k.contains, B::StrContains, vec![REF_STR], BOOL),
+            (k.find, B::StrFind, vec![REF_STR], self.tys.mk_option(USIZE)),
+            (k.rfind, B::StrRfind, vec![REF_STR], self.tys.mk_option(USIZE)),
             (k.starts_with, B::StrStartsWith, vec![REF_STR], BOOL),
             (k.ends_with, B::StrEndsWith, vec![REF_STR], BOOL),
             (k.trim, B::StrTrim, vec![], REF_STR),

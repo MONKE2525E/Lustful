@@ -419,6 +419,8 @@ known_syms!(
     first,
     last,
     contains,
+    find,
+    rfind,
     swap,
     take,
     clear,
