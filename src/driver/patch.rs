@@ -22,9 +22,11 @@
 // - the root file changed and carries the std splice;
 // - an edit is not strictly inside one top-level fn or method body, or
 //   inside cfg-disabled code the expander dropped (`find_inactive_edit`);
-// - the old or new body holds an item keyword, an attribute, a `$`, a
-//   macro the expander owns (anything but the parser's own `println!`
-//   family), or a parser macro while a user macro may take its name;
+// - the old or new body holds an attribute, a `$`, an item keyword
+//   other than `fn`, `static`, `const`, and `use`, a macro the expander
+//   owns (anything but the parser's own `println!` family), or a parser
+//   macro while a user macro may take its name; or its items (`stmt_items`)
+//   are not the old ones in the old blocks (`same_items`);
 // - the fn returns `impl Trait` (its body is part of its item), or has
 //   parameter patterns or expressions in its parameter types (see
 //   `find_body_edit`); a `const fn` patches, but `const` values bake its
@@ -301,6 +303,8 @@ struct NewBody {
     old_exprs: (u32, u32),
     /// The fn is a `const fn`.
     is_const: bool,
+    /// The old body's items (`same_items`), where the new body's go.
+    items: Vec<u32>,
 }
 
 /// A collected program kept for later requests (W-INCR3), one per mode
@@ -333,6 +337,8 @@ struct KeptEdit {
     /// for an edit inside cfg-disabled code.
     fn_index: Option<usize>,
     plain: bool,
+    /// The body holds items: collect runs again (see `reuse_kept`).
+    items: bool,
     /// The old body's expression range (a template's picks key on it).
     old_exprs: (u32, u32),
 }
@@ -362,6 +368,7 @@ pub(super) fn try_patch(
             ctxts: FxMap::default(),
             fn_index: e.body.as_ref().map(|b| b.fn_index),
             plain: e.body.as_ref().is_none_or(|b| b.plain),
+            items: e.body.as_ref().is_some_and(|b| !b.items.is_empty()),
             old_exprs: e.body.as_ref().map_or((0, 0), |b| b.old_exprs),
         })
         .collect();
@@ -553,11 +560,17 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     }
     // Parse and rewrite the new body on its own: an error there (a
     // half-typed edit) gives up before any state changes, so the base
-    // stands for the next request.
-    let toks = &new_body.tokens[..new_body.tokens.len() - 1];
+    // stands for the next request. A static's init closure hoists into
+    // a hidden fn first, as the resolver's token pass does.
+    let hoisted = crate::expand::lazy::hoist_static_closures(
+        lexer::Lexed { tokens: new_body.tokens.clone(), strings: new_body.strings.clone() },
+        &front.interner,
+    );
+    let toks = &hoisted.tokens[..hoisted.tokens.len() - 1];
     let mut body_ast = Ast::default();
     let (body, exprs, pats) =
-        crate::parser::parse_body(toks, &new_body.strings, &mut body_ast, &front.interner, &front.known).map_err(|_| "body parse")?;
+        crate::parser::parse_body(toks, &hoisted.strings, &mut body_ast, &front.interner, &front.known).map_err(|_| "body parse")?;
+    let items = same_items(ast, old, text, span, &body_ast, (&old_body.tokens, &new_body.tokens), edit)?;
     let mut scratch = def.clone();
     scratch.body = Some(body);
     let outer = match &ast.items[item].kind {
@@ -582,7 +595,64 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let new_closures = body_ast.exprs.iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
     let plain = !old_closures && !new_closures && plain_body(&old_body, &front.interner) && plain_body(&new_body, &front.interner);
     let is_const = def.qual.is_const;
-    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, is_const })
+    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, is_const, items })
+}
+
+/// The items (`stmt_items` indexes, in parse order) of the old fn body at
+/// `span`, when the new body (`body_ast`, parsed from `text`) holds the
+/// same ones: as many, each with the same source text at its old place
+/// moved by the edit, and no brace
+/// token in the changed tokens of the body (`toks`: old and new), so each
+/// item sits in the same block as before and sees the same items and
+/// `use`s. Resolve and collect then make the same defs of them, with the
+/// same indexes once `apply` puts each new item at its old index.
+fn same_items(
+    ast: &Ast,
+    old: &str,
+    text: &str,
+    span: crate::diag::Span,
+    body_ast: &Ast,
+    toks: (&[lexer::Token], &[lexer::Token]),
+    edit: Edit,
+) -> Result<Vec<u32>, &'static str> {
+    let inside = |s: crate::diag::Span| s.file == span.file && span.lo <= s.lo && s.hi <= span.hi;
+    let olds: Vec<u32> = (0..ast.stmt_items.len() as u32).filter(|&i| inside(ast.stmt_items[i as usize].span)).collect();
+    if olds.len() != body_ast.stmt_items.len() {
+        return Err("body items");
+    }
+    if olds.is_empty() {
+        return Ok(olds);
+    }
+    let (pre, post) = token_window(toks.0, toks.1, edit);
+    let (ow, nw) = (&toks.0[pre..toks.0.len() - post], &toks.1[pre..toks.1.len() - post]);
+    if ow.iter().chain(nw).any(|t| matches!(t.tok, Tok::LBrace | Tok::RBrace)) {
+        return Err("body items");
+    }
+    // Same text at the same place: span keys of the resolver tables
+    // (`const_init_module`) move with the edit.
+    let src = |t: &str, s: crate::diag::Span| t.get(s.lo as usize..s.hi as usize).map(str::to_owned);
+    for (k, &i) in olds.iter().enumerate() {
+        let (o, n) = (ast.stmt_items[i as usize].span, body_ast.stmt_items[k].span);
+        if edit.plain(o) != n || src(old, o).is_none() || src(old, o) != src(text, n) {
+            return Err("body items");
+        }
+    }
+    Ok(olds)
+}
+
+/// The changed tokens of one edit: how many tokens of `old` (lexed from
+/// the old text) and `new` (the same range of the new text) lie wholly
+/// before the edit at the same spans, and how many lie wholly after it at
+/// the same spans moved by the edit. Those are the same text at the same
+/// boundaries, so the same tokens; the rest of each is the window.
+fn token_window(old: &[lexer::Token], new: &[lexer::Token], edit: Edit) -> (usize, usize) {
+    let (a, b, d) = (edit.a, edit.b, edit.d);
+    let span_eq = |x: &lexer::Token, y: &lexer::Token, shift: i64| {
+        (x.span.lo as i64 + shift, x.span.hi as i64 + shift) == (y.span.lo as i64, y.span.hi as i64)
+    };
+    let pre = old.iter().zip(new).take_while(|(x, y)| x.span.hi <= a && span_eq(x, y, 0)).count();
+    let post = old[pre..].iter().rev().zip(new[pre..].iter().rev()).take_while(|(x, y)| x.span.lo >= b && span_eq(x, y, d)).count();
+    (pre, post)
 }
 
 /// Proves that `edit` (the map's text of its file to `text`) sits inside
@@ -633,13 +703,7 @@ fn find_inactive_edit(front: &Front, text: &str, edit: Edit) -> Result<(), Optio
     if !ends(ot, node.hi as usize) || !ends(nt, new_hi) {
         return Err(Some("inactive lex"));
     }
-    // Tokens wholly before the edit and wholly after it are the same text
-    // at the same boundaries, so the same tokens; the rest is the window.
-    let span_eq = |x: &lexer::Token, y: &lexer::Token, shift: i64| {
-        (x.span.lo as i64 + shift, x.span.hi as i64 + shift) == (y.span.lo as i64, y.span.hi as i64)
-    };
-    let pre = ot.iter().zip(nt).take_while(|(x, y)| x.span.hi <= a && span_eq(x, y, 0)).count();
-    let post = ot[pre..].iter().rev().zip(nt[pre..].iter().rev()).take_while(|(x, y)| x.span.lo >= b && span_eq(x, y, d)).count();
+    let (pre, post) = token_window(ot, nt, edit);
     let (ow, nw) = (&ot[pre..ot.len() - post], &nt[pre..nt.len() - post]);
     // The groups around the window: open before it and closed after it,
     // in both versions (each version must balance).
@@ -746,8 +810,8 @@ fn plain_body(lexed: &lexer::Lexed, interner: &crate::intern::Interner) -> bool 
 }
 
 /// Checks one lexed body (`{` at `lo` through `}` ending at `hi`, then
-/// `Eof`): one balanced brace group, no item keyword, attribute, `$`,
-/// or macro the expander owns. Returns whether it calls a parser macro
+/// `Eof`): one balanced brace group, no attribute, `$`, macro the
+/// expander owns, or item keyword but `fn`, `static`, `const`, `use`. Returns whether it calls a parser macro
 /// (`println!` and kin), or why the body fails a check.
 fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::intern::Interner) -> Result<bool, &'static str> {
     let toks = &lexed.tokens;
@@ -773,10 +837,9 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
                     return Err("body shape");
                 }
             }
-            Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Trait | Tok::Mod | Tok::Extern | Tok::Type => return Err("body item"),
-            Tok::Use => return Err("body use"),
-            Tok::Static => return Err("body static"),
-            Tok::Const => return Err("body const"),
+            // `fn`, `static`, `const`, and `use` items are compared after
+            // the parse (`same_items`).
+            Tok::Struct | Tok::Enum | Tok::Impl | Tok::Trait | Tok::Mod | Tok::Extern | Tok::Type => return Err("body item"),
             Tok::Pound | Tok::Dollar | Tok::DocStr(_) => return Err("body attr"),
             Tok::Ident(s) if s == macro_rules || s == union => return Err("body item"),
             Tok::Bang => calls |= i > 0 && matches!(toks[i - 1].tok, Tok::Ident(_)),
@@ -837,7 +900,21 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         let ast = &front.ast;
         let before = (ast.exprs.len(), ast.pats.len(), ast.tys.len(), ast.blocks.len(), ast.stmt_items.len());
         let stmt_base = before.4 as u32;
-        let _ = Arc::make_mut(&mut front.ast).append_chunk(std::mem::take(&mut e.body_ast), stmt_base);
+        let (_, new_items, _) = Arc::make_mut(&mut front.ast).append_chunk(std::mem::take(&mut e.body_ast), stmt_base);
+        // Each body item takes its old index (`same_items`).
+        if !e.items.is_empty() {
+            let ast = Arc::make_mut(&mut front.ast);
+            for blk in &mut ast.blocks[before.3..] {
+                for s in &mut blk.stmts {
+                    if let crate::ast::Stmt::Item(i) = s {
+                        *i = *e.items.get((*i - stmt_base) as usize).ok_or("body items")?;
+                    }
+                }
+            }
+            for (&i, it) in e.items.iter().zip(new_items) {
+                ast.stmt_items[i as usize] = it;
+            }
+        }
         let def = fn_def_at_mut(Arc::make_mut(&mut front.ast), e.item, e.sub);
         def.body = Some(BlockId(e.body.0 + before.3 as u32));
         def.exprs = (e.exprs.0 + before.0 as u32, e.exprs.1 + before.0 as u32);
@@ -923,32 +1000,67 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
 }
 
 /// Rescans the edited fn's item after its new body landed: the item
-/// scan must stand (the edit changed no head) and no method of the item
-/// may hold a body item (a nested fn's hash folds its outer item in, so
-/// the patch would owe it a new hash too). Returns the edited fn's raw
-/// body hash and idents. The first edit in an impl scans every method
-/// and stores their hashes in the base; later edits in that impl scan
-/// only the edited method, because a body hash reads structure only
-/// (never spans), so unchanged methods keep theirs.
-fn rescan_edited(front: &Front, base: &mut PatchBase, e: &NewBody) -> Result<(u64, Vec<Sym>), &'static str> {
-    let item = &front.ast.items[e.item];
+/// scan must stand (the edit changed no head). Returns the edited fn's
+/// raw body hash and idents. The first edit in an impl whose bodies hold
+/// no item scans every method and stores their hashes in the base; later
+/// edits in that impl scan only the edited method, because a body hash
+/// reads structure only (never spans), so unchanged methods keep theirs.
+/// An item that holds body items rescans whole: its nested fns' hashes
+/// fold in its content (`nested_fn_hashes`).
+fn rescan_edited(front: &mut Front, base: &mut PatchBase, e: &NewBody) -> Result<(u64, Vec<Sym>), &'static str> {
     if let (Some(sub), Some(stored)) = (e.sub, base.item_scans.get(&e.item).cloned()) {
         let (hash, idents, inner) = super::ast_hash::scan_body(&front.ast, fn_def_at(&front.ast, e.item, e.sub));
-        let mut hashes = stored;
-        *hashes.get_mut(sub).ok_or("item scan")? = hash;
-        let scan = super::ast_hash::scan_item_reuse(&front.ast, item, &hashes);
-        if front.items.get(e.item) != Some(&scan) || !inner.is_empty() {
-            return Err("item scan");
+        if inner.is_empty() {
+            let mut hashes = stored;
+            *hashes.get_mut(sub).ok_or("item scan")? = hash;
+            let scan = super::ast_hash::scan_item_reuse(&front.ast, &front.ast.items[e.item], &hashes);
+            if front.items.get(e.item) != Some(&scan) {
+                return Err("item scan");
+            }
+            base.item_scans.insert(e.item, hashes);
+            return Ok((hash, idents));
         }
-        base.item_scans.insert(e.item, hashes);
-        return Ok((hash, idents));
     }
-    let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, item);
-    if front.items.get(e.item) != Some(&scan) || !inner.is_empty() {
+    let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, &front.ast.items[e.item]);
+    if front.items.get(e.item) != Some(&scan) {
         return Err("item scan");
     }
-    base.item_scans.insert(e.item, bodies.iter().map(|b| b.0).collect());
+    nested_fn_hashes(front, base, &scan, &bodies, &inner)?;
+    if inner.is_empty() {
+        base.item_scans.insert(e.item, bodies.iter().map(|b| b.0).collect());
+    } else {
+        base.item_scans.remove(&e.item);
+    }
     bodies.into_iter().nth(e.sub.unwrap_or(0)).ok_or("item scan")
+}
+
+/// The body hashes of the fns nested anywhere in one edited item
+/// (`inner`, from `scan_item`), which fold in the item's content hash, as
+/// the full scan computes them (`ast_hash::assemble`), and their lines.
+fn nested_fn_hashes(
+    front: &mut Front,
+    base: &mut PatchBase,
+    scan: &crate::scan::ItemScan,
+    bodies: &[(u64, Vec<Sym>)],
+    inner: &[u32],
+) -> Result<(), &'static str> {
+    if inner.is_empty() {
+        return Ok(());
+    }
+    let content = super::ast_hash::item_content(scan, bodies);
+    for &i in inner {
+        let ItemKind::Fn(def) = &front.ast.stmt_items[i as usize].kind else { continue };
+        let j = front.fn_loc.iter().position(|&l| l == (usize::MAX, Some(i as usize))).ok_or("state")?;
+        let (hash, idents) = super::ast_hash::body_scan(&front.ast, def, None);
+        let line = front.map.line_col(def.name_span).0;
+        let h = fn_text_hash(&front.ast, &front.map, def, line, crate::scan::fold_outer(hash, content));
+        base.fn_lines[j] = line;
+        base.body_hashes[j] = h;
+        let chunk = &mut front.chunks[0];
+        chunk.scan.fns.get_mut(j).ok_or("state")?.body_hash = h;
+        *chunk.scan.body_idents.get_mut(j).ok_or("state")? = idents;
+    }
+    Ok(())
 }
 
 /// Takes the kept program in place of a fresh collect, with the number
@@ -987,6 +1099,11 @@ pub(super) fn reuse_kept(
     for e in &edits {
         if !e.plain && !p.gx.user_generics {
             return Err("body scan");
+        }
+        // The program's body item tables (statics, consts, item blocks,
+        // nested fns) hold the old item nodes and spans.
+        if e.items {
+            return Err("body items");
         }
         // A template checks again below, in a check only: a build's
         // instances replay its picks.
@@ -1628,6 +1745,75 @@ pub fn run() -> i64 {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
             assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
         }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module whose fns hold items: a `OnceLock` static, a `LazyLock`
+    /// static (its init closure hoists into a hidden fn), and a const and
+    /// a fn that reads it.
+    const ITEMS: &str = "use std::sync::{LazyLock, OnceLock};
+
+pub fn mode() -> u32 {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    *MODE.get_or_init(|| 7)
+}
+
+pub fn lazy() -> u32 {
+    static TABLE: LazyLock<Vec<u32>> = LazyLock::new(|| vec![1, 2, 3]);
+    TABLE.len() as u32
+}
+
+pub fn nested() -> i64 {
+    const K: i64 = 4;
+    fn inner(x: i64) -> i64 {
+        x + K
+    }
+    inner(2)
+}
+
+pub fn run() -> i64 {
+    mode() as i64 + lazy() as i64 + nested()
+}
+";
+
+    /// An edit around unchanged body items takes the body patch: edit,
+    /// error, fix, undo, and another edit each give the cold answer, and a
+    /// build prints what a cold build prints. An edit to an item, or one
+    /// that moves braces around items, resolves in full.
+    #[test]
+    fn body_items_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-items-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, ITEMS).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str, bool)] = &[
+            ("    *MODE.get_or_init(|| 7)\n", "    let m = *MODE.get_or_init(|| 7);\n    m + 1\n", true),
+            ("    m + 1\n", "    m + true\n", true),
+            ("    m + true\n", "    m + 1\n", true),
+            ("    let m = *MODE.get_or_init(|| 7);\n    m + 1\n", "    *MODE.get_or_init(|| 7)\n", true),
+            ("    inner(2)\n", "    inner(3) * K\n", true),
+            ("    TABLE.len() as u32\n", "    let n = TABLE.len();\n    n as u32 + 1\n", true),
+            // the item itself, or braces around it
+            ("    const K: i64 = 4;\n", "    const K: i64 = 5;\n", false),
+            ("    static MODE: OnceLock<u32> = OnceLock::new();\n    *MODE.get_or_init(|| 7)\n", "    {\n        static MODE: OnceLock<u32> = OnceLock::new();\n    }\n    7\n", false),
+        ];
+        for &(old, new, fast) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            if fast {
+                assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            }
+        }
+        warm_equals_cold(&mut warm, &root, &m1, "    {\n        static MODE: OnceLock<u32> = OnceLock::new();\n    }\n    7\n", "    static MODE: OnceLock<u32> = OnceLock::new();\n    *MODE.get_or_init(|| 7)\n");
+        let v = warm_equals_cold(&mut warm, &root, &m1, "    inner(3) * K\n", "    inner(4) * K\n");
+        assert_eq!(field(&v, "path"), "patch", "{v}");
         assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
         let bin = root.with_extension("bin");
         let out = run_bin(&bin);

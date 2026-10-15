@@ -95,10 +95,7 @@ fn assemble(ast: &Ast, per_item: Vec<ItemScans>) -> AstScans {
     // nested fn rechecks it (it reads the names of the blocks around it).
     let mut outer = vec![0u64; ast.stmt_items.len()];
     for (scan, bs, inner) in per_item {
-        let mut h = FxHasher::default();
-        scan.hash.hash(&mut h);
-        bs.iter().for_each(|b| b.0.hash(&mut h));
-        let content = h.finish();
+        let content = item_content(&scan, &bs);
         for i in inner {
             if let Some(o) = outer.get_mut(i as usize) {
                 *o = content;
@@ -157,7 +154,16 @@ pub(crate) fn fn_head_hash(ast: &Ast, f: &FnDef) -> u64 {
 
 /// The body hash and sorted identifier set of one fn. `inner`, when set,
 /// gains the body items inside it.
-fn body_scan(ast: &Ast, f: &FnDef, inner: Option<&mut Vec<u32>>) -> (u64, Vec<Sym>) {
+/// The content hash (header and bodies) of one top-level item, from its
+/// `scan_item` output: a nested fn's body hash folds it in.
+pub(crate) fn item_content(scan: &scan::ItemScan, bodies: &[(u64, Vec<Sym>)]) -> u64 {
+    let mut h = FxHasher::default();
+    scan.hash.hash(&mut h);
+    bodies.iter().for_each(|b| b.0.hash(&mut h));
+    h.finish()
+}
+
+pub(crate) fn body_scan(ast: &Ast, f: &FnDef, inner: Option<&mut Vec<u32>>) -> (u64, Vec<Sym>) {
     let mut idents = Vec::new();
     let mut w = Walker { ast, idents: Some(&mut idents), inner };
     let mut h = FxHasher::default();
