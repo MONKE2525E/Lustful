@@ -932,8 +932,8 @@
   {
    "id": "ext.memchr",
    "title": "Adapter crate memchr 2.8.2: memchr/memrchr, memchr_iter, memmem::Finder",
-   "status": "partial",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
