@@ -137,12 +137,16 @@ for k in rss_kb tmp_kb; do
   [ -n "$s" ] || s=$(read_col $k | sed -n 2p)
   [ "$e" -le $((s * 2 + 65536)) ] || bad "$k grew: $s at request 200 -> $e at the end"
 done
+# Stop the daemon and wait for it: on exit it sweeps its own temp dir, which races
+# with the rm below.
 kill "$dpid" 2>/dev/null
+for _ in $(seq 1 100); do [ -d "/proc/$dpid" ] || break; sleep 0.05; done
 # The daemon logs a stats line every 100 requests (sessions, expansion tables).
 grep -h "stats:" fixed/.lust-cache/daemon.log 2>/dev/null | sed -n '1p;$p'
 if [ "$fail" = 0 ]; then
+  cd / && rm -rf "$out" 2>/dev/null
   echo "daemon-soak: $N requests, probe ${first_lat} -> ${last_lat} ms, 0 failed"
-  cd / && rm -rf "$out"
+  exit 0
 else
   echo "samples: $out/samples.txt"
   echo "daemon-soak: $N requests, $fail failed"; exit 1
