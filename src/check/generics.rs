@@ -117,7 +117,8 @@ pub struct LangTraits {
 /// One lang def under the builtin crate identity, hashed from its
 /// std path like the builtin Adt defs in `ty`.
 fn lang_def(module: &[&str], kind: crate::def::DefKind, name: &str) -> DefId {
-    let hash = crate::def::stable_crate_hash("lust-builtin-v1", "lib", "builtin", false);
+    static CRATE: std::sync::OnceLock<crate::def::StableCrateHash> = std::sync::OnceLock::new();
+    let hash = *CRATE.get_or_init(|| crate::def::stable_crate_hash("lust-builtin-v1", "lib", "builtin", false));
     DefId { krate: BUILTIN_CRATE, hash: crate::def::item_hash(hash, module, kind, name, 0) }
 }
 
@@ -548,7 +549,7 @@ fn into_iter_item_bound(lang: &LangTraits, tys: &mut impl TyIntern) -> Predicate
 /// (its variants, layout, and derives are the ordinary enum
 /// machinery); this def is its stable identity.
 pub fn ordering_def() -> DefId {
-    lang_def(&["core", "cmp"], crate::def::DefKind::Adt, "Ordering")
+    std_adt_table()[0].2
 }
 
 /// The `core::cmp::Ordering` type.
@@ -560,14 +561,14 @@ pub fn ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// (W-STD-B). Collect registers a local Adt for it like `Ordering`,
 /// but never under a bare name: only `fmt::Error` paths reach it.
 pub fn fmt_error_def() -> DefId {
-    lang_def(&["core", "fmt"], crate::def::DefKind::Adt, "Error")
+    std_adt_table()[1].2
 }
 
 /// The def of `alloc::borrow::Cow` (W-STD-B): a synthetic generic enum
 /// collect registers like `Ordering`, reached only through std paths
 /// (`std::borrow::Cow` and imports of it), never by a bare name.
 pub fn cow_def() -> DefId {
-    lang_def(&["alloc", "borrow"], crate::def::DefKind::Adt, "Cow")
+    std_adt_table()[9].2
 }
 
 /// The `core::fmt::Error` type.
@@ -580,24 +581,24 @@ pub fn fmt_error_ty(tys: &mut impl TyIntern) -> Ty {
 /// the type's hash, with field names source text cannot write. Only
 /// `any::TypeId` paths reach it.
 pub fn type_id_def() -> DefId {
-    lang_def(&["core", "any"], crate::def::DefKind::Adt, "TypeId")
+    std_adt_table()[7].2
 }
 
 /// The defs of `core::cell::BorrowError` and `BorrowMutError`, the
 /// errors of `RefCell::try_borrow` and `try_borrow_mut`: synthetic unit
 /// structs (W-STD-B).
 pub fn borrow_error_def() -> DefId {
-    lang_def(&["core", "cell"], crate::def::DefKind::Adt, "BorrowError")
+    std_adt_table()[10].2
 }
 
 pub fn borrow_mut_error_def() -> DefId {
-    lang_def(&["core", "cell"], crate::def::DefKind::Adt, "BorrowMutError")
+    std_adt_table()[11].2
 }
 
 /// The def of `core::panic::Location` (check/caller.rs): a synthetic std
 /// Adt of `file: &str, line: u32, column: u32`, reached by path only.
 pub fn location_def() -> DefId {
-    lang_def(&["core", "panic"], crate::def::DefKind::Adt, "Location")
+    std_adt_table()[8].2
 }
 
 /// The `core::any::TypeId` type.
@@ -614,32 +615,32 @@ pub fn fmt_result_ty(tys: &mut impl TyIntern) -> Ty {
 /// The def of `core::str::Utf8Error`, a synthetic struct Adt like
 /// `Ordering` (W-STD-A): `valid_up_to: usize, error_len: Option<u8>`.
 pub fn utf8_error_def() -> DefId {
-    lang_def(&["core", "str"], crate::def::DefKind::Adt, "Utf8Error")
+    std_adt_table()[2].2
 }
 
 /// The def of `alloc::string::FromUtf8Error`, a synthetic struct Adt:
 /// `bytes: Vec<u8>, error: Utf8Error`.
 pub fn from_utf8_error_def() -> DefId {
-    lang_def(&["alloc", "string"], crate::def::DefKind::Adt, "FromUtf8Error")
+    std_adt_table()[3].2
 }
 
 /// The def of `core::sync::atomic::Ordering`, the memory ordering
 /// enum of the atomics (W-THREADS): a synthetic Adt like `cmp::Ordering`,
 /// with Rust's variant order (Relaxed, Release, Acquire, AcqRel, SeqCst).
 pub fn atomic_ordering_def() -> DefId {
-    lang_def(&["core", "sync", "atomic"], crate::def::DefKind::Adt, "Ordering")
+    std_adt_table()[4].2
 }
 
 /// The def of `std::sync::mpsc::RecvError`, a synthetic unit struct
 /// (W-THREADS).
 pub fn recv_error_def() -> DefId {
-    lang_def(&["std", "sync", "mpsc"], crate::def::DefKind::Adt, "RecvError")
+    std_adt_table()[5].2
 }
 
 /// The def of `std::sync::mpsc::TryRecvError`, a synthetic enum
 /// (`Empty`, `Disconnected`; W-THREADS).
 pub fn try_recv_error_def() -> DefId {
-    lang_def(&["std", "sync", "mpsc"], crate::def::DefKind::Adt, "TryRecvError")
+    std_adt_table()[6].2
 }
 
 /// The `core::sync::atomic::Ordering` type.
@@ -654,20 +655,30 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
 pub fn std_adts() -> [(usize, &'static str, DefId, bool); 12] {
-    [
-        (0, "Ordering", ordering_def(), true),
-        (1, "Error", fmt_error_def(), false),
-        (2, "Utf8Error", utf8_error_def(), false),
-        (3, "FromUtf8Error", from_utf8_error_def(), false),
-        (4, "Ordering", atomic_ordering_def(), true),
-        (5, "RecvError", recv_error_def(), false),
-        (6, "TryRecvError", try_recv_error_def(), true),
-        (7, "TypeId", type_id_def(), false),
-        (8, "Location", location_def(), false),
-        (9, "Cow", cow_def(), true),
-        (10, "BorrowError", borrow_error_def(), false),
-        (11, "BorrowMutError", borrow_mut_error_def(), false),
-    ]
+    *std_adt_table()
+}
+
+/// The `std_adts` rows, hashed once per process: the `*_def` fns above
+/// read them on hot paths (field privacy, every collect run).
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 12] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 12]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
+        [
+            (0, "Ordering", adt(&["core", "cmp"], "Ordering"), true),
+            (1, "Error", adt(&["core", "fmt"], "Error"), false),
+            (2, "Utf8Error", adt(&["core", "str"], "Utf8Error"), false),
+            (3, "FromUtf8Error", adt(&["alloc", "string"], "FromUtf8Error"), false),
+            (4, "Ordering", adt(&["core", "sync", "atomic"], "Ordering"), true),
+            (5, "RecvError", adt(&["std", "sync", "mpsc"], "RecvError"), false),
+            (6, "TryRecvError", adt(&["std", "sync", "mpsc"], "TryRecvError"), true),
+            (7, "TypeId", adt(&["core", "any"], "TypeId"), false),
+            (8, "Location", adt(&["core", "panic"], "Location"), false),
+            (9, "Cow", adt(&["alloc", "borrow"], "Cow"), true),
+            (10, "BorrowError", adt(&["core", "cell"], "BorrowError"), false),
+            (11, "BorrowMutError", adt(&["core", "cell"], "BorrowMutError"), false),
+        ]
+    })
 }
 
 /// True when the synthetic std Adt at `index` (see `std_adts`) enters
@@ -719,7 +730,8 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
 /// True when the Adt is one of the synthetic std Adts: a std path may
 /// name it, and code outside std sees none of its fields.
 pub fn is_std_adt(tys: &impl TyIntern, a: AdtId) -> bool {
-    std_adts().iter().any(|s| tys.local_adt_of(s.2) == Some(a))
+    tys.def_of_local_adt(a)
+        .is_some_and(|d| d.krate == BUILTIN_CRATE && std_adt_table().iter().any(|s| s.2 == d) && tys.local_adt_of(d) == Some(a))
 }
 
 /// The signature of one lang trait method over the trait's generics

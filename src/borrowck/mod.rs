@@ -469,7 +469,8 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
             ck.loan_scopes();
         }
     }
-    if std::env::var_os("LUST_BCK_DEBUG").is_some() {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEBUG.get_or_init(|| std::env::var_os("LUST_BCK_DEBUG").is_some()) {
         ck.debug_dump();
     }
     ck.report_pass(&entry);

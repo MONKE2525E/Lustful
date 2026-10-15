@@ -934,9 +934,12 @@ fn std_names_without_use(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>) {
             _ => false,
         })
     };
+    // Paths repeat their first names (`i64`, `Vec`), so each name is
+    // looked up in the std table once.
+    let mut known: HashMap<Sym, bool> = HashMap::default();
     let mut report = |first: Sym, span: Span| {
         let n = interner.get(first);
-        if crate::ty::lang::needs_std_use(n) && !defined(first) {
+        if *known.entry(first).or_insert_with(|| crate::ty::lang::needs_std_use(n)) && !defined(first) {
             let hint = crate::ty::lang::std_use_hint(n);
             errs.push(Diag::new("L0102", span, format!("cannot find type `{n}` in this scope"), format!("Import it: `use {hint};`.")));
         }
