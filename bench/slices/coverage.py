@@ -208,7 +208,13 @@ def main():
         u, k, e = by_crate[c]
         md.append(f"| {c} | {u:,} | {k:,} | {pc(k, u)} | {e:,} | {pc(e, u)} |")
     md.append(f"| **all** | {tot[0]:,} | **{tot[1]:,}** | **{pc(tot[1], tot[0])}** | {tot[2]:,} | {pc(tot[2], tot[0])} |")
-    md += ["", "### Per top module", "", "| crate | module | universe | accepted | % | estimate | % |", "|---|---|---:|---:|---:|---:|---:|"]
+    md += ["", "Measured vs estimate: the estimate counts a whole file when every construct the scanner sees maps",
+           "to a supported feature (no type data, so it misses type errors and cascades). The measured number",
+           "counts items that all three oracles take, so a file can be half in. goport_util and goport_lsproto",
+           "measure far above the estimate (most of their files hold one unsupported construct, and only that",
+           "item goes); ts_goport measures below it (one early failure, such as the `handle!` ids in core.rs,",
+           "removes every user).",
+           "", "### Per top module", "", "| crate | module | universe | accepted | % | estimate | % |", "|---|---|---:|---:|---:|---:|---:|"]
     for (c, mod), (u, k, e, g) in sorted(per.items(), key=lambda kv: -kv[1][0]):
         md.append(f"| {c} | `{mod}` | {u:,} | {k:,} | {pc(k, u)} | {e:,} | {pc(e, u)} |")
 
@@ -228,7 +234,9 @@ def main():
            "One row per root cause kind (oracle, code, message with numbers masked). `own` is the lines of the",
            "items the error was in; `cascade` is the lines of removals whose \"cannot find\" kind of error",
            "names one of those items, or a name the root's error named first (a std item lust lacks). Fix the",
-           "top rows first. `external` rows are crates with no stand-in in support.rs, not lust errors.", "",
+           "top rows first. `external` rows are crates with no stand-in in support.rs, not lust errors. Lines",
+           "can count twice when an item and its parent go in different rounds, so the columns sum to more",
+           "than the slice lost.", "",
            "| # | oracle | code | message | roots | own lines | cascade lines | items | example |",
            "|---|---|---|---|---:|---:|---:|---:|---|"]
     for i, ((by, code, msg), g) in enumerate(ranked[:a.top], 1):
