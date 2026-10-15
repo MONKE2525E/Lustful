@@ -12,8 +12,19 @@ Modes:
   (default)       run the probes and print the status table
   --write         also write status and milestone into features.json
                   (supported sets milestone 0; notes stay hand-written)
+  --check         write nothing; exit 1 and list every feature whose
+                  committed status (or supported milestone) differs
+                  from the probe result on this tree. Statuses come
+                  only from probes, so --check needs no ts-rust
+                  checkout. scripts/port-sync-check.sh is the gate
+                  form of this mode.
   --coverage      run lust-port on ts-rust, refresh docs/ts-rust-gaps.json,
                   and write docs/ts-rust-coverage.md for the core CLI scope
+
+Probes are independent: --jobs N runs N at a time (default: CPU
+count, max 8; 1 is serial). Each probe gets its own work dir (rustc
+binary, lust cache, Cargo target, run working directory), so
+parallel probes cannot see each other's files.
 
 Probes with `// oracle: lust-only` have no single-file rustc oracle
 (a proc macro). They never set supported by themselves: a lust reject
@@ -30,12 +41,16 @@ Env: LUST (lust binary), LUST_PORT (scanner binary), TS_RUST (ts-rust
 checkout), LUST_TCC_HOME (passed through to lust).
 """
 import argparse
+import atexit
+import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -122,8 +137,8 @@ def cargo_package(path, deps, tmp):
     return pkg / "Cargo.toml", pkg / "src/main.rs"
 
 
-def probe_one(path, lust, tmp, env):
-    """Test one probe file. Returns a result dict."""
+def probe_one(path, lust, work, env):
+    """Test one probe file in its own work dir. Returns a result dict."""
     head = parse_header(path)
     res = {"file": path.name, "feature": head.get("feature", ""), "form": head.get("form", "")}
     if head.get("helper") == "true":
@@ -131,13 +146,13 @@ def probe_one(path, lust, tmp, env):
         return res
     deps = re.findall(r"^//\s*cargo-dep:\s*(.+?)\s*$", path.read_text(), re.M)
     if deps:
-        return probe_package(path, deps, lust, tmp, env, res)
+        return probe_package(path, deps, lust, work, env, res)
     lust_only = head.get("oracle") == "lust-only"
     panic = head.get("rustc-panic", "abort")
     # A probe that needs unwinding builds lust with the same strategy.
     mode = ["-C", "panic=unwind"] if panic == "unwind" else []
     if not lust_only:
-        rbin = tmp / (path.stem + ".rustc")
+        rbin = work / (path.stem + ".rustc")
         code, _, err = run(
             ["rustc", "--edition", "2024", "-C", f"panic={panic}", "-o", str(rbin), str(path)],
             COMPILE_TIMEOUT,
@@ -147,7 +162,7 @@ def probe_one(path, lust, tmp, env):
             return res
         # Same working directory as the lust run below: probes that touch relative paths
         # (core_std_basics_b reads Cargo.toml) must see the same files.
-        rcode, rout, _ = run([str(rbin)], RUN_TIMEOUT, cwd=str(tmp))
+        rcode, rout, _ = run([str(rbin)], RUN_TIMEOUT, cwd=str(work))
         res["rustc_stdout"] = rout
         res["rustc_exit"] = rcode
     ccode, _, cerr = run([str(lust), "check", *mode, str(path)], COMPILE_TIMEOUT, env)
@@ -155,8 +170,8 @@ def probe_one(path, lust, tmp, env):
     if ccode != 0:
         res["verdict"] = "reject"
         return res
-    # `lust run` drops its binary in the working directory; keep it in tmp.
-    lcode, lout, lerr = run([str(lust), "run", *mode, str(path)], COMPILE_TIMEOUT, env, cwd=str(tmp))
+    # `lust run` drops its binary in the working directory; keep it in the work dir.
+    lcode, lout, lerr = run([str(lust), "run", *mode, str(path)], COMPILE_TIMEOUT, env, cwd=str(work))
     res["lust_stdout"] = lout
     res["lust_exit"] = lcode
     if lust_only:
@@ -215,8 +230,114 @@ def feature_status(results):
     return "manual"  # lust-only accepts, or a wrong-output probe
 
 
+# Verdicts that fail the whole run in every mode: lust ran with wrong
+# output (a false accept), the rustc oracle itself rejected the probe,
+# or the probe runner crashed on the probe.
+BAD_VERDICTS = ("wrong", "rustc-reject", "error")
+
+
+def run_probes(paths, lust, tmp, env, jobs):
+    """Run every probe and return the results sorted by file name.
+
+    Each probe runs in tmp/<stem> with its own lust cache, so probes
+    can run in parallel (jobs > 1) without seeing each other's files,
+    binaries, or Cargo target dirs. A probe that crashes the runner
+    is a failed probe (verdict "error"), not a crashed run.
+    """
+
+    def one(p):
+        work = tmp / p.stem
+        work.mkdir(parents=True, exist_ok=True)
+        penv = dict(env, LUST_CACHE_DIR=str(work / "cache"), LUST_DAEMON_SOCKET=str(work / "none.sock"))
+        try:
+            return probe_one(p, lust, work, penv)
+        except Exception as e:
+            try:
+                head = parse_header(p)
+            except Exception:
+                head = {}
+            return {
+                "file": p.name,
+                "feature": head.get("feature", ""),
+                "form": head.get("form", ""),
+                "verdict": "error",
+                "detail": f"{type(e).__name__}: {e}"[:160],
+            }
+
+    if jobs <= 1:
+        results = [one(p) for p in paths]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+            results = list(ex.map(one, paths))
+    return sorted(results, key=lambda r: r["file"])
+
+
+def check_features(features, derived, by_feature):
+    """Compare the committed feature table with the probe results.
+
+    Returns {"passed": [id], "failed": [(id, message)], "unchecked":
+    [(id, why)]}. A feature passes only when --write would leave its
+    row alone: same status, and milestone 0 when supported. A
+    feature with no probe, or a manual one (a lust-only accept needs
+    a human call), cannot be derived from probes, so it is unchecked
+    rather than silently passed. A probe whose feature id is not in
+    the table fails: its status is not in features.json at all.
+    """
+    passed, failed, unchecked = [], [], []
+    for f in features:
+        fid = f["id"]
+        rs = by_feature.get(fid)
+        if rs is None:
+            unchecked.append((fid, "no probe"))
+            continue
+        bad = [r for r in rs if r["verdict"] in BAD_VERDICTS]
+        if bad:
+            failed.append((fid, "probe " + ", ".join(f"{r['file']}:{r['verdict']}" for r in bad) + "; fix the probe or lust"))
+            continue
+        d = derived.get(fid)
+        if d == "manual":
+            unchecked.append((fid, "manual"))
+        elif f["status"] != d:
+            failed.append((fid, f"committed status {f['status']!r} != probe status {d!r}"))
+        elif d == "supported" and f.get("milestone") != 0:
+            failed.append((fid, f"supported but committed milestone is {f.get('milestone')!r}; --write sets milestone 0"))
+        else:
+            passed.append(fid)
+    known = {f["id"] for f in features}
+    for fid in sorted(set(by_feature) - known):
+        failed.append((fid, "probe feature id is not in features.json; add the feature row or fix the probe header"))
+    failed.sort(key=lambda x: x[0])
+    return {"passed": passed, "failed": failed, "unchecked": unchecked}
+
+
+def print_check_fix(has_bad, has_unknown):
+    """Tell the failing package exactly how to make the gate green."""
+    print("port-sync check failed: tools/lust-port/features.json does not match the probe results on this tree.")
+    print("A stale status from an old base can hide real coverage. Do not edit a status by hand.")
+    print("Fix it in your worktree:")
+    print("  1. Rebase on the current next:  git rebase next")
+    print("  2. Rebuild lust:                export LUST_TCC_HOME=/home/theo/.t3/projects/lust-lang/third_party/tcc")
+    print("                                  cargo build --release")
+    print("  3. Rewrite the statuses:        python3 scripts/port-scan-sync.py --write")
+    print("  4. Commit the result:           git add tools/lust-port/features.json")
+    print("                                  git commit (a new commit, or amend yours)")
+    print("  5. Run this check again:        scripts/port-sync-check.sh")
+    if has_bad:
+        print("A probe above also reports wrong output, a rustc reject, or a runner error.")
+        print("--write cannot fix that. Fix the probe or lust first, then do steps 3 to 5.")
+    if has_unknown:
+        print("A probe above names a feature id that is not in features.json.")
+        print("Add the feature row or fix the probe header first, then do the steps above.")
+
+
 def do_probes(args):
     lust = Path(os.environ.get("LUST", ROOT / "target/release/lust"))
+    # Probes run lust with cwd in their work dir, so a relative path
+    # (the gate uses LUST=target/release/lust) must become absolute
+    # now, while cwd is still the repo root. A bare name stays as is
+    # and resolves through PATH.
+    if len(lust.parts) > 1 and not lust.is_absolute():
+        lust = lust.resolve()
     if not lust.exists():
         sys.exit(f"lust binary not found: {lust} (build with cargo build --release)")
     table = json.loads(FEATURES_JSON.read_text())
@@ -224,9 +345,12 @@ def do_probes(args):
     env = dict(os.environ)
     env["LUST_NO_DAEMON"] = "1"
     tmp = Path(tempfile.mkdtemp(prefix="port-scan-sync-"))
-    env["LUST_CACHE_DIR"] = str(tmp / "cache")
-    env["LUST_DAEMON_SOCKET"] = str(tmp / "none.sock")
-    results = [probe_one(p, lust, tmp, env) for p in sorted(PROBES.glob("*.rs"))]
+    # Probe work dirs hold Cargo target dirs; do not leak them.
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+    jobs = getattr(args, "jobs", 0) or min(8, os.cpu_count() or 4)
+    t0 = time.monotonic()
+    results = run_probes(sorted(PROBES.glob("*.rs")), lust, tmp, env, jobs)
+    print(f"probes: {len(results)} files in {time.monotonic() - t0:.1f}s (jobs={jobs})")
     by_feature = {}
     for r in results:
         if r["verdict"] != "helper":
@@ -245,7 +369,7 @@ def do_probes(args):
     if unknown:
         print("probe id not in features.json:", ", ".join(unknown))
 
-    bad = [r for r in results if r["verdict"] in ("wrong", "rustc-reject")]
+    bad = [r for r in results if r["verdict"] in BAD_VERDICTS]
     for r in bad:
         print(f"FAIL {r['file']}: {r['verdict']} {r.get('detail', '')}")
     if args.json:
@@ -259,6 +383,18 @@ def do_probes(args):
                     f["milestone"] = 0
         FEATURES_JSON.write_text(json.dumps(table, indent=1) + "\n")
         print(f"wrote {FEATURES_JSON}")
+    if getattr(args, "check", False):
+        chk = check_features(table["features"], derived, by_feature)
+        for fid, msg in chk["failed"]:
+            print(f"MISMATCH {fid}: {msg}")
+        manual = [fid for fid, why in chk["unchecked"] if why == "manual"]
+        if manual:
+            print("manual (status not checked, needs a human call):", ", ".join(manual))
+        # One machine line; scripts/port-sync-check.sh reads the counts from it.
+        print(f"port-scan-sync check: {len(chk['passed'])} passed, {len(chk['failed'])} failed, {len(chk['unchecked'])} unchecked")
+        if chk["failed"]:
+            print_check_fix(has_bad=bool(bad), has_unknown=bool(unknown))
+            sys.exit(2 if bad else 1)
     if bad:
         sys.exit(2)
     return derived
@@ -448,10 +584,15 @@ def do_coverage(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--write", action="store_true", help="write probe statuses into features.json")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--write", action="store_true", help="write probe statuses into features.json")
+    mode.add_argument("--check", action="store_true", help="fail when a committed status differs from the probe result")
+    mode.add_argument("--coverage", action="store_true", help="scan ts-rust and write the coverage docs")
     ap.add_argument("--json", help="write raw probe results to this file")
-    ap.add_argument("--coverage", action="store_true", help="scan ts-rust and write the coverage docs")
+    ap.add_argument("--jobs", type=int, default=0, help="probe workers (default: CPU count, max 8; 1 is serial)")
     args = ap.parse_args()
+    if args.jobs < 0:
+        ap.error("--jobs must be 0 (auto) or a positive worker count")
     if args.coverage:
         do_coverage(args)
     else:
