@@ -1636,6 +1636,37 @@ pub mod vec_deque {
         }
 
         pub fn drain<R: core::ops::RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T> {
+            use core::ops::Bound;
+            // The ring head after the drain finishes (consumed or
+            // dropped): std closes the gap from the shorter side,
+            // and a full drain resets it. The bounds are read
+            // here only for the ghost head; `buf.drain` panics on
+            // a bad range before the head can be observed.
+            let len = self.buf.len();
+            let start = match range.start_bound() {
+                Bound::Included(&n) => n,
+                Bound::Excluded(&n) => n.wrapping_add(1),
+                Bound::Unbounded => 0,
+            };
+            let end = match range.end_bound() {
+                Bound::Included(&n) => n.wrapping_add(1),
+                Bound::Excluded(&n) => n,
+                Bound::Unbounded => len,
+            };
+            if end >= start && end <= len {
+                let removed = end - start;
+                if removed >= len {
+                    self.head = 0;
+                } else if start < len - end {
+                    let mut h = self.head;
+                    let mut i = 0;
+                    while i < removed {
+                        h = self.wrap_next(h);
+                        i += 1;
+                    }
+                    self.head = h;
+                }
+            }
             self.buf.drain(range)
         }
 
