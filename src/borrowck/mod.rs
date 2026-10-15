@@ -992,11 +992,11 @@ impl<'b, 'p> Ck<'b, 'p> {
         }
         match drop_uses {
             None => Self::live_term(&b.term, live),
-            Some(_) => {
+            Some(du) => {
                 if let Terminator::Call { dest, .. } = &b.term
                     && dest.proj.is_empty()
                 {
-                    live.remove(dest.local as usize);
+                    Self::drop_def(live, dest.local, du[base + b.stmts.len()]);
                 }
                 // A whole-local move out ends the local's own `Drop`:
                 // after it, the local is not drop-live, not even on
@@ -1026,7 +1026,7 @@ impl<'b, 'p> Ck<'b, 'p> {
                 None => Self::live_stmt(&s.kind, live),
                 Some(du) => {
                     match &s.kind {
-                        StmtKind::Assign(dest, _) if dest.proj.is_empty() => live.remove(dest.local as usize),
+                        StmtKind::Assign(dest, _) if dest.proj.is_empty() => Self::drop_def(live, dest.local, du[base + si]),
                         StmtKind::StorageDead(l) => live.remove(*l as usize),
                         StmtKind::Drop(l) if du[base + si] => live.insert(*l as usize),
                         _ => {}
@@ -1053,6 +1053,17 @@ impl<'b, 'p> Ck<'b, 'p> {
         }
     }
 
+    /// Drop-liveness at a whole-local write of `l`: the write kills it,
+    /// unless it drops an old opaque value in place (`use_old`, see
+    /// `liveness`), which is a use of that value first.
+    fn drop_def(live: &mut BitSet, l: Local, use_old: bool) {
+        if use_old {
+            live.insert(l as usize);
+        } else {
+            live.remove(l as usize);
+        }
+    }
+
     /// Use-liveness at every point, and drop-liveness when some local's
     /// drop touches its regions: a `Drop` of a maybe-initialized local with
     /// drop-live slots is a use of those regions (ARCH 5.4). `entry` is the
@@ -1067,20 +1078,44 @@ impl<'b, 'p> Ck<'b, 'p> {
         let mut uses = vec![false; self.point_base[self.body.blocks.len()]];
         let mut st = State::new(self.sh);
         let body = self.body;
+        // A whole write of a local that may still hold an `impl Trait`
+        // value (`Body::opaque_locals`) drops the old value in place, as
+        // the drop rustc puts before the write: rustc keeps the borrows
+        // the old value captured in scope while the local stays live
+        // (E0506 on `it = None; c.n = 1;` after `it = Some(f(&c))`). A
+        // value the write itself moves out first (`it = g(it)`) drops
+        // nothing.
+        let opaque = &body.opaque_locals;
+        let overwrites = |st: &State, dest: &Place, ops: &[&Operand]| {
+            let l = dest.local;
+            dest.proj.is_empty()
+                && opaque.contains(&l)
+                && bit_has(st.init(), l as usize)
+                && !ops.iter().any(|o| matches!(o, Operand::Move(pl) if pl.local == l))
+        };
         for (bi, b) in body.blocks.iter().enumerate() {
-            if !b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Drop(l) if drop_live[l as usize])) {
+            if opaque.is_empty() && !b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Drop(l) if drop_live[l as usize])) {
                 continue;
             }
             let Some(e) = &entry[bi] else { continue };
             st.w.copy_from_slice(&e.w);
             for (si, s) in b.stmts.iter().enumerate() {
-                if let StmtKind::Drop(l) = s.kind
-                    && drop_live[l as usize]
-                    && bit_has(st.init(), l as usize)
-                {
-                    uses[self.point_base[bi] + si] = true;
+                let q = self.point_base[bi] + si;
+                match &s.kind {
+                    StmtKind::Drop(l) if drop_live[*l as usize] && bit_has(st.init(), *l as usize) => uses[q] = true,
+                    StmtKind::Assign(dest, rv) if !opaque.is_empty() => {
+                        let mut ops: Vec<&Operand> = Vec::new();
+                        rvalue_operands(rv, &mut |o| ops.push(o));
+                        uses[q] |= overwrites(&st, dest, &ops);
+                    }
+                    _ => {}
                 }
                 self.stmt(bi as u32, si as u32, &s.kind, s.span, &mut st);
+            }
+            if let Terminator::Call { args, dest, .. } = &b.term
+                && overwrites(&st, dest, &args.iter().collect::<Vec<_>>())
+            {
+                uses[self.point_base[bi] + b.stmts.len()] = true;
             }
         }
         if uses.iter().any(|&u| u) {
