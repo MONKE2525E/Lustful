@@ -34,6 +34,9 @@ spec.json (see bench/slices/*/spec.json):
                not a ts-rust module file; use it to unmount a module lust cannot take)
   unmount      optional [name, ...]: comment out the root's `pub mod <name>;` lines (a smaller
                slice of the same crate; users of an unmounted module are pruned)
+  drop         optional [[file, item name, reason], ...]: items removed before the first round,
+               for a lust failure the loop cannot locate (a build error outside fn bodies).
+               Recorded in prune.json with "by": "spec"; their users are pruned as usual.
 
 Only the files in root_from's module tree are copied.
 """
@@ -202,6 +205,21 @@ def items_of(path, cache):
             sys.exit(f"slice-items: {r.stderr.strip()}")
         cache[path] = [(int(a), int(b), int(c), k, n) for a, b, c, k, n in (l.split() for l in r.stdout.splitlines())]
     return cache[path]
+
+
+def apply_drops(spec, src_root, removed):
+    """Remove the spec's `drop` items (one item of that name in the file) before the loop."""
+    for f, name, why in spec.get("drop", []):
+        p = src_root / f
+        hits = [it for it in items_of(str(p), {}) if it[4] == name]
+        if len(hits) != 1:
+            sys.exit(f"drop: {len(hits)} items named {name} in {f}")
+        it = hits[0]
+        lines = p.read_text().split("\n")
+        del lines[it[0] - 1:it[1]]
+        p.write_text("\n".join(lines))
+        removed.append({"file": f, "kind": it[3], "name": name, "lines": it[1] - it[0] + 1, "by": "spec",
+                        "code": "DROP", "message": why[:160]})
 
 
 def prune_round(errs, tool, removed, src_root, unlocated, relocate):
@@ -400,6 +418,7 @@ def main():
     t0 = time.time()
     env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(out / ".lust-cache"))
     removed = []
+    apply_drops(spec, src_root, removed)
     unlocated = []
     rounds = 0
     # Three oracles in turn until all accept: lust check, rustc, lust build.
