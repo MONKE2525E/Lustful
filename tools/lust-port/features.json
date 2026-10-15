@@ -1280,7 +1280,7 @@
    "fix_class": "adapter",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs Timestamp::try_from(SystemTime), TimeZone::tzif (a TZif v1-v3 parser plus POSIX footer rule evaluation after the last transition), try_system, and civil date conversion, all exact at DST edges. That is its own adapter slice with a transition corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+   "notes": "Gap recorded by w-cinterop2, re-sized by w-cinterop3: not exact-matchable as a small adapter. The ts-rust form needs Timestamp::try_from(SystemTime), TimeZone::tzif, TimeZone::UTC, try_system (Windows cfg only in ts-rust), and to_datetime civil fields. Upstream jiff-core 0.1.1 implements that as a 1,361-line TZif parser plus a 3,758-line POSIX footer rule engine plus civil date math; every parse and range error also has its own jiff Error text a program can print. Reimplementing that exactly at DST edges (spring/fall transitions, past the last transition, footer-only zones) in the lust subset is its own package with a transition corpus against the real crate (fixed zone files as bytes). Split from cinterop.system so the count is visible. See dependencies.json.",
    "primary_keys": [
     "ext.type.jiff::*"
    ],
@@ -1300,7 +1300,7 @@
    "fix_class": "adapter",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Gap recorded by w-cinterop2: not small. The ts-rust form needs an LZMA1 range decoder (embed.rs LzmaReader over the packed libs) and, for the build script, a byte-exact LzmaWriter. That is its own adapter slice with a stream corpus. Split from cinterop.system so the count is visible. See dependencies.json.",
+   "notes": "Gap recorded by w-cinterop2, re-sized by w-cinterop3: not small and not byte-exactable in this slice. All ts-rust uses are wasm-only (embed.rs LzmaReader over the packed libs, and parts/goport_util/build.rs LzmaWriter with Bt4/EncodeMode::Normal options whose output bytes must match upstream exactly). A decode-only adapter still needs a full LZMA1 range decoder; the writer needs upstream's match finder and price model. Its own slice with a stream corpus against the real crate. Split from cinterop.system so the count is visible. See dependencies.json.",
    "primary_keys": [
     "ext.type.lzma_rust2::*"
    ],
