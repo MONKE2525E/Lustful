@@ -16,5 +16,5 @@ mod span_shift;
 mod session;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
-pub use compile::{compile, sweep_bases};
+pub use compile::{compile, release_bases, sweep_bases};
 pub use session::Session;

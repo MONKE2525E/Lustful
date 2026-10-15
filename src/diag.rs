@@ -254,6 +254,11 @@ pub struct Expansion {
 /// requests: spans in reused chunks stay valid.
 static GLOBAL_EXPANSIONS: std::sync::Mutex<Vec<Expansion>> = std::sync::Mutex::new(Vec::new());
 
+/// How many expansions the process-wide table holds (daemon stats lines).
+pub fn expansion_count() -> usize {
+    GLOBAL_EXPANSIONS.lock().unwrap().len()
+}
+
 /// Records one expansion in the process-wide table and returns the context
 /// id for its tokens. The macro expander is the caller.
 pub fn register_expansion(exp: Expansion) -> CtxtId {

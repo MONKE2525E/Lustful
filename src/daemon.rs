@@ -18,6 +18,10 @@
 // executables: base libraries live in a persistent dir, not here (see
 // `resolve_base_dir` in driver/compile.rs). On exit each base dir is swept too, so
 // bases of deleted executables are removed while bases of kept executables stay.
+// Bounds for a long session: at most `max_sessions` warm sessions (LRU eviction), and a
+// hang watchdog (`spawn_hang_watchdog`) that exits when a request runs on after its client
+// left, so one compile that never ends cannot wedge every later request. Every 100
+// requests the log gets a stats line (RSS, sessions, expansion tables).
 // Two safety nets watch the warm answers:
 //   - A panic in one request is caught. That crate's session is dropped, the request is
 //     answered by a fresh session at once, and the daemon keeps serving.
@@ -93,6 +97,66 @@ extern "C" fn on_shutdown_signal(_sig: i32) {
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 const POLLIN: i16 = 1;
+const POLLERR: i16 = 0x8;
+const POLLHUP: i16 = 0x10;
+#[cfg(target_os = "linux")]
+const POLLRDHUP: i16 = 0x2000;
+#[cfg(not(target_os = "linux"))]
+const POLLRDHUP: i16 = 0;
+
+/// The request the serve loop is compiling: its connection fd and start
+/// time, or None between requests. The hang watchdog reads it; the serve
+/// loop clears it before the connection closes, so a set fd is always open.
+static BUSY: std::sync::Mutex<Option<(i32, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// How long a request may run before the watchdog checks its client
+/// (`LUST_DAEMON_HANG`, seconds, default 30; 0 turns the watchdog off).
+fn hang_limit() -> Option<std::time::Duration> {
+    match std::env::var("LUST_DAEMON_HANG").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(n) => Some(std::time::Duration::from_secs(n)),
+        None => Some(std::time::Duration::from_secs(30)),
+    }
+}
+
+/// True when the peer of connection `fd` has closed it (the client was
+/// killed, timed out, or got Ctrl-C). A client that still waits for its
+/// answer has sent its whole request and reads, so no event is pending.
+fn client_gone(fd: i32) -> bool {
+    let mut pfd = PollFd { fd, events: POLLRDHUP, revents: 0 };
+    // SAFETY: one valid pollfd for the duration of the call; timeout 0.
+    unsafe { poll(&mut pfd, 1, 0) > 0 && pfd.revents & (POLLRDHUP | POLLHUP | POLLERR) != 0 }
+}
+
+/// Starts the hang watchdog. The daemon compiles one request at a time,
+/// so a compile that never ends (a compiler bug) used to wedge it: every
+/// later request queued behind it forever (fx-resolve3's probe sweep saw
+/// every build time out after one such program). A Rust thread cannot be
+/// stopped, so when a request has run past `limit` and its client is
+/// gone, the daemon removes its socket and temp dir and exits. Queued
+/// clients then get no answer and compile cold, and the next client
+/// starts a new daemon. A slow compile whose client still waits is left
+/// alone.
+fn spawn_hang_watchdog(sock: PathBuf, base: PathBuf, limit: std::time::Duration) {
+    let _ = std::thread::Builder::new().name("lust-hang-watch".into()).spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((fd, since)) = *busy
+                && since.elapsed() >= limit
+                && client_gone(fd)
+            {
+                eprintln!(
+                    "lust daemon: a request ran {} s and its client is gone (a compiler hang?); exiting so a new daemon can serve",
+                    since.elapsed().as_secs()
+                );
+                let _ = std::fs::remove_file(&sock);
+                let _ = std::fs::remove_dir_all(&base);
+                std::process::exit(3);
+            }
+        }
+    });
+}
 
 #[repr(C)]
 struct PollFd {
@@ -324,6 +388,9 @@ struct Entry {
     /// A background guard found a mismatch: the next request for this key is
     /// recomputed in a brand-new session before it is answered.
     recompute_next: bool,
+    /// When a request last used this entry; the least recent one is
+    /// evicted first (`evict_lru`).
+    last_used: std::time::Instant,
 }
 
 impl Entry {
@@ -344,6 +411,7 @@ impl Entry {
             served: 0,
             replaced_gen: 0,
             recompute_next: false,
+            last_used: std::time::Instant::now(),
         }
     }
 }
@@ -580,20 +648,62 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
     }
 }
 
-/// The session entry for `key`, made on first use. New keys get the next
-/// directory number (entries are never removed, so numbers stay unique)
-/// and one log line naming the full key and its directory.
-fn entry_for<'m>(sessions: &'m mut HashMap<SessionKey, Entry>, base: &Path, key: &SessionKey) -> &'m mut Entry {
-    use std::collections::hash_map::Entry as MapEntry;
-    let n = sessions.len();
-    match sessions.entry(key.clone()) {
-        MapEntry::Occupied(e) => e.into_mut(),
-        MapEntry::Vacant(v) => {
-            let dir = base.join(n.to_string());
-            eprintln!("lust daemon: new session for crate {} in {}", key.describe(), dir.display());
-            v.insert(Entry::new(dir, key.clone()))
-        }
+/// How many warm sessions the daemon keeps (`LUST_DAEMON_SESSIONS`,
+/// default 32, at least 1). Each distinct file or crate selection is one
+/// session, so a long run over many small programs (a probe sweep) made
+/// one per program and kept them all: RSS and temp space grew with every
+/// new file. Past the cap the least recently used session is evicted.
+fn max_sessions() -> usize {
+    std::env::var("LUST_DAEMON_SESSIONS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(32).max(1)
+}
+
+/// Evicts least recently used sessions until at most `cap` remain,
+/// never `keep` (the key being served). An evicted session's object
+/// dir is deleted, and so are its base files that no kept executable
+/// names. A later request for that key starts a new session. A guard
+/// check still running for it finds no entry and drops its result.
+fn evict_lru(sessions: &mut HashMap<SessionKey, Entry>, keep: &SessionKey, cap: usize) {
+    while sessions.len() > cap {
+        let Some(old) = sessions.iter().filter(|(k, _)| *k != keep).min_by_key(|(_, e)| e.last_used).map(|(k, _)| k.clone()) else {
+            return;
+        };
+        let entry = sessions.remove(&old).expect("the key was just found");
+        driver::release_bases(&entry.session);
+        let _ = std::fs::remove_dir_all(entry.session.obj_dir());
+        eprintln!("lust daemon: evicted the least recently used session for crate {} (cap {cap})", old.describe());
     }
+}
+
+/// The session entry for `key`, made on first use and marked used now.
+/// New keys get the next directory number from `made` (never reused,
+/// also after evictions) and one log line naming the full key and its
+/// directory; past the session cap the least recently used entry goes.
+fn entry_for<'m>(sessions: &'m mut HashMap<SessionKey, Entry>, base: &Path, key: &SessionKey, made: &mut usize) -> &'m mut Entry {
+    if !sessions.contains_key(key) {
+        let dir = base.join(made.to_string());
+        *made += 1;
+        eprintln!("lust daemon: new session for crate {} in {}", key.describe(), dir.display());
+        sessions.insert(key.clone(), Entry::new(dir, key.clone()));
+        evict_lru(sessions, key, max_sessions());
+    }
+    let entry = sessions.get_mut(key).expect("the entry was just made");
+    entry.last_used = std::time::Instant::now();
+    entry
+}
+
+/// One resource line every 100 requests, so a daemon.log shows growth
+/// over a long session (scripts/daemon-soak.sh asserts the bounds).
+fn log_stats(served: u64, sessions: usize) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field =
+        |name: &str| status.lines().find(|l| l.starts_with(name)).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("?").to_string();
+    eprintln!(
+        "lust daemon: stats: {served} requests, {sessions} sessions, rss {} kB, {} threads, {} expansions, {} cached expansions",
+        field("VmRSS:"),
+        field("Threads:"),
+        crate::diag::expansion_count(),
+        crate::expand::cache_len()
+    );
 }
 
 /// Serves requests until idle. Each crate selection (`SessionKey`) has its own session.
@@ -668,7 +778,12 @@ pub fn serve(sock: &Path) -> ! {
     let mut last = std::time::Instant::now();
     let base = std::env::temp_dir().join(format!("lust-daemon-{}", std::process::id()));
     let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+    let mut made = 0usize;
+    let mut served = 0u64;
     let mut jobs = GuardJobs::new();
+    if let Some(limit) = hang_limit() {
+        spawn_hang_watchdog(sock.to_path_buf(), base.clone(), limit);
+    }
     // Autostart pre-warm: the client that started us names the file it is compiling
     // cold. Checking it here fills a session, so the next command is truly warm. It
     // waits for that cold process to exit first, so it never competes with it. A
@@ -700,7 +815,7 @@ pub fn serve(sock: &Path) -> ! {
             client: protocol::Client::default(),
             file: file.clone(),
         };
-        let entry = entry_for(&mut sessions, &base, &req.session);
+        let entry = entry_for(&mut sessions, &base, &req.session, &mut made);
         let _ = compile_guarded(entry, &req, &mut jobs);
         last = std::time::Instant::now();
     }
@@ -738,6 +853,7 @@ pub fn serve(sock: &Path) -> ! {
             let mut reader = BufReader::new(&conn);
             protocol::read_request(&mut reader)
         };
+        *BUSY.lock().unwrap_or_else(|e| e.into_inner()) = Some((conn.as_raw_fd(), std::time::Instant::now()));
         let resp = match req {
             Some(req) => {
                 // A daemon never runs user code in memory: that run forks,
@@ -746,7 +862,7 @@ pub fn serve(sock: &Path) -> ! {
                 // Finished guard checks for this key land before its next
                 // compile, so a marked recompute takes effect here.
                 jobs.drain(&mut sessions);
-                let entry = entry_for(&mut sessions, &base, &req.session);
+                let entry = entry_for(&mut sessions, &base, &req.session, &mut made);
                 // Graph and build-script routing (sections 1.1, 1.8): if
                 // a covered file changed since this session was made,
                 // replace it before serving, never after.
@@ -761,6 +877,11 @@ pub fn serve(sock: &Path) -> ! {
             None => Response { stderr: "error: bad request\n".into(), code: 2, ..Default::default() },
         };
         let _ = protocol::write_response(&mut conn, &resp);
+        *BUSY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        served += 1;
+        if served % 100 == 0 {
+            log_stats(served, sessions.len());
+        }
         last = std::time::Instant::now();
     }
 }
@@ -795,7 +916,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let key = SessionKey::synthetic(Path::new("/tmp/g/main.rs"), false);
         let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
-        let entry = entry_for(&mut sessions, &base, &key);
+        let entry = entry_for(&mut sessions, &base, &key, &mut 0);
         entry.served = 5;
         let warm_dir = entry.session.obj_dir().to_path_buf();
 
@@ -892,12 +1013,44 @@ mod tests {
     /// A replaced session's object dir is deleted at replacement time,
     /// not left until daemon exit.
     #[test]
+    fn client_gone_sees_a_closed_peer_only() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!client_gone(ours.as_raw_fd()));
+        drop(theirs);
+        assert!(client_gone(ours.as_raw_fd()));
+    }
+
+    #[test]
+    fn evict_lru_drops_the_least_recent_entry_and_its_dir() {
+        let tmp = std::env::temp_dir().join(format!("lust-daemon-evict-{}", std::process::id()));
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let mut made = 0;
+        let keys: Vec<SessionKey> = (0..3).map(|i| SessionKey::synthetic(&tmp.join(format!("f{i}.rs")), false)).collect();
+        for k in &keys {
+            let e = entry_for(&mut sessions, &tmp, k, &mut made);
+            std::fs::create_dir_all(e.session.obj_dir()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Touch key 0: key 1 is now the least recently used.
+        entry_for(&mut sessions, &tmp, &keys[0], &mut made);
+        let dir1 = sessions[&keys[1]].session.obj_dir().to_path_buf();
+        evict_lru(&mut sessions, &keys[2], 2);
+        assert!(sessions.contains_key(&keys[0]) && sessions.contains_key(&keys[2]) && !sessions.contains_key(&keys[1]));
+        assert!(!dir1.exists());
+        // The served key is never evicted, and dir numbers are not reused.
+        evict_lru(&mut sessions, &keys[2], 0);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(made, 3);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn replace_session_deletes_the_old_obj_dir() {
         let base = std::env::temp_dir().join(format!("lust-replace-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let key = SessionKey::synthetic(Path::new("/tmp/g/main.rs"), false);
         let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
-        let entry = entry_for(&mut sessions, &base, &key);
+        let entry = entry_for(&mut sessions, &base, &key, &mut 0);
         let old_dir = entry.session.obj_dir().to_path_buf();
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::write(old_dir.join("u1.o"), b"x").unwrap();

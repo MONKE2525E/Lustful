@@ -470,6 +470,32 @@ fn base_still_used(users: &[(String, PathBuf)], soname: &str) -> bool {
     users.iter().filter(|(u, _)| u == soname).any(|(_, out)| output_names_base(out, soname))
 }
 
+/// Deletes the base files `session` built that no kept executable still
+/// names. The daemon calls it when it evicts the session: nothing will
+/// relink against those files, and the manifest sweep keeps a live
+/// daemon's files, so without this they would stay until the daemon exits.
+pub fn release_bases(session: &super::Session) {
+    let caches = &session.caches;
+    let Some(dir) = &caches.base_dir else { return };
+    for soname in &caches.base_files {
+        if !base_still_used(&caches.base_users, soname) {
+            let _ = std::fs::remove_file(dir.join(soname));
+        }
+    }
+}
+
+/// True when the merged Ast holds many more nodes than its last fresh
+/// parse. Bodies mode, signatures mode, and the body patch append the
+/// re-parsed nodes and leave the replaced ones in the arenas, so a long
+/// warm session grew without bound (about 650 nodes per edit of a small
+/// crate that adds or removes a fn; hundreds of MB after a few thousand
+/// edits). Past twice the fresh size (plus a margin, so a small crate
+/// does not reparse often) the request takes the full parse, which
+/// rebuilds the Ast from the chunks and resets the count.
+fn ast_bloated(front: &Front) -> bool {
+    front.ast.exprs.len() > front.fresh_exprs * 2 + 65_536
+}
+
 /// The persistent directory for this session's base libraries. Executables
 /// load a base by absolute rpath, so the base must sit somewhere stable:
 /// the disk cache dir's `bases/` subdir first (per source tree, next to
