@@ -6,7 +6,7 @@ Feature statuses come from the probes in `tools/lust-port/tests/features/`
 when every construct the scanner sees in it maps to a supported feature.
 The scanner has no type data, so this is an upper bound.
 
-lust commit: `6f114a2d` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
+lust commit: `b210176a` (the scanned tree, landed on `next`). ts-rust: `b11b618ae`.
 `docs/ts-rust-gaps.md` still holds the milestone-3 table scan and its inventory comparison; this file is the current burn-down.
 scan: 1036 files, 789064 lines, target x86_64-unknown-linux-gnu.
 
@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 187 files, 109171 lines (46.1% of files, 27.9% of lines).
+Core: 406 files, 390709 lines. Compiles today: 189 files, 110550 lines (46.6% of files, 28.3% of lines).
 
-All active prod files: 444 of 773 files compile today (30.8% of lines).
+All active prod files: 446 of 773 files compile today (31.0% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,17 +31,17 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `core.std_basics` | partial | 4 | W-STD-B | 167 | 230863 | 65 | 64901 |
+| 1 | `core.std_basics` | partial | 4 | W-SHIM-P2 | 167 | 230863 | 73 | 72825 |
 | 2 | `ext.indexmap` | unsupported | 5 | W-DEPS | 58 | 77962 | 23 | 18903 |
 | 3 | `cinterop.system` | unsupported | 7 | wave C (shims) | 36 | 55543 | 3 | 654 |
 | 4 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 3 | 4962 |
 | 5 | `attrs.unsupported` | unsupported | 4 | W-CHECK-G | 22 | 42181 | 5 | 4516 |
 | 6 | `ext.smallvec` | unsupported | 5 | W-DEPS | 19 | 38018 | 5 | 8260 |
-| 7 | `std.other` | unsupported | 4 | W-STD-B | 19 | 22616 | 2 | 1379 |
-| 8 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 3 | 1915 |
-| 9 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
-| 10 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 0 | 0 |
-| 11 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
+| 7 | `ext.memchr` | partial | 5 | W-DEPS | 14 | 21294 | 3 | 1915 |
+| 8 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
+| 9 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 0 | 0 |
+| 10 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
+| 11 | `std.net` | unsupported | 7 | W-SHIM-P2 | 1 | 1448 | 0 | 0 |
 | 12 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
 | 13 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
 
@@ -49,7 +49,7 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 187 | 46.1 | 27.9 |
+| supported today | 189 | 46.6 | 28.3 |
 | milestone 4 | 273 | 67.2 | 52.2 |
 | milestone 5 | 364 | 89.7 | 84.2 |
 | milestone 6 | 367 | 90.4 | 85.1 |
@@ -60,10 +60,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 444 | 57.4 | 30.8 |
-| milestone 4 | 575 | 74.4 | 53.4 |
-| milestone 5 | 719 | 93.0 | 86.3 |
-| milestone 6 | 724 | 93.7 | 87.0 |
+| supported today | 446 | 57.7 | 31.0 |
+| milestone 4 | 574 | 74.3 | 53.4 |
+| milestone 5 | 718 | 92.9 | 86.3 |
+| milestone 6 | 723 | 93.5 | 87.0 |
 | milestone 7 | 767 | 99.2 | 98.4 |
 | milestone 8 | 769 | 99.5 | 99.4 |
 

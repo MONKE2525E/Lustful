@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 9776,
+  "elapsed_ms": 8824,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,8 +32,8 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 1171,
-    "files_with_findings": 279,
+    "findings": 1177,
+    "files_with_findings": 280,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
@@ -41,12 +41,12 @@
   "root_causes": [
     {
       "root_cause": "std-runtime",
-      "findings": 564,
-      "files": 336,
+      "findings": 570,
+      "files": 333,
       "features": [
         "core.std_basics",
         "std.cow",
-        "std.other"
+        "std.net"
       ]
     },
     {
@@ -686,6 +686,69 @@
       ]
     },
     {
+      "id": "std.net",
+      "title": "TCP and UDP sockets (TcpStream, TcpListener, UdpSocket, Shutdown)",
+      "status": "unsupported",
+      "milestone": 7,
+      "milestone_label": "milestone 7: Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
+      "inventory_step": "5",
+      "root_cause": "std-runtime",
+      "fix_class": "compiler work",
+      "release_safe_rewrite": false,
+      "release_impact": "unchanged",
+      "notes": "Split from std.other (W-STD-C phase 2 scan). Owner: W-SHIM-P2 (system io, with io/fs/process). Probe: std_net.rs (loopback listener). The address types are std.net_addr.",
+      "findings": 6,
+      "raw_uses": 6,
+      "prod_uses": 0,
+      "files": 4,
+      "prod_files": 0,
+      "prod_fns": 0,
+      "scopes": {
+        "test-only": 6
+      },
+      "samples": [
+        {
+          "feature": "std.net",
+          "raw_key": "std.type.std::net::TcpStream",
+          "file": "crates/ts_goport/src/frontend/compiler/file_loader.rs",
+          "byte_start": 151377,
+          "byte_end": 151396,
+          "line": 3533,
+          "column": 23,
+          "snippet": "std::net::TcpStream",
+          "scope": "test-only",
+          "fix_class": "compiler work",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "std.net",
+          "raw_key": "std.type.std::net::TcpStream",
+          "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/spawner.rs",
+          "byte_start": 2896,
+          "byte_end": 2902,
+          "line": 80,
+          "column": 13,
+          "snippet": "Stream",
+          "scope": "test-only",
+          "fix_class": "compiler work",
+          "release_safe_rewrite": false
+        },
+        {
+          "feature": "std.net",
+          "raw_key": "std.type.std::net::TcpStream",
+          "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/spawner.rs",
+          "byte_start": 3822,
+          "byte_end": 3828,
+          "line": 116,
+          "column": 38,
+          "snippet": "Stream",
+          "scope": "test-only",
+          "fix_class": "compiler work",
+          "release_safe_rewrite": false
+        }
+      ]
+    },
+    {
       "id": "ext.memchr",
       "title": "Adapter crate memchr 2.8.2: memchr/memrchr, memchr_iter, memmem::Finder",
       "status": "partial",
@@ -871,7 +934,7 @@
       "findings": 0,
       "raw_uses": 0,
       "prod_uses": 0,
-      "files": 28,
+      "files": 0,
       "prod_files": 0,
       "prod_fns": 0,
       "scopes": {},
@@ -1463,38 +1526,38 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 444,
+    "supported_today_files": 446,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 444,
-        "lines": 175730,
-        "files_pct": 57.4,
-        "lines_pct": 30.8
+        "files": 446,
+        "lines": 177109,
+        "files_pct": 57.7,
+        "lines_pct": 31.0
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 575,
-        "lines": 305268,
-        "files_pct": 74.4,
+        "files": 574,
+        "lines": 305075,
+        "files_pct": 74.3,
         "lines_pct": 53.4
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 719,
-        "lines": 493309,
-        "files_pct": 93.0,
+        "files": 718,
+        "lines": 493116,
+        "files_pct": 92.9,
         "lines_pct": 86.3
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 724,
-        "lines": 497239,
-        "files_pct": 93.7,
+        "files": 723,
+        "lines": 497046,
+        "files_pct": 93.5,
         "lines_pct": 87.0
       },
       {
@@ -1518,41 +1581,41 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 444,
-        "lines": 175730,
-        "files_pct": 57.4,
-        "lines_pct": 30.8
+        "files": 446,
+        "lines": 177109,
+        "files_pct": 57.7,
+        "lines_pct": 31.0
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 561,
-        "lines": 281577,
-        "files_pct": 72.6,
+        "files": 560,
+        "lines": 281384,
+        "files_pct": 72.4,
         "lines_pct": 49.3
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 575,
-        "lines": 305268,
-        "files_pct": 74.4,
+        "files": 574,
+        "lines": 305075,
+        "files_pct": 74.3,
         "lines_pct": 53.4
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 575,
-        "lines": 305268,
-        "files_pct": 74.4,
+        "files": 574,
+        "lines": 305075,
+        "files_pct": 74.3,
         "lines_pct": 53.4
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 575,
-        "lines": 305268,
-        "files_pct": 74.4,
+        "files": 574,
+        "lines": 305075,
+        "files_pct": 74.3,
         "lines_pct": 53.4
       },
       {
@@ -1624,10 +1687,10 @@
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 249,
-        "lines": 328619,
-        "files_pct": 32.2,
-        "lines_pct": 57.5
+        "files": 247,
+        "lines": 327240,
+        "files_pct": 32.0,
+        "lines_pct": 57.3
       },
       {
         "id": "2",
@@ -1656,10 +1719,10 @@
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 157,
-        "lines": 220558,
-        "files_pct": 20.3,
-        "lines_pct": 38.6
+        "files": 159,
+        "lines": 222199,
+        "files_pct": 20.6,
+        "lines_pct": 38.9
       },
       {
         "id": "6",
@@ -1715,38 +1778,38 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 445,
+    "supported_today_files": 447,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 445,
-        "lines": 175745,
-        "files_pct": 57.2,
-        "lines_pct": 30.6
+        "files": 447,
+        "lines": 177124,
+        "files_pct": 57.5,
+        "lines_pct": 30.9
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 577,
-        "lines": 306293,
-        "files_pct": 74.2,
-        "lines_pct": 53.4
+        "files": 576,
+        "lines": 306100,
+        "files_pct": 74.0,
+        "lines_pct": 53.3
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 721,
-        "lines": 494334,
-        "files_pct": 92.7,
-        "lines_pct": 86.2
+        "files": 720,
+        "lines": 494141,
+        "files_pct": 92.5,
+        "lines_pct": 86.1
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 726,
-        "lines": 498264,
-        "files_pct": 93.3,
+        "files": 725,
+        "lines": 498071,
+        "files_pct": 93.2,
         "lines_pct": 86.8
       },
       {
@@ -1770,42 +1833,42 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 445,
-        "lines": 175745,
-        "files_pct": 57.2,
-        "lines_pct": 30.6
+        "files": 447,
+        "lines": 177124,
+        "files_pct": 57.5,
+        "lines_pct": 30.9
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 563,
-        "lines": 282602,
-        "files_pct": 72.4,
-        "lines_pct": 49.3
+        "files": 562,
+        "lines": 282409,
+        "files_pct": 72.2,
+        "lines_pct": 49.2
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 577,
-        "lines": 306293,
-        "files_pct": 74.2,
-        "lines_pct": 53.4
+        "files": 576,
+        "lines": 306100,
+        "files_pct": 74.0,
+        "lines_pct": 53.3
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 577,
-        "lines": 306293,
-        "files_pct": 74.2,
-        "lines_pct": 53.4
+        "files": 576,
+        "lines": 306100,
+        "files_pct": 74.0,
+        "lines_pct": 53.3
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 577,
-        "lines": 306293,
-        "files_pct": 74.2,
-        "lines_pct": 53.4
+        "files": 576,
+        "lines": 306100,
+        "files_pct": 74.0,
+        "lines_pct": 53.3
       },
       {
         "id": "5",
@@ -1876,10 +1939,10 @@
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 253,
-        "lines": 331092,
-        "files_pct": 32.5,
-        "lines_pct": 57.7
+        "files": 251,
+        "lines": 329713,
+        "files_pct": 32.3,
+        "lines_pct": 57.5
       },
       {
         "id": "2",
@@ -1908,10 +1971,10 @@
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 157,
-        "lines": 220558,
-        "files_pct": 20.2,
-        "lines_pct": 38.4
+        "files": 159,
+        "lines": 222199,
+        "files_pct": 20.4,
+        "lines_pct": 38.7
       },
       {
         "id": "6",
@@ -2306,8 +2369,7 @@
       "missing_features": [
         "attrs.unsupported",
         "cinterop.system",
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 4
     },
@@ -2501,8 +2563,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -3949,8 +4010,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -5867,8 +5927,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 3
     },
@@ -6182,7 +6241,7 @@
         "attrs.unsupported",
         "cinterop.system",
         "core.std_basics",
-        "std.other"
+        "std.net"
       ],
       "findings": 3
     },
@@ -6268,8 +6327,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 1
     },
@@ -6572,7 +6630,7 @@
         "cinterop.system",
         "core.std_basics"
       ],
-      "findings": 14
+      "findings": 15
     },
     {
       "file": "crates/ts_goport/src/frontend/compiler/files_parser.rs",
@@ -6926,8 +6984,7 @@
       "parse_error": false,
       "missing_features": [
         "cinterop.system",
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -6939,8 +6996,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -7455,8 +7511,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -7470,8 +7525,7 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "std.cow",
-        "std.other"
+        "std.cow"
       ],
       "findings": 4
     },
@@ -7785,8 +7839,7 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.indexmap",
-        "std.other"
+        "ext.indexmap"
       ],
       "findings": 7
     },
@@ -7817,9 +7870,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.other"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -7853,8 +7904,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "ext.memchr",
-        "std.other"
+        "ext.memchr"
       ],
       "findings": 0
     },
@@ -7878,8 +7928,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 3
     },
@@ -7994,9 +8043,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.other"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8109,7 +8156,7 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "std.other"
+        "std.net"
       ],
       "findings": 1
     },
@@ -8134,8 +8181,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -9066,8 +9112,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -9493,8 +9538,7 @@
       "missing_features": [
         "cinterop.system",
         "core.std_basics",
-        "ext.memchr",
-        "std.other"
+        "ext.memchr"
       ],
       "findings": 6
     },
@@ -10931,8 +10975,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 2
     },
@@ -12126,9 +12169,9 @@
       "parse_error": false,
       "missing_features": [
         "core.std_basics",
-        "std.other"
+        "std.net"
       ],
-      "findings": 0
+      "findings": 5
     },
     {
       "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/supplemental.rs",
@@ -12230,8 +12273,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -12648,9 +12690,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.other"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -13118,8 +13158,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -13288,8 +13327,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -13301,8 +13339,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     },
@@ -13423,8 +13460,7 @@
         "attrs.unsupported",
         "core.std_basics",
         "derives.unknown",
-        "ext.unknown_crate",
-        "std.other"
+        "ext.unknown_crate"
       ],
       "findings": 5
     },
@@ -13436,8 +13472,7 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "core.std_basics",
-        "std.other"
+        "core.std_basics"
       ],
       "findings": 0
     }
@@ -13847,6 +13882,19 @@
       "release_safe_rewrite": false
     },
     {
+      "feature": "std.net",
+      "raw_key": "std.type.std::net::TcpStream",
+      "file": "crates/ts_goport/src/frontend/compiler/file_loader.rs",
+      "byte_start": 151377,
+      "byte_end": 151396,
+      "line": 3533,
+      "column": 23,
+      "snippet": "std::net::TcpStream",
+      "scope": "test-only",
+      "fix_class": "compiler work",
+      "release_safe_rewrite": false
+    },
+    {
       "feature": "ext.memchr",
       "raw_key": "ext.type.memchr::memmem::Finder",
       "file": "crates/ts_goport/src/frontend/scanner/comment_ranges.rs",
@@ -13948,6 +13996,58 @@
       "snippet": "await",
       "scope": "active",
       "fix_class": "manual",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "std.net",
+      "raw_key": "std.type.std::net::TcpStream",
+      "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/spawner.rs",
+      "byte_start": 2896,
+      "byte_end": 2902,
+      "line": 80,
+      "column": 13,
+      "snippet": "Stream",
+      "scope": "test-only",
+      "fix_class": "compiler work",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "std.net",
+      "raw_key": "std.type.std::net::TcpStream",
+      "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/spawner.rs",
+      "byte_start": 3822,
+      "byte_end": 3828,
+      "line": 116,
+      "column": 38,
+      "snippet": "Stream",
+      "scope": "test-only",
+      "fix_class": "compiler work",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "std.net",
+      "raw_key": "std.type.std::net::TcpStream",
+      "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/spawner.rs",
+      "byte_start": 3830,
+      "byte_end": 3836,
+      "line": 116,
+      "column": 46,
+      "snippet": "Stream",
+      "scope": "test-only",
+      "fix_class": "compiler work",
+      "release_safe_rewrite": false
+    },
+    {
+      "feature": "std.net",
+      "raw_key": "std.type.std::net::TcpStream",
+      "file": "crates/ts_goport/tests/go_baselines/support/contentmappertest/spawner.rs",
+      "byte_start": 3916,
+      "byte_end": 3922,
+      "line": 121,
+      "column": 38,
+      "snippet": "Stream",
+      "scope": "test-only",
+      "fix_class": "compiler work",
       "release_safe_rewrite": false
     },
     {
@@ -14107,7 +14207,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 1171,
+  "findings_total": 1177,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],
