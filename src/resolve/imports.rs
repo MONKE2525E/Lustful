@@ -467,8 +467,15 @@ impl ResolvedTables {
     }
 
     /// The visibility rule of section 1.5: can code in module `from` use
-    /// a binding with visibility `vis` defined in `def_module`?
+    /// a binding with visibility `vis` defined in `def_module`? Spliced
+    /// std source (`STD_MODULE`, no module of these tables) sees all: it
+    /// reaches a user item only through generics, as `Option::map(Self)`
+    /// calls a user tuple struct constructor, and privacy was checked
+    /// where user code named the item.
     pub fn visible(&self, vis: &VisKind, def_module: ModuleId, from: ModuleId, interner: &Interner) -> bool {
+        if from == crate::ty::defs::STD_MODULE {
+            return true;
+        }
         match vis {
             VisKind::Pub => true,
             VisKind::Crate => self.root_of(from) == self.root_of(def_module),

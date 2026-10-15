@@ -2610,8 +2610,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// or fresh variables, with the Adt's bounds queued, as a call of
     /// the constructor does.
     fn ctor_value_ty(&mut self, e: ExprId, a: AdtId, v: u32, span: Span) -> Ty {
-        self.check_ne_ctor(a, v, span);
         let p = self.p;
+        // Naming a tuple struct constructor needs every field visible,
+        // called or not (`.map(m::P)` is rustc E0603).
+        if !p.adt(a).is_enum {
+            self.check_ctor_vis(a, span);
+        }
+        self.check_ne_ctor(a, v, span);
         let c = self.tys.intern_const(ConstKind::Int(v as u128));
         let mut args = vec![GenericArg::Const(c)];
         let generics = p.gx.adt_generics[a.0 as usize].clone();
