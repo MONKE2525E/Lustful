@@ -10019,6 +10019,23 @@ fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
             continue;
         }
         let self_ty = rec.self_ty(&p.tys);
+        // Only a struct, enum, or union of the crate can be made `Copy`
+        // (rustc E0184 for `Box<Local>`, which has a destructor; E0206
+        // for `&mut Local`; `&Local` conflicts with core's `&T` impl).
+        let user_adt = match p.tys.kind(self_ty) {
+            TyKind::Adt(def, _) => p.gx.adt_info.iter().any(|&(d, _)| d == def),
+            _ => false,
+        };
+        if !user_adt && !p.std_source_span(rec.span) && !matches!(p.tys.kind(self_ty), TyKind::Ref(_, Mut::Shared, _)) {
+            let boxed = matches!(p.tys.kind(self_ty), TyKind::Adt(d, _) if d == p.tys.builtins().boxed);
+            errs.push(Diag::new(
+                "L0110",
+                rec.span,
+                if boxed { "the trait `Copy` cannot be implemented for `Box`: it has a destructor" } else { "the trait `Copy` cannot be implemented for this type" },
+                "Implement `Copy` for a struct or enum of this crate.",
+            ));
+            continue;
+        }
         let TyKind::Adt(def, args) = p.tys.kind(self_ty) else { continue };
         let Some(idx) = p.gx.adt_info.iter().position(|&(d, _)| d == def) else { continue };
         let field_tys: Vec<Ty> = p.adt(AdtId(idx as u32)).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
@@ -10735,14 +10752,41 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     check_written_wf(p, errs);
     crate::check::outlives::check_all(p, errs);
     normalize_signatures(p);
-    let is_local = |d: DefId| d.krate == p.krate;
+    crate::check::coherence_std::add_std_shadow_impls(p);
+    // Local to the user crate: std source module items (`Duration`,
+    // `std::error::Error`) and shipped crates are upstream, so an
+    // upstream release may add impls for them (no negative reasoning).
+    let upstream_span = |p: &Program, s: Span| p.shipped_crate_at(s).is_some() || p.std_source_span(s);
+    let mut upstream: FxMap<DefId, ()> = p.gx.index.trait_records().filter(|r| upstream_span(p, r.span)).map(|r| (r.def, ())).collect();
+    for (i, adt) in p.adts.iter().enumerate() {
+        if upstream_span(p, adt.span)
+            && let Some(d) = p.defs.def_of_adt(AdtId(i as u32))
+        {
+            upstream.insert(d, ());
+        }
+    }
+    let is_local = |d: DefId| d.krate == p.krate && !upstream.contains_key(&d);
     let lang = p.gx.lang;
     let by_construction = [lang.sized, lang.send, lang.sync, lang.unpin];
     // `Box` is the one fundamental Adt lust has (`Pin` is not a
-    // supported type); the reference wrappers are structural.
-    let fundamental = [p.tys.builtins().boxed];
+    // supported type); the reference wrappers are structural. The
+    // `Fn` traits are fundamental too (knowable for negative reasoning).
+    let fundamental = [p.tys.builtins().boxed, lang.fn_, lang.fn_mut, lang.fn_once];
     let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &fundamental, &by_construction, &is_local);
-    for (_, later) in pairs {
+    // Pairs of two upstream impls (std source among itself) are std's own.
+    let user_impl = |id| {
+        let rec = p.gx.index.get(id);
+        rec.local && !upstream_span(p, rec.span)
+    };
+    let mut overlapping: Vec<crate::traits::ImplId> = pairs.into_iter().filter(|&(a, b)| user_impl(a) || user_impl(b)).map(|(_, later)| later).collect();
+    let users: Vec<bool> = p.gx.index.all_impls().map(|(_, rec)| rec.local && !upstream_span(p, rec.span)).collect();
+    let with_std = p.gx.index.shadow_overlaps(&mut p.tys, &fundamental, &by_construction, &is_local, &|id| users[id.0 as usize]);
+    for id in with_std {
+        if !overlapping.contains(&id) {
+            overlapping.push(id);
+        }
+    }
+    for later in overlapping {
         let rec = p.gx.index.get(later);
         let trait_name = p.gx.index.trait_record(rec.trait_def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
         errs.push(Diag::new(

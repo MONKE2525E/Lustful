@@ -5,6 +5,7 @@ pub mod alias_path;
 pub mod any;
 pub mod caller;
 pub mod closure;
+pub mod coherence_std;
 pub mod cells;
 pub mod process;
 pub mod utf8;

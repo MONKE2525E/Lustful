@@ -241,6 +241,13 @@ pub struct ImplIndex {
     /// `dyn Trait`, so a blanket `impl<T: Clone> X for T` leaves the
     /// unsized heads to their own impls (W-STD-B: `[T]: ToOwned`).
     pub sized_only: Vec<DefId>,
+    /// Std impls that coherence must see but selection must not
+    /// (`impl<T: Hash> Hash for &T`, `impl<T> Drop for Box<T>`): lust
+    /// has no bodies for them, so they stay out of every bucket. A
+    /// user impl that overlaps one is a conflict with std (rustc E0119),
+    /// and a where clause they can satisfy is no disproof. A negative
+    /// impl (`!Clone for &mut T`, flagged) only conflicts.
+    shadows: Vec<(ImplRecord, bool)>,
 }
 
 impl ImplIndex {
@@ -252,7 +259,7 @@ impl ImplIndex {
     /// Visits every span the index holds: each impl and trait record's
     /// span and generic parameter spans (check/prog_shift.rs moves them).
     pub fn for_each_span(&mut self, f: &mut dyn FnMut(&mut Span)) {
-        for r in &mut self.impls {
+        for r in self.impls.iter_mut().chain(self.shadows.iter_mut().map(|(r, _)| r)) {
             let ImplRecord {
                 def: _,
                 trait_def: _,
@@ -290,6 +297,11 @@ impl ImplIndex {
         self.traits.get(&def)
     }
 
+    /// Every trait record, in no particular order.
+    pub fn trait_records(&self) -> impl Iterator<Item = &TraitRecord> {
+        self.traits.values()
+    }
+
     /// The trait an associated item belongs to.
     pub fn trait_of_assoc(&self, assoc: DefId) -> Option<DefId> {
         self.assoc_trait.get(&assoc).copied()
@@ -323,6 +335,11 @@ impl ImplIndex {
         self.by_trait.entry(rec.trait_def).or_default().push(id);
         self.impls.push(rec);
         id
+    }
+
+    /// Records one coherence-only std impl (see `shadows`).
+    pub fn insert_shadow(&mut self, rec: ImplRecord, negative: bool) {
+        self.shadows.push((rec, negative));
     }
 
     /// One impl record by id.
@@ -712,6 +729,8 @@ fn apply_pattern_subst_ref(tys: &mut impl TyIntern, map: &FxMap<ParamId, Ty>, tr
 
 /// Strips fundamental wrappers (`&`, `&mut`, raw pointers, and the
 /// `fundamental` Adts such as `Box` and `Pin`) from a Self type,
+/// (`fundamental` lists rustc's `#[fundamental]` items: Adts, and for
+/// coherence also the `Fn` traits),
 /// following pattern bindings. Returns the base type.
 fn strip_fundamental(tys: &impl TyIntern, map: &FxMap<ParamId, Ty>, mut t: Ty, fundamental: &[DefId]) -> Ty {
     loop {
@@ -754,8 +773,9 @@ impl ImplIndex {
         if self.dyn_object_impl_holds(tys, tr) {
             return false;
         }
-        for &id in self.impls_of_trait(tr.def) {
-            let rec = self.get(id).clone();
+        let shadows = self.shadows.iter().filter(|(r, neg)| !neg && r.trait_def == tr.def).map(|(r, _)| r);
+        for rec in self.impls_of_trait(tr.def).iter().map(|&id| self.get(id)).chain(shadows) {
+            let rec = rec.clone();
             let n = rec.generics.params.len();
             let cand = rename_trait_ref(tys, rec.trait_ref, n, vars_in_use);
             let mut map: FxMap<ParamId, Ty> = FxMap::default();
@@ -861,7 +881,23 @@ impl ImplIndex {
         if matches!(tys.kind(base), TyKind::Param(_) | TyKind::Infer(_) | TyKind::Error) {
             return false;
         }
-        let local_side = is_local(clause.def) || ref_has_local_side(tys, clause.args, fundamental, is_local);
+        // A fundamental trait (`Fn`, `FnMut`, `FnOnce`) is knowable like
+        // a local one: no upstream release adds an impl of it. Its fn
+        // item, fn pointer, and closure impls are structural (no
+        // records), so those Self types and opaque ones can hold.
+        // rustc's `trait_ref_is_knowable`: a downstream crate may
+        // implement the clause when any of its types is an uncovered
+        // variable (`Local: PartialEq<?B>` for a downstream `B`).
+        if tys.args(clause.args).iter().any(|g| g.as_ty().is_some_and(|t| has_uncovered_param(tys, t, fundamental))) {
+            return false;
+        }
+        let fundamental_trait = fundamental.contains(&clause.def);
+        if fundamental_trait
+            && matches!(tys.kind(base), TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Closure(..) | TyKind::Opaque(..) | TyKind::Projection(..))
+        {
+            return false;
+        }
+        let local_side = is_local(clause.def) || fundamental_trait || ref_has_local_side(tys, clause.args, fundamental, is_local);
         local_side && self.no_impl_can_match(tys, clause, n_vars as u32, depth, fundamental, by_construction, is_local)
     }
 
@@ -916,6 +952,28 @@ impl ImplIndex {
             let (ra, rb) = (self.get(a), self.get(b));
             if self.pair_overlaps(tys, ra, rb, fundamental, by_construction, is_local) {
                 out.push((a, b));
+            }
+        }
+        out
+    }
+
+    /// The local impls that overlap a coherence-only std impl (see
+    /// `shadows`), each once, in index order.
+    pub fn shadow_overlaps(
+        &self,
+        tys: &mut impl TyIntern,
+        fundamental: &[DefId],
+        by_construction: &[DefId],
+        is_local: &dyn Fn(DefId) -> bool,
+        user_impl: &dyn Fn(ImplId) -> bool,
+    ) -> Vec<ImplId> {
+        let mut out = Vec::new();
+        for (id, rec) in self.all_impls() {
+            if !user_impl(id) {
+                continue;
+            }
+            if self.shadows.iter().any(|(s, _)| s.trait_def == rec.trait_def && self.pair_overlaps(tys, s, rec, fundamental, by_construction, is_local)) {
+                out.push(id);
             }
         }
         out
@@ -1010,52 +1068,51 @@ impl ImplIndex {
 }
 
 /// The type-list half of the orphan rule over one trait ref's
-/// types (Self first, then the inputs): true when a type in the
-/// list is local by its outer form (fundamental wrappers
-/// stripped) and no uncovered type parameter occurs in any type
-/// before it. Used by the orphan rule itself and by the
-/// coherence disproof, which needs the same test on a clause.
+/// types (Self first, then the inputs), in RFC 2451's form: true
+/// when a type in the list is local and no uncovered type parameter
+/// occurs in any type before it. A type is local when it is a local
+/// Adt or `dyn LocalTrait`, or a fundamental wrapper (`&`, `&mut`,
+/// and fundamental Adts such as `Box` and `Pin`, never raw pointers)
+/// of one. Used by the orphan rule itself and by the coherence
+/// disproof, which needs the same test on a clause.
 fn ref_has_local_side(tys: &impl TyIntern, args: ArgsId, fundamental: &[DefId], is_local: &dyn Fn(DefId) -> bool) -> bool {
-    let empty: FxMap<ParamId, Ty> = FxMap::default();
     let mut seen_uncovered = false;
     for g in tys.args(args) {
         let Some(t) = g.as_ty() else { continue };
-        let base = strip_fundamental(tys, &empty, t, fundamental);
-        let local = match tys.kind(base) {
-            TyKind::Adt(d, _) => is_local(d),
-            // `dyn LocalTrait` is local, as in rustc.
-            TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| is_local(pr.value.def)),
-            _ => false,
-        };
-        if local {
+        if is_local_ty(tys, t, fundamental, is_local) {
             return !seen_uncovered;
         }
-        if has_uncovered_param(tys, t, false, fundamental) {
+        if has_uncovered_param(tys, t, fundamental) {
             seen_uncovered = true;
         }
     }
     false
 }
 
-/// True when a type parameter occurs in `t` outside a fundamental
-/// wrapper (a reference, a raw pointer, or a fundamental Adt).
-fn has_uncovered_param(tys: &impl TyIntern, t: Ty, covered: bool, fundamental: &[DefId]) -> bool {
+/// True when `t` is local for the orphan rule (see `ref_has_local_side`).
+fn is_local_ty(tys: &impl TyIntern, t: Ty, fundamental: &[DefId], is_local: &dyn Fn(DefId) -> bool) -> bool {
     match tys.kind(t) {
-        TyKind::Param(_) => !covered,
-        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) => has_uncovered_param(tys, e, true, fundamental),
-        TyKind::Slice(e) | TyKind::Array(e, _) => has_uncovered_param(tys, e, covered, fundamental),
-        TyKind::Adt(d, a) => {
-            let inner = covered || fundamental.contains(&d);
-            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_uncovered_param(tys, e, inner, fundamental)))
+        TyKind::Ref(_, _, e) => is_local_ty(tys, e, fundamental, is_local),
+        TyKind::Adt(d, a) if fundamental.contains(&d) => {
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| is_local_ty(tys, e, fundamental, is_local)))
         }
-        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
-            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_uncovered_param(tys, e, covered, fundamental)))
-        }
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_uncovered_param(tys, e, covered, fundamental)),
-        TyKind::FnPtr(sig) => {
-            let b = tys.sig(sig);
-            tys.tys_of(b.value.inputs).iter().any(|&e| has_uncovered_param(tys, e, covered, fundamental))
-                || has_uncovered_param(tys, b.value.output, covered, fundamental)
+        TyKind::Adt(d, _) => is_local(d),
+        // `dyn LocalTrait` is local, as in rustc.
+        TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| is_local(pr.value.def)),
+        _ => false,
+    }
+}
+
+/// True when a type parameter occurs uncovered in `t` (RFC 2451): `t`
+/// is the parameter itself or a fundamental wrapper (`&T`, `&mut T`,
+/// `Box<T>`, `Pin<T>`) of an uncovered one. Any other type constructor
+/// (`Vec<T>`, `(T,)`, `*const T`) covers the parameters inside it.
+fn has_uncovered_param(tys: &impl TyIntern, t: Ty, fundamental: &[DefId]) -> bool {
+    match tys.kind(t) {
+        TyKind::Param(_) => true,
+        TyKind::Ref(_, _, e) => has_uncovered_param(tys, e, fundamental),
+        TyKind::Adt(d, a) if fundamental.contains(&d) => {
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_uncovered_param(tys, e, fundamental)))
         }
         _ => false,
     }
@@ -1262,6 +1319,30 @@ mod tests {
             })
         };
         assert!(!index.orphan_ok(&g, index.get(id), &[], &local_only));
+    }
+
+    /// RFC 2451: a fundamental wrapper does not cover its parameter
+    /// (`impl<T> Foreign<Local> for &T` and `for Box<T>` are orphans),
+    /// another type constructor does (`for Vec<T>` is fine).
+    #[test]
+    fn orphan_rule_fundamental_does_not_cover() {
+        let mut g = GlobalTys::new();
+        let (foreign_tr, foreign_adt, box_adt, local_adt) = (def(5000), def(6000), def(6001), def(20));
+        let mut index = ImplIndex::new();
+        let local_only = |d: DefId| d.hash.0 < 1000;
+        let local_ty = g.mk_adt(local_adt, &[]);
+        let p0 = g.intern(TyKind::Param(ParamId(0)));
+        let ref_p = g.mk_ref(false, p0);
+        let box_p = g.mk_adt(box_adt, &[GenericArg::Ty(p0)]);
+        let vec_p = g.mk_adt(foreign_adt, &[GenericArg::Ty(p0)]);
+        let ptr_local = g.intern(TyKind::RawPtr(Mut::Shared, local_ty));
+        let box_local = g.mk_adt(box_adt, &[GenericArg::Ty(local_ty)]);
+        let cases = [(ref_p, Some(local_ty), false), (box_p, Some(local_ty), false), (vec_p, Some(local_ty), true), (ptr_local, None, false), (box_local, None, true)];
+        for (n, (self_ty, input, ok)) in cases.into_iter().enumerate() {
+            let inputs: Vec<Ty> = input.into_iter().collect();
+            let id = add_impl(&mut g, &mut index, 1200 + n as u64, foreign_tr, self_ty, &inputs, 1, vec![]);
+            assert_eq!(index.orphan_ok(&g, index.get(id), &[box_adt], &local_only), ok, "case {n}");
+        }
     }
 
     /// `dyn Local` is a local type, also behind a reference (rustc's
