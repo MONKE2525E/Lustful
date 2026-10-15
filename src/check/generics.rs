@@ -1839,6 +1839,11 @@ fn resolve_generic_args(
 /// True when the integer `v` (two's complement in a u128, as
 /// `ConstKind::Int` holds it) is a value of `it`.
 pub(crate) fn const_int_fits(v: u128, it: IntTy) -> bool {
+    // Every 128-bit pattern is a value of a 128-bit type; the
+    // signed read below would call u128 values past 2^127 negative.
+    if it.bits() >= 128 {
+        return true;
+    }
     let v = v as i128;
     if it.signed() {
         let max = (it.max128() as i128).max(0);
