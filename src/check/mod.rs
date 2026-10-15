@@ -13829,6 +13829,34 @@ impl<'p> Ctx<'p> {
         let sh = |b: Builtin| Some((b, Autoref::None, vec![u32t], t));
         let un = |b: Builtin| Some((b, Autoref::None, vec![], t));
         let n = name;
+        // The `u8` ascii family (`u8::is_ascii_uppercase` and friends):
+        // core defines them on the byte value with the same ranges as
+        // the `char` forms, so the char builtins serve both. The
+        // predicates take `&self`; the case maps return a new `u8`.
+        if i == IntTy::U8 {
+            let pred = [
+                (k.is_ascii, B::CharIsAscii),
+                (k.is_ascii_alphabetic, B::CharIsAlphabetic),
+                (k.is_ascii_alphanumeric, B::CharIsAlphanumeric),
+                (k.is_ascii_digit, B::CharIsDigit),
+                (k.is_ascii_whitespace, B::CharIsWhitespace),
+                (k.is_ascii_uppercase, B::CharIsUppercase),
+                (k.is_ascii_lowercase, B::CharIsLowercase),
+                (k.is_ascii_hexdigit, B::CharIsAsciiHexdigit),
+                (k.is_ascii_punctuation, B::CharIsAsciiPunctuation),
+                (k.is_ascii_graphic, B::CharIsAsciiGraphic),
+                (k.is_ascii_control, B::CharIsAsciiControl),
+            ];
+            if let Some(&(_, b)) = pred.iter().find(|(m, _)| *m == n) {
+                return Some((b, Autoref::Ref, vec![], BOOL));
+            }
+            if n == k.to_ascii_uppercase {
+                return Some((B::CharToUppercase, Autoref::Ref, vec![], t));
+            }
+            if n == k.to_ascii_lowercase {
+                return Some((B::CharToLowercase, Autoref::Ref, vec![], t));
+            }
+        }
         // The families that stay within the value (wrapping and plain).
         if n == k.wrapping_add {
             return bin(B::WrappingAdd);
