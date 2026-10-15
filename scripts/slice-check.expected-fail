@@ -1,9 +1,3 @@
 # Expected cold-check failures for scripts/slice-check.sh.
 # One per line: <slice-name> <reason>. A listed slice that passes is a
 # failure of slice-check: remove it from this list when its fix lands.
-# Owner of the fix below: fx-bench4-gaps (derive prover). Empty this
-# list when the L0110 regression is fixed.
-goport-util-lsp derive(Hash) over Option<Box<Self>> false-rejects L0110 (fx-stdos round 1, repro /home/theo/lust-scratch/fx-stdos/repro2/hash_box_self.rs)
-tsrust-full derive(Hash) over Option<Box<Self>> false-rejects L0110 (fx-stdos round 1, repro /home/theo/lust-scratch/fx-stdos/repro2/hash_box_self.rs)
-tsrust-all derive(Hash) over Option<Box<Self>> false-rejects L0110 (fx-stdos round 1, repro /home/theo/lust-scratch/fx-stdos/repro2/hash_box_self.rs)
-tsrust-all4 derive(Hash) over Option<Box<Self>> false-rejects L0110 (fx-stdos round 1, repro /home/theo/lust-scratch/fx-stdos/repro2/hash_box_self.rs)

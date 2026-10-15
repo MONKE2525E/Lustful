@@ -10158,6 +10158,11 @@ pub fn append_trait_default_templates(p: &mut Program) {
 /// hold by construction here (sizedness is checked where types
 /// are used). A goal the solver can only defer counts as not
 /// proved: at collect the bound must be in the env or in an impl.
+/// `seen` holds the derived-Adt goals on the current walk: a
+/// repeat is a recursive type (`Option<Box<S>>` in `S`), which
+/// rustc proves from the derive impl itself, so it counts as
+/// proved. Only derived-Adt steps push to `seen`; a cycle through
+/// written impls alone still fails by depth, as rustc rejects it.
 fn prove_trait_ref(
     p: &Program,
     solver: &mut crate::traits::solve::Solver,
@@ -10165,6 +10170,7 @@ fn prove_trait_ref(
     env: &[Predicate],
     tr: TraitRef,
     depth: u32,
+    seen: &mut Vec<(DefId, Ty)>,
 ) -> bool {
     use crate::traits::solve::Selection;
     let (index, lang) = (&p.gx.index, &p.gx.lang);
@@ -10258,6 +10264,11 @@ fn prove_trait_ref(
         // decompose only the record-less shapes (tuple, array,
         // slice, reference) and otherwise keep the solver's answer.
         let containers = tr.def == lang.debug || tr.def == lang.clone || tr.def == lang.copy || tr.def == lang.hash;
+        // Set when `parts` are a derived Adt's fields: that is the
+        // only step that can cycle (`S` derives `Hash`, a field is
+        // `Option<Box<S>>`), and rustc proves such a cycle from the
+        // derive impl itself, so a goal already in `seen` holds.
+        let mut derived_adt = false;
         let parts: Option<Vec<Ty>> = match cx.tys.kind(t) {
             // A shared reference is always `Copy` and `Clone`
             // (`impl<T: ?Sized> Copy for &T` in core), with no
@@ -10285,6 +10296,13 @@ fn prove_trait_ref(
                 let limited = tr.def != lang.clone && tr.def != lang.copy;
                 (!limited || elems.len() <= 12).then_some(elems)
             }
+            // Core implements the family traits for every raw
+            // pointer, and all but `Default` for every fn pointer,
+            // with no goal on the signature or pointee (they compare
+            // and hash by address; a raw pointer defaults to null).
+            // The solver has no records for these heads.
+            TyKind::FnPtr(_) if !is_default => Some(Vec::new()),
+            TyKind::RawPtr(..) => Some(Vec::new()),
             _ if !containers => None,
             _ => {
                 let elem = if is_copy {
@@ -10310,6 +10328,7 @@ fn prove_trait_ref(
                         d.hash
                     };
                     if derived {
+                        derived_adt = true;
                         let args: Vec<GenericArg> = cx.tys.adt_parts(t).map(|(_, a)| cx.tys.args(a).to_vec()).unwrap_or_default();
                         let raw: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
                         let fields: Vec<Ty> =
@@ -10324,19 +10343,29 @@ fn prove_trait_ref(
             }
         };
         if let Some(parts) = parts {
-            return parts.into_iter().all(|e| {
+            if derived_adt {
+                if seen.contains(&(tr.def, t)) {
+                    return true;
+                }
+                seen.push((tr.def, t));
+            }
+            let all = parts.into_iter().all(|e| {
                 let args = if two_args {
                     cx.tys.intern_args(&[GenericArg::Ty(e), GenericArg::Ty(e)])
                 } else {
                     cx.tys.intern_args(&[GenericArg::Ty(e)])
                 };
-                prove_trait_ref(p, solver, cx, env, TraitRef { def: tr.def, args, bindings: EMPTY_BINDINGS }, depth + 1)
+                prove_trait_ref(p, solver, cx, env, TraitRef { def: tr.def, args, bindings: EMPTY_BINDINGS }, depth + 1, seen)
             });
+            if derived_adt {
+                seen.pop();
+            }
+            return all;
         }
     }
     match solver.select(cx, index, env, tr) {
         Selection::Impl { nested, .. } => nested.iter().all(|pred| match pred {
-            Predicate::Trait(b) if b.count == 0 => prove_trait_ref(p, solver, cx, env, b.value, depth + 1),
+            Predicate::Trait(b) if b.count == 0 => prove_trait_ref(p, solver, cx, env, b.value, depth + 1, seen),
             _ => true,
         }),
         Selection::ParamEvidence(_) => true,
@@ -10406,7 +10435,7 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
 fn prove_goal(p: &Program, env: &[Predicate], tr: TraitRef) -> bool {
     let mut cx = crate::traits::solve::PureCx::new(&p.tys);
     let mut solver = crate::traits::solve::Solver::new();
-    prove_trait_ref(p, &mut solver, &mut cx, env, tr, 0)
+    prove_trait_ref(p, &mut solver, &mut cx, env, tr, 0, &mut Vec::new())
 }
 
 /// The obligations one written impl owes its trait: the trait's
