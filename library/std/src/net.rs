@@ -1,7 +1,7 @@
 // `std::net` overlay (docs/ARCH.md section 3.1; W-STD-C phase 2):
-// the address types. `TcpStream`, `TcpListener`, `UdpSocket`, and
-// the rest of the module stay with W-SHIM (system io); `std::net::X`
-// walks into this module only for the names it defines
+// the address types, plus the sockets at the end of the file
+// (w-cinterop, over the sysnet intrinsics). `std::net::X` walks
+// into this module only for the names it defines
 // (`STD_MODULES` in src/stdmods.rs).
 //
 // Lust std source with the stable, observable behavior of
@@ -1060,5 +1060,788 @@ impl FromStr for SocketAddr {
     }
 }
 
+// Sockets (w-cinterop): TcpListener, TcpStream, and UdpSocket over
+// the `sys_net_*` intrinsics (src/runtime/sysnet.c), with std's
+// syscall choices on Linux (SO_REUSEADDR listeners, dual-stack v6
+// binds, getaddrinfo order and error text) so results and io::Error
+// values match rustc 1.99 std.
 
+use std::io;
 
+/// One address record field, read back from a syscall buffer.
+fn rec64(raw: &[u8], off: usize) -> u64 {
+    let mut v: u64 = 0;
+    let mut i: usize = 0;
+    while i < 8 {
+        v |= (raw[off + i] as u64) << (8 * i);
+        i += 1;
+    }
+    v
+}
+
+fn put64(out: &mut Vec<u8>, v: u64) {
+    let mut i: usize = 0;
+    while i < 8 {
+        out.push((v >> (8 * i)) as u8);
+        i += 1;
+    }
+}
+
+/// The eight little-endian bytes of a record field.
+fn bytes64(v: u64) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    let mut i: usize = 0;
+    while i < 8 {
+        b[i] = (v >> (8 * i)) as u8;
+        i += 1;
+    }
+    b
+}
+
+/// A record field from its eight little-endian bytes.
+fn word64(b: [u8; 8]) -> u64 {
+    let mut v: u64 = 0;
+    let mut i: usize = 0;
+    while i < 8 {
+        v |= (b[i] as u64) << (8 * i);
+        i += 1;
+    }
+    v
+}
+
+/// Packs an address as one 48-byte syscall record (sysnet.h).
+fn pack_addr(a: &SocketAddr) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    match a {
+        SocketAddr::V4(v4) => {
+            let o = v4.ip().octets();
+            put64(&mut out, 4);
+            put64(&mut out, v4.port() as u64);
+            put64(&mut out, word64([o[0], o[1], o[2], o[3], 0, 0, 0, 0]));
+            put64(&mut out, 0);
+            put64(&mut out, 0);
+            put64(&mut out, 0);
+        }
+        SocketAddr::V6(v6) => {
+            let o = v6.ip().octets();
+            let mut lo = [0u8; 8];
+            let mut hi = [0u8; 8];
+            let mut i: usize = 0;
+            while i < 8 {
+                lo[i] = o[i];
+                hi[i] = o[8 + i];
+                i += 1;
+            }
+            put64(&mut out, 6);
+            put64(&mut out, v6.port() as u64);
+            put64(&mut out, word64(lo));
+            put64(&mut out, word64(hi));
+            put64(&mut out, v6.flowinfo() as u64);
+            put64(&mut out, v6.scope_id() as u64);
+        }
+    }
+    out
+}
+
+/// One address record back from a syscall buffer.
+fn unpack_addr(raw: &[u8], off: usize) -> SocketAddr {
+    let fam = rec64(raw, off);
+    let port = rec64(raw, off + 8) as u16;
+    let lo = bytes64(rec64(raw, off + 16));
+    let hi = bytes64(rec64(raw, off + 24));
+    if fam == 4 {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(lo[0], lo[1], lo[2], lo[3]), port))
+    } else {
+        let mut o = [0u8; 16];
+        let mut i: usize = 0;
+        while i < 8 {
+            o[i] = lo[i];
+            o[8 + i] = hi[i];
+            i += 1;
+        }
+        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(o), port, rec64(raw, off + 32) as u32, rec64(raw, off + 40) as u32))
+    }
+}
+
+fn os_err(code: i32) -> io::Error {
+    io::Error::from_raw_os_error(code)
+}
+
+/// The result of a status that is 0 or an errno.
+fn net_status(code: i32) -> io::Result<()> {
+    if code == 0 { Ok(()) } else { Err(os_err(code)) }
+}
+
+/// The local or peer address of a socket.
+fn addr_of(fd: i32, peer: bool) -> io::Result<SocketAddr> {
+    let mut raw: Vec<u8> = Vec::new();
+    match net_status(core::intrinsics::sys_net_addr_of(fd, if peer { 1 } else { 0 }, &mut raw)) {
+        Ok(()) => Ok(unpack_addr(&raw, 0)),
+        Err(e) => Err(e),
+    }
+}
+
+/// A getaddrinfo failure, with std's text and kind.
+fn lookup_error(text: &str) -> io::Error {
+    let mut msg = String::from("failed to lookup address information: ");
+    msg.push_str(text);
+    io::Error::new(io::ErrorKind::__Uncategorized, msg)
+}
+
+/// Resolves a host name and port to addresses, in resolver order.
+fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut raw: Vec<u8> = Vec::new();
+    let n = core::intrinsics::sys_net_resolve(host.as_bytes(), port as u64, &mut raw);
+    if n < 0 {
+        return Err(lookup_error(core::str::from_utf8(&raw).unwrap_or("")));
+    }
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut i: i32 = 0;
+    while i < n {
+        out.push(unpack_addr(&raw, (i as usize) * 48));
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// The `str` form of ToSocketAddrs: an address literal first, else
+/// a host and port split at the last colon, as std parses it.
+fn str_to_addrs(s: &str) -> io::Result<Vec<SocketAddr>> {
+    if let Some(a) = parse_sa4(bytes_of(s)) {
+        return Ok(vec![SocketAddr::V4(a)]);
+    }
+    if let Some(a) = parse_sa6(bytes_of(s)) {
+        return Ok(vec![SocketAddr::V6(a)]);
+    }
+    let b = s.as_bytes();
+    let mut colon: Option<usize> = None;
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == b':' {
+            colon = Some(i);
+        }
+        i += 1;
+    }
+    let idx = match colon {
+        Some(idx) => idx,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid socket address")),
+    };
+    let host = &s[..idx];
+    let port_str = &s[idx + 1..];
+    // A port is decimal digits that fit a u16, as u16's FromStr.
+    let port: u16 = {
+        let pb = port_str.as_bytes();
+        let mut v: u32 = 0;
+        let mut bad = pb.is_empty();
+        // u16's FromStr takes one leading `+`.
+        let mut j: usize = if !pb.is_empty() && pb[0] == b'+' { 1 } else { 0 };
+        if j >= pb.len() {
+            bad = true;
+        }
+        while j < pb.len() {
+            let c = pb[j];
+            if !(b'0' <= c && c <= b'9') {
+                bad = true;
+            } else {
+                v = v.wrapping_mul(10).wrapping_add((c - b'0') as u32);
+                if v > 65535 {
+                    bad = true;
+                }
+            }
+            j += 1;
+        }
+        if bad {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid port value"));
+        }
+        v as u16
+    };
+    let host = if host.len() >= 2 && host.as_bytes()[0] == b'[' && host.as_bytes()[host.len() - 1] == b']' {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    resolve_host(host, port)
+}
+
+/// The iterator of every ToSocketAddrs impl here: the resolved list.
+pub struct __AddrIter {
+    v: Vec<SocketAddr>,
+    i: usize,
+}
+
+impl Iterator for __AddrIter {
+    type Item = SocketAddr;
+    fn next(&mut self) -> Option<SocketAddr> {
+        if self.i >= self.v.len() {
+            return None;
+        }
+        let a = self.v[self.i];
+        self.i += 1;
+        Some(a)
+    }
+}
+
+fn addr_iter(v: Vec<SocketAddr>) -> __AddrIter {
+    __AddrIter { v, i: 0 }
+}
+
+/// Converts a value to one or more socket addresses, in order.
+///
+/// std bounds `Iter` by `Iterator<Item = SocketAddr>`; lust cannot
+/// state a bound on an associated type yet, so the impls below keep
+/// std's contract without the written bound, and `each_addr` states
+/// it as a where clause instead.
+pub trait ToSocketAddrs {
+    type Iter;
+    fn to_socket_addrs(&self) -> io::Result<Self::Iter>;
+}
+
+impl ToSocketAddrs for SocketAddr {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        Ok(addr_iter(vec![*self]))
+    }
+}
+
+impl ToSocketAddrs for SocketAddrV4 {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        Ok(addr_iter(vec![SocketAddr::V4(*self)]))
+    }
+}
+
+impl ToSocketAddrs for SocketAddrV6 {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        Ok(addr_iter(vec![SocketAddr::V6(*self)]))
+    }
+}
+
+impl ToSocketAddrs for (IpAddr, u16) {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        Ok(addr_iter(vec![SocketAddr::from(*self)]))
+    }
+}
+
+impl ToSocketAddrs for (Ipv4Addr, u16) {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        Ok(addr_iter(vec![SocketAddr::from(*self)]))
+    }
+}
+
+impl ToSocketAddrs for (Ipv6Addr, u16) {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        Ok(addr_iter(vec![SocketAddr::from(*self)]))
+    }
+}
+
+impl ToSocketAddrs for (&str, u16) {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        match resolve_host(self.0, self.1) {
+            Ok(v) => Ok(addr_iter(v)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl ToSocketAddrs for (String, u16) {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        match resolve_host(&self.0, self.1) {
+            Ok(v) => Ok(addr_iter(v)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl ToSocketAddrs for str {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        match str_to_addrs(self) {
+            Ok(v) => Ok(addr_iter(v)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl ToSocketAddrs for String {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        match str_to_addrs(self) {
+            Ok(v) => Ok(addr_iter(v)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl ToSocketAddrs for &str {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        match str_to_addrs(self) {
+            Ok(v) => Ok(addr_iter(v)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl ToSocketAddrs for &String {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        match str_to_addrs(self) {
+            Ok(v) => Ok(addr_iter(v)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl ToSocketAddrs for &SocketAddr {
+    type Iter = __AddrIter;
+    fn to_socket_addrs(&self) -> io::Result<__AddrIter> {
+        Ok(addr_iter(vec![**self]))
+    }
+}
+
+/// Resolves `addr` and runs `f` on each address until one works, as
+/// std's bind and connect do; the last error wins.
+fn each_addr<A: ToSocketAddrs, T, F: Fn(&SocketAddr) -> io::Result<T>>(addr: A, f: F) -> io::Result<T>
+where
+    A::Iter: Iterator<Item = SocketAddr>,
+{
+    let mut last: Option<io::Error> = None;
+    let mut iter = addr.to_socket_addrs()?;
+    while let Some(a) = iter.next() {
+        match f(&a) {
+            Ok(v) => return Ok(v),
+            Err(e) => last = Some(e),
+        }
+    }
+    match last {
+        Some(e) => Err(e),
+        None => Err(io::Error::new(io::ErrorKind::InvalidInput, "no socket addresses resolved")),
+    }
+}
+
+/// Which half of a connection to shut down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    Read,
+    Write,
+    Both,
+}
+
+impl core::fmt::Debug for Shutdown {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Shutdown::Read => f.write_str("Read"),
+            Shutdown::Write => f.write_str("Write"),
+            Shutdown::Both => f.write_str("Both"),
+        }
+    }
+}
+
+/// A TCP stream between a local and a remote socket. Dropping it
+/// closes the descriptor.
+pub struct TcpStream {
+    fd: i32,
+}
+
+impl TcpStream {
+    /// Opens a TCP connection to a remote host.
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream>
+    where
+        A::Iter: Iterator<Item = SocketAddr>,
+    {
+        each_addr(addr, |a| {
+            let mut raw: Vec<u8> = Vec::new();
+            let fd = core::intrinsics::sys_net_tcp_connect(&pack_addr(a), &mut raw);
+            if fd < 0 { Err(os_err(-fd)) } else { Ok(TcpStream { fd }) }
+        })
+    }
+
+    /// Returns the socket address of the remote peer.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        addr_of(self.fd, true)
+    }
+
+    /// Returns the socket address of the local half.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        addr_of(self.fd, false)
+    }
+
+    /// Shuts down part of the connection.
+    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        let h = match how {
+            Shutdown::Read => 0,
+            Shutdown::Write => 1,
+            Shutdown::Both => 2,
+        };
+        net_status(core::intrinsics::sys_net_shutdown(self.fd, h))
+    }
+
+    /// A new handle to the same connection.
+    pub fn try_clone(&self) -> io::Result<TcpStream> {
+        let fd = core::intrinsics::sys_fd_dup(self.fd);
+        if fd < 0 { Err(os_err(-fd)) } else { Ok(TcpStream { fd }) }
+    }
+
+    /// Moves the socket into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 3, if nonblocking { 1 } else { 0 }))
+    }
+
+    /// Sets TCP_NODELAY.
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 0, if nodelay { 1 } else { 0 }))
+    }
+
+    /// The TCP_NODELAY state.
+    pub fn nodelay(&self) -> io::Result<bool> {
+        let v = core::intrinsics::sys_net_getopt(self.fd, 0);
+        if v < 0 { Err(os_err((-v) as i32)) } else { Ok(v != 0) }
+    }
+
+    /// Sets the time-to-live.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 1, ttl as i64))
+    }
+
+    /// The time-to-live.
+    pub fn ttl(&self) -> io::Result<u32> {
+        let v = core::intrinsics::sys_net_getopt(self.fd, 1);
+        if v < 0 { Err(os_err((-v) as i32)) } else { Ok(v as u32) }
+    }
+
+    /// Receives data without removing it from the queue.
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut tmp: Vec<u8> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
+        let n = core::intrinsics::sys_net_recvfrom(self.fd, buf.len() as u64, 1, &mut tmp, &mut sink);
+        if n < 0 {
+            return Err(os_err((-n) as i32));
+        }
+        let n = n as usize;
+        let mut i: usize = 0;
+        while i < n {
+            buf[i] = tmp[i];
+            i += 1;
+        }
+        Ok(n)
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            let _ = core::intrinsics::sys_fd_close(self.fd);
+        }
+    }
+}
+
+impl core::fmt::Debug for TcpStream {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("TcpStream");
+        if let Ok(addr) = self.local_addr() {
+            d.field("addr", &addr);
+        }
+        if let Ok(peer) = self.peer_addr() {
+            d.field("peer", &peer);
+        }
+        d.field("fd", &self.fd).finish()
+    }
+}
+
+fn read_fd_into(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
+    let mut tmp: Vec<u8> = Vec::new();
+    let n = core::intrinsics::sys_fd_read(fd, buf.len() as u64, &mut tmp);
+    if n < 0 {
+        return Err(os_err((-n) as i32));
+    }
+    let n = n as usize;
+    let mut i: usize = 0;
+    while i < n {
+        buf[i] = tmp[i];
+        i += 1;
+    }
+    Ok(n)
+}
+
+fn write_fd(fd: i32, buf: &[u8]) -> io::Result<usize> {
+    let n = core::intrinsics::sys_fd_write(fd, buf);
+    if n < 0 { Err(os_err((-n) as i32)) } else { Ok(n as usize) }
+}
+
+impl io::Read for TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        read_fd_into(self.fd, buf)
+    }
+}
+
+impl io::Read for &TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        read_fd_into(self.fd, buf)
+    }
+}
+
+impl io::Write for TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        write_fd(self.fd, buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Write for &TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        write_fd(self.fd, buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A TCP socket server, listening for connections. Dropping it
+/// closes the descriptor.
+pub struct TcpListener {
+    fd: i32,
+}
+
+impl TcpListener {
+    /// Creates a listening TCP socket bound to the address.
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener>
+    where
+        A::Iter: Iterator<Item = SocketAddr>,
+    {
+        each_addr(addr, |a| {
+            let mut raw: Vec<u8> = Vec::new();
+            let fd = core::intrinsics::sys_net_tcp_bind(&pack_addr(a), &mut raw);
+            if fd < 0 { Err(os_err(-fd)) } else { Ok(TcpListener { fd }) }
+        })
+    }
+
+    /// Returns the local socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        addr_of(self.fd, false)
+    }
+
+    /// Accepts a new incoming connection.
+    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let mut raw: Vec<u8> = Vec::new();
+        let fd = core::intrinsics::sys_net_accept(self.fd, &mut raw);
+        if fd < 0 { Err(os_err(-fd)) } else { Ok((TcpStream { fd }, unpack_addr(&raw, 0))) }
+    }
+
+    /// A new handle to the same listener.
+    pub fn try_clone(&self) -> io::Result<TcpListener> {
+        let fd = core::intrinsics::sys_fd_dup(self.fd);
+        if fd < 0 { Err(os_err(-fd)) } else { Ok(TcpListener { fd }) }
+    }
+
+    /// Moves the socket into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 3, if nonblocking { 1 } else { 0 }))
+    }
+
+    /// Sets the time-to-live.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 1, ttl as i64))
+    }
+
+    /// The time-to-live.
+    pub fn ttl(&self) -> io::Result<u32> {
+        let v = core::intrinsics::sys_net_getopt(self.fd, 1);
+        if v < 0 { Err(os_err((-v) as i32)) } else { Ok(v as u32) }
+    }
+
+    /// Returns an iterator over incoming connections.
+    pub fn incoming(&self) -> Incoming<'_> {
+        Incoming { listener: self }
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            let _ = core::intrinsics::sys_fd_close(self.fd);
+        }
+    }
+}
+
+impl core::fmt::Debug for TcpListener {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("TcpListener");
+        if let Ok(addr) = self.local_addr() {
+            d.field("addr", &addr);
+        }
+        d.field("fd", &self.fd).finish()
+    }
+}
+
+/// An iterator over incoming connections to a listener.
+pub struct Incoming<'a> {
+    listener: &'a TcpListener,
+}
+
+impl Iterator for Incoming<'_> {
+    type Item = io::Result<TcpStream>;
+    fn next(&mut self) -> Option<io::Result<TcpStream>> {
+        Some(match self.listener.accept() {
+            Ok((s, _)) => Ok(s),
+            Err(e) => Err(e),
+        })
+    }
+}
+
+impl core::fmt::Debug for Incoming<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Incoming { .. }")
+    }
+}
+
+/// A UDP socket. Dropping it closes the descriptor.
+pub struct UdpSocket {
+    fd: i32,
+}
+
+impl UdpSocket {
+    /// Creates a UDP socket bound to the address.
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket>
+    where
+        A::Iter: Iterator<Item = SocketAddr>,
+    {
+        each_addr(addr, |a| {
+            let mut raw: Vec<u8> = Vec::new();
+            let fd = core::intrinsics::sys_net_udp_bind(&pack_addr(a), &mut raw);
+            if fd < 0 { Err(os_err(-fd)) } else { Ok(UdpSocket { fd }) }
+        })
+    }
+
+    /// Returns the local socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        addr_of(self.fd, false)
+    }
+
+    /// Returns the remote address this socket is connected to.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        addr_of(self.fd, true)
+    }
+
+    /// Connects the socket to a remote address.
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()>
+    where
+        A::Iter: Iterator<Item = SocketAddr>,
+    {
+        each_addr(addr, |a| net_status(core::intrinsics::sys_net_connect_fd(self.fd, &pack_addr(a))))
+    }
+
+    /// Sends data to the given address.
+    pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize>
+    where
+        A::Iter: Iterator<Item = SocketAddr>,
+    {
+        each_addr(addr, |a| {
+            let n = core::intrinsics::sys_net_sendto(self.fd, buf, &pack_addr(a));
+            if n < 0 { Err(os_err((-n) as i32)) } else { Ok(n as usize) }
+        })
+    }
+
+    /// Sends data to the connected peer.
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        let n = core::intrinsics::sys_net_sendto(self.fd, buf, &[]);
+        if n < 0 { Err(os_err((-n) as i32)) } else { Ok(n as usize) }
+    }
+
+    /// Receives a single datagram and its source address.
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (n, from) = self.recv_inner(buf, 0)?;
+        Ok((n, from))
+    }
+
+    /// Receives a single datagram from the connected peer.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let (n, _) = self.recv_inner(buf, 0)?;
+        Ok(n)
+    }
+
+    /// Reads a datagram without removing it from the queue.
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let (n, _) = self.recv_inner(buf, 1)?;
+        Ok(n)
+    }
+
+    /// Reads a datagram without removing it, with its source.
+    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_inner(buf, 1)
+    }
+
+    fn recv_inner(&self, buf: &mut [u8], flags: i32) -> io::Result<(usize, SocketAddr)> {
+        let mut tmp: Vec<u8> = Vec::new();
+        let mut araw: Vec<u8> = Vec::new();
+        let n = core::intrinsics::sys_net_recvfrom(self.fd, buf.len() as u64, flags, &mut tmp, &mut araw);
+        if n < 0 {
+            return Err(os_err((-n) as i32));
+        }
+        let n = n as usize;
+        let mut i: usize = 0;
+        while i < n {
+            buf[i] = tmp[i];
+            i += 1;
+        }
+        Ok((n, unpack_addr(&araw, 0)))
+    }
+
+    /// A new handle to the same socket.
+    pub fn try_clone(&self) -> io::Result<UdpSocket> {
+        let fd = core::intrinsics::sys_fd_dup(self.fd);
+        if fd < 0 { Err(os_err(-fd)) } else { Ok(UdpSocket { fd }) }
+    }
+
+    /// Moves the socket into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 3, if nonblocking { 1 } else { 0 }))
+    }
+
+    /// Sets SO_BROADCAST.
+    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 2, if broadcast { 1 } else { 0 }))
+    }
+
+    /// The SO_BROADCAST state.
+    pub fn broadcast(&self) -> io::Result<bool> {
+        let v = core::intrinsics::sys_net_getopt(self.fd, 2);
+        if v < 0 { Err(os_err((-v) as i32)) } else { Ok(v != 0) }
+    }
+
+    /// Sets the time-to-live.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        net_status(core::intrinsics::sys_net_setopt(self.fd, 1, ttl as i64))
+    }
+
+    /// The time-to-live.
+    pub fn ttl(&self) -> io::Result<u32> {
+        let v = core::intrinsics::sys_net_getopt(self.fd, 1);
+        if v < 0 { Err(os_err((-v) as i32)) } else { Ok(v as u32) }
+    }
+}
+
+impl Drop for UdpSocket {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            let _ = core::intrinsics::sys_fd_close(self.fd);
+        }
+    }
+}
+
+impl core::fmt::Debug for UdpSocket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("UdpSocket");
+        if let Ok(addr) = self.local_addr() {
+            d.field("addr", &addr);
+        }
+        d.field("fd", &self.fd).finish()
+    }
+}

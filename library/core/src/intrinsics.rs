@@ -26,6 +26,23 @@
 //     pub fn sys_os_error_text(code: i32, out: &mut String);
 //     pub fn sys_fmt_arguments_bytes(args: fmt::Arguments) -> Vec<u8>;
 //
+// The socket calls behind `std::net` (w-cinterop; C in
+// src/runtime/sysnet.c, contracts in sysnet.h). An address crosses
+// as one 48-byte record of 8-byte little-endian fields:
+//
+//     pub fn sys_net_resolve(host: &[u8], port: u64, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_net_tcp_bind(rec: &[u8], out: &mut Vec<u8>) -> i32;
+//     pub fn sys_net_udp_bind(rec: &[u8], out: &mut Vec<u8>) -> i32;
+//     pub fn sys_net_tcp_connect(rec: &[u8], out: &mut Vec<u8>) -> i32;
+//     pub fn sys_net_connect_fd(fd: i32, rec: &[u8]) -> i32;
+//     pub fn sys_net_accept(fd: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_net_addr_of(fd: i32, peer: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_net_shutdown(fd: i32, how: i32) -> i32;
+//     pub fn sys_net_setopt(fd: i32, opt: i32, val: i64) -> i32;
+//     pub fn sys_net_getopt(fd: i32, opt: i32) -> i64;
+//     pub fn sys_net_sendto(fd: i32, buf: &[u8], rec: &[u8]) -> i64;
+//     pub fn sys_net_recvfrom(fd: i32, max: u64, flags: i32, out: &mut Vec<u8>, addr: &mut Vec<u8>) -> i64;
+//
 // Every other row of the section 3.2 table is registered with its
 // signature and privilege list, but has no body yet: a privileged call
 // rejects with L0640 until W-STD lands the wrapper and the runtime hook.

@@ -1102,6 +1102,77 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // The socket calls behind `std::net` (w-cinterop,
+    // src/runtime/sysnet.c). An address crosses as one 48-byte record
+    // (sysnet.h has the layout and each contract).
+    // getaddrinfo: address records out, the count, or -1 with the
+    // gai_strerror text in the Vec.
+    IntrinsicDef {
+        name: "sys_net_resolve",
+        c_symbol: "lust_sys_net_resolve",
+        params: &[S::Bytes, S::U64, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // TCP listener bind of one record: the fd or -errno.
+    IntrinsicDef {
+        name: "sys_net_tcp_bind",
+        c_symbol: "lust_sys_net_tcp_bind",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // UDP bind of one record: the fd or -errno.
+    IntrinsicDef {
+        name: "sys_net_udp_bind",
+        c_symbol: "lust_sys_net_udp_bind",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // TCP connect to one record: the fd or -errno.
+    IntrinsicDef {
+        name: "sys_net_tcp_connect",
+        c_symbol: "lust_sys_net_tcp_connect",
+        params: &[S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // connect of an existing fd: 0 or errno.
+    IntrinsicDef { name: "sys_net_connect_fd", c_symbol: "lust_sys_net_connect_fd", params: &[S::I32, S::Bytes], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // accept: the new fd or -errno, the peer record out.
+    IntrinsicDef { name: "sys_net_accept", c_symbol: "lust_sys_net_accept", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // getsockname (peer 0) or getpeername (peer 1): 0 or errno.
+    IntrinsicDef { name: "sys_net_addr_of", c_symbol: "lust_sys_net_addr_of", params: &[S::I32, S::I32, S::VecU8Mut], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // shutdown: 0 read, 1 write, 2 both. 0 or errno.
+    IntrinsicDef { name: "sys_net_shutdown", c_symbol: "lust_sys_net_shutdown", params: &[S::I32, S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // Socket options by number (sysnet.h): set 0 or errno.
+    IntrinsicDef { name: "sys_net_setopt", c_symbol: "lust_sys_net_setopt", params: &[S::I32, S::I32, S::I64], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // The option's value, or -errno.
+    IntrinsicDef { name: "sys_net_getopt", c_symbol: "lust_sys_net_getopt", params: &[S::I32, S::I32], ret: S::I64, allowed: ONLY_STD, implemented: true },
+    // sendto (empty record is a plain send): the count or -errno.
+    IntrinsicDef {
+        name: "sys_net_sendto",
+        c_symbol: "lust_sys_net_sendto",
+        params: &[S::I32, S::Bytes, S::Bytes],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // recvfrom into the Vec, the source record into the second Vec:
+    // the count or -errno. Flags bit 0 is MSG_PEEK.
+    IntrinsicDef {
+        name: "sys_net_recvfrom",
+        c_symbol: "lust_sys_net_recvfrom",
+        params: &[S::I32, S::U64, S::I32, S::VecU8Mut, S::VecU8Mut],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // The Formatter's alignment as `rt::Alignment` encodes it (0 left,
     // 1 right, 2 center, 3 none written), for Debug impls that pad by
     // hand like `Duration`'s (W-STD-C; runtime/stdc.c).
