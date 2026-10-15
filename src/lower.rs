@@ -427,8 +427,14 @@ impl<'p> Lower<'p> {
     /// check revealed (`Checked::revealed`): its drop is a use of every
     /// region it holds (`Body::opaque_locals`). A plain value of the same
     /// type counts too, which can only make the borrow check stricter.
+    /// A hidden type the check left unresolved (an inference var or a
+    /// projection, which no local's type holds) counts for every local,
+    /// so a missed match is a false reject, never a false accept.
     fn holds_revealed(&self, ty: Ty) -> bool {
-        !self.ck.revealed.is_empty() && self.ck.revealed.iter().any(|&r| crate::check::opaque::ty_contains(&self.body.tys, ty, r))
+        self.ck.revealed.iter().any(|&r| {
+            let f = self.body.tys.flags(r);
+            f.contains_infer() || f.contains_projection() || crate::check::opaque::ty_contains(&self.body.tys, ty, r)
+        })
     }
     fn emit_drops(&mut self, locals: &[Local], span: Span) {
         for &l in locals.iter().rev() {
