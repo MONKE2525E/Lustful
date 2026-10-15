@@ -18201,6 +18201,19 @@ impl<'p> Ctx<'p> {
     /// Walks one expression, lints overflowing operations with known
     /// operands, applies assignment effects to `env`, and returns the
     /// expression's known value when there is one.
+    /// True when a `size_of`/`align_of`/`needs_drop` callee's baked
+    /// answer is the template placeholder (its type argument names
+    /// a parameter of this template): the value is not known here.
+    fn k_query_placeholder(&mut self, callee: ExprId) -> bool {
+        if !self.is_template_check() {
+            return false;
+        }
+        let ast::Expr::Path(segs) = self.p.ast.expr(callee) else { return false };
+        let Some(&arg) = segs.last().and_then(|s| s.type_args().first()) else { return false };
+        let t = self.resolve_written(arg);
+        self.tys.flags(t).contains_param()
+    }
+
     fn k_expr(&mut self, e: ExprId, env: &mut KEnv, lint: &mut KLint) -> Option<KVal> {
         let p = self.p;
         let span = self.span(e);
@@ -18459,7 +18472,7 @@ impl<'p> Ctx<'p> {
                         other => other,
                     },
                     _ => match self.out.expr_res[self.ei(*callee)] {
-                        Res::ConstUsize(u) => Some(KVal::Int(u as i128)),
+                        Res::ConstUsize(u) if !self.k_query_placeholder(*callee) => Some(KVal::Int(u as i128)),
                         Res::Variant(a, v) if p.adt(a).is_enum => Some(KVal::Enum(a, v)),
                         Res::Variant(a, _) if !p.adt(a).is_enum => Some(KVal::Agg(vals)),
                         Res::OptSome => Some(KVal::Agg(vals)),
