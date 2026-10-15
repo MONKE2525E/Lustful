@@ -164,8 +164,8 @@
   {
    "id": "generics.const_param",
    "title": "Const generic parameters and const type arguments",
-   "status": "unsupported",
-   "milestone": 8,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "0",
    "root_cause": "traits-generics",
    "fix_class": "mechanical",
@@ -804,14 +804,14 @@
   {
    "id": "ext.rustc_hash",
    "title": "Adapter crate rustc-hash 2.1.2: FxHashMap/FxHashSet aliases, FxHasher, FxBuildHasher",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "external-crates",
    "fix_class": "adapter",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh rustc-hash. Split from ext.builtin_crates. See dependencies.json.",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh rustc-hash (4 cases match the real crate). Probes: ext_rustc_hash.rs (FxHashMap::default) and _b (FxHashSet, with_capacity_and_hasher(n, Default::default()), with_hasher(FxBuildHasher), derived Default). FxHashMap::from_iter by path still rejects (L0104). Split from ext.builtin_crates. See dependencies.json.",
    "primary_keys": [
     "ext.type.rustc_hash::*"
    ],
@@ -1301,14 +1301,14 @@
   {
    "id": "std.hashmap_hasher",
    "title": "HashMap and HashSet with an explicit hasher type",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/std_hashmap_hasher.rs fails (L0641). The scanner emits map.hasher_arg when a collections map has a third type arg, the shape behind FxHashMap aliases and ts-rust CacheKeyHasher maps. Keeps blocking after a plain HashMap lands.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_hashmap_hasher.rs passes (W-STD-B). The scanner emits map.hasher_arg when a collections map has a third type arg, the shape behind FxHashMap aliases and ts-rust CacheKeyHasher maps.",
    "primary_keys": [
     "map.hasher_arg"
    ],
@@ -1319,14 +1319,14 @@
   {
    "id": "std.hashmap",
    "title": "HashMap and HashSet",
-   "status": "unsupported",
-   "milestone": 4,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "1",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/std_hashmap.rs fails (L0641, the HashMap type is not supported yet). Split from core.std_basics so mem and cmp files do not count as blocked by maps they never use.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/std_hashmap.rs passes (W-STD-B). Split from core.std_basics so mem and cmp files do not count as blocked by maps they never use.",
    "primary_keys": [
     "std.type.std::collections::HashMap",
     "std.type.std::collections::HashSet"
