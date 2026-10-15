@@ -132,6 +132,11 @@ pub trait ConstCx<'a> {
     fn assoc_const_item(&mut self, _segs: &[ast::PathSeg]) -> Option<TypedValue> {
         None
     }
+    /// A trait associated const through a qualified path
+    /// (`<S as Tr>::C`), evaluating it if needed.
+    fn qpath_const(&mut self, _self_ty: ast::TyId, _trait_path: &[ast::PathSeg], _name: Sym) -> Option<TypedValue> {
+        None
+    }
     /// A call target for a callee expression already known to be a path.
     fn call_target(&mut self, callee: ExprId) -> CallTarget;
     /// A path used as a value: a unit variant, if it names one.
@@ -1026,6 +1031,12 @@ impl Evaluator {
             }
             Expr::Unit => (ConstValue::Unit, UNIT),
             Expr::Path(segs) => return Ok(Flow::Val(self.path_value(cx, env, segs, span, expected)?)),
+            Expr::QPath { self_ty, trait_path, segs } if segs.len() == 1 && !trait_path.is_empty() => {
+                return match cx.qpath_const(*self_ty, trait_path, segs[0].name) {
+                    Some(v) => Ok(Flow::Val(v)),
+                    None => Err(outside(span, "this path")),
+                };
+            }
             Expr::Block(b) => return self.block(cx, env, *b, expected),
             Expr::ConstBlock(b) => {
                 // An inline const with no expected type pins its own

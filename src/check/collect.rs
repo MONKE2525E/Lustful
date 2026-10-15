@@ -5842,6 +5842,47 @@ impl CollectCx<'_> {
     }
 
     /// Evaluates one pending item, on demand from other items.
+    /// A trait associated const read at a concrete Self type in a
+    /// const initializer (`S::C`, `<S as Tr>::C`): the one non-generic
+    /// impl for `self_ty` (of `trait_def` when written) that defines
+    /// `name`, else that impl's trait default; a bare `S::C` takes
+    /// only traits in scope. None when no impl or
+    /// several apply (rustc E0599, E0034) or a generic impl would.
+    fn trait_assoc_const(&mut self, self_ty: Ty, trait_def: Option<DefId>, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+        let p = &*self.p;
+        let mut hits: Vec<usize> = Vec::new();
+        for (_, rec) in p.gx.index.all_impls() {
+            if trait_def.is_some_and(|t| t != rec.trait_def) {
+                continue;
+            }
+            // `S::C` names no trait: it must be in scope (rustc E0599).
+            if trait_def.is_none()
+                && let Some(m) = self.module
+                && !p.trait_in_module_answer(m, rec.trait_def)
+            {
+                continue;
+            }
+            let Some(trec) = p.gx.index.trait_record(rec.trait_def) else { continue };
+            let Some(assoc) = trec.assoc_by_name(name).filter(|a| p.gx.trait_assoc_consts.contains_key(a)) else { continue };
+            if rec.self_ty(&p.tys) != self_ty {
+                // A generic impl that may apply leaves the read to the checker.
+                if !rec.generics.params.is_empty() && rec.blanket.is_some() {
+                    return None;
+                }
+                continue;
+            }
+            let own = self.pending.iter().position(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitImpl { impl_def, assoc: a }) if impl_def == rec.def && a == assoc));
+            let dflt = || self.pending.iter().position(|(it, _)| matches!(it.assoc, Some(PendingAssoc::TraitDefault { assoc: a, .. }) if a == assoc));
+            match own.or_else(dflt) {
+                Some(i) => hits.push(i),
+                None => return None,
+            }
+        }
+        let [i] = hits[..] else { return None };
+        let ty = self.pending[i].0.ty;
+        self.eval_pending(i).map(|v| (v, ty))
+    }
+
     fn eval_pending(&mut self, idx: usize) -> Option<crate::ty::consteval::ConstValue> {
         match &self.pending[idx].1 {
             PendingState::Done(v) => return Some(v.clone()),
@@ -6108,10 +6149,32 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             let ty = self.pending[i].0.ty;
             return self.eval_pending(i).map(|v| (v, ty));
         }
+        // A primitive Self (`u8::N` of a user trait impl for `u8`).
+        if !self_form
+            && let Some(it) = self.p.known.int_ty(ty_name)
+        {
+            return self.trait_assoc_const(int(it), None, item_seg.name);
+        }
         let adt = self.p.type_names.get(&ty_name).copied()?;
-        let &[idx] = self.p.inherent_assoc_consts(adt, item_seg.name) else { return None };
-        let c = &self.p.consts[idx as usize];
-        Some((c.value.clone(), c.ty))
+        if let &[idx] = self.p.inherent_assoc_consts(adt, item_seg.name) {
+            let c = &self.p.consts[idx as usize];
+            return Some((c.value.clone(), c.ty));
+        }
+        // A trait's const for a non-generic Adt (`S::C`).
+        if self.p.gx.adt_generics.get(adt.0 as usize).is_some_and(|g| !g.params.is_empty()) {
+            return None;
+        }
+        let self_ty = self.p.tys.adt_ty(adt);
+        self.trait_assoc_const(self_ty, None, item_seg.name)
+    }
+    fn qpath_const(&mut self, self_ty: ast::TyId, trait_path: &[ast::PathSeg], name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+        let t = resolve_item_ty(self.p, self_ty, None).ok()?;
+        let [.., tseg] = trait_path else { return None };
+        if !matches!(tseg.args, ast::GenericArgs::None) {
+            return None;
+        }
+        let trait_def = self.p.gx.trait_names.get(&tseg.name).copied()?;
+        self.trait_assoc_const(t, Some(trait_def), name)
     }
     fn static_item(&mut self, name: Sym, at: Span) -> Option<(u32, Ty)> {
         if let Some(hit) = self.span_lookup(name, at).or_else(|| self.scope_lookup(name)) {

@@ -1536,7 +1536,7 @@ impl<'a> Program {
     }
 
     /// The `trait_in_module` answer without recording. See `binding_res`.
-    fn trait_in_module_answer(&self, module: ModuleId, trait_def: DefId) -> bool {
+    pub(crate) fn trait_in_module_answer(&self, module: ModuleId, trait_def: DefId) -> bool {
         use crate::resolve::imports::{BindState, ns_index};
         let Some(res) = &self.resolved else { return true };
         let Some(info) = res.def_info.get(&trait_def) else { return true };

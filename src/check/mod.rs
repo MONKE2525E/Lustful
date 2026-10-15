@@ -16015,6 +16015,43 @@ impl<'p> Ctx<'p> {
     /// fresh variables otherwise, as in `trait_assoc_base`). A
     /// `None` span (body const evaluation) reports no argument
     /// errors: the path's own check reports them.
+    /// A trait associated const of a concrete Self type, for body const
+    /// evaluation (`[0; <S as Tr>::N]`): the one non-generic impl for
+    /// `self_ty` (of `trait_def` when written, else of a trait in scope)
+    /// that has the const, with the impl's value or the trait default
+    /// collect evaluated. None when none or several apply, or a generic
+    /// impl might.
+    fn trait_const_value(&mut self, self_ty: Ty, trait_def: Option<DefId>, name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+        let p = self.p;
+        let self_ty = self.deep(self_ty);
+        let mut hit: Option<u32> = None;
+        for (_, rec) in p.gx.index.all_impls() {
+            if trait_def.is_some_and(|t| t != rec.trait_def) {
+                continue;
+            }
+            let Some(assoc) = p.gx.index.trait_record(rec.trait_def).and_then(|r| r.assoc_by_name(name)) else { continue };
+            if !p.gx.trait_assoc_consts.contains_key(&assoc) {
+                continue;
+            }
+            if rec.self_ty(&p.tys) != self_ty {
+                if !rec.generics.params.is_empty() && rec.blanket.is_some() {
+                    return None;
+                }
+                continue;
+            }
+            if trait_def.is_none() && !method::trait_in_scope_pub(self, rec.trait_def) {
+                continue;
+            }
+            let idx = p.impl_assoc_consts.get(&(rec.def, assoc)).or_else(|| p.trait_assoc_const_values.get(&assoc)).copied()?;
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(idx);
+        }
+        let c = &p.consts[hit? as usize];
+        Some((c.value.clone(), c.ty))
+    }
+
     fn assoc_const_base(&mut self, segs: &[ast::PathSeg], span: Option<Span>) -> Option<Ty> {
         let p = self.p;
         let head = segs[0].name;
@@ -19540,7 +19577,12 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
         // evaluation, through the same pick as `path_expr`.
         let p = self.cx.p;
         let (adt, item) = self.cx.assoc_const_key(segs)?;
-        let idx = self.cx.assoc_const_base(segs, None).and_then(|base| self.cx.inherent_assoc_pick(adt, item, base, None))??;
+        let picked = self.cx.assoc_const_base(segs, None).and_then(|base| self.cx.inherent_assoc_pick(adt, item, base, None)).flatten();
+        let Some(idx) = picked else {
+            // A trait's const for a non-generic Adt (`S::N` in `[0; S::N]`).
+            let base = self.cx.assoc_const_base(segs, None)?;
+            return self.cx.trait_const_value(base, None, item);
+        };
         let out = {
             let c = &p.consts[idx as usize];
             (c.value.clone(), c.ty)
@@ -19549,6 +19591,12 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
             let _ = p.sig_of(&mut self.cx.out.reads, def);
         }
         Some(out)
+    }
+    fn qpath_const(&mut self, self_ty: ast::TyId, trait_path: &[ast::PathSeg], name: Sym) -> Option<crate::ty::consteval::TypedValue> {
+        let t = self.cx.resolve_written(self_ty);
+        let tref = ast::TraitRefExpr { path: trait_path.to_vec() };
+        let tr = self.cx.written_trait_ref(t, &tref, Span::default()).ok()?;
+        self.cx.trait_const_value(t, Some(tr.def), name)
     }
     fn static_item(&mut self, name: Sym, at: Span) -> Option<(u32, Ty)> {
         let body = self.cx.body_item_of(name).or_else(|| {
