@@ -5927,6 +5927,8 @@ fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assi
                 glue_clone(p, tys, self_ty, seen)
             } else if d == lang.partial_eq {
                 rhs == Some(self_ty) && glue_eq(p, tys, self_ty, seen)
+            } else if d == lang.eq {
+                glue_total_eq(p, tys, self_ty, seen)
             } else if d == lang.partial_ord {
                 rhs == Some(self_ty) && glue_cmp(p, tys, self_ty, false, seen)
             } else if d == lang.ord {
@@ -5952,11 +5954,12 @@ fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assi
 }
 
 /// True when a written (not derived) impl of `trait_def` applies to
-/// Adt type `t` and the glue can call its `method`: the impl header
-/// matches `t` (and `rhs` for `PartialEq`/`PartialOrd`, which glue
-/// only ever asks with `Rhs = Self`), its bounds hold by glue
-/// walks, and it carries none of `bad_items` (a written `ne` or
-/// `lt` changes what the glue's one call must mean; see
+/// Adt type `t` and the glue can call its `method` (no method for a
+/// marker trait like `Eq`, asked only as an impl bound): the impl
+/// header matches `t` (and `rhs` for `PartialEq`/`PartialOrd`,
+/// which glue only ever asks with `Rhs = Self`), its bounds hold by
+/// glue walks, and it carries none of `bad_items` (a written `ne`
+/// or `lt` changes what the glue's one call must mean; see
 /// `compute_glue_methods`). Generic impls count: mono instantiates
 /// the method for each concrete Adt (`ensure_glue_methods`), which
 /// inserts exactly the impls this answer accepts. For `Clone`, a
@@ -5966,7 +5969,7 @@ fn written_glue_impl(
     tys: &impl TyIntern,
     t: Ty,
     trait_def: DefId,
-    method: &str,
+    method: Option<&str>,
     bad_items: &[&str],
     seen: &mut Vec<Ty>,
 ) -> bool {
@@ -5992,7 +5995,7 @@ fn written_glue_impl(
         if rec.synthetic != Synthetic::None || rec.head != SelfHead::Adt(def) {
             return false;
         }
-        if !has_item(rec, method) || bad_items.iter().any(|&n| has_item(rec, n)) {
+        if method.is_some_and(|m| !has_item(rec, m)) || bad_items.iter().any(|&n| has_item(rec, n)) {
             return false;
         }
         let mut assign: Vec<Option<Ty>> = Vec::new();
@@ -6073,9 +6076,9 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
                 return true;
             }
             (p.adt(a).derives.clone && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
-                || written_glue_impl(p, tys, t, p.gx.lang.clone, "clone", &[], seen)
+                || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen)
         }
-        None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, "clone", &[], seen),
+        None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen),
     }
 }
 
@@ -6173,11 +6176,11 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                 // A written generic `PartialOrd`: as the two arms
                 // above, through `written_glue_impl` (mono makes the
                 // instance `ensure_glue_methods` records).
-                Some(_) if pcmp && !total && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, "partial_cmp", &["lt"], seen) => true,
+                Some(_) if pcmp && !total && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, Some("partial_cmp"), &["lt"], seen) => true,
                 Some(a)
                     if no_ord
                         && !p.adt(a).derives.ord
-                        && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, "partial_cmp", &["lt", "le", "gt", "ge"], seen) =>
+                        && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, Some("partial_cmp"), &["lt", "le", "gt", "ge"], seen) =>
                 {
                     true
                 }
@@ -6478,7 +6481,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
                     if p.gx.glue_methods.contains_key(&(a, p.gx.lang.default)) {
                         return true;
                     }
-                    if written_glue_impl(p, tys, t, p.gx.lang.default, "default", &[], seen) {
+                    if written_glue_impl(p, tys, t, p.gx.lang.default, Some("default"), &[], seen) {
                         return true;
                     }
                     let adt = p.adt(a);
@@ -6488,7 +6491,58 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
                     // An enum's default is its unit `#[default]` variant.
                     adt.is_enum || adt_fields_all(p, a, t, seen, &mut |f, seen| glue_default(p, tys, f, seen))
                 }
-                None => written_glue_impl(p, tys, t, p.gx.lang.default, "default", &[], seen),
+                None => written_glue_impl(p, tys, t, p.gx.lang.default, Some("default"), &[], seen),
+            }
+        }
+    }
+}
+
+/// True when `t` implements `Eq` by structure: the `glue_eq`
+/// shapes with no floats anywhere (a float's `==` is not total),
+/// Adts that derive `Eq` over such fields, and written generic
+/// `Eq` impls whose bounds hold. Only `glue_impl_pred_holds` asks
+/// (`impl<K: Eq + Hash, ..> PartialEq` on a map type); a derived
+/// `Eq`'s own field check stays with the solver in
+/// `check_derive_bounds`.
+fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    if let Some(b) = cow_arg(tys, t) {
+        return glue_total_eq(p, tys, b, seen);
+    }
+    match tys.kind(t) {
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.eq, None),
+        TyKind::FnPtr(_) | TyKind::RawPtr(..) => true,
+        TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        TyKind::Infer(v) => v.is_int(),
+        TyKind::Ref(_, _, e) => glue_total_eq(p, tys, e, seen),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_total_eq(p, tys, e, seen)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => glue_total_eq(p, tys, e, seen),
+        _ => {
+            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
+                return true;
+            }
+            if tys.guard_elem(t).is_some() {
+                return false;
+            }
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)) {
+                return glue_total_eq(p, tys, e, seen);
+            }
+            if let Some((a, b)) = tys.result_args(t) {
+                return glue_total_eq(p, tys, a, seen) && glue_total_eq(p, tys, b, seen);
+            }
+            if let Some((k, args)) = crate::ty::hash::hash_parts(tys, t) {
+                use crate::ty::hash::HashTy;
+                return match k {
+                    HashTy::HashMap => glue_total_eq(p, tys, args[0], seen) && glue_total_eq(p, tys, args[1], seen),
+                    HashTy::HashSet => glue_total_eq(p, tys, args[0], seen),
+                    _ => false,
+                };
+            }
+            match tys.local_adt(t) {
+                Some(a) => {
+                    (p.adt(a).derives.eq && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
+                        || written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen)
+                }
+                None => written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen),
             }
         }
     }
@@ -6546,9 +6600,9 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
                 Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,
                 Some(a) => {
                     (p.adt(a).derives.partial_eq && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
-                        || written_glue_impl(p, tys, t, p.gx.lang.partial_eq, "eq", &["ne"], seen)
+                        || written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen)
                 }
-                None => written_glue_impl(p, tys, t, p.gx.lang.partial_eq, "eq", &["ne"], seen),
+                None => written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen),
             }
         }
     }
