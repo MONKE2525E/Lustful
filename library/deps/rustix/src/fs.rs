@@ -2,13 +2,13 @@
 // core files use, over sysx. Flag Debug forms are the derived
 // tuple forms, not upstream's name lists (README).
 
-use crate::fd::{AsFd, BorrowedFd, OwnedFd};
+use crate::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use crate::io::{Errno, Result};
 use crate::path::Arg;
 use crate::{rec_i64, rec_u64};
 
 /// `AT_FDCWD`: the current working directory as a dirfd.
-pub const CWD: BorrowedFd<'static> = BorrowedFd::cwd();
+pub const CWD: BorrowedFd<'static> = BorrowedFd::borrow_raw(-100);
 
 /// The path bytes of `path`, or EINVAL for an interior NUL.
 fn path_bytes<P: Arg>(path: &P) -> Result<Vec<u8>> {
@@ -434,7 +434,7 @@ pub fn openat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, flags: OFlags, mode: Mode) -
     if fd < 0 {
         Err(Errno::from_raw_os_error(-fd))
     } else {
-        Ok(OwnedFd::from_raw(fd))
+        Ok(OwnedFd::from_raw_fd(fd))
     }
 }
 

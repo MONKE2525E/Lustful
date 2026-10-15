@@ -1,6 +1,6 @@
 // `rustix::termios`: only the window size query ts-rust uses.
 
-use crate::fd::AsFd;
+use crate::fd::{AsFd, AsRawFd};
 use crate::io::{Errno, Result};
 
 /// A terminal window size.

@@ -2,7 +2,7 @@
 // calls. Errno's Debug and Display are std's io::Error forms, as
 // upstream delegates to them.
 
-use crate::fd::AsFd;
+use crate::fd::{AsFd, AsRawFd};
 use core::fmt;
 
 /// A specialized `Result` type for rustix APIs.

@@ -733,7 +733,7 @@ impl From<ChildStderr> for Stdio {
 
 /// The bytes as an `OsString` (for the `Command` Debug forms).
 fn os_string(bytes: &[u8]) -> OsString {
-    OsString::from_vec(bytes.to_vec())
+    OsString::__from_vec(bytes.to_vec())
 }
 
 /// The `CommandEnv` value of the alternate `Command` Debug.

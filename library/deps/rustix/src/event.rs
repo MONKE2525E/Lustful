@@ -4,8 +4,8 @@
 // with no ready fd, the only form whose length a program can
 // print). README lists this.
 
-use crate::fd::{AsFd, BorrowedFd};
-use crate::fs::Timespec;
+use crate::fd::{AsFd, AsRawFd, BorrowedFd};
+pub use crate::fs::Timespec;
 use crate::io::{Errno, Result};
 
 /// Poll event flags (`POLL*`, Linux values).

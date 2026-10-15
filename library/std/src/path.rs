@@ -1010,7 +1010,7 @@ impl AsRef<OsStr> for PathBuf {
 
 impl From<String> for PathBuf {
     fn from(s: String) -> PathBuf {
-        PathBuf { inner: OsString::from_vec(s.into_bytes()) }
+        PathBuf { inner: OsString::__from_vec(s.into_bytes()) }
     }
 }
 
@@ -1022,7 +1022,7 @@ impl From<OsString> for PathBuf {
 
 impl From<&str> for PathBuf {
     fn from(s: &str) -> PathBuf {
-        PathBuf { inner: OsString::from_vec(core::intrinsics::sys_str_as_bytes(s).to_vec()) }
+        PathBuf { inner: OsString::__from_vec(core::intrinsics::sys_str_as_bytes(s).to_vec()) }
     }
 }
 
@@ -1034,7 +1034,7 @@ impl From<&Path> for PathBuf {
 
 impl From<&String> for PathBuf {
     fn from(s: &String) -> PathBuf {
-        PathBuf { inner: OsString::from_vec(core::intrinsics::sys_str_as_bytes(s).to_vec()) }
+        PathBuf { inner: OsString::__from_vec(core::intrinsics::sys_str_as_bytes(s).to_vec()) }
     }
 }
 

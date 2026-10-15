@@ -1,6 +1,6 @@
 // `rustix::pipe`: pipe creation.
 
-use crate::fd::OwnedFd;
+use crate::fd::{FromRawFd, OwnedFd};
 use crate::io::{Errno, Result};
 use crate::rec_u64;
 
@@ -44,7 +44,7 @@ pub fn pipe_with(flags: PipeFlags) -> Result<(OwnedFd, OwnedFd)> {
     if e != 0 || rec.len() < 16 {
         return Err(Errno::from_raw_os_error(e));
     }
-    Ok((OwnedFd::from_raw(rec_u64(&rec, 0) as i32), OwnedFd::from_raw(rec_u64(&rec, 1) as i32)))
+    Ok((OwnedFd::from_raw_fd(rec_u64(&rec, 0) as i32), OwnedFd::from_raw_fd(rec_u64(&rec, 1) as i32)))
 }
 
 /// `pipe()`: a pipe with no flags.

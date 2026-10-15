@@ -246,6 +246,24 @@ impl File {
         status(core::intrinsics::sys_fd_truncate(self.fd, size))
     }
 
+    /// The raw descriptor (for `std::os::fd` in os.rs).
+    pub(crate) fn __raw_fd(&self) -> i32 {
+        self.fd
+    }
+
+    /// A `File` that owns `fd` (for `std::os::fd` in os.rs). The
+    /// descriptor's own mode governs reads and writes, as in std.
+    pub(crate) fn __from_raw_fd(fd: i32) -> File {
+        File { fd, read: true, write: true }
+    }
+
+    /// The raw descriptor, without closing it (os.rs).
+    pub(crate) fn __into_raw_fd(self) -> i32 {
+        let fd = self.fd;
+        core::mem::forget(self);
+        fd
+    }
+
     /// The file's metadata.
     pub fn metadata(&self) -> io::Result<Metadata> {
         let mut raw: Vec<u8> = Vec::new();
@@ -271,7 +289,7 @@ impl fmt::Debug for File {
         let _ = core::intrinsics::sys_readlink(core::intrinsics::sys_str_as_bytes(&link), &mut raw);
         f.debug_struct("File")
             .field("fd", &self.fd)
-            .field("path", &PathBuf::from_os_string(OsString::from_vec(raw)))
+            .field("path", &PathBuf::from_os_string(OsString::__from_vec(raw)))
             .field("read", &self.read)
             .field("write", &self.write)
             .finish()
@@ -421,7 +439,7 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
 pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     let mut buf: Vec<u8> = Vec::new();
     match status(core::intrinsics::sys_realpath(bytes_of(path.as_ref()), &mut buf)) {
-        Ok(()) => Ok(PathBuf::from_os_string(OsString::from_vec(buf))),
+        Ok(()) => Ok(PathBuf::from_os_string(OsString::__from_vec(buf))),
         Err(e) => Err(e),
     }
 }
@@ -678,7 +696,7 @@ impl Iterator for ReadDir {
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
         if self.next < self.names.len() {
             self.next += 1;
-            let name = OsString::from_vec(self.names[self.next - 1].clone());
+            let name = OsString::__from_vec(self.names[self.next - 1].clone());
             Some(Ok(DirEntry { path: self.root.join(&name), name }))
         } else {
             None

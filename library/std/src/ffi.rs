@@ -1,5 +1,7 @@
 // `std::ffi` (W-SHIM): `OsStr` and `OsString` as on Unix, raw bytes
-// with no encoding promise.
+// with no encoding promise, plus `CStr` (tf-adapters: the borrowed
+// NUL-terminated form rustix `RawDir` names return). `CString`, the
+// `c_*` type aliases, and `FromBytesUntilNulError` forms are not here.
 //
 // `OsStr` is an unsized newtype over `[u8]` (the compiler lays it out
 // as its field; shipped source may turn `&[u8]` into `&OsStr`).
@@ -192,7 +194,7 @@ impl OsString {
     }
 
     /// The `OsString` of the bytes, as given.
-    pub(crate) fn from_vec(inner: Vec<u8>) -> OsString {
+    pub(crate) fn __from_vec(inner: Vec<u8>) -> OsString {
         OsString { inner }
     }
 
@@ -372,3 +374,131 @@ impl Deref for OsString {
         os_str_from_bytes(&self.inner)
     }
 }
+
+/// Borrowed C string: bytes with exactly one NUL, at the end. An
+/// unsized newtype over `[u8]`, like `OsStr`.
+pub struct CStr {
+    inner: [u8],
+}
+
+/// The `CStr` view of bytes that end with their only NUL.
+pub(crate) fn c_str_from_bytes(bytes: &[u8]) -> &CStr {
+    bytes
+}
+
+/// An error from `CStr::from_bytes_with_nul`, as std's enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FromBytesWithNulError {
+    /// A NUL byte before the end of the input.
+    InteriorNul { position: usize },
+    /// No NUL byte at the end of the input.
+    NotNulTerminated,
+}
+
+impl fmt::Display for FromBytesWithNulError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FromBytesWithNulError::InteriorNul { position } => {
+                write!(f, "data provided contains an interior nul byte at byte position {}", position)
+            }
+            FromBytesWithNulError::NotNulTerminated => f.write_str("data provided is not nul terminated"),
+        }
+    }
+}
+
+impl CStr {
+    /// The `CStr` of `bytes` when the last byte is its only NUL.
+    pub fn from_bytes_with_nul(bytes: &[u8]) -> Result<&CStr, FromBytesWithNulError> {
+        // std finds the first NUL: at the end is Ok, earlier is an
+        // interior NUL, and no NUL at all is not terminated.
+        for i in 0..bytes.len() {
+            if bytes[i] == 0 {
+                if i == bytes.len() - 1 {
+                    return Ok(c_str_from_bytes(bytes));
+                }
+                return Err(FromBytesWithNulError::InteriorNul { position: i });
+            }
+        }
+        Err(FromBytesWithNulError::NotNulTerminated)
+    }
+
+    /// The bytes without the final NUL.
+    pub fn to_bytes(&self) -> &[u8] {
+        &self.inner[..self.inner.len() - 1]
+    }
+
+    /// The bytes with the final NUL.
+    pub fn to_bytes_with_nul(&self) -> &[u8] {
+        &self.inner
+    }
+
+    /// True for the empty string (only the NUL).
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 1
+    }
+
+    /// The bytes as text, borrowed when valid, else lossy owned.
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        match bytes_to_str(self.to_bytes()) {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(bytes_to_string_lossy(self.to_bytes())),
+        }
+    }
+}
+
+impl fmt::Debug for CStr {
+    // std's form: quoted, valid text as text, ", \, \n, \r, \t named,
+    // other control and invalid bytes as lowercase \xNN.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"")?;
+        let mut rest = self.to_bytes();
+        while !rest.is_empty() {
+            let valid = core::intrinsics::sys_utf8_valid_up_to(rest);
+            let text = &rest[..valid];
+            let mut run = 0usize;
+            for i in 0..text.len() {
+                let b = text[i];
+                let esc: Option<&str> = match b {
+                    b'"' => Some("\\\""),
+                    b'\\' => Some("\\\\"),
+                    b'\n' => Some("\\n"),
+                    b'\r' => Some("\\r"),
+                    b'\t' => Some("\\t"),
+                    0x00..=0x1f | 0x7f => None,
+                    _ => {
+                        run += 1;
+                        continue;
+                    }
+                };
+                if run > 0 {
+                    f.write_str(core::intrinsics::sys_bytes_as_str(&text[i - run..i]))?;
+                    run = 0;
+                }
+                match esc {
+                    Some(e) => f.write_str(e)?,
+                    None => write!(f, "\\x{:02x}", b)?,
+                }
+            }
+            if run > 0 {
+                f.write_str(core::intrinsics::sys_bytes_as_str(&text[text.len() - run..]))?;
+            }
+            if valid == rest.len() {
+                break;
+            }
+            let bad = invalid_len(&rest[valid..]);
+            for k in 0..bad {
+                write!(f, "\\x{:02x}", rest[valid + k])?;
+            }
+            rest = &rest[valid + bad..];
+        }
+        f.write_str("\"")
+    }
+}
+
+impl PartialEq for CStr {
+    fn eq(&self, other: &CStr) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl Eq for CStr {}

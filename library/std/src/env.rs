@@ -32,7 +32,7 @@ impl fmt::Display for VarError {
 pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     let key: &OsStr = key.as_ref();
     let mut value: Vec<u8> = Vec::new();
-    if core::intrinsics::sys_getenv(key.as_encoded_bytes(), &mut value) { Some(OsString::from_vec(value)) } else { None }
+    if core::intrinsics::sys_getenv(key.as_encoded_bytes(), &mut value) { Some(OsString::__from_vec(value)) } else { None }
 }
 
 /// The value of the variable `key` as a `String`.
@@ -75,7 +75,7 @@ fn env_pairs() -> Vec<(OsString, OsString)> {
             pos += 1;
         }
         if pos < entry.len() {
-            out.push((OsString::from_vec(entry[..pos].to_vec()), OsString::from_vec(entry[pos + 1..].to_vec())));
+            out.push((OsString::__from_vec(entry[..pos].to_vec()), OsString::__from_vec(entry[pos + 1..].to_vec())));
         }
     }
     out
@@ -148,7 +148,7 @@ impl Iterator for ArgsOs {
     fn next(&mut self) -> Option<OsString> {
         if self.next < self.args.len() {
             self.next += 1;
-            Some(OsString::from_vec(self.args[self.next - 1].clone()))
+            Some(OsString::__from_vec(self.args[self.next - 1].clone()))
         } else {
             None
         }
@@ -171,7 +171,7 @@ fn nul_error() -> io::Error {
 pub fn current_dir() -> io::Result<PathBuf> {
     let mut buf: Vec<u8> = Vec::new();
     match core::intrinsics::sys_getcwd(&mut buf) {
-        0 => Ok(PathBuf::from_os_string(OsString::from_vec(buf))),
+        0 => Ok(PathBuf::from_os_string(OsString::__from_vec(buf))),
         code => Err(io::Error::from_raw_os_error(code)),
     }
 }
@@ -190,7 +190,7 @@ pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub fn temp_dir() -> PathBuf {
     match var_os("TMPDIR") {
         Some(dir) => PathBuf::from_os_string(dir),
-        None => PathBuf::from_os_string(OsString::from_vec(b"/tmp".to_vec())),
+        None => PathBuf::from_os_string(OsString::__from_vec(b"/tmp".to_vec())),
     }
 }
 
@@ -198,7 +198,7 @@ pub fn temp_dir() -> PathBuf {
 pub fn current_exe() -> io::Result<PathBuf> {
     let mut buf: Vec<u8> = Vec::new();
     match core::intrinsics::sys_readlink(&b"/proc/self/exe"[..], &mut buf) {
-        0 => Ok(PathBuf::from_os_string(OsString::from_vec(buf))),
+        0 => Ok(PathBuf::from_os_string(OsString::__from_vec(buf))),
         2 => Err(io::Error::simple_message(io::ErrorKind::__Uncategorized, "no /proc/self/exe available. Is /proc mounted?")),
         code => Err(io::Error::from_raw_os_error(code)),
     }

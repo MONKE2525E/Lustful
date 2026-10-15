@@ -1,6 +1,6 @@
 // `rustix::stdio`: the standard stream fds and dup2 onto them.
 
-use crate::fd::{AsFd, BorrowedFd};
+use crate::fd::{AsFd, AsRawFd, BorrowedFd};
 use crate::io::{Errno, Result};
 
 /// `STDIN_FILENO` as a borrowed fd.
