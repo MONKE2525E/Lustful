@@ -1,4 +1,5 @@
 // expect: L0801
+// rustc-timeout: 5 (rustc never finishes this one; it used to burn the full case limit in every gate)
 // rustc: syntax errors (parse-fuzz case 02264). Lust expands first: the doubling count! hits
 // the match step cap in under a second, where it used to hang and then overflow the stack.
 macro_rules! count { () => { 0 }; ($h:tt $($t:tt)*) => { 1 + count!($(pub$t)*) struct}; }

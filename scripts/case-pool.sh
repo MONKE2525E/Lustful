@@ -88,7 +88,10 @@ rustc_oracle() {
       return
     fi
   fi
-  run_cc rustc "$@" -o rustc.bin "$f" 2>rustc.err; cc=$?
+  # A case may lower rustc's compile limit with a "// rustc-timeout: N" line, for a fail case
+  # whose rustc rejection is a hang (a timeout counts as a reject and is never cached).
+  local ct; ct=$(sed -n 's|^// rustc-timeout: *\([0-9][0-9]*\).*|\1|p' "$f" | head -1)
+  case_timeout=${ct:-$case_timeout} run_cc rustc "$@" -o rustc.bin "$f" 2>rustc.err; cc=$?
   echo $cc >rustc.cc
   if [ "$mode" = run ] && [ $cc -eq 0 ]; then
     # stderr (panic text and location) is kept with the case's path as @CASE@, so a
