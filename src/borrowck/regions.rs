@@ -3780,6 +3780,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             // call only: the opaque rule over the receiver alone.
             _ if let CallTarget::Builtin(b @ (crate::check::Builtin::MapInsert | crate::check::Builtin::MapRemove)) = target
                 && self.call_map_value(b, &avs, dt, &dv) => {}
+            _ if let CallTarget::Builtin(crate::check::Builtin::MapGet | crate::check::Builtin::MapGetMut) = target
+                && self.call_map_get(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
                 self.call_opaque(&avs[..1], dt, &dv)
             }
@@ -4374,6 +4376,25 @@ impl<'b, 'p> Builder<'b, 'p> {
             let others: Vec<u32> = avs[1..].iter().flat_map(|(_, v)| v.iter().copied()).collect();
             self.flow_all(&others, &v0[1..]);
         }
+        true
+    }
+
+    /// `map.get(&q)` and `map.get_mut(&q)` (rustc `-> Option<&'r V>`):
+    /// the reference is the receiver's loan, and `V` is the map's V (a
+    /// subtype behind `&`, equal behind `&mut`), as `call_receiver` does for
+    /// a Vec. The key is only read. False when the types do not pair.
+    fn call_map_get(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, map) = self.body.tys.kind(*t0) else { return false };
+        let Some((crate::ty::hash::HashTy::HashMap, margs)) = crate::ty::hash::hash_parts(&self.body.tys, map) else { return false };
+        let &[k, v, ..] = &margs[..] else { return false };
+        let (nk, nv) = (self.sc.slots(k) as usize, self.sc.slots(v) as usize);
+        if v0.len() < 1 + nk + nv || dv.len() != nv + 1 {
+            return false;
+        }
+        let vv = v0[1 + nk..1 + nk + nv].to_vec();
+        let mut at = 0usize;
+        self.receiver_walk(dt, dv, &mut at, v0[0], Some(v), &vv, Variance::Co);
         true
     }
 
@@ -4984,9 +5005,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            // The other W-STD-B kinds (hash iterators, array::IntoIter,
-            // repeat_n, Windows, CharIndices, Flatten, option::IntoIter): the
-            // conservative item rule (`item_slots` for the hash forms).
+            // The hash iterators: `item_slots` names their items (`&'a V`
+            // is the map loan and the map's V; `(K, V)` by value is the
+            // map's K and V).
             K::MapIter
             | K::MapIterMut
             | K::MapKeys
@@ -4996,8 +5017,17 @@ impl<'b, 'p> Builder<'b, 'p> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter
-            | K::ArrayIntoIter
+            | K::SetIntoIter => match self.item_slots(t, vars) {
+                Some(v) => {
+                    out.push(v);
+                    true
+                }
+                None => false,
+            },
+            // The other W-STD-B kinds (array::IntoIter, repeat_n, Windows,
+            // CharIndices, Flatten, option::IntoIter): the conservative item
+            // rule.
+            K::ArrayIntoIter
             | K::RepeatN
             | K::Windows
             | K::CharIndices
