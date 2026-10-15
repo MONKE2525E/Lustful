@@ -1816,6 +1816,16 @@ fn resolve_generic_args(
                 out.push(GenericArg::Lifetime(Region::Erased));
             }
             AstArg::Const(e) => {
+                // A const value in a type parameter's slot is a kind
+                // error (rustc E0747), never a type argument.
+                if param_is_const.get(vi).copied() == Some(false) {
+                    return Err(Diag::new(
+                        "L0110",
+                        span,
+                        "constant provided when a type was expected",
+                        "Write a type for this parameter, such as `u8`.",
+                    ));
+                }
                 out.push(GenericArg::Const(resolve_const_arg(ast, interner, known, tys, scope, *e, span)?));
                 vi += 1;
             }
@@ -2531,7 +2541,17 @@ fn resolve_trait_path_args(
             }
             for a in args {
                 match a {
-                    AstArg::Type(t) => inputs.push(GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?)),
+                    AstArg::Type(t) => {
+                        // A bare name in a const parameter's slot names
+                        // a const (`Tr<N>`); a type there is a kind
+                        // error (rustc E0747).
+                        let decl = rec.and_then(|r| r.generics.params.iter().filter(|p| !matches!(p.kind, ParamKind::Lifetime)).nth(1 + inputs.len()));
+                        if matches!(decl.map(|p| p.kind), Some(ParamKind::Const(_))) {
+                            inputs.push(GenericArg::Const(resolve_const_path_arg(ast, interner, known, cx, tys, scope, *t, span)?));
+                        } else {
+                            inputs.push(GenericArg::Ty(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?));
+                        }
+                    }
                     AstArg::Lifetime(lt) => {
                         check_lifetime(interner, scope, *lt)?;
                         if interner.get(lt.name) == "_" {
@@ -2547,6 +2567,16 @@ fn resolve_trait_path_args(
                         let c = resolve_const_arg(ast, interner, known, tys, scope, *e, span)?;
                         // The trait's declared type for this position (Self is param 0).
                         let decl = rec.and_then(|r| r.generics.params.iter().filter(|p| !matches!(p.kind, ParamKind::Lifetime)).nth(1 + inputs.len()));
+                        // A const value in a type parameter's slot is a
+                        // kind error (rustc E0747).
+                        if matches!(decl.map(|p| p.kind), Some(ParamKind::Type)) {
+                            return Err(Diag::new(
+                                "L0110",
+                                span,
+                                "constant provided when a type was expected",
+                                "Write a type for this parameter, such as `u8`.",
+                            ));
+                        }
                         if let Some(ParamKind::Const(t)) = decl.map(|p| p.kind)
                             && let Some(want) = ConstScalar::of(tys, t)
                         {
