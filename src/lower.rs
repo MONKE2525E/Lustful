@@ -1025,8 +1025,13 @@ impl<'p> Lower<'p> {
                 let t = self.temp(self.ty(e));
                 Place::local(t)
             }
+            // A value expression goes into a temporary, and the mutable use
+            // is of that temporary: the places inside the value (`s[i..]`
+            // in `s[i..].chars().next()`) are read as usual.
             _ => {
+                let saved = std::mem::take(&mut self.mut_index);
                 let t = self.materialize(e, self.ty(e), false);
+                self.mut_index = saved;
                 Place::local(t)
             }
         }
