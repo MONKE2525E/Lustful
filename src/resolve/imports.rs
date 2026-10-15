@@ -20,6 +20,7 @@ use crate::diag::{Diag, Span};
 use crate::driver::graph::{BindingRes, Namespace};
 use crate::intern::{FxMap, Interner, Sym};
 use crate::ty::defs::ModuleId;
+use std::collections::BTreeMap;
 
 /// The namespace index of a binding table (type, value, macro).
 pub fn ns_index(ns: Namespace) -> usize {
@@ -209,8 +210,15 @@ pub struct ResolvedTables {
     /// bound name) -> the import's visibility and the canonical
     /// std path the name stands for. Std items have no local def
     /// to bind, so the rewrite pass expands the name back to the
-    /// written path check reads.
-    pub std_aliases: FxMap<(ModuleId, u8, Sym), (VisKind, Vec<Sym>)>,
+    /// written path check reads. Ordered by module, so a glob import
+    /// reads the aliases of its source module as one range.
+    pub std_aliases: BTreeMap<(ModuleId, u8, Sym), (VisKind, Vec<Sym>)>,
+    /// The `std_aliases` keys a glob import brought (rank 1), with the
+    /// module whose scope defines privacy for each (`Bind::def_module`;
+    /// an explicit alias uses its own module). A local item or explicit
+    /// import of the name replaces one; a glob binding of another item
+    /// makes the name ambiguous (`insert_glob_std_alias`).
+    pub std_glob_aliases: FxMap<(ModuleId, u8, Sym), ModuleId>,
     /// The adapter crates of the session (ARCH 3.6) and the files each
     /// one read. Check reads it for intrinsic privilege and to keep
     /// layout queries off adapter types whose layout is not exact.
@@ -328,7 +336,8 @@ impl ResolvedTables {
             flat: Default::default(),
             fn_module: Vec::new(),
             crate_magic: FxMap::default(),
-            std_aliases: FxMap::default(),
+            std_aliases: BTreeMap::new(),
+            std_glob_aliases: FxMap::default(),
             adapters: Vec::new(),
             std_globs: Vec::new(),
             std_platform: None,
@@ -612,6 +621,16 @@ impl ResolvedTables {
     /// explicit sources name different targets (a user error the caller
     /// reports after the fixpoint).
     pub fn insert(&mut self, module: ModuleId, ns: Namespace, name: Sym, bind: Bind) -> InsertOut {
+        // A glob std alias of the name loses to a local item or explicit
+        // import, and is ambiguous with a glob binding of a crate item.
+        let key = (module, ns_index(ns) as u8, name);
+        if !self.std_glob_aliases.is_empty() && self.std_glob_aliases.remove(&key).is_some() {
+            self.std_aliases.remove(&key);
+            if bind.rank <= 1 {
+                self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::Ambiguous);
+                return InsertOut::Changed;
+            }
+        }
         let map = &mut self.maps[module.0 as usize][ns_index(ns)];
         match map.get(&name) {
             None => {
@@ -653,6 +672,63 @@ impl ResolvedTables {
     /// the raw table read; `Program::binding` layers the fallbacks.
     pub fn lookup(&self, module: ModuleId, ns: Namespace, name: Sym) -> Option<&BindState> {
         self.maps.get(module.0 as usize).and_then(|m| m[ns_index(ns)].get(&name))
+    }
+
+    /// True when `module` has an explicit std alias (not a glob one)
+    /// under this key.
+    pub fn explicit_std_alias(&self, key: (ModuleId, u8, Sym)) -> bool {
+        self.std_aliases.contains_key(&key) && !self.std_glob_aliases.contains_key(&key)
+    }
+
+    /// The module whose scope defines privacy for one std alias.
+    pub fn std_alias_def_module(&self, key: (ModuleId, u8, Sym)) -> ModuleId {
+        self.std_glob_aliases.get(&key).copied().unwrap_or(key.0)
+    }
+
+    /// The std aliases of one module that code in `from` can see, as
+    /// (namespace index, name, vis, defining module, path). A glob of
+    /// `module` imports these as it imports the module's bindings.
+    pub fn visible_std_aliases(&self, module: ModuleId, from: ModuleId, interner: &Interner) -> Vec<(u8, Sym, VisKind, ModuleId, Vec<Sym>)> {
+        self.std_aliases
+            .range((module, 0, Sym(0))..=(module, u8::MAX, Sym(u32::MAX)))
+            .filter_map(|(&key, (vis, path))| {
+                let def_module = self.std_alias_def_module(key);
+                self.visible(vis, def_module, from, interner).then(|| (key.1, key.2, vis.clone(), def_module, path.clone()))
+            })
+            .collect()
+    }
+
+    /// Binds a std alias at glob rank (`use prelude::*;` of a module
+    /// with `pub use std::rc::Rc;`). A local item, an explicit import,
+    /// or an explicit std alias of the name wins. A glob binding of a
+    /// crate item, or a glob alias of another std item, makes the name
+    /// ambiguous (rustc E0659 when used). Returns true on a change.
+    pub fn insert_glob_std_alias(&mut self, module: ModuleId, ns: Namespace, name: Sym, vis: VisKind, def_module: ModuleId, path: Vec<Sym>) -> bool {
+        let key = (module, ns_index(ns) as u8, name);
+        match self.lookup(module, ns, name) {
+            Some(BindState::One(b)) if b.rank >= 2 => return false,
+            Some(BindState::Ambiguous) => return false,
+            Some(BindState::One(_)) => {
+                self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::Ambiguous);
+                return true;
+            }
+            None => {}
+        }
+        match self.std_aliases.get(&key) {
+            None => {
+                self.std_aliases.insert(key, (vis, path));
+                self.std_glob_aliases.insert(key, def_module);
+                true
+            }
+            Some(_) if !self.std_glob_aliases.contains_key(&key) => false,
+            Some((_, old)) if same_std_item(old, &path) => false,
+            Some(_) => {
+                self.std_aliases.remove(&key);
+                self.std_glob_aliases.remove(&key);
+                self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::Ambiguous);
+                true
+            }
+        }
     }
 
     /// True when some module defines `name` locally (not by import), in
@@ -1469,10 +1545,12 @@ fn record_std_alias(tables: &mut ResolvedTables, imp: &Import, path: &[Sym], nam
         if anon && tables.std_aliases.contains_key(&key) {
             continue;
         }
-        if explicit_exists(tables, imp, ns, name) || tables.std_aliases.contains_key(&key) {
+        if explicit_exists(tables, imp, ns, name) || tables.explicit_std_alias(key) {
             dup = true;
             continue;
         }
+        // An explicit alias replaces a glob one of the same name.
+        tables.std_glob_aliases.remove(&key);
         tables.std_aliases.insert(key, (imp.vis.clone(), path.to_vec()));
         inserted = true;
     }
@@ -1579,6 +1657,13 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 changed = true;
                             }
                         }
+                        // The std imports of the source module
+                        // (`pub use std::rc::Rc;`) bind like its other names.
+                        for (ns, name, vis, def_module, path) in tables.visible_std_aliases(src, imp.module, interner) {
+                            let (vis, def_module) = tables.glob_vis(imp, &vis, def_module, interner);
+                            let ns = [Namespace::Type, Namespace::Value, Namespace::Macro][ns as usize];
+                            changed |= tables.insert_glob_std_alias(imp.module, ns, name, vis, def_module, path);
+                        }
                         // A glob stays live: new names in the source module can
                         // appear as other imports settle. It stays pending until
                         // a no-change sweep; the caller drops a resolved glob
@@ -1602,13 +1687,9 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             }
                             for v in crate::ty::lang::std_enum_variants(&strs) {
                                 let name = interner.intern(v);
-                                let key = (imp.module, ns_index(Namespace::Value) as u8, name);
-                                if tables.lookup(imp.module, Namespace::Value, name).is_none() && !tables.std_aliases.contains_key(&key) {
-                                    let mut full = path.clone();
-                                    full.push(name);
-                                    tables.std_aliases.insert(key, (imp.vis.clone(), full));
-                                    changed = true;
-                                }
+                                let mut full = path.clone();
+                                full.push(name);
+                                changed |= tables.insert_glob_std_alias(imp.module, Namespace::Value, name, imp.vis.clone(), imp.module, full);
                             }
                         }
                         TryOut::Done(changed)
@@ -1849,9 +1930,12 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             // no target; importing it onward copies
                             // the alias under this import's name.
                             None => {
-                                if let Some((avis, apath)) = tables.std_aliases.get(&(src, ns_index(ns) as u8, last)).cloned() {
-                                    if tables.visible(&avis, src, imp.module, interner) {
+                                let key = (src, ns_index(ns) as u8, last);
+                                if let Some((avis, apath)) = tables.std_aliases.get(&key).cloned() {
+                                    let adef = tables.std_alias_def_module(key);
+                                    if tables.visible(&avis, adef, imp.module, interner) {
                                         any = true;
+                                        narrower |= imp.vis != VisKind::Priv && !tables.vis_within(&imp.vis, imp.module, &avis, adef, interner);
                                         if !alias_paths.contains(&apath) {
                                             alias_paths.push(apath);
                                         }
@@ -1892,7 +1976,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         // An earlier std alias of the same name in the
                         // same namespace is an explicit binding too.
                         let dup = explicit_exists(tables, imp, ns, bind_name)
-                            || tables.std_aliases.contains_key(&(imp.module, ns_index(ns) as u8, bind_name));
+                            || tables.explicit_std_alias((imp.module, ns_index(ns) as u8, bind_name));
                         let out = tables.insert(imp.module, ns, bind_name, bind);
                         if dup && interner.get(*name) != "_" {
                             if !dup_reported {
@@ -1957,6 +2041,14 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
             }
         }
     }
+}
+
+/// True when two canonical std paths name one item: equal, or equal
+/// after the crate segment (`core::cell::RefCell` is `std::cell::RefCell`).
+/// Other spellings of one item count as two (an ambiguity, which only
+/// rejects).
+fn same_std_item(a: &[Sym], b: &[Sym]) -> bool {
+    a == b || (a.len() > 1 && a.len() == b.len() && a[1..] == b[1..])
 }
 
 /// Marks a name ambiguous through an explicit import of an ambiguous

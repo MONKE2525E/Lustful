@@ -5321,7 +5321,20 @@ impl Rewrite<'_> {
                                         any = true;
                                         dup |= insert_local(scopes, name, ns, LocalBind::Ambiguous, 2);
                                     }
-                                    _ => {}
+                                    // A std import of the source module
+                                    // (`pub use std::rc::Rc;`) copies as an alias.
+                                    Some(_) => {}
+                                    None => {
+                                        let key = (src, ns_index(ns) as u8, last);
+                                        if let Some((avis, apath)) = self.tables.std_aliases.get(&key)
+                                            && self.tables.visible(avis, self.tables.std_alias_def_module(key), module, self.interner)
+                                        {
+                                            any = true;
+                                            if self.interner.get(name) != "_" {
+                                                dup |= insert_local_std(scopes, name, ns, apath.clone());
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if dup && self.interner.get(name) != "_" {
@@ -5445,6 +5458,9 @@ impl Rewrite<'_> {
                         }
                         for (name, ns, bind) in entries {
                             insert_local(scopes, name, ns, bind, 1);
+                        }
+                        for (ns, name, _, _, path) in self.tables.visible_std_aliases(src, module, self.interner) {
+                            insert_glob_local_std(scopes, name, ns as usize, path);
                         }
                         }
                         _ => self.push_unresolved_use(span, &path),
@@ -5959,8 +5975,29 @@ fn insert_local_std(scopes: &mut [Frame], name: Sym, ns: Namespace, path: Vec<Sy
         return true;
     }
     frame.explicit.push(key);
+    // It beats an earlier glob binding of the name.
+    frame.imports.remove(&key);
     frame.std_imports.insert(key, path);
     false
+}
+
+/// Records a std alias a function-local glob of a module brings
+/// (`use crate::prelude::*;` with `pub use std::rc::Rc;` there). An
+/// explicit binding of the frame wins; a glob of a crate item or of
+/// another std item makes the name ambiguous.
+fn insert_glob_local_std(scopes: &mut [Frame], name: Sym, ns: usize, path: Vec<Sym>) {
+    let Some(frame) = scopes.last_mut() else { return };
+    let key = (name, ns);
+    if frame.explicit.contains(&key) || matches!(frame.imports.get(&key), Some(LocalBind::Ambiguous)) {
+        return;
+    }
+    let same = |old: &[Sym]| old == path.as_slice() || (old.len() > 1 && old.len() == path.len() && old[1..] == path[1..]);
+    if frame.imports.contains_key(&key) || frame.std_imports.get(&key).is_some_and(|old| !same(old)) {
+        frame.std_imports.remove(&key);
+        frame.imports.insert(key, LocalBind::Ambiguous);
+        return;
+    }
+    frame.std_imports.insert(key, path);
 }
 
 fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind, rank: u8) -> bool {
@@ -5969,6 +6006,16 @@ fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind,
     let dup = rank >= 2 && frame.explicit.contains(&key);
     if rank >= 2 && !dup {
         frame.explicit.push(key);
+    }
+    // An explicit binding of the frame (an import, a std import, or a
+    // block item) beats a glob.
+    if rank <= 1 && frame.explicit.contains(&key) {
+        return false;
+    }
+    // A glob of a crate item beside a glob std alias of the name.
+    if rank <= 1 && frame.std_imports.remove(&key).is_some() {
+        frame.imports.insert(key, LocalBind::Ambiguous);
+        return false;
     }
     match (frame.imports.get(&key), bind) {
         (Some(LocalBind::Target(old)), LocalBind::Target(new)) if *old != new && rank <= 1 => {

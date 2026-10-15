@@ -16,7 +16,7 @@ use crate::intern::{FxMap, Sym};
 
 /// One module in a crate's module tree. Today a crate is one file with one root
 /// module; W-RESOLVE fills the tree (ARCH 1.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ModuleId(pub u32);
 
 /// The crate root module, the only module today.
