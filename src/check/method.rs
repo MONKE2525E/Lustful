@@ -1212,6 +1212,20 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
             items.iter().copied().find_map(|x| p.local_def(x.hash).filter(|&l| p.fn_info(l).name == fname)).map(|l| (l, args2))
         });
         let Some((local, mut prefix)) = target else {
+            // A synthetic conversion impl (`Borrow::borrow(x)` on a
+            // builtin Self) has no fn: the call is the conversion
+            // builtin, as `convert_method` sets for a method call.
+            let targs: Vec<Ty> = cx.tys.args(d.tr.args).iter().filter_map(|g| g.as_ty()).collect();
+            let conv = targs.get(1).copied().and_then(|target| {
+                let target = cx.deep(target);
+                let core = cx.deep(targs[0]);
+                cx.conv_call_builtin(d.tr.def, core, target)
+            });
+            if let Some(b) = conv {
+                let res = if d.path { Res::Builtin(b) } else { Res::BuiltinMethod { b, derefs: d.derefs, autoref: d.autoref } };
+                cx.set_res(d.e, res);
+                continue;
+            }
             if d.path {
                 path_call_unresolved(cx, d.e);
             }

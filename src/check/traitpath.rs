@@ -57,7 +57,10 @@ impl<'p> Ctx<'p> {
             if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Trait) {
                 return None;
             }
-            p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_bare_name(&p.interner, segs[last - 1].name)?
+            // A full canonical path names its trait whether or not the
+            // trait is in the prelude (`std::borrow::Borrow`), as
+            // `trait_def_of_path` reads it: by name, not by bare name.
+            p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_name(&p.interner, segs[last - 1].name)?
         };
         let rec = p.gx.index.trait_record(tdef)?;
         // A std path through another trait of the same bare name must
@@ -287,6 +290,15 @@ impl<'p> Ctx<'p> {
             return TraitFnRes::Fn(stub, full);
         }
         let self_ty = targs.first().copied().unwrap_or(ERROR);
+        // A synthetic conversion impl (`Borrow::borrow` on a builtin
+        // Self) has no fn: the value is the conversion builtin.
+        if targs.len() >= 2
+            && known(self, self_ty)
+            && known(self, targs[1])
+            && let Some(b) = self.conv_call_builtin(tr.def, self_ty, targs[1])
+        {
+            return TraitFnRes::Builtin(b);
+        }
         if tr.def == lang.clone && self.name(name) == "clone" && has_clone(p, &self.tys, self_ty) {
             return TraitFnRes::Builtin(Builtin::Clone);
         }

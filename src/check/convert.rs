@@ -340,6 +340,24 @@ impl<'p> Ctx<'p> {
         Some(self.tys.mk_ref(mutable, target))
     }
 
+    /// The builtin a synthetic conversion impl runs for a deferred
+    /// call (`Borrow::borrow(x)` and kin, selected at body end in
+    /// method.rs and traitpath.rs): None when `core` has no impl of
+    /// the trait for `target` in the conversion table.
+    pub(super) fn conv_call_builtin(&mut self, trait_def: DefId, core: Ty, target: Ty) -> Option<Builtin> {
+        let lang = self.p.gx.lang;
+        let conv = match () {
+            _ if trait_def == lang.as_ref => Conv::AsRef,
+            _ if trait_def == lang.as_mut => Conv::AsMut,
+            _ if trait_def == lang.borrow => Conv::Borrow,
+            _ if trait_def == lang.borrow_mut => Conv::BorrowMut,
+            _ => return None,
+        };
+        let cands = self.conv_targets(conv, core);
+        cands.iter().copied().find(|&c| c == target).or_else(|| cands.iter().copied().find(|&c| self.unify(c, target)))?;
+        Some(self.conv_builtin(core, target))
+    }
+
     /// The trait arguments of a conversion trait's impls for `core`.
     fn conv_targets(&mut self, conv: Conv, core: Ty) -> Vec<Ty> {
         let bytes = self.tys.intern(TyKind::Slice(int(IntTy::U8)));

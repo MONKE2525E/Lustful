@@ -10860,6 +10860,11 @@ impl<'p> Ctx<'p> {
                     if let Some(t) = self.assoc_call(e, callee, base, hint, segs[0].name, args, span) {
                         return t;
                     }
+                    // A builtin Self's std trait item (`<Vec<u8> as
+                    // Borrow<[u8]>>::borrow`), as for `Alias::new()`.
+                    if let Some(t) = self.std_trait_assoc_call(e, callee, base, segs[0].name, args, span) {
+                        return t;
+                    }
                 }
                 for &a in args {
                     self.expr(a, None);
@@ -10904,19 +10909,23 @@ impl<'p> Ctx<'p> {
                 // receiver. The Self type comes from that
                 // argument (trial-checked, then rechecked by the
                 // assoc call itself).
-                if segs.len() == 2 && !args.is_empty() {
-                    let cxr = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                    if let Some(tdef) = cxr.trait_by_bare_name(&p.interner, segs[0].name)
-                        && let Some(rec) = p.gx.index.trait_record(tdef).cloned()
-                        && rec.method_by_name(segs[1].name).is_some()
-                        // A method with no `self` (`From::from`) takes
-                        // no receiver: its Self is the output type,
-                        // never the first argument's. The deferred
-                        // trait path below types those instead.
-                        && !rec.method_by_name(segs[1].name).is_some_and(|m| {
-                            p.gx.trait_methods.get(&m).map(|t| t.self_kind).or_else(|| p.gx.lang_method_sigs.get(&m).map(|s| s.self_kind)).is_some_and(|k| k.is_none())
-                        })
+                if !args.is_empty()
+                    && let Some((tdef, method_def, tseg)) = self.trait_path_head(segs)
+                    && let Some(rec) = p.gx.index.trait_record(tdef).cloned()
+                    // A method with no `self` (`From::from`) takes
+                    // no receiver: its Self is the output type,
+                    // never the first argument's. The deferred
+                    // trait path below types those instead.
+                    && !p
+                        .gx
+                        .trait_methods
+                        .get(&method_def)
+                        .map(|t| t.self_kind)
+                        .or_else(|| p.gx.lang_method_sigs.get(&method_def).map(|s| s.self_kind))
+                        .is_some_and(|k| k.is_none())
+                {
                     {
+                        let mname = segs[segs.len() - 1].name;
                         let snap = self.snapshot_vars();
                         let obl_len = self.obl_len();
                         let sites_len = self.generic_sites.len();
@@ -10934,8 +10943,8 @@ impl<'p> Ctx<'p> {
                         for base in bases {
                             // Written trait args (`Tr::<u8>::m(x)`) fix the
                             // trait ref, as in `<_ as Tr<u8>>::m(x)`.
-                            let hint = if matches!(segs[0].args, ast::GenericArgs::Angle(_)) {
-                                let tref = ast::TraitRefExpr { path: vec![segs[0].clone()] };
+                            let hint = if matches!(segs[tseg].args, ast::GenericArgs::Angle(_)) {
+                                let tref = ast::TraitRefExpr { path: segs[..=tseg].to_vec() };
                                 match self.written_trait_ref(base, &tref, span) {
                                     Ok(tr) => tr,
                                     Err(d) => {
@@ -10954,11 +10963,11 @@ impl<'p> Ctx<'p> {
                                 let args_id = self.tys.intern_args(&tr_args);
                                 TraitRef { def: tdef, args: args_id, bindings: EMPTY_BINDINGS }
                             };
-                            if let Some(t) = self.assoc_call(e, callee, base, Some(hint), segs[1].name, args, span) {
+                            if let Some(t) = self.assoc_call(e, callee, base, Some(hint), mname, args, span) {
                                 return t;
                             }
                         }
-                        if matches!(segs[0].args, ast::GenericArgs::Angle(_)) {
+                        if matches!(segs[tseg].args, ast::GenericArgs::Angle(_)) {
                             let shown = match self.tys.kind(at) {
                                 TyKind::Ref(_, _, inner) => self.deep(inner),
                                 _ => at,
