@@ -20,7 +20,8 @@
 // - the crate selection inputs, the client view, or an expansion's
 //   outside inputs changed, or an expansion read a position;
 // - the root file changed and carries the std splice;
-// - an edit is not strictly inside one top-level fn or method body;
+// - an edit is not strictly inside one top-level fn or method body, or
+//   inside cfg-disabled code the expander dropped (`find_inactive_edit`);
 // - the old or new body holds an item keyword, an attribute, a `$`, a
 //   macro the expander owns (anything but the parser's own `println!`
 //   family), or a parser macro while a user macro may take its name;
@@ -106,6 +107,18 @@ pub(crate) struct PatchBase {
     /// holds a body item): a later edit in the same impl rescans only
     /// the edited method and reuses these for the rest.
     item_scans: FxMap<usize, Vec<u64>>,
+    /// The cfg-disabled nodes the expander dropped (`Dep::Dropped`), by
+    /// file and start, with the spans of this text.
+    dropped: Vec<Dropped>,
+}
+
+/// One cfg-disabled node the last full resolve dropped (`Dep::Dropped`).
+#[derive(Clone, Copy)]
+struct Dropped {
+    file: u32,
+    lo: u32,
+    hi: u32,
+    item: bool,
 }
 
 /// The crate selection inputs a patch must see unchanged: anything that
@@ -193,6 +206,16 @@ impl PatchBase {
                 *l = true;
             }
         }
+        let mut dropped: Vec<Dropped> = front
+            .chunks
+            .iter()
+            .flat_map(|c| &c.expand_deps)
+            .filter_map(|d| match *d {
+                crate::expand::Dep::Dropped { file, lo, hi, item } => Some(Dropped { file, lo, hi, item }),
+                _ => None,
+            })
+            .collect();
+        dropped.sort_unstable_by_key(|d| (d.file, d.lo));
         PatchBase {
             inputs,
             root_unspliced,
@@ -214,6 +237,7 @@ impl PatchBase {
             fns_by_file,
             live_slots,
             item_scans: FxMap::default(),
+            dropped,
         }
     }
 }
@@ -240,11 +264,19 @@ pub(super) struct Patched {
     pub reads: usize,
 }
 
-/// One edit proven to sit inside one fn body (`find_body_edit`).
+/// One edit proven to sit inside one fn body (`find_body_edit`), or
+/// inside cfg-disabled code (`find_inactive_edit`, no `body`).
 struct BodyEdit {
     file: FileId,
     text: String,
     edit: Edit,
+    needs: (StdNeeds, bool),
+    /// The new fn body; None when no Ast node changes.
+    body: Option<NewBody>,
+}
+
+/// The fn body side of a `BodyEdit`.
+struct NewBody {
     /// The fn's index in `Front::fn_loc` order and its location.
     fn_index: usize,
     item: usize,
@@ -258,7 +290,6 @@ struct BodyEdit {
     body: BlockId,
     exprs: (u32, u32),
     pats: (u32, u32),
-    needs: (StdNeeds, bool),
     /// Neither body holds a closure or a token collect's whole-Ast scans
     /// look for (`plain_body`).
     plain: bool,
@@ -292,8 +323,9 @@ struct KeptEdit {
     edit: Edit,
     /// The fresh expansion contexts the Ast's span walk chose.
     ctxts: FxMap<u32, CtxtId>,
-    /// The edited fn, in `Front::fn_loc` order (its `LocalDefId`).
-    fn_index: usize,
+    /// The edited fn, in `Front::fn_loc` order (its `LocalDefId`); None
+    /// for an edit inside cfg-disabled code.
+    fn_index: Option<usize>,
     plain: bool,
     /// The old body's expression range (a template's picks key on it).
     old_exprs: (u32, u32),
@@ -317,8 +349,16 @@ pub(super) fn try_patch(
     request_start: SystemTime,
 ) -> Result<Patched, &'static str> {
     let (edits, reads) = find_edits(front, inputs, root, request_start)?;
-    let edits_in: Vec<KeptEdit> =
-        edits.iter().map(|e| KeptEdit { edit: e.edit, ctxts: FxMap::default(), fn_index: e.fn_index, plain: e.plain, old_exprs: e.old_exprs }).collect();
+    let edits_in: Vec<KeptEdit> = edits
+        .iter()
+        .map(|e| KeptEdit {
+            edit: e.edit,
+            ctxts: FxMap::default(),
+            fn_index: e.body.as_ref().map(|b| b.fn_index),
+            plain: e.body.as_ref().is_none_or(|b| b.plain),
+            old_exprs: e.body.as_ref().map_or((0, 0), |b| b.old_exprs),
+        })
+        .collect();
     // Everything above only read; from here the front state changes, and
     // a failure must drop the base so no later request patches on it.
     // A kept program that shares this Ast lets go of it and of the
@@ -332,9 +372,10 @@ pub(super) fn try_patch(
             k.program.resolved = None;
             let edits = k.edits.get_or_insert_with(Vec::new);
             for e in &edits_in {
-                if !edits.iter().any(|x| x.fn_index == e.fn_index) && !k.bases.iter().any(|b| b.0 == e.fn_index) {
-                    let def = k.program.def_id(crate::def::LocalDefId(e.fn_index as u32));
-                    k.bases.push((e.fn_index, caches.gen_reuse.out_copy(def)));
+                let Some(fn_index) = e.fn_index else { continue };
+                if !edits.iter().any(|x| x.fn_index == e.fn_index) && !k.bases.iter().any(|b| b.0 == fn_index) {
+                    let def = k.program.def_id(crate::def::LocalDefId(fn_index as u32));
+                    k.bases.push((fn_index, caches.gen_reuse.out_copy(def)));
                 }
             }
         }
@@ -412,7 +453,20 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     }
     let mut edits = Vec::with_capacity(changed.len());
     for (file, text) in changed {
-        edits.push(find_body_edit(front, file, text)?);
+        let old = front.map.text(file).ok_or("no text")?;
+        let (p, s) = super::compile::common_ends(old.as_bytes(), text.as_bytes());
+        let edit = Edit { file, a: p as u32, b: (old.len() - s) as u32, d: text.len() as i64 - old.len() as i64 };
+        let body = match find_body_edit(front, &text, edit) {
+            Ok(body) => Some(body),
+            // No active fn body holds the edit: it may sit in code the
+            // expander dropped.
+            Err(why @ ("not in a fn body" | "no active item")) => {
+                find_inactive_edit(front, &text, edit).map_err(|inactive| inactive.unwrap_or(why))?;
+                None
+            }
+            Err(why) => return Err(why),
+        };
+        edits.push(BodyEdit { file, needs: file_needs(&text), text, edit, body });
     }
     // The std splice and the platform crate follow every file's needs;
     // they stand when the union over files does. The new union folds
@@ -438,14 +492,14 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     Ok((edits, reads))
 }
 
-/// Proves that the edit from the map's text of `file` to `text` sits
-/// strictly inside one top-level fn or method body, and lexes that body.
-fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit, &'static str> {
+/// Proves that `edit` (the map's text of its file to `text`) sits
+/// strictly inside one top-level fn or method body, and lexes, parses,
+/// and rewrites the new body.
+fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'static str> {
     let base = front.patch.as_ref().ok_or("no base")?;
+    let file = edit.file;
     let old = front.map.text(file).ok_or("no text")?;
-    let (p, s) = super::compile::common_ends(old.as_bytes(), text.as_bytes());
-    let (a, b) = (p, old.len() - s);
-    let d = text.len() as i64 - old.len() as i64;
+    let (a, b, d) = (edit.a as usize, edit.b as usize, edit.d);
     let ast = &front.ast;
     let (fn_index, &(item, sub)) = front
         .fn_loc
@@ -518,26 +572,149 @@ fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit,
     if !diags.is_empty() {
         return Err("body rewrite");
     }
-    let needs = file_needs(&text);
     let old_closures = ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
     let new_closures = body_ast.exprs.iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
     let plain = !old_closures && !new_closures && plain_body(&old_body, &front.interner) && plain_body(&new_body, &front.interner);
-    Ok(BodyEdit {
-        file,
-        text,
-        edit: Edit { file, a: a as u32, b: b as u32, d },
-        fn_index,
-        item,
-        sub,
-        old_body: (span.lo, span.hi),
-        body_ast,
-        body,
-        exprs,
-        pats,
-        needs,
-        plain,
-        old_exprs: def.exprs,
-    })
+    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs })
+}
+
+/// Proves that `edit` (the map's text of its file to `text`) sits inside
+/// a cfg-disabled node the expander dropped at the last full resolve
+/// (`Dep::Dropped`), in a way a cold resolve of `text` answers the same
+/// up to spans: the node lexes alone to the same tokens outside the
+/// edit, the changed tokens sit in one brace group inside the node and
+/// outside any macro call or attribute, they hold nothing the expander's
+/// prescan, the module outline, or the cfg name check reads (`$`, `#`,
+/// item keywords, `cfg`, `macro_rules`), and the new node passes the
+/// expander's own grammar check (`parser::check_cfg_syntax`). The file's
+/// text scans (`macro_rules`, parser macro shadowing) must stand too.
+/// `Err(None)` when no dropped node holds the edit.
+fn find_inactive_edit(front: &Front, text: &str, edit: Edit) -> Result<(), Option<&'static str>> {
+    let base = front.patch.as_ref().ok_or(Some("no base"))?;
+    let file = edit.file;
+    let old = front.map.text(file).ok_or(Some("no text"))?;
+    let (a, b, d) = (edit.a, edit.b, edit.d);
+    let node = base.dropped.iter().find(|n| n.file == file.0 && n.lo < a && b < n.hi).ok_or(None)?;
+    // The node sits in an item list (a module's, an impl's, a trait's),
+    // in no active item's own text: an edit inside an active body would
+    // move positions inside it, and only the patch's fns rehash their
+    // text (`fn_text_hash`).
+    let ast = &front.ast;
+    let holds = |s: crate::diag::Span| s.file == file && s.lo <= node.lo && node.hi <= s.hi;
+    let fn_holds = |f: &FnDef| holds(f.name_span) || f.body.is_some_and(|bl| holds(ast.blocks[bl.0 as usize].span));
+    for it in ast.items.iter().filter(|it| holds(it.span)) {
+        let inside = match &it.kind {
+            ItemKind::Impl(imp) => imp.fns.iter().any(fn_holds) || imp.consts.iter().any(|c| holds(c.span)),
+            ItemKind::Trait(tr) => tr.fns.iter().any(fn_holds) || tr.consts.iter().any(|c| holds(c.span)),
+            _ => true,
+        };
+        if inside {
+            return Err(Some("inactive in item"));
+        }
+    }
+    let new_hi = (node.hi as i64 + d) as usize;
+    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, node.lo, &front.interner).ok()).ok_or(Some("inactive lex"));
+    let (old_toks, new_lexed) = (lex(old.get(node.lo as usize..node.hi as usize))?, lex(text.get(node.lo as usize..new_hi))?);
+    let (ot, nt) = (&old_toks.tokens[..old_toks.tokens.len() - 1], &new_lexed.tokens[..new_lexed.tokens.len() - 1]);
+    // Both end where the node ends, on a token that cannot run into the
+    // text after it.
+    let ends = |toks: &[lexer::Token], hi: usize| {
+        toks.last().is_some_and(|t| {
+            t.span.hi as usize == hi && matches!(t.tok, Tok::RBrace | Tok::Semi | Tok::RParen | Tok::RBracket | Tok::Comma)
+        })
+    };
+    if !ends(ot, node.hi as usize) || !ends(nt, new_hi) {
+        return Err(Some("inactive lex"));
+    }
+    // Tokens wholly before the edit and wholly after it are the same text
+    // at the same boundaries, so the same tokens; the rest is the window.
+    let span_eq = |x: &lexer::Token, y: &lexer::Token, shift: i64| {
+        (x.span.lo as i64 + shift, x.span.hi as i64 + shift) == (y.span.lo as i64, y.span.hi as i64)
+    };
+    let pre = ot.iter().zip(nt).take_while(|(x, y)| x.span.hi <= a && span_eq(x, y, 0)).count();
+    let post = ot[pre..].iter().rev().zip(nt[pre..].iter().rev()).take_while(|(x, y)| x.span.lo >= b && span_eq(x, y, d)).count();
+    let (ow, nw) = (&ot[pre..ot.len() - post], &nt[pre..nt.len() - post]);
+    // The groups around the window: open before it and closed after it,
+    // in both versions (each version must balance).
+    let closes = |toks: &[lexer::Token]| -> Option<Vec<usize>> {
+        let (mut stack, mut close) = (Vec::new(), vec![usize::MAX; toks.len()]);
+        for (i, t) in toks.iter().enumerate() {
+            match t.tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => stack.push(i),
+                Tok::RBrace | Tok::RParen | Tok::RBracket => close[stack.pop()?] = i,
+                _ => {}
+            }
+        }
+        stack.is_empty().then_some(close)
+    };
+    let (oc, nc) = (closes(ot).ok_or(Some("inactive lex"))?, closes(nt).ok_or(Some("inactive lex"))?);
+    let (oend, nend) = (ot.len() - post, nt.len() - post);
+    let chain: Vec<usize> =
+        (0..pre).filter(|&i| oc[i] != usize::MAX && oc[i] >= oend && nc[i] >= nend && oc[i] - oend == nc[i] - nend).collect();
+    let (macro_rules, cfg, union) = (front.interner.intern("macro_rules"), front.interner.intern("cfg"), front.interner.intern("union"));
+    // Tokens the expander's prescan, the module outline, or the cfg name
+    // check acts on: none may change.
+    let read = |t: &lexer::Token| {
+        matches!(
+            t.tok,
+            Tok::Pound
+                | Tok::Dollar
+                | Tok::DocStr(_)
+                | Tok::Fn
+                | Tok::Struct
+                | Tok::Enum
+                | Tok::Impl
+                | Tok::Trait
+                | Tok::Mod
+                | Tok::Use
+                | Tok::Extern
+                | Tok::Static
+                | Tok::Const
+                | Tok::Type
+        ) || matches!(t.tok, Tok::Ident(s) if s == macro_rules || s == cfg || s == union)
+    };
+    // A construct those passes read starts with one of those tokens: one
+    // that starts just before the window (`#` + `[cfg_attr(..)]`, `cfg` +
+    // `!(..)`, `macro_rules` + `! m {..}`) would take window tokens.
+    if chain.is_empty() || ow.iter().chain(nw).any(read) || ot[pre.saturating_sub(4)..pre].iter().any(read) {
+        return Err(Some("inactive tokens"));
+    }
+    // No group around the window is an attribute's (`#[`, `#![`) or a
+    // macro definition's body (`macro_rules! m {`; the prescan defines
+    // macros even in disabled code), and the window is in no `use` or
+    // `extern` item of any group around it (the prescan reads the `use`
+    // items of module lists).
+    let before = |i: usize, k: usize| i.checked_sub(k).map(|j| ot[j].tok);
+    if chain.iter().any(|&i| {
+        matches!(before(i, 1), Some(Tok::Pound))
+            || matches!((before(i, 2), before(i, 1)), (Some(Tok::Bang), Some(Tok::Ident(_))) | (Some(Tok::Pound), Some(Tok::Bang)))
+    }) {
+        return Err(Some("inactive macro"));
+    }
+    for (k, &g) in chain.iter().enumerate() {
+        // This group's own tokens from its open up to the next group in
+        // the chain (or the window): an item still open there holds it.
+        let upto = chain.get(k + 1).copied().unwrap_or(pre);
+        let mut i = g + 1;
+        let mut open_item = false;
+        while i < upto {
+            match ot[i].tok {
+                Tok::Semi => open_item = false,
+                Tok::Use | Tok::Extern => open_item = true,
+                _ => {}
+            }
+            i = if oc[i] != usize::MAX { oc[i] + 1 } else { i + 1 };
+        }
+        if open_item {
+            return Err(Some("inactive tokens"));
+        }
+    }
+    let hint = if node.item { crate::parser::CfgSyntaxHint::Item } else { crate::parser::CfgSyntaxHint::Node };
+    crate::parser::check_cfg_syntax(nt, &new_lexed.strings, &front.interner, &front.known, hint).map_err(|_| Some("inactive syntax"))?;
+    if old.contains("macro_rules") != text.contains("macro_rules") || shadows_parser_macro(old) != shadows_parser_macro(text) {
+        return Err(Some("inactive text"));
+    }
+    Ok(())
 }
 
 /// Why an edit at `a..b` of `file` is in no top-level fn body: it sits
@@ -624,7 +801,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         // because some passes scan whole arenas (closures, `dyn`, `Cow`).
         let ranges = base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize));
         let extras = base.extras.as_ref().and_then(|x| x.get(e.file.0 as usize)).unwrap_or(&no_extras);
-        span_shift::blank_nodes_extras(Arc::make_mut(&mut front.ast), e.file, e.old_body, ranges, extras);
+        if let Some(body) = &e.body {
+            span_shift::blank_nodes_extras(Arc::make_mut(&mut front.ast), e.file, body.old_body, ranges, extras);
+        }
         // Spans next: the new body is lexed at the new positions.
         let mut memo = FxMap::default();
         spans += span_shift::shift_ast_extras(Arc::make_mut(&mut front.ast), e.edit, ranges, extras, &mut memo);
@@ -640,8 +819,14 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         }
         base.needs[e.file.0 as usize] = e.needs;
         base.stamps[e.file.0 as usize] = None;
+        for d in base.dropped.iter_mut().filter(|d| d.file == e.file.0) {
+            let s = e.edit.plain(crate::diag::Span { file: e.file, lo: d.lo, hi: d.hi, ctxt: CtxtId::ROOT });
+            (d.lo, d.hi) = (s.lo, s.hi);
+        }
     }
     for e in edits.iter_mut() {
+        let file = e.file;
+        let Some(e) = e.body.as_mut() else { continue };
         let ast = &front.ast;
         let before = (ast.exprs.len(), ast.pats.len(), ast.tys.len(), ast.blocks.len(), ast.stmt_items.len());
         let stmt_base = before.4 as u32;
@@ -651,7 +836,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         def.exprs = (e.exprs.0 + before.0 as u32, e.exprs.1 + before.0 as u32);
         def.pats = (e.pats.0 + before.1 as u32, e.pats.1 + before.1 as u32);
         // The new body's nodes join the file's ranges for later edits.
-        if let Some(r) = base.ranges.as_mut().and_then(|r| r.get_mut(e.file.0 as usize)) {
+        if let Some(r) = base.ranges.as_mut().and_then(|r| r.get_mut(file.0 as usize)) {
             let ast = &front.ast;
             r.exprs.push(before.0..ast.exprs.len());
             r.pats.push(before.1..ast.pats.len());
@@ -706,9 +891,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
             }
         }
     }
-    let edited: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
+    let edited: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref().map(|b| b.fn_index)).collect();
     let changed = slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots);
-    let edits_len = edits.len();
+    let edits_len = edits.iter().filter(|e| e.body.is_some()).count();
     let out = Patched {
         map: front.map.clone(),
         changed,
@@ -737,7 +922,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
 /// and stores their hashes in the base; later edits in that impl scan
 /// only the edited method, because a body hash reads structure only
 /// (never spans), so unchanged methods keep theirs.
-fn rescan_edited(front: &Front, base: &mut PatchBase, e: &BodyEdit) -> Result<(u64, Vec<Sym>), &'static str> {
+fn rescan_edited(front: &Front, base: &mut PatchBase, e: &NewBody) -> Result<(u64, Vec<Sym>), &'static str> {
     let item = &front.ast.items[e.item];
     if let (Some(sub), Some(stored)) = (e.sub, base.item_scans.get(&e.item).cloned()) {
         let (hash, idents, inner) = super::ast_hash::scan_body(&front.ast, fn_def_at(&front.ast, e.item, e.sub));
@@ -797,8 +982,9 @@ pub(super) fn reuse_kept(
         }
         // A template checks again below, in a check only: a build's
         // instances replay its picks.
-        let f = LocalDefId(e.fn_index as u32);
-        match p.gx.fn_class.get(e.fn_index) {
+        let Some(fn_index) = e.fn_index else { continue };
+        let f = LocalDefId(fn_index as u32);
+        match p.gx.fn_class.get(fn_index) {
             Some(FnClass::Plain) => {}
             Some(FnClass::Template)
                 if !walk_instances
@@ -818,11 +1004,12 @@ pub(super) fn reuse_kept(
     let mut template_errs = Vec::new();
     let mut seen: Vec<usize> = Vec::new();
     for e in &edits {
-        if p.gx.fn_class.get(e.fn_index) != Some(&FnClass::Template) || seen.contains(&e.fn_index) {
+        let Some(fn_index) = e.fn_index else { continue };
+        if p.gx.fn_class.get(fn_index) != Some(&FnClass::Template) || seen.contains(&fn_index) {
             continue;
         }
-        seen.push(e.fn_index);
-        let f = LocalDefId(e.fn_index as u32);
+        seen.push(fn_index);
+        let f = LocalDefId(fn_index as u32);
         let ranges: Vec<(u32, u32)> = edits.iter().filter(|x| x.fn_index == e.fn_index).map(|x| x.old_exprs).collect();
         p.gx.trait_picks.retain(|x, _| !ranges.iter().any(|r| x.0 >= r.0 && x.0 < r.1));
         p.gx.template_closures.retain(|k, _| k.0 != f);
@@ -836,7 +1023,7 @@ pub(super) fn reuse_kept(
     // Discovery checks every plain body when user generics exist; with
     // only the lang enum methods' generics, a build checks the bodies
     // that name one (not tracked here) and a check none.
-    if p.gx.has_generics && !edits.is_empty() {
+    if p.gx.has_generics && edits.iter().any(|e| e.fn_index.is_some()) {
         if !p.gx.user_generics && walk_instances {
             return Err("lang generics");
         }
@@ -1281,10 +1468,11 @@ pub fn run() -> i64 {
         assert_eq!(per_size[0], per_size[1], "kept program work (discovery, checked) for 3 and 12 modules");
     }
 
-    /// Edits a crate root, checks it warm, and asserts the warm answer
-    /// is a cold session's; returns the warm `lust-visits:` line.
-    fn warm_equals_cold(warm: &mut Session, root: &Path, old: &str, new: &str) -> String {
-        edit(root, old, new);
+    /// Edits `file` of the crate at `root`, checks it warm, and asserts
+    /// the warm answer is a cold session's; returns the warm
+    /// `lust-visits:` line.
+    fn warm_equals_cold(warm: &mut Session, root: &Path, file: &Path, old: &str, new: &str) -> String {
+        edit(file, old, new);
         let got = check(warm, root);
         let dir = root.parent().unwrap().join(format!("obj-cold-{}", warm.front.last_visits.len()));
         let mut cold = Session::new(dir.clone(), false, SessionKey::synthetic(root, false));
@@ -1308,8 +1496,92 @@ pub fn run() -> i64 {
         std::fs::write(&root, src).unwrap();
         let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
         assert_eq!(check(&mut warm, &root), (0, String::new()));
-        let v = warm_equals_cold(&mut warm, &root, "        self\n", "        let _e: u32 = 1;\n        self\n");
+        let v = warm_equals_cold(&mut warm, &root, &root, "        self\n", "        let _e: u32 = 1;\n        self\n");
         assert_eq!((field(&v, "path"), field(&v, "kept")), ("patch", "reuse"), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module with cfg-disabled code the expander drops: a test module
+    /// and a fn for another platform, around active fns.
+    const INACTIVE: &str = "pub fn helper(x: i64) -> i64 {
+    x * 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doubles() {
+        assert_eq!(helper(1), 2);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn os_name() -> &'static str {
+    \"other\"
+}
+
+pub fn run() -> i64 {
+    let v: i64 = helper(3);
+    v
+}
+
+pub trait Twice {
+    fn twice(&self) -> i64 {
+        #[cfg(test)]
+        let _t = 1;
+        2
+    }
+}
+";
+
+    /// An edit inside cfg-disabled code takes the body patch with no Ast
+    /// node built (`find_inactive_edit`): edit, error, fix, undo, and
+    /// another edit each give the cold answer. A grammar error in
+    /// disabled code is the cold error (it resolves in full); a type error
+    /// there is no error, as in rustc. Tokens the cold passes read (`cfg`,
+    /// `#`), and disabled code inside an active body, resolve in full. A
+    /// later active error shows its moved line.
+    #[test]
+    fn inactive_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-inactive-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, INACTIVE).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let path = |v: &str| (field(v, "path").to_string(), field(v, "nodes").to_string());
+        let patch = || ("patch".to_string(), "0".to_string());
+        let steps: &[(&str, &str, bool)] = &[
+            // edit (adds lines), type error (no error in disabled code), fix
+            ("        assert_eq!(helper(1), 2);\n", "        let y = 3;\n        assert_eq!(helper(1), y - 1);\n", true),
+            ("let y = 3;", "let y: u32 = \"no\";", true),
+            ("let y: u32 = \"no\";", "let y = 3;", true),
+            // a grammar error: cold rejects; then the fix
+            ("let y = 3;", "let y = ;", false),
+            ("let y = ;", "let y = 3;", false),
+            // undo, then another edit in the other disabled fn
+            ("        let y = 3;\n        assert_eq!(helper(1), y - 1);\n", "        assert_eq!(helper(1), 2);\n", true),
+            ("    \"other\"\n", "    let s = \"other\";\n    s\n", true),
+            // tokens the cold passes read
+            ("    let s = \"other\";\n", "    let s = if cfg!(windows) { \"w\" } else { \"other\" };\n", false),
+            ("    let s = if cfg!(windows) { \"w\" } else { \"other\" };\n", "    let s = \"other\";\n", false),
+        ];
+        for &(old, new, fast) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            if fast {
+                assert_eq!(path(&v), patch(), "{new:?}: {v}");
+            }
+        }
+        // A disabled statement inside an active body (a trait default
+        // method's): its positions would move under the patch.
+        let v = warm_equals_cold(&mut warm, &root, &m1, "        let _t = 1;\n", "        let _t = 2;\n");
+        assert_eq!((field(&v, "path"), field(&v, "why")), ("resolve", "inactive_in_item"), "{v}");
+        // An active error after disabled code that grew: its line moves.
+        warm_equals_cold(&mut warm, &root, &m1, "    #[test]\n", "    #[test]\n\n\n");
+        let v = warm_equals_cold(&mut warm, &root, &m1, "    v\n}", "    v + true\n}");
+        assert_eq!(field(&v, "path"), "patch", "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

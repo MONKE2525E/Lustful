@@ -734,6 +734,17 @@ pub enum Dep {
         path: String,
         shown: String,
     },
+    /// Not an outside input: a cfg-disabled node of the file's own tokens
+    /// (macro depth 0) that the expander grammar-checked and dropped
+    /// (`check_disabled_syntax`), as file id, byte range (attribute run
+    /// included), and whether it was checked as an item. The body patch
+    /// proves an edit inside it the same way (driver/patch.rs).
+    Dropped {
+        file: u32,
+        lo: u32,
+        hi: u32,
+        item: bool,
+    },
 }
 
 /// Hashes bytes for a file dependency record.
@@ -751,7 +762,7 @@ pub fn deps_stale_with(deps: &[Dep], env: &dyn Fn(&str) -> Option<String>) -> bo
     deps.iter().any(|dep| match dep {
         Dep::File { path, hash } => std::fs::read(path).map_or(true, |bytes| dep_bytes_hash(&bytes) != *hash),
         Dep::Env { name, value } => env(name) != *value,
-        Dep::Position | Dep::Shown { .. } => false,
+        Dep::Position | Dep::Shown { .. } | Dep::Dropped { .. } => false,
     })
 }
 
@@ -2690,10 +2701,20 @@ impl<'a> Expander<'a> {
     /// no macro inside expands, no name resolution or type check runs,
     /// and a disabled `mod name;` never loads a file (module loading
     /// stays with the outline, which already honors cfg).
-    fn check_disabled_syntax(&self, trees: &[Tt], start: usize, end: usize, hint: crate::parser::CfgSyntaxHint) -> Result<(), Diag> {
+    /// A node of the file's own tokens (`depth` 0) is recorded as a
+    /// `Dep::Dropped`.
+    fn check_disabled_syntax(&mut self, trees: &[Tt], start: usize, end: usize, hint: crate::parser::CfgSyntaxHint, depth: u32) -> Result<(), Diag> {
         let mut toks = Vec::new();
         flatten_final(&trees[start..end], &mut toks);
-        crate::parser::check_cfg_syntax(&toks, &self.strings, self.ctx.interner, self.ctx.known, hint)
+        crate::parser::check_cfg_syntax(&toks, &self.strings, self.ctx.interner, self.ctx.known, hint)?;
+        if let (0, Some(first), Some(last)) = (depth, toks.first(), toks.last()) {
+            let (a, b) = (first.span, last.span);
+            if a.ctxt == CtxtId::ROOT && b.ctxt == CtxtId::ROOT && a.file == b.file && a.lo < b.hi {
+                let item = hint == crate::parser::CfgSyntaxHint::Item;
+                self.deps.push(Dep::Dropped { file: a.file.0, lo: a.lo, hi: b.hi, item });
+            }
+        }
+        Ok(())
     }
 
     /// Handles an attribute run starting at `i` in `trees`, appending any
@@ -2706,7 +2727,7 @@ impl<'a> Expander<'a> {
         pending_macro_use: &mut bool,
         out: &mut Vec<Tt>,
         item_list: bool,
-        _depth: u32,
+        depth: u32,
     ) -> Result<usize, Diag> {
         // The expander reads `#![recursion_limit]` itself and the
         // parser has no form for it, so it is consumed here, once its
@@ -2805,14 +2826,14 @@ impl<'a> Expander<'a> {
                             return Ok(end);
                         }
                         if let Some(end) = item_end(trees, after, self.ctx.interner) {
-                            self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Item)?;
+                            self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Item, depth)?;
                             return Ok(end);
                         }
                         // A statement, match arm, or comma-ended part:
                         // bounded at token level, dropped whole so
                         // nothing inside it expands.
                         if let Some(end) = node_end(trees, after) {
-                            self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Node)?;
+                            self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Node, depth)?;
                             return Ok(end);
                         }
                         let _ = attr_start;
@@ -2850,14 +2871,14 @@ impl<'a> Expander<'a> {
                     return Ok(end);
                 }
                 if let Some(end) = item_end(trees, after, self.ctx.interner) {
-                    self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Item)?;
+                    self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Item, depth)?;
                     return Ok(end);
                 }
                 // A statement, match arm, or comma-ended part:
                 // bounded at token level, dropped whole so
                 // nothing inside it expands.
                 if let Some(end) = node_end(trees, after) {
-                    self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Node)?;
+                    self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Node, depth)?;
                     return Ok(end);
                 }
                 let _ = attr_start;
