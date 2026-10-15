@@ -225,7 +225,8 @@ impl<'p> Ctx<'p> {
         // generic body), else one reference peeled (the by-value step of
         // a `&self` method), else the receiver by autoref.
         let conv_traits = [lang.as_ref, lang.as_mut, lang.borrow, lang.borrow_mut, lang.to_owned];
-        let (self_ty, self_derefs) = match self.replay_pick(e).filter(|pk| conv_traits.contains(&pk.trait_def)) {
+        let replayed = self.replay_pick(e).filter(|pk| conv_traits.contains(&pk.trait_def));
+        let (self_ty, self_derefs) = match replayed {
             Some(pick) => {
                 let mut t = rt;
                 for _ in 0..pick.derefs {
@@ -241,7 +242,22 @@ impl<'p> Ctx<'p> {
                 _ => (rt, 0u8),
             },
         };
-        if self.tys.local_adt(self_ty).is_some() || matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..)) {
+        // A user Adt's own impls answer in the generic method search
+        // first. Only core's reflexive `impl<T> Borrow<T> for T` (and
+        // BorrowMut) is left for it here: a synthetic impl has no
+        // method fn to call, so the search counts it as a miss
+        // (`p.borrow()`, or `k.borrow()` in `K: Borrow<Q>` at K = P).
+        // Next to a user `impl Borrow<str> for P` a plain `p.borrow()`
+        // is ambiguous in rustc (E0283), so it stays a miss here; an
+        // instance replays its template's pick, which fixed the input.
+        let reflexive = match n {
+            "borrow" | "borrow_mut" => {
+                let tr = if n == "borrow" { lang.borrow } else { lang.borrow_mut };
+                replayed.is_some() || !self.tys.adt_parts(self_ty).is_some_and(|(def, _)| user_impl_for_adt(p, tr, def))
+            }
+            _ => false,
+        };
+        if (self.tys.local_adt(self_ty).is_some() && !reflexive) || matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..)) {
             return None;
         }
         if n == "clone_into" {
@@ -633,4 +649,14 @@ impl<'p> Ctx<'p> {
         let owned = self.normalize_here(pr);
         (owned != pr && owned == src).then_some(FromConv::CowOwned)
     }
+}
+
+/// True when the crate has a written impl of `trait_def` for the Adt
+/// `def` (any args): `impl Borrow<str> for P`.
+fn user_impl_for_adt(p: &crate::check::Program, trait_def: DefId, def: DefId) -> bool {
+    use crate::traits::index::{SelfHead, Synthetic};
+    p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
+        let rec = p.gx.index.get(id);
+        rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
+    })
 }
