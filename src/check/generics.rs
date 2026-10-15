@@ -8807,6 +8807,62 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
     out
 }
 
+/// True when template `t`'s closures, checked again now (its body was
+/// edited under a kept program, driver/patch.rs `reuse_kept`), are the
+/// ones registered: as many, and each one's kind, signature, and borrow
+/// facts equal its entry and body fn. `check_template` then reuses every
+/// body fn as a fresh collect would make it (`register_closures` finds
+/// each by its def), so the program stands. Also true for no closure.
+pub(crate) fn template_closures_stand(p: &mut Program, t: LocalDefId) -> bool {
+    use crate::check::closure::ClosureKind;
+    let old = p.gx.closures.values().filter(|e| e.parent == t).count();
+    if old == 0 && !fn_has_closures(p, t) {
+        return true;
+    }
+    let owned = {
+        let (c, errs) = crate::check::check_fn(p, t);
+        if !errs.is_empty() {
+            return false;
+        }
+        snapshot_closures(&c)
+    };
+    let Some(owned) = owned else { return false };
+    if owned.len() != old {
+        return false;
+    }
+    for oc in owned {
+        let Some(e) = p.gx.closures.get(&oc.def).cloned() else { return false };
+        let env = build_owned_ty(p, &oc.env);
+        let env = match oc.kind {
+            ClosureKind::Fn => p.tys.mk_ref(false, env),
+            ClosureKind::FnMut => p.tys.mk_ref(true, env),
+            ClosureKind::FnOnce => env,
+        };
+        let inputs: Vec<Ty> = oc.inputs.iter().map(|x| build_owned_ty(p, x)).collect();
+        let output = build_owned_ty(p, &oc.output);
+        let input_regions: Vec<Option<Ty>> = oc.input_regions.iter().map(|o| o.as_ref().map(|x| build_owned_ty(p, x))).collect();
+        let output_region = oc.output_region.as_ref().map(|x| build_owned_ty(p, x));
+        let bound_output = oc.bound_output.as_ref().map(|x| build_owned_ty(p, x));
+        let f = p.fn_info(e.body_fn);
+        let same = e.parent == t
+            && e.kind == oc.kind
+            && e.inputs == inputs
+            && e.output == output
+            && e.free_args == oc.free_args
+            && e.scope_body == oc.scope_body
+            && e.input_regions == input_regions
+            && e.output_region == output_region
+            && e.bound_output == bound_output
+            && f.params.first() == Some(&env)
+            && f.params[1..] == inputs[..]
+            && f.ret == output;
+        if !same {
+            return false;
+        }
+    }
+    true
+}
+
 /// Creates (or finds) the concrete instance of one template.
 fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> LocalDefId {
     // A trait method stub has no body of its own (a lang method's stub

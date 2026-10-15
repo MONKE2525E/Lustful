@@ -1307,9 +1307,10 @@ pub(super) fn reuse_kept(
         let f = LocalDefId(fn_index as u32);
         match p.gx.fn_class.get(fn_index) {
             Some(FnClass::Plain) => {}
+            // A template with closures stands when its closures are the
+            // registered ones (checked below, before its template check).
             Some(FnClass::Template)
                 if !walk_instances
-                    && e.plain
                     && !p.is_lang_method(f)
                     && !p.gx.opaques.contains_key(&crate::check::generics::opaque_def(p.def_id(f))) => {}
             _ => return Err("fn class"),
@@ -1331,6 +1332,9 @@ pub(super) fn reuse_kept(
         }
         seen.push(fn_index);
         let f = LocalDefId(fn_index as u32);
+        if !crate::check::generics::template_closures_stand(&mut p, f) {
+            return Err("closures");
+        }
         let ranges: Vec<(u32, u32)> = edits.iter().filter(|x| x.fn_index == e.fn_index).map(|x| x.old_exprs).collect();
         p.gx.trait_picks.retain(|x, _| !ranges.iter().any(|r| x.0 >= r.0 && x.0 < r.1));
         p.gx.template_closures.retain(|k, _| k.0 != f);
@@ -2283,6 +2287,61 @@ fn main() {
             (s.front.ast.shipped.clone(), s.front.ast.lang_methods, b.std_ranges.clone(), b.std_methods, b.tables.std_splice_lo, b.tables.std_ranges.clone())
         };
         assert!(pos(&warm) == pos(&fresh), "splice positions after the patches");
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Templates whose bodies hold closures.
+    const TEMPLATE_CLOSURES: &str = "pub fn map_get<V: Copy>(m: &[(&str, V)], key: &str) -> Option<V> {
+    m.iter().find(|(k, _)| *k == key).map(|e| e.1)
+}
+
+pub fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 {
+    let g = |y: i64| f(y) + 1;
+    g(x)
+}
+
+pub fn run() -> i64 {
+    map_get(&[(\"a\", 1i64)], \"a\").unwrap_or(0) + apply(|v| v * 2, 3)
+}
+";
+
+    /// A body edit of a template with closures keeps the program while
+    /// its closures are the registered ones (as many, same kinds and
+    /// signatures); another closure, or one of another kind, collects
+    /// again. Edit, error, fix, undo, and another edit each give the cold
+    /// answer, and a build prints what a cold build prints.
+    #[test]
+    fn template_closure_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-tclos-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, TEMPLATE_CLOSURES).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        // (old, new, expected kept=; "" for any)
+        let steps: &[(&str, &str, &str)] = &[
+            ("    m.iter().find", "    let n = m.len();\n    let _ = n;\n    m.iter().find", "reuse"),
+            ("*k == key", "*k == 1", ""),
+            ("*k == 1", "k.len() == key.len() && *k == key", ""),
+            ("k.len() == key.len() && *k == key", "*k == key", "reuse"),
+            ("    let g = |y: i64| f(y) + 1;\n", "    let g = |y: i64| f(y) + 2;\n", "reuse"),
+            ("    let g = |y: i64| f(y) + 2;\n    g(x)\n", "    let g = |y: i64| f(y) + 2;\n    let h = |z: i64| z;\n    h(g(x))\n", "closures"),
+            ("    let h = |z: i64| z;\n    h(g(x))\n", "    g(x)\n", "closures"),
+            ("    let g = |y: i64| f(y) + 2;\n    g(x)\n", "    let mut n = 0;\n    let mut g = |y: i64| {\n        n += 1;\n        f(y) + n\n    };\n    g(x)\n", "closures"),
+        ];
+        for &(old, new, kept) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            if !kept.is_empty() {
+                assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
+            }
+        }
         assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
         let bin = root.with_extension("bin");
         let out = run_bin(&bin);
