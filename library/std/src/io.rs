@@ -1301,7 +1301,7 @@ pub trait Seek {
     }
 }
 
-impl<S: Seek + ?Sized> Seek for &mut S {
+impl<T: Seek + ?Sized> Seek for &mut T {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         (**self).seek(pos)
     }
