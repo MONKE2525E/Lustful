@@ -578,8 +578,26 @@ impl ResolvedTables {
         let (item_vis, item_module) = match target {
             Target::Def(d) | Target::Variant(d, _) => match self.def_info.get(&d) {
                 // Macros are textual: `#[macro_export]` puts them at the
-                // crate root in public, so re-export rules do not bind.
-                Some(info) if info.kind == ResKind::Macro => return true,
+                // crate root in public, so re-export rules do not bind
+                // there. A macro without it is public only within its
+                // crate: a `pub use` of it is rustc E0364 ("only public
+                // within the crate"), while `pub(crate) use` is the
+                // re-export idiom. An exported macro has a public
+                // binding at its crate root.
+                Some(info) if info.kind == ResKind::Macro => {
+                    if imp.vis != VisKind::Pub {
+                        return true;
+                    }
+                    let root = self.root_of(info.module);
+                    let sym = interner.intern(name);
+                    let exported = matches!(self.lookup(root, Namespace::Macro, sym),
+                        Some(BindState::One(b)) if b.target == target && b.vis == VisKind::Pub);
+                    if exported {
+                        return true;
+                    }
+                    diags.push(reexport_diag(name, imp.span));
+                    return false;
+                }
                 Some(info) => (info.vis.clone(), info.module),
                 None => return true,
             },
@@ -700,7 +718,16 @@ impl ResolvedTables {
         let stale = matches!(self.lookup(module, ns, name), Some(BindState::One(old)) if old.rank <= 1 && old.target != bind.target)
             && self.glob_src.get(&key) == Some(&src)
             && !self.std_glob_aliases.contains_key(&key);
-        if stale {
+        // The mirror case: this source made the name ambiguous here
+        // (its own binding was ambiguous, propagated by the glob copy
+        // in `try_import`), and its binding has since settled to one
+        // item (its explicit import landed). The copy follows it back
+        // to that item; any other live glob that still brings a
+        // different item re-makes the ambiguity on a later sweep.
+        let settled = matches!(self.lookup(module, ns, name), Some(BindState::Ambiguous))
+            && self.glob_src.get(&key) == Some(&src)
+            && !self.std_glob_aliases.contains_key(&key);
+        if stale || settled {
             self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
             return InsertOut::Changed;
         }
@@ -1752,6 +1779,27 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         for (ns, name, bind) in entries {
                             if tables.insert_glob(imp.module, ns, name, bind, src) == InsertOut::Changed {
                                 changed = true;
+                            }
+                        }
+                        // An ambiguous name in the source is ambiguous
+                        // through this glob too, as in rustc: copying
+                        // only its settled names would leave a stale
+                        // binding from an earlier sweep, or let another
+                        // glob's item win silently. The source records
+                        // itself in `glob_src`, so its own later
+                        // settling (an explicit import there) can undo
+                        // exactly this poisoning (`insert_glob`).
+                        for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+                            let mut names: Vec<Sym> = tables.maps[src.0 as usize][ns_index(ns)]
+                                .iter()
+                                .filter_map(|(name, state)| matches!(state, BindState::Ambiguous).then_some(*name))
+                                .collect();
+                            names.sort_by(|a, b| interner.get(*a).cmp(interner.get(*b)));
+                            for name in names {
+                                if insert_ambiguous(tables, imp.module, ns, name) {
+                                    tables.glob_src.insert((imp.module, ns_index(ns) as u8, name), src);
+                                    changed = true;
+                                }
                             }
                         }
                         // The std imports of the source module
