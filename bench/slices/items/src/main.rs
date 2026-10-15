@@ -70,10 +70,12 @@ fn tree(file: &Path, dir: PathBuf, out: &mut Vec<PathBuf>) {
     }
     out.push(file.to_path_buf());
     let parsed = parse(file);
-    mods(&parsed.items, file, &dir, out);
+    mods(&parsed.items, file, &dir, false, out);
 }
 
-fn mods(list: &[Item], file: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+/// `inline`: `list` is the body of an inline `mod m { .. }`. A `#[path]` there is relative to
+/// `dir`; outside inline blocks it is relative to the directory of `file` (the Reference rule).
+fn mods(list: &[Item], file: &Path, dir: &Path, inline: bool, out: &mut Vec<PathBuf>) {
     for it in list {
         let Item::Mod(m) = it else { continue };
         let name = m.ident.to_string();
@@ -82,12 +84,12 @@ fn mods(list: &[Item], file: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
                 Some(p) => dir.join(p),
                 None => dir.join(&name),
             };
-            mods(inner, file, &sub, out);
+            mods(inner, file, &sub, true, out);
             continue;
         }
         if let Some(p) = path_attr(&m.attrs) {
             // A #[path] file owns its directory: its children sit next to it.
-            let f = dir.join(p);
+            let f = if inline { dir.join(p) } else { file.parent().unwrap().join(p) };
             if f.exists() {
                 let d = f.parent().unwrap().to_path_buf();
                 tree(&f, d, out);
