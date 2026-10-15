@@ -822,6 +822,12 @@ pub trait TyIntern {
     fn unsized_field(&self, _def: DefId) -> Option<Ty> {
         None
     }
+    /// True when `t` lives in the global store, so a fresh store over
+    /// `GlobalTys` (a `PureCx`) reads it the same way. Body-local
+    /// types answer false.
+    fn is_global_ty(&self, _t: Ty) -> bool {
+        true
+    }
 
     /// The `f32` or `f64` type.
     fn float_ty(&mut self, f: FloatTy) -> Ty {
@@ -1565,6 +1571,9 @@ impl TyIntern for Tys<'_> {
     }
     fn unsized_field(&self, def: DefId) -> Option<Ty> {
         self.global.unsized_field(def)
+    }
+    fn is_global_ty(&self, t: Ty) -> bool {
+        t.0 < self.global.kinds.len()
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
         self.global.def_of_local_adt(local)

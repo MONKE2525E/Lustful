@@ -10177,10 +10177,18 @@ fn prove_trait_ref(
     if depth > 24 {
         return false;
     }
+    // A confirmed impl's nested goal names its Self by the probe
+    // variable the header bound (`S: Send` with `S = ?3`), so the
+    // structural answers below read Self deep-resolved; an unbound
+    // variable proves nothing.
+    let self_resolved = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()).map(|t| crate::traits::solve::SolveCx::deep_resolve(cx, t));
     if tr.def == lang.sized {
         // Sized by structure (check::sized): a parameter is when the
         // env says so (an implicit `T: Sized` is in every env that has one).
-        let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
+        let Some(t) = self_resolved else { return false };
+        if cx.tys.flags(t).contains_infer() {
+            return false;
+        }
         let sized_params = crate::check::sized::env_sized_params(&cx.tys, env, lang.sized);
         return crate::check::sized::is_sized(p, &mut cx.tys, t, &|q| sized_params.contains(&q));
     }
@@ -10191,7 +10199,7 @@ fn prove_trait_ref(
     }
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {
-        let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
+        let Some(t) = self_resolved else { return false };
         return crate::check::collect::auto_structural(p, &mut cx.tys, env, tr.def, t, &mut Vec::new()) == Some(true);
     }
     // rustc's object candidate: `dyn Tr` implements its principal and
@@ -10380,6 +10388,9 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
     let lang = p.gx.lang;
     let default = trait_def == lang.default;
     match p.tys.kind(ty) {
+        // A field whose type did not resolve: that error is reported
+        // already, and a derive error on top would name the wrong cause.
+        TyKind::Error => true,
         TyKind::Tuple(ts) => {
             let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
             // core's tuple impls of the derive family stop at 12
@@ -10428,6 +10439,28 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
             prove_goal(p, env, TraitRef { def: trait_def, args: a, bindings: EMPTY_BINDINGS })
         }
     }
+}
+
+/// One where clause of an impl, instantiated with `args` (global
+/// types), proven by the full solver. The derive glue's written-impl
+/// check (`collect::glue_impl_pred_holds`) uses it for the bounds its
+/// own walks do not cover: traits outside the derive family
+/// (`S: BuildHasher` on a map's `PartialEq` impl) and bounds whose
+/// Self is not a bare parameter. False when the instance still names
+/// a parameter.
+pub(crate) fn prove_inst_trait_ref(p: &Program, tr: TraitRef, args: &[GenericArg]) -> bool {
+    let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+    let tr = crate::traits::index::subst_trait_ref_pub(&mut cx.tys, tr, args);
+    let open = |g: &GenericArg| match *g {
+        GenericArg::Ty(t) => cx.tys.flags(t).contains_param() || cx.tys.flags(t).contains_infer(),
+        GenericArg::Const(c) => matches!(cx.tys.const_kind(c), ConstKind::Param(_) | ConstKind::Infer(_)),
+        GenericArg::Lifetime(_) => false,
+    };
+    if cx.tys.args(tr.args).iter().any(open) || cx.tys.bindings(tr.bindings).iter().any(|(_, g)| open(g)) {
+        return false;
+    }
+    let mut solver = crate::traits::solve::Solver::new();
+    prove_trait_ref(p, &mut solver, &mut cx, &[], tr, 0, &mut Vec::new())
 }
 
 /// One trait goal with a fresh solver (collect-time proves are

@@ -6838,12 +6838,13 @@ fn match_impl_pat(p: &Program, tys: &impl TyIntern, pat: Ty, t: Ty, assign: &mut
 
 /// Proves one predicate of a written glue impl after matching:
 /// trait predicates whose Self (and `Rhs`) are single matched
-/// parameters, by the glue walk of their trait. Anything else is
-/// not proven here (the impl then does not count for glue, which
-/// can only keep a reject), except outlives predicates, which do
-/// not change what the glue calls (as in `prove_trait_ref`).
+/// parameters by the glue walk of their trait, and other trait
+/// predicates (and `Sized`) over a concrete instance by the full
+/// solver (`inst_args`). Anything else is not proven here (the impl
+/// then does not count for glue, which can only keep a reject),
+/// except outlives predicates, which do not change what the glue
+/// calls (as in `prove_trait_ref`).
 fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assign: &[Option<Ty>], seen: &mut Vec<Ty>) -> bool {
-    let lang = &p.gx.lang;
     let arg_ty = |g: &GenericArg| -> Option<Ty> {
         match g.as_ty().map(|t| p.tys.kind(t)) {
             Some(TyKind::Param(id)) => assign.get(id.0 as usize).copied().flatten(),
@@ -6853,39 +6854,80 @@ fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assi
     match pred {
         Predicate::Trait(b) if b.count == 0 => {
             let args = p.tys.args(b.value.args);
-            let Some(self_ty) = args.first().and_then(arg_ty) else { return false };
-            let rhs = args.get(1).and_then(arg_ty);
-            let d = b.value.def;
-            if d == lang.sized {
-                true
-            } else if d == lang.clone {
-                glue_clone(p, tys, self_ty, seen)
-            } else if d == lang.partial_eq {
-                rhs == Some(self_ty) && glue_eq(p, tys, self_ty, seen)
-            } else if d == lang.eq {
-                glue_total_eq(p, tys, self_ty, seen)
-            } else if d == lang.partial_ord {
-                rhs == Some(self_ty) && glue_cmp(p, tys, self_ty, false, seen)
-            } else if d == lang.ord {
-                glue_cmp(p, tys, self_ty, true, seen)
-            } else if d == lang.hash {
-                glue_hash(p, tys, self_ty, seen)
-            } else if d == lang.default {
-                glue_default(p, tys, self_ty, seen)
-            } else if d == lang.debug {
-                glue_debug(p, tys, self_ty, seen)
-            } else if d == lang.display {
-                has_display(p, tys, self_ty)
-            } else if d == lang.copy {
-                is_copy(p, tys, self_ty)
-            } else {
-                false
+            let self_ty = args.first().and_then(arg_ty);
+            let inst = inst_args(p, tys, assign);
+            // `Sized` (implicit on every impl param) by the solver's
+            // structural answer when the instance is concrete; a body's
+            // generic or local type by structure here.
+            if b.value.def == p.gx.lang.sized {
+                return match (&inst, self_ty) {
+                    (Some(a), _) => crate::check::generics::prove_inst_trait_ref(p, b.value, a),
+                    (None, Some(t)) => match tys.kind(t) {
+                        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.sized, None),
+                        _ => is_sized_ty(tys, t),
+                    },
+                    (None, None) => false,
+                };
             }
+            let by_glue = self_ty.is_some_and(|t| glue_family_holds(p, tys, b.value.def, t, args.get(1).and_then(arg_ty), seen));
+            by_glue || inst.is_some_and(|a| crate::check::generics::prove_inst_trait_ref(p, b.value, &a))
         }
         Predicate::Trait(_) => false,
         Predicate::Outlives(..) | Predicate::TypeOutlives(..) => true,
         Predicate::AssocEq(_) => false,
     }
+}
+
+/// A written glue impl's bound `self_ty: d` (with `Rhs = rhs` for
+/// `PartialEq` and `PartialOrd`), for a trait the glue walks know.
+fn glue_family_holds(p: &Program, tys: &impl TyIntern, d: DefId, self_ty: Ty, rhs: Option<Ty>, seen: &mut Vec<Ty>) -> bool {
+    let lang = &p.gx.lang;
+    if d == lang.clone {
+        glue_clone(p, tys, self_ty, seen)
+    } else if d == lang.partial_eq {
+        rhs == Some(self_ty) && glue_eq(p, tys, self_ty, seen)
+    } else if d == lang.eq {
+        glue_total_eq(p, tys, self_ty, seen)
+    } else if d == lang.partial_ord {
+        rhs == Some(self_ty) && glue_cmp(p, tys, self_ty, false, seen)
+    } else if d == lang.ord {
+        glue_cmp(p, tys, self_ty, true, seen)
+    } else if d == lang.hash {
+        glue_hash(p, tys, self_ty, seen)
+    } else if d == lang.default {
+        glue_default(p, tys, self_ty, seen)
+    } else if d == lang.debug {
+        glue_debug(p, tys, self_ty, seen)
+    } else if d == lang.display {
+        has_display(p, tys, self_ty)
+    } else if d == lang.copy {
+        is_copy(p, tys, self_ty)
+    } else {
+        false
+    }
+}
+
+/// A written glue impl's matched params as solver args, for bounds
+/// the glue walks do not prove (`S: BuildHasher`, `Vec<T>: Tr`):
+/// None unless every assigned type is concrete and global (a
+/// body-local or generic one stays with the glue walks, which can
+/// only keep a reject).
+fn inst_args(p: &Program, tys: &impl TyIntern, assign: &[Option<Ty>]) -> Option<Vec<GenericArg>> {
+    let mut args: Vec<GenericArg> = Vec::with_capacity(assign.len());
+    for a in assign {
+        match *a {
+            Some(t) if tys.is_global_ty(t) && !p.tys.flags(t).contains_param() && !p.tys.flags(t).contains_infer() => args.push(GenericArg::Ty(t)),
+            Some(_) => return None,
+            // An unassigned parameter stays as written (subst keeps a
+            // param with no type argument), so the solver's open check
+            // rejects a bound that names it.
+            None => match p.tys.get(TyKind::Param(ParamId(args.len() as u32))) {
+                Some(q) => args.push(GenericArg::Ty(q)),
+                None => args.push(GenericArg::Lifetime(Region::Static)),
+            },
+        }
+    }
+    Some(args)
 }
 
 /// True when a written (not derived) impl of `trait_def` applies to
