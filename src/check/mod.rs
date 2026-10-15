@@ -27,6 +27,7 @@ pub mod picks;
 pub mod platform;
 pub mod split;
 pub mod project;
+pub mod prog_shift;
 pub mod sized;
 pub mod stdtypes;
 pub mod std_inherent;

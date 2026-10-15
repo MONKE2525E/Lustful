@@ -126,6 +126,16 @@ impl Defs {
         Defs::default()
     }
 
+    /// Visits every span the table holds: each def's span and its
+    /// generic parameters' spans (check/prog_shift.rs moves them).
+    pub fn for_each_span(&mut self, f: &mut dyn FnMut(&mut Span)) {
+        for (_, d) in &mut self.data {
+            let DefData { kind: _, parent: _, name: _, module: _, vis: _, generics, span, sig: _ } = d;
+            f(span);
+            generics.params.iter_mut().for_each(|p| f(&mut p.span));
+        }
+    }
+
     /// Records one def. A second record for the same `DefId` replaces the first;
     /// duplicate definitions are user errors reported by collect (L0106), and the
     /// surviving record only feeds later error messages.

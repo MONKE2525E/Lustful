@@ -99,9 +99,11 @@ pub fn ranges_by_file(ast: &Ast, n_files: usize) -> Vec<FileRanges> {
 
 /// Applies `edit` to every span of `ast`, or, with `ranges`, to the
 /// spans of the nodes in those ranges (see `ranges_by_file`). Returns
-/// the number of spans visited (the patch's work counter).
-pub fn shift_ast(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>) -> usize {
-    let mut w = Walk { edit, ctxts: FxMap::default(), visited: 0 };
+/// the number of spans visited (the patch's work counter). `ctxts`
+/// collects the fresh expansion contexts (`Edit::span`), so a kept
+/// program's spans can move to the same ones (check/prog_shift.rs).
+pub fn shift_ast(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>, ctxts: &mut FxMap<u32, CtxtId>) -> usize {
+    let mut w = Walk { edit, ctxts: std::mem::take(ctxts), visited: 0 };
     let Ast { inner_attrs, items, stmt_items, exprs, expr_spans, pats, pat_spans, tys, ty_spans, blocks, .. } = ast;
     let all = |n: usize| vec![0..n];
     let pick = |n: usize, f: fn(&FileRanges) -> &Vec<Range<usize>>| ranges.map_or_else(|| all(n), |r| f(r).clone());
@@ -134,6 +136,7 @@ pub fn shift_ast(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>) -> usiz
     for r in pick(stmt_items.len(), |r| &r.stmt_items) {
         stmt_items[r].iter_mut().for_each(|it| w.item(it));
     }
+    *ctxts = w.ctxts;
     w.visited
 }
 
@@ -734,12 +737,12 @@ fn main() {
             let edit = Edit { file: FileId(0), a: a as u32, b: b as u32, d: ins.len() as i64 - (b - a) as i64 };
             let mut whole = parse(SRC, &interner, &known);
             assert_ne!(dump(&whole), want, "the edit moves some span");
-            shift_ast(&mut whole, edit, None);
+            shift_ast(&mut whole, edit, None, &mut FxMap::default());
             assert_eq!(dump(&whole), want, "whole-Ast shift for edit at {a}..{b}");
             assert_eq!(call_sites(&whole), call_sites(&parse(&edited, &interner, &known)), "call sites for edit at {a}..{b}");
             let mut ranged = parse(SRC, &interner, &known);
             let ranges = ranges_by_file(&ranged, 1);
-            shift_ast(&mut ranged, edit, Some(&ranges[0]));
+            shift_ast(&mut ranged, edit, Some(&ranges[0]), &mut FxMap::default());
             assert_eq!(dump(&ranged), want, "ranged shift for edit at {a}..{b}");
         }
     }

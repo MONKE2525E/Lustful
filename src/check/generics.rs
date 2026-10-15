@@ -7207,7 +7207,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
 /// snapshot breaks that borrow. It names defs by `DefId`, so it also
 /// outlives the program: the driver's generic reuse cache keeps
 /// discovery output in this form across requests (driver/gen_reuse.rs).
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum OwnedTy {
     Leaf(TyKind),
     Ref(Region, Mut, Box<OwnedTy>),
@@ -7227,7 +7227,7 @@ pub(crate) enum OwnedTy {
     Dyn(Option<(DefId, Vec<OwnedArg>, Vec<(DefId, OwnedArg)>)>, AutoTraits, Region),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum OwnedArg {
     Ty(OwnedTy),
     Lifetime(Region),
@@ -7728,7 +7728,7 @@ pub fn check_lang_templates(p: &mut Program) -> Vec<Diag> {
 /// One template's check against its param env (see `template_check`):
 /// its picks, closure call kinds, and closure bodies are recorded for
 /// its instances. Returns the check's errors.
-fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::driver::gen_reuse::GenReuse) -> Vec<Diag> {
+pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::driver::gen_reuse::GenReuse) -> Vec<Diag> {
     // A template whose stored check still holds (driver session
     // reuse) contributes its picks and closure call kinds without
     // a recheck. A body with closure expressions always rechecks:
@@ -8019,7 +8019,7 @@ fn instance_owner(p: &mut Program, params: &[Ty], self_kind: Option<ast::SelfKin
 
 /// One closure of a checked body, snapshotted out of its store so
 /// the program can grow while it registers (see `register_closures`).
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct OwnedClosure {
     pub(crate) def: DefId,
     pub(crate) kind: crate::check::closure::ClosureKind,
@@ -8797,59 +8797,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             } else {
                 reuse.discovery_checked += 1;
                 let (checked, discarded) = crate::check::check_fn(p, fid);
-                let closures_owned = snapshot_closures(&checked).unwrap_or_default();
-                // Each type once, in first-seen order: a body names the
-                // same Adt type at many expressions, and every stored
-                // copy is rebuilt on each discovery replay (driver
-                // session reuse), while `ensure_global_adt_instances`
-                // makes an instance only the first time.
-                let mut adt_tys: Vec<OwnedTy> = Vec::new();
-                let mut seen: crate::intern::FxMap<Ty, ()> = crate::intern::FxMap::default();
-                for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
-                    if seen.insert(t, ()).is_none()
-                        && let Some(o) = snapshot_ty(&checked.tys, t)
-                    {
-                        adt_tys.push(o);
-                    }
-                }
-                let mut vts: Vec<(OwnedTy, OwnedTy)> = Vec::new();
-                for &(src, dyn_ty) in &checked.vtable_requests {
-                    if let (Some(a), Some(b)) = (snapshot_ty(&checked.tys, src), snapshot_ty(&checked.tys, dyn_ty)) {
-                        vts.push((a, b));
-                    }
-                }
-                let mut reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = Vec::new();
-                for (template, raw_args) in &checked.inst_requests {
-                    if checked.closure_map_pending
-                        && raw_args.iter().any(|g| matches!(g, GenericArg::Ty(t) if crate::check::opaque::mentions_template_closure(p, &checked.tys, *t)))
-                    {
-                        continue;
-                    }
-                    let mut owned: Vec<OwnedArg> = Vec::new();
-                    let mut ok = true;
-                    for g in raw_args {
-                        match g {
-                            GenericArg::Ty(e) => match snapshot_ty(&checked.tys, *e) {
-                                Some(o) => owned.push(OwnedArg::Ty(o)),
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            },
-                            GenericArg::Const(c) => match checked.tys.const_kind(*c) {
-                                ConstKind::Infer(_) => {
-                                    ok = false;
-                                    break;
-                                }
-                                k => owned.push(OwnedArg::Const(k)),
-                            },
-                            GenericArg::Lifetime(r) => owned.push(OwnedArg::Lifetime(*r)),
-                        }
-                    }
-                    if ok {
-                        reqs.push((*template, owned));
-                    }
-                }
+                let (adt_tys, reqs, closures_owned, vts) = discovery_out(p, &checked, &discarded);
                 // A body whose types still name a generic definer's
                 // template closures (its instance is made from this very
                 // body's requests) checks again next round; its requests
@@ -8860,13 +8808,8 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                     recheck.push(fid);
                 } else if discarded.is_empty() {
                     reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
-                }
-                // A body with errors fails the build (the driver's check
-                // reports them), and its picks may name a trait method
-                // stub, which has no instance (an opaque view's picks on
-                // an `impl Trait` value). Its other requests stand.
-                if discarded.iter().any(|d| d.severity == "error") {
-                    reqs.retain(|(t, _)| p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Stub));
+                } else {
+                    reuse.note_unstored(p, fid);
                 }
                 (adt_tys, reqs, closures_owned, vts)
             };
@@ -8964,6 +8907,90 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         errs.extend(crate::check::platform::user_write_fmt_instance(p, LocalDefId(i as u32)));
     }
     errs
+}
+
+/// The output of one fresh discovery check of a body (see
+/// `materialize`): the Adt types it names, each once in first-seen
+/// order; its instance requests; its closures; and its vtable requests
+/// (concrete type, dyn type). The daemon's kept program compares an
+/// edited body's output with its stored one (driver/patch.rs).
+pub(crate) fn discovery_out(p: &Program, checked: &crate::check::Checked<'_>, discarded: &[Diag]) -> crate::driver::gen_reuse::Discovered {
+    let closures_owned = snapshot_closures(checked).unwrap_or_default();
+    // Each type once, in first-seen order: a body names the
+    // same Adt type at many expressions, and every stored
+    // copy is rebuilt on each discovery replay (driver
+    // session reuse), while `ensure_global_adt_instances`
+    // makes an instance only the first time. Every type enters
+    // the global store (lowering and codegen read body types
+    // there); only some can name an instance (`may_make_instances`).
+    let mut adt_tys: Vec<OwnedTy> = Vec::new();
+    let mut seen: crate::intern::FxMap<Ty, ()> = crate::intern::FxMap::default();
+    for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
+        if seen.insert(t, ()).is_none()
+            && let Some(o) = snapshot_ty(&checked.tys, t)
+        {
+            adt_tys.push(o);
+        }
+    }
+    let mut vts: Vec<(OwnedTy, OwnedTy)> = Vec::new();
+    for &(src, dyn_ty) in &checked.vtable_requests {
+        if let (Some(a), Some(b)) = (snapshot_ty(&checked.tys, src), snapshot_ty(&checked.tys, dyn_ty)) {
+            vts.push((a, b));
+        }
+    }
+    let mut reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = Vec::new();
+    for (template, raw_args) in &checked.inst_requests {
+        if checked.closure_map_pending
+            && raw_args.iter().any(|g| matches!(g, GenericArg::Ty(t) if crate::check::opaque::mentions_template_closure(p, &checked.tys, *t)))
+        {
+            continue;
+        }
+        let mut owned: Vec<OwnedArg> = Vec::new();
+        let mut ok = true;
+        for g in raw_args {
+            match g {
+                GenericArg::Ty(e) => match snapshot_ty(&checked.tys, *e) {
+                    Some(o) => owned.push(OwnedArg::Ty(o)),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                },
+                GenericArg::Const(c) => match checked.tys.const_kind(*c) {
+                    ConstKind::Infer(_) => {
+                        ok = false;
+                        break;
+                    }
+                    k => owned.push(OwnedArg::Const(k)),
+                },
+                GenericArg::Lifetime(r) => owned.push(OwnedArg::Lifetime(*r)),
+            }
+        }
+        if ok {
+            reqs.push((*template, owned));
+        }
+    }
+    // A body with errors fails the build (the driver's check reports
+    // them), and its picks may name a trait method stub, which has no
+    // instance (an opaque view's picks on an `impl Trait` value). Its
+    // other requests stand.
+    if discarded.iter().any(|d| d.severity == "error") {
+        reqs.retain(|(t, _)| p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Stub));
+    }
+    (adt_tys, reqs, closures_owned, vts)
+}
+
+/// True when `ensure_global_adt_instances` can make an instance from
+/// `t`: it holds an Adt application with arguments where that walk
+/// looks (under references, pointers, slices, arrays, tuples, and Adt
+/// arguments). For any other type the walk does nothing.
+pub(crate) fn may_make_instances(t: &OwnedTy) -> bool {
+    match t {
+        OwnedTy::Adt(_, args) => !args.is_empty(),
+        OwnedTy::Ref(_, _, e) | OwnedTy::RawPtr(_, e) | OwnedTy::Slice(e) | OwnedTy::Array(e, _) => may_make_instances(e),
+        OwnedTy::Tuple(ts) => ts.iter().any(may_make_instances),
+        _ => false,
+    }
 }
 
 /// `ensure_adt_instances_in` for types already in the global

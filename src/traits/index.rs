@@ -249,6 +249,34 @@ impl ImplIndex {
         ImplIndex::default()
     }
 
+    /// Visits every span the index holds: each impl and trait record's
+    /// span and generic parameter spans (check/prog_shift.rs moves them).
+    pub fn for_each_span(&mut self, f: &mut dyn FnMut(&mut Span)) {
+        for r in &mut self.impls {
+            let ImplRecord {
+                def: _,
+                trait_def: _,
+                trait_ref: _,
+                generics,
+                assoc_tys: _,
+                assoc_consts: _,
+                items: _,
+                synthetic: _,
+                local: _,
+                span,
+                head: _,
+                blanket: _,
+            } = r;
+            f(span);
+            generics.params.iter_mut().for_each(|p| f(&mut p.span));
+        }
+        for r in self.traits.values_mut() {
+            let TraitRecord { def: _, name: _, generics, assoc_items: _, methods: _, local: _, span } = r;
+            f(span);
+            generics.params.iter_mut().for_each(|p| f(&mut p.span));
+        }
+    }
+
     /// Records one trait. Its associated items are indexed back to it.
     pub fn insert_trait(&mut self, rec: TraitRecord) {
         for (assoc, _, _) in &rec.assoc_items {

@@ -68,6 +68,34 @@ struct DiscoveryEntry {
     vtables: Vec<(OwnedTy, OwnedTy)>,
 }
 
+/// A copy of one stored discovery output (`GenReuse::out_copy`).
+pub(crate) struct OutCopy {
+    adt_tys: Vec<OwnedTy>,
+    requests: Vec<(DefId, Vec<OwnedArg>)>,
+    closures: Vec<OwnedClosure>,
+    vtables: Vec<(OwnedTy, OwnedTy)>,
+}
+
+impl OutCopy {
+    /// True when fn `f`'s new discovery output `out` equals this copy
+    /// where it can make anything: the closures, vtables, and the types
+    /// that can name an Adt instance, in order. Collect then makes the
+    /// same closures, instances, vtables, and glue from it (the other
+    /// types only enter the global store; the caller interns them). A
+    /// check walks no instance requests, so they must match only for a
+    /// build (`walk_instances`).
+    pub(crate) fn same(&self, p: &Program, out: &Discovered, walk_instances: bool) -> bool {
+        let (adt_tys, requests, closures, vtables) = out;
+        let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).cloned().collect::<Vec<_>>();
+        self.closures == *closures
+            && makers(&self.adt_tys) == makers(adt_tys)
+            && self.vtables == *vtables
+            && (!walk_instances
+                || self.requests.len() == requests.len()
+                    && self.requests.iter().zip(requests).all(|((d, a), (t, b))| *d == p.def_id(*t) && a == b))
+    }
+}
+
 /// What one stored discovery check replays: Adt types, requests with
 /// templates as this program's local ids, closures to register, and
 /// vtable requests.
@@ -88,6 +116,9 @@ pub struct GenReuse {
     pub env: u64,
     templates: FxMap<DefId, TemplateEntry>,
     discovery: FxMap<DefId, DiscoveryEntry>,
+    /// Defs whose last discovery check stored nothing (a body error), so
+    /// their entry, if any, is older than what that collect used.
+    unstored: FxMap<DefId, ()>,
     /// Node answers of this collect's program, for read replays.
     memo: FxMap<ReadKey, Read>,
     /// This collect's template check outputs that instances replay, by
@@ -115,6 +146,12 @@ impl GenReuse {
     pub fn clear(&mut self) {
         self.templates.clear();
         self.discovery.clear();
+        self.unstored.clear();
+    }
+
+    /// Notes that a fresh discovery check of `f` stored nothing.
+    pub fn note_unstored(&mut self, p: &Program, f: LocalDefId) {
+        self.unstored.insert(p.def_id(f), ());
     }
 
     /// Drops every entry when the trait-system key moved since the last
@@ -134,6 +171,18 @@ impl GenReuse {
         self.memo.clear();
         self.tpl_out.clear();
         self.closure_out.clear();
+        self.templates_checked = 0;
+        self.templates_reused = 0;
+        self.discovery_checked = 0;
+        self.discovery_reused = 0;
+        self.template_errors = 0;
+    }
+
+    /// Resets this request's work counters when the daemon's kept program
+    /// stands in for collect (driver/patch.rs): no collect ran, so no
+    /// template check, and the trait system stands.
+    pub fn begin_kept(&mut self) {
+        self.trait_changed = false;
         self.templates_checked = 0;
         self.templates_reused = 0;
         self.discovery_checked = 0;
@@ -330,6 +379,18 @@ impl GenReuse {
         Some((e.adt_tys.clone(), requests, e.closures.clone(), e.vtables.clone()))
     }
 
+    /// A copy of the stored discovery output of the fn with def `def`,
+    /// unless its last discovery check stored nothing: what collect used
+    /// for that body. The daemon's kept programs take one per edited fn
+    /// at the patch (driver/patch.rs).
+    pub(crate) fn out_copy(&self, def: DefId) -> Option<OutCopy> {
+        if self.unstored.contains_key(&def) {
+            return None;
+        }
+        let e = self.discovery.get(&def)?;
+        Some(OutCopy { adt_tys: e.adt_tys.clone(), requests: e.requests.clone(), closures: e.closures.clone(), vtables: e.vtables.clone() })
+    }
+
     /// Stores the output of one clean discovery check of fn `f`.
     #[allow(clippy::too_many_arguments)]
     pub fn store_discovered(
@@ -357,6 +418,7 @@ impl GenReuse {
             closures: closures.to_vec(),
             vtables: vtables.to_vec(),
         };
+        self.unstored.remove(&p.def_id(f));
         self.discovery.insert(p.def_id(f), entry);
     }
 }

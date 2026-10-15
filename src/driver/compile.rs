@@ -200,13 +200,20 @@ impl Stats {
 /// update compared. `collect`: items and fns collect walked.
 /// `discovery`: bodies instance discovery checked or replayed.
 /// `checked`: bodies checked. `why`: on a full resolve, the condition
-/// that stopped the body patch (`no_base` on a first compile).
+/// that stopped the body patch (`no_base` on a first compile). `kept`:
+/// `reuse` when a kept program stood in for collect (W-INCR3), else
+/// why not; `prog_spans`: its spans moved. Error answers record the
+/// line too (`Front::last_visits`, `LUST_VISITS_LOG`), never on stderr.
 #[derive(Default)]
 struct Visits {
     path: &'static str,
     /// Why a resolver-path request did not patch (`patch::try_patch`),
     /// or the chunk path's rule (`bodies`, `signatures`, `full`).
     why: &'static str,
+    /// `reuse` when the kept program stood in for collect, else why not
+    /// (`patch::reuse_kept`); `prog_spans` counts its spans moved.
+    kept: &'static str,
+    prog_spans: usize,
     files: usize,
     nodes: usize,
     spans: usize,
@@ -221,7 +228,7 @@ impl Visits {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={}",
+            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={}",
             self.path,
             if self.why.is_empty() { "-".to_string() } else { self.why.replace(' ', "_") },
             self.files,
@@ -231,7 +238,9 @@ impl Visits {
             self.slot_fns,
             self.collect,
             self.discovery,
-            self.checked
+            self.checked,
+            if self.kept.is_empty() { "-".to_string() } else { self.kept.replace(' ', "_") },
+            self.prog_spans
         );
     }
 }
@@ -840,7 +849,7 @@ fn shift_ast_spans(front: &mut Front, a: usize, b: usize, delta: i64) {
         return;
     }
     let edit = span_shift::Edit { file: ROOT_FILE, a: a.min(b) as u32, b: b as u32, d: delta };
-    span_shift::shift_ast(Arc::make_mut(&mut front.ast), edit, None);
+    span_shift::shift_ast(Arc::make_mut(&mut front.ast), edit, None, &mut Default::default());
 }
 
 /// True when a column-0 line starts an outer doc comment, which the lexer
@@ -1772,14 +1781,16 @@ fn resolved_setup(
     // A large old Ast drops on a side thread in a daemon session. A
     // one-shot session drops it here: its process may fork for an
     // in-memory run, and no other thread may live at the fork (tcc.rs).
-    // The patch base describes the Ast being replaced. (A resolve error
-    // above leaves both in place, so the request after it can patch.)
+    // The patch base and a kept program describe the Ast being replaced.
+    // (A resolve error above leaves them in place, so the request after
+    // it can patch.)
     front.patch = None;
+    let old_kept = std::mem::take(&mut front.kept);
     let old_ast = std::mem::replace(&mut front.ast, Arc::new(ast));
-    if old_ast.exprs.len() > 20_000 && caches.persistent {
+    if (old_ast.exprs.len() > 20_000 || old_kept.iter().any(Option::is_some)) && caches.persistent {
         // Nested token trees in the Ast drop recursively; use the
         // compiler stack size like every other compiler thread.
-        let _ = crate::pool::thread("lust-drop").spawn(move || drop(old_ast));
+        let _ = crate::pool::thread("lust-drop").spawn(move || drop((old_ast, old_kept)));
     }
     front.map = map.clone();
     front.src.clone_from(&root_text);
@@ -2014,6 +2025,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.patch = None;
     }
     let use_resolver = front.resolved_crate || wants_resolver;
+    // The chunk path edits the Ast in place and never reuses a kept
+    // program (only the body patch does).
+    if !use_resolver {
+        front.kept = Default::default();
+    }
     t.lap("route");
     let mut visits = Visits { path: "chunks", files: 1, ..Default::default() };
 
@@ -2628,19 +2644,23 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // a const fn body edit (const values move), a nested static (its
     // index can move), or a slot compaction (cached C carries slot
     // numbers). The source key of an AST fn is its body and head hash.
+    // A body patch moves no static (its bodies hold no item), so on that
+    // path nested statics keep their indices and the cache holds; it
+    // also stores entries on the other paths, after the drop, for the
+    // patches that follow.
     let gen_env = front.env_hash.map(|env| {
         let mut h = crate::intern::FxHasher::default();
         std::hash::Hash::hash(&(env, fn_count), &mut h);
         std::hash::Hasher::finish(&h)
     });
-    let nested_static = front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
+    let statics_may_move = visits.path != "patch" && front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
     // The trait-system half of this joins after collect (`gen_ok`).
-    let gen_ok_here = caches.persistent && gen_env.is_some() && !const_fn_changed && !nested_static && !front.slots_renumbered;
+    let gen_ok_here = caches.persistent && gen_env.is_some() && !const_fn_changed && !statics_may_move && !front.slots_renumbered;
     if !gen_ok_here {
         caches.gen_reuse.clear();
     }
     front.slots_renumbered = false;
-    caches.gen_reuse.on = caches.persistent && gen_env.is_some() && !nested_static;
+    caches.gen_reuse.on = caches.persistent && gen_env.is_some();
     caches.gen_reuse.env = gen_env.unwrap_or(0);
     caches.gen_reuse.ast_src = (0..fn_count)
         .map(|i| {
@@ -2653,19 +2673,64 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The resolver tables enter here, before collect's own body
     // checks (mono's template checks) run, so every body checks
     // with the visibility tables attached (see `Program::resolved`).
-    Arc::make_mut(&mut front.ast).shipped = std_ranges.clone();
-    Arc::make_mut(&mut front.ast).lang_methods = std_methods;
-    let mut program = match collect::collect_reuse(
-        front.ast.clone(),
-        front.interner.clone(),
-        front.known.clone(),
-        crate_ids,
-        req.cmd == Cmd::Build,
-        &mut front.def_order,
-        resolved_tables,
-        &mut caches.gen_reuse,
-        &std_routes,
-    ) {
+    // Unchanged values do not write: a kept program may share the Ast.
+    // A write is no body edit, so it drops the kept programs.
+    if front.ast.shipped != std_ranges || front.ast.lang_methods != std_methods {
+        front.kept = Default::default();
+        let ast = Arc::make_mut(&mut front.ast);
+        ast.shipped = std_ranges.clone();
+        ast.lang_methods = std_methods;
+    }
+    // The kept program of the last request stands in for collect when
+    // only provable body edits happened since (`patch::reuse_kept`).
+    let kept = if gen_ok_here {
+        super::patch::reuse_kept(front, caches, resolved_tables.as_ref(), req.cmd == Cmd::Build)
+    } else {
+        Err("gen state")
+    };
+    let kept = match kept {
+        Ok((p, spans, errs)) => {
+            visits.kept = "reuse";
+            visits.prog_spans = spans;
+            if errs.is_empty() {
+                Some(Ok(p))
+            } else {
+                // Template errors are body errors: the program stands
+                // for the next edit, which checks that template again.
+                super::patch::keep(front, p);
+                Some(Err(errs))
+            }
+        }
+        Err(why) => {
+            // This mode's program goes (collect makes a new one); the
+            // other mode's stays unless the generic state moved.
+            visits.kept = why;
+            let slot = usize::from(req.cmd == Cmd::Build);
+            let drop_all = why == "gen state";
+            let old: Vec<_> = (0..2).filter(|&i| i == slot || drop_all).filter_map(|i| front.kept[i].take()).collect();
+            if !old.is_empty() && caches.persistent {
+                let _ = crate::pool::thread("lust-drop").spawn(move || drop(old));
+            }
+            None
+        }
+    };
+    // Template check errors from the kept program are collect's errors
+    // (`gen_reuse.template_errors` counts them).
+    let collected = match kept {
+        Some(r) => r,
+        None => collect::collect_reuse(
+            front.ast.clone(),
+            front.interner.clone(),
+            front.known.clone(),
+            crate_ids,
+            req.cmd == Cmd::Build,
+            &mut front.def_order,
+            resolved_tables,
+            &mut caches.gen_reuse,
+            &std_routes,
+        ),
+    };
+    let mut program = match collected {
         Ok(p) => p,
         Err(mut ds) => {
             // A collect error drops the item state, so the next request
@@ -2675,6 +2740,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if caches.gen_reuse.template_errors != ds.len() {
                 front.env_hash = None;
             }
+            front.last_visits.clear();
+            visits.render(&mut front.last_visits);
+            log_visits(&front.last_visits);
             return errors(&mut ds, &map, &src, req);
         }
     };
@@ -2813,7 +2881,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("collect");
-    visits.collect = front.ast.items.len() + front.ast.stmt_items.len() + program.fns.len();
+    if visits.kept != "reuse" {
+        visits.collect = front.ast.items.len() + front.ast.stmt_items.len() + program.fns.len();
+    }
     visits.discovery = caches.gen_reuse.discovery_checked + caches.gen_reuse.discovery_reused;
     // A full-mode edit or a const fn edit can move what derived glue
     // was generated from. Record that now, for whatever build comes
@@ -3083,10 +3153,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // so leak them on every return below and let the OS reclaim the memory at exit.
     let leak_at_exit = !caches.persistent;
     if !diags.is_empty() {
+        // The visits line for tests and logs only: an error answer must
+        // stay the cold one, so stderr gets no stats.
+        front.last_visits.clear();
+        Visits { checked: work.len(), ..visits }.render(&mut front.last_visits);
+        log_visits(&front.last_visits);
         let resp = errors(&mut diags, &map, &src, req);
         if leak_at_exit {
             std::mem::forget(results);
             std::mem::forget(program);
+        } else {
+            drop(results);
+            super::patch::keep(front, program);
         }
         return resp;
     }
@@ -3130,6 +3208,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         if leak_at_exit {
             std::mem::forget(results);
             std::mem::forget(program);
+        } else {
+            drop(results);
+            super::patch::keep(front, program);
         }
         return resp;
     }
@@ -3460,6 +3541,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 std::mem::forget(bodies);
                 std::mem::forget(units);
                 std::mem::forget(program);
+            } else {
+                drop((bodies, units));
+                super::patch::keep(front, program);
             }
             return resp;
         }
@@ -3841,6 +3925,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         std::mem::forget(bodies);
         std::mem::forget(units);
         std::mem::forget(program);
+    } else {
+        drop((bodies, units));
+        super::patch::keep(front, program);
     }
     resp
 }

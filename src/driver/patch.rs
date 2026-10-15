@@ -36,7 +36,7 @@ use super::compile::{fn_def_at, fn_text_hash};
 use super::session::{Caches, Front};
 use super::span_shift::{self, Edit, FileRanges};
 use crate::ast::{Ast, BlockId, FnDef, ItemKind, TyExpr};
-use crate::diag::{FileId, SourceMap};
+use crate::diag::{CtxtId, FileId, SourceMap};
 use crate::intern::{FxMap, Sym};
 use crate::lexer::{self, Tok};
 use crate::resolve::imports::ResolvedTables;
@@ -218,7 +218,50 @@ struct BodyEdit {
     exprs: (u32, u32),
     pats: (u32, u32),
     needs: (StdNeeds, bool),
+    /// Neither body holds a closure or a token collect's whole-Ast scans
+    /// look for (`plain_body`).
+    plain: bool,
+    /// The old body's expression range (`FnDef::exprs`).
+    old_exprs: (u32, u32),
 }
+
+/// A collected program kept for later requests (W-INCR3), one per mode
+/// (`Front::kept`: check, build). It shares the front's merged Ast and
+/// resolver tables (`Program::ast`, `Program::resolved`) until a body
+/// patch detaches it; from then on every patch records its edits, until
+/// `reuse_kept` moves its spans and takes it in place of a fresh collect
+/// (when every edit allows it). Any other change to the Ast drops it.
+pub(crate) struct KeptProgram {
+    pub(crate) program: crate::check::collect::Program,
+    /// The edits patches made since the program was detached, in order;
+    /// None while the program shares the front's Ast.
+    edits: Option<Vec<KeptEdit>>,
+    bases: Vec<KeptBase>,
+}
+
+/// Keeps `program` for later requests, in its mode's slot.
+pub(crate) fn keep(front: &mut Front, program: crate::check::collect::Program) {
+    let slot = usize::from(program.gx.walk_instances);
+    front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new() });
+}
+
+/// One patch edit under a detached kept program.
+#[derive(Clone)]
+struct KeptEdit {
+    edit: Edit,
+    /// The fresh expansion contexts the Ast's span walk chose.
+    ctxts: FxMap<u32, CtxtId>,
+    /// The edited fn, in `Front::fn_loc` order (its `LocalDefId`).
+    fn_index: usize,
+    plain: bool,
+    /// The old body's expression range (a template's picks key on it).
+    old_exprs: (u32, u32),
+}
+
+/// One edited fn's discovery output as the kept program was built with
+/// it, taken at the fn's first edit since (`GenReuse::out_copy`); None
+/// when the cache held none.
+type KeptBase = (usize, Option<crate::driver::gen_reuse::OutCopy>);
 
 /// Tries the body patch for this request (see the module docs). `root`
 /// is the root file's text before any std splice. On `Err` the caller
@@ -233,11 +276,40 @@ pub(super) fn try_patch(
     request_start: SystemTime,
 ) -> Result<Patched, &'static str> {
     let edits = find_edits(front, inputs, root, request_start)?;
+    let edits_in: Vec<KeptEdit> =
+        edits.iter().map(|e| KeptEdit { edit: e.edit, ctxts: FxMap::default(), fn_index: e.fn_index, plain: e.plain, old_exprs: e.old_exprs }).collect();
     // Everything above only read; from here the front state changes, and
     // a failure must drop the base so no later request patches on it.
-    let out = apply(front, caches, edits);
+    // A kept program that shares this Ast lets go of it and of the
+    // resolver tables, so the patch edits both in place; it records the
+    // edits (see `KeptProgram`). With no edit it stays as it is.
+    let mut kept: [Option<KeptProgram>; 2] = if edits.is_empty() { Default::default() } else { std::mem::take(&mut front.kept) };
+    for slot in &mut kept {
+        *slot = slot.take().filter(|k| k.edits.is_some() || Arc::ptr_eq(&k.program.ast, &front.ast));
+        if let Some(k) = slot {
+            k.program.ast = Arc::default();
+            k.program.resolved = None;
+            let edits = k.edits.get_or_insert_with(Vec::new);
+            for e in &edits_in {
+                if !edits.iter().any(|x| x.fn_index == e.fn_index) && !k.bases.iter().any(|b| b.0 == e.fn_index) {
+                    let def = k.program.def_id(crate::def::LocalDefId(e.fn_index as u32));
+                    k.bases.push((e.fn_index, caches.gen_reuse.out_copy(def)));
+                }
+            }
+        }
+    }
+    let mut ctxts: Vec<FxMap<u32, CtxtId>> = Vec::new();
+    let out = apply(front, caches, edits, &mut ctxts);
     if out.is_err() {
         front.patch = None;
+    } else {
+        for (slot, k) in kept.into_iter().enumerate() {
+            if let Some(mut k) = k {
+                let new = edits_in.iter().zip(&ctxts).map(|(e, c)| KeptEdit { ctxts: c.clone(), ..e.clone() });
+                k.edits.get_or_insert_with(Vec::new).extend(new);
+                front.kept[slot] = Some(k);
+            }
+        }
     }
     out
 }
@@ -249,7 +321,9 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     if base.inputs != inputs {
         return Err("inputs");
     }
-    if front.env_hash.is_none() || front.chunks.len() != 1 || Arc::strong_count(&base.tables) != 1 {
+    // The tables are this base's own, or shared with the kept program only.
+    let kept_tables = front.kept.iter().flatten().filter(|k| k.program.resolved.as_ref().is_some_and(|t| Arc::ptr_eq(t, &base.tables))).count();
+    if front.env_hash.is_none() || front.chunks.len() != 1 || Arc::strong_count(&base.tables) != 1 + kept_tables {
         return Err("state");
     }
     if front.ast.exprs.len() > base.arena_base.saturating_mul(2) + 65_536 {
@@ -399,6 +473,9 @@ fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit,
         return Err("body rewrite");
     }
     let needs = file_needs(&text);
+    let old_closures = ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
+    let new_closures = body_ast.exprs.iter().any(|e| matches!(e, crate::ast::Expr::Closure { .. }));
+    let plain = !old_closures && !new_closures && plain_body(&old_body, &front.interner) && plain_body(&new_body, &front.interner);
     Ok(BodyEdit {
         file,
         text,
@@ -412,6 +489,21 @@ fn find_body_edit(front: &Front, file: FileId, text: String) -> Result<BodyEdit,
         exprs,
         pats,
         needs,
+        plain,
+        old_exprs: def.exprs,
+    })
+}
+
+/// True when a lexed body has no token that collect's whole-Ast scans
+/// look for: `dyn` (a `dyn` type turns on the generic machinery) and
+/// the names `ast_mentions` and `ast_uses_bound` scan for. Closure
+/// expressions are checked on the nodes (`find_body_edit`).
+fn plain_body(lexed: &lexer::Lexed, interner: &crate::intern::Interner) -> bool {
+    const SCANNED: &[&str] = &["Cow", "Bound", "Included", "Excluded", "Unbounded", "RangeBounds", "start_bound", "end_bound"];
+    lexed.tokens.iter().all(|t| match t.tok {
+        Tok::Dyn => false,
+        Tok::Ident(s) => !SCANNED.contains(&interner.get(s)),
+        _ => true,
     })
 }
 
@@ -466,7 +558,8 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
 }
 
 /// Applies the proven edits to the front state and runs the slot update.
-fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>) -> Result<Patched, &'static str> {
+/// `ctxts` gets each edit's fresh expansion contexts, in edit order.
+fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, ctxts: &mut Vec<FxMap<u32, CtxtId>>) -> Result<Patched, &'static str> {
     let mut base = front.patch.take().ok_or("no base")?;
     let (mut spans, files) = (0usize, edits.len());
     let nodes_before = super::compile::ast_nodes(&front.ast);
@@ -476,7 +569,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>) -> Re
         let ranges = base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize));
         span_shift::blank_nodes(Arc::make_mut(&mut front.ast), e.file, e.old_body, ranges);
         // Spans next: the new body is lexed at the new positions.
-        spans += span_shift::shift_ast(Arc::make_mut(&mut front.ast), e.edit, base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize)));
+        let mut memo = FxMap::default();
+        spans += span_shift::shift_ast(Arc::make_mut(&mut front.ast), e.edit, ranges, &mut memo);
+        ctxts.push(memo);
         let tables = Arc::get_mut(&mut base.tables).ok_or("state")?;
         shift_table_spans(tables, e.edit);
         let lines = front.map.lines(e.file).splice(&e.text, e.edit.a as usize, e.edit.b as usize, (e.edit.b as i64 + e.edit.d) as usize);
@@ -547,6 +642,121 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>) -> Re
     };
     front.patch = Some(base);
     Ok(out)
+}
+
+/// Takes the kept program in place of a fresh collect, with the number
+/// of its spans moved, or says why not (the `kept=` of `lust-visits:`).
+/// The program holds when it still shares the front's Ast, or when this
+/// request's patch detached it and every edit allows it: the edited fn
+/// is a plain fn (not a template, so no template check reads its body);
+/// without user generics, both bodies hold nothing collect's whole-Ast
+/// scans look for (`BodyEdit::plain`); and when collect runs instance
+/// discovery over plain bodies, the new body's discovery output equals
+/// the one the program was built with (`KeptBase`). Collect would then build the same tables, up to
+/// spans, which move here with the edits. `tables` are this request's
+/// resolver tables, as collect would attach them.
+pub(super) fn reuse_kept(
+    front: &mut Front,
+    caches: &mut Caches,
+    tables: Option<&Arc<ResolvedTables>>,
+    walk_instances: bool,
+) -> Result<(crate::check::collect::Program, usize, Vec<crate::diag::Diag>), &'static str> {
+    use crate::check::generics::FnClass;
+    use crate::def::LocalDefId;
+    // A build's program holds the generic instances a check's lacks.
+    let k = front.kept[usize::from(walk_instances)].take().ok_or(if front.kept.iter().any(Option::is_some) { "mode" } else { "none" })?;
+    let bases = k.bases;
+    let mut edits = match k.edits {
+        Some(e) => e,
+        None if Arc::ptr_eq(&k.program.ast, &front.ast) => Vec::new(),
+        None => return Err("ast"),
+    };
+    let mut p = k.program;
+    p.ast = front.ast.clone();
+    p.resolved = tables.cloned();
+    caches.gen_reuse.begin_kept();
+    // Collect's whole-Ast scans only turn the generic flags on; once
+    // `user_generics` is on they decide nothing.
+    for e in &edits {
+        if !e.plain && !p.gx.user_generics {
+            return Err("body scan");
+        }
+        // A template checks again below, in a check only: a build's
+        // instances replay its picks.
+        let f = LocalDefId(e.fn_index as u32);
+        match p.gx.fn_class.get(e.fn_index) {
+            Some(FnClass::Plain) => {}
+            Some(FnClass::Template)
+                if !walk_instances
+                    && e.plain
+                    && !p.is_lang_method(f)
+                    && !p.gx.opaques.contains_key(&crate::check::generics::opaque_def(p.def_id(f))) => {}
+            _ => return Err("fn class"),
+        }
+    }
+    let mut spans = 0;
+    for e in &mut edits {
+        let (edit, ctxts) = (e.edit, &mut e.ctxts);
+        spans += crate::check::prog_shift::shift_program(&mut p, &mut |s| edit.span(s, ctxts));
+    }
+    // An edited template checks again as collect's template check does:
+    // its old picks and closure call kinds go, the check records new ones.
+    let mut template_errs = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    for e in &edits {
+        if p.gx.fn_class.get(e.fn_index) != Some(&FnClass::Template) || seen.contains(&e.fn_index) {
+            continue;
+        }
+        seen.push(e.fn_index);
+        let f = LocalDefId(e.fn_index as u32);
+        let ranges: Vec<(u32, u32)> = edits.iter().filter(|x| x.fn_index == e.fn_index).map(|x| x.old_exprs).collect();
+        p.gx.trait_picks.retain(|x, _| !ranges.iter().any(|r| x.0 >= r.0 && x.0 < r.1));
+        p.gx.template_closures.retain(|k, _| k.0 != f);
+        p.gx.template_calls.retain(|k, _| k.0 != f);
+        let counts = p.gx.mono_counts;
+        template_errs.extend(crate::check::generics::check_template(&mut p, f, &mut caches.gen_reuse));
+        p.gx.mono_counts = counts;
+    }
+    // Discovery checks every plain body when user generics exist; with
+    // only the lang enum methods' generics, a build checks the bodies
+    // that name one (not tracked here) and a check none.
+    if p.gx.has_generics && !edits.is_empty() {
+        if !p.gx.user_generics && walk_instances {
+            return Err("lang generics");
+        }
+        if p.gx.user_generics {
+            // As collect runs discovery: before the driver sets these.
+            let (record_reads, unwind) = (p.record_reads, p.unwind);
+            (p.record_reads, p.unwind) = (true, false);
+            for (fn_index, base) in &bases {
+                if p.gx.fn_class.get(*fn_index) != Some(&FnClass::Plain) {
+                    continue;
+                }
+                let f = LocalDefId(*fn_index as u32);
+                let (checked, discarded) = crate::check::check_fn(&p, f);
+                if checked.closure_map_pending {
+                    return Err("discovery");
+                }
+                let out = crate::check::generics::discovery_out(&p, &checked, &discarded);
+                if !base.as_ref().is_some_and(|b| b.same(&p, &out, walk_instances)) {
+                    return Err("discovery");
+                }
+                if discarded.is_empty() {
+                    let (adt_tys, reqs, closures, vts) = &out;
+                    caches.gen_reuse.store_discovered(&p, f, &checked.reads, adt_tys, reqs, closures, vts);
+                }
+                caches.gen_reuse.discovery_checked += 1;
+                drop((checked, discarded));
+                // Every body type enters the global store, as discovery's
+                // replay does (lowering and codegen read it there).
+                for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
+                    crate::check::generics::build_owned_ty(&mut p, t);
+                }
+            }
+            (p.record_reads, p.unwind) = (record_reads, unwind);
+        }
+    }
+    Ok((p, spans, template_errs))
 }
 
 /// Moves the span keys and module spans of the resolver tables for one
@@ -647,8 +857,12 @@ pub fn run() -> i64 {
     }
 
     fn check(session: &mut Session, root: &Path) -> (i32, String) {
+        run(session, root, Cmd::Check)
+    }
+
+    fn run(session: &mut Session, root: &Path, cmd: Cmd) -> (i32, String) {
         let req = Request {
-            cmd: Cmd::Check,
+            cmd,
             session: SessionKey::synthetic(root, false),
             file: root.to_path_buf(),
             out: root.with_extension("bin"),
@@ -729,5 +943,138 @@ pub fn run() -> i64 {
             let _ = std::fs::remove_dir_all(&dir);
         }
         assert_eq!(per_size[0], per_size[1], "patch work (nodes, spans) for 3 and 12 modules");
+    }
+
+    /// A module with most kinds of span a collected program keeps: Adts
+    /// with generic params, a trait and impls, a `dyn` signature, a
+    /// nested fn (an item block), and a generic fn, all after `helper`.
+    const RICH: &str = "pub fn helper(x: i64) -> i64 {
+    x * 2
+}
+
+pub trait Shape {
+    fn area(&self) -> i64;
+}
+
+pub struct Sq<T> {
+    pub s: T,
+}
+
+impl Shape for Sq<i64> {
+    fn area(&self) -> i64 {
+        self.s * self.s
+    }
+}
+
+pub fn total(s: &dyn Shape) -> i64 {
+    s.area()
+}
+
+pub fn nested() -> i64 {
+    fn inner(x: i64) -> i64 {
+        x + 1
+    }
+    inner(2)
+}
+
+pub fn pick<T: Copy>(x: T) -> T {
+    x
+}
+
+pub fn run() -> i64 {
+    let q = Sq { s: 3 };
+    total(&q) + nested() + pick(helper(1))
+}
+";
+
+    /// The stdout of a binary just built. Another test thread's fork can
+    /// hold it open for writing for a moment (ETXTBSY): retry then.
+    fn run_bin(bin: &Path) -> Vec<u8> {
+        for _ in 0..100 {
+            match std::process::Command::new(bin).output() {
+                Ok(o) => return o.stdout,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(e) => panic!("{}: {e}", bin.display()),
+            }
+        }
+        panic!("{}: still busy", bin.display())
+    }
+
+    /// Every span of a program, sorted (contexts aside: their ids are
+    /// per process, not per session).
+    fn program_spans(p: &mut crate::check::collect::Program) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        crate::check::prog_shift::shift_program(p, &mut |s| {
+            out.push((s.file.0, s.lo, s.hi));
+            s
+        });
+        out.sort_unstable();
+        out
+    }
+
+    /// A body edit reuses the kept program instead of collecting, its
+    /// collect work does not grow with the crate (3 and 12 modules), and
+    /// the kept program's spans after the edit are those of a fresh
+    /// collect of the edited text.
+    #[test]
+    fn kept_program_matches_a_fresh_collect() {
+        let mut per_size = Vec::new();
+        for n in [3usize, 12] {
+            let dir = std::env::temp_dir().join(format!("lust-kept-test-{}-{n}", std::process::id()));
+            let root = write_crate(&dir, n);
+            for k in 0..n {
+                std::fs::write(dir.join(format!("m{k}.rs")), RICH).unwrap();
+            }
+            let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+            assert_eq!(check(&mut warm, &root), (0, String::new()));
+            let m1 = dir.join("m1.rs");
+            // Adds a line in the first fn of the file: every later item moves.
+            edit(&m1, "    x * 2\n", "    let y = x + 1;\n    (y - 1) * 2\n");
+            assert_eq!(check(&mut warm, &root), (0, String::new()));
+            let v = warm.front.last_visits.clone();
+            assert_eq!((field(&v, "path"), field(&v, "kept"), field(&v, "collect")), ("patch", "reuse", "0"), "{v}");
+            per_size.push((field(&v, "discovery").to_string(), field(&v, "checked").to_string()));
+            let mut fresh = Session::new(dir.join("obj-fresh"), true, SessionKey::synthetic(&root, false));
+            assert_eq!(check(&mut fresh, &root), (0, String::new()));
+            let (a, b) = (warm.front.kept[0].as_mut().unwrap(), fresh.front.kept[0].as_mut().unwrap());
+            assert_eq!(program_spans(&mut a.program), program_spans(&mut b.program), "kept and fresh program spans");
+            // A build keeps its own program: after a check-only edit and a
+            // check, the next build reuses it too and runs as cold does.
+            let (code, err) = run(&mut warm, &root, Cmd::Build);
+            assert_eq!(code, 0, "{err}");
+            edit(&m1, "    (y - 1) * 2\n", "    (y - 2) * 2\n");
+            assert_eq!(check(&mut warm, &root), (0, String::new()));
+            assert_eq!(field(&warm.front.last_visits, "kept"), "reuse", "{}", warm.front.last_visits);
+            assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+            assert_eq!(field(&warm.front.last_visits, "kept"), "reuse", "{}", warm.front.last_visits);
+            let bin = root.with_extension("bin");
+            let out = run_bin(&bin);
+            let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+            assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+            assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+            // A generic fn's body: the kept program checks it again as a
+            // template; an error there is collect's error, as cold.
+            edit(&m1, "pub fn pick<T: Copy>(x: T) -> T {\n    x\n", "pub fn pick<T: Copy>(x: T) -> T {\n    let y = x;\n    y\n");
+            assert_eq!(check(&mut warm, &root), (0, String::new()));
+            assert_eq!(field(&warm.front.last_visits, "kept"), "reuse", "{}", warm.front.last_visits);
+            edit(&m1, "    let y = x;\n    y\n", "    let y = x;\n    y + 1\n");
+            let (code, err) = check(&mut warm, &root);
+            assert_eq!(field(&warm.front.last_visits, "kept"), "reuse", "{}", warm.front.last_visits);
+            let mut cold = Session::new(dir.join("obj-cold-t"), false, SessionKey::synthetic(&root, false));
+            assert_eq!((code, err), check(&mut cold, &root), "warm and cold agree on the template error");
+            assert_ne!(code, 0);
+            edit(&m1, "    let y = x;\n    y + 1\n", "    let y = x;\n    y\n");
+            assert_eq!(check(&mut warm, &root), (0, String::new()));
+            assert_eq!(field(&warm.front.last_visits, "kept"), "reuse", "the fix reuses it too: {}", warm.front.last_visits);
+            // An error in the edited body: the warm answer is the cold one.
+            edit(&m1, "    (y - 2) * 2\n", "    (y - 1) * true\n");
+            let (code, err) = check(&mut warm, &root);
+            assert_eq!(field(&warm.front.last_visits, "kept"), "reuse", "{}", warm.front.last_visits);
+            let mut cold = Session::new(dir.join("obj-cold"), false, SessionKey::synthetic(&root, false));
+            assert_eq!((code, err), check(&mut cold, &root), "warm and cold agree on the error");
+            assert_ne!(code, 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(per_size[0], per_size[1], "kept program work (discovery, checked) for 3 and 12 modules");
     }
 }

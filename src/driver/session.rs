@@ -153,6 +153,10 @@ pub(crate) struct Front {
     /// request (driver/patch.rs). Set by a full resolve that reached
     /// the slot update; None otherwise.
     pub(crate) patch: Option<super::patch::PatchBase>,
+    /// The last collected program of each mode (check, build), for a body
+    /// patch to reuse in place of a fresh collect (driver/patch.rs
+    /// `KeptProgram`).
+    pub(crate) kept: [Option<super::patch::KeptProgram>; 2],
     /// The last successful compile's `lust-visits:` line (see
     /// `compile::Visits`), kept for tests.
     pub(crate) last_visits: String,
@@ -373,6 +377,7 @@ impl Session {
                 display_root: None,
                 resolve_cache: crate::resolve::worklist::ResolveCache::new(!persistent),
                 patch: None,
+                kept: Default::default(),
                 last_visits: String::new(),
                 last_check: None,
                 std_plan: None,
