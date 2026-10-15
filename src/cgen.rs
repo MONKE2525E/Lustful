@@ -33,6 +33,9 @@ pub enum CTy {
     /// `Result<T, E>`: variant 0 is `Ok(T)`, variant 1 is `Err(E)`.
     Result(Box<CTy>, Box<CTy>),
     Ref(Box<CTy>),
+    /// A raw pointer (w-cinterop): the same C pointer as `Ref`, but its
+    /// glue compares, orders, hashes, and prints the address itself.
+    Ptr(Box<CTy>),
     Adt(AdtId),
     Args,
     Chars,
@@ -204,6 +207,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Slice(e) => CTy::Slice(Box::new(cty(tys, e))),
         TyKind::Dyn(..) => CTy::Dyn,
         TyKind::Ref(_, _, e) => ref_cty(tys, e),
+        TyKind::RawPtr(_, e) => CTy::Ptr(Box::new(cty(tys, e))),
         // An unsized newtype is laid out as its field (W-SHIM).
         TyKind::Adt(d, _) if let Some(f) = tys.unsized_field(d) => match tys.local_adt(t) {
             Some(a) => CTy::Unsized(a, Box::new(cty(tys, f))),
@@ -449,6 +453,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Cell(inner) => ctype(inner),
         CTy::Guard(inner, _) => format!("RCL_{}*", mangle(inner)),
         CTy::Ref(inner) => format!("{}*", ctype(inner)),
+        CTy::Ptr(inner) => format!("{}*", ctype(inner)),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(_) => format!("O_{}", mangle(t)),
         CTy::Result(..) => format!("R_{}", mangle(t)),
@@ -546,6 +551,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::BoxSlice(e) => tok(s, "BS", &[e]),
         CTy::Sync(k, e) => tok(s, &format!("Sy{}", *k as u32), &[e]),
         CTy::Ref(e) => tok(s, "R", &[e]),
+        CTy::Ptr(e) => tok(s, "P", &[e]),
         CTy::Option(e) => tok(s, "O", &[e]),
         CTy::Result(a, b) => tok(s, "Re", &[a, b]),
         CTy::Slice(e) => tok(s, "sl", &[e]),
@@ -667,6 +673,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         | CTy::Float(_)
         | CTy::FnPtr(..)
         | CTy::Ref(_)
+        | CTy::Ptr(_)
         | CTy::Args
         | CTy::ExitCode
         | CTy::AccessError
@@ -997,6 +1004,8 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::BoxDyn | CTy::RcDyn => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
+            // A raw pointer may be null: no niche (w-cinterop).
+            CTy::Ptr(_) => Some(layout::raw_ptr_layout()),
             CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn | CTy::Unsized(..) => Some(layout::fat_ptr_layout()),
             CTy::Tuple(es) => {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
@@ -1232,7 +1241,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
             CTy::BoxDyn | CTy::RcDyn => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
-            CTy::Ref(_) => (8, 8),
+            CTy::Ref(_) | CTy::Ptr(_) => (8, 8),
             CTy::Option(e) => {
                 let (es, ea) = go(p, e, seen);
                 let align = ea.max(4);
@@ -4843,6 +4852,22 @@ impl FnGen<'_, '_, '_> {
                 let _ = writeln!(self.out, "    {st} {t} = {{ ({et}*){vv}, 1 }};");
                 t
             }
+            // The safe raw pointer surface (w-cinterop): every value is
+            // the C address itself.
+            B::PtrFromRef => vals[0].clone(),
+            B::PtrNull => "((void*)0)".into(),
+            B::PtrEqFn => format!("((void*)({}) == (void*)({}))", vals[0], vals[1]),
+            B::PtrIsNull => format!("(({}) == 0)", vals[0]),
+            B::PtrCast => format!("((void*)({}))", vals[0]),
+            B::PtrAddr => format!("((uint64_t)(uintptr_t)({}))", vals[0]),
+            B::PtrWithAddr => format!("((void*)(uintptr_t)({}))", vals[1]),
+            // `Rc::as_ptr`: the payload behind the counts.
+            B::SmartAsPtr => format!("(&(*{})->v)", vals[0]),
+            B::SeqAsPtr => slice_like(&tys[0], &vals[0]).1,
+            B::StrAsPtr => match &tys[0] {
+                CTy::Ref(inner) if **inner == CTy::String => format!("({})->ptr", vals[0]),
+                _ => format!("({}).ptr", vals[0]),
+            },
             B::VecAsSlice | B::VecAsMutSlice => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };
@@ -7575,7 +7600,7 @@ fn glue_def_value(
                 match t {
                     CTy::Unit | CTy::AccessError => "1".into(),
                     CTy::Int(i) if is128(*i) => format!("(({x}).lo == ({y}).lo && ({x}).hi == ({y}).hi)"),
-                    CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::ExitCode => format!("({x} == {y})"),
+                    CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::ExitCode | CTy::Ptr(_) => format!("({x} == {y})"),
                     _ => {
                         need(Glue::Eq, t);
                         format!("eq_{}(&{x}, &{y})", mangle(t))
@@ -7728,6 +7753,8 @@ fn glue_def_value(
                         format!("((int8_t)((lust_{f}_cmp({x}, {y}) > 0) - (lust_{f}_cmp({x}, {y}) < 0)))")
                     }
                     CTy::Bool | CTy::Char | CTy::Int(_) => format!("((int8_t)(({x}) < ({y}) ? -1 : ({x}) > ({y})))"),
+                    // Raw pointers order by address (w-cinterop).
+                    CTy::Ptr(_) => format!("((int8_t)(((uintptr_t)({x})) < ((uintptr_t)({y})) ? -1 : ((uintptr_t)({x})) > ((uintptr_t)({y}))))"),
                     CTy::Float(_) => format!("((int8_t)(({x}) < ({y}) ? -1 : ({x}) > ({y}) ? 1 : ({x}) == ({y}) ? 0 : 2))"),
                     _ => {
                         need(if partial { Glue::PCmp } else { Glue::Cmp }, t);

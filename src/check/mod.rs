@@ -360,6 +360,31 @@ pub enum Builtin {
     /// `core::slice::from_ref(&T) -> &[T]` and `from_mut`
     /// (fx-option-rest): a one-element slice of the argument.
     SliceFromRef,
+    /// The safe raw pointer surface (w-cinterop): `core::ptr::from_ref`
+    /// and `from_mut` (the reference value as a raw pointer).
+    PtrFromRef,
+    /// `core::ptr::null` and `null_mut`: the zero address.
+    PtrNull,
+    /// `core::ptr::eq` and `addr_eq`: address equality of two raw
+    /// pointers (references coerce at the call).
+    PtrEqFn,
+    /// Raw pointer methods by value (w-cinterop): `is_null`.
+    PtrIsNull,
+    /// `cast`, `cast_mut`, and `cast_const`: the address at a new
+    /// pointee or mutability.
+    PtrCast,
+    /// `addr` and `expose_provenance`: the address as a `usize`.
+    PtrAddr,
+    /// `with_addr`: the pointer at a new address.
+    PtrWithAddr,
+    /// `Rc::as_ptr`, `Arc::as_ptr`, and `Box::as_ptr`: the payload
+    /// address of a smart pointer (cgen reads the receiver form).
+    SmartAsPtr,
+    /// `Vec::as_ptr`, `as_mut_ptr`, and the slice and array forms: the
+    /// buffer address (w-cinterop).
+    SeqAsPtr,
+    /// `str::as_ptr` and `String::as_ptr`: the first byte's address.
+    StrAsPtr,
     CharsBytesLeft,
     CharsNextBack,
     /// `Default::default()` of a type whose default is built by
@@ -1016,6 +1041,10 @@ pub enum Coerce {
     /// zero-sized value is evaluated, then the trampoline of the item
     /// its type names is the result. The payload is the fn pointer type.
     ReifyFn(Ty),
+    /// A reference (or a `*mut T`) to a raw pointer (w-cinterop): the
+    /// address value stays; the payload is the raw pointer type. The
+    /// borrow ends here, as in Rust: a raw pointer carries no loan.
+    RefToPtr(Ty),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4533,6 +4562,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // `&dyn Tr` needs `&S: Tr`), so neither does this.
         let dyn_target = matches!(ek, TyKind::Ref(_, _, y) if matches!(self.kind(y), TyKind::Dyn(..)));
         let c = match (fk, ek) {
+            // A reference to a raw pointer, and `*mut T` to `*const T`
+            // (w-cinterop): safe coercions in Rust; the address stays.
+            (TyKind::Ref(_, fm, x), TyKind::RawPtr(em, y)) if (!em.is_mut() || fm.is_mut()) && self.unify(x, y) => {
+                Coerce::RefToPtr(expected)
+            }
+            (TyKind::RawPtr(Mut::Mut, x), TyKind::RawPtr(Mut::Shared, y)) if self.unify(x, y) => Coerce::RefToPtr(expected),
             (TyKind::Ref(..), TyKind::Ref(_, Mut::Shared, s))
                 if self.kind(s) == TyKind::Str && self.tys.is_string_ty(self.resolve(fbase)) =>
             {
@@ -4976,6 +5011,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// True when a reference coercion (unsize to a slice, `&String` to
     /// `&str`, `&mut` to `&`) takes `f` to `e`. Pure: no unification.
     fn ref_coercible(&self, f: Ty, e: Ty) -> bool {
+        // A reference (or `*mut T`) to a raw pointer (w-cinterop), so a
+        // deep coercion through `Some(..)` or a tuple reaches it.
+        match (self.kind(f), self.kind(e)) {
+            (TyKind::Ref(_, fm, x), TyKind::RawPtr(em, y)) => return (!em.is_mut() || fm.is_mut()) && self.ty_matchish(x, y),
+            (TyKind::RawPtr(Mut::Mut, x), TyKind::RawPtr(Mut::Shared, y)) => return self.ty_matchish(x, y),
+            _ => {}
+        }
         let (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y)) = (self.kind(f), self.kind(e)) else { return false };
         if em.is_mut() && !fm.is_mut() {
             return false;
@@ -6736,7 +6778,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 // &[T]`): it holds exactly when the coercion does. The
                 // probe rolls back on failure so the cast error below
                 // is the only diagnostic.
-                let ref_cast = matches!((self.kind(t), self.kind(target)), (TyKind::Ref(..), TyKind::Ref(..))) && {
+                let ref_cast = matches!(
+                    (self.kind(t), self.kind(target)),
+                    (TyKind::Ref(..), TyKind::Ref(..)) | (TyKind::Ref(..), TyKind::RawPtr(..)) | (TyKind::RawPtr(..), TyKind::RawPtr(..))
+                ) && {
                     let snap = self.snapshot_vars();
                     let obl_len = self.obl_len();
                     let err_len = self.errs.len();
@@ -6764,6 +6809,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         (TyKind::Int(_) | TyKind::Float(_), TyKind::Float(_)) => true,
                         (TyKind::Float(_), TyKind::Int(_)) => true,
                         (TyKind::Int(IntTy::U8) | TyKind::Char, TyKind::Char) => true,
+                        // Pointer casts (w-cinterop): between raw pointers
+                        // of any pointee or mutability, and between a raw
+                        // pointer and an integer, as in Rust. A reference
+                        // to a raw pointer is the coercion cast above.
+                        (TyKind::RawPtr(..), TyKind::RawPtr(..)) => true,
+                        (TyKind::RawPtr(..), TyKind::Int(_)) => true,
+                        (TyKind::Int(_), TyKind::RawPtr(..)) => true,
                         (TyKind::Bool, TyKind::Bool) => true,
                         (TyKind::Error, _) | (_, TyKind::Error) => true,
                         _ => false,
@@ -6774,7 +6826,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         "L0116",
                         span,
                         format!("cannot cast `{a}` as `{b}`"),
-                        "Lust allows `as` between integers, from bool and char to integers, and from u8 to char.",
+                        "Lust allows `as` between integers, from bool and char to integers, from u8 to char, and between raw pointers and integers.",
                     );
                 }
                 target
@@ -8961,6 +9013,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
                 ("iter", "repeat_n") => Some(Builtin::IterRepeatN),
                 ("slice", "from_ref") | ("slice", "from_mut") => Some(Builtin::SliceFromRef),
+                ("ptr", "from_ref") | ("ptr", "from_mut") => Some(Builtin::PtrFromRef),
+                ("ptr", "null") | ("ptr", "null_mut") => Some(Builtin::PtrNull),
+                ("ptr", "eq") | ("ptr", "addr_eq") => Some(Builtin::PtrEqFn),
                 _ => None,
             };
             if let Some(b) = b {
@@ -11108,7 +11163,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         let opt = self.tys.mk_option(r);
                         (vec![rm], opt)
                     }
-                    Builtin::RcDowngrade | Builtin::RcPtrEq | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
+                    Builtin::RcDowngrade | Builtin::RcPtrEq | Builtin::SmartAsPtr | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
                         self.cell_call_sig(b, callee)
                     }
                     Builtin::DefaultGlue => self.cell_default_sig(callee, span),
@@ -11180,6 +11235,37 @@ impl<'p, 'a> Ctx<'p, 'a> {
                         };
                         let sl = self.tys.intern(TyKind::Slice(t));
                         (vec![self.tys.mk_ref(m, t)], self.tys.mk_ref(m, sl))
+                    }
+                    // `ptr::from_ref(&T) -> *const T`, `from_mut(&mut T)
+                    // -> *mut T` (w-cinterop): the written name gives the
+                    // mutability, as for `slice::from_ref`.
+                    Builtin::PtrFromRef => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        self.deferred_sized.push((t, span));
+                        let m = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs.last().is_some_and(|s| self.name(s.name) == "from_mut"),
+                            _ => false,
+                        };
+                        (vec![self.tys.mk_ref(m, t)], self.tys.intern(TyKind::RawPtr(Mut::from_bool(m), t)))
+                    }
+                    // `ptr::null::<T>() -> *const T`, `null_mut` the
+                    // mutable form (w-cinterop).
+                    Builtin::PtrNull => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        self.deferred_sized.push((t, span));
+                        let m = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs.last().is_some_and(|s| self.name(s.name) == "null_mut"),
+                            _ => false,
+                        };
+                        (vec![], self.tys.intern(TyKind::RawPtr(Mut::from_bool(m), t)))
+                    }
+                    // `ptr::eq` and `addr_eq` (w-cinterop): two raw
+                    // pointers of one pointee; references coerce.
+                    Builtin::PtrEqFn => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        self.deferred_sized.push((t, span));
+                        let rp = self.tys.intern(TyKind::RawPtr(Mut::Shared, t));
+                        (vec![rp, rp], BOOL)
                     }
                     // `Option::iter(&o)`, `Result::into_iter(r)`, and
                     // kin (fx-option-rest): a method in path form, so
@@ -12253,6 +12339,8 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // Builtin methods dispatch on the v2 builtin def in the first slot and on
         // the general kind in the second; user Adts were handled above.
         let found: Option<(B, Autoref, Vec<Ty>, Ty)> = match (self.tys.builtin_of(base), bk) {
+            // The safe raw pointer methods (w-cinterop).
+            (None, TyKind::RawPtr(m, inner)) => self.ptr_method(name, m, inner, &explicit, name_span),
             (Some(BuiltinTy::String), _) => {
                 if name == k.len {
                     Some((B::StringLen, Autoref::Ref, vec![], USIZE))
@@ -12301,13 +12389,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 } else if name == k.into_bytes {
                     let v = self.tys.mk_vec(int(IntTy::U8));
                     Some((B::StringIntoBytes, Autoref::None, vec![], v))
+                } else if self.name(name) == "as_ptr" {
+                    Some((B::StrAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, int(IntTy::U8)))))
                 } else {
                     // String derefs to str, so it has every str method.
                     self.str_method(name)
                 }
             }
             (None, TyKind::Str) => {
-                if name == k.len {
+                if self.name(name) == "as_ptr" {
+                    Some((B::StrAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, int(IntTy::U8)))))
+                } else if name == k.len {
                     Some((B::StrLen, Autoref::Ref, vec![], USIZE))
                 } else if name == k.is_empty {
                     Some((B::StrIsEmpty, Autoref::Ref, vec![], BOOL))
@@ -12409,6 +12501,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     let sl = self.tys.intern(TyKind::Slice(elem));
                     let r = self.tys.mk_ref(true, sl);
                     Some((B::VecAsMutSlice, Autoref::RefMut, vec![], r))
+                } else if self.name(name) == "as_ptr" {
+                    Some((B::SeqAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, elem))))
+                } else if self.name(name) == "as_mut_ptr" {
+                    Some((B::SeqAsPtr, Autoref::RefMut, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, elem))))
                 } else {
                     None
                 }
@@ -12418,7 +12514,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                     TyKind::Slice(e) | TyKind::Array(e, _) => e,
                     _ => ERROR,
                 };
-                if name == k.len {
+                if self.name(name) == "as_ptr" {
+                    Some((B::SeqAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, elem))))
+                } else if self.name(name) == "as_mut_ptr" {
+                    Some((B::SeqAsPtr, Autoref::RefMut, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, elem))))
+                } else if name == k.len {
                     Some((B::SliceLen, Autoref::Ref, vec![], USIZE))
                 } else if name == k.is_empty {
                     Some((B::SliceIsEmpty, Autoref::Ref, vec![], BOOL))
@@ -12953,6 +13053,39 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// Methods shared by `str` and `String` (through Deref). The receiver is always `&self`.
+    /// The safe inherent methods of `*const T` and `*mut T` (w-cinterop):
+    /// address queries and casts. Every one takes the pointer by value.
+    /// Deref and the arithmetic that reads or writes through the pointer
+    /// stay unsupported (they need `unsafe`, L0404's area), so a name
+    /// outside this set falls through to the normal method error.
+    fn ptr_method(
+        &mut self,
+        name: Sym,
+        m: Mut,
+        inner: Ty,
+        explicit: &[Option<GenericArg>],
+        name_span: Span,
+    ) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
+        use Builtin as B;
+        let n = self.p.interner.get(name);
+        let self_ty = self.tys.intern(TyKind::RawPtr(m, inner));
+        match n {
+            "is_null" => Some((B::PtrIsNull, Autoref::None, vec![], BOOL)),
+            "addr" | "expose_provenance" => Some((B::PtrAddr, Autoref::None, vec![], USIZE)),
+            "with_addr" => Some((B::PtrWithAddr, Autoref::None, vec![USIZE], self_ty)),
+            // `cast::<U>()` keeps the mutability; `cast_mut` and
+            // `cast_const` keep the pointee.
+            "cast" => {
+                let u = explicit.first().copied().flatten().and_then(|g| g.as_ty()).unwrap_or_else(|| self.new_var(false));
+                self.deferred_sized.push((u, name_span));
+                Some((B::PtrCast, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(m, u))))
+            }
+            "cast_mut" => Some((B::PtrCast, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, inner)))),
+            "cast_const" => Some((B::PtrCast, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, inner)))),
+            _ => None,
+        }
+    }
+
     fn str_method(&mut self, name: Sym) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
         use Builtin as B;
         let k = self.p.known;

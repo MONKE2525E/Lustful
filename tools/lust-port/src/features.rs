@@ -216,6 +216,12 @@ mod tests {
         // Split features added by the port-scan-sync probes.
         assert_eq!(t.classify("macro.thread_local").unwrap().id, "threads.thread_local");
         assert_eq!(t.classify("expr.unsafe").unwrap().id, "unsafe.blocks");
+        // The cinterop split (w-cinterop).
+        assert_eq!(t.classify("type.raw_ptr").unwrap().id, "cinterop.raw_ptr");
+        assert_eq!(t.classify("item.foreign_mod").unwrap().id, "cinterop.extern");
+        assert_eq!(t.classify("fn.extern_abi").unwrap().id, "cinterop.extern");
+        assert_eq!(t.classify("attr.global_allocator").unwrap().id, "cinterop.global_allocator");
+        assert_eq!(t.classify("ext.type.rustix::fs::FileType").unwrap().id, "cinterop.system");
         assert_eq!(t.classify("attr.cfg").unwrap().id, "attrs.cfg");
         assert_eq!(t.classify("attr.default").unwrap().id, "attrs.cfg");
         assert_eq!(t.classify("attr.rustfmt::skip").unwrap().id, "attrs.cfg");

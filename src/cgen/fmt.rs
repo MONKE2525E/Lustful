@@ -34,6 +34,8 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         CTy::String => str_expr(debug, f, &format!("lust_string_as_str({v})")),
         CTy::Unit => format!("lust_f_unit({f})"),
         CTy::FnPtr(..) => format!("lust_f_fnptr({f}, (const void*)(*{v}))"),
+        // A raw pointer's Debug is its address (w-cinterop).
+        CTy::Ptr(_) => format!("lust_f_fnptr({f}, (const void*)(*{v}))"),
         CTy::Ref(inner) | CTy::Boxed(inner) => fmt_expr(inner, kind, f, &format!("(*{v})"), need),
         CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
         // A `RefCell` guard formats its value (W-STD-A).

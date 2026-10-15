@@ -21,6 +21,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let b = match (t.as_str(), i.as_str()) {
             ("Rc", "downgrade") => Builtin::RcDowngrade,
             ("Rc", "ptr_eq") => Builtin::RcPtrEq,
+            ("Rc", "as_ptr") => Builtin::SmartAsPtr,
             ("Weak", "new") => Builtin::WeakNew,
             ("Weak", "ptr_eq") => Builtin::WeakPtrEq,
             ("RefCell", "new") => Builtin::RefCellNew,
@@ -74,6 +75,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 let rc = self.tys.mk_rc(elem);
                 let r = self.tys.mk_ref(false, rc);
                 (vec![r, r], BOOL)
+            }
+            // `Rc::as_ptr(&rc) -> *const T` (w-cinterop).
+            Builtin::SmartAsPtr => {
+                self.deferred_sized.push((elem, self.p.ast.expr_span(callee)));
+                let rc = self.tys.mk_rc(elem);
+                let r = self.tys.mk_ref(false, rc);
+                (vec![r], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, elem)))
             }
             Builtin::WeakNew => (vec![], mk(self, |d| d.weak)),
             Builtin::WeakPtrEq => {

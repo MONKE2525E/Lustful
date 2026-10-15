@@ -908,6 +908,13 @@ impl<'p, 'a> Lower<'p, 'a> {
             }
             Coerce::Unsize(target) => self.unsize(op, ty, target, span),
             Coerce::ReifyFn(target) => self.reify_fn(op, ty, target, span),
+            // A reference to a raw pointer (w-cinterop): the address
+            // value at the pointer type.
+            Coerce::RefToPtr(target) => {
+                let tmp = self.temp(target);
+                self.assign(Place::local(tmp), Rvalue::Use(op), span);
+                Operand::Copy(Place::local(tmp))
+            }
             // Through user `Deref` impls: the coerced reference's place,
             // then each impl's `deref` (or `deref_mut`).
             Coerce::UserDeref(target) => {
@@ -944,7 +951,7 @@ impl<'p, 'a> Lower<'p, 'a> {
         match self.ck.coerce(e) {
             Coerce::None => ty,
             Coerce::StrFromString => REF_STR,
-            Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) | Coerce::ReifyFn(t) => t,
+            Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) | Coerce::ReifyFn(t) | Coerce::RefToPtr(t) => t,
             // A receiver-only coercion: `operand` leaves the value as is.
             Coerce::CowRecv(..) => ty,
             Coerce::ByNext(w) => w,

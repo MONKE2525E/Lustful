@@ -1,4 +1,4 @@
-// feature: cinterop.system
+// feature: cinterop.extern
 // form: extern block, raw pointer types and an unsafe read, the C shim surface
 unsafe extern "C" { fn abs(x: i32) -> i32; }
 fn main() {

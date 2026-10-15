@@ -2441,6 +2441,12 @@ pub fn resolve_scoped(
         }
         TyExpr::Ptr { mutable, inner } => {
             let e = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
+            // A raw pointer to an unsized pointee is a fat pointer in
+            // Rust (address plus metadata); lust's raw pointers are thin
+            // addresses (w-cinterop), so the fat forms reject here.
+            if matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                return Err(not_yet("L0602", span, "a raw pointer to an unsized type"));
+            }
             Ok(tys.intern(TyKind::RawPtr(Mut::from_bool(*mutable), e)))
         }
         TyExpr::Infer => match &scope.infer_cell {
@@ -6437,6 +6443,16 @@ pub fn add_synthetic_impls(p: &mut Program) {
     let ref_p0 = p.tys.mk_ref(false, p0);
     insert_synthetic(p, &mut ordinal, lang.copy, ref_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     insert_synthetic(p, &mut ordinal, lang.clone, ref_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    // Raw pointers (w-cinterop): Copy, Clone, Eq, Ord, Hash, and Debug
+    // unconditionally, as in core: they act on the address alone.
+    for self_pat in [p.tys.intern(TyKind::RawPtr(Mut::Shared, p0)), p.tys.intern(TyKind::RawPtr(Mut::Mut, p0))] {
+        for tr in [lang.copy, lang.clone, lang.eq, lang.hash, lang.ord, lang.debug] {
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        for tr in [lang.partial_eq, lang.partial_ord] {
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &[self_pat], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
     // Display: the std scalars, str, and String, and `&T` and `&mut T`
     // through T, so a `T: Display` bound holds at those types.
     let mut shown: Vec<Ty> = IntTy::ALL_SUPPORTED.iter().map(|&i| int(i)).collect();

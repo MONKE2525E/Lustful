@@ -5664,6 +5664,8 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never | TyKind::Error => true,
         // Fn items, fn pointers, and (non-capturing) closures are Copy.
         TyKind::FnDef(..) | TyKind::FnPtr(_) => true,
+        // Raw pointers are Copy (w-cinterop): the value is the address.
+        TyKind::RawPtr(..) => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
         TyKind::Ref(_, m, _) => !m.is_mut(),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_copy(p, tys, e)),
@@ -5815,6 +5817,8 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
             }
         }
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        // Raw pointers order by address (w-cinterop).
+        TyKind::RawPtr(..) => true,
         TyKind::Float(_) => !total,
         TyKind::Infer(v) => v.is_int() || (v.is_float() && !total),
         TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_cmp_mode(p, tys, e, total, seen, pcmp),
@@ -6052,6 +6056,8 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> boo
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.hash, None),
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
+        // A raw pointer hashes its address as a usize (w-cinterop).
+        TyKind::RawPtr(..) => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_hash(p, tys, e, seen),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| glue_hash(p, tys, e, seen)),
@@ -6161,6 +6167,8 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.partial_eq, Some(t)),
         // Fn pointers compare by address in Rust; fn items do not.
         TyKind::FnPtr(_) => true,
+        // Raw pointers compare by address, for every pointee (w-cinterop).
+        TyKind::RawPtr(..) => true,
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
@@ -6216,6 +6224,8 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
         TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.debug),
         TyKind::Float(_) => true,
+        // A raw pointer's Debug is its address (w-cinterop).
+        TyKind::RawPtr(..) => true,
         // `impl Debug for !` (a `catch_unwind` of a closure that always
         // panics gives `Result<!, _>`).
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error | TyKind::Never => true,

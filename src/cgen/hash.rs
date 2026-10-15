@@ -226,6 +226,8 @@ fn hash_stmts(p: &Program, slots: &[u32], t: &CTy, hc: &CTy, h: &str, v: &str, n
             let s = if *t == CTy::String { format!("lust_string_as_str({v})") } else { format!("(*{v})") };
             format!("{{ lust_str s_ = {s}; {} {} }}", call(write, &bytes("s_.ptr", "s_.len")), call(write_int(IntTy::U8), "0xff"))
         }
+        // A raw pointer hashes its address as a usize (w-cinterop).
+        CTy::Ptr(_) => call(write_int(IntTy::Usize), &format!("(uint64_t)(uintptr_t)(*{v})")),
         CTy::Ref(inner) if **inner == CTy::Str => hash_stmts(p, slots, &CTy::Str, hc, h, v, need),
         CTy::Ref(inner) | CTy::Boxed(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(*{v})"), need),
         CTy::Rc(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(&(*{v})->v)"), need),

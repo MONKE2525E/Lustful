@@ -562,6 +562,7 @@ impl FnGen<'_, '_, '_> {
             | S::ArcStrongCount
             | S::ArcWeakCount
             | S::ArcPtrEq
+            | S::ArcAsPtr
             | S::ArcDowngrade
             | S::ArcGetMut
             | S::ArcMakeMut
@@ -1188,6 +1189,8 @@ impl FnGen<'_, '_, '_> {
             S::ArcStrongCount => format!("lust_arc_load(&(*{})->strong)", vals[0]),
             S::ArcWeakCount => format!("lust_arc_weak_count({})", h(&format!("*{}", vals[0]))),
             S::ArcPtrEq | S::ArcWeakPtrEq => format!("(*{} == *{})", vals[0], vals[1]),
+            // `Arc::as_ptr` (w-cinterop): the payload address.
+            S::ArcAsPtr => format!("(&(*{})->v)", vals[0]),
             S::ArcDowngrade => {
                 let t = self.tmp();
                 let _ = writeln!(self.out, "    {it} *{t} = *{}; lust_arc_downgrade({});", vals[0], h(&t));

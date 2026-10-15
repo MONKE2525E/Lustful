@@ -52,6 +52,8 @@ pub enum SyncOp {
     ArcStrongCount,
     ArcWeakCount,
     ArcPtrEq,
+    /// `Arc::as_ptr` (w-cinterop): the payload address.
+    ArcAsPtr,
     ArcDowngrade,
     ArcGetMut,
     ArcMakeMut,
@@ -170,7 +172,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 106] = [
+    pub const ALL: [SyncOp; 107] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -197,6 +199,7 @@ impl SyncOp {
         SyncOp::ArcStrongCount,
         SyncOp::ArcWeakCount,
         SyncOp::ArcPtrEq,
+        SyncOp::ArcAsPtr,
         SyncOp::ArcDowngrade,
         SyncOp::ArcGetMut,
         SyncOp::ArcMakeMut,
@@ -312,6 +315,7 @@ impl SyncOp {
             SyncOp::ArcStrongCount => (&["std::sync::Arc<T>"], &["strong_count"], a),
             SyncOp::ArcWeakCount => (&["std::sync::Arc<T>"], &["weak_count"], a),
             SyncOp::ArcPtrEq => (&["std::sync::Arc<T>"], &["ptr_eq"], a),
+            SyncOp::ArcAsPtr => (&["std::sync::Arc<T>"], &["as_ptr"], a),
             SyncOp::ArcDowngrade => (&["std::sync::Arc<T>"], &["downgrade"], a),
             SyncOp::ArcGetMut => (&["std::sync::Arc<T>"], &["get_mut"], a),
             SyncOp::ArcMakeMut => (&["std::sync::Arc<T>"], &["make_mut"], a),
@@ -504,6 +508,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             (SyncTy::Arc, _, "strong_count") => SyncOp::ArcStrongCount,
             (SyncTy::Arc, _, "weak_count") => SyncOp::ArcWeakCount,
             (SyncTy::Arc, _, "ptr_eq") => SyncOp::ArcPtrEq,
+            (SyncTy::Arc, _, "as_ptr") => SyncOp::ArcAsPtr,
             (SyncTy::Arc, _, "downgrade") => SyncOp::ArcDowngrade,
             (SyncTy::Arc, _, "get_mut") => SyncOp::ArcGetMut,
             (SyncTy::Arc, _, "make_mut") => SyncOp::ArcMakeMut,
@@ -558,6 +563,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             SyncOp::ArcNew => (vec![elem], arc),
             SyncOp::ArcStrongCount | SyncOp::ArcWeakCount => (vec![arc_ref], USIZE),
             SyncOp::ArcPtrEq => (vec![arc_ref, arc_ref], BOOL),
+            SyncOp::ArcAsPtr => (vec![arc_ref], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, elem))),
             SyncOp::ArcDowngrade => (vec![arc_ref], weak),
             SyncOp::ArcGetMut => {
                 let r = self.tys.mk_ref(true, elem);

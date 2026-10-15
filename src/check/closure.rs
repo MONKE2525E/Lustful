@@ -997,7 +997,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     fn cap_coerced(&mut self, e: ExprId, w: &mut CapWalk) -> bool {
         let c = self.out.coerce[self.ei(e)];
         let (derefs, mode) = match c {
-            Coerce::None | Coerce::ReifyFn(_) => return false,
+            // A raw pointer coercion (w-cinterop) borrows nothing past
+            // the coercion site: the plain walk sees the borrow inside.
+            Coerce::None | Coerce::ReifyFn(_) | Coerce::RefToPtr(_) => return false,
             Coerce::MutToShared => (1, CaptureMode::Ref),
             Coerce::Reborrow => (1, CaptureMode::MutRef),
             Coerce::Deref(n) => (n as usize + 1, CaptureMode::Ref),

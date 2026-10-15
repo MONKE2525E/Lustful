@@ -3503,6 +3503,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     8u8.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::Ptr(x) => {
+                    44u8.hash(h);
+                    inner(h, p, x);
+                }
                 cgen::CTy::Adt(a) => {
                     (9u8, a.0).hash(h);
                     crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);

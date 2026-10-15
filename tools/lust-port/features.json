@@ -460,8 +460,64 @@
    ]
   },
   {
+   "id": "cinterop.raw_ptr",
+   "title": "Raw pointer types as identity values (*const T, *mut T)",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "10",
+   "root_cause": "c-interop",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from cinterop.system (w-cinterop). Probe: cinterop_raw_ptr.rs: coercion from references, core::ptr::from_ref/null/eq, cast, addr, Eq/Ord/Hash by address, Rc::as_ptr. No deref: that needs unsafe (unsafe.blocks) and stays rejected.",
+   "primary_keys": [
+    "type.raw_ptr"
+   ],
+   "keys": [
+    "type.raw_ptr"
+   ]
+  },
+  {
+   "id": "cinterop.extern",
+   "title": "extern blocks and extern fn ABI",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "10",
+   "root_cause": "c-interop",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from cinterop.system (w-cinterop). Probe: cinterop_extern.rs (the old cinterop_system.rs): a foreign fn call needs unsafe (unsafe.blocks) plus the extern surface; lust rejects both today (L0810, L0404).",
+   "primary_keys": [
+    "item.foreign_mod",
+    "fn.extern_abi"
+   ],
+   "keys": [
+    "item.foreign_mod",
+    "fn.extern_abi"
+   ]
+  },
+  {
+   "id": "cinterop.global_allocator",
+   "title": "#[global_allocator] statics",
+   "status": "unsupported",
+   "milestone": 7,
+   "inventory_step": "10",
+   "root_cause": "c-interop",
+   "fix_class": "compiler",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Split from cinterop.system (w-cinterop). Probe: cinterop_global_allocator.rs with std::alloc::System. ts-rust's bins name tikv_jemallocator::Jemalloc, which also needs that adapter crate.",
+   "primary_keys": [
+    "attr.global_allocator"
+   ],
+   "keys": [
+    "attr.global_allocator"
+   ]
+  },
+  {
    "id": "cinterop.system",
-   "title": "C interop and system crates (rustix, nix, signal-hook, jemalloc, zlib, local time)",
+   "title": "System crates (rustix, nix, signal-hook, jemalloc, zlib, local time)",
    "status": "unsupported",
    "milestone": 7,
    "inventory_step": "10",
@@ -469,12 +525,10 @@
    "fix_class": "adapter",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Cached rustc-built C ABI shims in milestone 7. See dependencies.json for the per-crate decision.",
+   "notes": "Cached rustc-built C ABI shims in milestone 7. See dependencies.json for the per-crate decision. Split by w-cinterop: raw pointer types are cinterop.raw_ptr, extern blocks are cinterop.extern, and #[global_allocator] is cinterop.global_allocator. No probe: each crate needs its own adapter probe.",
    "primary_keys": [
-    "item.foreign_mod",
-    "fn.extern_abi",
-    "type.raw_ptr",
-    "attr.global_allocator"
+    "ext.type.rustix::*",
+    "ext.type.libc::*"
    ],
    "keys": [
     "ext.type.rustix::*",
@@ -518,11 +572,7 @@
     "ext.use.unicode_normalization::*",
     "ext.type.libc::*",
     "ext.expr.libc::*",
-    "ext.use.libc::*",
-    "item.foreign_mod",
-    "fn.extern_abi",
-    "type.raw_ptr",
-    "attr.global_allocator"
+    "ext.use.libc::*"
    ]
   },
   {
