@@ -3206,6 +3206,14 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
                 }
             }
             _ if matches!(target, CallTarget::Builtin(b) if item_builtin(b) && self.call_item(b, &avs, dt, &dv)) => {}
+            // `Type::from_iter(src)` whose items `call_item` cannot name
+            // slot by slot (fx-fromiter): the conservative rule over the
+            // whole source, its borrow region included, never the
+            // receiver-stripping item rule below (the source is an
+            // argument, not a `&mut` iterator receiver).
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::FromIter)) => {
+                self.call_opaque(&avs, dt, &dv);
+            }
             _ if matches!(target, CallTarget::Builtin(b) if item_builtin(b)) => {
                 // Items the receiver cannot name slot by slot (a `map`
                 // closure makes them): an item (or a collection of items)
@@ -4470,7 +4478,7 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         }
         let Some((_, args)) = self.body.tys.adt_parts(dt) else { return false };
         let comps: Vec<Ty> = self.body.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
-        let collect = b == crate::check::Builtin::IterCollect;
+        let collect = matches!(b, crate::check::Builtin::IterCollect | crate::check::Builtin::FromIter);
         let parts = match (self.body.tys.builtin_of(dt), &comps[..]) {
             (Some(BuiltinTy::Option | BuiltinTy::Vec), &[t]) => vec![t],
             (Some(BuiltinTy::Hash(HashTy::HashMap)), &[k, v, _]) if collect => vec![k, v],
@@ -4479,9 +4487,35 @@ impl<'b, 'p, 'a> Builder<'b, 'p, 'a> {
         };
         let n: usize = parts.iter().map(|&t| self.sc.slots(t) as usize).sum();
         let Some(dv) = dv.get(..n) else { return false };
+        // `Type::from_iter(src)` (fx-fromiter): a `&Vec`/`&[T]`/`&[T; N]`
+        // source is a slice iterator whose item `&T` is the source's own
+        // slots (the borrow region first, then `T`'s); a `Vec` source is
+        // `vec::IntoIter`, whose item `T` is the Vec's element slots.
+        let src_cand: Option<Vec<u32>> = if b == crate::check::Builtin::FromIter {
+            match self.body.tys.kind(*t0) {
+                TyKind::Ref(_, _, inner) => {
+                    let el = match self.body.tys.kind(inner) {
+                        TyKind::Slice(e) | TyKind::Array(e, _) => Some(e),
+                        _ => self.body.tys.vec_elem(inner),
+                    };
+                    el.and_then(|e| (v0.len() == 1 + self.sc.slots(e) as usize).then(|| v0.clone()))
+                }
+                _ => self
+                    .body
+                    .tys
+                    .vec_elem(*t0)
+                    .and_then(|e| v0.get(..self.sc.slots(e) as usize).map(|v| v.to_vec())),
+            }
+        } else {
+            None
+        };
         let mut cands = Vec::new();
-        if !self.iter_items(it, &iv, &mut cands) || cands.is_empty() || cands.iter().any(|c| c.len() != n) {
-            return false;
+        match src_cand {
+            Some(c) if c.len() == n => cands.push(c),
+            _ if !self.iter_items(it, &iv, &mut cands) || cands.is_empty() || cands.iter().any(|c| c.len() != n) => {
+                return false;
+            }
+            _ => {}
         }
         for c in cands {
             let mut at = 0;
@@ -6019,6 +6053,7 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
             | B::IterMinByKey
             | B::IterMaxByKey
             | B::IterCollect
+            | B::FromIter
     )
 }
 

@@ -62,6 +62,22 @@ const DECLARED_ONLY: &[&str] = &[
     "min_by",
 ];
 
+/// The answer of a `from_iter` target probe (`from_iter_ty_target`):
+/// a type this call builds, an error already reported, or no claim.
+enum FromIterProbe {
+    Found(Ty),
+    Bail,
+    Miss,
+}
+
+/// How a concrete `from_iter` target builds (`from_iter_class`).
+#[derive(PartialEq)]
+enum FromIterClass {
+    Collect,
+    BTree,
+    Unsupported,
+}
+
 impl<'p, 'a> Ctx<'p, 'a> {
     /// `iter`, `iter_mut`, and `into_iter` on Vec, slices, and arrays,
     /// and every iterator method on a builtin iterator or `Chars`
@@ -1622,6 +1638,393 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return false;
         }
         true
+    }
+
+    /// `Type::from_iter(arg)` by path, in every spelling rustc reads
+    /// as `FromIterator::from_iter` (fx-fromiter; the trait is in the
+    /// 2021+ prelude): a type path or alias, `<T>::`, `<T as
+    /// FromIterator<..>>::`, and `FromIterator::from_iter` with the
+    /// Self type from the expected type. The builtin targets build
+    /// through the `collect` expansion (`Builtin::FromIter`), as
+    /// rustc's `collect` is `from_iter`; the std source collections
+    /// (`BTreeMap`, `BTreeSet`) call their source `from_iter`, as
+    /// `collect` into them does. None when the callee is another
+    /// form: a user type, an inherent fn, a type parameter, and a
+    /// user trait's `from_iter` keep the ordinary path-call flow.
+    pub(super) fn from_iter_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span, expected: Option<Ty>) -> Option<Ty> {
+        let p = self.p;
+        let mut hint_item: Option<Ty> = None;
+        let mut qpath_trait = false;
+        let (found, turbo) = match p.ast.expr(callee) {
+            Expr::QPath { self_ty, trait_path, segs } => {
+                if segs.len() != 1 || self.name(segs[0].name) != "from_iter" {
+                    return None;
+                }
+                let turbo = segs[0].clone();
+                let base = self.resolve_written(*self_ty);
+                if base == ERROR {
+                    return None;
+                }
+                if !trait_path.is_empty() {
+                    let tref = ast::TraitRefExpr { path: trait_path.clone() };
+                    match self.written_trait_ref(base, &tref, span) {
+                        Ok(tr) if tr.def == p.gx.lang.from_iterator => {
+                            qpath_trait = true;
+                            hint_item = self.tys.args(tr.args).get(1).and_then(|g| g.as_ty());
+                            if let Some(t) = hint_item {
+                                let t = self.instantiate_infers(t);
+                                hint_item = Some(self.deep(t));
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                (FromIterProbe::Found(base), turbo)
+            }
+            Expr::Path(segs) => {
+                let segs = segs.clone();
+                let n = segs.len();
+                if n < 2 || self.name(segs[n - 1].name) != "from_iter" {
+                    return None;
+                }
+                let turbo = segs[n - 1].clone();
+                // `T::from_iter` on a type parameter (or a param named
+                // like a std type) is the bound flow's, not this one's.
+                if n == 2 && self.body_scope.param_tys.iter().any(|(nm, _)| *nm == segs[0].name) {
+                    return None;
+                }
+                let prefix: Vec<String> = segs[..n - 1].iter().map(|s| self.name(s.name).to_string()).collect();
+                let trait_form = prefix.len() == 1 && prefix[0] == "FromIterator"
+                    || prefix.len() == 3
+                        && matches!(prefix[0].as_str(), "std" | "core")
+                        && prefix[1] == "iter"
+                        && prefix[2] == "FromIterator";
+                if trait_form {
+                    let ta = segs[n - 2].type_args();
+                    if ta.len() > 1 {
+                        return None;
+                    }
+                    if let Some(t) = ta.first() {
+                        let t = self.resolve_written(*t);
+                        let t = self.instantiate_infers(t);
+                        hint_item = Some(self.deep(t));
+                    }
+                    let exp = expected.map(|t| self.deep(t)).filter(|&b| b != ERROR && !self.unbound_general(b))?;
+                    (FromIterProbe::Found(exp), turbo)
+                } else {
+                    (self.from_iter_ty_target(&segs, callee, span), turbo)
+                }
+            }
+            _ => return None,
+        };
+        let target = match found {
+            FromIterProbe::Found(t) => self.resolve(t),
+            FromIterProbe::Bail => {
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
+            FromIterProbe::Miss => return None,
+        };
+        // Another in-scope trait with a `from_iter` method: rustc's
+        // probe sees it next to std's (E0034 when both apply). Keep
+        // the ordinary flow (and its L0643/L0720 answers) for that
+        // case; a written `<T as FromIterator>::` names its trait.
+        if !qpath_trait {
+            let name = turbo.name;
+            let other = p
+                .gx
+                .traits_by_method
+                .get(&name)
+                .is_some_and(|ds| ds.iter().any(|&d| d != p.gx.lang.from_iterator && method::trait_in_scope_pub(self, d)));
+            if other {
+                return None;
+            }
+        }
+        // The expected result fixes the target's open args first (a
+        // table's `S` most of all), as rustc's expected output does;
+        // classification then sees the type as written there.
+        if let Some(want) = expected {
+            let want = self.resolve(want);
+            if want != ERROR {
+                let snap = self.snapshot_vars();
+                if !self.unify(target, want) {
+                    self.rollback_vars(snap);
+                }
+            }
+        }
+        let class = self.from_iter_class(target)?;
+        // The item turbofish names the `IntoIterator` type itself
+        // (`Vec::from_iter::<Vec<u32>>(v)`), as the method's own
+        // generic parameter: exactly one type argument.
+        let turbo_ty = if turbo.has_args() {
+            let ta = turbo.type_args();
+            if ta.len() != 1 {
+                self.err("L0107", span, "this associated function takes 1 generic argument", "Write the iterator type.");
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
+            let t = self.resolve_written(ta[0]);
+            Some(self.instantiate_infers(t))
+        } else {
+            None
+        };
+        let [a] = args else {
+            self.err("L0105", span, "`from_iter` takes 1 argument", "Pass the iterator.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return Some(ERROR);
+        };
+        let aspan = self.span(*a);
+        let at = self.expr(*a, None);
+        let at = self.deep(at);
+        if at == ERROR {
+            return Some(ERROR);
+        }
+        if class == FromIterClass::Unsupported {
+            let tn = self.tn(target);
+            self.err(
+                "L0640",
+                span,
+                format!("`from_iter` into `{tn}` is not implemented yet"),
+                "Collect into a `Vec`, `String`, map, or set instead.",
+            );
+            return Some(ERROR);
+        }
+        if let Some(tt) = turbo_ty
+            && !self.unify(at, tt)
+        {
+            self.mismatch(aspan, tt, at);
+            return Some(ERROR);
+        }
+        // The argument through `IntoIterator`, as `extend` reads it.
+        let it = self
+            .p
+            .collection_iter_inner(&mut self.tys, at)
+            .or_else(|| it::as_iter_ty(&mut self.tys, at))
+            .or_else(|| self.by_next_arg(*a, at));
+        let Some(it) = it else {
+            let tn = self.tn(at);
+            self.err("L0640", aspan, format!("`from_iter` from `{tn}` is not implemented yet"), "Pass an iterator, a Vec, or a slice.");
+            return Some(ERROR);
+        };
+        if it == ERROR {
+            return Some(ERROR);
+        }
+        if let TyKind::Array(el, _) = self.kind(at)
+            && !self.array_iter_elem_ok(el, aspan)
+        {
+            return Some(ERROR);
+        }
+        let item = self.iter_item(it);
+        if let Some(hint) = hint_item
+            && !self.unify(item, hint)
+        {
+            self.mismatch(span, hint, item);
+            return Some(ERROR);
+        }
+        match class {
+            FromIterClass::Collect => {
+                if !self.collect_target_ok(target, item, span) {
+                    return Some(ERROR);
+                }
+                self.set_res(callee, Res::Builtin(Builtin::FromIter));
+                self.set_res(e, Res::Builtin(Builtin::FromIter));
+                Some(self.resolve(target))
+            }
+            FromIterClass::BTree => Some(self.btree_from_iter(e, target, at, item, turbo.name, span)),
+            FromIterClass::Unsupported => unreachable!(),
+        }
+    }
+
+    /// `BTreeMap::from_iter(arg)` and `BTreeSet::from_iter(arg)`: the
+    /// std source impl's fn, selected at body end like `collect`
+    /// into them (see the `collect` arm). The method's own generic
+    /// is the argument's `IntoIterator` type as written.
+    fn btree_from_iter(&mut self, e: ExprId, target: Ty, at: Ty, item: Ty, name: Sym, span: Span) -> Ty {
+        let tr = self.resolve(target);
+        let Some(a) = self.tys.local_adt(tr).or_else(|| self.tys.adt_parts(tr).and_then(|(d, _)| self.tys.local_adt_of(d))) else {
+            return ERROR;
+        };
+        let path = self.p.display_path(self.p.adt(a).name);
+        let targs: Vec<Ty> =
+            self.tys.adt_parts(tr).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+        let entry = match (path.rsplit("::").next(), targs.as_slice()) {
+            (Some("BTreeMap"), [k, v]) => {
+                let ts = self.tys.intern_tys(&[*k, *v]);
+                Some(self.tys.intern(TyKind::Tuple(ts)))
+            }
+            (Some("BTreeSet"), [t]) => Some(*t),
+            _ => None,
+        };
+        let Some(entry) = entry else { return ERROR };
+        if !self.unify(entry, item) {
+            self.mismatch(span, entry, item);
+            return ERROR;
+        }
+        let targs = self.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]);
+        let trait_ref = TraitRef { def: self.p.gx.lang.from_iterator, args: targs, bindings: EMPTY_BINDINGS };
+        self.obl.push_trait_at(trait_ref, span, 0);
+        method::defer_path_call(self, e, trait_ref, name, vec![GenericArg::Ty(at)]);
+        self.record_pick(e, self.p.gx.lang.from_iterator, 0, ReceiverForm::Value);
+        tr
+    }
+
+    /// The target type of a type-relative `from_iter` path (not the
+    /// trait-name form): an alias's type, the written type with its
+    /// turbofish, or a bare std collection name at fresh arguments,
+    /// as rustc infers them there. `Miss` keeps the ordinary flow.
+    fn from_iter_ty_target(&mut self, segs: &[ast::PathSeg], callee: ExprId, span: Span) -> FromIterProbe {
+        let p = self.p;
+        let n = segs.len();
+        let ty_seg = &segs[n - 2];
+        let cspan = self.span(callee);
+        if n == 2 && ty_seg.name == p.known.self_type {
+            return match self.body_scope.self_ty {
+                Some(t) if !matches!(self.kind(self.resolve(t)), TyKind::Param(_)) => FromIterProbe::Found(self.resolve(t)),
+                _ => FromIterProbe::Miss,
+            };
+        }
+        if n == 2 {
+            if let Some(t) = self.alias_path_target(segs, cspan, false) {
+                if t == ERROR {
+                    return FromIterProbe::Miss;
+                }
+                // Like the alias flow in `call`: args on a plain alias
+                // are rustc's E0107, and the type must be well-formed.
+                if let Some((_, generic)) = self.alias_seg_ty(&segs[0], cspan, false)
+                    && !generic
+                    && segs[0].has_args()
+                {
+                    self.err("L0107", cspan, "this type alias takes no generic arguments", "Remove the `<..>` part.");
+                    return FromIterProbe::Bail;
+                }
+                self.wf_check_written(t, cspan);
+                return FromIterProbe::Found(t);
+            }
+            // An alias of a std source collection (`type BM =
+            // BTreeMap<u32, u32>`): its args are the alias's.
+            if let Some((a, aargs, _)) = self.alias_adt_seg(&segs[0], cspan) {
+                if !p.is_std_adt(a) {
+                    return FromIterProbe::Miss;
+                }
+                let generics = p.gx.adt_generics[a.0 as usize].clone();
+                let args = if aargs.is_empty() { self.fresh_args(&generics) } else { aargs };
+                return FromIterProbe::Found(self.tys.mk_adt(p.def_of_adt(a), &args));
+            }
+        }
+        if ty_seg.has_args() {
+            return match self.written_builtin_self(segs, span) {
+                Some(t) if t == ERROR => FromIterProbe::Bail,
+                Some(t) => FromIterProbe::Found(t),
+                None => FromIterProbe::Miss,
+            };
+        }
+        if n > 2 {
+            let path: Vec<&str> = segs[..n - 1].iter().map(|s| self.name(s.name)).collect();
+            if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Type) {
+                return FromIterProbe::Miss;
+            }
+        }
+        let (k, ty_name) = (p.known, ty_seg.name);
+        if ty_name == k.Vec {
+            let el = self.new_var(false);
+            return FromIterProbe::Found(self.tys.mk_vec(el));
+        }
+        if ty_name == k.String {
+            return FromIterProbe::Found(STRING);
+        }
+        // Targets with rustc `FromIterator` impls lust does not build
+        // yet, so they reach the L0640 in `from_iter_call` instead of
+        // the builtin tables' L0104 (a user type of the name shadows
+        // std's, never on a std path, as in `resolve_assoc`).
+        let lang_ty = n > 2 || !p.type_names.contains_key(&ty_name);
+        if ty_name == k.Option && lang_ty {
+            let el = self.new_var(false);
+            return FromIterProbe::Found(self.tys.mk_option(el));
+        }
+        if ty_name == k.Result && lang_ty {
+            let (a, b) = (self.new_var(false), self.new_var(false));
+            return FromIterProbe::Found(self.tys.mk_result(a, b));
+        }
+        if ty_name == k.Box {
+            let el = self.new_var(false);
+            return FromIterProbe::Found(self.tys.mk_boxed(el));
+        }
+        if ty_name == k.Rc && lang_ty {
+            let el = self.new_var(false);
+            return FromIterProbe::Found(self.tys.mk_rc(el));
+        }
+        // The hashed collections arrive by their std path, as in
+        // `hash_ctor_sig` (a bare name was not imported).
+        if n > 2
+            && let Some(hk) = crate::ty::hash::HashTy::by_name(self.name(ty_name))
+            && matches!(hk, crate::ty::hash::HashTy::HashMap | crate::ty::hash::HashTy::HashSet)
+        {
+            let args: Vec<Ty> = (0..hk.n_args()).map(|_| self.new_var(false)).collect();
+            return FromIterProbe::Found(crate::ty::hash::mk_hash(&mut self.tys, hk, &args));
+        }
+        // A std source collection by its imported or std-path name.
+        if let BindingRes::Def(def) = self.binding(Namespace::Type, ty_name)
+            && let Some(a) = p.adt_by_def(def)
+            && p.is_std_adt(a)
+        {
+            let generics = p.gx.adt_generics[a.0 as usize].clone();
+            let args = self.fresh_args(&generics);
+            return FromIterProbe::Found(self.tys.mk_adt(def, &args));
+        }
+        FromIterProbe::Miss
+    }
+
+    /// What a concrete `from_iter` target builds through (see
+    /// `from_iter_call`). None for a target this package does not
+    /// claim: user types, type parameters, and types with no
+    /// `FromIterator` impl in rustc keep the ordinary flow and its
+    /// errors. `Unsupported` is a rustc impl lust has no build for.
+    fn from_iter_class(&mut self, t: Ty) -> Option<FromIterClass> {
+        let t = self.resolve(t);
+        if self.tys.vec_elem(t).is_some() || self.tys.is_string_ty(t) {
+            return Some(FromIterClass::Collect);
+        }
+        if let Some((hk, _)) = crate::ty::hash::hash_parts(&self.tys, t) {
+            return match hk {
+                crate::ty::hash::HashTy::HashMap | crate::ty::hash::HashTy::HashSet => Some(FromIterClass::Collect),
+                _ => None,
+            };
+        }
+        if let Some(a) = self.tys.local_adt(t).or_else(|| self.tys.adt_parts(t).and_then(|(d, _)| self.tys.local_adt_of(d))) {
+            if self.p.is_vec_deque_adt(a) {
+                return Some(FromIterClass::Collect);
+            }
+            if !self.p.is_std_adt(a) {
+                return None;
+            }
+            let path = self.p.display_path(self.p.adt(a).name);
+            return match path.rsplit("::").next() {
+                Some("BTreeMap" | "BTreeSet") => Some(FromIterClass::BTree),
+                Some("PathBuf" | "OsString" | "LinkedList" | "BinaryHeap") => Some(FromIterClass::Unsupported),
+                _ => None,
+            };
+        }
+        match self.tys.builtin_of(t) {
+            Some(BuiltinTy::Option | BuiltinTy::Result) => Some(FromIterClass::Unsupported),
+            Some(BuiltinTy::Boxed) => self.tys.boxed_elem(t).and_then(|e| self.unsized_from_iter(e)),
+            Some(BuiltinTy::Rc) => self.tys.rc_elem(t).and_then(|e| self.unsized_from_iter(e)),
+            _ if t == UNIT => Some(FromIterClass::Unsupported),
+            _ => None,
+        }
+    }
+
+    /// `Box<[T]>`, `Box<str>`, and their Rc forms have rustc
+    /// `FromIterator` impls lust does not build yet; a sized element
+    /// has none (the ordinary flow's L0104).
+    fn unsized_from_iter(&self, e: Ty) -> Option<FromIterClass> {
+        let e = self.resolve(e);
+        matches!(self.kind(e), TyKind::Slice(_) | TyKind::Str).then_some(FromIterClass::Unsupported)
     }
 
     /// A range expression used as a value: one of the six

@@ -15,7 +15,8 @@ reads written out. Gate: `scripts/test-adapters.sh rustc-hash`.
 - Maps and sets with these hashers print the same iteration order,
   capacity, and hash values as the real crate, built through the aliases
   as ts-rust writes them (`FxHashMap::default()`,
-  `with_capacity_and_hasher(n, Default::default())`, `with_hasher`) and
+  `with_capacity_and_hasher(n, Default::default())`, `with_hasher`,
+  `FxHashSet::from_iter(..)`) and
   hashing values with a written `Hash` impl
   (tests/adapters/crates/rustc-hash: layout, maps, maps_typed,
   hash_values).
@@ -24,12 +25,6 @@ reads written out. Gate: `scripts/test-adapters.sh rustc-hash`.
   named `MULTIPLIER`, not `K` (private; with `K`, lust resolves the
   type parameter `K` of the re-exported `FxHashMapSeed<K, V>` to the
   const).
-
-## Not usable through lust yet (lust rejects)
-
-- `FxHashMap::from_iter(..)` and `FxHashSet::from_iter(..)` by path
-  (L0104): lust has no `from_iter` by path on any std type yet.
-  `.collect()` works.
 
 ## Rejected (lust error, never a different answer)
 

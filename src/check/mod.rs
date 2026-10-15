@@ -339,6 +339,10 @@ pub enum Builtin {
     IterMinByKey,
     IterMaxByKey,
     IterCollect,
+    /// `Type::from_iter(arg)` by path (fx-fromiter): the arg goes
+    /// through `IntoIterator`, then the same expansion as
+    /// `IterCollect` into the result type (lower/iter.rs).
+    FromIter,
     IterSum,
     IterProduct,
     VecIterNext,
@@ -9862,6 +9866,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if let Some(t) = self.try_into_assoc_call(e, callee, base, hint, name, args, span) {
             return Some(t);
         }
+        // `BuildHasher::build_hasher` and `hash_one` by path
+        // (check/hashmap.rs): written methods, std's builders, and
+        // the provided `hash_one` have no fn in the trait index.
+        if let Some(t) = self.builder_assoc_call(e, callee, base, hint, name, args, span) {
+            return Some(t);
+        }
         if self.name(name) == "default"
             && args.is_empty()
             && matches!(self.kind(base), TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit)
@@ -10481,6 +10491,10 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         if let Some(align) = self.layout_of_val_callee(callee) {
             return self.layout_of_val(e, args, align, span);
+        }
+        // `Type::from_iter(arg)` by path (check/iter.rs, fx-fromiter).
+        if let Some(t) = self.from_iter_call(e, callee, args, span, expected) {
+            return t;
         }
         // The Self type a type-relative builtin call writes (an alias's
         // type, `<T>::`, or a turbofish on the type), which the builtin's

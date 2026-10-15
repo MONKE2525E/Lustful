@@ -168,9 +168,96 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// The std hash trait `name` is usable here: imported by its std
-    /// path, or a bound in the env (as rustc needs the trait in scope).
+    /// path, the trait of the impl this body is in, or a bound in the
+    /// env (as rustc needs the trait in scope).
     fn hash_trait_in_scope(&self, trait_def: DefId, name: &str) -> bool {
-        self.std_trait_imported("hash", name) || self.env().iter().any(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == trait_def))
+        self.std_trait_imported("hash", name)
+            || self.enclosing_impl_trait_pub() == Some(trait_def)
+            || self.env().iter().any(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == trait_def))
+    }
+
+    /// The written `BuildHasher` method `name` (`build_hasher`, or a
+    /// written `hash_one`) of the impl `base` selects, instantiated
+    /// at this call: (fn, params with the receiver first, return).
+    /// None when the impl is synthetic (std's own builders) or does
+    /// not write the method: the glue builtins answer those. A
+    /// written `hash_one` must be called as written: rustc does not
+    /// run the provided body over it.
+    fn written_builder_method(&mut self, e: ExprId, base: Ty, name: &str, span: Span) -> Option<(LocalDefId, Vec<Ty>, Ty)> {
+        let p = self.p;
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(base)]);
+        let tr = TraitRef { def: p.gx.lang.build_hasher, args: args_id, bindings: EMPTY_BINDINGS };
+        let Selection::Impl { id, args: impl_args, .. } = self.select_obligation(tr) else { return None };
+        let rec = p.gx.index.get(id).clone();
+        if rec.synthetic != crate::traits::index::Synthetic::None {
+            return None;
+        }
+        if !rec.items.iter().any(|d| p.local_def(d.hash).is_some_and(|l| p.name(p.fn_info(l).name) == name)) {
+            return None;
+        }
+        self.method_instance_for_impl(e, id, tr, impl_args, name, span)
+    }
+
+    /// `Type::build_hasher(&b)`, `Type::hash_one(&b, x)`, and the
+    /// `<T as BuildHasher>::..` forms, from `assoc_call`: a written
+    /// method is the impl's own fn; `hash_one` with no written one
+    /// and std's builders are the glue builtins, whose operands are
+    /// the path call's arguments as written. None for other calls.
+    pub(super) fn builder_assoc_call(
+        &mut self,
+        e: ExprId,
+        callee: ExprId,
+        base: Ty,
+        hint: Option<TraitRef>,
+        name: Sym,
+        args: &[ExprId],
+        span: Span,
+    ) -> Option<Ty> {
+        use Builtin as B;
+        let lang = self.p.gx.lang;
+        let n = self.name(name).to_string();
+        if !matches!(n.as_str(), "build_hasher" | "hash_one") || hint.is_some_and(|h| h.def != lang.build_hasher) {
+            return None;
+        }
+        if hint.is_none() && !method::trait_in_scope_pub(self, lang.build_hasher) {
+            return None;
+        }
+        let base = self.deep(base);
+        if let Some((local, params, ret)) = self.written_builder_method(e, base, &n, span) {
+            self.record_pick(e, lang.build_hasher, 0, ReceiverForm::Value);
+            self.set_res(e, Res::Fn(local));
+            self.check_args(&params, args, span);
+            return Some(self.normalize_use(ret, span));
+        }
+        if !self.implements(lang.build_hasher, base) {
+            return None;
+        }
+        let r = self.tys.mk_ref(false, base);
+        match n.as_str() {
+            "build_hasher" => {
+                let h = match hash_parts(&self.tys, base) {
+                    Some((HashTy::RandomState, _)) => mk_hash(&mut self.tys, HashTy::DefaultHasher, &[]),
+                    Some((HashTy::BuildHasherDefault, a)) => a[0],
+                    _ => return None,
+                };
+                self.set_res(callee, Res::Builtin(B::BuildHasher));
+                self.set_res(e, Res::Builtin(B::BuildHasher));
+                self.check_args(&[r], args, span);
+                Some(h)
+            }
+            _ => {
+                let x = self.new_var(false);
+                self.set_res(callee, Res::Builtin(B::HashOne));
+                self.set_res(e, Res::Builtin(B::HashOne));
+                self.check_args(&[r, x], args, span);
+                let x = self.deep(x);
+                if args.len() == 2 {
+                    let aspan = self.span(args[1]);
+                    self.glue_hashable(x, aspan);
+                }
+                Some(int(IntTy::U64))
+            }
+        }
     }
 
     /// A value hashed by the glue (`x.hash(..)`, `hash_one(x)`): `T:
@@ -197,8 +284,9 @@ impl<'p, 'a> Ctx<'p, 'a> {
     }
 
     /// `x.hash(&mut state)` (Hash::hash for core and derived impls),
-    /// `s.hash_one(x)` (BuildHasher), `s.build_hasher()` on std's
-    /// builders, and Hasher methods on a concrete
+    /// `s.hash_one(x)` and `s.build_hasher()` (BuildHasher: a
+    /// written method is the impl's own fn, std's builders and the
+    /// provided `hash_one` are glue), and Hasher methods on a concrete
     /// hasher that lust's glue answers (DefaultHasher's, and the
     /// provided `write_*` of a user hasher; a written method is the
     /// impl's own fn, found before this). None for other calls.
@@ -228,6 +316,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(UNIT)
             }
             "hash_one" if args.len() == 1 && self.hash_trait_in_scope(lang.build_hasher, "BuildHasher") => {
+                // A written `hash_one` runs as written; the glue is
+                // only the provided body (fx-fromiter).
+                if let Some((f, params, ret)) = self.written_builder_method(e, base, "hash_one", name_span) {
+                    self.set_res(e, Res::Method { f, derefs, autoref: Autoref::Ref });
+                    self.check_args(&params[1.min(params.len())..], args, name_span);
+                    return Some(self.normalize_use(ret, name_span));
+                }
                 if !self.implements(lang.build_hasher, base) {
                     return None;
                 }
@@ -236,10 +331,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::BuiltinMethod { b: B::HashOne, derefs, autoref: Autoref::Ref });
                 Some(int(IntTy::U64))
             }
-            // std's builders (a user builder's written method is found
-            // before this): RandomState builds a DefaultHasher,
-            // BuildHasherDefault<H> an `H::default()`.
+            // A user builder's written `build_hasher` is its own fn
+            // (fx-fromiter; the trait probe does not see the lang
+            // trait here); std's builders are the glue: RandomState
+            // builds a DefaultHasher, BuildHasherDefault<H> an
+            // `H::default()`.
             "build_hasher" if args.is_empty() && self.hash_trait_in_scope(lang.build_hasher, "BuildHasher") => {
+                if let Some((f, params, ret)) = self.written_builder_method(e, base, "build_hasher", name_span) {
+                    self.set_res(e, Res::Method { f, derefs, autoref: Autoref::Ref });
+                    self.check_args(&params[1.min(params.len())..], args, name_span);
+                    return Some(self.normalize_use(ret, name_span));
+                }
                 let h = match hash_parts(&self.tys, base) {
                     Some((HashTy::RandomState, _)) => mk_hash(&mut self.tys, HashTy::DefaultHasher, &[]),
                     Some((HashTy::BuildHasherDefault, a)) if self.implements(lang.build_hasher, base) => a[0],

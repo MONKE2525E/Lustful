@@ -1723,7 +1723,7 @@ pub mod vec_deque {
     // capacity is std's for a deque too; a source `from_iter`
     // body could not state that capacity (the trusted-length
     // exact reservation). A direct `VecDeque::from_iter(..)`
-    // call rejects for now, as `Vec::from_iter(..)` does.
+    // call takes the same builtin (check/iter.rs, fx-fromiter).
 
     /// Std's extend: reserve the size hint's lower bound once,
     /// then push at the back.

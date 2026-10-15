@@ -106,6 +106,10 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         || (trait_def == lang.borrow_mut && cx.std_trait_imported("borrow", "BorrowMut"))
         || (trait_def == lang.any && cx.std_trait_imported("any", "Any"))
         || (trait_def == lang.range_bounds && cx.std_trait_imported("ops", "RangeBounds"))
+        || (trait_def == lang.hasher
+            && (cx.std_trait_imported("hash", "Hasher") || cx.enclosing_impl_trait_pub() == Some(trait_def)))
+        || (trait_def == lang.build_hasher
+            && (cx.std_trait_imported("hash", "BuildHasher") || cx.enclosing_impl_trait_pub() == Some(trait_def)))
     {
         return true;
     }

@@ -4596,6 +4596,7 @@ impl FnGen<'_, '_, '_> {
             | B::IterMinByKey
             | B::IterMaxByKey
             | B::IterCollect
+            | B::FromIter
             | B::IterSum
             | B::IterProduct
             | B::IterOptRes => unreachable!("iterator builtins are expanded before codegen (lower/iter.rs)"),

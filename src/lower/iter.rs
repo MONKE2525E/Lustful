@@ -101,6 +101,7 @@ fn expands(b: Builtin) -> bool {
             | B::IterMinByKey
             | B::IterMaxByKey
             | B::IterCollect
+            | B::FromIter
             | B::IterSum
             | B::IterProduct
             | B::HashExtend
@@ -856,6 +857,21 @@ impl Ex<'_, '_, '_> {
                     self.search(b, itp, ty, Place::local(fl), fty, dest, dest_ty)?;
                 }
                 self.drop_local(fl);
+            }
+            // `Type::from_iter(src)` (fx-fromiter): `src` through
+            // `IntoIterator`, then the `collect` expansion, as
+            // `Iterator::collect` is `FromIterator::from_iter`.
+            B::FromIter => {
+                let src = arg()?;
+                let st = self.op_ty(&src)?;
+                let want = self
+                    .wrapper_inner(st)
+                    .or_else(|| it::as_iter_ty(&mut self.body.tys, st))
+                    .ok_or("iterator expansion: bad `from_iter` argument")?;
+                let iv = self.into_iter(src, want)?;
+                let (owned, ty) = self.own(iv)?;
+                self.collect(Place::local(owned), ty, dest, dest_ty)?;
+                self.drop_local(owned);
             }
             B::IterCount | B::IterLast | B::IterMin | B::IterMax | B::IterCollect | B::IterSum | B::IterProduct => {
                 let i = arg()?;
