@@ -140,6 +140,13 @@ pub(crate) struct Front {
     /// streams plus outlines), kept across requests in this crate
     /// session. Unused until the session first takes the resolver path.
     pub(crate) resolve_cache: crate::resolve::worklist::ResolveCache,
+    /// The resolver state the body patch edits in place on the next
+    /// request (driver/patch.rs). Set by a full resolve that reached
+    /// the slot update; None otherwise.
+    pub(crate) patch: Option<super::patch::PatchBase>,
+    /// The last successful compile's `lust-visits:` line (see
+    /// `compile::Visits`), kept for tests.
+    pub(crate) last_visits: String,
 }
 
 pub(crate) struct Chunk {
@@ -333,6 +340,8 @@ impl Session {
                 resolved_crate_ids: None,
                 display_root: None,
                 resolve_cache: crate::resolve::worklist::ResolveCache::new(!persistent),
+                patch: None,
+                last_visits: String::new(),
             },
             caches: Caches {
                 ok: Vec::new(),

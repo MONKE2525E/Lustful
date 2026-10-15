@@ -4488,6 +4488,13 @@ impl Rewrite<'_> {
         if let Some(t) = def.ret {
             self.ty(ast, t, module, outer);
         }
+        self.fn_body(ast, def, module, outer);
+        self.gen_params.truncate(mark);
+    }
+
+    /// The body half of `fn_def_in`: the parameter bindings, then the
+    /// body block. The item's params must already be in `gen_params`.
+    fn fn_body(&mut self, ast: &mut Ast, def: &FnDef, module: ModuleId, outer: &[Frame]) {
         if let Some(body) = def.body {
             let mut scopes = if outer.is_empty() { vec![Frame::default()] } else { outer.to_vec() };
             let mut frame = Frame::default();
@@ -4503,7 +4510,6 @@ impl Rewrite<'_> {
             scopes.push(frame);
             self.block(ast, body, module, &mut scopes);
         }
-        self.gen_params.truncate(mark);
     }
 
     /// Collects the binding names a pattern introduces.
@@ -5833,6 +5839,43 @@ impl Rewrite<'_> {
             }
         }
     }
+}
+
+/// Rewrites the paths of one fn body in a merged Ast against frozen
+/// tables, exactly as the rewrite pass does for that body in a full
+/// resolve: the daemon's body patch (driver/patch.rs) re-parses one
+/// body and rewrites it here instead of resolving the crate again.
+/// `outer` holds the generics of the impl or trait around a method.
+/// The body must hold no items (the patch checks that). Returns the
+/// rewrite's diagnostics; the patch gives up on any.
+#[allow(clippy::too_many_arguments)]
+pub fn rewrite_fn_body(
+    tables: &ResolvedTables,
+    interner: &Interner,
+    local_names: &FxMap<Sym, u8>,
+    std_splice_lo: Option<u32>,
+    ast: &mut Ast,
+    def: &FnDef,
+    outer: Option<&Generics>,
+    module: ModuleId,
+) -> Vec<Diag> {
+    let no_lists = FxMap::default();
+    let mut rw = Rewrite {
+        tables,
+        interner,
+        list_module: &no_lists,
+        local_names,
+        diags: Vec::new(),
+        gen_params: Vec::new(),
+        std_splice_lo,
+        gen_floor: 0,
+    };
+    if let Some(g) = outer {
+        rw.push_params(g);
+    }
+    rw.push_params(&def.generics);
+    rw.fn_body(ast, def, module, &[]);
+    rw.diags
 }
 
 /// True when an `if`/`while` condition holds a `let` (directly or in a

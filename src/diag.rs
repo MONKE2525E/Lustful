@@ -354,6 +354,52 @@ pub fn call_site_span(span: Span) -> Span {
     span
 }
 
+/// The context to use for `ctxt` after a text edit moved source
+/// positions (the daemon's body patch, driver/patch.rs). `shift` maps a
+/// span to its position after the edit. When the call site, the parent
+/// chain, or the hygiene definition point of `ctxt` moves, this
+/// registers a fresh context with the moved spans and the same marks;
+/// else it returns `ctxt`. Records are append-only and the old ones
+/// stay, so cached token streams that still name them stay valid.
+/// `memo` maps old context ids to their answer for one edit.
+pub fn reshift_ctxt(ctxt: CtxtId, shift: &dyn Fn(Span) -> Span, memo: &mut crate::intern::FxMap<u32, CtxtId>) -> CtxtId {
+    if ctxt == CtxtId::ROOT {
+        return ctxt;
+    }
+    if let Some(&c) = memo.get(&ctxt.0) {
+        return c;
+    }
+    let Some(exp) = global_expansion(ctxt) else { return ctxt };
+    let parent = reshift_ctxt(exp.parent, shift, memo);
+    let mut call_span = shift(exp.call_span);
+    call_span.ctxt = reshift_ctxt(exp.call_span.ctxt, shift, memo);
+    let mark = hygiene_mark(ctxt).map(|m| {
+        let mut def_span = shift(m.def_span);
+        def_span.ctxt = reshift_ctxt(m.def_span.ctxt, shift, memo);
+        HygieneMark { def_span, local_def: m.local_def }
+    });
+    let old_mark = hygiene_mark(ctxt);
+    let same_mark = match (mark, old_mark) {
+        (Some(a), Some(b)) => a.def_span == b.def_span,
+        (None, None) => true,
+        _ => false,
+    };
+    let out = if parent == exp.parent && call_span == exp.call_span && same_mark {
+        ctxt
+    } else {
+        let fresh = register_expansion(Expansion { macro_def: exp.macro_def, call_span, parent });
+        if let Some(m) = mark {
+            register_hygiene(fresh, m);
+        }
+        if is_no_capture(ctxt) {
+            mark_no_capture(fresh);
+        }
+        fresh
+    };
+    memo.insert(ctxt.0, out);
+    out
+}
+
 /// The expansion record for a context id from the process-wide table, if any.
 fn global_expansion(ctxt: CtxtId) -> Option<Expansion> {
     if ctxt == CtxtId::ROOT {
@@ -409,6 +455,13 @@ impl SourceMap {
     /// from the last request's index, so it arrives ready-made.
     pub fn set_file(&mut self, file: FileId, path: &str, lines: LineIndex) {
         self.files[file.0 as usize] = SourceFile { path: path.to_string(), lines, text: None };
+    }
+    /// Replaces the kept text of one multi-file crate file and its line
+    /// index (the daemon's body patch edits one file in place).
+    pub fn replace_text(&mut self, file: FileId, text: String, lines: LineIndex) {
+        let f = &mut self.files[file.0 as usize];
+        f.lines = lines;
+        f.text = Some(text);
     }
     /// True when no file has been added yet (a fresh session).
     pub fn is_empty(&self) -> bool {

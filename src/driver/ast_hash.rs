@@ -25,10 +25,10 @@ pub struct AstScans {
 
 /// One item's scan, its fns' body scans, and the body items (`stmt_items`
 /// indexes) at any depth inside it.
-type ItemScans = (scan::ItemScan, Vec<(u64, Vec<Sym>)>, Vec<u32>);
+pub(crate) type ItemScans = (scan::ItemScan, Vec<(u64, Vec<Sym>)>, Vec<u32>);
 
 /// One item's scan and its fns' body scans (see `ItemScans`).
-fn scan_item(ast: &Ast, item: &Item) -> ItemScans {
+pub(crate) fn scan_item(ast: &Ast, item: &Item) -> ItemScans {
     let mut inner = Vec::new();
     let mut w = Walker { ast, idents: None, inner: Some(&mut inner) };
     let mut h = FxHasher::default();

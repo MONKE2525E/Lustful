@@ -259,7 +259,7 @@ pub struct Program<'a> {
     /// template and instance checks read their defining module and
     /// the visibility tables from it. The S7 `Binding` query fns in
     /// driver/graph.rs read through it.
-    pub resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
+    pub resolved: Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>,
     /// The generic tables (traits, templates, instances) built by
     /// `check::generics` during collection and finished by mono.
     pub gx: GenTables<'a>,
@@ -2349,7 +2349,7 @@ pub fn collect_with_order_resolved<'a>(
     crate_ids: CrateIds,
     walk_instances: bool,
     def_order: &mut DefOrder,
-    resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
+    resolved: Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>,
 ) -> Result<Program<'a>, Vec<Diag>> {
     collect_reuse(ast, interner, known, crate_ids, walk_instances, def_order, resolved, &mut Default::default(), &[])
 }
@@ -2367,7 +2367,7 @@ pub fn collect_reuse<'a>(
     crate_ids: CrateIds,
     walk_instances: bool,
     def_order: &mut DefOrder,
-    resolved: Option<Box<crate::resolve::imports::ResolvedTables>>,
+    resolved: Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>,
     reuse: &mut crate::driver::gen_reuse::GenReuse,
     std_routes: &[&'static crate::ty::lang::StdFnDef],
 ) -> Result<Program<'a>, Vec<Diag>> {

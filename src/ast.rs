@@ -19,6 +19,7 @@ macro_rules! ids {
 }
 ids!(ExprId, PatId, TyId, BlockId);
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone, Default)]
 pub struct Ast {
     /// Inner attributes at the start of the file (`#![..]`, `//!` docs).
@@ -145,6 +146,7 @@ impl Ast {
     }
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct Item {
     pub vis: Vis,
@@ -153,6 +155,7 @@ pub struct Item {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub enum ItemKind {
     Fn(FnDef),
@@ -298,6 +301,7 @@ pub enum SelfKind {
     Typed,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct SelfParam {
     pub kind: SelfKind,
@@ -310,6 +314,7 @@ pub struct SelfParam {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct Param {
     /// The binding name for a plain `name: Ty` parameter. When `pat` is set it
@@ -322,6 +327,7 @@ pub struct Param {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct FnDef {
     pub name: Sym,
@@ -349,6 +355,7 @@ pub struct FnDef {
     pub pats: (u32, u32),
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct FieldDef {
     pub name: Sym,
@@ -358,6 +365,7 @@ pub struct FieldDef {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct StructDef {
     pub name: Sym,
@@ -370,6 +378,7 @@ pub struct StructDef {
     pub derives: Vec<(Sym, Span)>,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub enum VariantFields {
     Unit,
@@ -377,6 +386,7 @@ pub enum VariantFields {
     Struct(Vec<FieldDef>),
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct VariantDef {
     pub name: Sym,
@@ -387,6 +397,7 @@ pub struct VariantDef {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct EnumDef {
     pub name: Sym,
@@ -397,6 +408,7 @@ pub struct EnumDef {
     pub derives: Vec<(Sym, Span)>,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct ImplDef {
     /// Inner attributes at the start of the impl body (`#![..]`).
@@ -416,6 +428,7 @@ pub struct ImplDef {
 }
 
 /// A `use` declaration: one tree (`use a::{b, c as d, self};`, `use a::*;`).
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct UseDef {
     pub tree: UseTree,
@@ -449,6 +462,7 @@ pub enum UseKind {
 /// A `mod` item. `body` is Some for an inline module (`mod m { .. }`) and
 /// None for a file module (`mod m;`); a `#[path]` attribute sits in the
 /// item's attrs.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct ModDef {
     pub name: Sym,
@@ -461,6 +475,7 @@ pub struct ModDef {
 
 /// A trait definition. Method signatures are `FnDef`s with no body;
 /// a method with a default body has one.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct TraitDef {
     /// Inner attributes at the start of the trait body (`#![..]`).
@@ -480,6 +495,7 @@ pub struct TraitDef {
 
 /// An associated const in a trait or an impl. `default` is the value in an
 /// impl, and in a trait when a default is written.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct AssocConstDef {
     pub name: Sym,
@@ -494,6 +510,7 @@ pub struct AssocConstDef {
 /// An associated type in a trait or an impl. In an impl, `default` is the
 /// assigned type (`type Item = u8;`); in a trait it is the written default.
 /// Its own generics (a GAT) are recorded here and rejected by the trait owner.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct AssocTypeDef {
     pub name: Sym,
@@ -508,6 +525,7 @@ pub struct AssocTypeDef {
 }
 
 /// A `type` alias item: `type Name<..> = Target;`.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct TypeAliasDef {
     pub name: Sym,
@@ -520,6 +538,7 @@ pub struct TypeAliasDef {
 
 /// A `const` item. `name` is None for an unnamed const (`const _: () = ..;`).
 /// `value` is None only where Rust allows a declaration without one.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct ConstDef {
     pub name: Option<Sym>,
@@ -530,6 +549,7 @@ pub struct ConstDef {
 }
 
 /// A `static` item. `value` is None only in an extern block.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct StaticDef {
     pub name: Sym,
@@ -542,6 +562,7 @@ pub struct StaticDef {
 
 /// A `macro_rules!` definition. The rules stay as raw token trees: matching
 /// and transcription belong to the macro owner (docs/ARCH.md section 6).
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct MacroRulesDef {
     pub name: Sym,
@@ -563,6 +584,7 @@ pub struct MacroCall {
 }
 
 /// An `extern crate` item, with an `as` rename when written.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct ExternCrateDef {
     pub name: Sym,
@@ -572,6 +594,7 @@ pub struct ExternCrateDef {
 }
 
 /// An `extern "abi" { .. }` block of foreign declarations.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct ExternBlockDef {
     /// The ABI string as an index into the AST string table, when written.
@@ -582,6 +605,7 @@ pub struct ExternBlockDef {
 }
 
 /// One declaration inside an extern block.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub enum ForeignItem {
     Fn(FnDef),
@@ -600,6 +624,7 @@ pub enum ForeignItem {
 }
 
 /// A `union` definition: named fields, like a struct.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct UnionDef {
     pub name: Sym,
@@ -677,6 +702,7 @@ impl PathSeg {
     }
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub enum TyExpr {
     Path(Vec<PathSeg>),
@@ -745,6 +771,7 @@ pub struct FtyParam {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct Block {
     /// Inner attributes at the start of the block (`#![..]`), where Rust
@@ -757,6 +784,7 @@ pub struct Block {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub enum Stmt {
     /// A `let` statement. `els` is the block of a `let .. else { .. }` form.
@@ -919,6 +947,7 @@ pub enum FmtPiece {
     Arg { index: usize, debug: bool, spec: FmtSpec },
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct Arm {
     pub attrs: Vec<Attr>,
@@ -936,6 +965,7 @@ pub enum OffsetField {
 }
 
 /// One closure parameter: a pattern and an optional written type.
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub struct ClosureParam {
     pub pat: PatId,
@@ -944,6 +974,7 @@ pub struct ClosureParam {
     pub span: Span,
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub enum Expr {
     Int(u128, Option<IntSuffix>),
@@ -1123,6 +1154,7 @@ pub enum Expr {
     ByteStr(u32),
 }
 
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone)]
 pub enum Pat {
     Wild,

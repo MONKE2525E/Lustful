@@ -180,6 +180,47 @@ impl Stats {
     }
 }
 
+/// What each front-end phase of one compile walked (W-INCR2), rendered
+/// under `LUST_STATS` as one `lust-visits:` line after `lust-stats:`.
+/// `Stats` counts checks; this counts the nodes and items each phase
+/// touched, so a warm edit that costs work in proportion to the crate
+/// shows here even when it rechecks one body. `path` is the front end:
+/// `patch` (driver/patch.rs), `resolve` (a full resolve), or `chunks`
+/// (the single-file path). `files`: files the front end lexed or
+/// parsed again. `nodes`: Ast nodes it built or copied (expressions,
+/// patterns, types, blocks). `spans`: spans the patch moved.
+/// `scanned`: items rescanned structurally. `slot_fns`: fns the slot
+/// update compared. `collect`: items and fns collect walked.
+/// `discovery`: bodies instance discovery checked or replayed.
+/// `checked`: bodies checked.
+#[derive(Default)]
+struct Visits {
+    path: &'static str,
+    files: usize,
+    nodes: usize,
+    spans: usize,
+    scanned: usize,
+    slot_fns: usize,
+    collect: usize,
+    discovery: usize,
+    checked: usize,
+}
+
+impl Visits {
+    fn render(&self, out: &mut String) {
+        let _ = writeln!(
+            out,
+            "lust-visits: path={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={}",
+            self.path, self.files, self.nodes, self.spans, self.scanned, self.slot_fns, self.collect, self.discovery, self.checked
+        );
+    }
+}
+
+/// Arena nodes of one Ast (expressions, patterns, types, blocks).
+pub(super) fn ast_nodes(ast: &Ast) -> usize {
+    ast.exprs.len() + ast.pats.len() + ast.tys.len() + ast.blocks.len()
+}
+
 /// The generic front-end work collect did for one program, for the
 /// stats line: (template checks run, discovery checks run). Generic
 /// reuse (driver/gen_reuse.rs) skips the bodies whose stored results
@@ -222,7 +263,7 @@ fn body_owns_stmt_items(ast: &Ast, item: usize, sub: Option<usize>) -> bool {
 }
 
 /// The fn at one `fn_locations` entry.
-fn fn_def_at(ast: &Ast, item: usize, sub: Option<usize>) -> &crate::ast::FnDef {
+pub(super) fn fn_def_at(ast: &Ast, item: usize, sub: Option<usize>) -> &crate::ast::FnDef {
     match (item != usize::MAX, sub) {
         (false, Some(k)) => match &ast.stmt_items[k].kind {
             ItemKind::Fn(d) => d,
@@ -241,7 +282,7 @@ fn fn_def_at(ast: &Ast, item: usize, sub: Option<usize>) -> &crate::ast::FnDef {
 /// with the distance from its base line (`line`, the line of its `fn`
 /// keyword) to its name's line. A fn with no body or no kept file text
 /// keeps `hash` as is.
-fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, line: u32, hash: u64) -> u64 {
+pub(super) fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, line: u32, hash: u64) -> u64 {
     let Some(body) = def.body else { return hash };
     let (head, end) = (def.name_span, ast.blocks[body.0 as usize].span);
     let Some(text) = map.text(head.file) else { return hash };
@@ -862,7 +903,7 @@ fn item_headers(src: &str) -> Vec<(usize, u64)> {
 }
 
 /// Lengths of the common prefix and common suffix of two strings (not overlapping).
-fn common_ends(a: &[u8], b: &[u8]) -> (usize, usize) {
+pub(super) fn common_ends(a: &[u8], b: &[u8]) -> (usize, usize) {
     // Compare in blocks first: slice equality is a fast memcmp.
     let n = a.len().min(b.len());
     let mut p = 0;
@@ -1541,11 +1582,13 @@ fn resolved_setup(
     std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,
     std_methods: &mut (u32, u32),
     t: &mut Timer,
-) -> Result<(SourceMap, Vec<usize>, Vec<usize>, bool, usize, &'static str, Vec<u32>, Vec<u64>, Option<crate::resolve::imports::ResolvedTables>), Response> {
+    visits: &mut Visits,
+) -> Result<(SourceMap, Vec<usize>, Vec<usize>, bool, usize, &'static str, Vec<u32>, Vec<u64>, Option<std::sync::Arc<crate::resolve::imports::ResolvedTables>>), Response> {
     use crate::resolve::cargo::{self, GraphRequest};
     use crate::resolve::cfg::CfgEnv;
     use crate::resolve::worklist::{self, CrateInput};
     front.resolved_crate = true;
+    let request_start = std::time::SystemTime::now();
     let key = &req.session;
     let code2 = |msg: String| Response { stderr: format!("error: {msg}\n"), code: 2, ..Default::default() };
     // Crate selection: through the Cargo graph when a manifest names the
@@ -1591,6 +1634,34 @@ fn resolved_setup(
         let env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
         (key.krate.root.clone(), user_src.to_string(), crate_ids_default, env, Vec::new(), stem)
     };
+    // Body patch (driver/patch.rs): when every edit since the last full
+    // resolve sits inside a fn body, edit the merged Ast in place.
+    let inputs = super::patch::inputs_fingerprint(&(
+        &root_path,
+        crate_ids.stable,
+        &env,
+        &externs,
+        &crate_name,
+        &front.display_root,
+        &front.client,
+        key.krate.test,
+    ));
+    if let Some(p) = super::patch::try_patch(front, caches, inputs, &root_text, request_start) {
+        (*std_ranges, *std_routes, *std_methods) = (p.std_ranges, p.std_routes, p.std_methods);
+        front.resolved_crate_ids = Some(crate_ids);
+        *visits = Visits {
+            path: "patch",
+            files: p.files,
+            nodes: p.nodes,
+            spans: p.spans,
+            scanned: p.bodies,
+            slot_fns: p.fn_count,
+            ..Default::default()
+        };
+        t.lap("body patch");
+        return Ok((p.map, p.changed, Vec::new(), false, p.fn_count, "bodies", p.fn_lines, p.body_hashes, Some(p.tables)));
+    }
+    front.patch = None;
     // Std splice, in the root file text, exactly as the single-file path
     // (user spans do not move). A second resolve runs when another file
     // names std source the root file does not: the splice then serves
@@ -1766,6 +1837,32 @@ fn resolved_setup(
                 return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() });
             }
         };
+    // Collect reads the splice ranges from the tables before it sets
+    // `Program::shipped_ranges` (generic std bodies check in collect).
+    let mut tables = tables;
+    tables.std_ranges = std_ranges.clone();
+    let tables = std::sync::Arc::new(tables);
+    *visits = Visits {
+        path: "resolve",
+        files: map.file_count(),
+        nodes: ast_nodes(&front.ast),
+        scanned: front.ast.items.len(),
+        slot_fns: fn_count,
+        ..Default::default()
+    };
+    if caches.persistent {
+        front.patch = Some(super::patch::PatchBase::new(
+            front,
+            inputs,
+            unspliced_root,
+            spliced,
+            tables.clone(),
+            (&std_ranges[..], &std_routes[..], *std_methods),
+            fn_lines.clone(),
+            body_hashes.clone(),
+            request_start,
+        ));
+    }
     Ok((map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines, body_hashes, Some(tables)))
 }
 
@@ -1880,9 +1977,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.map = SourceMap::default();
         front.resolved_crate = false;
         front.resolved_crate_ids = None;
+        front.patch = None;
     }
     let use_resolver = front.resolved_crate || wants_resolver;
     t.lap("route");
+    let mut visits = Visits { path: "chunks", files: 1, ..Default::default() };
 
     // Source std (S5): if this file can mention a source std fn, load the
     // checked shipped library (once per session) and splice its fns after
@@ -1906,7 +2005,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Both front ends produce the same locals for the shared tail.
     let (map, mut changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
-        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, route_std_mods, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t) {
+        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, route_std_mods, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t, &mut visits) {
             Ok(x) => x,
             Err(resp) => return resp,
         }
@@ -2507,14 +2606,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         crate_ids,
         req.cmd == Cmd::Build,
         &mut front.def_order,
-        resolved_tables
-            .map(|mut t| {
-                // Collect checks generic std bodies before `shipped_ranges`
-                // is set below; they read the splice ranges from here.
-                t.std_ranges = std_ranges.clone();
-                t
-            })
-            .map(Box::new),
+        resolved_tables,
         &mut caches.gen_reuse,
         &std_routes,
     ) {
@@ -2665,6 +2757,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("collect");
+    visits.collect = front.ast.items.len() + front.ast.stmt_items.len() + program.fns.len();
+    visits.discovery = caches.gen_reuse.discovery_checked + caches.gen_reuse.discovery_reused;
     // A full-mode edit or a const fn edit can move what derived glue
     // was generated from. Record that now, for whatever build comes
     // next: this request may be check-only, and the build request
@@ -2951,6 +3045,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 ..Default::default()
             }
             .render(&mut resp.stderr);
+        }
+        front.last_visits.clear();
+        Visits { checked: work.len(), ..visits }.render(&mut front.last_visits);
+        if stats_on() {
+            resp.stderr.push_str(&front.last_visits);
         }
         if req.timings {
             let _ = writeln!(
@@ -3582,6 +3681,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             discovered: generic_work(&caches.gen_reuse).1,
         }
         .render(&mut resp.stderr);
+    }
+    front.last_visits.clear();
+    Visits { checked: work.len(), ..visits }.render(&mut front.last_visits);
+    if stats_on() {
+        resp.stderr.push_str(&front.last_visits);
     }
     if req.timings {
         let kb = units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;

@@ -9,6 +9,8 @@ pub mod cache;
 mod compile;
 pub(crate) mod gen_reuse;
 pub mod graph;
+mod patch;
+mod span_shift;
 mod session;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
