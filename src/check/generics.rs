@@ -9500,12 +9500,21 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     // Closures need the instance machinery too: each closure body is
     // its own fn with a slot, made here (ARCH 2.9, 4.1); and so do
     // `dyn Fn` values made from fn items, whose vtables only body
-    // checks ask for.
+    // checks ask for. A `panic_any` call asks the same way: lowering
+    // boxes its payload as `dyn Any + Send`, a dyn type no source
+    // text names, so the eager vtable pass cannot see it.
     if !p.gx.user_generics {
         let user = |sp: &Span| !p.in_lang_methods(*sp);
         let closures = p.ast.exprs.iter().zip(&p.ast.expr_spans).any(|(e, sp)| matches!(e, ast::Expr::Closure { .. }) && user(sp));
         let dyns = p.ast.tys.iter().zip(&p.ast.ty_spans).any(|(t, sp)| matches!(t, TyExpr::Dyn { .. }) && user(sp));
-        if closures || dyns || !p.gx.opaques.is_empty() {
+        let panic_any = p.interner.intern("panic_any");
+        let panic_anys = p
+            .ast
+            .exprs
+            .iter()
+            .zip(&p.ast.expr_spans)
+            .any(|(e, sp)| matches!(e, ast::Expr::Path(segs) if segs.last().is_some_and(|s| s.name == panic_any)) && user(sp));
+        if closures || dyns || panic_anys || !p.gx.opaques.is_empty() {
             p.gx.has_generics = true;
             p.gx.user_generics = true;
         }

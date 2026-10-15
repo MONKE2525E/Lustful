@@ -6669,8 +6669,9 @@ pub struct UnwindInit {
     pub hook_runner: Option<u32>,
 }
 
-/// The `main_unit` argument for `p` (`slot_of` maps a fn to its slot):
-/// None under panic=abort when no hook can be installed.
+/// The `main_unit` argument for `p` (`slot_of` maps a fn to its slot).
+/// Always given: a `panic_any` payload's text reads the `&str` and
+/// `String` type ids even under panic=abort with no hook installed.
 pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<UnwindInit> {
     let runner = p
         .fns
@@ -6681,9 +6682,6 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
                 && p.display_path(f.name) == "std::panic::__lust_run_hook"
         })
         .map(|i| slot_of(LocalDefId(i as u32)));
-    if !p.unwind && runner.is_none() {
-        return None;
-    }
     let (a, b) = crate::check::any::type_id_words(p, &p.tys, REF_STR);
     let (c, d) = crate::check::any::type_id_words(p, &p.tys, STRING);
     Some(UnwindInit { unwind: p.unwind, ids: [a, b, c, d], hook_runner: runner })
