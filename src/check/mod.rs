@@ -6101,7 +6101,7 @@ impl<'p> Ctx<'p> {
                                 // A `let...else` allows refutable
                                 // patterns, like a match arm does.
                                 self.pattern(*pat, ty, els.is_some());
-                                if !self.pat_always_matches(*pat) {
+                                if !self.pat_always_matches_at(*pat, init.is_some_and(|i| self.place_behind_deref(i))) {
                                     let s = self.p.ast.pat_span(*pat);
                                     if els.is_none() {
                                         self.err(
@@ -6142,7 +6142,7 @@ impl<'p> Ctx<'p> {
                                 // A `let...else` allows refutable
                                 // patterns, like a match arm does.
                                 self.pattern(*pat, ty, els.is_some());
-                                if !self.pat_always_matches(*pat) {
+                                if !self.pat_always_matches_at(*pat, init.is_some_and(|i| self.place_behind_deref(i))) {
                                     let s = self.p.ast.pat_span(*pat);
                                     if els.is_none() {
                                         self.err(
@@ -7059,7 +7059,8 @@ impl<'p> Ctx<'p> {
                     sites.push(arm.body);
                     self.scopes.truncate(scope);
                 }
-                self.exhaustive(st, arms, span);
+                let behind = self.place_behind_deref(*scrut);
+                self.exhaustive(st, arms, span, behind);
                 result.unwrap_or(NEVER)
             }
             Expr::Call { callee, args } => {
@@ -17385,7 +17386,7 @@ impl<'p> Ctx<'p> {
     /// Exhaustiveness for `match`, by the usefulness check in
     /// `usefulness.rs`. Patterns it cannot read still make it
     /// reject a match that Rust accepts (lust is a subset).
-    fn exhaustive(&mut self, scrut_ty: Ty, arms: &[ast::Arm], span: Span) {
+    fn exhaustive(&mut self, scrut_ty: Ty, arms: &[ast::Arm], span: Span, behind_deref: bool) {
         let p = self.p;
         // A scrutinee of an uninhabited type needs no arm at all
         // (`match v {}` on an empty enum).
@@ -17394,7 +17395,7 @@ impl<'p> Ctx<'p> {
             return;
         }
         let pats: Vec<PatId> = arms.iter().filter(|a| a.guard.is_none()).map(|a| a.pat).collect();
-        if self.covers(&pats) {
+        if self.covers_behind(&pats, behind_deref) {
             return;
         }
         let (_, base) = self.autoderef(scrut_ty);
@@ -17497,10 +17498,28 @@ impl<'p> Ctx<'p> {
     /// enum, a range over the whole type, and `Ok(x)` over
     /// `Result<_, Void>` always match, as in Rust).
     fn pat_always_matches(&self, pat: PatId) -> bool {
+        self.pat_always_matches_at(pat, false)
+    }
+
+    /// `pat_always_matches` for a pattern matched on a place
+    /// behind a dereference (`let Ok(x) = *r`), where empty
+    /// constructors do not count.
+    fn pat_always_matches_at(&self, pat: PatId, behind_deref: bool) -> bool {
         if self.irrefutable(pat) {
             return true;
         }
-        self.covers(&[pat])
+        self.covers_behind(&[pat], behind_deref)
+    }
+
+    /// True when a place expression reads through a dereference
+    /// (`*r`, `(*r).f`, `(*r)[0]`), so its matched place sits
+    /// behind that dereference.
+    fn place_behind_deref(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::Deref(_) => true,
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => self.place_behind_deref(*base),
+            _ => false,
+        }
     }
 
     /// True when a guarded arm's pattern binds a slice

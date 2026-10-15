@@ -77,15 +77,34 @@ const FUEL: u32 = 200_000;
 impl<'p> Ctx<'p> {
     /// True when `pats`, all matching values of one type, together
     /// match every value (rustc's usefulness of a wildcard row).
-    pub(super) fn covers(&self, pats: &[PatId]) -> bool {
+    /// For patterns matched on a place behind a dereference
+    /// (`match *r`, `let Ok(x) = *r`), empty constructors do
+    /// not count there, as in rustc.
+    pub(super) fn covers_behind(&self, pats: &[PatId], behind: bool) -> bool {
         let rows: Vec<Vec<Cell>> = pats.iter().map(|&p| vec![Some(p)]).collect();
         let fuel = std::cell::Cell::new(FUEL);
-        self.rows_cover_all(rows, &fuel)
+        self.rows_cover_all(rows, vec![behind], &fuel)
+    }
+
+    /// True when this pattern's place sits behind a reference:
+    /// an explicit `&` pattern, or the auto-derefs match
+    /// ergonomics recorded for it.
+    fn pat_behind_ref(&self, pat: PatId) -> bool {
+        let mut pat = pat;
+        loop {
+            match self.p.ast.pat(pat) {
+                Pat::At { inner, .. } | Pat::Paren(inner) => pat = *inner,
+                Pat::Ref { .. } => return true,
+                _ => return self.out.pat_derefs[(pat.0 - self.out.pat_base) as usize] > 0,
+            }
+        }
     }
 
     /// True when the rows together match every tuple of values for
-    /// their columns.
-    fn rows_cover_all(&self, rows: Vec<Vec<Cell>>, fuel: &std::cell::Cell<u32>) -> bool {
+    /// their columns. `behind[i]` says column `i`'s place sits
+    /// behind a dereference, where empty constructors do not
+    /// count.
+    fn rows_cover_all(&self, rows: Vec<Vec<Cell>>, behind: Vec<bool>, fuel: &std::cell::Cell<u32>) -> bool {
         if fuel.get() == 0 {
             return false;
         }
@@ -101,11 +120,13 @@ impl<'p> Ctx<'p> {
             self.expand_or_head(row, &mut flat);
         }
         let rows = flat;
-        let ty = rows.iter().find_map(|r| r[0].filter(|&p| !self.cell_is_wild(p)).map(|p| self.pat_ty_of(self.pat_unwrap(p))));
+        let head_pat = rows.iter().find_map(|r| r[0].filter(|&p| !self.cell_is_wild(p)));
+        let ty = head_pat.map(|p| self.pat_ty_of(self.pat_unwrap(p)));
+        let behind_col = behind.first().copied().unwrap_or(false) || head_pat.is_some_and(|p| self.pat_behind_ref(p));
         let splits = match ty {
             None => None,
             Some(t) => {
-                let col = self.column(t);
+                let col = self.column(t, behind_col);
                 let heads: Vec<Head> = rows.iter().map(|r| r[0].map_or(Head::Wild, |p| self.head(p, &col))).collect();
                 self.split(&col, &heads).map(|s| (s, heads))
             }
@@ -116,11 +137,17 @@ impl<'p> Ctx<'p> {
             // heads, and then cover everything only if those rows do.
             let default: Vec<Vec<Cell>> =
                 rows.iter().filter(|r| r[0].is_none_or(|p| self.cell_is_wild(p))).map(|r| r[1..].to_vec()).collect();
-            return self.rows_cover_all(default, fuel);
+            return self.rows_cover_all(default, behind[1.min(behind.len())..].to_vec(), fuel);
         };
         splits.into_iter().all(|s| {
             let spec: Vec<Vec<Cell>> = rows.iter().zip(&heads).filter_map(|(r, h)| self.specialize(r, h, s)).collect();
-            self.rows_cover_all(spec, fuel)
+            let n = match s {
+                Split::Ctor(_, n) | Split::Len(n) | Split::MinLen(n) => n,
+                Split::Range(..) => 0,
+            };
+            let mut spec_behind = vec![behind_col; n];
+            spec_behind.extend_from_slice(&behind[1.min(behind.len())..]);
+            self.rows_cover_all(spec, spec_behind, fuel)
         })
     }
 
@@ -205,9 +232,11 @@ impl<'p> Ctx<'p> {
     }
 
     /// The constructors of type `t`, seen through references.
-    fn column(&self, t: Ty) -> Col {
+    fn column(&self, t: Ty, behind: bool) -> Col {
         let mut t = self.resolve(t);
+        let mut behind = behind;
         while let TyKind::Ref(_, _, inner) = self.kind(t) {
+            behind = true;
             t = self.resolve(inner);
         }
         match self.kind(t) {
@@ -215,7 +244,7 @@ impl<'p> Ctx<'p> {
             TyKind::Unit => Col::Ctors(vec![(0, false)]),
             TyKind::Tuple(ts) => {
                 let elems: Vec<Ty> = self.tys.tys_of(ts).to_vec();
-                let empty = elems.iter().any(|&e| self.ty_uninhabited(e, &[], 0));
+                let empty = !behind && elems.iter().any(|&e| self.ty_uninhabited(e, &[], 0));
                 Col::Ctors(vec![(elems.len(), empty)])
             }
             TyKind::Int(it) => {
@@ -236,9 +265,9 @@ impl<'p> Ctx<'p> {
             },
             TyKind::Adt(..) => {
                 if let Some(elem) = self.tys.option_elem(t) {
-                    Col::Ctors(vec![(0, false), (1, self.ty_uninhabited(elem, &[], 0))])
+                    Col::Ctors(vec![(0, false), (1, !behind && self.ty_uninhabited(elem, &[], 0))])
                 } else if let Some((ok, err)) = self.tys.result_args(t) {
-                    Col::Ctors(vec![(1, self.ty_uninhabited(ok, &[], 0)), (1, self.ty_uninhabited(err, &[], 0))])
+                    Col::Ctors(vec![(1, !behind && self.ty_uninhabited(ok, &[], 0)), (1, !behind && self.ty_uninhabited(err, &[], 0))])
                 } else if let Some(a) = self.tys.local_adt(t) {
                     // A `#[non_exhaustive]` enum needs a wildcard
                     // outside its defining crate (rustc E0004); std's
@@ -258,7 +287,7 @@ impl<'p> Ctx<'p> {
                             .adt(a)
                             .variants
                             .iter()
-                            .map(|v| (v.fields.len(), v.fields.iter().any(|f| self.ty_uninhabited(f.ty, &args, 0))))
+                            .map(|v| (v.fields.len(), !behind && v.fields.iter().any(|f| self.ty_uninhabited(f.ty, &args, 0))))
                             .collect(),
                     )
                 } else {
