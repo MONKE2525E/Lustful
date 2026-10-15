@@ -891,7 +891,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     /// entry. With `drop_uses`, this is drop-liveness: only a `Drop` whose
     /// point is marked uses its local; whole-local assignments and
     /// `StorageDead` kill. Otherwise every read is a use.
-    fn backward(&self, drop_uses: Option<&[bool]>) -> Vec<u64> {
+    fn backward(&self, drop_uses: Option<&[bool]>, init_entry: Option<&[Option<State>]>) -> Vec<u64> {
         let n = self.n_locals();
         let nb = self.body.blocks.len();
         let mut live_in = vec![BitSet::new(n); nb];
@@ -911,6 +911,17 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             for &bi in &order {
                 let bi = bi as usize;
                 self.block_backward(bi, &live_in, &mut live, drop_uses, None);
+                // Drop-liveness ends where the local is not maybe-init:
+                // a shared cleanup block's marked `Drop` (live on the
+                // path that still owns the value) must not flow back
+                // into blocks the value was already moved out of.
+                if let Some(entry) = init_entry
+                    && let Some(e) = &entry[bi]
+                {
+                    for (w, m) in live.words_mut().iter_mut().zip(e.init()) {
+                        *w &= m;
+                    }
+                }
                 if live != live_in[bi] {
                     live_in[bi] = live.clone();
                     changed = true;
@@ -921,6 +932,14 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         let mut out = vec![0u64; self.point_base[nb] * wn];
         for bi in 0..nb {
             self.block_backward(bi, &live_in, &mut live, drop_uses, Some(&mut out));
+            if let Some(entry) = init_entry
+                && let Some(e) = &entry[bi]
+            {
+                let base = self.point_base[bi];
+                for (w, m) in out[base * wn..(base + 1) * wn].iter_mut().zip(e.init()) {
+                    *w &= m;
+                }
+            }
         }
         out
     }
@@ -943,6 +962,23 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
                 {
                     live.remove(dest.local as usize);
                 }
+                // A whole-local move out ends the local's own `Drop`:
+                // after it, the local is not drop-live, not even on
+                // this call's unwind edge into a shared cleanup block
+                // whose `Drop` of it is marked for another path.
+                let mut kill = |o: &Operand| {
+                    if let Operand::Move(p) = o
+                        && p.proj.is_empty()
+                    {
+                        live.remove(p.local as usize);
+                    }
+                };
+                match &b.term {
+                    Terminator::Call { args, .. } => args.iter().for_each(&mut kill),
+                    Terminator::If(o, ..) | Terminator::Switch(o, ..) => kill(o),
+                    Terminator::Panic(parts) => parts_operands(parts, &mut kill),
+                    _ => {}
+                }
             }
         }
         let tp = base + b.stmts.len();
@@ -952,12 +988,27 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
         for (si, s) in b.stmts.iter().enumerate().rev() {
             match drop_uses {
                 None => Self::live_stmt(&s.kind, live),
-                Some(du) => match &s.kind {
-                    StmtKind::Assign(dest, _) if dest.proj.is_empty() => live.remove(dest.local as usize),
-                    StmtKind::StorageDead(l) => live.remove(*l as usize),
-                    StmtKind::Drop(l) if du[base + si] => live.insert(*l as usize),
-                    _ => {}
-                },
+                Some(du) => {
+                    match &s.kind {
+                        StmtKind::Assign(dest, _) if dest.proj.is_empty() => live.remove(dest.local as usize),
+                        StmtKind::StorageDead(l) => live.remove(*l as usize),
+                        StmtKind::Drop(l) if du[base + si] => live.insert(*l as usize),
+                        _ => {}
+                    }
+                    // Whole-local moves out, as at a terminator.
+                    let mut kill = |o: &Operand| {
+                        if let Operand::Move(p) = o
+                            && p.proj.is_empty()
+                        {
+                            live.remove(p.local as usize);
+                        }
+                    };
+                    match &s.kind {
+                        StmtKind::Assign(_, rv) => rvalue_operands(rv, &mut kill),
+                        StmtKind::Print { parts, .. } => parts_operands(parts, &mut kill),
+                        _ => {}
+                    }
+                }
             }
             if let Some(o) = out.as_deref_mut() {
                 let p = base + si;
@@ -972,7 +1023,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
     /// init fixpoint, which says whether a local may be initialized at its
     /// `Drop` (a drop of a moved-out local runs no destructor).
     fn liveness(&mut self, entry: &[Option<State>]) {
-        self.live_entry = self.backward(None);
+        self.live_entry = self.backward(None, None);
         let drop_live = match &self.sol {
             Some(sol) if sol.drop_live.iter().any(|&d| d) => sol.drop_live.clone(),
             _ => return,
@@ -997,7 +1048,7 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             }
         }
         if uses.iter().any(|&u| u) {
-            self.drop_entry = self.backward(Some(&uses));
+            self.drop_entry = self.backward(Some(&uses), Some(entry));
         }
     }
 
