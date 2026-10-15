@@ -60,6 +60,8 @@ OWNER = {
     "cinterop.extern": "W-CINTEROP",
     "cinterop.global_allocator": "W-CINTEROP",
     "ext.unknown_crate": "wave D",
+    "ext.serde": "wave D",
+    "ext.serde_json": "wave D",
     "std.net": "W-SHIM-P2",
     "std.net_addr": "W-STD-C",
     "std.error": "W-STD-C",

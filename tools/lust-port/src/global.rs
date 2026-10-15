@@ -73,6 +73,8 @@ pub const EXT_CRATES: &[&str] = &[
     "miow",
     "same_file",
     "libc",
+    "serde",
+    "serde_json",
 ];
 pub const STD_ROOTS: &[&str] = &["std", "core", "alloc"];
 

@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "description": "Per-crate dev-path decision from DESIGN-TS section 4 and INVENTORY Q4. decision is one of builtin-adapter, c-shim, compile-from-source. Release always uses the original crates through Cargo. Match by cargo package name; names are also tried with - and _ swapped. Unknown crates get decision unknown in reports.",
+ "description": "Per-crate dev-path decision from DESIGN-TS section 4 and INVENTORY Q4. decision is one of builtin-adapter, c-shim, compile-from-source, cargo-built-tool. Release always uses the original crates through Cargo. Match by cargo package name; names are also tried with - and _ swapped. Unknown crates get decision unknown in reports.",
  "dependencies": [
   {
    "name": "goport_util",
@@ -241,6 +241,18 @@
    "decision": "c-shim",
    "milestone": 7,
    "notes": "Part of flate2. Mostly safe but grouped with the gzip shim."
+  },
+  {
+   "name": "serde",
+   "decision": "cargo-built-tool",
+   "milestone": null,
+   "notes": "Used only by the ts_ast_codegen and ts_diagnostics_codegen tools, which run under Cargo (verify.sh) with committed output. The Deserialize derive is a proc macro; a lust adapter crate cannot replace it, and a compiler built-in derive is large. Named gap: feature ext.serde (w-tail)."
+  },
+  {
+   "name": "serde_json",
+   "decision": "cargo-built-tool",
+   "milestone": null,
+   "notes": "Same two codegen tools as serde: from_str into Deserialize types. Needs ext.serde plus byte-exact serde_json error text. Named gap: feature ext.serde_json (w-tail)."
   }
  ]
 }

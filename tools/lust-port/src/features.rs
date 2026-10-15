@@ -245,6 +245,13 @@ mod tests {
         assert_eq!(t.classify("std.type.std::collections::HashMap").unwrap().id, "std.hashmap");
         assert_eq!(t.classify("macro.write").unwrap().id, "macros.std_unsupported");
         assert_eq!(t.classify("macro.matches").unwrap().id, "macros.std_missing");
+        // The serde split (w-tail): per-crate rows beat the catch-alls.
+        assert_eq!(t.classify("ext.use.serde::Deserialize").unwrap().id, "ext.serde");
+        assert_eq!(t.classify("derive.Deserialize").unwrap().id, "ext.serde");
+        assert_eq!(t.classify("derive.Serialize").unwrap().id, "ext.serde");
+        assert_eq!(t.classify("derive.Builder").unwrap().id, "derives.unknown");
+        assert_eq!(t.classify("ext.expr.serde_json::from_str").unwrap().id, "ext.serde_json");
+        assert_eq!(t.classify("ext.expr.anyhow::Ok").unwrap().id, "ext.unknown_crate");
     }
 
     #[test]

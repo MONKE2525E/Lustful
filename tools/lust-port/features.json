@@ -654,7 +654,7 @@
    "fix_class": "compiler",
    "release_safe_rewrite": false,
    "release_impact": "unchanged",
-   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_serde.rs is a lust-only oracle and lust rejects it (L0402). The attribute only has meaning under derive(Serialize) or derive(Deserialize), which lust also rejects (derives.unknown), so accepting and ignoring it would change program behavior. It stays a clean reject.",
+   "notes": "Probe evidence: tools/lust-port/tests/features/attrs_serde.rs is a lust-only oracle and lust rejects it (L0402). The attribute only has meaning under derive(Serialize) or derive(Deserialize), which map to ext.serde (a named gap, w-tail), so accepting and ignoring the helper attribute would change program behavior. It stays a clean reject, and this row stays separate so the helper-attribute count remains visible.",
    "primary_keys": [
     "attr.serde*"
    ],
@@ -1071,6 +1071,51 @@
     "ext.type.tikv_jemallocator::*",
     "ext.expr.tikv_jemallocator::*",
     "ext.use.tikv_jemallocator::*"
+   ]
+  },
+  {
+   "id": "ext.serde",
+   "title": "External crate serde 1.0.228 with derive feature: Deserialize/Serialize derives (proc macros)",
+   "status": "unsupported",
+   "milestone": null,
+   "inventory_step": null,
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Named gap (w-tail). Split from ext.unknown_crate and derives.unknown. In ts-rust, serde is used only by the two codegen tools (tools/ts_ast_codegen, tools/ts_diagnostics_codegen): 15 derive(Deserialize) types fed by serde_json::from_str, with #[serde(default)], rename, rename_all = \"camelCase\", and untagged. The derive output is used, so the derives cannot be ignored. A lust adapter cannot stand in for a proc-macro derive: support needs a compiler built-in derive plus the serde trait framework, which is large. The tools run under Cargo (scripts/verify.sh: cargo run -p ts_ast_codegen) and their output files are committed, so the dev path does not need lust to build them. See dependencies.json (decision cargo-built-tool). Probes: ext_serde.rs (lust-only oracle; the derive is a clean reject, never a silent accept).",
+   "primary_keys": [
+    "ext.type.serde::*",
+    "derive.Deserialize",
+    "derive.Serialize"
+   ],
+   "keys": [
+    "ext.type.serde::*",
+    "ext.expr.serde::*",
+    "ext.use.serde::*",
+    "derive.Deserialize",
+    "derive.Serialize"
+   ]
+  },
+  {
+   "id": "ext.serde_json",
+   "title": "External crate serde_json 1.0.150: from_str into Deserialize types",
+   "status": "unsupported",
+   "milestone": null,
+   "inventory_step": null,
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Named gap (w-tail). Split from ext.unknown_crate. In ts-rust, serde_json::from_str is called 5 times in the two codegen tools, always into a serde Deserialize type (or a String), and its Error reaches output through Display. A correct adapter must match serde_json error text and positions byte for byte and needs ext.serde first, so it is large. The tools run under Cargo and their output files are committed. See dependencies.json (decision cargo-built-tool). Probes: ext_serde_json.rs (lust-only oracle).",
+   "primary_keys": [
+    "ext.type.serde_json::*",
+    "ext.expr.serde_json::*"
+   ],
+   "keys": [
+    "ext.type.serde_json::*",
+    "ext.expr.serde_json::*",
+    "ext.use.serde_json::*"
    ]
   },
   {
@@ -1663,7 +1708,7 @@
    "fix_class": "manual",
    "release_safe_rewrite": false,
    "release_impact": "runtime-review",
-   "notes": "May be proc-macro derives from other crates. Proc macros stay out of PLAN.md.",
+   "notes": "May be proc-macro derives from other crates. Proc macros stay out of PLAN.md. w-tail: every ts-rust use of this row was serde's derive(Deserialize), now ext.serde; this row stays as the catch-all for any other unknown derive.",
    "primary_keys": [
     "derive.*"
    ],
@@ -1703,7 +1748,7 @@
    "fix_class": "adapter",
    "release_safe_rewrite": false,
    "release_impact": "runtime-review",
-   "notes": "Add a decision in dependencies.json and a rule here. Only crates in the scanner EXT list produce ext.* keys; other crates show in the dependency report as unknown.",
+   "notes": "Add a decision in dependencies.json and a rule here. Only crates in the scanner EXT list produce ext.* keys; other crates show in the dependency report as unknown. w-tail split out ext.serde and ext.serde_json (the ts-rust codegen tools); bare one-segment paths are locals, not crate roots (analyze.rs resolve), so this row has no ts-rust files left. It stays as the catch-all for the next crate.",
    "primary_keys": [
     "ext.type.*"
    ],

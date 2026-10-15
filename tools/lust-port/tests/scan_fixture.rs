@@ -131,6 +131,43 @@ fn human_output_groups_findings() {
 }
 
 #[test]
+fn bare_names_are_locals_and_serde_paths_are_named() {
+    // One directory per test, as in `fixture`.
+    let root = std::env::temp_dir().join(format!("lust-port-test-{}-serde", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    write(&root, "Cargo.toml", "[package]\nname = \"fixture2\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &root,
+        "src/lib.rs",
+        "pub mod bare;\nuse serde::Deserialize;\n#[derive(Debug, Deserialize)]\npub struct Cfg { pub name: String }\npub fn read(s: &str) -> String { serde_json::from_str::<String>(s).unwrap_or_default() }\n",
+    );
+    // `notify` and `same_file` are crate names in the seed list, but
+    // here they are a local binding and a local function. A bare
+    // one-segment path is never a crate root (w-tail).
+    write(
+        &root,
+        "src/bare.rs",
+        "fn same_file() -> bool { true }\npub fn g(notify: i32) -> i32 { if same_file() { notify } else { 0 } }\n",
+    );
+    let v = scan_json(&root);
+    let file = |name: &str| v["files"].as_array().unwrap().iter().find(|f| f["file"] == name).unwrap().clone();
+    let missing = |f: &serde_json::Value| {
+        f["missing_features"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    let lib = missing(&file("src/lib.rs"));
+    assert!(lib.contains(&"ext.serde".to_string()), "lib missing: {lib:?}");
+    assert!(lib.contains(&"ext.serde_json".to_string()), "lib missing: {lib:?}");
+    assert!(!lib.contains(&"ext.unknown_crate".to_string()), "lib missing: {lib:?}");
+    assert!(!lib.contains(&"derives.unknown".to_string()), "lib missing: {lib:?}");
+    let bare = missing(&file("src/bare.rs"));
+    assert!(bare.is_empty(), "bare locals blocked the file: {bare:?}");
+    // The dependency report is separate from path use: no serde in
+    // this manifest, so no dependency rows appear for it.
+    let deps = v["dependencies"].as_array().unwrap();
+    assert!(!deps.iter().any(|d| d["name"] == "serde"), "deps: {deps:?}");
+}
+
+#[test]
 fn unknown_package_is_an_error() {
     let root = fixture("human");
     let out = Command::new(env!("CARGO_BIN_EXE_lust-port"))
