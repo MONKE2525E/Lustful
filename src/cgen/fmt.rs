@@ -303,6 +303,23 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut 
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::borrow_mut_error_def()) == Some(*a) => {
             format!("  (void)p; return lust_f_pad(f, {});\n", lit("RefCell already borrowed"))
         }
+        // core's conversion errors (fx-tryfrom): str Display of
+        // core's texts, the kind's for `TryFromIntError`.
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::try_from_int_error_def()) == Some(*a) => {
+            let kct = p.tys.local_adt_of(crate::check::generics::int_error_kind_def()).map_or(CTy::Unit, CTy::Adt);
+            format!(
+                "  return {} == 2 ? lust_f_pad(f, {}) : lust_f_pad(f, {});\n",
+                disc_call(p, &kct, "(&(*p).f0)"),
+                lit("number too large to fit in target type"),
+                lit("number too small to fit in target type")
+            )
+        }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::char_try_from_error_def()) == Some(*a) => {
+            format!("  (void)p; return lust_f_pad(f, {});\n", lit("converted integer out of range for `char`"))
+        }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::try_from_char_error_def()) == Some(*a) => {
+            format!("  (void)p; return lust_f_pad(f, {});\n", lit("unicode code point out of range"))
+        }
         // mpsc's errors (W-THREADS): str Display of std's text.
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::recv_error_def()) == Some(*a) => {
             format!("  (void)p; return lust_f_pad(f, {});\n", lit("receiving on a closed channel"))

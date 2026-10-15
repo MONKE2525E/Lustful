@@ -1500,6 +1500,16 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/hash/DefaultHasher",
     "std/hash/BuildHasherDefault",
     "core/hash/BuildHasherDefault",
+    "core/num/TryFromIntError",
+    "std/num/TryFromIntError",
+    "core/num/IntErrorKind",
+    "std/num/IntErrorKind",
+    "core/char/CharTryFromError",
+    "std/char/CharTryFromError",
+    "core/char/TryFromCharError",
+    "std/char/TryFromCharError",
+    "core/convert/Infallible",
+    "std/convert/Infallible",
 ];
 
 const STD_TRAIT_PATHS: &[&str] = &[
@@ -1523,6 +1533,10 @@ const STD_TRAIT_PATHS: &[&str] = &[
     "std/convert/AsRef",
     "core/convert/AsMut",
     "std/convert/AsMut",
+    "core/convert/TryFrom",
+    "std/convert/TryFrom",
+    "core/convert/TryInto",
+    "std/convert/TryInto",
     "core/default/Default",
     "std/default/Default",
     "core/fmt/Debug",

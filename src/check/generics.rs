@@ -76,6 +76,12 @@ pub struct LangTraits {
     pub from_iterator: DefId,
     pub from: DefId,
     pub into: DefId,
+    /// `core::convert::TryFrom` and `TryInto`, each with its `Error`
+    /// assoc (fx-tryfrom; check/tryfrom.rs).
+    pub try_from: DefId,
+    pub try_into: DefId,
+    pub assoc_try_from_error: DefId,
+    pub assoc_try_into_error: DefId,
     pub fn_: DefId,
     pub fn_mut: DefId,
     pub fn_once: DefId,
@@ -202,6 +208,8 @@ impl LangTraits {
         let build_hasher = lang_trait(&["core", "hash"], "BuildHasher");
         let from = lang_trait(&["core", "convert"], "From");
         let into = lang_trait(&["core", "convert"], "Into");
+        let try_from = lang_trait(&["core", "convert"], "TryFrom");
+        let try_into = lang_trait(&["core", "convert"], "TryInto");
         let any = lang_trait(&["core", "any"], "Any");
         let assoc_out = |t: DefId| lang_assoc(t, "Output");
         LangTraits {
@@ -251,6 +259,10 @@ impl LangTraits {
             from_iterator,
             from,
             into,
+            try_from,
+            try_into,
+            assoc_try_from_error: lang_assoc(try_from, "Error"),
+            assoc_try_into_error: lang_assoc(try_into, "Error"),
             fn_,
             fn_mut,
             fn_once,
@@ -376,6 +388,8 @@ impl LangTraits {
             "BuildHasher" => self.build_hasher,
             "From" => self.from,
             "Into" => self.into,
+            "TryFrom" => self.try_from,
+            "TryInto" => self.try_into,
             "Fn" => self.fn_,
             "FnMut" => self.fn_mut,
             "FnOnce" => self.fn_once,
@@ -537,6 +551,22 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.build_hasher, "BuildHasher", 0, vec![], vec![(lang.assoc_hasher, "Hasher")], &["build_hasher", "hash_one"]),
         rec(lang.from, "From", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["from"]),
         rec(lang.into, "Into", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["into"]),
+        rec(
+            lang.try_from,
+            "TryFrom",
+            1,
+            vec![self_pred(tys, lang.sized, &[])],
+            vec![(lang.assoc_try_from_error, "Error")],
+            &["try_from"],
+        ),
+        rec(
+            lang.try_into,
+            "TryInto",
+            1,
+            vec![self_pred(tys, lang.sized, &[])],
+            vec![(lang.assoc_try_into_error, "Error")],
+            &["try_into"],
+        ),
         rec(lang.fn_, "Fn", 1, vec![self_pred(tys, lang.fn_mut, &[1])], vec![], &["call"]),
         rec(lang.fn_mut, "FnMut", 1, vec![self_pred(tys, lang.fn_once, &[1])], vec![], &["call_mut"]),
         rec(lang.fn_once, "FnOnce", 1, vec![], vec![(lang.output_of(lang.fn_once).unwrap(), "Output")], &["call_once"]),
@@ -558,6 +588,18 @@ fn into_iter_item_bound(lang: &LangTraits, tys: &mut impl TyIntern) -> Predicate
     let args = tys.intern_args(&[GenericArg::Ty(into_iter)]);
     let bindings = tys.intern_bindings(&[(lang.assoc_item, GenericArg::Ty(item))]);
     Predicate::Trait(Binder::plain(TraitRef { def: lang.iterator, args, bindings }))
+}
+
+/// The defs of `TryFrom::Error` and `TryInto::Error`, recomputed
+/// from their std paths for callers without a `LangTraits` at hand
+/// (the solver's pure context, fx-tryfrom).
+pub fn try_from_error_assoc() -> DefId {
+    lang_assoc(lang_trait(&["core", "convert"], "TryFrom"), "Error")
+}
+
+/// `TryInto::Error`'s def (see `try_from_error_assoc`).
+pub fn try_into_error_assoc() -> DefId {
+    lang_assoc(lang_trait(&["core", "convert"], "TryInto"), "Error")
 }
 
 /// The def of `core::cmp::Ordering`, the fieldless enum lang
@@ -659,6 +701,63 @@ pub fn try_recv_error_def() -> DefId {
     std_adt_table()[6].2
 }
 
+/// The def of `core::num::TryFromIntError` (fx-tryfrom), a synthetic
+/// tuple struct over `IntErrorKind` like `Ordering`. Only `num::`
+/// paths reach it (no flat name, like `fmt::Error`).
+pub fn try_from_int_error_def() -> DefId {
+    std_adt_table()[13].2
+}
+
+/// The `core::num::TryFromIntError` type.
+pub fn try_from_int_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(try_from_int_error_def(), EMPTY_ARGS))
+}
+
+/// The def of `core::num::IntErrorKind`, the kind field of
+/// `TryFromIntError` (fx-tryfrom): `Empty`, `InvalidDigit`,
+/// `PosOverflow`, `NegOverflow`, `Zero`, in core's order.
+pub fn int_error_kind_def() -> DefId {
+    std_adt_table()[14].2
+}
+
+/// The `core::num::IntErrorKind` type.
+pub fn int_error_kind_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(int_error_kind_def(), EMPTY_ARGS))
+}
+
+/// The def of `core::char::CharTryFromError` (fx-tryfrom), the error
+/// of `char: TryFrom<u32>`: a tuple struct over `()`.
+pub fn char_try_from_error_def() -> DefId {
+    std_adt_table()[15].2
+}
+
+/// The `core::char::CharTryFromError` type.
+pub fn char_try_from_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(char_try_from_error_def(), EMPTY_ARGS))
+}
+
+/// The def of `core::char::TryFromCharError` (fx-tryfrom), the error
+/// of `u8`/`u16`/`usize: TryFrom<char>`: a tuple struct over `()`.
+pub fn try_from_char_error_def() -> DefId {
+    std_adt_table()[16].2
+}
+
+/// The `core::char::TryFromCharError` type.
+pub fn try_from_char_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(try_from_char_error_def(), EMPTY_ARGS))
+}
+
+/// The def of `core::convert::Infallible` (fx-tryfrom), core's empty
+/// enum: the `Error` of the blanket `TryFrom` through `Into`.
+pub fn infallible_def() -> DefId {
+    std_adt_table()[17].2
+}
+
+/// The `core::convert::Infallible` type.
+pub fn infallible_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(infallible_def(), EMPTY_ARGS))
+}
+
 /// The `core::sync::atomic::Ordering` type.
 pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
@@ -687,14 +786,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 13] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 18] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 13] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 13]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 18] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 18]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -711,6 +810,11 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 13] {
             (10, "BorrowError", adt(&["core", "cell"], "BorrowError"), false),
             (11, "BorrowMutError", adt(&["core", "cell"], "BorrowMutError"), false),
             (12, "Bound", adt(&["core", "ops"], "Bound"), true),
+            (13, "TryFromIntError", adt(&["core", "num"], "TryFromIntError"), false),
+            (14, "IntErrorKind", adt(&["core", "num"], "IntErrorKind"), true),
+            (15, "CharTryFromError", adt(&["core", "char"], "CharTryFromError"), false),
+            (16, "TryFromCharError", adt(&["core", "char"], "TryFromCharError"), false),
+            (17, "Infallible", adt(&["core", "convert"], "Infallible"), true),
         ]
     })
 }
@@ -719,7 +823,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 13] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -756,7 +860,12 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
         ("cell", "BorrowMutError", borrow_mut_error_def()),
-            ]
+        ("num", "TryFromIntError", try_from_int_error_def()),
+        ("num", "IntErrorKind", int_error_kind_def()),
+        ("char", "CharTryFromError", char_try_from_error_def()),
+        ("char", "TryFromCharError", try_from_char_error_def()),
+        ("convert", "Infallible", infallible_def()),
+    ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
         .map(|(_, _, d)| d)
@@ -878,6 +987,14 @@ pub fn lang_method_sigs(
                 (d, "from") if d == lang.from => LangMethodSig { self_kind: None, params: vec![p1], ret: p0, ret_borrows_from: None },
                 (d, "into") if d == lang.into => {
                     LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: p1, ret_borrows_from: None }
+                }
+                (d, "try_from") if d == lang.try_from => {
+                    let err = proj(tys, lang.assoc_try_from_error, &[p0, p1]);
+                    LangMethodSig { self_kind: None, params: vec![p1], ret: tys.mk_result(p0, err), ret_borrows_from: None }
+                }
+                (d, "try_into") if d == lang.try_into => {
+                    let err = proj(tys, lang.assoc_try_into_error, &[p0, p1]);
+                    LangMethodSig { self_kind: Some(Value), params: vec![p0], ret: tys.mk_result(p1, err), ret_borrows_from: None }
                 }
                 (d, "default") if d == lang.default => {
                     LangMethodSig { self_kind: None, params: Vec::new(), ret: p0, ret_borrows_from: None }
@@ -6509,6 +6626,39 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let opt_p0 = p.tys.mk_option(p0);
         for (dst, src) in [(vec_p0, box_slice), (box_slice, vec_p0), (opt_p0, p0)] {
             insert_synthetic(p, &mut ordinal, lang.from, dst, &[src], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
+    // TryFrom through Into (Error = Infallible), TryInto through
+    // TryFrom (fx-tryfrom; core::convert's two blankets), and the
+    // `Display` records of core's conversion error types. The scalar
+    // `TryFrom` pairs are builtins (check/tryfrom.rs), like numeric
+    // `From`: selection answers them ahead of these records.
+    {
+        let inf = p.tys.intern(TyKind::Adt(infallible_def(), EMPTY_ARGS));
+        let (nt, nu) = (p.interner.intern("T"), p.interner.intern("U"));
+        let pred = |p: &mut Program, pred_def: DefId| {
+            let args = p.tys.intern_args(&[GenericArg::Ty(p1), GenericArg::Ty(p0)]);
+            Generics {
+                parent: None,
+                params: vec![
+                    ParamDef { name: nt, kind: ParamKind::Type, span },
+                    ParamDef { name: nu, kind: ParamKind::Type, span },
+                ],
+                predicates: vec![Predicate::Trait(Binder::plain(TraitRef { def: pred_def, args, bindings: EMPTY_BINDINGS }))],
+            }
+        };
+        let g = pred(p, lang.into);
+        insert_synthetic(p, &mut ordinal, lang.try_from, p0, &[p1], g, vec![(lang.assoc_try_from_error, inf)], Synthetic::Lang, false, span);
+        let err_args = p.tys.intern_args(&[GenericArg::Ty(p1), GenericArg::Ty(p0)]);
+        let err_proj = p.tys.intern(TyKind::Projection(AssocId(lang.assoc_try_from_error), err_args));
+        let g = pred(p, lang.try_from);
+        insert_synthetic(p, &mut ordinal, lang.try_into, p0, &[p1], g, vec![(lang.assoc_try_into_error, err_proj)], Synthetic::Lang, false, span);
+        // core's `Display` for its conversion errors (the text is
+        // `display_glue_body`'s): a record, so the source `Error`
+        // impls in library/core/src/error.rs meet their supertrait.
+        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def()] {
+            let t = p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
+            insert_synthetic(p, &mut ordinal, lang.display, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
     }
     // The conversion traits (W-STD-B, check/convert.rs), as core and

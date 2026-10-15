@@ -31,6 +31,7 @@ pub mod sized;
 pub mod stdtypes;
 pub mod std_inherent;
 pub mod tls;
+pub mod tryfrom;
 pub mod usefulness;
 pub mod sync;
 pub mod unwind;
@@ -765,6 +766,13 @@ pub enum Res {
     /// A numeric `From::from` call, lowered as a cast to the
     /// call's type. Widening conversions only (checked).
     FromCast,
+    /// A scalar `TryFrom::try_from` call, lowered as a checked
+    /// cast to the call's `Result` type (check/tryfrom.rs).
+    TryFromCast,
+    /// A `TryFrom::try_from` call through the blanket from `Into`:
+    /// `Ok` around the `From` call, or around the argument itself
+    /// for the identity impl (check/tryfrom.rs).
+    TryFromOk(Option<LocalDefId>),
     /// A scalar `Default::default()` call, lowered as the zero
     /// value of the call's type.
     DefaultVal,
@@ -877,6 +885,10 @@ pub enum PrimOpKind {
     /// `recv.into()` to a scalar target: the widening cast core's
     /// `From` impl is, cast to the call's type.
     IntoCast,
+    /// `recv.try_into()` to a scalar target: the checked cast
+    /// core's `TryFrom` impl is, to the call's `Result` type
+    /// (check/tryfrom.rs).
+    TryIntoCast,
     /// `recv.into_iter()` on an iterator: core's blanket
     /// `impl<I: Iterator> IntoIterator for I` returns the receiver.
     IntoIterSelf,
@@ -1270,6 +1282,10 @@ struct Ctx<'p, 'a> {
     /// The last trait pick a probe confirmed (`record_pick_env`): the call
     /// and its trait.
     last_pick: Option<(ExprId, DefId)>,
+    /// `?` expressions whose error type was still a projection:
+    /// (expr, error type, return error type, span). Their
+    /// conversion decides at body end (`decide_try_res`).
+    deferred_try: Vec<(ExprId, Ty, Ty, Span)>,
     /// Operators whose result waits on an `Output` obligation because
     /// an operand was a general variable at their first check (see
     /// `binary`).
@@ -1595,6 +1611,7 @@ fn check_fn_mode<'p, 'a>(
         std_first: Vec::new(),
         user_deref_call: None,
         last_pick: None,
+        deferred_try: Vec::new(),
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
         deferred_layout: Vec::new(),
@@ -2330,6 +2347,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// rechecks this body when a visibility it asked about changes.
     fn check_field_vis(&mut self, a: AdtId, field: Sym, span: Span) {
         let p = self.p;
+        // std's own bodies (`Result::map` calling a user constructor
+        // passed as a value) reach user items only through generics,
+        // which the naming site already checked.
+        if self.module == crate::ty::defs::STD_MODULE {
+            return;
+        }
         // The fields of std's structs are private to std.
         if generics::is_std_adt(&p.tys, a) {
             let name = self.name(field).to_string();
@@ -2356,6 +2379,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// Tuple-field visibility, like `check_field_vis` for `t.1` forms.
     fn check_tuple_field_vis(&mut self, a: AdtId, index: u32, span: Span) {
         let p = self.p;
+        // std's own bodies (`Result::map` calling a user constructor
+        // passed as a value) reach user items only through generics,
+        // which the naming site already checked.
+        if self.module == crate::ty::defs::STD_MODULE {
+            return;
+        }
+        // std's tuple structs (`TryFromIntError`, the char errors) keep
+        // their fields private to std, like `check_field_vis`.
+        if generics::is_std_adt(&p.tys, a) && !p.adt(a).is_enum {
+            self.err("L0510", span, format!("field `{index}` is private"), "Use the type's methods instead.");
+            return;
+        }
         let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
@@ -2376,6 +2411,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// (rustc E0603), for calls and patterns alike.
     fn check_ctor_vis(&mut self, a: AdtId, span: Span) {
         let p = self.p;
+        // std's own bodies (`Result::map` calling a user constructor
+        // passed as a value) reach user items only through generics,
+        // which the naming site already checked.
+        if self.module == crate::ty::defs::STD_MODULE {
+            return;
+        }
+        if generics::is_std_adt(&p.tys, a) && !p.adt(a).is_enum {
+            let name = p.display_path(p.adt(a).name);
+            self.err("L0510", span, format!("tuple struct constructor `{name}` is private"), "Use the type's methods instead.");
+            return;
+        }
         let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
@@ -3198,7 +3244,12 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let normed: Vec<GenericArg> = raw
                 .iter()
                 .map(|&g| match g {
-                    GenericArg::Ty(t) => GenericArg::Ty(self.normalize_here(t)),
+                    // Variables resolve first: a variable bound to
+                    // `<u32 as TryInto<u16>>::Error` normalizes too.
+                    GenericArg::Ty(t) => {
+                        let t = if self.tys.flags(t).contains_infer() { self.deep(t) } else { t };
+                        GenericArg::Ty(self.normalize_here(t))
+                    }
                     other => other,
                 })
                 .collect();
@@ -3206,6 +3257,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             TraitRef { args, ..tr }
         };
         let self_ty = self.deep(self.tys.args(tr.args)[0].as_ty().unwrap_or(ERROR));
+        // A projection that cannot normalize while an input is still a
+        // variable (`<u32 as TryInto<?T>>::Error: Debug` from
+        // `x.try_into().unwrap()` before a later use names `?T`) waits
+        // for inference instead of failing (fx-tryfrom).
+        if matches!(self.tys.kind(self_ty), TyKind::Projection(..)) && self.has_unbound_deep(self_ty) {
+            return Selection::Ambiguous;
+        }
         if tr.def == lang.sized {
             // A general variable may still become `[T]`, `str`, a dyn
             // type, or a `?Sized` param's stand-in (`f(s)` runs this
@@ -3250,6 +3308,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 Some(false) => return Selection::NoImpl,
                 None => {}
             }
+        }
+        // Scalar `TryFrom` and `TryInto` are checked casts, like
+        // numeric `From` (check/tryfrom.rs).
+        if let Some(sel) = self.try_from_select(tr, self_ty) {
+            return sel;
         }
         if lang.is_auto(tr.def) {
             match self.auto_holds(tr.def, self_ty) {
@@ -7289,7 +7352,6 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// `From` impl, selected here like `From::from` itself is in
     /// `assoc_call`. The conversion plan rides in `Res` for lowering.
     fn try_expr(&mut self, e: ExprId, inner: ExprId, span: Span) -> Ty {
-        let p = self.p;
         let it0 = self.expr(inner, None);
         self.run_obligations(false);
         let it = self.resolve(it0);
@@ -7336,57 +7398,17 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::TryPlain);
                 return ok_t;
             };
-            // The common case: the error types already agree.
-            let snap = self.snapshot_vars();
-            if self.unify(err_t, ret_err) {
+            // An error type still a projection (`x.try_into()?`
+            // before a later use fixes the target, fx-tryfrom)
+            // decides its conversion at body end, once it
+            // normalizes; anything else decides here.
+            let err_t = self.normalize_here(err_t);
+            if matches!(self.kind(err_t), TyKind::Projection(..)) {
+                self.deferred_try.push((e, err_t, ret_err, span));
                 self.set_res(e, Res::TryPlain);
                 return ok_t;
             }
-            self.rollback_vars(snap);
-            let (e1, e2) = (self.resolve(err_t), self.resolve(ret_err));
-            if Self::numeric_from_ok(self.kind(e1), self.kind(e2)) {
-                self.set_res(e, Res::TryCast);
-                return ok_t;
-            }
-            // The builtin `From<&str>` and `From<&String>` for
-            // String: a copy, with no impl record behind it.
-            if e2 == STRING && matches!(self.kind(e1), TyKind::Ref(_, _, i) if i == STR || i == STRING) {
-                self.set_res(e, Res::TryStringFrom);
-                return ok_t;
-            }
-            let args_id = self.tys.intern_args(&[GenericArg::Ty(e2), GenericArg::Ty(e1)]);
-            let tr = TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS };
-            // The obligation is what makes a generic body without the
-            // `From` bound fail at finish; selection here only picks
-            // the call target for lowering.
-            self.obl.push_trait_at(tr, span, 0);
-            let sel = self.select_obligation_at(tr, span, 0);
-            let from_fn = match &sel {
-                Selection::Impl { id, args: impl_args, .. } => {
-                    self.method_instance_for_impl(e, *id, tr, impl_args.clone(), "from", span).map(|(local, _, _)| local)
-                }
-                _ => None,
-            };
-            match (sel, from_fn) {
-                (_, Some(local)) => self.set_res(e, Res::TryFrom(local)),
-                // The MAX marker is a template-only plan: an instance
-                // check re-selects and fills in the real target. In a
-                // concrete body it would lower as a plain move of the
-                // wrong type, so it must not escape a template check.
-                (Selection::Impl { .. } | Selection::ParamEvidence(_), None) if self.is_template_check() => {
-                    self.set_res(e, Res::TryFrom(LocalDefId(u32::MAX)))
-                }
-                _ => {
-                    let (a, b) = (self.tn(e1), self.tn(e2));
-                    self.err(
-                        "L0112",
-                        span,
-                        format!("the `?` operator cannot convert the error type `{a}` to `{b}`"),
-                        format!("Implement `From<{a}>` for `{b}`, or map the error before the `?`."),
-                    );
-                    self.set_res(e, Res::TryPlain);
-                }
-            }
+            self.decide_try_res(e, err_t, ret_err, span);
             return ok_t;
         }
         if self.kind(it) != TyKind::Error {
@@ -7400,6 +7422,66 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         self.set_res(e, Res::TryPlain);
         ERROR
+    }
+
+    /// Picks how one `?` on `Result` converts its error type
+    /// `err_t` into the enclosing return error `ret_err`, and
+    /// records it as the expression's `Res`. Runs in `try_expr`,
+    /// or at body end for an error type that was still a
+    /// projection there (`deferred_try`, fx-tryfrom).
+    fn decide_try_res(&mut self, e: ExprId, err_t: Ty, ret_err: Ty, span: Span) {
+        let p = self.p;
+        // The common case: the error types already agree.
+        let snap = self.snapshot_vars();
+        if self.unify(err_t, ret_err) {
+            self.set_res(e, Res::TryPlain);
+            return;
+        }
+        self.rollback_vars(snap);
+        let (e1, e2) = (self.resolve(err_t), self.resolve(ret_err));
+        if Self::numeric_from_ok(self.kind(e1), self.kind(e2)) {
+            self.set_res(e, Res::TryCast);
+            return;
+        }
+        // The builtin `From<&str>` and `From<&String>` for
+        // String: a copy, with no impl record behind it.
+        if e2 == STRING && matches!(self.kind(e1), TyKind::Ref(_, _, i) if i == STR || i == STRING) {
+            self.set_res(e, Res::TryStringFrom);
+            return;
+        }
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(e2), GenericArg::Ty(e1)]);
+        let tr = TraitRef { def: p.gx.lang.from, args: args_id, bindings: EMPTY_BINDINGS };
+        // The obligation is what makes a generic body without the
+        // `From` bound fail at finish; selection here only picks
+        // the call target for lowering.
+        self.obl.push_trait_at(tr, span, 0);
+        let sel = self.select_obligation_at(tr, span, 0);
+        let from_fn = match &sel {
+            Selection::Impl { id, args: impl_args, .. } => {
+                self.method_instance_for_impl(e, *id, tr, impl_args.clone(), "from", span).map(|(local, _, _)| local)
+            }
+            _ => None,
+        };
+        match (sel, from_fn) {
+            (_, Some(local)) => self.set_res(e, Res::TryFrom(local)),
+            // The MAX marker is a template-only plan: an instance
+            // check re-selects and fills in the real target. In a
+            // concrete body it would lower as a plain move of the
+            // wrong type, so it must not escape a template check.
+            (Selection::Impl { .. } | Selection::ParamEvidence(_), None) if self.is_template_check() => {
+                self.set_res(e, Res::TryFrom(LocalDefId(u32::MAX)))
+            }
+            _ => {
+                let (a, b) = (self.tn(e1), self.tn(e2));
+                self.err(
+                    "L0112",
+                    span,
+                    format!("the `?` operator cannot convert the error type `{a}` to `{b}`"),
+                    format!("Implement `From<{a}>` for `{b}`, or map the error before the `?`."),
+                );
+                self.set_res(e, Res::TryPlain);
+            }
+        }
     }
 
     fn unit_body(&mut self, t: Ty, b: ast::BlockId) {
@@ -9772,6 +9854,14 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 return None;
             }
         }
+        // Scalar and blanket `try_from` (check/tryfrom.rs), like
+        // the numeric `from` above.
+        if let Some(t) = self.try_from_assoc_call(e, callee, base, hint, name, args, span) {
+            return Some(t);
+        }
+        if let Some(t) = self.try_into_assoc_call(e, callee, base, hint, name, args, span) {
+            return Some(t);
+        }
         if self.name(name) == "default"
             && args.is_empty()
             && matches!(self.kind(base), TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit)
@@ -10015,6 +10105,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
         let lang_fn = match self.name(segs[1].name) {
             "default" => tdef == lang.default && args.is_empty(),
             "from" => tdef == lang.from && args.len() == 1,
+            "try_from" => tdef == lang.try_from && args.len() == 1,
             _ => false,
         };
         let user_fn = !lang_fn
@@ -10022,6 +10113,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
         if !lang_fn && !user_fn {
             return None;
         }
+        // `TryFrom::try_from` is expected at a `Result<Self, _>`:
+        // Self is its `Ok` type (fx-tryfrom).
+        let expected = if tdef == lang.try_from {
+            expected.and_then(|t| { let t = self.deep(t); self.tys.result_args(t) }).map(|(ok, _)| ok)
+        } else {
+            expected
+        };
         let known = expected.map(|t| self.deep(t)).filter(|&b| b != ERROR && !self.unbound_general(b));
         let Some(base) = known else {
             if !user_fn {
@@ -11431,7 +11529,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             // `prim_into_method` and `into_iter_self` build these
             // kinds, never this match.
-            K::IntoCast | K::IntoIterSelf => unreachable!(),
+            K::IntoCast | K::IntoIterSelf | K::TryIntoCast => unreachable!(),
         };
         self.set_res(e, Res::PrimOp { kind, derefs });
         Some(ret)
@@ -12030,6 +12128,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
         }
         // `into()` through a std `From` impl lust keeps builtin (check/into.rs).
         if let Some(ret) = self.builtin_into_method(e, rt, name, args, turbofish, expected) {
+            return ret;
+        }
+        // `try_into()` to a scalar target: the checked cast
+        // (check/tryfrom.rs).
+        if let Some(ret) = self.prim_try_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
             return ret;
         }
         // `into_iter()` on a value that is its own iterator.
@@ -17400,6 +17503,15 @@ impl<'p, 'a> Ctx<'p, 'a> {
         // Anything left there is an annotation error, never a silent default.
         self.run_obligations(true);
         method::finish_deferred_methods(self);
+        // `?` conversions deferred on a projection error type:
+        // it normalizes now its types are known (fx-tryfrom).
+        for (e, err_t, ret_err, span) in std::mem::take(&mut self.deferred_try) {
+            let err_t = self.deep(err_t);
+            let err_t = self.normalize_here(err_t);
+            let ret_err = self.deep(ret_err);
+            self.decide_try_res(e, err_t, ret_err, span);
+        }
+        self.run_obligations(false);
         for (e, op, t) in std::mem::take(&mut self.open_binops) {
             use BinOp::*;
             let t = self.deep(t);
@@ -17562,7 +17674,11 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_debug) {
+            // A projection (`<T as TryFrom<U>>::Error` from a
+            // deferred `try_into`, fx-tryfrom) reads through its
+            // normalization, like the Clone loop above.
             let t = self.deep(t);
+            let t = self.normalize_here(t);
             if !has_debug(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` does not implement Debug"), "Add #[derive(Debug)] to the type.");
@@ -17721,7 +17837,13 @@ impl<'p, 'a> Ctx<'p, 'a> {
             let zargs: Vec<GenericArg> = args
                 .iter()
                 .map(|&g| match g {
-                    GenericArg::Ty(t) => GenericArg::Ty(self.zonk(t)),
+                    // A projection whose inputs inference fixed late
+                    // (`x.try_into().ok()` at a return type, fx-tryfrom)
+                    // normalizes now, so lowering finds the instance.
+                    GenericArg::Ty(t) => {
+                        let z = self.zonk(t);
+                        GenericArg::Ty(self.normalize_here(z))
+                    }
                     GenericArg::Const(c) => GenericArg::Const(self.resolve_const(c)),
                     other => other,
                 })
@@ -18240,6 +18362,13 @@ impl<'p> SolveCx for Ctx<'p, '_> {
     fn closure_output(&mut self, assoc: DefId, self_ty: Ty) -> Option<Ty> {
         self.closure_output_impl(assoc, self_ty)
     }
+    fn builtin_assoc(&mut self, assoc: DefId, args: ArgsId) -> Option<Ty> {
+        self.try_from_assoc(assoc, args)
+    }
+    fn builtin_select(&mut self, obl: TraitRef) -> Option<Selection> {
+        let self_ty = self.tys.args(obl.args).first().and_then(|g| g.as_ty())?;
+        self.try_from_select(obl, self_ty)
+    }
     fn structural(&mut self, tr: TraitRef) -> Option<bool> {
         let p = self.p;
         let lang = &p.gx.lang;
@@ -18250,6 +18379,25 @@ impl<'p> SolveCx for Ctx<'p, '_> {
         }
         if tr.def == lang.sized {
             return Some(self.sized_ok(self_ty));
+        }
+        // The scalar `TryFrom` and `TryInto` pairs have no impl records
+        // either: the pair table answers (fx-tryfrom).
+        match self.try_from_select(tr, self_ty) {
+            Some(Selection::ParamEvidence(_)) => return Some(true),
+            Some(Selection::NoImpl) => return Some(false),
+            _ => {}
+        }
+        // Numeric `From` has no impl records (it is a builtin widening
+        // cast), so an empty bucket must not read as "never holds".
+        if tr.def == lang.from
+            && let Some(input) = self.tys.args(tr.args).get(1).and_then(|g| g.as_ty())
+        {
+            let input = self.deep(input);
+            let (ik, sk) = (self.kind(input), self.kind(self_ty));
+            let literal = matches!(ik, TyKind::Infer(v) if v.is_int() || v.is_float());
+            if matches!(sk, TyKind::Int(_) | TyKind::Float(_)) && (literal || Self::numeric_from_ok(ik, sk)) {
+                return Some(true);
+            }
         }
         if let Some(refs) = unwind::unwind_trait(p, tr.def) {
             let env = self.solve_env();

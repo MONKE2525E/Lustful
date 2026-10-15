@@ -18,3 +18,10 @@ pub trait Error: core::fmt::Debug + core::fmt::Display {
         "description() is deprecated; use Display"
     }
 }
+
+// core's conversion errors (fx-tryfrom): `Error` with the default
+// `description`, as in core.
+impl Error for core::num::TryFromIntError {}
+impl Error for core::char::CharTryFromError {}
+impl Error for core::char::TryFromCharError {}
+impl Error for core::convert::Infallible {}

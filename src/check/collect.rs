@@ -2699,6 +2699,48 @@ pub fn collect_reuse<'a>(
                         Derives { debug: true, clone: true, partial_eq: true, eq: true, ..Derives::default() },
                     )
                 }
+                // fx-tryfrom: core's conversion errors. `TryFromIntError`
+                // is a tuple struct over `IntErrorKind`; the two char
+                // errors are tuple structs over `()`; `Infallible` is
+                // the empty enum. Derives are core's.
+                13 => {
+                    let kind = p.tys.intern(TyKind::Adt(generics::int_error_kind_def(), EMPTY_ARGS));
+                    (
+                        generics::try_from_int_error_def(),
+                        vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", kind)], disc: 0, non_exhaustive: false }],
+                        Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
+                14 => (
+                    generics::int_error_kind_def(),
+                    vec![unit("Empty", 0), unit("InvalidDigit", 1), unit("PosOverflow", 2), unit("NegOverflow", 3), unit("Zero", 4)],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
+                15 => (
+                    generics::char_try_from_error_def(),
+                    vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", UNIT)], disc: 0, non_exhaustive: false }],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
+                16 => (
+                    generics::try_from_char_error_def(),
+                    vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", UNIT)], disc: 0, non_exhaustive: false }],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
+                17 => (
+                    generics::infallible_def(),
+                    Vec::new(),
+                    Derives {
+                        debug: true,
+                        clone: true,
+                        copy: true,
+                        partial_eq: true,
+                        eq: true,
+                        hash: true,
+                        partial_ord: true,
+                        ord: true,
+                        ..Derives::default()
+                    },
+                ),
                 // `core::any::TypeId` (check/any.rs): two `u64` words of the
                 // type hash. Only the derives lust can match (no Debug,
                 // Hash, or Ord: their output depends on rustc's hash values).
@@ -6254,6 +6296,12 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::location_def()
                         || d == generics::borrow_error_def()
                         || d == generics::borrow_mut_error_def()
+                        || d == generics::try_from_int_error_def()
+                        || d == generics::char_try_from_error_def()
+                        || d == generics::try_from_char_error_def()
+                        // `Infallible`'s Display is `match *self {}`:
+                        // it exists, and no value reaches it.
+                        || d == generics::infallible_def()
                 })
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))

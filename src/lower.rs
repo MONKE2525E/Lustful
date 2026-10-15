@@ -1623,6 +1623,25 @@ impl<'p, 'a> Lower<'p, 'a> {
                         self.set_or_temp(dest, Rvalue::DynMeta { ptr, word }, ty, span)
                     }
                     Res::FromCast => self.set_or_temp(dest, Rvalue::Cast(ops.into_iter().next().unwrap(), ty), ty, span),
+                    Res::TryFromCast => {
+                        let src_ty = self.ty(args[0]);
+                        self.try_cast_into(ops.into_iter().next().unwrap(), src_ty, ty, dest, span)
+                    }
+                    Res::TryFromOk(f) => {
+                        // `Ok(From::from(x))`, or `Ok(x)` for identity.
+                        let op = ops.into_iter().next().unwrap();
+                        let (ok_ty, _) = self.body.tys.result_args(ty).unwrap_or((UNIT, UNIT));
+                        let ok_op = match f {
+                            Some(f) => {
+                                let f = self.resolve_generic_fn(e, f);
+                                let t = self.temp(ok_ty);
+                                self.call_into(CallTarget::Fn(f), vec![op], Place::local(t), span);
+                                Operand::Move(Place::local(t))
+                            }
+                            None => op,
+                        };
+                        self.set_or_temp(dest, Rvalue::Res(ty, true, ok_op), ty, span)
+                    }
                     Res::DefaultVal => {
                         let zero = match self.kind(ty) {
                             TyKind::Int(it) => Const::Int(0, it),
@@ -3084,6 +3103,165 @@ impl<'p, 'a> Lower<'p, 'a> {
     }
 
     /// A scalar operator trait method (`Res::PrimOp`): the
+    /// One scalar `TryFrom` checked cast (check/tryfrom.rs):
+    /// `Ok(cast)` when the value fits the target, else `Err` of
+    /// the pair's error type. An `Infallible` pair is a plain cast
+    /// in `Ok`. Integer ranges compare in `i128` (a `u128` source
+    /// compares in `u128` against the target's max), so every
+    /// pair takes the same shape.
+    fn try_cast_into(&mut self, op: Operand, src_ty: Ty, result_ty: Ty, dest: Option<&Place>, span: Span) {
+        use crate::check::generics as gdef;
+        let Some((dst_ty, err_ty)) = self.body.tys.result_args(result_ty) else { return };
+        let d = self.call_dest(dest, result_ty);
+        let s = self.temp(src_ty);
+        self.assign(Place::local(s), Rvalue::Use(op), span);
+        let copy_s = Operand::Copy(Place::local(s));
+        let err_def = self.body.tys.adt_parts(err_ty).map(|(x, _)| x);
+        if err_def == Some(gdef::infallible_def()) {
+            let c = self.temp(dst_ty);
+            self.assign(Place::local(c), Rvalue::Cast(copy_s, dst_ty), span);
+            self.assign(d, Rvalue::Res(result_ty, true, Operand::Move(Place::local(c))), span);
+            return;
+        }
+        // (fits, too-large) as bool temps; `okval` precomputes the
+        // `Ok` payload when it is not a cast (integer to `bool`).
+        let bin = |cx: &mut Self, op: BinOp, a: Operand, b: Operand| -> Local {
+            let t = cx.temp(BOOL);
+            cx.assign(Place::local(t), Rvalue::Bin(op, a, b), span);
+            t
+        };
+        let konst = |v: bool| Operand::Const(Const::Bool(v));
+        let (ok, pos, okval): (Local, Operand, Option<Local>) = match (self.kind(src_ty), self.kind(dst_ty)) {
+            (TyKind::Int(si), TyKind::Int(di)) => {
+                let bits = di.bits();
+                if si == IntTy::U128 {
+                    let max: u128 = if di.signed() {
+                        (1u128 << (bits - 1)) - 1
+                    } else if bits >= 128 {
+                        u128::MAX
+                    } else {
+                        (1u128 << bits) - 1
+                    };
+                    let ok = bin(self, BinOp::Le, copy_s, Operand::Const(Const::Int(max, IntTy::U128)));
+                    (ok, konst(true), None)
+                } else {
+                    let i128t = int(IntTy::I128);
+                    let w = self.temp(i128t);
+                    self.assign(Place::local(w), Rvalue::Cast(copy_s, i128t), span);
+                    let wc = Operand::Copy(Place::local(w));
+                    if di == IntTy::U128 {
+                        let ok = bin(self, BinOp::Ge, wc, Operand::Const(Const::Int(0, IntTy::I128)));
+                        (ok, konst(false), None)
+                    } else {
+                        let (min, max): (i128, i128) = if di.signed() {
+                            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+                        } else {
+                            (0, (1i128 << bits) - 1)
+                        };
+                        let ge = bin(self, BinOp::Ge, wc.clone(), Operand::Const(Const::Int(min as u128, IntTy::I128)));
+                        let le = bin(self, BinOp::Le, wc.clone(), Operand::Const(Const::Int(max as u128, IntTy::I128)));
+                        let ok = bin(self, BinOp::BitAnd, Operand::Copy(Place::local(ge)), Operand::Copy(Place::local(le)));
+                        let pos = bin(self, BinOp::Gt, wc, Operand::Const(Const::Int(max as u128, IntTy::I128)));
+                        (ok, Operand::Copy(Place::local(pos)), None)
+                    }
+                }
+            }
+            (TyKind::Int(si), TyKind::Bool) => {
+                let (z, o) = (Operand::Const(Const::Int(0, si)), Operand::Const(Const::Int(1, si)));
+                let e0 = bin(self, BinOp::Eq, copy_s.clone(), z.clone());
+                let e1 = bin(self, BinOp::Eq, copy_s.clone(), o.clone());
+                let ok = bin(self, BinOp::BitOr, Operand::Copy(Place::local(e0)), Operand::Copy(Place::local(e1)));
+                let val = bin(self, BinOp::Ne, copy_s.clone(), z);
+                let pos = bin(self, BinOp::Gt, copy_s, o);
+                (ok, Operand::Copy(Place::local(pos)), Some(val))
+            }
+            (TyKind::Int(IntTy::U32), TyKind::Char) => {
+                let c = |v: u128| Operand::Const(Const::Int(v, IntTy::U32));
+                let le = bin(self, BinOp::Le, copy_s.clone(), c(0x10FFFF));
+                let lo = bin(self, BinOp::Lt, copy_s.clone(), c(0xD800));
+                let hi = bin(self, BinOp::Gt, copy_s, c(0xDFFF));
+                let mid = bin(self, BinOp::BitOr, Operand::Copy(Place::local(lo)), Operand::Copy(Place::local(hi)));
+                let ok = bin(self, BinOp::BitAnd, Operand::Copy(Place::local(le)), Operand::Copy(Place::local(mid)));
+                (ok, konst(true), None)
+            }
+            (TyKind::Char, TyKind::Int(di)) => {
+                let u32t = int(IntTy::U32);
+                let w = self.temp(u32t);
+                self.assign(Place::local(w), Rvalue::Cast(copy_s, u32t), span);
+                let max: u128 = match di {
+                    IntTy::U8 => 0xFF,
+                    IntTy::U16 => 0xFFFF,
+                    _ => 0xFFFF_FFFF,
+                };
+                let ok = bin(self, BinOp::Le, Operand::Copy(Place::local(w)), Operand::Const(Const::Int(max, IntTy::U32)));
+                (ok, konst(true), None)
+            }
+            // The checker gates the pairs; a pair that still
+            // reaches here widens (its error is `Infallible`,
+            // handled above), so it always fits.
+            _ => {
+                let t = self.temp(BOOL);
+                self.assign(Place::local(t), Rvalue::Use(konst(true)), span);
+                (t, konst(true), None)
+            }
+        };
+        let ok_bb = self.new_block();
+        let err_bb = self.new_block();
+        let join = self.new_block();
+        {
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::Switch(Operand::Copy(Place::local(ok)), vec![(1, ok_bb)], err_bb);
+            b.term_span = span;
+        }
+        self.cur = ok_bb;
+        let oval = match okval {
+            Some(v) => Operand::Copy(Place::local(v)),
+            None => {
+                let c = self.temp(dst_ty);
+                self.assign(Place::local(c), Rvalue::Cast(Operand::Copy(Place::local(s)), dst_ty), span);
+                Operand::Move(Place::local(c))
+            }
+        };
+        self.assign(d.clone(), Rvalue::Res(result_ty, true, oval), span);
+        self.goto(join, span);
+        self.cur = err_bb;
+        // The error value: a kinded `TryFromIntError`, or a char
+        // error over `()`.
+        let is_int_err = err_def == Some(gdef::try_from_int_error_def());
+        let err_adt = self.body.tys.local_adt(err_ty);
+        if is_int_err && let (Some(ea), Some(ka)) = (err_adt, self.body.tys.local_adt_of(gdef::int_error_kind_def())) {
+            let variant = |cx: &Self, name: &str| -> u32 {
+                cx.p.adt(ka).variants.iter().position(|v| cx.p.interner.get(v.name) == name).unwrap_or(0) as u32
+            };
+            let (pos_v, neg_v) = (variant(self, "PosOverflow"), variant(self, "NegOverflow"));
+            let kind_ty = self.body.tys.intern(TyKind::Adt(gdef::int_error_kind_def(), EMPTY_ARGS));
+            let pos_bb = self.new_block();
+            let neg_bb = self.new_block();
+            {
+                let b = &mut self.body.blocks[self.cur.0 as usize];
+                b.term = Terminator::Switch(pos, vec![(1, pos_bb)], neg_bb);
+                b.term_span = span;
+            }
+            for (bb, v) in [(pos_bb, pos_v), (neg_bb, neg_v)] {
+                self.cur = bb;
+                let k = self.temp(kind_ty);
+                self.assign(Place::local(k), Rvalue::Aggregate(ka, v, Vec::new()), span);
+                let et = self.temp(err_ty);
+                self.assign(Place::local(et), Rvalue::Aggregate(ea, 0, vec![Operand::Move(Place::local(k))]), span);
+                self.assign(d.clone(), Rvalue::Res(result_ty, false, Operand::Move(Place::local(et))), span);
+                self.goto(join, span);
+            }
+        } else if let Some(ea) = err_adt {
+            let et = self.temp(err_ty);
+            self.assign(Place::local(et), Rvalue::Aggregate(ea, 0, vec![Operand::Const(Const::Unit)]), span);
+            self.assign(d.clone(), Rvalue::Res(result_ty, false, Operand::Move(Place::local(et))), span);
+            self.goto(join, span);
+        } else {
+            self.goto(join, span);
+        }
+        self.cur = join;
+    }
+
     /// operation itself on the receiver value (by-value `self`),
     /// a unary operation, or a compound assignment into the
     /// receiver place, exactly as the operators lower.
@@ -3117,6 +3295,11 @@ impl<'p, 'a> Lower<'p, 'a> {
             K::IntoCast => {
                 let a = self.operand_derefs(recv, derefs);
                 self.set_or_temp(dest, Rvalue::Cast(a, self.ty(e)), self.ty(e), span);
+            }
+            K::TryIntoCast => {
+                let a = self.operand_derefs(recv, derefs);
+                let src_ty = self.peel(self.ty(recv), derefs);
+                self.try_cast_into(a, src_ty, self.ty(e), dest, span);
             }
             // core's blanket `IntoIterator for I: Iterator`: the receiver moves through.
             K::IntoIterSelf => {

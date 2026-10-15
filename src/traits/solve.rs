@@ -68,6 +68,19 @@ pub trait SolveCx {
     fn closure_output(&mut self, _assoc: DefId, _self_ty: Ty) -> Option<Ty> {
         None
     }
+    /// A builtin associated type with no impl record behind it
+    /// (the scalar `TryFrom` pairs' `Error`, fx-tryfrom), for
+    /// normalization. `None` leaves the projection to selection.
+    fn builtin_assoc(&mut self, _assoc: DefId, _args: ArgsId) -> Option<Ty> {
+        None
+    }
+    /// Builtin selection for a trait ref with no impl records (the
+    /// scalar `TryFrom` and `TryInto` pairs, fx-tryfrom), so a nested
+    /// where clause such as `u8: TryFrom<i64>` holds as it does at
+    /// the top level. `None` leaves the obligation to the impl index.
+    fn builtin_select(&mut self, _obl: TraitRef) -> Option<Selection> {
+        None
+    }
     /// The structural answer for a trait ref the impl index has no
     /// records for (`Sized` and the auto traits; the derive family
     /// on tuples, arrays, slices, and references): Some(holds) when
@@ -582,6 +595,10 @@ impl Solver {
             }
         }
 
+        if let Some(sel) = cx.builtin_select(obl) {
+            return sel;
+        }
+
         // Step 2: header candidates by probe unification.
         let self_ty = self_ty_of(cx.tys(), &obl);
         let cands: Vec<ImplId> = {
@@ -695,7 +712,11 @@ impl Solver {
         }
         let self_ty = self_ty_of(cx.tys(), &tr);
         let self_deep = cx.deep_resolve(self_ty);
-        if head_of(cx.tys(), self_deep, &|t| t).is_none() {
+        // An integer or float literal variable is one of a closed set
+        // of heads, which `candidates` reads all of (`{integer}:
+        // Into<S>` is false when no `From` impl of S takes an integer).
+        let literal_var = matches!(cx.tys().kind(self_deep), TyKind::Infer(v) if v.is_int() || v.is_float());
+        if !literal_var && head_of(cx.tys(), self_deep, &|t| t).is_none() {
             return false;
         }
         // A trait that needs `Self: Sized` never holds for an unsized
@@ -826,6 +847,11 @@ impl Solver {
                 // Normalize inside the trait args first, so nested
                 // projections reach selection in their simplest form.
                 let normed_args = self.normalize_args(cx, index, env, args, depth + 1);
+                // A builtin assoc with no impl record (a scalar
+                // `TryFrom` pair's `Error`, fx-tryfrom).
+                if let Some(out) = cx.builtin_assoc(assoc.0, normed_args) {
+                    return self.normalize_inner(cx, index, env, out, depth + 1);
+                }
                 let t = cx.tys().intern(TyKind::Projection(assoc, normed_args));
                 let tr = TraitRef { def: trait_def, args: normed_args, bindings: EMPTY_BINDINGS };
                 match self.select(cx, index, env, tr) {
@@ -1020,6 +1046,31 @@ impl<'g> PureCx<'g> {
 impl<'g> SolveCx for PureCx<'g> {
     type Snapshot = usize;
     type Store = Tys<'g>;
+
+    /// A scalar `TryFrom` pair's `Error` (fx-tryfrom), by the same
+    /// table body checking uses.
+    fn builtin_assoc(&mut self, assoc: DefId, args: ArgsId) -> Option<Ty> {
+        use crate::check::generics as g;
+        let a: Vec<Ty> = self.tys.args(args).iter().filter_map(|x| x.as_ty()).collect();
+        let [a0, a1] = a[..] else { return None };
+        let (src, dst) = if assoc == g::try_from_error_assoc() {
+            (a1, a0)
+        } else if assoc == g::try_into_error_assoc() {
+            (a0, a1)
+        } else {
+            return None;
+        };
+        let src = self.deep_resolve(src);
+        let dst = self.deep_resolve(dst);
+        let (sk, dk) = (self.tys.kind(src), self.tys.kind(dst));
+        let sort = crate::check::tryfrom::scalar_try_from(sk, dk)?;
+        Some(match sort {
+            crate::check::tryfrom::TryErr::Infallible => g::infallible_ty(&mut self.tys),
+            crate::check::tryfrom::TryErr::Int => g::try_from_int_error_ty(&mut self.tys),
+            crate::check::tryfrom::TryErr::CharFrom => g::char_try_from_error_ty(&mut self.tys),
+            crate::check::tryfrom::TryErr::FromChar => g::try_from_char_error_ty(&mut self.tys),
+        })
+    }
 
     fn tys(&mut self) -> &mut Tys<'g> {
         &mut self.tys

@@ -129,6 +129,9 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.from_str,
         lang.from,
         lang.into,
+        // Prelude since Rust 2021 (fx-tryfrom).
+        lang.try_from,
+        lang.try_into,
         // Prelude conversion traits (W-STD-B).
         lang.as_ref,
         lang.as_mut,
@@ -475,6 +478,13 @@ pub(super) fn trait_probe_for(
                     t
                 } else if trait_def == p.gx.lang.into && i == 0 {
                     expected.unwrap_or_else(|| cx.new_var(false))
+                } else if trait_def == p.gx.lang.try_into && i == 0 {
+                    // `try_into` returns `Result` of the trait input:
+                    // an expected `Result` type names it (fx-tryfrom).
+                    expected
+                        .and_then(|t| { let t = cx.deep(t); cx.tys.result_args(t) })
+                        .map(|(ok, _)| ok)
+                        .unwrap_or_else(|| cx.new_var(false))
                 } else {
                     cx.new_var(false)
                 };
@@ -512,7 +522,43 @@ pub(super) fn trait_probe_for(
                             // of its own: the call is the selected
                             // `From` impl's `from`, with the
                             // receiver as its argument.
-                            let bridged = if trait_def == p.gx.lang.into && input_vars.len() == 1 {
+                            // Core's blanket `TryInto` likewise has
+                            // no method of its own: the call is the
+                            // selected `TryFrom` impl's `try_from`,
+                            // with the receiver as its argument
+                            // (fx-tryfrom).
+                            let bridged = if trait_def == p.gx.lang.try_into && input_vars.len() == 1 {
+                                let u = cx.deep(input_vars[0]);
+                                let fargs = cx.tys.intern_args(&[GenericArg::Ty(u), GenericArg::Ty(step)]);
+                                let ftr = TraitRef { def: p.gx.lang.try_from, args: fargs, bindings: EMPTY_BINDINGS };
+                                match cx.select_obligation(ftr) {
+                                    Selection::Impl { id: id2, args: args2, .. } => {
+                                        let rec2 = p.gx.index.get(id2);
+                                        let fname = p
+                                            .gx
+                                            .index
+                                            .trait_record(p.gx.lang.try_from)
+                                            .and_then(|r| r.methods.first().map(|m| m.1));
+                                        fname
+                                            .and_then(|fname| {
+                                                rec2.items
+                                                    .iter()
+                                                    .copied()
+                                                    .find(|&d| p.local_def(d.hash).is_some_and(|l| p.fn_info(l).name == fname))
+                                            })
+                                            .and_then(|d| p.local_def(d.hash))
+                                            .map(|l| (l, args2.clone(), Some((u, cx.deep(step)))))
+                                    }
+                                    Selection::ParamEvidence(i) if i != usize::MAX => p
+                                        .gx
+                                        .index
+                                        .trait_record(p.gx.lang.try_from)
+                                        .and_then(|r| r.methods.first().map(|m| m.0))
+                                        .and_then(|m| param_env_hit(cx, m, ftr))
+                                        .map(|(l, a)| (l, a, Some((u, cx.deep(step))))),
+                                    _ => None,
+                                }
+                            } else if trait_def == p.gx.lang.into && input_vars.len() == 1 {
                                 let u = cx.deep(input_vars[0]);
                                 let fargs = cx.tys.intern_args(&[GenericArg::Ty(u), GenericArg::Ty(step)]);
                                 let ftr = TraitRef { def: p.gx.lang.from, args: fargs, bindings: EMPTY_BINDINGS };
@@ -587,6 +633,7 @@ pub(super) fn trait_probe_for(
             if was_impl
                 && !rec.local
                 && trait_def != p.gx.lang.into
+                && trait_def != p.gx.lang.try_into
                 && !matches!(trait_def, d if d == p.gx.lang.fn_ || d == p.gx.lang.fn_mut || d == p.gx.lang.fn_once)
                 && p.gx.lang_method_sigs.get(&method_def).is_some_and(|s| s.self_kind.is_some())
                 && !lang_hits.contains(&trait_def)
@@ -796,10 +843,12 @@ pub(super) fn trait_probe_for(
             let prefix: Vec<GenericArg> = if let Some((u, from_step)) = bridge {
                 // Bookkeep the `Into` obligation, then take the
                 // instantiation prefix from the `From` impl whose
-                // `from` method this call really is.
+                // `from` method this call really is. A `try_into`
+                // call bridges to `TryFrom` the same way (fx-tryfrom).
                 let _ = cx.select_obligation(tr);
+                let fdef = if trait_def == p.gx.lang.try_into { p.gx.lang.try_from } else { p.gx.lang.from };
                 let fargs = cx.tys.intern_args(&[GenericArg::Ty(u), GenericArg::Ty(from_step)]);
-                let ftr = TraitRef { def: p.gx.lang.from, args: fargs, bindings: EMPTY_BINDINGS };
+                let ftr = TraitRef { def: fdef, args: fargs, bindings: EMPTY_BINDINGS };
                 match cx.select_obligation(ftr) {
                     Selection::Impl { args: args2, .. } => args2,
                     _ => prefix,
@@ -1084,6 +1133,29 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
             cx.set_res(d.e, Res::Fn(stub));
             continue;
         }
+        // A scalar `try_into` or `try_from` picked once the types
+        // were known is the checked cast (fx-tryfrom), as the
+        // `From` path call below is `FromCast`.
+        if matches!(sel, Selection::ParamEvidence(usize::MAX)) {
+            if !d.path && d.tr.def == p.gx.lang.try_into {
+                cx.set_res(d.e, Res::PrimOp { kind: PrimOpKind::TryIntoCast, derefs: d.derefs });
+                continue;
+            }
+            if d.path && d.tr.def == p.gx.lang.try_from && let Expr::Call { callee, .. } = p.ast.expr(d.e) {
+                cx.set_res(*callee, Res::TryFromCast);
+                cx.set_res(d.e, Res::TryFromCast);
+                continue;
+            }
+            if d.path && d.tr.def == p.gx.lang.try_into {
+                // `TryInto::try_into(x)` to a scalar target at a
+                // path call: the same cast, in assoc form.
+                if let Expr::Call { callee, .. } = p.ast.expr(d.e) {
+                    cx.set_res(*callee, Res::TryFromCast);
+                }
+                cx.set_res(d.e, Res::TryFromCast);
+                continue;
+            }
+        }
         let Selection::Impl { id, args: impl_args, .. } = sel else {
             if d.path {
                 // `From` by structure: core's identity impl or a numeric
@@ -1112,6 +1184,22 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
                 (l, raw.iter().map(|&g| if let GenericArg::Ty(t) = g { GenericArg::Ty(cx.deep(t)) } else { g }).collect())
             }),
         };
+        // A blanket `TryInto` selection has no `try_into` fn: the
+        // call is the `TryFrom` impl's `try_from` (fx-tryfrom).
+        let target = target.or_else(|| {
+            if d.tr.def != p.gx.lang.try_into {
+                return None;
+            }
+            let a: Vec<Ty> = cx.tys.args(d.tr.args).iter().filter_map(|g| g.as_ty()).collect();
+            let [src, dst] = a[..] else { return None };
+            let (dst, src) = (cx.deep(dst), cx.deep(src));
+            let fargs = cx.tys.intern_args(&[GenericArg::Ty(dst), GenericArg::Ty(src)]);
+            let ftr = TraitRef { def: p.gx.lang.try_from, args: fargs, bindings: EMPTY_BINDINGS };
+            let Selection::Impl { id: id2, args: args2, .. } = cx.select_obligation(ftr) else { return None };
+            let fname = p.gx.index.trait_record(p.gx.lang.try_from).and_then(|r| r.methods.first().map(|m| m.1))?;
+            let items = p.gx.index.get(id2).items.clone();
+            items.iter().copied().find_map(|x| p.local_def(x.hash).filter(|&l| p.fn_info(l).name == fname)).map(|l| (l, args2))
+        });
         let Some((local, mut prefix)) = target else {
             if d.path {
                 path_call_unresolved(cx, d.e);
