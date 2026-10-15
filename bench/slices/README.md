@@ -9,6 +9,7 @@ and `lust build` builds it.
 
 | Slice | Lines (code) | From |
 |---|---|---|
+| `tsrust-all4` | 165,204 (102,440) | the `tsrust-all` spec, pruned again with lust next 4f4c96f84 (W-BENCH4; 671,746 lines copied) |
 | `tsrust-all` | 160,065 (98,983) | all of ts_goport (`lib.rs`) with both part crates mounted, plus smallvec and xxhash_rust stand-ins (671,746 lines copied) |
 | `tsrust-full` | 150,147 (91,879) | all of ts_goport (`lib.rs`) with both part crates mounted (670,906 lines copied) |
 | `tsrust-nochecker` | 107,084 (67,850) | ts_goport `lib.rs` with both part crates, without checker, ls, lsp, project, api, execute, cmd (406,266 lines copied) |
@@ -43,7 +44,7 @@ Bench-owned text, not ts-rust code:
   those crates are rewritten to `crate::<name>::` (spec `rewrite`).
 - `support_smallvec.rs` (lust's smallvec adapter, `smallvec!` as a module
   macro) and `support_xxhash.rs` (the xxh3 API over FNV-1a: other hash
-  values than the real crate, the same in lust and rustc). `tsrust-all` only.
+  values than the real crate, the same in lust and rustc). `tsrust-all` and `tsrust-all4` only.
 - in `goport-util-lsp`, `goport_util::` paths become `crate::` (spec
   `rewrite_to`): goport_lsproto's own root re-exports goport_util, so the
   merged crate keeps every path's meaning.
@@ -69,6 +70,11 @@ cargo build --release
 python3 bench/slices/prune.py bench/slices/goport-util/spec.json /tmp/gu
 rm -rf bench/slices/goport-util/src && cp -r /tmp/gu/src /tmp/gu/prune.json bench/slices/goport-util/
 ```
+
+When a round stops on a lust error it cannot locate (a build failure outside fn bodies), add the
+item to the spec's `drop` list (`[[file, item, reason]]`; prune.json records it with `"by": "spec"`)
+and run again. On next 71f51f1d4 that is `frontend/module/cache.rs` `AheadCall` (W-BENCH4 repro
+arc_slice_recursive_enum_build.rs).
 
 Then check that the anchors in `edits.json` still occur once (the benchmark
 fails with a clear message if not), and rerun the benchmark.

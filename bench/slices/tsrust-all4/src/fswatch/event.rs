@@ -1,0 +1,228 @@
+//! Go: internal/fswatch/event.go (event kinds and the per-directory event
+//! list that coalesces events inside one debounce window).
+//!
+//! PORT: the backend threads and the debouncer thread share an `eventList`,
+//! so Go `el.mu` is a `std::sync::Mutex` over the fields it guards
+//! (`EventListLocked`). Go's `*Locked` helpers take that guarded data.
+
+use crate::fswatch::prelude::*;
+
+use std::sync::Mutex;
+
+// Go: event.go:6 EventKind
+/// EventKind classifies a filesystem change.
+///
+/// PORT: Go `type EventKind int` with the consts `EventUpdate` (1) and
+/// `EventDelete` (2). The shared contract (map-watch-api U1) makes it an
+/// enum with the same values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    Update = 1,
+    Delete = 2,
+}
+
+impl EventKind {
+    // Go: event.go:13 EventKind.String
+    // PORT: Go also has a `default: "unknown"` case for other ints. The
+    // enum has no other values.
+    pub fn string(&self) -> String {
+        match self {
+            EventKind::Update => "update".to_string(),
+            EventKind::Delete => "delete".to_string(),
+        }
+    }
+}
+
+// Go: event.go:25 Event
+/// Event describes a single filesystem change.
+///
+/// PORT: Go also has the unexported field `includedWatchRoot`. Code outside
+/// this module builds `Event` literals, so the flag is not a field here:
+/// `snapshot_since_locked` returns it beside each event, and only
+/// `dirWatch.triggerCallbacks` reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub kind: EventKind,
+    pub path: String,
+}
+
+// Go: event.go:32 eventEntry
+/// eventEntry tracks coalescing state during a debounce batch.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventEntry {
+    pub created_seq: u64,
+    pub updated_seq: u64,
+    pub deleted_seq: u64,
+    pub included_watch_root: bool,
+}
+
+impl EventEntry {
+    // Go: event.go:255 eventEntry.isDeleted
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_seq > self.created_seq && self.deleted_seq > self.updated_seq
+    }
+
+    // Go: event.go:259 eventEntry.kindSince
+    pub fn kind_since(&self, start_seq: u64) -> Option<EventKind> {
+        if self.deleted_seq > start_seq {
+            if self.created_seq > start_seq
+                && self.created_seq < self.deleted_seq
+                && self.updated_seq < self.deleted_seq
+            {
+                return None;
+            }
+            return Some(EventKind::Delete);
+        }
+        let seq = self.created_seq.max(self.updated_seq);
+        if seq > start_seq {
+            return Some(EventKind::Update);
+        }
+        None
+    }
+}
+
+// Go: event.go:42 eventList
+/// eventList coalesces filesystem events by path within a debounce window.
+///   - create after delete → update (rapid delete+recreate)
+///   - getEvents skips entries that were both created and deleted
+#[derive(Default)]
+pub struct EventList {
+    pub mu: Mutex<EventListLocked>,
+}
+
+/// PORT: the `eventList` fields that Go `el.mu` guards.
+#[derive(Default)]
+pub struct EventListLocked {
+    /// Go `map[string]*eventEntry`; `None` is Go's nil map.
+    pub entries: Option<FxHashMap<String, EventEntry>>,
+    pub err: Option<GoError>,
+    pub seq: u64,
+}
+
+impl EventList {
+    // Go: event.go:52 eventList.create
+
+    // Go: event.go:59 eventList.createAt
+
+    // Go: event.go:66 eventList.createLocked
+
+    // Go: event.go:81 eventList.update
+
+    // Go: event.go:88 eventList.updateAt
+
+    // Go: event.go:95 eventList.updateWatchRootAt
+
+
+    // Go: event.go:103 eventList.updateLocked
+
+    // Go: event.go:108 eventList.remove
+
+    // Go: event.go:115 eventList.removeAndGetSequence
+
+    // Go: event.go:123 eventList.removeAt
+
+    // Go: event.go:130 eventList.removeWatchRootAt
+
+
+    // Go: event.go:138 eventList.removeLocked
+
+    // Go: event.go:145 eventList.size
+    /// size returns the number of tracked entries (including ones that may
+    /// cancel out in getEvents).
+    pub fn size(&self) -> i32 {
+        let el = self.mu.lock().unwrap();
+        el.entries
+            .as_ref()
+            .map_or(0, |entries| entries.len() as i32)
+    }
+
+    // Go: event.go:153 eventList.snapshotLocked
+    /// snapshotLocked returns the current set of pending events with
+    /// create+delete pairs filtered out. Caller must hold el.mu.
+    ///
+    /// PORT: takes the data that `el.mu` guards. Go map order is random;
+    /// the result order is not guaranteed in Go either.
+    pub fn snapshot_locked(el: &EventListLocked) -> Vec<Event> {
+        EventList::snapshot_since_locked(el, 0)
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect()
+    }
+
+    // Go: event.go:157 eventList.snapshotSinceLocked
+    // PORT: each event comes with its Go `includedWatchRoot` flag (see
+    // `Event`).
+    pub fn snapshot_since_locked(el: &EventListLocked, start_seq: u64) -> Vec<(Event, bool)> {
+        let entries = el.entries.as_ref();
+        let mut out: Vec<(Event, bool)> =
+            Vec::with_capacity(entries.map_or(0, |entries| entries.len()));
+        if let Some(entries) = entries {
+            for (path, e) in entries {
+                let Some(kind) = e.kind_since(start_seq) else {
+                    continue;
+                };
+                out.push((
+                    Event {
+                        kind,
+                        path: path.clone(),
+                    },
+                    e.included_watch_root,
+                ));
+            }
+        }
+        out
+    }
+
+    // Go: event.go:171 eventList.getEvents
+
+    // Go: event.go:180 eventList.drain
+
+    // Go: event.go:190 eventList.drainForSequences
+
+    // Go: event.go:204 eventList.setError
+    /// setError stores the first error encountered (later errors are ignored).
+    pub fn set_error(&self, err: GoError) {
+        let mut el = self.mu.lock().unwrap();
+        if el.err.is_none() {
+            el.err = Some(err);
+        }
+    }
+
+    // Go: event.go:213 eventList.hasError
+    /// hasError reports whether an error has been recorded.
+    pub fn has_error(&self) -> bool {
+        let el = self.mu.lock().unwrap();
+        el.err.is_some()
+    }
+
+    // Go: event.go:220 eventList.getError
+    /// getError returns the stored error (or nil if none).
+    pub fn get_error(&self) -> Option<GoError> {
+        let el = self.mu.lock().unwrap();
+        el.err.clone()
+    }
+
+    // Go: event.go:226 eventList.getOrCreate
+    // PORT: Go calls it with el.mu held; it takes the guarded data. Go
+    // returns the map's `*eventEntry`; the port returns a mutable reference
+    // into the map.
+
+    // Go: event.go:238 eventList.sequence
+    pub fn sequence(&self) -> u64 {
+        let el = self.mu.lock().unwrap();
+        el.seq
+    }
+
+    // Go: event.go:244 eventList.nextSeqLocked
+    pub fn next_seq_locked(el: &mut EventListLocked) -> u64 {
+        el.seq += 1;
+        el.seq
+    }
+
+    // Go: event.go:249 eventList.advanceSeqLocked
+    pub fn advance_seq_locked(el: &mut EventListLocked, seq: u64) {
+        if seq > el.seq {
+            el.seq = seq;
+        }
+    }
+}
