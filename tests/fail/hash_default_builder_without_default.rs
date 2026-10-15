@@ -1,5 +1,7 @@
-// expect: L0101
-// rustc E0277: HashMap<K, V, S>: Default needs S: Default.
+// expect: L0612
+// rustc E0277: HashMap<K, V, S>: Default needs S: Default. With
+// trait-name calls deferred to body end, the obligation names
+// the missing impl (it was an L0101 on `Default` before).
 use std::collections::HashMap;
 use std::hash::{BuildHasher, DefaultHasher};
 
