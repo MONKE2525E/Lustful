@@ -2634,6 +2634,7 @@ pub fn collect_reuse<'a>(
                 shape: if ty.is_some() { VariantShape::Tuple } else { VariantShape::Unit },
                 fields: ty.map(|ty| vec![Field { name: zero, ty }]).unwrap_or_default(),
                 disc,
+                non_exhaustive: false,
             };
             p.adts[id.0 as usize] = AdtDef {
                 name,
@@ -2642,6 +2643,7 @@ pub fn collect_reuse<'a>(
                 derives: Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, ..Derives::default() },
                 span,
                 repr: crate::ty::layout::Repr::default(),
+                non_exhaustive: false,
             };
             p.gx.adt_info[id.0 as usize] = (def, 1);
             let sized = {
