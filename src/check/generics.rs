@@ -602,6 +602,17 @@ pub fn try_into_error_assoc() -> DefId {
     lang_assoc(lang_trait(&["core", "convert"], "TryInto"), "Error")
 }
 
+/// The defs of `alloc::string::ToString` and its `to_string`
+/// method, recomputed from their std paths (see
+/// `try_from_error_assoc`). `ToString` is not a lang trait: when
+/// the shipped std source brings the real trait its def differs,
+/// and these name only the marker `check/traitpath.rs` puts on a
+/// `ToString::to_string` value when no record exists.
+pub fn to_string_defs() -> (DefId, DefId) {
+    let tr = lang_trait(&["alloc", "string"], "ToString");
+    (tr, lang_assoc(tr, "to_string"))
+}
+
 /// The def of `core::cmp::Ordering`, the fieldless enum lang
 /// signatures below name. Collect registers a local Adt for it
 /// (its variants, layout, and derives are the ordinary enum
