@@ -1452,6 +1452,10 @@ struct Ctx<'p> {
     /// The method call `method_via_user_deref` is probing on its target:
     /// its receiver is `&Target` there, where rustc's step is the place.
     user_deref_call: Option<ExprId>,
+    /// Method calls whose Self Adt has a private inherent method of the
+    /// called name: the probes skip it (rustc E0624 only when nothing
+    /// else answers, `method_call_at`).
+    private_inherent: Vec<(ExprId, AdtId)>,
     /// The last trait pick a probe confirmed (`record_pick_env`): the call
     /// and its trait.
     last_pick: Option<(ExprId, DefId)>,
@@ -1844,6 +1848,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_lang_methods: Vec::new(),
         std_first: Vec::new(),
         user_deref_call: None,
+        private_inherent: Vec::new(),
         last_pick: None,
         deferred_try: Vec::new(),
         deferred_binops: Vec::new(),
@@ -2821,6 +2826,15 @@ impl<'p> Ctx<'p> {
         if let Some(a) = self.tys.local_adt(base) {
             self.check_assoc_vis(a, name, "method", span);
         }
+    }
+
+    /// True when the inherent item `name` of Adt `a` is not visible here.
+    fn assoc_private(&mut self, a: AdtId, name: Sym) -> bool {
+        let p = self.p;
+        let Some(tables) = &p.resolved else { return false };
+        let def = p.def_of_adt(a);
+        let _ = p.sig_of(&mut self.out.reads, def);
+        tables.assoc_vis.get(&def).and_then(|items| items.get(&name)).is_some_and(|(vis, def_mod)| !tables.visible(vis, *def_mod, self.module, &p.interner))
     }
 
     /// Inherent associated item visibility: a method call, or a
@@ -12940,7 +12954,13 @@ impl<'p> Ctx<'p> {
         } else {
             self.autoderef_smart(rt)
         };
-        self.check_method_vis(base, name, name_span);
+        // A private inherent method of the name is no candidate: a visible
+        // trait method may answer instead, and a miss reports it private.
+        if let Some(a) = self.tys.local_adt(base)
+            && self.assoc_private(a, name)
+        {
+            self.private_inherent.push((e, a));
+        }
         let bk = self.tys.kind(base);
         // ARCH 2.12: a method call needs a known receiver head (rustc
         // E0282, also for a closure parameter a later call would fix).
@@ -13112,6 +13132,9 @@ impl<'p> Ctx<'p> {
             }
             let set = p.method_set(&mut self.out.reads, head, name, form);
             for c in set.candidates {
+                if matches!(head, Head::Adt(d) if self.private_inherent.iter().any(|&(x, a)| x == e && p.def_of_adt(a) == d)) {
+                    continue;
+                }
                 let Some(cform) = c.receiver else {
                     assoc_fn_seen = true;
                     continue;
@@ -13721,6 +13744,10 @@ impl<'p> Ctx<'p> {
                 // lust does not model.
                 if self.std_first.contains(&e) {
                     self.report_std_shadow(base, name, false, name_span);
+                    return ERROR;
+                }
+                if let Some(&(_, a)) = self.private_inherent.iter().find(|(x, _)| *x == e) {
+                    self.check_assoc_vis(a, name, "method", name_span);
                     return ERROR;
                 }
                 let tn = self.tn(base);

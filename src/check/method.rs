@@ -295,6 +295,9 @@ pub(super) fn inherent_template_probe(
 ) -> Probe {
     let p = cx.p;
     let Some((adt_def, _)) = cx.tys.adt_parts(probe.self_ty) else { return Probe::Miss };
+    if cx.private_inherent.iter().any(|&(x, a)| x == e && p.def_of_adt(a) == adt_def) {
+        return Probe::Miss;
+    }
     let Some(templates) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return Probe::Miss };
     let templates: Vec<(LocalDefId, crate::check::generics::FnTemplate)> = templates
         .into_iter()
@@ -1347,6 +1350,10 @@ pub(super) fn plain_inherent_probe(
     let p = cx.p;
     let head = Head::of(&cx.tys, probe.self_ty);
     let set = p.method_set(&mut cx.out.reads, head, name, probe.filter);
+    // A private inherent method is skipped (`private_inherent`).
+    if matches!(head, Head::Adt(d) if cx.private_inherent.iter().any(|&(x, a)| x == e && p.def_of_adt(a) == d)) {
+        return Probe::Miss;
+    }
     for c in set.candidates {
         let Some(f) = p.local_def(c.def.hash) else { continue };
         if c.receiver.is_none() {
