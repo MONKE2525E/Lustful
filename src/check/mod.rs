@@ -17865,13 +17865,15 @@ impl<'p> Ctx<'p> {
         self.build_closure_map();
         // A revealed hidden type is recorded at its call, when a generic
         // definer's args can still be inference vars; zonk it like every
-        // other output type, or lowering cannot match it to a local's
-        // type and the local loses its drop-live mark
+        // other output type, and normalize the projections its args now
+        // decide (`I::IntoIter` at `I = &Vec<u32>` is `slice::Iter`, as
+        // the local's type is). Else lowering cannot match it to a
+        // local's type and the local loses its drop-live mark
         // (`Body::opaque_locals`), so borrowck would let the captured
         // borrow end before the opaque value drops.
         for i in 0..self.out.revealed.len() {
-            let t = self.out.revealed[i];
-            self.out.revealed[i] = self.zonk(t);
+            let t = self.zonk(self.out.revealed[i]);
+            self.out.revealed[i] = self.normalize_here(t);
         }
         self.out.revealed.dedup();
         for i in 0..self.out.expr_ty.len() {
