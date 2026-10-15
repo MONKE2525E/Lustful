@@ -385,7 +385,12 @@ impl<'a> V<'a> {
     fn resolve(&self, p: &syn::Path) -> Option<String> {
         let segs: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
         let first = segs.first()?.as_str();
-        let base = if p.leading_colon.is_some() || STD_ROOTS.contains(&first) || self.g.ext_crates.contains(first) {
+        // A bare one-segment path with no leading `::` names a local
+        // value, function, or imported name, never a crate root: a crate
+        // name alone is not a value or a type. Without this guard a
+        // local `notify` or `same_file` reads as the crate of that name.
+        let rooted = p.leading_colon.is_some() || segs.len() > 1;
+        let base = if rooted && (STD_ROOTS.contains(&first) || self.g.ext_crates.contains(first)) {
             segs.join("::")
         } else if let Some(full) = self.aliases.get(first) {
             std::iter::once(full.clone()).chain(segs[1..].iter().cloned()).collect::<Vec<_>>().join("::")
