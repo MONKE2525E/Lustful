@@ -105,6 +105,7 @@ fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, 
         env.re.push((Region::Param(a), if b == STATIC_FACT { Region::Static } else { Region::Param(b) }));
     }
     for &t in implied {
+        let t = expand_free(tys, t);
         let mut reqs = Vec::new();
         wf(cx, tys, t, &mut reqs);
         for (g, r) in reqs {
@@ -117,6 +118,7 @@ fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, 
 /// The first requirement of the `required` types that `env` does not prove.
 fn unmet(cx: &Cx, tys: &mut impl TyIntern, env: &Env, required: &[Ty]) -> Option<Req> {
     for &t in required {
+        let t = expand_free(tys, t);
         let mut reqs = Vec::new();
         wf(cx, tys, t, &mut reqs);
         if let Some(bad) = reqs.into_iter().find(|&(g, r)| !holds(cx, tys, env, g, r)) {
@@ -272,6 +274,82 @@ fn region_holds(env: &Env, x: Region, r: Region) -> bool {
         }
     }
     false
+}
+
+/// `t` with the free region of every fn pointer type in it written into
+/// the slots it fills (`FnSig::free_slots`, W-BORROW3), in borrowck's slot
+/// order: a reference's region, then its pointee; an Adt's lifetime args,
+/// then its type args; a dyn type's object lifetime. The walks then read
+/// a fn pointer's regions from its inputs and output alone.
+fn expand_free(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    expand_in(tys, t, &mut |_: Region| None)
+}
+
+/// `expand_free`, where `slot` gives the region of the next slot of an
+/// enclosing fn pointer (None: keep the written one).
+fn expand_in(tys: &mut impl TyIntern, t: Ty, slot: &mut dyn FnMut(Region) -> Option<Region>) -> Ty {
+    match tys.kind(t) {
+        TyKind::Ref(r, m, e) => {
+            let r = slot(r).unwrap_or(r);
+            let e = expand_in(tys, e, slot);
+            tys.intern(TyKind::Ref(r, m, e))
+        }
+        TyKind::Adt(d, a) => {
+            let argv: Vec<GenericArg> = tys.args(a).to_vec();
+            let mut out = Vec::with_capacity(argv.len());
+            for g in argv {
+                out.push(match g {
+                    GenericArg::Lifetime(r) => GenericArg::Lifetime(slot(r).unwrap_or(r)),
+                    GenericArg::Ty(e) => GenericArg::Ty(expand_in(tys, e, slot)),
+                    c => c,
+                });
+            }
+            let a = tys.intern_args(&out);
+            tys.intern(TyKind::Adt(d, a))
+        }
+        TyKind::Tuple(ts) => {
+            let parts: Vec<Ty> = tys.tys_of(ts).to_vec().into_iter().map(|e| expand_in(tys, e, slot)).collect();
+            let ts = tys.intern_tys(&parts);
+            tys.intern(TyKind::Tuple(ts))
+        }
+        TyKind::Array(e, n) => {
+            let e = expand_in(tys, e, slot);
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Slice(e) => {
+            let e = expand_in(tys, e, slot);
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::RawPtr(m, e) => {
+            let e = expand_in(tys, e, slot);
+            tys.intern(TyKind::RawPtr(m, e))
+        }
+        TyKind::Dyn(b, r) => {
+            let r = slot(r).unwrap_or(r);
+            tys.intern(TyKind::Dyn(b, r))
+        }
+        TyKind::FnPtr(sig) => {
+            let b = tys.sig(sig);
+            let s = b.value;
+            // A nested fn pointer with a free region is one slot of ours.
+            if s.free_slots != 0 {
+                let _ = slot(s.free_region);
+            }
+            let (bits, free) = (s.free_slots, s.free_region);
+            let mut j = 0u32;
+            let mut own = |r: Region| {
+                let k = j;
+                j += 1;
+                (bits >> k & 1 == 1).then_some(free).or(Some(r))
+            };
+            let ins: Vec<Ty> = tys.tys_of(s.inputs).to_vec().into_iter().map(|e| expand_in(tys, e, &mut own)).collect();
+            let output = expand_in(tys, s.output, &mut own);
+            let inputs = tys.intern_tys(&ins);
+            let sig = tys.intern_sig(Binder { count: b.count, value: FnSig { inputs, output, ..s } });
+            tys.intern(TyKind::FnPtr(sig))
+        }
+        _ => t,
+    }
 }
 
 /// The outlives components of `t` (rustc's `compute_components`): every
