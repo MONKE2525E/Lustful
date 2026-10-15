@@ -40,7 +40,18 @@
 # edit, import edit, new file. Run both forms to compare against
 # the single-file path.
 # Line count reported is physical source lines of the generated crate.
+#
+# --slice bench/slices/<name> measures a pinned ts-rust slice against cargo
+# on identical source (cold, restart, no-op, 100+ body edits, signature,
+# type, impl, error, and fix edits; see scripts/speed_slice.py, which holds
+# that mode and its options).
 import json, os, signal, subprocess, sys, tempfile, time
+
+if "--slice" in sys.argv[1:]:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import speed_slice
+    speed_slice.main(sys.argv[1:])
+    sys.exit(0)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUST = os.path.join(ROOT, "target/release/lust")

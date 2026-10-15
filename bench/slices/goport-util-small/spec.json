@@ -1,0 +1,38 @@
+{
+  "name": "goport-util-small",
+  "about": "A quick-run slice: goport_util without gostd, locale, fswatch, and astdata, pruned to what lust accepts",
+  "src_dir": "crates/ts_goport/src",
+  "root_from": "goport_util_root.rs",
+  "root": "slice_main.rs",
+  "append": "\n// bench slice: stand-ins for the external crates, and a bin entry.\nmod support;\npub use support::{indexmap, memchr, rustc_hash};\n\nfn main() {}\n",
+  "support": {
+    "support.rs": "bench/slices/support.rs"
+  },
+  "rewrite": [
+    "rustc_hash",
+    "indexmap",
+    "memchr"
+  ],
+  "root_replace": [
+    [
+      "#[path = \"gopanic.rs\"]\npub mod core;\n",
+      "// bench slice: `core` (gopanic.rs) is not mounted; a user `mod core` breaks lust's std paths (lust bug).\n"
+    ],
+    [
+      "pub mod astdata;\n",
+      "// bench small slice: astdata not mounted.\n"
+    ],
+    [
+      "pub mod fswatch;\n",
+      "// bench small slice: fswatch not mounted.\n"
+    ],
+    [
+      "pub mod gostd;\n",
+      "// bench small slice: gostd not mounted.\n"
+    ],
+    [
+      "pub mod locale;\n",
+      "// bench small slice: locale not mounted.\n"
+    ]
+  ]
+}

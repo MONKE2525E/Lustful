@@ -8,3 +8,5 @@
 /tests/cargo-proj/target
 /tests/cargo-proj/Cargo.lock
 __pycache__/
+/bench/slices/items/target
+/bench/slices/items/Cargo.lock

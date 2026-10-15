@@ -1,0 +1,15 @@
+# slice-items: prints the removable items of one Rust file with their line
+# spans, for bench/slices/prune.py. Detached from the root crate.
+[package]
+name = "slice-items"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+syn = { version = "=2.0.118", default-features = false, features = ["full", "parsing", "printing", "clone-impls", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[profile.release]
+debug = false
