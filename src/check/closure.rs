@@ -1985,7 +1985,10 @@ impl<'p> Ctx<'p> {
             return None;
         }
         let snap = self.snapshot_vars();
-        let ok = ia.iter().zip(&ib).all(|(&x, &y)| self.unify(x, y)) && self.unify(oa, ob);
+        let ok = ia.iter().zip(&ib).all(|(&x, &y)| self.unify(x, y))
+            && self.unify(oa, ob)
+            && !self.closure_has_free_ref_arg(a)
+            && !self.closure_has_free_ref_arg(b);
         if !ok {
             self.rollback_vars(snap);
             return None;
@@ -2017,6 +2020,39 @@ impl<'p> Ctx<'p> {
         Some(fp)
     }
 
+    /// True when a closure argument may hold a free (inferred, not
+    /// higher-ranked) region: an unannotated argument of a closure whose
+    /// argument regions are free (`ClosureInfo::free_args`, `|x| x` in a
+    /// `let`), or one annotated with a named lifetime. rustc cannot make
+    /// such a closure a higher-ranked `fn(&T)` pointer, and lust does not
+    /// track which fn pointer slots are higher-ranked, so it never turns
+    /// one into a fn pointer. An instance trusts its template check,
+    /// where a type param holds no region.
+    fn closure_has_free_ref_arg(&mut self, ct: Ty) -> bool {
+        let TyKind::Closure(def, _) = self.kind(self.resolve(ct)) else { return false };
+        if matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
+            return false;
+        }
+        let (inputs, free_args, input_regions) = match self.closures.iter().find(|c| c.def == def) {
+            Some(c) => (c.inputs.clone(), c.free_args.clone(), c.input_regions.clone()),
+            None => match self.p.gx.closures.get(&def) {
+                Some(g) => (g.inputs.clone(), g.free_args.clone(), g.input_regions.clone()),
+                None => return false,
+            },
+        };
+        let Some(free_args) = free_args else { return false };
+        (0..inputs.len()).any(|i| {
+            let free = !free_args.get(i).copied().unwrap_or(false);
+            match input_regions.get(i).copied().flatten() {
+                Some(r) => free && names_param_region(&self.tys, r),
+                None => free && {
+                    let t = self.deep(inputs[i]);
+                    may_hold_region(&self.tys, t)
+                },
+            }
+        })
+    }
+
     /// True when a closure that captures nothing has a signature that
     /// unifies with the safe fn pointer type `ptr` (rustc's
     /// ClosureFnPointer coercion). A failed probe rolls back.
@@ -2030,7 +2066,9 @@ impl<'p> Ctx<'p> {
         let Some((_, inputs, output)) = self.closure_facts(found) else { return false };
         let fp = self.fn_ptr_ty(&inputs, output);
         let snap = self.snapshot_vars();
-        if self.unify(fp, ptr) {
+        // The free-region test runs after unification, which gives an
+        // unannotated argument the pointer's type.
+        if self.unify(fp, ptr) && !self.closure_has_free_ref_arg(found) {
             return true;
         }
         self.rollback_vars(snap);
@@ -2157,4 +2195,40 @@ fn truncate_for_optimization(mut pl: CPlace, mut mode: CaptureMode, tys: &impl T
         truncate_place(&mut pl, &mut mode, i + 1, tys);
     }
     (pl, mode)
+}
+
+/// True when a closure argument type may hold a region (see
+/// `closure_has_free_ref_arg`): a reference, a dyn or opaque type, an
+/// unresolved type (not a numeric literal's), or an Adt with a lifetime
+/// argument, at any depth.
+/// A type param holds none in a template.
+fn may_hold_region(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Infer(v) => !v.is_int() && !v.is_float(),
+        TyKind::Ref(..) | TyKind::Dyn(..) | TyKind::Opaque(..) => true,
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_hold_region(tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => may_hold_region(tys, e),
+        TyKind::Adt(_, a) => tys.args(a).iter().any(|g| match *g {
+            GenericArg::Lifetime(_) => true,
+            GenericArg::Ty(e) => may_hold_region(tys, e),
+            GenericArg::Const(_) => false,
+        }),
+        _ => false,
+    }
+}
+
+/// True when an annotation's regioned type names a lifetime of the
+/// enclosing fn (`|x: &'a T|`), which is a free region.
+fn names_param_region(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(r, _, e) => matches!(r, crate::ty::Region::Param(_)) || names_param_region(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| names_param_region(tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => names_param_region(tys, e),
+        TyKind::Adt(_, a) => tys.args(a).iter().any(|g| match *g {
+            GenericArg::Lifetime(r) => matches!(r, crate::ty::Region::Param(_)),
+            GenericArg::Ty(e) => names_param_region(tys, e),
+            GenericArg::Const(_) => false,
+        }),
+        _ => false,
+    }
 }
