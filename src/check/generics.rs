@@ -2055,11 +2055,22 @@ impl<T: TyIntern> ConstTyper<'_, '_, T> {
         use ConstScalar as S;
         let ast = self.ast;
         match ast.expr(e) {
-            Expr::Int(_, None) => match want {
+            // A literal must fit the type that pins it (rustc's
+            // overflowing_literals): the value check in `holds`
+            // cannot see it, since a magnitude past `i128::MAX`
+            // wraps to an in-range bit pattern.
+            Expr::Int(mag, None) => match want {
+                Some(S::Int(it)) if *mag > it.max128() => Err(()),
                 None | Some(S::Int(_)) => Ok(None),
                 Some(_) => Err(()),
             },
-            Expr::Int(_, Some(sfx)) => const_want(want, S::Int(IntTy::from_suffix(*sfx))),
+            Expr::Int(mag, Some(sfx)) => {
+                let it = IntTy::from_suffix(*sfx);
+                if *mag > it.max128() {
+                    return Err(());
+                }
+                const_want(want, S::Int(it))
+            }
             Expr::Bool(_) => const_want(want, S::Bool),
             Expr::Char(_) => const_want(want, S::Char),
             Expr::Float(_) | Expr::Str(_) | Expr::Unit => {
@@ -2071,6 +2082,26 @@ impl<T: TyIntern> ConstTyper<'_, '_, T> {
             }
             Expr::Block(b) | Expr::ConstBlock(b) => self.block(*b, want),
             Expr::Unary { op: UnOp::Neg, expr } => {
+                // A negated literal may reach one past the max
+                // (the type's min): check its magnitude here, where
+                // the negation is visible.
+                if let Expr::Int(mag, sfx) = ast.expr(*expr) {
+                    let mag = *mag;
+                    return match (sfx, want) {
+                        (Some(s), _) => {
+                            let it = IntTy::from_suffix(*s);
+                            if !it.signed() || mag > it.max128() + 1 {
+                                return Err(());
+                            }
+                            const_want(want, S::Int(it))
+                        }
+                        (None, Some(S::Int(it))) => {
+                            if it.signed() && mag <= it.max128() + 1 { Ok(None) } else { Err(()) }
+                        }
+                        (None, Some(_)) => Err(()),
+                        (None, None) => Ok(None),
+                    };
+                }
                 let unsigned = |s: Option<S>| match s {
                     Some(S::Int(it)) => !it.signed(),
                     Some(_) => true,

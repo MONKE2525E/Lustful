@@ -1509,6 +1509,48 @@ fn named_const_expr(ast: &Ast, names: &[Sym]) -> Option<ast::ExprId> {
     }
 }
 
+/// The declared type of the named const `named_const_expr` finds,
+/// with the same ambiguity rules (None when the pick is ambiguous).
+fn named_const_decl(ast: &Ast, names: &[Sym]) -> Option<ast::TyId> {
+    match names {
+        [name] => {
+            for item in &ast.items {
+                if let ItemKind::Const(c) = &item.kind
+                    && c.name == Some(*name)
+                    && c.value.is_some()
+                {
+                    return Some(c.ty);
+                }
+            }
+            None
+        }
+        [ty_name, name] => {
+            let mut found = None;
+            for item in &ast.items {
+                let ItemKind::Impl(imp) = &item.kind else { continue };
+                if imp.trait_ref.is_some() {
+                    continue;
+                }
+                let TyExpr::Path(segs) = ast.ty(imp.self_ty) else { continue };
+                if segs.first().map(|s| s.name) != Some(*ty_name) {
+                    continue;
+                }
+                for c in &imp.consts {
+                    if c.name == *name && c.default.is_some() {
+                        let generic = imp.generics.params.iter().any(|g| !matches!(g, ast::GenericParam::Lifetime { .. }));
+                        if found.is_some() || generic {
+                            return None;
+                        }
+                        found = Some(c.ty);
+                    }
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
 /// The integer value of a named const (see `named_const_expr`),
 /// for const generic arguments written as bare paths.
 pub fn named_const_int(ast: &Ast, interner: &Interner, known: &Known, names: &[Sym]) -> Option<u128> {
@@ -1623,14 +1665,37 @@ pub fn float_literal_overflows(text: &str, f: FloatTy) -> bool {
 
 /// Evaluates a constant integer expression at collection time: literals,
 /// negation and bit-not, integer arithmetic and shifts, and `as` casts
-/// between integer types. Returns None for anything else. The full bounded
-/// evaluator lives in `ty::consteval` (ARCH 2.13); this is its scalar subset
-/// for discriminants and array lengths, which collect needs before bodies run.
+/// between scalar types. Returns None for anything else, and for every
+/// const failure (typed overflow, division by zero, a shift at or past
+/// the bit width, an out-of-range literal). The full bounded evaluator
+/// lives in `ty::consteval` (ARCH 2.13); this is its scalar subset for
+/// discriminants and array lengths, which collect needs before bodies
+/// run, sharing the same typed arithmetic core.
 pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId) -> Option<i128> {
-    let mut env = Vec::new();
-    let mut steps = 0u64;
-    match eval_scalar(ast, interner, known, e, 0, &mut env, &mut steps) {
-        SFlow::V(v) => v,
+    eval_const_int_exp(ast, interner, known, e, None)
+}
+
+/// `eval_const_int` with an expected integer type pinning the
+/// expression's unpinned literals (a discriminant's repr type, a
+/// const parameter's declared type): a literal or operation out
+/// of that type's range is None, as rustc rejects it.
+pub fn eval_const_int_exp(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, exp: Option<IntTy>) -> Option<i128> {
+    let mut ev = ScalarEval { ast, interner, known, slots: Vec::new(), steps: 0 };
+    let mut env: SEnv = Vec::new();
+    let v = match ev.expr(&mut env, e, exp.map(SExp::Int), 0) {
+        SFlow::V(Some(v)) => v,
+        _ => return None,
+    };
+    match v {
+        SVal::Int(x, _) => match exp {
+            Some(it) => s_coerce_int(v, it).map(|c| match c {
+                SVal::Int(x, _) => x,
+                _ => unreachable!(),
+            }),
+            None => Some(x),
+        },
+        SVal::Bool(b) => Some(b as i128),
+        SVal::Char(c) => Some(c as i128),
         _ => None,
     }
 }
@@ -1872,350 +1937,771 @@ fn disc_ty_block(ast: &Ast, interner: &Interner, known: &Known, b: ast::BlockId,
     out
 }
 
-/// Control flow of the scalar interpreter below.
+/// A scalar value in the interpreter below. Integers carry their
+/// type when anything pins it (a suffix, a written type, a cast, a
+/// const item's declared type) and use the stored form of
+/// `ty::consteval` (sign- or zero-extended, raw bits at 128), so
+/// arithmetic through `ty::consteval::int_binop` matches the main
+/// evaluator exactly. `None` is an unpinned `{integer}` value kept
+/// wide in i128.
+#[derive(Clone, Copy, PartialEq)]
+enum SVal {
+    Int(i128, Option<IntTy>),
+    Float(u64, FloatTy),
+    Bool(bool),
+    Char(char),
+    Unit,
+    /// A reference to a local's slot (`&x`, `&mut x`, a `&mut` param).
+    Ref(usize),
+}
+
+/// The scalar type a context expects, for pinning literals.
+#[derive(Clone, Copy, PartialEq)]
+enum SExp {
+    Int(IntTy),
+    Float(FloatTy),
+    Bool,
+    Char,
+}
+
+/// Control flow of the scalar interpreter below. `V(None)` is
+/// "outside the subset, or a const failure" (overflow, division
+/// by zero, a bad shift, an out-of-range literal, a panic):
+/// callers reject both, never a wrong value.
 enum SFlow {
-    /// A plain value (None is unit, or not a scalar).
-    V(Option<i128>),
-    Break(Option<i128>),
-    Continue,
-    Return(Option<i128>),
+    V(Option<SVal>),
+    Break(Option<Sym>, Option<SVal>),
+    Continue(Option<Sym>),
+    Return(Option<SVal>),
 }
 
-/// One block of the scalar interpreter: plain binding lets and
-/// expression statements, then the tail value.
-fn eval_scalar_block(
-    ast: &Ast,
-    interner: &Interner,
-    known: &Known,
-    b: ast::BlockId,
-    depth: u32,
-    env: &mut Vec<(Sym, i128)>,
-    steps: &mut u64,
-) -> SFlow {
-    use crate::ast::{Pat, Stmt};
-    let saved = env.len();
-    let block = ast.block(b);
-    for stmt in &block.stmts {
-        match stmt {
-            Stmt::Let { pat, init, .. } => {
-                let (Some(init), Pat::Binding { name, .. }) = (init, ast.pat(*pat)) else {
-                    env.truncate(saved);
-                    return SFlow::V(None);
-                };
-                let v = match eval_scalar(ast, interner, known, *init, depth, env, steps) {
-                    SFlow::V(Some(v)) => v,
-                    _ => {
-                        env.truncate(saved);
-                        return SFlow::V(None);
-                    }
-                };
-                env.push((*name, v));
-            }
-            Stmt::Expr { expr, .. } => match eval_scalar(ast, interner, known, *expr, depth, env, steps) {
-                SFlow::V(_) => {}
-                other => {
-                    env.truncate(saved);
-                    return other;
-                }
-            },
-            _ => {
-                env.truncate(saved);
-                return SFlow::V(None);
-            }
+/// Locals by name, pointing into the interpreter's slot arena.
+/// Slots outlive their name scope, so a `&mut` param can write
+/// through to a caller's local.
+type SEnv = Vec<(Sym, usize)>;
+
+/// The scalar type a written one-segment type names, if scalar.
+fn sexp_of_written(ast: &Ast, interner: &Interner, known: &Known, ty: ast::TyId) -> Option<SExp> {
+    let TyExpr::Path(segs) = ast.ty(ty) else { return None };
+    if segs.len() != 1 {
+        return None;
+    }
+    let name = segs[0].name;
+    if let Some(it) = known.int_ty(name) {
+        return Some(SExp::Int(it));
+    }
+    match interner.get(name) {
+        "f32" => Some(SExp::Float(FloatTy::F32)),
+        "f64" => Some(SExp::Float(FloatTy::F64)),
+        "bool" => Some(SExp::Bool),
+        "char" => Some(SExp::Char),
+        _ => None,
+    }
+}
+
+/// True when the plain (wide) integer `v` is a value of `it`.
+fn s_fits(v: i128, it: IntTy) -> bool {
+    let bits = it.bits();
+    if bits >= 128 {
+        return true;
+    }
+    if it.signed() { v >= -(1i128 << (bits - 1)) && v < (1i128 << (bits - 1)) } else { v >= 0 && v < (1i128 << bits) }
+}
+
+/// Pins a scalar value to an expected integer type: a flex value
+/// must fit, a typed value must already have the type.
+fn s_coerce_int(v: SVal, it: IntTy) -> Option<SVal> {
+    match v {
+        SVal::Int(_, Some(t)) if t == it => Some(v),
+        SVal::Int(x, None) if s_fits(x, it) => Some(SVal::Int(x, Some(it))),
+        _ => None,
+    }
+}
+
+/// The expected scalar type of a stored value, for assignments.
+fn s_exp_of(v: SVal) -> Option<SExp> {
+    match v {
+        SVal::Int(_, Some(it)) => Some(SExp::Int(it)),
+        SVal::Float(_, f) => Some(SExp::Float(f)),
+        SVal::Bool(_) => Some(SExp::Bool),
+        SVal::Char(_) => Some(SExp::Char),
+        _ => None,
+    }
+}
+
+/// A shift amount from a scalar value of any integer type.
+fn s_shift_amt(v: SVal) -> Option<u32> {
+    match v {
+        SVal::Int(x, Some(it)) if !it.signed() => u32::try_from(x as u128).ok(),
+        SVal::Int(x, _) if x >= 0 => u32::try_from(x).ok(),
+        _ => None,
+    }
+}
+
+/// One arithmetic, bitwise, shift, or comparison operation over
+/// two scalar values whose types the caller has reconciled (flex
+/// operands re-pinned or coerced). Typed integer arithmetic goes
+/// through `int_binop`, the main evaluator's own core.
+fn s_combine(op: crate::ast::BinOp, a: SVal, b: SVal) -> Option<SVal> {
+    use crate::ast::BinOp;
+    use crate::ty::consteval::{int_binop, int_cmp};
+    if op.is_cmp() {
+        let ord = match (a, b) {
+            (SVal::Int(x, Some(it)), SVal::Int(y, Some(it2))) if it == it2 => Some(int_cmp(it, x, y)),
+            (SVal::Int(x, _), SVal::Int(y, _)) => Some(x.cmp(&y)),
+            (SVal::Char(x), SVal::Char(y)) => Some(x.cmp(&y)),
+            (SVal::Bool(x), SVal::Bool(y)) => Some(x.cmp(&y)),
+            (SVal::Float(x, FloatTy::F64), SVal::Float(y, FloatTy::F64)) => f64::from_bits(x).partial_cmp(&f64::from_bits(y)),
+            (SVal::Float(x, FloatTy::F32), SVal::Float(y, FloatTy::F32)) => f32::from_bits(x as u32).partial_cmp(&f32::from_bits(y as u32)),
+            _ => return None,
+        };
+        let eq = ord == Some(std::cmp::Ordering::Equal);
+        let r = match op {
+            BinOp::Eq => eq,
+            BinOp::Ne => !eq,
+            BinOp::Lt => ord == Some(std::cmp::Ordering::Less),
+            BinOp::Le => matches!(ord, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+            BinOp::Gt => ord == Some(std::cmp::Ordering::Greater),
+            BinOp::Ge => matches!(ord, Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+            _ => return None,
+        };
+        return Some(SVal::Bool(r));
+    }
+    match (a, b) {
+        // A flex left side with a typed right side (a compound
+        // assignment through a `&mut` param into an unpinned
+        // local): the operation runs in the typed side's type.
+        (SVal::Int(x, None), SVal::Int(_, Some(it))) if !matches!(op, BinOp::Shl | BinOp::Shr) => {
+            let x = match s_coerce_int(a, it) {
+                Some(SVal::Int(x, _)) => x,
+                _ => return None,
+            };
+            let SVal::Int(y, _) = b else { return None };
+            int_binop(op, it, x, y).map(|r| SVal::Int(r, Some(it)))
         }
+        (SVal::Int(x, Some(it)), SVal::Int(y, t2)) => {
+            let y = if matches!(op, BinOp::Shl | BinOp::Shr) {
+                s_shift_amt(b)? as i128
+            } else {
+                if t2 != Some(it) {
+                    return None;
+                }
+                y
+            };
+            int_binop(op, it, x, y).map(|r| SVal::Int(r, Some(it)))
+        }
+        (SVal::Int(x, None), SVal::Int(y, None)) => {
+            let r = match op {
+                BinOp::Add => x.checked_add(y),
+                BinOp::Sub => x.checked_sub(y),
+                BinOp::Mul => x.checked_mul(y),
+                BinOp::Div => x.checked_div(y),
+                BinOp::Rem => x.checked_rem(y),
+                BinOp::BitAnd => Some(x & y),
+                BinOp::BitOr => Some(x | y),
+                BinOp::BitXor => Some(x ^ y),
+                BinOp::Shl => s_shift_amt(b).and_then(|s| x.checked_shl(s)),
+                BinOp::Shr => s_shift_amt(b).and_then(|s| x.checked_shr(s)),
+                _ => return None,
+            }?;
+            Some(SVal::Int(r, None))
+        }
+        (SVal::Float(x, f), SVal::Float(y, g)) if f == g => {
+            let bits = match f {
+                FloatTy::F64 => {
+                    let (x, y) = (f64::from_bits(x), f64::from_bits(y));
+                    let r = match op {
+                        BinOp::Add => x + y,
+                        BinOp::Sub => x - y,
+                        BinOp::Mul => x * y,
+                        BinOp::Div => x / y,
+                        BinOp::Rem => x % y,
+                        _ => return None,
+                    };
+                    r.to_bits()
+                }
+                FloatTy::F32 => {
+                    let (x, y) = (f32::from_bits(x as u32), f32::from_bits(y as u32));
+                    let r = match op {
+                        BinOp::Add => x + y,
+                        BinOp::Sub => x - y,
+                        BinOp::Mul => x * y,
+                        BinOp::Div => x / y,
+                        BinOp::Rem => x % y,
+                        _ => return None,
+                    };
+                    r.to_bits() as u64
+                }
+            };
+            Some(SVal::Float(bits, f))
+        }
+        (SVal::Bool(x), SVal::Bool(y)) => match op {
+            BinOp::BitAnd => Some(SVal::Bool(x & y)),
+            BinOp::BitOr => Some(SVal::Bool(x | y)),
+            BinOp::BitXor => Some(SVal::Bool(x ^ y)),
+            _ => None,
+        },
+        _ => None,
     }
-    let out = match block.tail {
-        Some(tail) => eval_scalar(ast, interner, known, tail, depth, env, steps),
-        None => SFlow::V(None),
-    };
-    env.truncate(saved);
-    out
 }
 
-/// The scalar interpreter behind `eval_const_int`: plain integer
-/// arithmetic and comparisons over literals, env-bound names, const
-/// items found by scanning the crate's items, and calls to const fns
-/// whose bodies stay in this scalar subset (lets, assignments, if,
-/// while, and loop). It answers at collection time, before function
-/// signatures exist, so it cannot use the full evaluator. Anything
-/// outside the subset is None, never a wrong value.
-fn eval_scalar(
-    ast: &Ast,
-    interner: &Interner,
-    known: &Known,
-    e: ast::ExprId,
-    depth: u32,
-    env: &mut Vec<(Sym, i128)>,
-    steps: &mut u64,
-) -> SFlow {
-    *steps += 1;
-    if depth > 32 || *steps > 100_000 {
-        return SFlow::V(None);
+/// The scalar interpreter behind `eval_const_int`: typed scalar
+/// arithmetic over literals, env-bound names, const items found by
+/// scanning the crate's items, and calls to const fns whose bodies
+/// stay in this scalar subset (lets, assignments through locals
+/// and `&mut` params, if, while, loop, labeled break/continue).
+/// It answers at collection time, before function signatures
+/// exist, so it cannot use the full evaluator; it runs the same
+/// typed arithmetic core (`ty::consteval::int_binop` and friends),
+/// so the two cannot disagree on a value. Anything outside the
+/// subset, and every const failure, is None.
+struct ScalarEval<'x> {
+    ast: &'x Ast,
+    interner: &'x Interner,
+    known: &'x Known,
+    slots: Vec<SVal>,
+    steps: u64,
+}
+
+impl<'x> ScalarEval<'x> {
+    fn new_slot(&mut self, v: SVal) -> usize {
+        self.slots.push(v);
+        self.slots.len() - 1
     }
-    use crate::ast::{BinOp, Expr, UnOp};
-    let val = |ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, depth: u32, env: &mut Vec<(Sym, i128)>, steps: &mut u64| {
-        match eval_scalar(ast, interner, known, e, depth, env, steps) {
+
+    /// Stores `v` into a slot, pinning a flex integer to the
+    /// slot's type. False on a kind or type mismatch.
+    fn store(&mut self, slot: usize, v: SVal) -> bool {
+        let cur = self.slots[slot];
+        let v = match (cur, v) {
+            (SVal::Int(_, Some(it)), SVal::Int(..)) => match s_coerce_int(v, it) {
+                Some(v) => v,
+                None => return false,
+            },
+            (SVal::Int(..), SVal::Int(..)) => v,
+            (SVal::Float(_, f), SVal::Float(_, g)) if f == g => v,
+            (SVal::Bool(_), SVal::Bool(_)) | (SVal::Char(_), SVal::Char(_)) | (SVal::Ref(_), SVal::Ref(_)) => v,
+            _ => return false,
+        };
+        self.slots[slot] = v;
+        true
+    }
+
+    /// The plain value of an expression, or None outside the subset.
+    fn val(&mut self, env: &mut SEnv, e: ast::ExprId, exp: Option<SExp>, depth: u32) -> Option<SVal> {
+        match self.expr(env, e, exp, depth) {
             SFlow::V(v) => v,
             _ => None,
         }
-    };
-    match ast.expr(e) {
-        Expr::Int(v, _) => SFlow::V(Some(*v as u128 as i128)),
-        Expr::Char(c) => SFlow::V(Some(*c as i128)),
-        Expr::Bool(b) => SFlow::V(Some(*b as i128)),
-        Expr::Unit => SFlow::V(None),
-        Expr::Unary { op, expr } => {
-            // A negated literal names its magnitude first: 170141183460469231731687303715884105728
-            // does not fit i128 alone, but its negation is i128::MIN.
-            if *op == UnOp::Neg
-                && let Expr::Int(mag, _) = ast.expr(*expr)
-            {
-                return SFlow::V(if *mag <= (1u128 << 127) { Some((*mag as i128).wrapping_neg()) } else { None });
-            }
-            let Some(v) = val(ast, interner, known, *expr, depth + 1, env, steps) else { return SFlow::V(None) };
-            SFlow::V(match op {
-                UnOp::Neg => v.checked_neg(),
-                UnOp::Not => Some(!v),
-            })
+    }
+
+    fn bool_val(&mut self, env: &mut SEnv, e: ast::ExprId, depth: u32) -> Option<bool> {
+        match self.val(env, e, Some(SExp::Bool), depth)? {
+            SVal::Bool(b) => Some(b),
+            SVal::Int(x, _) => Some(x != 0),
+            _ => None,
         }
-        Expr::Binary { op, lhs, rhs } => {
-            if matches!(op, BinOp::And | BinOp::Or) {
-                let Some(a) = val(ast, interner, known, *lhs, depth + 1, env, steps) else { return SFlow::V(None) };
-                if (*op == BinOp::And && a == 0) || (*op == BinOp::Or && a != 0) {
-                    return SFlow::V(Some((a != 0) as i128));
-                }
-                let b = val(ast, interner, known, *rhs, depth + 1, env, steps);
-                return SFlow::V(b.map(|b| (b != 0) as i128));
-            }
-            let (a, b) = (val(ast, interner, known, *lhs, depth + 1, env, steps), val(ast, interner, known, *rhs, depth + 1, env, steps));
-            let (Some(a), Some(b)) = (a, b) else { return SFlow::V(None) };
-            SFlow::V(match op {
-                BinOp::Add => a.checked_add(b),
-                BinOp::Sub => a.checked_sub(b),
-                BinOp::Mul => a.checked_mul(b),
-                BinOp::Div => a.checked_div(b),
-                BinOp::Rem => a.checked_rem(b),
-                BinOp::BitAnd => Some(a & b),
-                BinOp::BitOr => Some(a | b),
-                BinOp::BitXor => Some(a ^ b),
-                BinOp::Shl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
-                BinOp::Shr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
-                BinOp::Eq => Some((a == b) as i128),
-                BinOp::Ne => Some((a != b) as i128),
-                BinOp::Lt => Some((a < b) as i128),
-                BinOp::Le => Some((a <= b) as i128),
-                BinOp::Gt => Some((a > b) as i128),
-                BinOp::Ge => Some((a >= b) as i128),
+    }
+
+    /// The slot an assignable place names: a local, or a deref of
+    /// a reference to one.
+    fn place_slot(&mut self, env: &mut SEnv, e: ast::ExprId, depth: u32) -> Option<usize> {
+        use crate::ast::Expr;
+        match self.ast.expr(e) {
+            Expr::Path(segs) if segs.len() == 1 => env.iter().rev().find(|(n, _)| *n == segs[0].name).map(|(_, s)| *s),
+            Expr::Deref(inner) => match self.val(env, *inner, None, depth + 1)? {
+                SVal::Ref(s) => Some(s),
                 _ => None,
-            })
+            },
+            _ => None,
         }
-        Expr::Cast { expr, ty } => {
-            let Some(v) = val(ast, interner, known, *expr, depth + 1, env, steps) else { return SFlow::V(None) };
-            let target = match ast.ty(*ty) {
-                TyExpr::Path(segs) if segs.len() == 1 => known.int_ty(segs[0].name),
-                _ => None,
-            };
-            SFlow::V(match target {
-                Some(it) => Some(truncate_to_int(v, it)),
-                None if matches!(ast.ty(*ty), TyExpr::Path(segs) if segs.len() == 1 && segs[0].name == known.char) => Some(v),
-                _ => None,
-            })
+    }
+
+    /// One block: plain binding lets and expression statements,
+    /// then the tail value. A statement outside the subset aborts
+    /// the whole evaluation (it may have effects this interpreter
+    /// cannot see, so skipping it could give a wrong value).
+    fn block(&mut self, env: &mut SEnv, b: ast::BlockId, exp: Option<SExp>, depth: u32) -> SFlow {
+        use crate::ast::{Pat, Stmt};
+        self.steps += 1;
+        if self.steps > 100_000 {
+            return SFlow::V(None);
         }
-        Expr::Block(b) | Expr::ConstBlock(b) => eval_scalar_block(ast, interner, known, *b, depth + 1, env, steps),
-        Expr::If { cond, then, els } => {
-            let Some(c) = val(ast, interner, known, *cond, depth + 1, env, steps) else { return SFlow::V(None) };
-            if c != 0 {
-                let b = *then;
-                eval_scalar_block(ast, interner, known, b, depth + 1, env, steps)
-            } else {
-                match els {
-                    Some(els) => eval_scalar(ast, interner, known, *els, depth + 1, env, steps),
-                    None => SFlow::V(None),
-                }
-            }
-        }
-        Expr::While { cond, body, .. } => loop {
-            let Some(c) = val(ast, interner, known, *cond, depth + 1, env, steps) else { return SFlow::V(None) };
-            if c == 0 {
-                return SFlow::V(None);
-            }
-            let b = *body;
-            match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
-                SFlow::V(_) | SFlow::Continue => {}
-                SFlow::Break(_) => return SFlow::V(None),
-                other => return other,
-            }
-            if *steps > 100_000 {
-                return SFlow::V(None);
-            }
-        },
-        Expr::Loop { body, .. } => loop {
-            let b = *body;
-            match eval_scalar_block(ast, interner, known, b, depth + 1, env, steps) {
-                SFlow::V(_) | SFlow::Continue => {}
-                SFlow::Break(v) => return SFlow::V(v),
-                other => return other,
-            }
-            if *steps > 100_000 {
-                return SFlow::V(None);
-            }
-        },
-        Expr::Break { value, .. } => {
-            let v = match value {
-                Some(v) => val(ast, interner, known, *v, depth + 1, env, steps),
-                None => None,
-            };
-            SFlow::Break(v)
-        }
-        Expr::Continue(_) => SFlow::Continue,
-        Expr::Return(v) => {
-            let v = match v {
-                Some(v) => val(ast, interner, known, *v, depth + 1, env, steps),
-                None => None,
-            };
-            SFlow::Return(v)
-        }
-        Expr::Assign { lhs, rhs } => {
-            let Some(v) = val(ast, interner, known, *rhs, depth + 1, env, steps) else { return SFlow::V(None) };
-            let Expr::Path(segs) = ast.expr(*lhs) else { return SFlow::V(None) };
-            if segs.len() != 1 {
-                return SFlow::V(None);
-            }
-            match env.iter_mut().rev().find(|(n, _)| *n == segs[0].name) {
-                Some(slot) => {
-                    slot.1 = v;
-                    SFlow::V(None)
-                }
-                None => SFlow::V(None),
-            }
-        }
-        Expr::AssignOp { op, lhs, rhs } => {
-            let cur = val(ast, interner, known, *lhs, depth + 1, env, steps);
-            let rv = val(ast, interner, known, *rhs, depth + 1, env, steps);
-            let (Some(a), Some(b)) = (cur, rv) else { return SFlow::V(None) };
-            let r = match op {
-                BinOp::Add => a.checked_add(b),
-                BinOp::Sub => a.checked_sub(b),
-                BinOp::Mul => a.checked_mul(b),
-                BinOp::Div => a.checked_div(b),
-                BinOp::Rem => a.checked_rem(b),
-                BinOp::BitAnd => Some(a & b),
-                BinOp::BitOr => Some(a | b),
-                BinOp::BitXor => Some(a ^ b),
-                BinOp::Shl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
-                BinOp::Shr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
-                _ => None,
-            };
-            let Some(r) = r else { return SFlow::V(None) };
-            let Expr::Path(segs) = ast.expr(*lhs) else { return SFlow::V(None) };
-            if segs.len() != 1 {
-                return SFlow::V(None);
-            }
-            match env.iter_mut().rev().find(|(n, _)| *n == segs[0].name) {
-                Some(slot) => {
-                    slot.1 = r;
-                    SFlow::V(None)
-                }
-                None => SFlow::V(None),
-            }
-        }
-        Expr::Call { callee, args } => {
-            // A call to a const fn found by scanning the crate's items.
-            let Expr::Path(segs) = ast.expr(*callee) else { return SFlow::V(None) };
-            if segs.len() != 1 {
-                return SFlow::V(None);
-            }
-            let name = segs[0].name;
-            let mut argv = Vec::new();
-            for &a in args {
-                match val(ast, interner, known, a, depth + 1, env, steps) {
-                    Some(v) => argv.push(v),
-                    None => return SFlow::V(None),
-                }
-            }
-            // A body item of this name in scope at the call wins: a
-            // nested const fn is the only candidate, and another body
-            // item shadows every module fn.
-            let mut defs: Vec<&ast::FnDef> = Vec::new();
-            match stmt_item_at(ast, name, ast.expr_span(*callee)) {
-                Some(si) => match &ast.stmt_items[si as usize].kind {
-                    ItemKind::Fn(d) => defs.push(d),
-                    _ => return SFlow::V(None),
-                },
-                None => {
-                    for item in &ast.items {
-                        if let ItemKind::Fn(def) = &item.kind {
-                            defs.push(def);
+        let ast = self.ast;
+        let saved = env.len();
+        let block = ast.block(b);
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { pat, ty, init, els, .. } => {
+                    let (Some(init), None, Pat::Binding { name, .. }) = (init, els, ast.pat(*pat)) else {
+                        env.truncate(saved);
+                        return SFlow::V(None);
+                    };
+                    let name = *name;
+                    let lexp = ty.and_then(|t| sexp_of_written(self.ast, self.interner, self.known, t));
+                    let Some(mut v) = self.val(env, *init, lexp, depth + 1) else {
+                        env.truncate(saved);
+                        return SFlow::V(None);
+                    };
+                    if let Some(SExp::Int(it)) = lexp {
+                        match s_coerce_int(v, it) {
+                            Some(c) => v = c,
+                            None => {
+                                env.truncate(saved);
+                                return SFlow::V(None);
+                            }
                         }
                     }
+                    let slot = self.new_slot(v);
+                    env.push((name, slot));
+                }
+                Stmt::Expr { expr, .. } => match self.expr(env, *expr, None, depth + 1) {
+                    SFlow::V(Some(_)) => {}
+                    other => {
+                        env.truncate(saved);
+                        return other;
+                    }
+                },
+                _ => {
+                    env.truncate(saved);
+                    return SFlow::V(None);
                 }
             }
-            for def in defs {
-                if def.name != name || !def.qual.is_const || def.self_param.is_some() || def.params.len() != argv.len() {
-                    continue;
+        }
+        let out = match block.tail {
+            Some(tail) => self.expr(env, tail, exp, depth + 1),
+            None => SFlow::V(Some(SVal::Unit)),
+        };
+        env.truncate(saved);
+        out
+    }
+
+    /// A binary operation: operand types reconcile as in the main
+    /// evaluator (an unpinned operand takes the other side's type,
+    /// two unpinned comparison operands fall back to i32, a shift's
+    /// amount never pins the shifted value).
+    fn binary(&mut self, env: &mut SEnv, op: crate::ast::BinOp, lhs: ast::ExprId, rhs: ast::ExprId, exp: Option<SExp>, depth: u32) -> Option<SVal> {
+        use crate::ast::BinOp;
+        use crate::ty::consteval::flex_int_expr;
+        let ast = self.ast;
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let lhs_exp = if op.is_cmp() { None } else { exp };
+        let mut a = self.val(env, lhs, lhs_exp, depth + 1)?;
+        let rhs_exp = if shift { None } else { s_exp_of(a).or(lhs_exp) };
+        let mut b = self.val(env, rhs, rhs_exp, depth + 1)?;
+        if shift {
+            if let SVal::Int(_, None) = a
+                && flex_int_expr(ast, lhs)
+            {
+                let pin = match lhs_exp {
+                    Some(SExp::Int(it)) => it,
+                    _ => IntTy::I32,
+                };
+                a = self.val(env, lhs, Some(SExp::Int(pin)), depth + 1)?;
+            }
+        } else {
+            match (a, b) {
+                (SVal::Int(_, Some(it)), SVal::Int(_, None)) => {
+                    b = if flex_int_expr(ast, rhs) {
+                        self.val(env, rhs, Some(SExp::Int(it)), depth + 1)?
+                    } else {
+                        s_coerce_int(b, it)?
+                    };
                 }
-                let Some(body) = def.body else { return SFlow::V(None) };
-                let mut fenv: Vec<(Sym, i128)> = Vec::new();
-                for (param, v) in def.params.iter().zip(argv) {
-                    if param.pat.is_some() {
-                        return SFlow::V(None);
+                (SVal::Int(_, None), SVal::Int(_, Some(it))) => {
+                    a = if flex_int_expr(ast, lhs) {
+                        self.val(env, lhs, Some(SExp::Int(it)), depth + 1)?
+                    } else {
+                        s_coerce_int(a, it)?
+                    };
+                }
+                (SVal::Int(_, None), SVal::Int(_, None)) if op.is_cmp() && flex_int_expr(ast, lhs) && flex_int_expr(ast, rhs) => {
+                    a = self.val(env, lhs, Some(SExp::Int(IntTy::I32)), depth + 1)?;
+                    b = self.val(env, rhs, Some(SExp::Int(IntTy::I32)), depth + 1)?;
+                }
+                _ => {}
+            }
+        }
+        s_combine(op, a, b)
+    }
+
+    /// An `as` cast between scalar types, with the main
+    /// evaluator's literal rules and saturating float-to-int casts.
+    fn cast(&mut self, env: &mut SEnv, expr: ast::ExprId, ty: ast::TyId, depth: u32) -> Option<SVal> {
+        use crate::ty::consteval::{flex_int_expr, float_to_int, is_unsuffixed_lit, truncate_to_int as trunc};
+        let ast = self.ast;
+        let target = sexp_of_written(ast, self.interner, self.known, ty)?;
+        let src_exp = if is_unsuffixed_lit(ast, expr) {
+            Some(target)
+        } else if flex_int_expr(ast, expr) {
+            Some(SExp::Int(IntTy::I32))
+        } else {
+            None
+        };
+        let v = self.val(env, expr, src_exp, depth + 1)?;
+        match (v, target) {
+            (SVal::Int(x, _), SExp::Int(it)) => Some(SVal::Int(trunc(x, it), Some(it))),
+            (SVal::Bool(b), SExp::Int(it)) => Some(SVal::Int(b as i128, Some(it))),
+            (SVal::Char(c), SExp::Int(it)) => Some(SVal::Int(trunc(c as i128, it), Some(it))),
+            (SVal::Float(bits, f), SExp::Int(it)) => Some(SVal::Int(float_to_int(bits, f, it), Some(it))),
+            (SVal::Int(x, t), SExp::Float(g)) => {
+                let unsigned = matches!(t, Some(it) if !it.signed());
+                let bits = match (g, unsigned) {
+                    (FloatTy::F64, true) => ((x as u128) as f64).to_bits(),
+                    (FloatTy::F32, true) => ((x as u128) as f32).to_bits() as u64,
+                    (FloatTy::F64, false) => (x as f64).to_bits(),
+                    (FloatTy::F32, false) => (x as f32).to_bits() as u64,
+                };
+                Some(SVal::Float(bits, g))
+            }
+            (SVal::Float(bits, f), SExp::Float(g)) => {
+                let r = match (f, g) {
+                    (FloatTy::F64, FloatTy::F32) => (f64::from_bits(bits) as f32).to_bits() as u64,
+                    (FloatTy::F32, FloatTy::F64) => (f32::from_bits(bits as u32) as f64).to_bits(),
+                    _ => bits,
+                };
+                Some(SVal::Float(r, g))
+            }
+            (SVal::Int(x, _), SExp::Char) => u32::try_from(x).ok().and_then(char::from_u32).map(SVal::Char),
+            _ => None,
+        }
+    }
+
+    /// A call to a const fn found by scanning the crate's items.
+    /// Argument types come from the written parameter types, so
+    /// the body's arithmetic runs in its real types; a `&mut`
+    /// param aliases the caller's slot, so writes through it land.
+    fn call(&mut self, env: &mut SEnv, callee: ast::ExprId, args: &[ast::ExprId], depth: u32) -> Option<SVal> {
+        use crate::ast::Expr;
+        let ast = self.ast;
+        let Expr::Path(segs) = ast.expr(callee) else { return None };
+        if segs.len() != 1 {
+            return None;
+        }
+        let name = segs[0].name;
+        // A body item of this name in scope at the call wins: a
+        // nested const fn is the only candidate, and another body
+        // item shadows every module fn.
+        let mut defs: Vec<&ast::FnDef> = Vec::new();
+        match stmt_item_at(ast, name, ast.expr_span(callee)) {
+            Some(si) => match &ast.stmt_items[si as usize].kind {
+                ItemKind::Fn(d) => defs.push(d),
+                _ => return None,
+            },
+            None => {
+                for item in &ast.items {
+                    if let ItemKind::Fn(def) = &item.kind {
+                        defs.push(def);
                     }
-                    fenv.push((param.name, v));
                 }
-                return match eval_scalar_block(ast, interner, known, body, depth + 1, &mut fenv, steps) {
-                    SFlow::V(v) | SFlow::Return(v) => SFlow::V(v),
-                    _ => SFlow::V(None),
+            }
+        }
+        for def in defs {
+            if def.name != name || !def.qual.is_const || def.self_param.is_some() || def.params.len() != args.len() {
+                continue;
+            }
+            let body = def.body?;
+            let mut fenv: SEnv = Vec::new();
+            for (param, &arg) in def.params.iter().zip(args) {
+                if param.pat.is_some() {
+                    return None;
+                }
+                let is_ref = matches!(ast.ty(param.ty), TyExpr::Ref { .. });
+                let pexp = if is_ref { None } else { sexp_of_written(ast, self.interner, self.known, param.ty) };
+                let mut v = self.val(env, arg, pexp, depth + 1)?;
+                if is_ref && !matches!(v, SVal::Ref(_)) {
+                    return None;
+                }
+                if let Some(SExp::Int(it)) = pexp {
+                    v = s_coerce_int(v, it)?;
+                }
+                if let (Some(SExp::Float(f)), SVal::Float(_, g)) = (pexp, v)
+                    && f != g
+                {
+                    return None;
+                }
+                let slot = self.new_slot(v);
+                fenv.push((param.name, slot));
+            }
+            let rexp = def.ret.and_then(|t| sexp_of_written(ast, self.interner, self.known, t));
+            let out = match self.block(&mut fenv, body, rexp, depth + 1) {
+                SFlow::V(v) | SFlow::Return(v) => v?,
+                _ => return None,
+            };
+            return match rexp {
+                Some(SExp::Int(it)) => s_coerce_int(out, it),
+                _ => Some(out),
+            };
+        }
+        None
+    }
+
+    /// The value of a one- or two-segment path: a local, a const
+    /// item (free or inherent associated), or an integer type's
+    /// `MAX`/`MIN`/`BITS`. A const item's value takes its declared
+    /// type, never the use site's expected type.
+    fn path_value(&mut self, env: &mut SEnv, segs: &[ast::PathSeg], e: ast::ExprId, exp: Option<SExp>, depth: u32) -> Option<SVal> {
+        let ast = self.ast;
+        if segs.len() == 1 {
+            let name = segs[0].name;
+            if let Some((_, slot)) = env.iter().rev().find(|(n, _)| *n == name) {
+                let v = self.slots[*slot];
+                return match (v, exp) {
+                    (SVal::Int(_, None), Some(SExp::Int(it))) => s_coerce_int(v, it),
+                    _ => Some(v),
                 };
             }
-            SFlow::V(None)
-        }
-        Expr::Path(segs) if segs.len() == 1 => {
-            let name = segs[0].name;
-            if let Some((_, v)) = env.iter().rev().find(|(n, _)| *n == name) {
-                return SFlow::V(Some(*v));
-            }
-            // A reference to another const item: a body const in scope
-            // at this use wins over a module const of the name (found
-            // by scanning the crate's items; collect evaluates all of
-            // them later anyway). Another body item shadows both.
-            let target = match stmt_item_at(ast, name, ast.expr_span(e)) {
+            let (target, decl) = match stmt_item_at(ast, name, ast.expr_span(e)) {
                 Some(si) => match &ast.stmt_items[si as usize].kind {
-                    ItemKind::Const(c) => c.value,
-                    _ => None,
+                    ItemKind::Const(c) => (c.value, Some(c.ty)),
+                    _ => (None, None),
                 },
-                None => named_const_expr(ast, &[name]),
+                None => (named_const_expr(ast, &[name]), named_const_decl(ast, &[name])),
             };
-            let out = target.and_then(|v| {
-                let mut empty = Vec::new();
-                val(ast, interner, known, v, depth + 1, &mut empty, steps)
-            });
-            SFlow::V(out)
+            let v = self.const_body(target?, decl, depth)?;
+            return Some(v);
         }
-        Expr::Path(segs) if segs.len() == 2 => {
-            // An inherent associated const (`Type::CONST`), found by
-            // scanning the crate's impls like a free const above.
-            // Written type args (`G::<i32>::N`) need the typed pick.
+        if segs.len() == 2 {
             if !segs[0].has_args()
                 && let Some(v) = named_const_expr(ast, &[segs[0].name, segs[1].name])
             {
-                let mut empty = Vec::new();
-                let out = val(ast, interner, known, v, depth + 1, &mut empty, steps);
-                return SFlow::V(out);
+                let decl = named_const_decl(ast, &[segs[0].name, segs[1].name]);
+                return self.const_body(v, decl, depth);
             }
-            // `i64::MAX` and friends by written name.
-            let out = known.int_ty(segs[0].name).and_then(|it| {
-                let item = interner.get(segs[1].name);
-                let bits = it.bits();
-                match item {
-                    "MAX" => Some(truncate_to_int(it.max128() as i128, it)),
-                    "MIN" => Some(if it.signed() { if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) } } else { 0 }),
-                    "BITS" => Some(bits as i128),
-                    _ => None,
-                }
+            let it = self.known.int_ty(segs[0].name)?;
+            let bits = it.bits();
+            return Some(match self.interner.get(segs[1].name) {
+                "MAX" => SVal::Int(crate::ty::consteval::int_stored(it.max128(), it), Some(it)),
+                "MIN" => SVal::Int(if it.signed() { if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) } } else { 0 }, Some(it)),
+                "BITS" => SVal::Int(bits as i128, Some(IntTy::U32)),
+                _ => return None,
             });
-            SFlow::V(out)
         }
-        _ => SFlow::V(None),
+        None
+    }
+
+    /// Evaluates one expression.
+    fn expr(&mut self, env: &mut SEnv, e: ast::ExprId, exp: Option<SExp>, depth: u32) -> SFlow {
+        use crate::ast::{BinOp, Expr, MacroKind, UnOp};
+        use crate::ty::consteval::{int_neg, int_not, int_stored};
+        self.steps += 1;
+        if depth > 32 || self.steps > 100_000 {
+            return SFlow::V(None);
+        }
+        let ast = self.ast;
+        match ast.expr(e) {
+            Expr::Int(mag, suffix) => {
+                let mag = *mag;
+                let v = match (suffix, exp) {
+                    (Some(s), _) => {
+                        let it = IntTy::from_suffix(*s);
+                        if mag > it.max128() { None } else { Some(SVal::Int(int_stored(mag, it), Some(it))) }
+                    }
+                    (None, Some(SExp::Int(it))) => {
+                        if mag > it.max128() { None } else { Some(SVal::Int(int_stored(mag, it), Some(it))) }
+                    }
+                    (None, _) => {
+                        if mag > i128::MAX as u128 {
+                            Some(SVal::Int(mag as i128, Some(IntTy::U128)))
+                        } else {
+                            Some(SVal::Int(mag as i128, None))
+                        }
+                    }
+                };
+                SFlow::V(v)
+            }
+            Expr::Float(i) => {
+                let text = ast.strings[*i as usize].as_str();
+                let v = parse_float_literal(text).and_then(|(_, suffix)| {
+                    let f = suffix.unwrap_or(match exp {
+                        Some(SExp::Float(f)) => f,
+                        _ => FloatTy::F64,
+                    });
+                    if float_literal_overflows(text, f) {
+                        return None;
+                    }
+                    parse_float_literal_as(text, f).map(|bits| SVal::Float(bits, f))
+                });
+                SFlow::V(v)
+            }
+            Expr::Char(c) => SFlow::V(Some(SVal::Char(*c))),
+            Expr::Bool(b) => SFlow::V(Some(SVal::Bool(*b))),
+            Expr::Unit => SFlow::V(Some(SVal::Unit)),
+            Expr::Unary { op, expr } => {
+                // A negated literal names its magnitude first: the
+                // magnitude may exceed the type's max by one (its min).
+                if *op == UnOp::Neg
+                    && let Expr::Int(mag, suffix) = ast.expr(*expr)
+                {
+                    let (mag, suffix) = (*mag, *suffix);
+                    let it = suffix.map(IntTy::from_suffix).or(match exp {
+                        Some(SExp::Int(it)) => Some(it),
+                        _ => None,
+                    });
+                    let v = match it {
+                        Some(it) => {
+                            if !it.signed() || mag > it.max128() + 1 {
+                                None
+                            } else {
+                                Some(SVal::Int((mag as i128).wrapping_neg(), Some(it)))
+                            }
+                        }
+                        None => {
+                            if mag <= (1u128 << 127) { Some(SVal::Int((mag as i128).wrapping_neg(), None)) } else { None }
+                        }
+                    };
+                    return SFlow::V(v);
+                }
+                let Some(v) = self.val(env, *expr, exp, depth + 1) else { return SFlow::V(None) };
+                SFlow::V(match (op, v) {
+                    (UnOp::Neg, SVal::Int(x, Some(it))) => int_neg(it, x).map(|r| SVal::Int(r, Some(it))),
+                    (UnOp::Neg, SVal::Int(x, None)) => x.checked_neg().map(|r| SVal::Int(r, None)),
+                    (UnOp::Neg, SVal::Float(bits, f)) => Some(SVal::Float(
+                        match f {
+                            FloatTy::F64 => (-f64::from_bits(bits)).to_bits(),
+                            FloatTy::F32 => (-f32::from_bits(bits as u32)).to_bits() as u64,
+                        },
+                        f,
+                    )),
+                    (UnOp::Not, SVal::Int(x, Some(it))) => Some(SVal::Int(int_not(it, x), Some(it))),
+                    (UnOp::Not, SVal::Int(x, None)) => Some(SVal::Int(!x, None)),
+                    (UnOp::Not, SVal::Bool(b)) => Some(SVal::Bool(!b)),
+                    _ => None,
+                })
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let Some(a) = self.bool_val(env, *lhs, depth + 1) else { return SFlow::V(None) };
+                    if (*op == BinOp::And && !a) || (*op == BinOp::Or && a) {
+                        return SFlow::V(Some(SVal::Bool(a)));
+                    }
+                    return SFlow::V(self.bool_val(env, *rhs, depth + 1).map(SVal::Bool));
+                }
+                SFlow::V(self.binary(env, *op, *lhs, *rhs, exp, depth))
+            }
+            Expr::Cast { expr, ty } => SFlow::V(self.cast(env, *expr, *ty, depth)),
+            Expr::Block(b) | Expr::ConstBlock(b) => self.block(env, *b, exp, depth + 1),
+            Expr::LabeledBlock { label, body } => match self.block(env, *body, exp, depth + 1) {
+                SFlow::Break(l, v) if l.is_none() || l == Some(label.name) => SFlow::V(v),
+                other => other,
+            },
+            Expr::If { cond, then, els } => {
+                let Some(c) = self.bool_val(env, *cond, depth + 1) else { return SFlow::V(None) };
+                if c {
+                    self.block(env, *then, exp, depth + 1)
+                } else {
+                    match els {
+                        Some(els) => self.expr(env, *els, exp, depth + 1),
+                        None => SFlow::V(Some(SVal::Unit)),
+                    }
+                }
+            }
+            Expr::While { label, cond, body } => loop {
+                let Some(c) = self.bool_val(env, *cond, depth + 1) else { return SFlow::V(None) };
+                if !c {
+                    return SFlow::V(Some(SVal::Unit));
+                }
+                match self.block(env, *body, None, depth + 1) {
+                    SFlow::V(Some(_)) => {}
+                    SFlow::Continue(l) if s_label_matches(l, label) => {}
+                    SFlow::Break(l, _) if s_label_matches(l, label) => return SFlow::V(Some(SVal::Unit)),
+                    other => return other,
+                }
+            },
+            Expr::Loop { label, body } => loop {
+                match self.block(env, *body, None, depth + 1) {
+                    SFlow::V(Some(_)) => {}
+                    SFlow::Continue(l) if s_label_matches(l, label) => {}
+                    SFlow::Break(l, v) if s_label_matches(l, label) => return SFlow::V(v),
+                    other => return other,
+                }
+            },
+            Expr::Break { label, value } => {
+                let v = match value {
+                    Some(v) => self.val(env, *v, None, depth + 1),
+                    None => Some(SVal::Unit),
+                };
+                SFlow::Break(label.map(|l| l.name), v)
+            }
+            Expr::Continue(label) => SFlow::Continue(label.map(|l| l.name)),
+            Expr::Return(v) => {
+                let v = match v {
+                    Some(v) => self.val(env, *v, exp, depth + 1),
+                    None => Some(SVal::Unit),
+                };
+                SFlow::Return(v)
+            }
+            Expr::Assign { lhs, rhs } => {
+                let Some(slot) = self.place_slot(env, *lhs, depth + 1) else { return SFlow::V(None) };
+                let exp = s_exp_of(self.slots[slot]);
+                let Some(v) = self.val(env, *rhs, exp, depth + 1) else { return SFlow::V(None) };
+                SFlow::V(if self.store(slot, v) { Some(SVal::Unit) } else { None })
+            }
+            Expr::AssignOp { op, lhs, rhs } => {
+                let Some(slot) = self.place_slot(env, *lhs, depth + 1) else { return SFlow::V(None) };
+                let cur = self.slots[slot];
+                let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+                let rexp = if shift { None } else { s_exp_of(cur) };
+                let Some(mut b) = self.val(env, *rhs, rexp, depth + 1) else { return SFlow::V(None) };
+                if !shift
+                    && let (SVal::Int(_, Some(it)), SVal::Int(_, None)) = (cur, b)
+                {
+                    let Some(c) = s_coerce_int(b, it) else { return SFlow::V(None) };
+                    b = c;
+                }
+                let Some(r) = s_combine(*op, cur, b) else { return SFlow::V(None) };
+                SFlow::V(if self.store(slot, r) { Some(SVal::Unit) } else { None })
+            }
+            Expr::Ref { expr, .. } => SFlow::V(self.place_slot(env, *expr, depth + 1).map(SVal::Ref)),
+            Expr::Deref(inner) => SFlow::V(match self.val(env, *inner, None, depth + 1) {
+                Some(SVal::Ref(s)) => Some(self.slots[s]),
+                _ => None,
+            }),
+            Expr::Call { callee, args } => SFlow::V(self.call(env, *callee, args, depth)),
+            Expr::Path(segs) => SFlow::V(self.path_value(env, segs, e, exp, depth)),
+            Expr::Macro { kind, args, .. } => SFlow::V(match kind {
+                // A panic in const evaluation is a const failure,
+                // never a skipped statement.
+                MacroKind::Assert => match args.first().and_then(|a| self.bool_val(env, *a, depth + 1)) {
+                    Some(true) => Some(SVal::Unit),
+                    _ => None,
+                },
+                _ => None,
+            }),
+            _ => SFlow::V(None),
+        }
+    }
+
+    /// Evaluates a const item's initializer in a fresh env and
+    /// pins the result to its declared type when that is scalar.
+    fn const_body(&mut self, body: ast::ExprId, decl: Option<ast::TyId>, depth: u32) -> Option<SVal> {
+        let dexp = decl.and_then(|t| sexp_of_written(self.ast, self.interner, self.known, t));
+        let mut empty: SEnv = Vec::new();
+        let v = self.val(&mut empty, body, dexp, depth + 1)?;
+        match dexp {
+            Some(SExp::Int(it)) => s_coerce_int(v, it),
+            Some(SExp::Bool) => match v {
+                SVal::Bool(_) => Some(v),
+                SVal::Int(x, _) => Some(SVal::Bool(x != 0)),
+                _ => None,
+            },
+            Some(SExp::Char) => match v {
+                SVal::Char(_) => Some(v),
+                SVal::Int(x, _) => u32::try_from(x).ok().and_then(char::from_u32).map(SVal::Char),
+                _ => None,
+            },
+            _ => Some(v),
+        }
+    }
+}
+
+/// True when a break/continue with `flow` label targets a loop
+/// with `loop_label` (an unlabeled jump targets the innermost loop).
+fn s_label_matches(flow: Option<Sym>, loop_label: &Option<crate::ast::Label>) -> bool {
+    match (flow, loop_label) {
+        (None, _) => true,
+        (Some(f), Some(l)) => f == l.name,
+        (Some(_), None) => false,
     }
 }
 
@@ -3252,7 +3738,11 @@ pub fn collect_reuse(
         // (variant, field, regioned type) for the borrow checker.
         let mut region_fields: Vec<(usize, usize, Ty)> = Vec::new();
         let mut disc_explicit: Vec<bool> = Vec::new();
-        let mut next_disc: i128 = 0;
+        // The next implicit discriminant, or None when the previous
+        // variant already holds the discriminant type's largest
+        // value (the implicit increment then overflows, E0370).
+        let mut next_disc: Option<i128> = Some(0);
+        let disc_max = crate::ty::consteval::int_stored(disc_want.max128(), disc_want);
         for (vname, vspan, shape, field_srcs, disc_src, variant_ne) in variants_src {
             let shape = if !is_enum && field_srcs.is_empty() { VariantShape::Unit } else { shape };
             let mut fields = Vec::new();
@@ -3299,7 +3789,7 @@ pub fn collect_reuse(
             }
             disc_explicit.push(disc_src.is_some());
             let disc = match disc_src {
-                Some(de) => match eval_const_int(ast, interner, known, de) {
+                Some(de) => match eval_const_int_exp(ast, interner, known, de, Some(disc_want)) {
                     Some(v) => {
                         // The written type must be the discriminant
                         // type (rustc E0308); only unsuffixed literal
@@ -3326,12 +3816,23 @@ pub fn collect_reuse(
                             "enum discriminant must be a constant integer",
                             "Write a literal value such as `A = 3`.",
                         ));
-                        next_disc
+                        next_disc.unwrap_or(0)
                     }
                 },
-                None => next_disc,
+                None => match next_disc {
+                    Some(d) => d,
+                    None => {
+                        errs.push(Diag::new(
+                            "L0110",
+                            vspan,
+                            "enum discriminant overflowed",
+                            "Give this variant an explicit discriminant, or use a wider repr integer type.",
+                        ));
+                        0
+                    }
+                },
             };
-            next_disc = disc.wrapping_add(1);
+            next_disc = if disc == disc_max { None } else { Some(disc.wrapping_add(1)) };
             variants.push(Variant { name: vname, shape, fields, disc, non_exhaustive: variant_ne });
         }
         let mut d = Derives::default();
@@ -3491,15 +3992,18 @@ pub fn collect_reuse(
             // whether a field is zero-sized can need another Adt's
             // layout.
             if let Some((bits, signed)) = adt.repr.int {
-                let (lo, hi): (i128, i128) = if signed {
-                    if bits >= 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
-                } else if bits >= 128 {
-                    (0, i128::MAX)
-                } else {
-                    (0, (1i128 << bits) - 1)
-                };
+                // A discriminant is stored in the repr type's bit
+                // form, so a u128 value at or above 2^127 is a
+                // negative i128 here and still in range.
                 for v in &adt.variants {
-                    if v.disc < lo || v.disc > hi {
+                    let in_range = if signed {
+                        bits >= 128 || (v.disc >= -(1i128 << (bits - 1)) && v.disc < (1i128 << (bits - 1)))
+                    } else if bits >= 128 {
+                        true
+                    } else {
+                        v.disc >= 0 && v.disc < (1i128 << bits)
+                    };
+                    if !in_range {
                         errs.push(Diag::new(
                             "L0110",
                             adt.span,
