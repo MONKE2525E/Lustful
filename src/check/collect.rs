@@ -6606,10 +6606,17 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
 /// True when `t` implements `Eq` by structure: the `glue_eq`
 /// shapes with no floats anywhere (a float's `==` is not total),
 /// Adts that derive `Eq` over such fields, and written generic
-/// `Eq` impls whose bounds hold. Only `glue_impl_pred_holds` asks
-/// (`impl<K: Eq + Hash, ..> PartialEq` on a map type); a derived
-/// `Eq`'s own field check stays with the solver in
-/// `check_derive_bounds`.
+/// `Eq` impls whose bounds hold. Asked by `glue_impl_pred_holds`
+/// (`impl<K: Eq + Hash, ..> PartialEq` on a map type) and by
+/// `derive_query_holds` for an `Eq` bound on a tuple, array,
+/// slice, or reference (the solver has no impl records for those
+/// heads); a derived `Eq`'s own field check stays with the solver
+/// in `check_derive_bounds`.
+pub fn has_total_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    glue_total_eq(p, tys, t, &mut Vec::new())
+}
+
+/// The walk behind `has_total_eq`; `seen` stops recursive generic types.
 fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
     if let Some(b) = cow_arg(tys, t) {
         return glue_total_eq(p, tys, b, seen);
@@ -6626,6 +6633,11 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) ->
             if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
                 return true;
             }
+            // The sync types `sync_glue` calls `PartialEq` are
+            // `Duration` and `ThreadId`, and both are `Eq` in std.
+            if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::PartialEq) {
+                return b;
+            }
             if tys.guard_elem(t).is_some() {
                 return false;
             }
@@ -6635,11 +6647,15 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) ->
             if let Some((a, b)) = tys.result_args(t) {
                 return glue_total_eq(p, tys, a, seen) && glue_total_eq(p, tys, b, seen);
             }
+            // std's `Eq` for the hash collections also needs the
+            // key to hash (`K: Eq + Hash`), as in `glue_eq`.
             if let Some((k, args)) = crate::ty::hash::hash_parts(tys, t) {
                 use crate::ty::hash::HashTy;
                 return match k {
-                    HashTy::HashMap => glue_total_eq(p, tys, args[0], seen) && glue_total_eq(p, tys, args[1], seen),
-                    HashTy::HashSet => glue_total_eq(p, tys, args[0], seen),
+                    HashTy::HashMap => {
+                        has_hash(p, tys, args[0]) && glue_total_eq(p, tys, args[0], seen) && glue_total_eq(p, tys, args[1], seen)
+                    }
+                    HashTy::HashSet => has_hash(p, tys, args[0]) && glue_total_eq(p, tys, args[0], seen),
                     _ => false,
                 };
             }

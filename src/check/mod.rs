@@ -3570,9 +3570,15 @@ impl<'p> Ctx<'p> {
             has_clone(p, &self.tys, self_ty)
         } else if trait_def == lang.debug {
             has_debug(p, &self.tys, self_ty)
-        } else if trait_def == lang.partial_eq || trait_def == lang.eq {
+        } else if trait_def == lang.partial_eq {
             self.record_glue_reads(trait_def, self_ty);
             has_eq(p, &self.tys, self_ty)
+        } else if trait_def == lang.eq {
+            // `Eq` is the total walk, not `PartialEq`'s: a float
+            // anywhere inside (or a field that is only `PartialEq`)
+            // breaks it (f32 and f64 have no `Eq` impl in core).
+            self.record_glue_reads(trait_def, self_ty);
+            has_total_eq(p, &self.tys, self_ty)
         } else if trait_def == lang.partial_ord {
             has_ord(p, &self.tys, self_ty)
         } else if trait_def == lang.ord {
