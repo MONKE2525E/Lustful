@@ -12,7 +12,7 @@
     "ts_diagnostics_codegen"
   ],
   "target": "x86_64-unknown-linux-gnu",
-  "elapsed_ms": 4056,
+  "elapsed_ms": 3814,
   "totals": {
     "files": 1036,
     "lines": 789064,
@@ -32,21 +32,13 @@
       "tool": 181
     },
     "inline_test_lines_in_prod": 23936,
-    "findings": 200,
-    "files_with_findings": 58,
+    "findings": 130,
+    "files_with_findings": 24,
     "parse_errors": 0,
     "missing_modules": 0,
     "undecidable_cfg": 2
   },
   "root_causes": [
-    {
-      "root_cause": "std-runtime",
-      "findings": 64,
-      "files": 39,
-      "features": [
-        "std.cow"
-      ]
-    },
     {
       "root_cause": "attrs-cfg",
       "findings": 39,
@@ -57,11 +49,10 @@
     },
     {
       "root_cause": "c-interop",
-      "findings": 38,
-      "files": 34,
+      "findings": 32,
+      "files": 30,
       "features": [
         "cinterop.system",
-        "cinterop.global_allocator",
         "cinterop.extern"
       ]
     },
@@ -108,69 +99,6 @@
     }
   ],
   "features": [
-    {
-      "id": "std.cow",
-      "title": "Cow (borrowed or owned strings and slices)",
-      "status": "unsupported",
-      "milestone": 5,
-      "milestone_label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-      "inventory_step": "5",
-      "root_cause": "std-runtime",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Probe evidence: tools/lust-port/tests/features/std_cow.rs fails (L0102): Cow<'_, str> returns, as in ts-rust normalize_slashes_cow. Split from std.rc_refcell, which held every std::borrow path.",
-      "findings": 64,
-      "raw_uses": 64,
-      "prod_uses": 64,
-      "files": 39,
-      "prod_files": 30,
-      "prod_fns": 51,
-      "scopes": {
-        "active": 64
-      },
-      "samples": [
-        {
-          "feature": "std.cow",
-          "raw_key": "std.type.std::borrow::Cow",
-          "file": "crates/ts_goport/src/api/encoder/encoder.rs",
-          "byte_start": 38124,
-          "byte_end": 38149,
-          "line": 768,
-          "column": 19,
-          "snippet": "Cow<'static, PositionMap>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "std.cow",
-          "raw_key": "std.type.std::borrow::Cow",
-          "file": "crates/ts_goport/src/api/encoder/encoder.rs",
-          "byte_start": 39887,
-          "byte_end": 39912,
-          "line": 814,
-          "column": 23,
-          "snippet": "Cow<'static, PositionMap>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "std.cow",
-          "raw_key": "std.type.std::borrow::Cow",
-          "file": "crates/ts_goport/src/api/proto.rs",
-          "byte_start": 4485,
-          "byte_end": 4502,
-          "line": 102,
-          "column": 23,
-          "snippet": "Cow<'static, str>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
     {
       "id": "attrs.serde",
       "title": "#[serde(...)] helper attributes of the serde derives",
@@ -313,7 +241,7 @@
       "findings": 27,
       "raw_uses": 27,
       "prod_uses": 22,
-      "files": 32,
+      "files": 28,
       "prod_files": 6,
       "prod_fns": 13,
       "scopes": {
@@ -484,70 +412,6 @@
           "line": 15,
           "column": 27,
           "snippet": "fn(Node, &SymbolAccessibilityResult) -> Option<&'static Message>",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        }
-      ]
-    },
-    {
-      "id": "cinterop.global_allocator",
-      "title": "#[global_allocator] statics",
-      "status": "unsupported",
-      "milestone": 7,
-      "milestone_label": "milestone 7: Threads and panics (sync, atomics, mpsc, panic recovery, C shims)",
-      "inventory_step": "10",
-      "root_cause": "c-interop",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false,
-      "release_impact": "unchanged",
-      "notes": "Split from cinterop.system (w-cinterop). Probe: cinterop_global_allocator.rs with std::alloc::System. ts-rust's bins name tikv_jemallocator::Jemalloc, which also needs that adapter crate.",
-      "findings": 6,
-      "raw_uses": 6,
-      "prod_uses": 5,
-      "files": 6,
-      "prod_files": 5,
-      "prod_fns": 0,
-      "scopes": {
-        "active": 5,
-        "test-only": 1
-      },
-      "samples": [
-        {
-          "feature": "cinterop.global_allocator",
-          "raw_key": "attr.global_allocator",
-          "file": "crates/ts_goport/src/bin/goport.rs",
-          "byte_start": 2598,
-          "byte_end": 2617,
-          "line": 53,
-          "column": 1,
-          "snippet": "#[global_allocator]",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "cinterop.global_allocator",
-          "raw_key": "attr.global_allocator",
-          "file": "crates/ts_goport/src/bin/goport_build.rs",
-          "byte_start": 1670,
-          "byte_end": 1689,
-          "line": 39,
-          "column": 1,
-          "snippet": "#[global_allocator]",
-          "scope": "active",
-          "fix_class": "compiler work",
-          "release_safe_rewrite": false
-        },
-        {
-          "feature": "cinterop.global_allocator",
-          "raw_key": "attr.global_allocator",
-          "file": "crates/ts_goport/src/bin/goport_emit.rs",
-          "byte_start": 3881,
-          "byte_end": 3900,
-          "line": 78,
-          "column": 1,
-          "snippet": "#[global_allocator]",
           "scope": "active",
           "fix_class": "compiler work",
           "release_safe_rewrite": false
@@ -1282,9 +1146,9 @@
       "used_by": [
         "ts_goport"
       ],
-      "decision": "c-shim",
+      "decision": "builtin-adapter",
       "milestone": 7,
-      "notes": "Shared allocator bridge. Lust needs a size and alignment API, not only malloc."
+      "notes": "Adapter in library/deps: the Jemalloc unit struct for #[global_allocator] statics. Dev keeps the lust runtime allocator; allocation strategy does not change output. The unsafe GlobalAlloc surface is not in the adapter."
     },
     {
       "name": "ts_goport",
@@ -1353,39 +1217,39 @@
     "universe": "prod files active on this target (lib and bin roots, generated files excluded)",
     "total_files": 773,
     "total_lines": 571292,
-    "supported_today_files": 700,
+    "supported_today_files": 739,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 700,
-        "lines": 471085,
-        "files_pct": 90.6,
-        "lines_pct": 82.5
+        "files": 739,
+        "lines": 539102,
+        "files_pct": 95.6,
+        "lines_pct": 94.4
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 700,
-        "lines": 471085,
-        "files_pct": 90.6,
-        "lines_pct": 82.5
+        "files": 739,
+        "lines": 539102,
+        "files_pct": 95.6,
+        "lines_pct": 94.4
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 735,
-        "lines": 537671,
-        "files_pct": 95.1,
-        "lines_pct": 94.1
+        "files": 739,
+        "lines": 539102,
+        "files_pct": 95.6,
+        "lines_pct": 94.4
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 742,
-        "lines": 544605,
-        "files_pct": 96.0,
-        "lines_pct": 95.3
+        "files": 746,
+        "lines": 546036,
+        "files_pct": 96.5,
+        "lines_pct": 95.6
       },
       {
         "id": "7",
@@ -1408,90 +1272,90 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 702,
-        "lines": 476494,
-        "files_pct": 90.8,
-        "lines_pct": 83.4
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 702,
-        "lines": 476494,
-        "files_pct": 90.8,
-        "lines_pct": 83.4
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 702,
-        "lines": 476494,
-        "files_pct": 90.8,
-        "lines_pct": 83.4
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 702,
-        "lines": 476494,
-        "files_pct": 90.8,
-        "lines_pct": 83.4
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 702,
-        "lines": 476494,
-        "files_pct": 90.8,
-        "lines_pct": 83.4
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 737,
-        "lines": 543080,
-        "files_pct": 95.3,
-        "lines_pct": 95.1
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 737,
-        "lines": 543080,
-        "files_pct": 95.3,
-        "lines_pct": 95.1
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 737,
-        "lines": 543080,
-        "files_pct": 95.3,
-        "lines_pct": 95.1
+        "files": 741,
+        "lines": 544511,
+        "files_pct": 95.9,
+        "lines_pct": 95.3
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 744,
-        "lines": 550014,
-        "files_pct": 96.2,
-        "lines_pct": 96.3
+        "files": 748,
+        "lines": 551445,
+        "files_pct": 96.8,
+        "lines_pct": 96.5
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 744,
-        "lines": 550014,
-        "files_pct": 96.2,
-        "lines_pct": 96.3
+        "files": 748,
+        "lines": 551445,
+        "files_pct": 96.8,
+        "lines_pct": 96.5
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 744,
-        "lines": 550014,
-        "files_pct": 96.2,
-        "lines_pct": 96.3
+        "files": 748,
+        "lines": 551445,
+        "files_pct": 96.8,
+        "lines_pct": 96.5
       },
       {
         "id": "10",
@@ -1546,10 +1410,10 @@
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 38,
-        "lines": 75098,
-        "files_pct": 4.9,
-        "lines_pct": 13.1
+        "files": 0,
+        "lines": 0,
+        "files_pct": 0.0,
+        "lines_pct": 0.0
       },
       {
         "id": "6",
@@ -1594,10 +1458,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 26,
-        "lines": 18794,
-        "files_pct": 3.4,
-        "lines_pct": 3.3
+        "files": 22,
+        "lines": 17363,
+        "files_pct": 2.8,
+        "lines_pct": 3.0
       }
     ]
   },
@@ -1605,39 +1469,39 @@
     "universe": "all prod files, every target (inventory-comparable)",
     "total_files": 778,
     "total_lines": 573780,
-    "supported_today_files": 702,
+    "supported_today_files": 741,
     "by_plan_milestone": [
       {
         "id": "0",
         "label": "supported today",
-        "files": 702,
-        "lines": 472110,
-        "files_pct": 90.2,
-        "lines_pct": 82.3
+        "files": 741,
+        "lines": 540127,
+        "files_pct": 95.2,
+        "lines_pct": 94.1
       },
       {
         "id": "4",
         "label": "milestone 4: The Rust core (modules, cfg, const/static, tuples, arrays, slices, Box, Result, Drop, std basics, macro_rules!)",
-        "files": 702,
-        "lines": 472110,
-        "files_pct": 90.2,
-        "lines_pct": 82.3
+        "files": 741,
+        "lines": 540127,
+        "files_pct": 95.2,
+        "lines_pct": 94.1
       },
       {
         "id": "5",
         "label": "milestone 5: Traits, closures, dyn, Rc (generics, iterators, Rc/RefCell, dyn Trait, built-in dependency layer)",
-        "files": 737,
-        "lines": 538696,
-        "files_pct": 94.7,
-        "lines_pct": 93.9
+        "files": 741,
+        "lines": 540127,
+        "files_pct": 95.2,
+        "lines_pct": 94.1
       },
       {
         "id": "6",
         "label": "milestone 6: Lifetimes ('static and '_ first, then lifetime params on user types)",
-        "files": 744,
-        "lines": 545630,
-        "files_pct": 95.6,
-        "lines_pct": 95.1
+        "files": 748,
+        "lines": 547061,
+        "files_pct": 96.1,
+        "lines_pct": 95.3
       },
       {
         "id": "7",
@@ -1660,90 +1524,90 @@
       {
         "id": "0",
         "label": "0. codemods (macros, impl-Trait args, async, #[path])",
-        "files": 704,
-        "lines": 477519,
-        "files_pct": 90.5,
-        "lines_pct": 83.2
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "1",
         "label": "1. M4 core syntax and std",
-        "files": 704,
-        "lines": 477519,
-        "files_pct": 90.5,
-        "lines_pct": 83.2
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "2",
         "label": "2. attributes and cfg",
-        "files": 704,
-        "lines": 477519,
-        "files_pct": 90.5,
-        "lines_pct": 83.2
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "3",
         "label": "3. traits and generics",
-        "files": 704,
-        "lines": 477519,
-        "files_pct": 90.5,
-        "lines_pct": 83.2
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "4",
         "label": "4. closures and iterators",
-        "files": 704,
-        "lines": 477519,
-        "files_pct": 90.5,
-        "lines_pct": 83.2
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 739,
-        "lines": 544105,
-        "files_pct": 95.0,
-        "lines_pct": 94.8
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "6",
         "label": "6. dyn Trait and Any",
-        "files": 739,
-        "lines": 544105,
-        "files_pct": 95.0,
-        "lines_pct": 94.8
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "7a",
         "label": "7a. 'static, '_ and std lifetime types",
-        "files": 739,
-        "lines": 544105,
-        "files_pct": 95.0,
-        "lines_pct": 94.8
+        "files": 743,
+        "lines": 545536,
+        "files_pct": 95.5,
+        "lines_pct": 95.1
       },
       {
         "id": "7b",
         "label": "7b. lifetime params on user types, named lifetimes",
-        "files": 746,
-        "lines": 551039,
-        "files_pct": 95.9,
-        "lines_pct": 96.0
+        "files": 750,
+        "lines": 552470,
+        "files_pct": 96.4,
+        "lines_pct": 96.3
       },
       {
         "id": "8",
         "label": "8. threads and sync",
-        "files": 746,
-        "lines": 551039,
-        "files_pct": 95.9,
-        "lines_pct": 96.0
+        "files": 750,
+        "lines": 552470,
+        "files_pct": 96.4,
+        "lines_pct": 96.3
       },
       {
         "id": "9",
         "label": "9. panic unwinding",
-        "files": 746,
-        "lines": 551039,
-        "files_pct": 95.9,
-        "lines_pct": 96.0
+        "files": 750,
+        "lines": 552470,
+        "files_pct": 96.4,
+        "lines_pct": 96.3
       },
       {
         "id": "10",
@@ -1798,10 +1662,10 @@
       {
         "id": "5",
         "label": "5. std runtime (Rc, RefCell, Fx/IndexMap, time)",
-        "files": 38,
-        "lines": 75098,
-        "files_pct": 4.9,
-        "lines_pct": 13.1
+        "files": 0,
+        "lines": 0,
+        "files_pct": 0.0,
+        "lines_pct": 0.0
       },
       {
         "id": "6",
@@ -1846,10 +1710,10 @@
       {
         "id": "10",
         "label": "10. C interop and system crates",
-        "files": 29,
-        "lines": 20257,
-        "files_pct": 3.7,
-        "lines_pct": 3.5
+        "files": 25,
+        "lines": 18826,
+        "files_pct": 3.2,
+        "lines_pct": 3.3
       }
     ]
   },
@@ -1923,10 +1787,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/api/encoder/encoder_generated.rs",
@@ -1955,9 +1817,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -1987,10 +1847,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/api/protocol_msgpack.rs",
@@ -2039,10 +1897,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/api/server.rs",
@@ -2141,10 +1997,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/mod.rs",
@@ -2256,10 +2110,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ast/utilities_p5.rs",
@@ -2408,11 +2260,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.global_allocator",
-        "cinterop.system"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/bin/goport_build.rs",
@@ -2421,11 +2270,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.global_allocator",
-        "cinterop.system"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/bin/goport_emit.rs",
@@ -2434,11 +2280,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.global_allocator",
-        "cinterop.system"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/bin/goport_live_programs.rs",
@@ -2467,11 +2310,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "cinterop.global_allocator",
-        "cinterop.system"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/bin/goport_watch.rs",
@@ -2491,11 +2331,10 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.global_allocator",
         "cinterop.system",
         "ext.unknown_crate"
       ],
-      "findings": 9
+      "findings": 8
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p1.rs",
@@ -2504,10 +2343,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/binder/binder_p2.rs",
@@ -2768,10 +2605,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p22.rs",
@@ -2800,10 +2635,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p25.rs",
@@ -2842,10 +2675,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/checker_p29.rs",
@@ -2884,9 +2715,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -2976,10 +2805,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/flow_p2.rs",
@@ -2988,10 +2815,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 5
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/flow_p3.rs",
@@ -3040,10 +2865,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/grammarchecks_p3.rs",
@@ -3282,10 +3105,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/checker/relater_p4.rs",
@@ -3468,10 +3289,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/contentmapper/mod.rs",
@@ -3755,10 +3574,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/effect/pluginoptions.rs",
@@ -5661,10 +5478,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/build_info_to_snapshot.rs",
@@ -5743,10 +5558,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/incremental/reference_map.rs",
@@ -5808,10 +5621,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "std.cow"
+        "cinterop.system"
       ],
-      "findings": 2
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/execute/tsc/emit.rs",
@@ -6324,9 +6136,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6346,10 +6156,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 7
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/json_ext.rs",
@@ -6428,10 +6236,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/module/staticresolver.rs",
@@ -6694,9 +6500,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -6896,10 +6700,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 3
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/util_prelude.rs",
@@ -6949,10 +6751,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "std.cow"
+        "cinterop.system"
       ],
-      "findings": 5
+      "findings": 2
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/trackingvfs.rs",
@@ -6971,10 +6772,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 2
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/frontend/vfs/walkdir.rs",
@@ -7427,10 +7226,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 8
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ipc/conn.rs",
@@ -7975,9 +7772,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8197,10 +7992,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/ls/lsutil/utilities.rs",
@@ -8279,9 +8072,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8341,10 +8132,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/lsp/dynamic_queue.rs",
@@ -8543,9 +8332,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -8695,10 +8482,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/modulespecifiers/symlinks.rs",
@@ -8849,10 +8634,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 8
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/printer/printer_p2.rs",
@@ -8962,10 +8745,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.system",
-        "std.cow"
+        "cinterop.system"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/program/go_frontend.rs",
@@ -9470,9 +9252,7 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -9594,10 +9374,8 @@
       "scope": "active",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
-      "findings": 1
+      "missing_features": [],
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/src/transformers/chain.rs",
@@ -11382,9 +11160,7 @@
       "scope": "test-only",
       "generated": false,
       "parse_error": false,
-      "missing_features": [
-        "std.cow"
-      ],
+      "missing_features": [],
       "findings": 0
     },
     {
@@ -12257,10 +12033,9 @@
       "generated": false,
       "parse_error": false,
       "missing_features": [
-        "cinterop.global_allocator",
         "cinterop.system"
       ],
-      "findings": 1
+      "findings": 0
     },
     {
       "file": "crates/ts_goport/tests/multi_program.rs",
@@ -12405,71 +12180,6 @@
   ],
   "findings": [
     {
-      "feature": "std.cow",
-      "raw_key": "std.type.std::borrow::Cow",
-      "file": "crates/ts_goport/src/api/encoder/encoder.rs",
-      "byte_start": 38124,
-      "byte_end": 38149,
-      "line": 768,
-      "column": 19,
-      "snippet": "Cow<'static, PositionMap>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "std.cow",
-      "raw_key": "std.type.std::borrow::Cow",
-      "file": "crates/ts_goport/src/api/encoder/encoder.rs",
-      "byte_start": 39887,
-      "byte_end": 39912,
-      "line": 814,
-      "column": 23,
-      "snippet": "Cow<'static, PositionMap>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "std.cow",
-      "raw_key": "std.type.std::borrow::Cow",
-      "file": "crates/ts_goport/src/api/proto.rs",
-      "byte_start": 4485,
-      "byte_end": 4502,
-      "line": 102,
-      "column": 23,
-      "snippet": "Cow<'static, str>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "std.cow",
-      "raw_key": "std.type.std::borrow::Cow",
-      "file": "crates/ts_goport/src/api/proto.rs",
-      "byte_start": 53830,
-      "byte_end": 53847,
-      "line": 1220,
-      "column": 41,
-      "snippet": "Cow<'static, str>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "std.cow",
-      "raw_key": "std.type.std::borrow::Cow",
-      "file": "crates/ts_goport/src/api/requestfilesystem/requestfilesystem.rs",
-      "byte_start": 1571,
-      "byte_end": 1588,
-      "line": 34,
-      "column": 21,
-      "snippet": "Cow<'static, str>",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
       "feature": "closures.fn_ptr_lifetime",
       "raw_key": "type.fn_ptr.lifetime",
       "file": "crates/ts_goport/src/ast/synthetic.rs",
@@ -12494,71 +12204,6 @@
       "scope": "active",
       "fix_class": "compiler work",
       "release_safe_rewrite": true
-    },
-    {
-      "feature": "cinterop.global_allocator",
-      "raw_key": "attr.global_allocator",
-      "file": "crates/ts_goport/src/bin/goport.rs",
-      "byte_start": 2598,
-      "byte_end": 2617,
-      "line": 53,
-      "column": 1,
-      "snippet": "#[global_allocator]",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "cinterop.global_allocator",
-      "raw_key": "attr.global_allocator",
-      "file": "crates/ts_goport/src/bin/goport_build.rs",
-      "byte_start": 1670,
-      "byte_end": 1689,
-      "line": 39,
-      "column": 1,
-      "snippet": "#[global_allocator]",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "cinterop.global_allocator",
-      "raw_key": "attr.global_allocator",
-      "file": "crates/ts_goport/src/bin/goport_emit.rs",
-      "byte_start": 3881,
-      "byte_end": 3900,
-      "line": 78,
-      "column": 1,
-      "snippet": "#[global_allocator]",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "cinterop.global_allocator",
-      "raw_key": "attr.global_allocator",
-      "file": "crates/ts_goport/src/bin/goport_typesyms.rs",
-      "byte_start": 1817,
-      "byte_end": 1836,
-      "line": 39,
-      "column": 1,
-      "snippet": "#[global_allocator]",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
-    },
-    {
-      "feature": "cinterop.global_allocator",
-      "raw_key": "attr.global_allocator",
-      "file": "crates/ts_goport/src/bin/tsgo.rs",
-      "byte_start": 2687,
-      "byte_end": 2706,
-      "line": 57,
-      "column": 1,
-      "snippet": "#[global_allocator]",
-      "scope": "active",
-      "fix_class": "compiler work",
-      "release_safe_rewrite": false
     },
     {
       "feature": "cinterop.system",
@@ -12964,7 +12609,7 @@
       "release_safe_rewrite": false
     }
   ],
-  "findings_total": 200,
+  "findings_total": 130,
   "findings_truncated": true,
   "parse_errors": [],
   "missing_modules": [],

@@ -20,9 +20,9 @@ This scanner counts 406: it adds the 5 codegen tool files cargo reports as
 lib and bin targets, and drops `cmd/tsgo/isprocessalive_other.rs`, which is
 inactive on this target.
 
-Core: 406 files, 390709 lines. Compiles today: 353 files, 320053 lines (86.9% of files, 81.9% of lines).
+Core: 406 files, 390709 lines. Compiles today: 381 files, 366480 lines (93.8% of files, 93.8% of lines).
 
-All active prod files: 700 of 773 files compile today (82.5% of lines).
+All active prod files: 739 of 773 files compile today (94.4% of lines).
 
 ## Top 15 blocking features, core scope
 
@@ -31,25 +31,23 @@ files where this feature is the only blocker: land it and those files compile.
 
 | # | feature | status | milestone | owner | files | lines blocked | sole files | sole lines |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `std.cow` | unsupported | 5 | W-STD-B | 27 | 53508 | 24 | 44996 |
-| 2 | `cinterop.system` | unsupported | 7 | wave C (shims) | 20 | 16466 | 11 | 5161 |
-| 3 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
-| 4 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 1 | 1248 |
-| 5 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
-| 6 | `cinterop.global_allocator` | unsupported | 7 | W-CINTEROP | 5 | 2444 | 0 | 0 |
-| 7 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
-| 8 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
-| 9 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
-| 10 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
+| 1 | `cinterop.system` | unsupported | 7 | wave C (shims) | 16 | 15035 | 14 | 13673 |
+| 2 | `closures.fn_ptr_lifetime` | unsupported | 6 | W-BORROW | 5 | 6422 | 3 | 3628 |
+| 3 | `ext.unknown_crate` | unsupported | none | wave D | 4 | 3497 | 1 | 1248 |
+| 4 | `lifetimes.hrtb` | unsupported | 6 | W-BORROW | 1 | 2445 | 0 | 0 |
+| 5 | `attrs.serde` | unsupported | none | W-CHECK-G | 2 | 1236 | 0 | 0 |
+| 6 | `derives.unknown` | unsupported | none | wave D | 2 | 1236 | 0 | 0 |
+| 7 | `cinterop.extern` | unsupported | 7 | W-CINTEROP | 2 | 637 | 0 | 0 |
+| 8 | `unsafe.blocks` | unsupported | 7 | wave C (shims) | 2 | 637 | 0 | 0 |
 
 ## Core CLI curve
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 353 | 86.9 | 81.9 |
-| milestone 4 | 353 | 86.9 | 81.9 |
-| milestone 5 | 377 | 92.9 | 93.4 |
-| milestone 6 | 381 | 93.8 | 95.0 |
+| supported today | 381 | 93.8 | 93.8 |
+| milestone 4 | 381 | 93.8 | 93.8 |
+| milestone 5 | 381 | 93.8 | 93.8 |
+| milestone 6 | 385 | 94.8 | 95.4 |
 | milestone 7 | 402 | 99.0 | 99.1 |
 | milestone 8 | 402 | 99.0 | 99.1 |
 
@@ -57,10 +55,10 @@ files where this feature is the only blocker: land it and those files compile.
 
 | after milestone | files | files % | lines % |
 |---|---|---|---|
-| supported today | 700 | 90.6 | 82.5 |
-| milestone 4 | 700 | 90.6 | 82.5 |
-| milestone 5 | 735 | 95.1 | 94.1 |
-| milestone 6 | 742 | 96.0 | 95.3 |
+| supported today | 739 | 95.6 | 94.4 |
+| milestone 4 | 739 | 95.6 | 94.4 |
+| milestone 5 | 739 | 95.6 | 94.4 |
+| milestone 6 | 746 | 96.5 | 95.6 |
 | milestone 7 | 767 | 99.2 | 98.4 |
 | milestone 8 | 769 | 99.5 | 99.4 |
 
