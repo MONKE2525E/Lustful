@@ -7679,12 +7679,17 @@ impl<'p> Ctx<'p> {
                 self.loops.push(LoopCtx { break_ty: None, want, is_loop: true, is_block: true, label: Some((label.name, label.span)) });
                 let t = self.block(*body, expected);
                 let l = self.loops.pop().unwrap();
-                match l.break_ty {
-                    Some(bt) => {
-                        let tail = p.ast.block(*body).tail;
-                        self.join(bt, t, &[], tail, span)
+                // The tail coerces to the breaks' type (rustc's target is
+                // the first break's type in a `let`), so distinct closures
+                // or fn items do not join as a fn pointer here; a fn
+                // pointer expectation (`LoopCtx::want`) made that type
+                // the pointer already.
+                match (l.break_ty, p.ast.block(*body).tail) {
+                    (Some(bt), Some(tail)) if self.kind(t) != TyKind::Never => {
+                        if self.coerce_expr(tail, t, bt) { bt } else { ERROR }
                     }
-                    None => t,
+                    (Some(bt), _) => self.join(bt, t, &[], None, span),
+                    (None, _) => t,
                 }
             }
             Expr::Macro { kind, args, fmt, repeat } => self.macro_expr(e, *kind, args, fmt, *repeat, span, expected),
