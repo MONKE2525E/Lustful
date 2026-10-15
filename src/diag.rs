@@ -412,7 +412,9 @@ fn global_expansion(ctxt: CtxtId) -> Option<Expansion> {
 /// Multi-file crates also keep each file's text in the map, so a diagnostic
 /// snippet reads the file its span names (docs/ARCH.md section 1.2). The
 /// one-file driver path keeps text out of the map and passes it to `render`.
-#[derive(Clone)]
+/// Entries sit behind an `Arc`, so cloning a map (the daemon's body patch
+/// does it per request) shares every unchanged file's text and line index
+/// instead of copying the whole crate's source.
 struct SourceFile {
     path: String,
     lines: LineIndex,
@@ -422,10 +424,12 @@ struct SourceFile {
 /// The session's source map: every file's path and line index, plus the expansion table
 /// that `CtxtId`s index into. Owned by the compile session. A stage that needs a path or a
 /// line for a span asks the map. Today a crate has one file, so the map holds one entry.
+/// Cloning a map bumps one `Arc` per file and shares the expansion table;
+/// a write to one file replaces only that file's entry.
 #[derive(Clone, Default)]
 pub struct SourceMap {
-    files: Vec<SourceFile>,
-    expansions: Vec<Expansion>,
+    files: Vec<std::sync::Arc<SourceFile>>,
+    expansions: std::sync::Arc<Vec<Expansion>>,
 }
 
 impl SourceMap {
@@ -433,13 +437,13 @@ impl SourceMap {
     /// same file for the rest of the session.
     pub fn add_file(&mut self, path: &str, src: &str) -> FileId {
         let id = FileId(self.files.len() as u32);
-        self.files.push(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: None });
+        self.files.push(std::sync::Arc::new(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: None }));
         id
     }
     /// Adds a file and keeps its text in the map (multi-file crates).
     pub fn add_file_with_text(&mut self, path: &str, src: &str) -> FileId {
         let id = FileId(self.files.len() as u32);
-        self.files.push(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: Some(src.to_string()) });
+        self.files.push(std::sync::Arc::new(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: Some(src.to_string()) }));
         id
     }
     /// The number of files in the map.
@@ -454,14 +458,14 @@ impl SourceMap {
     /// file on each request: the path comes from the request, and the index is spliced
     /// from the last request's index, so it arrives ready-made.
     pub fn set_file(&mut self, file: FileId, path: &str, lines: LineIndex) {
-        self.files[file.0 as usize] = SourceFile { path: path.to_string(), lines, text: None };
+        self.files[file.0 as usize] = std::sync::Arc::new(SourceFile { path: path.to_string(), lines, text: None });
     }
     /// Replaces the kept text of one multi-file crate file and its line
-    /// index (the daemon's body patch edits one file in place).
+    /// index (the daemon's body patch edits one file in place). Only this
+    /// file's entry is rebuilt; maps cloned earlier keep the old text.
     pub fn replace_text(&mut self, file: FileId, text: String, lines: LineIndex) {
-        let f = &mut self.files[file.0 as usize];
-        f.lines = lines;
-        f.text = Some(text);
+        let path = self.files[file.0 as usize].path.clone();
+        self.files[file.0 as usize] = std::sync::Arc::new(SourceFile { path, lines, text: Some(text) });
     }
     /// True when no file has been added yet (a fresh session).
     pub fn is_empty(&self) -> bool {
@@ -519,7 +523,7 @@ impl SourceMap {
     /// session: both number contexts from 1, and this table wins lookups.
     #[allow(dead_code)] // The expander uses the process-wide table today; the worklist driver (ARCH 6.1) will own this one.
     pub fn add_expansion(&mut self, exp: Expansion) -> CtxtId {
-        self.expansions.push(exp);
+        std::sync::Arc::make_mut(&mut self.expansions).push(exp);
         CtxtId(self.expansions.len() as u32)
     }
 }
@@ -728,6 +732,23 @@ mod tests {
         let inner = Span { file: b, lo: 4, hi: 5, ctxt: c2 };
         assert_eq!(map.call_site(inner), outer_call);
         assert_eq!(map.call_site(outer_call), outer_call);
+    }
+
+    /// A cloned map shares its file entries: replacing one file's text in
+    /// the clone leaves the original map's text and lines as they were.
+    #[test]
+    fn cloned_map_shares_unchanged_files() {
+        let mut map = SourceMap::default();
+        let a = map.add_file_with_text("a.rs", "aa\nbb\n");
+        let b = map.add_file_with_text("b.rs", "x\n");
+        let mut clone = map.clone();
+        clone.replace_text(a, "aa\nbb\ncc\n".to_string(), LineIndex::new("aa\nbb\ncc\n"));
+        assert_eq!(map.text(a), Some("aa\nbb\n"));
+        assert_eq!(map.line_col(Span::new(a, 4, 5)), (2, 2));
+        assert_eq!(clone.text(a), Some("aa\nbb\ncc\n"));
+        assert_eq!(clone.line_col(Span::new(a, 6, 7)), (3, 1));
+        assert_eq!(clone.text(b), Some("x\n"));
+        assert!(std::sync::Arc::ptr_eq(&map.files[b.0 as usize], &clone.files[b.0 as usize]));
     }
 
     /// JSON diagnostics take `file` and line numbers from the span's file in the map.
