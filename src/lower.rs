@@ -951,9 +951,34 @@ impl<'p> Lower<'p> {
                 }
                 _ => {
                     let span = self.span(e);
-                    match self.deref_steps(e, *inner, span) {
-                        Some(root) => root.deref(),
-                        None => self.place(*inner).deref(),
+                    // `*s` for a `String` or `Vec` (their `Deref`
+                    // to `str` / `[T]`): the place behind the
+                    // fat view of the value, as for a Cow.
+                    let inner_ty = self.ty(*inner);
+                    if self.body.tys.is_string_ty(inner_ty) {
+                        let m = self.mut_index > 0;
+                        let pl = self.place(*inner);
+                        let srt = self.ref_ty(m, STRING);
+                        let sr = self.temp(srt);
+                        self.assign(Place::local(sr), Rvalue::Ref(m, pl), span);
+                        let vt = self.ref_ty(m, STR);
+                        let t = self.temp(vt);
+                        let b = if m { Builtin::StringAsMutStr } else { Builtin::StringAsStr };
+                        self.call_into(CallTarget::Builtin(b), vec![Operand::Copy(Place::local(sr))], Place::local(t), span);
+                        Place::local(t).deref()
+                    } else if let Some(elem) = self.body.tys.vec_elem(inner_ty) {
+                        let m = self.mut_index > 0;
+                        let pl = self.place(*inner);
+                        let slice = self.body.tys.intern(TyKind::Slice(elem));
+                        let rt = self.ref_ty(m, slice);
+                        let t = self.temp(rt);
+                        self.assign(Place::local(t), Rvalue::SliceOf(pl), span);
+                        Place::local(t).deref()
+                    } else {
+                        match self.deref_steps(e, *inner, span) {
+                            Some(root) => root.deref(),
+                            None => self.place(*inner).deref(),
+                        }
                     }
                 }
             },

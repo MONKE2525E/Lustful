@@ -7544,6 +7544,14 @@ impl<'p> Ctx<'p> {
                 match self.kind(t) {
                     TyKind::Ref(_, _, x) => x,
                     TyKind::Error => ERROR,
+                    // `String` and `Vec<T>` deref to `str` and
+                    // `[T]` (their std `Deref` impls), as a method
+                    // receiver step already treats them.
+                    _ if self.tys.is_string_ty(t) => STR,
+                    _ if self.tys.vec_elem(t).is_some() => {
+                        let elem = self.tys.vec_elem(t).unwrap_or(ERROR);
+                        self.tys.intern(TyKind::Slice(elem))
+                    }
                     _ if self.tys.smart_elem(t).is_some() => self.tys.smart_elem(t).unwrap_or(ERROR),
                     // `*cow` is `*Deref::deref(&cow)` (W-STD-B): the place
                     // behind the Cow's `&B` view.
@@ -13533,7 +13541,15 @@ impl<'p> Ctx<'p> {
                     TyKind::Slice(e) | TyKind::Array(e, _) => e,
                     _ => ERROR,
                 };
-                if self.name(name) == "as_ptr" {
+                if name == k.as_slice && matches!(bk, TyKind::Array(..)) {
+                    let sl = self.tys.intern(TyKind::Slice(elem));
+                    let r = self.tys.mk_ref(false, sl);
+                    Some((B::VecAsSlice, Autoref::Ref, vec![], r))
+                } else if name == k.as_mut_slice && matches!(bk, TyKind::Array(..)) {
+                    let sl = self.tys.intern(TyKind::Slice(elem));
+                    let r = self.tys.mk_ref(true, sl);
+                    Some((B::VecAsMutSlice, Autoref::RefMut, vec![], r))
+                } else if self.name(name) == "as_ptr" {
                     Some((B::SeqAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, elem))))
                 } else if self.name(name) == "as_mut_ptr" {
                     Some((B::SeqAsPtr, Autoref::RefMut, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, elem))))

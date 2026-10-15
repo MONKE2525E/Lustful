@@ -5184,13 +5184,12 @@ impl FnGen<'_, '_> {
                 _ => format!("({}).ptr", vals[0]),
             },
             B::VecAsSlice | B::VecAsMutSlice => {
-                let CTy::Ref(v) = &tys[0] else { unreachable!() };
-                let CTy::Vec(e) = &**v else { unreachable!() };
-                let et = ctype(e);
-                let sl = CTy::Slice(e.clone());
+                // `Vec`, arrays, and slices all give the same
+                // fat value (core's `as_slice` family).
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let sl = CTy::Slice(Box::new(e));
                 let (st, t) = (ctype(&sl), self.tmp());
-                let vv = &vals[0];
-                let _ = writeln!(self.out, "    {st} {t} = {{ ({et}*){vv}->ptr, {vv}->len }};");
+                let _ = writeln!(self.out, "    {st} {t} = {{ {ptr}, {len} }};");
                 t
             }
             B::SliceToVec | B::VecFrom => {
