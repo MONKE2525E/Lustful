@@ -8258,7 +8258,35 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
     let mut out = Vec::new();
     for oc in owned {
         if let Some(e) = p.gx.closures.get(&oc.def) {
-            out.push(e.body_fn);
+            let id = e.body_fn;
+            // Registered from a check that still named a generic
+            // definer's template closures (`Checked::closure_map_pending`):
+            // the recheck's types replace them, or the closure's body
+            // and its callers' instances would disagree on them.
+            let stale = |p: &Program, t: Ty| crate::check::opaque::mentions_template_closure(p, &p.tys, t);
+            if p.fn_info(id).params.iter().chain([&p.fn_info(id).ret]).any(|&t| stale(p, t)) {
+                let env = build_owned_ty(p, &oc.env);
+                let inputs: Vec<Ty> = oc.inputs.iter().map(|t| build_owned_ty(p, t)).collect();
+                let output = build_owned_ty(p, &oc.output);
+                let env_param = match oc.kind {
+                    ClosureKind::Fn => p.tys.mk_ref(false, env),
+                    ClosureKind::FnMut => p.tys.mk_ref(true, env),
+                    ClosureKind::FnOnce => env,
+                };
+                let mut params = vec![env_param];
+                params.extend(inputs.iter().copied());
+                if let Some(d) = p.defs.get_mut(oc.def) {
+                    d.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret: output };
+                }
+                let f = &mut p.fns[id.0 as usize];
+                f.params = params;
+                f.ret = output;
+                if let Some(e) = p.gx.closures.get_mut(&oc.def) {
+                    e.inputs = inputs;
+                    e.output = output;
+                }
+            }
+            out.push(id);
             continue;
         }
         let env = build_owned_ty(p, &oc.env);
