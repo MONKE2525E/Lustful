@@ -5195,6 +5195,66 @@ impl<'p, 'a> Lower<'p, 'a> {
     /// of the receiver around the borrows of the format arguments, then
     /// one `WriteFmt` rvalue. An argument that borrows the receiver again
     /// is live at the activation, so borrowck rejects it as rustc does.
+    /// A BTree `range`/`range_mut` call (check's `range_method`):
+    /// build the two `Bound` values from the written argument,
+    /// then call the private `range_between` fn.
+    fn range_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], dest: Option<&Place>, span: Span, mutable: bool, derefs: u8) {
+        use crate::check::RangeForm;
+        let Some(rec) = self.ck.range_recv(e).cloned() else { return };
+        let f = if rec.args.is_empty() { rec.f } else { crate::check::generics::instance_for(self.p, &self.body.tys, rec.f, &rec.args).unwrap_or(rec.f) };
+        let (b, root_ty) = match self.deref_steps(e, recv, span) {
+            Some(root) => {
+                let t = self.body.locals[root.local as usize].ty;
+                (root, t)
+            }
+            None => (self.place(recv), self.ty(recv)),
+        };
+        let b = Self::derefs(b, derefs);
+        let bt = self.peel(root_ty, derefs);
+        let rt = self.ref_ty(mutable, bt);
+        let r = self.temp(rt);
+        self.assign(Place::local(r), Rvalue::Ref(mutable, b), span);
+        // The Bound type of the instantiated callee (its own
+        // signature names the materialized Adt instance).
+        let bound_ty = self.p.fn_info(f).params.get(1).copied().unwrap_or(ERROR);
+        let bound_adt = self.body.tys.local_adt(bound_ty);
+        let bound_op = |this: &mut Self, tag: u8, val: Option<(ExprId, bool)>| -> Operand {
+            let t = this.temp(bound_ty);
+            let Some(a) = bound_adt else { return Operand::Copy(Place::local(t)) };
+            let ops = match (tag, val) {
+                (_, Some((ve, true))) => vec![this.operand(ve)],
+                (_, Some((ve, false))) => {
+                    let vt = this.temp(this.ty(ve));
+                    this.expr_into(ve, Some(&Place::local(vt)));
+                    let rt2 = this.ref_ty(false, this.ty(ve));
+                    let rv = this.temp(rt2);
+                    this.assign(Place::local(rv), Rvalue::Ref(false, Place::local(vt)), span);
+                    vec![Operand::Copy(Place::local(rv))]
+                }
+                _ => Vec::new(),
+            };
+            this.assign(Place::local(t), Rvalue::Aggregate(a, tag as u32, ops), span);
+            Operand::Move(Place::local(t))
+        };
+        let (lo_op, hi_op) = match rec.form {
+            RangeForm::Tuple => {
+                let arg_op = self.operand(args[0]);
+                let pl = self.op_place(arg_op, self.ty(args[0]), span);
+                (self.operand_from(pl.clone().project(Proj::Field(0)), bound_ty), self.operand_from(pl.project(Proj::Field(1)), bound_ty))
+            }
+            RangeForm::Static { lo_tag, lo_ref, hi_tag, hi_ref } => {
+                let (lo_e, hi_e) = match self.p.ast.expr(args[0]) {
+                    Expr::Range { lo, hi, .. } => (*lo, *hi),
+                    _ => (None, None),
+                };
+                (bound_op(self, lo_tag, lo_e.map(|ve| (ve, lo_ref))), bound_op(self, hi_tag, hi_e.map(|ve| (ve, hi_ref))))
+            }
+        };
+        let self_arg = if mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
+        let out = self.call_dest(dest, self.ty(e));
+        self.call_into(CallTarget::Fn(f), vec![self_arg, lo_op, hi_op], out, span);
+    }
+
     fn write_fmt_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], derefs: u8, dest: Option<&Place>, span: Span) {
         let recv_ty = self.peel(self.ty(recv), derefs);
         let pl = self.place_for_mut(recv);

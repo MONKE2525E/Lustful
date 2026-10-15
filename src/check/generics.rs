@@ -587,6 +587,14 @@ pub fn cow_def() -> DefId {
     std_adt_table()[9].2
 }
 
+/// The def of `core::ops::Bound` (W-STD-C phase 2): a synthetic
+/// generic enum collect registers like `Cow`, reached only
+/// through std paths. Its shape matches fx-vec-drain's stated
+/// RangeBounds design, so whichever lands second drops theirs.
+pub fn bound_def() -> DefId {
+    lang_def(&["core", "ops"], crate::def::DefKind::Adt, "Bound")
+}
+
 /// The `core::fmt::Error` type.
 pub fn fmt_error_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(fmt_error_def(), EMPTY_ARGS))
@@ -719,7 +727,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 13] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -752,6 +760,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("mpsc", "RecvError", recv_error_def()),
         ("mpsc", "TryRecvError", try_recv_error_def()),
         ("any", "TypeId", type_id_def()),
+        ("ops", "Bound", bound_def()),
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
         ("cell", "BorrowMutError", borrow_mut_error_def()),
@@ -2672,6 +2681,19 @@ pub(crate) fn resolve_path_ty(
             // `std::borrow::Cow<'a, B>` (W-STD-B).
             if path.len() == 3 && path[1] == "borrow" && path[2] == "Cow" {
                 return resolve_cow_path(ast, interner, known, cx, tys, scope, segs.last().unwrap(), span);
+            }
+            // `std::ops::Bound<T>` (W-STD-C phase 2).
+            if path.len() == 3 && path[1] == "ops" && path[2] == "Bound" {
+                let seg = segs.last().unwrap();
+                let GenericArgs::Angle(a) = &seg.args else {
+                    return Err(Diag::new("L0110", span, "`Bound` takes one type argument", "Write `Bound<&T>`, for example."));
+                };
+                let args: Vec<GenericArg> =
+                    resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, "Bound")?.into_iter().filter(|g| g.as_ty().is_some()).collect();
+                if args.len() != 1 {
+                    return Err(Diag::new("L0110", span, "`Bound` takes one type argument", "Write `Bound<&T>`, for example."));
+                }
+                return Ok(tys.mk_adt(bound_def(), &args));
             }
             // The owning std iterators (W-STD-B, ty/iter.rs).
             if let Some(k) = crate::ty::iter::owning_by_path(&path) {

@@ -25,7 +25,7 @@
 //   `collection_iter_inner`), with std's item types. They stay
 //   distinct from the inner types, as std's own iterator structs
 //   are. They have no `Debug` (std's prints the remaining items).
-// Not here yet: `range`, the cursor and `extract_if`
+// Not here yet: the cursor and `extract_if`
 // APIs, `DoubleEndedIterator`
 // for the `Map` aliases beyond what the builtin adapters provide.
 
@@ -142,6 +142,25 @@ pub mod btree_map {
     impl<K, V> Iterator for IntoValues<K, V> {
         type Item = V;
         fn next(&mut self) -> Option<V> {
+            self.inner.next()
+        }
+    }
+    pub struct Range<'a, K, V> {
+        inner: core::iter::Map<core::slice::Iter<'a, (K, V)>, fn(&(K, V)) -> (&K, &V)>,
+    }
+    pub struct RangeMut<'a, K, V> {
+        inner: core::iter::Map<core::slice::IterMut<'a, (K, V)>, fn(&mut (K, V)) -> (&K, &mut V)>,
+    }
+
+    impl<'a, K, V> Iterator for Range<'a, K, V> {
+        type Item = (&'a K, &'a V);
+        fn next(&mut self) -> Option<(&'a K, &'a V)> {
+            self.inner.next()
+        }
+    }
+    impl<'a, K, V> Iterator for RangeMut<'a, K, V> {
+        type Item = (&'a K, &'a mut V);
+        fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
             self.inner.next()
         }
     }
@@ -427,6 +446,119 @@ pub mod btree_map {
         }
     }
 
+    impl<K: Ord, V> BTreeMap<K, V> {
+        /// The entry span of a range: std's panic checks first
+        /// (BTreeMap texts), then binary searches for both ends.
+        fn range_span<Q: ?Sized + Ord>(&self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> (usize, usize)
+        where
+            K: Borrow<Q>,
+        {
+            use core::ops::Bound;
+            let bounded = match (&start, &end) {
+                (Bound::Excluded(s), Bound::Excluded(e)) => {
+                    if super::cmp_of(*s, *e) == core::cmp::Ordering::Equal {
+                        panic!("range start and end are equal and excluded in BTreeMap");
+                    }
+                    Some((s, e))
+                }
+                (Bound::Included(s), Bound::Included(e)) => Some((s, e)),
+                (Bound::Included(s), Bound::Excluded(e)) => Some((s, e)),
+                (Bound::Excluded(s), Bound::Included(e)) => Some((s, e)),
+                _ => None,
+            };
+            if let Some((s, e)) = bounded
+                && super::cmp_of(*s, *e) == core::cmp::Ordering::Greater
+            {
+                panic!("range start is greater than range end in BTreeMap");
+            }
+            let lo = match &start {
+                Bound::Included(x) => match self.search(*x) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                },
+                Bound::Excluded(x) => match self.search(*x) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                },
+                Bound::Unbounded => 0,
+            };
+            let hi = match &end {
+                Bound::Included(x) => match self.search(*x) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                },
+                Bound::Excluded(x) => match self.search(*x) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                },
+                Bound::Unbounded => self.entries.len(),
+            };
+            (lo, hi)
+        }
+
+        /// `range` with its bounds already split: the checker's
+        /// `range` call desugars to this (std source cannot name
+        /// `RangeBounds` yet).
+        fn range_between<Q: ?Sized + Ord>(&self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> Range<'_, K, V>
+        where
+            K: Borrow<Q>,
+        {
+            let (lo, hi) = self.range_span(start, end);
+            let slice: &[(K, V)] = &self.entries[lo..hi];
+            Range { inner: slice.iter().map(pair_ref as fn(&(K, V)) -> (&K, &V)) }
+        }
+
+        /// `range_mut`, likewise.
+        fn range_between_mut<Q: ?Sized + Ord>(&mut self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> RangeMut<'_, K, V>
+        where
+            K: Borrow<Q>,
+        {
+            let (lo, hi) = self.range_span(start, end);
+            let slice: &mut [(K, V)] = &mut self.entries[lo..hi];
+            RangeMut { inner: slice.iter_mut().map(pair_mut as fn(&mut (K, V)) -> (&K, &mut V)) }
+        }
+    }
+
+    impl<K: Ord, V> BTreeMap<K, V> {
+        /// `range` over owned bounds, by way of the reference form.
+        fn range_between_owned<Q: Ord>(&self, start: core::ops::Bound<Q>, end: core::ops::Bound<Q>) -> Range<'_, K, V>
+        where
+            K: Borrow<Q>,
+        {
+            use core::ops::Bound;
+            let start = match &start {
+                Bound::Included(x) => Bound::Included(x),
+                Bound::Excluded(x) => Bound::Excluded(x),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            let end = match &end {
+                Bound::Included(x) => Bound::Included(x),
+                Bound::Excluded(x) => Bound::Excluded(x),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            self.range_between(start, end)
+        }
+
+        /// `range_mut` over owned bounds, likewise.
+        fn range_between_owned_mut<Q: Ord>(&mut self, start: core::ops::Bound<Q>, end: core::ops::Bound<Q>) -> RangeMut<'_, K, V>
+        where
+            K: Borrow<Q>,
+        {
+            use core::ops::Bound;
+            let start = match &start {
+                Bound::Included(x) => Bound::Included(x),
+                Bound::Excluded(x) => Bound::Excluded(x),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            let end = match &end {
+                Bound::Included(x) => Bound::Included(x),
+                Bound::Excluded(x) => Bound::Excluded(x),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            self.range_between_mut(start, end)
+        }
+    }
+
     /// A view into one entry of a map.
     pub enum Entry<'a, K, V> {
         Vacant(VacantEntry<'a, K, V>),
@@ -706,6 +838,15 @@ pub mod btree_set {
             self.inner.next()
         }
     }
+    pub struct Range<'a, T> {
+        inner: core::slice::Iter<'a, T>,
+    }
+    impl<'a, T> Iterator for Range<'a, T> {
+        type Item = &'a T;
+        fn next(&mut self) -> Option<&'a T> {
+            self.inner.next()
+        }
+    }
     impl<T> Iterator for IntoIter<T> {
         type Item = T;
         fn next(&mut self) -> Option<T> {
@@ -938,6 +1079,88 @@ pub mod btree_set {
                 }
             }
             true
+        }
+    }
+
+    impl<T: Ord> BTreeSet<T> {
+        /// The element span of a range, with std's panic checks
+        /// (BTreeSet texts).
+        fn range_span<Q: ?Sized + Ord>(&self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> (usize, usize)
+        where
+            T: Borrow<Q>,
+        {
+            use core::ops::Bound;
+            let bounded = match (&start, &end) {
+                (Bound::Excluded(s), Bound::Excluded(e)) => {
+                    if super::cmp_of(*s, *e) == core::cmp::Ordering::Equal {
+                        panic!("range start and end are equal and excluded in BTreeSet");
+                    }
+                    Some((s, e))
+                }
+                (Bound::Included(s), Bound::Included(e)) => Some((s, e)),
+                (Bound::Included(s), Bound::Excluded(e)) => Some((s, e)),
+                (Bound::Excluded(s), Bound::Included(e)) => Some((s, e)),
+                _ => None,
+            };
+            if let Some((s, e)) = bounded
+                && super::cmp_of(*s, *e) == core::cmp::Ordering::Greater
+            {
+                panic!("range start is greater than range end in BTreeSet");
+            }
+            let lo = match &start {
+                Bound::Included(x) => match self.search(*x) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                },
+                Bound::Excluded(x) => match self.search(*x) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                },
+                Bound::Unbounded => 0,
+            };
+            let hi = match &end {
+                Bound::Included(x) => match self.search(*x) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                },
+                Bound::Excluded(x) => match self.search(*x) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                },
+                Bound::Unbounded => self.items.len(),
+            };
+            (lo, hi)
+        }
+
+        /// `range` with its bounds already split (see BTreeMap's).
+        fn range_between<Q: ?Sized + Ord>(&self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> Range<'_, T>
+        where
+            T: Borrow<Q>,
+        {
+            let (lo, hi) = self.range_span(start, end);
+            let slice: &[T] = &self.items[lo..hi];
+            Range { inner: slice.iter() }
+        }
+    }
+
+    impl<T: Ord> BTreeSet<T> {
+        /// `range` over owned bounds, by way of the reference form.
+        fn range_between_owned<Q: Ord>(&self, start: core::ops::Bound<Q>, end: core::ops::Bound<Q>) -> Range<'_, T>
+        where
+            T: Borrow<Q>,
+        {
+            use core::ops::Bound;
+            let start = match &start {
+                Bound::Included(x) => Bound::Included(x),
+                Bound::Excluded(x) => Bound::Excluded(x),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            let end = match &end {
+                Bound::Included(x) => Bound::Included(x),
+                Bound::Excluded(x) => Bound::Excluded(x),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            self.range_between(start, end)
         }
     }
 
