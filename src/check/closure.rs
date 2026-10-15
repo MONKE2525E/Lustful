@@ -1670,7 +1670,8 @@ impl<'p> Ctx<'p> {
     /// Facts about a closure type for calls and selection: its kind,
     /// inputs, and output. Closures of this body answer from the
     /// checker's own record; others from the registered program table.
-    pub(super) fn closure_facts(&mut self, def: DefId) -> Option<(ClosureKind, Vec<Ty>, Ty)> {
+    pub(super) fn closure_facts(&mut self, ct: Ty) -> Option<(ClosureKind, Vec<Ty>, Ty)> {
+        let TyKind::Closure(def, _) = self.kind(ct) else { return None };
         if let Some(c) = self.closures.iter().find(|c| c.def == def) {
             return Some((c.kind, c.inputs.clone(), c.output));
         }
@@ -1678,24 +1679,28 @@ impl<'p> Ctx<'p> {
         let (kind, inputs, output) = (g.kind, g.inputs.clone(), g.output);
         // A generic definer's hidden closure, revealed at a call: its
         // signature names the definer's params, which the call's args
-        // give (`opaque_closure_args`).
+        // give (`opaque_closure_args`). Calls at different args (`mk(1)`
+        // and `mk(2.5)`) reveal different closure types: the call whose
+        // revealed type is `ct` wins.
         // A lost method probe also revealed the call, at vars nothing
         // decides: the args that resolve win.
+        let want = self.deep(ct);
         let mut found: Option<Vec<GenericArg>> = None;
-        for (d, a) in self.opaque_closure_args.clone() {
+        for (d, a, rt) in self.opaque_closure_args.clone() {
             if d != def {
                 continue;
             }
             let args: Vec<GenericArg> = self.tys.args(a).to_vec();
+            if self.deep(rt) == want {
+                found = Some(args);
+                break;
+            }
             let resolved = args.iter().filter_map(|g| g.as_ty()).all(|t| {
                 let t = self.deep(t);
                 !self.tys.flags(t).contains_infer()
             });
             if resolved || found.is_none() {
                 found = Some(args);
-            }
-            if resolved {
-                break;
             }
         }
         if let Some(args) = found {
@@ -1769,7 +1774,7 @@ impl<'p> Ctx<'p> {
         loop {
             match self.kind(t) {
                 TyKind::Closure(def, _) => {
-                    let Some((kind, inputs, output)) = self.closure_facts(def) else {
+                    let Some((kind, inputs, output)) = self.closure_facts(t) else {
                         self.err("L0820", span, "this closure call is not supported yet", "Call the closure where it is defined.");
                         return ERROR;
                     };
@@ -1966,7 +1971,7 @@ impl<'p> Ctx<'p> {
         }
         let sig = |cx: &mut Self, t: Ty| -> Option<(Vec<Ty>, Ty)> {
             match cx.kind(t) {
-                TyKind::Closure(def, caps) if cx.tys.args(caps).is_empty() => cx.closure_facts(def).map(|(_, i, o)| (i, o)),
+                TyKind::Closure(_, caps) if cx.tys.args(caps).is_empty() => cx.closure_facts(t).map(|(_, i, o)| (i, o)),
                 TyKind::FnPtr(_) => cx.callable_sig(t),
                 TyKind::FnDef(..) if cx.is_fn_item(t) => cx.callable_sig(t),
                 _ => None,
@@ -2016,13 +2021,13 @@ impl<'p> Ctx<'p> {
     /// unifies with the safe fn pointer type `ptr` (rustc's
     /// ClosureFnPointer coercion). A failed probe rolls back.
     pub(super) fn closure_ptr_unifies(&mut self, found: Ty, ptr: Ty) -> bool {
-        let TyKind::Closure(def, caps) = self.kind(self.resolve(found)) else { return false };
+        let TyKind::Closure(_, caps) = self.kind(self.resolve(found)) else { return false };
         let TyKind::FnPtr(sig) = self.kind(self.resolve(ptr)) else { return false };
         let s = self.tys.sig(sig).value;
         if !self.tys.args(caps).is_empty() || s.is_unsafe || s.extern_c {
             return false;
         }
-        let Some((_, inputs, output)) = self.closure_facts(def) else { return false };
+        let Some((_, inputs, output)) = self.closure_facts(found) else { return false };
         let fp = self.fn_ptr_ty(&inputs, output);
         let snap = self.snapshot_vars();
         if self.unify(fp, ptr) {
@@ -2051,7 +2056,7 @@ impl<'p> Ctx<'p> {
         let lang = self.p.gx.lang;
         let t = self.deep(t);
         match self.kind(t) {
-            TyKind::Closure(def, _) => self.closure_facts(def),
+            TyKind::Closure(..) => self.closure_facts(t),
             TyKind::FnPtr(_) | TyKind::FnDef(..) => self.fn_value_sig(t).map(|(params, ret)| (ClosureKind::Fn, params, ret)),
             TyKind::Dyn(..) => {
                 let (tdef, tuple, out) = self.dyn_fn_parts(t)?;

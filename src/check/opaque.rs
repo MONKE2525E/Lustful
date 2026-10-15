@@ -180,14 +180,17 @@ impl Ctx<'_> {
                 && let Some(info) = p.gx.opaques.get(&od)
             {
                 let _ = p.sig_of(&mut self.out.reads, info.owner);
-                if let (TyKind::Opaque(_, args), Some(&h)) = (self.tys.kind(o), p.gx.opaque_hidden.get(&od)) {
+                if let TyKind::Opaque(_, args) = self.tys.kind(o)
+                    && p.gx.opaque_hidden.contains_key(&od)
+                {
+                    let h = reveal(&p.gx.opaque_hidden, &mut self.tys, o, 0);
                     let mut cts = Vec::new();
                     collect_closures(&self.tys, h, &mut cts);
                     for ct in cts {
                         if let TyKind::Closure(d, _) = self.tys.kind(ct)
-                            && !self.opaque_closure_args.contains(&(d, args))
+                            && !self.opaque_closure_args.contains(&(d, args, ct))
                         {
-                            self.opaque_closure_args.push((d, args));
+                            self.opaque_closure_args.push((d, args, ct));
                         }
                     }
                 }

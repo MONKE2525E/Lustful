@@ -1575,8 +1575,9 @@ struct Ctx<'p> {
     closure_map: Vec<(Ty, DefId)>,
     /// Per template closure that a revealed generic `impl Trait` call
     /// put in a type: the call's args for the definer's params, which
-    /// the closure's signature names (`closure_facts`).
-    opaque_closure_args: Vec<(DefId, ArgsId)>,
+    /// the closure's signature names, and the closure type the call
+    /// revealed (`closure_facts`).
+    opaque_closure_args: Vec<(DefId, ArgsId, Ty)>,
     /// This body's closure expressions in token order, for their defs.
     closure_order: Option<Vec<ExprId>>,
     /// The closure-argument type vars of iterator methods (`iter.rs`
