@@ -16,7 +16,10 @@ Removing an item makes its users fail to resolve, so the loop also removes
 them: the slice is closed under its own dependencies by construction. It
 grows by itself when lust supports more: rerun this script on the same spec.
 
-Usage: prune.py <spec.json> <out-dir> [--lust PATH] [--max-rounds N]
+Usage: prune.py <spec.json> <out-dir> [--lust PATH] [--max-rounds N] [--tsrust DIR [--tsrust-commit SHA]] [--lust-commit SHA]
+
+--tsrust overrides the spec's tsrust_dir (a copy on a boat sandbox); --tsrust-commit
+records the commit when that copy is not a git checkout.
 
 spec.json (see bench/slices/*/spec.json):
   tsrust_dir   ts-rust checkout (read only; default /home/theo/.t3/projects/ts-rust)
@@ -29,6 +32,8 @@ spec.json (see bench/slices/*/spec.json):
   rewrite_to   {name: prefix}: `name::` becomes `prefix::` (a part crate merged into this one)
   root_replace optional [[old, new], ...] text edits of the root (the root is bench text,
                not a ts-rust module file; use it to unmount a module lust cannot take)
+  unmount      optional [name, ...]: comment out the root's `pub mod <name>;` lines (a smaller
+               slice of the same crate; users of an unmounted module are pruned)
 
 Only the files in root_from's module tree are copied.
 """
@@ -39,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -57,10 +63,14 @@ def build_items_tool():
             sys.exit(f"slice-items build failed:\n{r.stderr[-2000:]}")
 
 
+def tsrust_dir(spec):
+    return Path(spec.get("tsrust_dir", "/home/theo/.t3/projects/ts-rust"))
+
+
 def copy_tree(spec, out):
     """Copy the crate's module tree: write the new root next to root_from, walk the tree
     from it (so `append` can mount more modules), and keep only the files it reaches."""
-    src = Path(spec.get("tsrust_dir", "/home/theo/.t3/projects/ts-rust")) / spec["src_dir"]
+    src = tsrust_dir(spec) / spec["src_dir"]
     dst = out / "src"
     for p in src.rglob("*.rs"):
         (dst / p.relative_to(src)).parent.mkdir(parents=True, exist_ok=True)
@@ -70,6 +80,11 @@ def copy_tree(spec, out):
         if old not in root_text:
             sys.exit(f"root_replace: text not found: {old!r}")
         root_text = root_text.replace(old, new, 1)
+    for name in spec.get("unmount", []):
+        pat = re.compile(rf"^((///|#\[)[^\n]*\n)*(pub(\([^)]*\))? )?mod {re.escape(name)};\n", re.M)
+        if len(pat.findall(root_text)) != 1:
+            sys.exit(f"unmount: `mod {name};` must occur once in the root")
+        root_text = pat.sub(f"// bench slice: `{name}` not mounted.\n", root_text)
     (dst / spec["root"]).write_text(root_text + spec.get("append", ""))
     for d, s in spec.get("support", {}).items():
         (dst / d).parent.mkdir(parents=True, exist_ok=True)
@@ -129,9 +144,11 @@ def lust_errors(lust, root, env, strict=True, verb="check"):
             errs.append((d["file"], line, d.get("code", ""), d.get("message", "")))
         else:
             other.append(d.get("message", ""))
-    if verb == "build" and r.returncode != 0 and not errs:
+    # A failed build with no located error, or a panic of either verb: one error at line 0,
+    # which the caller bisects. Numbers in parens (ids) are dropped so probes compare equal.
+    if r.returncode != 0 and not errs and (verb == "build" or "panicked at" in r.stderr):
         first = next((l for l in r.stderr.splitlines() if l.strip()), "")
-        return [(str(root), 0, "BUILD", re.sub(r"\(\d+\)", "", first)[:200])]
+        return [(str(root), 0, "BUILD" if verb == "build" else "PANIC", re.sub(r"\(\d+\)", "", first)[:200])]
     if strict and r.returncode != 0 and not errs:
         tail = (r.stderr or r.stdout)[-1500:]
         sys.exit(f"lust failed with no located error (exit {r.returncode}):\n{other}\n{tail}")
@@ -317,14 +334,28 @@ def count_lines(src):
     return sum(sum(1 for _ in open(p)) for p in src.rglob("*.rs"))
 
 
+def lines_by_module(src):
+    """Lines per top-level module (first path part, `.rs` dropped) of the slice's src."""
+    out = {}
+    for p in src.rglob("*.rs"):
+        k = p.relative_to(src).parts[0].removesuffix(".rs")
+        out[k] = out.get(k, 0) + count_lines_file(p)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("spec")
     ap.add_argument("out")
     ap.add_argument("--lust", default=str(ROOT / "target/release/lust"))
     ap.add_argument("--max-rounds", type=int, default=400)
+    ap.add_argument("--tsrust", help="ts-rust checkout to copy from (overrides spec tsrust_dir)")
+    ap.add_argument("--tsrust-commit", help="ts-rust commit to record when --tsrust is not a git checkout")
+    ap.add_argument("--lust-commit", help="lust commit to record when this tree is not a git checkout (boat)")
     a = ap.parse_args()
     spec = json.loads(Path(a.spec).read_text())
+    if a.tsrust:
+        spec["tsrust_dir"] = a.tsrust
     out = Path(a.out).resolve()
     if out.exists():
         shutil.rmtree(out)
@@ -332,6 +363,8 @@ def main():
     root = copy_tree(spec, out)
     src_root = (out / "src").resolve()
     start_lines = count_lines(src_root)
+    start_by_module = lines_by_module(src_root)
+    t0 = time.time()
     env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(out / ".lust-cache"))
     removed = []
     unlocated = []
@@ -356,7 +389,8 @@ def main():
         verb = "build" if tool == "lust-build" else "check"
         n = prune_round(errs, tool, removed, src_root, unlocated,
                         lambda c, m: bisect(a.lust, root, env, src_root, c, m, verb))
-        print(f"round {rounds} ({tool}): {len(errs)} errors, removed {n} items, {count_lines(src_root)} lines left", flush=True)
+        print(f"round {rounds} ({tool}): {len(errs)} errors, removed {n} items, {count_lines(src_root)} lines left, "
+              f"{time.time() - t0:.0f} s", flush=True)
     else:
         sys.exit("prune did not converge")
     # Keep only the files rustc loads on this target: cfg-disabled modules (windows,
@@ -379,13 +413,16 @@ def main():
     dep.unlink()
     shutil.rmtree(out / ".lust-cache", ignore_errors=True)
     (out / "slice.rmeta").unlink(missing_ok=True)
-    ts = Path(spec.get("tsrust_dir", "/home/theo/.t3/projects/ts-rust"))
-    commit = sh(["git", "-C", str(ts), "rev-parse", "HEAD"]).stdout.strip()
-    lust_commit = sh(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.strip()
+    commit = a.tsrust_commit or sh(["git", "-C", str(tsrust_dir(spec)), "rev-parse", "HEAD"]).stdout.strip()
+    spec.pop("tsrust_dir", None) if a.tsrust else None
+    end_by_module = lines_by_module(src_root)
+    lust_commit = a.lust_commit or sh(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.strip()
     manifest = {
         "tsrust_commit": commit, "lust_commit": lust_commit, "spec": spec,
         "lines_before": start_lines, "lines": count_lines(src_root),
         "code_lines": nonblank_lines(src_root), "unloaded_lines_dropped": dropped, "rounds": rounds,
+        "prune_seconds": round(time.time() - t0),
+        "lines_by_module": {k: [v, end_by_module.get(k, 0)] for k, v in sorted(start_by_module.items())},
         "removed_items": len(removed),
         "removed_by_rustc": [r for r in removed if r["by"] == "rustc"],
         "removed_by_lust_build": [r for r in removed if r["by"] == "lust-build"],

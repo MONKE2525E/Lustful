@@ -1,0 +1,30 @@
+{
+  "name": "tsrust-full",
+  "about": "all of ts-rust's ts_goport crate with its part crates goport_util and goport_lsproto mounted as modules, pruned to what lust accepts",
+  "src_dir": "crates/ts_goport/src",
+  "root_from": "lib.rs",
+  "root": "slice_main.rs",
+  "append": "\n// bench slice: the part crates goport_util and goport_lsproto as modules of this crate (their `crate::` paths\n// reach the same items through ts_goport's re-exports), stand-ins for the external crates, and a bin entry.\n#[path = \"goport_util_root.rs\"]\npub mod goport_util;\n#[path = \"goport_lsproto_root.rs\"]\npub mod goport_lsproto;\nmod support;\npub use support::{indexmap, memchr, rustc_hash};\n\nfn main() {}\n",
+  "support": {
+    "support.rs": "bench/slices/support.rs"
+  },
+  "rewrite": [
+    "rustc_hash",
+    "indexmap",
+    "memchr"
+  ],
+  "root_replace": [
+    [
+      "mod flags_macros {\n    pub(crate) use goport_util::{go_enum, go_flags};\n}\n",
+      "mod flags_macros {\n    pub(crate) use crate::{go_enum, go_flags};\n}\n"
+    ],
+    [
+      "pub use goport_util::{go_assert, unported};\n",
+      "// bench slice: go_assert! and unported! are #[macro_export] in the goport_util module, so they are at this root.\n"
+    ]
+  ],
+  "rewrite_to": {
+    "goport_util": "crate::goport_util",
+    "goport_lsproto": "crate::goport_lsproto"
+  }
+}

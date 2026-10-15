@@ -25,7 +25,8 @@ found by stubbing fn bodies in halves (bisect). `prune.json` lists every
 removed item with the oracle and error code that removed it. That list is a
 ranked to-do list for lust coverage.
 
-`items/` is a small syn tool that lists items, fn bodies, and the module tree.
+`items/` is a small syn tool that lists items, fn bodies, and the module tree
+(`#[path]` resolved as rustc does: next to the file, or below an inline module).
 `driver.rs` is the bench `main` body (tspath calls with printed results); the
 benchmark mounts it in its work copy so build rows can compare program output
 with rustc. Keep the fns it calls in every slice, or update it.
@@ -41,9 +42,19 @@ Bench-owned text, not ts-rust code:
   `rewrite_to`): goport_lsproto's own root re-exports goport_util, so the
   merged crate keeps every path's meaning.
 
-`core` (`gopanic.rs`) is not mounted: a user module named `core` makes lust's
-std fail to resolve its own `core::` paths (lust bug, see REPORT). When that
-is fixed, drop that `root_replace` entry and rerun prune.py.
+`core` (`gopanic.rs`) is mounted again: lust's std no longer breaks on a
+user module named `core` (fixed in c6beebe29).
+
+Bigger slices (`tsrust-*`) start from ts_goport's `lib.rs` and mount the two
+part crates as modules (`#[path = "goport_util_root.rs"] pub mod goport_util;`).
+Their files keep their `crate::` paths, which reach the same items through
+ts_goport's re-exports; `goport_util::` and `goport_lsproto::` paths become
+`crate::goport_util::` and `crate::goport_lsproto::`. A spec's `unmount` list
+leaves top modules of `lib.rs` out, for a slice between 50k lines and full size.
+
+Not stubbed: `smallvec`, `xxhash_rust`, and the other external crates (users
+are pruned), and the data files that `include_bytes!` reads (prune.py copies
+only `.rs` files). `bench/slices/coverage.py` counts both apart from lust errors.
 
 ## Grow a slice
 
