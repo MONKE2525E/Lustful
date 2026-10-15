@@ -2076,8 +2076,13 @@ impl Evaluator {
                     let debt_before = self.flex_debt.clone();
                     let mut v = self.value_moved(cx, env, *init, exp)?;
                     // The initializer coerces to the written type, or
-                    // the binding is a mismatch (rustc E0308).
-                    if let Some(t) = exp {
+                    // the binding is a mismatch (rustc E0308). Only in
+                    // the const expression's own code: a called const
+                    // fn's body is type-checked as a fn, and its written
+                    // types (its params, `Self`) do not resolve here.
+                    if let Some(t) = exp
+                        && self.call_depth == 0
+                    {
                         if !const_ty_compatible(cx.tys_ref(), v.1, t) {
                             return Err(const_ty_mismatch(cx.ast().expr_span(*init), "this `let` initializer"));
                         }
