@@ -10077,6 +10077,12 @@ fn prove_trait_ref(
         // slice, reference) and otherwise keep the solver's answer.
         let containers = tr.def == lang.debug || tr.def == lang.clone || tr.def == lang.copy || tr.def == lang.hash;
         let parts: Option<Vec<Ty>> = match cx.tys.kind(t) {
+            // A shared reference is always `Copy` and `Clone`
+            // (`impl<T: ?Sized> Copy for &T` in core), with no
+            // element goal: forwarding to `T` would ask `str: Copy`
+            // for `&str: Copy` and fail a goal the solver's record
+            // answered before Self read deep-resolved here.
+            TyKind::Ref(_, m, _) if !m.is_mut() && (is_copy || tr.def == lang.clone) => Some(Vec::new()),
             // A reference defaults only as `&str` or `&[T]`, with no
             // element goal; the other family traits forward to `T`.
             TyKind::Ref(_, m, e) if is_default => matches!(cx.tys.kind(e), TyKind::Str | TyKind::Slice(_)).then_some(Vec::new()),
