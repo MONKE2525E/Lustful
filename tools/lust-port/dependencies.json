@@ -88,9 +88,9 @@
   },
   {
    "name": "rustix",
-   "decision": "c-shim",
+   "decision": "builtin-adapter",
    "milestone": 7,
-   "notes": "Signals, pipes, fstat, termios, events, polling and processes. Keep ownership and errno."
+   "notes": "Adapter in library/deps over src/runtime/sysx.c: fs (openat, statat, statx, accessat, utimensat, mknodat, fcntl), process (Pid, Signal, kill, rlimit), termios winsize, pipe, poll, stdio, io::Errno with std error texts. RawDir and std OwnedFd interop are absent; see the adapter README."
   },
   {
    "name": "signal-hook",

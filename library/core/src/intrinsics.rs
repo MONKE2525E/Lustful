@@ -43,6 +43,26 @@
 //     pub fn sys_net_sendto(fd: i32, buf: &[u8], rec: &[u8]) -> i64;
 //     pub fn sys_net_recvfrom(fd: i32, max: u64, flags: i32, out: &mut Vec<u8>, addr: &mut Vec<u8>) -> i64;
 //
+// The Unix calls behind the rustix adapter (w-cinterop2; C in
+// src/runtime/sysx.c, contracts in sysx.h), callable only from
+// that adapter:
+//
+//     pub fn sys_x_kill(pid: i32, sig: i32) -> i32;
+//     pub fn sys_x_getppid() -> i32;
+//     pub fn sys_x_prctl_deathsig(sig: i32) -> i32;
+//     pub fn sys_x_getrlimit(resource: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_setrlimit(resource: i32, current: u64, maximum: u64) -> i32;
+//     pub fn sys_x_openat(dirfd: i32, path: &[u8], flags: i32, mode: u32) -> i32;
+//     pub fn sys_x_statat(dirfd: i32, path: &[u8], flags: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_fstat(fd: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_statx(dirfd: i32, path: &[u8], flags: i32, mask: u32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_accessat(dirfd: i32, path: &[u8], mode: i32, flags: i32) -> i32;
+//     pub fn sys_x_utimensat(dirfd: i32, path: &[u8], a_sec: i64, a_nsec: i64, m_sec: i64, m_nsec: i64, flags: i32) -> i32;
+//     pub fn sys_x_mknodat(dirfd: i32, path: &[u8], mode: u32, dev: u64) -> i32;
+//     pub fn sys_x_fcntl_getfl(fd: i32) -> i32;
+//     pub fn sys_x_fcntl_setfl(fd: i32, flags: i32) -> i32;
+//     pub fn sys_x_winsize(fd: i32, out: &mut Vec<u8>) -> i32;
+//
 // Every other row of the section 3.2 table is registered with its
 // signature and privilege list, but has no body yet: a privileged call
 // rejects with L0640 until W-STD lands the wrapper and the runtime hook.

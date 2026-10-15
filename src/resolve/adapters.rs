@@ -49,6 +49,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "num-traits",
     "tikv-jemallocator",
     "tikv-jemalloc-ctl",
+    "rustix",
 ];
 
 /// One adapter crate, read from its manifest.

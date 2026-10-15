@@ -1,0 +1,14 @@
+true false
+true true
+None Some(Pid(1)) 1
+true 0
+Ok(())
+No such process (os error 3)
+Os { code: 3, kind: Uncategorized, message: "No such process" }
+"Signal::TERM" Some("Signal::KILL") None None
+2 2
+Operation not permitted (os error 1) PermissionDenied Some(Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" })
+Nofile As
+true true
+Ok(()) true
+true

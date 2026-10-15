@@ -5884,7 +5884,9 @@ fn runtime_source(with_impls: bool) -> String {
     let src = src.replacen("#include \"sysio.h\"", &sysio, 1);
     let sysnet =
         include_str!("runtime/sysnet.h").replacen("#include \"sysnet.c\"", if with_impls { include_str!("runtime/sysnet.c") } else { "" }, 1);
-    src.replacen("#include \"sysnet.h\"", &sysnet, 1)
+    let src = src.replacen("#include \"sysnet.h\"", &sysnet, 1);
+    let sysx = include_str!("runtime/sysx.h").replacen("#include \"sysx.c\"", if with_impls { include_str!("runtime/sysx.c") } else { "" }, 1);
+    src.replacen("#include \"sysx.h\"", &sysx, 1)
 }
 
 /// Removes C comments, replacing each with one space (the C meaning of a

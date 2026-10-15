@@ -1,0 +1,12 @@
+12
+12 RegularFile 420
+12 true
+true 12 RegularFile
+1600000000 123456789 true
+Ok(()) Err(Os { code: 13, kind: PermissionDenied, message: "Permission denied" })
+Fifo
+false
+12 hello rustix
+No such file or directory (os error 2)
+true
+2097152

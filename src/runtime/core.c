@@ -1917,5 +1917,8 @@ uint32_t lust_from_digit(uint32_t digit, uint32_t radix, lust_loc loc) LUST_BODY
 /* The socket calls behind std::net (src/runtime/sysnet.h,
    w-cinterop). */
 #include "sysnet.h"
+/* The Unix calls behind the rustix adapter (src/runtime/sysx.h,
+   w-cinterop2). */
+#include "sysx.h"
 /* Std runtime hooks for time and fmt (src/runtime/stdc.h, W-STD-C). */
 #include "stdc.h"

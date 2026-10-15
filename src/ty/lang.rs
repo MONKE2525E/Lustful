@@ -45,6 +45,7 @@ pub enum ShippedCrate {
     XxhashRust,
     RyuJs,
     NumBigInt,
+    Rustix,
 }
 
 impl ShippedCrate {
@@ -62,6 +63,7 @@ impl ShippedCrate {
         ShippedCrate::XxhashRust,
         ShippedCrate::RyuJs,
         ShippedCrate::NumBigInt,
+        ShippedCrate::Rustix,
     ];
 
     /// The crate name as user code writes it in a path (`std::...`).
@@ -78,6 +80,7 @@ impl ShippedCrate {
             ShippedCrate::XxhashRust => "xxhash_rust",
             ShippedCrate::RyuJs => "ryu_js",
             ShippedCrate::NumBigInt => "num_bigint",
+            ShippedCrate::Rustix => "rustix",
         }
     }
 
@@ -958,7 +961,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         implemented: true,
     },
     // getpid.
-    IntrinsicDef { name: "sys_getpid", c_symbol: "lust_sys_getpid", params: &[], ret: S::U32, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef { name: "sys_getpid", c_symbol: "lust_sys_getpid", params: &[], ret: S::U32, allowed: &[C::Std, C::Rustix], implemented: true },
     // Appends the OS text of an error code (strerror) to the String.
     IntrinsicDef {
         name: "sys_os_error_text",
@@ -977,7 +980,7 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         c_symbol: "lust_sys_fd_read",
         params: &[S::I32, S::U64, S::VecU8Mut],
         ret: S::I64,
-        allowed: ONLY_STD,
+        allowed: &[C::Std, C::Rustix],
         implemented: true,
     },
     // One write of the bytes to the fd.
@@ -986,13 +989,13 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         c_symbol: "lust_sys_fd_write",
         params: &[S::I32, S::Bytes],
         ret: S::I64,
-        allowed: ONLY_STD,
+        allowed: &[C::Std, C::Rustix],
         implemented: true,
     },
     // close.
-    IntrinsicDef { name: "sys_fd_close", c_symbol: "lust_sys_fd_close", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef { name: "sys_fd_close", c_symbol: "lust_sys_fd_close", params: &[S::I32], ret: S::I32, allowed: &[C::Std, C::Rustix], implemented: true },
     // dup with FD_CLOEXEC: the new fd, or -errno.
-    IntrinsicDef { name: "sys_fd_dup", c_symbol: "lust_sys_fd_dup", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    IntrinsicDef { name: "sys_fd_dup", c_symbol: "lust_sys_fd_dup", params: &[S::I32], ret: S::I32, allowed: &[C::Std, C::Rustix], implemented: true },
     // fsync.
     IntrinsicDef { name: "sys_fd_sync", c_symbol: "lust_sys_fd_sync", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
     // fdatasync.
@@ -1173,6 +1176,34 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // The Unix calls behind the rustix adapter (w-cinterop2,
+    // src/runtime/sysx.c). Errors are errno, or -errno where the
+    // value is an fd or flags (sysx.h has each contract).
+    IntrinsicDef { name: "sys_x_kill", c_symbol: "lust_sys_x_kill", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_getppid", c_symbol: "lust_sys_x_getppid", params: &[], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_prctl_deathsig", c_symbol: "lust_sys_x_prctl_deathsig", params: &[S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_getrlimit", c_symbol: "lust_sys_x_getrlimit", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_setrlimit", c_symbol: "lust_sys_x_setrlimit", params: &[S::I32, S::U64, S::U64], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_openat", c_symbol: "lust_sys_x_openat", params: &[S::I32, S::Bytes, S::I32, S::U32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_statat", c_symbol: "lust_sys_x_statat", params: &[S::I32, S::Bytes, S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_fstat", c_symbol: "lust_sys_x_fstat", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_statx", c_symbol: "lust_sys_x_statx", params: &[S::I32, S::Bytes, S::I32, S::U32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_accessat", c_symbol: "lust_sys_x_accessat", params: &[S::I32, S::Bytes, S::I32, S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef {
+        name: "sys_x_utimensat",
+        c_symbol: "lust_sys_x_utimensat",
+        params: &[S::I32, S::Bytes, S::I64, S::I64, S::I64, S::I64, S::I32],
+        ret: S::I32,
+        allowed: &[C::Rustix],
+        implemented: true,
+    },
+    IntrinsicDef { name: "sys_x_mknodat", c_symbol: "lust_sys_x_mknodat", params: &[S::I32, S::Bytes, S::U32, S::U64], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_fcntl_getfl", c_symbol: "lust_sys_x_fcntl_getfl", params: &[S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_fcntl_setfl", c_symbol: "lust_sys_x_fcntl_setfl", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_winsize", c_symbol: "lust_sys_x_winsize", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_pipe", c_symbol: "lust_sys_x_pipe", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_dup2", c_symbol: "lust_sys_x_dup2", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    IntrinsicDef { name: "sys_x_poll", c_symbol: "lust_sys_x_poll", params: &[S::VecU8Mut, S::I64, S::I64], ret: S::I32, allowed: &[C::Rustix], implemented: true },
     // The Formatter's alignment as `rt::Alignment` encodes it (0 left,
     // 1 right, 2 center, 3 none written), for Debug impls that pad by
     // hand like `Duration`'s (W-STD-C; runtime/stdc.c).

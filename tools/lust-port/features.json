@@ -527,13 +527,9 @@
    "release_impact": "unchanged",
    "notes": "Cached rustc-built C ABI shims in milestone 7. See dependencies.json for the per-crate decision. Split by w-cinterop: raw pointer types are cinterop.raw_ptr, extern blocks are cinterop.extern, and #[global_allocator] is cinterop.global_allocator. No probe: each crate needs its own adapter probe.",
    "primary_keys": [
-    "ext.type.rustix::*",
     "ext.type.libc::*"
    ],
    "keys": [
-    "ext.type.rustix::*",
-    "ext.expr.rustix::*",
-    "ext.use.rustix::*",
     "ext.type.nix::*",
     "ext.expr.nix::*",
     "ext.use.nix::*",
@@ -1136,6 +1132,26 @@
     "ext.type.tikv_jemalloc_ctl::*",
     "ext.expr.tikv_jemalloc_ctl::*",
     "ext.use.tikv_jemalloc_ctl::*"
+   ]
+  },
+  {
+   "id": "ext.rustix",
+   "title": "Adapter crate rustix 1.1.5: fs, process, termios, pipe, event, stdio subsets",
+   "status": "supported",
+   "milestone": 0,
+   "inventory_step": "10",
+   "root_cause": "external-crates",
+   "fix_class": "adapter",
+   "release_safe_rewrite": false,
+   "release_impact": "unchanged",
+   "notes": "Lust adapter in library/deps (docs/ARCH.md 3.6), matched to the resolved package version; gate scripts/test-adapters.sh rustix (3 cases match the real crate; verified locally, the boat snapshot lacks the windows-link crate file cargo metadata needs). RawDir and std OwnedFd interop are absent, as the adapter README lists. Split from cinterop.system. See dependencies.json.",
+   "primary_keys": [
+    "ext.type.rustix::*"
+   ],
+   "keys": [
+    "ext.type.rustix::*",
+    "ext.expr.rustix::*",
+    "ext.use.rustix::*"
    ]
   },
   {
