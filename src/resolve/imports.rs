@@ -684,8 +684,18 @@ impl ResolvedTables {
                     // two definitions of one name (rustc E0252/E0255): a
                     // repeated `use`, or a `use` of an item this module
                     // defines. A glob (rank 1) re-binding the same target
-                    // is legal and stays `Same`.
-                    if old.rank == 2 && bind.rank == 2 { InsertOut::Dup } else { InsertOut::Same }
+                    // is legal and stays `Same`. An explicit import of the
+                    // item a glob already brought is legal too, and it
+                    // raises the binding to explicit rank: other globs
+                    // can then no longer make the name ambiguous here.
+                    if old.rank == 2 && bind.rank == 2 {
+                        InsertOut::Dup
+                    } else if bind.rank > old.rank {
+                        map.insert(name, BindState::One(bind));
+                        InsertOut::Changed
+                    } else {
+                        InsertOut::Same
+                    }
                 } else if bind.rank > old.rank {
                     map.insert(name, BindState::One(bind));
                     InsertOut::Changed
