@@ -1,0 +1,3 @@
+[workspace]
+members = ["parts/p"]
+resolver = "3"

@@ -22,6 +22,10 @@
 #   stderr=exact      also compare the program's stderr, with the thread id
 #                     of a panic line masked (panic location fixtures; the
 #                     package sets panic = "abort" so the exits match)
+#   lib=1             check the lib target only: `cargo check --lib` and
+#                     `lust check <root> --lib` must both accept (or both
+#                     reject, with expect=); nothing runs. root= names the
+#                     lib root (default src/lib.rs)
 #   expect=<L####>    negative fixture: lust must reject with this code.
 #                     Cargo must also reject unless the line cargo=pass is
 #                     present (valid Rust lust rejects on purpose).
@@ -90,6 +94,7 @@ for dir in "$fixtures"/*/; do
   expect=""
   cargo_pass=""
   stderr_mode=""
+  lib=""
   prog_args=()
   if [ -f "$case_dir/proj/fixture.txt" ]; then
     while IFS='=' read -r k v; do
@@ -103,6 +108,7 @@ for dir in "$fixtures"/*/; do
         expect) expect=$v ;;
         cargo) cargo_pass=$v ;;
         stderr) stderr_mode=$v ;;
+        lib) lib=$v ;;
         args) # split on spaces by design (see header)
           read -r -a prog_args <<<"$v" ;;
         "" | \#*) ;;
@@ -111,6 +117,7 @@ for dir in "$fixtures"/*/; do
     done <"$case_dir/proj/fixture.txt"
   fi
   if [ "$target" = host ]; then target=$host_triple; fi
+  if [ -n "$lib" ] && ! grep -q '^root=' "$case_dir/proj/fixture.txt"; then root_file=src/lib.rs; fi
 
   cargo_args=(build --manifest-path "$case_dir/proj/$manifest" --bin "$bin")
   lust_args=(build "$case_dir/proj/$root_file" -o "$case_dir/lust.bin"
@@ -129,6 +136,11 @@ for dir in "$fixtures"/*/; do
     cargo_args+=(--target "$target")
     lust_args+=(--target "$target")
     cargo_bin=$case_dir/cargo-target/$target/debug/$bin
+  fi
+
+  if [ -n "$lib" ]; then
+    cargo_args=(check --manifest-path "$case_dir/proj/$manifest" --lib)
+    lust_args=(check "$case_dir/proj/$root_file" --manifest-path "$case_dir/proj/$manifest" --lib)
   fi
 
   cargo_ok=1
@@ -155,6 +167,16 @@ for dir in "$fixtures"/*/; do
       report ok "$name"
     else
       report bad "$name" "want $expect, got: $(head -3 "$case_dir/lust.err")"
+    fi
+    continue
+  fi
+  if [ -n "$lib" ]; then
+    if [ $cargo_ok -eq 0 ]; then
+      report bad "$name" "cargo check --lib failed: $(tail -3 "$case_dir/cargo.err")"
+    elif ! timeout 60 "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; then
+      report bad "$name" "lust check --lib failed: $(head -5 "$case_dir/lust.err")"
+    else
+      report ok "$name"
     fi
     continue
   fi

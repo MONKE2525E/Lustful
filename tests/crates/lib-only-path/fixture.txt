@@ -1,0 +1,3 @@
+lib=1
+root=src/p_root.rs
+manifest=parts/p/Cargo.toml

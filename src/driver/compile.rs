@@ -2050,6 +2050,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             ..Default::default()
         };
     }
+    // A lib target has no `main` to link and lust has no rlib format: `check --lib` works,
+    // `build`/`run --lib` is a clear error (Cargo release builds still build libs).
+    if req.session.krate.target_kind == "lib" && !req.harness && !matches!(req.cmd, crate::protocol::Cmd::Check) {
+        return Response {
+            stderr: "error: lust builds bin targets only: use `lust check --lib` for a lib target\n".into(),
+            code: 1,
+            ..Default::default()
+        };
+    }
     // Lust builds for the host target today. A named non-host triple is a
     // clear error, not a host binary under a foreign name.
     let triple = &req.session.target_triple;
@@ -3336,7 +3345,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     // A lust file is a bin crate, so check needs `main` too, as `rustc --emit=metadata`
     // does. `lust test` sets `harness`: it adds a generated `main` after this check.
-    if !req.harness && program.main.is_none() {
+    // A Cargo lib target (`--lib`) is a lib crate: rustc needs no `main` there.
+    if !req.harness && req.session.krate.target_kind != "lib" && program.main.is_none() {
         diags.push(Diag::new("L0130", diag::Span::default(), "no `main` function", "Add `fn main() { ... }`."));
     }
     t.lap(if mode == "full" { "check+borrowck (par)" } else { "check changed fns (par)" });
