@@ -274,15 +274,21 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
         }
         // The fmt traits are not vtable supertraits: the dyn type
         // implements them through the fixed header shims, as rustc's
-        // object type implements every supertrait. Only for a trait
-        // of this crate: a std trait with fmt supertraits as the
-        // principal (`dyn Error`) stays the documented L0702 reject
-        // below, since its object methods are std's own.
-        if p.shipped_crate_at(rec.span).is_none() && sup == lang.debug {
+        // object type implements every supertrait. For a trait of
+        // this crate, and for core's `Error` (the one std principal
+        // whose supertraits are the fmt pair and whose methods are
+        // plain source in library/core/src/error.rs, F3): any other
+        // std principal keeps the L0702 reject below.
+        // The splice range of a std module reads as the crate the
+        // user program selected (std), so `Error` is matched by its
+        // shipped span and name, not by the range's crate tag.
+        let crate_at = p.shipped_crate_at(rec.span);
+        let fmt_super_ok = crate_at.is_none() || p.name(rec.name).split('$').next_back() == Some("Error");
+        if fmt_super_ok && sup == lang.debug {
             info.fmt_debug = true;
             continue;
         }
-        if p.shipped_crate_at(rec.span).is_none() && sup == lang.display {
+        if fmt_super_ok && sup == lang.display {
             info.fmt_display = true;
             continue;
         }
