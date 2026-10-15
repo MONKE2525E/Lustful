@@ -66,7 +66,8 @@ prints "reserved, not yet emitted".
 | L0614 | Traits and inference | W-TRAITS-CORE | in use | Trait, generic, or where-clause form is not supported yet (S3b parser reject) |
 | L0615 | Traits and inference | W-TRAITS-CORE | in use | Overlapping impls (coherence) |
 | L0616 | Traits and inference | W-TRAITS-CORE | in use | Orphan-rule violation |
-| L0617-L0619 | Traits and inference | W-TRAITS-CORE | reserved | |
+| L0617 | Traits and inference | fx-outlives | in use | A written type needs an outlives bound that does not hold (rustc E0309, E0310, E0491) |
+| L0618-L0619 | Traits and inference | W-TRAITS-CORE | reserved | |
 | L0620 | Associated items | W-TRAITS-CORE | reserved | L0620 GAT |
 | L0621 | Associated items | W-TRAITS-CORE | in use | Associated item, binding, or qualified path is not supported yet (S3b parser reject) |
 | L0622-L0629 | Associated items | W-TRAITS-CORE | reserved | |

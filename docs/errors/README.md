@@ -79,6 +79,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0614](L0614.md) | this trait or generic form is not supported yet |
 | [L0615](L0615.md) | overlapping impls |
 | [L0616](L0616.md) | an impl that the orphan rule forbids |
+| [L0617](L0617.md) | a type here needs an outlives bound that does not hold |
 | [L0621](L0621.md) | associated items are not supported yet |
 | [L0621](L0621.md) | associated consts are not supported yet |
 | [L0630](L0630.md) | outside the bounded const evaluator |
