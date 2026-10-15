@@ -340,6 +340,41 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut 
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::try_from_char_error_def()) == Some(*a) => {
             format!("  (void)p; return lust_f_pad(f, {});\n", lit("unicode code point out of range"))
         }
+        // core's parse errors (tf-str): str Display of core's texts,
+        // by the kind field's discriminant.
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::parse_int_error_def()) == Some(*a) => {
+            let kct = p.tys.local_adt_of(crate::check::generics::int_error_kind_def()).map_or(CTy::Unit, CTy::Adt);
+            let d = disc_call(p, &kct, "(&(*p).f0)");
+            format!(
+                "  return lust_f_pad(f, {d} == 0 ? {} : {d} == 1 ? {} : {d} == 2 ? {} : {d} == 3 ? {} : {});\n",
+                lit("cannot parse integer from empty string"),
+                lit("invalid digit found in string"),
+                lit("number too large to fit in target type"),
+                lit("number too small to fit in target type"),
+                lit("number would be zero for non-zero type")
+            )
+        }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::parse_float_error_def()) == Some(*a) => {
+            let kct = p.tys.local_adt_of(crate::check::generics::float_error_kind_def()).map_or(CTy::Unit, CTy::Adt);
+            format!(
+                "  return {} ? lust_f_pad(f, {}) : lust_f_pad(f, {});\n",
+                disc_call(p, &kct, "(&(*p).f0)"),
+                lit("invalid float literal"),
+                lit("cannot parse float from empty string")
+            )
+        }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::parse_bool_error_def()) == Some(*a) => {
+            format!("  (void)p; return lust_f_pad(f, {});\n", lit("provided string was not `true` or `false`"))
+        }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::parse_char_error_def()) == Some(*a) => {
+            let kct = p.tys.local_adt_of(crate::check::generics::char_error_kind_def()).map_or(CTy::Unit, CTy::Adt);
+            format!(
+                "  return {} ? lust_f_pad(f, {}) : lust_f_pad(f, {});\n",
+                disc_call(p, &kct, "(&(*p).f0)"),
+                lit("too many characters in string"),
+                lit("cannot parse char from empty string")
+            )
+        }
         // mpsc's errors (W-THREADS): str Display of std's text.
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::recv_error_def()) == Some(*a) => {
             format!("  (void)p; return lust_f_pad(f, {});\n", lit("receiving on a closed channel"))

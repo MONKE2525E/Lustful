@@ -1547,6 +1547,10 @@ impl<'p> Ctx<'p> {
             // The str splits (W-STD-B): by mode, and over a pattern whose
             // searcher is double-ended (char, char sets, predicates; not
             // `&str`), as std's `DoubleEndedSearcher` impls.
+            // The str matches forms (tf-str): double-ended over a
+            // double-ended searcher (not a string needle), as in std.
+            K::StrMatches => !crate::check::split::str_needle(&self.tys, a[0]),
+            K::EncodeUtf16 => false,
             K::StrSplit => match it::split_mode(&self.tys, a[1]) {
                 Some(it::SplitMode::SplitN | it::SplitMode::RSplitN) | None => false,
                 Some(it::SplitMode::SplitWhitespace | it::SplitMode::SplitAsciiWhitespace | it::SplitMode::Lines) => true,
@@ -2318,6 +2322,29 @@ fn match_arg_pat(p: &Program, src: &dyn crate::ty::TyIntern, pat: GenericArg, t:
 /// with them; any other type (a template check, or a non-generic
 /// impl) answers with the impl's own fns, found by matching the
 /// impl's Self pattern against `t`.
+/// The written `FromStr::from_str` fn for a concrete type (tf-str),
+/// for `str::parse`'s expansion (lower/iter.rs), found as
+/// `by_next_fns` finds a written `Iterator` impl. The primitive
+/// types' synthetic impls have no fn here: the caller runs their
+/// runtime parsers instead.
+pub fn from_str_fn(p: &Program, src: &dyn crate::ty::TyIntern, t: Ty) -> Result<LocalDefId, &'static str> {
+    let lang = p.gx.lang;
+    for &id in p.gx.index.impls_of_trait(lang.from_str) {
+        let r = p.gx.index.get(id);
+        if r.synthetic != crate::traits::index::Synthetic::None {
+            continue;
+        }
+        if match_self_pat(p, src, r.self_ty(&p.tys), t, &mut Vec::new()) {
+            return r
+                .items
+                .iter()
+                .find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "from_str"))
+                .ok_or("the `FromStr` impl has no `from_str` lust can call");
+        }
+    }
+    Err("it has no written `FromStr` impl lust can call")
+}
+
 pub fn by_next_fns(p: &Program, src: &dyn crate::ty::TyIntern, t: Ty) -> Result<ByNextFns, &'static str> {
     let lang = p.gx.lang;
     if let Some(a) = src.local_adt(t)

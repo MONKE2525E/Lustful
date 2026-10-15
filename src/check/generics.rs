@@ -776,6 +776,59 @@ pub fn infallible_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(infallible_def(), EMPTY_ARGS))
 }
 
+/// The def of `core::num::ParseIntError` (tf-str), the error of int
+/// `FromStr`: a struct over an `IntErrorKind` field named `kind`.
+pub fn parse_int_error_def() -> DefId {
+    std_adt_table()[18].2
+}
+
+/// The `core::num::ParseIntError` type.
+pub fn parse_int_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(parse_int_error_def(), EMPTY_ARGS))
+}
+
+/// The def of `core::num::ParseFloatError` (tf-str).
+pub fn parse_float_error_def() -> DefId {
+    std_adt_table()[19].2
+}
+
+/// The `core::num::ParseFloatError` type.
+pub fn parse_float_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(parse_float_error_def(), EMPTY_ARGS))
+}
+
+/// The def of core's float parse kind enum (`Empty`, `Invalid`):
+/// not nameable in source, but `ParseFloatError`'s Debug prints it.
+pub fn float_error_kind_def() -> DefId {
+    std_adt_table()[20].2
+}
+
+/// The def of `core::str::ParseBoolError` (tf-str), a unit struct.
+pub fn parse_bool_error_def() -> DefId {
+    std_adt_table()[21].2
+}
+
+/// The `core::str::ParseBoolError` type.
+pub fn parse_bool_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(parse_bool_error_def(), EMPTY_ARGS))
+}
+
+/// The def of `core::char::ParseCharError` (tf-str).
+pub fn parse_char_error_def() -> DefId {
+    std_adt_table()[22].2
+}
+
+/// The `core::char::ParseCharError` type.
+pub fn parse_char_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(parse_char_error_def(), EMPTY_ARGS))
+}
+
+/// The def of core's char parse kind enum (`EmptyString`,
+/// `TooManyChars`): not nameable in source, but Debug prints it.
+pub fn char_error_kind_def() -> DefId {
+    std_adt_table()[23].2
+}
+
 /// The `core::sync::atomic::Ordering` type.
 pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
@@ -804,14 +857,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 18] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 24] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 18] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 18]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 24] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 24]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -833,6 +886,12 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 18] {
             (15, "CharTryFromError", adt(&["core", "char"], "CharTryFromError"), false),
             (16, "TryFromCharError", adt(&["core", "char"], "TryFromCharError"), false),
             (17, "Infallible", adt(&["core", "convert"], "Infallible"), true),
+            (18, "ParseIntError", adt(&["core", "num"], "ParseIntError"), false),
+            (19, "ParseFloatError", adt(&["core", "num"], "ParseFloatError"), false),
+            (20, "FloatErrorKind", adt(&["core", "num"], "FloatErrorKind"), true),
+            (21, "ParseBoolError", adt(&["core", "str"], "ParseBoolError"), false),
+            (22, "ParseCharError", adt(&["core", "char"], "ParseCharError"), false),
+            (23, "CharErrorKind", adt(&["core", "char"], "CharErrorKind"), true),
         ]
     })
 }
@@ -841,7 +900,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 18] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -883,6 +942,10 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("char", "CharTryFromError", char_try_from_error_def()),
         ("char", "TryFromCharError", try_from_char_error_def()),
         ("convert", "Infallible", infallible_def()),
+        ("num", "ParseIntError", parse_int_error_def()),
+        ("num", "ParseFloatError", parse_float_error_def()),
+        ("str", "ParseBoolError", parse_bool_error_def()),
+        ("char", "ParseCharError", parse_char_error_def()),
     ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
@@ -7541,7 +7604,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
         // core's `Display` for its conversion errors (the text is
         // `display_glue_body`'s): a record, so the source `Error`
         // impls in library/core/src/error.rs meet their supertrait.
-        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def()] {
+        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def()] {
             let t = p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
             insert_synthetic(p, &mut ordinal, lang.display, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
@@ -7665,6 +7728,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     let ts = p.tys.intern_tys(&[USIZE, CHAR]);
                     p.tys.intern(TyKind::Tuple(ts))
                 }
+                K::EncodeUtf16 => int(IntTy::U16),
                 K::Flatten => proj(p, ps[1]),
                 K::OptionIntoIter | K::ResultIntoIter => ps[0],
                 K::OptionIter | K::ResultIter => p.tys.mk_ref(false, ps[0]),
@@ -7761,6 +7825,41 @@ pub fn add_synthetic_impls(p: &mut Program) {
         }
         let chars = CHARS;
         insert_synthetic(p, &mut ordinal, lang.iterator, chars, &[], g0.clone(), vec![(lang.assoc_item, CHAR)], Synthetic::Lang, false, span);
+    }
+    // `FromStr` for the primitive types (tf-str): selection and the
+    // `Err` normalization only; `str::parse` runs through its own
+    // builtin (lower/iter.rs), as `next` does for `Iterator` above.
+    {
+        use crate::ty::{FloatTy, IntTy};
+        let pie = parse_int_error_ty(&mut p.tys);
+        for i in [
+            IntTy::I8,
+            IntTy::I16,
+            IntTy::I32,
+            IntTy::I64,
+            IntTy::I128,
+            IntTy::Isize,
+            IntTy::U8,
+            IntTy::U16,
+            IntTy::U32,
+            IntTy::U64,
+            IntTy::U128,
+            IntTy::Usize,
+        ] {
+            let t = p.tys.intern(TyKind::Int(i));
+            insert_synthetic(p, &mut ordinal, lang.from_str, t, &[], g0.clone(), vec![(lang.assoc_from_str_err, pie)], Synthetic::Lang, false, span);
+        }
+        let pfe = parse_float_error_ty(&mut p.tys);
+        for f in [FloatTy::F32, FloatTy::F64] {
+            let t = p.tys.intern(TyKind::Float(f));
+            insert_synthetic(p, &mut ordinal, lang.from_str, t, &[], g0.clone(), vec![(lang.assoc_from_str_err, pfe)], Synthetic::Lang, false, span);
+        }
+        let pbe = parse_bool_error_ty(&mut p.tys);
+        insert_synthetic(p, &mut ordinal, lang.from_str, BOOL, &[], g0.clone(), vec![(lang.assoc_from_str_err, pbe)], Synthetic::Lang, false, span);
+        let pce = parse_char_error_ty(&mut p.tys);
+        insert_synthetic(p, &mut ordinal, lang.from_str, CHAR, &[], g0.clone(), vec![(lang.assoc_from_str_err, pce)], Synthetic::Lang, false, span);
+        let inf = infallible_ty(&mut p.tys);
+        insert_synthetic(p, &mut ordinal, lang.from_str, STRING, &[], g0.clone(), vec![(lang.assoc_from_str_err, inf)], Synthetic::Lang, false, span);
     }
     // ExactSizeIterator and DoubleEndedIterator for the builtin
     // iterator sources: selection only, like `Iterator` above. The

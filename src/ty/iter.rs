@@ -143,6 +143,15 @@ pub enum IterKind {
     /// front and back search positions, flags, count left), then the
     /// pattern (runtime/core.c `lust_split_step`).
     StrSplit,
+    /// The `str` matches iterators (tf-str): `Matches`, `RMatches`,
+    /// `MatchIndices`, and `RMatchIndices`, by `MatchesMode`. Args
+    /// `[P, M]` as `StrSplit`'s. Fields: the same `lust_split` state
+    /// (only haystack, search positions, and flags are used), then
+    /// the pattern (runtime/core.c `lust_matches_step`).
+    StrMatches,
+    /// `core::str::EncodeUtf16` (tf-str): no args, item `u16`;
+    /// (the `Chars` left, a buffered low surrogate or 0).
+    EncodeUtf16,
     /// `alloc::vec::Drain<T>`: args `[T]`, item `T`. Holds the
     /// drained Vec mutably; its drop removes what it did not yield.
     VecDrain,
@@ -205,6 +214,43 @@ pub fn split_mode(tys: &impl TyIntern, marker: Ty) -> Option<SplitMode> {
     SplitMode::ALL.get(n as usize).copied()
 }
 
+/// Which std struct a `StrMatches` is (its `[u8; mode]` marker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchesMode {
+    Matches,
+    RMatches,
+    MatchIndices,
+    RMatchIndices,
+}
+
+impl MatchesMode {
+    const ALL: [MatchesMode; 4] = [MatchesMode::Matches, MatchesMode::RMatches, MatchesMode::MatchIndices, MatchesMode::RMatchIndices];
+
+    /// True for the `(usize, &str)` item forms.
+    pub fn indexed(self) -> bool {
+        matches!(self, MatchesMode::MatchIndices | MatchesMode::RMatchIndices)
+    }
+
+    /// True for the forms whose `next` searches from the back.
+    pub fn reversed(self) -> bool {
+        matches!(self, MatchesMode::RMatches | MatchesMode::RMatchIndices)
+    }
+}
+
+/// A `StrMatches` type for pattern type `p` in `mode`.
+pub fn mk_matches(tys: &mut impl TyIntern, p: Ty, mode: MatchesMode) -> Ty {
+    let c = tys.intern_const(ConstKind::Int(mode as u128));
+    let marker = tys.intern(TyKind::Array(int(IntTy::U8), c));
+    mk_iter(tys, IterKind::StrMatches, &[p, marker])
+}
+
+/// The mode of a `StrMatches` type's marker argument.
+pub fn matches_mode(tys: &impl TyIntern, marker: Ty) -> Option<MatchesMode> {
+    let TyKind::Array(_, c) = tys.kind(marker) else { return None };
+    let ConstKind::Int(n) = tys.const_kind(c) else { return None };
+    MatchesMode::ALL.get(n as usize).copied()
+}
+
 /// One stored field of a builtin iterator, over the type's args.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -239,7 +285,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 53] = [
+    pub const ALL: [IterKind; 55] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -287,6 +333,8 @@ impl IterKind {
         IterKind::ResultIterMut,
         IterKind::ResultIntoIter,
         IterKind::StrSplit,
+        IterKind::StrMatches,
+        IterKind::EncodeUtf16,
         IterKind::VecDrain,
         IterKind::StringDrain,
         IterKind::RangeFrom,
@@ -361,6 +409,8 @@ impl IterKind {
             K::ResultIterMut => (&["core", "result"], "IterMut"),
             K::ResultIntoIter => (&["core", "result"], "IntoIter"),
             K::StrSplit => (&["core", "str", "iter"], "Split"),
+            K::StrMatches => (&["core", "str", "iter"], "Matches"),
+            K::EncodeUtf16 => (&["core", "str"], "EncodeUtf16"),
             K::VecDrain => (&["alloc", "vec"], "Drain"),
             K::StringDrain => (&["alloc", "string"], "Drain"),
             K::RangeFrom => (&["core", "ops"], "RangeFrom"),
@@ -400,7 +450,8 @@ impl IterKind {
             | K::Cloned
             | K::ArrayIntoIter
             | K::ByNext
-            | K::StrSplit => 2,
+            | K::StrSplit
+            | K::StrMatches => 2,
             K::MapIter
             | K::MapIterMut
             | K::MapKeys
@@ -409,7 +460,7 @@ impl IterKind {
             | K::MapIntoIter
             | K::MapIntoKeys
             | K::MapIntoValues => 2,
-            K::CharIndices | K::StringDrain | K::RangeFull => 0,
+            K::CharIndices | K::StringDrain | K::RangeFull | K::EncodeUtf16 => 0,
             _ => 1,
         }
     }
@@ -465,6 +516,8 @@ impl IterKind {
             K::ResultIterMut => "std::result::IterMut",
             K::ResultIntoIter => "std::result::IntoIter",
             K::StrSplit => "std::str::Split",
+            K::StrMatches => "std::str::Matches",
+            K::EncodeUtf16 => "std::str::EncodeUtf16",
             K::VecDrain => "std::vec::Drain",
             K::StringDrain => "std::string::Drain",
             K::RangeFrom => "std::ops::RangeFrom",
@@ -479,7 +532,7 @@ impl IterKind {
     pub fn shown_args(self) -> usize {
         match self {
             IterKind::Map | IterKind::FilterMap => 2,
-            IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten | IterKind::StrSplit => 1,
+            IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten | IterKind::StrSplit | IterKind::StrMatches => 1,
             k => k.n_args(),
         }
     }
@@ -529,7 +582,8 @@ impl IterKind {
             K::OptionIntoIter | K::ResultIntoIter => &[F::OptArg(0)],
             K::OptionIter | K::ResultIter => &[F::OptRef(0, false)],
             K::OptionIterMut | K::ResultIterMut => &[F::OptRef(0, true)],
-            K::StrSplit => &[F::Str, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Arg(0)],
+            K::StrSplit | K::StrMatches => &[F::Str, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize, F::Arg(0)],
+            K::EncodeUtf16 => &[F::Chars, F::Usize],
             // The drains: the borrowed container, then start, front,
             // back, tail start, and tail length, as indexes into the
             // container's buffer (std's Drain bookkeeping).
@@ -635,6 +689,14 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::OptionIter | K::ResultIter => tys.mk_ref(false, a[0]),
         K::OptionIterMut | K::ResultIterMut => tys.mk_ref(true, a[0]),
         K::StrSplit => REF_STR,
+        K::StrMatches => match matches_mode(tys, a[1]) {
+            Some(m) if m.indexed() => {
+                let ts = tys.intern_tys(&[USIZE, REF_STR]);
+                tys.intern(TyKind::Tuple(ts))
+            }
+            _ => REF_STR,
+        },
+        K::EncodeUtf16 => int(IntTy::U16),
     })
 }
 

@@ -93,6 +93,9 @@ fn expands(b: Builtin) -> bool {
             | B::DlEntries
             | B::DmEntries
             | B::StrSplit
+            | B::StrMatches
+            | B::StrEncodeUtf16
+            | B::StrParse
             | B::IterSizeHint
             | B::IterFold
             | B::IterForEach
@@ -258,6 +261,9 @@ impl Ex<'_, '_> {
     fn usize_c(n: u64) -> Operand {
         Operand::Const(Const::Int(n as u128, IntTy::Usize))
     }
+    fn u32_c(n: u32) -> Operand {
+        Operand::Const(Const::Int(n as u128, IntTy::U32))
+    }
     /// A copy or a move of a place, by its type.
     fn take(&self, pl: Place, ty: Ty) -> Operand {
         if is_copy(self.p, &self.body.tys, ty) { Operand::Copy(pl) } else { Operand::Move(pl) }
@@ -407,6 +413,15 @@ impl Ex<'_, '_> {
                     return Ok(());
                 }
                 if let Some(&(_, bf)) = builtin.iter().find(|(d, _)| *d == def) {
+                    // `String::as_str` shares the String def: its item
+                    // const is 1 (check `builtin_item_value`, tf-str).
+                    let bf = if def == b.string
+                        && matches!(self.body.tys.args(fargs).first(), Some(GenericArg::Const(c)) if matches!(self.body.tys.const_kind(*c), ConstKind::Int(1)))
+                    {
+                        Builtin::StringAsStr
+                    } else {
+                        bf
+                    };
                     self.call(CallTarget::Builtin(bf), args, dest);
                     return Ok(());
                 }
@@ -851,6 +866,76 @@ impl Ex<'_, '_> {
                     dest,
                     Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(o)), Operand::Move(Place::local(s)), Operand::Move(Place::local(s2))]),
                 );
+            }
+            // A str matches iterator (tf-str, check/split.rs): the
+            // split family's runtime state over the receiver's `&str`
+            // with no trailing piece, then the pattern.
+            B::StrMatches => {
+                let s = arg()?;
+                let st = self.op_ty(&s)?;
+                let hay = match self.body.tys.kind(st) {
+                    TyKind::Ref(_, _, i) if self.body.tys.is_string_ty(i) => {
+                        let v = self.local(REF_STR);
+                        self.call_builtin(Builtin::StringAsStr, vec![s], Place::local(v));
+                        Operand::Copy(Place::local(v))
+                    }
+                    _ => s,
+                };
+                let pat = arg()?;
+                let hl = self.local(REF_STR);
+                self.assign(Place::local(hl), Rvalue::Use(hay));
+                let len = self.local(USIZE);
+                self.call_builtin(Builtin::StrLen, vec![Operand::Copy(Place::local(hl))], Place::local(len));
+                let fields = vec![
+                    Operand::Copy(Place::local(hl)),
+                    Self::usize_c(0),
+                    Operand::Copy(Place::local(len)),
+                    Self::usize_c(0),
+                    Operand::Copy(Place::local(len)),
+                    Self::usize_c(12),
+                    Self::usize_c(0),
+                    pat,
+                ];
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, fields));
+            }
+            // `s.encode_utf16()` (tf-str): (s.chars(), 0), with the
+            // second field the buffered low surrogate (0 for none).
+            B::StrEncodeUtf16 => {
+                let s = arg()?;
+                let c = self.local(CHARS);
+                self.call_builtin(Builtin::StrChars, vec![s], Place::local(c));
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(c)), Self::usize_c(0)]));
+            }
+            // `s.parse::<T>()` (tf-str): by the target type, the
+            // primitive runtime parsers or the written `FromStr`
+            // impl's `from_str` (check/iter.rs `from_str_fn`).
+            B::StrParse => {
+                let s = arg()?;
+                let st = self.op_ty(&s)?;
+                let hay = match self.body.tys.kind(st) {
+                    TyKind::Ref(_, _, i) if self.body.tys.is_string_ty(i) => {
+                        let v = self.local(REF_STR);
+                        self.call_builtin(Builtin::StringAsStr, vec![s], Place::local(v));
+                        Operand::Copy(Place::local(v))
+                    }
+                    _ => s,
+                };
+                let (tgt, _) = self.body.tys.result_args(dest_ty).ok_or("parse expansion: not a Result")?;
+                match self.body.tys.kind(tgt) {
+                    TyKind::Int(it) => self.call_builtin(Builtin::ParseInt(it), vec![hay], dest),
+                    TyKind::Float(f) => self.call_builtin(Builtin::ParseFloat(f), vec![hay], dest),
+                    TyKind::Bool => self.call_builtin(Builtin::ParseBool, vec![hay], dest),
+                    TyKind::Char => self.call_builtin(Builtin::ParseChar, vec![hay], dest),
+                    _ if self.body.tys.is_string_ty(tgt) => {
+                        let v = self.local(STRING);
+                        self.call_builtin(Builtin::StringFrom, vec![hay], Place::local(v));
+                        self.assign(dest, Rvalue::Res(dest_ty, true, Operand::Move(Place::local(v))));
+                    }
+                    _ => {
+                        let f = crate::check::iter::from_str_fn(self.p, &self.body.tys, tgt)?;
+                        self.call(CallTarget::Fn(f), vec![hay], dest);
+                    }
+                }
             }
             // `s.char_indices()` (W-STD-B): (s.chars(), 0), as std builds it.
             B::StrCharIndices => {
@@ -1689,6 +1774,79 @@ impl Ex<'_, '_> {
                 let r = self.ref_to(true, itp, ty);
                 let b = if back { Builtin::StrSplitNextBack } else { Builtin::StrSplitNext };
                 self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
+                self.goto(join);
+            }
+            // The str matches forms (tf-str): one runtime step yields
+            // the `(usize, &str)` pair; the plain forms keep its text.
+            K::StrMatches => {
+                let pair = self.tuple_ty(&[USIZE, REF_STR]);
+                let opair = self.body.tys.mk_option(pair);
+                let x = self.local(opair);
+                let r = self.ref_to(true, itp, ty);
+                let b = if back { Builtin::StrMatchesNextBack } else { Builtin::StrMatchesNext };
+                self.call_builtin(b, vec![Operand::Move(Place::local(r))], Place::local(x));
+                let indexed = it::matches_mode(&self.body.tys, a[1]).is_some_and(|m| m.indexed());
+                if indexed {
+                    self.assign(dest, Rvalue::Use(Operand::Move(Place::local(x))));
+                } else {
+                    let (s, n) = self.switch_opt(&Place::local(x));
+                    self.cur = s;
+                    let text = Self::payload(&Place::local(x)).project(Proj::Field(1));
+                    self.some(&dest, opt, Operand::Copy(text));
+                    self.goto(join);
+                    self.cur = n;
+                    self.none(&dest, opt);
+                }
+                self.goto(join);
+            }
+            // `EncodeUtf16` (tf-str): a buffered low surrogate first,
+            // else the next char's units (the high surrogate first,
+            // its low half buffered in field 1). Forward only, as std.
+            K::EncodeUtf16 => {
+                let u16t = int(IntTy::U16);
+                let u32t = int(IntTy::U32);
+                let has = self.cmp(Ne, Operand::Copy(f(1)), Self::usize_c(0));
+                let (buf_b, chr_b) = self.branch(has);
+                self.cur = buf_b;
+                let v = self.local(u16t);
+                self.assign(Place::local(v), Rvalue::Cast(Operand::Copy(f(1)), u16t));
+                self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
+                self.some(&dest, opt, Operand::Copy(Place::local(v)));
+                self.goto(join);
+                self.cur = chr_b;
+                let oc = self.body.tys.mk_option(CHAR);
+                let x = self.local(oc);
+                let rm = self.ref_to(true, f(0), CHARS);
+                self.call_builtin(Builtin::CharsNext, vec![Operand::Move(Place::local(rm))], Place::local(x));
+                let (s, n) = self.switch_opt(&Place::local(x));
+                self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = s;
+                let cp = self.local(u32t);
+                self.assign(Place::local(cp), Rvalue::Cast(Operand::Copy(Self::payload(&Place::local(x))), u32t));
+                let small = self.cmp(Lt, Operand::Copy(Place::local(cp)), Self::u32_c(0x10000));
+                let (one, two) = self.branch(small);
+                self.cur = one;
+                let v1 = self.local(u16t);
+                self.assign(Place::local(v1), Rvalue::Cast(Operand::Copy(Place::local(cp)), u16t));
+                self.some(&dest, opt, Operand::Copy(Place::local(v1)));
+                self.goto(join);
+                self.cur = two;
+                let d = self.local(u32t);
+                self.assign(Place::local(d), Rvalue::Bin(Sub, Operand::Copy(Place::local(cp)), Self::u32_c(0x10000)));
+                let hi = self.local(u32t);
+                let hi_shift = self.local(u32t);
+                self.assign(Place::local(hi_shift), Rvalue::Bin(Shr, Operand::Copy(Place::local(d)), Self::u32_c(10)));
+                self.assign(Place::local(hi), Rvalue::Bin(Add, Operand::Copy(Place::local(hi_shift)), Self::u32_c(0xD800)));
+                let lo = self.local(u32t);
+                let lo_mask = self.local(u32t);
+                self.assign(Place::local(lo_mask), Rvalue::Bin(BitAnd, Operand::Copy(Place::local(d)), Self::u32_c(0x3FF)));
+                self.assign(Place::local(lo), Rvalue::Bin(Add, Operand::Copy(Place::local(lo_mask)), Self::u32_c(0xDC00)));
+                self.assign(f(1), Rvalue::Cast(Operand::Copy(Place::local(lo)), USIZE));
+                let v2 = self.local(u16t);
+                self.assign(Place::local(v2), Rvalue::Cast(Operand::Copy(Place::local(hi)), u16t));
+                self.some(&dest, opt, Operand::Copy(Place::local(v2)));
                 self.goto(join);
             }
             // The `option` and `result` iterators (W-STD-B,
@@ -3434,6 +3592,38 @@ impl Ex<'_, '_> {
             K::Map | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Rev => return self.hint(f(0), a[0]),
             // `CharIndices` forwards to its `Chars`.
             K::CharIndices => return self.hint(f(0), CHARS),
+            // The str matches forms: std's default `(0, None)`.
+            K::StrMatches => {
+                self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                self.none(&Place::local(hi), ou);
+            }
+            // `EncodeUtf16` (tf-str): with `b` bytes left in the
+            // `Chars` and a buffered low surrogate counted in `x`,
+            // `((b + 2) / 3 + x, Some(b + x))`, as std bounds it.
+            K::EncodeUtf16 => {
+                let bytes = self.local(USIZE);
+                let r = self.ref_to(false, f(0), CHARS);
+                self.call_builtin(Builtin::CharsBytesLeft, vec![Operand::Move(Place::local(r))], Place::local(bytes));
+                let x = self.local(USIZE);
+                let has = self.cmp(Ne, Operand::Copy(f(1)), Self::usize_c(0));
+                let (hb, nb) = self.branch(has);
+                let after_x = self.block();
+                self.cur = hb;
+                self.assign(Place::local(x), Rvalue::Use(Self::usize_c(1)));
+                self.goto(after_x);
+                self.cur = nb;
+                self.assign(Place::local(x), Rvalue::Use(Self::usize_c(0)));
+                self.goto(after_x);
+                self.cur = after_x;
+                let b2 = self.local(USIZE);
+                self.assign(Place::local(b2), Rvalue::Bin(Add, Operand::Copy(Place::local(bytes)), Self::usize_c(2)));
+                let base = self.local(USIZE);
+                self.assign(Place::local(base), Rvalue::Bin(Div, Operand::Copy(Place::local(b2)), Self::usize_c(3)));
+                self.assign(Place::local(lo), Rvalue::Bin(Add, Operand::Copy(Place::local(base)), Operand::Copy(Place::local(x))));
+                let top = self.local(USIZE);
+                self.assign(Place::local(top), Rvalue::Bin(Add, Operand::Copy(Place::local(bytes)), Operand::Copy(Place::local(x))));
+                self.some(&Place::local(hi), ou, Operand::Copy(Place::local(top)));
+            }
             // The str splits: std's default `(0, None)`, but
             // `split_ascii_whitespace`, whose slice split bounds it.
             K::StrSplit => {
@@ -3803,7 +3993,7 @@ impl Ex<'_, '_> {
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator may implement the unstable TrustedLen only
             // in std itself.
-            K::ByNext | K::CharIndices | K::StrSplit => false,
+            K::ByNext | K::CharIndices | K::StrSplit | K::StrMatches | K::EncodeUtf16 => false,
             K::Windows | K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
                 true
             }

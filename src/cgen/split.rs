@@ -12,7 +12,26 @@ impl FnGen<'_, '_> {
     /// builtin. `StrSplit` itself is expanded in lower/iter.rs.
     pub(super) fn split_builtin(&mut self, b: Builtin, ops: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> Option<String> {
         use Builtin as B;
-        if !matches!(b, B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce) {
+        if !matches!(
+            b,
+            B::StrSplitNext
+                | B::StrSplitNextBack
+                | B::StrSplitUpper
+                | B::StrSplitOnce
+                | B::StrRSplitOnce
+                | B::StrMatchesNext
+                | B::StrMatchesNextBack
+                | B::StrPatFind
+                | B::StrPatRfind
+                | B::StrPatContains
+                | B::StrPatStartsWith
+                | B::StrPatEndsWith
+                | B::StrPatStripPrefix
+                | B::StrPatStripSuffix
+                | B::StrTrimMatches
+                | B::StrTrimStartMatches
+                | B::StrTrimEndMatches
+        ) {
             return None;
         }
         let mut vals = Vec::new();
@@ -40,6 +59,96 @@ impl FnGen<'_, '_> {
                 let none = self.make_variant(dest, 0, &[]);
                 let _ = writeln!(self.out, "    {dc} {t} = {t}_k ? {some} : {none};");
                 Some(t)
+            }
+            B::StrMatchesNext | B::StrMatchesNextBack => {
+                let (p, mode) = self.matches_parts(&ops[0]);
+                let s = &vals[0];
+                let pat = self.split_pat(p, SplitMode::Split, &format!("(&({s})->f7)"));
+                let back = u8::from((b == B::StrMatchesNextBack) != mode.reversed());
+                let _ = writeln!(
+                    self.out,
+                    "    lust_str {t}_s; uint64_t {t}_i; lust_pat {t}_p = {pat}; int {t}_k = lust_matches_step((lust_split*)({s}), &{t}_p, {back}, &{t}_i, &{t}_s);"
+                );
+                let pair = CTy::Tuple(vec![CTy::Int(IntTy::Usize), CTy::Ref(Box::new(CTy::Str))]);
+                collect_types(&pair, &mut self.sig_types);
+                let some = self.make_variant(dest, 1, &[format!("(({}){{ {t}_i, {t}_s }})", ctype(&pair))]);
+                let none = self.make_variant(dest, 0, &[]);
+                let _ = writeln!(self.out, "    {dc} {t} = {t}_k ? {some} : {none};");
+                Some(t)
+            }
+            B::StrPatFind
+            | B::StrPatRfind
+            | B::StrPatContains
+            | B::StrPatStartsWith
+            | B::StrPatEndsWith
+            | B::StrPatStripPrefix
+            | B::StrPatStripSuffix
+            | B::StrTrimMatches
+            | B::StrTrimStartMatches
+            | B::StrTrimEndMatches => {
+                // (`&str` or `&String`, pattern by value), as
+                // `split_once` above.
+                let hay = str_of(&vals[0], &tys[0]);
+                let p = self.op_lust_ty(&ops[1]);
+                let _ = writeln!(self.out, "    {} {t}_v = {};", ctype(&tys[1]), vals[1]);
+                let pat = self.split_pat(p, SplitMode::Split, &format!("(&{t}_v)"));
+                let _ = writeln!(self.out, "    lust_str {t}_h = {hay}; lust_pat {t}_p = {pat};");
+                let drop_pat = |this: &mut Self| {
+                    if needs_drop_c(this.p, &tys[1]) {
+                        this.want(Glue::Drop, &tys[1]);
+                        let _ = writeln!(this.out, "    drop_{}(&{t}_v);", mangle(&tys[1]));
+                    }
+                };
+                let r = match b {
+                    B::StrTrimMatches | B::StrTrimStartMatches | B::StrTrimEndMatches => {
+                        let expr = match b {
+                            B::StrTrimStartMatches => format!("lust_pat_trim_start({t}_h, &{t}_p)"),
+                            B::StrTrimEndMatches => format!("lust_pat_trim_end({t}_h, &{t}_p)"),
+                            _ => format!("lust_pat_trim_end(lust_pat_trim_start({t}_h, &{t}_p), &{t}_p)"),
+                        };
+                        let _ = writeln!(self.out, "    {dc} {t} = {expr};");
+                        drop_pat(self);
+                        t.clone()
+                    }
+                    B::StrPatContains | B::StrPatStartsWith | B::StrPatEndsWith => {
+                        let call = match b {
+                            B::StrPatContains => format!("lust_pat_match({t}_h, &{t}_p, 0, &{t}_a, &{t}_b)"),
+                            B::StrPatStartsWith => format!("lust_pat_prefix({t}_h, &{t}_p, &{t}_b)"),
+                            _ => format!("lust_pat_suffix({t}_h, &{t}_p, &{t}_a)"),
+                        };
+                        let _ = writeln!(self.out, "    uint64_t {t}_a, {t}_b; int {t}_k = {call};");
+                        drop_pat(self);
+                        format!("((uint8_t){t}_k)")
+                    }
+                    B::StrPatFind | B::StrPatRfind => {
+                        let back = u8::from(b == B::StrPatRfind);
+                        let _ = writeln!(
+                            self.out,
+                            "    uint64_t {t}_a, {t}_b; int {t}_k = lust_pat_match({t}_h, &{t}_p, {back}, &{t}_a, &{t}_b);"
+                        );
+                        let some = self.make_variant(dest, 1, &[format!("{t}_a")]);
+                        let none = self.make_variant(dest, 0, &[]);
+                        let _ = writeln!(self.out, "    {dc} {t} = {t}_k ? {some} : {none};");
+                        drop_pat(self);
+                        t.clone()
+                    }
+                    _ => {
+                        // strip_prefix and strip_suffix.
+                        let _ = writeln!(self.out, "    uint64_t {t}_x;");
+                        let (call, val) = if b == B::StrPatStripPrefix {
+                            (format!("lust_pat_prefix({t}_h, &{t}_p, &{t}_x)"), format!("lust_split_sub({t}_h, {t}_x, {t}_h.len)"))
+                        } else {
+                            (format!("lust_pat_suffix({t}_h, &{t}_p, &{t}_x)"), format!("lust_split_sub({t}_h, 0, {t}_x)"))
+                        };
+                        let _ = writeln!(self.out, "    int {t}_k = {call};");
+                        let some = self.make_variant(dest, 1, &[val]);
+                        let none = self.make_variant(dest, 0, &[]);
+                        let _ = writeln!(self.out, "    {dc} {t} = {t}_k ? {some} : {none};");
+                        drop_pat(self);
+                        t.clone()
+                    }
+                };
+                Some(r)
             }
             B::StrSplitUpper => Some(format!("lust_split_upper((const lust_split*)({}))", vals[0])),
             _ => {
@@ -87,6 +196,18 @@ impl FnGen<'_, '_> {
             };
         }
         t
+    }
+
+    /// The pattern type and mode of a `&mut StrMatches<P, M>` operand.
+    fn matches_parts(&self, o: &Operand) -> (Ty, it::MatchesMode) {
+        let mut t = self.op_lust_ty(o);
+        while let TyKind::Ref(_, _, i) = self.body.tys.kind(t) {
+            t = i;
+        }
+        match it::iter_parts(&self.body.tys, t) {
+            Some((it::IterKind::StrMatches, a)) => (a[0], it::matches_mode(&self.body.tys, a[1]).unwrap_or(it::MatchesMode::Matches)),
+            _ => (CHAR, it::MatchesMode::Matches),
+        }
     }
 
     /// The pattern type and mode of a `&mut StrSplit<P, M>` operand.

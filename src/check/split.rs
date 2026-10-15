@@ -126,4 +126,213 @@ impl<'p> Ctx<'p> {
             None => it::mk_split(&mut self.tys, p, mode),
         })
     }
+
+    /// `str::parse::<T>()` (tf-str): `Result<T, <T as FromStr>::Err>`
+    /// over a `FromStr` obligation on `T` (the turbofish when
+    /// written, else a fresh variable the use fixes), run by the
+    /// `StrParse` builtin. None for other methods and receivers.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn str_parse_method(
+        &mut self,
+        e: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+    ) -> Option<Ty> {
+        if self.p.interner.get(name) != "parse" {
+            return None;
+        }
+        let base = self.deep(base);
+        if self.kind(base) != TyKind::Str && !self.tys.is_string_ty(base) {
+            return None;
+        }
+        if !args.is_empty() {
+            self.err("L0105", name_span, format!("this method takes 0 argument(s) but {} were given", args.len()), "Pass exactly the declared arguments.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return Some(ERROR);
+        }
+        let t = match turbofish.first() {
+            Some(ast::GenericArg::Type(w)) => {
+                if turbofish.len() > 1 {
+                    self.err("L0105", name_span, "this method takes 1 type argument", "Write one target type.");
+                }
+                self.resolve_written(*w)
+            }
+            _ => self.new_var(false),
+        };
+        self.deferred_sized.push((t, name_span));
+        let lang = self.p.gx.lang;
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        self.obl.push(obligations::Obligation::Trait {
+            trait_ref: TraitRef { def: lang.from_str, args: args_id, bindings: EMPTY_BINDINGS },
+            span: name_span,
+            depth: 0,
+        });
+        // The error type is a fresh variable tied to the impl by an
+        // associated-type equality, so it unifies as `T` settles
+        // (a raw projection does not, in a `map_err` chain).
+        let err = self.new_var(false);
+        self.obl.push(obligations::Obligation::AssocEq {
+            eq: AssocEqData { assoc: lang.assoc_from_str_err, trait_args: args_id, ty: err },
+            span: name_span,
+        });
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::StrParse, derefs, autoref: Autoref::Ref });
+        Some(self.tys.mk_result(t, err))
+    }
+
+    /// One checked pattern argument (the split family's rules): a
+    /// closure literal is checked against `FnMut(char) -> bool`, a
+    /// closure value must have that signature, and the type must be
+    /// one lust takes. The pattern's type, or None after an error.
+    fn check_pattern_arg(&mut self, a: ExprId, name_span: Span) -> Option<Ty> {
+        let closure_expr = matches!(self.p.ast.expr(a), Expr::Closure { .. });
+        let t = if closure_expr {
+            let f = self.fn_mut_param(&[CHAR], BOOL, name_span);
+            self.check_args(&[f], &[a], name_span);
+            f
+        } else {
+            self.expr(a, None)
+        };
+        let t = self.deep(t);
+        if let TyKind::Closure(..) = self.kind(t)
+            && !closure_expr
+        {
+            let f = self.fn_mut_param(&[CHAR], BOOL, name_span);
+            if !self.unify(f, t) {
+                self.mismatch(self.span(a), f, t);
+                return None;
+            }
+        }
+        if !pattern_ok(&self.tys, t) {
+            if self.kind(t) != TyKind::Error {
+                let tn = self.tn(t);
+                self.err(
+                    "L0612",
+                    self.span(a),
+                    format!("`{tn}` is not a str pattern lust takes"),
+                    "Pass a char, a `&str`, a char array or slice, or a closure `|c: char| -> bool`.",
+                );
+            }
+            return None;
+        }
+        Some(t)
+    }
+
+    /// The str search and trim methods over a `Pattern` (tf-str):
+    /// `find`, `rfind`, `contains`, `starts_with`, `ends_with`,
+    /// `strip_prefix`, `strip_suffix`, the `trim_*_matches` family,
+    /// and the `matches` iterators, on a `str` or `String` receiver.
+    /// The `char` and string-needle patterns of the search methods
+    /// keep their older builtins (a char records `Coerce::CharPat`);
+    /// char sets and closures run through `StrPat*` builtins over
+    /// the split family's searchers. None for other methods.
+    pub(super) fn str_search_method(&mut self, e: ExprId, base: Ty, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        let base = self.deep(base);
+        if self.kind(base) != TyKind::Str && !self.tys.is_string_ty(base) {
+            return None;
+        }
+        use it::MatchesMode as MM;
+        #[derive(Clone, Copy, PartialEq)]
+        enum Op {
+            Find,
+            Rfind,
+            Contains,
+            StartsWith,
+            EndsWith,
+            StripPrefix,
+            StripSuffix,
+            TrimMatches,
+            TrimStartMatches,
+            TrimEndMatches,
+            Matches(MM),
+        }
+        let op = match self.p.interner.get(name) {
+            "find" => Op::Find,
+            "rfind" => Op::Rfind,
+            "contains" => Op::Contains,
+            "starts_with" => Op::StartsWith,
+            "ends_with" => Op::EndsWith,
+            "strip_prefix" => Op::StripPrefix,
+            "strip_suffix" => Op::StripSuffix,
+            "trim_matches" | "trim_left_matches" | "trim_right_matches" => {
+                // The deprecated aliases have the `trim_*` meanings:
+                // left is start, right is end. `trim_matches` itself
+                // trims both ends.
+                match self.p.interner.get(name) {
+                    "trim_left_matches" => Op::TrimStartMatches,
+                    "trim_right_matches" => Op::TrimEndMatches,
+                    _ => Op::TrimMatches,
+                }
+            }
+            "trim_start_matches" => Op::TrimStartMatches,
+            "trim_end_matches" => Op::TrimEndMatches,
+            "matches" => Op::Matches(MM::Matches),
+            "rmatches" => Op::Matches(MM::RMatches),
+            "match_indices" => Op::Matches(MM::MatchIndices),
+            "rmatch_indices" => Op::Matches(MM::RMatchIndices),
+            _ => return None,
+        };
+        if args.len() != 1 {
+            self.err("L0105", name_span, format!("this method takes 1 argument(s) but {} were given", args.len()), "Pass exactly the declared arguments.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return Some(ERROR);
+        }
+        let a = args[0];
+        let Some(t) = self.check_pattern_arg(a, name_span) else { return Some(ERROR) };
+        self.reject_unsized_value(a);
+        let needle = str_needle(&self.tys, t);
+        // std's `trim_matches` needs a `DoubleEndedSearcher`, which
+        // string needles do not have: rustc rejects `&str` there.
+        if op == Op::TrimMatches && needle {
+            self.err(
+                "L0612",
+                self.span(a),
+                "`trim_matches` does not take a `&str` pattern".to_string(),
+                "Pass a char, a char array or slice, or a closure `|c: char| -> bool`, or use `trim_start_matches` and `trim_end_matches`.",
+            );
+            return Some(ERROR);
+        }
+        use Builtin as B;
+        let char_like = !needle && self.kind(t) != TyKind::Char;
+        let (b, ret) = match op {
+            Op::Matches(mode) => (B::StrMatches, it::mk_matches(&mut self.tys, t, mode)),
+            Op::TrimMatches => (B::StrTrimMatches, REF_STR),
+            Op::TrimStartMatches => (B::StrTrimStartMatches, REF_STR),
+            Op::TrimEndMatches => (B::StrTrimEndMatches, REF_STR),
+            Op::Find if char_like => (B::StrPatFind, self.tys.mk_option(USIZE)),
+            Op::Rfind if char_like => (B::StrPatRfind, self.tys.mk_option(USIZE)),
+            Op::Contains if char_like => (B::StrPatContains, BOOL),
+            Op::StartsWith if char_like => (B::StrPatStartsWith, BOOL),
+            Op::EndsWith if char_like => (B::StrPatEndsWith, BOOL),
+            Op::StripPrefix if char_like => (B::StrPatStripPrefix, self.tys.mk_option(REF_STR)),
+            Op::StripSuffix if char_like => (B::StrPatStripSuffix, self.tys.mk_option(REF_STR)),
+            Op::Find => (B::StrFind, self.tys.mk_option(USIZE)),
+            Op::Rfind => (B::StrRfind, self.tys.mk_option(USIZE)),
+            Op::Contains => (B::StrContains, BOOL),
+            Op::StartsWith => (B::StrStartsWith, BOOL),
+            Op::EndsWith => (B::StrEndsWith, BOOL),
+            Op::StripPrefix => (B::StrStripPrefix, self.tys.mk_option(REF_STR)),
+            Op::StripSuffix => (B::StrStripSuffix, self.tys.mk_option(REF_STR)),
+        };
+        // The older builtins take the pattern as a `&str`: a char
+        // becomes its encoding (`Coerce::CharPat`), and a needle
+        // coerces as before.
+        if matches!(b, B::StrFind | B::StrRfind | B::StrContains | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix) {
+            if self.kind(t) == TyKind::Char {
+                let ix = self.ei(a);
+                self.out.coerce[ix] = Coerce::CharPat;
+            } else {
+                self.coerce_expr(a, t, REF_STR);
+            }
+        }
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+        Some(ret)
+    }
 }

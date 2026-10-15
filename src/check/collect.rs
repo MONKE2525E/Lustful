@@ -3373,6 +3373,49 @@ pub fn collect_reuse(
                     vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", UNIT)], disc: 0, non_exhaustive: false }],
                     Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
+                // tf-str: core's parse errors. The three structs hold
+                // a `kind` field (Debug prints it); `ParseBoolError`
+                // is a unit struct. Derives are core's (no Copy, no
+                // Hash).
+                18 => {
+                    let kind = p.tys.intern(TyKind::Adt(generics::int_error_kind_def(), EMPTY_ARGS));
+                    (
+                        generics::parse_int_error_def(),
+                        named(vec![field("kind", kind)]),
+                        Derives { debug: true, clone: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
+                19 => {
+                    let kind = p.tys.intern(TyKind::Adt(generics::float_error_kind_def(), EMPTY_ARGS));
+                    (
+                        generics::parse_float_error_def(),
+                        named(vec![field("kind", kind)]),
+                        Derives { debug: true, clone: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
+                20 => (
+                    generics::float_error_kind_def(),
+                    vec![unit("Empty", 0), unit("Invalid", 1)],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
+                21 => (
+                    generics::parse_bool_error_def(),
+                    vec![Variant { name, shape: VariantShape::Unit, fields: Vec::new(), disc: 0, non_exhaustive: false }],
+                    Derives { debug: true, clone: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
+                22 => {
+                    let kind = p.tys.intern(TyKind::Adt(generics::char_error_kind_def(), EMPTY_ARGS));
+                    (
+                        generics::parse_char_error_def(),
+                        named(vec![field("kind", kind)]),
+                        Derives { debug: true, clone: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
+                23 => (
+                    generics::char_error_kind_def(),
+                    vec![unit("EmptyString", 0), unit("TooManyChars", 1)],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
                 17 => (
                     generics::infallible_def(),
                     Vec::new(),
@@ -8074,6 +8117,10 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::try_from_int_error_def()
                         || d == generics::char_try_from_error_def()
                         || d == generics::try_from_char_error_def()
+                        || d == generics::parse_int_error_def()
+                        || d == generics::parse_float_error_def()
+                        || d == generics::parse_bool_error_def()
+                        || d == generics::parse_char_error_def()
                         // `Infallible`'s Display is `match *self {}`:
                         // it exists, and no value reaches it.
                         || d == generics::infallible_def()

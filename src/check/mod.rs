@@ -350,6 +350,42 @@ pub enum Builtin {
     StringIntoBytes,
     StrStripPrefix,
     StrStripSuffix,
+    // The char-set and closure `Pattern` forms of the str search
+    // methods (tf-str): the pattern goes by value and cgen/split.rs
+    // runs it through the split family's `lust_pat` searchers. The
+    // `&str` and `char` forms keep the older builtins above.
+    StrPatFind,
+    StrPatRfind,
+    StrPatContains,
+    StrPatStartsWith,
+    StrPatEndsWith,
+    StrPatStripPrefix,
+    StrPatStripSuffix,
+    // `trim_matches`, `trim_start_matches`, and `trim_end_matches`
+    // over every pattern kind lust takes (tf-str).
+    StrTrimMatches,
+    StrTrimStartMatches,
+    StrTrimEndMatches,
+    // `to_ascii_lowercase` and `to_ascii_uppercase` on `str` (tf-str).
+    StrToAsciiLowercase,
+    StrToAsciiUppercase,
+    // `str::encode_utf16` (tf-str): builds an `EncodeUtf16`
+    // iterator, expanded in lower/iter.rs.
+    StrEncodeUtf16,
+    // `String::from_utf16_lossy(&[u16])` (tf-str).
+    StringFromUtf16Lossy,
+    /// `str::parse::<T>()` (tf-str): expanded in lower/iter.rs by
+    /// the target type (the primitive parsers below, or a written
+    /// `FromStr` impl's `from_str`).
+    StrParse,
+    /// The primitive `FromStr` parsers (tf-str, runtime/core.c):
+    /// one `&str` in, a `Result` of the value or its parse error out.
+    ParseInt(IntTy),
+    ParseFloat(FloatTy),
+    ParseBool,
+    ParseChar,
+    /// `ParseIntError::kind(&self) -> &IntErrorKind` (tf-str).
+    ParseIntErrorKind,
     StrTrimStart,
     StrTrimEnd,
     StrReplace,
@@ -673,6 +709,14 @@ pub enum Builtin {
     StrSplitUpper,
     StrSplitOnce,
     StrRSplitOnce,
+    /// The str matches family (tf-str): `s.matches(p)` and kin build
+    /// a `StrMatches` (expanded in lower/iter.rs); its `next` and
+    /// `next_back` run in the runtime (cgen/split.rs). One step
+    /// yields a `(usize, &str)` pair; plain `matches` drops the index
+    /// in lowering.
+    StrMatches,
+    StrMatchesNext,
+    StrMatchesNextBack,
     /// `BuildHasher::hash_one(&self, x)`: build a hasher, hash `x`,
     /// finish (W-STD-B).
     HashOne,
@@ -3090,9 +3134,17 @@ impl<'p> Ctx<'p> {
             Res::ResErr => (b.result, Some(1)),
             Res::Builtin(Builtin::BoxNew) => (b.boxed, None),
             Res::Builtin(Builtin::RcNew) => (b.rc, None),
+            // `String::as_str` shares the String def with
+            // `String::from`; its item const is 1 (tf-str).
+            Res::Builtin(Builtin::StringAsStr) => (b.string, Some(1)),
             _ => (b.string, None),
         };
-        let tys = if def == b.string {
+        let tys = if def == b.string && variant == Some(1) {
+            if segs.iter().any(|s| !s.type_args().is_empty()) {
+                self.err("L0107", span, "`String::as_str` takes no generic arguments", "Remove the generic arguments.");
+            }
+            Vec::new()
+        } else if def == b.string {
             // `From::from` has no params of its own: the input is open
             // until a use fixes it, then it must be a form lust's
             // `String::from` takes (checked at finish).
@@ -3132,6 +3184,9 @@ impl<'p> Ctx<'p> {
             &[t, e] if def == b.result => (Res::ResErr, vec![e], self.tys.mk_result(t, e)),
             &[t] if def == b.boxed => (Res::Builtin(Builtin::BoxNew), vec![t], self.tys.mk_boxed(t)),
             &[t] if def == b.rc => (Res::Builtin(Builtin::RcNew), vec![t], self.tys.mk_rc(t)),
+            &[] if def == b.string && self.ctor_variant(args) == 1 => {
+                (Res::Builtin(Builtin::StringAsStr), vec![self.tys.mk_ref(false, STRING)], REF_STR)
+            }
             &[t] if def == b.string => (Res::Builtin(Builtin::StringFrom), vec![t], STRING),
             _ => return None,
         })
@@ -9671,7 +9726,7 @@ impl<'p> Ctx<'p> {
             if let Res::Fn(f) = r {
                 return self.fn_value_ty(e, f, span);
             }
-            if matches!(r, Res::OptSome | Res::ResOk | Res::ResErr | Res::Builtin(Builtin::BoxNew | Builtin::RcNew | Builtin::StringFrom)) {
+            if matches!(r, Res::OptSome | Res::ResOk | Res::ResErr | Res::Builtin(Builtin::BoxNew | Builtin::RcNew | Builtin::StringFrom | Builtin::StringAsStr)) {
                 return self.builtin_item_value(e, r, segs, span);
             }
             // Other std fns (`String::new`, `Vec::from`) have no value
@@ -9981,6 +10036,8 @@ impl<'p> Ctx<'p> {
         if ty_name == k.String {
             let b = if item == k.new {
                 Builtin::StringNew
+            } else if item == k.as_str {
+                Builtin::StringAsStr
             } else if item == k.from {
                 Builtin::StringFrom
             } else if item == k.with_capacity {
@@ -9992,7 +10049,7 @@ impl<'p> Ctx<'p> {
                     "L0104",
                     span,
                     format!("no function `String::{}`", self.name(item)),
-                    "Lust supports String::new, String::from, and String::with_capacity.",
+                    "Lust supports String::new, String::from, String::with_capacity, and String::as_str.",
                 );
                 return None;
             };
@@ -11204,6 +11261,7 @@ impl<'p> Ctx<'p> {
     fn callable_res(&mut self, ct: Ty) -> Option<Res> {
         match self.kind(ct) {
             TyKind::FnPtr(_) => Some(Res::Indirect),
+            TyKind::FnDef(def, cargs) if def == self.tys.builtins().string => self.builtin_item_res(def, cargs).map(|(r, _, _)| r),
             TyKind::FnDef(def, cargs) => match self.p.adt_by_def(def) {
                 Some(a) => Some(Res::Variant(a, self.ctor_variant(cargs))),
                 None => self.builtin_item_res(def, cargs).map(|(r, _, _)| r).or_else(|| self.p.local_def(def.hash).map(Res::Fn)),
@@ -11985,6 +12043,7 @@ impl<'p> Ctx<'p> {
                         (vec![r], base)
                     }
                     Builtin::StringNew => (vec![], STRING),
+                    Builtin::StringAsStr => (vec![self.tys.mk_ref(false, STRING)], REF_STR),
                     // `Cow::from(x)` (the String and Vec forms pick it in
                     // their own arms): the expected Cow if one is written,
                     // else the argument picks the Cow: the str and slice
@@ -12202,7 +12261,7 @@ impl<'p> Ctx<'p> {
                         None => self.cell_default_sig(callee, span),
                     },
                     Builtin::ExitCodeFrom => (vec![int(IntTy::U8)], self.tys.exit_code_ty()),
-                    Builtin::StringFromUtf8 | Builtin::StrFromUtf8 | Builtin::StringFromUtf8Lossy => self.utf8_call_sig(b),
+                    Builtin::StringFromUtf8 | Builtin::StrFromUtf8 | Builtin::StringFromUtf8Lossy | Builtin::StringFromUtf16Lossy => self.utf8_call_sig(b),
                     Builtin::RcTryUnwrap => {
                         let elem = self.new_var(false);
                         self.deferred_sized.push((elem, span));
@@ -13400,6 +13459,11 @@ impl<'p> Ctx<'p> {
         if let Some(ret) = iter_ret {
             return ret;
         }
+        // `str::parse` (tf-str, check/split.rs): ahead of the
+        // turbofish-free hooks below, as it takes a turbofish.
+        if let Some(ret) = self.str_parse_method(e, base, derefs, name, name_span, args, turbofish) {
+            return ret;
+        }
         // `write!` (`write_fmt(format_args!(..))`), Formatter and builder
         // methods, and `fmt` on builtin values (check/fmt.rs, W-STD-B).
         if turbofish.is_empty() {
@@ -13433,6 +13497,11 @@ impl<'p> Ctx<'p> {
             }
             // The str split family (check/split.rs).
             if let Some(ret) = self.str_split_method(e, base, derefs, name, name_span, args) {
+                return ret;
+            }
+            // The str search, trim, and matches methods over a
+            // `Pattern` (check/split.rs, tf-str).
+            if let Some(ret) = self.str_search_method(e, base, derefs, name, name_span, args) {
                 return ret;
             }
         }
@@ -14524,6 +14593,10 @@ impl<'p> Ctx<'p> {
         let bytes = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
         let ref_bytes = self.tys.mk_ref(false, bytes);
         let n = self.p.interner.get(name);
+        if n == "encode_utf16" {
+            let ret = crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::EncodeUtf16, &[]);
+            return Some((B::StrEncodeUtf16, Autoref::Ref, vec![], ret));
+        }
         if n == "char_indices" || n == "bytes" {
             // (W-STD-B, lower/iter.rs.)
             let ret = if n == "bytes" {
@@ -14543,6 +14616,8 @@ impl<'p> Ctx<'p> {
             (k.starts_with, B::StrStartsWith, vec![REF_STR], BOOL),
             (k.ends_with, B::StrEndsWith, vec![REF_STR], BOOL),
             (k.trim, B::StrTrim, vec![], REF_STR),
+            (k.to_ascii_lowercase, B::StrToAsciiLowercase, vec![], STRING),
+            (k.to_ascii_uppercase, B::StrToAsciiUppercase, vec![], STRING),
             (k.to_uppercase, B::StrToUppercase, vec![], STRING),
             (k.to_lowercase, B::StrToLowercase, vec![], STRING),
             (k.chars, B::StrChars, vec![], chars),

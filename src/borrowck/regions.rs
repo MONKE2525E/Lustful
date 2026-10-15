@@ -4555,8 +4555,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
             K::Flatten => self.item_slots(a[1], &args[1])?,
             K::OptionIntoIter | K::ResultIntoIter => args[0].clone(),
-            // `&'a str` of the haystack (W-STD-B).
-            K::StrSplit => own,
+            // `&'a str` of the haystack (W-STD-B); the matches forms
+            // yield it too, with a plain `usize` for the indices forms.
+            K::StrSplit | K::StrMatches => own,
+            // `u16` items: no regions (tf-str).
+            K::EncodeUtf16 => Vec::new(),
             // An mpsc receiver's items are its `T` values (W-THREADS).
             K::RecvIter | K::RecvTryIter | K::RecvIntoIter => args[0].clone(),
         })
@@ -4972,8 +4975,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
             }
             // A str split's item is `&'a str` of its haystack: the own
-            // region (W-STD-B).
-            K::StrSplit => match vars.first() {
+            // region (W-STD-B). The matches forms are the same
+            // (tf-str).
+            K::StrSplit | K::StrMatches => match vars.first() {
                 Some(&r) => {
                     out.push(vec![r]);
                     true
@@ -4999,6 +5003,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             | K::CharIndices
             | K::Flatten
             | K::OptionIntoIter
+            | K::EncodeUtf16
             | K::ResultIntoIter => false,
         }
     }
@@ -6659,6 +6664,11 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::StrTrimEnd
             | B::StrStripPrefix
             | B::StrStripSuffix
+            | B::StrPatStripPrefix
+            | B::StrPatStripSuffix
+            | B::StrTrimMatches
+            | B::StrTrimStartMatches
+            | B::StrTrimEndMatches
             | B::IterIter
             | B::IterIterMut
             | B::VecPop

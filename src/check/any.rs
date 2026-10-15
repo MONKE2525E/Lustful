@@ -883,7 +883,13 @@ fn tn_std_adt(p: &Program, tys: &mut impl TyIntern, t: Ty, def: DefId, open: boo
         14 => return plain("core::num::error::IntErrorKind"),
         15 => return plain("core::char::convert::CharTryFromError"),
         16 => return plain("core::char::TryFromCharError"),
-        _ => return plain("core::convert::Infallible"),
+        17 => return plain("core::convert::Infallible"),
+        18 => return plain("core::num::error::ParseIntError"),
+        19 => return plain("core::num::float_parse::ParseFloatError"),
+        20 => return plain("core::num::error::FloatErrorKind"),
+        21 => return plain("core::str::error::ParseBoolError"),
+        22 => return plain("core::char::convert::ParseCharError"),
+        _ => return plain("core::char::convert::CharErrorKind"),
     }))
 }
 

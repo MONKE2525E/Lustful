@@ -1828,6 +1828,234 @@ int lust_str_split_once(lust_str hay, const lust_pat *p, int back, lust_str *a, 
     return 1;
 })
 
+/* The str search and trim methods over a `lust_pat` (tf-str), on the
+   split family's searchers so predicate calls run once per char in
+   scan order, as std's do. A char-at-a-time pattern matches single
+   chars; a string needle matches its bytes (only on char boundaries,
+   as both texts are valid UTF-8). */
+
+/* One match of `p` in `hay`, the first (or last, when `back`). */
+int lust_pat_match(lust_str hay, const lust_pat *p, int back, uint64_t *a, uint64_t *b) LUST_BODY({
+    lust_split s;
+    s.hay = hay; s.start = 0; s.end = hay.len; s.fpos = 0; s.bpos = hay.len;
+    s.flags = LUST_SPLIT_MATCH_FW | LUST_SPLIT_MATCH_BW; s.count = 0;
+    return back ? lust_split_match_bw(&s, p, a, b) : lust_split_match_fw(&s, p, a, b);
+})
+
+/* A match at the start of `hay`, with its end: the needle as a
+   prefix, or the first char against a char-at-a-time pattern. */
+int lust_pat_prefix(lust_str hay, const lust_pat *p, uint64_t *end) LUST_BODY({
+    if (p->kind == LUST_PAT_STR) {
+        *end = p->needle.len;
+        return p->needle.len <= hay.len && (p->needle.len == 0 || memcmp(hay.ptr, p->needle.ptr, p->needle.len) == 0);
+    }
+    if (hay.len == 0) return 0;
+    uint64_t j = 0;
+    uint32_t c = lust_utf8_next(hay.ptr, &j);
+    if (!lust_pat_hit(p, c)) return 0;
+    *end = j;
+    return 1;
+})
+
+/* A match at the end of `hay`, with its start. */
+int lust_pat_suffix(lust_str hay, const lust_pat *p, uint64_t *start) LUST_BODY({
+    if (p->kind == LUST_PAT_STR) {
+        if (p->needle.len > hay.len) return 0;
+        *start = hay.len - p->needle.len;
+        return p->needle.len == 0 || memcmp(hay.ptr + *start, p->needle.ptr, p->needle.len) == 0;
+    }
+    if (hay.len == 0) return 0;
+    uint64_t e = hay.len;
+    uint32_t c = lust_utf8_prev(hay.ptr, &e);
+    if (!lust_pat_hit(p, c)) return 0;
+    *start = e;
+    return 1;
+})
+
+/* `trim_start_matches`: for a needle, strip it as a prefix while it
+   is one (an empty needle changes nothing); else strip matching
+   chars from the front. */
+lust_str lust_pat_trim_start(lust_str hay, const lust_pat *p) LUST_BODY({
+    uint64_t a = 0;
+    if (p->kind == LUST_PAT_STR) {
+        uint64_t m = p->needle.len;
+        while (m > 0 && a + m <= hay.len && memcmp(hay.ptr + a, p->needle.ptr, m) == 0) a += m;
+    } else {
+        while (a < hay.len) {
+            uint64_t j = a;
+            if (!lust_pat_hit(p, lust_utf8_next(hay.ptr, &j))) break;
+            a = j;
+        }
+    }
+    return lust_split_sub(hay, a, hay.len);
+})
+
+/* `trim_end_matches`, from the back. */
+lust_str lust_pat_trim_end(lust_str hay, const lust_pat *p) LUST_BODY({
+    uint64_t b = hay.len;
+    if (p->kind == LUST_PAT_STR) {
+        uint64_t m = p->needle.len;
+        while (m > 0 && b >= m && memcmp(hay.ptr + b - m, p->needle.ptr, m) == 0) b -= m;
+    } else {
+        while (b > 0) {
+            uint64_t e = b;
+            if (!lust_pat_hit(p, lust_utf8_prev(hay.ptr, &e))) break;
+            b = e;
+        }
+    }
+    return lust_split_sub(hay, 0, b);
+})
+
+/* One `next` (`next_back` when `back`) of a matches iterator: the
+   match's start index and text. The state is a `lust_split` whose
+   start and end stay 0 and hay.len. */
+int lust_matches_step(lust_split *s, const lust_pat *p, int back, uint64_t *idx, lust_str *out) LUST_BODY({
+    uint64_t a, b;
+    if (!(back ? lust_split_match_bw(s, p, &a, &b) : lust_split_match_fw(s, p, &a, &b))) return 0;
+    *idx = a;
+    *out = lust_split_sub(s->hay, a, b);
+    return 1;
+})
+
+/* The primitive `FromStr` parsers (tf-str), core's semantics.
+   Int kinds follow `IntErrorKind` (Empty 0, InvalidDigit 1,
+   PosOverflow 2, NegOverflow 3): core's `from_str_radix` at radix
+   10 checks each digit, then the checked multiply and add, in
+   order, so an overflow ahead of a bad digit reports the overflow.
+   The magnitude is accumulated in two words, so 128-bit targets
+   take the same path. */
+int lust_parse_int(lust_str s, int is_signed, int bits, uint64_t *lo, uint64_t *hi, int *kind) LUST_BODY({
+    *lo = 0; *hi = 0;
+    if (s.len == 0) { *kind = 0; return 0; }
+    uint64_t i = 0;
+    int neg = 0;
+    if (s.ptr[0] == '+') {
+        i = 1;
+    } else if (s.ptr[0] == '-' && is_signed) {
+        neg = 1;
+        i = 1;
+    }
+    if (i >= s.len) { *kind = 1; return 0; }
+    /* The magnitude limit: the type's max, or its min's magnitude. */
+    uint64_t lim_lo, lim_hi;
+    if (bits >= 128) {
+        lim_hi = is_signed ? 0x7fffffffffffffffULL : 0xffffffffffffffffULL;
+        lim_lo = 0xffffffffffffffffULL;
+        if (is_signed && neg) { lim_hi = 0x8000000000000000ULL; lim_lo = 0; }
+    } else if (bits == 64) {
+        lim_hi = 0;
+        lim_lo = is_signed ? (neg ? 0x8000000000000000ULL : 0x7fffffffffffffffULL) : 0xffffffffffffffffULL;
+    } else {
+        lim_hi = 0;
+        uint64_t top = bits == 32 ? 0xffffffffULL : (bits == 16 ? 0xffffULL : 0xffULL);
+        lim_lo = is_signed ? (neg ? (top / 2 + 1) : top / 2) : top;
+    }
+    uint64_t rlo = 0, rhi = 0;
+    for (; i < s.len; i++) {
+        uint8_t ch = s.ptr[i];
+        if (ch < '0' || ch > '9') { *kind = 1; return 0; }
+        uint64_t d = ch - '0';
+        /* r = r * 10 + d, checked against the limit. A high word
+           that would wrap past two words is past every limit. */
+        uint64_t lo10 = (rlo & 0xffffffffULL) * 10;
+        uint64_t hi10 = (rlo >> 32) * 10 + (lo10 >> 32);
+        if (rhi > (0xffffffffffffffffULL - (hi10 >> 32)) / 10) { *kind = neg ? 3 : 2; return 0; }
+        uint64_t nlo = (lo10 & 0xffffffffULL) | ((hi10 & 0xffffffffULL) << 32);
+        uint64_t nhi = (hi10 >> 32) + rhi * 10;
+        nlo += d;
+        if (nlo < d) {
+            if (nhi == 0xffffffffffffffffULL) { *kind = neg ? 3 : 2; return 0; }
+            nhi += 1;
+        }
+        if (nhi > lim_hi || (nhi == lim_hi && nlo > lim_lo)) { *kind = neg ? 3 : 2; return 0; }
+        rlo = nlo; rhi = nhi;
+    }
+    if (neg) {
+        /* Two's complement negation in the target width. */
+        if (bits >= 128) {
+            *lo = ~rlo + 1;
+            *hi = ~rhi + (*lo == 0);
+        } else if (bits == 64) {
+            *lo = 0 - rlo; *hi = 0;
+        } else {
+            uint64_t mask = bits == 32 ? 0xffffffffULL : (bits == 16 ? 0xffffULL : 0xffULL);
+            *lo = (0 - rlo) & mask; *hi = 0;
+        }
+    } else {
+        *lo = rlo; *hi = rhi;
+    }
+    *kind = 0;
+    return 1;
+})
+
+/* The float parsers of float.c (Rust's grammar, correctly
+   rounded), declared in float.h below; 1 is empty, 2 is invalid. */
+int lust_parse_f64(lust_str s, double *out);
+int lust_parse_f32(lust_str s, float *out);
+
+/* `f64::from_str` (tf-str): over the float core's parser, with
+   core's error kinds (0 Empty, 1 Invalid). */
+int lust_str_parse_f64(lust_str s, double *out, int *kind) LUST_BODY({
+    int rc = lust_parse_f64(s, out);
+    *kind = rc == 1 ? 0 : 1;
+    return rc == 0;
+})
+
+int lust_str_parse_f32(lust_str s, float *out, int *kind) LUST_BODY({
+    int rc = lust_parse_f32(s, out);
+    *kind = rc == 1 ? 0 : 1;
+    return rc == 0;
+})
+
+/* `bool::from_str`: exactly `true` or `false`. */
+int lust_parse_bool(lust_str s, uint8_t *out) LUST_BODY({
+    if (s.len == 4 && memcmp(s.ptr, "true", 4) == 0) { *out = 1; return 1; }
+    if (s.len == 5 && memcmp(s.ptr, "false", 5) == 0) { *out = 0; return 1; }
+    return 0;
+})
+
+/* `char::from_str`: exactly one char (kind: 0 EmptyString,
+   1 TooManyChars). */
+int lust_parse_char(lust_str s, uint32_t *out, int *kind) LUST_BODY({
+    if (s.len == 0) { *kind = 0; return 0; }
+    uint64_t j = 0;
+    uint32_t c = lust_utf8_next(s.ptr, &j);
+    if (j != s.len) { *kind = 1; return 0; }
+    *out = c;
+    *kind = 0;
+    return 1;
+})
+
+/* `String::from_utf16_lossy` (tf-str): `char::decode_utf16` over
+   the units collected into a String, as alloc runs it. The collect
+   starts at the decoder's size-hint lower bound, `(units + 1) / 2`
+   rounded as core counts it (an even count halves exactly), then
+   pushes one char at a time, with U+FFFD for each unpaired
+   surrogate, so capacities grow as std's do. */
+lust_String lust_string_from_utf16_lossy(const uint16_t *v, uint64_t n) LUST_BODY({
+    lust_String s = lust_string_new();
+    lust_string_reserve(&s, (n + 1) / 2);
+    uint64_t i = 0;
+    while (i < n) {
+        uint16_t u = v[i++];
+        uint32_t c;
+        if (u >= 0xD800 && u < 0xDC00) {
+            if (i < n && v[i] >= 0xDC00 && v[i] < 0xE000) {
+                c = 0x10000 + (((uint32_t)(u - 0xD800) << 10) | (uint32_t)(v[i] - 0xDC00));
+                i++;
+            } else {
+                c = 0xFFFD;
+            }
+        } else if (u >= 0xDC00 && u < 0xE000) {
+            c = 0xFFFD;
+        } else {
+            c = u;
+        }
+        lust_string_push_char(&s, c);
+    }
+    return s;
+})
+
 /* str::to_uppercase and str::to_lowercase as Rust 1.99 runs them
    (W-STD-B): the ASCII prefix byte by byte into a String with the str's
    length as capacity (`convert_while_ascii`), then each char through

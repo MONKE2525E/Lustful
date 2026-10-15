@@ -24,6 +24,10 @@ impl<'p> Ctx<'p> {
             let v = self.tys.mk_vec(bytes);
             let e = self.utf8_error_ty(true);
             (vec![v], self.tys.mk_result(STRING, e))
+        } else if b == Builtin::StringFromUtf16Lossy {
+            let sl = self.tys.intern(TyKind::Slice(int(IntTy::U16)));
+            let r = self.tys.mk_ref(false, sl);
+            (vec![r], STRING)
         } else if b == Builtin::StringFromUtf8Lossy {
             let sl = self.tys.intern(TyKind::Slice(bytes));
             let r = self.tys.mk_ref(false, sl);
@@ -45,9 +49,10 @@ impl<'p> Ctx<'p> {
         let n = self.name(item).to_string();
         match (string, n.as_str()) {
             (true, "from_utf8") => Some(Some(Res::Builtin(Builtin::StringFromUtf8))),
+            (true, "from_utf16_lossy") => Some(Some(Res::Builtin(Builtin::StringFromUtf16Lossy))),
             (true, "from_utf8_lossy") => Some(Some(Res::Builtin(Builtin::StringFromUtf8Lossy))),
             (false, "from_utf8") => Some(Some(Res::Builtin(Builtin::StrFromUtf8))),
-            (true, "from_utf8_unchecked" | "from_utf16" | "from_utf16_lossy")
+            (true, "from_utf8_unchecked" | "from_utf16")
             | (false, "from_utf8_mut" | "from_utf8_unchecked" | "from_utf8_unchecked_mut") => {
                 let t = if string { "String" } else { "str" };
                 self.err("L0640", span, format!("`{t}::{n}` is not implemented yet"), "Use `from_utf8` and handle its error.");
@@ -78,6 +83,10 @@ impl<'p> Ctx<'p> {
                 "into_bytes" => (B::FromUtf8ErrorIntoBytes, Autoref::None, self.tys.mk_vec(int(IntTy::U8))),
                 _ => return None,
             }
+        } else if def == generics::parse_int_error_def() && n == "kind" {
+            // `ParseIntError::kind(&self) -> &IntErrorKind` (tf-str).
+            let k = generics::int_error_kind_ty(&mut self.tys);
+            (B::ParseIntErrorKind, Autoref::Ref, self.tys.mk_ref(false, k))
         } else if def == generics::utf8_error_def() {
             match n.as_str() {
                 "valid_up_to" => (B::Utf8ErrorValidUpTo, Autoref::Ref, USIZE),

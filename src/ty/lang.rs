@@ -1684,6 +1684,14 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/char/TryFromCharError",
     "core/convert/Infallible",
     "std/convert/Infallible",
+    "core/num/ParseIntError",
+    "std/num/ParseIntError",
+    "core/num/ParseFloatError",
+    "std/num/ParseFloatError",
+    "core/str/ParseBoolError",
+    "std/str/ParseBoolError",
+    "core/char/ParseCharError",
+    "std/char/ParseCharError",
 ];
 
 const STD_TRAIT_PATHS: &[&str] = &[

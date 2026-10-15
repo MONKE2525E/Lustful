@@ -3878,10 +3878,10 @@ impl FnGen<'_, '_> {
             | B::HashOne
             | B::BuildHasher
             | B::HasherCall => unreachable!("hash builtins emit in cgen/hash.rs"),
-            B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce => {
+            B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce | B::StrMatchesNext | B::StrMatchesNextBack | B::StrPatFind | B::StrPatRfind | B::StrPatContains | B::StrPatStartsWith | B::StrPatEndsWith | B::StrPatStripPrefix | B::StrPatStripSuffix | B::StrTrimMatches | B::StrTrimStartMatches | B::StrTrimEndMatches => {
                 unreachable!("split builtins emit in cgen/split.rs")
             }
-            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice | B::ArrayFromFn => {
+            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice | B::ArrayFromFn | B::StrMatches | B::StrEncodeUtf16 | B::StrParse => {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
             B::ConvInto => unreachable!("expanded per conversion (lower/iter.rs)"),
@@ -3958,6 +3958,102 @@ impl FnGen<'_, '_> {
                 format!("((lust_Vec){{ (void*)({0}).ptr, ({0}).len, {cap} }})", vals[0])
             }
             B::BoxSliceIntoIter => format!("((lust_VecIter){{ (void*)({0}).ptr, ({0}).len, ({0}).len, 0 }})", vals[0]),
+            B::ParseIntErrorKind => format!("(&({})->f0)", vals[0]),
+            B::ParseInt(it) => {
+                // The primitive int `FromStr` (tf-str): the runtime
+                // parses into two words plus an `IntErrorKind` tag;
+                // here they become the `Result` and its error struct.
+                let p = self.p;
+                let (Some(pie), Some(iek)) = (
+                    p.tys.local_adt_of(crate::check::generics::parse_int_error_def()),
+                    p.tys.local_adt_of(crate::check::generics::int_error_kind_def()),
+                ) else {
+                    unreachable!("parse type-checks only with std's error Adts")
+                };
+                let val_ty = CTy::Int(it);
+                let res = CTy::Result(Box::new(val_ty.clone()), Box::new(CTy::Adt(pie)));
+                collect_types(&res, &mut self.sig_types);
+                let (t, lo, hi, kind) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
+                let a = str_of(&vals[0], &tys[0]);
+                let _ = writeln!(self.out, "    uint64_t {lo}, {hi}; int {kind}; {} {t};", ctype(&res));
+                let _ = writeln!(
+                    self.out,
+                    "    if (lust_parse_int({a}, {}, {}, &{lo}, &{hi}, &{kind})) {{ {ok_f} = {}; {ok_d} }}",
+                    u8::from(it.signed()),
+                    it.bits(),
+                    if it.bits() >= 128 { format!("(({}){{ {lo}, {hi} }})", ctype(&val_ty)) } else { format!("(({}){lo})", ctype(&val_ty)) }
+                );
+                let kct = CTy::Adt(iek);
+                let kinds: Vec<String> = (0..4).map(|v| self.make_variant(&kct, v, &[])).collect();
+                let _ = writeln!(
+                    self.out,
+                    "    else {{ {err_f}.f0 = {kind} == 0 ? {} : {kind} == 1 ? {} : {kind} == 2 ? {} : {}; {err_d} }}",
+                    kinds[0], kinds[1], kinds[2], kinds[3]
+                );
+                t
+            }
+            B::ParseFloat(f) => {
+                let p = self.p;
+                let (Some(pfe), Some(fek)) = (
+                    p.tys.local_adt_of(crate::check::generics::parse_float_error_def()),
+                    p.tys.local_adt_of(crate::check::generics::float_error_kind_def()),
+                ) else {
+                    unreachable!("parse type-checks only with std's error Adts")
+                };
+                let val_ty = CTy::Float(f);
+                let res = CTy::Result(Box::new(val_ty.clone()), Box::new(CTy::Adt(pfe)));
+                collect_types(&res, &mut self.sig_types);
+                let (t, v, kind) = (self.tmp(), self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
+                let a = str_of(&vals[0], &tys[0]);
+                let (ct, rf) = if f == FloatTy::F32 { ("float", "lust_str_parse_f32") } else { ("double", "lust_str_parse_f64") };
+                let _ = writeln!(self.out, "    {ct} {v}; int {kind}; {} {t};", ctype(&res));
+                let _ = writeln!(self.out, "    if ({rf}({a}, &{v}, &{kind})) {{ {ok_f} = {v}; {ok_d} }}");
+                let kct = CTy::Adt(fek);
+                let (k0, k1) = (self.make_variant(&kct, 0, &[]), self.make_variant(&kct, 1, &[]));
+                let _ = writeln!(self.out, "    else {{ {err_f}.f0 = {kind} ? {k1} : {k0}; {err_d} }}");
+                t
+            }
+            B::ParseBool => {
+                let p = self.p;
+                let Some(pbe) = p.tys.local_adt_of(crate::check::generics::parse_bool_error_def()) else {
+                    unreachable!("parse type-checks only with std's error Adts")
+                };
+                let res = CTy::Result(Box::new(CTy::Bool), Box::new(CTy::Adt(pbe)));
+                collect_types(&res, &mut self.sig_types);
+                let (t, v) = (self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
+                let a = str_of(&vals[0], &tys[0]);
+                let _ = writeln!(self.out, "    uint8_t {v}; {} {t};", ctype(&res));
+                let _ = writeln!(self.out, "    if (lust_parse_bool({a}, &{v})) {{ {ok_f} = {v}; {ok_d} }}");
+                let _ = writeln!(self.out, "    else {{ {err_f} = (({}){{}}); {err_d} }}", ctype(&CTy::Adt(pbe)));
+                t
+            }
+            B::ParseChar => {
+                let p = self.p;
+                let (Some(pce), Some(cek)) = (
+                    p.tys.local_adt_of(crate::check::generics::parse_char_error_def()),
+                    p.tys.local_adt_of(crate::check::generics::char_error_kind_def()),
+                ) else {
+                    unreachable!("parse type-checks only with std's error Adts")
+                };
+                let res = CTy::Result(Box::new(CTy::Char), Box::new(CTy::Adt(pce)));
+                collect_types(&res, &mut self.sig_types);
+                let (t, v, kind) = (self.tmp(), self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
+                let a = str_of(&vals[0], &tys[0]);
+                let _ = writeln!(self.out, "    uint32_t {v}; int {kind}; {} {t};", ctype(&res));
+                let _ = writeln!(self.out, "    if (lust_parse_char({a}, &{v}, &{kind})) {{ {ok_f} = {v}; {ok_d} }}");
+                let kct = CTy::Adt(cek);
+                let (k0, k1) = (self.make_variant(&kct, 0, &[]), self.make_variant(&kct, 1, &[]));
+                let _ = writeln!(self.out, "    else {{ {err_f}.f0 = {kind} ? {k1} : {k0}; {err_d} }}");
+                t
+            }
             B::StringFromUtf8 | B::StrFromUtf8 => {
                 // Validate, then build `Ok(text)` or `Err(error)` with
                 // Rust's `valid_up_to` and `error_len` (runtime core.c).
@@ -5441,6 +5537,12 @@ impl FnGen<'_, '_> {
                 format!("{f}({a}, {})", vals[1])
             }
             B::StrTrim => format!("lust_str_trim({})", str_of(&vals[0], &tys[0])),
+            B::StrToAsciiLowercase => format!("lust_str_ascii_case({}, 0)", str_of(&vals[0], &tys[0])),
+            B::StrToAsciiUppercase => format!("lust_str_ascii_case({}, 1)", str_of(&vals[0], &tys[0])),
+            B::StringFromUtf16Lossy => {
+                let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                format!("lust_string_from_utf16_lossy({ptr}, {len})")
+            }
             B::StrToUppercase => format!("lust_str_case({}, 1)", str_of(&vals[0], &tys[0])),
             B::StrToLowercase => format!("lust_str_case({}, 0)", str_of(&vals[0], &tys[0])),
             B::StrChars => format!("lust_chars({})", str_of(&vals[0], &tys[0])),
