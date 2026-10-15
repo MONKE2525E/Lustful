@@ -12939,6 +12939,25 @@ impl<'p, 'a> Ctx<'p, 'a> {
                 self.set_res(e, Res::Bin { ld, rd });
                 return BOOL;
             }
+            // A written `PartialEq<Rhs>` or `PartialOrd<Rhs>` whose
+            // Rhs is the right operand's type as written (`PathBuf
+            // == &Path`, `Meters == &str`): rustc's operator lookup
+            // selects by trait with that Rhs, not by first stripping
+            // both sides to a common type. Try it when the operand
+            // types differ as written; same-type comparisons keep
+            // the structural path below. A failed selection rolls
+            // back so the guards below still report the plain
+            // operator error.
+            {
+                let (dl, dr) = (self.deep(lt), self.deep(rt));
+                if dl != dr {
+                    let snap = self.snapshot_vars();
+                    if let Some(t) = self.trait_cmp(e, op, dl, dr, 0, 0, span) {
+                        return t;
+                    }
+                    self.rollback_vars(snap);
+                }
+            }
             // Equality allows `&T` against `&mut T`; ordering needs the same mutability.
             if !matches!(op, Eq | Ne) && self.ref_layers(lt) != self.ref_layers(rt) {
                 return bad(self);
