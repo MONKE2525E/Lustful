@@ -4097,17 +4097,33 @@ fn build_generics_owned(
     for pred in &w.preds {
         match pred {
             ast::WherePred::Lifetime { .. } => {}
-            ast::WherePred::Type { ty, bounds, .. } => match resolve_scoped(ast, interner, known, cx, tys, *ty, &rscope) {
-                Ok(lhs) => {
-                    for b in bounds {
-                        bound_predicates(ast, interner, known, cx, tys, &rscope, lhs, b, &mut predicates, &mut relaxed, errs);
-                    }
-                    scope.assoc_srcs = assoc_srcs_of(cx, tys, &predicates);
-                    rscope.assoc_srcs.clone_from(&seed.assoc_srcs);
-                    rscope.assoc_srcs.extend(scope.assoc_srcs.iter().cloned());
+            ast::WherePred::Type { binder, ty, bounds } => {
+                // A `for<'a>` binder on the predicate binds the
+                // lifetimes its type and bounds name. Checker types
+                // are region-erased, so its predicates are plain
+                // here, as for a bound's own `for<..>` binder
+                // (`bound_predicates`); the region distinction is
+                // the borrow checker's, read from the AST.
+                if let Err(d) = binder_shadow(interner, &rscope, binder) {
+                    errs.push(d);
+                    continue;
                 }
-                Err(d) => errs.push(d),
-            },
+                let mut bscope = rscope.clone();
+                for (i, lt) in binder.iter().enumerate() {
+                    bscope.alias_lifetimes.push((lt.name, Region::Bound(i as u32)));
+                }
+                match resolve_scoped(ast, interner, known, cx, tys, *ty, &bscope) {
+                    Ok(lhs) => {
+                        for b in bounds {
+                            bound_predicates(ast, interner, known, cx, tys, &bscope, lhs, b, &mut predicates, &mut relaxed, errs);
+                        }
+                        scope.assoc_srcs = assoc_srcs_of(cx, tys, &predicates);
+                        rscope.assoc_srcs.clone_from(&seed.assoc_srcs);
+                        rscope.assoc_srcs.extend(scope.assoc_srcs.iter().cloned());
+                    }
+                    Err(d) => errs.push(d),
+                }
+            }
         }
     }
     // The implicit `Sized` bound on every type parameter that did
