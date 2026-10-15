@@ -1956,8 +1956,9 @@ impl<'p> Ctx<'p> {
     }
 
     /// The fn pointer two branch types join as when each is a closure
-    /// that captures nothing (or one of them is already a fn pointer)
-    /// and the signatures agree. None otherwise, or for one closure type.
+    /// that captures nothing (or one of them is a plain fn item or
+    /// already a fn pointer) and the signatures agree: rustc's LUB
+    /// special case. None otherwise, or for one closure type.
     pub(super) fn closure_lub(&mut self, a: Ty, b: Ty) -> Option<Ty> {
         let (a, b) = (self.resolve(a), self.resolve(b));
         if a == b {
@@ -1967,6 +1968,7 @@ impl<'p> Ctx<'p> {
             match cx.kind(t) {
                 TyKind::Closure(def, caps) if cx.tys.args(caps).is_empty() => cx.closure_facts(def).map(|(_, i, o)| (i, o)),
                 TyKind::FnPtr(_) => cx.callable_sig(t),
+                TyKind::FnDef(..) if cx.is_fn_item(t) => cx.callable_sig(t),
                 _ => None,
             }
         };
@@ -1984,6 +1986,50 @@ impl<'p> Ctx<'p> {
             return None;
         }
         Some(self.fn_ptr_ty(&ia, oa))
+    }
+
+    /// rustc's LUB of closures to a fn pointer at the coercion sites of
+    /// an `if`, `match`, or labeled block: `prev` are the sites that
+    /// joined to `a` so far and `be` is the site of `b`. Each site that
+    /// is not a fn pointer yet gets the reify coercion. None (no join)
+    /// when a side that needs the coercion has no known site, as for
+    /// earlier `break` values, so the caller reports the mismatch.
+    pub(super) fn closure_lub_sites(&mut self, a: Ty, b: Ty, prev: &[ExprId], be: Option<ExprId>) -> Option<Ty> {
+        let needs = |cx: &Self, t: Ty| !matches!(cx.kind(cx.resolve(t)), TyKind::FnPtr(_));
+        if (needs(self, a) && prev.is_empty()) || (needs(self, b) && be.is_none()) {
+            return None;
+        }
+        let fp = self.closure_lub(a, b)?;
+        for &s in prev {
+            let t = self.out.expr_ty[self.ei(s)];
+            if self.out.coerce[self.ei(s)] == Coerce::None && !matches!(self.kind(self.resolve(t)), TyKind::FnPtr(_) | TyKind::Never) {
+                self.coerce_expr(s, t, fp);
+            }
+        }
+        if let Some(be) = be {
+            self.coerce_expr(be, b, fp);
+        }
+        Some(fp)
+    }
+
+    /// True when a closure that captures nothing has a signature that
+    /// unifies with the safe fn pointer type `ptr` (rustc's
+    /// ClosureFnPointer coercion). A failed probe rolls back.
+    pub(super) fn closure_ptr_unifies(&mut self, found: Ty, ptr: Ty) -> bool {
+        let TyKind::Closure(def, caps) = self.kind(self.resolve(found)) else { return false };
+        let TyKind::FnPtr(sig) = self.kind(self.resolve(ptr)) else { return false };
+        let s = self.tys.sig(sig).value;
+        if !self.tys.args(caps).is_empty() || s.is_unsafe || s.extern_c {
+            return false;
+        }
+        let Some((_, inputs, output)) = self.closure_facts(def) else { return false };
+        let fp = self.fn_ptr_ty(&inputs, output);
+        let snap = self.snapshot_vars();
+        if self.unify(fp, ptr) {
+            return true;
+        }
+        self.rollback_vars(snap);
+        false
     }
 
     /// The output of a closure for `<C as FnOnce<A>>::Output`.

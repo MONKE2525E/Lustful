@@ -1357,6 +1357,12 @@ struct Var {
 
 struct LoopCtx {
     break_ty: Option<Ty>,
+    /// A fn pointer type the `loop` or labeled block is expected to
+    /// have: rustc coerces every break value to it (its CoerceMany
+    /// target), so distinct closures in breaks reify. Only a fn pointer
+    /// expectation seeds it, since lust's other expectations can be
+    /// hints that rustc would not coerce to.
+    want: Option<Ty>,
     /// True when `break` may carry a value (a `loop` or a labeled block).
     is_loop: bool,
     /// True for a labeled block, which `continue` cannot target.
@@ -5100,6 +5106,10 @@ impl<'p> Ctx<'p> {
                     None => Coerce::None,
                 }
             }
+            // A closure value that captures nothing coerces to a fn
+            // pointer with its signature: lowering reads the zero-sized
+            // value, then takes its body fn's trampoline.
+            (TyKind::Closure(..), TyKind::FnPtr(_)) if e.is_some() && self.closure_ptr_unifies(found, expected) => Coerce::ReifyFn(expected),
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if dyn_target && (!em.is_mut() || fm.is_mut()) && !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float()) =>
             {
@@ -6842,7 +6852,10 @@ impl<'p> Ctx<'p> {
                         {
                             return t2;
                         }
-                        self.join(t1, t2, Some(*els), span)
+                        {
+                            let tail: Vec<ExprId> = p.ast.block(*then).tail.into_iter().collect();
+                            self.join(t1, t2, &tail, Some(*els), span)
+                        }
                     }
                 }
             }
@@ -6878,14 +6891,17 @@ impl<'p> Ctx<'p> {
                         {
                             return t2;
                         }
-                        self.join(t1, t2, Some(*els), span)
+                        {
+                            let tail: Vec<ExprId> = p.ast.block(*then).tail.into_iter().collect();
+                            self.join(t1, t2, &tail, Some(*els), span)
+                        }
                     }
                 }
             }
             Expr::While { label, cond, body } if self.is_let_chain(*cond) => {
                 let scope = self.scopes.len();
                 self.check_chain(*cond);
-                self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
+                self.loops.push(LoopCtx { break_ty: None, want: None, is_loop: false, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 self.loops.pop();
@@ -6894,14 +6910,15 @@ impl<'p> Ctx<'p> {
             }
             Expr::While { label, cond, body } => {
                 self.expect_expr(*cond, BOOL);
-                self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
+                self.loops.push(LoopCtx { break_ty: None, want: None, is_loop: false, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 self.loops.pop();
                 UNIT
             }
             Expr::Loop { label, body } => {
-                self.loops.push(LoopCtx { break_ty: None, is_loop: true, is_block: false, label: label_of(label) });
+                let want = self.fn_ptr_expectation(expected);
+                self.loops.push(LoopCtx { break_ty: None, want, is_loop: true, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 let l = self.loops.pop().unwrap();
@@ -6920,7 +6937,7 @@ impl<'p> Ctx<'p> {
                         "Use `while let` or `match` for a pattern that can fail.",
                     );
                 }
-                self.loops.push(LoopCtx { break_ty: None, is_loop: false, is_block: false, label: label_of(label) });
+                self.loops.push(LoopCtx { break_ty: None, want: None, is_loop: false, is_block: false, label: label_of(label) });
                 let t = self.block(*body, Some(UNIT));
                 self.unit_body(t, *body);
                 self.loops.pop();
@@ -6969,7 +6986,7 @@ impl<'p> Ctx<'p> {
                     result = Some(match result {
                         None => bt,
                         Some(r) if expected.is_none() && self.lub_flip(&sites, r, bt) => bt,
-                        Some(r) => self.join(r, bt, Some(arm.body), self.span(arm.body)),
+                        Some(r) => self.join(r, bt, &sites, Some(arm.body), self.span(arm.body)),
                     });
                     sites.push(arm.body);
                     self.scopes.truncate(scope);
@@ -7576,7 +7593,7 @@ impl<'p> Ctx<'p> {
                     return NEVER;
                 };
                 let is_loop = self.loops[ti].is_loop;
-                let prev = self.loops[ti].break_ty;
+                let prev = self.loops[ti].break_ty.or(self.loops[ti].want);
                 match val {
                     Some(v) if !is_loop => {
                         self.expr(*v, None);
@@ -7592,6 +7609,7 @@ impl<'p> Ctx<'p> {
                         match prev {
                             Some(pt) => {
                                 self.coerce_expr(*v, t, pt);
+                                self.loops[ti].break_ty = Some(pt);
                             }
                             None => self.loops[ti].break_ty = Some(t),
                         }
@@ -7599,6 +7617,7 @@ impl<'p> Ctx<'p> {
                     None if is_loop => match prev {
                         Some(pt) => {
                             self.coerce_at(UNIT, pt, span, None);
+                            self.loops[ti].break_ty = Some(pt);
                         }
                         None => self.loops[ti].break_ty = Some(UNIT),
                     },
@@ -7656,11 +7675,15 @@ impl<'p> Ctx<'p> {
                 NEVER
             }
             Expr::LabeledBlock { label, body } => {
-                self.loops.push(LoopCtx { break_ty: None, is_loop: true, is_block: true, label: Some((label.name, label.span)) });
+                let want = self.fn_ptr_expectation(expected);
+                self.loops.push(LoopCtx { break_ty: None, want, is_loop: true, is_block: true, label: Some((label.name, label.span)) });
                 let t = self.block(*body, expected);
                 let l = self.loops.pop().unwrap();
                 match l.break_ty {
-                    Some(bt) => self.join(bt, t, None, span),
+                    Some(bt) => {
+                        let tail = p.ast.block(*body).tail;
+                        self.join(bt, t, &[], tail, span)
+                    }
                     None => t,
                 }
             }
@@ -7675,7 +7698,7 @@ impl<'p> Ctx<'p> {
                     let want = exp.as_ref().map(|v| v[i]);
                     // A `&dyn` element is a coercion site, as in rustc's
                     // tuple check under a tuple expectation.
-                    if let Some(w) = self.dyn_ref_expectation(want) {
+                    if let Some(w) = self.dyn_ref_expectation(want).or(self.fn_ptr_expectation(want)) {
                         self.expect_expr(el, w);
                         out.push(w);
                     } else if let Some(w) = want {
@@ -7696,93 +7719,7 @@ impl<'p> Ctx<'p> {
                     TyKind::Array(el, _) => Some(el),
                     _ => None,
                 });
-                let elem = match (exp_elem, elems.first()) {
-                    (Some(el), _) => {
-                        for &el_e in elems {
-                            self.expect_expr(el_e, el);
-                        }
-                        self.fn_elems_lub(elems, el);
-                        el
-                    }
-                    (None, Some(&first)) => {
-                        let el = self.expr(first, None);
-                        // An array of plain fn items holds function
-                        // pointers: retag the first element too when any
-                        // element is a different fn item.
-                        let elt = self.resolve(el);
-                        // Closures that capture nothing join as a fn
-                        // pointer when they differ (rustc's LUB coercion).
-                        if elems.len() > 1 && matches!(self.kind(elt), TyKind::Closure(_, caps) if self.tys.args(caps).is_empty()) {
-                            let mut joined = elt;
-                            for &el_e in &elems[1..] {
-                                let t = self.expr(el_e, None);
-                                joined = match self.closure_lub(joined, t) {
-                                    Some(fp) => fp,
-                                    None => {
-                                        if !self.unify(joined, t) {
-                                            let sp = self.span(el_e);
-                                            self.mismatch(sp, joined, t);
-                                        }
-                                        joined
-                                    }
-                                };
-                            }
-                            if matches!(self.kind(joined), TyKind::FnPtr(_)) {
-                                for &el_e in elems.iter() {
-                                    self.set(el_e, joined);
-                                }
-                            }
-                            let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
-                            return self.tys.intern(TyKind::Array(joined, c));
-                        }
-                        // Fn items join as a fn pointer only when they
-                        // differ (`[a, b]`); `[a, a]` keeps the item type,
-                        // which is zero-sized (rustc's LUB coercion).
-                        if elems.len() > 1 && self.is_fn_item(elt) {
-                            let rest: Vec<Ty> = elems[1..].iter().map(|&el_e| self.expr(el_e, None)).collect();
-                            if rest.iter().all(|&t| self.same_fn_item(elt, t)) {
-                                let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
-                                return self.tys.intern(TyKind::Array(elt, c));
-                            }
-                            let Some((params, ret)) = self.callable_sig(elt) else {
-                                let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
-                                return self.tys.intern(TyKind::Array(ERROR, c));
-                            };
-                            let fp = self.fn_ptr_ty(&params, ret);
-                            self.set(first, fp);
-                            for (&el_e, &t) in elems[1..].iter().zip(&rest) {
-                                self.coerce_expr(el_e, t, fp);
-                            }
-                            // W-BORROW3: rustc's LUB of two fn items needs the
-                            // same lifetimes when either is higher-ranked.
-                            if let Res::Fn(a) = self.out.expr_res[self.ei(first)] {
-                                for &el_e in &elems[1..] {
-                                    if let Res::Fn(b) = self.out.expr_res[self.ei(el_e)]
-                                        && a != b
-                                        && !crate::borrowck::lub_items_fit(self.p, &self.tys, a, b, fp)
-                                    {
-                                        let sp = self.span(el_e);
-                                        self.lub_lifetimes_err(sp);
-                                    }
-                                }
-                            }
-                            let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
-                            return self.tys.intern(TyKind::Array(fp, c));
-                        }
-                        let mut el = el;
-                        for (i, &el_e) in elems.iter().enumerate().skip(1) {
-                            let t = self.expr(el_e, Some(el));
-                            if self.lub_flip(&elems[..i], el, t) {
-                                el = t;
-                            } else {
-                                self.coerce_expr(el_e, t, el);
-                            }
-                        }
-                        self.fn_elems_lub(elems, el);
-                        el
-                    }
-                    (None, None) => self.new_var(false),
-                };
+                let elem = self.array_elems(elems, exp_elem);
                 let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
                 self.tys.intern(TyKind::Array(elem, c))
             }
@@ -8190,6 +8127,125 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The expected type when it is a fn pointer (see `LoopCtx::want`).
+    fn fn_ptr_expectation(&self, expected: Option<Ty>) -> Option<Ty> {
+        expected.map(|t| self.resolve(t)).filter(|&t| matches!(self.kind(t), TyKind::FnPtr(_)))
+    }
+
+    /// The element type of an array literal (or `vec![..]`) with
+    /// elements `elems`, checked against the expected element type
+    /// `exp_elem` when there is one, else joined as rustc's LUB does.
+    fn array_elems(&mut self, elems: &[ExprId], exp_elem: Option<Ty>) -> Ty {
+        match (exp_elem, elems.first()) {
+            (Some(el), _) => {
+                for &el_e in elems {
+                    self.expect_expr(el_e, el);
+                }
+                self.fn_elems_lub(elems, el);
+                el
+            }
+            (None, Some(&first)) => {
+                let el = self.expr(first, None);
+                // An array of plain fn items holds function
+                // pointers: retag the first element too when any
+                // element is a different fn item.
+                let elt = self.resolve(el);
+                // Closures that capture nothing join as a fn
+                // pointer when they differ (rustc's LUB coercion). An
+                // element whose form coerces inside (`{ || 2 }`) must
+                // have the first element's type, rustc's hint for it.
+                if elems.len() > 1 && matches!(self.kind(elt), TyKind::Closure(_, caps) if self.tys.args(caps).is_empty()) {
+                    let mut joined = elt;
+                    for (i, &el_e) in elems.iter().enumerate().skip(1) {
+                        let t = self.expr(el_e, None);
+                        if self.kind(self.resolve(t)) == TyKind::Never || (self.coerces_to_hint(el_e) && !self.coerce_expr(el_e, t, elt)) {
+                            continue;
+                        }
+                        joined = match self.closure_lub_sites(joined, t, &elems[..i], Some(el_e)) {
+                            Some(fp) => fp,
+                            None => {
+                                if !self.unify(joined, t) {
+                                    let sp = self.span(el_e);
+                                    self.mismatch(sp, joined, t);
+                                }
+                                joined
+                            }
+                        };
+                    }
+                    return joined;
+                }
+                // Fn items join as a fn pointer only when they
+                // differ (`[a, b]`); `[a, a]` keeps the item type,
+                // which is zero-sized (rustc's LUB coercion).
+                if elems.len() > 1 && self.is_fn_item(elt) {
+                    let rest: Vec<Ty> = elems[1..].iter().map(|&el_e| self.expr(el_e, None)).collect();
+                    for (&el_e, &t) in elems[1..].iter().zip(&rest) {
+                        if self.coerces_to_hint(el_e) && self.kind(self.resolve(t)) != TyKind::Never && !self.same_fn_item(elt, t) {
+                            let sp = self.span(el_e);
+                            self.mismatch(sp, elt, t);
+                            return ERROR;
+                        }
+                    }
+                    if rest.iter().all(|&t| self.same_fn_item(elt, t)) {
+                        return elt;
+                    }
+                    let Some((params, ret)) = self.callable_sig(elt) else {
+                        return ERROR;
+                    };
+                    let fp = self.fn_ptr_ty(&params, ret);
+                    self.set(first, fp);
+                    for (&el_e, &t) in elems[1..].iter().zip(&rest) {
+                        self.coerce_expr(el_e, t, fp);
+                    }
+                    // W-BORROW3: rustc's LUB of two fn items needs the
+                    // same lifetimes when either is higher-ranked.
+                    if let Res::Fn(a) = self.out.expr_res[self.ei(first)] {
+                        for &el_e in &elems[1..] {
+                            if let Res::Fn(b) = self.out.expr_res[self.ei(el_e)]
+                                && a != b
+                                && !crate::borrowck::lub_items_fit(self.p, &self.tys, a, b, fp)
+                            {
+                                let sp = self.span(el_e);
+                                self.lub_lifetimes_err(sp);
+                            }
+                        }
+                    }
+                    return fp;
+                }
+                let mut el = el;
+                for (i, &el_e) in elems.iter().enumerate().skip(1) {
+                    let t = self.expr(el_e, Some(el));
+                    if self.lub_flip(&elems[..i], el, t) {
+                        el = t;
+                    } else {
+                        self.coerce_expr(el_e, t, el);
+                    }
+                }
+                self.fn_elems_lub(elems, el);
+                el
+            }
+            (None, None) => self.new_var(false),
+        }
+    }
+
+    /// True for the expression forms that rustc checks by coercing
+    /// their inner value sites to the expected type (a block's tail,
+    /// `if` and `match` arms, a loop's breaks). As an array element
+    /// after the first, such a form must coerce to the first element's
+    /// type, which is rustc's hint there, instead of joining by LUB.
+    fn coerces_to_hint(&self, e: ExprId) -> bool {
+        matches!(
+            self.p.ast.expr(e),
+            Expr::Block(_)
+                | Expr::UnsafeBlock(_)
+                | Expr::LabeledBlock { .. }
+                | Expr::ConstBlock(_)
+                | Expr::If { .. }
+                | Expr::Match { .. }
+                | Expr::Loop { .. }
+        )
+    }
+
     /// rustc's LUB of the elements of an array or `vec!` literal of fn
     /// pointer type `el` (W-BORROW3): each fn item after the first must
     /// have `el`'s lifetimes up to renaming its binders when either is
@@ -8282,8 +8338,10 @@ impl<'p> Ctx<'p> {
         false
     }
 
-    /// Joins the types of two branches. A diverging branch takes the other branch's type.
-    fn join(&mut self, a: Ty, b: Ty, be: Option<ExprId>, span: Span) -> Ty {
+    /// Joins the types of two branches. A diverging branch takes the
+    /// other branch's type. `prev` are the coercion sites that joined to
+    /// `a` so far and `be` is the site of `b` (when known).
+    fn join(&mut self, a: Ty, b: Ty, prev: &[ExprId], be: Option<ExprId>, span: Span) -> Ty {
         if self.kind(a) == TyKind::Never {
             self.mark_diverging(b);
             return b;
@@ -8292,10 +8350,10 @@ impl<'p> Ctx<'p> {
             self.mark_diverging(a);
             return a;
         }
-        // Two closures that capture nothing (or one and a fn pointer)
-        // with one signature join as a function pointer, as rustc's LUB
-        // coercion does; lowering makes each a trampoline value.
-        if let Some(fp) = self.closure_lub(a, b) {
+        // Two closures that capture nothing (or one and a fn item or
+        // pointer) with one signature join as a function pointer, as
+        // rustc's LUB coercion does; each site gets the reify coercion.
+        if let Some(fp) = self.closure_lub_sites(a, b, prev, be) {
             return fp;
         }
         if self.same_fn_item(a, b) {
@@ -15327,12 +15385,10 @@ impl<'p> Ctx<'p> {
                             "Derive Clone on the element type.",
                         );
                     }
-                } else {
-                    for &a in args {
-                        self.expect_expr(a, elem);
-                    }
-                    self.fn_elems_lub(args, elem);
+                    return self.tys.mk_vec(elem);
                 }
+                // `vec![a, b]` is an array literal moved into a Vec.
+                let elem = self.array_elems(args, elem_expected);
                 return self.tys.mk_vec(elem);
             }
             MacroKind::Assert => {

@@ -1089,13 +1089,20 @@ impl<'p> Lower<'p> {
         }
     }
 
-    /// Lowers a fn item value to the fn pointer `target`: the
-    /// zero-sized operand is read (for its side effects), then the slot
-    /// trampoline of the item `found` names (its mono instance for a
-    /// generic fn) is the value.
+    /// Lowers a fn item value, or a closure value that captures
+    /// nothing, to the fn pointer `target`: the zero-sized operand is
+    /// read (for its side effects), then the slot trampoline of the
+    /// item `found` names (its mono instance for a generic fn), or of
+    /// the closure's body fn, is the value.
     fn reify_fn(&mut self, op: Operand, found: Ty, target: Ty, span: Span) -> Operand {
         let zst = self.temp(found);
         self.assign(Place::local(zst), Rvalue::Use(op), span);
+        if let TyKind::Closure(def, _) = self.kind(found) {
+            let f = self.p.gx.closures.get(&def).expect("ReifyFn names a checked closure").body_fn;
+            let t = self.temp(target);
+            self.assign(Place::local(t), Rvalue::FnValue(f, target), span);
+            return Operand::Copy(Place::local(t));
+        }
         let TyKind::FnDef(def, args) = self.kind(found) else { unreachable!("ReifyFn on a non fn item type") };
         let f = self.p.local_def(def.hash).expect("ReifyFn names a local fn");
         let args = self.body.tys.args(args).to_vec();
