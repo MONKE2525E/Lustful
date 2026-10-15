@@ -10,8 +10,12 @@
 # (target/release/lust or $LUST), and, for the cargo-dep probes, Cargo with
 # the offline registry cache (the gate sandbox snapshot has it).
 # PORT_SYNC_JOBS sets the probe worker count (default: the script's auto).
-# On failure, the check prints the exact fix: rebase on next, rebuild,
-# rerun --write, and commit features.json.
+# On a status mismatch, the check prints the exact fix: rebase on next,
+# rebuild, rerun --write, and commit features.json. A probe that times
+# out under load is retried once, serially, with a long limit, and is
+# never read as a reject; a probe that times out again fails as a
+# TIMEOUT, not a MISMATCH (see port-scan-sync.py; PORT_SCAN_*_TIMEOUT
+# env vars set the limits and pass through this script).
 # Usage: scripts/port-sync-check.sh
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)

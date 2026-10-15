@@ -26,6 +26,19 @@ count, max 8; 1 is serial). Each probe gets its own work dir (rustc
 binary, lust cache, Cargo target, run working directory), so
 parallel probes cannot see each other's files.
 
+A timeout is never a status. A compile step that passes its time
+limit (exit 124 from run()), is killed by a signal, or (for a lust
+compile) fails with no L#### diagnostic gives verdict "timeout",
+not a reject: under gate load a healthy lust compile can pass the
+limit or die from the load, and reading that as a reject flips a
+supported feature to unsupported (the ext.rustix gate failures; a
+real lust reject always carries an L#### code). Such a probe runs
+once more, serially after the pool, with the long RETRY_* limits.
+If it still is not judged, --check fails that feature as a timeout
+(not a status mismatch) and --write keeps its committed status and
+warns. Each probe result records its wall time in "secs" (first
+try plus any retry), and the run prints the slowest probes.
+
 Probes with `// oracle: lust-only` have no single-file rustc oracle
 (a proc macro). They never set supported by themselves: a lust reject
 records unsupported, a lust accept is reported for a human call.
@@ -38,7 +51,12 @@ registry cache) as the oracle, and lust builds it from the same
 manifest, which swaps in the lust adapter (docs/ARCH.md 3.6).
 
 Env: LUST (lust binary), LUST_PORT (scanner binary), TS_RUST (ts-rust
-checkout), LUST_TCC_HOME (passed through to lust).
+checkout), LUST_TCC_HOME (passed through to lust). Per-step time
+limits in seconds (floats allowed) can be set for tests:
+PORT_SCAN_COMPILE_TIMEOUT, PORT_SCAN_RUN_TIMEOUT,
+PORT_SCAN_CARGO_TIMEOUT, and the retry forms
+PORT_SCAN_RETRY_COMPILE_TIMEOUT, PORT_SCAN_RETRY_RUN_TIMEOUT and
+PORT_SCAN_RETRY_CARGO_TIMEOUT.
 """
 import argparse
 import atexit
@@ -56,8 +74,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PROBES = ROOT / "tools/lust-port/tests/features"
 FEATURES_JSON = ROOT / "tools/lust-port/features.json"
-COMPILE_TIMEOUT = 30
-RUN_TIMEOUT = 10
+
+
+def _timeout_env(name, default):
+    """One per-step time limit in seconds, from $PORT_SCAN_<name> when set.
+
+    A float such as 0.05 is allowed so a test can plant a tiny limit
+    that even a fast probe step passes.
+    """
+    try:
+        return max(0.01, float(os.environ.get("PORT_SCAN_" + name, default)))
+    except ValueError:
+        return float(default)
+
+
+COMPILE_TIMEOUT = _timeout_env("COMPILE_TIMEOUT", 30)
+RUN_TIMEOUT = _timeout_env("RUN_TIMEOUT", 10)
+CARGO_TIMEOUT = _timeout_env("CARGO_TIMEOUT", 300)
+# A timed-out probe runs once more, serially, with these long limits.
+RETRY_COMPILE_TIMEOUT = _timeout_env("RETRY_COMPILE_TIMEOUT", 180)
+RETRY_RUN_TIMEOUT = _timeout_env("RETRY_RUN_TIMEOUT", 60)
+RETRY_CARGO_TIMEOUT = _timeout_env("RETRY_CARGO_TIMEOUT", 600)
 NOT_CORE = {"ls", "lsp", "project", "api", "effect", "format", "fswatch", "ipc", "contentmapper"}
 # Owner per feature for the coverage report. Unlisted features fall back
 # to a root-cause owner in OWNER_BY_CAUSE.
@@ -137,8 +174,39 @@ def cargo_package(path, deps, tmp):
     return pkg / "Cargo.toml", pkg / "src/main.rs"
 
 
-def probe_one(path, lust, work, env):
-    """Test one probe file in its own work dir. Returns a result dict."""
+def timed_out(res, step, limit):
+    """Mark a probe result as timed out at one step. A timeout is not a verdict on lust."""
+    res.update(verdict="timeout", detail=f"{step} timed out after {limit:g}s")
+    return res
+
+
+def unjudged(res, step, code, err):
+    """Mark a compile step that died without judging the probe.
+
+    Killed by a signal (code < 0, for example the OOM killer under
+    load), or a lust compile that failed with no L#### diagnostic:
+    a real lust reject always carries a code, so a failure without
+    one is a load or tool failure, never a reject. The verdict is
+    "timeout", so the probe gets the serial retry and, if it still
+    is not judged, the timeout failure path.
+    """
+    if code < 0:
+        detail = f"{step} killed by signal {-code}"
+    else:
+        first = err.strip().splitlines()[0][:120] if err.strip() else "no stderr"
+        detail = f"{step} failed with no diagnostic (exit {code}): {first}"
+    res.update(verdict="timeout", detail=detail)
+    return res
+
+
+def probe_one(path, lust, work, env, compile_timeout=COMPILE_TIMEOUT, run_timeout=RUN_TIMEOUT, cargo_timeout=CARGO_TIMEOUT):
+    """Test one probe file in its own work dir. Returns a result dict.
+
+    A compile step that exits 124 (run() hit its limit), is killed,
+    or fails with no L#### diagnostic gives verdict "timeout",
+    never a reject: the probe was not judged. Program runs keep
+    their exit comparison, so a panicking probe still counts.
+    """
     head = parse_header(path)
     res = {"file": path.name, "feature": head.get("feature", ""), "form": head.get("form", "")}
     if head.get("helper") == "true":
@@ -146,7 +214,7 @@ def probe_one(path, lust, work, env):
         return res
     deps = re.findall(r"^//\s*cargo-dep:\s*(.+?)\s*$", path.read_text(), re.M)
     if deps:
-        return probe_package(path, deps, lust, work, env, res)
+        return probe_package(path, deps, lust, work, env, res, compile_timeout, run_timeout, cargo_timeout)
     lust_only = head.get("oracle") == "lust-only"
     panic = head.get("rustc-panic", "abort")
     # A probe that needs unwinding builds lust with the same strategy.
@@ -155,63 +223,92 @@ def probe_one(path, lust, work, env):
         rbin = work / (path.stem + ".rustc")
         code, _, err = run(
             ["rustc", "--edition", "2024", "-C", f"panic={panic}", "-o", str(rbin), str(path)],
-            COMPILE_TIMEOUT,
+            compile_timeout,
         )
+        if code == 124:
+            return timed_out(res, "rustc compile", compile_timeout)
+        if code < 0:
+            return unjudged(res, "rustc compile", code, err)
         if code != 0:
             res.update(verdict="rustc-reject", detail=err.strip().splitlines()[-1][:160] if err.strip() else "")
             return res
         # Same working directory as the lust run below: probes that touch relative paths
         # (core_std_basics_b reads Cargo.toml) must see the same files.
-        rcode, rout, _ = run([str(rbin)], RUN_TIMEOUT, cwd=str(work))
+        rcode, rout, _ = run([str(rbin)], run_timeout, cwd=str(work))
+        if rcode == 124:
+            return timed_out(res, "rustc run", run_timeout)
         res["rustc_stdout"] = rout
         res["rustc_exit"] = rcode
-    ccode, _, cerr = run([str(lust), "check", *mode, str(path)], COMPILE_TIMEOUT, env)
+    ccode, _, cerr = run([str(lust), "check", *mode, str(path)], compile_timeout, env)
     res["lust_code"] = first_code(cerr)
+    if ccode == 124:
+        return timed_out(res, "lust check", compile_timeout)
+    if ccode != 0 and (ccode < 0 or not res["lust_code"]):
+        return unjudged(res, "lust check", ccode, cerr)
     if ccode != 0:
         res["verdict"] = "reject"
         return res
     # `lust run` drops its binary in the working directory; keep it in the work dir.
-    lcode, lout, lerr = run([str(lust), "run", *mode, str(path)], COMPILE_TIMEOUT, env, cwd=str(work))
+    lcode, lout, lerr = run([str(lust), "run", *mode, str(path)], compile_timeout, env, cwd=str(work))
     res["lust_stdout"] = lout
     res["lust_exit"] = lcode
+    if lcode == 124:
+        return timed_out(res, "lust run", compile_timeout)
     if lust_only:
         res["verdict"] = "lust-only-accept" if lcode == 0 else "lust-only-runfail"
         return res
     same_exit = lcode == res["rustc_exit"] or (lcode != 0 and res["rustc_exit"] != 0)
     if lout == res["rustc_stdout"] and same_exit:
         res["verdict"] = "pass"
-    elif lcode == 124 or (lcode != 0 and not lout):
+    elif lcode != 0 and not lout:
         res.update(verdict="runfail", detail=first_code(lerr) or "lust run failed after check passed")
     else:
         res.update(verdict="wrong", detail=f"lust stdout {lout!r} != rustc {res['rustc_stdout']!r}")
     return res
 
 
-def probe_package(path, deps, lust, tmp, env, res):
-    """A `cargo-dep` probe: Cargo with the real crate is the oracle."""
+def probe_package(path, deps, lust, tmp, env, res, compile_timeout=COMPILE_TIMEOUT, run_timeout=RUN_TIMEOUT, cargo_timeout=CARGO_TIMEOUT):
+    """A `cargo-dep` probe: Cargo with the real crate is the oracle.
+
+    Unjudged compile steps are verdict "timeout", as in probe_one.
+    The lust build of an adapter shim is the step that failed for
+    ext.rustix under gate load.
+    """
     manifest, src = cargo_package(path, deps, tmp)
     cenv = dict(env, CARGO_NET_OFFLINE="true")
     target = manifest.parent / "target"
-    code, _, err = run(["cargo", "build", "-q", "--manifest-path", str(manifest), "--target-dir", str(target)], 300, cenv)
+    code, _, err = run(["cargo", "build", "-q", "--manifest-path", str(manifest), "--target-dir", str(target)], cargo_timeout, cenv)
+    if code == 124:
+        return timed_out(res, "cargo build", cargo_timeout)
+    if code < 0:
+        return unjudged(res, "cargo build", code, err)
     if code != 0:
         res.update(verdict="rustc-reject", detail=err.strip().splitlines()[-1][:160] if err.strip() else "")
         return res
-    rcode, rout, _ = run([str(target / "debug/probe")], RUN_TIMEOUT)
+    rcode, rout, _ = run([str(target / "debug/probe")], run_timeout)
+    if rcode == 124:
+        return timed_out(res, "cargo run", run_timeout)
     res["rustc_stdout"] = rout
     res["rustc_exit"] = rcode
     lbin = manifest.parent / "probe.lust"
-    ccode, _, cerr = run([str(lust), "build", str(src), "-o", str(lbin), "--manifest-path", str(manifest), "--bin", "probe"], COMPILE_TIMEOUT, cenv)
+    ccode, _, cerr = run([str(lust), "build", str(src), "-o", str(lbin), "--manifest-path", str(manifest), "--bin", "probe"], compile_timeout, cenv)
     res["lust_code"] = first_code(cerr)
+    if ccode == 124:
+        return timed_out(res, "lust build", compile_timeout)
+    if ccode != 0 and (ccode < 0 or not res["lust_code"]):
+        return unjudged(res, "lust build", ccode, cerr)
     if ccode != 0:
         res["verdict"] = "reject"
         return res
-    lcode, lout, _ = run([str(lbin)], RUN_TIMEOUT)
+    lcode, lout, _ = run([str(lbin)], run_timeout)
     res["lust_stdout"] = lout
     res["lust_exit"] = lcode
+    if lcode == 124:
+        return timed_out(res, "lust run", run_timeout)
     same_exit = lcode == rcode or (lcode != 0 and rcode != 0)
     if lout == rout and same_exit:
         res["verdict"] = "pass"
-    elif lcode == 124 or (lcode != 0 and not lout):
+    elif lcode != 0 and not lout:
         res.update(verdict="runfail", detail="lust build ran and failed")
     else:
         res.update(verdict="wrong", detail=f"lust stdout {lout!r} != cargo {rout!r}")
@@ -219,8 +316,15 @@ def probe_package(path, deps, lust, tmp, env, res):
 
 
 def feature_status(results):
-    """Derive one status from the probe verdicts of one feature."""
+    """Derive one status from the probe verdicts of one feature.
+
+    A timed-out probe was not judged, so it blocks every status: the
+    feature derives "timeout", which --write never writes and
+    --check reports as a timeout, not as a status mismatch.
+    """
     vs = [r["verdict"] for r in results]
+    if any(v == "timeout" for v in vs):
+        return "timeout"
     if all(v == "pass" for v in vs):
         return "supported"
     if any(v == "pass" for v in vs):
@@ -243,47 +347,67 @@ def run_probes(paths, lust, tmp, env, jobs):
     can run in parallel (jobs > 1) without seeing each other's files,
     binaries, or Cargo target dirs. A probe that crashes the runner
     is a failed probe (verdict "error"), not a crashed run.
+
+    A probe that times out runs once more after the pool, serially,
+    in the same work dir (its Cargo target and lust cache carry
+    over) with the long RETRY_* limits, and is marked "retried".
+    Every result carries "secs": wall time of the first try plus
+    any retry.
     """
 
-    def one(p):
+    def one(p, compile_timeout=COMPILE_TIMEOUT, run_timeout=RUN_TIMEOUT, cargo_timeout=CARGO_TIMEOUT):
         work = tmp / p.stem
         work.mkdir(parents=True, exist_ok=True)
         penv = dict(env, LUST_CACHE_DIR=str(work / "cache"), LUST_DAEMON_SOCKET=str(work / "none.sock"))
+        t0 = time.monotonic()
         try:
-            return probe_one(p, lust, work, penv)
+            res = probe_one(p, lust, work, penv, compile_timeout, run_timeout, cargo_timeout)
         except Exception as e:
             try:
                 head = parse_header(p)
             except Exception:
                 head = {}
-            return {
+            res = {
                 "file": p.name,
                 "feature": head.get("feature", ""),
                 "form": head.get("form", ""),
                 "verdict": "error",
                 "detail": f"{type(e).__name__}: {e}"[:160],
             }
+        res["secs"] = round(time.monotonic() - t0, 2)
+        return res
 
     if jobs <= 1:
         results = [one(p) for p in paths]
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
             results = list(ex.map(one, paths))
+    by_file = {p.name: p for p in paths}
+    for i, r in enumerate(results):
+        if r["verdict"] == "timeout":
+            retry = one(by_file[r["file"]], RETRY_COMPILE_TIMEOUT, RETRY_RUN_TIMEOUT, RETRY_CARGO_TIMEOUT)
+            retry["secs"] = round(r.get("secs", 0) + retry["secs"], 2)
+            retry["retried"] = True
+            results[i] = retry
     return sorted(results, key=lambda r: r["file"])
 
 
 def check_features(features, derived, by_feature):
     """Compare the committed feature table with the probe results.
 
-    Returns {"passed": [id], "failed": [(id, message)], "unchecked":
-    [(id, why)]}. A feature passes only when --write would leave its
-    row alone: same status, and milestone 0 when supported. A
-    feature with no probe, or a manual one (a lust-only accept needs
-    a human call), cannot be derived from probes, so it is unchecked
-    rather than silently passed. A probe whose feature id is not in
-    the table fails: its status is not in features.json at all.
+    Returns {"passed": [id], "failed": [(id, message)], "timeouts":
+    [(id, message)], "unchecked": [(id, why)]}. A feature passes only
+    when --write would leave its row alone: same status, and
+    milestone 0 when supported. A feature with no probe, or a manual
+    one (a lust-only accept needs a human call), cannot be derived
+    from probes, so it is unchecked rather than silently passed. A
+    probe whose feature id is not in the table fails: its status is
+    not in features.json at all. A feature with a timed-out probe
+    (after the serial retry) is a timeout failure, kept apart from
+    "failed": its committed status was not judged, so there is no
+    status mismatch to fix with --write.
     """
-    passed, failed, unchecked = [], [], []
+    passed, failed, timeouts, unchecked = [], [], [], []
     for f in features:
         fid = f["id"]
         rs = by_feature.get(fid)
@@ -293,6 +417,17 @@ def check_features(features, derived, by_feature):
         bad = [r for r in rs if r["verdict"] in BAD_VERDICTS]
         if bad:
             failed.append((fid, "probe " + ", ".join(f"{r['file']}:{r['verdict']}" for r in bad) + "; fix the probe or lust"))
+            continue
+        slow = [r for r in rs if r["verdict"] == "timeout"]
+        if slow:
+            timeouts.append(
+                (
+                    fid,
+                    "probe "
+                    + ", ".join(f"{r['file']}: {r.get('detail', 'timed out')}" for r in slow)
+                    + f" (serial retry limit {RETRY_COMPILE_TIMEOUT:g}s); the committed status {f['status']!r} was not judged",
+                )
+            )
             continue
         d = derived.get(fid)
         if d == "manual":
@@ -307,7 +442,8 @@ def check_features(features, derived, by_feature):
     for fid in sorted(set(by_feature) - known):
         failed.append((fid, "probe feature id is not in features.json; add the feature row or fix the probe header"))
     failed.sort(key=lambda x: x[0])
-    return {"passed": passed, "failed": failed, "unchecked": unchecked}
+    timeouts.sort(key=lambda x: x[0])
+    return {"passed": passed, "failed": failed, "timeouts": timeouts, "unchecked": unchecked}
 
 
 def print_check_fix(has_bad, has_unknown):
@@ -328,6 +464,16 @@ def print_check_fix(has_bad, has_unknown):
     if has_unknown:
         print("A probe above names a feature id that is not in features.json.")
         print("Add the feature row or fix the probe header first, then do the steps above.")
+
+
+def print_timeout_fix():
+    """An unjudged probe is not a stale status. Say what to do instead of --write."""
+    print("port-sync check timed out: a probe above was not judged (it timed out, was killed, or")
+    print(f"failed with no diagnostic) in the parallel pool and again in the serial retry")
+    print(f"(compile limit {RETRY_COMPILE_TIMEOUT:g}s). Its feature status was not judged.")
+    print("Do not edit features.json and do not run --write to fix this. Run the check again when")
+    print("the box is less loaded. If the same probe is not judged on an idle box, it is a slow")
+    print("probe or a slow lust compile: keep the 'slowest probes' line from this log and report it.")
 
 
 def do_probes(args):
@@ -351,6 +497,12 @@ def do_probes(args):
     t0 = time.monotonic()
     results = run_probes(sorted(PROBES.glob("*.rs")), lust, tmp, env, jobs)
     print(f"probes: {len(results)} files in {time.monotonic() - t0:.1f}s (jobs={jobs})")
+    slowest = sorted(results, key=lambda r: r.get("secs", 0), reverse=True)[:5]
+    if slowest:
+        print(
+            "slowest probes: "
+            + ", ".join(f"{r['file']}:{r['verdict']} {r.get('secs', 0):.1f}s" + (" (retried)" if r.get("retried") else "") for r in slowest)
+        )
     by_feature = {}
     for r in results:
         if r["verdict"] != "helper":
@@ -372,12 +524,18 @@ def do_probes(args):
     bad = [r for r in results if r["verdict"] in BAD_VERDICTS]
     for r in bad:
         print(f"FAIL {r['file']}: {r['verdict']} {r.get('detail', '')}")
+    timed = [r for r in results if r["verdict"] == "timeout"]
+    for r in timed:
+        print(f"TIMEOUT {r['file']}: {r.get('detail', '')} (after the serial retry; probe not judged)")
     if args.json:
         Path(args.json).write_text(json.dumps({"probes": results, "derived": derived}, indent=1) + "\n")
     if args.write:
         for f in table["features"]:
             d = derived.get(f["id"])
-            if d in ("supported", "partial", "unsupported"):
+            if d == "timeout":
+                # A timeout is not a status. Keep the committed row as it is.
+                print(f"WARN {f['id']}: probe timed out; committed status {f['status']!r} left unchanged")
+            elif d in ("supported", "partial", "unsupported"):
                 f["status"] = d
                 if d == "supported":
                     f["milestone"] = 0
@@ -387,15 +545,22 @@ def do_probes(args):
         chk = check_features(table["features"], derived, by_feature)
         for fid, msg in chk["failed"]:
             print(f"MISMATCH {fid}: {msg}")
+        for fid, msg in chk["timeouts"]:
+            print(f"TIMEOUT {fid}: {msg}")
         manual = [fid for fid, why in chk["unchecked"] if why == "manual"]
         if manual:
             print("manual (status not checked, needs a human call):", ", ".join(manual))
         # One machine line; scripts/port-sync-check.sh reads the counts from it.
-        print(f"port-scan-sync check: {len(chk['passed'])} passed, {len(chk['failed'])} failed, {len(chk['unchecked'])} unchecked")
+        # A timeout failure counts as failed here, but keeps its own lines above.
+        n_failed = len(chk["failed"]) + len(chk["timeouts"])
+        print(f"port-scan-sync check: {len(chk['passed'])} passed, {n_failed} failed, {len(chk['unchecked'])} unchecked")
+        if chk["timeouts"]:
+            print_timeout_fix()
         if chk["failed"]:
             print_check_fix(has_bad=bool(bad), has_unknown=bool(unknown))
-            sys.exit(2 if bad else 1)
-    if bad:
+        if n_failed:
+            sys.exit(2 if (bad or chk["timeouts"]) else 1)
+    if bad or timed:
         sys.exit(2)
     return derived
 
