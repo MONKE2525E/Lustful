@@ -58,6 +58,12 @@ pub enum Autoref {
     None,
     Ref,
     RefMut,
+    /// The array-to-slice autoderef step (rustc's probe reaches
+    /// `[T]` after `[T; N]`): after `derefs` peels to the array
+    /// place, the receiver is `&[T]` (`SliceOf`), not `&[T; N]`.
+    SliceRef,
+    /// `SliceRef` with a `&mut [T]` receiver.
+    SliceRefMut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5470,7 +5476,9 @@ impl<'p> Ctx<'p> {
         self.user_deref_call = outer;
         self.deref_depth -= 1;
         let mutable = match self.out.expr_res[self.ei(e)] {
-            Res::Method { autoref, .. } | Res::BuiltinMethod { autoref, .. } | Res::DynMethod { autoref, .. } => autoref == Autoref::RefMut,
+            Res::Method { autoref, .. } | Res::BuiltinMethod { autoref, .. } | Res::DynMethod { autoref, .. } => {
+                matches!(autoref, Autoref::RefMut | Autoref::SliceRefMut)
+            }
             // The lookup on the target failed and reported why.
             Res::None => return Some(ret),
             _ => {

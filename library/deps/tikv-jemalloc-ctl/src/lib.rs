@@ -96,16 +96,6 @@ impl AsName for str {
     }
 }
 
-/// `b"key\0"` literals are byte arrays; upstream reaches the
-/// `[u8]` impl by autoderef unsizing, which lust's method probe
-/// does not do yet, so the adapter spells the array impl out.
-/// The call behaves exactly as the `[u8]` one (README).
-impl<const N: usize> AsName for [u8; N] {
-    fn name(&self) -> &Name {
-        (&self[..]).name()
-    }
-}
-
 /// True when `v` starts with `pre` (byte slices have no
 /// `starts_with` in the lust subset yet).
 fn starts_with(v: &[u8], pre: &[u8]) -> bool {

@@ -3643,6 +3643,55 @@ impl<'p> Lower<'p> {
                     ops.push(o);
                 }
             }
+            Autoref::SliceRef | Autoref::SliceRefMut => {
+                // The array-to-slice autoderef step: `derefs` peels
+                // to the array place and the receiver is its slice
+                // reference. An unsize autoref is not two-phase, so
+                // the slice is made before the arguments run.
+                let m = autoref == Autoref::SliceRefMut;
+                let pl = match &root {
+                    Some(pl) => pl.clone(),
+                    None if m => self.place_for_mut(recv),
+                    None => self.place(recv),
+                };
+                let pl = Self::derefs(pl, derefs);
+                let elem = match self.kind(recv_ty) {
+                    TyKind::Array(e, _) => e,
+                    _ => recv_ty,
+                };
+                let slice = self.body.tys.intern(TyKind::Slice(elem));
+                let rt = self.ref_ty(m, slice);
+                let t = self.temp(rt);
+                self.assign(Place::local(t), Rvalue::SliceOf(pl), span);
+                ops.push(if m { Operand::Move(Place::local(t)) } else { Operand::Copy(Place::local(t)) });
+                for &a in args {
+                    let o = self.operand(a);
+                    // As in the `RefMut` unsize path: a direct place
+                    // read in an argument has no statement of its
+                    // own, so read it into a temporary first when
+                    // the slice borrow is mutable.
+                    let o = match o {
+                        Operand::Copy(pl) if m && !pl.proj.is_empty() => {
+                            let aty = match self.ck.coerce(a) {
+                                Coerce::Deref(n) => self.peel(self.ty(a), n),
+                                Coerce::Unsize(t) => t,
+                                _ => self.ty(a),
+                            };
+                            let tt = self.temp(aty);
+                            self.assign(Place::local(tt), Rvalue::Use(Operand::Copy(pl)), span);
+                            self.operand_from(Place::local(tt), aty)
+                        }
+                        Operand::Move(pl) if m && !pl.proj.is_empty() => {
+                            let aty = self.ty(a);
+                            let tt = self.temp(aty);
+                            self.assign(Place::local(tt), Rvalue::Use(Operand::Move(pl)), span);
+                            self.operand_from(Place::local(tt), aty)
+                        }
+                        o => o,
+                    };
+                    ops.push(o);
+                }
+            }
             Autoref::RefMut => {
                 let pl = match &root {
                     Some(pl) => pl.clone(),

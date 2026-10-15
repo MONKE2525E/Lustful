@@ -44,6 +44,10 @@ pub struct TraitPick {
     pub derefs: u8,
     /// Method calls: the method's receiver form on Self.
     pub form: ReceiverForm,
+    /// True when Self is reached by the array-to-slice autoderef
+    /// step after `derefs` peels (the receiver is a `SliceOf` of
+    /// the array place, `Autoref::SliceRef`).
+    pub slice: bool,
     /// The template env predicate that proved the call (a
     /// `ParamEvidence` pick), by index into the template's env. Other
     /// checks replay that trait ref with its inputs (`U: From<u8>`
@@ -81,13 +85,24 @@ impl Ctx<'_> {
     /// its index in this body's env (`TraitPick::env_pred`).
     /// `usize::MAX` is selection's structural answer, not a predicate.
     pub(super) fn record_pick_env(&mut self, e: ExprId, trait_def: DefId, derefs: u8, form: ReceiverForm, env: Option<usize>) {
+        self.record_pick_full(e, trait_def, derefs, form, env, false);
+    }
+
+    /// Records a pick a method probe confirmed: the probe carries
+    /// the array-to-slice step in its autoref.
+    pub(super) fn record_pick_probe(&mut self, e: ExprId, trait_def: DefId, derefs: u8, probe: RcvProbe, env: Option<usize>) {
+        let slice = matches!(probe.autoref, Autoref::SliceRef | Autoref::SliceRefMut);
+        self.record_pick_full(e, trait_def, derefs, probe.filter, env, slice);
+    }
+
+    fn record_pick_full(&mut self, e: ExprId, trait_def: DefId, derefs: u8, form: ReceiverForm, env: Option<usize>, slice: bool) {
         self.last_pick = Some((e, trait_def));
         if self.records_picks() {
             // An index past the fn's own env names an opaque type's bound
             // (`Ctx::solve_env`): the revealed check selects on the hidden
             // type instead.
             let env_pred = env.filter(|&i| i < self.env().len()).and_then(|i| u32::try_from(i).ok());
-            self.out.trait_picks.push((e, TraitPick { trait_def, derefs, form, env_pred }));
+            self.out.trait_picks.push((e, TraitPick { trait_def, derefs, form, slice, env_pred }));
         }
     }
 
@@ -265,8 +280,25 @@ pub(super) fn replay_method(
         _ if pick.trait_def == cx.p.gx.lang.into => cx.instance_bound_arg(pick.trait_def, step).or(expected),
         _ => expected,
     };
+    if ok && pick.slice {
+        // The template's step unsized an array to a slice.
+        match cx.tys.kind(step) {
+            TyKind::Array(el, _) => step = cx.tys.intern(TyKind::Slice(el)),
+            _ => ok = false,
+        }
+    }
     if ok {
-        let probe = RcvProbe::at(cx, step, pick.form);
+        let probe = if pick.slice {
+            RcvProbe {
+                self_ty: step,
+                recv_ty: cx.tys.mk_ref(pick.form == ReceiverForm::RefMut, step),
+                autoref: if pick.form == ReceiverForm::RefMut { Autoref::SliceRefMut } else { Autoref::SliceRef },
+                extra_derefs: 0,
+                filter: pick.form,
+            }
+        } else {
+            RcvProbe::at(cx, step, pick.form)
+        };
         // A `?Sized` param instantiated at a dyn type whose principal (or
         // a supertrait of it) is the picked trait: the object candidate,
         // through the vtable (ARCH 2.8), never an `impl dyn` method.

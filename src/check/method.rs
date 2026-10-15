@@ -903,13 +903,13 @@ pub(super) fn trait_probe_for(
                     }
                     cx.set_res(e, Res::Method { f: local, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
                     cx.check_args(&params[1..], args, name_span);
-                    cx.record_pick(e, trait_def, derefs + probe.extra_derefs, probe.filter);
+                    cx.record_pick_probe(e, trait_def, derefs + probe.extra_derefs, probe, None);
                     return Probe::Hit(cx.normalize_here(ret));
                 }
             };
             match confirm_method(cx, e, local, &generics, &prefix, explicit, probe, derefs, args, name_span) {
                 Some(ret) => {
-                    cx.record_pick_env(e, trait_def, derefs + probe.extra_derefs, probe.filter, env_pick);
+                    cx.record_pick_probe(e, trait_def, derefs + probe.extra_derefs, probe, env_pick);
                     Probe::Hit(ret)
                 }
                 None => Probe::Miss,
@@ -1121,7 +1121,7 @@ fn confirm_deferred(
     cx.obl.push_trait_at(tr, name_span, 0);
     let derefs = derefs + probe.extra_derefs;
     cx.deferred_methods.push(DeferredMethod { e, tr, name: t.name, own: full[n_trait..].to_vec(), derefs, autoref: probe.autoref, path: false });
-    cx.record_pick(e, trait_def, derefs, probe.filter);
+    cx.record_pick_probe(e, trait_def, derefs, probe, None);
     cx.check_args(&params[1..], args, name_span);
     Probe::Hit(cx.normalize_use(ret, name_span))
 }
@@ -1487,10 +1487,14 @@ pub(super) fn generic_method_search(
 ) -> Probe {
     // Autoderef steps through references and `Box` (the builtin
     // derefs of this wave), each with its deref count for lowering.
-    let mut steps: Vec<(Ty, u8)> = Vec::new();
+    // A final array step unsizes to a slice step at the same deref
+    // count, as in rustc: `b"x\0".name()` reaches an impl for
+    // `[u8]` there. The flag marks that step; its autoref is a
+    // `SliceOf` of the array place (`Autoref::SliceRef`).
+    let mut steps: Vec<(Ty, u8, bool)> = Vec::new();
     let mut cur = cx.resolve(recv_ty);
     for derefs in 0..32u8 {
-        steps.push((cur, derefs));
+        steps.push((cur, derefs, false));
         match cx.tys.kind(cur) {
             TyKind::Ref(_, _, inner) => cur = cx.resolve(inner),
             _ => match cx.tys.smart_elem(cur) {
@@ -1499,7 +1503,13 @@ pub(super) fn generic_method_search(
             },
         }
     }
-    for (step, derefs) in steps {
+    if let Some(&(last, derefs, _)) = steps.last()
+        && let TyKind::Array(el, _) = cx.tys.kind(last)
+    {
+        let slice = cx.tys.intern(TyKind::Slice(el));
+        steps.push((slice, derefs, true));
+    }
+    for (step, derefs, unsize) in steps {
         // One group per receiver type, in probe order: by value
         // (the step type itself; at a reference step this group
         // also has the pointee variant), then `&step`, then
@@ -1538,7 +1548,31 @@ pub(super) fn generic_method_search(
                 filter: if m == Mut::Mut { ReceiverForm::RefMut } else { ReceiverForm::Ref },
             });
         }
-        let groups = [by_value, vec![RcvProbe::at(cx, step, ReceiverForm::Ref)], vec![RcvProbe::at(cx, step, ReceiverForm::RefMut)]];
+        // The unsize step has no by-value probe (an unsized Self
+        // is never held by value); its autorefs make the slice
+        // reference from the array place instead of a plain ref.
+        let (by_value, ref_probe, refmut_probe) = if unsize {
+            (
+                Vec::new(),
+                RcvProbe {
+                    self_ty: step,
+                    recv_ty: cx.tys.mk_ref(false, step),
+                    autoref: Autoref::SliceRef,
+                    extra_derefs: 0,
+                    filter: ReceiverForm::Ref,
+                },
+                RcvProbe {
+                    self_ty: step,
+                    recv_ty: cx.tys.mk_ref(true, step),
+                    autoref: Autoref::SliceRefMut,
+                    extra_derefs: 0,
+                    filter: ReceiverForm::RefMut,
+                },
+            )
+        } else {
+            (by_value, RcvProbe::at(cx, step, ReceiverForm::Ref), RcvProbe::at(cx, step, ReceiverForm::RefMut))
+        };
+        let groups = [by_value, vec![ref_probe], vec![refmut_probe]];
         for group in &groups {
             for &probe in group {
                 match dyn_probe(cx, e, probe, derefs, name, name_span, args, None) {

@@ -1447,8 +1447,8 @@ impl<'p> Ctx<'p> {
         let span = self.span(recv);
         let mode = match autoref {
             Autoref::None => None,
-            Autoref::Ref => Some(CaptureMode::Ref),
-            Autoref::RefMut => Some(CaptureMode::MutRef),
+            Autoref::Ref | Autoref::SliceRef => Some(CaptureMode::Ref),
+            Autoref::RefMut | Autoref::SliceRefMut => Some(CaptureMode::MutRef),
         };
         match self.cap_cat(recv) {
             Cat::Place(mut pl) => {
@@ -1471,7 +1471,7 @@ impl<'p> Ctx<'p> {
             Cat::Bad => self.cap_bad_if_upvar(recv, w),
             Cat::Rvalue => {}
         }
-        self.cap_walk(recv, autoref == Autoref::RefMut, w);
+        self.cap_walk(recv, matches!(autoref, Autoref::RefMut | Autoref::SliceRefMut), w);
     }
 
     /// Builtin macros: format arguments are borrowed, `vec!` and
@@ -1880,8 +1880,8 @@ impl<'p> Ctx<'p> {
                         return ERROR;
                     };
                     let kind = match autoref {
-                        Autoref::Ref => ClosureKind::Fn,
-                        Autoref::RefMut => ClosureKind::FnMut,
+                        Autoref::Ref | Autoref::SliceRef => ClosureKind::Fn,
+                        Autoref::RefMut | Autoref::SliceRefMut => ClosureKind::FnMut,
                         Autoref::None => ClosureKind::FnOnce,
                     };
                     self.out.closure_calls.push((e, kind));
