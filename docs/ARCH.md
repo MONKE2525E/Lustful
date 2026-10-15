@@ -3201,6 +3201,13 @@ the target takes any, no borrowed output where it returns
   with a free region is L0203.
 - In fn pointer types elision does not count lifetimes inside
   fn pointer params (`elision_regions`, rustc E0106).
+- Array and `vec!` literals join their elements by rustc's
+  LUB: a fn item after the first must have the element fn
+  pointer type's lifetimes up to renaming binders when either
+  is higher-ranked (check `fn_elems_lub`, `lub_shapes_fit`;
+  L0110, rustc E0308). `if`/`match` arms coerce to the
+  expected type as before, and to a fn pointer type with a
+  free region one by one (rustc's expectation).
 
 ## 6. Macros
 
