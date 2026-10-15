@@ -10035,14 +10035,49 @@ fn prove_trait_ref(
         && cx.tys.args(tr.args).len() == 1
         && let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty())
     {
+        // `Copy` forwards through fewer containers than the
+        // others: `Vec`, `Box`, `Rc`, and `Arc` are never Copy,
+        // and a slice is not a sized value at all.
+        let is_copy = tr.def == lang.copy;
         let parts: Option<Vec<Ty>> = match cx.tys.kind(t) {
-            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => Some(vec![e]),
+            TyKind::Ref(_, m, e) if !is_copy || !m.is_mut() => Some(vec![e]),
+            TyKind::Array(e, _) => Some(vec![e]),
+            TyKind::Slice(e) if !is_copy => Some(vec![e]),
             TyKind::Tuple(ts) => Some(cx.tys.tys_of(ts).to_vec()),
             _ => {
-                if let Some(e) = cx.tys.vec_elem(t).or_else(|| cx.tys.option_elem(t)).or_else(|| cx.tys.smart_elem(t)) {
-                    Some(vec![e])
+                let elem = if is_copy {
+                    cx.tys.option_elem(t)
                 } else {
+                    cx.tys.vec_elem(t).or_else(|| cx.tys.option_elem(t)).or_else(|| cx.tys.smart_elem(t))
+                };
+                if let Some(e) = elem {
+                    Some(vec![e])
+                } else if cx.tys.result_args(t).is_some() {
                     cx.tys.result_args(t).map(|(a, b)| vec![a, b])
+                } else if let Some(a) = cx.tys.local_adt(t) {
+                    // A derived Adt: every field must hold, with
+                    // this application's args substituted.
+                    let d = p.adt(a).derives;
+                    let derived = if tr.def == lang.copy {
+                        d.copy
+                    } else if tr.def == lang.clone {
+                        d.clone
+                    } else if tr.def == lang.debug {
+                        d.debug
+                    } else {
+                        d.hash
+                    };
+                    if derived {
+                        let args: Vec<GenericArg> = cx.tys.adt_parts(t).map(|(_, a)| cx.tys.args(a).to_vec()).unwrap_or_default();
+                        let raw: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+                        let fields: Vec<Ty> =
+                            raw.into_iter().map(|f| if args.is_empty() { f } else { subst(&mut cx.tys, f, &args) }).collect();
+                        Some(fields)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
             }
         };
