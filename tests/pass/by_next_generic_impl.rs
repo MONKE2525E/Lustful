@@ -1,6 +1,5 @@
-// expect: L0640
-// Valid Rust: adapters over a user iterator whose Iterator impl is
-// generic (lust calls only non-generic `next` impls so far).
+// Adapters over a user iterator whose Iterator impl is generic:
+// the expansion calls the impl's `next` instance for `G<i32>`.
 struct G<T>(Vec<T>);
 
 impl<T> Iterator for G<T> {

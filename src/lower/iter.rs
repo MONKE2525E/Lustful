@@ -1174,7 +1174,7 @@ impl Ex<'_, '_, '_> {
         if self.kind_args(ty).is_some() || self.body.tys.is_chars_ty(ty) {
             return Ok((itp, ty));
         }
-        let fns = crate::check::iter::by_next_fns(self.p, ty)?;
+        let fns = crate::check::iter::by_next_fns(self.p, &self.body.tys, ty)?;
         let item = fns.item.ok_or("iterator expansion: no `Item` in the impl")?;
         let held = self.body.tys.mk_ref(true, ty);
         let w = it::mk_iter(&mut self.body.tys, IterKind::ByNext, &[held, item]);
@@ -1604,7 +1604,7 @@ impl Ex<'_, '_, '_> {
             // The wrapped iterator's own `next` (W-STD-B): forward only.
             K::ByNext => {
                 let (inner, at) = self.by_next_held(a[0], f(0));
-                let fns = crate::check::iter::by_next_fns(self.p, inner)?;
+                let fns = crate::check::iter::by_next_fns(self.p, &self.body.tys, inner)?;
                 let step = if back { fns.next_back.ok_or("iterator expansion: no `next_back`")? } else { fns.next };
                 let r = self.ref_to(true, at, inner);
                 self.call(CallTarget::Fn(step), vec![Operand::Move(Place::local(r))], dest);
@@ -3255,7 +3255,7 @@ impl Ex<'_, '_, '_> {
             }
             // The wrapped iterator's own `size_hint`, else the trait's
             // default `(0, None)` (W-STD-B).
-            K::ByNext => match crate::check::iter::by_next_fns(self.p, self.by_next_held(a[0], f(0)).0)?.size_hint {
+            K::ByNext => match crate::check::iter::by_next_fns(self.p, &self.body.tys, self.by_next_held(a[0], f(0)).0)?.size_hint {
                 Some(sh) => {
                     let (inner, at) = self.by_next_held(a[0], f(0));
                     let r = self.ref_to(false, at, inner);

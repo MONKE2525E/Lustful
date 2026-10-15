@@ -4077,6 +4077,12 @@ pub struct GenTables<'a> {
     /// reads these for the hash glue).
     pub hasher_methods: FxMap<(AdtId, u8), LocalDefId>,
     pub build_hashers: FxMap<AdtId, (LocalDefId, Ty)>,
+    /// The `Iterator` method instances of one concrete Adt whose impl
+    /// is generic (`next`, `size_hint`, `next_back`, and the `Item`
+    /// type): the `ByNext` expansion calls them, as it calls the
+    /// plain fns of a non-generic impl (check/iter.rs `by_next_fns`;
+    /// iface: lower/iter.rs reads this through it).
+    pub iter_methods: FxMap<AdtId, (LocalDefId, Option<LocalDefId>, Option<LocalDefId>, Option<Ty>)>,
     /// The written `Hash::hash` template of a non-generic impl on a
     /// non-generic local Adt (no `hash_slice` of its own), and its
     /// instances by hasher type: the hash glue calls one for a value of
@@ -4211,6 +4217,7 @@ impl Default for GenTables<'_> {
             deferred_debug_fields: Vec::new(),
             hasher_methods: FxMap::default(),
             build_hashers: FxMap::default(),
+            iter_methods: FxMap::default(),
             written_hash: FxMap::default(),
             hash_impls: FxMap::default(),
             borrow_impls: FxMap::default(),
@@ -8417,6 +8424,84 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
     }
 }
 
+/// One impl method at its concrete instance, for `ensure_iter_methods`:
+/// the plain fn when the impl is not a template, else its instance
+/// (queued for checking when new), as in `ensure_fmt_methods`.
+fn iter_fn_instance(p: &mut Program, local: LocalDefId, impl_args: &[GenericArg], queue: &mut Vec<LocalDefId>) -> LocalDefId {
+    if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
+        let before = p.fns.len();
+        let inst = fn_instance(p, local, impl_args);
+        if inst.0 as usize >= before {
+            queue.push(inst);
+        }
+        inst
+    } else {
+        local
+    }
+}
+
+/// The user `Iterator` method instances of one concrete Adt
+/// (`gx.iter_methods`): selection on the Adt's full type, then the
+/// written impl's `next` and `size_hint`, plus `next_back` from its
+/// `DoubleEndedIterator` impl. Only the shape the `ByNext` expansion
+/// can call records anything (check/iter.rs `by_next_fns`): a written
+/// impl that defines no provided method besides `size_hint`. Std
+/// source Adts keep their builtin iterator kinds and are skipped.
+fn ensure_iter_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) {
+    use crate::traits::index::Synthetic;
+    if p.gx.iter_methods.contains_key(&adt) || p.is_std_adt(adt) {
+        return;
+    }
+    let Some(self_ty) = p.tys.full_adt_ty(adt) else { return };
+    if p.tys.flags(self_ty).contains_param() {
+        return;
+    }
+    let lang = p.gx.lang;
+    let self_args = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
+    let select = |p: &Program, trait_def: DefId| {
+        let tr = TraitRef { def: trait_def, args: self_args, bindings: EMPTY_BINDINGS };
+        let sel = {
+            let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+            let mut solver = Solver::new();
+            solver.select(&mut cx, &p.gx.index, &[], tr)
+        };
+        match sel {
+            Selection::Impl { id, args, .. } if prove_goal(p, &[], tr) => Some((id, args)),
+            _ => None,
+        }
+    };
+    let Some((id, impl_args)) = select(p, lang.iterator) else { return };
+    let record = p.gx.index.get(id).clone();
+    if record.synthetic != Synthetic::None {
+        return;
+    }
+    let (mut next, mut size_hint) = (None, None);
+    for d in record.items.clone() {
+        let Some(local) = p.local_def(d.hash) else { return };
+        match p.name(p.fn_info(local).name) {
+            "next" => next = Some(local),
+            "size_hint" => size_hint = Some(local),
+            _ => return,
+        }
+    }
+    let Some(next) = next else { return };
+    let next = iter_fn_instance(p, next, &impl_args, queue);
+    let size_hint = size_hint.map(|l| iter_fn_instance(p, l, &impl_args, queue));
+    let item = record.assoc_ty(lang.assoc_item).map(|t| {
+        let t = subst(&mut p.tys, t, &impl_args);
+        normalize_global(p, t)
+    });
+    let next_back = select(p, lang.double_ended_iterator).and_then(|(id, args)| {
+        let rec = p.gx.index.get(id).clone();
+        if rec.synthetic != Synthetic::None {
+            return None;
+        }
+        let local = rec.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "next_back"))?;
+        Some(iter_fn_instance(p, local, &args, queue))
+    });
+    p.gx.iter_methods.insert(adt, (next, size_hint, next_back, item));
+}
+
 /// True when a written fmt impl's where clauses hold for its selected
 /// args (`ensure_fmt_methods`). A `Debug`/`Display` bound holds when the
 /// format site's structural question (`has_debug`, `has_display`) or
@@ -8425,22 +8510,45 @@ fn ensure_fmt_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
 /// references. Other bounds take `prove_goal`, with the same escape.
 fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplRecord, impl_args: &[GenericArg], tr: TraitRef, self_ty: Ty) -> bool {
     let lang = p.gx.lang;
-    let mut other = false;
+    // Bounds that are not `Debug`/`Display` are proven one by one at
+    // the end, each at its normal form: proving the whole `tr` again
+    // re-asks the fmt bounds as projections (`A::Item: Debug`),
+    // which the pure solver cannot select on, and a written impl
+    // was then skipped for a structural answer (wrong output).
+    let mut others: Vec<TraitRef> = Vec::new();
     for pr in &record.generics.predicates {
-        let Predicate::Trait(b) = pr else {
-            other = true;
+        // Non-trait predicates and higher-ranked bounds are not
+        // goals here, as in `prove_trait_ref`.
+        let Predicate::Trait(b) = pr else { continue };
+        if b.count != 0 {
             continue;
-        };
+        }
         let d = b.value.def;
         if d == lang.sized {
             continue;
         }
         if d != lang.debug && d != lang.display {
-            other = true;
+            let raw: Vec<GenericArg> = p.tys.args(b.value.args).to_vec();
+            let mut args: Vec<GenericArg> = Vec::with_capacity(raw.len());
+            for g in raw {
+                args.push(match g.as_ty() {
+                    Some(t) => {
+                        let t = crate::ty::subst(&mut p.tys, t, impl_args);
+                        GenericArg::Ty(normalize_global(p, t))
+                    }
+                    None => g,
+                });
+            }
+            let args = p.tys.intern_args(&args);
+            others.push(TraitRef { def: d, args, bindings: b.value.bindings });
             continue;
         }
         let Some(arg) = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) else { return false };
+        // A bound on a projection (`A::Item: Debug`) names its normal
+        // form here: the structural check and `prove_goal` do not
+        // normalize projections in a trait ref's Self type.
         let t = crate::ty::subst(&mut p.tys, arg, impl_args);
+        let t = normalize_global(p, t);
         // The structural answer (builtin types, tuples, derives), else a
         // written impl (`prove_goal`), else an arg the proof cannot see.
         let structural = if d == lang.debug { crate::check::collect::has_debug(p, &p.tys, t) } else { crate::check::collect::has_display(p, &p.tys, t) };
@@ -8452,7 +8560,8 @@ fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplReco
             return false;
         }
     }
-    !other || prove_goal(p, &[], tr) || args_hold_refs(&p.tys, self_ty)
+    let _ = tr;
+    others.iter().all(|&o| prove_goal(p, &[], o)) || args_hold_refs(&p.tys, self_ty)
 }
 
 /// True when some type argument of `t` (at any depth) is a reference,
@@ -8766,6 +8875,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 ensure_drop_method(p, a, &mut next_queue);
                 ensure_fmt_methods(p, a, &mut next_queue);
                 ensure_hash_methods(p, a, &mut next_queue);
+                ensure_iter_methods(p, a, &mut next_queue);
             }
             ensure_written_hash(p, &mut next_queue);
         }

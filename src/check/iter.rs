@@ -1062,18 +1062,32 @@ impl<'p, 'a> Ctx<'p, 'a> {
             }
             "collect" => {
                 let target = self.iter_target(turbofish, expected, span);
-                // A std source collection (`BTreeMap`, `BTreeSet`): the
-                // call is its `FromIterator::from_iter(self)`, as rustc's
-                // `collect` is (W-STD-C). The `Target: FromIterator<Item>`
+                // A source collection (`BTreeMap`, `BTreeSet`, or a user
+                // type with a `FromIterator` impl, adapter crates
+                // included): the call is its
+                // `FromIterator::from_iter(self)`, as rustc's `collect`
+                // is (W-STD-C). The `Target: FromIterator<Item>`
                 // obligation proves the impl's bounds (`T: Ord`).
+                // Std ADTs take this route as before; a user ADT only
+                // when selection finds an impl for this item type, so
+                // a user type without one keeps the L0640 below.
                 // `VecDeque` is not here: its collect capacity is
                 // `Vec`'s, so it takes the builtin collect below and
                 // lowering wraps the `Vec` (W-STD-C phase 2).
                 let tr = self.resolve(target);
+                let from_iter_ref = |this: &mut Self| TraitRef {
+                    def: this.p.gx.lang.from_iterator,
+                    args: this.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]),
+                    bindings: EMPTY_BINDINGS,
+                };
                 if let Some(a) = self.tys.local_adt(tr).or_else(|| self.tys.adt_parts(tr).and_then(|(d, _)| self.tys.local_adt_of(d)))
-                    && self.p.is_std_adt(a)
                     && !self.p.is_vec_deque_adt(a)
                     && args.is_empty()
+                    && (self.p.is_std_adt(a)
+                        || {
+                            let r = from_iter_ref(self);
+                            matches!(self.select_obligation(r), Selection::Impl { .. })
+                        })
                 {
                     // Each has one `FromIterator` impl, whose item is the
                     // entry type: unify it now, so `collect::<BTreeMap<_,
@@ -1305,11 +1319,18 @@ impl<'p, 'a> Ctx<'p, 'a> {
             return Some(self.normalize_here(item));
         }
         let tr = TraitRef { def: lang.iterator, args, bindings: EMPTY_BINDINGS };
-        match self.select_obligation(tr) {
-            Selection::Impl { .. } | Selection::ParamEvidence(_) => {}
+        let impl_id = match self.select_obligation(tr) {
+            Selection::Impl { id, .. } => Some(id),
+            Selection::ParamEvidence(_) => None,
             _ => return None,
-        }
-        if user && let Err(why) = by_next_fns(p, base) {
+        };
+        // The selected impl's shape is the gate: a written impl the
+        // expansion can call through `next` (generic impls included;
+        // their instances are made with the Adt, `ensure_iter_methods`).
+        if user
+            && let Some(id) = impl_id
+            && let Err(why) = iter_impl_shape(p, p.gx.index.get(id))
+        {
             let tn = self.tn(base);
             self.err("L0640", span, format!("adapters over `{tn}` are not implemented yet: {why}"), "Loop with `while let Some(x) = it.next()` instead.");
             return Some(ERROR);
@@ -1488,7 +1509,7 @@ impl<'p, 'a> Ctx<'p, 'a> {
             | K::SetIntoIter => false,
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator with a `DoubleEndedIterator` impl.
-            K::ByNext => by_next_fns(self.p, a[0]).is_ok_and(|f| f.next_back.is_some()),
+            K::ByNext => by_next_fns(self.p, &self.tys, a[0]).is_ok_and(|f| f.next_back.is_some()),
             // Forward only in lust so far.
             K::Flatten => false,
             K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => true,
@@ -2111,11 +2132,13 @@ const ITER_METHODS: &[&str] = &[
 ];
 
 /// The user fns a `ByNext` iterator calls: `next`, and `size_hint`
-/// when the impl defines it. The impl must be non-generic and define
-/// no other method: std's adapters call the inner iterator's own
-/// `fold`, `nth`, `count`, and kin, which lust's expansions do not
-/// (they loop on `next`), so an impl that overrides one of those is
-/// refused rather than run differently.
+/// when the impl defines it. The impl must define no other method:
+/// std's adapters call the inner iterator's own `fold`, `nth`,
+/// `count`, and kin, which lust's expansions do not (they loop on
+/// `next`), so an impl that overrides one of those is refused rather
+/// than run differently. A generic impl is called at its instance
+/// for the concrete type (`gx.iter_methods`, made in
+/// check/generics.rs `ensure_iter_methods`).
 pub struct ByNextFns {
     pub next: LocalDefId,
     pub size_hint: Option<LocalDefId>,
@@ -2125,21 +2148,9 @@ pub struct ByNextFns {
     pub item: Option<Ty>,
 }
 
-/// `by_next_fns` for a user type `t` (concrete), or why lust cannot
-/// iterate it through `next` yet.
-pub fn by_next_fns(p: &Program, t: Ty) -> Result<ByNextFns, &'static str> {
-    let lang = p.gx.lang;
-    let rec = p
-        .gx
-        .index
-        .impls_of_trait(lang.iterator)
-        .iter()
-        .map(|&id| p.gx.index.get(id))
-        .find(|r| r.local && r.self_ty(&p.tys) == t)
-        .ok_or("its `Iterator` impl is generic")?;
-    if !rec.generics.params.is_empty() {
-        return Err("its `Iterator` impl is generic");
-    }
+/// The `next` and `size_hint` items of one written `Iterator` impl,
+/// or why the `ByNext` expansion cannot call it.
+pub(crate) fn iter_impl_shape(p: &Program, rec: &crate::traits::index::ImplRecord) -> Result<(LocalDefId, Option<LocalDefId>), &'static str> {
     let (mut next, mut size_hint) = (None, None);
     for &d in &rec.items {
         let Some(l) = p.local_def(d.hash) else { continue };
@@ -2149,15 +2160,134 @@ pub fn by_next_fns(p: &Program, t: Ty) -> Result<ByNextFns, &'static str> {
             _ => return Err("its `Iterator` impl defines a provided method"),
         }
     }
-    let item = rec.assoc_tys.iter().find(|(d, _)| *d == lang.assoc_item).map(|&(_, t)| t);
-    // A non-generic `DoubleEndedIterator` impl gives `next_back`.
+    Ok((next.ok_or("its `Iterator` impl has no `next`")?, size_hint))
+}
+
+/// True when impl Self pattern `pat` (read in the global store)
+/// matches type `t` (read in `src`, the caller's store: a body
+/// store's ids past the global ones are not global ids), binding
+/// each pattern parameter in `binds` (by parameter index). Only the
+/// shapes a written impl's Self type takes: parameters, Adts,
+/// references, tuples, slices, and arrays over them.
+fn match_self_pat(p: &Program, src: &dyn crate::ty::TyIntern, pat: Ty, t: Ty, binds: &mut Vec<Option<GenericArg>>) -> bool {
+    match p.tys.kind(pat) {
+        TyKind::Param(i) => {
+            let i = i.0 as usize;
+            if binds.len() <= i {
+                binds.resize(i + 1, None);
+            }
+            match binds[i] {
+                None => {
+                    binds[i] = Some(GenericArg::Ty(t));
+                    true
+                }
+                Some(GenericArg::Ty(u)) => u == t,
+                _ => false,
+            }
+        }
+        TyKind::Adt(d, a) => match src.kind(t) {
+            TyKind::Adt(d2, a2) if d == d2 => {
+                let (pa, ta) = (p.tys.args(a).to_vec(), src.args(a2).to_vec());
+                pa.len() == ta.len() && pa.iter().zip(&ta).all(|(&g, &h)| match_arg_pat(p, src, g, h, binds))
+            }
+            _ => false,
+        },
+        TyKind::Ref(_, _, e) => match src.kind(t) {
+            TyKind::Ref(_, _, e2) => match_self_pat(p, src, e, e2, binds),
+            _ => false,
+        },
+        TyKind::Tuple(ts) => match src.kind(t) {
+            TyKind::Tuple(ts2) => {
+                let (pa, ta) = (p.tys.tys_of(ts).to_vec(), src.tys_of(ts2).to_vec());
+                pa.len() == ta.len() && pa.iter().zip(&ta).all(|(&x, &y)| match_self_pat(p, src, x, y, binds))
+            }
+            _ => false,
+        },
+        TyKind::Slice(e) => match src.kind(t) {
+            TyKind::Slice(e2) => match_self_pat(p, src, e, e2, binds),
+            _ => false,
+        },
+        TyKind::Array(e, _) => match src.kind(t) {
+            TyKind::Array(e2, _) => match_self_pat(p, src, e, e2, binds),
+            _ => false,
+        },
+        // A leaf kind (a scalar, `str`, a raw pointer head): the ids
+        // of plain kinds agree across stores.
+        k => k == src.kind(t),
+    }
+}
+
+/// One generic argument of a Self pattern against its concrete form.
+fn match_arg_pat(p: &Program, src: &dyn crate::ty::TyIntern, pat: GenericArg, t: GenericArg, binds: &mut Vec<Option<GenericArg>>) -> bool {
+    match (pat, t) {
+        (GenericArg::Ty(x), GenericArg::Ty(y)) => match_self_pat(p, src, x, y, binds),
+        (GenericArg::Lifetime(_), GenericArg::Lifetime(_)) => true,
+        (GenericArg::Const(c), GenericArg::Const(c2)) => match p.tys.const_kind(c) {
+            ConstKind::Param(i) => {
+                let i = i as usize;
+                if binds.len() <= i {
+                    binds.resize(i + 1, None);
+                }
+                match binds[i] {
+                    None => {
+                        binds[i] = Some(GenericArg::Const(c2));
+                        true
+                    }
+                    Some(GenericArg::Const(u)) => u == c2,
+                    _ => false,
+                }
+            }
+            _ => c == c2,
+        },
+        _ => false,
+    }
+}
+
+/// `by_next_fns` for a user type `t` (read in `src`, the caller's
+/// store), or why lust cannot iterate it through `next` yet. A
+/// concrete Adt with made instances (`gx.iter_methods`) answers
+/// with them; any other type (a template check, or a non-generic
+/// impl) answers with the impl's own fns, found by matching the
+/// impl's Self pattern against `t`.
+pub fn by_next_fns(p: &Program, src: &dyn crate::ty::TyIntern, t: Ty) -> Result<ByNextFns, &'static str> {
+    let lang = p.gx.lang;
+    if let Some(a) = src.local_adt(t)
+        && let Some(&(next, size_hint, next_back, item)) = p.gx.iter_methods.get(&a)
+    {
+        return Ok(ByNextFns { next, size_hint, next_back, item });
+    }
+    let mut found = None;
+    for &id in p.gx.index.impls_of_trait(lang.iterator) {
+        let r = p.gx.index.get(id);
+        if r.synthetic != crate::traits::index::Synthetic::None {
+            continue;
+        }
+        let mut binds = Vec::new();
+        if match_self_pat(p, src, r.self_ty(&p.tys), t, &mut binds) {
+            found = Some((r, binds));
+            break;
+        }
+    }
+    let (rec, binds) = found.ok_or("it has no written `Iterator` impl lust can call")?;
+    let (next, size_hint) = iter_impl_shape(p, rec)?;
+    // The impl's Item pattern at `t`: a plain type as itself, a bare
+    // parameter through its binding; anything richer is left to the
+    // projection the check already normalized.
+    let item = rec.assoc_ty(lang.assoc_item).and_then(|it| match p.tys.kind(it) {
+        TyKind::Param(i) => binds.get(i.0 as usize).copied().flatten().and_then(|g| g.as_ty()),
+        _ if !p.tys.flags(it).contains_param() => Some(it),
+        _ => None,
+    });
+    // A `DoubleEndedIterator` impl for the same Self gives `next_back`.
     let next_back = p
         .gx
         .index
         .impls_of_trait(lang.double_ended_iterator)
         .iter()
         .map(|&id| p.gx.index.get(id))
-        .find(|r| r.local && r.self_ty(&p.tys) == t && r.generics.params.is_empty())
+        .find(|r| {
+            r.synthetic == crate::traits::index::Synthetic::None && match_self_pat(p, src, r.self_ty(&p.tys), t, &mut Vec::new())
+        })
         .and_then(|r| r.items.iter().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "next_back")));
-    Ok(ByNextFns { next: next.ok_or("its `Iterator` impl has no `next`")?, size_hint, next_back, item })
+    Ok(ByNextFns { next, size_hint, next_back, item })
 }
