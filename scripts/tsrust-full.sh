@@ -72,7 +72,7 @@ if [ $boat = 1 ]; then
   (cd "$sub" && git ls-files -co --exclude-standard -z) > "$W/files" || exit 2
   tar -czf "$W/ts-rust.tgz" -C "$sub" --null -T "$W/files" -C "$W" .fork-head || exit 2
   q=""; for x in "${args[@]}"; do q+=" $(printf %q "$x")"; done
-  name=tsrust-full${deep:+-deep}
+  name=${TSRUST_BOAT_NAME:-tsrust-full${deep:+-deep}}
   "${BOAT_RUN:-/tmp/lust-wt/boat-run.sh}" --hours "${TSRUST_BOAT_HOURS:-3}" --up "$W/ts-rust.tgz" --fetch "$name" -- \
     "scripts/build.sh >/dev/null 2>&1 || { scripts/build.sh 2>&1 | tail -30; exit 8; }; scripts/tsrust-full.sh $deep --out ~/w/$name$q"
   rc=$?; rm -rf "$W"; exit $rc
