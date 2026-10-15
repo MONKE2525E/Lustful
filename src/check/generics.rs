@@ -6791,11 +6791,14 @@ fn validate_method_sig(
                 })
                 .collect();
             let goal = TraitRef { def: b.value.def, args: p.tys.intern_args(&goal_args), bindings: b.value.bindings };
-            if !prove_goal(p, &env, goal) {
+            // A bound that holds outright (`where u8: Copy`) needs
+            // no implication from the trait.
+            if !prove_goal(p, &env, goal) && !prove_goal(p, &[], goal) {
+                let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
                 errs.push(Diag::new(
                     "L0110",
                     f_name_span,
-                    "impl has stricter requirements than the trait method",
+                    format!("impl has stricter requirements than the trait method: the `{gname}` bound here is not implied by the trait"),
                     "Remove the extra bound, or add it to the trait definition.",
                 ));
                 break;

@@ -3386,6 +3386,10 @@ impl<'p> Ctx<'p> {
             self.err("L0110", span, "parenthesized arguments are only for Fn traits", "Use angle arguments.");
             return self.error_args(&generics);
         };
+        // An empty turbofish (`W::<>(..)`) infers every argument.
+        if written.is_empty() {
+            return self.fresh_args(&generics);
+        }
         let mut args: Vec<GenericArg> = Vec::new();
         for (i, w) in written.iter().filter(|w| !matches!(w, ast::GenericArg::Lifetime(_))).enumerate() {
             let is_const = matches!(generics.params.get(i).map(|g| g.kind), Some(ParamKind::Const(_)));
@@ -6639,7 +6643,11 @@ impl<'p> Ctx<'p> {
     /// None when the segment writes no angle list.
     fn seg_supplied(seg: &ast::PathSeg) -> Option<usize> {
         match &seg.args {
-            ast::GenericArgs::Angle(a) => Some(a.iter().filter(|x| !matches!(x, ast::GenericArg::Lifetime(_))).count()),
+            // An empty turbofish (`g::<>(..)`) supplies nothing and
+            // is allowed: every argument is inferred.
+            ast::GenericArgs::Angle(a) if !a.is_empty() => {
+                Some(a.iter().filter(|x| !matches!(x, ast::GenericArg::Lifetime(_))).count())
+            }
             _ => None,
         }
     }
