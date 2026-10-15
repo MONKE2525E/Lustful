@@ -2290,14 +2290,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // file order. Such a file takes the full parse. (The signatures
     // splice below does replace a re-parsed chunk's body items; this
     // guard stays as the driver's rule until reuse there is proven.)
-    // A chunk without parsed items (`Chunk::items`) is new text, or a kept
-    // chunk an earlier request left stale after a parse error: either way
-    // the live Ast has no nodes for it (stale ones were blanked), so it
-    // must be parsed before use. Bodies mode parses no chunk, so it needs
-    // none of them.
+    // Bodies mode parses no chunk, so it needs an Ast with live nodes for
+    // every item (`Front::chunks_blanked`).
     let splice = front.ast.stmt_items.is_empty();
-    let stale = front.chunks.iter().zip(&fresh_chunks).any(|(ch, &fresh)| ch.items.is_none() && !fresh);
-    let bodies_only = splice && !stale && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
+    let bodies_only = splice && !front.chunks_blanked && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
     // The edit window in old coordinates: old bytes `edit.0..edit.1`
     // changed; everything before and after is the same text.
     let edit = (prefix, old_len - suffix);
@@ -2376,12 +2372,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
             }
             shift_ast_spans(front, edit.0, edit.1, delta);
+            t.lap("blank+shift");
             if let Some(d) = failed {
                 // The changed bodies are blank and not replaced: their
-                // chunks go stale, so the next request parses them again.
+                // chunks lose their items, so the next request parses them
+                // again (in signatures or full mode).
                 for &i in &changed {
                     front.chunks[fn_at[i].0].items = None;
                 }
+                front.chunks_blanked = true;
                 return errors(&mut [d], &map, &src, req);
             }
             for (&i, (body_ast, body, exprs, pats)) in changed.iter().zip(parsed) {
@@ -2433,7 +2432,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // The replaced items' nodes go (see the bodies mode blank) while
         // their spans are in old coordinates, then every span moves. On a
         // parse error too: the fresh chunks then stay without items, so
-        // the next request parses them again.
+        // the next request parses them again (`Front::chunks_blanked`).
         // Fresh chunks replace old bytes `replaced_old`; a stale kept
         // chunk replaces its own old bytes (it moved by `delta` if it sits
         // after the edit).
@@ -2452,6 +2451,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         if let Some(Err(d)) = parsed.iter().find(|p| p.is_err()) {
             let d = d.clone();
+            front.chunks_blanked = old_len > 0;
             return errors(&mut [d], &map, &src, req);
         }
         let mut new_asts: FxMap<usize, Ast> = todo.iter().copied().zip(parsed.into_iter().map(|p| p.unwrap())).collect();
@@ -2585,6 +2585,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // The chunk path's rule, for the visits line (fuzz coverage).
     visits.why = mode;
+    // Every item has live nodes again (bodies mode never runs while some lack them).
+    front.chunks_blanked = false;
     let fn_lines_all: Vec<u32> = (0..fn_count).map(|i| scan_of(front, i).1).collect();
     let body_hashes_all: Vec<u64> = (0..fn_count).map(|i| scan_of(front, i).0).collect();
     (map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, None)
@@ -4387,7 +4389,10 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
     /// its expression range over other fns' closures); a body that drops
     /// a closure and a bad path (their dead nodes must not stay visible);
     /// one write that edits two bodies; a body syntax error, then a
-    /// signature edit elsewhere while it stands, then its fix.
+    /// signature edit elsewhere while it stands, then its fix; a body
+    /// syntax error, the same text again, then the text before it (fuzz
+    /// realish seed 314: the error requests blanked a chunk's items, and
+    /// bodies mode must not run on that Ast).
     #[test]
     fn chunk_modes_match_a_cold_parse() {
         let dir = std::env::temp_dir().join(format!("lust-chunk-modes-test-{}", std::process::id()));
@@ -4416,6 +4421,9 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
         let v7 = v6.replace("        t += x + 0;\n", "        t += ;\n");
         let v8 = v7.replace("fn fill1500(n: i64) -> i64 {\n    n + 1500\n", "fn fill1500(n: i64, _k: u8) -> i64 {\n    n + 1500\n");
         let v9 = v8.replace("        t += ;\n", "        t += x;\n");
+        // A signature edit first, so every chunk holds parsed items again.
+        let v10 = v9.replace("fn fill1500(n: i64, _k: u8) -> i64 {", "fn fill1500(n: i64) -> i64 {");
+        let v11 = v10.replace("        t += x;\n", "        t += x;\n        for\n");
         let steps = [
             ("primer", &v0, Some("full")),
             ("lines removed", &v1, Some("bodies")),
@@ -4427,6 +4435,10 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
             ("syntax error", &v7, None),
             ("signature edit under it", &v8, None),
             ("fixed", &v9, None),
+            ("signature back", &v10, Some("signatures")),
+            ("body error again", &v11, None),
+            ("same text", &v11, None),
+            ("restored", &v10, Some("signatures")),
         ];
         let mut warm = Session::new(dir.join("warm"), true, key.clone());
         let mut codes = Vec::new();
@@ -4444,7 +4456,7 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
                 assert!(chunk_shape(&warm) == chunk_shape(&cold_session), "step {name}: warm Ast shape vs cold");
             }
         }
-        assert_eq!(codes, [0, 0, 0, 0, 1, 0, 0, 1, 1, 0], "each step's expected answer");
+        assert_eq!(codes, [0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0], "each step's expected answer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -122,6 +122,11 @@ pub(crate) struct Front {
     pub(crate) map: SourceMap,
     /// The chunk-boundary mask (see `split_items`). Fixed for the session, so boundaries are too.
     pub(crate) split_mask: Option<u64>,
+    /// The chunk path blanked the nodes of some items it could not parse
+    /// again (a parse error mid-request), so the Ast lacks live nodes for
+    /// them. Bodies mode, which parses no chunk, stays off until a
+    /// signatures or full parse succeeds.
+    pub(crate) chunks_blanked: bool,
     /// True while this session's front state was built by the resolver
     /// (W-RESOLVE): a merged multi-file AST the chunk path must never
     /// try to reuse. Routing itself follows the current text (see
@@ -358,6 +363,7 @@ impl Session {
                 src: String::new(),
                 map: SourceMap::default(),
                 split_mask: None,
+                chunks_blanked: false,
                 resolved_crate: false,
                 resolved_crate_ids: None,
                 display_root: None,
