@@ -318,12 +318,25 @@ pub(super) fn replay_method(
             Probe::Failed => return Some(ERROR),
             Probe::Miss => {}
         }
+        // A `Clone` pick with no impl fn (a reference, a builtin type):
+        // the builtin clone of exactly the step the template picked, so
+        // `t.clone()` on `t: &T` with an unbounded `T` copies the reference.
+        let lang = cx.p.gx.lang;
+        if pick.trait_def == lang.clone
+            && cx.name(name) == "clone"
+            && pick.form == ReceiverForm::Ref
+            && !pick.slice
+            && args.is_empty()
+            && super::has_clone(cx.p, &cx.tys, step)
+        {
+            cx.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs: pick.derefs, autoref: Autoref::Ref });
+            return Some(step);
+        }
         // `impl AsRef<U> for &T where T: AsRef<U>` (and `&mut T`; AsMut
         // through `&mut T`) has no body in lust: it forwards to T's impl,
         // so a pick that landed on a reference to a type with a user
         // impl calls that impl one deref further (W-SHIM: `P:
         // AsRef<Path>` at `&PathBuf` or `&str`).
-        let lang = cx.p.gx.lang;
         let (mut step, mut derefs) = (step, pick.derefs);
         while pick.trait_def == lang.as_ref || pick.trait_def == lang.as_mut {
             let TyKind::Ref(_, m, inner) = cx.tys.kind(step) else { break };

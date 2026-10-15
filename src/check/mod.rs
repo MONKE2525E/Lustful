@@ -13216,6 +13216,9 @@ impl<'p> Ctx<'p> {
                 }
                 self.check_packed_borrow(recv, name_span);
                 self.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs: derefs - 1, autoref: Autoref::Ref });
+                // An instance must clone the same reference even where its
+                // pointee type is Clone (`t.clone()` on `t: &T`, T unbounded).
+                self.record_pick(e, p.gx.lang.clone, derefs - 1, ReceiverForm::Ref);
                 self.check_args(&[], args, name_span);
                 return cur;
             }
