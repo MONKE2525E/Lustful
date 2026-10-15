@@ -20,6 +20,7 @@
 use crate::check::collect::Program;
 use crate::check::generics::STATIC_FACT;
 use crate::def::DefId;
+use crate::intern::FxMap;
 use crate::diag::{Diag, Span};
 use crate::ty::*;
 
@@ -191,16 +192,23 @@ fn diag_in(p: &Program, tys: &impl TyIntern, g: GenericArg, r: Region, span: Spa
     Diag::new("L0617", span, format!("{what} may not live long enough: a type here needs it to outlive {life}"), fix)
 }
 
-/// Records the requirements of an implied type as facts.
+/// Records the requirements of an implied type as facts. Only named
+/// regions make facts: an elided or bound one is no region a bound names
+/// (and `region_holds` takes any unnamed region as holding).
 fn assume(tys: &impl TyIntern, env: &mut Env, g: GenericArg, r: Region) {
+    if !named(r) {
+        return;
+    }
     match g {
-        GenericArg::Lifetime(x) => env.re.push((x, r)),
+        GenericArg::Lifetime(x) if named(x) => env.re.push((x, r)),
+        GenericArg::Lifetime(_) => {}
         GenericArg::Ty(t) => {
             let mut cs = Vec::new();
             components(tys, t, &mut cs);
             for c in cs {
                 match c {
-                    Comp::Re(x) => env.re.push((x, r)),
+                    Comp::Re(x) if named(x) => env.re.push((x, r)),
+                    Comp::Re(_) => {}
                     Comp::Param(x) | Comp::Proj(x) => env.ty.push((x, r)),
                 }
             }
@@ -282,7 +290,21 @@ fn region_holds(env: &Env, x: Region, r: Region) -> bool {
 /// then its type args; a dyn type's object lifetime. The walks then read
 /// a fn pointer's regions from its inputs and output alone.
 fn expand_free(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    if !has_free_ptr(tys, t) {
+        return t;
+    }
     expand_in(tys, t, &mut |_: Region| None)
+}
+
+/// Whether `t` holds a fn pointer type with a free region.
+fn has_free_ptr(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::FnPtr(sig) => tys.sig(sig).value.free_slots != 0,
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => has_free_ptr(tys, e),
+        TyKind::Adt(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_free_ptr(tys, e))),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_free_ptr(tys, e)),
+        _ => false,
+    }
 }
 
 /// `expand_free`, where `slot` gives the region of the next slot of an
@@ -527,29 +549,29 @@ fn adt_reqs(cx: &Cx, tys: &mut impl TyIntern, d: DefId, argv: &[GenericArg], out
 /// Fills `RegionTables::adt_outlives`: per user Adt, the requirements
 /// over its own params that its fields put (rustc's inferred outlives),
 /// its declared `'a: 'b` facts, and its `T: 'static` bounds. Nested Adts
-/// pass theirs up; the table iterates to a fixpoint.
+/// pass theirs up; the table iterates to a fixpoint. An Adt whose fields
+/// hold no region (`may_need`) and that has no bound has no table.
 fn infer_adts(p: &mut Program) {
     p.regions.adt_outlives.clear();
-    let mut defs: Vec<DefId> = p.regions.adt_fields.keys().copied().collect();
+    let mut statics: FxMap<DefId, Vec<Ty>> = FxMap::default();
+    let mut defs: Vec<DefId> = Vec::new();
+    for &d in p.regions.adt_fields.keys() {
+        let s = p.adt_by_def(d).map(|a| statics_of(&p.gx.adt_generics[a.0 as usize].predicates)).unwrap_or_default();
+        if !s.is_empty() {
+            statics.insert(d, s);
+        }
+        defs.push(d);
+    }
     defs.sort_by_key(|d| (d.krate.0, d.hash.0));
-    let statics: Vec<(DefId, Vec<Ty>)> = defs
-        .iter()
-        .filter_map(|&d| {
-            let a = p.adt_by_def(d)?;
-            let s: Vec<Ty> = p.gx.adt_generics[a.0 as usize]
-                .predicates
-                .iter()
-                .filter_map(|q| if let Predicate::TypeOutlives(x, Region::Static) = q { Some(*x) } else { None })
-                .collect();
-            Some((d, s))
-        })
-        .collect();
     for _ in 0..16 {
         let mut changed = false;
         for &d in &defs {
-            let fields: Vec<Ty> = p.regions.adt_fields[&d].iter().flatten().copied().collect();
-            let facts = p.regions.adt_facts.get(&d).cloned().unwrap_or_default();
             let cx = Cx { regions: &p.regions, index: &p.gx.index };
+            let fields: Vec<Ty> = cx.regions.adt_fields[&d].iter().flatten().copied().collect();
+            let facts = cx.regions.adt_facts.get(&d).cloned().unwrap_or_default();
+            if facts.is_empty() && !statics.contains_key(&d) && !fields.iter().any(|&t| may_need(&cx, &p.tys, t)) {
+                continue;
+            }
             let env = implied_env(&cx, &mut p.tys, &fields, &facts, &[]);
             let mut table: Vec<Req> = Vec::new();
             for &(x, r) in &env.re {
@@ -562,11 +584,9 @@ fn infer_adts(p: &mut Program) {
                     table.push((GenericArg::Ty(x), r));
                 }
             }
-            for (_, s) in statics.iter().filter(|(e, _)| *e == d) {
-                for &x in s {
-                    if !table.contains(&(GenericArg::Ty(x), Region::Static)) {
-                        table.push((GenericArg::Ty(x), Region::Static));
-                    }
+            for &x in statics.get(&d).map_or(&[][..], |v| v.as_slice()) {
+                if !table.contains(&(GenericArg::Ty(x), Region::Static)) {
+                    table.push((GenericArg::Ty(x), Region::Static));
                 }
             }
             if table.is_empty() {
@@ -580,5 +600,25 @@ fn infer_adts(p: &mut Program) {
         if !changed {
             break;
         }
+    }
+}
+
+/// Whether a field type may put an outlives requirement: it holds a
+/// reference, a lifetime arg, a dyn or fn pointer type, a projection, or
+/// an Adt with a table.
+fn may_need(cx: &Cx, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(..) | TyKind::Dyn(..) | TyKind::FnPtr(_) | TyKind::Projection(..) => true,
+        TyKind::Adt(d, a) => {
+            cx.regions.adt_outlives.contains_key(&d)
+                || tys.args(a).iter().any(|g| match g {
+                    GenericArg::Lifetime(_) => true,
+                    GenericArg::Ty(e) => may_need(cx, tys, *e),
+                    GenericArg::Const(_) => false,
+                })
+        }
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_need(cx, tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => may_need(cx, tys, e),
+        _ => false,
     }
 }

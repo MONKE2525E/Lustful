@@ -3781,24 +3781,23 @@ pub fn collect_reuse(
         if let Some((od, info)) = opaque {
             p.gx.opaques.insert(od, info);
         }
-        if let Some(rs) = &region_sig {
-            let required = {
-                let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
-                let skip = usize::from(def.self_param.is_some());
-                let extra = generics::apit_bounds(ast, def, &params[skip.min(params.len())..], &scope);
-                generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, &def.generics, &def.where_clause, &extra)
-            };
-            let mut implied: Vec<Ty> = rs.params.iter().copied().chain([rs.ret]).collect();
-            implied.extend(rs.header.iter().copied());
-            let item = crate::check::outlives::Item {
-                implied,
-                required,
-                facts: scope.region_facts.clone(),
-                statics: crate::check::outlives::statics_of(&generics.predicates),
-                span: def.name_span,
-            };
-            if crate::check::outlives::wanted(p, &item) {
-                p.regions.outlives_items.push(item);
+        {
+            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+            let skip = usize::from(def.self_param.is_some());
+            let extra = generics::apit_bounds(ast, def, &params[skip.min(params.len())..], &scope);
+            let required = generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, &def.generics, &def.where_clause, &extra);
+            if !required.is_empty() {
+                let implied = generics::implied_sig_tys(ast, interner, known, &cx, &mut p.tys, &scope, def, &params);
+                let item = crate::check::outlives::Item {
+                    implied,
+                    required,
+                    facts: scope.region_facts.clone(),
+                    statics: crate::check::outlives::statics_of(&generics.predicates),
+                    span: def.name_span,
+                };
+                if crate::check::outlives::wanted(p, &item) {
+                    p.regions.outlives_items.push(item);
+                }
             }
         }
         if def.self_param.is_some() && self_ty.is_none() {

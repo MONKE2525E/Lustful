@@ -5190,6 +5190,10 @@ pub fn regioned_bound_tys(
     where_clause: &ast::WhereClause,
     extra: &[(Ty, &[TraitBound])],
 ) -> Vec<Ty> {
+    let bounded = generics.params.iter().any(|gp| matches!(gp, ast::GenericParam::Type { bounds, .. } if !bounds.is_empty()));
+    if !bounded && where_clause.preds.is_empty() && extra.is_empty() {
+        return Vec::new();
+    }
     let mut ks = scope.clone();
     ks.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
     let mut lhs_bounds: Vec<(Ty, &[TraitBound])> = extra.to_vec();
@@ -5219,6 +5223,47 @@ pub fn regioned_bound_tys(
         if let Predicate::Trait(b) = pred {
             crate::check::outlives::trait_ref_wf_tys(tys, b.value, &mut out);
         }
+    }
+    out
+}
+
+/// The types a fn may assume well-formed (`check::outlives`): its params
+/// and return resolved with regions kept and elided ones erased (a bound
+/// can name only the named ones), and its impl's header types. `params`
+/// are the erased param types (self first): an `impl Trait` arg keeps its
+/// synthetic param. A type that does not resolve is left out.
+#[allow(clippy::too_many_arguments)]
+pub fn implied_sig_tys(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    def: &ast::FnDef,
+    params: &[Ty],
+) -> Vec<Ty> {
+    let mut ks = scope.clone();
+    ks.regions = RegionMode::Keep { next: None, elided: Some(Region::Erased) };
+    let mut out: Vec<Ty> = scope.header_regioned.clone();
+    let skip = usize::from(def.self_param.is_some());
+    if let (Some(sp), Some(st)) = (&def.self_param, scope.self_ty_regioned.or(scope.self_ty)) {
+        match (sp.kind, sp.ty) {
+            (ast::SelfKind::Typed, Some(t)) => out.extend(resolve_scoped(ast, interner, known, cx, tys, t, &ks).ok()),
+            _ => out.push(st),
+        }
+    }
+    for (prm, &t) in def.params.iter().zip(params.get(skip..).unwrap_or_default()) {
+        if matches!(ast.ty(prm.ty), TyExpr::ImplTrait { .. }) {
+            out.push(t);
+        } else {
+            out.extend(resolve_scoped(ast, interner, known, cx, tys, prm.ty, &ks).ok());
+        }
+    }
+    if let Some(r) = def.ret
+        && !matches!(ast.ty(r), TyExpr::ImplTrait { .. })
+    {
+        out.extend(resolve_scoped(ast, interner, known, cx, tys, r, &ks).ok());
     }
     out
 }
@@ -5636,15 +5681,19 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(&p.ast, &p.interner, &p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)
             };
-            if let Some(rs) = &region_sig {
-                let required = {
-                    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                    let skip = usize::from(fdef.self_param.is_some());
-                    let extra = apit_bounds(&p.ast, fdef, &params[skip.min(params.len())..], &mscope);
-                    regioned_bound_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &mscope, &fdef.generics, &fdef.where_clause, &extra)
+            {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                let skip = usize::from(fdef.self_param.is_some());
+                let extra = apit_bounds(&p.ast, fdef, &params[skip.min(params.len())..], &mscope);
+                let required =
+                    regioned_bound_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &mscope, &fdef.generics, &fdef.where_clause, &extra);
+                let implied = if required.is_empty() {
+                    Vec::new()
+                } else {
+                    implied_sig_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &mscope, fdef, &params)
                 };
                 let item = crate::check::outlives::Item {
-                    implied: rs.params.iter().copied().chain([rs.ret]).collect(),
+                    implied,
                     required,
                     facts: mscope.region_facts.clone(),
                     statics: crate::check::outlives::statics_of(&combined.predicates),
