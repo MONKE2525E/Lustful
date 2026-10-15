@@ -65,8 +65,9 @@ impl<'p> Ctx<'p> {
         let mk = |this: &mut Self, which: fn(&BuiltinDefs) -> DefId| this.tys.mk_builtin1(which, elem);
         match b {
             Builtin::RcDowngrade => {
-                // A `Weak` is a thin pointer: no `Weak<dyn Tr>` yet.
-                self.deferred_sized.push((elem, self.p.ast.expr_span(callee)));
+                // `Weak<dyn Tr>` is the Rc's fat value; a Weak of `str`,
+                // `[T]`, or a dyn cell is not built yet.
+                self.deferred_downgrade.push((elem, self.p.ast.expr_span(callee)));
                 let rc = self.tys.mk_rc(elem);
                 let r = self.tys.mk_ref(false, rc);
                 (vec![r], mk(self, |d| d.weak))
@@ -83,7 +84,11 @@ impl<'p> Ctx<'p> {
                 let r = self.tys.mk_ref(false, rc);
                 (vec![r], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, elem)))
             }
-            Builtin::WeakNew => (vec![], mk(self, |d| d.weak)),
+            // std's `impl<T> Weak<T>`: `new` needs a sized `T`.
+            Builtin::WeakNew => {
+                self.deferred_sized.push((elem, self.p.ast.expr_span(callee)));
+                (vec![], mk(self, |d| d.weak))
+            }
             Builtin::WeakPtrEq => {
                 let w = mk(self, |d| d.weak);
                 let r = self.tys.mk_ref(false, w);

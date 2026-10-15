@@ -3267,9 +3267,10 @@ pub(crate) fn resolve_path_ty(
         };
         let mut elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
         crate::check::sync::check_sync_arg(tys, k, elem, span)?;
-        // `Arc<dyn Tr>` (and `Mutex<dyn Tr>`) with no written bound is
-        // `'static` in a signature, as for `Box` and `Rc` above.
-        if matches!(k, crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::Mutex)
+        // `Arc<dyn Tr>` (and `Mutex<dyn Tr>`, `sync::Weak<dyn Tr>`) with
+        // no written bound is `'static` in a signature, as for `Box` and
+        // `Rc` above.
+        if matches!(k, crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::ArcWeak)
             && scope.infer_cell.is_none()
             && matches!(scope.regions, RegionMode::Erase)
             && let TyKind::Dyn(b, Region::Erased) = tys.kind(elem)
@@ -3326,9 +3327,10 @@ pub(crate) fn resolve_path_ty(
             _ => return Err(Diag::new("L0110", span, format!("`{n}` takes one type argument"), "Write it with its element type.")),
         };
         let mut elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
-        // `RefCell<dyn Tr>` behind a pointer is check/own.rs's; its
-        // object lifetime defaults as for `Box<dyn Tr>`.
-        let dyn_cell = n == "RefCell" && matches!(tys.kind(elem), TyKind::Dyn(..));
+        // `RefCell<dyn Tr>` behind a pointer is check/own.rs's, and
+        // `Weak<dyn Tr>` is cgen/own.rs's; their object lifetime
+        // defaults as for `Box<dyn Tr>`.
+        let dyn_cell = matches!(n, "RefCell" | "Weak") && matches!(tys.kind(elem), TyKind::Dyn(..));
         if dyn_cell
             && scope.infer_cell.is_none()
             && matches!(scope.regions, RegionMode::Erase)

@@ -1259,7 +1259,9 @@ impl<'p> Lower<'p> {
         use crate::check::object;
         // An owning unsizing (`Box<T>` to `Box<dyn Tr>`, `Rc<T>` to
         // `Rc<dyn Tr>`): the box or Rc moves into the fat pointer.
-        if let (Some(mut src), Some(mut dyn_ty)) = (self.body.tys.smart_elem(found), self.body.tys.smart_elem(target)) {
+        // `Weak<T>` to `Weak<dyn Tr>` the same way (cgen keeps a dangling Weak dangling).
+        let elem = |tys: &crate::ty::Tys<'_>, t: Ty| tys.smart_elem(t).or_else(|| tys.weak_elem(t)).or_else(|| tys.arc_weak_elem(t));
+        if let (Some(mut src), Some(mut dyn_ty)) = (elem(&self.body.tys, found), elem(&self.body.tys, target)) {
             // `Rc<RefCell<S>>` to `Rc<RefCell<dyn Tr>>`: the vtable is
             // the value's; the data still points at the cell.
             if let (Some(s), Some(d)) = (self.body.tys.refcell_elem(src), self.body.tys.refcell_elem(dyn_ty)) {

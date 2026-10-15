@@ -2392,8 +2392,11 @@ impl<'b, 'p> Builder<'b, 'p> {
                     TyKind::Adt(..) if tys.guard_elem(ty).is_some() => {
                         // A `RefCell` guard derefs like the reference it
                         // stands for: its own region leads, then the value's.
-                        let (inner, is_mut) = tys.guard_elem(ty).unwrap();
-                        derefs.push((out[0], is_mut));
+                        // The deref is `Deref::deref(&self)`, a borrow of the
+                        // guard, so a reborrow chain goes on past it (as past
+                        // a `&mut`) to the reference that reached the guard.
+                        let (inner, _) = tys.guard_elem(ty).unwrap();
+                        derefs.push((out[0], true));
                         out.remove(0);
                         let n = self.sc.slots(inner) as usize;
                         out.truncate(n);

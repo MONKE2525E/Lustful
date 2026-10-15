@@ -30,7 +30,7 @@ pub fn parts(tys: &impl TyIntern, t: Ty, need: &mut impl FnMut(Ty)) {
         }
         TyKind::Array(e, _) | TyKind::Slice(e) => need(e),
         TyKind::Adt(_, a) => match tys.builtin_of(t) {
-            None | Some(BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc)) => {}
+            None | Some(BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Weak | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => {}
             // `RefCell<T: ?Sized>` and `Mutex<T: ?Sized>`: with a dyn
             // value they are unsized themselves; `MutexGuard<T: ?Sized>`
             // is a pointer.

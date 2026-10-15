@@ -29,13 +29,76 @@ pub(super) fn own_cty(tys: &impl TyIntern, t: Ty) -> Option<CTy> {
     Some(CTy::Own(k, Box::new(x)))
 }
 
+/// The `CTy::WeakDyn` form of `t`, if `t` is a `rc::Weak<dyn Tr>` or a
+/// `sync::Weak<dyn Tr>`.
+pub(super) fn weak_dyn_cty(tys: &impl TyIntern, t: Ty) -> Option<CTy> {
+    let arc = match tys.builtin_of(t)? {
+        BuiltinTy::Weak => false,
+        BuiltinTy::Sync(crate::ty::sync::SyncTy::ArcWeak) => true,
+        _ => return None,
+    };
+    matches!(tys.kind(tys.adt_first_ty_arg(t)?), TyKind::Dyn(..)).then_some(CTy::WeakDyn(arc))
+}
+
+/// The glue `g` of a `Weak<dyn Tr>` (`arc`: `sync::Weak`): Drop gives
+/// up its weak ref and frees the allocation after the last one; Clone
+/// takes one more; Debug prints `(Weak)`. A dangling Weak (data
+/// `UINTPTR_MAX`, from `Weak::new()`) owns nothing.
+pub(super) fn weak_dyn_glue_def(g: Glue, arc: bool, protos: &mut String, defs: &mut String) {
+    let t = CTy::WeakDyn(arc);
+    let (m, ct) = (mangle(&t), ctype(&t));
+    let live = "p->data != (void *)~(uintptr_t)0";
+    let h = counts(&CTy::Dyn, "(*p)");
+    let k = if arc { Owner::Arc } else { Owner::Rc };
+    let (proto, body) = match g {
+        Glue::Drop => (
+            format!("void drop_{m}({ct} *p)"),
+            format!(
+                "  if ({live}) {{ uint64_t *h = {h}; if ({}) lust_dealloc((void *)h, {} + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }}\n",
+                dec(k, "&h[1]"),
+                counts_off(&CTy::Dyn, "(*p)")
+            ),
+        ),
+        Glue::Clone => {
+            let inc = if arc { format!("lust_arc_inc(&{h}[1])") } else { format!("{h}[1]++") };
+            (format!("{ct} clone_{m}({ct} *p)"), format!("  if ({live}) {inc}; return *p;\n"))
+        }
+        Glue::Debug => (format!("int dbg_{m}(lust_Formatter *f, {ct} *p)"), "  (void)p; return lust_f_write_str(f, (lust_str){(uint8_t *)\"(Weak)\", 6});\n".to_string()),
+        _ => unreachable!("Weak<dyn Tr> has only Drop, Clone, and Debug glue"),
+    };
+    let _ = writeln!(protos, "{proto};");
+    let _ = writeln!(defs, "{proto} {{\n{body}}}\n");
+}
+
 /// The data pointer of the fat value `v` of pointee place `x`, as a
-/// `uint64_t *` (the counts of an Rc or Arc sit at `[-2]` and `[-1]`).
+/// `uint64_t *` (an Rc's or Arc's counts are at `counts`).
 pub(super) fn data_words(x: &CTy, v: &str) -> String {
     match x {
         CTy::Dyn | CTy::DynCell | CTy::DynLock(_) => format!("((uint64_t *)({v}).data)"),
         _ => format!("((uint64_t *)({v}).ptr)"),
     }
+}
+
+/// The byte offset of the value in the counted allocation of an Rc or
+/// Arc whose fat value `v` has pointee form `x`: the counts take 16
+/// bytes, and the value starts at the first offset its alignment
+/// allows (`RcI_T`'s layout, so `Rc<T>` to `Rc<dyn Tr>` keeps the
+/// value's address).
+pub(super) fn counts_off(x: &CTy, v: &str) -> String {
+    let at_least_16 = |a: String| format!("({a} > 16 ? {a} : 16)");
+    match x {
+        CTy::Dyn => at_least_16(format!("(uint64_t)(uintptr_t)({v}).vt[2]")),
+        CTy::DynCell => at_least_16(cell_off(&format!("({v}).vt"))),
+        CTy::DynLock(_) => at_least_16(lock_align(&format!("({v}).vt"))),
+        _ => "16".to_string(),
+    }
+}
+
+/// The counts of the Rc or Arc whose fat value is `v` (pointee form
+/// `x`), as a `uint64_t *`: `[0]` strong, `[1]` weak (with the strong
+/// refs' implicit weak ref).
+pub(super) fn counts(x: &CTy, v: &str) -> String {
+    format!("((uint64_t *)((char *){} - {}))", data_words(x, v), counts_off(x, v))
 }
 
 /// The byte size of the value behind the fat value `v` of pointee `x`.
@@ -115,11 +178,12 @@ pub(super) fn own_glue_def(
                     _ => "16".to_string(),
                 };
                 format!(
-                    "  uint64_t *h = {} - 2;\n  if ({}) {{ {}if ({}) lust_dealloc((void *)h, 16 + {}, {align}); }}\n",
-                    data_words(x, "(*p)"),
+                    "  uint64_t *h = {};\n  if ({}) {{ {}if ({}) lust_dealloc((void *)h, {} + {}, {align}); }}\n",
+                    counts(x, "(*p)"),
                     dec(k, "&h[0]"),
                     drop_value(p, x, "(*p)", need),
                     dec(k, "&h[1]"),
+                    counts_off(x, "(*p)"),
                     value_size(x, "(*p)"),
                 )
             };
@@ -131,8 +195,8 @@ pub(super) fn own_glue_def(
                     "  {ct} r = *p; r.ptr = ({})lust_alloc(p->len, 1); lust_memcpy((void *)r.ptr, (void *)p->ptr, p->len); return r;\n",
                     if *x == CTy::Str { "uint8_t *".to_string() } else { format!("{}*", ctype(x)) }
                 ),
-                Owner::Rc => format!("  {}[-2]++; return *p;\n", data_words(x, "(*p)")),
-                Owner::Arc => format!("  lust_arc_inc(&{}[-2]); return *p;\n", data_words(x, "(*p)")),
+                Owner::Rc => format!("  {}[0]++; return *p;\n", counts(x, "(*p)")),
+                Owner::Arc => format!("  lust_arc_inc(&{}[0]); return *p;\n", counts(x, "(*p)")),
             };
             (format!("{ct} clone_{m}({ct} *p)"), body)
         }
@@ -235,10 +299,14 @@ impl FnGen<'_, '_> {
                 _ => return None,
             });
         }
+        if let Some(v) = self.weak_dyn_builtin(b, vals, tys) {
+            return Some(v);
+        }
         // The count ops take `&Rc<T>` or `&Arc<T>`.
         let CTy::Ref(r) = tys.first()? else { return None };
         let CTy::Own(k, x) = &**r else { return None };
         let w = |v: &str| data_words(x, &format!("(*{v})"));
+        let c = |v: &str| counts(x, &format!("(*{v})"));
         // The `&mut` view of the pointee: the same fat value.
         let view = match &**x {
             CTy::Str => CTy::Ref(Box::new(CTy::Str)),
@@ -251,21 +319,65 @@ impl FnGen<'_, '_> {
                 let t = self.tmp();
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
-                let h = w(&vals[0]);
-                let unique =
-                    if *k == Owner::Arc { format!("lust_arc_is_unique({h} - 2)") } else { format!("({h}[-2] == 1 && {h}[-1] == 1)") };
+                let h = c(&vals[0]);
+                let unique = if *k == Owner::Arc { format!("lust_arc_is_unique({h})") } else { format!("({h}[0] == 1 && {h}[1] == 1)") };
                 let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
                 let _ = writeln!(self.out, "    if ({unique}) {{ {field} = *{}; {some} }}", vals[0]);
                 t
             }
             B::RcMakeMut | B::Sync(S::ArcMakeMut) => self.own_make_mut(*k, x, &vals[0]),
-            B::RcStrongCount => format!("{}[-2]", w(&vals[0])),
-            B::RcWeakCount => format!("({}[-1] - 1)", w(&vals[0])),
+            B::RcStrongCount => format!("{}[0]", c(&vals[0])),
+            B::RcWeakCount => format!("({}[1] - 1)", c(&vals[0])),
             B::RcPtrEq | B::Sync(S::ArcPtrEq) => format!("({} == {})", w(&vals[0]), w(&vals[1])),
-            B::Sync(S::ArcStrongCount) => format!("lust_arc_load(&{}[-2])", w(&vals[0])),
-            B::Sync(S::ArcWeakCount) => format!("lust_arc_weak_count({} - 2)", w(&vals[0])),
+            B::Sync(S::ArcStrongCount) => format!("lust_arc_load(&{}[0])", c(&vals[0])),
+            B::Sync(S::ArcWeakCount) => format!("lust_arc_weak_count({})", c(&vals[0])),
             _ => return None,
         })
+    }
+
+    /// `Rc::downgrade` and `Arc::downgrade` of a pointer to a dyn value,
+    /// and the `Weak<dyn Tr>` methods: the Weak is the pointer's fat
+    /// value, its counts found by the vtable's alignment (`counts`).
+    /// None for any other call.
+    fn weak_dyn_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy]) -> Option<String> {
+        use crate::check::sync::SyncOp as S;
+        use Builtin as B;
+        let first = deref_cty(tys.first()?);
+        let h = |v: &str| counts(&CTy::Dyn, v);
+        let dangling = |v: &str| format!("(({v}).data == (void *)~(uintptr_t)0)");
+        match (b, &first) {
+            (B::RcDowngrade, CTy::RcDyn) | (B::Sync(S::ArcDowngrade), CTy::Own(Owner::Arc, _)) if first == CTy::RcDyn || first == CTy::Own(Owner::Arc, Box::new(CTy::Dyn)) => {
+                let t = self.tmp();
+                let inc = if b == B::RcDowngrade { format!("{}[1]++", h(&t)) } else { format!("lust_arc_downgrade({})", h(&t)) };
+                let _ = writeln!(self.out, "    lust_dyn {t} = *{}; {inc};", vals[0]);
+                Some(t)
+            }
+            (B::WeakUpgrade | B::Sync(S::ArcWeakUpgrade), CTy::WeakDyn(arc)) => {
+                let ptr = if *arc { CTy::Own(Owner::Arc, Box::new(CTy::Dyn)) } else { CTy::RcDyn };
+                let opt = CTy::Option(Box::new(ptr));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, w) = (self.tmp(), self.tmp());
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let up = if *arc { format!("lust_arc_upgrade({})", h(&w)) } else { format!("({0}[0] > 0 && ++{0}[0])", h(&w)) };
+                let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    lust_dyn {w} = *{}; if (!{} && {up}) {{ {field} = {w}; {some} }}", vals[0], dangling(&w));
+                Some(t)
+            }
+            (B::WeakStrongCount | B::Sync(S::ArcWeakStrongCount), CTy::WeakDyn(arc)) => {
+                let v = format!("(*{})", vals[0]);
+                let n = if *arc { format!("lust_arc_load(&{}[0])", h(&v)) } else { format!("{}[0]", h(&v)) };
+                Some(format!("({} ? (uint64_t)0 : {n})", dangling(&v)))
+            }
+            (B::WeakWeakCount | B::Sync(S::ArcWeakWeakCount), CTy::WeakDyn(arc)) => {
+                let v = format!("(*{})", vals[0]);
+                let n = if *arc { format!("lust_arc_weak_weak_count({})", h(&v)) } else { format!("({0}[0] == 0 ? (uint64_t)0 : {0}[1] - 1)", h(&v)) };
+                Some(format!("({} ? (uint64_t)0 : {n})", dangling(&v)))
+            }
+            // The addresses, not the vtables (`ptr::addr_eq`).
+            (B::WeakPtrEq | B::Sync(S::ArcWeakPtrEq), CTy::WeakDyn(_)) => Some(format!("((*{}).data == (*{}).data)", vals[0], vals[1])),
+            _ => None,
+        }
     }
 
     /// `Rc::make_mut` or `Arc::make_mut` on `*v`, an `Rc` or `Arc` (owner
@@ -288,7 +400,7 @@ impl FnGen<'_, '_> {
             format!("for (uint64_t i_ = 0; i_ < (*{v}).len; i_++) (({et}*)({n} + 2))[i_] = clone_{}(&(*{v}).ptr[i_]);", mangle(&e))
         };
         let fresh = format!("uint64_t *{n} = (uint64_t *)lust_alloc(16 + {size}, 16); {n}[0] = 1; {n}[1] = 1;");
-        let _ = writeln!(self.out, "    uint64_t *{h} = {} - 2;", data_words(x, &format!("(*{v})")));
+        let _ = writeln!(self.out, "    uint64_t *{h} = {};", counts(x, &format!("(*{v})")));
         match k {
             Owner::Arc => {
                 // 0: shared, 1: only Weaks, 2: unique (runtime/sync.c).

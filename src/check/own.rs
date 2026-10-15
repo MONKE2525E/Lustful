@@ -263,6 +263,10 @@ impl<'p> Ctx<'p> {
         }) else {
             return false;
         };
+        // `Arc::downgrade` of an `Arc<dyn Tr>` is built (cgen/own.rs).
+        if b == Builtin::Sync(S::ArcDowngrade) && matches!(self.kind(e), TyKind::Dyn(..)) {
+            return false;
+        }
         let tn = self.tn(e);
         if sized_only {
             self.err(

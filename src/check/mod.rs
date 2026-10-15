@@ -1575,6 +1575,8 @@ struct Ctx<'p> {
     /// (by-value `try_unwrap` and `into_inner`, `get_mut`, and
     /// `downgrade`, whose `Weak` is a thin pointer).
     deferred_sized: Vec<(Ty, Span)>,
+    /// `Rc::downgrade` element types: sized, or a plain dyn value.
+    deferred_downgrade: Vec<(Ty, Span)>,
     /// The pointee of an `Rc::make_mut`/`get_mut` (`Arc::make_mut`) call
     /// and whether it must be cloned (`make_mut`): checked at body end
     /// (check/own.rs `finish_make_mut`).
@@ -1916,6 +1918,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_sized: Vec::new(),
+        deferred_downgrade: Vec::new(),
         deferred_make_mut: Vec::new(),
         deferred_hash_key: Vec::new(),
         deferred_glue_hash: Vec::new(),
@@ -6033,6 +6036,14 @@ impl<'p> Ctx<'p> {
         let (f, e) = (self.resolve(found), self.resolve(expected));
         if self.tys.builtin_of(f) != self.tys.builtin_of(e) {
             return None;
+        }
+        // `rc::Weak<T>` and `sync::Weak<T>` to a `Weak<dyn Tr>` too
+        // (std's `CoerceUnsized` impls), only to a dyn value.
+        let weak = |t: Ty| self.tys.weak_elem(t).or_else(|| self.tys.arc_weak_elem(t));
+        if let (Some(x), Some(y)) = (weak(f), weak(e)) {
+            let (x, y) = (self.resolve(x), self.resolve(y));
+            let known = !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float());
+            return (known && matches!(self.kind(y), TyKind::Dyn(..))).then_some((x, y));
         }
         let (x, y) = match (self.tys.boxed_elem(f), self.tys.boxed_elem(e)) {
             (Some(x), Some(y)) => (x, y),
@@ -20005,6 +20016,12 @@ impl<'p> Ctx<'p> {
                 self.err("L0612", span, format!("`{tn}` does not implement Default, or lust cannot build its default yet"), "Use `replace` with a value.");
             }
         }
+        for (t, span) in std::mem::take(&mut self.deferred_downgrade) {
+            let t = self.deep(t);
+            if matches!(self.kind(t), TyKind::Slice(_) | TyKind::Str) || crate::check::own::dyn_wrapped_elem(&self.tys, t).is_some() {
+                self.errs.push(not_yet("L0641", span, "a `Weak` of this unsized type"));
+            }
+        }
         for (t, span) in std::mem::take(&mut self.deferred_sized) {
             let t = self.deep(t);
             if matches!(self.kind(t), TyKind::Dyn(..) | TyKind::Slice(_) | TyKind::Str) {
@@ -20120,11 +20137,19 @@ impl<'p> Ctx<'p> {
                 _ => {}
             }
         }
+        // A body with errors already (a missing impl, an error type) has
+        // its vtable misses explained by them.
+        let clean = !self.errs.iter().any(|d| d.severity == "error");
         for (x, y, span) in std::mem::take(&mut self.vtable_sites) {
             let (x, y) = (self.zonk(x), self.zonk(y));
             // After mono, a concrete body's every coercion has its
             // vtable; a miss is a compiler gap, reported, never emitted.
-            if self.p.gx.mono_done && generics::vtable_for(self.p, &self.tys, x, y).is_none() {
+            if self.p.gx.mono_done
+                && clean
+                && !self.has_error_kind(x)
+                && !self.has_error_kind(y)
+                && generics::vtable_for(self.p, &self.tys, x, y).is_none()
+            {
                 let tn = self.tn(x);
                 self.err(
                     "L0702",

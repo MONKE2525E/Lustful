@@ -455,14 +455,15 @@ pub fn sync_type_named(interner: &Interner, segs: &[ast::PathSeg]) -> Option<Syn
     SyncTy::by_path(&path)
 }
 
-/// Rejects a type argument lust cannot give a sync type yet: an
-/// unsized `T` in `sync::Weak<T>`. `Arc<str>`, `Arc<[T]>`, `Arc<dyn
-/// Trait>`, and `Mutex<dyn Trait>` are the fat forms of check/own.rs.
+/// Rejects a type argument lust cannot give a sync type yet: `str` or
+/// `[T]` in `sync::Weak<T>`. `Arc<str>`, `Arc<[T]>`, `Arc<dyn Trait>`,
+/// `Mutex<dyn Trait>` (check/own.rs), and `sync::Weak<dyn Trait>`
+/// (cgen/own.rs) are fat forms.
 pub fn check_sync_arg(tys: &impl TyIntern, k: SyncTy, e: Ty, span: Span) -> Result<(), Diag> {
     if matches!(k, SyncTy::Mutex | SyncTy::MutexGuard) && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str) {
         return Err(crate::diag::not_yet("L0641", span, "a Mutex of an unsized type"));
     }
-    let unsized_ok = k == SyncTy::Arc || (k == SyncTy::Mutex && matches!(tys.kind(e), TyKind::Dyn(..)));
+    let unsized_ok = k == SyncTy::Arc || (matches!(k, SyncTy::Mutex | SyncTy::ArcWeak) && matches!(tys.kind(e), TyKind::Dyn(..)));
     if !unsized_ok && matches!(k, SyncTy::Arc | SyncTy::ArcWeak) && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
         return Err(crate::diag::not_yet("L0641", span, &format!("an {} of an unsized type", k.name())));
     }
@@ -586,7 +587,11 @@ impl<'p> Ctx<'p> {
                 self.deferred_clone.push((elem, span));
                 (vec![arc], elem)
             }
-            SyncOp::ArcWeakNew => (vec![], weak),
+            // std's `impl<T> Weak<T>`: `new` needs a sized `T`.
+            SyncOp::ArcWeakNew => {
+                self.deferred_sized.push((elem, span));
+                (vec![], weak)
+            }
             SyncOp::ArcWeakUpgrade => (vec![weak_ref], self.tys.mk_option(arc)),
             SyncOp::ArcWeakStrongCount | SyncOp::ArcWeakWeakCount => (vec![weak_ref], USIZE),
             SyncOp::ArcWeakPtrEq => (vec![weak_ref, weak_ref], BOOL),

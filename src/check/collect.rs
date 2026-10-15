@@ -1313,7 +1313,8 @@ pub fn resolve_ty(
                     return Err(Diag::new("L0110", span, format!("{n} takes one type argument"), format!("Write `{n}<T>`.")));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
-                if matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                let weak_dyn = n == "Weak" && matches!(tys.kind(e), TyKind::Dyn(..));
+                if !weak_dyn && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
                     return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));
                 }
                 let which: fn(&crate::ty::BuiltinDefs) -> crate::def::DefId = match n {

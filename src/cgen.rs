@@ -72,6 +72,11 @@ pub enum CTy {
     /// A `rc::Weak<T>`: the same counted-header pointer as `Rc<T>`, or
     /// `UINTPTR_MAX` for `Weak::new()` (W-STD-A).
     Weak(Box<CTy>),
+    /// A `rc::Weak<dyn Trait>` (false) or `sync::Weak<dyn Trait>`
+    /// (true): the `lust_dyn` of the `Rc<dyn Trait>` or `Arc<dyn
+    /// Trait>` it came from, its data `UINTPTR_MAX` when dangling
+    /// (cgen/own.rs).
+    WeakDyn(bool),
     /// A `RefCell<T>`: the generated struct `RCL_..` of the borrow
     /// flag `f0` (as Rust's `isize`) and the value `f1`.
     RefCell(Box<CTy>),
@@ -241,6 +246,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::String) => CTy::String,
             Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             _ if let Some(o) = own::own_cty(tys, t) => o,
+            _ if let Some(w) = own::weak_dyn_cty(tys, t) => w,
             Some(BuiltinTy::Boxed | BuiltinTy::Rc) if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Dyn(..))) => {
                 if tys.builtin_of(t) == Some(BuiltinTy::Boxed) { CTy::BoxDyn } else { CTy::RcDyn }
             }
@@ -489,7 +495,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Ref(inner) if **inner == CTy::Str => "lust_str".into(),
         // `Box<dyn Tr>` and `Rc<dyn Tr>` are owning fat pointers whose
         // data points at the value (ARCH 2.8).
-        CTy::BoxDyn | CTy::RcDyn => "lust_dyn".into(),
+        CTy::BoxDyn | CTy::RcDyn | CTy::WeakDyn(_) => "lust_dyn".into(),
         CTy::Boxed(inner) => format!("{}*", ctype(inner)),
         CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::VecIter(_) => "lust_VecIter".into(),
@@ -581,6 +587,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Dyn => tok(s, "dyn", &[]),
         CTy::BoxDyn => tok(s, "Bxdyn", &[]),
         CTy::RcDyn => tok(s, "Rcdyn", &[]),
+        CTy::WeakDyn(arc) => tok(s, if *arc { "AWkdyn" } else { "Wkdyn" }, &[]),
         CTy::ExitCode => tok(s, "XC", &[]),
         CTy::AccessError => tok(s, "AE", &[]),
         CTy::Fmt(k) => tok(s, &format!("Fmt{}", *k as u8), &[]),
@@ -774,7 +781,7 @@ fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynGuard(_) | CTy::DynLock(true) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::VecDrain(_) | CTy::StrDrain | CTy::Weak(_) | CTy::Guard(..) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynGuard(_) | CTy::DynLock(true) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::WeakDyn(_) | CTy::VecIter(_) | CTy::VecDrain(_) | CTy::StrDrain | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Sync(k, e) => sync::sync_needs_drop(p, *k, e),
         CTy::Hash(k, a) => {
@@ -1070,7 +1077,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             )
             .ok(),
             CTy::Ref(inner) if **inner == CTy::Str => Some(layout::fat_ptr_layout()),
-            CTy::BoxDyn | CTy::RcDyn => Some(layout::fat_ptr_layout()),
+            CTy::BoxDyn | CTy::RcDyn | CTy::WeakDyn(_) => Some(layout::fat_ptr_layout()),
             CTy::Boxed(_) | CTy::Rc(_) => Some(layout::ptr_layout()),
             CTy::Ref(_) => Some(layout::ptr_layout()),
             // A raw pointer may be null: no niche (w-cinterop).
@@ -1319,7 +1326,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 }
             },
             CTy::Ref(inner) if **inner == CTy::Str => (16, 8),
-            CTy::BoxDyn | CTy::RcDyn => (16, 8),
+            CTy::BoxDyn | CTy::RcDyn | CTy::WeakDyn(_) => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
             CTy::Ref(_) | CTy::Ptr(_) => (8, 8),
             CTy::Option(e) => {
@@ -3136,8 +3143,15 @@ impl FnGen<'_, '_> {
                     .expect("mono builds a vtable for every unsizing coercion in a concrete body");
                 let vt = self.vtable_sym(vid);
                 // An `Rc<T>` source points the data at the value in its
-                // allocation (`Rc<dyn Tr>` finds the counts before it).
-                let data = if at_value { format!("&({v})->v") } else { format!("({v})") };
+                // allocation (`Rc<dyn Tr>` finds the counts before it);
+                // a `Weak<T>` too, unless it dangles (`Weak::new()`).
+                let data = match ct {
+                    _ if at_value => format!("&({v})->v"),
+                    CTy::Weak(_) | CTy::Sync(crate::ty::sync::SyncTy::ArcWeak, _) => {
+                        format!("(({v}) == (void *)~(uintptr_t)0 ? (void *)~(uintptr_t)0 : (void *)&({v})->v)")
+                    }
+                    _ => format!("({v})"),
+                };
                 format!("((lust_dyn){{ (void *){data}, {vt} }})")
             }
             Rvalue::DynUpcast { ptr, path } => {
@@ -3923,11 +3937,8 @@ impl FnGen<'_, '_> {
             // An `Rc<dyn Tr>`'s two counts sit right before its value; the
             // weak count holds the strong refs' implicit weak ref (W-STD-A).
             B::RcStrongCount | B::RcWeakCount if matches!(&tys[0], CTy::Ref(r) if **r == CTy::RcDyn) => {
-                if b == B::RcStrongCount {
-                    format!("((uint64_t *)(*{}).data)[-2]", vals[0])
-                } else {
-                    format!("(((uint64_t *)(*{}).data)[-1] - 1)", vals[0])
-                }
+                let h = own::counts(&CTy::Dyn, &format!("(*{})", vals[0]));
+                if b == B::RcStrongCount { format!("{h}[0]") } else { format!("({h}[1] - 1)") }
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
             B::ExitCodeFrom => format!("((uint8_t){})", vals[0]),
@@ -8175,6 +8186,10 @@ fn glue_def_value(
         own::own_glue_def(p, *g, *k, x, protos, defs, &mut need);
         return;
     }
+    if let CTy::WeakDyn(arc) = t {
+        own::weak_dyn_glue_def(*g, *arc, protos, defs);
+        return;
+    }
     if let (Glue::Drop, CTy::DynGuard(_) | CTy::DynLock(true)) = (g, t) {
         own::dyn_guard_drop(t, protos, defs);
         return;
@@ -8217,10 +8232,14 @@ fn glue_def_value(
                     body.push_str("  lust_dealloc(p->data, (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]);\n");
                 }
                 CTy::RcDyn => {
-                    // The two counts sit right before the value (`RcI_T`).
-                    body.push_str("  uint64_t *h = (uint64_t *)p->data - 2;\n");
+                    // The two counts start the allocation (`RcI_T`).
+                    let _ = writeln!(body, "  uint64_t *h = {};", own::counts(&CTy::Dyn, "(*p)"));
                     // The strong refs hold one implicit weak ref, as for `Rc<T>`.
-                    body.push_str("  if (--h[0] == 0) { if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data); UNW_DSTEP if (--h[1] == 0) lust_dealloc((void *)h, 16 + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }\n");
+                    let _ = writeln!(
+                        body,
+                        "  if (--h[0] == 0) {{ if (p->vt[0]) ((void (*)(void *))p->vt[0])(p->data); UNW_DSTEP if (--h[1] == 0) lust_dealloc((void *)h, {} + (uint64_t)(uintptr_t)p->vt[1], (uint64_t)(uintptr_t)p->vt[2]); }}",
+                        own::counts_off(&CTy::Dyn, "(*p)")
+                    );
                 }
                 CTy::Boxed(e) => {
                     if needs_drop_c(p, e) {
@@ -8427,7 +8446,7 @@ fn glue_def_value(
                     let _ = writeln!(body, "  {et} *r = ({et}*)lust_alloc(sizeof({et}), _Alignof({et})); *r = {c}; return r;");
                 }
                 CTy::RcDyn => {
-                    body.push_str("  ((uint64_t *)p->data)[-2]++; return *p;\n");
+                    let _ = writeln!(body, "  {}[0]++; return *p;", own::counts(&CTy::Dyn, "(*p)"));
                 }
                 CTy::BoxSlice(e) => {
                     let et = ctype(e);

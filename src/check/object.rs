@@ -517,15 +517,21 @@ pub fn dyn_type_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Opt
         }
         TyKind::Adt(d, a) => {
             // A dyn arg for a param that needs `Sized` (`Vec<dyn Tr>`);
-            // `Box<T: ?Sized>`, `Rc<T: ?Sized>`, `Arc<T: ?Sized>`,
-            // `RefCell<T: ?Sized>`, and `Mutex<T: ?Sized>` hold dyn values,
-            // and their guards point at one.
+            // `Box<T: ?Sized>`, `Rc<T: ?Sized>`, `Arc<T: ?Sized>`, their
+            // `Weak`s, `RefCell<T: ?Sized>`, and `Mutex<T: ?Sized>` hold
+            // dyn values, and their guards point at one.
             let owns_unsized = matches!(
                 tys.builtin_of(t),
                 Some(
                     BuiltinTy::Boxed
                         | BuiltinTy::Rc
-                        | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::MutexGuard)
+                        | BuiltinTy::Weak
+                        | BuiltinTy::Sync(
+                            crate::ty::sync::SyncTy::Arc
+                                | crate::ty::sync::SyncTy::ArcWeak
+                                | crate::ty::sync::SyncTy::Mutex
+                                | crate::ty::sync::SyncTy::MutexGuard
+                        )
                         | BuiltinTy::RefCell
                         | BuiltinTy::RefGuard
                         | BuiltinTy::RefMutGuard
