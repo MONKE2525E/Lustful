@@ -306,6 +306,12 @@ struct Ck<'b, 'p, 'a> {
     /// The two-phase receiver loan of the call being checked, while its
     /// arguments are: until the call activates it, it is a shared borrow.
     reserved: Option<usize>,
+    /// Per local: it holds only a byte string literal's bytes (a
+    /// const blob with static storage in the generated C), so its
+    /// storage ending drops nothing a borrow of it reads. Returning
+    /// such a borrow still rejects (`check_return`): the compound
+    /// literal's storage is the frame's, not the program's.
+    promoted: Vec<bool>,
 }
 
 /// The Adt defs that have a user `Drop` impl: every impl of the lang
@@ -418,6 +424,36 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             mpath_at: Vec::new(),
             ops_buf: Vec::new(),
             reserved: None,
+            promoted: {
+                // A local whose every whole-local assignment is a byte
+                // string const: only the literal temp qualifies (a
+                // user variable assigned a literal once and other
+                // values later does not).
+                let mut v = vec![false; body.locals.len()];
+                let mut other = vec![false; body.locals.len()];
+                for b in &body.blocks {
+                    for s in &b.stmts {
+                        if let StmtKind::Assign(dest, rv) = &s.kind
+                            && dest.proj.is_empty()
+                        {
+                            if matches!(rv, Rvalue::Use(Operand::Const(Const::Bytes(_)))) {
+                                v[dest.local as usize] = true;
+                            } else {
+                                other[dest.local as usize] = true;
+                            }
+                        }
+                    }
+                    if let Terminator::Call { dest, .. } = &b.term
+                        && dest.proj.is_empty()
+                    {
+                        other[dest.local as usize] = true;
+                    }
+                }
+                for i in 0..v.len() {
+                    v[i] &= !other[i];
+                }
+                v
+            },
         }
     }
 }
@@ -2073,6 +2109,11 @@ impl<'b, 'p, 'a> Ck<'b, 'p, 'a> {
             // A write to a whole local is shallow: writing a reference local itself does
             // not touch the value behind it, so a loan on `*a` does not block `a = ...`.
             if kind == Access::Write && p.proj.is_empty() && loan.place.proj.first() == Some(&Proj::Deref) && self.through_ref(&loan.place) {
+                continue;
+            }
+            // Storage ending for a byte string literal's temp drops
+            // nothing: its bytes are a const blob (see `promoted`).
+            if kind == Access::Dead && self.promoted.get(loan.place.local as usize).copied().unwrap_or(false) {
                 continue;
             }
             let mutable = loan.mutable && self.reserved != Some(li);
