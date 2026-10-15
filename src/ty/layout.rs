@@ -27,8 +27,8 @@ pub struct Niche {
 /// How an enum stores its discriminant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnumTag {
-    /// One variant only: no tag is stored.
-    None,
+    /// Only the named variant is inhabited: no tag is stored.
+    None(usize),
     /// A tag scalar at offset 0 with this width in bytes.
     Explicit { size: u64, signed: bool },
     /// The discriminant lives in the niche of the named variant; the other
@@ -47,12 +47,16 @@ pub struct Layout {
     pub variant_offsets: Vec<Vec<u64>>,
     pub niche: Option<Niche>,
     pub enum_tag: Option<EnumTag>,
+    /// Uninhabited in rustc's layout sense: no value exists, and the
+    /// type is zero-sized (a non-ZST uninhabited type like
+    /// `(u8, Never)` does not count, so enums keep its variant).
+    pub uninhabited: bool,
 }
 
 impl Layout {
     /// A plain scalar or aggregate layout with no field or tag detail.
     fn simple(size: u64, align: u64, niche: Option<Niche>) -> Layout {
-        Layout { size, align, field_offsets: Vec::new(), variant_offsets: Vec::new(), niche, enum_tag: None }
+        Layout { size, align, field_offsets: Vec::new(), variant_offsets: Vec::new(), niche, enum_tag: None, uninhabited: false }
     }
 }
 
@@ -133,6 +137,20 @@ pub fn zst_layout(align: u64) -> Layout {
     Layout::simple(0, align.max(1), None)
 }
 
+/// The never type: zero-sized and uninhabited.
+pub fn never_layout() -> Layout {
+    let mut l = zst_layout(1);
+    l.uninhabited = true;
+    l
+}
+
+/// A `Vec`/`String` capacity word: rustc caps a capacity at
+/// `isize::MAX`, so every value above it is niche space. This is the
+/// niche that lets `Option<Option<Vec<T>>>` stay one word per field.
+pub fn cap_layout() -> Layout {
+    Layout::simple(8, 8, Some(Niche { offset: 0, scalar_size: 8, free: 1u128 << 63, start: 1u128 << 63 }))
+}
+
 /// A `NonZero` integer scalar: zero is free.
 pub fn nonzero_layout(t: IntTy) -> Layout {
     let mut l = int_layout(t);
@@ -145,7 +163,9 @@ pub fn nonzero_layout(t: IntTy) -> Layout {
 pub fn array_layout(elem: &Layout, len: u64) -> Result<Layout, ()> {
     let size = elem.size.checked_mul(len).ok_or(())?;
     let niche = if len > 0 { elem.niche } else { None };
-    Ok(Layout::simple(size, elem.align, niche))
+    let mut l = Layout::simple(size, elem.align, niche);
+    l.uninhabited = len > 0 && elem.uninhabited;
+    Ok(l)
 }
 
 /// Places fields in the given order with normal padding. Returns size before
@@ -253,6 +273,7 @@ fn univariant_biased(fields: &[Layout], repr: Repr, kind: UnivKind, bias: NicheB
     }
     let mut out = Layout::simple(align_up(end_off, align), align, best);
     out.field_offsets = offsets;
+    out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
     finish(out, repr)
 }
 
@@ -298,6 +319,7 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
                 }
             }
             out.field_offsets = vec![0; fields.len()];
+            out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
             return finish(out, repr);
         }
         ReprKind::Packed => {
@@ -311,6 +333,7 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
             let niche = best_niche(fields, &offsets, &order);
             let mut out = Layout::simple(cur, 1, niche);
             out.field_offsets = offsets;
+            out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
             return finish(out, repr);
         }
         ReprKind::C => {
@@ -320,6 +343,7 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
             let niche = best_niche(fields, &offsets, &order);
             let mut out = Layout::simple(align_up(end, align), align, niche);
             out.field_offsets = offsets;
+            out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
             return finish(out, repr);
         }
         ReprKind::Default => {}
@@ -426,7 +450,9 @@ fn tagged_variant(fields: &[Layout], tag_w: u64) -> (u64, u64, Vec<u64>) {
 /// declaration order; `discs` holds the discriminant of each variant.
 pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Result<Layout, ()> {
     if variants.is_empty() {
-        return finish(zst_layout(1), repr);
+        let mut l = zst_layout(1);
+        l.uninhabited = true;
+        return finish(l, repr);
     }
     if discs.len() != variants.len() {
         return Err(());
@@ -439,7 +465,7 @@ pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Resu
         }
         let mut l = struct_layout(&variants[0], repr)?;
         l.variant_offsets = vec![l.field_offsets.clone()];
-        l.enum_tag = Some(EnumTag::None);
+        l.enum_tag = Some(EnumTag::None(0));
         return Ok(l);
     }
     // A fixed integer tag must hold every discriminant. A u128
@@ -463,8 +489,36 @@ pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Resu
     if variants.len() == 1 && !repr.fixes_tag() {
         let mut l = struct_layout(&variants[0], Repr::default())?;
         l.variant_offsets = vec![l.field_offsets.clone()];
-        l.enum_tag = Some(EnumTag::None);
+        l.enum_tag = Some(EnumTag::None(0));
         return finish(l, repr);
+    }
+    // A variant whose payload is uninhabited (in the layout sense:
+    // zero-sized with an uninhabited field) takes no part in the
+    // layout under the default repr. With one inhabited variant
+    // left, the enum is that variant with no tag; with none, it is
+    // itself uninhabited. With two or more left, the candidates
+    // below run over every variant as before.
+    if !repr.fixes_tag() && variants.len() > 1 {
+        let dropped = |v: &Vec<Layout>| v.iter().any(|f| f.uninhabited) && v.iter().all(|f| f.size == 0);
+        let kept: Vec<usize> = (0..variants.len()).filter(|&i| !dropped(&variants[i])).collect();
+        if kept.len() < variants.len() {
+            if kept.is_empty() {
+                let mut l = zst_layout(1);
+                l.uninhabited = true;
+                l.variant_offsets = variants.iter().map(|_| Vec::new()).collect();
+                return finish(l, repr);
+            }
+            if kept.len() == 1 {
+                let vi = kept[0];
+                let mut l = struct_layout(&variants[vi], Repr::default())?;
+                let kept_offsets = l.field_offsets.clone();
+                l.variant_offsets = (0..variants.len())
+                    .map(|i| if i == vi { kept_offsets.clone() } else { vec![0; variants[i].len()] })
+                    .collect();
+                l.enum_tag = Some(EnumTag::None(vi));
+                return finish(l, repr);
+            }
+        }
     }
     let tagged = tagged_enum_layout(variants, discs, repr)?;
     if repr.fixes_tag() {
@@ -777,7 +831,8 @@ fn compute(
             }
             go(tys, shapes, u, uenv, frames, memo, active)
         }
-        TyKind::Unit | TyKind::Never => Ok(zst_layout(1)),
+        TyKind::Unit => Ok(zst_layout(1)),
+        TyKind::Never => Ok(never_layout()),
         TyKind::Bool => Ok(bool_layout()),
         TyKind::Char => Ok(char_layout()),
         TyKind::Int(i) => Ok(int_layout(i)),
@@ -826,9 +881,10 @@ fn compute(
             // `Box<[T]>` is a fat pointer, like `&[T]`.
             Some(BuiltinTy::Boxed) if tys.boxed_slice_elem(t).is_some() => Ok(fat_ptr_layout()),
             Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc) => Ok(ptr_layout()),
-            Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => {
-                struct_layout(&[ptr_layout(), int_layout(IntTy::Usize), int_layout(IntTy::Usize)], Repr::default())
-            }
+            Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => struct_layout(
+                &[ptr_layout(), int_layout(IntTy::Usize), cap_layout()],
+                Repr { kind: ReprKind::C, ..Repr::default() },
+            ),
             Some(BuiltinTy::Option) => {
                 let e = tys.adt_first_ty_arg(t).ok_or(())?;
                 let el = go(tys, shapes, e, env, frames, memo, active)?;
@@ -950,6 +1006,40 @@ mod tests {
         assert_eq!(l.size, 16);
         let l = enum_layout(&[vec![ptr_layout()], vec![]], &[0, 1], Repr { kind: ReprKind::C, ..Repr::default() }).unwrap();
         assert_eq!(l.size, 16);
+    }
+
+    #[test]
+    fn vec_capacity_niche() {
+        // A Vec/String-shaped (ptr, len, cap) value reports the
+        // capacity niche, so two nested Options stay 24 bytes.
+        let v = struct_layout(
+            &[ptr_layout(), int_layout(IntTy::Usize), cap_layout()],
+            Repr { kind: ReprKind::C, ..Repr::default() },
+        )
+        .unwrap();
+        assert_eq!(sz(&v), (24, 8));
+        let n = v.niche.expect("a niche");
+        assert_eq!((n.offset, n.start), (16, 1u128 << 63));
+        let one = enum_layout(&[vec![], vec![v]], &[0, 1], Repr::default()).unwrap();
+        let two = enum_layout(&[vec![], vec![one]], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(two.size, 24);
+    }
+
+    #[test]
+    fn uninhabited_variants() {
+        // enum { A(Never), B(u8) } is just the u8, with no tag; a
+        // variant whose payload is a non-ZST uninhabited type is kept.
+        let l = enum_layout(&[vec![never_layout()], ints(&[IntTy::U8])], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(sz(&l), (1, 1));
+        assert_eq!(l.enum_tag, Some(EnumTag::None(1)));
+        let pair = tuple_layout(&[int_layout(IntTy::U8), never_layout()]).unwrap();
+        assert!(!pair.uninhabited);
+        let l = enum_layout(&[vec![pair], ints(&[IntTy::U8])], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(l.size, 2);
+        // Every variant uninhabited: the enum itself is.
+        let l = enum_layout(&[vec![never_layout()], vec![never_layout()]], &[0, 1], Repr::default()).unwrap();
+        assert_eq!(l.size, 0);
+        assert!(l.uninhabited);
     }
 
     #[test]

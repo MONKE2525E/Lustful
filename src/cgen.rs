@@ -927,7 +927,7 @@ struct FnGen<'b, 'p> {
 /// A layout with no field or niche detail, for runtime struct types whose
 /// C form is fixed in runtime.h (`lust_String`, `lust_Vec`, and kin).
 fn plain_layout(size: u64, align: u64) -> Layout {
-    Layout { size, align, field_offsets: Vec::new(), variant_offsets: Vec::new(), niche: None, enum_tag: None }
+    Layout { size, align, field_offsets: Vec::new(), variant_offsets: Vec::new(), niche: None, enum_tag: None, uninhabited: false }
 }
 
 /// True when `type_decls` can emit an enum of this layout with the exact
@@ -938,7 +938,7 @@ fn enum_is_exact(l: &Layout, variants: usize) -> bool {
     match l.enum_tag {
         Some(EnumTag::Explicit { size, .. }) => size <= 16,
         Some(EnumTag::NicheFilled { niche, .. }) => matches!(niche.scalar_size, 1 | 2 | 4 | 8 | 16),
-        Some(EnumTag::None) => variants == 1,
+        Some(EnumTag::None(_)) => true,
         None => false,
     }
 }
@@ -994,9 +994,11 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Str => Some(layout::fat_ptr_layout()),
             CTy::String | CTy::Vec(_) => {
                 // (ptr, len, cap) in runtime order; the pointer word is
-                // never null (empty buffers dangle), so it is a niche.
+                // never null (empty buffers dangle), and the capacity
+                // word is capped at isize::MAX: both are niches, and
+                // the capacity is the larger one.
                 layout::struct_layout(
-                    &[layout::ptr_layout(), layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize)],
+                    &[layout::ptr_layout(), layout::int_layout(IntTy::Usize), layout::cap_layout()],
                     layout::Repr { kind: ReprKind::C, ..layout::Repr::default() },
                 )
                 .ok()
@@ -1188,6 +1190,7 @@ fn disc_call(p: &Program, t: &CTy, ptr: &str) -> String {
                 format!("(({ptr})->u._tag)")
             }
             Some(EnumTag::Explicit { .. }) | Some(EnumTag::NicheFilled { .. }) => format!("disc_{}({ptr})", mangle(t)),
+            Some(EnumTag::None(vi)) => vi.to_string(),
             _ => "0".into(),
         },
         None => format!("({ptr})->tag"),
