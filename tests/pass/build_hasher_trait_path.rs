@@ -1,5 +1,5 @@
-// expect: L0505
-// Valid Rust; a trait-name path call through the expanded std trait path is not taken yet (the method and type-path forms work).
+// A trait-name path call through the expanded std trait path
+// (`BuildHasher::build_hasher`), like the method form.
 use std::hash::{BuildHasher, Hasher};
 #[derive(Default)] struct F(u64);
 impl Hasher for F { fn finish(&self) -> u64 { self.0 } fn write(&mut self, b: &[u8]) { for &x in b { self.0 += x as u64; } } }
