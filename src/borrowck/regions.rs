@@ -4089,7 +4089,15 @@ impl<'b, 'p> Builder<'b, 'p> {
         {
             self.flow_all(xv, &tv);
         }
-        self.call_opaque(avs, dt, dv);
+        // `with(f)` and kin return what `f` returns (`F: FnOnce(&T) -> R`):
+        // `call` already flowed the closure's output sources
+        // (`closure_sources`) into the result, and its `&T` argument is
+        // higher-ranked. Its captures do not reach the result otherwise.
+        // Any other `f` (a fn item) takes the conservative rule.
+        let closure_f = avs.get(1).is_some_and(|(ft, _)| matches!(self.body.tys.kind(*ft), TyKind::Closure(..)));
+        if !(closure_f && matches!(b, B::TlsWith | B::TlsTryWith | B::TlsWithBorrow | B::TlsWithBorrowMut)) {
+            self.call_opaque(avs, dt, dv);
+        }
         true
     }
 
