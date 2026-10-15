@@ -1764,6 +1764,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/sync/mpsc/channel",
     "std/sync/mpsc/sync_channel",
     "std/thread/sleep",
+    "core/any/type_name",
+    "std/any/type_name",
 ];
 
 const STD_MACRO_PATHS: &[&str] = &[

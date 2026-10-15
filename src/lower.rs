@@ -1605,6 +1605,7 @@ impl<'p> Lower<'p> {
                     Res::ConstUsize(v) => {
                         self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Int(v as u128, IntTy::Usize))), ty, span)
                     }
+                    Res::Any { op, .. } if op == crate::check::any::AnyOp::TypeName => self.type_name_into(e, dest, ty, span),
                     Res::Any { .. } => self.type_id_of_into(e, dest, ty, span),
                     Res::ConstBool(b) => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Bool(b))), ty, span),
                     Res::SizeOfVal { len, elem } => {

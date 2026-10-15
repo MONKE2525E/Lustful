@@ -344,6 +344,7 @@ impl Ex<'_, '_> {
             Operand::Const(Const::Unit) => Ok(UNIT),
             // A string literal (a `"..".into()` receiver, W-STD-B).
             Operand::Const(Const::Str(_)) => Ok(REF_STR),
+            Operand::Const(Const::StrBytes(_)) => Ok(REF_STR),
             Operand::Const(_) => Err("iterator expansion: unexpected constant operand".into()),
         }
     }

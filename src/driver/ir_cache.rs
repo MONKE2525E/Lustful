@@ -78,6 +78,10 @@ fn hash_const(h: &mut FxHasher, p: &Program, c: &Const) {
             6u8.hash(h);
             b.as_slice().hash(h);
         }
+        Const::StrBytes(b) => {
+            7u8.hash(h);
+            b.as_slice().hash(h);
+        }
         Const::Unit => 5u8.hash(h),
     }
 }
@@ -555,6 +559,8 @@ enum CachedConst {
     // The blob's bytes travel with the cached body: no AST table
     // index stays valid across rebuilds.
     Bytes(Vec<u8>),
+    // A synthesized `&str` (`type_name`): its bytes travel too.
+    StrBytes(Vec<u8>),
     Unit,
 }
 
@@ -847,6 +853,7 @@ fn cache_operand(_b: &mut TreeBuilder, p: &Program, o: &Operand) -> CachedOperan
             Const::Char(x) => CachedConst::Char(*x),
             Const::Str(i) => CachedConst::Str(p.ast.strings.get(*i as usize).cloned().unwrap_or_default()),
             Const::Bytes(b) => CachedConst::Bytes(b.as_slice().to_vec()),
+            Const::StrBytes(b) => CachedConst::StrBytes(b.as_slice().to_vec()),
             Const::Unit => CachedConst::Unit,
         }),
     }
@@ -1000,6 +1007,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
                 CachedConst::Char(x) => Const::Char(*x),
                 CachedConst::Str(s) => Const::Str(*strings.get(s.as_str())?),
                 CachedConst::Bytes(bs) => Const::Bytes(crate::ast::ByteBlob::new(bs.clone())),
+                CachedConst::StrBytes(bs) => Const::StrBytes(crate::ast::ByteBlob::new(bs.clone())),
                 CachedConst::Unit => Const::Unit,
             }),
         })

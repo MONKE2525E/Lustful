@@ -2266,6 +2266,9 @@ impl FnGen<'_, '_> {
                     let s = &self.p.ast.strings[*i as usize];
                     (format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len()), CTy::Ref(Box::new(CTy::Str)))
                 }
+                Const::StrBytes(b) => {
+                    (format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(b.as_slice()), b.len()), CTy::Ref(Box::new(CTy::Str)))
+                }
                 Const::Bytes(b) => {
                     let t = CTy::Array(Box::new(CTy::Int(IntTy::U8)), b.len() as u64);
                     (bytes_array_lit(self.p, &t, b.as_slice()), t)

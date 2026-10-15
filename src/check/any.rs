@@ -47,6 +47,10 @@ pub enum AnyOp {
     Downcast,
     /// `TypeId::of::<T>()`, on the callee path.
     TypeIdOf,
+    /// `std::any::type_name::<T>()`, on the callee path: the named
+    /// type is `Checked::generic_args[e][0]`, and lowering bakes
+    /// rustc's exact string for it (`type_name_of` below).
+    TypeName,
 }
 
 /// The two words of the type id of `t` (a concrete type, in any store):
@@ -383,6 +387,36 @@ impl<'p> Ctx<'p> {
         Some(Res::Any { op: AnyOp::TypeIdOf, derefs: 0, autoref: Autoref::None })
     }
 
+    /// True when a call's callee path is `std::any::type_name` (or
+    /// `core::any::type_name`, or an import the resolver expanded to
+    /// one of them).
+    pub(super) fn is_type_name_path(&self, segs: &[ast::PathSeg]) -> bool {
+        let names: Vec<&str> = segs.iter().map(|s| self.p.interner.get(s.name)).collect();
+        matches!(names.as_slice(), ["std" | "core", "any", "type_name"])
+    }
+
+    /// `std::any::type_name::<T>()`: the callee path's resolution,
+    /// with T recorded for lowering. Whether lust can print rustc's
+    /// exact string for T is decided at body end
+    /// (`deferred_type_names`), when T is fully known.
+    pub(super) fn type_name_path(&mut self, e: ExprId, seg: &ast::PathSeg, span: Span) -> Option<Res> {
+        let written = seg.type_args();
+        if written.len() != 1 {
+            self.err("L0110", span, "`type_name` takes one type argument", "Write `type_name::<Type>()`.");
+            return None;
+        }
+        let t = self.resolve_written(written[0]);
+        let t = self.deep(t);
+        // The baked string names every Adt in T by its full path:
+        // record the reads a layout query records, so a rename or a
+        // module move rechecks this body.
+        self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
+        let i = self.ei(e);
+        self.out.generic_args[i] = vec![GenericArg::Ty(t)];
+        self.deferred_type_names.push((t, span));
+        Some(Res::Any { op: AnyOp::TypeName, derefs: 0, autoref: Autoref::None })
+    }
+
     /// The type a downcast tests: the turbofish, else the type the
     /// expected result fixes (`want`). Records it for lowering. None
     /// (after an error) when it is missing or not a valid `T: Any`.
@@ -503,6 +537,598 @@ fn contains_ref(tys: &impl TyIntern, t: Ty) -> bool {
         }
         _ => false,
     }
+}
+
+// ---------- `std::any::type_name` ----------
+//
+// rustc's exact `type_name::<T>()` string: full defining paths
+// (`alloc::vec::Vec<i32>`, `mycrate::mod::S`), lifetimes erased
+// except the `'_` rustc shows for a lifetime argument and for a
+// reference inside a fn pointer signature, and trailing generic
+// arguments equal to their defaults trimmed (`D` for `D<u8>` when
+// the default is `u8`, `HashMap<K, V>` without the default hasher).
+// None when lust cannot be sure of the exact string: closures, fn
+// items, `impl Trait`, unnormalized projections, std-source types
+// with no verified row below, and iterator kinds with no row. With
+// `open`, a type parameter, projection, or inference variable is a
+// placeholder instead of None (a template check: each instance
+// decides again with its concrete type).
+
+/// The `type_name` string of `t`, when lust can print it exactly.
+pub fn type_name_of(p: &Program, tys: &mut impl TyIntern, t: Ty, open: bool) -> Option<String> {
+    tn_ty(p, tys, t, open, false)
+}
+
+/// One type in `type_name` form. `in_sig` is true inside a fn
+/// pointer signature, where an anonymous reference shows `&'_`.
+fn tn_ty(p: &Program, tys: &mut impl TyIntern, t: Ty, open: bool, in_sig: bool) -> Option<String> {
+    match tys.kind(t) {
+        TyKind::Error => None,
+        TyKind::Unit => Some("()".into()),
+        TyKind::Bool => Some("bool".into()),
+        TyKind::Char => Some("char".into()),
+        TyKind::Str => Some("str".into()),
+        TyKind::Never => Some("!".into()),
+        TyKind::Int(i) => Some(i.name().into()),
+        TyKind::Float(f) => Some(f.name().into()),
+        TyKind::Ref(r, m, e) => {
+            let lt = if in_sig && r != Region::Static { "'_ " } else { "" };
+            Some(format!("&{lt}{}{}", if m.is_mut() { "mut " } else { "" }, tn_ty(p, tys, e, open, in_sig)?))
+        }
+        TyKind::RawPtr(m, e) => Some(format!("*{}{}", if m.is_mut() { "mut " } else { "const " }, tn_ty(p, tys, e, open, in_sig)?)),
+        TyKind::Slice(e) => Some(format!("[{}]", tn_ty(p, tys, e, open, in_sig)?)),
+        TyKind::Array(e, n) => Some(format!("[{}; {}]", tn_ty(p, tys, e, open, in_sig)?, tn_const(tys, n, open)?)),
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = tys.tys_of(ts).to_vec();
+            let parts: Option<Vec<String>> = elems.iter().map(|&e| tn_ty(p, tys, e, open, in_sig)).collect();
+            let parts = parts?;
+            let trail = if parts.len() == 1 { "," } else { "" };
+            Some(format!("({}{trail})", parts.join(", ")))
+        }
+        TyKind::Adt(..) => tn_adt(p, tys, t, open, in_sig),
+        TyKind::FnPtr(sig) => {
+            let s = tys.sig(sig).value;
+            let in_tys: Vec<Ty> = tys.tys_of(s.inputs).to_vec();
+            let ins: Option<Vec<String>> = in_tys.iter().map(|&e| tn_ty(p, tys, e, open, true)).collect();
+            let out = tn_ty(p, tys, s.output, open, true)?;
+            let ret = if s.output == UNIT { String::new() } else { format!(" -> {out}") };
+            Some(format!(
+                "{}{}fn({}){ret}",
+                if s.is_unsafe { "unsafe " } else { "" },
+                if s.extern_c { "extern \"C\" " } else { "" },
+                ins?.join(", ")
+            ))
+        }
+        TyKind::Dyn(b, _) => tn_dyn(p, tys, tys.dyn_bounds(b).clone(), open),
+        TyKind::Param(_) | TyKind::Projection(..) | TyKind::Infer(_) if open => Some("_".into()),
+        _ => None,
+    }
+}
+
+/// A const generic argument in `type_name` form.
+fn tn_const(tys: &impl TyIntern, c: crate::ty::ConstId, open: bool) -> Option<String> {
+    match tys.const_kind(c) {
+        ConstKind::Int(v) => Some(format!("{v}")),
+        ConstKind::Bool(b) => Some(format!("{b}")),
+        ConstKind::Char(ch) => Some(format!("'{ch}'", ch = ch.escape_debug())),
+        _ if open => Some("_".into()),
+        _ => None,
+    }
+}
+
+/// One generic argument in `type_name` form.
+fn tn_arg(p: &Program, tys: &mut impl TyIntern, g: GenericArg, open: bool, in_sig: bool) -> Option<String> {
+    match g {
+        GenericArg::Ty(t) => tn_ty(p, tys, t, open, in_sig),
+        GenericArg::Lifetime(_) => Some("'_".into()),
+        GenericArg::Const(c) => tn_const(tys, c, open),
+    }
+}
+
+/// `path` plus `<args>` (no brackets when `args` is empty).
+fn tn_apply(path: &str, args: Vec<String>) -> String {
+    if args.is_empty() { path.to_string() } else { format!("{path}<{}>", args.join(", ")) }
+}
+
+/// The first type argument of an Adt type, in `type_name` form.
+fn tn_first(p: &Program, tys: &mut impl TyIntern, t: Ty, open: bool, in_sig: bool) -> Option<String> {
+    tn_ty(p, tys, tys.adt_first_ty_arg(t)?, open, in_sig)
+}
+
+/// An Adt type in `type_name` form: builtin, synthetic std, and
+/// hashed/sync/iterator tables first (each row checked against
+/// rustc 1.99), then a user type by its defining path.
+fn tn_adt(p: &Program, tys: &mut impl TyIntern, t: Ty, open: bool, in_sig: bool) -> Option<String> {
+    use crate::ty::BuiltinTy as B;
+    let mut one = |p: &Program, tys: &mut _, path: &str| Some(tn_apply(path, vec![tn_first(p, tys, t, open, in_sig)?]));
+    match tys.builtin_of(t) {
+        Some(B::String) => return Some("alloc::string::String".into()),
+        Some(B::Vec) => return one(p, tys, "alloc::vec::Vec"),
+        Some(B::Option) => return one(p, tys, "core::option::Option"),
+        Some(B::Result) => {
+            let (a, b) = tys.result_args(t)?;
+            return Some(tn_apply(
+                "core::result::Result",
+                vec![tn_ty(p, tys, a, open, in_sig)?, tn_ty(p, tys, b, open, in_sig)?],
+            ));
+        }
+        Some(B::Boxed) => return one(p, tys, "alloc::boxed::Box"),
+        Some(B::Rc) => return one(p, tys, "alloc::rc::Rc"),
+        Some(B::Weak) => return one(p, tys, "alloc::rc::Weak"),
+        Some(B::RefCell) => return one(p, tys, "core::cell::RefCell"),
+        Some(B::Cell) => return one(p, tys, "core::cell::Cell"),
+        Some(B::RefGuard) => return Some(tn_apply("core::cell::Ref", vec!["'_".into(), tn_first(p, tys, t, open, in_sig)?])),
+        Some(B::RefMutGuard) => return Some(tn_apply("core::cell::RefMut", vec!["'_".into(), tn_first(p, tys, t, open, in_sig)?])),
+        Some(B::Chars) => return Some("core::str::iter::Chars<'_>".into()),
+        Some(B::Args) => return Some("std::env::Args".into()),
+        Some(B::ExitCode) => return Some("std::process::ExitCode".into()),
+        Some(B::LocalKey) => return one(p, tys, "std::thread::local::LocalKey"),
+        Some(B::AccessError) => return Some("std::thread::local::AccessError".into()),
+        Some(B::Fmt(k)) => {
+            use crate::ty::fmt::FmtTy as F;
+            return Some(match k {
+                F::Formatter => "core::fmt::Formatter<'_>".into(),
+                F::Arguments => "core::fmt::Arguments<'_>".into(),
+                F::DebugStruct => "core::fmt::builders::DebugStruct<'_, '_>".into(),
+                F::DebugTuple => "core::fmt::builders::DebugTuple<'_, '_>".into(),
+                F::DebugList => "core::fmt::builders::DebugList<'_, '_>".into(),
+                F::DebugSet => "core::fmt::builders::DebugSet<'_, '_>".into(),
+                F::DebugMap => "core::fmt::builders::DebugMap<'_, '_>".into(),
+            });
+        }
+        Some(B::Sync(k)) => return tn_sync(p, tys, t, k, open, in_sig),
+        Some(B::Hash(k)) => return tn_hash(p, tys, t, k, open, in_sig),
+        Some(B::Iter(k)) => return tn_iter(p, tys, t, k, open, in_sig),
+        None => {}
+    }
+    let (def, args_id) = tys.adt_parts(t)?;
+    // The synthetic std Adts (`generics::std_adts`), by def.
+    if let Some(s) = tn_std_adt(p, tys, t, def, open, in_sig) {
+        return s;
+    }
+    let a = p.adt_by_def(def).or_else(|| tys.local_adt(t))?;
+    let path = tn_def_path(p, def, p.adt(a).name)?;
+    let args: Vec<GenericArg> = tys.args(args_id).to_vec();
+    let shown = tn_user_args(p, tys, a, def, &args, open, in_sig)?;
+    Some(tn_apply(&path, shown))
+}
+
+/// A `SyncTy` in `type_name` form (rustc 1.99 paths; atomics print
+/// through the generic `Atomic<T>`).
+fn tn_sync(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::sync::SyncTy, open: bool, in_sig: bool) -> Option<String> {
+    use crate::ty::sync::SyncTy as S;
+    let first = tn_first(p, tys, t, open, in_sig);
+    let one = |path: &str| Some(tn_apply(path, vec![first.clone()?]));
+    let lt_one = |path: &str| Some(tn_apply(path, vec!["'_".into(), first.clone()?]));
+    Some(match k {
+        S::Arc => return one("alloc::sync::Arc"),
+        S::ArcWeak => return one("alloc::sync::Weak"),
+        S::AtomicBool => "core::sync::atomic::Atomic<bool>".into(),
+        S::AtomicI8 => "core::sync::atomic::Atomic<i8>".into(),
+        S::AtomicU8 => "core::sync::atomic::Atomic<u8>".into(),
+        S::AtomicI16 => "core::sync::atomic::Atomic<i16>".into(),
+        S::AtomicU16 => "core::sync::atomic::Atomic<u16>".into(),
+        S::AtomicI32 => "core::sync::atomic::Atomic<i32>".into(),
+        S::AtomicU32 => "core::sync::atomic::Atomic<u32>".into(),
+        S::AtomicI64 => "core::sync::atomic::Atomic<i64>".into(),
+        S::AtomicU64 => "core::sync::atomic::Atomic<u64>".into(),
+        S::AtomicIsize => "core::sync::atomic::Atomic<isize>".into(),
+        S::AtomicUsize => "core::sync::atomic::Atomic<usize>".into(),
+        S::Mutex => return one("std::sync::poison::mutex::Mutex"),
+        S::MutexGuard => return lt_one("std::sync::poison::mutex::MutexGuard"),
+        S::RwLock => return one("std::sync::poison::rwlock::RwLock"),
+        S::RwLockReadGuard => return lt_one("std::sync::poison::rwlock::RwLockReadGuard"),
+        S::RwLockWriteGuard => return lt_one("std::sync::poison::rwlock::RwLockWriteGuard"),
+        S::PoisonError => return one("std::sync::poison::PoisonError"),
+        S::TryLockError => return one("std::sync::poison::TryLockError"),
+        S::JoinHandle => return one("std::thread::join_handle::JoinHandle"),
+        S::Thread => "std::thread::thread::Thread".into(),
+        S::ThreadId => "std::thread::id::ThreadId".into(),
+        S::ScopedJoinHandle => return lt_one("std::thread::scoped::ScopedJoinHandle"),
+        S::Sender => return one("std::sync::mpsc::Sender"),
+        S::SyncSender => return one("std::sync::mpsc::SyncSender"),
+        S::Receiver => return one("std::sync::mpsc::Receiver"),
+        S::SendError => return one("std::sync::mpsc::SendError"),
+        S::Condvar => "std::sync::poison::condvar::Condvar".into(),
+        S::Barrier => "std::sync::barrier::Barrier".into(),
+        S::BarrierWaitResult => "std::sync::barrier::BarrierWaitResult".into(),
+        S::OnceLock => return one("std::sync::once_lock::OnceLock"),
+        S::Duration => "core::time::Duration".into(),
+        // No path names these in a form rustc prints from a written
+        // type lust accepts (`JoinError` stands for `Box<dyn Any>`).
+        S::JoinError | S::Scope => return None,
+    })
+}
+
+/// A `HashTy` in `type_name` form. The default hasher argument is
+/// trimmed, as rustc trims it.
+fn tn_hash(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::hash::HashTy, open: bool, in_sig: bool) -> Option<String> {
+    use crate::ty::hash::HashTy as H;
+    let args: Vec<Ty> = tys.adt_parts(t).map(|(_, a)| tys.args(a).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+    let show = |tys: &mut _, i: usize| tn_ty(p, tys, *args.get(i)?, open, in_sig);
+    let random = crate::ty::BuiltinTy::Hash(H::RandomState);
+    match k {
+        H::HashMap => {
+            let trim = args.get(2).is_some_and(|&s| tys.builtin_of(s) == Some(random));
+            let mut shown = vec![show(tys, 0)?, show(tys, 1)?];
+            if args.len() > 2 && !trim {
+                shown.push(show(tys, 2)?);
+            }
+            Some(tn_apply("std::collections::hash::map::HashMap", shown))
+        }
+        H::HashSet => {
+            let trim = args.get(1).is_some_and(|&s| tys.builtin_of(s) == Some(random));
+            let mut shown = vec![show(tys, 0)?];
+            if args.len() > 1 && !trim {
+                shown.push(show(tys, 1)?);
+            }
+            Some(tn_apply("std::collections::hash::set::HashSet", shown))
+        }
+        H::RandomState => Some("std::hash::random::RandomState".into()),
+        H::DefaultHasher => Some("std::hash::random::DefaultHasher".into()),
+        H::BuildHasherDefault => Some(tn_apply("core::hash::BuildHasherDefault", vec![show(tys, 0)?])),
+        H::Entry => Some(tn_apply("std::collections::hash::map::Entry", vec!["'_".into(), show(tys, 0)?, show(tys, 1)?])),
+        _ => None,
+    }
+}
+
+/// An `IterKind` in `type_name` form, for the kinds whose rustc
+/// path and argument shape are verified. An argument that does not
+/// print (a closure in `Map<I, F>`) rejects the whole string.
+fn tn_iter(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::iter::IterKind, open: bool, in_sig: bool) -> Option<String> {
+    use crate::ty::iter::IterKind as K;
+    let args: Vec<GenericArg> = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+    let mut arg = |tys: &mut _, i: usize| tn_arg(p, tys, *args.get(i)?, open, in_sig);
+    let one = |tys: &mut _, path: &str| Some(tn_apply(path, vec![tn_arg(p, tys, *args.get(0)?, open, in_sig)?]));
+    let lt_one = |tys: &mut _, path: &str| Some(tn_apply(path, vec!["'_".into(), tn_arg(p, tys, *args.get(0)?, open, in_sig)?]));
+    let two = |tys: &mut _, path: &str| Some(tn_apply(path, vec![tn_arg(p, tys, *args.get(0)?, open, in_sig)?, tn_arg(p, tys, *args.get(1)?, open, in_sig)?]));
+    match k {
+        K::Range => one(tys, "core::ops::range::Range"),
+        K::RangeInclusive => one(tys, "core::ops::range::RangeInclusive"),
+        K::RangeFrom => one(tys, "core::ops::range::RangeFrom"),
+        K::RangeTo => one(tys, "core::ops::range::RangeTo"),
+        K::RangeToInclusive => one(tys, "core::ops::range::RangeToInclusive"),
+        K::RangeFull => Some("core::ops::range::RangeFull".into()),
+        K::SliceIter => lt_one(tys, "core::slice::iter::Iter"),
+        K::SliceIterMut => lt_one(tys, "core::slice::iter::IterMut"),
+        K::VecIntoIter => one(tys, "alloc::vec::into_iter::IntoIter"),
+        K::ArrayIntoIter => two(tys, "core::array::iter::IntoIter"),
+        K::OptionIntoIter => one(tys, "core::option::IntoIter"),
+        K::OptionIter => lt_one(tys, "core::option::Iter"),
+        K::OptionIterMut => lt_one(tys, "core::option::IterMut"),
+        K::ResultIntoIter => one(tys, "core::result::IntoIter"),
+        K::ResultIter => lt_one(tys, "core::result::Iter"),
+        K::ResultIterMut => lt_one(tys, "core::result::IterMut"),
+        K::Enumerate => one(tys, "core::iter::adapters::enumerate::Enumerate"),
+        K::Rev => one(tys, "core::iter::adapters::rev::Rev"),
+        K::Take => one(tys, "core::iter::adapters::take::Take"),
+        K::Skip => one(tys, "core::iter::adapters::skip::Skip"),
+        K::Peekable => one(tys, "core::iter::adapters::peekable::Peekable"),
+        K::StepBy => one(tys, "core::iter::adapters::step_by::StepBy"),
+        K::Copied => one(tys, "core::iter::adapters::copied::Copied"),
+        K::Cloned => one(tys, "core::iter::adapters::cloned::Cloned"),
+        K::Flatten => one(tys, "core::iter::adapters::flatten::Flatten"),
+        K::Chain => two(tys, "core::iter::adapters::chain::Chain"),
+        K::Zip => two(tys, "core::iter::adapters::zip::Zip"),
+        K::Map => two(tys, "core::iter::adapters::map::Map"),
+        K::Filter => two(tys, "core::iter::adapters::filter::Filter"),
+        K::FilterMap => two(tys, "core::iter::adapters::filter_map::FilterMap"),
+        K::TakeWhile => two(tys, "core::iter::adapters::take_while::TakeWhile"),
+        K::SkipWhile => two(tys, "core::iter::adapters::skip_while::SkipWhile"),
+        K::Inspect => two(tys, "core::iter::adapters::inspect::Inspect"),
+        K::Windows => lt_one(tys, "core::slice::iter::Windows"),
+        K::CharIndices => Some("core::str::iter::CharIndices<'_>".into()),
+        K::VecDrain => lt_one(tys, "alloc::vec::drain::Drain"),
+        K::StringDrain => Some("alloc::string::Drain<'_>".into()),
+        K::ByNext => arg(tys, 0),
+        K::MapIter => Some(tn_apply("std::collections::hash::map::Iter", vec!["'_".into(), arg(tys, 0)?, arg(tys, 1)?])),
+        K::MapIterMut => Some(tn_apply("std::collections::hash::map::IterMut", vec!["'_".into(), arg(tys, 0)?, arg(tys, 1)?])),
+        K::MapKeys => Some(tn_apply("std::collections::hash::map::Keys", vec!["'_".into(), arg(tys, 0)?, arg(tys, 1)?])),
+        K::MapValues => Some(tn_apply("std::collections::hash::map::Values", vec!["'_".into(), arg(tys, 0)?, arg(tys, 1)?])),
+        K::MapValuesMut => Some(tn_apply("std::collections::hash::map::ValuesMut", vec!["'_".into(), arg(tys, 0)?, arg(tys, 1)?])),
+        K::MapIntoIter => two(tys, "std::collections::hash::map::IntoIter"),
+        K::MapIntoKeys => two(tys, "std::collections::hash::map::IntoKeys"),
+        K::MapIntoValues => two(tys, "std::collections::hash::map::IntoValues"),
+        K::SetIter => lt_one(tys, "std::collections::hash::set::Iter"),
+        K::SetIntoIter => one(tys, "std::collections::hash::set::IntoIter"),
+        K::StrSplit => tn_str_split(p, tys, &args, open, in_sig),
+        _ => None,
+    }
+}
+
+/// A `str` split iterator in `type_name` form (see `collect::ty_name`
+/// for the mode read).
+fn tn_str_split(p: &Program, tys: &mut impl TyIntern, args: &[GenericArg], open: bool, in_sig: bool) -> Option<String> {
+    use crate::ty::iter::SplitMode as M;
+    let tys_arg: Vec<Ty> = args.iter().filter_map(|g| g.as_ty()).collect();
+    let mode = tys_arg.get(1).and_then(|&m| crate::ty::iter::split_mode(tys, m))?;
+    let mut pat = || tn_arg(p, tys, *args.first()?, open, in_sig);
+    Some(match mode {
+        M::SplitWhitespace => "core::str::iter::SplitWhitespace<'_>".into(),
+        M::SplitAsciiWhitespace => "core::str::iter::SplitAsciiWhitespace<'_>".into(),
+        M::Lines => "core::str::iter::Lines<'_>".into(),
+        M::RSplit => tn_apply("core::str::iter::RSplit", vec!["'_".into(), pat()?]),
+        M::SplitTerminator => tn_apply("core::str::iter::SplitTerminator", vec!["'_".into(), pat()?]),
+        M::RSplitTerminator => tn_apply("core::str::iter::RSplitTerminator", vec!["'_".into(), pat()?]),
+        M::SplitN => tn_apply("core::str::iter::SplitN", vec!["'_".into(), pat()?]),
+        M::RSplitN => tn_apply("core::str::iter::RSplitN", vec!["'_".into(), pat()?]),
+        M::SplitInclusive => tn_apply("core::str::iter::SplitInclusive", vec!["'_".into(), pat()?]),
+        _ => tn_apply("core::str::iter::Split", vec!["'_".into(), pat()?]),
+    })
+}
+
+/// The synthetic std Adts (`generics::std_adts`) in `type_name`
+/// form, by def. Some(None) for a row with no verified string.
+fn tn_std_adt(p: &Program, tys: &mut impl TyIntern, t: Ty, def: DefId, open: bool, in_sig: bool) -> Option<Option<String>> {
+    let row = generics::std_adts().iter().position(|r| r.2 == def)?;
+    let plain = |s: &str| Some(Some(s.to_string()));
+    Some(Some(match row {
+        0 => return plain("core::cmp::Ordering"),
+        1 => return plain("core::fmt::Error"),
+        2 => return plain("core::str::error::Utf8Error"),
+        3 => return plain("alloc::string::FromUtf8Error"),
+        4 => return plain("core::sync::atomic::Ordering"),
+        5 => return plain("std::sync::mpsc::RecvError"),
+        6 => return plain("std::sync::mpsc::TryRecvError"),
+        7 => return plain("core::any::TypeId"),
+        8 => return plain("core::panic::location::Location<'_>"),
+        9 => {
+            let b = crate::check::collect::cow_arg(tys, t)?;
+            tn_apply("alloc::borrow::Cow", vec!["'_".into(), tn_ty(p, tys, b, open, in_sig)?])
+        }
+        10 => return plain("core::cell::BorrowError"),
+        11 => return plain("core::cell::BorrowMutError"),
+        12 => tn_apply("core::ops::range::Bound", vec![tn_first(p, tys, t, open, in_sig)?]),
+        13 => return plain("core::num::error::TryFromIntError"),
+        14 => return plain("core::num::error::IntErrorKind"),
+        15 => return plain("core::char::convert::CharTryFromError"),
+        16 => return plain("core::char::TryFromCharError"),
+        _ => return plain("core::convert::Infallible"),
+    }))
+}
+
+/// Verified `type_name` paths for Adts and traits that come from
+/// shipped std source, keyed by the display path collect knows
+/// (the public path, which is not always rustc's defining path).
+fn tn_std_source_path(display: &str) -> Option<&'static str> {
+    Some(match display {
+        "core::marker::PhantomData" => "core::marker::PhantomData",
+        "core::marker::PhantomPinned" => "core::marker::PhantomPinned",
+        "std::collections::VecDeque" | "alloc::collections::VecDeque" => "alloc::collections::vec_deque::VecDeque",
+        "std::collections::LinkedList" | "alloc::collections::LinkedList" => "alloc::collections::linked_list::LinkedList",
+        "std::collections::BTreeMap" | "alloc::collections::BTreeMap" => "alloc::collections::btree::map::BTreeMap",
+        "std::collections::BTreeSet" | "alloc::collections::BTreeSet" => "alloc::collections::btree::set::BTreeSet",
+        "std::collections::BinaryHeap" | "alloc::collections::BinaryHeap" => "alloc::collections::binary_heap::BinaryHeap",
+        "std::num::Wrapping" => "core::num::wrapping::Wrapping",
+        "std::mem::ManuallyDrop" => "core::mem::manually_drop::ManuallyDrop",
+        "std::mem::MaybeUninit" => "core::mem::maybe_uninit::MaybeUninit",
+        "std::pin::Pin" => "core::pin::Pin",
+        "std::error::Error" => "core::error::Error",
+        "std::cell::OnceCell" | "core::cell::OnceCell" => "core::cell::once::OnceCell",
+        "std::time::Instant" => "std::time::Instant",
+        "std::time::SystemTime" => "std::time::SystemTime",
+        "std::path::Path" => "std::path::Path",
+        "std::path::PathBuf" => "std::path::PathBuf",
+        "std::io::Error" => "core::io::error::Error",
+        "std::fs::File" => "std::fs::File",
+        "core::time::Duration" | "std::time::Duration" => "core::time::Duration",
+        _ => return None,
+    })
+}
+
+/// The defining path of a user type or trait (`crate::mod::Name`,
+/// with a fn-local type's enclosing fns in between, as rustc
+/// prints them). None when the resolver tables do not name the def
+/// or the def is shipped std source with no verified row.
+fn tn_def_path(p: &Program, def: DefId, flat: Sym) -> Option<String> {
+    let display = p.display_path(flat);
+    if let Some(s) = tn_std_source_path(&display) {
+        return Some(s.to_string());
+    }
+    let tables = p.resolved.as_ref()?;
+    let info = tables.def_info.get(&def)?;
+    let module = tables.modules.get(info.module.0 as usize)?;
+    // A type from the shipped std source splice: its display path
+    // is a std path, and only the verified rows above may print.
+    if module.path.first().is_some_and(|s| tables.std_modules.iter().any(|(n, _)| n == s)) {
+        return None;
+    }
+    if matches!(display.split("::").next(), Some("std" | "core" | "alloc")) && info.module.0 != 0 {
+        // A std platform/adapter type whose display path only looks
+        // like a source path: not verified, do not guess.
+        if tables.std_platform.is_some_and(|(root, _)| module.krate_root == root) {
+            return None;
+        }
+    }
+    // Fn-local items: the enclosing fn names sit between the module
+    // path and the item name in rustc's print.
+    let mut mid: Vec<String> = Vec::new();
+    let mut data = p.defs.get(def)?;
+    while let Some(parent) = data.parent {
+        let pd = p.defs.get(parent)?;
+        match pd.kind {
+            crate::ty::defs::DefKind::Module => break,
+            crate::ty::defs::DefKind::Fn | crate::ty::defs::DefKind::Method | crate::ty::defs::DefKind::AssocFn => {
+                mid.push(crate::intern::source_name(p.interner.get(pd.name)).to_string());
+                data = pd;
+            }
+            _ => return None,
+        }
+    }
+    mid.reverse();
+    let base = if module.krate_root.0 == 0 {
+        let krate = crate::intern::source_name(p.interner.get(tables.modules[0].name)).replace('-', "_");
+        format!("{krate}::{display}")
+    } else {
+        display
+    };
+    if mid.is_empty() {
+        return Some(base);
+    }
+    // Insert the fn names before the item's own last segment.
+    let (head, last) = base.rsplit_once("::")?;
+    Some(format!("{head}::{}::{last}", mid.join("::")))
+}
+
+/// A user Adt's generic arguments in `type_name` form: lifetimes
+/// show as `'_` in their declared positions, and trailing type or
+/// const arguments equal to their defaults are trimmed.
+fn tn_user_args(p: &Program, tys: &mut impl TyIntern, a: AdtId, def: DefId, args: &[GenericArg], open: bool, in_sig: bool) -> Option<Vec<String>> {
+    // One shown entry per declared param when the generics are
+    // known (so a lifetime the args omit still shows), else one per
+    // stored argument. `value_i` is the entry's index among the
+    // type/const params, for the defaults table.
+    let mut shown: Vec<(Option<usize>, String)> = Vec::new();
+    let generics = p.gx.adt_generics.get(a.0 as usize);
+    match generics {
+        Some(g) if !g.params.is_empty() => {
+            let mut ai = 0usize;
+            let mut vi = 0usize;
+            for param in &g.params {
+                match param.kind {
+                    ParamKind::Lifetime => {
+                        if matches!(args.get(ai), Some(GenericArg::Lifetime(_))) {
+                            ai += 1;
+                        }
+                        shown.push((None, "'_".into()));
+                    }
+                    ParamKind::Type | ParamKind::Const(_) => {
+                        let g = args.get(ai)?;
+                        ai += 1;
+                        shown.push((Some(vi), tn_arg(p, tys, *g, open, in_sig)?));
+                        vi += 1;
+                    }
+                }
+            }
+            // Stored arguments past the declared params (an
+            // instance's own encoding): show them as they are.
+            while ai < args.len() {
+                shown.push((None, tn_arg(p, tys, args[ai], open, in_sig)?));
+                ai += 1;
+            }
+        }
+        _ => {
+            let mut vi = 0usize;
+            for g in args {
+                let is_lt = matches!(g, GenericArg::Lifetime(_));
+                shown.push((if is_lt { None } else { Some(vi) }, tn_arg(p, tys, *g, open, in_sig)?));
+                if !is_lt {
+                    vi += 1;
+                }
+            }
+        }
+    }
+    // Trim trailing arguments equal to their defaults (the default
+    // substituted with the arguments before it, compared by their
+    // printed forms).
+    if let Some(defaults) = p.gx.param_defaults.get(&def).cloned() {
+        while let Some(&(Some(vi), ref s)) = shown.last() {
+            let Some(Some(d)) = defaults.get(vi) else { break };
+            let ds = match *d {
+                GenericArg::Ty(dt) => {
+                    let prefix: Vec<GenericArg> = args.iter().copied().filter(|g| !matches!(g, GenericArg::Lifetime(_))).collect();
+                    let dt = subst(tys, dt, &prefix[..vi.min(prefix.len())]);
+                    tn_ty(p, tys, dt, open, in_sig)
+                }
+                GenericArg::Const(c) => tn_const(tys, c, open),
+                GenericArg::Lifetime(_) => None,
+            };
+            if ds.as_deref() == Some(s.as_str()) {
+                shown.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    Some(shown.into_iter().map(|(_, s)| s).collect())
+}
+
+/// A trait's path in `type_name` form: a lang trait by its verified
+/// row, else the defining path of a user trait.
+fn tn_trait_path(p: &Program, def: DefId) -> Option<String> {
+    let lang = &p.gx.lang;
+    let row = match def {
+        d if d == lang.debug => Some("core::fmt::Debug"),
+        d if d == lang.display => Some("core::fmt::Display"),
+        d if d == lang.any => Some("core::any::Any"),
+        d if d == lang.clone => Some("core::clone::Clone"),
+        d if d == lang.copy => Some("core::marker::Copy"),
+        d if d == lang.iterator => Some("core::iter::traits::iterator::Iterator"),
+        d if d == lang.into_iterator => Some("core::iter::traits::collect::IntoIterator"),
+        d if d == lang.from_iterator => Some("core::iter::traits::collect::FromIterator"),
+        d if d == lang.default => Some("core::default::Default"),
+        d if d == lang.from => Some("core::convert::From"),
+        d if d == lang.into => Some("core::convert::Into"),
+        d if d == lang.hash => Some("core::hash::Hash"),
+        d if d == lang.partial_eq => Some("core::cmp::PartialEq"),
+        d if d == lang.eq => Some("core::cmp::Eq"),
+        d if d == lang.partial_ord => Some("core::cmp::PartialOrd"),
+        d if d == lang.ord => Some("core::cmp::Ord"),
+        d if d == lang.deref => Some("core::ops::deref::Deref"),
+        d if d == lang.deref_mut => Some("core::ops::deref::DerefMut"),
+        _ => None,
+    };
+    if let Some(s) = row {
+        return Some(s.to_string());
+    }
+    let rec = p.gx.index.trait_record(def)?;
+    tn_def_path(p, def, rec.name)
+}
+
+/// A `dyn` type in `type_name` form: the principal (the Fn family
+/// in sugar form), then the auto traits. The region never prints.
+fn tn_dyn(p: &Program, tys: &mut impl TyIntern, b: DynBounds, open: bool) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(pr) = b.principal {
+        let tr = pr.value;
+        let lang = &p.gx.lang;
+        if lang.is_fn_family(tr.def) {
+            let name = tn_trait_path(p, tr.def).or_else(|| {
+                Some(match () {
+                    _ if tr.def == lang.fn_ => "core::ops::function::Fn".into(),
+                    _ if tr.def == lang.fn_mut => "core::ops::function::FnMut".into(),
+                    _ => "core::ops::function::FnOnce".into(),
+                })
+            })?;
+            let ins_ty = tys.args(tr.args).get(1).and_then(|g| g.as_ty())?;
+            let ins: Vec<String> = match tys.kind(ins_ty) {
+                TyKind::Tuple(ts) => {
+                    let ins_tys: Vec<Ty> = tys.tys_of(ts).to_vec();
+                    let v: Option<Vec<String>> = ins_tys.iter().map(|&e| tn_ty(p, tys, e, open, true)).collect();
+                    v?
+                }
+                _ => return None,
+            };
+            let out = tys.bindings(tr.bindings).first().and_then(|(_, g)| g.as_ty()).filter(|&t| t != UNIT);
+            let ret = match out {
+                Some(o) => format!(" -> {}", tn_ty(p, tys, o, open, true)?),
+                None => String::new(),
+            };
+            parts.push(format!("{name}({}){ret}", ins.join(", ")));
+        } else {
+            let name = tn_trait_path(p, tr.def)?;
+            let mut shown: Vec<String> = Vec::new();
+            let rest: Vec<GenericArg> = tys.args(tr.args).iter().skip(1).copied().collect();
+            for g in rest {
+                shown.push(tn_arg(p, tys, g, open, false)?);
+            }
+            let rec = p.gx.index.trait_record(tr.def);
+            for (assoc, g) in tys.bindings(tr.bindings).to_vec() {
+                let an = rec.and_then(|r| r.assoc_items.iter().find(|(d, _, _)| *d == assoc).map(|(_, n, _)| p.interner.get(*n).to_string()))?;
+                shown.push(format!("{an} = {}", tn_arg(p, tys, g, open, false)?));
+            }
+            parts.push(tn_apply(&name, shown));
+        }
+    }
+    for (on, name) in [(b.auto.send, "core::marker::Send"), (b.auto.sync, "core::marker::Sync"), (b.auto.unpin, "core::marker::Unpin")] {
+        if on {
+            parts.push(name.to_string());
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("dyn {}", parts.join(" + ")))
 }
 
 /// True when an `impl Trait` type occurs anywhere in `t`.

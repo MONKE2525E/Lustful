@@ -81,7 +81,7 @@ impl<'p> Lower<'p> {
                 self.goto(end, span);
                 self.cur = end;
             }
-            AnyOp::Downcast | AnyOp::TypeIdOf => unreachable!("not a by-reference `Any` method"),
+            AnyOp::Downcast | AnyOp::TypeIdOf | AnyOp::TypeName => unreachable!("not a by-reference `Any` method"),
         }
     }
 
@@ -108,6 +108,26 @@ impl<'p> Lower<'p> {
         self.assign(out, Rvalue::Res(ty, false, Operand::Move(Place::local(b))), span);
         self.goto(end, span);
         self.cur = end;
+    }
+
+    /// `std::any::type_name::<T>()` into `dest`: rustc's exact
+    /// string for the type check recorded, baked as a `&str`
+    /// constant. Check rejected every type it cannot print.
+    pub(super) fn type_name_into(&mut self, e: ExprId, dest: Option<&Place>, ty: Ty, span: Span) {
+        let t = self.ck.generic_args.get((e.0 - self.ck.expr_base) as usize).and_then(|a| a.first()).and_then(|g| g.as_ty());
+        let t = t.expect("check records the named type of every `type_name` call");
+        // A template body lowers with its parameters still open:
+        // the string is a placeholder there (each instance bakes
+        // its own), as a layout query's zero is.
+        let open = self.body.tys.flags(t).contains_param() || self.body.tys.flags(t).contains_projection();
+        let s = if open {
+            String::new()
+        } else {
+            crate::check::any::type_name_of(self.p, &mut self.body.tys, t, false)
+                .expect("check rejected a `type_name` it cannot print")
+        };
+        let blob = crate::ast::ByteBlob::new(s.into_bytes());
+        self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::StrBytes(blob))), ty, span);
     }
 
     /// `TypeId::of::<T>()` (the call's resolution) into `dest`.

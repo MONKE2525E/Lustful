@@ -1351,6 +1351,10 @@ struct Ctx<'p> {
     /// (`.map(String::from)`), re-tested at finish: lust's
     /// `String::from` takes `&str`, `char`, or `String`.
     deferred_string_from: Vec<(Ty, Span)>,
+    /// Types a `std::any::type_name::<T>()` call names, tested at
+    /// finish: lust must be able to print rustc's exact string for
+    /// each (`any::type_name_of`), else the call is a reject.
+    deferred_type_names: Vec<(Ty, Span)>,
     /// `Some`, `Ok`, `Err`, `Box::new`, or `Rc::new` passed as a call
     /// argument (`keep(Some, &x)` under `F: Fn(T) -> R`): borrowck does
     /// not relate a fn item's signature at a generic Fn bound yet
@@ -1652,6 +1656,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         format_args_ok: Vec::new(),
         deferred_clone: Vec::new(),
         deferred_string_from: Vec::new(),
+        deferred_type_names: Vec::new(),
         deferred_item_args: Vec::new(),
         deferred_eq: Vec::new(),
         deferred_copy: Vec::new(),
@@ -10769,7 +10774,13 @@ impl<'p> Ctx<'p> {
                 }
                 let cs = self.span(callee);
                 let mark = self.errs.len();
-                let r = if self.is_type_id_of(segs) { self.type_id_of_path(e, segs.last().unwrap(), cs) } else { self.resolve_assoc(segs, cs) };
+                let r = if self.is_type_id_of(segs) {
+                    self.type_id_of_path(e, segs.last().unwrap(), cs)
+                } else if self.is_type_name_path(segs) {
+                    self.type_name_path(e, segs.last().unwrap(), cs)
+                } else {
+                    self.resolve_assoc(segs, cs)
+                };
                 match r {
                     Some(r) => r,
                     None => {
@@ -10866,11 +10877,11 @@ impl<'p> Ctx<'p> {
                 }
                 USIZE
             }
-            Res::Any { .. } => {
+            Res::Any { op, .. } => {
                 if !args.is_empty() {
                     self.err("L0105", span, "this function takes no arguments", "Write `TypeId::of::<Type>()`.");
                 }
-                generics::type_id_ty(&mut self.tys)
+                if op == any::AnyOp::TypeName { REF_STR } else { generics::type_id_ty(&mut self.tys) }
             }
             Res::ConstBool(_) => {
                 if !args.is_empty() {
@@ -17792,6 +17803,27 @@ impl<'p> Ctx<'p> {
                     let what = format!("`String::from` as a value with input `{tn}` (lust takes `&str`, `char`, or `String` there)");
                     self.errs.push(unsupported(span, &what));
                 }
+            }
+        }
+        // `type_name::<T>()` calls: with every constraint in, lust
+        // must be able to print rustc's exact string for T (in a
+        // template check a parameter or projection inside T is a
+        // placeholder; each instance decides again).
+        for (t, span) in std::mem::take(&mut self.deferred_type_names) {
+            let t = self.deep(t);
+            let t = self.normalize_here(t);
+            if self.has_error_kind(t) || matches!(self.kind(t), TyKind::Infer(_)) {
+                continue;
+            }
+            let open = self.tys.flags(t).contains_param() || self.tys.flags(t).contains_projection();
+            if any::type_name_of(self.p, &mut self.tys, t, open).is_none() {
+                let tn = self.tn(t);
+                self.err(
+                    "L0641",
+                    span,
+                    format!("`type_name` of `{tn}` is not supported yet"),
+                    "Name a type whose exact `type_name` string lust can print (no closures, fn items, or `impl Trait`).",
+                );
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_eq) {

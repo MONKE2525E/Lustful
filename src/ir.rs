@@ -54,6 +54,9 @@ pub enum Const {
     Char(char),
     /// Index into the AST string table.
     Str(u32),
+    /// A synthesized `&str` value that is in no AST string table
+    /// (a `type_name::<T>()` answer), as one shared buffer.
+    StrBytes(crate::ast::ByteBlob),
     /// A byte array value (`[u8; N]`) as one shared buffer, never
     /// one operand per byte.
     Bytes(crate::ast::ByteBlob),
