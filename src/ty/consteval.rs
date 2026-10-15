@@ -2647,6 +2647,36 @@ impl Evaluator {
                 "saturating_abs" if signed => int_v(if xs == lo { hi_s } else { xs.abs() }),
                 "wrapping_abs" if signed => int_v(if xs == lo { lo } else { xs.abs() }),
                 "isqrt" if !signed => bits_v(xb.isqrt()),
+                "isqrt" if signed => {
+                    if xs < 0 {
+                        Err(over())
+                    } else {
+                        int_v((xs as u128).isqrt() as i128)
+                    }
+                }
+                "checked_isqrt" if signed => {
+                    let r = if xs < 0 { None } else { Some((xs as u128).isqrt() as i128) };
+                    Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
+                }
+                "cast_signed" if !signed => Ok((ConstValue::Int(int_from_bits(xb, it.counterpart())), super::int(it.counterpart()))),
+                "cast_unsigned" if signed => Ok((ConstValue::Int(int_from_bits(xb, it.counterpart())), super::int(it.counterpart()))),
+                "bit_width" if !signed => u32_v(width - (xb.leading_zeros() - (128 - width))),
+                "highest_one" => {
+                    let r = if xb == 0 { None } else { Some(width - 1 - (xb.leading_zeros() - (128 - width))) };
+                    Ok(self.opt_value(cx, super::int(IntTy::U32), r.map(|v| ConstValue::Int(v as i128))))
+                }
+                "lowest_one" => {
+                    let r = if xb == 0 { None } else { Some(xb.trailing_zeros()) };
+                    Ok(self.opt_value(cx, super::int(IntTy::U32), r.map(|v| ConstValue::Int(v as i128))))
+                }
+                "isolate_lowest_one" => bits_v(xb & 0u128.wrapping_sub(xb)),
+                "isolate_highest_one" => {
+                    if xb == 0 {
+                        bits_v(0)
+                    } else {
+                        bits_v(1u128 << (width - 1 - (xb.leading_zeros() - (128 - width))))
+                    }
+                }
                 "is_power_of_two" if !signed => bool_v(xb != 0 && (xb & (xb - 1)) == 0),
                 "next_power_of_two" if !signed => {
                     if xb == 0 {
@@ -2716,7 +2746,7 @@ impl Evaluator {
         if matches!(
             name,
             "pow" | "checked_pow" | "saturating_pow" | "wrapping_pow" | "checked_shl" | "checked_shr" | "wrapping_shl"
-                | "wrapping_shr" | "rotate_left" | "rotate_right" | "ilog" | "checked_ilog"
+                | "wrapping_shr" | "unbounded_shl" | "unbounded_shr" | "rotate_left" | "rotate_right" | "ilog" | "checked_ilog"
         ) {
             let a = self.int_arg(cx, env, arg, super::int(IntTy::U32), span)?;
             let amt = u32::try_from(a).map_err(|_| outside_err())?;
@@ -2781,6 +2811,22 @@ impl Evaluator {
                         int_v(xs >> (amt % width))
                     } else {
                         bits_v(xb >> (amt % width))
+                    }
+                }
+                "unbounded_shl" => {
+                    if amt >= width {
+                        bits_v(0)
+                    } else {
+                        bits_v(xb << amt)
+                    }
+                }
+                "unbounded_shr" => {
+                    if signed {
+                        int_v(if amt >= width { if xs < 0 { -1 } else { 0 } } else { xs >> amt })
+                    } else if amt >= width {
+                        bits_v(0)
+                    } else {
+                        bits_v(xb >> amt)
                     }
                 }
                 "rotate_left" | "rotate_right" => {
@@ -2964,6 +3010,7 @@ impl Evaluator {
                     bits_v(xb.midpoint(yb))
                 }
             }
+            "is_multiple_of" if !signed => Ok((ConstValue::Bool(if yb == 0 { xb == 0 } else { xb % yb == 0 }), BOOL)),
             "eq_ignore_ascii_case" if it == IntTy::U8 => Ok((ConstValue::Bool((xb as u8).eq_ignore_ascii_case(&(yb as u8))), BOOL)),
             _ => Err(outside_err()),
         }

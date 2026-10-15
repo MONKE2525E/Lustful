@@ -864,6 +864,15 @@ uint64_t lust_rem_euclid(uint64_t a, uint64_t b, unsigned bits, int is_signed, l
     }
 })
 
+uint64_t lust_isqrt64(uint64_t v) LUST_BODY({
+    uint64_t r = 1ull << 32, n;
+    if (v < 2) return v;
+    for (;;) {
+        n = (r + v / r) / 2;
+        if (n >= r) return r;
+        r = n;
+    }
+})
 uint32_t lust_count_ones64(uint64_t v) LUST_BODY({
     v = v - ((v >> 1) & 0x5555555555555555ull);
     v = (v & 0x3333333333333333ull) + ((v >> 2) & 0x3333333333333333ull);

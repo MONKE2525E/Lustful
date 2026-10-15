@@ -4359,7 +4359,20 @@ impl FnGen<'_, '_> {
             | B::Signum
             | B::IsPositive
             | B::IsNegative
-            | B::IsPowerOfTwo => self.int_method_c(b, &vals, &tys, loc),
+            | B::IsPowerOfTwo
+            | B::IsMultipleOf
+            | B::UnboundedShl
+            | B::UnboundedShr
+            | B::CastSigned
+            | B::CastUnsigned
+            | B::Isqrt
+            | B::CheckedIsqrt
+            | B::BitWidth
+            | B::HighestOne
+            | B::LowestOne
+            | B::IsolateHighestOne
+            | B::IsolateLowestOne
+            | B::IntMidpoint => self.int_method_c(b, &vals, &tys, loc),
             B::FloatSqrt
             | B::FloatPowi
             | B::FloatPowf
@@ -5565,6 +5578,63 @@ impl FnGen<'_, '_> {
             B::IsPositive => format!("({a} > 0)"),
             B::IsNegative => format!("({a} < 0)"),
             B::IsPowerOfTwo => format!("({masked_a} != 0 && ({masked_a} & ({masked_a} - 1)) == 0)"),
+            B::IsMultipleOf => {
+                let masked_b = format!("({ub} & {mask})");
+                format!("({masked_b} == 0 ? {masked_a} == 0 : ({masked_a} % {masked_b}) == 0)")
+            }
+            B::UnboundedShl => format!("(({}) >= {bits}u ? ({ct})0 : ({ct})(({masked_a} << {}) & {mask}))", vals[1], vals[1]),
+            B::UnboundedShr => {
+                if sgn {
+                    format!("(({}) >= {bits}u ? ({ct})(({a} < 0) ? -1 : 0) : ({ct})(((int64_t)({a}) >> {}) & (int64_t){mask}))", vals[1], vals[1])
+                } else {
+                    format!("(({}) >= {bits}u ? ({ct})0 : ({ct})({masked_a} >> {}))", vals[1], vals[1])
+                }
+            }
+            B::CastSigned | B::CastUnsigned => format!("(({})({a}))", int_c(it.counterpart())),
+            B::BitWidth => format!("({bits}u - lust_leading_zeros64({masked_a}, {bits}))"),
+            B::HighestOne => self.int_option_c(&format!("({bits}u - 1u - lust_leading_zeros64({masked_a}, {bits}))"), &format!("{masked_a} != 0"), IntTy::U32),
+            B::LowestOne => self.int_option_c(&format!("lust_trailing_zeros64({masked_a}, {bits})"), &format!("{masked_a} != 0"), IntTy::U32),
+            B::IsolateLowestOne => format!("(({ct})({masked_a} & (0ull - {masked_a}) & {mask}))"),
+            B::IsolateHighestOne => {
+                let (x, t) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {x} = {masked_a}; {ct} {t} = {x} == 0 ? ({ct})0 : ({ct})((1ull << ({bits} - 1 - lust_leading_zeros64({x}, {bits}))) & {mask});"
+                );
+                t
+            }
+            B::Isqrt | B::CheckedIsqrt => {
+                let root = format!("lust_isqrt64({masked_a})");
+                if b == B::CheckedIsqrt {
+                    self.int_option_c(&format!("(({ct}){root})"), &format!("{a} >= 0"), it)
+                } else if sgn {
+                    let t = self.tmp();
+                    let _ = writeln!(
+                        self.out,
+                        "    if ({a} < 0) lust_panic_cstr(\"argument of integer square root cannot be negative\", {loc}); {ct} {t} = ({ct}){root};"
+                    );
+                    t
+                } else {
+                    format!("(({ct}){root})")
+                }
+            }
+            // `midpoint` rounds toward zero and cannot overflow:
+            // opposite signs sum safely, equal signs go through the
+            // unsigned bit trick on the magnitudes.
+            B::IntMidpoint => {
+                let masked_b = format!("({ub} & {mask})");
+                if !sgn {
+                    format!("(({ct})((({masked_a} & {masked_b}) + (({masked_a} ^ {masked_b}) >> 1)) & {mask}))")
+                } else {
+                    let (x, y, t) = (self.tmp(), self.tmp(), self.tmp());
+                    let _ = writeln!(self.out, "    {ct} {x} = {a}, {y} = {};", vals[1]);
+                    let _ = writeln!(
+                        self.out,
+                        "    {ct} {t} = ({x} < 0) != ({y} < 0) ? ({ct})(((int64_t){x} + (int64_t){y}) / 2) : {x} >= 0 ? ({ct})(((uint64_t){x} & (uint64_t){y}) + (((uint64_t){x} ^ (uint64_t){y}) >> 1)) : ({ct})(0ull - ((((0ull - (uint64_t){x}) & {mask}) & ((0ull - (uint64_t){y}) & {mask})) + ((((0ull - (uint64_t){x}) & {mask}) ^ ((0ull - (uint64_t){y}) & {mask})) >> 1)));"
+                    );
+                    t
+                }
+            }
             _ => "0".into(),
         }
     }
@@ -5647,6 +5717,45 @@ impl FnGen<'_, '_> {
             B::IsPositive => format!("((int64_t){x}.hi > 0 || ({x}.hi == 0 && {x}.lo != 0))"),
             B::IsNegative => format!("((int64_t){x}.hi < 0)"),
             B::IsPowerOfTwo => format!("(lust_count_ones64({x}.lo) + lust_count_ones64({x}.hi) == 1)"),
+            B::IsMultipleOf => {
+                let (y, r, t) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    {ct} {y} = {}; {ct} {r} = {{0, 0}}; int {t} = ({y}.lo == 0 && {y}.hi == 0) ? ({x}.lo == 0 && {x}.hi == 0) : (lust_u128_divmod({x}, {y}, &{r}), {r}.lo == 0 && {r}.hi == 0);",
+                    vals[1]
+                );
+                t
+            }
+            B::UnboundedShl => format!("(({}) >= 128u ? (({ct}){{0, 0}}) : lust_{f}_shl({x}, {}))", vals[1], vals[1]),
+            B::UnboundedShr => {
+                if it.signed() {
+                    format!("(({}) >= 128u ? (({ct}){{(uint64_t)((int64_t){x}.hi >> 63), (uint64_t)((int64_t){x}.hi >> 63)}}) : lust_{f}_shr({x}, {}))", vals[1], vals[1])
+                } else {
+                    format!("(({}) >= 128u ? (({ct}){{0, 0}}) : lust_{f}_shr({x}, {}))", vals[1], vals[1])
+                }
+            }
+            B::CastSigned => format!("lust_i128_from_u128({x})"),
+            B::CastUnsigned => format!("lust_u128_from_i128({x})"),
+            B::BitWidth => format!("(128u - ({x}.hi != 0 ? lust_leading_zeros64({x}.hi, 64) : 64u + lust_leading_zeros64({x}.lo, 64)))"),
+            B::HighestOne => self.int_option_c(
+                &format!("(127u - ({x}.hi != 0 ? lust_leading_zeros64({x}.hi, 64) : 64u + lust_leading_zeros64({x}.lo, 64)))"),
+                &format!("({x}.lo != 0 || {x}.hi != 0)"),
+                IntTy::U32,
+            ),
+            B::LowestOne => self.int_option_c(
+                &format!("({x}.lo != 0 ? lust_trailing_zeros64({x}.lo, 64) : 64u + lust_trailing_zeros64({x}.hi, 64))"),
+                &format!("({x}.lo != 0 || {x}.hi != 0)"),
+                IntTy::U32,
+            ),
+            B::IsolateLowestOne => format!("lust_{f}_and({x}, lust_{f}_sub((({ct}){{0, 0}}), {x}))"),
+            B::IsolateHighestOne => {
+                let (lz, t) = (self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint32_t {lz} = {x}.hi != 0 ? lust_leading_zeros64({x}.hi, 64) : 64u + lust_leading_zeros64({x}.lo, 64); {ct} {t} = ({x}.lo == 0 && {x}.hi == 0) ? (({ct}){{0, 0}}) : lust_{f}_shl((({ct}){{1, 0}}), 127u - {lz});"
+                );
+                t
+            }
             _ => "0".into(),
         }
     }

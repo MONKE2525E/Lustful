@@ -146,6 +146,19 @@ pub enum Builtin {
     IsPositive,
     IsNegative,
     IsPowerOfTwo,
+    IsMultipleOf,
+    UnboundedShl,
+    UnboundedShr,
+    CastSigned,
+    CastUnsigned,
+    Isqrt,
+    CheckedIsqrt,
+    BitWidth,
+    HighestOne,
+    LowestOne,
+    IsolateHighestOne,
+    IsolateLowestOne,
+    IntMidpoint,
     FloatSqrt,
     FloatPowi,
     FloatPowf,
@@ -10319,6 +10332,19 @@ impl<'p> Ctx<'p> {
             self.set_res(e, Res::DefaultVal);
             return Some(base);
         }
+        // `{integer}::midpoint(a, b)` (1.85 unsigned, 1.87 signed):
+        // an inherent associated fn, so no trait probe finds it.
+        // The 128-bit forms stay out for now.
+        if name == p.known.midpoint
+            && args.len() == 2
+            && let TyKind::Int(it) = self.kind(base)
+            && it.bits() < 128
+        {
+            self.set_res(callee, Res::Builtin(Builtin::IntMidpoint));
+            self.set_res(e, Res::Builtin(Builtin::IntMidpoint));
+            self.check_args(&[base, base], args, span);
+            return Some(base);
+        }
         // `<dyn P as Tr>::m(d)` and `<dyn P>::m(d)` (ARCH 2.8): an
         // `impl dyn P` method, or an object candidate through the vtable.
         if let Some(t) = self.dyn_assoc_call(e, base, hint, name, args, span) {
@@ -13336,6 +13362,42 @@ impl<'p> Ctx<'p> {
         if n == k.is_power_of_two && !s {
             return Some((B::IsPowerOfTwo, Autoref::None, vec![], BOOL));
         }
+        // The 1.84 to 1.97 bit and shift families (fx-defaults):
+        // `is_multiple_of` and `bit_width` are unsigned only, the
+        // casts name the other signedness, and the isolate and
+        // highest/lowest forms run on the raw bits of either.
+        if n == k.is_multiple_of && !s {
+            return Some((B::IsMultipleOf, Autoref::None, vec![t], BOOL));
+        }
+        if n == k.unbounded_shl {
+            return sh(B::UnboundedShl);
+        }
+        if n == k.unbounded_shr {
+            return sh(B::UnboundedShr);
+        }
+        if n == k.cast_signed && !s {
+            return Some((B::CastSigned, Autoref::None, vec![], int(i.counterpart())));
+        }
+        if n == k.cast_unsigned && s {
+            return Some((B::CastUnsigned, Autoref::None, vec![], int(i.counterpart())));
+        }
+        if n == k.bit_width && !s {
+            return Some((B::BitWidth, Autoref::None, vec![], u32t));
+        }
+        if n == k.highest_one {
+            let o = self.tys.mk_option(u32t);
+            return Some((B::HighestOne, Autoref::None, vec![], o));
+        }
+        if n == k.lowest_one {
+            let o = self.tys.mk_option(u32t);
+            return Some((B::LowestOne, Autoref::None, vec![], o));
+        }
+        if n == k.isolate_highest_one {
+            return un(B::IsolateHighestOne);
+        }
+        if n == k.isolate_lowest_one {
+            return un(B::IsolateLowestOne);
+        }
         if n == k.count_ones {
             return Some((B::CountOnes, Autoref::None, vec![], u32t));
         }
@@ -13371,6 +13433,16 @@ impl<'p> Ctx<'p> {
         }
         if w128 {
             return None;
+        }
+        // `isqrt` (1.84): every integer; the signed form panics on a
+        // negative input, `checked_isqrt` gives `None` there. The
+        // 128-bit forms stay out with the families below.
+        if n == k.isqrt {
+            return un(B::Isqrt);
+        }
+        if n == k.checked_isqrt && s {
+            let o = self.tys.mk_option(t);
+            return Some((B::CheckedIsqrt, Autoref::None, vec![], o));
         }
         // Checked, saturating, and overflowing families (64-bit and below).
         if n == k.checked_add {

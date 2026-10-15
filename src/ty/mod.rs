@@ -192,6 +192,25 @@ impl IntTy {
     pub fn signed(self) -> bool {
         matches!(self, IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize | IntTy::I128)
     }
+    /// The same-width integer type of the other signedness
+    /// (`u32` <-> `i32`), for `cast_signed` and `cast_unsigned`.
+    pub fn counterpart(self) -> IntTy {
+        use IntTy::*;
+        match self {
+            I8 => U8,
+            I16 => U16,
+            I32 => U32,
+            I64 => U64,
+            Isize => Usize,
+            I128 => U128,
+            U8 => I8,
+            U16 => I16,
+            U32 => I32,
+            U64 => I64,
+            Usize => Isize,
+            U128 => I128,
+        }
+    }
     pub fn bits(self) -> u32 {
         match self {
             IntTy::I8 | IntTy::U8 => 8,
