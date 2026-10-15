@@ -18208,8 +18208,11 @@ impl<'p> Ctx<'p> {
         if !self.is_template_check() {
             return false;
         }
-        let ast::Expr::Path(segs) = self.p.ast.expr(callee) else { return false };
-        let Some(&arg) = segs.last().and_then(|s| s.type_args().first()) else { return false };
+        let arg = match self.p.ast.expr(callee) {
+            ast::Expr::Path(segs) => segs.last().and_then(|s| s.type_args().first().copied()),
+            _ => None,
+        };
+        let Some(arg) = arg else { return false };
         let t = self.resolve_written(arg);
         self.tys.flags(t).contains_param()
     }
@@ -18471,7 +18474,7 @@ impl<'p> Ctx<'p> {
                         Some(KVal::Int(v)) => self.k_wrap(v, ety).map(KVal::Int),
                         other => other,
                     },
-                    _ => match self.out.expr_res[self.ei(*callee)] {
+                    _ => match { let r = self.out.expr_res[self.ei(*callee)]; r } {
                         Res::ConstUsize(u) if !self.k_query_placeholder(*callee) => Some(KVal::Int(u as i128)),
                         Res::Variant(a, v) if p.adt(a).is_enum => Some(KVal::Enum(a, v)),
                         Res::Variant(a, _) if !p.adt(a).is_enum => Some(KVal::Agg(vals)),
