@@ -455,7 +455,8 @@
     "closure.arg_of.spawn_scoped",
     "method.lock",
     "std.use.std::thread",
-    "std.use.std::thread::*"
+    "std.use.std::thread::*",
+    "std.type.std::thread"
    ]
   },
   {
@@ -1054,7 +1055,9 @@
     "std.use.std::fmt",
     "std.use.std::fmt::*",
     "std.use.std::ops",
-    "std.use.std::ops::*"
+    "std.use.std::ops::*",
+    "std.type.std::fmt",
+    "std.type.std::ops"
    ]
   },
   {
@@ -1393,7 +1396,10 @@
     "std.use.std::fs",
     "std.use.std::fs::*",
     "std.use.std::env",
-    "std.use.std::env::*"
+    "std.use.std::env::*",
+    "std.type.std::io",
+    "std.type.std::fs",
+    "std.type.std::env"
    ]
   },
   {
@@ -1632,8 +1638,8 @@
   {
    "id": "std.net_addr",
    "title": "IP and socket address types (IpAddr, SocketAddr, parsing)",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
@@ -1673,8 +1679,8 @@
   {
    "id": "std.error",
    "title": "std::error::Error trait",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
@@ -1694,8 +1700,8 @@
   {
    "id": "std.float_consts",
    "title": "std::f64::consts and std::f32::consts by full path",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
@@ -1713,8 +1719,8 @@
   {
    "id": "std.vec_into_iter",
    "title": "std::vec::IntoIter named as a type",
-   "status": "unsupported",
-   "milestone": 5,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "5",
    "root_cause": "std-runtime",
    "fix_class": "compiler",
