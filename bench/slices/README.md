@@ -9,6 +9,7 @@ and `lust build` builds it.
 
 | Slice | Lines (code) | From |
 |---|---|---|
+| `tsrust-all` | 160,065 (98,983) | all of ts_goport (`lib.rs`) with both part crates mounted, plus smallvec and xxhash_rust stand-ins (671,746 lines copied) |
 | `tsrust-full` | 150,147 (91,879) | all of ts_goport (`lib.rs`) with both part crates mounted (670,906 lines copied) |
 | `tsrust-nochecker` | 107,084 (67,850) | ts_goport `lib.rs` with both part crates, without checker, ls, lsp, project, api, execute, cmd (406,266 lines copied) |
 | `goport-util-lsp` | 53,918 (36,890) | ts-rust `goport_util` + `goport_lsproto` merged into one crate (147,484 lines) |
@@ -40,6 +41,9 @@ Bench-owned text, not ts-rust code:
 - `support.rs`: stand-ins for `rustc_hash`, `indexmap`, `memchr` (from
   tests/kernels, with two lust-friendly changes; see its header). Paths to
   those crates are rewritten to `crate::<name>::` (spec `rewrite`).
+- `support_smallvec.rs` (lust's smallvec adapter, `smallvec!` as a module
+  macro) and `support_xxhash.rs` (the xxh3 API over FNV-1a: other hash
+  values than the real crate, the same in lust and rustc). `tsrust-all` only.
 - in `goport-util-lsp`, `goport_util::` paths become `crate::` (spec
   `rewrite_to`): goport_lsproto's own root re-exports goport_util, so the
   merged crate keeps every path's meaning.
@@ -54,8 +58,8 @@ ts_goport's re-exports; `goport_util::` and `goport_lsproto::` paths become
 `crate::goport_util::` and `crate::goport_lsproto::`. A spec's `unmount` list
 leaves top modules of `lib.rs` out, for a slice between 50k lines and full size.
 
-Not stubbed: `smallvec`, `xxhash_rust`, and the other external crates (users
-are pruned), and the data files that `include_bytes!` reads (prune.py copies
+Not stubbed: `smallvec` and `xxhash_rust` outside `tsrust-all`, and the other
+external crates (users are pruned), and the data files that `include_bytes!` reads (prune.py copies
 only `.rs` files). `bench/slices/coverage.py` counts both apart from lust errors.
 
 ## Grow a slice

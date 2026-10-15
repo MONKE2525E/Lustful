@@ -76,8 +76,9 @@ def top_module(rel):
 EXTERNAL = {"smallvec", "SmallVec", "xxhash_rust", "bumpalo", "flate2", "jiff", "rustix", "signal_hook", "nix", "num_bigint",
             "num_traits", "ryu_js", "tikv_jemallocator", "tikv_jemalloc_ctl", "miow", "same_file", "name_to_handle_at",
             "notify", "unicode_normalization", "lzma_rust2"}
+DERIVE = re.compile(r"^deriving `\w+` requires every field|^cannot derive")
 # Messages that say a name does not resolve: the only ones that can be a cascade.
-UNRESOLVED = re.compile(r"cannot find|unresolved|not found|no method|no field|no associated|unknown|does not exist|failed to resolve")
+UNRESOLVED = re.compile(r"cannot find|unresolved|not found|no method|no field|no associated|no variant|unknown|does not exist|failed to resolve")
 
 
 def root_causes(removed, item_text=None):
@@ -109,6 +110,13 @@ def root_causes(removed, item_text=None):
                 named_first.setdefault(nm, i)
     for i, r in enumerate(removed):
         msg = r["message"]
+        # A derive that fails on a field whose type prune.py removed earlier is that
+        # type's cascade (lust reports the derive before "cannot find type").
+        if item_text and DERIVE.search(msg):
+            j = next((item_at[x] for x in re.findall(r"\b([A-Z]\w*)\b", item_text(r)) if item_at.get(x, i) < i), None)
+            if j is not None:
+                parent[i] = j
+            continue
         if item_text and msg.startswith("module paths in"):
             j = next((item_at[x] for x in re.findall(r"::([A-Z]\w*)", item_text(r)) if item_at.get(x, i) != i), None)
             if j is not None:
@@ -243,10 +251,10 @@ def main():
     md.append(f"| **all** | {tot[0]:,} | **{tot[1]:,}** | **{pc(tot[1], tot[0])}** | {tot[2]:,} | {pc(tot[2], tot[0])} |")
     md += ["", "Measured vs estimate: the estimate counts a whole file when every construct the scanner sees maps",
            "to a supported feature (no type data, so it misses type errors and cascades). The measured number",
-           "counts items that all three oracles take, so a file can be half in. goport_util and goport_lsproto",
-           "measure far above the estimate (most of their files hold one unsupported construct, and only that",
-           "item goes); ts_goport measures below it (one early failure, such as the `handle!` ids in core.rs,",
-           "removes every user).",
+           "counts items that all three oracles take, so a file can be half in. A file with one unsupported",
+           "construct loses only that item (the measured number can be above the estimate), but one early",
+           "failure removes every user of the item in every file (below the estimate). The ranked root causes",
+           "below name those failures.",
            "", "### Per top module", "", "| crate | module | universe | accepted | % | estimate | % |", "|---|---|---:|---:|---:|---:|---:|"]
     for (c, mod), (u, k, e, g) in sorted(per.items(), key=lambda kv: -kv[1][0]):
         md.append(f"| {c} | `{mod}` | {u:,} | {k:,} | {pc(k, u)} | {e:,} | {pc(e, u)} |")
@@ -266,7 +274,10 @@ def main():
     md += ["", f"## Top {a.top} reasons lust (or rustc, or lust build) removed code from `{main_dir.name}`", "",
            "One row per root cause kind (oracle, code, message with numbers masked). `own` is the lines of the",
            "items the error was in; `cascade` is the lines of removals whose \"cannot find\" kind of error",
-           "names one of those items, or a name the root's error named first (a std item lust lacks). Fix the",
+           "names one of those items, or a name the root's error named first (a std item lust lacks). Also",
+           "cascades: a derive that fails on a field whose type went earlier, and a lust error that names the",
+           "module (`ata`) or says \"module paths in types\" for a missing `mod::Item` (the removed item's",
+           "source finds the Item). Removed trait impls have no name, so their users count as roots. Fix the",
            "top rows first. `external` rows are crates with no stand-in in support.rs, not lust errors. Lines",
            "can count twice when an item and its parent go in different rounds, so the columns sum to more",
            "than the slice lost.", "",
