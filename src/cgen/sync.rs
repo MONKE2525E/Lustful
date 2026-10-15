@@ -1063,10 +1063,10 @@ impl FnGen<'_, '_, '_> {
             S::SyncNew(SyncTy::Barrier) => format!("((lust_Barrier){{0, 0, 0, 0, {}}})", vals[0]),
             S::SyncNew(_) => "((uint32_t)0)".into(),
             S::TryLock(write) => {
-                let (gk, call) = match (k, write) {
-                    (SyncTy::Mutex, _) => (SyncTy::MutexGuard, "lust_mutex_trylock"),
-                    (_, false) => (SyncTy::RwLockReadGuard, "lust_rw_tryread"),
-                    _ => (SyncTy::RwLockWriteGuard, "lust_rw_trywrite"),
+                let (gk, call, unlock) = match (k, write) {
+                    (SyncTy::Mutex, _) => (SyncTy::MutexGuard, "lust_mutex_trylock", "lust_mutex_unlock"),
+                    (_, false) => (SyncTy::RwLockReadGuard, "lust_rw_tryread", "lust_rw_read_unlock"),
+                    _ => (SyncTy::RwLockWriteGuard, "lust_rw_trywrite", "lust_rw_write_unlock"),
                 };
                 let guard = CTy::Sync(gk, Box::new(elem.clone()));
                 let res = CTy::Result(Box::new(guard.clone()), Box::new(CTy::Sync(SyncTy::TryLockError, Box::new(guard.clone()))));
@@ -1074,9 +1074,13 @@ impl FnGen<'_, '_, '_> {
                 let t = self.tmp();
                 let f = variant_field(self.p, &res, &t, 0, 0);
                 let o = &vals[0];
+                let enter = if gk == SyncTy::RwLockReadGuard { String::new() } else { format!(" lust_poison_enter(&({o})->poison);", o = vals[0]) };
+                // A poisoned lock is an Err (std's `TryLockError::Poisoned`,
+                // which lust's TryLockError does not carry: the lock is
+                // released and the Err is the one lust has).
                 let _ = writeln!(
                     self.out,
-                    "    {} {t}; if ({call}(&({o})->st)) {{ {} {f} = {o}; }} else {{ {} }}",
+                    "    {} {t}; if ({call}(&({o})->st) && !(({o})->poison & 1 && ({unlock}(&({o})->st), 1))) {{ {} {f} = {o};{enter} }} else {{ {} }}",
                     ctype(&res),
                     disc_set(self.p, &res, &t, 0),
                     disc_set(self.p, &res, &t, 1),
