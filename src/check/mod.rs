@@ -1144,6 +1144,27 @@ enum PatIdent {
     Other,
 }
 
+/// How a checked const pattern value resolves (see
+/// `Ctx::check_const_value`).
+#[derive(Clone, Copy)]
+enum ConstPat {
+    Scalar,
+    Variant(AdtId, u32),
+    OptNone,
+}
+
+/// True when a const value holds a NaN float at any depth.
+fn const_value_has_nan(v: &crate::ty::consteval::ConstValue) -> bool {
+    use crate::ty::consteval::ConstValue as CV;
+    match v {
+        CV::Float(bits, crate::ty::FloatTy::F32) => f32::from_bits(*bits as u32).is_nan(),
+        CV::Float(bits, crate::ty::FloatTy::F64) => f64::from_bits(*bits).is_nan(),
+        CV::Aggregate(parts) | CV::Variant(_, parts) => parts.iter().any(const_value_has_nan),
+        CV::Repeat(inner, _) | CV::Ref(inner) => const_value_has_nan(inner),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum PatRes {
     None,
@@ -1485,6 +1506,11 @@ struct Ctx<'p> {
     /// Ord, and a `PartialOrd::lt` lust can call (std's sort compares
     /// with `lt`, not `Ord::cmp`), re-tested at finish.
     deferred_sort_ord: Vec<(Ty, Span)>,
+    /// Fn item / fn pointer casts whose target holds a `_`:
+    /// rustc checks the signatures after inference, so the
+    /// operand does not bind the `_` at the cast. The pair is
+    /// (operand type, target type); rechecked at finish.
+    deferred_fn_casts: Vec<(Ty, Ty, Span)>,
     /// Types a `Result` method formats with Debug in its panic message.
     deferred_debug: Vec<(Ty, Span)>,
     /// Types a `take` builds with `Default::default()`.
@@ -1826,6 +1852,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_copy: Vec::new(),
         deferred_ord: Vec::new(),
         deferred_sort_ord: Vec::new(),
+        deferred_fn_casts: Vec::new(),
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_sized: Vec::new(),
@@ -2412,6 +2439,71 @@ impl<'p> Ctx<'p> {
             return Some((ConstValue::Char(c), CHAR));
         }
         None
+    }
+
+    /// A primitive float associated const used as a pattern
+    /// (`f64::INFINITY`, `std::f64::consts::PI`): its value and
+    /// type, from the const evaluator's table.
+    fn primitive_float_const_pattern(&mut self, segs: &[ast::PathSeg]) -> Option<(crate::ty::consteval::ConstValue, Ty)> {
+        use crate::ty::consteval::ConstValue;
+        let names: Vec<&str> = segs.iter().map(|s| self.name(s.name)).collect();
+        let (ty_name, item, module) = match names.as_slice() {
+            [t, i] => (*t, *i, false),
+            [p, t, c, i] if matches!(*p, "std" | "core" | "alloc") && *c == "consts" => (*t, *i, true),
+            _ => return None,
+        };
+        let f = match ty_name {
+            "f32" => FloatTy::F32,
+            "f64" => FloatTy::F64,
+            _ => return None,
+        };
+        if module {
+            let bits = crate::ty::consteval::float_consts_value(f, item)?;
+            return Some((ConstValue::Float(bits, f), self.tys.float_ty(f)));
+        }
+        match crate::ty::consteval::primitive_float_assoc(f, item)? {
+            (bits, None) => Some((ConstValue::Float(bits, f), self.tys.float_ty(f))),
+            (v, Some(it)) => Some((ConstValue::Int(v as i128), int(it))),
+        }
+    }
+
+    /// A primitive associated const of an already resolved base
+    /// type (the `<u8>::MAX` / `<f64>::INFINITY` pattern forms).
+    fn primitive_const_for_base(&mut self, base: Ty, name: Sym) -> Option<(crate::ty::consteval::ConstValue, Ty)> {
+        use crate::ty::consteval::ConstValue;
+        let item = self.name(name);
+        match self.kind(base) {
+            TyKind::Int(it) => {
+                let v = match item {
+                    "MAX" => crate::ty::consteval::truncate_to_int(it.max128() as i128, it),
+                    "MIN" => {
+                        if it.signed() {
+                            if it.bits() >= 128 { i128::MIN } else { -(1i128 << (it.bits() - 1)) }
+                        } else {
+                            0
+                        }
+                    }
+                    "BITS" => return Some((ConstValue::Int(it.bits() as i128), int(IntTy::U32))),
+                    _ => return None,
+                };
+                let v = if it == IntTy::U128 && item == "MAX" { -1 } else { v };
+                Some((ConstValue::Int(v), int(it)))
+            }
+            TyKind::Float(f) => match crate::ty::consteval::primitive_float_assoc(f, item)? {
+                (bits, None) => Some((ConstValue::Float(bits, f), self.tys.float_ty(f))),
+                (v, Some(it)) => Some((ConstValue::Int(v as i128), int(it))),
+            },
+            TyKind::Char => {
+                let c = match item {
+                    "MAX" => char::MAX,
+                    "MIN" => char::MIN,
+                    "REPLACEMENT_CHARACTER" => char::REPLACEMENT_CHARACTER,
+                    _ => return None,
+                };
+                Some((ConstValue::Char(c), CHAR))
+            }
+            _ => None,
+        }
     }
 
     /// True when `name` is a std prelude variant (`None`, `Some`, `Ok`,
@@ -4287,6 +4379,46 @@ impl<'p> Ctx<'p> {
             TyKind::FnDef(d, a) => {
                 let a = self.instantiate_args(a, map);
                 self.tys.intern(TyKind::FnDef(d, a))
+            }
+            TyKind::RawPtr(m, e) => {
+                let e = self.instantiate_inner(e, map);
+                self.tys.intern(TyKind::RawPtr(m, e))
+            }
+            TyKind::Closure(d, a) => {
+                let a = self.instantiate_args(a, map);
+                self.tys.intern(TyKind::Closure(d, a))
+            }
+            TyKind::Opaque(d, a) => {
+                let a = self.instantiate_args(a, map);
+                self.tys.intern(TyKind::Opaque(d, a))
+            }
+            TyKind::FnPtr(sig) => {
+                let b = self.tys.sig(sig);
+                let old: Vec<Ty> = self.tys.tys_of(b.value.inputs).to_vec();
+                let new: Vec<Ty> = old.iter().map(|&e| self.instantiate_inner(e, map)).collect();
+                let inputs = self.tys.intern_tys(&new);
+                let output = self.instantiate_inner(b.value.output, map);
+                let sig = self.tys.intern_sig(Binder { count: b.count, value: FnSig { inputs, output, ..b.value } });
+                self.tys.intern(TyKind::FnPtr(sig))
+            }
+            TyKind::Dyn(b, r) => {
+                let mut bounds = self.tys.dyn_bounds(b).clone();
+                if let Some(pr) = &mut bounds.principal {
+                    pr.value.args = self.instantiate_args(pr.value.args, map);
+                    let old: Vec<(DefId, GenericArg)> = self.tys.bindings(pr.value.bindings).to_vec();
+                    if !old.is_empty() {
+                        let new: Vec<(DefId, GenericArg)> = old
+                            .into_iter()
+                            .map(|(d, g)| match g {
+                                GenericArg::Ty(t) => (d, GenericArg::Ty(self.instantiate_inner(t, map))),
+                                g => (d, g),
+                            })
+                            .collect();
+                        pr.value.bindings = self.tys.intern_bindings(&new);
+                    }
+                }
+                let b = self.tys.intern_dyn_bounds(bounds);
+                self.tys.intern(TyKind::Dyn(b, r))
             }
             _ => t,
         }
@@ -7087,6 +7219,19 @@ impl<'p> Ctx<'p> {
             }
             Expr::Cast { expr, ty } => {
                 let target = self.resolve_written(*ty);
+                // A bare `_` cast target takes the expected type:
+                // `let x: u16 = 3u8 as _` casts to `u16`.
+                let target = if matches!(self.kind(target), TyKind::Infer(_)) {
+                    match expected {
+                        Some(exp) => {
+                            self.unify(target, exp);
+                            self.resolve(target)
+                        }
+                        None => target,
+                    }
+                } else {
+                    target
+                };
                 // An unsuffixed literal takes its type from the cast
                 // target: `300 as u8` is a u8 literal out of range,
                 // and `3000000000 as u64` needs no i32 fit first.
@@ -7106,13 +7251,39 @@ impl<'p> Ctx<'p> {
                 // and a fn pointer casts to itself. The item form goes
                 // through the coercion path, which gives the inner
                 // expression the pointer type for lowering.
+                // A target with a `_` (`f as fn(_) -> u8`) is only
+                // probed here: rustc checks fn casts after
+                // inference, so the operand's signature must not
+                // bind the `_` yet (a later `g(3)` defaults it to
+                // `i32` and the cast then fails). The real check
+                // is deferred to `finish`.
                 let fn_cast = match (self.kind(t), self.kind(target)) {
                     (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(t) => {
-                        self.fn_item_ptr_unifies(t, target) && self.coerce_at(t, target, span, Some(*expr))
+                        if self.has_unbound_deep(target) {
+                            let snap = self.snapshot_vars();
+                            let ok = self.fn_item_ptr_unifies(t, target) && self.coerce_at(t, target, span, Some(*expr));
+                            self.rollback_vars(snap);
+                            if ok {
+                                self.deferred_fn_casts.push((t, target, span));
+                            }
+                            ok
+                        } else {
+                            self.fn_item_ptr_unifies(t, target) && self.coerce_at(t, target, span, Some(*expr))
+                        }
                     }
                     (TyKind::FnPtr(_), TyKind::FnPtr(_)) => match (self.callable_sig(t), self.callable_sig(target)) {
                         (Some((pa, ra)), Some((pb, rb))) => {
-                            pa.len() == pb.len() && pa.iter().zip(&pb).all(|(&a, &b)| self.unify(a, b)) && self.unify(ra, rb)
+                            if self.has_unbound_deep(target) {
+                                let snap = self.snapshot_vars();
+                                let ok = pa.len() == pb.len() && pa.iter().zip(&pb).all(|(&a, &b)| self.unify(a, b)) && self.unify(ra, rb);
+                                self.rollback_vars(snap);
+                                if ok {
+                                    self.deferred_fn_casts.push((t, target, span));
+                                }
+                                ok
+                            } else {
+                                pa.len() == pb.len() && pa.iter().zip(&pb).all(|(&a, &b)| self.unify(a, b)) && self.unify(ra, rb)
+                            }
                         }
                         _ => false,
                     },
@@ -15250,11 +15421,58 @@ impl<'p> Ctx<'p> {
     /// cannot compare yet is the non-scalar unsupported error), then
     /// type equality and refutability outside `match`. Returns true
     /// when the pattern may use the value.
-    fn check_const_value(&mut self, cty: Ty, val: &crate::ty::consteval::ConstValue, t: Ty, span: Span, in_match: bool) -> bool {
+    /// Checks a const pattern's value against the scrutinee type.
+    /// Returns how the pattern resolves: a scalar comparison, a
+    /// unit variant, or `None` (the error is already reported).
+    fn check_const_value(
+        &mut self,
+        cty: Ty,
+        val: &crate::ty::consteval::ConstValue,
+        t: Ty,
+        span: Span,
+        in_match: bool,
+    ) -> Option<ConstPat> {
         use crate::ty::consteval::ConstValue as CV;
         let ct = self.resolve(cty);
-        match val {
-            CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Float(..) | CV::Str(_) => {}
+        // rustc rejects a NaN anywhere in a const pattern's value,
+        // before the structural rules below.
+        if const_value_has_nan(val) {
+            self.err("L0110", span, "cannot use NaN in patterns", "Use a guard to test for NaN.");
+            return None;
+        }
+        let out = match val {
+            CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Float(..) | CV::Str(_) => ConstPat::Scalar,
+            CV::Variant(v, fields) if fields.is_empty() => {
+                let nonstructural = matches!(self.tys.local_adt(ct), Some(a) if !self.p.adt(a).derives.partial_eq);
+                if nonstructural {
+                    let tn = self.tn(ct);
+                    self.err(
+                        "L0633",
+                        span,
+                        format!("constant of non-structural type `{tn}` cannot be used in a pattern"),
+                        "Derive `PartialEq` on the type, match a field, or compare in a guard instead.",
+                    );
+                    return None;
+                }
+                if self.tys.option_elem(ct).is_some() && *v == 0 {
+                    ConstPat::OptNone
+                } else if let Some(a) = self.tys.local_adt(ct).filter(|&a| {
+                    self.p.adt(a).is_enum
+                        && self.p.adt(a).variants.get(*v as usize).is_some_and(|var| var.shape == VariantShape::Unit)
+                }) {
+                    // A generic enum instance scrutinee names its own
+                    // Adt; the const's type may name the template.
+                    let dt = self.deep(t);
+                    let a = match self.tys.local_adt(dt) {
+                        Some(inst) if inst != a && self.p.def_of_adt(inst) == self.p.def_of_adt(a) => inst,
+                        _ => a,
+                    };
+                    ConstPat::Variant(a, *v)
+                } else {
+                    self.errs.push(unsupported(span, "non-scalar const patterns"));
+                    return None;
+                }
+            }
             _ => {
                 let nonstructural = matches!(self.tys.local_adt(ct), Some(a) if !self.p.adt(a).derives.partial_eq);
                 if nonstructural {
@@ -15268,18 +15486,18 @@ impl<'p> Ctx<'p> {
                 } else {
                     self.errs.push(unsupported(span, "non-scalar const patterns"));
                 }
-                return false;
+                return None;
             }
-        }
+        };
         let eff = if matches!(val, CV::Str(_)) && self.kind(t) == TyKind::Str { t } else { ct };
         if !self.unify(eff, t) {
             self.mismatch(span, t, eff);
-            return false;
+            return None;
         }
         if !in_match {
             self.errs.push(unsupported(span, "refutable patterns here"));
         }
-        true
+        Some(out)
     }
 
     /// A free const item used as a pattern, by const index.
@@ -15292,8 +15510,11 @@ impl<'p> Ctx<'p> {
         }
         let c = &self.p.consts[idx as usize];
         let (ct, val) = (c.ty, c.value.clone());
-        if self.check_const_value(ct, &val, t, span, in_match) {
-            self.out.pat_res[pi] = PatRes::ConstItem(idx);
+        match self.check_const_value(ct, &val, t, span, in_match) {
+            Some(ConstPat::Scalar) => self.out.pat_res[pi] = PatRes::ConstItem(idx),
+            Some(ConstPat::Variant(a, v)) => self.out.pat_res[pi] = PatRes::Variant(a, v),
+            Some(ConstPat::OptNone) => self.out.pat_res[pi] = PatRes::Opt(false),
+            None => {}
         }
     }
 
@@ -15330,11 +15551,21 @@ impl<'p> Ctx<'p> {
                     (int(it), v)
                 };
                 let cv = crate::ty::consteval::ConstValue::Int(val);
-                if self.check_const_value(ct, &cv, t, span, in_match) {
+                if self.check_const_value(ct, &cv, t, span, in_match).is_some() {
                     self.out.pat_res[pi] = PatRes::PrimConst(val);
                 }
                 return true;
             }
+        }
+        // Primitive float associated consts (`f64::INFINITY`,
+        // `std::f64::consts::PI`): the same table the const
+        // evaluator reads. A NaN value rejects in
+        // `check_const_value`, as rustc rejects it.
+        if let Some((cv, ct)) = self.primitive_float_const_pattern(segs) {
+            if self.check_const_value(ct, &cv, t, span, in_match).is_some() {
+                self.out.pat_const[pi] = Some(cv);
+            }
+            return true;
         }
         if let Some((adt, item)) = self.assoc_const_key(segs)
             && let Some(picked) = self.assoc_const_base(segs, Some(span)).and_then(|base| self.inherent_assoc_pick(adt, item, base, Some(span)))
@@ -15347,16 +15578,140 @@ impl<'p> Ctx<'p> {
         }
         // A trait associated const pattern on a concrete type
         // (`S::C`): only a confirmed impl gives the value a
-        // pattern needs.
+        // pattern needs. An abstract read (`U::K`, `Self::K` in
+        // a generic context) depends on a generic parameter:
+        // rustc rejects it (E0158), so it must not fall through
+        // to variant handling.
         if segs.len() == 2
             && !self.assoc_const_key(segs).is_some_and(|(adt, item)| self.inherent_value_blocks(adt, item))
             && let Some(base) = self.assoc_const_base(segs, Some(span))
-            && let Some((Some(idx), _)) = self.trait_assoc_const(None, base, None, segs[1].name, span)
+            && let Some(found) = self.trait_assoc_const(None, base, None, segs[1].name, span)
         {
-            self.const_item_pat(pi, idx, t, span, in_match);
+            match found {
+                (Some(idx), _) => self.const_item_pat(pi, idx, t, span, in_match),
+                (None, ty) if self.kind(ty) != TyKind::Error => {
+                    self.err(
+                        "L0110",
+                        span,
+                        "constant pattern cannot depend on generic parameters",
+                        "Compare with the constant in a guard instead.",
+                    );
+                }
+                (None, _) => {}
+            }
             return true;
         }
         false
+    }
+
+    /// A qualified path in pattern position: `<Type>::CONST`,
+    /// `<Type as Trait>::CONST`, or a unit variant (`<E>::A`).
+    /// The value side is `qpath_value`; a pattern needs a
+    /// concrete value, so an abstract (generic-dependent) assoc
+    /// const is an error here, as rustc's E0158.
+    fn qpath_pat(
+        &mut self,
+        pi: usize,
+        self_ty: ast::TyId,
+        trait_path: &[ast::PathSeg],
+        segs: &[ast::PathSeg],
+        t: Ty,
+        span: Span,
+        in_match: bool,
+    ) {
+        if segs.len() != 1 {
+            self.err("L0101", span, "cannot find the associated item", "Check the qualified path and the name.");
+            return;
+        }
+        let name = segs[0].name;
+        let base = self.resolve_written(self_ty);
+        if self.kind(base) == TyKind::Error {
+            return;
+        }
+        let hint = if trait_path.is_empty() {
+            None
+        } else {
+            let tref = ast::TraitRefExpr { path: trait_path.to_vec() };
+            match self.written_trait_ref(base, &tref, span) {
+                Ok(tr) => Some(tr),
+                Err(d) => {
+                    self.errs.push(d);
+                    return;
+                }
+            }
+        };
+        if hint.is_none() {
+            if let Some((cv, ct)) = self.primitive_const_for_base(base, name) {
+                if self.check_const_value(ct, &cv, t, span, in_match).is_some() {
+                    self.out.pat_const[pi] = Some(cv);
+                }
+                return;
+            }
+            if let Some(adt) = self.tys.local_adt(self.resolve(base)) {
+                // A unit variant through a qualified path is a
+                // variant pattern, not a const comparison.
+                if self.p.adt(adt).is_enum
+                    && let Some(v) = self.p.adt(adt).variants.iter().position(|var| var.name == name)
+                {
+                    let v = v as u32;
+                    let dt = self.deep(t);
+                    let (a, adt_ty) = match self.tys.local_adt(dt) {
+                        Some(inst) if inst != adt && self.p.def_of_adt(inst) == self.p.def_of_adt(adt) => (inst, dt),
+                        _ => (adt, self.tys.adt_ty(adt)),
+                    };
+                    if !self.unify(adt_ty, t) {
+                        self.mismatch(span, t, adt_ty);
+                        return;
+                    }
+                    if self.p.adt(a).variants[v as usize].shape != VariantShape::Unit {
+                        self.err("L0110", span, "this variant has fields", "Match its fields with `(..)` or `{ .. }`.");
+                        return;
+                    }
+                    if self.hidden_variant(a, v, span) {
+                        return;
+                    }
+                    self.check_ne_ctor(a, v, span);
+                    self.out.pat_res[pi] = PatRes::Variant(a, v);
+                    return;
+                }
+                if let Some(picked) = self.inherent_assoc_pick(adt, name, base, Some(span)) {
+                    if let Some(idx) = picked {
+                        self.check_assoc_vis(adt, name, "associated constant", span);
+                        self.const_item_pat(pi, idx, t, span, in_match);
+                    }
+                    return;
+                }
+                if self.inherent_value_blocks(adt, name) {
+                    self.err(
+                        "L0110",
+                        span,
+                        "expected a const or a unit variant in this pattern",
+                        "Use an associated const, or compare in a guard.",
+                    );
+                    return;
+                }
+            }
+        }
+        match self.trait_assoc_const(None, base, hint, name, span) {
+            Some((Some(idx), _)) => self.const_item_pat(pi, idx, t, span, in_match),
+            Some((None, ty)) if self.kind(ty) != TyKind::Error => {
+                self.err(
+                    "L0110",
+                    span,
+                    "constant pattern cannot depend on generic parameters",
+                    "Compare with the constant in a guard instead.",
+                );
+            }
+            Some((None, _)) => {}
+            None => {
+                self.err(
+                    "L0104",
+                    span,
+                    format!("no associated const named `{}` here", self.name(name)),
+                    "Check the spelling against the impl or trait definition.",
+                );
+            }
+        }
     }
 
     /// A qualified path in value position: `<Type>::CONST` or
@@ -15882,21 +16237,13 @@ impl<'p> Ctx<'p> {
             && let Some(crate::check::collect::BodyItem::Const(ci)) = self.body_item_of(*name)
         {
             let c = &p.body_consts[ci as usize];
-            if !matches!(
-                c.value,
-                crate::ty::consteval::ConstValue::Int(_)
-                    | crate::ty::consteval::ConstValue::Bool(_)
-                    | crate::ty::consteval::ConstValue::Char(_)
-            ) {
-                self.errs.push(unsupported(span, "non-scalar const patterns"));
-                return;
+            let (ct, val) = (c.ty, c.value.clone());
+            match self.check_const_value(ct, &val, t, span, in_match) {
+                Some(ConstPat::Scalar) => self.out.pat_res[pi] = PatRes::BodyConst(ci),
+                Some(ConstPat::Variant(a, v)) => self.out.pat_res[pi] = PatRes::Variant(a, v),
+                Some(ConstPat::OptNone) => self.out.pat_res[pi] = PatRes::Opt(false),
+                None => {}
             }
-            let ct = c.ty;
-            if !self.unify(ct, t) {
-                self.mismatch(span, t, ct);
-                return;
-            }
-            self.out.pat_res[pi] = PatRes::BodyConst(ci);
             return;
         }
         // A body fn or static of the name hides module items (a body
@@ -15960,6 +16307,13 @@ impl<'p> Ctx<'p> {
                 }
                 return;
             }
+        }
+        // A qualified path pattern (`<K>::A`, `<K as Tr>::C`):
+        // a const comparison or a unit variant, never a binding.
+        if let Pat::QPath { self_ty, trait_path, segs } = p.ast.pat(pat) {
+            let (self_ty, trait_path, segs) = (*self_ty, trait_path.clone(), segs.clone());
+            self.qpath_pat(pi, self_ty, &trait_path, &segs, t, span, in_match);
+            return;
         }
         match p.ast.pat(pat) {
             Pat::Wild => {}
@@ -16540,7 +16894,8 @@ impl<'p> Ctx<'p> {
                 }
             }
             Pat::Paren(inner) => self.pattern_mode(*inner, t, mode, in_match),
-            // AST v2 pattern forms the parser still rejects.
+            // QPath returns above; macro patterns stay rejected
+            // by the parser.
             Pat::QPath { .. } | Pat::MacroCall(_) => {}
         }
     }
@@ -16792,7 +17147,7 @@ impl<'p> Ctx<'p> {
                 matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if one_variant(a))
                     && elems.iter().all(|&s| self.irrefutable(s))
             }
-            Pat::Path(_) => {
+            Pat::Path(_) | Pat::QPath { .. } => {
                 self.out.pat_const[(pat.0 - self.out.pat_base) as usize].is_none()
                     && !matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::ConstItem(_) | PatRes::BodyConst(_))
                     && matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Variant(a, _) if one_variant(a))
@@ -18301,6 +18656,57 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// Binds every integer or float literal variable in `t` to
+    /// its fallback type (`i32`, `f64`), at any depth. General
+    /// variables stay free.
+    fn literal_fallback_ty(&mut self, t: Ty) {
+        if !self.tys.flags(t).contains_infer() {
+            return;
+        }
+        let args = |cx: &mut Self, a: ArgsId| {
+            for g in cx.tys.args(a).to_vec() {
+                if let Some(e) = g.as_ty() {
+                    cx.literal_fallback_ty(e);
+                }
+            }
+        };
+        match self.tys.kind(self.resolve(t)) {
+            TyKind::Infer(v) => {
+                if v.is_int() {
+                    self.bind_var(v.index(), I32);
+                } else if v.is_float() {
+                    let f = self.tys.float_ty(FloatTy::F64);
+                    self.bind_var(v.index(), f);
+                }
+            }
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.literal_fallback_ty(e),
+            TyKind::Tuple(ts) => {
+                for e in self.tys.tys_of(ts).to_vec() {
+                    self.literal_fallback_ty(e);
+                }
+            }
+            TyKind::Adt(_, a) | TyKind::Projection(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Opaque(_, a) => args(self, a),
+            TyKind::FnPtr(sig) => {
+                let b = self.tys.sig(sig);
+                for e in self.tys.tys_of(b.value.inputs).to_vec() {
+                    self.literal_fallback_ty(e);
+                }
+                self.literal_fallback_ty(b.value.output);
+            }
+            TyKind::Dyn(b, _) => {
+                if let Some(pr) = self.tys.dyn_bounds(b).principal.clone() {
+                    args(self, pr.value.args);
+                    for (_, g) in self.tys.bindings(pr.value.bindings).to_vec() {
+                        if let Some(e) = g.as_ty() {
+                            self.literal_fallback_ty(e);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn unbound_const(&self, c: ConstId) -> bool {
         matches!(self.tys.const_kind(self.resolve_const(c)), ConstKind::Infer(_))
     }
@@ -18679,6 +19085,33 @@ impl<'p> Ctx<'p> {
                     span,
                     format!("sorting `{tn}` compares with its written `PartialOrd::lt`, which lust cannot call yet"),
                     "Sort with `sort_by` and an explicit comparator, or derive `PartialOrd`.",
+                );
+            }
+        }
+        // Deferred fn casts with a `_` target: literal fallback
+        // first (`g(3)` makes the `_` an `i32`), then the
+        // signature check rustc runs after inference. A `_`
+        // nothing else decided takes the operand's type here.
+        for (src, dst, span) in std::mem::take(&mut self.deferred_fn_casts) {
+            let dst = self.deep(dst);
+            self.literal_fallback_ty(dst);
+            let ok = match self.kind(src) {
+                TyKind::FnDef(..) => self.fn_item_ptr_unifies(src, dst),
+                _ => match (self.callable_sig(src), self.callable_sig(dst)) {
+                    (Some((pa, ra)), Some((pb, rb))) => {
+                        pa.len() == pb.len() && pa.iter().zip(&pb).all(|(&a, &b)| self.unify(a, b)) && self.unify(ra, rb)
+                    }
+                    _ => false,
+                },
+            };
+            if !ok {
+                let (src_d, dst_d) = (self.deep(src), self.deep(dst));
+                let (a, b) = (self.tn(src_d), self.tn(dst_d));
+                self.err(
+                    "L0116",
+                    span,
+                    format!("cannot cast `{a}` as `{b}`"),
+                    "A fn item or fn pointer casts only to a fn pointer of the same signature.",
                 );
             }
         }

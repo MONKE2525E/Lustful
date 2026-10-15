@@ -5242,7 +5242,7 @@ impl<'p> Lower<'p> {
                     self.test_pat(sub, place.project(Proj::Index(idx)), fail);
                 }
             }
-            Pat::Path(_) | Pat::TupleStruct { .. } | Pat::Struct { .. } => {
+            Pat::Path(_) | Pat::QPath { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } => {
                 let PatRes::Variant(a, v) = self.ck.pat_res(pat) else { return };
                 let is_enum = p.adt(a).is_enum;
                 if is_enum {

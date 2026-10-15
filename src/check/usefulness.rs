@@ -316,7 +316,7 @@ impl<'p> Ctx<'p> {
                 Some(i) => ctor(i, arity(i).and_then(|n| positional(elems, n))),
                 None => Head::Opaque,
             },
-            Pat::Path(_) | Pat::Binding { .. } => match index {
+            Pat::Path(_) | Pat::QPath { .. } | Pat::Binding { .. } => match index {
                 Some(i) => ctor(i, Some(Vec::new())),
                 None => Head::Opaque,
             },
