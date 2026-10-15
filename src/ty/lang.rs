@@ -1243,7 +1243,16 @@ pub fn std_enum_variants(path: &[&str]) -> Vec<&'static str> {
 
 /// True when `name` is one of `STD_IMPORTED_TYPES`.
 pub fn needs_std_use(name: &str) -> bool {
-    STD_IMPORTED_TYPES.iter().any(|&(_, _, n)| n == name) || crate::ty::sync::SyncTy::ALL.iter().any(|k| k.name() == name) || STD_MPSC_ADTS.contains(&name)
+    // A set built once: the resolver asks for every path it rewrites.
+    type Names = std::collections::HashSet<&'static str, std::hash::BuildHasherDefault<crate::intern::FxHasher>>;
+    static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let mut set: Names = STD_IMPORTED_TYPES.iter().map(|&(_, _, n)| n).collect();
+        set.extend(crate::ty::sync::SyncTy::ALL.iter().map(|k| k.name()));
+        set.extend(STD_MPSC_ADTS.iter().copied());
+        set
+    });
+    names.contains(name)
 }
 
 /// The methods std source defines on `Option` and `Result`

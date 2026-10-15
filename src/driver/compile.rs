@@ -1535,6 +1535,7 @@ fn resolved_setup(
     std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
     user_src: &str,
     root_lexed: Option<lexer::Lexed>,
+    route_std_mods: Option<bool>,
     crate_ids_default: CrateIds,
     std_ranges: &mut Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
     std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,
@@ -1595,7 +1596,12 @@ fn resolved_setup(
     // names std source the root file does not: the splice then serves
     // every file's needs (`all_text` holds them all).
     let unspliced_root = root_text.clone();
-    let mut spliced_needs = crate::ty::lang::std_needs(&root_text);
+    // A single-file root is the routed text: routing scanned it for std
+    // source modules already.
+    let mut spliced_needs = match route_std_mods {
+        Some(m) if key.krate.manifest_path.is_none() => crate::ty::lang::std_needs_known(&root_text, m),
+        _ => crate::ty::lang::std_needs(&root_text),
+    };
     let mut spliced = spliced_needs.any();
     if spliced {
         let sp = splice_std(&mut root_text, std_cache, spliced_needs)?;
@@ -1856,6 +1862,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         crate::resolve::worklist::route_root_std(&src, &front.interner, true)
     };
     let wants_resolver = wants_resolver || std_mods;
+    let route_std_mods = req.session.krate.manifest_path.is_none().then_some(std_mods);
     if front.resolved_crate && !wants_resolver {
         front.ast = Ast::default();
         front.env_hash = None;
@@ -1899,7 +1906,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 
     // Both front ends produce the same locals for the shared tail.
     let (map, mut changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, resolved_tables) = if use_resolver {
-        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t) {
+        match resolved_setup(req, front, caches, std_cache, &src, root_lexed, route_std_mods, crate_ids, &mut std_ranges, &mut std_routes, &mut std_methods, &mut t) {
             Ok(x) => x,
             Err(resp) => return resp,
         }
