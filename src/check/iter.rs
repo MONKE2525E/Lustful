@@ -1116,7 +1116,12 @@ impl<'p> Ctx<'p> {
                     super::method::defer_trait_method(self, e, trait_ref, name, vec![GenericArg::Ty(actual_base)], derefs, Autoref::None);
                     return tr;
                 }
-                if !self.collect_target_ok(target, item, span) {
+                // A target only a later use fixes: checked at finish. A
+                // `FromIterator` ADT found then is still rejected there
+                // (its route above is picked here).
+                if matches!(self.kind(tr), TyKind::Infer(_)) && !self.kind(tr).is_int_infer() && !self.kind(tr).is_float_infer() {
+                    self.deferred_collect.push((target, item, span));
+                } else if !self.collect_target_ok(target, item, span) {
                     return self.iter_bail(args);
                 }
                 (B::IterCollect, vec![], target)
@@ -1639,7 +1644,7 @@ impl<'p> Ctx<'p> {
     /// `collect` into `Vec<Item>`, `Box<[Item]>`, or `String` (from
     /// `char`, `&char`, `&str`, or `String` items): the targets lust
     /// builds.
-    fn collect_target_ok(&mut self, target: Ty, item: Ty, span: Span) -> bool {
+    pub(super) fn collect_target_ok(&mut self, target: Ty, item: Ty, span: Span) -> bool {
         let t = self.resolve(target);
         // alloc's `FromIterator<T> for Box<[T]>` collects a `Vec`
         // and boxes it (lowering mirrors that). The deep form: a

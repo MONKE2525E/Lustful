@@ -1548,6 +1548,10 @@ struct Ctx<'p> {
     /// Element types a builtin Vec method needs to be PartialEq
     /// (`contains`, `dedup`), re-tested at finish as above.
     deferred_eq: Vec<(Ty, Span)>,
+    /// `collect` calls whose target type a later use fixes
+    /// (`let r = it.collect(); (r, n)` returned as `(Vec<String>, _)`):
+    /// target, item, and span, checked at finish (`collect_target_ok`).
+    deferred_collect: Vec<(Ty, Ty, Span)>,
     /// Item types an iterator method needs to be Copy (`copied`),
     /// re-tested at finish as above (W-STD-A).
     deferred_copy: Vec<(Ty, Span)>,
@@ -1904,6 +1908,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_trait_fn_calls: Vec::new(),
         deferred_item_args: Vec::new(),
         deferred_eq: Vec::new(),
+        deferred_collect: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_ord: Vec::new(),
         deferred_sort_ord: Vec::new(),
@@ -19790,6 +19795,9 @@ impl<'p> Ctx<'p> {
         // A deferred `as_deref` pick can bind type variables other
         // sites wait on, so it runs before the uninferred check.
         method::finish_deferred_lang_methods(self);
+        for (target, item, span) in std::mem::take(&mut self.deferred_collect) {
+            self.collect_target_ok(target, item, span);
+        }
         self.uninferred_site_args();
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.
         // Anything left there is an annotation error, never a silent default.
