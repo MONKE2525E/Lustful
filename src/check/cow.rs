@@ -93,22 +93,14 @@ impl<'p> Ctx<'p> {
         // picks whether it coerces to `&str`.
         if (n == "add" || n == "add_assign") && b == STR {
             if n == "add" && derefs > 0 {
-                self.err(
-                    "L0640",
-                    name_span,
-                    "`add` through a reference is not implemented yet",
-                    "Call it on the Cow value itself.",
-                );
+                self.err("L0640", name_span, "`add` through a reference is not implemented yet", "Call it on the Cow value itself.");
                 for &a in args {
                     self.expr(a, None);
                 }
                 return Some(ERROR);
             }
-            let (bt, autoref, ret) = if n == "add" {
-                (Builtin::CowAddStr, Autoref::None, base)
-            } else {
-                (Builtin::CowAddAssignStr, Autoref::RefMut, UNIT)
-            };
+            let (bt, autoref, ret) =
+                if n == "add" { (Builtin::CowAddStr, Autoref::None, base) } else { (Builtin::CowAddAssignStr, Autoref::RefMut, UNIT) };
             if autoref != Autoref::None {
                 self.check_packed_borrow(recv, name_span);
             }
@@ -149,7 +141,9 @@ impl<'p> Ctx<'p> {
                 (Builtin::CowToMut, Autoref::RefMut, self.tys.mk_ref(true, o), Vec::new())
             }
             "as_ref" => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b), Vec::new()),
-            "borrow" if self.std_trait_imported("borrow", "Borrow") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b), Vec::new()),
+            "borrow" if self.std_trait_imported("borrow", "Borrow") => {
+                (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b), Vec::new())
+            }
             "deref" if self.std_trait_imported("ops", "Deref") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b), Vec::new()),
             // The blanket `ToOwned` of a Clone type: a Cow's own
             // `to_owned` is its clone (a Borrowed stays Borrowed).
@@ -159,12 +153,7 @@ impl<'p> Ctx<'p> {
             // `Clone::clone_from` (and with it the blanket
             // `clone_into`) has no lust form yet, on any type.
             "clone_from" | "clone_into" => {
-                self.err(
-                    "L0640",
-                    name_span,
-                    format!("`{n}` is not implemented yet"),
-                    "Assign a clone instead: `*dst = src.clone()`.",
-                );
+                self.err("L0640", name_span, format!("`{n}` is not implemented yet"), "Assign a clone instead: `*dst = src.clone()`.");
                 for &a in args {
                     self.expr(a, None);
                 }
