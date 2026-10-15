@@ -33,11 +33,11 @@ runtest_case() {
   # Which run path did it take? A program with more than one function unit (glue_shared has
   # three; the glue_*_type_cross_unit tests force a split with filler fns; a program that
   # splices a std source module has hundreds of functions) must use the file. Units compiled
-  # = main, glue, runtime, table, plus the function units.
+  # = main, glue, runtime, table, loc, plus the function units.
   probe=$(run_cc "$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
   if grep -q "in memory" <<<"$probe"; then mode=mem; else mode=file; fi
   units=$(run_cc "$lust" build --timings "$f" -o "$name.units" 2>&1 >/dev/null | grep -o '[0-9]* units compiled' | grep -o '^[0-9]*')
-  want_mode=mem; [ "${units:-0}" -gt 5 ] && want_mode=file
+  want_mode=mem; [ "${units:-0}" -gt 6 ] && want_mode=file
   # The glue_*_type_cross_unit tests force a unit split with filler fns.
   [[ "$name" == glue_shared || "$name" == glue_*_type_cross_unit ]] && want_mode=file
   # A program that names a std platform module (W-SHIM) compiles the

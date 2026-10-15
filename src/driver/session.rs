@@ -225,6 +225,13 @@ pub(crate) struct Caches {
     /// fingerprint is the built-state record that survives that gap.
     /// Zero means no build yet.
     pub(crate) statics_fp: u64,
+    /// Fingerprint of the location tables last built into the loc
+    /// unit (slot lines, slot files, file paths). A build whose
+    /// tables match does not re-emit or recompile that unit. Zero
+    /// means no build yet. Like `statics_fp`, it is recorded when
+    /// the build that compiles the unit starts, so an edit consumed
+    /// by a check request still rebuilds the unit in the next build.
+    pub(crate) loc_fp: u64,
     /// `graph::glue_method_slots_fp` as of the last glue build: the
     /// slots that glue calling written `fmt` and `drop` methods names.
     pub(crate) glue_slots_fp: u64,
@@ -370,6 +377,7 @@ impl Session {
                 slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,
+                loc_fp: 0,
                 glue_slots_fp: 0,
                 glue_stale: false,
                 wiped_slots: Vec::new(),

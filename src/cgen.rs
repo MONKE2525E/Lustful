@@ -5477,10 +5477,12 @@ impl FnGen<'_, '_, '_> {
 
 // ---------- Compilation units ----------
 //
-// Unit 0 holds the globals, the function line table, and `main`. Unit 1 holds the shared glue
-// (see `GlueSet`); other glue is static in the function units. The other units hold functions, in
-// fixed groups of slots. Grouping depends only on the slot count, so an edit that keeps the
-// program's shape recompiles only the units it touches (plus unit 0).
+// Unit 0 holds the globals and `main`. Unit 1 holds the shared glue
+// (see `GlueSet`); other glue is static in the function units. Unit 4
+// holds the per-slot location tables (`loc_unit`). The other units
+// hold functions, in groups the driver sizes by C bytes and freezes
+// between fresh bases, so an edit that keeps the program's shape
+// recompiles only the units it touches (plus unit 0).
 
 /// Function groups for units 2 and up, fixed slot counts. Kept for
 /// tests that build units by hand; the driver groups by bytes below.
@@ -6043,19 +6045,14 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
     Some(UnwindInit { unwind: p.unwind, ids: [a, b, c, d], hook_runner: runner })
 }
 
-/// Unit 0: the line and file tables (by slot), globals, overlay registration, and `main`.
-/// Rebuilt on every build. With `init` (see `unwind_init`) it sets up the
-/// runtime's panic payloads and hook runner; under panic=unwind a `main`
-/// that ends by a panic exits 101.
-pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays: &[usize], init: Option<UnwindInit>) -> String {
-    let unwind = init.as_ref().is_some_and(|i| i.unwind);
-    let (init, runner) = match init {
-        Some(UnwindInit { unwind, ids: [a, b, c, d], hook_runner }) => (
-            format!("\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);", unwind as u8),
-            hook_runner.map_or(String::new(), |s| format!("\n  lust_hook_set_runner(lust_fns[{s}]);")),
-        ),
-        None => (String::new(), String::new()),
-    };
+/// The location unit: the per-slot line and file tables and
+/// `lust_loc_init`, which points the runtime at them. Its own unit
+/// (see the driver) so a build whose slot lines and files did not
+/// change does not re-emit or recompile the arrays: the main unit
+/// rebuilds on every build, and the arrays are most of its bytes on
+/// a large program. The symbol is not static, so an overlay copy in
+/// the executable replaces the base copy, as glue does.
+pub fn loc_unit(files: &SlotFiles, slot_lines: &[u32]) -> String {
     let mut c = unit_header();
     let lines: Vec<String> = slot_lines.iter().map(|l| l.to_string()).collect();
     let _ = writeln!(c, "static const uint32_t lines[{}] = {{{}}};", lines.len().max(1), lines.join(","));
@@ -6068,14 +6065,37 @@ pub fn main_unit(main_slot: u32, files: &SlotFiles, slot_lines: &[u32], overlays
         let of: Vec<String> = files.of_slot.iter().map(|f| f.to_string()).collect();
         let _ = writeln!(c, "static const uint32_t slot_file[{}] = {{{}}};", of.len().max(1), of.join(","));
     }
+    let _ = writeln!(
+        c,
+        "void lust_loc_init(void) {{\n  lust_file = {};\n  lust_fn_line = lines;{}\n}}",
+        c_string_lit(file.as_bytes()),
+        if multi { "\n  lust_files = files;\n  lust_slot_file = slot_file;" } else { "\n  lust_files = 0;\n  lust_slot_file = 0;" }
+    );
+    c
+}
+
+/// Unit 0: globals, overlay registration, and `main`. Rebuilt on every
+/// build; the per-slot location tables live in `loc_unit`, which is
+/// rebuilt only when they change. With `init` (see `unwind_init`) it
+/// sets up the runtime's panic payloads and hook runner; under
+/// panic=unwind a `main` that ends by a panic exits 101.
+pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -> String {
+    let unwind = init.as_ref().is_some_and(|i| i.unwind);
+    let (init, runner) = match init {
+        Some(UnwindInit { unwind, ids: [a, b, c, d], hook_runner }) => (
+            format!("\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);", unwind as u8),
+            hook_runner.map_or(String::new(), |s| format!("\n  lust_hook_set_runner(lust_fns[{s}]);")),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let mut c = unit_header();
+    c.push_str("void lust_loc_init(void);\n");
     for u in overlays {
         let _ = writeln!(c, "void lust_overlay_u{u}(void);");
     }
     let _ = writeln!(
         c,
-        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_file = {};\n  lust_fn_line = lines;{}{}\n  lust_rt_init();\n  lust_base_init();",
-        c_string_lit(file.as_bytes()),
-        if multi { "\n  lust_files = files;\n  lust_slot_file = slot_file;" } else { "" },
+        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_loc_init();{}\n  lust_rt_init();\n  lust_base_init();",
         init
     );
     for u in overlays {
@@ -8120,11 +8140,12 @@ mod tests {
         let mut glue = GlueSet::default();
         glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
         let units = [
-            main_unit(slots[main.0 as usize], &SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n], &[], None),
+            main_unit(slots[main.0 as usize], &[], None),
             glue_unit(&program, &glue),
             runtime_unit(),
-            table_unit(n, &[4]),
-            fn_unit(&program, &outs, 0..n, &glue, "lust_register_u4", Some(slots[main.0 as usize])),
+            table_unit(n, &[5]),
+            loc_unit(&SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n]),
+            fn_unit(&program, &outs, 0..n, &glue, "lust_register_u5", Some(slots[main.0 as usize])),
         ];
         let dir = std::env::temp_dir().join(format!("lust-cgen-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

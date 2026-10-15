@@ -3329,14 +3329,51 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let glue_changed = shared_changed || regenerated || statics_changed;
     t.lap("codegen (par)");
 
-    // Units: 0 = main (always rebuilt), 1 = glue, 2 = runtime, 3 = function table, 4.. = function
-    // groups. A cold build links them all statically. The daemon links everything but main into
-    // libbase.so once, then each edit compiles only "overlay" copies of the changed units and links
-    // a small executable that loads libbase.so and swaps the new functions into `lust_fns`.
-    const FIRST_FN_UNIT: usize = 4;
+    // Units: 0 = main (always rebuilt), 1 = glue, 2 = runtime, 3 = function table, 4 = location
+    // tables, 5.. = function groups. A cold build links them all statically. The daemon links
+    // everything but main into libbase.so once, then each edit compiles only "overlay" copies of
+    // the changed units and links a small executable that loads libbase.so and swaps the new
+    // functions into `lust_fns`. The location unit overlays like glue: only a build whose slot
+    // lines or files changed recompiles it.
+    const FIRST_FN_UNIT: usize = 5;
+    const LOC_UNIT: usize = 4;
     const MAX_OVERLAYS: usize = 32;
     let fn_units: Vec<usize> = (0..groups.len()).map(|g| g + FIRST_FN_UNIT).collect();
     let dirty_fn_units: Vec<usize> = (0..groups.len()).filter(|&g| dirty_groups[g]).map(|g| g + FIRST_FN_UNIT).collect();
+    let main_slot = front.fn_slot[program.main.unwrap().0 as usize];
+    // Instance slots take their template's line: cgen stores an
+    // instance's panic lines relative to it (see `line_base_of`).
+    let mut slot_lines = vec![0u32; n_slots];
+    let mut slot_files = vec![ROOT_FILE.0; n_slots];
+    for i in 0..front.fn_slot.len().min(program.fns.len()) {
+        slot_lines[slot(i)] = line_base_of(front, i);
+        slot_files[slot(i)] = fn_files[i];
+    }
+    // Paths as rustc prints them: under Cargo, relative to the workspace root.
+    let file_paths: Vec<String> = (0..map.file_count())
+        .map(|f| {
+            let p = map.path(FileId(f as u32));
+            // Else as the user typed the root path (`client_view`).
+            match front.display_root.as_deref().and_then(|r| Path::new(p).strip_prefix(r).ok()) {
+                Some(rel) => rel.to_string_lossy().into_owned(),
+                None => front.client.shown(p),
+            }
+        })
+        .collect();
+    let file_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
+    let files = cgen::SlotFiles { paths: &file_refs, of_slot: &slot_files };
+    // The location unit rebuilds only when its tables change (see
+    // `Caches::loc_fp`): most warm edits keep every slot's line.
+    let loc_fp = {
+        use std::hash::Hash as _;
+        let mut h = crate::intern::FxHasher::default();
+        slot_lines.hash(&mut h);
+        slot_files.hash(&mut h);
+        file_paths.hash(&mut h);
+        std::hash::Hasher::finish(&h)
+    };
+    let loc_changed = caches.loc_fp != loc_fp;
+    caches.loc_fp = loc_fp;
     // A fresh base: no base yet under this debug setting, or a one-shot
     // (static) build. Growth no longer forces one (section 4.2): when
     // slots outgrow the table capacity or a new fn unit appears, only
@@ -3362,7 +3399,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if rebuild_base {
         // Everything not yet in the base goes in: all units on a fresh base, else the overlays.
         if fresh_base {
-            todo.extend([(1, false), (2, false), (3, false)]);
+            todo.extend([(1, false), (2, false), (3, false), (LOC_UNIT, false)]);
             todo.extend(fn_units.iter().map(|&u| (u, false)));
         } else {
             let mut units: Vec<usize> = caches.overlays.iter().copied().chain(dirty_fn_units.iter().copied()).collect();
@@ -3379,6 +3416,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if table_dirty && !todo.contains(&(3, false)) {
                 todo.push((3, false));
             }
+            if loc_changed && !todo.contains(&(LOC_UNIT, false)) {
+                todo.push((LOC_UNIT, false));
+            }
             // The relinked base now registers every current unit.
             caches.base_units = groups.len();
         }
@@ -3390,31 +3430,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             caches.overlays.insert(1);
             todo.push((1, true));
         }
+        if loc_changed {
+            caches.overlays.insert(LOC_UNIT);
+            todo.push((LOC_UNIT, true));
+        }
     }
     let registered: Vec<usize> = caches.overlays.iter().copied().filter(|&u| u >= FIRST_FN_UNIT).collect();
     todo.push((0, false));
-    let main_slot = front.fn_slot[program.main.unwrap().0 as usize];
-    // Instance slots take their template's line: cgen stores an
-    // instance's panic lines relative to it (see `line_base_of`).
-    let mut slot_lines = vec![0u32; n_slots];
-    let mut slot_files = vec![ROOT_FILE.0; n_slots];
-    for i in 0..front.fn_slot.len().min(program.fns.len()) {
-        slot_lines[slot(i)] = line_base_of(front, i);
-        slot_files[slot(i)] = fn_files[i];
-    }
-    // Paths as rustc prints them: under Cargo, relative to the workspace root.
-    let file_paths: Vec<String> = (0..map.file_count())
-        .map(|f| {
-            let p = map.path(FileId(f as u32));
-            // Else as the user typed the root path (`client_view`).
-            match front.display_root.as_deref().and_then(|r| Path::new(p).strip_prefix(r).ok()) {
-                Some(rel) => rel.to_string_lossy().into_owned(),
-                None => front.client.shown(p),
-            }
-        })
-        .collect();
-    let file_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
-    let files = cgen::SlotFiles { paths: &file_refs, of_slot: &slot_files };
     // Hybrid glue: glue reached by 3 or more units stays in the shared glue unit, the rest is
     // static per unit. The set is frozen until the next fresh base (see cgen::GlueSet). The
     // glue unit's C is built below, only when unit 1 is in `todo`.
@@ -3422,10 +3444,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
     let gen_unit = |u: usize, overlay: bool| match u {
-        0 => cgen::main_unit(main_slot, &files, &slot_lines, &registered, cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])),
+        0 => cgen::main_unit(main_slot, &registered, cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])),
         1 => cgen::glue_unit(&program, &caches.glue),
         2 => cgen::runtime_unit(),
         3 => cgen::table_unit(caches.table_cap, &fn_units),
+        LOC_UNIT => cgen::loc_unit(&files, &slot_lines),
         g => {
             let register = if overlay { format!("lust_overlay_u{g}") } else { format!("lust_register_u{g}") };
             cgen::fn_unit(&program, &caches.out, groups[g - FIRST_FN_UNIT].clone(), &caches.glue, &register, Some(main_slot))
@@ -3436,9 +3459,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if let Some(p) = &req.emit_c {
         // Emitted C must be self-contained: write every base unit, not only the units
         // rebuilt for this (possibly warm, incremental) build.
-        for u in [0, 1, 2, 3].into_iter().chain(fn_units.iter().copied()) {
+        for u in [0, 1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()) {
             // The standalone main unit registers no overlays; `lust_base_init` covers all units.
-            let c = if u == 0 { cgen::main_unit(main_slot, &files, &slot_lines, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])) } else { gen_unit(u, false) };
+            let c = if u == 0 { cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])) } else { gen_unit(u, false) };
             let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
         }
     }
@@ -3621,6 +3644,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         use crate::driver::graph::{Fingerprint, used_slots_hash};
         match u {
             3 => crate::driver::graph::table_unit_key(&manifest, caches.table_cap, fn_units.len()),
+            // The location unit's C is a function of its tables alone,
+            // which `loc_fp` hashes: key on it directly (never 0, the
+            // unkeyed sentinel), so base and overlay copies of
+            // different tables cannot serve each other from disk.
+            LOC_UNIT => crate::driver::graph::UnitKey(if loc_fp == 0 { 1 } else { loc_fp }),
             g if g >= FIRST_FN_UNIT => {
                 let range = &groups[g - FIRST_FN_UNIT];
                 let instances: Vec<Fingerprint> =
@@ -3710,7 +3738,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     caches.objects = Some(req.debug);
     t.lap("tcc compile");
-    let all_base: Vec<PathBuf> = [1, 2, 3].into_iter().chain(fn_units.iter().copied()).map(base_obj).collect();
+    let all_base: Vec<PathBuf> = [1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()).map(base_obj).collect();
     let linked = if !caches.persistent {
         let mut objs = vec![base_obj(0)];
         objs.extend(all_base);
