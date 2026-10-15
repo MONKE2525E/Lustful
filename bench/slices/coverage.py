@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 ITEMS = HERE / "items/target/release/slice-items"
 SRC = "crates/ts_goport/src"
+NOTES_MARK = "<!-- hand notes: kept by coverage.py -->"
 BENCH_FILES = {"slice_main.rs", "support.rs", "support_smallvec.rs", "support_xxhash.rs"}
 
 
@@ -290,7 +291,11 @@ def main():
            "| oracle code | lines |", "|---|---:|"]
     for k, v in list(main_m["removed_lines_by_oracle_and_code"].items())[:20]:
         md.append(f"| {k} | {v:,} |")
-    Path(a.out).write_text("\n".join(md) + "\n")
+    # Hand-written notes (grouped root causes, repro links) after NOTES_MARK survive a rerun.
+    out = Path(a.out)
+    old = out.read_text() if out.exists() else ""
+    notes = old[old.index(NOTES_MARK):] if NOTES_MARK in old else ""
+    out.write_text("\n".join(md) + "\n" + ("\n" + notes if notes else ""))
     print(f"wrote {a.out}: {tot[1]:,} of {tot[0]:,} universe lines accepted ({pc(tot[1], tot[0])}%)")
 
 
