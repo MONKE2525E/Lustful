@@ -462,8 +462,8 @@
   {
    "id": "cinterop.raw_ptr",
    "title": "Raw pointer types as identity values (*const T, *mut T)",
-   "status": "unsupported",
-   "milestone": 7,
+   "status": "supported",
+   "milestone": 0,
    "inventory_step": "10",
    "root_cause": "c-interop",
    "fix_class": "compiler",
