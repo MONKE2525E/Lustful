@@ -853,7 +853,10 @@ impl<'p> Lower<'p> {
                 let out_ref = self.ref_ty(mutable, self.ty(e));
                 let t = self.temp(out_ref);
                 let self_arg = if mutable { Operand::Move(Place::local(r)) } else { Operand::Copy(Place::local(r)) };
-                self.call_into(CallTarget::Fn(f), vec![self_arg, idx_op], Place::local(t), span);
+                // `Index::index` is `#[track_caller]` in core: a panic
+                // it passes on reports at the brackets, as a Vec's does.
+                let at = self.bracket_span(e, *base, *index);
+                self.call_into(CallTarget::Fn(f), vec![self_arg, idx_op], Place::local(t), at);
                 Place::local(t).deref()
             }
             (Expr::Deref(inner), _) => match self.ck.coerce(*inner) {

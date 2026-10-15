@@ -1524,6 +1524,8 @@ pub mod vec_deque {
         }
 
         pub fn swap(&mut self, i: usize, j: usize) {
+            assert!(i < self.len());
+            assert!(j < self.len());
             self.buf.swap(i, j);
         }
 
@@ -1628,6 +1630,8 @@ pub mod vec_deque {
         }
 
         pub fn split_off(&mut self, at: usize) -> VecDeque<T> {
+            let len = self.buf.len();
+            assert!(at <= len, "`at` out of bounds");
             VecDeque { buf: self.buf.split_off(at), head: 0 }
         }
 
@@ -1746,14 +1750,16 @@ pub mod vec_deque {
 
     impl<T> core::ops::Index<usize> for VecDeque<T> {
         type Output = T;
+        #[track_caller]
         fn index(&self, index: usize) -> &T {
-            &self.buf[index]
+            self.get(index).expect("out of bounds access")
         }
     }
 
     impl<T> core::ops::IndexMut<usize> for VecDeque<T> {
+        #[track_caller]
         fn index_mut(&mut self, index: usize) -> &mut T {
-            &mut self.buf[index]
+            self.get_mut(index).expect("out of bounds access")
         }
     }
 
