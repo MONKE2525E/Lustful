@@ -1752,6 +1752,14 @@ impl<'p> Lower<'p> {
                     self.closure_call(e, *callee, args, kind, derefs, dest, span);
                     return;
                 }
+                // `PartialEq::eq(a, b)` and kin at a builtin comparison:
+                // the method form with `a` as the receiver.
+                if let Res::PrimCmp { kind, derefs } = res
+                    && let [recv, rest @ ..] = args.as_slice()
+                {
+                    self.prim_cmp_into(e, *recv, rest, dest, span, kind, derefs);
+                    return;
+                }
                 // An indirect call reads the callee value before the
                 // arguments run, as Rust evaluates the callee first.
                 let indirect_local = if res == Res::Indirect {

@@ -27,6 +27,9 @@ pub(super) enum TraitFnRes {
     Cast,
     /// The `Default` glue.
     Default,
+    /// A comparison trait method at a type whose comparison is builtin
+    /// (`PartialEq::eq(&a, &b)` at `u8`): the method form's `PrimCmp`.
+    PrimCmp(PrimCmpKind),
     /// Nothing lust can call; already reported, or to report.
     Failed,
 }
@@ -348,7 +351,50 @@ impl<'p> Ctx<'p> {
             }
             return TraitFnRes::Builtin(Builtin::ToString);
         }
+        if let Some(kind) = self.prim_cmp_path(tr.def, name, &targs) {
+            return TraitFnRes::PrimCmp(kind);
+        }
         TraitFnRes::Failed
+    }
+
+    /// A `PartialEq`, `PartialOrd`, or `Ord` comparison method named
+    /// through its trait, at a Self type whose comparison core builds
+    /// in (scalars, `str`, and structures compared part by part, the
+    /// types `prim_cmp_method` takes in method form), with `Rhs` the
+    /// Self type: the call is the comparison of its two arguments.
+    fn prim_cmp_path(&mut self, tdef: DefId, name: Sym, targs: &[Ty]) -> Option<PrimCmpKind> {
+        let p = self.p;
+        let lang = &p.gx.lang;
+        let self_ty = *targs.first()?;
+        if targs.get(1).is_some_and(|&r| r != self_ty)
+            || self.tys.flags(self_ty).contains_infer()
+            || self.tys.flags(self_ty).contains_param()
+            || self.has_error_kind(self_ty)
+        {
+            return None;
+        }
+        let float = matches!(self.kind(self_ty), TyKind::Float(_));
+        let scalar = float || matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Bool | TyKind::Char);
+        let n = self.name(name);
+        let (kind, want, ok) = match n {
+            "eq" | "ne" => {
+                let op = if n == "eq" { BinOp::Eq } else { BinOp::Ne };
+                (PrimCmpKind::Op(op), lang.partial_eq, scalar || has_eq(p, &self.tys, self_ty))
+            }
+            "lt" | "le" | "gt" | "ge" | "partial_cmp" => {
+                let kind = match n {
+                    "lt" => PrimCmpKind::Op(BinOp::Lt),
+                    "le" => PrimCmpKind::Op(BinOp::Le),
+                    "gt" => PrimCmpKind::Op(BinOp::Gt),
+                    "ge" => PrimCmpKind::Op(BinOp::Ge),
+                    _ => PrimCmpKind::Partial(p.tys.local_adt_of(generics::ordering_def())?),
+                };
+                (kind, lang.partial_ord, scalar || has_ord(p, &self.tys, self_ty))
+            }
+            "cmp" => (PrimCmpKind::Total(p.tys.local_adt_of(generics::ordering_def())?), lang.ord, !float && (scalar || has_total_ord(p, &self.tys, self_ty))),
+            _ => return None,
+        };
+        (ok && tdef == want).then_some(kind)
     }
 
     /// Body end for trait fn values: point each at what it calls
@@ -391,7 +437,7 @@ impl<'p> Ctx<'p> {
                 TraitFnRes::Default => {
                     self.finish_marker_value(e, Res::Builtin(Builtin::DefaultGlue), tr, name, span);
                 }
-                TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, true),
+                TraitFnRes::PrimCmp(_) | TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, true),
             }
         }
     }
@@ -430,6 +476,8 @@ impl<'p> Ctx<'p> {
                 TraitFnRes::Builtin(b) => self.set_res(e, Res::Builtin(b)),
                 TraitFnRes::Cast => self.set_res(e, Res::FromCast),
                 TraitFnRes::Default => self.set_res(e, Res::DefaultVal),
+                // The first argument is `&Self`: one deref to the value.
+                TraitFnRes::PrimCmp(kind) => self.set_res(e, Res::PrimCmp { kind, derefs: 1 }),
                 TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, false),
             }
         }

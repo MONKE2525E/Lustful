@@ -1771,7 +1771,7 @@ impl<'p> Ctx<'p> {
         // Smart pointers peeled on the way (`Box<F>`, `Rc<F>`): calls
         // go through the pointee, as `impl Fn for Box<F>` and the
         // callee autoderef do in rustc.
-        let (mut via_box, mut via_rc, mut box_by_value) = (false, false, false);
+        let (mut via_box, mut via_rc, mut box_by_value, mut via_ref) = (false, false, false, false);
         loop {
             match self.kind(t) {
                 TyKind::Closure(def, _) => {
@@ -1798,7 +1798,13 @@ impl<'p> Ctx<'p> {
                     // In an instance, a call keeps the Fn trait the
                     // template resolved it through (FnOnce consumes the
                     // closure even when it is Fn), as rustc's generic body.
-                    let mode = self.template_call_mode(e).or_else(|| self.view_calls.get(&e).copied()).unwrap_or(kind);
+                    // Behind a shared reference (`F = Box<&C>`) only `Fn`
+                    // reaches the closure: `&C: FnOnce` calls `C` by `Fn`.
+                    let mode = if via_ref && kind == ClosureKind::Fn && box_by_value {
+                        ClosureKind::Fn
+                    } else {
+                        self.template_call_mode(e).or_else(|| self.view_calls.get(&e).copied()).unwrap_or(kind)
+                    };
                     self.out.closure_calls.push((e, mode));
                     self.set_res(e, Res::ClosureCall { kind: mode, derefs });
                     self.check_args(&inputs, args, span);
@@ -1806,12 +1812,10 @@ impl<'p> Ctx<'p> {
                 }
                 TyKind::Ref(_, _, inner) if derefs < 8 => {
                     derefs += 1;
+                    via_ref = true;
                     t = self.resolve(inner);
                 }
-                TyKind::Adt(..)
-                    if derefs < 8
-                        && self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(e), TyKind::Closure(..) | TyKind::Dyn(..))) =>
-                {
+                TyKind::Adt(..) if derefs < 8 && self.tys.smart_elem(t).is_some_and(|e| self.reaches_closure(e)) => {
                     if self.tys.rc_elem(t).is_some() {
                         via_rc = true;
                     } else {
@@ -1905,6 +1909,24 @@ impl<'p> Ctx<'p> {
                 }
             }
         }
+    }
+
+    /// True when `t`, through shared references and smart pointers, is
+    /// a closure or a trait object: what a smart pointer to it calls
+    /// (`Box<F>`, `Box<&F>`, and `Box<&Box<F>>` implement `Fn` when `F`
+    /// does).
+    fn reaches_closure(&self, mut t: Ty) -> bool {
+        for _ in 0..8 {
+            match self.kind(t) {
+                TyKind::Closure(..) | TyKind::Dyn(..) => return true,
+                TyKind::Ref(_, Mut::Shared, inner) => t = inner,
+                _ => match self.tys.smart_elem(t) {
+                    Some(e) => t = e,
+                    None => return false,
+                },
+            }
+        }
+        false
     }
 
     /// The call mode a template's abstract check recorded for this call.
