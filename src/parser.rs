@@ -2827,10 +2827,10 @@ impl<'a> Parser<'a> {
         let generics = self.generics(true)?;
         let is_negative = self.eat(Tok::Bang);
         // A trait path may also start with `crate`, `super`, `self`, or
-        // `::`. Only the cfg syntax check takes those for now: in enabled
-        // code later passes do not resolve such a trait ref yet.
-        let path_start = matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper)
-            || (self.cfg_syntax && matches!(self.peek(), Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep));
+        // `::` (`impl crate::a::Trait for T`): `path` reads the anchor as
+        // a first segment and the resolver rewrites it, as in a bound.
+        // An inherent impl's Self type may start the same way.
+        let path_start = matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep);
         let (trait_ref, self_ty) = if path_start {
             let header_start = self.span();
             let path = self.trait_path()?;
@@ -3602,16 +3602,18 @@ impl<'a> Parser<'a> {
     }
 
     /// True when the next token can start a range pattern bound: a
-    /// literal, or a path to a const (`u8::MAX`, `m::LO`, `LO`).
+    /// literal, or a path to a const (`u8::MAX`, `m::LO`, `LO`,
+    /// `crate::m::HI`).
     fn at_bound_start(&self) -> bool {
-        self.at_literal_start() || matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper)
+        self.at_literal_start()
+            || matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep)
     }
 
     /// Parses one range pattern bound: a literal (possibly negated) or
     /// a path. The checker evaluates it as a const expression.
     fn pattern_bound(&mut self) -> PResult<ExprId> {
         let start = self.span();
-        if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper) {
+        if matches!(self.peek(), Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep) {
             let path = self.path(false)?;
             let span = start.to(self.prev_span());
             Ok(self.push_expr(Expr::Path(path), span))
@@ -3685,7 +3687,11 @@ impl<'a> Parser<'a> {
                 Pat::Wild
             }
             Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(start)),
-            Tok::Ident(_) | Tok::SelfUpper => {
+            // A path pattern may start with a module anchor
+            // (`crate::m::E::A`, `super::S { .. }`, `::m::C`): the same
+            // path forms as after an identifier, never a binding.
+            Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep => {
+                let anchored = matches!(self.peek(), Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep);
                 let path = self.path(false)?;
                 if self.peek() == Tok::DotDotEq || self.peek() == Tok::DotDot {
                     // A path as a range lower bound (`LO..=HI`, `u8::MIN..`).
@@ -3704,7 +3710,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                 } else if self.peek() == Tok::At {
-                    if path.len() != 1 || path[0].has_args() {
+                    if anchored || path.len() != 1 || path[0].has_args() {
                         return Err(syntax(start, "expected a binding name before `@`"));
                     }
                     self.bump();
@@ -3762,6 +3768,10 @@ impl<'a> Parser<'a> {
                             }
                             self.expect(Tok::RBrace, "`}`")?;
                             Pat::Struct { path, fields, rest }
+                        }
+                        _ if anchored && path.len() == 1 => {
+                            // A lone anchor (`crate`, `super`, `self`) names no pattern.
+                            return Err(syntax(start, format!("expected a pattern, found `{}`", self.interner.get(path[0].name))));
                         }
                         _ if path.len() == 1 => {
                             // A lone identifier is a binding. Unit variants need a path such as `Kind::C`.
