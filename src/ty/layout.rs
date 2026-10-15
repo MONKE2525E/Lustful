@@ -327,6 +327,22 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
     univariant_layout(fields, repr, UnivKind::AlwaysSized)
 }
 
+/// The `repr(C)` tag: a C `int` when every discriminant fits in
+/// it, else a C `unsigned int` when they all fit there, else an
+/// 8-byte signed tag. This is rustc's rule (discriminants of a
+/// `repr(C)` enum are `isize` values, so 8 signed bytes always
+/// hold them); a fixed signed 4-byte tag truncates values past
+/// `i32` and sign-extends values past `u32` on reads.
+fn tag_width_c(discs: &[i128]) -> (u64, bool) {
+    if discs.iter().all(|&d| d >= i32::MIN as i128 && d <= i32::MAX as i128) {
+        (4, true)
+    } else if discs.iter().all(|&d| d >= 0 && d <= u32::MAX as i128) {
+        (4, false)
+    } else {
+        (8, true)
+    }
+}
+
 /// The smallest tag width in bytes (1, 2, 4, 8, 16) whose range holds every
 /// discriminant. Signedness is signed when any discriminant is negative.
 fn tag_width(discs: &[i128]) -> Result<(u64, bool), ()> {
@@ -426,16 +442,20 @@ pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Resu
         l.enum_tag = Some(EnumTag::None);
         return Ok(l);
     }
-    // A fixed integer tag must hold every discriminant.
+    // A fixed integer tag must hold every discriminant. A u128
+    // discriminant at or above 2^127 is stored as a negative i128
+    // and is in range.
     if let Some((bits, signed)) = repr.int {
-        let (lo, hi): (i128, i128) = if signed {
-            if bits >= 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) }
-        } else if bits >= 128 {
-            (0, i128::MAX)
-        } else {
-            (0, (1i128 << bits) - 1)
+        let in_range = |d: i128| {
+            if signed {
+                bits >= 128 || (d >= -(1i128 << (bits - 1)) && d < (1i128 << (bits - 1)))
+            } else if bits >= 128 {
+                true
+            } else {
+                d >= 0 && d < (1i128 << bits)
+            }
         };
-        if !discs.iter().all(|&d| d >= lo && d <= hi) {
+        if !discs.iter().all(|&d| in_range(d)) {
             return Err(());
         }
     }
@@ -465,7 +485,7 @@ fn tagged_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> R
     let (mut tag_w, signed) = if let Some((bits, signed)) = repr.int {
         ((bits / 8) as u64, signed)
     } else if repr.kind == ReprKind::C {
-        (4, true)
+        tag_width_c(discs)
     } else {
         tag_width(discs)?
     };
