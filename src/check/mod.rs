@@ -80,6 +80,9 @@ pub enum Builtin {
     VecIsEmpty,
     VecPush,
     Clone,
+    /// `ToOwned::clone_into` on `str` and on a slice of Copy
+    /// elements (check/convert.rs): clear the target, then copy.
+    CloneInto,
     ToString,
     WrappingAdd,
     WrappingSub,
@@ -9124,6 +9127,11 @@ impl<'p> Ctx<'p> {
             if names[3] == k.from {
                 return Some(Res::Builtin(Builtin::ConvInto));
             }
+            // `Cow::default()`: the default glue over the Owned type
+            // (`cow_default_sig`, check/cow.rs).
+            if self.name(names[3]) == "default" {
+                return Some(Res::Builtin(Builtin::DefaultGlue));
+            }
         }
         // `mpsc::RecvError`, the unit struct value (W-THREADS).
         if names.len() == 4
@@ -11389,7 +11397,10 @@ impl<'p> Ctx<'p> {
                     Builtin::RcDowngrade | Builtin::RcPtrEq | Builtin::SmartAsPtr | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
                         self.cell_call_sig(b, callee)
                     }
-                    Builtin::DefaultGlue => self.cell_default_sig(callee, span),
+                    Builtin::DefaultGlue => match self.cow_default_sig(callee, span) {
+                        Some(sig) => sig,
+                        None => self.cell_default_sig(callee, span),
+                    },
                     Builtin::ExitCodeFrom => (vec![int(IntTy::U8)], self.tys.exit_code_ty()),
                     Builtin::StringFromUtf8 | Builtin::StrFromUtf8 | Builtin::StringFromUtf8Lossy => self.utf8_call_sig(b),
                     Builtin::RcTryUnwrap => {

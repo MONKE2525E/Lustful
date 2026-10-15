@@ -47,6 +47,25 @@ const COW_OWN: &[&str] = &[
 ];
 
 impl<'p> Ctx<'p> {
+    /// `Cow::default()`: `() -> Cow<B>` with B inferred or written
+    /// (`Cow::<str>::default()`, filled by `unify_builtin_self` like
+    /// the cell types); the fn-end check proves the Owned type's
+    /// Default by structure (`deferred_default` on the Cow itself).
+    /// None when the callee does not name `Cow`.
+    pub(super) fn cow_default_sig(&mut self, callee: ExprId, span: Span) -> Option<(Vec<Ty>, Ty)> {
+        let is_cow = match self.p.ast.expr(callee) {
+            Expr::Path(segs) if segs.len() >= 2 => self.name(segs[segs.len() - 2].name) == "Cow",
+            _ => false,
+        };
+        if !is_cow {
+            return None;
+        }
+        let b = self.new_var(false);
+        let cow = self.tys.mk_adt(generics::cow_def(), &[GenericArg::Ty(b)]);
+        self.deferred_default.push((cow, span));
+        Some((vec![], cow))
+    }
+
     /// A method on a `Cow<B>` receiver, or None for other receivers and
     /// names (the other dispatch then runs).
     #[allow(clippy::too_many_arguments)]
@@ -90,6 +109,23 @@ impl<'p> Ctx<'p> {
             "as_ref" => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b)),
             "borrow" if self.std_trait_imported("borrow", "Borrow") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b)),
             "deref" if self.std_trait_imported("ops", "Deref") => (Builtin::CowDeref, Autoref::Ref, self.tys.mk_ref(false, b)),
+            // The blanket `ToOwned` of a Clone type: a Cow's own
+            // `to_owned` is its clone (a Borrowed stays Borrowed).
+            "to_owned" => (Builtin::Clone, Autoref::Ref, base),
+            // `Clone::clone_from` (and with it the blanket
+            // `clone_into`) has no lust form yet, on any type.
+            "clone_from" | "clone_into" => {
+                self.err(
+                    "L0640",
+                    name_span,
+                    format!("`{n}` is not implemented yet"),
+                    "Assign a clone instead: `*dst = src.clone()`.",
+                );
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
             _ => return None,
         };
         if autoref != Autoref::None {

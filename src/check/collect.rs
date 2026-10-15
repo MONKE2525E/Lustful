@@ -6440,6 +6440,23 @@ pub fn has_default(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    // `Cow<B>` defaults to `Owned(<B as ToOwned>::Owned::default())`
+    // (std's impl): str and slices always qualify (String and Vec),
+    // a sized `B` through itself, and any other `B` through the
+    // concrete Owned field of its instance when one is registered.
+    if let Some(b) = cow_arg(tys, t) {
+        return match tys.kind(b) {
+            TyKind::Str | TyKind::Slice(_) => true,
+            _ if is_sized_ty(tys, b) && has_clone(p, tys, b) => glue_default(p, tys, b, seen),
+            _ => match tys.local_adt(t) {
+                Some(a) => match p.adt(a).variants.get(1).and_then(|v| v.fields.first()) {
+                    Some(f) if !matches!(tys.kind(f.ty), TyKind::Projection(..)) => glue_default(p, tys, f.ty, seen),
+                    _ => false,
+                },
+                None => false,
+            },
+        };
+    }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.default, None),
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Error => true,

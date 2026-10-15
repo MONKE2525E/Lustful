@@ -4093,6 +4093,28 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    {}->len = 0;", vals[0]);
                 "((lust_Unit){})".into()
             }
+            B::CloneInto => {
+                // `ToOwned::clone_into` on str (into a String) and on a
+                // Copy slice (into a Vec): read the source into
+                // temporaries, clear the target (its buffer stays),
+                // then copy in, growing as push and extend grow.
+                let dst = &vals[1];
+                if matches!(&tys[0], CTy::Ref(inner) if **inner == CTy::Str) || matches!(&tys[0], CTy::Str) {
+                    let s = self.tmp();
+                    let _ = writeln!(self.out, "    lust_str {s} = {}; {dst}->len = 0; lust_string_push_str({dst}, {s});", vals[0]);
+                } else {
+                    let CTy::Ref(v) = &tys[1] else { unreachable!("clone_into target is a &mut Vec") };
+                    let CTy::Vec(e) = &**v else { unreachable!("clone_into target is a &mut Vec") };
+                    let et = ctype(e);
+                    let (_, sptr, slen) = slice_like(&tys[0], &vals[0]);
+                    let (sp, sn, i) = (self.tmp(), self.tmp(), self.tmp());
+                    let _ = writeln!(
+                        self.out,
+                        "    {et} *{sp} = {sptr};\n    uint64_t {sn} = {slen};\n    {dst}->len = 0;\n    lust_vec_reserve({dst}, {sn}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = 0; {i} < {sn}; {i}++) (({et}*){dst}->ptr)[{dst}->len++] = {sp}[{i}];"
+                    );
+                }
+                "((lust_Unit){})".into()
+            }
             B::StringSplitOff => format!("lust_string_split_off({}, {}, {loc})", vals[0], vals[1]),
             B::StringAsBytes => {
                 let sl = CTy::Slice(Box::new(CTy::Int(IntTy::U8)));
@@ -8071,6 +8093,12 @@ fn glue_def_value(
                     let it = format!("RcI_{}", mangle(e));
                     let d = def_of(e, &mut need);
                     let _ = writeln!(body, "  {it} *r = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); r->strong = 1; r->weak = 1; r->v = {d};\n  return r;");
+                }
+                // `Cow<B>` defaults to `Owned(Owned::default())`.
+                CTy::Adt(adt_id) if p.gx.adt_instance_of.get(adt_id.0 as usize).copied().flatten().is_some_and(|(d, _)| d == crate::check::generics::cow_def()) => {
+                    let owned = cty(&p.tys, p.adt(*adt_id).variants[1].fields[0].ty);
+                    let d = def_of(&owned, &mut need);
+                    let _ = writeln!(body, "  return {};", variant_lit(p, t, 1, &[d]));
                 }
                 CTy::Adt(adt_id) => {
                     let adt = p.adt(*adt_id);

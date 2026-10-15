@@ -7130,8 +7130,20 @@ pub fn add_synthetic_impls(p: &mut Program) {
     {
         let cow_p0 = p.tys.mk_adt(cow_def(), &[GenericArg::Ty(p0)]);
         insert_synthetic(p, &mut ordinal, lang.clone, cow_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
-        // `Borrow<B>` (map lookups of `Cow<str>` keys by `&str`).
+        // `Default` when the Owned type has one: `Owned::default()`.
+        {
+            let a = p.tys.intern_args(&[GenericArg::Ty(p0)]);
+            let owned_p0 = p.tys.intern(TyKind::Projection(AssocId(lang.assoc_owned), a));
+            let mut g = one.clone();
+            g.predicates = vec![pred_on(p, lang.default, owned_p0)];
+            insert_synthetic(p, &mut ordinal, lang.default, cow_p0, &[], g, Vec::new(), Synthetic::Lang, false, span);
+        }
+        // `Borrow<B>` (map lookups of `Cow<str>` keys by `&str`),
+        // `AsRef<B>`, and `Deref` to `B`: selection only, the calls
+        // are `Builtin::CowDeref` (check/cow.rs).
         insert_synthetic(p, &mut ordinal, lang.borrow, cow_p0, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.as_ref, cow_p0, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.deref, cow_p0, &[], one.clone(), vec![(lang.assoc_target, p0)], Synthetic::Lang, false, span);
         for tr in [lang.debug, lang.display, lang.eq, lang.hash, lang.partial_eq, lang.partial_ord, lang.ord] {
             let mut g1 = one.clone();
             g1.predicates = pred_on_p0(p, tr);
@@ -9314,6 +9326,18 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
             _ => false,
         },
         TyKind::Ref(_, _, e) if default => matches!(p.tys.kind(e), TyKind::Str | TyKind::Slice(_)),
+        // `Cow<B>` defaults through its Owned type, which the pure
+        // solver cannot normalize at the unsized heads (str, [T]);
+        // the structural glue answer decides, plus the derive's own
+        // `B: Default` bound in the env for a parameter `B`.
+        TyKind::Adt(..) if default && crate::check::collect::cow_arg(&p.tys, ty).is_some() => {
+            crate::check::collect::has_default(p, &p.tys, ty)
+                || env.iter().any(|pr| {
+                    matches!(pr, Predicate::Trait(b) if b.value.def == trait_def
+                        && p.tys.args(b.value.args).first().and_then(|g| g.as_ty())
+                            == crate::check::collect::cow_arg(&p.tys, ty))
+                })
+        }
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
         _ => {
             let mut a = vec![GenericArg::Ty(ty)];

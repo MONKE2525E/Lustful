@@ -204,7 +204,8 @@ impl<'p> Ctx<'p> {
         let p = self.p;
         let lang = p.gx.lang;
         let n = p.interner.get(name);
-        if !args.is_empty() {
+        // `clone_into` is the one of these with an argument.
+        if n != "clone_into" && !args.is_empty() {
             return None;
         }
         let rt = self.deep(rt);
@@ -230,6 +231,12 @@ impl<'p> Ctx<'p> {
         };
         if self.tys.local_adt(self_ty).is_some() || matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..)) {
             return None;
+        }
+        if n == "clone_into" {
+            if args.len() != 1 {
+                return None;
+            }
+            return self.clone_into_call(e, recv, self_ty, self_derefs, name_span, args);
         }
         // A builtin with an inherent `borrow` of its own (RefCell and its
         // kin) wins at its step: rustc probes inherent methods first.
@@ -421,6 +428,38 @@ impl<'p> Ctx<'p> {
         self.check_packed_borrow(recv, name_span);
         self.set_res(e, Res::BuiltinMethod { b, derefs: self_derefs, autoref: Autoref::Ref });
         Some(ret)
+    }
+
+    /// `clone_into(&mut target)`: `str` into a String and a slice of
+    /// Copy elements into a Vec, clearing the target first (its
+    /// buffer is reused, as std's impls do). A slice of non-Copy
+    /// elements clones element by element through each element's
+    /// `clone_from`, which lust has no form for yet (L0640); every
+    /// other receiver resolves its written or generic impl in the
+    /// generic method search (None here).
+    fn clone_into_call(&mut self, e: ExprId, recv: ExprId, self_ty: Ty, self_derefs: u8, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        let owned = match self.tys.kind(self_ty) {
+            TyKind::Str => STRING,
+            TyKind::Slice(el) => {
+                if !is_copy(self.p, &self.tys, el) {
+                    self.err(
+                        "L0640",
+                        name_span,
+                        "`clone_into` on a slice of non-Copy elements is not implemented yet".to_string(),
+                        "Assign a fresh Vec instead: `*target = src.to_vec()`.",
+                    );
+                    self.expr(args[0], None);
+                    return Some(ERROR);
+                }
+                self.tys.mk_vec(el)
+            }
+            _ => return None,
+        };
+        self.check_packed_borrow(recv, name_span);
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::CloneInto, derefs: self_derefs, autoref: Autoref::Ref });
+        let target = self.tys.mk_ref(true, owned);
+        self.check_args(&[target], args, name_span);
+        Some(UNIT)
     }
 
     /// In an instance of a generic body, the trait argument of the
