@@ -1857,7 +1857,12 @@ impl<'p> Lower<'p> {
                         }
                     }
                 }
-                let ops: Vec<Operand> = args.iter().map(|&a| self.operand(a)).collect();
+                let ops: Vec<Operand> = match (res, args.as_slice()) {
+                    (Res::Fn(_), [a0, rest @ ..]) if !rest.is_empty() && self.ck.coerce(*a0) == Coerce::Reborrow && self.is_place_expr(*a0) => {
+                        self.two_phase_reborrow_args(*a0, rest, span)
+                    }
+                    _ => args.iter().map(|&a| self.operand(a)).collect(),
+                };
                 match res {
                     Res::Fn(f) => {
                         let f = self.resolve_generic_fn(e, f);
@@ -3891,6 +3896,27 @@ impl<'p> Lower<'p> {
         let v = self.temp(view);
         self.call_into(CallTarget::Builtin(Builtin::CowDeref), vec![Operand::Copy(Place::local(r))], Place::local(v), span);
         v
+    }
+
+    /// The operands of a fn call whose first argument is a `&mut` place
+    /// reborrowed by coercion (`f(nodes, nodes.len())`): rustc's argument
+    /// coercion reborrow is two-phase, so it is lowered as a method
+    /// receiver's (a shared reservation while `rest` runs, `FakeRead`,
+    /// then the `&mut`; `two_phase_receiver` in borrowck).
+    fn two_phase_reborrow_args(&mut self, a0: ExprId, rest: &[ExprId], span: Span) -> Vec<Operand> {
+        let pl = self.place(a0).deref();
+        let inner = self.peel(self.ty(a0), 1);
+        let st = self.ref_ty(false, inner);
+        let reserve = self.temp(st);
+        self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+        let rest_ops: Vec<Operand> = rest.iter().map(|&a| self.operand(a)).collect();
+        self.push(StmtKind::FakeRead(reserve), span);
+        let mt = self.ref_ty(true, inner);
+        let t = self.temp(mt);
+        self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+        let mut ops = vec![Operand::Move(Place::local(t))];
+        ops.extend(rest_ops);
+        ops
     }
 
     /// The autoref of a range-indexed receiver (`v[1..].iter()`,
