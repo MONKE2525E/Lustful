@@ -9,7 +9,8 @@ and `lust build` builds it.
 
 | Slice | Lines (code) | From |
 |---|---|---|
-| `goport-util` | 35,038 (26,468) | ts-rust `goport_util` (87,779 lines on this target) |
+| `goport-util-lsp` | 50,597 (34,236) | ts-rust `goport_util` + `goport_lsproto` merged into one crate (146,877 lines) |
+| `goport-util` | 35,038 (26,468) | ts-rust `goport_util` (87,178 lines in its module tree) |
 | `goport-util-small` | 7,253 (4,223) | the same crate without gostd, locale, fswatch, astdata |
 
 ## How a slice is made
@@ -33,6 +34,9 @@ Bench-owned text, not ts-rust code:
 - `support.rs`: stand-ins for `rustc_hash`, `indexmap`, `memchr` (from
   tests/kernels, with two lust-friendly changes; see its header). Paths to
   those crates are rewritten to `crate::<name>::` (spec `rewrite`).
+- in `goport-util-lsp`, `goport_util::` paths become `crate::` (spec
+  `rewrite_to`): goport_lsproto's own root re-exports goport_util, so the
+  merged crate keeps every path's meaning.
 
 `core` (`gopanic.rs`) is not mounted: a user module named `core` makes lust's
 std fail to resolve its own `core::` paths (lust bug, see REPORT). When that

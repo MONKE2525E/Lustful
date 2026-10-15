@@ -26,6 +26,7 @@ spec.json (see bench/slices/*/spec.json):
   append       text appended to the root (stand-in mods, fn main)
   support      extra files copied into src_dir of the slice: {dest: path-in-lust-repo}
   rewrite      extern crate names whose paths become `crate::<name>::` (stand-ins)
+  rewrite_to   {name: prefix}: `name::` becomes `prefix::` (a part crate merged into this one)
   root_replace optional [[old, new], ...] text edits of the root (the root is bench text,
                not a ts-rust module file; use it to unmount a module lust cannot take)
 
@@ -57,24 +58,32 @@ def build_items_tool():
 
 
 def copy_tree(spec, out):
+    """Copy the crate's module tree: write the new root next to root_from, walk the tree
+    from it (so `append` can mount more modules), and keep only the files it reaches."""
     src = Path(spec.get("tsrust_dir", "/home/theo/.t3/projects/ts-rust")) / spec["src_dir"]
     dst = out / "src"
-    r = sh([str(ITEMS), "--tree", str(src / spec["root_from"])])
-    if r.returncode != 0:
-        sys.exit(f"slice-items --tree: {r.stderr.strip()}")
-    for line in r.stdout.splitlines():
-        rel = Path(line).relative_to(src)
-        (dst / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(line, dst / rel)
-    for d, s in spec.get("support", {}).items():
-        (dst / d).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(ROOT / s, dst / d)
+    for p in src.rglob("*.rs"):
+        (dst / p.relative_to(src)).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(p, dst / p.relative_to(src))
     root_text = (src / spec["root_from"]).read_text()
     for old, new in spec.get("root_replace", []):
         if old not in root_text:
             sys.exit(f"root_replace: text not found: {old!r}")
         root_text = root_text.replace(old, new, 1)
     (dst / spec["root"]).write_text(root_text + spec.get("append", ""))
+    for d, s in spec.get("support", {}).items():
+        (dst / d).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / s, dst / d)
+    r = sh([str(ITEMS), "--tree", str(dst / spec["root"])])
+    if r.returncode != 0:
+        sys.exit(f"slice-items --tree: {r.stderr.strip()}")
+    keep = {str(Path(l).resolve()) for l in r.stdout.splitlines()}
+    for p in list(dst.rglob("*.rs")):
+        if str(p.resolve()) not in keep:
+            p.unlink()
+    for d in sorted((x for x in dst.rglob("*") if x.is_dir()), reverse=True):
+        if not any(d.iterdir()):
+            d.rmdir()
     names = spec.get("rewrite", [])
     if names:
         pat = re.compile(r"(?<![\w:])(" + "|".join(map(re.escape, names)) + r")::")
@@ -83,6 +92,15 @@ def copy_tree(spec, out):
                 continue
             t = p.read_text()
             n = pat.sub(r"crate::\1::", t)
+            if n != t:
+                p.write_text(n)
+    # rewrite_to: whole-path renames, such as a part crate merged into this one
+    # (`goport_util::x` becomes `crate::x`).
+    for name, to in spec.get("rewrite_to", {}).items():
+        pat = re.compile(rf"(?<![\w:]){re.escape(name)}::")
+        for p in dst.rglob("*.rs"):
+            t = p.read_text()
+            n = pat.sub(to + "::", t)
             if n != t:
                 p.write_text(n)
     return dst / spec["root"]

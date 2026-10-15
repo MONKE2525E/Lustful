@@ -1,0 +1,25 @@
+{
+  "name": "goport-util-lsp",
+  "about": "ts-rust's goport_util and goport_lsproto part crates merged into one crate, pruned to what lust accepts",
+  "src_dir": "crates/ts_goport/src",
+  "root_from": "goport_util_root.rs",
+  "root": "slice_main.rs",
+  "append": "\n// bench slice: goport_lsproto's modules (that crate's root re-exports goport_util), stand-ins for the external crates, and a bin entry.\npub mod lsp {\n    pub mod lsproto;\n}\nmod support;\npub use support::{indexmap, memchr, rustc_hash};\n\nfn main() {}\n",
+  "support": {
+    "support.rs": "bench/slices/support.rs"
+  },
+  "rewrite": [
+    "rustc_hash",
+    "indexmap",
+    "memchr"
+  ],
+  "root_replace": [
+    [
+      "#[path = \"gopanic.rs\"]\npub mod core;\n",
+      "// bench slice: `core` (gopanic.rs) is not mounted; a user `mod core` breaks lust's std paths (lust bug).\n"
+    ]
+  ],
+  "rewrite_to": {
+    "goport_util": "crate"
+  }
+}

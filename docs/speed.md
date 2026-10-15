@@ -40,31 +40,62 @@ Reproduce:
 ```sh
 cargo build --release
 python3 scripts/scale-gate.py --slice bench/slices/goport-util --json gu.json
-python3 scripts/speed_slice.py --render docs/speed.md gu.json small.json
+python3 scripts/speed_slice.py --render docs/speed.md lsp.json gu.json small.json
 ```
 
 The quick gate row: `scripts/speed-row.sh` (small slice, 20 body edits).
 
 ## Where we are (2026-10-14)
 
-The promise row is **body edit check**. On the 35k-line slice it is 0.9x
-today: lust 278 ms, rustc 242 ms. 100x on this slice means 2.4 ms per warm
-check.
+The promise row is **body edit check**. Today, on the 50k-line slice
+(goport-util-lsp), it is 1.6x: lust 393 ms, rustc 642 ms. 100x on this slice
+means 6.4 ms per warm check.
 
-- lust's own edit work is small: "check changed fns" is 9 ms. The rest is
+| Slice | lines | warm body edit check, lust / rustc | ratio | 100x needs |
+|---|---:|---|---:|---:|
+| goport-util-lsp | 50,597 | 393 / 642 ms | 1.6x | 6.4 ms |
+| goport-util | 35,038 | 278 / 242 ms | 0.9x | 2.4 ms |
+| goport-util-small | 7,253 | 132 / 94 ms | 0.7x | 0.9 ms |
+
+- lust's own edit work is small: "check changed fns" is 9 to 15 ms. The rest is
   whole-crate work that every warm request repeats, even a no-op: std
-  load+splice (97 ms), collect (57 ms), and resolve (about 45 ms). Removing it
-  is the first step (W-INCR2).
-- rustc's warm cost grows with the crate: 242 ms here, 12.1 s on all of
-  ts-rust (bench/tsrust/baseline.json). So the same lust speed gives a larger
-  ratio on a larger slice. A ratio on a small slice is the harder test; do not
-  compare a slice's lust time with the full-crate rustc time.
-- Cold check is 1.5x on this slice. rustc with `-Z threads=8` checks 35k lines
-  cold in 377 ms.
+  load+splice (97 to 142 ms), collect (57 to 79 ms), and resolve (about 45 ms).
+  Removing it is the first step (W-INCR2).
+- rustc's warm cost grows with the crate: 242 ms at 35k lines, 642 ms at 50k
+  (the lsproto part is dense generated code), 12.1 s on all of ts-rust
+  (bench/tsrust/baseline.json). So the same lust speed gives a larger ratio on
+  a larger slice. Do not compare a slice's lust time with the full-crate rustc
+  time.
+- Cold check is 1.1x to 2.5x. rustc with `-Z threads=8` is fast on these
+  slices.
 
 ## Results
 
 <!-- speed-table:start -->
+### `goport-util-lsp`: 50,597 lines (34,236 code)
+
+ts-rust `b11b618ae`, lust `3fb35fed`, rustc 1.99.0 (b940084d7 2026-09-28), 16 vCPU. 171 source states; lust and cargo agree on pass or fail on every one.
+
+| Row | lust median | p95 | worst | n | rustc median (config) | Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| cold check | 319 ms | 362 | 368 | 5 | 810 ms (threads8) | 2.5x |
+| cold build | 400 ms | 418 | 422 | 5 | 861 ms (threads8) | 2.1x |
+| daemon first check (new session, empty cache) | 381 ms | 381 | 381 | 1 | 10 ms (default) | 0.03x |
+| no-op check (warm daemon) | 328 ms | 354 | 360 | 5 | 11 ms (threads8) | 0.03x |
+| cached restart check (new daemon, disk cache) | 368 ms | 382 | 385 | 5 | 10 ms (threads8) | 0.03x |
+| body edit check (one fn) | 392 ms | 465 | 523 | 120 | 642 ms (default) | **1.6x** |
+| body edit build (one fn) | 489 ms | 604 | 647 | 12 | 769 ms (threads8) | 1.6x |
+| signature edit check | 375 ms | 411 | 416 | 10 | 596 ms (default) | 1.6x |
+| type edit check | 395 ms | 437 | 438 | 10 | 670 ms (threads8) | 1.7x |
+| impl edit check | 398 ms | 489 | 536 | 10 | 620 ms (threads8) | 1.6x |
+| error edit check (both reject) | 345 ms | 356 | 357 | 5 | 472 ms (threads8) | 1.4x |
+| fix edit check | 393 ms | 456 | 471 | 5 | 547 ms (default) | 1.4x |
+
+Cold build: 9.5 MB of C, 25 units, link 5 ms.
+Peak RSS: lust cold check 267 MB, lust daemon 1030 MB (VmHWM over the run), cargo cold check 426 MB (default), 586 MB (threads8) (largest process in the tree).
+
+lust phases, body edit check (median ms): std load+splice 142, collect 79, resolve: expand+parse 29, check changed fns (par) 15, resolve: strip+register 12.
+
 ### `goport-util`: 35,038 lines (26,468 code)
 
 ts-rust `b11b618ae`, lust `83c9e328`, rustc 1.99.0 (b940084d7 2026-09-28), 16 vCPU. 171 source states; lust and cargo agree on pass or fail on every one.

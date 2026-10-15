@@ -1,6 +1,6 @@
 {
  "tsrust_commit": "b11b618aedde90c10c184869b208f1c3c0badea9",
- "lust_commit": "83c9e328fcecba1a19ac3286a570efecd916d7ec",
+ "lust_commit": "3fb35fede039c24637d517b0098c59d321413d10",
  "spec": {
   "name": "goport-util",
   "about": "ts-rust's bottom crate (goport_util: gostd, diagnostics, astdata, json, tspath, vfs, locale, ...), pruned to what lust accepts",
@@ -23,10 +23,10 @@
    ]
   ]
  },
- "lines_before": 87779,
+ "lines_before": 87178,
  "lines": 35038,
  "code_lines": 26468,
- "unloaded_lines_dropped": 3170,
+ "unloaded_lines_dropped": 2569,
  "rounds": 76,
  "removed_items": 3453,
  "removed_by_rustc": [],
@@ -178,17 +178,17 @@
   "lust L0503": 2
  },
  "removed": [
-  {"file": "gostd/strconv.rs", "kind": "moddecl", "name": "isprint", "lines": 2, "by": "lust", "code": "L0503", "message": "file not found for module `isprint`: `#[path]` names /home/theo/lust-scratch/w-bench/slice-gu/src/gostd/strconv_isprint.rs"},
+  {"file": "gostd/strconv.rs", "kind": "moddecl", "name": "isprint", "lines": 2, "by": "lust", "code": "L0503", "message": "file not found for module `isprint`: `#[path]` names /home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/strconv_isprint.rs"},
   {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_any_interface", "lines": 21, "by": "lust", "code": "L0802", "message": "cannot find macro `unported` in this scope"},
-  {"file": "frontend/bundled/embed.rs", "kind": "static", "name": "EMBEDDED_CONTENTS", "lines": 115, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/frontend/bundled/../../../libs/lib.d.ts` was not found"},
-  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_EXPAND_ELEM", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/collate_main_expand_elem.bin` was not found"},
-  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_CONTRACT_ELEM", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/collate_main_contract_elem.bin` was not found"},
-  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_VALUES", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/collate_main_values.bin` was not found"},
-  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_LOOKUP", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/collate_main_lookup.bin` was not found"},
-  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_CT_ENTRIES", "lines": 2, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/collate_main_ct_entries.bin` was not found"},
-  {"file": "gostd/norm.rs", "kind": "static", "name": "DECOMPS", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/norm_decomps.bin` was not found"},
-  {"file": "gostd/norm.rs", "kind": "static", "name": "NFC_DATA", "lines": 9, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/norm_nfc_values.bin` was not found"},
-  {"file": "gostd/norm.rs", "kind": "static", "name": "NFKC_DATA", "lines": 9, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu/src/gostd/data/norm_nfkc_values.bin` was not found"},
+  {"file": "frontend/bundled/embed.rs", "kind": "static", "name": "EMBEDDED_CONTENTS", "lines": 115, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/frontend/bundled/../../../libs/lib.d.ts` was not found"},
+  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_EXPAND_ELEM", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/collate_main_expand_elem.bin` was not found"},
+  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_CONTRACT_ELEM", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/collate_main_contract_elem.bin` was not found"},
+  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_VALUES", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/collate_main_values.bin` was not found"},
+  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_LOOKUP", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/collate_main_lookup.bin` was not found"},
+  {"file": "gostd/collate.rs", "kind": "static", "name": "MAIN_CT_ENTRIES", "lines": 2, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/collate_main_ct_entries.bin` was not found"},
+  {"file": "gostd/norm.rs", "kind": "static", "name": "DECOMPS", "lines": 1, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/norm_decomps.bin` was not found"},
+  {"file": "gostd/norm.rs", "kind": "static", "name": "NFC_DATA", "lines": 9, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/norm_nfc_values.bin` was not found"},
+  {"file": "gostd/norm.rs", "kind": "static", "name": "NFKC_DATA", "lines": 9, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gu2/src/gostd/data/norm_nfkc_values.bin` was not found"},
   {"file": "fswatch/unix.rs", "kind": "const", "name": "_", "lines": 9, "by": "lust", "code": "L0809", "message": "`assert!` with no message on a long or item-holding condition is not supported yet"},
   {"file": "fswatch/unix.rs", "kind": "fn", "name": "name_to_handle_at", "lines": 33, "by": "lust", "code": "L0001", "message": "expected a pattern, found `::`"},
   {"file": "jsnum.rs", "kind": "use", "name": "-", "lines": 1, "by": "lust", "code": "L0506", "message": "unresolved import `num_traits::ToPrimitive`"},

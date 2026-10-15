@@ -1,6 +1,6 @@
 {
  "tsrust_commit": "b11b618aedde90c10c184869b208f1c3c0badea9",
- "lust_commit": "83c9e328fcecba1a19ac3286a570efecd916d7ec",
+ "lust_commit": "3fb35fede039c24637d517b0098c59d321413d10",
  "spec": {
   "name": "goport-util-small",
   "about": "A quick-run slice: goport_util without gostd, locale, fswatch, and astdata, pruned to what lust accepts",
@@ -39,12 +39,12 @@
    ]
   ]
  },
- "lines_before": 87779,
+ "lines_before": 41294,
  "lines": 7253,
  "code_lines": 4223,
- "unloaded_lines_dropped": 46220,
+ "unloaded_lines_dropped": 96,
  "rounds": 48,
- "removed_items": 2764,
+ "removed_items": 2763,
  "removed_by_rustc": [],
  "removed_by_lust_build": [],
  "unlocated_errors": [
@@ -52,7 +52,6 @@
    "code": "L0102",
    "message": "unknown trait `TryFrom`",
    "found_in": [
-    "astdata/syntax_kind.rs:1293",
     "frontend/json_ext.rs:787",
     "frontend/json_ext.rs:799"
    ]
@@ -60,7 +59,7 @@
  ],
  "removed_lines_by_oracle_and_code": {
   "lust L0101": 26786,
-  "lust L0102": 3042,
+  "lust L0102": 2681,
   "lust L0104": 2352,
   "lust L0110": 437,
   "lust L0610": 308,
@@ -87,7 +86,7 @@
  },
  "removed": [
   {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_any_interface", "lines": 21, "by": "lust", "code": "L0802", "message": "cannot find macro `unported` in this scope"},
-  {"file": "frontend/bundled/embed.rs", "kind": "static", "name": "EMBEDDED_CONTENTS", "lines": 115, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gus/src/frontend/bundled/../../../libs/lib.d.ts` was not found"},
+  {"file": "frontend/bundled/embed.rs", "kind": "static", "name": "EMBEDDED_CONTENTS", "lines": 115, "by": "lust", "code": "L0803", "message": "include file `/home/theo/lust-scratch/w-bench/slice-gus2/src/frontend/bundled/../../../libs/lib.d.ts` was not found"},
   {"file": "jsnum.rs", "kind": "use", "name": "-", "lines": 1, "by": "lust", "code": "L0506", "message": "unresolved import `num_traits::ToPrimitive`"},
   {"file": "jsnum.rs", "kind": "use", "name": "-", "lines": 1, "by": "lust", "code": "L0506", "message": "unresolved import `num_bigint::BigInt`"},
   {"file": "jsonrpc/mod.rs", "kind": "use", "name": "-", "lines": 1, "by": "lust", "code": "L0506", "message": "unresolved import `crate::gostd::GoError`"},
@@ -156,7 +155,6 @@
   {"file": "frontend/nativepath.rs", "kind": "use", "name": "-", "lines": 1, "by": "lust", "code": "L0506", "message": "unresolved import `crate::frontend::vfs::FsError`"},
   {"file": "frontend/nativepath.rs", "kind": "fn", "name": "realpath", "lines": 28, "by": "lust", "code": "L0101", "message": "cannot find value `go_string_from_os` in this scope"},
   {"file": "jsonrpc/jsonrpc.rs", "kind": "impl", "name": "-", "lines": 31, "by": "lust", "code": "L0102", "message": "cannot find type `Message` in this scope"},
-  {"file": "astdata/syntax_kind.rs", "kind": "traitimpl", "name": "-", "lines": 361, "by": "lust", "code": "L0102", "message": "unlocated: unknown trait `TryFrom`"},
   {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_int_as", "lines": 11, "by": "lust", "code": "L0102", "message": "unlocated: unknown trait `TryFrom`"},
   {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_uint_as", "lines": 11, "by": "lust", "code": "L0102", "message": "unlocated: unknown trait `TryFrom`"},
   {"file": "frontend/json_ext.rs", "kind": "fn", "name": "unmarshal_json_method", "lines": 31, "by": "lust", "code": "L0505", "message": "module paths in types is not supported yet"},
