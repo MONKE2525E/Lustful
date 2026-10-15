@@ -127,6 +127,9 @@ pub struct DepReport {
     pub target: Option<String>,
     pub applies_to_target: String,
     pub optional: bool,
+    /// True when a non-optional dep, or an optional dep some using
+    /// package enables under its effective dev features.
+    pub enabled: bool,
     pub features: Vec<String>,
     pub used_by: Vec<String>,
     pub decision: String,
@@ -156,6 +159,8 @@ pub struct Report {
     pub manifest_path: String,
     pub workspace_root: String,
     pub packages: Vec<String>,
+    /// Effective Cargo features per scanned package (dev config applied).
+    pub cargo_features: BTreeMap<String, Vec<String>>,
     pub target: String,
     pub elapsed_ms: u128,
     pub totals: Totals,
@@ -288,6 +293,7 @@ pub fn build(
     manifest_path: &str,
     workspace_root: &str,
     packages: Vec<String>,
+    cargo_features: BTreeMap<String, Vec<String>>,
     target: &TargetInfo,
     elapsed_ms: u128,
     files: &Files,
@@ -462,6 +468,7 @@ pub fn build(
         manifest_path: manifest_path.to_string(),
         workspace_root: workspace_root.to_string(),
         packages,
+        cargo_features,
         target: target.triple.clone(),
         elapsed_ms,
         totals: Totals {
@@ -510,12 +517,20 @@ pub fn build(
 }
 
 /// Aggregates direct dependencies of the scanned packages.
-pub fn dep_reports(packages: &[&crate::cargo_meta::Package], table: &DepTable, target: &TargetInfo) -> Vec<DepReport> {
+/// `enabled_deps` maps a package name to the optional dependency names
+/// its effective dev features enable.
+pub fn dep_reports(
+    packages: &[&crate::cargo_meta::Package],
+    table: &DepTable,
+    target: &TargetInfo,
+    enabled_deps: &HashMap<String, HashSet<String>>,
+) -> Vec<DepReport> {
     let mut map: BTreeMap<(String, String, String), DepReport> = BTreeMap::new();
     for p in packages {
         for d in &p.dependencies {
             let kind = d.kind.clone().unwrap_or_else(|| "normal".into());
             let tgt = d.target.clone().unwrap_or_default();
+            let enabled_here = !d.optional || enabled_deps.get(&p.name).is_some_and(|s| s.contains(&d.name));
             let e = map.entry((d.name.clone(), kind.clone(), tgt)).or_insert_with(|| {
                 let (decision, milestone, notes) = match table.lookup(&d.name) {
                     Some(x) => (x.decision.clone(), x.milestone, x.notes.clone()),
@@ -532,6 +547,7 @@ pub fn dep_reports(packages: &[&crate::cargo_meta::Package], table: &DepTable, t
                     target: d.target.clone(),
                     applies_to_target: applies,
                     optional: d.optional,
+                    enabled: enabled_here,
                     features: d.features.clone(),
                     used_by: Vec::new(),
                     decision,
@@ -539,6 +555,7 @@ pub fn dep_reports(packages: &[&crate::cargo_meta::Package], table: &DepTable, t
                     notes,
                 }
             });
+            e.enabled |= enabled_here;
             if !e.used_by.contains(&p.name) {
                 e.used_by.push(p.name.clone());
             }

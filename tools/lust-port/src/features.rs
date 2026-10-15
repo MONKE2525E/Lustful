@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(t.classify("item.foreign_mod").unwrap().id, "cinterop.extern");
         assert_eq!(t.classify("fn.extern_abi").unwrap().id, "cinterop.extern");
         assert_eq!(t.classify("attr.global_allocator").unwrap().id, "cinterop.global_allocator");
-        assert_eq!(t.classify("ext.type.rustix::fs::FileType").unwrap().id, "cinterop.system");
+        assert_eq!(t.classify("ext.type.rustix::fs::FileType").unwrap().id, "ext.rustix");
         assert_eq!(t.classify("attr.cfg").unwrap().id, "attrs.cfg");
         assert_eq!(t.classify("attr.default").unwrap().id, "attrs.cfg");
         assert_eq!(t.classify("attr.rustfmt::skip").unwrap().id, "attrs.cfg");

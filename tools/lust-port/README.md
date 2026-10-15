@@ -31,6 +31,21 @@ tools/lust-port/target/release/lust-port scan --manifest-path /path/to/Cargo.tom
 - The scan is read-only. It runs `cargo metadata --no-deps`, with
   `--locked` when a `Cargo.lock` exists, and only reads `.rs` files.
 - A completed scan exits 0 even when gaps are found. Gaps are output.
+- Cargo features: `cfg(feature = "...")` is evaluated with each
+  package's effective dev features. The project lust config wins
+  (`[package.metadata.lust]` or `[workspace.metadata.lust]`
+  `dev-features` / `dev-exclude-features`, or a `.lust.toml` file; see
+  `docs/dev-features.md` in the lust repo). With no config, the package
+  `default` list applies, expanded through the `[features]` table.
+  `--cargo-features a,b` (exact list) and
+  `--cargo-exclude-features a,b` (removed from `default`) override the
+  config for one scan. Cfg-false items, statements, fields, variants,
+  and match arms are dropped from the AST before counting, and a
+  cfg-false `mod` file is target-specific. The JSON report lists the
+  effective features per package in `cargo_features`, and each
+  dependency row says whether the dev selection enables it
+  (`enabled`). Feature expansion is syntactic (metadata runs with
+  `--no-deps`, so no resolve graph is read).
 
 ## What it reports
 
@@ -47,7 +62,8 @@ tools/lust-port/target/release/lust-port scan --manifest-path /path/to/Cargo.tom
   the dev-path decision from `dependencies.json` (built-in adapter,
   C shim, or compile from source). Release always uses Cargo.
 - Parse errors, missing modules, and cfg predicates that cannot be
-  decided from the target triple (for example `feature = "..."`).
+  decided from the target triple and the effective features (custom
+  cfg flags and `target_feature`).
 
 ## Tables and how they stay true
 

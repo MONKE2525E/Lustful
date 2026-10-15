@@ -12,7 +12,7 @@ name = "lust-port"
 path = "src/main.rs"
 
 [dependencies]
-syn = { version = "=2.0.118", default-features = false, features = ["full", "visit", "parsing", "printing", "clone-impls", "extra-traits"] }
+syn = { version = "=2.0.118", default-features = false, features = ["full", "visit", "visit-mut", "parsing", "printing", "clone-impls", "extra-traits"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 serde = { version = "1", features = ["derive"] }

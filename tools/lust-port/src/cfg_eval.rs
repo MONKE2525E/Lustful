@@ -1,8 +1,11 @@
-//! Syntactic `#[cfg(...)]` evaluation for one target triple.
-//! Values we can get from the triple (os, arch, family, env, vendor,
-//! endian, pointer width) are decided. `feature ="..."`, custom cfg flags
-//! and `target_feature` are undecidable here and recorded, never guessed.
+//! Syntactic `#[cfg(...)]` evaluation for one target triple and one
+//! effective Cargo feature set. Values we can get from the triple (os,
+//! arch, family, env, vendor, endian, pointer width) are decided, and
+//! `feature = "..."` is decided when the caller sets the feature set
+//! (`TargetInfo::with_features`, from devfeat.rs). Custom cfg flags and
+//! `target_feature` stay undecidable and recorded, never guessed.
 
+use std::collections::BTreeSet;
 use syn::punctuated::Punctuated;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,6 +56,11 @@ pub struct TargetInfo {
     pub families: Vec<String>,
     pub endian: Option<String>,
     pub pointer_width: Option<String>,
+    /// Effective Cargo features of the package under evaluation. Empty
+    /// with `features_known` false means `feature = "..."` is not
+    /// decided here (the old triple-only behavior).
+    pub features: BTreeSet<String>,
+    pub features_known: bool,
 }
 
 const OSES: &[&str] = &[
@@ -152,7 +160,13 @@ impl TargetInfo {
             Some(a) if a.starts_with("arm") => Some("32".to_string()),
             _ => None,
         };
-        TargetInfo { triple, arch, vendor, os, env, families, endian, pointer_width }
+        TargetInfo { triple, arch, vendor, os, env, families, endian, pointer_width, features: BTreeSet::new(), features_known: false }
+    }
+
+    /// This target with one package's effective feature set, so
+    /// `cfg(feature = "...")` decides against it.
+    pub fn with_features(&self, features: BTreeSet<String>) -> TargetInfo {
+        TargetInfo { features, features_known: true, ..self.clone() }
     }
 
     fn field(&self, key: &str) -> Option<Tri> {
@@ -262,6 +276,7 @@ pub fn eval_meta(m: &syn::Meta, t: &TargetInfo) -> CfgEval {
                 }
                 "target_endian" => cmp(&t.endian, &val),
                 "target_pointer_width" => cmp(&t.pointer_width, &val),
+                "feature" if t.features_known => yesno(t.features.contains(&val)),
                 _ => {
                     out.undecidable.push(format!("{key} = \"{val}\""));
                     Tri::Unknown
@@ -293,6 +308,166 @@ pub fn eval_meta(m: &syn::Meta, t: &TargetInfo) -> CfgEval {
         }
     }
     out
+}
+
+/// True when any `#[cfg(...)]` in `attrs` decides false for `t`.
+fn cfg_false(attrs: &[syn::Attribute], t: &TargetInfo) -> bool {
+    attrs.iter().any(|a| a.path().is_ident("cfg") && eval_cfg_attr(a, t).state == Tri::False)
+}
+
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::ExternCrate(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Macro(i) => &i.attrs,
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::TraitAlias(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Use(i) => &i.attrs,
+        syn::Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(i) => &i.attrs,
+        syn::ImplItem::Fn(i) => &i.attrs,
+        syn::ImplItem::Macro(i) => &i.attrs,
+        syn::ImplItem::Type(i) => &i.attrs,
+        syn::ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(i) => &i.attrs,
+        syn::TraitItem::Fn(i) => &i.attrs,
+        syn::TraitItem::Macro(i) => &i.attrs,
+        syn::TraitItem::Type(i) => &i.attrs,
+        syn::TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(i) => &i.attrs,
+        syn::ForeignItem::Macro(i) => &i.attrs,
+        syn::ForeignItem::Static(i) => &i.attrs,
+        syn::ForeignItem::Type(i) => &i.attrs,
+        syn::ForeignItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+/// Attrs of the expression forms that carry a cfg in real code (blocks
+/// first). Other forms keep their code; the scanner stays an upper
+/// bound there, as before.
+fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        _ => &[],
+    }
+}
+
+fn stmt_false(stmt: &syn::Stmt, t: &TargetInfo) -> bool {
+    match stmt {
+        syn::Stmt::Local(l) => cfg_false(&l.attrs, t),
+        syn::Stmt::Item(i) => cfg_false(item_attrs(i), t),
+        syn::Stmt::Expr(e, _) => cfg_false(expr_attrs(e), t),
+        syn::Stmt::Macro(m) => cfg_false(&m.attrs, t),
+    }
+}
+
+/// Removes cfg-false items, statements, fields, variants, and match
+/// arms from one parsed file, in place. The walk already loaded the
+/// module files, so a removed `mod` item here does not unload its file;
+/// it only stops the analyzer and the global pass from counting code
+/// the dev build does not compile (for example the `tikv_jemalloc_ctl`
+/// blocks in ts-rust `program.rs` when `jemalloc` is off).
+pub fn strip_cfg_false(file: &mut syn::File, t: &TargetInfo) {
+    struct Strip<'t> {
+        t: &'t TargetInfo,
+    }
+    impl syn::visit_mut::VisitMut for Strip<'_> {
+        fn visit_file_mut(&mut self, f: &mut syn::File) {
+            f.items.retain(|i| !cfg_false(item_attrs(i), self.t));
+            syn::visit_mut::visit_file_mut(self, f);
+        }
+        fn visit_item_mod_mut(&mut self, m: &mut syn::ItemMod) {
+            if let Some((_, items)) = &mut m.content {
+                items.retain(|i| !cfg_false(item_attrs(i), self.t));
+            }
+            syn::visit_mut::visit_item_mod_mut(self, m);
+        }
+        fn visit_item_impl_mut(&mut self, m: &mut syn::ItemImpl) {
+            m.items.retain(|i| !cfg_false(impl_item_attrs(i), self.t));
+            syn::visit_mut::visit_item_impl_mut(self, m);
+        }
+        fn visit_item_trait_mut(&mut self, m: &mut syn::ItemTrait) {
+            m.items.retain(|i| !cfg_false(trait_item_attrs(i), self.t));
+            syn::visit_mut::visit_item_trait_mut(self, m);
+        }
+        fn visit_item_foreign_mod_mut(&mut self, m: &mut syn::ItemForeignMod) {
+            m.items.retain(|i| !cfg_false(foreign_item_attrs(i), self.t));
+            syn::visit_mut::visit_item_foreign_mod_mut(self, m);
+        }
+        fn visit_item_enum_mut(&mut self, m: &mut syn::ItemEnum) {
+            let keep: Vec<syn::Variant> = m.variants.iter().filter(|v| !cfg_false(&v.attrs, self.t)).cloned().collect();
+            m.variants = keep.into_iter().collect();
+            syn::visit_mut::visit_item_enum_mut(self, m);
+        }
+        fn visit_fields_mut(&mut self, f: &mut syn::Fields) {
+            match f {
+                syn::Fields::Named(n) => {
+                    let keep: Vec<syn::Field> = n.named.iter().filter(|x| !cfg_false(&x.attrs, self.t)).cloned().collect();
+                    n.named = keep.into_iter().collect();
+                }
+                syn::Fields::Unnamed(n) => {
+                    let keep: Vec<syn::Field> = n.unnamed.iter().filter(|x| !cfg_false(&x.attrs, self.t)).cloned().collect();
+                    n.unnamed = keep.into_iter().collect();
+                }
+                syn::Fields::Unit => {}
+            }
+            syn::visit_mut::visit_fields_mut(self, f);
+        }
+        fn visit_block_mut(&mut self, b: &mut syn::Block) {
+            b.stmts.retain(|s| !stmt_false(s, self.t));
+            syn::visit_mut::visit_block_mut(self, b);
+        }
+        fn visit_expr_match_mut(&mut self, e: &mut syn::ExprMatch) {
+            e.arms.retain(|a| !cfg_false(&a.attrs, self.t));
+            syn::visit_mut::visit_expr_match_mut(self, e);
+        }
+        fn visit_expr_struct_mut(&mut self, e: &mut syn::ExprStruct) {
+            let keep: Vec<syn::FieldValue> = e.fields.iter().filter(|x| !cfg_false(&x.attrs, self.t)).cloned().collect();
+            e.fields = keep.into_iter().collect();
+            syn::visit_mut::visit_expr_struct_mut(self, e);
+        }
+    }
+    syn::visit_mut::VisitMut::visit_file_mut(&mut Strip { t }, file);
 }
 
 #[cfg(test)]
@@ -335,5 +510,39 @@ mod tests {
         let tri = TargetInfo::from_triple(Some("x86_64-unknown-linux-gnu"));
         assert_eq!(eval_cfg_str(r#"cfg(not(target_family = "wasm"))"#, &tri), Tri::True);
         assert_eq!(eval_cfg_str(r#"cfg(windows)"#, &tri), Tri::False);
+    }
+
+    #[test]
+    fn feature_decides_with_a_known_set() {
+        let base = TargetInfo::from_triple(Some("x86_64-unknown-linux-gnu"));
+        let off = base.with_features(BTreeSet::from(["fast".to_string()]));
+        let m = syn::parse_str::<syn::Meta>(r#"all(feature = "jemalloc", not(windows))"#).unwrap();
+        assert_eq!(eval_meta(&m, &off).state, Tri::False);
+        assert!(eval_meta(&m, &off).undecidable.is_empty());
+        let on = base.with_features(BTreeSet::from(["jemalloc".to_string()]));
+        assert_eq!(eval_meta(&m, &on).state, Tri::True);
+        let not = syn::parse_str::<syn::Meta>(r#"not(all(feature = "jemalloc", not(windows)))"#).unwrap();
+        assert_eq!(eval_meta(&not, &off).state, Tri::True);
+    }
+
+    #[test]
+    fn strip_removes_cfg_false_code() {
+        let t = TargetInfo::from_triple(Some("x86_64-unknown-linux-gnu")).with_features(BTreeSet::from(["fast".to_string()]));
+        let mut f: syn::File = syn::parse_str(
+            "#[cfg(feature = \"jemalloc\")]\nfn off() -> u32 { tikv_jemalloc_ctl::x() }\n\
+             #[cfg(not(feature = \"jemalloc\"))]\nfn on() -> u32 { 1 }\n\
+             fn arena() -> Option<u32> {\n\
+                 #[cfg(all(feature = \"jemalloc\", not(windows)))]\n\
+                 { use tikv_jemalloc_ctl::Access; return Some(1); }\n\
+                 #[cfg(not(all(feature = \"jemalloc\", not(windows))))]\n\
+                 { None }\n\
+             }\n",
+        )
+        .unwrap();
+        strip_cfg_false(&mut f, &t);
+        let text = quote::quote!(#f).to_string();
+        assert!(!text.contains("tikv_jemalloc_ctl"), "{text}");
+        assert!(!text.contains("fn off"), "{text}");
+        assert!(text.contains("fn on"), "{text}");
     }
 }

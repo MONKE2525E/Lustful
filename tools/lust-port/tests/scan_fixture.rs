@@ -61,9 +61,11 @@ fn scan_reports_gaps_and_survives_bad_files() {
     assert_eq!(v["totals"]["parse_errors"], 1);
     assert_eq!(v["parse_errors"][0]["file"], "src/broken.rs");
 
-    // feature="x" cannot be decided from the triple.
+    // feature="x" decides false: this package declares no features, so
+    // its effective set is known and empty.
     let und: Vec<&str> = v["undecidable_cfg"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
-    assert!(und.iter().any(|u| u.contains("feature")), "undecidable: {und:?}");
+    assert!(!und.iter().any(|u| u.contains("feature")), "undecidable: {und:?}");
+    assert_eq!(v["cargo_features"]["fixture1"], serde_json::json!([]));
 
     let findings = v["findings"].as_array().unwrap();
     let has = |feature: &str, file: &str, scope: &str| {
@@ -76,7 +78,9 @@ fn scan_reports_gaps_and_survives_bad_files() {
     // dyn.boxed are supported rows), so it makes no finding.
     assert!(!has("dyn.fn", "src/sub/mod.rs", "active"));
     assert!(!has("dyn.boxed", "src/sub/mod.rs", "active"));
-    assert!(has("lifetimes.hrtb", "src/lib.rs", "active"));
+    // for<'a> fn pointers are supported today (lifetimes.hrtb), so the
+    // lib.rs `h` fn makes no finding.
+    assert!(!has("lifetimes.hrtb", "src/lib.rs", "active"));
 
     // Every finding carries a byte range inside its file and a snippet.
     for f in findings {
@@ -90,14 +94,15 @@ fn scan_reports_gaps_and_survives_bad_files() {
     // Findings are grouped by root cause.
     let causes: Vec<&str> = v["root_causes"].as_array().unwrap().iter().map(|g| g["root_cause"].as_str().unwrap()).collect();
     assert!(causes.contains(&"attrs-cfg"), "causes: {causes:?}");
-    assert!(causes.contains(&"lifetimes"));
 
-    // feat.rs (empty fn), elsewhere.rs (a const), and sub/mod.rs
-    // (Box<dyn Fn>) compile now; lib.rs needs milestone 6 for its
-    // for<'a> fn.
+    // elsewhere.rs (a const) and sub/mod.rs (Box<dyn Fn>) compile now;
+    // feat.rs is cfg(feature="x")-off, so it is target-specific and out
+    // of the active coverage universe. lib.rs needs milestone 4 for
+    // its #[used] static (attrs.unsupported).
     let feat = v["files"].as_array().unwrap().iter().find(|f| f["file"] == "src/feat.rs").unwrap();
     assert!(feat["missing_features"].as_array().unwrap().is_empty(), "{feat}");
-    assert_eq!(v["coverage"]["supported_today_files"], 3);
+    assert_eq!(feat["scope"], "target-specific", "{feat}");
+    assert_eq!(v["coverage"]["supported_today_files"], 2);
     let today = &v["coverage"]["by_plan_milestone"][0];
     let m6 = &v["coverage"]["by_plan_milestone"][3];
     assert_eq!(today["id"], "0");
@@ -144,11 +149,7 @@ fn bare_names_are_locals_and_serde_paths_are_named() {
     // `notify` and `same_file` are crate names in the seed list, but
     // here they are a local binding and a local function. A bare
     // one-segment path is never a crate root (w-tail).
-    write(
-        &root,
-        "src/bare.rs",
-        "fn same_file() -> bool { true }\npub fn g(notify: i32) -> i32 { if same_file() { notify } else { 0 } }\n",
-    );
+    write(&root, "src/bare.rs", "fn same_file() -> bool { true }\npub fn g(notify: i32) -> i32 { if same_file() { notify } else { 0 } }\n");
     let v = scan_json(&root);
     let file = |name: &str| v["files"].as_array().unwrap().iter().find(|f| f["file"] == name).unwrap().clone();
     let missing = |f: &serde_json::Value| {
@@ -165,6 +166,48 @@ fn bare_names_are_locals_and_serde_paths_are_named() {
     // this manifest, so no dependency rows appear for it.
     let deps = v["dependencies"].as_array().unwrap();
     assert!(!deps.iter().any(|d| d["name"] == "serde"), "deps: {deps:?}");
+}
+
+/// The ts-rust jemalloc shape: `default = ["heavy", "fast"]` with
+/// `[package.metadata.lust] dev-exclude-features = ["heavy"]`. Code
+/// under `cfg(feature = "heavy")` (an item, a block, and a whole mod
+/// file) must not block the active files, and `--cargo-features`
+/// must bring it back for one scan.
+#[test]
+fn dev_config_excludes_a_default_feature() {
+    let root = std::env::temp_dir().join(format!("lust-port-test-{}-devfeat", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    write(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"devfeat\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[package.metadata.lust]\ndev-exclude-features = [\"heavy\"]\n\n[features]\ndefault = [\"heavy\", \"fast\"]\nheavy = []\nfast = []\n",
+    );
+    write(
+        &root,
+        "src/lib.rs",
+        "#[cfg(feature = \"heavy\")]\npub mod heavy;\npub fn f() -> usize {\n    #[cfg(feature = \"heavy\")]\n    { #[used] static M: usize = 3; }\n    #[cfg(not(feature = \"heavy\"))]\n    { }\n    1\n}\n#[cfg(feature = \"heavy\")]\npub fn g() { #[used] static M: usize = 3; }\n",
+    );
+    write(&root, "src/heavy.rs", "pub fn w() { #[used] static M: usize = 3; }\n");
+    let manifest = root.join("Cargo.toml");
+    let scan = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec!["scan", "--manifest-path", manifest.to_str().unwrap(), "--target", "x86_64-unknown-linux-gnu", "--json"];
+        args.extend(extra);
+        let out = Command::new(env!("CARGO_BIN_EXE_lust-port")).args(&args).output().unwrap();
+        assert!(out.status.success(), "scan failed: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let file = |v: &serde_json::Value, name: &str| v["files"].as_array().unwrap().iter().find(|f| f["file"] == name).unwrap().clone();
+    let v = scan(&[]);
+    assert_eq!(v["cargo_features"]["devfeat"], serde_json::json!(["fast"]));
+    let lib = file(&v, "src/lib.rs");
+    assert!(lib["missing_features"].as_array().unwrap().is_empty(), "lib: {lib}");
+    assert_eq!(file(&v, "src/heavy.rs")["scope"], "target-specific");
+    // The override turns heavy back on: lib.rs is blocked again.
+    let v = scan(&["--cargo-features", "heavy,fast"]);
+    assert_eq!(v["cargo_features"]["devfeat"], serde_json::json!(["fast", "heavy"]));
+    let lib = file(&v, "src/lib.rs");
+    assert!(lib["missing_features"].as_array().unwrap().iter().any(|x| x == "attrs.unsupported"), "lib: {lib}");
+    assert_eq!(file(&v, "src/heavy.rs")["scope"], "active");
 }
 
 #[test]

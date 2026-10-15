@@ -6,6 +6,7 @@
 use crate::cfg_eval::{CfgEval, TargetInfo, Tri, eval_cfg_attr};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub enum Cat {
@@ -36,6 +37,8 @@ pub struct File {
     /// Combined cfg state for this file on the scan target.
     pub cfg_state: Tri,
     pub parse_error: Option<String>,
+    /// Effective Cargo features of the package this file belongs to.
+    pub cargo_features: Arc<BTreeSet<String>>,
 }
 
 impl File {
@@ -59,6 +62,8 @@ pub struct Root {
     pub package: String,
     pub target_name: String,
     pub kind: String,
+    /// Effective Cargo features of this root's package.
+    pub cargo_features: Arc<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +88,9 @@ struct Ctx {
     cfg: Vec<String>,
     cfg_state: Tri,
     mod_dir: PathBuf,
+    /// Scan target with this package's effective features set.
+    target: TargetInfo,
+    cargo_features: Arc<BTreeSet<String>>,
 }
 
 pub fn load(roots: Vec<Root>, base: &Path, target: &TargetInfo) -> Files {
@@ -96,9 +104,20 @@ pub fn load(roots: Vec<Root>, base: &Path, target: &TargetInfo) -> Files {
     let mut roots = roots;
     roots.sort_by_key(|r| r.cat);
     for r in &roots {
-        let Some(idx) = add_file(&r.path, r.cat, &[], Tri::True, base, &mut out, &mut by_path) else { continue };
+        let Some(idx) = add_file(&r.path, r.cat, &[], Tri::True, &r.cargo_features, base, &mut out, &mut by_path) else { continue };
         let mod_dir = r.path.parent().unwrap_or(base).to_path_buf();
-        queue.push_back((idx, Ctx { cat: r.cat, cfg: Vec::new(), cfg_state: Tri::True, mod_dir }));
+        let pkg_target = target.with_features((*r.cargo_features).clone());
+        queue.push_back((
+            idx,
+            Ctx {
+                cat: r.cat,
+                cfg: Vec::new(),
+                cfg_state: Tri::True,
+                mod_dir,
+                target: pkg_target,
+                cargo_features: r.cargo_features.clone(),
+            },
+        ));
     }
 
     while let Some((idx, ctx)) = queue.pop_front() {
@@ -119,7 +138,7 @@ pub fn load(roots: Vec<Root>, base: &Path, target: &TargetInfo) -> Files {
                 }
                 for a in &m.attrs {
                     if a.path().is_ident("cfg") {
-                        let ev: CfgEval = eval_cfg_attr(a, target);
+                        let ev: CfgEval = eval_cfg_attr(a, &ctx.target);
                         child.cfg_state = child.cfg_state.and(ev.state);
                         if ev.mentions_test && (child.cat == Cat::Prod || child.cat == Cat::Gen) {
                             child.cat = Cat::Test;
@@ -154,7 +173,9 @@ pub fn load(roots: Vec<Root>, base: &Path, target: &TargetInfo) -> Files {
                                 break;
                             }
                             if c.exists() {
-                                if let Some(id) = add_file(c, child.cat, &child.cfg, child.cfg_state, base, &mut out, &mut by_path) {
+                                if let Some(id) =
+                                    add_file(c, child.cat, &child.cfg, child.cfg_state, &child.cargo_features, base, &mut out, &mut by_path)
+                                {
                                     found = Some((id, c.clone(), false));
                                 }
                                 break;
@@ -199,11 +220,13 @@ pub fn load(roots: Vec<Root>, base: &Path, target: &TargetInfo) -> Files {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_file(
     path: &Path,
     cat: Cat,
     cfg: &[String],
     cfg_state: Tri,
+    cargo_features: &Arc<BTreeSet<String>>,
     base: &Path,
     out: &mut Files,
     by_path: &mut HashMap<PathBuf, usize>,
@@ -241,6 +264,7 @@ fn add_file(
         cfg: cfg.to_vec(),
         cfg_state,
         parse_error: err,
+        cargo_features: cargo_features.clone(),
     });
     Some(idx)
 }

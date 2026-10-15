@@ -3,6 +3,7 @@
 //! when a Cargo.lock already exists so a read-only tree is not rewritten.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,6 +16,9 @@ pub struct Metadata {
     pub workspace_root: PathBuf,
     #[serde(default)]
     pub target_directory: PathBuf,
+    /// `[workspace.metadata]` as raw JSON (the lust dev config reads it).
+    #[serde(default)]
+    pub workspace_metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -30,6 +34,12 @@ pub struct Package {
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
     pub edition: String,
+    /// The `[features]` table: feature name to its entries.
+    #[serde(default)]
+    pub features: BTreeMap<String, Vec<String>>,
+    /// `[package.metadata]` as raw JSON (the lust dev config reads it).
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
