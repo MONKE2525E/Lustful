@@ -118,11 +118,6 @@ impl Ctx<'_> {
         if p.gx.opaques.is_empty() || self.is_template_check() || self.opaque_mode == OpaqueMode::View {
             return;
         }
-        if self.opaque_copy_hazard {
-            let span = p.fn_def(self.fid).name_span;
-            self.errs.push(not_yet("L0602", span, "using an `impl Trait` value whose hidden type is `Copy` when its bounds are not"));
-            return;
-        }
         let n = self.out.expr_ty.len();
         for i in 0..n {
             let t = self.out.expr_ty[i];
@@ -185,10 +180,6 @@ impl Ctx<'_> {
                 && let Some(info) = p.gx.opaques.get(&od)
             {
                 let _ = p.sig_of(&mut self.out.reads, info.owner);
-                let h = reveal(&p.gx.opaque_hidden, &mut self.tys, o, 0);
-                if crate::check::collect::is_copy(p, &self.tys, h) && !opaque_bound_holds(p, &self.tys, o, p.gx.lang.copy) {
-                    self.opaque_copy_hazard = true;
-                }
             }
         }
         // A generic definer's hidden closures are its template's; the
@@ -333,8 +324,15 @@ pub(crate) fn view_hold(p: &Program, tys: &impl TyIntern, t: Ty) -> Hold {
 /// Fills a revealed check's `Checked::opaque_holds` and `local_holds`
 /// from its opaque view's types: each expression, pattern, and binding
 /// that holds an opaque value in the view gives its revealed type (the
-/// type lowering gives the locals that hold its value).
-fn holds_from_view(p: &Program, view: &Checked, ck: &mut Checked) {
+/// type lowering gives the locals that hold its value). Also the values
+/// the view moves where the revealed check would copy (`expr_moves`,
+/// `local_moves`), and L0602 for a closure that the hidden type's
+/// `Copy` makes borrow what rustc moves into it.
+fn holds_from_view(p: &Program, fid: LocalDefId, view: &Checked, ck: &mut Checked, errs: &mut Vec<Diag>) {
+    use crate::check::collect::is_copy;
+    let moved = |v: Ty, r: Ty| view_hold(p, &view.tys, v) != Hold::None && !is_copy(p, &view.tys, v) && is_copy(p, &ck.tys, r);
+    let expr_moves: Vec<bool> = view.expr_ty.iter().zip(&ck.expr_ty).map(|(&v, &r)| moved(v, r)).collect();
+    ck.expr_moves = if expr_moves.contains(&true) { expr_moves } else { Vec::new() };
     let mut holds: Vec<(Ty, Hold)> = Vec::new();
     let mut add = |t: Ty, h: Hold| {
         if h == Hold::None {
@@ -357,6 +355,28 @@ fn holds_from_view(p: &Program, view: &Checked, ck: &mut Checked) {
     let same = view.locals.len() == ck.locals.len() && view.locals.iter().zip(&ck.locals).all(|(a, b)| a.name == b.name && a.span == b.span);
     ck.local_holds = if same { local_holds } else { Vec::new() };
     ck.opaque_holds = holds;
+    // Without lined-up bindings no binding is known to move: a binding
+    // that might is not supported yet.
+    let local_moves: Vec<bool> = view.locals.iter().zip(&ck.locals).map(|(v, r)| moved(v.ty, r.ty)).collect();
+    if !same && local_moves.contains(&true) {
+        let span = p.fn_def(fid).name_span;
+        errs.push(not_yet("L0602", span, "an `impl Trait` binding whose hidden type is `Copy` when its bounds are not, here"));
+    }
+    ck.local_moves = if same && local_moves.contains(&true) { local_moves } else { Vec::new() };
+    // A closure the view makes take a value it moves (by value) but the
+    // revealed check lets borrow it (its hidden type is `Copy`): rustc's
+    // closure owns the value, lust's would not.
+    for c in &ck.closures {
+        let Some(vc) = view.closures.iter().find(|v| v.def == c.def) else { continue };
+        for cap in &c.captures {
+            let by_value = vc.captures.iter().any(|v| v.root == cap.root && v.mode == closure::CaptureMode::Value);
+            if cap.mode != closure::CaptureMode::Value && by_value {
+                let span = p.ast.expr_span(c.expr);
+                errs.push(not_yet("L0602", span, "a closure that takes an `impl Trait` value whose hidden type is `Copy` when its bounds are not"));
+                return;
+            }
+        }
+    }
 }
 
 /// How one check sees opaque types (see the file header).
@@ -384,8 +404,8 @@ pub(super) fn check_fn_opaque<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'
                 return (view, errs);
             }
             let out = ViewOut { picks: view.trait_picks.iter().copied().collect(), calls: view.closure_calls.iter().copied().collect() };
-            let (mut ck, errs) = check_fn_mode(p, fid, OpaqueMode::Revealed, out);
-            holds_from_view(p, &view, &mut ck);
+            let (mut ck, mut errs) = check_fn_mode(p, fid, OpaqueMode::Revealed, out);
+            holds_from_view(p, fid, &view, &mut ck, &mut errs);
             (ck, errs)
         }
     }

@@ -192,6 +192,7 @@ impl<'p> Lower<'p> {
                 place = place.project(*pr);
             }
             let op = match cap.mode {
+                CaptureMode::Value if self.local_moved(cap.root) => Operand::Move(place),
                 CaptureMode::Value => self.operand_from(place, cap.place_ty),
                 m => {
                     let mutable = m != CaptureMode::Ref;
@@ -221,11 +222,13 @@ impl<'p> Lower<'p> {
         let Some(entry) = self.p.gx.closures.get(&def) else { return };
         let (target, kind) = (entry.body_fn, entry.kind);
         let mut owned: Option<Local> = None;
+        // A callee rustc moves where it is `Copy` here (`view_moved`).
+        let moved = derefs == 0 && self.view_moved(callee);
         let env = match (kind, mode) {
             (ClosureKind::FnOnce, _) => self.operand_from(place, cty),
             (_, ClosureKind::FnOnce) => {
                 let own = self.temp(cty);
-                let op = self.operand_from(place, cty);
+                let op = if moved { Operand::Move(place) } else { self.operand_from(place, cty) };
                 self.assign(Place::local(own), Rvalue::Use(op), span);
                 owned = Some(own);
                 self.env_ref(Place::local(own), kind == ClosureKind::FnMut, cty, span)

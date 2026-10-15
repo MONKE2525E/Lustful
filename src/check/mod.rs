@@ -1197,6 +1197,15 @@ pub struct Checked<'g> {
     /// opaque view, which marks its IR local directly; empty when the
     /// two checks' bindings do not line up (then the type match decides).
     pub local_holds: Vec<opaque::Hold>,
+    /// Per expression (by index from `expr_base`), true when its value
+    /// is `Copy` here but not in the opaque view (an `impl Trait` whose
+    /// hidden type is `Copy` and its bounds do not say so): rustc moves
+    /// it, so lowering does too (`opaque::holds_from_view`). Empty when
+    /// none is.
+    pub expr_moves: Vec<bool>,
+    /// The same per checker local (binding), for the moves lowering
+    /// makes from places: by-value bindings and closure captures.
+    pub local_moves: Vec<bool>,
     /// A revealed call of a generic definer whose hidden type holds
     /// closures, before mono made its instance: the types still name the
     /// template's closures. Mono checks the body again once the instance
@@ -1451,9 +1460,7 @@ struct Ctx<'p> {
     /// after the fn's own env (`opaque::note_opaques`); empty until one.
     opaque_env: Vec<Predicate>,
     opaque_seen: Vec<Ty>,
-    /// A revealed hidden type is `Copy` where its bounds do not say so:
-    /// lust's borrow checker would see copies where rustc sees moves.
-    opaque_copy_hazard: bool,
+
     /// The revealed callee returns that name a generic definer's opaque,
     /// and the closure def map body end builds from them for `zonk`
     /// (`opaque::callee_closure_map`).
@@ -1689,6 +1696,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             opaque_hidden: Vec::new(),
             opaque_holds: Vec::new(),
             local_holds: Vec::new(),
+            expr_moves: Vec::new(),
+            local_moves: Vec::new(),
             closure_map_pending: false,
         },
         scopes: Vec::new(),
@@ -1755,7 +1764,6 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         view_calls: view.calls,
         opaque_env: Vec::new(),
         opaque_seen: Vec::new(),
-        opaque_copy_hazard: false,
         opaque_calls: Vec::new(),
         closure_map: Vec::new(),
         closure_order: None,

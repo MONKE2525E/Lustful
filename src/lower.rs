@@ -576,6 +576,15 @@ impl<'p> Lower<'p> {
     fn operand_from(&self, place: Place, ty: Ty) -> Operand {
         if is_copy(self.p, &self.body.tys, ty) { Operand::Copy(place) } else { Operand::Move(place) }
     }
+    /// True when the value of `e` is `Copy` here but moves in rustc (an
+    /// `impl Trait` whose hidden type is `Copy`, `Checked::expr_moves`).
+    fn view_moved(&self, e: ExprId) -> bool {
+        self.ck.expr_moves.get((e.0 - self.ck.expr_base) as usize).copied().unwrap_or(false)
+    }
+    /// `view_moved` for a checker local (a binding or a captured root).
+    fn local_moved(&self, local: u32) -> bool {
+        self.ck.local_moves.get(local as usize).copied().unwrap_or(false)
+    }
     fn derefs(place: Place, n: u8) -> Place {
         let mut p = place;
         for _ in 0..n {
@@ -1245,14 +1254,18 @@ impl<'p> Lower<'p> {
                 // temporary so the borrow checker reports exactly that.
                 // Pattern bindings project indexes directly and are not
                 // affected (they do not come through here).
-                if p.proj.iter().any(|x| matches!(x, Proj::Index(_))) && !is_copy(self.p, &self.body.tys, ty) {
+                let moved = self.view_moved(e);
+                if p.proj.iter().any(|x| matches!(x, Proj::Index(_))) && (moved || !is_copy(self.p, &self.body.tys, ty)) {
                     let span = self.span(e);
                     let rt = self.ref_ty(false, ty);
                     let tmp = self.temp(rt);
                     self.assign(Place::local(tmp), Rvalue::Ref(false, p), span);
+                    if moved {
+                        return Operand::Move(Place::local(tmp).deref());
+                    }
                     return self.operand_from(Place::local(tmp).deref(), ty);
                 }
-                self.operand_from(p, ty)
+                if moved { Operand::Move(p) } else { self.operand_from(p, ty) }
             }
             _ => {
                 let t = self.materialize(e, ty, true);
@@ -1390,7 +1403,7 @@ impl<'p> Lower<'p> {
                 Res::Local(_) => {
                     if let Some(d) = dest {
                         let pl = self.place(e);
-                        let op = self.operand_from(pl, ty);
+                        let op = if self.view_moved(e) { Operand::Move(pl) } else { self.operand_from(pl, ty) };
                         self.assign(d.clone(), Rvalue::Use(op), span);
                     }
                 }
@@ -1449,11 +1462,14 @@ impl<'p> Lower<'p> {
                     // Index reads go through the `Index` trait (see
                     // `operand_raw`): a non-Copy move out of a place
                     // below one is a move out of a reference.
-                    let op = if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) && !is_copy(self.p, &self.body.tys, ty) {
+                    let moved = self.view_moved(e);
+                    let op = if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) && (moved || !is_copy(self.p, &self.body.tys, ty)) {
                         let rt = self.ref_ty(false, ty);
                         let tmp = self.temp(rt);
                         self.assign(Place::local(tmp), Rvalue::Ref(false, pl), span);
-                        self.operand_from(Place::local(tmp).deref(), ty)
+                        if moved { Operand::Move(Place::local(tmp).deref()) } else { self.operand_from(Place::local(tmp).deref(), ty) }
+                    } else if moved {
+                        Operand::Move(pl)
                     } else {
                         self.operand_from(pl, ty)
                     };
@@ -3577,6 +3593,7 @@ impl<'p> Lower<'p> {
         match autoref {
             Autoref::None => {
                 let o = match &root {
+                    Some(pl) if derefs == 0 && self.view_moved(recv) => Operand::Move(pl.clone()),
                     Some(pl) => self.operand_from(Self::derefs(pl.clone(), derefs), recv_ty),
                     None => self.operand_derefs(recv, derefs),
                 };
@@ -5251,6 +5268,7 @@ impl<'p> Lower<'p> {
         };
         self.local_map[local as usize] = l;
         let rv = match mode {
+            BindMode::Move if self.local_moved(local) => Rvalue::Use(Operand::Move(place)),
             BindMode::Move => Rvalue::Use(self.operand_from(place, value_ty)),
             BindMode::Ref(m) => Rvalue::Ref(m, place),
         };
