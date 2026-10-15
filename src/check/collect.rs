@@ -40,6 +40,10 @@ pub enum VariantShape {
 pub struct Field {
     pub name: Sym,
     pub ty: Ty,
+    /// The span of the field's written type (the Adt's own span for a
+    /// synthetic field). Written-type diagnostics (WF bounds) point
+    /// here, at the field that owes the bound, not at the Adt name.
+    pub span: Span,
 }
 
 pub struct Variant {
@@ -3230,7 +3234,7 @@ pub fn collect_reuse(
             let variant = |n: &str, ty: Ty, disc: i128| Variant {
                 name: interner.intern(n),
                 shape: VariantShape::Tuple,
-                fields: vec![Field { name: zero, ty }],
+                fields: vec![Field { name: zero, ty, span }],
                 disc,
                 non_exhaustive: false,
             };
@@ -3268,7 +3272,7 @@ pub fn collect_reuse(
             // derives are std's, written here directly (no AST item).
             let id = AdtId(adt_base as u32 + rank);
             let unit = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Unit, fields: Vec::new(), disc, non_exhaustive: false };
-            let field = |n: &str, ty: Ty| Field { name: interner.intern(n), ty };
+            let field = |n: &str, ty: Ty| Field { name: interner.intern(n), ty, span };
             let named = |fields: Vec<Field>| vec![Variant { name, shape: VariantShape::Named, fields, disc: 0, non_exhaustive: false }];
             let (def, variants, derives) = match usize::MAX - item_idx {
                 0 => (
@@ -3776,11 +3780,11 @@ pub fn collect_reuse(
                             )),
                             Err(_) => {}
                         }
-                        fields.push(Field { name: fname, ty: t });
+                        fields.push(Field { name: fname, ty: t, span: ast.ty_span(fty) });
                     }
                     Err(d) => {
                         errs.push(d);
-                        fields.push(Field { name: fname, ty: ERROR });
+                        fields.push(Field { name: fname, ty: ERROR, span: ast.ty_span(fty) });
                     }
                 }
             }

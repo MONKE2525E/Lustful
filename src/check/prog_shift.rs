@@ -64,7 +64,10 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         regions: _,
     } = p;
     defs.for_each_span(&mut |s| sp(s));
-    adts.iter_mut().for_each(|a| sp(&mut a.span));
+    adts.iter_mut().for_each(|a| {
+        sp(&mut a.span);
+        a.variants.iter_mut().for_each(|v| v.fields.iter_mut().for_each(|f| sp(&mut f.span)));
+    });
     item_blocks.iter_mut().for_each(|(s, _)| sp(s));
     // Shipped std source ranges are byte ranges of file 0.
     for (lo, hi, _) in shipped_ranges.iter_mut() {

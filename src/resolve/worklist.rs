@@ -4846,6 +4846,51 @@ impl Rewrite<'_> {
         *segs = out;
     }
 
+    /// The precise diagnostic for a path whose longest module prefix
+    /// resolves but whose next segment is not in that module. None
+    /// when no prefix is a real local module (an associated item of a
+    /// type, a std path, an extern crate root), when the segment
+    /// exists under another form the checker reports itself (a module
+    /// read as a value, a std alias), or when the module is a hidden
+    /// std source module (it holds only part of a std module, so a
+    /// name it lacks may still be a std item lust has no form for).
+    fn missing_in_module(&self, names: &[Sym], ns: Namespace, module: ModuleId, span: Span) -> Option<Diag> {
+        if names.len() < 2 || ns == Namespace::Macro {
+            return None;
+        }
+        for plen in (1..names.len()).rev() {
+            let PathRes::Done(Target::Module(m)) = self.tables.resolve_module_path(module, &names[..plen], false, self.interner) else {
+                continue;
+            };
+            if self.tables.std_modules.iter().any(|&(_, sm)| sm == m) {
+                return None;
+            }
+            let seg = names[plen];
+            let last = plen + 1 == names.len();
+            let test_ns = if last { ns } else { Namespace::Type };
+            if self.tables.lookup(m, test_ns, seg).is_some() {
+                return None;
+            }
+            if test_ns != Namespace::Type
+                && matches!(self.tables.lookup(m, Namespace::Type, seg), Some(BindState::One(b)) if matches!(b.target, Target::Module(_)))
+            {
+                return None;
+            }
+            if last && (0..3).any(|i| self.tables.std_aliases.contains_key(&(m, i, seg))) {
+                return None;
+            }
+            let in_module = names[..plen].iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>().join("::");
+            let seg = self.interner.get(seg);
+            let fix = "Check the spelling, or import the item from the module that defines it.";
+            return Some(if test_ns == Namespace::Value {
+                Diag::new("L0101", span, format!("cannot find value `{seg}` in module `{in_module}`"), fix)
+            } else {
+                Diag::new("L0102", span, format!("cannot find type `{seg}` in module `{in_module}`"), fix)
+            });
+        }
+        None
+    }
+
     /// Rewrites one written path (segments borrowed out of the arena by
     /// the caller, then put back through `set`).
     fn rewrite_path(&mut self, segs: &mut Vec<PathSeg>, ns: Namespace, span: Span, module: ModuleId, scopes: &[Frame], ast: &mut Ast) {
@@ -4982,6 +5027,16 @@ impl Rewrite<'_> {
                     format!("cannot find type `{n}` in this scope"),
                     format!("Import it: `use {hint};`."),
                 ));
+                return;
+            }
+            // A module prefix that resolves, with the next segment
+            // missing in it (`ata::Missing`, `crate::a::b::Gone`):
+            // name the missing segment and its module, as rustc does,
+            // not the module's own name.
+            if res == PathRes::Absent
+                && let Some(d) = self.missing_in_module(&names, ns, module, span)
+            {
+                self.diags.push(d);
                 return;
             }
             if res == PathRes::Absent && names.first().is_some_and(|n| self.local_names.contains_key(n)) {

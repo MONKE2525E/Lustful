@@ -8627,19 +8627,19 @@ fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId 
     if let Some(inst) = p.tys.local_adt_instance(def, args_id) {
         return inst;
     }
-    let src_variants: Vec<(Sym, crate::check::collect::VariantShape, i128, bool, Vec<(Sym, Ty)>)> =
+    let src_variants: Vec<(Sym, crate::check::collect::VariantShape, i128, bool, Vec<(Sym, Ty, Span)>)> =
         p.adt(template)
             .variants
             .iter()
-            .map(|v| (v.name, v.shape, v.disc, v.non_exhaustive, v.fields.iter().map(|f| (f.name, f.ty)).collect()))
+            .map(|v| (v.name, v.shape, v.disc, v.non_exhaustive, v.fields.iter().map(|f| (f.name, f.ty, f.span)).collect()))
             .collect();
     let mut variants: Vec<crate::check::collect::Variant> = Vec::with_capacity(src_variants.len());
     for (vname, shape, disc, variant_ne, fields) in src_variants {
         let mut out_fields = Vec::with_capacity(fields.len());
-        for (name, ty) in fields {
+        for (name, ty, span) in fields {
             let ty = subst(&mut p.tys, ty, args);
             let ty = normalize_global(p, ty);
-            out_fields.push(crate::check::collect::Field { name, ty });
+            out_fields.push(crate::check::collect::Field { name, ty, span });
         }
         variants.push(crate::check::collect::Variant { name: vname, shape, fields: out_fields, disc, non_exhaustive: variant_ne });
     }
@@ -10775,7 +10775,10 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
     use crate::traits::index::Synthetic;
     // (types, value types, item predicates, span); the generics
     // also serve the param-free predicate rule.
-    let mut items: Vec<(Vec<Ty>, Vec<Ty>, Generics, Span)> = Vec::new();
+    // Each written type carries its own span (a field type's, for an
+    // Adt), so a failed bound points at the type that owes it.
+    let mut items: Vec<(Vec<(Ty, Span)>, Vec<(Ty, Span)>, Generics, Span)> = Vec::new();
+    let at = |tys: Vec<Ty>, span: Span| -> Vec<(Ty, Span)> { tys.into_iter().map(|t| (t, span)).collect() };
     for i in 0..p.fns.len() {
         // Stubs are trait method signatures again, and a trait
         // default template is its trait method: both are checked
@@ -10798,7 +10801,7 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         if let Some(own) = own_trait_pred(p, p.def_id(LocalDefId(i as u32)), &generics) {
             generics.predicates.push(own);
         }
-        items.push((tys, values, generics, span));
+        items.push((at(tys, span), at(values, span), generics, span));
     }
     let methods: Vec<(DefId, Vec<Ty>, bool, Generics, Span)> =
         p.gx.trait_methods
@@ -10818,18 +10821,18 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
             generics.predicates.push(own);
         }
         let values = if has_body { tys.clone() } else { Vec::new() };
-        items.push((tys, values, generics, span));
+        items.push((at(tys, span), at(values, span), generics, span));
     }
     for idx in 0..p.gx.adt_info.len() {
         if p.gx.adt_instance_of.get(idx).is_some_and(|i| i.is_some()) {
             continue;
         }
         let a = p.adt(AdtId(idx as u32));
-        let tys: Vec<Ty> = a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+        let tys: Vec<(Ty, Span)> = a.variants.iter().flat_map(|v| v.fields.iter().map(|f| (f.ty, f.span))).collect();
         // Only a struct's last field may be unsized.
         let unsized_ok = usize::from(!a.is_enum);
-        let values: Vec<Ty> =
-            a.variants.iter().flat_map(|v| v.fields.iter().take(v.fields.len().saturating_sub(unsized_ok)).map(|f| f.ty)).collect();
+        let values: Vec<(Ty, Span)> =
+            a.variants.iter().flat_map(|v| v.fields.iter().take(v.fields.len().saturating_sub(unsized_ok)).map(|f| (f.ty, f.span))).collect();
         items.push((tys, values, p.gx.adt_generics[idx].clone(), a.span));
     }
     for (_, rec) in p.gx.index.all_impls() {
@@ -10838,10 +10841,10 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         }
         let mut tys: Vec<Ty> = p.tys.args(rec.trait_ref.args).iter().filter_map(|g| g.as_ty()).collect();
         tys.extend(rec.assoc_tys.iter().map(|&(_, t)| t));
-        items.push((tys, Vec::new(), rec.generics.clone(), rec.span));
+        items.push((at(tys, rec.span), Vec::new(), rec.generics.clone(), rec.span));
     }
     for (ty, generics, span) in &p.gx.wf_headers {
-        items.push((vec![*ty], Vec::new(), generics.clone(), *span));
+        items.push((vec![(*ty, *span)], Vec::new(), generics.clone(), *span));
     }
     for rec in p.gx.trait_names.values().filter_map(|&d| p.gx.index.trait_record(d)).cloned().collect::<Vec<_>>() {
         // The trait's own definition assumes `Self: Trait<..>` (as
@@ -10867,16 +10870,19 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
     check_default_wf(p, &adt_idx, errs);
     for (tys, values, generics, span) in items {
         let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
-        let mut goals: Vec<TraitRef> = Vec::new();
+        let mut goals: Vec<(TraitRef, Span)> = Vec::new();
         // Sized goals from value positions and `parts` fail as
         // L0110; a failed param-bound goal keeps the L0612 shape.
-        let mut sized_goals: Vec<TraitRef> = Vec::new();
-        for t in values {
-            sized_goals.push(sized_ref(p, t));
+        let mut sized_goals: Vec<(TraitRef, Span)> = Vec::new();
+        for (t, tspan) in values {
+            sized_goals.push((sized_ref(p, t), tspan));
         }
         let mut seen: Vec<Ty> = Vec::new();
-        for t in tys {
-            wf_goals(p, &adt_idx, t, &mut seen, &mut goals, &mut sized_goals);
+        for (t, tspan) in tys {
+            let (mut g2, mut s2) = (Vec::new(), Vec::new());
+            wf_goals(p, &adt_idx, t, &mut seen, &mut g2, &mut s2);
+            goals.extend(g2.into_iter().map(|g| (g, tspan)));
+            sized_goals.extend(s2.into_iter().map(|g| (g, tspan)));
         }
         // The types a where clause names are written types too
         // (`where Vec<T>: Clone` needs `T: Sized`).
@@ -10884,7 +10890,10 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
             if let Predicate::Trait(b) = pred {
                 for g in p.tys.args(b.value.args).to_vec() {
                     if let Some(t) = g.as_ty() {
-                        wf_goals(p, &adt_idx, t, &mut seen, &mut goals, &mut sized_goals);
+                        let (mut g2, mut s2) = (Vec::new(), Vec::new());
+                        wf_goals(p, &adt_idx, t, &mut seen, &mut g2, &mut s2);
+                        goals.extend(g2.into_iter().map(|g| (g, span)));
+                        sized_goals.extend(s2.into_iter().map(|g| (g, span)));
                     }
                 }
             }
@@ -10913,17 +10922,17 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
                 ));
             }
         }
-        if let Some(goal) = sized_goals.into_iter().find(|g| !prove_goal(p, &env, *g)) {
+        if let Some((goal, gspan)) = sized_goals.into_iter().find(|(g, _)| !prove_goal(p, &env, *g)) {
             let t = p.tys.args(goal.args).first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
-            errs.push(crate::check::sized::unsized_diag(p, &p.tys, t, span));
+            errs.push(crate::check::sized::unsized_diag(p, &p.tys, t, gspan));
             continue;
         }
-        for goal in goals {
+        for (goal, gspan) in goals {
             if !prove_wf_goal(p, &env, goal) {
                 let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
                 errs.push(Diag::new(
                     "L0612",
-                    span,
+                    gspan,
                     format!("a type here does not satisfy the `{gname}` bound its definition requires"),
                     format!("Add the `{gname}` bound to this item, or change the type so the bound holds."),
                 ));
