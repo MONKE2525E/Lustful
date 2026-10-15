@@ -48,6 +48,9 @@ pub struct CrateInput {
     pub env: CfgEnv,
     pub crate_ids: CrateIds,
     pub crate_name: String,
+    /// Env values Cargo sets for rustc for the selected crate,
+    /// build script outputs included (see `ExpandCtx::cargo_env`).
+    pub cargo_env: Vec<(String, String)>,
     /// The selected crate's direct dependency lib units, recursively.
     pub deps: Vec<super::cargo::DepUnit>,
     /// The requesting client's env and shown paths, for `env!` and `file!` in every crate.
@@ -75,6 +78,8 @@ struct OneInput {
     /// so one identity space per merged program is consistent.
     crate_ids: CrateIds,
     crate_name: String,
+    /// See `CrateInput::cargo_env`, per crate.
+    cargo_env: Vec<(String, String)>,
     /// `CrateInput::std_splice_lo` for the selected crate; None for a
     /// dependency.
     std_splice_lo: Option<u32>,
@@ -799,6 +804,27 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
         n.hash(&mut h);
     }
     input.env.allow_lust_dev.hash(&mut h);
+    // Cargo env values and per-dependency build script cfg outputs:
+    // files that read env are never cached, but a `rustc-cfg` change
+    // re-expands a dependency's files, so the fingerprint must move.
+    for (k, v) in &input.cargo_env {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    }
+    fn dep_fp(deps: &[super::cargo::DepUnit], h: &mut crate::intern::FxHasher) {
+        use std::hash::Hash;
+        for d in deps {
+            d.package_id.hash(h);
+            for (k, v) in &d.cargo_env {
+                k.hash(h);
+                v.hash(h);
+            }
+            d.build_cfgs.hash(h);
+            d.build_check_cfgs.hash(h);
+            dep_fp(&d.deps, h);
+        }
+    }
+    dep_fp(&input.deps, &mut h);
     input.crate_ids.stable.0.hash(&mut h);
     // `file!` text: a shown root change re-expands every file. (The env
     // is not here: files that read it are never cached, see `reads_outside`.)
@@ -1231,6 +1257,7 @@ fn add_platform_job(input: &CrateInput, tables: &mut ResolvedTables, jobs: &mut 
             env,
             crate_ids: input.crate_ids,
             crate_name: "std".to_string(),
+            cargo_env: Vec::new(),
             std_splice_lo: None,
             display_root: input.display_root.clone(),
         },
@@ -1264,6 +1291,7 @@ pub fn resolve_crate_with(
             env: input.env.clone(),
             crate_ids: input.crate_ids,
             crate_name: input.crate_name.clone(),
+            cargo_env: input.cargo_env.clone(),
             std_splice_lo: input.std_splice_lo,
             display_root: input.display_root.clone(),
         },
@@ -1483,6 +1511,16 @@ fn add_dep_job(
     let mut env = input.env.with_features(&dep.features);
     if lust_owned {
         env.allow_lust_dev = true;
+    } else {
+        // A source dependency sees its own build script's cfgs, as
+        // under Cargo. Lust-owned adapter and shim sources do not:
+        // their root is not the package Cargo would build.
+        for c in &dep.build_cfgs {
+            env.add_rustc_cfg(c);
+        }
+        for c in &dep.build_check_cfgs {
+            env.add_check_cfg(c);
+        }
     }
     let idx = jobs.len();
     by_key.insert(key, idx);
@@ -1493,6 +1531,7 @@ fn add_dep_job(
             env,
             crate_ids: input.crate_ids,
             crate_name,
+            cargo_env: if lust_owned { Vec::new() } else { dep.cargo_env.clone() },
             std_splice_lo: None,
             display_root: input.display_root.clone(),
         },
@@ -2564,6 +2603,8 @@ fn resolve_one(
                     Some(rel) => rel.to_string_lossy().to_string(),
                     None => path.to_string_lossy().to_string(),
                 },
+                real_path: path.clone(),
+                cargo_env: input.cargo_env.clone(),
                 src: &text,
                 cfg: expand_cfg(&input.env),
                 module_path: module_paths[di].clone(),
@@ -6529,6 +6570,7 @@ mod tests {
             env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash(&format!("pkg:{name}"), "bin", name, false) },
             crate_name: name.into(),
+            cargo_env: Vec::new(),
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
@@ -6668,6 +6710,7 @@ mod tests {
             env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash(&format!("pkg:{crate_name}"), "bin", crate_name, false) },
             crate_name: crate_name.into(),
+            cargo_env: Vec::new(),
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
@@ -6700,6 +6743,7 @@ mod tests {
             env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:cachetest", "bin", "cachetest", false) },
             crate_name: "cachetest".into(),
+            cargo_env: Vec::new(),
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
@@ -6771,6 +6815,7 @@ mod tests {
             env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:displaytest", "bin", "displaytest", false) },
             crate_name: "displaytest".into(),
+            cargo_env: Vec::new(),
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
@@ -6810,6 +6855,7 @@ mod tests {
             env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
             crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:nestedtest", "bin", "nestedtest", false) },
             crate_name: "nestedtest".into(),
+            cargo_env: Vec::new(),
             deps: Vec::new(),
             client: Default::default(),
             std_splice_lo: None,
@@ -6852,6 +6898,10 @@ mod tests {
             lib_src: PathBuf::from("/nonexistent/lib.rs"),
             lib_name: name.into(),
             edition: "2021".into(),
+            manifest_dir: PathBuf::new(),
+            cargo_env: Vec::new(),
+            build_cfgs: Vec::new(),
+            build_check_cfgs: Vec::new(),
             features: Vec::new(),
             deps: Vec::new(),
         }

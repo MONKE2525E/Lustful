@@ -224,6 +224,15 @@ pub struct PackageInfo {
     pub version: String,
     pub edition: String,
     pub manifest_path: PathBuf,
+    /// Manifest fields Cargo exposes to rustc as `CARGO_PKG_*` env vars.
+    pub authors: Vec<String>,
+    pub description: Option<String>,
+    pub homepage: Option<String>,
+    pub license: Option<String>,
+    pub license_file: Option<String>,
+    pub repository: Option<String>,
+    pub readme: Option<String>,
+    pub rust_version: Option<String>,
     pub source: Option<String>,
     pub targets: Vec<TargetInfo>,
     pub dependencies: Vec<DepInfo>,
@@ -243,6 +252,9 @@ pub struct UnitInfo {
     /// name, version, and the workspace-relative manifest path.
     pub package_id: String,
     pub features: Vec<String>,
+    /// Env values Cargo sets for rustc for this unit, before build
+    /// script outputs (`package_cargo_env`).
+    pub cargo_env: Vec<(String, String)>,
     /// Direct dependency lib units, each with its own dependencies.
     pub deps: Vec<DepUnit>,
 }
@@ -269,6 +281,15 @@ pub struct DepUnit {
     /// The lib target's name (the crate name, with `-` as written).
     pub lib_name: String,
     pub edition: String,
+    /// The package manifest directory (`CARGO_MANIFEST_DIR`).
+    pub manifest_dir: PathBuf,
+    /// Env values Cargo sets for rustc for this unit. The driver adds
+    /// build script outputs (`OUT_DIR`, `rustc-env`) for path packages.
+    pub cargo_env: Vec<(String, String)>,
+    /// Build script `rustc-cfg` values for this unit (driver-filled).
+    pub build_cfgs: Vec<String>,
+    /// Build script `rustc-check-cfg` values for this unit (driver-filled).
+    pub build_check_cfgs: Vec<String>,
     /// The exact feature set of this unit, as for the selected unit.
     pub features: Vec<String>,
     pub deps: Vec<DepUnit>,
@@ -460,6 +481,14 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
             version: p.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0").to_string(),
             edition: p.get("edition").and_then(|v| v.as_str()).unwrap_or("2015").to_string(),
             manifest_path: PathBuf::from(p.get("manifest_path").and_then(|v| v.as_str()).unwrap_or("")),
+            authors: p.get("authors").map(|v| v.strings()).unwrap_or_default(),
+            description: p.get("description").and_then(|v| v.as_str()).map(str::to_string),
+            homepage: p.get("homepage").and_then(|v| v.as_str()).map(str::to_string),
+            license: p.get("license").and_then(|v| v.as_str()).map(str::to_string),
+            license_file: p.get("license_file").and_then(|v| v.as_str()).map(str::to_string),
+            repository: p.get("repository").and_then(|v| v.as_str()).map(str::to_string),
+            readme: p.get("readme").and_then(|v| v.as_str()).map(str::to_string),
+            rust_version: p.get("rust_version").and_then(|v| v.as_str()).map(str::to_string),
             source: p.get("source").and_then(|v| v.as_str()).map(str::to_string),
             targets: p
                 .get("targets")
@@ -499,6 +528,49 @@ pub fn package_id_string(graph: &CrateGraph, pkg: &PackageInfo) -> String {
             format!("{} {} (path+{})", pkg.name, pkg.version, rel.display())
         }
     }
+}
+
+/// The env values Cargo sets for rustc when it builds one target of
+/// one package (Cargo reference, "environment variables Cargo sets for
+/// crates"), from the metadata of the package. Every `CARGO_PKG_*`
+/// var is always set by Cargo, empty when the manifest field is
+/// absent, so each one appears here. Not included: `CARGO` (the
+/// cargo binary path; see REPORT gap), `OUT_DIR` and build-script
+/// `rustc-env` pairs (the driver adds those from the recorded build
+/// script output), and `DEP_*` links vars of dependencies.
+pub fn package_cargo_env(pkg: &PackageInfo, target: &TargetInfo) -> Vec<(String, String)> {
+    let manifest_dir = pkg.manifest_path.parent().map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+    // Version parts as Cargo splits them: major.minor.patch[-pre].
+    let (core, pre) = match pkg.version.split_once('-') {
+        Some((c, p)) => (c, p),
+        None => (pkg.version.as_str(), ""),
+    };
+    let mut nums = core.split('.');
+    let (major, minor, patch) = (nums.next().unwrap_or(""), nums.next().unwrap_or(""), nums.next().unwrap_or(""));
+    let empty = String::new();
+    let mut env: Vec<(String, String)> = vec![
+        ("CARGO_MANIFEST_DIR".into(), manifest_dir),
+        ("CARGO_MANIFEST_PATH".into(), pkg.manifest_path.to_string_lossy().into_owned()),
+        ("CARGO_PKG_NAME".into(), pkg.name.clone()),
+        ("CARGO_PKG_VERSION".into(), pkg.version.clone()),
+        ("CARGO_PKG_VERSION_MAJOR".into(), major.to_string()),
+        ("CARGO_PKG_VERSION_MINOR".into(), minor.to_string()),
+        ("CARGO_PKG_VERSION_PATCH".into(), patch.to_string()),
+        ("CARGO_PKG_VERSION_PRE".into(), pre.to_string()),
+        ("CARGO_PKG_AUTHORS".into(), pkg.authors.join(":")),
+        ("CARGO_PKG_DESCRIPTION".into(), pkg.description.clone().unwrap_or_default()),
+        ("CARGO_PKG_HOMEPAGE".into(), pkg.homepage.clone().unwrap_or_default()),
+        ("CARGO_PKG_LICENSE".into(), pkg.license.clone().unwrap_or_default()),
+        ("CARGO_PKG_LICENSE_FILE".into(), pkg.license_file.clone().unwrap_or_default()),
+        ("CARGO_PKG_REPOSITORY".into(), pkg.repository.clone().unwrap_or_default()),
+        ("CARGO_PKG_README".into(), pkg.readme.clone().unwrap_or(empty)),
+        ("CARGO_PKG_RUST_VERSION".into(), pkg.rust_version.clone().unwrap_or_default()),
+        ("CARGO_CRATE_NAME".into(), target.name.replace('-', "_")),
+    ];
+    if target.kind.iter().any(|k| k == "bin") {
+        env.push(("CARGO_BIN_NAME".into(), target.name.clone()));
+    }
+    env
 }
 
 /// The per-unit feature sets from one `cargo check --message-format=json`
@@ -634,13 +706,24 @@ pub fn select_unit(
                     lib_src: lib.src_path.clone(),
                     lib_name: lib.name.clone(),
                     edition: lib.edition.clone(),
+                    manifest_dir: pkg.manifest_path.parent().map_or_else(PathBuf::new, Path::to_path_buf),
+                    cargo_env: package_cargo_env(pkg, lib),
+                    build_cfgs: Vec::new(),
+                    build_check_cfgs: Vec::new(),
                     features: lib_features,
                     deps: deps.clone(),
                 },
             );
         }
     }
-    Ok(UnitInfo { package_id: package_id_string(graph, pkg), package: pkg.clone(), target: target.clone(), features, deps })
+    Ok(UnitInfo {
+        package_id: package_id_string(graph, pkg),
+        package: pkg.clone(),
+        target: target.clone(),
+        features,
+        cargo_env: package_cargo_env(pkg, target),
+        deps,
+    })
 }
 
 /// Builds the lib dependency units of one package, recursively. A
@@ -687,6 +770,10 @@ fn build_deps(
             lib_src: lib.src_path.clone(),
             lib_name: lib.name.clone(),
             edition: lib.edition.clone(),
+            manifest_dir: dep_pkg.manifest_path.parent().map_or_else(PathBuf::new, Path::to_path_buf),
+            cargo_env: package_cargo_env(dep_pkg, lib),
+            build_cfgs: Vec::new(),
+            build_check_cfgs: Vec::new(),
             features,
             deps: sub,
         });

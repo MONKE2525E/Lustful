@@ -625,7 +625,20 @@ pub fn compile_ast_macro(def: &MacroRulesDef, exported: bool, strings: &[String]
 pub struct ExpandCtx<'a> {
     pub interner: &'a Interner,
     pub known: &'a Known,
+    /// The file path as `file!` shows it before the client view: for a
+    /// Cargo crate this is workspace-relative, so it must never be used
+    /// to open files. `real_path` is the filesystem path.
     pub file_path: String,
+    /// The filesystem path of the file being expanded: relative
+    /// `include!` family paths resolve against its directory, as in
+    /// rustc (the file of the macro call site; a file pulled in by
+    /// `include!` becomes the current file for its own includes).
+    pub real_path: std::path::PathBuf,
+    /// Env values Cargo sets for rustc for this crate (`CARGO_PKG_*`,
+    /// `CARGO_MANIFEST_DIR`, `OUT_DIR`, build-script `rustc-env` pairs).
+    /// `env!` reads these before the client env, as Cargo's vars win in
+    /// the rustc process. Empty off the Cargo path (single file, std).
+    pub cargo_env: Vec<(String, String)>,
     pub src: &'a str,
     pub cfg: builtin::CfgEnv,
     /// The module path (from the crate root) of the file being expanded.
@@ -688,6 +701,8 @@ impl<'a> ExpandCtx<'a> {
             interner,
             known,
             file_path: file_path.to_string_lossy().to_string(),
+            real_path: file_path.to_path_buf(),
+            cargo_env: Vec::new(),
             src,
             cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new(), panic_unwind: false },
             module_path: Vec::new(),
@@ -952,9 +967,11 @@ pub struct Expander<'a> {
     module_imports: FxMap<(Vec<Sym>, Sym), u32>,
     /// The module path of the code being walked, from the crate root.
     module: Vec<Sym>,
-    /// The file `file!` and relative includes currently refer to, and
-    /// its text for `line!` / `column!`. `include!` swaps these.
+    /// The file `file!` currently refers to (shown form), its filesystem
+    /// path for relative includes, and its text for `line!` / `column!`.
+    /// `include!` swaps these.
     cur_file: String,
+    cur_real: std::path::PathBuf,
     cur_src: String,
     /// The file id of the tokens being expanded (the first input token's),
     /// so `assert_msg` can tell a macro body in this file from one in
@@ -1020,6 +1037,7 @@ impl<'a> Expander<'a> {
             module_imports: FxMap::default(),
             module: ctx.module_path.clone(),
             cur_file: ctx.file_path.clone(),
+            cur_real: ctx.real_path.clone(),
             cur_src: ctx.src.to_string(),
             root_file: None,
             deps_hash: 0,
@@ -1106,6 +1124,13 @@ impl<'a> Expander<'a> {
             self.deps.push(dep);
         }
         shown
+    }
+
+    /// The compile-time value of env var `name`: this crate's Cargo
+    /// env first (Cargo sets those vars in the rustc process, over the
+    /// inherited ones), then the requesting client's env.
+    pub fn env_lookup(&self, name: &str) -> Option<String> {
+        self.ctx.cargo_env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).or_else(|| self.ctx.client.env_var(name))
     }
 
     /// Records an env var a builtin read and the value it saw.

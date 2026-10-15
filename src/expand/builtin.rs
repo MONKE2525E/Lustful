@@ -275,10 +275,14 @@ fn literal_string(st: &Expander, trees: &[Tt]) -> Option<(String, Span)> {
     }
 }
 
-/// Reads a file for an `include` family macro, relative to the current
-/// file's directory (ARCH 6.4). Returns the resolved path and bytes.
+/// Reads a file for an `include` family macro, relative to the
+/// directory of the file being expanded (ARCH 6.4): the filesystem
+/// path, never the shown `file!` form, which for a Cargo crate is
+/// workspace-relative and does not open from an arbitrary cwd. An
+/// absolute `rel` (the `concat!(env!("OUT_DIR"), ...)` form) replaces
+/// the base, as `Path::join` does. Returns the resolved path and bytes.
 fn read_include(st: &mut Expander, rel: &str, span: Span) -> Result<(std::path::PathBuf, Vec<u8>), Diag> {
-    let base = std::path::Path::new(&st.cur_file).parent().map_or_else(|| std::path::PathBuf::from("."), |p| p.to_path_buf());
+    let base = st.cur_real.parent().map_or_else(|| std::path::PathBuf::from("."), |p| p.to_path_buf());
     let path = base.join(rel);
     match std::fs::read(&path) {
         Ok(bytes) => {
@@ -548,7 +552,7 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let Some((var, _)) = literal_string(st, &expanded) else {
                 return Err(bad(format!("{name}! takes one string literal")));
             };
-            let value = st.ctx.client.env_var(&var);
+            let value = st.env_lookup(&var);
             st.read_dep_env(&var, value.as_deref());
             match (name, value) {
                 ("env", Some(v)) => Ok(vec![st.str_tree(&v, span)]),
@@ -712,9 +716,11 @@ fn include_macro(st: &mut Expander, name: &str, call: &Call, depth: u32) -> Resu
             let file = crate::diag::FileId(0);
             let trees = st.lex_file_trees(&text, file)?;
             let old_file = std::mem::replace(&mut st.cur_file, path.to_string_lossy().to_string());
+            let old_real = std::mem::replace(&mut st.cur_real, path.clone());
             let old_src = std::mem::replace(&mut st.cur_src, text);
             let expanded = st.expand_list(trees, depth + 1, true, false, 0);
             st.cur_file = old_file;
+            st.cur_real = old_real;
             st.cur_src = old_src;
             expanded
         }

@@ -1,9 +1,10 @@
 # A package with a build script (ARCH 1.1): Cargo runs build.rs, lust
 # does not compile it. The program does not read the script's outputs
-# (env! and OUT_DIR includes land later), so both builds must produce
-# the same program while the driver's refresh check records the
-# script's inputs and outputs. scripts/test-driver.py edits data.txt
-# and proves the daemon refreshes instead of serving the old session.
+# (the include-paths fixture covers env! and OUT_DIR reads), so both
+# builds must produce the same program while the driver's refresh
+# check records the script's inputs and outputs.
+# scripts/test-driver.py edits data.txt and proves the daemon
+# refreshes instead of serving the old session.
 [package]
 name = "buildscript"
 version = "0.1.0"

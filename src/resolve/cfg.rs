@@ -187,6 +187,38 @@ impl CfgEnv {
         self.pairs.push((name.to_string(), value.to_string()));
     }
 
+    /// Adds one build-script `cargo::rustc-cfg` value (`name` or
+    /// `name="value"`, the form Cargo passes to rustc as `--cfg`).
+    /// The name becomes a known custom cfg name.
+    pub fn add_rustc_cfg(&mut self, cfg: &str) {
+        let cfg = cfg.trim();
+        match cfg.split_once('=') {
+            Some((name, value)) => {
+                let value = value.trim().trim_matches('"');
+                self.custom_names.insert(name.trim().to_string());
+                self.pair(name.trim(), value);
+            }
+            None => {
+                self.custom_names.insert(cfg.to_string());
+                self.flags.insert(cfg.to_string());
+            }
+        }
+    }
+
+    /// Records one build-script `cargo::rustc-check-cfg` value
+    /// (`cfg(name, values(...))`, `cfg(name)`, or the old bare `name`)
+    /// as a known custom cfg name, without setting it.
+    pub fn add_check_cfg(&mut self, cfg: &str) {
+        let cfg = cfg.trim();
+        let name = match cfg.strip_prefix("cfg(") {
+            Some(rest) => rest.split(['(', ',', ')']).next().unwrap_or("").trim(),
+            None => cfg.split('=').next().unwrap_or("").trim(),
+        };
+        if !name.is_empty() {
+            self.custom_names.insert(name.to_string());
+        }
+    }
+
     /// True when `name` may appear in a predicate at all (section 1.6).
     pub fn knows(&self, name: &str) -> bool {
         KNOWN_CFG_NAMES.contains(&name)

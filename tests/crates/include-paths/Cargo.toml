@@ -1,0 +1,13 @@
+# Include paths in a Cargo crate (ARCH 1.1, 6.4): relative includes
+# resolve against the filesystem directory of the file that holds the
+# macro call site, not the workspace-relative path `file!` shows and
+# not the process working directory. The build script's OUT_DIR,
+# rustc-env and rustc-cfg outputs reach the crate as under Cargo.
+[package]
+name = "include-paths"
+version = "1.2.3-beta.1"
+edition = "2024"
+authors = ["Ann A", "Bob B"]
+description = "include path fixture"
+
+[workspace]

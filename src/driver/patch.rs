@@ -635,6 +635,11 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
                 interner: &front.interner,
                 known: &front.known,
                 file_path: shown.map_or_else(|| path.to_string(), |rel| rel.to_string_lossy().to_string()),
+                real_path: std::path::PathBuf::from(path),
+                // No Cargo env on the patch path: a body that reads
+                // one (`env!`, an include) records a non-`Dropped`
+                // dep below and the patch gives up to a full resolve.
+                cargo_env: Vec::new(),
                 src: text,
                 cfg: crate::resolve::worklist::expand_cfg(env),
                 module_path: base.tables.modules[module.0 as usize].path.clone(),

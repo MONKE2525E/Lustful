@@ -85,6 +85,41 @@ fn post_mono(p: &collect::Program, f: LocalDefId) -> bool {
 /// and paths shown relative to the root file as the user typed it. A
 /// manifest-selected crate shows paths relative to the workspace root
 /// instead, set once the graph is loaded (`resolved_setup`).
+/// Fills build script outputs into path dependency units, recursively:
+/// `OUT_DIR` and `rustc-env` pairs join the unit's Cargo env, and the
+/// `rustc-cfg` values ride along for the resolver's per-crate cfg env.
+/// Only path packages compile from source here; adapter and shim
+/// units keep no Cargo env (their root is a lust-owned crate).
+fn fill_dep_build_outputs(
+    deps: &mut [crate::resolve::cargo::DepUnit],
+    cache: &Path,
+    memo: &mut FxMap<PathBuf, Option<super::buildscript::Outputs>>,
+) -> Result<(), String> {
+    for dep in deps {
+        if dep.source.is_none() {
+            let out = match memo.get(&dep.manifest_dir) {
+                Some(o) => o.clone(),
+                None => {
+                    let o = super::buildscript::outputs(&dep.manifest_dir, cache)
+                        .map_err(|e| format!("build script of `{}` failed: {e}", dep.package_name))?;
+                    memo.insert(dep.manifest_dir.clone(), o.clone());
+                    o
+                }
+            };
+            if let Some(out) = out {
+                if let Some(dir) = &out.out_dir {
+                    dep.cargo_env.push(("OUT_DIR".into(), dir.to_string_lossy().into_owned()));
+                }
+                dep.cargo_env.extend(out.rustc_env);
+                dep.build_cfgs = out.rustc_cfg;
+                dep.build_check_cfgs = out.rustc_check_cfg;
+            }
+        }
+        fill_dep_build_outputs(&mut dep.deps, cache, memo)?;
+    }
+    Ok(())
+}
+
 fn client_view(req: &Request) -> expand::ClientView {
     let shown_root = match (&req.client.shown, &req.session.krate.manifest_path) {
         (Some(typed), None) => req.file.parent().zip(typed.parent()).map(|(abs, shown)| (abs.to_path_buf(), shown.to_path_buf())),
@@ -1614,7 +1649,7 @@ fn resolved_setup(
     let code2 = |msg: String| Response { stderr: format!("error: {msg}\n"), code: 2, ..Default::default() };
     // Crate selection: through the Cargo graph when a manifest names the
     // crate, else the synthetic one-file package of the session key.
-    let (root_path, mut root_text, crate_ids, env, externs, crate_name) = if let Some(manifest) = &key.krate.manifest_path {
+    let (root_path, mut root_text, crate_ids, env, externs, crate_name, cargo_env) = if let Some(manifest) = &key.krate.manifest_path {
         let greq = GraphRequest {
             manifest_path: manifest.clone(),
             package: None,
@@ -1642,19 +1677,45 @@ fn resolved_setup(
                 return Err(errors(std::slice::from_mut(&mut d), &gate_map, &root_text, req));
             }
         }
-        let env = CfgEnv::new(&key.target_triple, &unit.features, key.krate.test, key.profile);
+        let mut env = CfgEnv::new(&key.target_triple, &unit.features, key.krate.test, key.profile);
+        // Cargo env for the selected unit plus its build script
+        // outputs (section 1.1): `OUT_DIR` and `rustc-env` pairs for
+        // `env!`, `rustc-cfg` values for `#[cfg]`. The script re-runs
+        // through Cargo when its recorded inputs changed.
+        let cache = super::cache::cache_dir(&req.file);
+        let manifest_dir = unit.package.manifest_path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+        let mut cargo_env = unit.cargo_env.clone();
+        let selected_out = super::buildscript::outputs(&manifest_dir, &cache)
+            .map_err(|e| code2(format!("build script of `{}` failed: {e}", unit.package.name)))?;
+        if let Some(out) = &selected_out {
+            if let Some(dir) = &out.out_dir {
+                cargo_env.push(("OUT_DIR".into(), dir.to_string_lossy().into_owned()));
+            }
+            cargo_env.extend(out.rustc_env.iter().cloned());
+            for c in &out.rustc_cfg {
+                env.add_rustc_cfg(c);
+            }
+            for c in &out.rustc_check_cfg {
+                env.add_check_cfg(c);
+            }
+        }
+        let mut deps = unit.deps.clone();
+        let mut memo: FxMap<PathBuf, Option<super::buildscript::Outputs>> = FxMap::default();
+        memo.insert(manifest_dir, selected_out);
+        fill_dep_build_outputs(&mut deps, &cache, &mut memo).map_err(code2)?;
+        t.lap("build script outputs");
         // Cargo runs rustc from the workspace root, so `file!` shows member paths relative to it.
         front.client.shown_root = Some((graph.workspace_root.clone(), PathBuf::new()));
         let ids = CrateIds {
             local: def::LOCAL_CRATE,
             stable: def::stable_crate_hash(&unit.package_id, &key.krate.target_kind, &unit.target.name, key.krate.test),
         };
-        (unit.target.src_path.clone(), root_text, ids, env, unit.deps.clone(), unit.package.name.replace('-', "_"))
+        (unit.target.src_path.clone(), root_text, ids, env, deps, unit.package.name.replace('-', "_"), cargo_env)
     } else {
         front.display_root = None;
         let stem = key.krate.root.file_stem().and_then(|s| s.to_str()).unwrap_or("main").to_string();
         let env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
-        (key.krate.root.clone(), user_src.to_string(), crate_ids_default, env, Vec::new(), stem)
+        (key.krate.root.clone(), user_src.to_string(), crate_ids_default, env, Vec::new(), stem, Vec::new())
     };
     // Body patch (driver/patch.rs): when every edit since the last full
     // resolve sits inside a fn body, edit the merged Ast in place.
@@ -1664,6 +1725,7 @@ fn resolved_setup(
         &env,
         &externs,
         &crate_name,
+        &cargo_env,
         &front.display_root,
         &front.client.shown_root,
         key.krate.test,
@@ -1780,6 +1842,7 @@ fn resolved_setup(
             env: env.clone(),
             crate_ids,
             crate_name: crate_name.clone(),
+            cargo_env: cargo_env.clone(),
             deps: externs.clone(),
             client: front.client.clone(),
             std_splice_lo: std_ranges.first().map(|r| r.0),

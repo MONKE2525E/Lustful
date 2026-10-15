@@ -8,9 +8,9 @@
 // `cargo::rustc-cfg`, `cargo::rustc-env`, and the contents of OUT_DIR
 // files; it enters the daemon's per-session refresh key and the cold
 // disk cache key, so a build script change can never serve output
-// resolved under the old one. Code that consumes the outputs (env!,
-// OUT_DIR includes) lands with W-MACRO and W-RESOLVE; until then lust
-// rejects such code, and this module keeps the routing honest.
+// resolved under the old one. `outputs` gives the recorded values
+// themselves to the driver, which feeds them to expansion (`env!`,
+// OUT_DIR includes) and to the crate cfg env (`rustc-cfg`).
 use crate::intern::{FxHasher, FxMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -19,11 +19,12 @@ use std::path::{Path, PathBuf};
 /// both `cargo:key=value` and `cargo::key=value`; other lines are the
 /// script's own diagnostics and are ignored here, as Cargo ignores
 /// them for build purposes.
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct BuildOutput {
     pub rerun_if_changed: Vec<String>,
     pub rerun_if_env_changed: Vec<String>,
     pub rustc_cfg: Vec<String>,
+    pub rustc_check_cfg: Vec<String>,
     pub rustc_env: Vec<(String, String)>,
 }
 
@@ -38,6 +39,7 @@ pub fn parse_output(text: &str) -> BuildOutput {
             "rerun-if-changed" => out.rerun_if_changed.push(value.to_string()),
             "rerun-if-env-changed" => out.rerun_if_env_changed.push(value.to_string()),
             "rustc-cfg" => out.rustc_cfg.push(value.to_string()),
+            "rustc-check-cfg" => out.rustc_check_cfg.push(value.to_string()),
             "rustc-env" => {
                 let (k, v) = value.split_once('=').unwrap_or((value, ""));
                 out.rustc_env.push((k.to_string(), v.to_string()));
@@ -49,15 +51,20 @@ pub fn parse_output(text: &str) -> BuildOutput {
 }
 
 /// One recorded build-script run: input hashes to re-check, plus the
-/// output hash consumers key on. Stored as text lines in the disk cache
-/// dir (magic `LBS1`); W-DRIVER owns the form and changes it only by
-/// bumping the magic, never by migrating an old record.
+/// outputs consumers read. Stored as text lines in the disk cache dir
+/// (magic `LBS2`; `LBS1` held only the output hash); W-DRIVER owns the
+/// form and changes it only by bumping the magic, never by migrating
+/// an old record (an old record reads as a miss and the script re-runs).
 pub struct Record {
     pub script: PathBuf,
     pub script_hash: u64,
     pub inputs: Vec<(PathBuf, u64)>,
     pub env_inputs: Vec<(String, Option<String>)>,
     pub output_hash: u64,
+    /// The OUT_DIR Cargo gave this run, when Cargo reported one.
+    pub out_dir: Option<PathBuf>,
+    /// The recorded directives (`rustc-cfg`, `rustc-env`, ...).
+    pub output: BuildOutput,
 }
 
 fn hash_parts(parts: &[&[u8]]) -> u64 {
@@ -77,6 +84,10 @@ fn output_hash(out: &BuildOutput, out_dir: Option<&Path>) -> u64 {
     let mut cfgs = out.rustc_cfg.clone();
     cfgs.sort();
     parts.extend(cfgs.iter().map(|c| c.as_bytes().to_vec()));
+    parts.push(b"checkcfg".to_vec());
+    let mut checks = out.rustc_check_cfg.clone();
+    checks.sort();
+    parts.extend(checks.iter().map(|c| c.as_bytes().to_vec()));
     parts.push(b"env".to_vec());
     let mut envs = out.rustc_env.clone();
     envs.sort();
@@ -125,7 +136,7 @@ impl Record {
     /// Serializes the record. Paths are lossy text; a record that
     /// fails to read back is a miss, never a wrong answer.
     fn encode(&self) -> Vec<u8> {
-        let mut s = String::from("LBS1\n");
+        let mut s = String::from("LBS2\n");
         s.push_str(&format!("script {} {}\n", self.script_hash, self.script.to_string_lossy()));
         for (p, h) in &self.inputs {
             s.push_str(&format!("input {h} {}\n", p.to_string_lossy()));
@@ -138,6 +149,18 @@ impl Record {
                 None => s.push_str(&format!("env {k}\n")),
             }
         }
+        if let Some(dir) = &self.out_dir {
+            s.push_str(&format!("outdir {}\n", dir.to_string_lossy()));
+        }
+        for c in &self.output.rustc_cfg {
+            s.push_str(&format!("cfg {c}\n"));
+        }
+        for c in &self.output.rustc_check_cfg {
+            s.push_str(&format!("checkcfg {c}\n"));
+        }
+        for (k, v) in &self.output.rustc_env {
+            s.push_str(&format!("renv {k} {v}\n"));
+        }
         s.push_str(&format!("output {}\n", self.output_hash));
         s.into_bytes()
     }
@@ -145,11 +168,12 @@ impl Record {
     /// Reads bytes written by `encode`. None on any malformed line.
     fn decode(text: &str) -> Option<Record> {
         let mut lines = text.lines();
-        if lines.next()? != "LBS1" {
+        if lines.next()? != "LBS2" {
             return None;
         }
         let (mut script, mut script_hash, mut output_hash) = (None, 0u64, None);
         let (mut inputs, mut env_inputs) = (Vec::new(), Vec::new());
+        let (mut out_dir, mut output) = (None, BuildOutput::default());
         for line in lines {
             let mut it = line.splitn(3, ' ');
             match it.next()? {
@@ -162,11 +186,18 @@ impl Record {
                     let k = it.next()?.to_string();
                     env_inputs.push((k, it.next().map(str::to_string)));
                 }
+                "outdir" => out_dir = Some(PathBuf::from(line.splitn(2, ' ').nth(1)?)),
+                "cfg" => output.rustc_cfg.push(line.splitn(2, ' ').nth(1)?.to_string()),
+                "checkcfg" => output.rustc_check_cfg.push(line.splitn(2, ' ').nth(1)?.to_string()),
+                "renv" => {
+                    let k = it.next()?.to_string();
+                    output.rustc_env.push((k, it.next().unwrap_or("").to_string()));
+                }
                 "output" => output_hash = Some(it.next()?.parse().ok()?),
                 _ => return None,
             }
         }
-        Some(Record { script: script?, script_hash, inputs, env_inputs, output_hash: output_hash? })
+        Some(Record { script: script?, script_hash, inputs, env_inputs, output_hash: output_hash?, out_dir, output })
     }
 
     /// True while every recorded input still holds: the script source
@@ -240,26 +271,67 @@ impl Refresh {
 /// the graph key already covers.
 pub fn refresh(manifest_dir: &Path, cache_dir: &Path) -> Refresh {
     let Some(script) = build_script_for(manifest_dir) else { return Refresh::None };
-    let path = record_path(cache_dir, manifest_dir);
-    let stored = std::fs::read_to_string(&path).ok().and_then(|t| Record::decode(&t));
-    if let Some(rec) = &stored
-        && rec.script == script
-        && rec.inputs_still_hold()
-    {
+    if let Some(rec) = fresh_record(manifest_dir, cache_dir, &script) {
         return Refresh::Fresh { hash: rec.output_hash };
     }
     match run_through_cargo(manifest_dir, &script) {
         Ok(rec) => {
             let hash = rec.output_hash;
-            let _ = std::fs::create_dir_all(cache_dir);
-            let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-            if std::fs::write(&tmp, rec.encode()).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
+            store_record(cache_dir, manifest_dir, &rec);
             Refresh::Reran { hash }
         }
         Err(e) => Refresh::Failed { hash: hash_parts(&[b"failed", e.as_bytes()]), error: e },
     }
+}
+
+/// The stored record for `manifest_dir` while its inputs still hold.
+fn fresh_record(manifest_dir: &Path, cache_dir: &Path, script: &Path) -> Option<Record> {
+    let path = record_path(cache_dir, manifest_dir);
+    let rec = std::fs::read_to_string(&path).ok().and_then(|t| Record::decode(&t))?;
+    (rec.script == script && rec.inputs_still_hold()).then_some(rec)
+}
+
+/// Writes one record to the cache dir (tmp file plus rename).
+fn store_record(cache_dir: &Path, manifest_dir: &Path, rec: &Record) {
+    let path = record_path(cache_dir, manifest_dir);
+    let _ = std::fs::create_dir_all(cache_dir);
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, rec.encode()).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The build script outputs expansion and cfg evaluation consume for
+/// one package: its OUT_DIR and recorded directives.
+#[derive(Default, Clone)]
+pub struct Outputs {
+    pub out_dir: Option<PathBuf>,
+    pub rustc_cfg: Vec<String>,
+    pub rustc_check_cfg: Vec<String>,
+    pub rustc_env: Vec<(String, String)>,
+}
+
+/// The current outputs of the build script of `manifest_dir`: the
+/// recorded ones while their inputs hold, else a fresh run through
+/// Cargo (which also rewrites the record). Ok(None) means the package
+/// has no build script. An Err means a script exists but its run
+/// failed; the caller must not compile the crate without its outputs.
+pub fn outputs(manifest_dir: &Path, cache_dir: &Path) -> Result<Option<Outputs>, String> {
+    let Some(script) = build_script_for(manifest_dir) else { return Ok(None) };
+    let rec = match fresh_record(manifest_dir, cache_dir, &script) {
+        Some(rec) => rec,
+        None => {
+            let rec = run_through_cargo(manifest_dir, &script)?;
+            store_record(cache_dir, manifest_dir, &rec);
+            rec
+        }
+    };
+    Ok(Some(Outputs {
+        out_dir: rec.out_dir,
+        rustc_cfg: rec.output.rustc_cfg,
+        rustc_check_cfg: rec.output.rustc_check_cfg,
+        rustc_env: rec.output.rustc_env,
+    }))
 }
 
 /// Runs the build script through Cargo and builds a fresh record.
@@ -286,11 +358,15 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
         return Err(format!("cargo check failed: {}", String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join(" ")));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut out_dir: Option<PathBuf> = None;
+    // One message per build script Cargo ran (this package and its
+    // dependencies). The one for `manifest_dir` is the message whose
+    // package_id names that directory (a path package id is
+    // `path+file://<dir>#...`); a single message needs no match.
+    let mut seen: Vec<(String, PathBuf)> = Vec::new();
     for line in stdout.lines() {
         if line.contains("\"build-script-executed\"") {
-            // The message is one JSON object per line; pull the two
-            // string fields this record needs without a JSON parser.
+            // The message is one JSON object per line; pull the string
+            // fields this record needs without a JSON parser.
             let field = |name: &str| -> Option<String> {
                 // Skip past the whole `"name":"` opener (quotes, name, colon).
                 let at = line.find(&format!("\"{name}\":\""))? + name.len() + 4;
@@ -307,10 +383,16 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
                 None
             };
             if let Some(d) = field("out_dir") {
-                out_dir = Some(PathBuf::from(d));
+                seen.push((field("package_id").unwrap_or_default(), PathBuf::from(d)));
             }
         }
     }
+    let want = format!("{}#", manifest_dir.to_string_lossy());
+    let out_dir = seen
+        .iter()
+        .find(|(id, _)| id.contains(&want))
+        .map(|(_, d)| d.clone())
+        .or_else(|| if seen.len() == 1 { seen.into_iter().next().map(|(_, d)| d) } else { None });
     let Some(out_dir_path) = out_dir.filter(|d| !d.as_os_str().is_empty()) else {
         return Err("cargo check ran no build script for this manifest".to_string());
     };
@@ -334,6 +416,8 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
         script_hash: file_hash(script),
         inputs,
         env_inputs,
+        out_dir: Some(out_dir_path),
+        output: parsed,
     })
 }
 
@@ -361,11 +445,13 @@ mod tests {
         let out = parse_output(
             "cargo::rerun-if-changed=build.rs\ncargo:rerun-if-changed=data.txt\n\
              cargo::rerun-if-env-changed=GOOS\ncargo::rustc-cfg=wasm_pack\n\
+             cargo::rustc-check-cfg=cfg(wasm_pack)\n\
              cargo:rustc-env=GREETING=hi there\ncargo:warning=ignored\nnoise\n",
         );
         assert_eq!(out.rerun_if_changed, ["build.rs", "data.txt"]);
         assert_eq!(out.rerun_if_env_changed, ["GOOS"]);
         assert_eq!(out.rustc_cfg, ["wasm_pack"]);
+        assert_eq!(out.rustc_check_cfg, ["cfg(wasm_pack)"]);
         assert_eq!(out.rustc_env, [("GREETING".to_string(), "hi there".to_string())]);
     }
 
@@ -387,9 +473,20 @@ mod tests {
             inputs: vec![(data.clone(), file_hash(&data))],
             env_inputs: vec![("LUST_BS_TEST_ENV".into(), None)],
             output_hash: 42,
+            out_dir: Some(dir.join("out")),
+            output: BuildOutput {
+                rustc_cfg: vec!["wasm_pack".into(), "flavor=\"fast\"".into()],
+                rustc_check_cfg: vec!["cfg(wasm_pack)".into()],
+                rustc_env: vec![("GREETING".into(), "hi there".into())],
+                ..Default::default()
+            },
         };
         let back = Record::decode(&String::from_utf8(rec.encode()).unwrap()).unwrap();
         assert_eq!((back.script_hash, back.output_hash), (rec.script_hash, 42));
+        assert_eq!(back.out_dir, rec.out_dir);
+        assert_eq!(back.output.rustc_cfg, rec.output.rustc_cfg);
+        assert_eq!(back.output.rustc_check_cfg, rec.output.rustc_check_cfg);
+        assert_eq!(back.output.rustc_env, rec.output.rustc_env);
         assert!(back.inputs_still_hold(), "unchanged inputs hold");
         std::fs::write(&data, "v2").unwrap();
         assert!(!back.inputs_still_hold(), "edited rerun-if-changed file is stale");
