@@ -15,7 +15,7 @@
 //    relations the signature does not give are L0733.
 mod regions;
 pub use regions::{FnBound, ImplHead, RegionSig, RegionTables, TraitLts, elision_regions, impl_trait_method, regions_of};
-pub(crate) use regions::paired_slot_regions;
+pub(crate) use regions::{lub_items_fit, lub_shapes_fit, paired_slot_regions};
 
 use crate::check::collect::*;
 use crate::diag::{Diag, Span, unsupported};

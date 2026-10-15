@@ -439,3 +439,139 @@ impl Builder<'_, '_> {
         Some((t_in, t_out))
     }
 }
+
+/// A region place of a fn signature for `lub_shapes_fit`: `'static`, a
+/// region that may become any other (an early-bound lifetime, a free
+/// one), or a binder (by first-use order).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Shape {
+    Static,
+    Var,
+    Bound(u32),
+}
+
+/// Renumbers binders by first use, so two shapes compare up to renaming.
+fn canon(shapes: Vec<Shape>) -> Vec<Shape> {
+    let mut seen: Vec<u32> = Vec::new();
+    shapes
+        .into_iter()
+        .map(|s| match s {
+            Shape::Bound(b) => Shape::Bound(match seen.iter().position(|&x| x == b) {
+                Some(i) => i as u32,
+                None => {
+                    seen.push(b);
+                    seen.len() as u32 - 1
+                }
+            }),
+            s => s,
+        })
+        .collect()
+}
+
+/// The shape of fn pointer type `ptr` (check's erased form), slot by slot:
+/// its free slots and early ones are `Var`, written `'static` is
+/// `Static`, each other input slot its own binder, and each other output
+/// slot the one input slot's.
+fn ptr_shape(p: &Program, tys: &impl TyIntern, ptr: Ty) -> Option<Vec<Shape>> {
+    let TyKind::FnPtr(s) = tys.kind(ptr) else { return None };
+    let s = tys.sig(s).value;
+    let mut sc = SlotCx::new(tys, p);
+    let mut j = 0u32;
+    let mut ins = Vec::new();
+    for &it in tys.tys_of(s.inputs) {
+        let mut rs = Vec::new();
+        regioned_slots(&mut sc, it, it, &mut rs);
+        for r in rs {
+            ins.push(if s.free_slots >> j & 1 == 1 {
+                Shape::Var
+            } else if r == Region::Static {
+                Shape::Static
+            } else {
+                Shape::Bound(j)
+            });
+            j += 1;
+        }
+    }
+    let mut outs = Vec::new();
+    let mut rs = Vec::new();
+    regioned_slots(&mut sc, s.output, s.output, &mut rs);
+    for r in rs {
+        outs.push(if s.free_slots >> j & 1 == 1 {
+            Shape::Var
+        } else if r == Region::Static {
+            Shape::Static
+        } else {
+            match ins[..] {
+                [one] => one,
+                _ => return None,
+            }
+        });
+        j += 1;
+    }
+    ins.extend(outs);
+    Some(canon(ins))
+}
+
+/// The shape of fn `f`'s region signature, paired with the erased fn
+/// pointer type `ptr` it becomes: early-bound lifetimes are `Var`,
+/// late-bound ones binders.
+fn fn_shape(p: &Program, tys: &impl TyIntern, f: LocalDefId, ptr: Ty) -> Option<Vec<Shape>> {
+    let sig = p.regions.body_sig(p, f)?;
+    let TyKind::FnPtr(s) = tys.kind(ptr) else { return None };
+    let s = tys.sig(s).value;
+    let ins: Vec<Ty> = tys.tys_of(s.inputs).to_vec();
+    if sig.params.len() != ins.len() {
+        return None;
+    }
+    let mut sc = SlotCx::new(tys, p);
+    let mut out = Vec::new();
+    for (&r, e) in sig.params.iter().zip(ins).chain(std::iter::once((&sig.ret, s.output))) {
+        let mut rs = Vec::new();
+        regions_of(&p.tys, r, &mut rs);
+        if rs.len() != sc.slots(e) as usize {
+            return None;
+        }
+        for r in rs {
+            let s = match r {
+                Region::Static => Shape::Static,
+                Region::Param(k) if sig.early.get(k as usize) == Some(&true) => Shape::Var,
+                Region::Param(k) => Shape::Bound(k),
+                _ => Shape::Bound(u32::MAX - out.len() as u32),
+            };
+            out.push(s);
+        }
+    }
+    Some(canon(out))
+}
+
+/// rustc's LUB of a fn item with the fn pointer type an array or `vec!`
+/// literal's earlier elements gave (W-BORROW3): when either has a
+/// higher-ranked region, the two must be the same type up to renaming
+/// binders (rustc relates them invariantly there); an early-bound region
+/// may become `'static` or a free one. False when they differ, or when
+/// lust cannot pair them.
+pub(crate) fn lub_shapes_fit(p: &Program, tys: &impl TyIntern, f: LocalDefId, ptr: Ty) -> bool {
+    let (Some(a), Some(b)) = (fn_shape(p, tys, f, ptr), ptr_shape(p, tys, ptr)) else { return false };
+    shapes_fit(&a, &b)
+}
+
+/// `lub_shapes_fit` for two fn items joined with no element type given
+/// (`[a, b]`): their signatures, reified to `ptr`, must match the same way.
+pub(crate) fn lub_items_fit(p: &Program, tys: &impl TyIntern, a: LocalDefId, b: LocalDefId, ptr: Ty) -> bool {
+    let (Some(x), Some(y)) = (fn_shape(p, tys, a, ptr), fn_shape(p, tys, b, ptr)) else { return false };
+    shapes_fit(&x, &y)
+}
+
+/// Two canonical shapes LUB to one type (`lub_shapes_fit`).
+fn shapes_fit(a: &[Shape], b: &[Shape]) -> bool {
+    let bound = |s: &[Shape]| s.iter().any(|x| matches!(x, Shape::Bound(_)));
+    if !bound(a) && !bound(b) {
+        return true;
+    }
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (Shape::Bound(i), Shape::Bound(j)) => i == j,
+            (Shape::Var, Shape::Var | Shape::Static) | (Shape::Static, Shape::Var | Shape::Static) => true,
+            _ => false,
+        })
+}

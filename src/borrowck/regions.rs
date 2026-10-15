@@ -31,7 +31,7 @@ use crate::ir::*;
 use crate::ty::*;
 
 mod fnptr;
-pub(crate) use fnptr::{paired_slot_regions, ptr_free};
+pub(crate) use fnptr::{lub_items_fit, lub_shapes_fit, paired_slot_regions, ptr_free};
 
 /// The variance of a type position.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

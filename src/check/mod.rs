@@ -5100,10 +5100,14 @@ impl<'p> Ctx<'p> {
                 a.into_iter().zip(b).find_map(|(p, q)| self.sig_pos_mismatch(p, q, input, invariant, f, e))
             }
             (TyKind::Slice(p), TyKind::Slice(q)) | (TyKind::Array(p, _), TyKind::Array(q, _)) => self.sig_pos_mismatch(p, q, input, invariant, f, e),
+            // The covariant std containers keep the position
+            // (`Option<&'static T>` is an `Option<&T>`, W-BORROW3); any
+            // other Adt holds its args invariant.
             (TyKind::Adt(dx, ax), TyKind::Adt(dy, ay)) if dx == dy => {
+                let covariant = matches!(self.tys.builtin_of(x), Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Rc));
                 let (a, b) = (self.tys.args(ax).to_vec(), self.tys.args(ay).to_vec());
                 a.into_iter().zip(b).find_map(|(p, q)| match (p.as_ty(), q.as_ty()) {
-                    (Some(p), Some(q)) => self.sig_pos_mismatch(p, q, input, true, f, e),
+                    (Some(p), Some(q)) => self.sig_pos_mismatch(p, q, input, invariant || !covariant, f, e),
                     _ => None,
                 })
             }
@@ -7336,6 +7340,7 @@ impl<'p> Ctx<'p> {
                         for &el_e in elems {
                             self.expect_expr(el_e, el);
                         }
+                        self.fn_elems_lub(elems, el);
                         el
                     }
                     (None, Some(&first)) => {
@@ -7387,6 +7392,19 @@ impl<'p> Ctx<'p> {
                             for (&el_e, &t) in elems[1..].iter().zip(&rest) {
                                 self.coerce_expr(el_e, t, fp);
                             }
+                            // W-BORROW3: rustc's LUB of two fn items needs the
+                            // same lifetimes when either is higher-ranked.
+                            if let Res::Fn(a) = self.out.expr_res[self.ei(first)] {
+                                for &el_e in &elems[1..] {
+                                    if let Res::Fn(b) = self.out.expr_res[self.ei(el_e)]
+                                        && a != b
+                                        && !crate::borrowck::lub_items_fit(self.p, &self.tys, a, b, fp)
+                                    {
+                                        let sp = self.span(el_e);
+                                        self.lub_lifetimes_err(sp);
+                                    }
+                                }
+                            }
                             let c = self.tys.intern_const(ConstKind::Int(elems.len() as u128));
                             return self.tys.intern(TyKind::Array(fp, c));
                         }
@@ -7399,6 +7417,7 @@ impl<'p> Ctx<'p> {
                                 self.coerce_expr(el_e, t, el);
                             }
                         }
+                        self.fn_elems_lub(elems, el);
                         el
                     }
                     (None, None) => self.new_var(false),
@@ -7801,6 +7820,35 @@ impl<'p> Ctx<'p> {
             TyKind::Adt(..) if self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(self.resolve(e)), TyKind::Dyn(..))) => Some(t),
             _ => None,
         }
+    }
+
+    /// rustc's LUB of the elements of an array or `vec!` literal of fn
+    /// pointer type `el` (W-BORROW3): each fn item after the first must
+    /// have `el`'s lifetimes up to renaming its binders when either is
+    /// higher-ranked (`borrowck::lub_shapes_fit`), else rustc's E0308.
+    fn fn_elems_lub(&mut self, elems: &[ExprId], el: Ty) {
+        let el = self.deep(el);
+        if !matches!(self.kind(el), TyKind::FnPtr(_)) {
+            return;
+        }
+        for &e in elems.iter().skip(1) {
+            if let Res::Fn(f) = self.out.expr_res[self.ei(e)]
+                && !crate::borrowck::lub_shapes_fit(self.p, &self.tys, f, el)
+            {
+                let sp = self.span(e);
+                self.lub_lifetimes_err(sp);
+            }
+        }
+    }
+
+    /// L0110 for `fn_elems_lub`.
+    fn lub_lifetimes_err(&mut self, span: Span) {
+        self.err(
+            "L0110",
+            span,
+            "this fn's lifetimes differ from the other elements' fn pointer type: one type is more general than the other",
+            "Give the fns in one array or `vec!` the same lifetimes.",
+        );
     }
 
     /// Coerces a block's result to `to` at its tail expression.
@@ -14632,6 +14680,7 @@ impl<'p> Ctx<'p> {
                     for &a in args {
                         self.expect_expr(a, elem);
                     }
+                    self.fn_elems_lub(args, elem);
                 }
                 return self.tys.mk_vec(elem);
             }
