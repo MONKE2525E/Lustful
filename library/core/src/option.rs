@@ -329,7 +329,7 @@ impl<T> Option<Vec<T>> {
     }
 }
 
-impl<T> Option<Box<T>> {
+impl<T: ?Sized> Option<Box<T>> {
     pub fn as_deref(&self) -> Option<&T> {
         match *self {
             Some(ref t) => Some(&**t),

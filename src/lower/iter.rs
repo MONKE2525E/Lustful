@@ -1125,6 +1125,8 @@ impl Ex<'_, '_> {
             F::VecFromArray => one(self, Builtin::VecFrom, x, dest),
             F::VecFromBoxSlice => one(self, Builtin::BoxSliceIntoVec, x, dest),
             F::BoxSliceFromVec => one(self, Builtin::VecIntoBoxedSlice, x, dest),
+            F::Own(k) => one(self, Builtin::OwnFrom(k), x, dest),
+            F::StringFromBoxStr => one(self, Builtin::OwnIntoString, x, dest),
             F::Some => self.some(&dest, dst, x),
             F::BoxNew => one(self, Builtin::BoxNew, x, dest),
             F::RcNew => one(self, Builtin::RcNew, x, dest),

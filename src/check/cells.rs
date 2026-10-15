@@ -114,6 +114,10 @@ impl<'p> Ctx<'p> {
                 _ => return None,
             }
         } else if let Some(el) = self.tys.refcell_elem(base) {
+            // `RefCell<dyn Tr>` (check/own.rs): `borrow` and `borrow_mut`.
+            if matches!(self.kind(el), TyKind::Dyn(..)) && !matches!(n.as_str(), "borrow" | "borrow_mut") {
+                return Some(self.dyn_cell_method_reject(&n, span, args));
+            }
             match n.as_str() {
                 "borrow" => {
                     let g = self.tys.mk_builtin1(|d| d.ref_guard, el);

@@ -1243,8 +1243,9 @@ pub fn resolve_ty(
                     return Err(Diag::new("L0110", span, "Box takes one type argument", "Write `Box<T>`."));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
-                // `Box<[T]>` is the one unsized Box lust has (W-STD-A).
-                if matches!(tys.kind(e), TyKind::Str | TyKind::Dyn(..)) {
+                // `Box<[T]>` (W-STD-A) and `Box<str>` (check/own.rs);
+                // `Box<dyn Tr>` takes the scoped resolver.
+                if matches!(tys.kind(e), TyKind::Dyn(..)) {
                     return Err(not_yet("L0641", span, "a Box of an unsized type"));
                 }
                 return Ok(tys.mk_boxed(e));
@@ -1257,7 +1258,9 @@ pub fn resolve_ty(
                     return Err(Diag::new("L0110", span, "Rc takes one type argument", "Write `Rc<T>`."));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
-                if matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                // `Rc<str>` and `Rc<[T]>` (check/own.rs); `Rc<dyn Tr>`
+                // takes the scoped resolver.
+                if matches!(tys.kind(e), TyKind::Dyn(..)) {
                     return Err(not_yet("L0641", span, "an Rc of an unsized type"));
                 }
                 return Ok(tys.mk_rc(e));
@@ -5859,6 +5862,7 @@ pub fn is_sized_ty(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) => false,
         TyKind::Adt(d, _) if tys.unsized_field(d).is_some() => false,
+        TyKind::Adt(..) if crate::check::own::dyn_wrapped_elem(tys, t).is_some() => false,
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| is_sized_ty(tys, e)),
         TyKind::Array(e, _) => is_sized_ty(tys, e),
         TyKind::Adt(..) => match tys.adt_first_ty_arg(t) {
@@ -6161,6 +6165,10 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
     }
     if let Some(e) = tys.cell_elem(t) {
         return is_copy(p, tys, e);
+    }
+    // `Box<str>` clones its bytes (check/own.rs).
+    if crate::check::own::own_parts(tys, t).is_some_and(|(k, e)| k == crate::check::own::Owner::Box && e == STR) {
+        return true;
     }
     // `Box<[T]>` clones its elements.
     if let Some(e) = tys.boxed_slice_elem(t) {
@@ -6605,6 +6613,10 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
             if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() {
                 return true;
             }
+            // std's empty `Box<str>`, `Rc<str>`, `Arc<[T]>`, kin (check/own.rs).
+            if let Some(d) = crate::check::own::own_default(tys, t) {
+                return d;
+            }
             match crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Default) {
                 Some(Ok(b)) => return b,
                 Some(Err(e)) => return glue_default(p, tys, e, seen),
@@ -6794,6 +6806,11 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
     if let Some(b) = cow_arg(tys, t) {
         return glue_debug(p, tys, b, seen);
+    }
+    // A `RefCell<dyn Tr>` or `Mutex<dyn Tr>` has no Debug glue yet
+    // (check/own.rs): a reject, even for `dyn Any`.
+    if crate::check::own::dyn_wrapped_elem(tys, t).is_some() {
+        return false;
     }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),

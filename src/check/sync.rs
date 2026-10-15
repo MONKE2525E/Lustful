@@ -456,10 +456,14 @@ pub fn sync_type_named(interner: &Interner, segs: &[ast::PathSeg]) -> Option<Syn
 }
 
 /// Rejects a type argument lust cannot give a sync type yet: an
-/// unsized `T` in `Arc<T>` or `Weak<T>` (`Arc<str>`, `Arc<[T]>`,
-/// `Arc<dyn Trait>`), as for `Rc`.
+/// unsized `T` in `sync::Weak<T>`. `Arc<str>`, `Arc<[T]>`, `Arc<dyn
+/// Trait>`, and `Mutex<dyn Trait>` are the fat forms of check/own.rs.
 pub fn check_sync_arg(tys: &impl TyIntern, k: SyncTy, e: Ty, span: Span) -> Result<(), Diag> {
-    if matches!(k, SyncTy::Arc | SyncTy::ArcWeak) && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+    if matches!(k, SyncTy::Mutex | SyncTy::MutexGuard) && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str) {
+        return Err(crate::diag::not_yet("L0641", span, "a Mutex of an unsized type"));
+    }
+    let unsized_ok = k == SyncTy::Arc || (k == SyncTy::Mutex && matches!(tys.kind(e), TyKind::Dyn(..)));
+    if !unsized_ok && matches!(k, SyncTy::Arc | SyncTy::ArcWeak) && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
         return Err(crate::diag::not_yet("L0641", span, &format!("an {} of an unsized type", k.name())));
     }
     Ok(())
@@ -505,6 +509,9 @@ impl<'p> Ctx<'p> {
             (_, Some(_), "default") => SyncOp::AtomicDefault(k),
             (SyncTy::Arc | SyncTy::ArcWeak, _, "clone") => return Some(Some(Res::Builtin(Builtin::Clone))),
             (SyncTy::Arc, _, "new") => SyncOp::ArcNew,
+            // `Arc::default()`: the default glue, as for `Rc` and `Box`.
+            (SyncTy::Arc, _, "default") => return None,
+            (SyncTy::Arc, _, "from") => return Some(Some(Res::Builtin(Builtin::OwnFrom(crate::check::own::Owner::Arc)))),
             (SyncTy::Arc, _, "strong_count") => SyncOp::ArcStrongCount,
             (SyncTy::Arc, _, "weak_count") => SyncOp::ArcWeakCount,
             (SyncTy::Arc, _, "ptr_eq") => SyncOp::ArcPtrEq,
@@ -570,7 +577,7 @@ impl<'p> Ctx<'p> {
                 (vec![arc_mut], self.tys.mk_option(r))
             }
             SyncOp::ArcMakeMut => {
-                self.deferred_clone.push((elem, span));
+                self.deferred_make_mut.push((elem, span, true));
                 (vec![arc_mut], self.tys.mk_ref(true, elem))
             }
             SyncOp::ArcTryUnwrap => (vec![arc], self.tys.mk_result(elem, arc)),
@@ -822,6 +829,10 @@ impl<'p> Ctx<'p> {
     fn lock_method(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name: Sym, span: Span, args: &[ExprId]) -> Option<Ty> {
         let n = self.name(name).to_string();
         let (op, autoref, ret) = if let Some((k, el)) = self.tys.lock_elem(base) {
+            // `Mutex<dyn Tr>` (check/own.rs): `lock` and `is_poisoned`.
+            if matches!(self.kind(el), TyKind::Dyn(..)) && !matches!(n.as_str(), "lock" | "is_poisoned") {
+                return Some(self.dyn_cell_method_reject(&n, span, args));
+            }
             let guard = |this: &mut Self, g: SyncTy| {
                 let t = sync_ty(&mut this.tys, g, &[el]);
                 this.lock_result(t)

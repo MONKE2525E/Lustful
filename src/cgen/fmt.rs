@@ -37,6 +37,8 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         // A raw pointer's Debug is its address (w-cinterop).
         CTy::Ptr(_) => format!("lust_f_fnptr({f}, (const void*)(*{v}))"),
         CTy::Ref(inner) | CTy::Boxed(inner) => fmt_expr(inner, kind, f, &format!("(*{v})"), need),
+        // An owning fat pointer formats its pointee through the same fat value (cgen/own.rs).
+        CTy::Own(_, inner) => fmt_expr(inner, kind, f, v, need),
         CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
         // A `RefCell` guard formats its value (W-STD-A).
         CTy::Guard(inner, _) => fmt_expr(inner, kind, f, &format!("(&(*{v})->f1)"), need),
@@ -52,7 +54,7 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         }
         // The only dyn type with Debug is `dyn Any` (`has_debug`): std
         // prints `Any { .. }` for every flag set.
-        CTy::Dyn | CTy::BoxDyn | CTy::RcDyn if debug => format!("lust_f_write_str({f}, {})", lit("Any { .. }")),
+        CTy::Dyn | CTy::BoxDyn | CTy::RcDyn | CTy::DynGuard(_) | CTy::DynLock(true) if debug => format!("lust_f_write_str({f}, {})", lit("Any { .. }")),
         _ if debug => {
             need(Glue::Debug, t);
             format!("dbg_{}({f}, {v})", mangle(t))
@@ -406,7 +408,7 @@ fn may_fail(t: &CTy) -> bool {
         // The locks and their guards format their value (W-THREADS).
         CTy::Sync(k, e) if k.is_cell_struct() || k.guard().is_some() => may_fail(e),
         // std's cells and boxed slices (W-STD-A) format their contents.
-        CTy::Cell(e) | CTy::RefCell(e) | CTy::Guard(e, _) | CTy::BoxSlice(e) => may_fail(e),
+        CTy::Cell(e) | CTy::RefCell(e) | CTy::Guard(e, _) | CTy::BoxSlice(e) | CTy::Own(_, e) => may_fail(e),
         CTy::Unsized(..) => true,
         CTy::Result(a, b) => may_fail(a) || may_fail(b),
         CTy::Tuple(es) => es.iter().any(may_fail),

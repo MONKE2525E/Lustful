@@ -17,6 +17,7 @@ mod sync;
 mod hash;
 mod split;
 mod unwind;
+mod own;
 use unwind::Unw;
 
 /// A body-independent type, so glue can be shared across functions.
@@ -100,6 +101,24 @@ pub enum CTy {
     /// A `Box<[T]>`: the slice's fat `{ptr, len}` struct, owning its
     /// elements and buffer; a deref is the slice place itself.
     BoxSlice(Box<CTy>),
+    /// An owning pointer to an unsized value (w-unsized, cgen/own.rs):
+    /// `Box<str>`, `Rc<str>`, `Arc<[T]>`, `Arc<dyn Tr>`. The second
+    /// part is the pointee place (`Str`, `Slice(T)`, or `Dyn`), and the
+    /// C value is that place's fat form; a deref is the place itself.
+    /// The Rc and Arc forms point at the value, with the two counts in
+    /// the 16 bytes before it.
+    Own(own::Owner, Box<CTy>),
+    /// A `RefCell<dyn Tr>` place, or a reference to one (w-unsized,
+    /// cgen/own.rs): `lust_dyn` whose data points at the cell (borrow
+    /// flag first, then the value) and whose vtable is the value's.
+    DynCell,
+    /// A `Ref<dyn Tr>` (false) or `RefMut<dyn Tr>` (true): the same fat
+    /// form as `DynCell`; a deref is the value's dyn place.
+    DynGuard(bool),
+    /// A `Mutex<dyn Tr>` place or reference, and a `MutexGuard<dyn Tr>`
+    /// (true): `lust_dyn` whose data points at the lock (the futex word,
+    /// the poison byte, then the value), with the value's vtable.
+    DynLock(bool),
     /// A `std::sync` or `std::thread` type and its type argument (`Unit`
     /// for the atomics), emitted by cgen/sync.rs (W-THREADS).
     Sync(crate::ty::sync::SyncTy, Box<CTy>),
@@ -221,6 +240,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Adt(..) => match tys.builtin_of(t) {
             Some(BuiltinTy::String) => CTy::String,
             Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            _ if let Some(o) = own::own_cty(tys, t) => o,
             Some(BuiltinTy::Boxed | BuiltinTy::Rc) if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Dyn(..))) => {
                 if tys.builtin_of(t) == Some(BuiltinTy::Boxed) { CTy::BoxDyn } else { CTy::RcDyn }
             }
@@ -240,6 +260,14 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             Some(BuiltinTy::Iter(k)) => iter_cty(tys, t, k),
             Some(BuiltinTy::Fmt(k)) => CTy::Fmt(k),
             Some(BuiltinTy::Weak) => CTy::Weak(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
+            Some(BuiltinTy::RefCell) if crate::check::own::dyn_cell_elem(tys, t).is_some() => CTy::DynCell,
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Mutex)) if crate::check::own::dyn_lock_elem(tys, t).is_some() => CTy::DynLock(false),
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::MutexGuard)) if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Dyn(..))) => {
+                CTy::DynLock(true)
+            }
+            Some(BuiltinTy::RefGuard | BuiltinTy::RefMutGuard) if tys.adt_first_ty_arg(t).is_some_and(|e| matches!(tys.kind(e), TyKind::Dyn(..))) => {
+                CTy::DynGuard(tys.builtin_of(t) == Some(BuiltinTy::RefMutGuard))
+            }
             Some(BuiltinTy::RefCell) => CTy::RefCell(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::Cell) => CTy::Cell(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),
             Some(BuiltinTy::RefGuard) => CTy::Guard(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR))), false),
@@ -273,6 +301,8 @@ fn ref_cty(tys: &impl TyIntern, e: Ty) -> CTy {
         TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
         TyKind::Dyn(..) => CTy::Dyn,
         TyKind::Adt(d, _) if tys.unsized_field(d).is_some() => cty(tys, e),
+        _ if crate::check::own::dyn_cell_elem(tys, e).is_some() => CTy::DynCell,
+        _ if crate::check::own::dyn_lock_elem(tys, e).is_some() => CTy::DynLock(false),
         _ => CTy::Ref(Box::new(cty(tys, e))),
     }
 }
@@ -477,6 +507,8 @@ pub fn ctype(t: &CTy) -> String {
         CTy::ExitCode => "uint8_t".into(),
         CTy::AccessError => "lust_Unit".into(),
         CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
+        CTy::Own(_, x) => ctype(x),
+        CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) => "lust_dyn".into(),
         CTy::Sync(k, e) => sync::sync_ctype(*k, e),
         CTy::Chars => "lust_Chars".into(),
         CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
@@ -566,6 +598,10 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Cell(e) => tok(s, "Cl", &[e]),
         CTy::Guard(e, m) => tok(s, if *m { "GdM" } else { "Gd" }, &[e]),
         CTy::BoxSlice(e) => tok(s, "BS", &[e]),
+        CTy::Own(k, e) => tok(s, k.code(), &[e]),
+        CTy::DynCell => tok(s, "DCl", &[]),
+        CTy::DynGuard(m) => tok(s, if *m { "DGdM" } else { "DGd" }, &[]),
+        CTy::DynLock(g) => tok(s, if *g { "DLkG" } else { "DLk" }, &[]),
         CTy::Sync(k, e) => tok(s, &format!("Sy{}", *k as u32), &[e]),
         CTy::Ref(e) => tok(s, "R", &[e]),
         CTy::Ptr(e) => tok(s, "P", &[e]),
@@ -619,7 +655,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             ps.iter().for_each(|e| collect_types(e, out));
             collect_types(r, out);
         }
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) => collect_types(e, out),
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) | CTy::Own(_, e) => collect_types(e, out),
         CTy::ArrayIter(e, n) => {
             out.insert(t.clone());
             collect_types(&CTy::Array(e.clone(), *n), out);
@@ -672,6 +708,7 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         // declared structs, so a recursive `Option<Rc<Node>>` field works.
         CTy::Cell(e) => by_value_deps(e, out),
         CTy::BoxSlice(e) => out.push(CTy::Slice(e.clone())),
+        CTy::Own(_, e) => by_value_deps(e, out),
         // A lock holds its value; a `PoisonError` is its value's C type.
         CTy::Sync(k, _) if k.is_cell_struct() => out.push(t.clone()),
         CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => by_value_deps(e, out),
@@ -701,6 +738,8 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         | CTy::Chars
         | CTy::Slice(_)
         | CTy::Unsized(..)
+        | CTy::DynCell
+        | CTy::DynLock(false)
         | CTy::Dyn => true,
         CTy::Option(e) => is_copy_c(p, e),
         CTy::Result(a, b) => is_copy_c(p, a) && is_copy_c(p, b),
@@ -734,7 +773,7 @@ fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::VecDrain(_) | CTy::StrDrain | CTy::Weak(_) | CTy::Guard(..) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynGuard(_) | CTy::DynLock(true) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::VecIter(_) | CTy::VecDrain(_) | CTy::StrDrain | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Sync(k, e) => sync::sync_needs_drop(p, *k, e),
         CTy::Hash(k, a) => {
@@ -1033,7 +1072,9 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Ref(_) => Some(layout::ptr_layout()),
             // A raw pointer may be null: no niche (w-cinterop).
             CTy::Ptr(_) => Some(layout::raw_ptr_layout()),
-            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn | CTy::Unsized(..) => Some(layout::fat_ptr_layout()),
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) | CTy::Dyn | CTy::Unsized(..) => {
+                Some(layout::fat_ptr_layout())
+            }
             CTy::Tuple(es) => {
                 let fields: Option<Vec<Layout>> = es.iter().map(|e| go(p, e, seen)).collect();
                 layout::tuple_layout(&fields?).ok()
@@ -1310,7 +1351,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let align = ea.max(8);
                 (align_up(align_up(es * (*n).max(1), 8) + 16, align), align)
             }
-            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Dyn | CTy::Unsized(..) => (16, 8),
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) | CTy::Dyn | CTy::Unsized(..) => (16, 8),
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
                     // A by-value cycle has no finite size; check rejects
@@ -2212,6 +2253,8 @@ impl FnGen<'_, '_> {
                     // A slice or dyn place is represented by its fat value, like `str`.
                 }
                 (Proj::Deref, CTy::Unsized(..)) => {}
+                // A `&RefCell<dyn Tr>` (`&Mutex<dyn Tr>`) is the fat place too.
+                (Proj::Deref, CTy::DynCell | CTy::DynLock(false)) => {}
                 (Proj::Field(0), CTy::Unsized(_, inner)) => {
                     // The field of an unsized newtype (W-SHIM): the same fat value.
                     t = *inner;
@@ -2219,6 +2262,19 @@ impl FnGen<'_, '_> {
                 (Proj::Deref, CTy::BoxSlice(el)) => {
                     // The boxed slice's fat value is its slice place too.
                     t = CTy::Slice(el);
+                }
+                // So is an owning fat pointer's (cgen/own.rs).
+                (Proj::Deref, CTy::Own(_, x)) => {
+                    t = *x;
+                }
+                // A `Ref<dyn Tr>`'s value sits after the cell's flag.
+                (Proj::Deref, CTy::DynGuard(_)) => {
+                    e = own::dyn_cell_value(&e);
+                    t = CTy::Dyn;
+                }
+                (Proj::Deref, CTy::DynLock(true)) => {
+                    e = own::dyn_lock_value(&e);
+                    t = CTy::Dyn;
                 }
                 (Proj::Index(l), CTy::Slice(el)) => {
                     let loc = self.index_loc(*l, loc);
@@ -2228,7 +2284,7 @@ impl FnGen<'_, '_> {
                     };
                     t = *el;
                 }
-                _ => panic!("bad projection in codegen"),
+                (pr, t) => panic!("bad projection in codegen: {pr:?} on {t:?}"),
             }
         }
         (e, t)
@@ -2709,7 +2765,13 @@ impl FnGen<'_, '_> {
                         Some(k) => matches!(k, TyKind::Dyn(..)),
                         None => matches!(pl.proj.last(), Some(Proj::Deref)),
                     };
-                if t == CTy::Str || slice_place || dyn_place { e } else { format!("(&{e})") }
+                // So is a `RefCell<dyn Tr>` place (cgen/own.rs).
+                let cell_place = matches!(t, CTy::DynCell | CTy::DynLock(false))
+                    && match self.place_sem_ty(pl) {
+                        Some(ty) => crate::check::own::dyn_wrapped_elem(tys, ty).is_some(),
+                        None => matches!(pl.proj.last(), Some(Proj::Deref)),
+                    };
+                if t == CTy::Str || slice_place || dyn_place || cell_place { e } else { format!("(&{e})") }
             }
             Rvalue::SliceOf(pl) => {
                 let (e, t) = self.place(pl, loc);
@@ -3042,12 +3104,27 @@ impl FnGen<'_, '_> {
             }
             Rvalue::MakeDyn { ptr, src, dyn_ty } => {
                 let (v, ct) = self.operand(ptr, loc, post);
+                // An Rc or Arc points the fat value at its value, after the counts.
+                let at_value = matches!(ct, CTy::Rc(_) | CTy::Sync(crate::ty::sync::SyncTy::Arc, _));
+                // `Box<[T; N]>`, `Rc<[T; N]>`, or `Arc<[T; N]>` to the
+                // `[T]` form: the element pointer and the constant length.
+                if let TyKind::Slice(e) = self.body.tys.kind(*dyn_ty) {
+                    let n = match cty(&self.body.tys, *src) {
+                        CTy::Array(_, n) => n,
+                        other => unreachable!("an owning slice from {other:?}"),
+                    };
+                    let sl = CTy::Slice(Box::new(cty(&self.body.tys, e)));
+                    collect_types(&sl, &mut self.sig_types);
+                    let (st, et) = (ctype(&sl), ctype(&cty(&self.body.tys, e)));
+                    let data = if at_value { format!("&({v})->v") } else { format!("({v})") };
+                    return format!("(({st}){{ ({et}*)({data}), {n} }})");
+                }
                 let vid = crate::check::generics::vtable_for(self.p, &self.body.tys, *src, *dyn_ty)
                     .expect("mono builds a vtable for every unsizing coercion in a concrete body");
                 let vt = self.vtable_sym(vid);
                 // An `Rc<T>` source points the data at the value in its
                 // allocation (`Rc<dyn Tr>` finds the counts before it).
-                let data = if matches!(ct, CTy::Rc(_)) { format!("&({v})->v") } else { format!("({v})") };
+                let data = if at_value { format!("&({v})->v") } else { format!("({v})") };
                 format!("((lust_dyn){{ (void *){data}, {vt} }})")
             }
             Rvalue::DynUpcast { ptr, path } => {
@@ -3631,6 +3708,11 @@ impl FnGen<'_, '_> {
         if let Some(v) = self.fmt_builtin(b, &vals, &tys, loc) {
             return v;
         }
+        // Owning fat pointers (cgen/own.rs): their counts, `ptr_eq`,
+        // and the conversions that build one.
+        if let Some(v) = self.own_builtin(b, &vals, &tys, loc) {
+            return v;
+        }
         if let B::Sync(op) = b {
             return self.sync_builtin(op, &vals, &tys, loc);
         }
@@ -3649,6 +3731,7 @@ impl FnGen<'_, '_> {
         };
         match b {
             B::Sync(_) => unreachable!("sync builtins emit in cgen/sync.rs"),
+            B::OwnFrom(_) | B::OwnIntoString => unreachable!("owning pointer builtins emit in cgen/own.rs"),
             // Emitted by `fmt_builtin` above (cgen/fmt.rs).
             B::FmtWriteStr
             | B::FmtWriteChar
@@ -7406,6 +7489,15 @@ fn glue_def_value(
     // shaped glue arms below (unused strings for other shapes).
     let disc_p = disc_call(p, t, "p");
     let pf = variant_field(p, t, "(*p)", 1, 0);
+    // Owning fat pointers' glue (cgen/own.rs).
+    if let CTy::Own(k, x) = t {
+        own::own_glue_def(p, *g, *k, x, protos, defs, &mut need);
+        return;
+    }
+    if let (Glue::Drop, CTy::DynGuard(_) | CTy::DynLock(true)) = (g, t) {
+        own::dyn_guard_drop(t, protos, defs);
+        return;
+    }
     // The sync types' glue (cgen/sync.rs).
     if let CTy::Sync(k, e) = t {
         sync::sync_glue_def(p, *g, *k, e, protos, defs, &mut need);

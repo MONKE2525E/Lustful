@@ -399,6 +399,9 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
                         if let Builtin::Sync(op) = b {
                             op.hash(&mut h);
                         }
+                        if let Builtin::OwnFrom(k) = b {
+                            k.hash(&mut h);
+                        }
                     }
                     CallTarget::Intrinsic(i) => (2u8, i).hash(&mut h),
                     CallTarget::Indirect(l) => (3u8, l).hash(&mut h),

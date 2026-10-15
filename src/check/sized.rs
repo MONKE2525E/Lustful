@@ -3,7 +3,7 @@
 // Two questions, one answer each. `parts` names the positions inside a
 // type that need a `Sized` type for the type to be well-formed: tuple
 // elements but the last, array and slice elements, the type args of the
-// builtin Adts other than `Box` and `Rc`. Local Adts owe the implicit
+// builtin Adts other than `Box`, `Rc`, `Arc`, `RefCell`, and `Mutex`. Local Adts owe the implicit
 // `Sized` of their params through their predicates, which the WF walks
 // already prove. `is_sized` answers for one type under a param env.
 //
@@ -30,7 +30,11 @@ pub fn parts(tys: &impl TyIntern, t: Ty, need: &mut impl FnMut(Ty)) {
         }
         TyKind::Array(e, _) | TyKind::Slice(e) => need(e),
         TyKind::Adt(_, a) => match tys.builtin_of(t) {
-            None | Some(BuiltinTy::Boxed | BuiltinTy::Rc) => {}
+            None | Some(BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc)) => {}
+            // `RefCell<T: ?Sized>` and `Mutex<T: ?Sized>`: with a dyn
+            // value they are unsized themselves; `MutexGuard<T: ?Sized>`
+            // is a pointer.
+            Some(BuiltinTy::RefCell | BuiltinTy::Sync(crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::MutexGuard)) => {}
             Some(_) => {
                 for g in tys.args(a) {
                     if let Some(e) = g.as_ty() {
@@ -55,6 +59,7 @@ pub fn is_sized(p: &Program, tys: &mut impl TyIntern, t: Ty, param_sized: &dyn F
 fn is_sized_depth(p: &Program, tys: &mut impl TyIntern, t: Ty, param_sized: &dyn Fn(ParamId) -> bool, depth: u32) -> bool {
     match tys.kind(t) {
         TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => false,
+        TyKind::Adt(..) if crate::check::own::dyn_wrapped_elem(tys, t).is_some() => false,
         TyKind::Param(q) => param_sized(q),
         TyKind::Tuple(ts) => match tys.tys_of(ts).last() {
             Some(&e) => is_sized_depth(p, tys, e, param_sized, depth),

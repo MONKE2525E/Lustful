@@ -56,6 +56,10 @@ pub enum FromConv {
     CowBorrowedView,
     /// `Cow<str>` from String, `Cow<[T]>` from Vec<T>: `Owned`.
     CowOwned,
+    /// `Box`, `Rc`, or `Arc` of `str` or `[T]` (w-unsized, check/own.rs).
+    Own(crate::check::own::Owner),
+    /// String from `Box<str>`: its buffer.
+    StringFromBoxStr,
 }
 
 /// The std `From` impl `dst: From<src>` between builtin types, if std
@@ -83,6 +87,9 @@ pub fn std_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Fr
             _ if ref_of(src).is_some_and(|(m, i)| !m.is_mut() && tys.is_string_ty(i)) => Some(F::StringFromRefString),
             _ if src == CHAR => Some(F::StringFromChar),
             _ if cow.is_some_and(|b| tys.kind(b) == TyKind::Str) => Some(F::CowIntoOwned),
+            _ if crate::check::own::own_parts(tys, src).is_some_and(|(k, e)| k == crate::check::own::Owner::Box && tys.kind(e) == TyKind::Str) => {
+                Some(F::StringFromBoxStr)
+            }
             _ => None,
         };
     }
@@ -116,8 +123,13 @@ pub fn std_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Fr
         }
         return None;
     }
-    if let Some(el) = tys.boxed_slice_elem(dst) {
-        return (tys.vec_elem(src) == Some(el)).then_some(F::BoxSliceFromVec);
+    if let Some(el) = tys.boxed_slice_elem(dst)
+        && tys.vec_elem(src) == Some(el)
+    {
+        return Some(F::BoxSliceFromVec);
+    }
+    if let Some(k) = crate::check::own::own_from(p, tys, dst, src) {
+        return Some(F::Own(k));
     }
     if tys.option_elem(dst) == Some(src) {
         return Some(F::Some);
@@ -418,7 +430,8 @@ impl<'p> Ctx<'p> {
                 }
             }
             _ if self.tys.vec_elem(core).is_some() => Builtin::VecAsSlice,
-            _ if self.tys.rc_elem(core).is_some() => Builtin::ConvRcInner,
+            // An Rc or Arc of an unsized value is its fat value (check/own.rs).
+            _ if self.tys.rc_elem(core).is_some() && crate::check::own::own_parts(&self.tys, core).is_none() => Builtin::ConvRcInner,
             _ => Builtin::ConvDeref,
         }
     }
@@ -549,9 +562,10 @@ impl<'p> Ctx<'p> {
     /// `std_into_method`'s source when it still has an integer or float
     /// variable: the variable unified with the element the target fixes
     /// (`Option<T>`, `Box<T>`, `Rc<T>` from T; `Vec<T>`, `Box<[T]>`,
-    /// `Cow<[T]>` from `[T; N]`, `&[T; N]`, `&[T]`). None for any other
+    /// `Rc<[T]>`, `Arc<[T]>`, `Cow<[T]>` from `[T; N]`, `&[T; N]`,
+    /// `&[T]`, `Vec<T>`). None for any other
     /// shape, and when the unification fails (nothing stays bound).
-    fn std_from_literal_src(&mut self, dst: Ty, src: Ty) -> Option<Ty> {
+    pub(super) fn std_from_literal_src(&mut self, dst: Ty, src: Ty) -> Option<Ty> {
         let lit = |cx: &Self, t: Ty| matches!(cx.kind(t), k if k.is_int_infer() || k.is_float_infer());
         let elem_of_seq = |cx: &Self, t: Ty| -> Option<Ty> {
             let t = match cx.kind(t) {
@@ -560,17 +574,19 @@ impl<'p> Ctx<'p> {
             };
             match cx.kind(t) {
                 TyKind::Array(e, _) | TyKind::Slice(e) => Some(cx.resolve(e)),
-                _ => None,
+                _ => cx.tys.vec_elem(t).map(|e| cx.resolve(e)),
             }
         };
         let (have, want) = if lit(self, src) {
             (src, self.tys.option_elem(dst).or_else(|| self.tys.boxed_elem(dst)).or_else(|| self.tys.rc_elem(dst))?)
         } else {
-            let e = elem_of_seq(self, src).filter(|&e| lit(self, e))?;
+            // An element with a literal anywhere (`({integer}, String)`).
+            let e = elem_of_seq(self, src).filter(|&e| lit(self, e) || self.tys.flags(e).contains_infer())?;
             let want = self
                 .tys
                 .vec_elem(dst)
                 .or_else(|| self.tys.boxed_slice_elem(dst))
+                .or_else(|| crate::check::own::shared_unsized_elem(&self.tys, dst).and_then(|b| elem_of_seq(self, b)))
                 .or_else(|| crate::check::collect::cow_arg(&self.tys, dst).and_then(|b| elem_of_seq(self, b)))?;
             (e, want)
         };

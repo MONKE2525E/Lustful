@@ -1112,7 +1112,14 @@ impl<'p> Lower<'p> {
         use crate::check::object;
         // An owning unsizing (`Box<T>` to `Box<dyn Tr>`, `Rc<T>` to
         // `Rc<dyn Tr>`): the box or Rc moves into the fat pointer.
-        if let (Some(src), Some(dyn_ty)) = (self.body.tys.smart_elem(found), self.body.tys.smart_elem(target)) {
+        if let (Some(mut src), Some(mut dyn_ty)) = (self.body.tys.smart_elem(found), self.body.tys.smart_elem(target)) {
+            // `Rc<RefCell<S>>` to `Rc<RefCell<dyn Tr>>`: the vtable is
+            // the value's; the data still points at the cell.
+            if let (Some(s), Some(d)) = (self.body.tys.refcell_elem(src), self.body.tys.refcell_elem(dyn_ty)) {
+                (src, dyn_ty) = (s, d);
+            } else if let (Some((_, s)), Some((_, d))) = (self.body.tys.lock_elem(src), self.body.tys.lock_elem(dyn_ty)) {
+                (src, dyn_ty) = (s, d);
+            }
             let rv = match (object::principal_of(&self.body.tys, src), object::principal_of(&self.body.tys, dyn_ty)) {
                 (Some(from), Some(to)) => {
                     let path = object::upcast_path(self.p, &mut self.body.tys, from, to).unwrap_or_default();

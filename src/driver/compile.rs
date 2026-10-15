@@ -3736,6 +3736,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     27u8.hash(h);
                     inner(h, p, x);
                 }
+                cgen::CTy::Own(k, x) => {
+                    (46u8, *k).hash(h);
+                    inner(h, p, x);
+                }
+                cgen::CTy::DynCell => 47u8.hash(h),
+                cgen::CTy::DynGuard(m) => (48u8, *m).hash(h),
+                cgen::CTy::DynLock(g) => (49u8, *g).hash(h),
                 cgen::CTy::Sync(k, x) => {
                     (28u8, *k).hash(h);
                     inner(h, p, x);

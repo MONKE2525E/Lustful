@@ -231,6 +231,8 @@ fn hash_stmts(p: &Program, slots: &[u32], t: &CTy, hc: &CTy, h: &str, v: &str, n
         CTy::Ref(inner) if **inner == CTy::Str => hash_stmts(p, slots, &CTy::Str, hc, h, v, need),
         CTy::Ref(inner) | CTy::Boxed(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(*{v})"), need),
         CTy::Rc(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(&(*{v})->v)"), need),
+        // An owning fat pointer hashes its pointee (cgen/own.rs).
+        CTy::Own(_, inner) => hash_stmts(p, slots, inner, hc, h, v, need),
         CTy::Tuple(es) => es.iter().enumerate().map(|(i, e)| hash_stmts(p, slots, e, hc, h, &format!("(&({v})->f{i})"), need)).collect(),
         // [T], Vec<T>, [T; N]: write_length_prefix (write_usize), then
         // hash_slice: one write of all bytes for integers, else each.
@@ -484,6 +486,8 @@ fn borrow_expr(p: &Program, slots: &[u32], k: &CTy, q: &CTy, kp: &str) -> String
             None => kp.to_string(),
         },
         (CTy::Rc(_), _) => format!("(&(*{kp})->v)"),
+        // `Rc<str>` borrows as `str`: the same fat value (cgen/own.rs).
+        (CTy::Own(..), _) => kp.to_string(),
         _ => kp.to_string(),
     }
 }

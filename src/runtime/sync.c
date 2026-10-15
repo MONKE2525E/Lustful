@@ -156,6 +156,16 @@ int lust_arc_dec(uint64_t *c) LUST_BODY({
     return 1;
 })
 
+/* The one shared allocation of every empty `Arc<str>` and `Arc<[T]>`
+   that `Default` makes (std's static ArcInner, w-unsized): its strong
+   count starts at 1, so it is never freed. Takes one more strong ref and
+   returns the data pointer, right after the two counts. */
+void *lust_arc_empty(void) LUST_BODY({
+    static _Alignas(16) uint64_t h[2] = { 1, 1 };
+    lust_arc_inc(&h[0]);
+    return (void *)(h + 2);
+})
+
 /* An acquire load of a count. */
 uint64_t lust_arc_load(uint64_t *c) LUST_BODY({
     uint64_t v;

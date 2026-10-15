@@ -1248,6 +1248,20 @@ import (2.10).
 Dev representation: a fat pointer `{ data: *mut (), vtable:
 *const VTable }` (section 4.4 for the C form).
 
+Owning pointers to unsized values (w-unsized, `check/own.rs`,
+`cgen/own.rs`): `Box`, `Rc`, and `Arc` of `str`, `[T]`, `dyn Tr`,
+`RefCell<dyn Tr>`, and `Mutex<dyn Tr>` are the pointee's fat form
+(`lust_str`, the slice struct, or `lust_dyn`). An `Rc` or `Arc`
+points at its value; the `strong` and `weak` counts are the 16
+bytes before it, as in `RcI_T`, so `Rc<T>` to `Rc<dyn Tr>` or
+`Rc<[T; N]>` to `Rc<[T]>` only takes the value's address. A
+`RefCell<dyn Tr>` (`Mutex<dyn Tr>`) pointer's data points at the
+cell (the borrow flag, or the futex word and poison byte, first),
+and its vtable is the value's: the value sits at the first offset
+past the cell words that the vtable's align allows. Every empty
+`Arc<str>` and `Arc<[T]>` that `Default` makes shares one static
+allocation (runtime `lust_arc_empty`), as std's do.
+
 ```c
 struct lust_vtable {
     void (*drop_in_place)(void *);

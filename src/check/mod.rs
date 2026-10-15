@@ -24,6 +24,7 @@ pub mod object;
 pub mod obligations;
 pub mod outlives;
 pub mod opaque;
+pub mod own;
 pub mod picks;
 pub mod platform;
 pub mod split;
@@ -284,6 +285,13 @@ pub enum Builtin {
     /// `Rc::into_inner` and `Rc::unwrap_or_clone` (W-STD-A phase 3).
     RcIntoInner,
     RcUnwrapOrClone,
+    /// `Box`, `Rc`, or `Arc` of `str` or `[T]` from a `&str`, `String`,
+    /// `Box<str>`, `&[T]`, `Vec<T>`, `Box<[T]>`, or `[T; N]`: the std
+    /// `From` impls of the owning pointers to unsized values
+    /// (w-unsized, check/own.rs). The operand's type picks the copy.
+    OwnFrom(own::Owner),
+    /// `String` from `Box<str>` (`From`, `into_string`): the buffer.
+    OwnIntoString,
     /// The `core::mem` byte-move family and `core::cmp::max`/`min`
     /// free fns (ARCH 4.4). `MemTake` only survives to lowering,
     /// which fills the freed slot with a synthesized default and
@@ -1439,6 +1447,10 @@ struct Ctx<'p> {
     /// (by-value `try_unwrap` and `into_inner`, `get_mut`, and
     /// `downgrade`, whose `Weak` is a thin pointer).
     deferred_sized: Vec<(Ty, Span)>,
+    /// The pointee of an `Rc::make_mut`/`get_mut` (`Arc::make_mut`) call
+    /// and whether it must be cloned (`make_mut`): checked at body end
+    /// (check/own.rs `finish_make_mut`).
+    deferred_make_mut: Vec<(Ty, Span, bool)>,
     /// Map and set keys and lookup types, re-tested at finish
     /// (`check_hash_key`, W-STD-B): (key, lookup, span).
     deferred_hash_key: Vec<(Ty, Ty, Span)>,
@@ -1771,6 +1783,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_sized: Vec::new(),
+        deferred_make_mut: Vec::new(),
         deferred_hash_key: Vec::new(),
         deferred_glue_hash: Vec::new(),
         in_norm: false,
@@ -3602,6 +3615,9 @@ impl<'p> Ctx<'p> {
     /// with an unsized last field making the Adt unsized.
     fn sized_ok(&mut self, t: Ty) -> bool {
         let t = self.normalize_here(t);
+        if own::dyn_wrapped_elem(&self.tys, t).is_some() {
+            return false;
+        }
         match self.tys.kind(t) {
             TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => false,
             TyKind::Param(p) => self.env().iter().any(|pred| {
@@ -4890,6 +4906,18 @@ impl<'p> Ctx<'p> {
             // `Box<T>` to `Box<dyn Tr>` and `Rc<T>` to `Rc<dyn Tr>`: an
             // owning unsizing, under the rules of the reference form.
             (TyKind::Adt(..), TyKind::Adt(..)) if let Some((x, y)) = self.owning_unsize_parts(found, expected) => {
+                // `Box<[T; N]>` to `Box<[T]>` (and the Rc and Arc forms).
+                if let (TyKind::Array(xe, _), TyKind::Slice(ye)) = (self.kind(x), self.kind(y)) {
+                    if !self.unify(xe, ye) {
+                        self.mismatch(span, expected, found);
+                        return false;
+                    }
+                    if let Some(e) = e {
+                        let i = self.ei(e);
+                        self.out.coerce[i] = Coerce::Unsize(expected);
+                    }
+                    return true;
+                }
                 match self.unsize_coercion(x, y, found, expected, span, e) {
                     Some(c) => c,
                     None => return false,
@@ -5689,17 +5717,33 @@ impl<'p> Ctx<'p> {
     }
 
     /// The pointees of an owning unsizing (`Box<T>` to `Box<dyn Tr>`,
-    /// `Rc<T>` to `Rc<dyn Tr>`, ARCH 2.8): the same smart pointer on
-    /// both sides, a dyn target, and a known source.
+    /// `Rc<T>` to `Rc<dyn Tr>`, ARCH 2.8; `Arc<[T; N]>` to `Arc<[T]>`,
+    /// w-unsized): the same smart pointer on both sides, a dyn target
+    /// (or a slice target from an array), and a known source.
     fn owning_unsize_parts(&self, found: Ty, expected: Ty) -> Option<(Ty, Ty)> {
         let (f, e) = (self.resolve(found), self.resolve(expected));
+        if self.tys.builtin_of(f) != self.tys.builtin_of(e) {
+            return None;
+        }
         let (x, y) = match (self.tys.boxed_elem(f), self.tys.boxed_elem(e)) {
             (Some(x), Some(y)) => (x, y),
             _ => (self.tys.rc_elem(f)?, self.tys.rc_elem(e)?),
         };
-        let (x, y) = (self.resolve(x), self.resolve(y));
+        let (mut x, mut y) = (self.resolve(x), self.resolve(y));
+        // `Rc<RefCell<S>>` to `Rc<RefCell<dyn Tr>>` (and `Arc<Mutex<S>>`
+        // to `Arc<Mutex<dyn Tr>>`): the cell's value unsizes.
+        let inner = |t: Ty| self.tys.refcell_elem(t).map(|e| (0u8, e)).or_else(|| self.tys.lock_elem(t).filter(|l| l.0 == crate::ty::sync::SyncTy::Mutex).map(|l| (1u8, l.1)));
+        if let (Some((xk, xe)), Some((yk, ye))) = (inner(x), inner(y))
+            && xk == yk
+        {
+            (x, y) = (self.resolve(xe), self.resolve(ye));
+            if !matches!(self.kind(y), TyKind::Dyn(..)) {
+                return None;
+            }
+        }
         let known = !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float());
-        (known && matches!(self.kind(y), TyKind::Dyn(..))).then_some((x, y))
+        let to_slice = matches!((self.kind(x), self.kind(y)), (TyKind::Array(..), TyKind::Slice(_)));
+        (known && (to_slice || matches!(self.kind(y), TyKind::Dyn(..)))).then_some((x, y))
     }
 
     /// True when `e` borrows a static item (`&S0`): the one reference
@@ -7031,10 +7075,13 @@ impl<'p> Ctx<'p> {
                 // &[T]`): it holds exactly when the coercion does. The
                 // probe rolls back on failure so the cast error below
                 // is the only diagnostic.
-                let ref_cast = matches!(
+                // So is an owning unsizing (`Rc<[T; N]> as Rc<[T]>`,
+                // `Box<S> as Box<dyn Tr>`).
+                let ref_cast = (matches!(
                     (self.kind(t), self.kind(target)),
                     (TyKind::Ref(..), TyKind::Ref(..)) | (TyKind::Ref(..), TyKind::RawPtr(..)) | (TyKind::RawPtr(..), TyKind::RawPtr(..))
-                ) && {
+                ) || self.owning_unsize_parts(t, target).is_some())
+                    && {
                     let snap = self.snapshot_vars();
                     let obl_len = self.obl_len();
                     let err_len = self.errs.len();
@@ -7824,18 +7871,22 @@ impl<'p> Ctx<'p> {
     }
 
     /// The expected type when it is a pointer to a dyn type: a
-    /// reference, or an owning `Box<dyn Tr>` or `Rc<dyn Tr>`. Branch
-    /// results then coerce to it one by one, as rustc's expectation
-    /// does, instead of joining the branch types first (ARCH 2.8). Also a
-    /// fn pointer type that names a lifetime of the fn (W-BORROW3): a
-    /// method with the impl's early-bound lifetime fits it, never the
-    /// joined pointer type of the branches.
+    /// reference, or an owning `Box<dyn Tr>` or `Rc<dyn Tr>` (also an
+    /// owning pointer to `RefCell<dyn Tr>`, `Mutex<dyn Tr>`, or `[T]`,
+    /// check/own.rs). Branch results then coerce to it one by one, as
+    /// rustc's expectation does, instead of joining the branch types
+    /// first (ARCH 2.8). Also a fn pointer type that names a lifetime of
+    /// the fn (W-BORROW3): a method with the impl's early-bound lifetime
+    /// fits it, never the joined pointer type of the branches.
     fn dyn_ref_expectation(&self, expected: Option<Ty>) -> Option<Ty> {
         let t = self.resolve(expected?);
         match self.kind(t) {
             TyKind::FnPtr(s) if self.tys.sig(s).value.free_slots != 0 => Some(t),
             TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..)) => Some(t),
             TyKind::Adt(..) if self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(self.resolve(e)), TyKind::Dyn(..))) => Some(t),
+            TyKind::Adt(..) if own::own_parts(&self.tys, t).is_some_and(|(_, e)| matches!(self.kind(e), TyKind::Slice(_)) || own::dyn_wrapped_elem(&self.tys, e).is_some()) => {
+                Some(t)
+            }
             _ => None,
         }
     }
@@ -9429,6 +9480,9 @@ impl<'p> Ctx<'p> {
             if item == k.leak {
                 return Some(Res::Builtin(Builtin::BoxLeak));
             }
+            if item == k.from {
+                return Some(Res::Builtin(Builtin::OwnFrom(own::Owner::Box)));
+            }
             self.err(
                 "L0104",
                 span,
@@ -9471,6 +9525,8 @@ impl<'p> Ctx<'p> {
                 Builtin::RcIntoInner
             } else if self.name(item) == "unwrap_or_clone" {
                 Builtin::RcUnwrapOrClone
+            } else if item == k.from {
+                Builtin::OwnFrom(own::Owner::Rc)
             } else {
                 self.err(
                     "L0104",
@@ -11170,7 +11226,7 @@ impl<'p> Ctx<'p> {
             }
             // A dyn deeper in (`Option<(&dyn Tr, u8)>`): the expectation
             // reaches the coercion sites inside the argument.
-            let hint = elem.filter(|&t| object::mentions_dyn(&self.tys, t));
+            let hint = elem.filter(|&t| object::mentions_dyn(&self.tys, t) || self.conversion_call(args[0]));
             let t = self.expr(args[0], hint);
             return self.tys.mk_option(t);
         }
@@ -11202,7 +11258,7 @@ impl<'p> Ctx<'p> {
                 self.expect_expr(args[0], if res == Res::ResOk { turbo[0] } else { turbo[1] });
                 return self.tys.mk_result(turbo[0], turbo[1]);
             }
-            let (want, other) = (side.filter(|&t| object::mentions_dyn(&self.tys, t)), self.new_var(false));
+            let (want, other) = (side.filter(|&t| object::mentions_dyn(&self.tys, t) || self.conversion_call(args[0])), self.new_var(false));
             let t = self.expr(args[0], want);
             return if res == Res::ResOk { self.tys.mk_result(t, other) } else { self.tys.mk_result(other, t) };
         }
@@ -11317,15 +11373,25 @@ impl<'p> Ctx<'p> {
                 // argument against the dyn type, so a closure takes that
                 // signature; the box of its own type then unsizes at the
                 // caller's coercion.
-                if matches!(b, Builtin::BoxNew | Builtin::RcNew)
+                let arc_new = b == Builtin::Sync(sync::SyncOp::ArcNew);
+                if (matches!(b, Builtin::BoxNew | Builtin::RcNew) || arc_new)
                     && args.len() == 1
                     && written_self.is_none()
                     && let Some(want) = expected.map(|t| self.resolve(t))
+                    && self.tys.builtin_of(want) == Some(match b {
+                        Builtin::BoxNew => BuiltinTy::Boxed,
+                        Builtin::RcNew => BuiltinTy::Rc,
+                        _ => BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc),
+                    })
                     && let Some(inner) = if b == Builtin::BoxNew { self.tys.boxed_elem(want) } else { self.tys.rc_elem(want) }
                     && matches!(self.kind(inner), TyKind::Dyn(..))
                 {
                     let at = self.expr(args[0], Some(inner));
-                    return if b == Builtin::BoxNew { self.tys.mk_boxed(at) } else { self.tys.mk_rc(at) };
+                    return match b {
+                        Builtin::BoxNew => self.tys.mk_boxed(at),
+                        Builtin::RcNew => self.tys.mk_rc(at),
+                        _ => crate::ty::sync::sync_ty(&mut self.tys, crate::ty::sync::SyncTy::Arc, &[at]),
+                    };
                 }
                 let (params, ret): (Vec<Ty>, Ty) = match b {
                     Builtin::Sync(op) => self.sync_call_sig(op, callee, span),
@@ -11436,6 +11502,7 @@ impl<'p> Ctx<'p> {
                         }
                     }
                     Builtin::StringWithCapacity => (vec![USIZE], STRING),
+                    Builtin::OwnFrom(k) => self.own_from_sig(k, callee, e, args, written_self.or(expected), span),
                     Builtin::EnvArgs => (vec![], ARGS),
                     Builtin::LocationCaller => {
                         let l = self.tys.intern(TyKind::Adt(generics::location_def(), EMPTY_ARGS));
@@ -11536,8 +11603,7 @@ impl<'p> Ctx<'p> {
                     }
                     Builtin::RcMakeMut => {
                         let elem = self.new_var(false);
-                        self.deferred_sized.push((elem, span));
-                        self.deferred_clone.push((elem, span));
+                        self.deferred_make_mut.push((elem, span, true));
                         let rc = self.tys.mk_rc(elem);
                         let rm = self.tys.mk_ref(true, rc);
                         let r = self.tys.mk_ref(true, elem);
@@ -11545,7 +11611,7 @@ impl<'p> Ctx<'p> {
                     }
                     Builtin::RcGetMut => {
                         let elem = self.new_var(false);
-                        self.deferred_sized.push((elem, span));
+                        self.deferred_make_mut.push((elem, span, false));
                         let rc = self.tys.mk_rc(elem);
                         let rm = self.tys.mk_ref(true, rc);
                         let r = self.tys.mk_ref(true, elem);
@@ -11779,6 +11845,11 @@ impl<'p> Ctx<'p> {
                     }
                 }
                 self.check_args(&params, args, span);
+                // The Rc and Arc fns that need a sized value, or that lust
+                // has not built for `str` and `[T]` (check/own.rs).
+                if self.own_call_guard(b, &params, span) {
+                    return ERROR;
+                }
                 // `Rc::try_unwrap` needs `T: Sized` (rustc E0277), and
                 // the other value-reaching Rc builtins are not built for
                 // `Rc<dyn Tr>` yet; the counts are.
@@ -12362,6 +12433,11 @@ impl<'p> Ctx<'p> {
         // Rust. Its own `clone` is found before the step (it is
         // the one Box method this wave resolves at step zero),
         // so that name keeps the unpeeled receiver.
+        // `Box<str>::into_string` and `String::into_boxed_str` by value
+        // (check/own.rs), found before the deref step.
+        if let Some(r) = self.own_by_value_method(e, rt, name, args, name_span) {
+            return r;
+        }
         // `Box<[T]>`'s by-value methods, found before the deref step.
         if let Some(el) = self.tys.boxed_slice_elem(self.resolve(rt)) {
             match self.name(name) {
@@ -18243,6 +18319,7 @@ impl<'p> Ctx<'p> {
         }
         // Deferred Clone and PartialEq needs of builtin Vec and
         // slice methods, with types as bound by now.
+        self.finish_make_mut();
         for (t, span) in std::mem::take(&mut self.deferred_clone) {
             let t = self.deep(t);
             let t = self.normalize_here(t);

@@ -282,7 +282,7 @@ impl<T, E> Result<Vec<T>, E> {
     }
 }
 
-impl<T, E> Result<Box<T>, E> {
+impl<T: ?Sized, E> Result<Box<T>, E> {
     pub fn as_deref(&self) -> Result<&T, &E> {
         match *self {
             Ok(ref t) => Ok(&**t),

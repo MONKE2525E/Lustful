@@ -3137,14 +3137,8 @@ pub(crate) fn resolve_path_ty(
             elem = tys.intern(TyKind::Dyn(b, Region::Static));
         }
         // `Box<dyn Tr>` and `Rc<dyn Tr>` are owning fat pointers (ARCH
-        // 2.8), and `Box<[T]>` a boxed slice (W-STD-A); boxed strs are
-        // not supported yet.
-        if name == known.Box && matches!(tys.kind(elem), TyKind::Str) {
-            return Err(not_yet("L0641", span, "a Box of an unsized type"));
-        }
-        if name == known.Rc && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str) {
-            return Err(not_yet("L0641", span, "an Rc of an unsized type"));
-        }
+        // 2.8), `Box<[T]>` a boxed slice (W-STD-A), and `Box<str>`,
+        // `Rc<str>`, and `Rc<[T]>` the fat forms of check/own.rs.
         return Ok(if name == known.Vec {
             tys.mk_vec(elem)
         } else if name == known.Box {
@@ -3172,8 +3166,20 @@ pub(crate) fn resolve_path_ty(
             GenericArgs::None if k.arity() == 0 => Vec::new(),
             _ => return Err(Diag::new("L0110", span, format!("`{}` takes one type argument", k.name()), "Write it with its element type.")),
         };
-        let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
+        let mut elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
         crate::check::sync::check_sync_arg(tys, k, elem, span)?;
+        // `Arc<dyn Tr>` (and `Mutex<dyn Tr>`) with no written bound is
+        // `'static` in a signature, as for `Box` and `Rc` above.
+        if matches!(k, crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::Mutex)
+            && scope.infer_cell.is_none()
+            && matches!(scope.regions, RegionMode::Erase)
+            && let TyKind::Dyn(b, Region::Erased) = tys.kind(elem)
+            && let GenericArgs::Angle(a) = &seg.args
+            && let Some(AstArg::Type(t)) = a.iter().find(|g| matches!(g, AstArg::Type(_)))
+            && dyn_lifetime_unwritten(ast, *t)
+        {
+            elem = tys.intern(TyKind::Dyn(b, Region::Static));
+        }
         // Lifetime params (a lock guard's, a scoped handle's, a `Scope`'s
         // two): none written (each elided) or all; a region signature
         // keeps them first, as for a user Adt's lifetimes.
@@ -3220,8 +3226,21 @@ pub(crate) fn resolve_path_ty(
             GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, n)?,
             _ => return Err(Diag::new("L0110", span, format!("`{n}` takes one type argument"), "Write it with its element type.")),
         };
-        let elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
-        if matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+        let mut elem = args.iter().find_map(|g| g.as_ty()).unwrap_or(ERROR);
+        // `RefCell<dyn Tr>` behind a pointer is check/own.rs's; its
+        // object lifetime defaults as for `Box<dyn Tr>`.
+        let dyn_cell = n == "RefCell" && matches!(tys.kind(elem), TyKind::Dyn(..));
+        if dyn_cell
+            && scope.infer_cell.is_none()
+            && matches!(scope.regions, RegionMode::Erase)
+            && let TyKind::Dyn(b, Region::Erased) = tys.kind(elem)
+            && let GenericArgs::Angle(a) = &seg.args
+            && let Some(AstArg::Type(t)) = a.iter().find(|g| matches!(g, AstArg::Type(_)))
+            && dyn_lifetime_unwritten(ast, *t)
+        {
+            elem = tys.intern(TyKind::Dyn(b, Region::Static));
+        }
+        if !dyn_cell && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
             return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));
         }
         let which: fn(&crate::ty::BuiltinDefs) -> DefId = match n {
@@ -7653,6 +7672,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
     }
     // The std::sync and std::thread types (W-THREADS, check/sync.rs).
     crate::check::sync::add_sync_impls(p, &mut ordinal, span);
+    crate::check::own::add_own_impls(p, &mut ordinal, span);
     // core's `impl<T: 'static + ?Sized> Any for T` (check/any.rs). The
     // `'static` bound is a region fact: selection ignores it, as rustc's
     // probe does, and the checker and the borrow checker prove it.
@@ -9738,6 +9758,25 @@ fn prove_trait_ref(
         let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty()) else { return false };
         return crate::check::collect::auto_structural(p, &mut cx.tys, env, tr.def, t, &mut Vec::new()) == Some(true);
     }
+    // rustc's object candidate: `dyn Tr` implements its principal and
+    // the principal's supertraits (`Box<dyn Write>: Write` through
+    // `impl<W: Write + ?Sized> Write for Box<W>`, w-unsized).
+    if let Some(t) = cx.tys.args(tr.args).first().and_then(|g| g.as_ty())
+        && let t = crate::traits::solve::SolveCx::deep_resolve(cx, t)
+        && let Some(principal) = crate::check::object::principal_of(&cx.tys, t)
+    {
+        let mut args: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
+        for g in args.iter_mut() {
+            if let GenericArg::Ty(x) = g {
+                *x = crate::traits::solve::SolveCx::deep_resolve(cx, *x);
+            }
+        }
+        args[0] = GenericArg::Ty(DYN_SELF);
+        let to = TraitRef { def: tr.def, args: cx.tys.intern_args(&args), bindings: principal.bindings };
+        if crate::check::object::upcast_path(p, &mut cx.tys, principal, to).is_some() {
+            return true;
+        }
+    }
     match solver.select(cx, index, env, tr) {
         Selection::Impl { nested, .. } => nested.iter().all(|pred| match pred {
             Predicate::Trait(b) if b.count == 0 => prove_trait_ref(p, solver, cx, env, b.value, depth + 1),
@@ -9783,6 +9822,17 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
                 })
         }
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
+        // `Box`, `Rc`, and `Arc` of `str` or `[T]` follow the pointee for
+        // the comparison and hash traits, as std's `T: ?Sized` impls do
+        // (the pure solver has no `[T]` records; check/own.rs).
+        TyKind::Adt(..)
+            if !default
+                && trait_def != lang.clone
+                && let Some((_, e)) = crate::check::own::own_parts(&p.tys, ty)
+                && matches!(p.tys.kind(e), TyKind::Str | TyKind::Slice(_)) =>
+        {
+            prove_field_trait(p, env, trait_def, e)
+        }
         _ => {
             let mut a = vec![GenericArg::Ty(ty)];
             if trait_def == lang.partial_eq || trait_def == lang.partial_ord {
