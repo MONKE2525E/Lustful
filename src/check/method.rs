@@ -379,6 +379,48 @@ pub(super) fn lang_plain_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs:
     Probe::Miss
 }
 
+/// Probes the inherent methods std source defines on a primitive
+/// receiver (`impl char` in `core::char`, TRIAGE T8), registered in
+/// `prim_inherent_methods`. `base` is the receiver type after
+/// `derefs` autoderef steps; the autoref follows the method's own
+/// receiver form, as in `lang_plain_probe`.
+pub(super) fn prim_inherent_probe(
+    cx: &mut Ctx,
+    e: ExprId,
+    base: Ty,
+    derefs: u8,
+    name: Sym,
+    name_span: Span,
+    args: &[ExprId],
+) -> Probe {
+    let p = cx.p;
+    let Some(cands) = p.gx.prim_inherent_methods.get(&(base, name)).cloned() else { return Probe::Miss };
+    for f in cands {
+        if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+            continue;
+        }
+        let params = p.fn_info(f).params.clone();
+        let Some(&want) = params.first() else { continue };
+        let (recv_ty, autoref) = match cx.tys.kind(want) {
+            TyKind::Ref(_, Mut::Mut, inner) if inner == base => (want, Autoref::RefMut),
+            TyKind::Ref(_, Mut::Shared, inner) if inner == base => (want, Autoref::Ref),
+            _ => (base, Autoref::None),
+        };
+        let ret = p.ret_view(f);
+        let snap = cx.snapshot_vars();
+        let obl_len = cx.obl_len();
+        if !cx.unify(want, recv_ty) {
+            cx.rollback_vars(snap);
+            cx.obl_truncate(obl_len);
+            continue;
+        }
+        cx.set_res(e, Res::Method { f, derefs, autoref });
+        cx.check_args(&params[1.min(params.len())..], args, name_span);
+        return Probe::Hit(ret);
+    }
+    Probe::Miss
+}
+
 /// Probes trait methods for one receiver-type probe group (the
 /// variants of one autoderef step that share a receiver type).
 /// Hits are counted across the whole group, as rustc counts

@@ -151,6 +151,11 @@ pub enum Builtin {
     IsNegative,
     IsPowerOfTwo,
     IsMultipleOf,
+    NextMultipleOf,
+    CheckedNextMultipleOf,
+    UnsignedAbs,
+    MakeAsciiLowercase,
+    MakeAsciiUppercase,
     UnboundedShl,
     UnboundedShr,
     CastSigned,
@@ -220,6 +225,8 @@ pub enum Builtin {
     F64FromBits,
     CharLenUtf8,
     CharLenUtf16,
+    CharEncodeUtf8,
+    CharEncodeUtf16,
     CharIsAscii,
     CharIsAsciiPunctuation,
     CharIsAsciiGraphic,
@@ -13721,6 +13728,10 @@ impl<'p> Ctx<'p> {
                     Some((B::CharToUppercase, Autoref::Ref, vec![], CHAR))
                 } else if name == k.to_ascii_lowercase {
                     Some((B::CharToLowercase, Autoref::Ref, vec![], CHAR))
+                } else if name == k.make_ascii_lowercase {
+                    Some((B::MakeAsciiLowercase, Autoref::RefMut, vec![], UNIT))
+                } else if name == k.make_ascii_uppercase {
+                    Some((B::MakeAsciiUppercase, Autoref::RefMut, vec![], UNIT))
                 } else if name == k.to_digit {
                     let o = self.tys.mk_option(int(IntTy::U32));
                     Some((B::CharToDigit, Autoref::None, vec![int(IntTy::U32)], o))
@@ -13730,6 +13741,15 @@ impl<'p> Ctx<'p> {
                     Some((B::CharLenUtf8, Autoref::None, vec![], USIZE))
                 } else if name == k.len_utf16 {
                     Some((B::CharLenUtf16, Autoref::None, vec![], USIZE))
+                } else if name == k.encode_utf8 {
+                    let sl = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
+                    let dst = self.tys.mk_ref(true, sl);
+                    let ret = self.tys.mk_ref(true, STR);
+                    Some((B::CharEncodeUtf8, Autoref::None, vec![dst], ret))
+                } else if name == k.encode_utf16 {
+                    let sl = self.tys.intern(TyKind::Slice(int(IntTy::U16)));
+                    let dst = self.tys.mk_ref(true, sl);
+                    Some((B::CharEncodeUtf16, Autoref::None, vec![dst], dst))
                 } else if name == k.is_ascii {
                     Some((B::CharIsAscii, Autoref::Ref, vec![], BOOL))
                 } else if name == k.is_ascii_punctuation {
@@ -13852,6 +13872,11 @@ impl<'p> Ctx<'p> {
                 ret
             }
             None => {
+                // Inherent methods std source defines on a primitive
+                // receiver (`impl char`, TRIAGE T8).
+                if let method::Probe::Hit(ret) = method::prim_inherent_probe(self, e, base, derefs, name, name_span, args) {
+                    return ret;
+                }
                 // Generic and trait methods over the full autoderef
                 // chain (check/method.rs).
                 if self.generic_mode() && !builtin_only {
@@ -13945,6 +13970,24 @@ impl<'p> Ctx<'p> {
             if n == k.to_ascii_lowercase {
                 return Some((B::CharToLowercase, Autoref::Ref, vec![], t));
             }
+            if n == k.make_ascii_lowercase {
+                return Some((B::MakeAsciiLowercase, Autoref::RefMut, vec![], UNIT));
+            }
+            if n == k.make_ascii_uppercase {
+                return Some((B::MakeAsciiUppercase, Autoref::RefMut, vec![], UNIT));
+            }
+        }
+        // `next_multiple_of` and its checked form are unsigned only;
+        // `unsigned_abs` maps a signed value to its unsigned twin.
+        if n == k.next_multiple_of && !s {
+            return bin(B::NextMultipleOf);
+        }
+        if n == k.checked_next_multiple_of && !s {
+            let o = self.tys.mk_option(t);
+            return Some((B::CheckedNextMultipleOf, Autoref::None, vec![t], o));
+        }
+        if n == k.unsigned_abs && s {
+            return Some((B::UnsignedAbs, Autoref::None, vec![], int(i.counterpart())));
         }
         // The families that stay within the value (wrapping and plain).
         if n == k.wrapping_add {

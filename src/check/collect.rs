@@ -4619,7 +4619,19 @@ pub fn collect_reuse(
                     }
                     _ => None,
                 };
-                if trait_ref.is_none() && owner.is_none() && !dyn_self && lang_self.is_none() {
+                // Std source's inherent impls on a primitive (`impl
+                // char` in `core::char`, TRIAGE T8): only the splice
+                // may name one, and its methods register apart from
+                // the Adt tables (`prim_inherent_methods`).
+                let prim_self = if trait_ref.is_none()
+                    && p.std_source_span(imp.span)
+                    && matches!(p.tys.kind(self_pat), TyKind::Char | TyKind::Bool | TyKind::Int(_) | TyKind::Float(_))
+                {
+                    Some(self_pat)
+                } else {
+                    None
+                };
+                if trait_ref.is_none() && owner.is_none() && !dyn_self && lang_self.is_none() && prim_self.is_none() {
                     errs.push(Diag::new(
                         "L0102",
                         ast.ty_span(imp.self_ty),
@@ -4737,6 +4749,9 @@ pub fn collect_reuse(
                             p.gx.inherent_self_pats.insert(id, (self_pat, parent_gen.generics.clone()));
                         } else if let Some(adt_def) = lang_self {
                             p.gx.inherent_methods.entry((adt_def, def.name)).or_default().push(id);
+                            p.gx.inherent_self_pats.insert(id, (self_pat, parent_gen.generics.clone()));
+                        } else if let Some(prim_ty) = prim_self {
+                            p.gx.prim_inherent_methods.entry((prim_ty, def.name)).or_default().push(id);
                             p.gx.inherent_self_pats.insert(id, (self_pat, parent_gen.generics.clone()));
                         }
                     }

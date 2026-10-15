@@ -113,6 +113,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         template_calls: _,
         instance_by_key: _,
         inherent_methods: _,
+        prim_inherent_methods: _,
         inherent_self_pats,
         inherent_impl_self,
         inherent_const_self,

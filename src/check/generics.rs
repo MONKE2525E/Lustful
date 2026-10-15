@@ -4398,6 +4398,10 @@ pub struct GenTables {
     /// Inherent method templates by (Adt template def, name), in
     /// registration order; disjoint Self patterns may share a name.
     pub inherent_methods: FxMap<(DefId, Sym), Vec<LocalDefId>>,
+    /// Inherent methods std source defines on a primitive type
+    /// (`impl char` in `core::char`, TRIAGE T8), by (Self type,
+    /// name). User source cannot add inherent impls on primitives.
+    pub prim_inherent_methods: FxMap<(Ty, Sym), Vec<LocalDefId>>,
     /// Each inherent method's impl Self pattern and impl generics,
     /// for the inherent overlap check in `finish_collect`.
     pub inherent_self_pats: FxMap<LocalDefId, (Ty, Generics)>,
@@ -4578,6 +4582,7 @@ impl Default for GenTables {
             template_calls: FxMap::default(),
             instance_by_key: FxMap::default(),
             inherent_methods: FxMap::default(),
+            prim_inherent_methods: FxMap::default(),
             inherent_self_pats: FxMap::default(),
             inherent_impl_self: FxMap::default(),
             inherent_const_self: FxMap::default(),

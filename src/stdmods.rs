@@ -74,6 +74,14 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["OnceCell", "LazyCell"],
     },
     StdModule {
+        name: "__lust_core_char",
+        rel: "core/src/char.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "char"), ("std", "char")],
+        full: false,
+        triggers: &["ToLowercase", "ToUppercase", "to_lowercase", "to_uppercase"],
+    },
+    StdModule {
         name: "__lust_std_sync",
         rel: "std/src/sync.rs",
         krate: ShippedCrate::Std,

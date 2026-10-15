@@ -1259,6 +1259,12 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // One char through the Unicode case tables (TRIAGE T8;
+    // runtime/core.c `lust_char_case`), for `core::char`'s
+    // `ToLowercase` and `ToUppercase`: the mapped code points (one
+    // to three, 21 bits each) in the low word, their count in the
+    // high word.
+    IntrinsicDef { name: "char_case", c_symbol: "lust_char_case", params: &[S::U32, S::Bool], ret: S::U128, allowed: LIB, implemented: true },
 ];
 
 /// The intrinsic with this `core::intrinsics` name: its registry id.

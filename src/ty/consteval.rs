@@ -3882,6 +3882,23 @@ impl Evaluator {
                 }
             }
             "is_multiple_of" if !signed => Ok((ConstValue::Bool(if yb == 0 { xb == 0 } else { xb % yb == 0 }), BOOL)),
+            "next_multiple_of" | "checked_next_multiple_of" if !signed => {
+                let r: Option<u128> = if yb == 0 {
+                    None
+                } else {
+                    let rem = xb % yb;
+                    let add = if rem == 0 { 0 } else { yb - rem };
+                    if add > mask - xb { None } else { Some(xb + add) }
+                };
+                if name.starts_with("checked") {
+                    Ok(self.opt_value(cx, rt, r.map(|u| ConstValue::Int(int_from_bits(u & mask, it)))))
+                } else {
+                    match r {
+                        Some(u) => bits_v(u),
+                        None => Err(over()),
+                    }
+                }
+            }
             "eq_ignore_ascii_case" if it == IntTy::U8 => Ok((ConstValue::Bool((xb as u8).eq_ignore_ascii_case(&(yb as u8))), BOOL)),
             _ => Err(outside_err()),
         }

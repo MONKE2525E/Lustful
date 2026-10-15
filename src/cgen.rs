@@ -4415,6 +4415,9 @@ impl FnGen<'_, '_> {
             | B::IsNegative
             | B::IsPowerOfTwo
             | B::IsMultipleOf
+            | B::NextMultipleOf
+            | B::CheckedNextMultipleOf
+            | B::UnsignedAbs
             | B::UnboundedShl
             | B::UnboundedShr
             | B::CastSigned
@@ -4484,6 +4487,26 @@ impl FnGen<'_, '_> {
             | B::F64FromBits => self.float_method_c(b, &vals, &tys),
             B::CharLenUtf8 => format!("((uint64_t)({0} < 0x80u ? 1 : {0} < 0x800u ? 2 : {0} < 0x10000u ? 3 : 4))", vals[0]),
             B::CharLenUtf16 => format!("((uint64_t)({0} < 0x10000u ? 1 : 2))", vals[0]),
+            B::CharEncodeUtf8 | B::CharEncodeUtf16 => {
+                let (d, n, t) = (self.tmp(), self.tmp(), self.tmp());
+                let dt = ctype(&tys[1]);
+                let (helper, sloc) = if b == B::CharEncodeUtf8 {
+                    ("lust_char_encode_utf8", std_loc(1, 2518, 9))
+                } else {
+                    ("lust_char_encode_utf16", std_loc(1, 2612, 13))
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {dt} {d} = {}; uint64_t {n} = {helper}({}, {d}.ptr, {d}.len, {sloc});",
+                    vals[1], vals[0]
+                );
+                if b == B::CharEncodeUtf8 {
+                    let _ = writeln!(self.out, "    lust_str {t} = {{ {d}.ptr, {n} }};");
+                } else {
+                    let _ = writeln!(self.out, "    {dt} {t} = {{ {d}.ptr, {n} }};");
+                }
+                t
+            }
             B::CharIsAscii => format!("(*{0} < 128u)", vals[0]),
             B::CharIsAsciiPunctuation => {
                 format!(
@@ -5483,6 +5506,20 @@ impl FnGen<'_, '_> {
             }
             B::CharToUppercase => format!("((*{0} >= 'a' && *{0} <= 'z') ? *{0} - 32 : *{0})", vals[0]),
             B::CharToLowercase => format!("((*{0} >= 'A' && *{0} <= 'Z') ? *{0} + 32 : *{0})", vals[0]),
+            B::MakeAsciiLowercase | B::MakeAsciiUppercase => {
+                let p = self.tmp();
+                let et = ctype(match &tys[0] {
+                    CTy::Ref(inner) => inner,
+                    other => other,
+                });
+                let expr = if b == B::MakeAsciiLowercase {
+                    format!("((*{p} >= 'A' && *{p} <= 'Z') ? *{p} + 32 : *{p})")
+                } else {
+                    format!("((*{p} >= 'a' && *{p} <= 'z') ? *{p} - 32 : *{p})")
+                };
+                let _ = writeln!(self.out, "    {et}* {p} = {}; *{p} = ({et}){expr};", vals[0]);
+                "((lust_Unit){})".into()
+            }
             B::CharToDigit => {
                 let opt = CTy::Option(Box::new(CTy::Int(IntTy::U32)));
                 let ot = ctype(&opt);
@@ -6056,6 +6093,31 @@ impl FnGen<'_, '_> {
                 let masked_b = format!("({ub} & {mask})");
                 format!("({masked_b} == 0 ? {masked_a} == 0 : ({masked_a} % {masked_b}) == 0)")
             }
+            B::NextMultipleOf | B::CheckedNextMultipleOf => {
+                let (x, y, add, t) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let nloc = num_loc(it, false);
+                let _ = writeln!(self.out, "    uint64_t {x} = {masked_a}, {y} = ({ub} & {mask});");
+                if b == B::NextMultipleOf {
+                    let _ = writeln!(
+                        self.out,
+                        "    if ({y} == 0) lust_panic_cstr(\"attempt to calculate the remainder with a divisor of zero\", {nloc});"
+                    );
+                }
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {add} = {y} == 0 ? 0 : ({x} % {y} == 0 ? 0 : {y} - {x} % {y}); {ct} {t} = ({ct})(({x} + {add}) & {mask});"
+                );
+                if b == B::NextMultipleOf {
+                    let _ = writeln!(self.out, "    if ({add} > ({mask}) - {x}) lust_panic_cstr(\"attempt to add with overflow\", {nloc});");
+                    t
+                } else {
+                    self.int_option_c(&t, &format!("{y} != 0 && {add} <= ({mask}) - {x}"), it)
+                }
+            }
+            B::UnsignedAbs => {
+                let uct = int_c(it.counterpart());
+                format!("(({uct})(({a} < 0 ? (0ull - {ua}) : {ua}) & {mask}))")
+            }
             B::UnboundedShl => format!("(({}) >= {bits}u ? ({ct})0 : ({ct})(({masked_a} << {}) & {mask}))", vals[1], vals[1]),
             B::UnboundedShr => {
                 if sgn {
@@ -6210,6 +6272,38 @@ impl FnGen<'_, '_> {
             }
             B::CastSigned => format!("lust_i128_from_u128({x})"),
             B::CastUnsigned => format!("lust_u128_from_i128({x})"),
+            B::UnsignedAbs => {
+                let t = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    lust_u128 {t} = lust_u128_from_i128((int64_t){x}.hi < 0 ? lust_i128_sub(((lust_i128){{0, 0}}), {x}) : {x});"
+                );
+                t
+            }
+            B::NextMultipleOf | B::CheckedNextMultipleOf => {
+                let (y, r, add, t) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let nloc = num_loc(it, false);
+                let _ = writeln!(self.out, "    {ct} {y} = {};", vals[1]);
+                if b == B::NextMultipleOf {
+                    let _ = writeln!(
+                        self.out,
+                        "    if ({y}.lo == 0 && {y}.hi == 0) lust_panic_cstr(\"attempt to calculate the remainder with a divisor of zero\", {nloc});"
+                    );
+                }
+                let _ = writeln!(
+                    self.out,
+                    "    {ct} {r} = {{0, 0}}; if ({y}.lo != 0 || {y}.hi != 0) lust_u128_divmod({x}, {y}, &{r}); {ct} {add} = ({r}.lo == 0 && {r}.hi == 0) ? (({ct}){{0, 0}}) : lust_u128_sub({y}, {r}); {ct} {t} = lust_u128_add({x}, {add});"
+                );
+                if b == B::NextMultipleOf {
+                    let _ = writeln!(
+                        self.out,
+                        "    if (lust_u128_cmp({t}, {x}) < 0) lust_panic_cstr(\"attempt to add with overflow\", {nloc});"
+                    );
+                    t
+                } else {
+                    self.int_option_c(&t, &format!("({y}.lo != 0 || {y}.hi != 0) && lust_u128_cmp({t}, {x}) >= 0"), it)
+                }
+            }
             B::BitWidth => format!("(128u - ({x}.hi != 0 ? lust_leading_zeros64({x}.hi, 64) : 64u + lust_leading_zeros64({x}.lo, 64)))"),
             B::HighestOne => self.int_option_c(
                 &format!("(127u - ({x}.hi != 0 ? lust_leading_zeros64({x}.hi, 64) : 64u + lust_leading_zeros64({x}.lo, 64)))"),

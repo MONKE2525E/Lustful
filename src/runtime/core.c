@@ -1900,6 +1900,87 @@ lust_String lust_str_case(lust_str s, int upper) LUST_BODY({
     return r;
 })
 
+/* `char::to_lowercase` and `char::to_uppercase` for one char, as the
+   `char_case` intrinsic returns it: the mapped code points (one to
+   three, 21 bits each) in `lo`, their count in `hi`. No final-sigma
+   rule: that is `str::to_lowercase` only. */
+lust_u128 lust_char_case(uint32_t c, uint8_t upper) LUST_BODY({
+    const uint32_t *m = upper ? lust_case_map(lust_upper_map, sizeof lust_upper_map / sizeof lust_upper_map[0], c)
+                              : lust_case_map(lust_lower_map, sizeof lust_lower_map / sizeof lust_lower_map[0], c);
+    uint32_t o0 = c, o1 = 0, o2 = 0;
+    uint64_t n = 1;
+    if (m) {
+        o0 = m[0]; o1 = m[1]; o2 = m[2];
+        n = o2 ? 3 : o1 ? 2 : 1;
+    }
+    lust_u128 r;
+    r.lo = (uint64_t)o0 | ((uint64_t)o1 << 21) | ((uint64_t)o2 << 42);
+    r.hi = n;
+    return r;
+})
+
+/* The `encode_utf8: need ...` panic text of core (char/methods.rs),
+   shared by the two encode helpers below. */
+static void lust_encode_panic(const char *what, uint64_t need, uint32_t c, uint64_t have, lust_loc loc) LUST_BODY({
+    char hex[16];
+    int hn = 0;
+    uint32_t v = c;
+    if (v == 0) hex[hn++] = '0';
+    char rev[16];
+    int rn = 0;
+    while (v) { rev[rn++] = "0123456789ABCDEF"[v & 15]; v >>= 4; }
+    while (rn + hn < 4) hex[hn++] = '0';
+    while (rn) hex[hn++] = rev[--rn];
+    hex[hn] = 0;
+    lust_String s = lust_string_new();
+    lust_string_push_cstr(&s, what);
+    lust_string_push_cstr(&s, ": need ");
+    lust_fmt_u64(&s, need);
+    lust_string_push_cstr(&s, " bytes to encode U+");
+    lust_string_push_cstr(&s, hex);
+    lust_string_push_cstr(&s, " but buffer has just ");
+    lust_fmt_u64(&s, have);
+    lust_panic_dyn(&s, loc);
+})
+
+/* `char::encode_utf8` into a caller buffer: the byte count written,
+   or core's panic when the buffer is short. */
+uint64_t lust_char_encode_utf8(uint32_t c, uint8_t *dst, uint64_t dst_len, lust_loc loc) LUST_BODY({
+    uint64_t n = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (dst_len < n) lust_encode_panic("encode_utf8", n, c, dst_len, loc);
+    if (n == 1) {
+        dst[0] = (uint8_t)c;
+    } else if (n == 2) {
+        dst[0] = (uint8_t)(0xC0 | (c >> 6));
+        dst[1] = (uint8_t)(0x80 | (c & 0x3F));
+    } else if (n == 3) {
+        dst[0] = (uint8_t)(0xE0 | (c >> 12));
+        dst[1] = (uint8_t)(0x80 | ((c >> 6) & 0x3F));
+        dst[2] = (uint8_t)(0x80 | (c & 0x3F));
+    } else {
+        dst[0] = (uint8_t)(0xF0 | (c >> 18));
+        dst[1] = (uint8_t)(0x80 | ((c >> 12) & 0x3F));
+        dst[2] = (uint8_t)(0x80 | ((c >> 6) & 0x3F));
+        dst[3] = (uint8_t)(0x80 | (c & 0x3F));
+    }
+    return n;
+})
+
+/* `char::encode_utf16` into a caller buffer: the unit count written,
+   or core's panic (which says "bytes") when the buffer is short. */
+uint64_t lust_char_encode_utf16(uint32_t c, uint16_t *dst, uint64_t dst_len, lust_loc loc) LUST_BODY({
+    uint64_t n = c < 0x10000 ? 1 : 2;
+    if (dst_len < n) lust_encode_panic("encode_utf16", n, c, dst_len, loc);
+    if (n == 1) {
+        dst[0] = (uint16_t)c;
+    } else {
+        uint32_t v = c - 0x10000;
+        dst[0] = (uint16_t)(0xD800 + (v >> 10));
+        dst[1] = (uint16_t)(0xDC00 + (v & 0x3FF));
+    }
+    return n;
+})
+
 /* UTF-8 validation with Rust's error report (core::str::validations::
    run_utf8_validation): 1 when `v` is valid; else 0 with the length of
    the valid prefix and the invalid sequence's length (1 to 3), or 0 when

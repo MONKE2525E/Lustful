@@ -17,6 +17,7 @@
 //     pub fn fmt_align(f: &mut Formatter<'_>) -> u32;  // core, std: 0 left 1 right 2 center 3 none
 //     pub fn panic_hook_custom(on: bool);              // std: a set_hook hook is installed
 //     pub fn panic_default_hook(file: &str, line: u32, col: u32, msg: &str);  // std: default hook text
+//     pub fn char_case(c: u32, upper: bool) -> u128;  // core: case mapping packed (points lo, count hi)
 //
 // The std platform crate (library/std/src/platform.rs, W-SHIM; C in
 // src/runtime/sys.c):
