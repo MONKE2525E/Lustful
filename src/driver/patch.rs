@@ -560,7 +560,7 @@ fn shift_table_spans(tables: &mut ResolvedTables, edit: Edit) {
     }
 }
 
-fn fn_def_at_mut(ast: &mut Ast, item: usize, sub: Option<usize>) -> &mut FnDef {
+pub(super) fn fn_def_at_mut(ast: &mut Ast, item: usize, sub: Option<usize>) -> &mut FnDef {
     match (&mut ast.items[item].kind, sub) {
         (ItemKind::Fn(d), None) => d,
         (ItemKind::Impl(imp), Some(k)) => &mut imp.fns[k],

@@ -141,8 +141,13 @@ pub fn shift_ast(ast: &mut Ast, edit: Edit, ranges: Option<&FileRanges>) -> usiz
 /// `file` (a replaced fn body, before the shift): expressions become
 /// `()`, patterns `_`, types `_`, blocks empty. Nothing reaches them any
 /// more, but passes that scan whole arenas would still see their kinds.
+/// A node a macro expanded counts by its call site: its own span can
+/// name the macro's definition, outside the body that called it.
 pub fn blank_nodes(ast: &mut Ast, file: FileId, (lo, hi): (u32, u32), ranges: Option<&FileRanges>) {
-    let inside = |s: &Span| s.file == file && lo <= s.lo && s.hi <= hi;
+    let inside = |s: &Span| {
+        let s = if s.ctxt == CtxtId::ROOT { *s } else { crate::diag::call_site_span(*s) };
+        s.file == file && lo <= s.lo && s.hi <= hi
+    };
     let all = |n: usize| vec![0..n];
     let pick = |n: usize, f: fn(&FileRanges) -> &Vec<Range<usize>>| ranges.map_or_else(|| all(n), |r| f(r).clone());
     for i in pick(ast.exprs.len(), |r| &r.exprs).into_iter().flatten() {

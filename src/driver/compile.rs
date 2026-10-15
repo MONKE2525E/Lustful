@@ -21,6 +21,8 @@
 //      clear instead when reuse is not provable (first compile, Adt sequence change, or slot
 //      compaction; see `slot_update`).
 use super::session::{Caches, Chunk, Front, Session};
+use super::patch::fn_def_at_mut;
+use super::span_shift;
 use super::{Cmd, Request, Response};
 use crate::ast::{Ast, ItemKind};
 use crate::cgen::{self, FnOut, GlueSet};
@@ -201,7 +203,8 @@ impl Stats {
 #[derive(Default)]
 struct Visits {
     path: &'static str,
-    /// Why a resolver-path request did not patch (`patch::try_patch`).
+    /// Why a resolver-path request did not patch (`patch::try_patch`),
+    /// or the chunk path's rule (`bodies`, `signatures`, `full`).
     why: &'static str,
     files: usize,
     nodes: usize,
@@ -293,17 +296,34 @@ fn fold_fn_text(sc: &mut scan::ChunkScan, lexed: &lexer::Lexed, src: &str) {
     }
 }
 
-/// True when a body item of the current Ast lies inside this fn's body
-/// (by span). Re-parsing such a body in bodies mode would push fresh
-/// copies of its body items next to the old ones in `stmt_items`, so
-/// the caller falls back to a full parse for that request instead.
-fn body_owns_stmt_items(ast: &Ast, item: usize, sub: Option<usize>) -> bool {
-    if ast.stmt_items.is_empty() {
+/// True when the chunk path's bodies mode can take a request exactly.
+/// The request's one edit (old bytes `edit.0..edit.1`, now `delta` bytes
+/// longer) moves every span edge at or after `edit.1` and no edge before
+/// it, so a kept node with an edge inside the window would land wrong: a
+/// moving edit must sit strictly inside one changed fn's body. And each
+/// changed fn must have no node between its parameters and its body
+/// (parameter patterns, expressions in parameter or return types):
+/// `FnDef::exprs` and `pats` start there in a cold parse, and the new
+/// body's ranges would drop them (closure numbering reads the ranges).
+/// The body patch (driver/patch.rs) applies the same two rules.
+fn bodies_mode_ok(ast: &Ast, fn_loc: &[(usize, Option<usize>)], changed: &[usize], edit: (usize, usize), delta: i64) -> bool {
+    let body_span = |i: usize| {
+        let (item, sub) = fn_loc[i];
+        fn_def_at(ast, item, sub).body.map(|b| ast.block(b).span)
+    };
+    let inside = |sp: diag::Span| sp.file == ROOT_FILE && (sp.lo as usize) < edit.0 && edit.1 < sp.hi as usize;
+    if delta != 0 && !changed.iter().any(|&i| body_span(i).is_some_and(inside)) {
         return false;
     }
-    let Some(body) = fn_def_at(ast, item, sub).body else { return false };
-    let span = ast.block(body).span;
-    ast.stmt_items.iter().any(|it| it.span.file == span.file && it.span.lo >= span.lo && it.span.hi <= span.hi)
+    changed.iter().all(|&i| {
+        let (item, sub) = fn_loc[i];
+        let def = fn_def_at(ast, item, sub);
+        let Some(body) = body_span(i) else { return false };
+        let starts_in_body = |(first, end): (u32, u32), spans: &[diag::Span]| {
+            first == end || spans.get(first as usize).is_some_and(|s| s.file == body.file && body.lo <= s.lo && s.hi <= body.hi)
+        };
+        def.params.iter().all(|p| p.pat.is_none()) && starts_in_body(def.exprs, &ast.expr_spans) && starts_in_body(def.pats, &ast.pat_spans)
+    })
 }
 
 /// The fn at one `fn_locations` entry.
@@ -806,97 +826,20 @@ fn chunk_reads_files(c: &Chunk) -> bool {
     c.text.contains("include")
 }
 
-/// Shifts every AST span in file `file` at or after old offset `lo` by `delta` bytes.
-/// The caller passes the old start of the common suffix: every byte from there on is the
-/// same text at a new offset, so every span there moves by `delta`. This threshold matters
-/// inside the changed region too: in bodies-only mode an unchanged function after the edit
-/// point in the same chunk keeps its old AST, and its spans must move or its diagnostic
-/// and panic columns are off by the edit size. Spans in changed text belong to bodies or
-/// items that this compile re-parses before use, so shifting their dead nodes is harmless.
-/// Runs before anything new is parsed in this compile, so every span in the AST is still
-/// in old coordinates.
-fn shift_ast_spans(front: &mut Front, file: FileId, lo: usize, delta: i64) {
+/// Moves every AST span of the root file for the request's one edit:
+/// old bytes `a..b` (the text between the common prefix and suffix) now
+/// take `b - a + delta` bytes. The walk is `span_shift::shift_ast`, which
+/// a test holds to a re-parse of edited text; a hand list of span fields
+/// here once missed `ImplDef::span`, and a std impl spliced after the
+/// edit fell out of `Ast::lang_methods` (fuzz realish seed 42, iter 135).
+/// Runs before anything new is parsed in this compile, so every span in
+/// the AST is still in old coordinates.
+fn shift_ast_spans(front: &mut Front, a: usize, b: usize, delta: i64) {
     if delta == 0 {
         return;
     }
-    let lo = lo as u32;
-    let mut sh = |s: &mut diag::Span| {
-        if s.file == file && s.lo >= lo {
-            *s = s.shifted(delta);
-        }
-    };
-    let ast = &mut front.ast;
-    for s in ast.expr_spans.iter_mut().chain(ast.pat_spans.iter_mut()).chain(ast.ty_spans.iter_mut()) {
-        sh(s);
-    }
-    for b in &mut ast.blocks {
-        sh(&mut b.span);
-        for st in &mut b.stmts {
-            if let crate::ast::Stmt::Let { span, .. } = st {
-                sh(span);
-            }
-        }
-    }
-    for e in &mut ast.exprs {
-        match e {
-            crate::ast::Expr::MethodCall { name_span, .. } => sh(name_span),
-            crate::ast::Expr::StructLit { fields, .. } => {
-                for (_, s, _) in fields {
-                    sh(s);
-                }
-            }
-            _ => {}
-        }
-    }
-    fn shift_fn(f: &mut crate::ast::FnDef, sh: &mut impl FnMut(&mut diag::Span)) {
-        sh(&mut f.name_span);
-        if let Some(sp) = &mut f.self_param {
-            sh(&mut sp.span);
-        }
-        for p in &mut f.params {
-            sh(&mut p.span);
-        }
-    }
-    for item in ast.items.iter_mut().chain(ast.stmt_items.iter_mut()) {
-        sh(&mut item.span);
-        match &mut item.kind {
-            ItemKind::Fn(f) => shift_fn(f, &mut sh),
-            ItemKind::Struct(s) => {
-                sh(&mut s.name_span);
-                match &mut s.fields {
-                    crate::ast::VariantFields::Struct(fs) | crate::ast::VariantFields::Tuple(fs) => {
-                        for fd in fs {
-                            sh(&mut fd.span);
-                        }
-                    }
-                    crate::ast::VariantFields::Unit => {}
-                }
-                for (_, sp) in &mut s.derives {
-                    sh(sp);
-                }
-            }
-            ItemKind::Enum(e) => {
-                sh(&mut e.name_span);
-                for v in &mut e.variants {
-                    sh(&mut v.span);
-                    if let crate::ast::VariantFields::Struct(fs) | crate::ast::VariantFields::Tuple(fs) = &mut v.fields {
-                        for fd in fs {
-                            sh(&mut fd.span);
-                        }
-                    }
-                }
-                for (_, sp) in &mut e.derives {
-                    sh(sp);
-                }
-            }
-            ItemKind::Impl(imp) => {
-                for f in &mut imp.fns {
-                    shift_fn(f, &mut sh);
-                }
-            }
-            _ => {}
-        }
-    }
+    let edit = span_shift::Edit { file: ROOT_FILE, a: a.min(b) as u32, b: b as u32, d: delta };
+    span_shift::shift_ast(&mut front.ast, edit, None);
 }
 
 /// True when a column-0 line starts an outer doc comment, which the lexer
@@ -2249,6 +2192,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // An unbalanced chunk parsed alone fails at its own first bad token; the whole file
     // (as a cold compile sees it) reports the delimiter first, before macro errors elsewhere.
     let unbalanced = ranges.len() > 1 && fresh.iter().flatten().any(|(l, ..)| expand::delimiter_error(&l.tokens).is_some());
+    // Per chunk of this request, true when its text was lexed fresh, and
+    // the old bytes whose items the fresh chunks replace.
+    let mut fresh_chunks: Vec<bool> = Vec::with_capacity(ranges.len());
+    let mut replaced_old = (region_start, region_end_old);
     if split_inner_attr || unbalanced || fresh.iter().any(|l| l.is_err()) {
         // A chunk cut a comment or string the scanner did not see, or the text is bad, or the
         // file has an inner attribute (`has_inner_attr`): lex the whole file. Its error is the
@@ -2259,6 +2206,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 let mut sc = scan::scan(&whole);
                 fold_fn_text(&mut sc, &whole, &src);
                 let inner_attr = has_inner_attr(&whole);
+                fresh_chunks.push(true);
+                replaced_old = (0, old_len);
                 front.chunks = vec![Chunk {
                     start: 0,
                     text: src.clone(),
@@ -2277,6 +2226,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let mut fresh = need.iter().zip(fresh).map(|(&i, r)| (i, r.unwrap())).collect::<Vec<_>>().into_iter();
         let mut next_fresh = fresh.next();
         for (i, &(a, b)) in ranges.iter().enumerate() {
+            fresh_chunks.push(reused[i].is_none());
             let chunk = match reused[i].take() {
                 Some(mut c) => {
                     // Same text at a new position, and the edges are proven boundaries, so the
@@ -2302,12 +2252,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             };
             front.chunks.push(chunk);
         }
-    }
-    // The common suffix moved by `delta`: put its AST spans (still in old coordinates, nothing
-    // new parsed yet) at their new positions. The threshold is the suffix start, not the first
-    // kept chunk: unchanged items between the edit and that chunk keep their old AST.
-    if old_len > 0 {
-        shift_ast_spans(front, ROOT_FILE, old_len - suffix, delta);
     }
     let item_scans: Vec<scan::ItemScan> = front.chunks.iter().flat_map(|c| c.scan.items.iter().copied()).collect();
     let env = scan::env_hash(item_scans.iter());
@@ -2346,11 +2290,34 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // file order. Such a file takes the full parse. (The signatures
     // splice below does replace a re-parsed chunk's body items; this
     // guard stays as the driver's rule until reuse there is proven.)
+    // A chunk without parsed items (`Chunk::items`) is new text, or a kept
+    // chunk an earlier request left stale after a parse error: either way
+    // the live Ast has no nodes for it (stale ones were blanked), so it
+    // must be parsed before use. Bodies mode parses no chunk, so it needs
+    // none of them.
     let splice = front.ast.stmt_items.is_empty();
-    let bodies_only = splice && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
+    let stale = front.chunks.iter().zip(&fresh_chunks).any(|(ch, &fresh)| ch.items.is_none() && !fresh);
+    let bodies_only = splice && !stale && front.env_hash == Some(env) && front.ast_fn_count == fn_count;
+    // The edit window in old coordinates: old bytes `edit.0..edit.1`
+    // changed; everything before and after is the same text.
+    let edit = (prefix, old_len - suffix);
+    // Bodies mode re-parses the changed bodies into the live Ast and moves
+    // every other span for the one edit. It applies only when that is
+    // exact (`bodies_mode_ok`); else the request takes signatures mode,
+    // which re-parses the chunks the edit touched.
+    let bodies_changed: Option<Vec<usize>> = bodies_only
+        .then(|| {
+            (0..fn_count)
+                .filter(|&i| {
+                    let slot = front.fn_slot[i] as usize;
+                    front.slot_hash[slot] != scan_of(front, i).0 || !caches.ok[slot]
+                })
+                .collect::<Vec<usize>>()
+        })
+        .filter(|changed| bodies_mode_ok(&front.ast, &front.fn_loc, changed, edit, delta));
     let changed_names =
-        if bodies_only || !splice || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
-    let mut mode = if bodies_only {
+        if bodies_changed.is_some() || !splice || front.env_hash.is_none() { None } else { fn_only_changes(&front.items, &item_scans) };
+    let mut mode = if bodies_changed.is_some() {
         "bodies"
     } else if changed_names.is_some() {
         "signatures"
@@ -2358,94 +2325,77 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         "full"
     };
 
-    // Bodies mode re-parses changed bodies into the live Ast. A body
-    // that owns body items (a nested fn, const, static, or `use`) cannot
-    // be re-parsed that way: `parse_body` appends fresh body items while
-    // the old ones stay in `stmt_items`, and collect would enumerate
-    // both. Such a request falls back to the full parse below, which
-    // rebuilds the Ast from chunks. `bodies_out` is None on that
-    // fall-back (and when bodies mode does not apply at all).
-    let bodies_out: Option<(Vec<usize>, Vec<usize>, bool)> = if bodies_only {
-        let mut changed: Vec<usize> = (0..fn_count)
-            .filter(|&i| {
-                let slot = front.fn_slot[i] as usize;
-                front.slot_hash[slot] != scan_of(front, i).0 || !caches.ok[slot]
-            })
-            .collect();
-        let owns_items = changed.iter().any(|&i| {
-            let (item, sub) = front.fn_loc[i];
-            body_owns_stmt_items(&front.ast, item, sub)
-        });
-        if owns_items {
-            mode = "full";
-            None
-        } else {
-        let mut grew_stmt_items = false;
+    // Bodies mode: parse every changed body on its own first (as the body
+    // patch does), so a parse error or a new body item is known before the
+    // live Ast changes. `bodies_out` is None when bodies mode does not
+    // apply, or when a new body gained body items (a nested fn, const,
+    // static, or `use`): `parse_body` cannot place those in `stmt_items`
+    // in parser order, so that request takes the full parse.
+    let bodies_out: Option<(Vec<usize>, Vec<usize>, bool)> = if let Some(mut changed) = bodies_changed {
         for &i in &changed {
-            // A changed body is in a changed chunk, so its tokens are freshly lexed.
-            let chunk = &front.chunks[fn_at[i].0];
-            let f = &chunk.scan.fns[fn_at[i].1];
-            let toks = &chunk.lexed.tokens[f.body.clone()];
             let slot = front.fn_slot[i] as usize;
-            front.slot_hash[slot] = f.body_hash;
             // The hash now names a body that has not been checked yet, so
-            // the old passing mark must go with it: if a later body in
-            // this loop fails to parse, the early return below must not
-            // leave this function looking unchanged and passing (fuzz
-            // seed 29, iter 562). The check loop rewrites `ok` for every
-            // changed function it reaches.
+            // the old passing mark goes with it: after a parse error below
+            // this function must not look unchanged and passing (fuzz seed
+            // 29, iter 562). The check loop rewrites `ok` for every changed
+            // function it reaches.
+            front.slot_hash[slot] = scan_of(front, i).0;
             caches.ok[slot] = false;
             caches.has_out[slot] = false;
             if let Some(r) = caches.slot_reads.get_mut(slot) {
                 *r = None;
             }
-            let stmt_before = front.ast.stmt_items.len();
-            match parser::parse_body(toks, &chunk.lexed.strings, &mut front.ast, &front.interner, &front.known) {
-                Ok((body, exprs, pats)) => {
-                    // The new body gained body items the old one did
-                    // not have (the pre-check above covers the old
-                    // side): bail to the full parse, which rebuilds
-                    // `stmt_items` in parser order.
-                    if front.ast.stmt_items.len() != stmt_before {
-                        grew_stmt_items = true;
-                        break;
-                    }
-                    let (item, sub) = front.fn_loc[i];
-                    let def = match (item != usize::MAX, sub) {
-                        (false, Some(k)) => match &mut front.ast.stmt_items[k].kind {
-                            ItemKind::Fn(d) => d,
-                            _ => unreachable!("fn_loc out of date"),
-                        },
-                        _ => match (&mut front.ast.items[item].kind, sub) {
-                            (ItemKind::Fn(d), None) => d,
-                            (ItemKind::Impl(imp), Some(k)) => &mut imp.fns[k],
-                            _ => unreachable!("fn_loc out of date"),
-                        },
-                    };
-                    def.body = Some(body);
-                    // Parameter patterns were parsed with the old
-                    // range and are not part of the new body: keep
-                    // the old range start so their nodes stay
-                    // inside it (the arena only appends).
-                    if def.params.iter().any(|p| p.pat.is_some()) {
-                        def.exprs = (def.exprs.0.min(exprs.0), exprs.1);
-                        def.pats = (def.pats.0.min(pats.0), pats.1);
-                    } else {
-                        def.exprs = exprs;
-                        def.pats = pats;
-                    }
-                }
+        }
+        let mut parsed = Vec::with_capacity(changed.len());
+        let mut failed = None;
+        for &i in &changed {
+            let chunk = &front.chunks[fn_at[i].0];
+            let f = &chunk.scan.fns[fn_at[i].1];
+            let mut body_ast = Ast::default();
+            match parser::parse_body(&chunk.lexed.tokens[f.body.clone()], &chunk.lexed.strings, &mut body_ast, &front.interner, &front.known) {
+                Ok((body, exprs, pats)) => parsed.push((body_ast, body, exprs, pats)),
                 Err(d) => {
-                    caches.ok[slot] = false;
-                    return errors(&mut [d], &map, &src, req);
+                    failed = Some(d);
+                    break;
                 }
             }
         }
         t.lap("parse changed bodies");
-        if grew_stmt_items {
+        if failed.is_none() && parsed.iter().any(|(a, ..)| !a.stmt_items.is_empty()) {
             mode = "full";
             None
         } else {
+            // The old bodies' nodes stay in the arenas, unreachable: blank
+            // them while their spans are in old coordinates, because some
+            // passes scan whole arenas (closures, `dyn`, type paths).
+            for &i in &changed {
+                let (item, sub) = front.fn_loc[i];
+                if let Some(b) = fn_def_at(&front.ast, item, sub).body {
+                    let sp = front.ast.block(b).span;
+                    span_shift::blank_nodes(&mut front.ast, sp.file, (sp.lo, sp.hi), None);
+                }
+            }
+            shift_ast_spans(front, edit.0, edit.1, delta);
+            if let Some(d) = failed {
+                // The changed bodies are blank and not replaced: their
+                // chunks go stale, so the next request parses them again.
+                for &i in &changed {
+                    front.chunks[fn_at[i].0].items = None;
+                }
+                return errors(&mut [d], &map, &src, req);
+            }
+            for (&i, (body_ast, body, exprs, pats)) in changed.iter().zip(parsed) {
+                let before = (front.ast.exprs.len() as u32, front.ast.pats.len() as u32, front.ast.blocks.len() as u32);
+                let stmt_base = front.ast.stmt_items.len() as u32;
+                let _ = front.ast.append_chunk(body_ast, stmt_base);
+                let (item, sub) = front.fn_loc[i];
+                let def = fn_def_at_mut(&mut front.ast, item, sub);
+                def.body = Some(crate::ast::BlockId(body.0 + before.2));
+                // `bodies_mode_ok` proved no node sits between the
+                // parameters and the body, so these are the cold ranges.
+                def.exprs = (exprs.0 + before.0, exprs.1 + before.0);
+                def.pats = (pats.0 + before.1, pats.1 + before.1);
+            }
         // A changed const fn body can move const and static values,
         // array lengths, and discriminants that unchanged bodies baked
         // in. Make every unchanged passing body a dirty-walk candidate,
@@ -2454,18 +2404,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // `Sig` fingerprints fold the new values.
         let const_fn_changed = changed.iter().any(|&i| {
             let (item, sub) = front.fn_loc[i];
-            let def = match (item != usize::MAX, sub) {
-                (false, Some(k)) => match &front.ast.stmt_items[k].kind {
-                    ItemKind::Fn(d) => d,
-                    _ => unreachable!("fn_loc out of date"),
-                },
-                _ => match (&front.ast.items[item].kind, sub) {
-                    (ItemKind::Fn(d), None) => d,
-                    (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
-                    _ => unreachable!("fn_loc out of date"),
-                },
-            };
-            def.qual.is_const
+            fn_def_at(&front.ast, item, sub).qual.is_const
         });
         let mut mention_only = Vec::new();
         if const_fn_changed {
@@ -2477,7 +2416,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         Some((changed, mention_only, const_fn_changed))
-        }
         }
     } else {
         None
@@ -2492,6 +2430,26 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // parse scopes them (the first chunk reads them itself).
         let seed = chunk_seed_allows(front);
         let parsed = par_map(&todo, |&i| parse_chunk(front, i, &seed));
+        // The replaced items' nodes go (see the bodies mode blank) while
+        // their spans are in old coordinates, then every span moves. On a
+        // parse error too: the fresh chunks then stay without items, so
+        // the next request parses them again.
+        // Fresh chunks replace old bytes `replaced_old`; a stale kept
+        // chunk replaces its own old bytes (it moved by `delta` if it sits
+        // after the edit).
+        if old_len > 0 {
+            let mut gone = vec![replaced_old];
+            for (c, &fresh) in front.chunks.iter().zip(&fresh_chunks) {
+                if c.items.is_none() && !fresh {
+                    let lo = if c.start >= region_end { (c.start as i64 - delta) as usize } else { c.start };
+                    gone.push((lo, lo + c.text.len()));
+                }
+            }
+            for (lo, hi) in gone {
+                span_shift::blank_nodes(&mut front.ast, ROOT_FILE, (lo as u32, hi as u32), None);
+            }
+            shift_ast_spans(front, edit.0, edit.1, delta);
+        }
         if let Some(Err(d)) = parsed.iter().find(|p| p.is_err()) {
             let d = d.clone();
             return errors(&mut [d], &map, &src, req);
@@ -2625,6 +2583,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
 
+    // The chunk path's rule, for the visits line (fuzz coverage).
+    visits.why = mode;
     let fn_lines_all: Vec<u32> = (0..fn_count).map(|i| scan_of(front, i).1).collect();
     let body_hashes_all: Vec<u64> = (0..fn_count).map(|i| scan_of(front, i).0).collect();
     (map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, None)
@@ -4377,6 +4337,114 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
             codes.push(w.code);
         }
         assert_eq!(codes, [0, 0, 1, 0, 1, 0, 0, 0], "each step's expected answer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a warm chunk-path Ast must share with a cold parse of the same
+    /// text: the spans of items, impls, and fn names; the closures and
+    /// `a::b` value paths whole-arena scans see; and per fn (in `fn_loc`
+    /// order) the sizes of its `exprs` and `pats` ranges and its closures.
+    type ChunkShape = (Vec<(u32, u32)>, usize, usize, Vec<(u32, u32, usize)>);
+
+    fn chunk_shape(s: &Session) -> ChunkShape {
+        use crate::ast::Expr;
+        let ast = &s.front.ast;
+        let mut spans = Vec::new();
+        for it in &ast.items {
+            spans.push((it.span.lo, it.span.hi));
+            match &it.kind {
+                ItemKind::Fn(f) => spans.push((f.name_span.lo, f.name_span.hi)),
+                ItemKind::Impl(imp) => {
+                    spans.push((imp.span.lo, imp.span.hi));
+                    spans.extend(imp.fns.iter().map(|f| (f.name_span.lo, f.name_span.hi)));
+                }
+                _ => {}
+            }
+        }
+        let closure = |e: &Expr| matches!(e, Expr::Closure { .. });
+        let closures = ast.exprs.iter().filter(|e| closure(e)).count();
+        let paths = ast.exprs.iter().filter(|e| matches!(e, Expr::Path(segs) if segs.len() > 1)).count();
+        let fns = s
+            .front
+            .fn_loc
+            .iter()
+            .map(|&(item, sub)| {
+                let d = fn_def_at(ast, item, sub);
+                let n = (d.exprs.0..d.exprs.1).filter(|&x| closure(&ast.exprs[x as usize])).count();
+                (d.exprs.1 - d.exprs.0, d.pats.1 - d.pats.0, n)
+            })
+            .collect();
+        (spans, closures, paths, fns)
+    }
+
+    /// The chunk path's bodies and signatures modes leave the same Ast a
+    /// cold parse builds (fuzz realish seeds 42, 123, 777: a body edit
+    /// that removed bytes left the span of a std impl spliced after the
+    /// user text in place, and the impl fell out of the std method range,
+    /// L0102). Each step's warm answer and Ast shape equal a cold
+    /// session's: a body edit that removes lines; a body edit of a fn
+    /// with a parameter pattern (signatures mode: bodies mode would widen
+    /// its expression range over other fns' closures); a body that drops
+    /// a closure and a bad path (their dead nodes must not stay visible);
+    /// one write that edits two bodies; a body syntax error, then a
+    /// signature edit elsewhere while it stands, then its fix.
+    #[test]
+    fn chunk_modes_match_a_cold_parse() {
+        let dir = std::env::temp_dir().join(format!("lust-chunk-modes-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("modes.rs");
+        let key = crate::protocol::SessionKey::synthetic(&file, false);
+        let req = req_for(key.clone());
+        let pad: String = (0..40).map(|i| format!("    let p{i} = {i};\n    t += p{i};\n")).collect();
+        // Over 64 KiB, so the file splits into many chunks.
+        let fill: String = (0..1600).map(|i| format!("fn fill{i}(n: i64) -> i64 {{\n    n + {i}\n}}\n")).collect();
+        let v0 = format!(
+            "fn total(xs: &[i64]) -> i64 {{\n    let mut t = 0;\n    for x in xs {{\n        t += x;\n    }}\n{pad}    t\n}}\n\
+             {fill}\
+             fn pair((a, b): (i64, i64)) -> i64 {{\n    let f = |x: i64| x + a;\n    f(b)\n}}\n\
+             fn twice(n: i64) -> i64 {{\n    let g = |x: i64| x * 2;\n    g(n)\n}}\n\
+             fn main() {{\n    let r: Result<i64, String> = Ok(total(&[1, 2, 3]));\n    let o: Option<i64> = r.ok().map(|v| v * 2);\n    \
+             println!(\"{{}} {{}} {{}} {{}}\", o.unwrap_or(0), pair((1, 2)), twice(3), fill7(1));\n}}\n"
+        );
+        let v1 = v0.replace(&pad, "");
+        let v2 = v1.replace("x + a;", "x + a + 1;");
+        let v3 = v2.replace("    let g = |x: i64| x * 2;\n    g(n)\n", "    n * 2\n");
+        let v4 = v3.replace("    n * 2\n", "    let m = HashMap::<i64, i64>::new();\n    n * 2\n");
+        let v5 = v3.clone();
+        let v6 = v5.replace("        t += x;\n", "        t += x + 0;\n").replace("    n * 2\n", "    n * 2 + 0\n");
+        let v7 = v6.replace("        t += x + 0;\n", "        t += ;\n");
+        let v8 = v7.replace("fn fill1500(n: i64) -> i64 {\n    n + 1500\n", "fn fill1500(n: i64, _k: u8) -> i64 {\n    n + 1500\n");
+        let v9 = v8.replace("        t += ;\n", "        t += x;\n");
+        let steps = [
+            ("primer", &v0, Some("full")),
+            ("lines removed", &v1, Some("bodies")),
+            ("param pattern", &v2, Some("signatures")),
+            ("closure dropped", &v3, Some("bodies")),
+            ("bad path", &v4, None),
+            ("bad path gone", &v5, Some("bodies")),
+            ("two bodies", &v6, Some("signatures")),
+            ("syntax error", &v7, None),
+            ("signature edit under it", &v8, None),
+            ("fixed", &v9, None),
+        ];
+        let mut warm = Session::new(dir.join("warm"), true, key.clone());
+        let mut codes = Vec::new();
+        for (k, (name, text, mode)) in steps.iter().enumerate() {
+            std::fs::write(&file, text).unwrap();
+            let w = compile(&req, &mut warm);
+            let mut cold_session = Session::new(dir.join(format!("cold{k}")), false, key.clone());
+            let c = compile(&req, &mut cold_session);
+            assert_eq!((w.code, &w.stderr), (c.code, &c.stderr), "step {name}: warm vs cold");
+            codes.push(w.code);
+            if let Some(mode) = mode {
+                assert_eq!(w.code, 0, "step {name}: {}", w.stderr);
+                let why = warm.front.last_visits.split_whitespace().find_map(|kv| kv.strip_prefix("why=")).unwrap_or("");
+                assert_eq!(why, *mode, "step {name}: chunk mode");
+                assert!(chunk_shape(&warm) == chunk_shape(&cold_session), "step {name}: warm Ast shape vs cold");
+            }
+        }
+        assert_eq!(codes, [0, 0, 0, 0, 1, 0, 0, 1, 1, 0], "each step's expected answer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
