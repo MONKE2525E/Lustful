@@ -18,9 +18,16 @@ source for both. Per slice it records:
   - signature, type, impl, error, and fix edits from the slice's edits.json,
     each applied and reverted in several cycles
   - warm build after a body edit (a subset of the body edits)
-  - wall median, p95, worst per row; lust phase times (--timings) per row;
-    C bytes, units compiled, and link time (LUST_STATS, build rows); peak RSS
-    (the lust daemon's VmHWM; for cargo, the largest process in its tree)
+  - wall median, p95, worst per row, and the rustc/lust ratio for median
+    and p95; lust phase times (--timings) per row; C bytes, units compiled,
+    and link time (LUST_STATS, build rows); peak RSS (the lust daemon's
+    VmHWM; for cargo, the largest process in its tree)
+  - one record per lust request in the result JSON (`requests`): row, edit
+    id, target fn, wall, every phase, and the `lust-visits:` counters, with
+    the body-patch and kept-program (W-INCR3 `kept=`) hit or miss and its
+    reason. Phase medians count a phase a request did not emit as zero
+    (`lust_phases_median_ms`); `lust_phases_when_present_median_ms` keeps
+    the old when-present view, with `lust_phases_present_n` counts.
 
 rustc runs in two configs, each with its own target dir: `default` (stable dev
 profile, incremental on) and `threads8` (RUSTC_BOOTSTRAP=1, -Z threads=8). Both
@@ -102,9 +109,96 @@ def parse_stats(stderr):
     return out
 
 
+def parse_visits(stderr):
+    """The last `lust-visits:` line (needs LUST_STATS) -> {counter: value}."""
+    out = {}
+    for line in stderr.splitlines():
+        if line.startswith("lust-visits:"):
+            out = {}
+            for kv in line.split(":", 1)[1].split():
+                k, _, v = kv.partition("=")
+                out[k] = int(v) if v.isdigit() else v
+    return out
+
+
+def classify_request(visits, phases):
+    """Body-patch and kept-program hit or miss for one request, with reasons.
+
+    Patch: `path=patch` is a hit; `path=resolve`/`chunks` is a full-resolve
+    miss and `why=` names the condition that stopped the patch. Kept
+    program (W-INCR3): `kept=reuse` is a hit, any other value (`mode`,
+    `fn_class`, `discovery`, `body_scan`, `gen_state`, `none`) is the miss
+    reason, and a visits line with no `kept=` field at all means this lust
+    build does not expose it yet (`not_exposed`, the hook for W-INCR3).
+    """
+    why = visits.get("why")
+    why = None if why in (None, "-", "") else why
+    path = visits.get("path")
+    if path == "patch":
+        patch = {"status": "hit", "reason": None}
+    elif path in ("resolve", "chunks"):
+        patch = {"status": "miss", "reason": why}
+    elif path:
+        patch = {"status": "unknown", "reason": f"path={path}"}
+    elif "body patch" in phases:
+        patch = {"status": "hit", "reason": None}
+    elif any(k.startswith("resolve:") for k in phases):
+        patch = {"status": "miss", "reason": None}
+    else:
+        patch = {"status": "unknown", "reason": None}
+    if not visits:
+        kept = {"status": "unknown", "reason": None}
+    elif "kept" not in visits:
+        kept = {"status": "not_exposed", "reason": None}
+    elif visits["kept"] == "reuse":
+        kept = {"status": "hit", "reason": None}
+    elif visits["kept"] in ("-", ""):
+        kept = {"status": "not_applicable", "reason": None}
+    else:
+        kept = {"status": "miss", "reason": visits["kept"]}
+    return {"patch": patch, "kept": kept}
+
+
+def count_patch_kept(requests):
+    """Hit/miss counts and miss reasons over per-request records."""
+    out = {"patch": {"hits": 0, "misses": 0, "unknown": 0, "miss_reasons": {}},
+           "kept": {"hits": 0, "misses": 0, "unknown": 0, "not_exposed": 0,
+                    "not_applicable": 0, "miss_reasons": {}}}
+    for r in requests:
+        for kind in ("patch", "kept"):
+            c = r[kind]
+            bucket = {"hit": "hits", "miss": "misses"}.get(c["status"], c["status"])
+            if bucket in out[kind]:
+                out[kind][bucket] += 1
+            if c["status"] == "miss" and c["reason"]:
+                out[kind]["miss_reasons"][c["reason"]] = out[kind]["miss_reasons"].get(c["reason"], 0) + 1
+    return out
+
+
+def phase_summaries(phases_list):
+    """Per-phase stats over all requests of a row. A phase a request did not
+    emit counts as zero in the overall values; `median_when_present` and
+    `n_present` keep the fallback-only view visible and labeled."""
+    names = []
+    for ph in phases_list:
+        for k in ph:
+            if k not in names:
+                names.append(k)
+    out = {}
+    for k in names:
+        present = [ph[k] for ph in phases_list if k in ph]
+        overall = summary([ph.get(k, 0.0) for ph in phases_list])
+        out[k] = {"median_overall": overall["median"], "p95_overall": overall["p95"],
+                  "worst_overall": overall["worst"],
+                  "median_when_present": round(statistics.median(present), 2),
+                  "n_present": len(present), "n": len(phases_list)}
+    return out
+
+
 def strip_noise(text):
     return "\n".join(l for l in text.splitlines()
-                     if not TIMING_LINE.match(l) and not TIMING_HEAD.match(l) and not l.startswith("lust-stats:"))
+                     if not TIMING_LINE.match(l) and not TIMING_HEAD.match(l)
+                     and not l.startswith("lust-stats:") and not l.startswith("lust-visits:"))
 
 
 class Bench:
@@ -132,11 +226,15 @@ class Bench:
         (self.crate / "Cargo.toml").write_text(
             f'[package]\nname = "slice"\nversion = "0.0.0"\nedition = "2024"\n\n'
             f'[[bin]]\nname = "slice"\npath = "src/{root}"\n\n[profile.dev]\ndebug = 0\n\n[workspace]\n')
+        # LUST_STATS on the daemon too: every warm answer then carries the
+        # lust-visits: line the per-request records are built from.
         self.env = dict(os.environ, LUST_DAEMON_SOCKET=str(self.work / "s.sock"),
-                        LUST_CACHE_DIR=str(self.work / "cache"), LUST_DAEMON_IDLE="3600s")
+                        LUST_CACHE_DIR=str(self.work / "cache"), LUST_DAEMON_IDLE="3600s",
+                        LUST_STATS="1")
         self.env.pop("LUST_NO_DAEMON", None)
         self.daemon = None
         self.rows = {}
+        self.requests = []
         self.cold_n = 0
         self.states = 0
         self.mismatches = []
@@ -208,15 +306,34 @@ class Bench:
     # ---- recording
 
     def row(self, name):
-        return self.rows.setdefault(name, {"lust": [], "phases": [], "stats": [], **{c: [] for c in self.rustc_cfgs}})
+        return self.rows.setdefault(name, {"lust": [], "phases": [], "stats": [], "requests": [],
+                                            **{c: [] for c in self.rustc_cfgs}})
 
-    def measure_check(self, name, expect_ok=True, cold_compare=False):
+    def record_request(self, rec, row_name, verb, ms, r, edit_id=None, target=None, target_fn=None):
+        """One per-request record: wall, every phase, visits counters, and the
+        patch/kept classification. Appended to the row and to the run list."""
+        phases = parse_timings(r.stderr)
+        visits = parse_visits(r.stderr)
+        req = {"seq": len(self.requests), "row": row_name, "verb": verb, "edit_id": edit_id,
+               "target": target, "target_fn": target_fn, "wall_ms": round(ms, 2),
+               "ok": r.returncode == 0, "phases_ms": phases, "visits": visits,
+               "stats": parse_stats(r.stderr), **classify_request(visits, phases)}
+        rec["requests"].append(req)
+        self.requests.append(req)
+        return req
+
+    def target_label(self, target):
+        p, ol, _fn = target
+        return f"{p.relative_to(self.crate / 'src')}:{ol}"
+
+    def measure_check(self, name, expect_ok=True, cold_compare=False, edit_id=None, target=None, target_fn=None):
         """Time a warm lust check and the cargo checks on the current state; check agreement."""
         self.states += 1
         ms, r = self.lust("check")
         rec = self.row(name)
         rec["lust"].append(ms)
         rec["phases"].append(parse_timings(r.stderr))
+        self.record_request(rec, name, "check", ms, r, edit_id, target, target_fn)
         ok = r.returncode == 0
         if ok != expect_ok:
             self.fail(f"{name}: lust check exit {r.returncode}, expected {'ok' if expect_ok else 'error'}\n{r.stderr[-1500:]}")
@@ -235,13 +352,14 @@ class Bench:
             rec["cold_compares"] += 1
         return ms
 
-    def measure_build(self, name):
+    def measure_build(self, name, edit_id=None, target=None, target_fn=None):
         ms, r = self.lust("build", {"LUST_STATS": "1"})
         if r.returncode != 0:
             self.fail(f"{name}: lust build failed\n{r.stderr[-1500:]}")
         rec = self.row(name)
         rec["lust"].append(ms)
         rec["phases"].append(parse_timings(r.stderr))
+        self.record_request(rec, name, "build", ms, r, edit_id, target, target_fn)
         st = parse_stats(r.stderr)
         st["link_ms"] = parse_timings(r.stderr).get("link", 0.0)
         rec["stats"].append(st)
@@ -294,7 +412,8 @@ class Bench:
                 head = lines[start - 1]
                 if cl - ol < 3 or lines[ol - 1][oc:].strip() or "const fn" in head:
                     continue
-                out.append((p, ol))
+                m = re.search(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)", " ".join(lines[start - 1:start + 2]))
+                out.append((p, ol, m.group(1) if m else None))
                 break
             if len(out) == self.opts["units"]:
                 break
@@ -302,7 +421,7 @@ class Bench:
 
     def body_edit(self, target, value):
         """Insert or change the bench `let` on the line after one fn body's open brace."""
-        p, ol = target
+        p, ol, _fn = target
         lines = p.read_text().split("\n")
         indent = " " * (len(lines[ol - 1]) - len(lines[ol - 1].lstrip()) + 4)
         new = f"{indent}let {EDIT_TAG}: u32 = {value};"
@@ -331,7 +450,7 @@ class Bench:
         rss = {}
 
         # Cold rows, interleaved per rep.
-        for _ in range(o["reps"]):
+        for rep in range(o["reps"]):
             for verb in ("check", "build"):
                 ms, r = self.lust(verb, {"LUST_STATS": "1"}, cold=True)
                 if r.returncode != 0:
@@ -339,6 +458,7 @@ class Bench:
                 rec = self.row(f"cold {verb}")
                 rec["lust"].append(ms)
                 rec["phases"].append(parse_timings(r.stderr))
+                self.record_request(rec, f"cold {verb}", verb, ms, r, edit_id=f"cold-{verb}-{rep + 1}")
                 if verb == "build":
                     st = parse_stats(r.stderr)
                     st["link_ms"] = parse_timings(r.stderr).get("link", 0.0)
@@ -361,37 +481,46 @@ class Bench:
             self.cargo(cfg, "build")
 
         self.start_daemon()
-        self.measure_check("daemon first check (new session, empty cache)")
-        for _ in range(o["reps"]):
-            self.measure_check("no-op check (warm daemon)")
-        for _ in range(o["reps"]):
+        self.measure_check("daemon first check (new session, empty cache)", edit_id="daemon-first")
+        for rep in range(o["reps"]):
+            self.measure_check("no-op check (warm daemon)", edit_id=f"no-op-{rep + 1}")
+        for rep in range(o["reps"]):
             self.kill_daemon()
             self.start_daemon()
-            self.measure_check("cached restart check (new daemon, disk cache)")
+            self.measure_check("cached restart check (new daemon, disk cache)", edit_id=f"restart-{rep + 1}")
 
         targets = self.body_targets()
         if len(targets) < 2:
             self.fail("fewer than 2 body edit targets")
         build_every = max(1, o["edits"] // o["build_samples"]) if o["build_samples"] else 0
         for i in range(o["edits"]):
-            self.body_edit(targets[i % len(targets)], i + 1)
-            self.measure_check("body edit check (one fn)")
+            tgt = targets[i % len(targets)]
+            self.body_edit(tgt, i + 1)
+            self.measure_check("body edit check (one fn)", edit_id=f"body-{i + 1}",
+                               target=self.target_label(tgt), target_fn=tgt[2])
             if build_every and i % build_every == 0:
-                self.measure_build("body edit build (one fn)")
+                self.measure_build("body edit build (one fn)", edit_id=f"body-{i + 1}",
+                                   target=self.target_label(tgt), target_fn=tgt[2])
 
         e = self.edits_spec
-        for _ in range(o["cycles"]):
+        for cyc in range(o["cycles"]):
             for kind in ("signature", "type", "impl"):
                 spec = e[kind]
                 pairs = [(x["file"], x["old"], x["new"]) for x in spec["edits"]]
+                files = ",".join(sorted({f for f, _, _ in pairs}))
                 self.text_edit(pairs)
-                self.measure_check(f"{kind} edit check", cold_compare=True)
+                self.measure_check(f"{kind} edit check", cold_compare=True,
+                                   edit_id=f"{kind}-{cyc + 1}-apply", target=files)
                 self.text_edit([(f, n, old) for f, old, n in pairs])
-                self.measure_check(f"{kind} edit check", cold_compare=True)
+                self.measure_check(f"{kind} edit check", cold_compare=True,
+                                   edit_id=f"{kind}-{cyc + 1}-revert", target=files)
             self.body_edit(targets[0], '"not a u32"')
-            self.measure_check("error edit check (both reject)", expect_ok=False, cold_compare=True)
+            self.measure_check("error edit check (both reject)", expect_ok=False, cold_compare=True,
+                               edit_id=f"error-{cyc + 1}", target=self.target_label(targets[0]),
+                               target_fn=targets[0][2])
             self.body_edit(targets[0], 7)
-            self.measure_check("fix edit check", cold_compare=True)
+            self.measure_check("fix edit check", cold_compare=True, edit_id=f"fix-{cyc + 1}",
+                               target=self.target_label(targets[0]), target_fn=targets[0][2])
         rss["lust_daemon_hwm_kb"] = self.daemon_hwm_kb()
         self.kill_daemon()
         return self.report(lines, rss, targets)
@@ -411,10 +540,7 @@ class Bench:
             lust = summary(rec["lust"])
             rus = {c: summary(rec[c]) for c in self.rustc_cfgs if rec[c]}
             best = min(rus.items(), key=lambda kv: kv[1]["median"]) if rus else None
-            phases = {}
-            for ph in rec["phases"]:
-                for k, v in ph.items():
-                    phases.setdefault(k, []).append(v)
+            ph = phase_summaries(rec["phases"])
             stats = {}
             for st in rec["stats"]:
                 for k in ("c_bytes", "units_compiled", "unit_cache_hits", "link_ms"):
@@ -424,7 +550,13 @@ class Bench:
                 "row": name, "lust": lust, "rustc": rus,
                 "rustc_best": {"config": best[0], **best[1]} if best else None,
                 "ratio": ratio(best[1]["median"], lust["median"]) if best and lust["median"] else None,
-                "lust_phases_median_ms": {k: round(statistics.median(v), 2) for k, v in phases.items()},
+                "ratio_p95": ratio(best[1]["p95"], lust["p95"]) if best and lust["p95"] else None,
+                # Overall medians: a phase a request did not emit counts as zero.
+                "lust_phases_median_ms": {k: v["median_overall"] for k, v in ph.items()},
+                "lust_phases_when_present_median_ms": {k: v["median_when_present"] for k, v in ph.items()},
+                "lust_phases_present_n": {k: v["n_present"] for k, v in ph.items()},
+                "lust_phases_ms": ph,
+                "patch_kept": count_patch_kept(rec["requests"]),
                 "build_stats_median": {k: statistics.median(v) for k, v in stats.items()},
                 "cold_compares": rec.get("cold_compares", 0),
             })
@@ -437,8 +569,9 @@ class Bench:
             "tsrust_commit": self.manifest["tsrust_commit"], "lust_commit": lust_commit, "rustc": rustc_v,
             "host": {"nproc": os.cpu_count(), "load_at_end": os.getloadavg()[0]},
             "opts": self.opts, "states_checked": self.states, "program_runs_compared": self.runs_compared,
-            "body_edit_targets": [f"{p.relative_to(self.crate / 'src')}:{ol}" for p, ol in targets],
-            "peak_rss": rss, "rows": rows,
+            "body_edit_targets": [self.target_label(t) for t in targets],
+            "body_edit_target_fns": [t[2] for t in targets],
+            "peak_rss": rss, "rows": rows, "requests": self.requests,
         }
         shutil.rmtree(self.work, ignore_errors=True)
         return out
@@ -450,15 +583,43 @@ def ratio(rustc_ms, lust_ms):
     return round(r, 1) if r >= 1 else round(r, 2)
 
 
+def patch_kept_line(pk):
+    """One plain sentence of patch/kept counts, or '' for old result files."""
+    if not pk:
+        return ""
+
+    def reasons(c):
+        return " (" + ", ".join(f"{k} x{v}" for k, v in sorted(c["miss_reasons"].items())) + ")" \
+            if c.get("miss_reasons") else ""
+
+    p, k = pk["patch"], pk["kept"]
+    line = f"body patch: {p['hits']} hit, {p['misses']} miss{reasons(p)}"
+    if p["unknown"]:
+        line += f", {p['unknown']} unknown"
+    line += f". kept program: {k['hits']} hit, {k['misses']} miss{reasons(k)}"
+    if k.get("not_exposed"):
+        line += f", {k['not_exposed']} not exposed by this lust build (no kept= counter yet)"
+    if k.get("not_applicable"):
+        line += f", {k['not_applicable']} not applicable"
+    if k.get("unknown"):
+        line += f", {k['unknown']} unknown"
+    return line + "."
+
+
 def print_table(res):
     print(f"\n{res['slice']}: {res['lines']} lines ({res['code_lines']} code), ts-rust {res['tsrust_commit'][:9]}, "
           f"lust {res['lust_commit']}, {res['rustc']}, {res['host']['nproc']} cpus")
-    print(f"{'row':<48} {'lust med':>9} {'p95':>8} {'worst':>8} {'n':>4} {'rustc med':>10} {'cfg':>9} {'ratio':>7}")
+    print(f"{'row':<48} {'lust med':>9} {'p95':>8} {'worst':>8} {'n':>4} {'rustc med':>10} "
+          f"{'rustc p95':>10} {'cfg':>9} {'ratio med':>10} {'ratio p95':>10}")
     for r in res["rows"]:
         l, b = r["lust"], r["rustc_best"]
         print(f"{r['row']:<48} {l['median']:>9.1f} {l['p95']:>8.1f} {l['worst']:>8.1f} {l['n']:>4} "
-              f"{(b['median'] if b else float('nan')):>10.1f} {(b['config'] if b else '-'):>9} "
-              f"{(str(r['ratio']) + 'x') if r['ratio'] else '-':>7}")
+              f"{(b['median'] if b else float('nan')):>10.1f} {(b['p95'] if b else float('nan')):>10.1f} "
+              f"{(b['config'] if b else '-'):>9} "
+              f"{(str(r['ratio']) + 'x') if r['ratio'] else '-':>10} "
+              f"{(str(r.get('ratio_p95')) + 'x') if r.get('ratio_p95') else '-':>10}")
+        if r["row"].startswith("body edit check") and patch_kept_line(r.get("patch_kept")):
+            print(f"  {patch_kept_line(r['patch_kept'])}")
     print(f"peak RSS: {res['peak_rss']}")
     print(f"states checked: {res['states_checked']} (lust and cargo agree on every one)")
 
@@ -472,14 +633,19 @@ def render_md(results):
                 f"ts-rust `{res['tsrust_commit'][:9]}`, lust `{res['lust_commit']}`, {res['rustc']}, "
                 f"{res['host']['nproc']} vCPU. {res['states_checked']} source states; lust and cargo agree on "
                 f"pass or fail on every one.", "",
-                "| Row | lust median | p95 | worst | n | rustc median (config) | Ratio |",
-                "|---|---:|---:|---:|---:|---:|---:|"]
+                "| Row | lust median | p95 | worst | n | rustc median | rustc p95 (config) | Ratio median | Ratio p95 |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for r in res["rows"]:
             l, b = r["lust"], r["rustc_best"]
-            rus = f"{b['median']:.0f} ms ({b['config']})" if b else "-"
+            rus = f"{b['median']:.0f} ms" if b else "-"
+            rus95 = f"{b['p95']:.0f} ms ({b['config']})" if b else "-"
             x = f"{ratio(b['median'], l['median'])}x" if b and l["median"] else "-"
-            x = f"**{x}**" if r["row"].startswith("body edit check") else x
-            out.append(f"| {r['row']} | {l['median']:.0f} ms | {l['p95']:.0f} | {l['worst']:.0f} | {l['n']} | {rus} | {x} |")
+            x95 = r.get("ratio_p95")
+            x95 = f"{x95}x" if x95 else (f"{ratio(b['p95'], l['p95'])}x" if b and l["p95"] else "-")
+            if r["row"].startswith("body edit check"):
+                x, x95 = f"**{x}**", f"**{x95}**"
+            out.append(f"| {r['row']} | {l['median']:.0f} ms | {l['p95']:.0f} | {l['worst']:.0f} | {l['n']} | "
+                       f"{rus} | {rus95} | {x} | {x95} |")
         build = next((r for r in res["rows"] if r["row"] == "cold build"), None)
         if build and build["build_stats_median"]:
             st = build["build_stats_median"]
@@ -491,8 +657,23 @@ def render_md(results):
                 + " (largest process in the tree).", ""]
         body = next((r for r in res["rows"] if r["row"].startswith("body edit check")), None)
         if body:
-            top = sorted(body["lust_phases_median_ms"].items(), key=lambda kv: -kv[1])[1:6]
-            out += ["lust phases, body edit check (median ms): " + ", ".join(f"{k} {v:.0f}" for k, v in top) + ".", ""]
+            if patch_kept_line(body.get("patch_kept")):
+                out += [f"Body edit check paths: {patch_kept_line(body['patch_kept'])}", ""]
+            top = sorted(((k, v) for k, v in body["lust_phases_median_ms"].items() if k != "total"),
+                         key=lambda kv: -kv[1])[:5]
+            if "lust_phases_present_n" in body:
+                out += ["lust phases, body edit check (median ms over all requests, absent = 0): "
+                        + ", ".join(f"{k} {v:.0f}" for k, v in top) + ".", ""]
+                n = body["lust"]["n"]
+                partial = sorted(((k, body["lust_phases_when_present_median_ms"][k], c)
+                                    for k, c in body["lust_phases_present_n"].items() if c < n),
+                                  key=lambda t: -t[1])[:5]
+                if partial:
+                    out += ["lust phases when present only (fallback requests, median ms): "
+                            + ", ".join(f"{k} {v:.0f} ({c}/{n} requests)" for k, v, c in partial) + ".", ""]
+            else:  # old result file: its phase medians are when-present only
+                out += ["lust phases, body edit check (median ms, when present; old result file): "
+                        + ", ".join(f"{k} {v:.0f}" for k, v in top) + ".", ""]
     return "\n".join(out)
 
 

@@ -44,7 +44,10 @@
 # --slice bench/slices/<name> measures a pinned ts-rust slice against cargo
 # on identical source (cold, restart, no-op, 100+ body edits, signature,
 # type, impl, error, and fix edits; see scripts/speed_slice.py, which holds
-# that mode and its options).
+# that mode and its options). Slice rows report median, p95, and worst wall
+# times, the rustc/lust ratio for median and p95, per-request rows with
+# phases and lust-visits counters, and body-patch / kept-program hit and
+# miss counts with reasons. Phase medians count an absent phase as zero.
 import json, os, signal, subprocess, sys, tempfile, time
 
 if "--slice" in sys.argv[1:]:
