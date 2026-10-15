@@ -57,6 +57,8 @@ pub struct Parser<'a> {
     /// AST drops: a binary, cast, or postfix expression that starts with
     /// one spans from it, as in rustc (panic locations read it).
     paren_lo: std::collections::HashMap<u32, Span>,
+    /// Types written in parentheses, by TyId (see `Ast::paren_tys`).
+    paren_tys: Vec<u32>,
     ast: Ast,
     interner: &'a Interner,
     known: &'a Known,
@@ -132,6 +134,7 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
         toks: &lexed.tokens,
         pos: 0,
         paren_lo: Default::default(),
+        paren_tys: Vec::new(),
         ast: Ast::default(),
         interner,
         known,
@@ -211,6 +214,7 @@ fn parse_tokens(
         toks,
         pos: 0,
         paren_lo: Default::default(),
+        paren_tys: Vec::new(),
         ast: Ast::default(),
         interner,
         known,
@@ -257,6 +261,7 @@ fn parse_tokens(
     if let Some(d) = p.deferred.take() {
         return Err(d);
     }
+    p.finish_parens();
     Ok(p.ast)
 }
 
@@ -323,6 +328,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
         toks: &toks,
         pos: 0,
         paren_lo: Default::default(),
+        paren_tys: Vec::new(),
         ast: std::mem::take(ast),
         interner,
         known,
@@ -343,6 +349,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
     let body = p.block();
     let ranges = ((e0, p.ast.exprs.len() as u32), (p0, p.ast.pats.len() as u32));
     let deferred = p.deferred.take();
+    p.finish_parens();
     *ast = p.ast;
     let body = match (body, deferred) {
         (Err(hard), Some(d)) if d.span.lo <= hard.span.lo => return Err(d),
@@ -366,6 +373,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
         toks: &v,
         pos: 0,
         paren_lo: Default::default(),
+        paren_tys: Vec::new(),
         ast,
         interner,
         known,
@@ -404,6 +412,7 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
         toks: &v,
         pos: 0,
         paren_lo: Default::default(),
+        paren_tys: Vec::new(),
         ast,
         interner,
         known,
@@ -3066,7 +3075,12 @@ impl<'a> Parser<'a> {
                     elems.push(self.ty()?);
                 }
                 self.expect(Tok::RParen, "`)`")?;
-                if tuple { Ok(self.push_ty(TyExpr::Tuple(elems), start.to(self.prev_span()))) } else { Ok(elems[0]) }
+                if tuple {
+                    Ok(self.push_ty(TyExpr::Tuple(elems), start.to(self.prev_span())))
+                } else {
+                    self.paren_tys.push(elems[0].0);
+                    Ok(elems[0])
+                }
             }
             Tok::LBracket => {
                 self.bump();
@@ -4270,6 +4284,23 @@ impl<'a> Parser<'a> {
             }
         };
         Ok(self.push_expr(e, start.to(self.prev_span())))
+    }
+
+    /// Records the parenthesized expressions this parse saw in the
+    /// AST (`Ast::paren_exprs`), sorted. A parse that appends to an
+    /// existing AST (`parse_body`) merges with what is there.
+    fn finish_parens(&mut self) {
+        if !self.paren_lo.is_empty() {
+            let mut ids: Vec<u32> = self.paren_lo.keys().copied().collect();
+            self.ast.paren_exprs.append(&mut ids);
+            self.ast.paren_exprs.sort_unstable();
+            self.ast.paren_exprs.dedup();
+        }
+        if !self.paren_tys.is_empty() {
+            self.ast.paren_tys.append(&mut self.paren_tys);
+            self.ast.paren_tys.sort_unstable();
+            self.ast.paren_tys.dedup();
+        }
     }
 
     /// `e`'s span, widened to its `(` when it was written in parentheses.

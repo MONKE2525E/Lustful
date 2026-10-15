@@ -2327,6 +2327,23 @@ impl<'p> Ctx<'p> {
     fn ei(&self, e: ExprId) -> usize {
         (e.0 - self.out.expr_base) as usize
     }
+    /// True when an array repeat operand may repeat a non-`Copy`
+    /// value: rustc re-evaluates a const item or inline const per
+    /// element, so no copy is ever made. A const item read (a free
+    /// or associated const) is the path form whose checked value is
+    /// a baked constant with no other resolution; a static read, a
+    /// constructor, and a const fn call all make one value and
+    /// still need `Copy`.
+    fn repeat_const_operand(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::ConstBlock(_) => true,
+            Expr::Path(_) | Expr::QPath { .. } => {
+                let i = self.ei(e);
+                self.out.const_exprs[i].is_some() && matches!(self.out.expr_res[i], Res::None)
+            }
+            _ => false,
+        }
+    }
     fn set(&mut self, e: ExprId, t: Ty) -> Ty {
         let i = self.ei(e);
         self.out.expr_ty[i] = t;
@@ -6505,7 +6522,9 @@ impl<'p> Ctx<'p> {
             Expr::Bool(b) => Some(ConstKind::Bool(*b)),
             Expr::Char(c) => Some(ConstKind::Char(*c)),
             Expr::Path(segs)
-                if segs.len() == 1
+                // `(N)` is a const operation on the parameter, not
+                // the parameter itself; reject like the type forms.
+                if segs.len() == 1 && !p.ast.is_parenthesized(inner)
                     && let Some((i, _, val)) = self.const_param(segs[0].name) =>
             {
                 Some(val.unwrap_or(ConstKind::Param(i)))
@@ -6633,7 +6652,17 @@ impl<'p> Ctx<'p> {
                             |cx: &Self, n: Sym| cx.body_scope.param_tys.iter().any(|(pn, _)| *pn == n) || n == p.known.self_type;
                         match segs.as_slice() {
                             // A const param of this body (`f::<N>()`).
+                            // `(N)` is a const operation on it, not
+                            // the parameter itself.
                             [seg] if let Some((i, _, val)) = self.const_param(seg.name) => {
+                                if p.ast.is_parenthesized_ty(*t) {
+                                    self.err(
+                                        "L0110",
+                                        p.ast.ty_span(*t),
+                                        "generic parameters may not be used in const operations",
+                                        "Write the const parameter without parentheses.",
+                                    );
+                                }
                                 Some(GenericArg::Const(self.tys.intern_const(val.unwrap_or(ConstKind::Param(i)))))
                             }
                             [seg]
@@ -7764,8 +7793,11 @@ impl<'p> Ctx<'p> {
                 // A const param length (`[x; N]`): symbolic in the template
                 // check, the instance's value in an instance. The element
                 // must be Copy or a const, as for any length above 1.
+                // `(N)` is a const operation, not the parameter itself:
+                // it falls through to the constant-integer error below.
                 if let Expr::Path(segs) = p.ast.expr(*len)
                     && segs.len() == 1
+                    && !p.ast.is_parenthesized(*len)
                     && self.lookup(segs[0].name, span.ctxt).is_none()
                     && let Some((i, _, val)) = self.const_param(segs[0].name)
                 {
@@ -7774,7 +7806,7 @@ impl<'p> Ctx<'p> {
                         Some(ConstKind::Int(n)) => n,
                         _ => 2,
                     };
-                    let const_val = self.out.const_exprs[self.ei(*value)].is_some();
+                    let const_val = self.repeat_const_operand(*value);
                     if n > 1 && !const_val && !is_copy(p, &self.tys, self.resolve(elem)) {
                         self.err(
                             "L0110",
@@ -7800,7 +7832,7 @@ impl<'p> Ctx<'p> {
                 });
                 match n {
                     Some(n) => {
-                        let const_val = self.out.const_exprs[self.ei(*value)].is_some();
+                        let const_val = self.repeat_const_operand(*value);
                         if n > 1 && !const_val && !is_copy(p, &self.tys, self.resolve(elem)) {
                             self.err(
                                 "L0110",
@@ -19813,6 +19845,9 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
     }
     fn ty_text(&self, t: Ty) -> String {
         crate::check::collect::ty_name(self.cx.p, &self.cx.tys, t)
+    }
+    fn is_copy(&self, t: Ty) -> bool {
+        crate::check::collect::is_copy(self.cx.p, &self.cx.tys, t)
     }
     fn named_field_private(&mut self, adt: AdtId, field: Sym) -> bool {
         // A privacy answer inside body const evaluation (a `const`

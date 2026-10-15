@@ -59,6 +59,15 @@ pub struct Ast {
     /// the rewrite to mark (`use Trait as _;` binds no name), so the
     /// resolved targets ride here instead (`Ctx::trait_scopes`).
     pub use_traits: Vec<(Span, UseTrait)>,
+    /// Expressions that were written in parentheses, sorted by id.
+    /// The parser drops the parens themselves; the distinction
+    /// still matters for a const parameter used as a const
+    /// argument, where `(N)` is a const operation and `N` is not.
+    pub paren_exprs: Vec<u32>,
+    /// Types that were written in parentheses, like `paren_exprs`
+    /// (the type parser returns the inner type directly, so a
+    /// `(N)` generic argument is otherwise indistinguishable).
+    pub paren_tys: Vec<u32>,
 }
 
 /// One trait a function-local `use` resolved to (`Ast::use_traits`).
@@ -161,6 +170,14 @@ impl Ast {
     }
     pub fn block(&self, id: BlockId) -> &Block {
         &self.blocks[id.0 as usize]
+    }
+    /// True when expression `id` was written in parentheses.
+    pub fn is_parenthesized(&self, id: ExprId) -> bool {
+        self.paren_exprs.binary_search(&id.0).is_ok()
+    }
+    /// True when type `id` was written in parentheses.
+    pub fn is_parenthesized_ty(&self, id: TyId) -> bool {
+        self.paren_tys.binary_search(&id.0).is_ok()
     }
 }
 
@@ -1576,6 +1593,8 @@ impl Ast {
             shipped: Vec::new(),
             lang_methods: (0, 0),
             use_traits: Vec::new(),
+            paren_exprs: Vec::new(),
+            paren_tys: Vec::new(),
         };
         for mut c in chunks {
             out.inner_attrs.append(&mut c.inner_attrs);
@@ -1591,6 +1610,8 @@ impl Ast {
             out.strings.append(&mut c.strings);
             out.blobs.append(&mut c.blobs);
             out.use_traits.append(&mut c.use_traits);
+            out.paren_exprs.append(&mut c.paren_exprs);
+            out.paren_tys.append(&mut c.paren_tys);
         }
         out
     }
@@ -1624,12 +1645,20 @@ impl Ast {
         self.strings.append(&mut o.strings);
         self.blobs.append(&mut o.blobs);
         self.use_traits.append(&mut o.use_traits);
+        self.paren_exprs.append(&mut o.paren_exprs);
+        self.paren_tys.append(&mut o.paren_tys);
         (o.items, o.stmt_items, o.inner_attrs)
     }
 
     /// Adds `sh` to every index stored in this chunk's nodes.
     fn shift(&mut self, sh: Shift) {
         let o = self;
+        for id in &mut o.paren_exprs {
+            *id += sh.e;
+        }
+        for id in &mut o.paren_tys {
+            *id += sh.t;
+        }
         sh.attrs(&mut o.inner_attrs);
         for item in o.items.iter_mut().chain(o.stmt_items.iter_mut()) {
             sh.item(item);

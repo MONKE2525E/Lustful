@@ -6403,6 +6403,9 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
     fn ty_text(&self, t: Ty) -> String {
         ty_name(self.p, &self.p.tys, t)
     }
+    fn is_copy(&self, t: Ty) -> bool {
+        is_copy(self.p, &self.p.tys, t)
+    }
     fn named_field_private(&mut self, adt: AdtId, field: Sym) -> bool {
         match self.module {
             Some(m) => named_field_is_private(self.p, adt, field, m),

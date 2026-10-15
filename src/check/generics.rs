@@ -1945,6 +1945,16 @@ fn resolve_const_path_arg(
         return Err(err());
     }
     if let Some(&(_, i, _)) = scope.const_params.iter().find(|(n, ..)| *n == seg.name) {
+        // `(N)` is a const operation on the parameter, not the
+        // parameter itself.
+        if ast.is_parenthesized_ty(t) {
+            return Err(Diag::new(
+                "L0110",
+                span,
+                "generic parameters may not be used in const operations",
+                "Write the const parameter without parentheses.",
+            ));
+        }
         return Ok(tys.intern_const(ConstKind::Param(i)));
     }
     match crate::check::collect::named_const_kind(ast, interner, known, seg.name, span) {
@@ -1967,6 +1977,17 @@ pub(crate) fn resolve_const_arg(
     match ast.expr(e) {
         ast::Expr::Path(segs) if segs.len() == 1 => {
             if let Some(&(_, i, _)) = scope.const_params.iter().find(|(n, ..)| *n == segs[0].name) {
+                // `(N)` is a const operation on the parameter, not
+                // the parameter itself (rustc: generic parameters
+                // may not be used in const operations).
+                if ast.is_parenthesized(e) {
+                    return Err(Diag::new(
+                        "L0110",
+                        span,
+                        "generic parameters may not be used in const operations",
+                        "Write the const parameter without parentheses.",
+                    ));
+                }
                 return Ok(tys.intern_const(ConstKind::Param(i)));
             }
             // A named const item evaluates like the literal forms below.

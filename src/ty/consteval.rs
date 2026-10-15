@@ -216,6 +216,11 @@ pub trait ConstCx<'a> {
     fn ty_text(&self, _t: Ty) -> String {
         "this type".to_string()
     }
+    /// True when values of this type are `Copy` (an array repeat
+    /// above length 1 duplicates its operand).
+    fn is_copy(&self, _t: Ty) -> bool {
+        false
+    }
 }
 
 /// Why evaluation left a block early.
@@ -1098,6 +1103,33 @@ impl Evaluator {
                     (ConstValue::Aggregate(Vec::new()), cx.tys().intern(TyKind::Array(elem, c)))
                 } else {
                     let (v, t) = self.value_moved(cx, env, *value, exp_elem)?;
+                    // Above length 1 a repeat duplicates its operand:
+                    // it must be `Copy`, or a const item or inline
+                    // const the compiler re-evaluates per element.
+                    // A const fn call makes one value, so it needs
+                    // `Copy` like any other operand (rustc E0277).
+                    if n > 1 && !cx.is_copy(t) {
+                        let operand_const = match cx.ast().expr(*value) {
+                            Expr::ConstBlock(_) => true,
+                            Expr::Path(segs) => {
+                                let local = segs.len() == 1 && env.iter().any(|(name, _, _, _)| *name == segs[0].name);
+                                !local
+                                    && match segs.as_slice() {
+                                        [s] => cx.static_item(s.name, span).is_none() && cx.const_item(s.name, span).is_some(),
+                                        _ => cx.assoc_const_item(segs).is_some(),
+                                    }
+                            }
+                            _ => false,
+                        };
+                        if !operand_const {
+                            return Err(Diag::new(
+                                "L0110",
+                                span,
+                                "the trait `Copy` is not implemented for this type",
+                                "Array repeat with a length above 1 needs a Copy element, a const item, or write the elements out.",
+                            ));
+                        }
+                    }
                     let c = cx.tys().intern_const(super::ConstKind::Int(n as u128));
                     (ConstValue::Repeat(Box::new(v), n), cx.tys().intern(TyKind::Array(t, c)))
                 }
