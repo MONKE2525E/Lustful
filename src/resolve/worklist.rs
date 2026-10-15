@@ -29,6 +29,7 @@ use crate::def::{self, CrateIds, DefId, DefPathHash};
 use crate::diag::{Diag, FileId, SourceMap, Span};
 use crate::driver::graph::Namespace;
 use crate::intern::{FxMap, Interner, Known, Sym};
+use crate::stdload::StdPlan;
 use crate::ty::defs::{ModuleId, ROOT_MODULE};
 use crate::{lexer, parser, scan};
 use std::path::PathBuf;
@@ -99,10 +100,13 @@ pub struct ResolvedCrate {
     pub structure_hash: u64,
     /// Every file's text concatenated, for the diagnostic source hash.
     pub all_text: String,
-    /// True when some file of the crate can mention a source std fn.
-    /// The driver owns std splicing: when it did not splice and this is
-    /// set, it splices and resolves once more.
-    pub needs_std: bool,
+    /// What the files ask of std (`stdload::StdPlan::asks`): every file
+    /// but the std platform crate's, the root without its std splice.
+    /// The driver owns std splicing and the platform crate: when these
+    /// differ from its plan, it resolves once more.
+    pub std_asks: StdPlan,
+    /// What the std platform crate's files ask, when it joined.
+    pub platform_asks: Option<StdPlan>,
     /// Outside inputs expansion read across the crate's files (added
     /// for W-MACRO; see `expand::Dep`).
     pub expand_deps: Vec<crate::expand::Dep>,
@@ -120,7 +124,9 @@ pub struct ResolvedCrate {
 pub struct ResolveError {
     pub map: SourceMap,
     pub all_text: String,
-    pub needs_std: bool,
+    /// As `ResolvedCrate::std_asks`, over the files seen before the error.
+    pub std_asks: StdPlan,
+    pub platform_asks: Option<StdPlan>,
     pub diags: Vec<Diag>,
 }
 
@@ -719,6 +725,9 @@ struct CachedFile {
     /// parsed Ast; the expanded stream's own hash can. Never
     /// stored for a file whose expansion reads outside data.
     parsed: Option<(u64, Ast)>,
+    /// What the file asks of std, with the length of the text it was
+    /// read from (`ResolveCache::std_asks`).
+    std_asks: Option<(usize, StdPlan)>,
     /// The file's flattened, rewritten chunk plus its per-fn facts
     /// and structural scan, from a successful resolve. Valid only
     /// under the epoch it was stored with (see
@@ -833,7 +842,8 @@ impl ResolveCache {
     }
 
     fn entry(&mut self, key: &str, text_hash: u64, file_id: FileId) -> &mut CachedFile {
-        let fresh = || CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None, parsed: None, final_chunk: None };
+        let fresh =
+            || CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None, parsed: None, std_asks: None, final_chunk: None };
         let e = self.files.entry(key.to_string()).or_insert_with(fresh);
         if e.text_hash != text_hash || e.file_id != file_id {
             *e = fresh();
@@ -861,6 +871,21 @@ impl ResolveCache {
         if !self.one_shot {
             self.entry(key, text_hash, file_id).raw = Some(clone_lexed(lexed));
         }
+    }
+
+    /// What one file asks of std (`StdPlan::asks` of `own`, its text
+    /// or the root's text before the splice), cached with its text,
+    /// one-shot caches included: the asks are four bits.
+    fn std_asks(&mut self, key: &str, text_hash: u64, file_id: FileId, own: &str) -> StdPlan {
+        let len = own.len();
+        if let Some((l, asks)) = self.peek(key, text_hash, file_id).and_then(|e| e.std_asks)
+            && l == len
+        {
+            return asks;
+        }
+        let asks = StdPlan::asks(own);
+        self.entry(key, text_hash, file_id).std_asks = Some((len, asks));
+        asks
     }
 
     /// The cached outline for one file, when its text and file id stand.
@@ -1014,7 +1039,7 @@ struct CrateOut {
     nested_modules: Vec<ModuleId>,
     structure_hash: u64,
     seen: Vec<(PathBuf, String, FileId)>,
-    needs_std: bool,
+    std_asks: StdPlan,
     exported_macros: Vec<OwnedMacroSource>,
     /// The outside inputs this crate's last expansion round read.
     expand_deps: Vec<crate::expand::Dep>,
@@ -1030,7 +1055,7 @@ struct CrateOut {
 struct OneError {
     diags: Vec<Diag>,
     seen: Vec<(PathBuf, String, FileId)>,
-    needs_std: bool,
+    std_asks: StdPlan,
 }
 
 /// Shim crates (ARCH 3.7): rustc-built, with a lust source API crate
@@ -1218,8 +1243,9 @@ fn add_platform_job(input: &CrateInput, tables: &mut ResolvedTables, jobs: &mut 
     Ok(jobs.len() - 1)
 }
 
-/// `resolve_crate_cached` with the platform crate in or out.
-fn resolve_crate_with(
+/// `resolve_crate_cached` with the platform crate in or out. The
+/// driver picks `with_platform` by its std plan (`stdload::StdPlan`).
+pub fn resolve_crate_with(
     input: &CrateInput,
     interner: &Interner,
     known: &Known,
@@ -1252,7 +1278,7 @@ fn resolve_crate_with(
     // crate's root file at the span's default file id.
     let build_err = |d: Diag| -> ResolveError {
         let (map, all_text) = make_map(&[(input.root_path.clone(), input.root_text.clone(), FileId(0))]);
-        ResolveError { map, all_text, needs_std: false, diags: vec![d] }
+        ResolveError { map, all_text, std_asks: StdPlan::default(), platform_asks: None, diags: vec![d] }
     };
     let mut by_key: FxMap<String, usize> = FxMap::default();
     let mut main_deps = Vec::new();
@@ -1262,10 +1288,14 @@ fn resolve_crate_with(
             Err(d) => return Err(build_err(d)),
         }
     }
+    let mut platform_job = None;
     if with_platform {
         match add_platform_job(input, &mut tables, &mut jobs, interner) {
             // First, so it resolves before every crate that names it.
-            Ok(j) => main_deps.insert(0, ("$lust$std".to_string(), Ok(j))),
+            Ok(j) => {
+                platform_job = Some(j);
+                main_deps.insert(0, ("$lust$std".to_string(), Ok(j)));
+            }
             Err(d) => return Err(build_err(d)),
         }
     }
@@ -1312,7 +1342,11 @@ fn resolve_crate_with(
     // selected root.
     shared.file_id(&input.root_path, ROOT_MODULE);
     let mut all_seen: Vec<(PathBuf, String, FileId)> = Vec::new();
-    let mut needs_std = false;
+    let (mut std_asks, mut platform_asks) = (StdPlan::default(), with_platform.then(StdPlan::default));
+    let mut add_asks = |j: usize, asks: StdPlan| match &mut platform_asks {
+        Some(p) if platform_job == Some(j) => *p = p.or(asks),
+        _ => std_asks = std_asks.or(asks),
+    };
     let mut chunks: Vec<Ast> = Vec::new();
     let mut fn_lines: Vec<u32> = Vec::new();
     let mut body_hashes: Vec<u64> = Vec::new();
@@ -1361,7 +1395,7 @@ fn resolve_crate_with(
                         exact_layout: exact_layout.clone(),
                     });
                 }
-                needs_std |= out.needs_std;
+                add_asks(j, out.std_asks);
                 all_seen.extend(out.seen);
                 fn_lines.extend(out.fn_lines);
                 body_hashes.extend(out.body_hashes);
@@ -1390,10 +1424,10 @@ fn resolve_crate_with(
                 chunks.push(out.ast);
             }
             Err(e) => {
-                needs_std |= e.needs_std;
+                add_asks(j, e.std_asks);
                 all_seen.extend(e.seen);
                 let (map, all_text) = make_map(&all_seen);
-                return Err(ResolveError { map, all_text, needs_std, diags: e.diags });
+                return Err(ResolveError { map, all_text, std_asks, platform_asks, diags: e.diags });
             }
         }
     }
@@ -1404,7 +1438,7 @@ fn resolve_crate_with(
     let ast = Ast::concat(chunks);
     scan_bodies.extend(nested_scan_bodies);
     let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, needs_std, expand_deps, timings, scans })
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, std_asks, platform_asks, expand_deps, timings, scans })
 }
 
 /// Creates (or reuses) the job for one source dependency, recursively.
@@ -1701,14 +1735,19 @@ fn process_disc_orig(
     job: &CrateJob,
     interner: &Interner,
     diags: &mut Vec<Diag>,
-    needs_std: &mut bool,
+    std_asks: &mut StdPlan,
 ) {
     let (text, file_id, module) = (discs[di].text.clone(), discs[di].file_id, discs[di].module);
-    *needs_std |= crate::ty::lang::needs_std_load(&text);
     // Raw tokens and outline from the per-file cache when the text
     // stands (keyed by canonical path plus module, as in discovery).
     let file_key = format!("{}#{}", cache.canon(&discs[di].path), module.0);
     let text_hash = hash_str(&text);
+    // The root file's std splice is the driver's, not the user's ask.
+    let own = match job.input.std_splice_lo {
+        Some(lo) if file_id == FileId(0) => text.get(..lo as usize).unwrap_or(&text),
+        _ => &text,
+    };
+    *std_asks = std_asks.or(cache.std_asks(&file_key, text_hash, file_id, own));
     let lexed = match cache.raw(&file_key, text_hash, file_id) {
         Some(l) => l,
         None => match lex_file(&text, file_id, interner) {
@@ -2457,7 +2496,7 @@ fn resolve_one(
             last = now;
         }};
     }
-    let mut needs_std = false;
+    let mut std_asks = StdPlan::default();
     let mut diags: Vec<Diag> = Vec::new();
     let root_file_id = shared.file_id(&input.root_path, job.root_module);
     let mut discs: Vec<FileDisc> = vec![FileDisc {
@@ -2472,10 +2511,10 @@ fn resolve_one(
     }];
     let mut queue: Vec<usize> = vec![0];
     while let Some(di) = queue.pop() {
-        process_disc_orig(di, &mut discs, &mut queue, tables, shared, cache, job, interner, &mut diags, &mut needs_std);
+        process_disc_orig(di, &mut discs, &mut queue, tables, shared, cache, job, interner, &mut diags, &mut std_asks);
     }
     if !diags.is_empty() {
-        return Err(OneError { diags, seen: seen_of(&discs), needs_std });
+        return Err(OneError { diags, seen: seen_of(&discs), std_asks });
     }
     lap!("resolve: discovery");
     // Unknown cfg names (L0520) are checked on the original tokens of
@@ -2484,7 +2523,7 @@ fn resolve_one(
         if let Some(orig) = &disc.lexed
             && let Err(d) = check_cfg_names(orig, &input.env, interner)
         {
-            return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std });
+            return Err(OneError { diags: vec![d], seen: seen_of(&discs), std_asks });
         }
     }
     // Expansion rounds (6.1): expand every file with the macro
@@ -2545,7 +2584,7 @@ fn resolve_one(
                     expanded[di] = l;
                     file_deps[di] = deps;
                 }
-                Err(d) => return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std }),
+                Err(d) => return Err(OneError { diags: vec![d], seen: seen_of(&discs), std_asks }),
             }
         }
         // Macro-generated module edges and macro definitions.
@@ -2567,10 +2606,10 @@ fn resolve_one(
             bind_outline_macros(&outline, disc_module, &inline, job, tables, interner);
         }
         while let Some(di) = new_queue.pop() {
-            process_disc_orig(di, &mut discs, &mut new_queue, tables, shared, cache, job, interner, &mut diags, &mut needs_std);
+            process_disc_orig(di, &mut discs, &mut new_queue, tables, shared, cache, job, interner, &mut diags, &mut std_asks);
         }
         if !diags.is_empty() {
-            return Err(OneError { diags, seen: seen_of(&discs), needs_std });
+            return Err(OneError { diags, seen: seen_of(&discs), std_asks });
         }
         // Files the expansions generated need their cfg names checked
         // and their own expansion in the next round.
@@ -2578,7 +2617,7 @@ fn resolve_one(
             if let Some(orig) = &disc.lexed
                 && let Err(d) = check_cfg_names(orig, &input.env, interner)
             {
-                return Err(OneError { diags: vec![d], seen: seen_of(&discs), needs_std });
+                return Err(OneError { diags: vec![d], seen: seen_of(&discs), std_asks });
             }
         }
         if discs.len() == before {
@@ -2593,7 +2632,7 @@ fn resolve_one(
                     "This is a lust bug; report it.",
                 )],
                 seen: seen_of(&discs),
-                needs_std,
+                std_asks,
             });
         }
     }
@@ -2713,7 +2752,7 @@ fn resolve_one(
                 }
                 works[pos] = ws;
             }
-            Err(d) => return Err(OneError { diags: vec![d], seen, needs_std }),
+            Err(d) => return Err(OneError { diags: vec![d], seen, std_asks }),
         }
     }
     let mut works: Vec<FileWork> = works.into_iter().flatten().collect();
@@ -2787,7 +2826,7 @@ fn resolve_one(
         }
     }
     if !inner_diags.is_empty() {
-        return Err(OneError { diags: inner_diags, seen, needs_std });
+        return Err(OneError { diags: inner_diags, seen, std_asks });
     }
     for w in works.iter() {
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
@@ -2795,7 +2834,7 @@ fn resolve_one(
         check_stmt_vis_restrictions(&w.ast, w.module, interner, tables, &mut inner_diags);
     }
     if !inner_diags.is_empty() {
-        return Err(OneError { diags: inner_diags, seen, needs_std });
+        return Err(OneError { diags: inner_diags, seen, std_asks });
     }
     lap!("resolve: strip+register");
     // The tables are frozen now. Every file whose cached final
@@ -2846,7 +2885,7 @@ fn resolve_one(
         per_work.into_iter().flatten().collect()
     };
     if !rw_diags.is_empty() {
-        return Err(OneError { diags: rw_diags, seen, needs_std });
+        return Err(OneError { diags: rw_diags, seen, std_asks });
     }
     lap!("resolve: rewrite");
     // ---- Flatten: inline module bodies splice into top-level items;
@@ -3073,7 +3112,7 @@ fn resolve_one(
         nested_modules,
         structure_hash,
         seen,
-        needs_std,
+        std_asks,
         exported_macros: menv.exported_sources(),
         expand_deps: file_deps.into_iter().flatten().collect(),
         timings,

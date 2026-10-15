@@ -30,6 +30,7 @@ use crate::diag::{self, Diag, FileId, LineIndex, SourceMap};
 use crate::expand;
 use crate::intern::{FxMap, Interner, Sym};
 use crate::lexer;
+use crate::stdload::StdPlan;
 use crate::scan;
 use crate::{borrowck, check, ir, lower, parser};
 use std::fmt::Write;
@@ -108,10 +109,13 @@ impl Timer {
     }
     /// Records sub-stage times measured inside a stage that just
     /// finished (the worklist phases), in place of one `lap` for the
-    /// whole stage.
-    fn lap_parts(&mut self, parts: Vec<(&'static str, f64)>) {
+    /// whole stage, plus the time they leave out as `rest`.
+    fn lap_parts(&mut self, parts: Vec<(&'static str, f64)>, rest: &'static str) {
+        let now = Instant::now();
+        let covered: f64 = parts.iter().map(|p| p.1).sum();
         self.stages.extend(parts);
-        self.last = Instant::now();
+        self.stages.push((rest, ((now - self.last).as_secs_f64() * 1e3 - covered).max(0.0)));
+        self.last = now;
     }
     fn render(&self, out: &mut String) {
         for (name, ms) in &self.stages {
@@ -1597,6 +1601,20 @@ fn splice_std(
     Ok(Spliced { ranges, routes: splice.routes, methods })
 }
 
+/// `StdLoad::close`, loading std only when the plan splices some.
+fn close_std_plan(
+    std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
+    user: StdPlan,
+    platform: Option<StdPlan>,
+) -> Result<StdPlan, Response> {
+    let first = if user.platform { user.or(platform.unwrap_or_default()) } else { user };
+    if !first.needs.any() {
+        return Ok(first); // An empty splice asks nothing.
+    }
+    let load = std_cache.get_or_insert_with(|| crate::stdload::load_std().map(std::sync::Arc::new)).clone();
+    load.and_then(|l| l.close(user, platform)).map_err(|e| Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() })
+}
+
 /// The resolver front end (W-RESOLVE): Cargo graph selection, the
 /// outline worklist, and the session setup the shared tail consumes.
 /// The worklist reruns per request (per-file caches inside it are
@@ -1724,31 +1742,48 @@ fn resolved_setup(
         Err(why) => visits.why = why,
     }
     // Std splice, in the root file text, exactly as the single-file path
-    // (user spans do not move). A second resolve runs when another file
-    // names std source the root file does not: the splice then serves
-    // every file's needs (`all_text` holds them all).
-    let unspliced_root = root_text.clone();
+    // (user spans do not move), and the std platform crate: both by the
+    // std plan (`StdPlan`). The first pass takes the session's last plan
+    // (a daemon request) or a guess from the root's module files (a new
+    // session); another pass runs only when the plan of the files the
+    // pass saw differs.
+    let unspliced_root = std::mem::take(&mut root_text);
     // A single-file root is the routed text: routing scanned it for std
     // source modules already.
-    let mut spliced_needs = match route_std_mods {
-        Some(m) if key.krate.manifest_path.is_none() => crate::ty::lang::std_needs_known(&root_text, m),
-        _ => crate::ty::lang::std_needs(&root_text),
+    let root_needs = match route_std_mods {
+        Some(m) if key.krate.manifest_path.is_none() => crate::ty::lang::std_needs_known(&unspliced_root, m),
+        _ => crate::ty::lang::std_needs(&unspliced_root),
     };
-    let mut spliced = spliced_needs.any();
-    if spliced {
-        let sp = splice_std(&mut root_text, std_cache, spliced_needs)?;
-        (*std_ranges, *std_routes, *std_methods) = (sp.ranges, sp.routes, sp.methods);
-        t.lap("std load+splice");
-    }
-    // Routing lexed the single-file root already: hand its tokens to
-    // discovery, unless a std splice changed the text.
-    if !spliced
-        && key.krate.manifest_path.is_none()
-        && let Some(lexed) = root_lexed
-    {
-        front.resolve_cache.seed_root(&root_path, &root_text, lexed);
-    }
+    let root_asks = StdPlan { needs: root_needs, platform: crate::resolve::worklist::mentions_std_platform(&unspliced_root) };
+    let mut plan = match front.std_plan {
+        Some(p) => p,
+        None => {
+            let user = StdPlan::guess_crate(&root_path, &unspliced_root, root_asks);
+            let plan = close_std_plan(std_cache, user, user.platform.then(crate::stdload::guess_platform))?;
+            t.lap("std plan guess");
+            plan
+        }
+    };
+    let mut root_lexed = root_lexed;
+    let mut passes = 0;
     let resolved = loop {
+        passes += 1;
+        root_text.clone_from(&unspliced_root);
+        if plan.needs.any() {
+            let sp = splice_std(&mut root_text, std_cache, plan.needs)?;
+            (*std_ranges, *std_routes, *std_methods) = (sp.ranges, sp.routes, sp.methods);
+        } else {
+            (*std_ranges, *std_routes, *std_methods) = (Vec::new(), Vec::new(), (0, 0));
+        }
+        t.lap("std load+splice");
+        // Routing lexed the single-file root already: hand its tokens to
+        // discovery, unless a std splice changed the text.
+        if !plan.needs.any()
+            && key.krate.manifest_path.is_none()
+            && let Some(lexed) = root_lexed.take()
+        {
+            front.resolve_cache.seed_root(&root_path, &root_text, lexed);
+        }
         let input = CrateInput {
             root_path: root_path.clone(),
             root_text: root_text.clone(),
@@ -1760,46 +1795,33 @@ fn resolved_setup(
             std_splice_lo: std_ranges.first().map(|r| r.0),
             display_root: front.display_root.clone(),
         };
-        match worklist::resolve_crate_cached(&input, &front.interner, &front.known, &mut front.resolve_cache) {
-            Ok(r) => {
-                if r.needs_std {
-                    let all = crate::ty::lang::std_needs(&r.all_text);
-                    let needs = crate::ty::lang::StdNeeds {
-                        fns: all.fns || spliced_needs.fns,
-                        methods: all.methods || spliced_needs.methods,
-                        modules: all.modules || spliced_needs.modules,
-                    };
-                    if !spliced || needs != spliced_needs {
-                        root_text.clone_from(&unspliced_root);
-                        let sp = splice_std(&mut root_text, std_cache, needs)?;
-                        (*std_ranges, *std_routes, *std_methods) = (sp.ranges, sp.routes, sp.methods);
-                        spliced = true;
-                        spliced_needs = needs;
-                        t.lap("std load+splice");
-                        continue;
-                    }
-                }
-                break r;
-            }
-            Err(e) => {
-                if e.needs_std && !spliced {
-                    let needs = crate::ty::lang::std_needs(&e.all_text);
-                    let sp = splice_std(&mut root_text, std_cache, needs)?;
-                    (*std_ranges, *std_routes, *std_methods) = (sp.ranges, sp.routes, sp.methods);
-                    spliced = true;
-                    spliced_needs = needs;
-                    continue;
-                }
-                let mut diags = e.diags;
-                return Err(errors(&mut diags, &e.map, &e.all_text, req));
-            }
+        let out = worklist::resolve_crate_with(&input, &front.interner, &front.known, &mut front.resolve_cache, plan.platform);
+        let (user, platform) = match &out {
+            Ok(r) => (r.std_asks, r.platform_asks),
+            Err(e) => (e.std_asks, e.platform_asks),
+        };
+        let seen = close_std_plan(std_cache, user, platform)?;
+        // Each pass's plan is the same function of the same user files,
+        // so the second pass agrees; the cap only guards a broken rule.
+        if seen == plan || passes == 3 {
+            front.std_plan = Some(seen);
+            break out;
+        }
+        plan = seen;
+        t.lap("resolve: std plan retry");
+    };
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(e) => {
+            let mut diags = e.diags;
+            return Err(errors(&mut diags, &e.map, &e.all_text, req));
         }
     };
     let worklist::ResolvedCrate {
         ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, scans, ..
     } =
         resolved;
-    t.lap_parts(resolve_timings);
+    t.lap_parts(resolve_timings, "resolve: other");
     let fn_count = fn_lines.len();
     // Dropping the previous merged Ast walks every node string and
     // Vec; at crate scale that is milliseconds on the request path.
@@ -1919,7 +1941,7 @@ fn resolved_setup(
             front,
             inputs,
             unspliced_root,
-            spliced,
+            !std_ranges.is_empty(),
             tables.clone(),
             (&std_ranges[..], &std_routes[..], *std_methods),
             fn_lines.clone(),

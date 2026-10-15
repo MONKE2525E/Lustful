@@ -151,6 +151,10 @@ pub(crate) struct Front {
     /// (`compile::check_fingerprint`): a no-op check of the same
     /// request on the resolver path returns it as is.
     pub(crate) last_check: Option<(u64, crate::protocol::Response)>,
+    /// The std plan the last resolver request settled on, the next
+    /// request's first guess (`StdPlan`). Only a guess: the driver
+    /// checks it against the files each pass sees.
+    pub(crate) std_plan: Option<crate::stdload::StdPlan>,
 }
 
 pub(crate) struct Chunk {
@@ -354,6 +358,7 @@ impl Session {
                 patch: None,
                 last_visits: String::new(),
                 last_check: None,
+                std_plan: None,
             },
             caches: Caches {
                 ok: Vec::new(),

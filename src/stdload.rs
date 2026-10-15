@@ -111,6 +111,275 @@ pub struct StdLoad {
     /// chunks and instances stay put.
     methods: String,
     rest: std::sync::OnceLock<Result<StdRest, String>>,
+    /// What each splice asks of std itself (`StdLoad::splice_asks`),
+    /// by `StdPlan::needs_index` of the splice's needs.
+    splice_asks: [std::sync::OnceLock<Result<StdPlan, String>>; 8],
+}
+
+/// The std one resolver compile runs with: what the splice carries,
+/// and whether the shipped std platform crate (W-SHIM) joins.
+///
+/// A compile's plan is a function of its user files only
+/// (`StdLoad::close`): the OR of `StdPlan::asks` over every file but
+/// the platform crate's, closed over what the std text asks itself.
+/// The driver resolves with a guess (a daemon's last plan), then
+/// compares the plan of the files that pass saw; it resolves again
+/// only when they differ. The user files a pass sees do not depend on
+/// the plan (a splice adds inline modules only, the platform crate is
+/// its own job), so warm and cold reach the same final plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StdPlan {
+    pub needs: lang::StdNeeds,
+    pub platform: bool,
+}
+
+impl StdPlan {
+    /// What one file's text asks: its std splice needs and whether it
+    /// can name a std platform module.
+    pub fn asks(text: &str) -> StdPlan {
+        StdPlan { needs: lang::std_needs(text), platform: crate::resolve::worklist::mentions_std_platform(text) }
+    }
+
+    /// Both plans' asks.
+    pub fn or(self, o: StdPlan) -> StdPlan {
+        let (a, b) = (self.needs, o.needs);
+        StdPlan {
+            needs: lang::StdNeeds { fns: a.fns || b.fns, methods: a.methods || b.methods, modules: a.modules || b.modules },
+            platform: self.platform || o.platform,
+        }
+    }
+
+    fn needs_index(needs: lang::StdNeeds) -> usize {
+        needs.fns as usize | (needs.methods as usize) << 1 | (needs.modules as usize) << 2
+    }
+
+    /// A new session's first guess at what its user files ask: the root
+    /// file plus every file its `mod name;` declarations reach, found by
+    /// a text scan (`mod_decls`), with no cfg and no macros. The driver
+    /// checks the guess against the files the resolve sees, so a wrong
+    /// guess only costs one more resolve pass.
+    /// `root_asks` is `StdPlan::asks(root_text)`, which the caller knows.
+    pub fn guess_crate(root_path: &std::path::Path, root_text: &str, root_asks: StdPlan) -> StdPlan {
+        let dir = root_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let plan = root_asks;
+        let mut seen: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
+        // (file, its children's directory, its text)
+        let mut queue: Vec<(std::path::PathBuf, std::path::PathBuf, String)> = Vec::new();
+        let mut push_children = |text: &str, file_dir: &std::path::Path, dir: &std::path::Path, queue: &mut Vec<_>| {
+            for (path, by_attr) in mod_files(text, file_dir, dir) {
+                // A cap for a root in a huge tree; a short guess is still checked.
+                if seen.len() < 20_000 && !seen.contains(&path) {
+                    seen.push(path.clone());
+                    if let Ok(t) = std::fs::read_to_string(&path) {
+                        // A `#[path]` file's children load as a mod.rs file's do.
+                        let dir =
+                            if by_attr { path.parent().map(std::path::Path::to_path_buf).unwrap_or_default() } else { child_dir(&path) };
+                        queue.push((path, dir, t));
+                    }
+                }
+            }
+        };
+        push_children(root_text, &dir, &dir, &mut queue);
+        let mut texts = Vec::new();
+        while let Some((path, dir, text)) = queue.pop() {
+            let file_dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            push_children(&text, &file_dir, &dir, &mut queue);
+            texts.push(text);
+        }
+        texts.iter().fold(plan, |p, t| p.or(StdPlan::asks(t)))
+    }
+}
+
+/// A guess at what the std platform crate's files ask (`guess_crate`
+/// over its root), read once per process. Only feeds a first guess.
+pub fn guess_platform() -> StdPlan {
+    static GUESS: std::sync::OnceLock<StdPlan> = std::sync::OnceLock::new();
+    *GUESS.get_or_init(|| {
+        let root = crate::resolve::worklist::std_platform_root();
+        let text = std::fs::read_to_string(&root).unwrap_or_default();
+        StdPlan::guess_crate(&root, &text, StdPlan::asks(&text))
+    })
+}
+
+/// The directory a module file's own `mod name;` children load from:
+/// its parent for a `mod.rs`, else `<parent>/<stem>`.
+fn child_dir(path: &std::path::Path) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or(std::path::Path::new(""));
+    match path.file_stem().and_then(|s| s.to_str()) {
+        Some("mod") | None => parent.to_path_buf(),
+        Some(stem) => parent.join(stem),
+    }
+}
+
+/// The files the `mod name;` declarations in `text` name, for a file
+/// in `file_dir` whose children load from `dir`: `dir/name.rs` or
+/// `dir/name/mod.rs`, or a `#[path = "p"]` value (relative to
+/// `file_dir`, or inside an inline module to its directory), with
+/// inline `mod m { .. }` blocks as directories. True marks a `#[path]`
+/// file. Comments, strings, and char literals are skipped; a
+/// declaration a macro writes is missed.
+fn mod_files(text: &str, file_dir: &std::path::Path, dir: &std::path::Path) -> Vec<(std::path::PathBuf, bool)> {
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    // Most files declare no file module: one substring search, no walk.
+    let decl_at = |i: usize| {
+        let mut j = i + 3;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let n = j;
+        while j < b.len() && ident(b[j]) {
+            j += 1;
+        }
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j > n && b.get(j) == Some(&b';')
+    };
+    if !text.match_indices("mod").any(|(i, _)| (i == 0 || !ident(b[i - 1])) && decl_at(i)) {
+        return Vec::new();
+    }
+    let word_at = |i: usize| -> &str {
+        let mut j = i;
+        while j < b.len() && ident(b[j]) {
+            j += 1;
+        }
+        &text[i..j]
+    };
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut out = Vec::new();
+    // One entry per open brace: the directory an inline module opened,
+    // or None for any other brace.
+    let mut braces: Vec<Option<std::path::PathBuf>> = Vec::new();
+    let mut path_attr: Option<String> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 0;
+                while i < b.len() {
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b'"' => i = skip_str(b, i + 1, 0),
+            b'r' if (i == 0 || !ident(b[i - 1])) && matches!(b.get(i + 1), Some(b'"' | b'#')) => {
+                let hashes = b[i + 1..].iter().take_while(|&&h| h == b'#').count();
+                if b.get(i + 1 + hashes) == Some(&b'"') {
+                    i = skip_str(b, i + 2 + hashes, hashes);
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            b'\'' => {
+                // A char literal ('x', '\n', '\u{..}', a multibyte char), or a lifetime.
+                if b.get(i + 1) == Some(&b'\\') {
+                    i += 2;
+                    while i < b.len() && b[i] != b'\'' {
+                        i += 1;
+                    }
+                } else if let Some(ch) = text.get(i + 1..).and_then(|r| r.chars().next())
+                    && b.get(i + 1 + ch.len_utf8()) == Some(&b'\'')
+                {
+                    i += 1 + ch.len_utf8();
+                }
+            }
+            b'#' if b.get(skip_ws(i + 1)) == Some(&b'[') => {
+                let j = skip_ws(skip_ws(i + 1) + 1);
+                if word_at(j) == "path" {
+                    let k = skip_ws(j + 4);
+                    if b.get(k) == Some(&b'=') && b.get(skip_ws(k + 1)) == Some(&b'"') {
+                        let s = skip_ws(k + 1) + 1;
+                        let e = skip_str(b, s, 0);
+                        path_attr = text.get(s..e.saturating_sub(1)).map(str::to_string);
+                        i = e;
+                        continue;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            b'{' => {
+                braces.push(None);
+                path_attr = None;
+            }
+            b'}' => {
+                braces.pop();
+                path_attr = None;
+            }
+            b';' => path_attr = None,
+            _ if ident(c) => {
+                let w = word_at(i);
+                if w == "mod" && (i == 0 || !ident(b[i - 1])) {
+                    let n = skip_ws(i + 3);
+                    let name = word_at(n);
+                    let after = skip_ws(n + name.len());
+                    let inline = braces.iter().rev().find_map(|d| d.clone());
+                    let here = inline.clone().unwrap_or_else(|| dir.to_path_buf());
+                    if !name.is_empty() && b.get(after) == Some(&b';') {
+                        match path_attr.take() {
+                            Some(p) => out.push((inline.unwrap_or_else(|| file_dir.to_path_buf()).join(p), true)),
+                            None => {
+                                let file = here.join(format!("{name}.rs"));
+                                out.push((if file.exists() { file } else { here.join(name).join("mod.rs") }, false));
+                            }
+                        }
+                        i = after + 1;
+                        continue;
+                    }
+                    if !name.is_empty() && b.get(after) == Some(&b'{') {
+                        braces.push(Some(here.join(path_attr.take().unwrap_or_else(|| name.to_string()))));
+                        i = after + 1;
+                        continue;
+                    }
+                }
+                i += w.len();
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The index just past the closing quote of a string body starting at
+/// `i` (after the opening quote), for a raw string with `hashes` hashes.
+fn skip_str(b: &[u8], mut i: usize, hashes: usize) -> usize {
+    while i < b.len() {
+        if hashes == 0 && b[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] == b'"' && b[i + 1..].iter().take(hashes).filter(|&&h| h == b'#').count() == hashes {
+            return i + 1 + hashes;
+        }
+        i += 1;
+    }
+    b.len()
 }
 
 /// The part of a std load past the lang enum methods.
@@ -163,6 +432,37 @@ impl StdLoad {
             }
         }
         Ok(Splice { blocks, methods_block, routes })
+    }
+
+    /// What the splice for `needs` asks of std itself (its methods call
+    /// lang methods, a std module can name a platform module).
+    fn splice_asks(&self, needs: lang::StdNeeds) -> Result<StdPlan, String> {
+        self.splice_asks[StdPlan::needs_index(needs)]
+            .get_or_init(|| Ok(self.splice(needs)?.blocks.iter().fold(StdPlan::default(), |p, (_, text)| p.or(StdPlan::asks(text)))))
+            .clone()
+    }
+
+    /// The plan of a compile whose user files ask `user` (see
+    /// `StdPlan`): the least plan that holds `user`, what its splice
+    /// asks, and, when it takes the platform crate, what the platform
+    /// files ask (`platform`, the OR of their asks; `None` when the pass
+    /// that saw `user` ran without the platform crate, so the next pass
+    /// adds them).
+    pub fn close(&self, user: StdPlan, platform: Option<StdPlan>) -> Result<StdPlan, String> {
+        let mut plan = user;
+        loop {
+            let mut next = user.or(self.splice_asks(plan.needs)?);
+            if next.platform
+                && let Some(p) = platform
+            {
+                next = next.or(p);
+            }
+            // Each step only adds asks, so this ends within a few steps.
+            if next == plan {
+                return Ok(plan);
+            }
+            plan = next;
+        }
     }
 
     /// The rest of the load, read and parsed on first use.
@@ -289,7 +589,10 @@ fn load_std_from(read: &mut dyn FnMut(&str) -> Result<String, String>, validate:
         let clean = if validate {
             let (checked, _) = check_file(file, &text, true)?;
             if let Some(it) = checked.ast.items.iter().find(|it| !matches!(it.kind, ItemKind::Impl(_))) {
-                return Err(format!("lust std load failed: library/{}: only impls can ride in a lang method file (item at {})", file.rel, it.span.lo));
+                return Err(format!(
+                    "lust std load failed: library/{}: only impls can ride in a lang method file (item at {})",
+                    file.rel, it.span.lo
+                ));
             }
             checked.clean
         } else {
@@ -301,7 +604,7 @@ fn load_std_from(read: &mut dyn FnMut(&str) -> Result<String, String>, validate:
     if validate {
         let _ = rest.set(Ok(load_rest(read, true)?));
     }
-    Ok(StdLoad { methods, rest })
+    Ok(StdLoad { methods, rest, splice_asks: Default::default() })
 }
 
 /// Loads the shipped files past the lang enum methods: the `STD_FNS`
@@ -321,19 +624,24 @@ fn load_rest(read: &mut dyn FnMut(&str) -> Result<String, String>, validate: boo
     let mut modules = Vec::new();
     for m in crate::stdmods::STD_MODULES {
         let text = read(m.rel)?;
-        modules.push((m.krate, module_splice(m, &text)?));
+        modules.push((m.krate, module_splice(m, &text, validate)?));
     }
     Ok(StdRest { lang: lang_items, fn_splices, fns, modules })
 }
 
-/// The splice text of one std source module (src/stdmods.rs). The file
-/// must lex, expand, and parse on its own; its items are checked in the
-/// user compile, inside their hidden module, because they use imports
-/// and module paths the standalone flat check here does not resolve.
-fn module_splice(m: &crate::stdmods::StdModule, text: &str) -> Result<String, String> {
+/// The splice text of one std source module (src/stdmods.rs). With
+/// `validate`, the file must lex, expand, and parse on its own (the
+/// built-in text is validated by the tests, so a compile skips it); its
+/// items are checked in the user compile, inside their hidden module,
+/// because they use imports and module paths the standalone flat check
+/// here does not resolve.
+fn module_splice(m: &crate::stdmods::StdModule, text: &str, validate: bool) -> Result<String, String> {
     let (clean, marks) = scan_lang_attrs(text, m.rel)?;
     if !marks.is_empty() {
         return Err(format!("lust std load failed: library/{}: a std source module cannot hold #[lust_lang] marks yet", m.rel));
+    }
+    if !validate {
+        return Ok(crate::stdmods::splice_text(m, &clean));
     }
     let interner = Interner::default();
     let known = Known::new(&interner);
@@ -568,6 +876,55 @@ mod tests {
         };
         let load = load_std_from(&mut read, true).expect("fixture library must load");
         assert!(load.rest().unwrap().lang.get(lang::LangItem::PhantomData).is_some(), "mark resolves to a def");
+    }
+
+    /// A plan closes over what its own splice asks, and closing twice
+    /// changes nothing (the driver compares closed plans).
+    #[test]
+    fn std_plan_closes() {
+        let load = load_std_from(&mut builtin_reader(), false).unwrap();
+        let none = StdPlan::default();
+        assert_eq!(load.close(none, None).unwrap(), none);
+        let modules = StdPlan { needs: lang::StdNeeds { modules: true, ..Default::default() }, platform: false };
+        let plan = load.close(modules, None).unwrap();
+        assert!(plan.needs.modules);
+        assert_eq!(load.close(plan, None).unwrap(), plan);
+        // The platform files' asks join only a plan that takes the platform crate.
+        let methods = StdPlan { needs: lang::StdNeeds { methods: true, ..Default::default() }, platform: false };
+        assert_eq!(load.close(none, Some(methods)).unwrap(), none);
+        let platform = StdPlan { platform: true, ..none };
+        assert!(load.close(platform, Some(methods)).unwrap().needs.methods);
+    }
+
+    /// The first-guess scan follows `mod name;`, `#[path]`, inline
+    /// modules, and `mod.rs` directories, and skips comments and strings.
+    #[test]
+    fn guess_follows_module_files() {
+        let dir = std::env::temp_dir().join(format!("lust-stdguess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["a", "c", "inner/deep"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let root = "mod a;\n#[path = \"other.rs\"]\npub mod b;\nmod c;\nmod inner { mod deep; }\n// mod gone;\nconst S: &str = \"mod gone;\";\nfn main() {}\n";
+        let files = [
+            ("a.rs", "mod sub;\n"),
+            ("a/sub.rs", "pub fn f(x: Option<u8>) -> u8 { x.unwrap_or(0) }\n"),
+            ("other.rs", "pub fn g() {}\n"),
+            ("c/mod.rs", "mod leaf;\n"),
+            ("c/leaf.rs", "use std::io::Write;\n"),
+            ("inner/deep.rs", "fn h() { std::process::exit(0); }\n"),
+            ("gone.rs", "use std::time::Duration;\n"),
+        ];
+        for (f, t) in files {
+            std::fs::write(dir.join(f), t).unwrap();
+        }
+        let path = dir.join("main.rs");
+        let plan = StdPlan::guess_crate(&path, root, StdPlan::asks(root));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(plan.needs.methods, "a/sub.rs (through a.rs) is reached");
+        assert!(plan.platform, "c/leaf.rs (through c/mod.rs) is reached");
+        assert!(plan.needs.fns, "inner/deep.rs (an inline module's child) is reached");
+        assert!(!plan.needs.modules, "a commented or quoted `mod gone;` is skipped");
     }
 
     /// A malformed mark is an installation error, never a silent skip.
