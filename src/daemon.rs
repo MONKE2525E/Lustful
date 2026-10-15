@@ -1010,8 +1010,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&other_dir);
     }
 
-    /// A replaced session's object dir is deleted at replacement time,
-    /// not left until daemon exit.
+    /// The watchdog's peer check: an open client is not gone, a closed one is.
     #[test]
     fn client_gone_sees_a_closed_peer_only() {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1020,6 +1019,7 @@ mod tests {
         assert!(client_gone(ours.as_raw_fd()));
     }
 
+    /// LRU order, the served key's protection, and dir numbers that are never reused.
     #[test]
     fn evict_lru_drops_the_least_recent_entry_and_its_dir() {
         let tmp = std::env::temp_dir().join(format!("lust-daemon-evict-{}", std::process::id()));
@@ -1044,6 +1044,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// A replaced session's object dir is deleted at replacement time,
+    /// not left until daemon exit.
     #[test]
     fn replace_session_deletes_the_old_obj_dir() {
         let base = std::env::temp_dir().join(format!("lust-replace-test-{}", std::process::id()));

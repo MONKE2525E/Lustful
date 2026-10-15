@@ -68,7 +68,7 @@ probe=fixed/f0.rs
 "$lust" build "$probe" -o fixed/bin0 >/dev/null 2>&1
 for _ in $(seq 1 200); do [ -S "$LUST_DAEMON_SOCKET" ] && break; sleep 0.05; done
 dpid=$(cat "$LUST_DAEMON_SOCKET.lock" 2>/dev/null)
-[ -n "$dpid" ] && [ -d "/proc/$dpid" ] || { echo "FAIL no daemon started"; exit 1; }
+[ -n "$dpid" ] && [ -d "/proc/$dpid" ] || { echo "daemon-soak: no daemon started, 1 failed"; exit 1; }
 echo "soak: daemon pid $dpid, $N requests, dir $out"
 
 # req <cmd...>: one client request with a hang limit. Prints nothing; sets rc.
@@ -141,8 +141,9 @@ kill "$dpid" 2>/dev/null
 # The daemon logs a stats line every 100 requests (sessions, expansion tables).
 grep -h "stats:" fixed/.lust-cache/daemon.log 2>/dev/null | sed -n '1p;$p'
 if [ "$fail" = 0 ]; then
-  echo "daemon-soak: $N requests, 0 failed (probe ${first_lat} -> ${last_lat} ms)"
+  echo "daemon-soak: $N requests, probe ${first_lat} -> ${last_lat} ms, 0 failed"
   cd / && rm -rf "$out"
 else
-  echo "daemon-soak: $fail failed (samples in $out/samples.txt)"; exit 1
+  echo "samples: $out/samples.txt"
+  echo "daemon-soak: $N requests, $fail failed"; exit 1
 fi
