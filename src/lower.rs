@@ -259,6 +259,79 @@ impl<'p> Lower<'p> {
         self.scopes[depth].push(t);
         t
     }
+    /// True when `&e` is promoted to `'static` (rustc's promotion rules,
+    /// a conservative subset): a literal, a negated or cast literal, a
+    /// const path check folded, arithmetic over those (never a call), a
+    /// unit variant or unit struct,
+    /// or a tuple, array, or struct literal of those, whose type needs
+    /// no drop and has no interior mutability (`promotable_ty`).
+    fn promotable(&mut self, e: ExprId) -> bool {
+        let ty = self.ty(e);
+        if !self.promotable_ty(ty, 0) {
+            return false;
+        }
+        match self.p.ast.expr(e) {
+            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Unit => true,
+            Expr::Unary { op: crate::ast::UnOp::Neg, expr } => matches!(self.p.ast.expr(*expr), Expr::Int(..) | Expr::Float(_)),
+            // Arithmetic over promotable operands. As in rustc, a division
+            // needs a divisor known to be nonzero (here: a nonzero literal),
+            // and `&&` and `||` branch, so they are not promoted.
+            Expr::Binary { op, lhs, rhs } => {
+                use crate::ast::BinOp as B;
+                let (op, lhs, rhs) = (*op, *lhs, *rhs);
+                let op_ok = match op {
+                    B::And | B::Or => false,
+                    B::Div | B::Rem => matches!(self.p.ast.expr(rhs), Expr::Int(v, _) if *v != 0),
+                    _ => true,
+                };
+                op_ok && self.promotable(lhs) && self.promotable(rhs)
+            }
+            Expr::Cast { expr, .. } => matches!(self.p.ast.expr(*expr), Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_)),
+            Expr::Tuple(es) | Expr::Array(es) => es.clone().iter().all(|&x| self.promotable(x)),
+            Expr::Path(_) => {
+                self.ck.const_value(e).is_some()
+                    || matches!(self.ck.res(e), Res::OptNone)
+                    || (matches!(self.ck.res(e), Res::Variant(..)) && !matches!(self.kind(ty), TyKind::FnDef(..)))
+            }
+            Expr::StructLit { fields, update: None, .. } => fields.clone().iter().all(|f| self.promotable(f.2)),
+            _ => false,
+        }
+    }
+
+    /// True when a value of type `t` may be promoted: no drop, no
+    /// interior mutability (scalars, `&str`, shared refs to such, and
+    /// tuples, arrays, `Option`, and this crate's Adts built of them).
+    fn promotable_ty(&mut self, t: Ty, depth: u32) -> bool {
+        if depth > 8 || self.needs_drop_ty(t) {
+            return false;
+        }
+        match self.kind(t) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Never => true,
+            TyKind::Tuple(ts) => self.body.tys.tys_of(ts).to_vec().into_iter().all(|x| self.promotable_ty(x, depth + 1)),
+            TyKind::Array(el, _) | TyKind::Slice(el) => self.promotable_ty(el, depth + 1),
+            TyKind::Ref(_, Mut::Shared, inner) => self.promotable_ty(inner, depth + 1),
+            _ if t == UNIT => true,
+            _ => {
+                if let Some(inner) = self.body.tys.option_elem(t) {
+                    return self.promotable_ty(inner, depth + 1);
+                }
+                let Some(a) = self.body.tys.local_adt(t) else { return false };
+                if self.p.is_std_adt(a) {
+                    return false;
+                }
+                let args: Vec<GenericArg> = match self.kind(t) {
+                    TyKind::Adt(_, a) => self.body.tys.args(a).to_vec(),
+                    _ => Vec::new(),
+                };
+                let fields: Vec<Ty> = self.p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+                fields.into_iter().all(|f| {
+                    let f = subst(&mut self.body.tys, f, &args);
+                    self.promotable_ty(f, depth + 1)
+                })
+            }
+        }
+    }
+
     /// Whether a value of type `ty` needs a drop (cached per body type).
     fn needs_drop_ty(&mut self, ty: Ty) -> bool {
         if let Some(&d) = self.drop_ty.get(&ty) {
@@ -1943,6 +2016,20 @@ impl<'p> Lower<'p> {
                 if let Res::Static(idx) = self.ck.res(*expr) {
                     if let Some(d) = dest {
                         self.assign(d.clone(), Rvalue::StaticRef(idx), span);
+                    }
+                    return;
+                }
+                // Constant promotion (rustc's rvalue static promotion):
+                // `&5`, `&CONST`, `&None`, `&(1, 'a')` borrow a value that
+                // is `'static`. The temporary is promoted (no loan, static
+                // storage in cgen) and holds the same constant each time.
+                if !*mutable && self.promotable(*expr) {
+                    let at = self.ty(*expr);
+                    let t = self.new_local(at, true, None);
+                    self.expr_into(*expr, Some(&Place::local(t)));
+                    self.body.promoted.push(t);
+                    if let Some(d) = dest {
+                        self.assign(d.clone(), Rvalue::Ref(false, Place::local(t)), span);
                     }
                     return;
                 }

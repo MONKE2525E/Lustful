@@ -1753,9 +1753,15 @@ impl FnGen<'_, '_> {
                 format!("l{i}")
             };
             let ct = ctype(t);
-            match by_type.iter_mut().find(|(c, _)| *c == ct) {
-                Some((_, v)) => v.push(decl),
-                None => by_type.push((ct, vec![decl])),
+            if self.body.promoted.contains(&(i as Local)) {
+                // A promoted constant (`&5` borrowed for `'static`): static
+                // storage, written with the same value each time it runs.
+                let _ = writeln!(self.out, "  static {ct} {decl};");
+            } else {
+                match by_type.iter_mut().find(|(c, _)| *c == ct) {
+                    Some((_, v)) => v.push(decl),
+                    None => by_type.push((ct, vec![decl])),
+                }
             }
             if self.local_drop[i] {
                 flags.push(format!("d{i} = {}", is_param as u8));
