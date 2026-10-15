@@ -382,6 +382,7 @@ fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     // Symbols, not texts: this reads every identifier token of the root.
     let (macro_rules, include) = (interner.intern("macro_rules"), interner.intern("include"));
     let std_sym = interner.intern("std");
+    let alloc_sym = interner.intern("alloc");
     let toks = &lexed.tokens;
     for (i, t) in toks.iter().enumerate() {
         match t.tok {
@@ -420,6 +421,15 @@ fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
                 }
             }
             Tok::Ident(s) if s == macro_rules => return true,
+            // A path from `alloc`: only the resolver knows whether the
+            // crate root links it (`extern crate alloc;`).
+            Tok::Ident(s)
+                if s == alloc_sym
+                    && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::PathSep))
+                    && (i == 0 || toks[i - 1].tok != Tok::PathSep) =>
+            {
+                return true;
+            }
             // `std::io::..` and the other platform modules: their items
             // live in the shipped platform crate, which only the
             // worklist loads (W-SHIM).
@@ -4143,6 +4153,15 @@ fn register_items(
             }
             ItemKind::ExternCrate(e) => {
                 let bind_name = e.rename.unwrap_or(e.name);
+                // At the root, `extern crate alloc;` puts `alloc` in the
+                // extern prelude (`ResolvedTables::extern_in_scope`).
+                if module == tables.root_of(module)
+                    && interner.get(bind_name) == "alloc"
+                    && interner.get(e.name) == "alloc"
+                    && !tables.alloc_roots.contains(&module)
+                {
+                    tables.alloc_roots.push(module);
+                }
                 if bind_name != interner.intern("_") {
                     check_dup(seen, Namespace::Type, bind_name, e.span, &mut reported, diags);
                     let target = if e.name == interner.intern("self") {
@@ -5004,6 +5023,22 @@ impl Rewrite<'_> {
         None
     }
 
+    /// Reports a path `alloc::...` (after any `::` marker) written where
+    /// the crate root has no `extern crate alloc;` (rustc E0433 in
+    /// edition 2024), and says so. Check would read it by name.
+    fn alloc_unlinked(&mut self, names: &[Sym], module: ModuleId, span: Span) -> bool {
+        if names.len() < 2 || self.interner.get(names[0]) != "alloc" || !self.tables.alloc_out_of_scope(module) {
+            return false;
+        }
+        self.diags.push(Diag::new(
+            "L0102",
+            span,
+            "cannot find crate `alloc`: it is not linked",
+            "Add `extern crate alloc;` at the crate root, or use the `std` path.",
+        ));
+        true
+    }
+
     /// Rewrites one written path (segments borrowed out of the arena by
     /// the caller, then put back through `set`).
     fn rewrite_path(&mut self, segs: &mut Vec<PathSeg>, ns: Namespace, span: Span, module: ModuleId, scopes: &[Frame], ast: &mut Ast) {
@@ -5028,6 +5063,9 @@ impl Rewrite<'_> {
         // through the extern prelude, and drop the marker when the path
         // stays written (std compat reads plain `std::...`).
         if names.first().is_some_and(|n| self.interner.get(*n) == "::") {
+            if self.alloc_unlinked(&names[1..], module, span) {
+                return;
+            }
             let res = self.tables.resolve_path(module, &names[1..], ns, PathMode::Lexical, true, self.interner);
             match res {
                 PathRes::Partial(Target::Extern(i), _) | PathRes::Done(Target::Extern(i)) if self.tables.externs[i as usize].is_std_lib => {
@@ -5105,6 +5143,10 @@ impl Rewrite<'_> {
                         self.apply(segs, res, span, module, ns, scopes);
                     }
                 }
+                return;
+            }
+            // After std aliases: `use std as alloc;` binds the name.
+            if res == PathRes::Absent && self.alloc_unlinked(&names, module, span) {
                 return;
             }
             // A bare name a module-level glob of a sync or thread module

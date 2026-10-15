@@ -261,6 +261,10 @@ pub struct ResolvedTables {
     /// before collect (`Program::shipped_crate_at` reads them while
     /// `Program::shipped_ranges` is still empty).
     pub std_ranges: Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
+    /// The crate roots with an `extern crate alloc;` item at the root:
+    /// only there (and in shipped std source) does `alloc` name the
+    /// alloc crate, as in rustc edition 2024 (`extern_in_scope`).
+    pub alloc_roots: Vec<ModuleId>,
 }
 
 /// The std modules whose items can come from the shipped platform
@@ -360,6 +364,7 @@ impl ResolvedTables {
             std_modules: Vec::new(),
             std_splice_lo: None,
             std_ranges: Vec::new(),
+            alloc_roots: Vec::new(),
         }
     }
 
@@ -972,6 +977,9 @@ impl ResolvedTables {
                 e.unsupported.hash(h);
             });
         }
+        for m in &self.alloc_roots {
+            fold!(0x49, |h: &mut crate::intern::FxHasher| h.write_u64(m.0 as u64));
+        }
         for (name, m) in &self.std_modules {
             fold!(0x48, |h: &mut crate::intern::FxHasher| {
                 h.write_u64(name.0 as u64);
@@ -1206,6 +1214,35 @@ impl ResolvedTables {
         self.externs.iter().position(|e| e.owner == owner && e.name == name).map(|i| i as u32)
     }
 
+    /// `extern_by_name` for a path written in `from`: the `alloc` std
+    /// extern only counts in a crate whose root has `extern crate
+    /// alloc;`, in the shipped platform crate, and in the std source
+    /// modules of the splice (rustc E0433 otherwise).
+    fn extern_in_scope(&self, from: ModuleId, name: &str) -> Option<u32> {
+        let i = self.extern_by_name(from, name)?;
+        if name != "alloc" || !self.externs[i as usize].is_std_lib {
+            return Some(i);
+        }
+        let root = self.root_of(from);
+        if self.alloc_roots.contains(&root) || self.std_platform.is_some_and(|(r, _)| r == root) {
+            return Some(i);
+        }
+        let mut m = Some(from);
+        while let Some(cur) = m {
+            if self.std_modules.iter().any(|&(_, sm)| sm == cur) {
+                return Some(i);
+            }
+            m = self.modules[cur.0 as usize].parent;
+        }
+        None
+    }
+
+    /// True when `alloc` is a std extern of `from`'s crate that paths
+    /// written in `from` cannot name (no root `extern crate alloc;`).
+    pub fn alloc_out_of_scope(&self, from: ModuleId) -> bool {
+        self.extern_by_name(from, "alloc").is_some() && self.extern_in_scope(from, "alloc").is_none()
+    }
+
     /// The hidden std source module that segment `seg` names under std
     /// extern `i` (`std::time`), when the std splice defined one
     /// (src/stdmods.rs).
@@ -1293,7 +1330,7 @@ impl ResolvedTables {
             None => {}
         }
         let name_str = interner.get(name);
-        if let Some(i) = self.extern_by_name(from, name_str) {
+        if let Some(i) = self.extern_in_scope(from, name_str) {
             return PathRes::Done(self.extern_target(i));
         }
         if !self.modules[from.0 as usize].no_prelude && in_std_prelude(name_str, ns) {
@@ -1352,7 +1389,7 @@ impl ResolvedTables {
             idx = 1;
         } else if leading_colon {
             // `::dep::...`: extern prelude only.
-            match self.extern_by_name(from, interner.get(segs[0])) {
+            match self.extern_in_scope(from, interner.get(segs[0])) {
                 Some(i) => cur = self.extern_target(i),
                 None => return PathRes::Absent,
             }
