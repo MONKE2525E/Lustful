@@ -647,13 +647,26 @@ impl<'p, 'a> Ctx<'p, 'a> {
     /// `S = RandomState`).
     pub(super) fn hash_ctor_sig(&mut self, b: Builtin, callee: ExprId, span: Span) -> Option<(Vec<Ty>, Ty)> {
         use Builtin as B;
-        let segs = match self.p.ast.expr(callee) {
-            Expr::Path(segs) if segs.len() >= 2 => segs.clone(),
+        // Through an alias (`type FxHashMap<K, V> = HashMap<K, V,
+        // BuildHasherDefault<FxHasher>>; FxHashMap::default()`) or `<T>::`
+        // the written type names the table and gives its args
+        // (check/alias_path.rs).
+        let (segs, written_ty) = match self.p.ast.expr(callee) {
+            Expr::Path(segs) if segs.len() >= 2 => (segs.clone(), self.builtin_alias_ty(segs, span, false)),
+            Expr::QPath { self_ty, segs, .. } => (segs.clone(), Some(self.resolve_written(*self_ty))),
             _ => return None,
         };
-        let ty_seg = &segs[segs.len() - 2];
-        let k = HashTy::by_name(self.p.interner.get(ty_seg.name))?;
-        let written: Vec<Ty> = ty_seg.type_args().iter().map(|&t| self.resolve_written(t)).collect();
+        let (k, written) = match written_ty {
+            Some(t) => match self.tys.builtin_of(t) {
+                Some(BuiltinTy::Hash(k)) => (k, self.builtin_self_args(t, k.n_args())),
+                _ => return None,
+            },
+            None => {
+                let ty_seg = &segs[segs.len() - 2];
+                let k = HashTy::by_name(self.p.interner.get(ty_seg.name))?;
+                (k, ty_seg.type_args().iter().map(|&t| self.resolve_written(t)).collect())
+            }
+        };
         let mut args: Vec<Ty> = (0..k.n_args()).map(|i| written.get(i).copied().unwrap_or_else(|| self.new_var(false))).collect();
         let rs = mk_hash(&mut self.tys, HashTy::RandomState, &[]);
         let fixed_rs = matches!(b, B::HashNew | B::HashWithCapacity) && matches!(k, HashTy::HashMap | HashTy::HashSet);
