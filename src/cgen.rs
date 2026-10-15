@@ -1149,11 +1149,14 @@ fn tag_c_type(size: u64, signed: bool) -> &'static str {
 }
 
 /// A zero compound literal of type `t`, in value position. Types the
-/// layout path emits at size 0 take the `{}` form, since tcc rejects
-/// `{0}` for an empty struct.
+/// layout path emits as structs or unions take the `{}` form: tcc
+/// rejects `{0}` when the first member is an empty struct (size 0, or
+/// a `lust_Unit` payload first in a niche-filled `Result<(), String>`).
+/// Scalars keep `{0}`, which tcc needs for them.
 fn zero_lit(p: &Program, t: &CTy) -> String {
     let ct = ctype(t);
-    if c_layout(p, t).is_some_and(|l| l.size == 0) { format!("(({ct}){{}})") } else { format!("(({ct}){{0}})") }
+    let aggregate = c_layout(p, t).is_some_and(|l| l.size == 0 || !l.field_offsets.is_empty() || !l.variant_offsets.is_empty());
+    if aggregate { format!("(({ct}){{}})") } else { format!("(({ct}){{0}})") }
 }
 
 /// The discriminant values of an enum or Option CTy, in variant order.
