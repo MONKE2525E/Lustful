@@ -310,6 +310,11 @@ pub enum Builtin {
     /// `[T]::copy_within` (`T: Copy`): the range bounds travel as
     /// drain's four words (check/slice.rs, lower.rs).
     SliceCopyWithin,
+    /// `[T]::get` and `get_mut` with a range index: the bounds
+    /// travel as drain's four words; out-of-range is `None`
+    /// (check/slice.rs, runtime `lust_range_bounds_get`).
+    SliceGetRange,
+    SliceGetRangeMut,
     VecFrom,
     MemDrop,
     /// `mem::forget(v)`: takes ownership and never drops (W-STD-C).
@@ -1264,6 +1269,9 @@ pub struct Checked<'g> {
     pub deref_recv: Vec<(ExprId, DerefRecv)>,
     /// The range form of each `drain` call, by expression.
     pub drain_ranges: Vec<(ExprId, DrainRange)>,
+    /// The range form of each range-value index (`v[r]`), by the
+    /// index expression (check/slice.rs).
+    pub index_ranges: Vec<(ExprId, DrainForm)>,
     /// The `into_iter` method instance of each `Coerce::IntoIterCall`
     /// (an `extend` or `from_iter` argument), by coerced expression.
     pub into_iter_calls: Vec<(ExprId, LocalDefId)>,
@@ -1333,6 +1341,10 @@ impl Checked<'_> {
     /// The range form of a `drain` call (check/iter.rs).
     pub fn drain_range(&self, e: ExprId) -> Option<DrainRange> {
         self.drain_ranges.iter().find(|(x, _)| *x == e).map(|(_, d)| *d)
+    }
+    /// The range form of a range-value index (check/slice.rs).
+    pub fn index_range(&self, e: ExprId) -> Option<DrainForm> {
+        self.index_ranges.iter().find(|(x, _)| *x == e).map(|(_, d)| *d)
     }
     /// The `into_iter` instance of a `Coerce::IntoIterCall` on `e`.
     pub fn into_iter_call(&self, e: ExprId) -> Option<LocalDefId> {
@@ -1821,6 +1833,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             vtable_requests: Vec::new(),
             deref_recv: Vec::new(),
             drain_ranges: Vec::new(),
+            index_ranges: Vec::new(),
             into_iter_calls: Vec::new(),
             deref_coerce: Vec::new(),
             index_recv: Vec::new(),
@@ -7333,7 +7346,21 @@ impl<'p> Ctx<'p> {
                         }
                     };
                 }
-                self.expect_expr(*index, USIZE);
+                // A range value as the index (`v[r]` with `r` a
+                // `RangeTo<usize>` value, tf-slice): the same slice
+                // place as a syntactic range. The helper checks the
+                // index either way (and coerces a plain one), so the
+                // `expect_expr` runs only when it did not run.
+                let seq_inner = matches!(self.kind(inner), TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str)
+                    || self.tys.vec_elem(inner).is_some()
+                    || self.tys.is_string_ty(inner);
+                if seq_inner {
+                    if let Some(t) = self.range_value_index(e, *index, inner, derefs, span) {
+                        return t;
+                    }
+                } else {
+                    self.expect_expr(*index, USIZE);
+                }
                 match self.kind(inner) {
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => {
                         self.set_res(e, Res::Index { derefs });

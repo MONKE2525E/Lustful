@@ -349,7 +349,7 @@ impl<'p> Ctx<'p> {
     /// six range kinds over `usize` (the index type unifies with
     /// `usize`), a `(Bound<usize>, Bound<usize>)` pair, or a shared
     /// reference to one of those.
-    fn drain_form_of(&mut self, t: Ty, span: Span) -> Option<crate::check::DrainForm> {
+    pub(super) fn drain_form_of(&mut self, t: Ty, span: Span) -> Option<crate::check::DrainForm> {
         use crate::check::DrainForm as F;
         use IterKind as K;
         let t = self.resolve(t);

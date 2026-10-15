@@ -519,6 +519,36 @@ lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, 
    the copied range leaves (`dest is out of bounds` at the caller,
    core's `#[track_caller]` assert), then moves the bytes, overlap
    included. */
+/* The `start..end` of a `SliceIndex` range argument (same tags as
+   `lust_range_bounds_check`), or 0 when core's `get` would answer
+   `None`: the end bound against the length first, then the start
+   bound, then their order (core's `try_into_slice_range`). */
+int lust_range_bounds_get(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t *out_s, uint64_t *out_e) LUST_BODY({
+    uint64_t end;
+    if (e_tag == 0) {
+        if (e_val >= len) return 0;
+        end = e_val + 1;
+    } else if (e_tag == 1) {
+        if (e_val > len) return 0;
+        end = e_val;
+    } else {
+        end = len;
+    }
+    uint64_t start;
+    if (s_tag == 2) {
+        start = 0;
+    } else if (s_tag == 1) {
+        if (s_val >= end) return 0;
+        start = s_val + 1;
+    } else {
+        if (s_val > end) return 0;
+        start = s_val;
+    }
+    *out_s = start;
+    *out_e = end;
+    return 1;
+})
+
 void lust_slice_copy_within(void *ptr, uint64_t len, uint64_t elem, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t dest, lust_loc loc) LUST_BODY({
     uint64_t start, end;
     lust_range_bounds_check(len, s_tag, s_val, e_tag, e_val, &start, &end);

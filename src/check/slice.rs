@@ -42,10 +42,15 @@ impl<'p> Ctx<'p> {
             "fill" => "fill",
             "copy_from_slice" => "copy_from_slice",
             "copy_within" => "copy_within",
+            "get" => "get",
+            "get_mut" => "get_mut",
             _ => return None,
         };
         if n == "copy_within" {
             return Some(self.copy_within_method(e, recv, elem, derefs, name_span, args, turbofish));
+        }
+        if n == "get" || n == "get_mut" {
+            return Some(self.slice_get_method(e, recv, elem, derefs, name_span, args, n == "get_mut"));
         }
         let needle = |this: &mut Self| {
             let sl = this.tys.intern(TyKind::Slice(elem));
@@ -109,6 +114,90 @@ impl<'p> Ctx<'p> {
         self.out.drain_ranges.push((e, form));
         self.set_res(e, Res::BuiltinMethod { b: Builtin::SliceCopyWithin, derefs, autoref: Autoref::RefMut });
         UNIT
+    }
+
+    /// `[T]::get` and `get_mut`: a `usize` index (the Vec table's
+    /// form, kept here so the argument is checked once) or any
+    /// `SliceIndex` range form: a syntactic range, a range value,
+    /// or a `(Bound, Bound)` pair. Range forms record like drain
+    /// and answer `Option<&[T]>`.
+    fn slice_get_method(&mut self, e: ExprId, recv: ExprId, elem: Ty, derefs: u8, name_span: Span, args: &[ExprId], mutable: bool) -> Ty {
+        use Builtin as B;
+        let autoref = if mutable { Autoref::RefMut } else { Autoref::Ref };
+        if args.len() != 1 {
+            // The table's arity error shape.
+            self.check_args(&[USIZE], args, name_span);
+            return ERROR;
+        }
+        let arg = args[0];
+        let form = if matches!(self.p.ast.expr(arg), Expr::Range { .. }) {
+            self.drain_range_form(e, arg, name_span)
+        } else {
+            let t = self.expr(arg, None);
+            let t = self.deep(t);
+            match self.drain_form_of(t, name_span) {
+                Some(f) => Some(DrainRange::Value(f)),
+                None => {
+                    // A plain index: the Vec table's builtin and
+                    // coercion, on the argument as already checked.
+                    self.coerce_expr(arg, t, USIZE);
+                    let r = self.tys.mk_ref(mutable, elem);
+                    let ret = self.tys.mk_option(r);
+                    self.check_packed_borrow(recv, name_span);
+                    let b = if mutable { B::VecGetMut } else { B::VecGet };
+                    self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+                    return ret;
+                }
+            }
+        };
+        let Some(form) = form else { return ERROR };
+        self.check_packed_borrow(recv, name_span);
+        self.out.drain_ranges.push((e, form));
+        let b = if mutable { B::SliceGetRangeMut } else { B::SliceGetRange };
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+        let sl = self.tys.intern(TyKind::Slice(elem));
+        let r = self.tys.mk_ref(mutable, sl);
+        self.tys.mk_option(r)
+    }
+
+    /// An index expression `base[index]` whose index is a range
+    /// value (not a syntactic range): the same slice place, with
+    /// the form recorded for lowering (`Checked::index_range`).
+    /// Returns the sliced type for a range form; None when the
+    /// index is no range form. The index is checked (and coerced
+    /// to `usize` for the plain form) in every case, so the caller
+    /// must not expect it again.
+    pub(super) fn range_value_index(&mut self, e: ExprId, index: ExprId, inner: Ty, derefs: u8, span: Span) -> Option<Ty> {
+        let t = self.expr(index, None);
+        let t = self.deep(t);
+        let form = self.drain_form_of(t, span);
+        match form {
+            // A `(Bound, Bound)` index panics at core's own sites,
+            // not the call's: not yet, as a plain mismatch.
+            Some(DrainForm::Bounds | DrainForm::BoundsRef) => {
+                self.coerce_expr(index, t, USIZE);
+                None
+            }
+            Some(f) => {
+                self.out.index_ranges.push((e, f));
+                self.set_res(e, Res::SliceIndex { derefs });
+                if self.kind(inner) == TyKind::Str || self.tys.is_string_ty(inner) {
+                    return Some(STR);
+                }
+                let elem = match self.kind(inner) {
+                    TyKind::Array(elem, _) | TyKind::Slice(elem) => Some(elem),
+                    _ => self.tys.vec_elem(inner),
+                };
+                Some(match elem {
+                    Some(elem) => self.tys.intern(TyKind::Slice(elem)),
+                    None => ERROR,
+                })
+            }
+            None => {
+                self.coerce_expr(index, t, USIZE);
+                None
+            }
+        }
     }
 
     /// Checks the arguments with no expectations and answers the

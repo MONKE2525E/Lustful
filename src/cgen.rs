@@ -5045,6 +5045,27 @@ impl FnGen<'_, '_> {
                 );
                 "((lust_Unit){})".into()
             }
+            B::SliceGetRange | B::SliceGetRangeMut => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let sl = CTy::Slice(Box::new(e));
+                let opt = CTy::Option(Box::new(sl.clone()));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, s0, e0) = (self.tmp(), self.tmp(), self.tmp());
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(
+                    self.out,
+                    "    {{ uint64_t {s0} = 0, {e0} = 0;\n      if (lust_range_bounds_get({len}, {}, {}, {}, {}, &{s0}, &{e0})) {{ {field} = ({}){{ {ptr} + {s0}, {e0} - {s0} }};{some} }} }}",
+                    vals[1],
+                    vals[2],
+                    vals[3],
+                    vals[4],
+                    ctype(&sl)
+                );
+                t
+            }
             B::VecClear | B::VecTruncate => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };

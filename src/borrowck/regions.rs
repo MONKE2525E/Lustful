@@ -6582,6 +6582,8 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::VecDrainAsSlice
             | B::ArrayIterAsSlice
             | B::StrDrainAsStr
+            | B::SliceGetRange
+            | B::SliceGetRangeMut
     )
 }
 

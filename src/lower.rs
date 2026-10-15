@@ -814,19 +814,26 @@ impl<'p> Lower<'p> {
                     None => self.place(*base),
                 };
                 let b = Self::derefs(b, derefs);
-                let (lo_e, hi_e, inclusive) = match self.p.ast.expr(*index) {
-                    Expr::Range { lo, hi, inclusive } => (*lo, *hi, *inclusive),
-                    _ => (None, None, false),
+                let (lo, hi, inclusive) = if let Some(form) = self.ck.index_range(e) {
+                    // A range value as the index (check/slice.rs):
+                    // its fields are the bounds.
+                    self.range_value_bounds(*index, form, span)
+                } else {
+                    let (lo_e, hi_e, inclusive) = match self.p.ast.expr(*index) {
+                        Expr::Range { lo, hi, inclusive } => (*lo, *hi, *inclusive),
+                        _ => (None, None, false),
+                    };
+                    let bound = |this: &mut Self, e: Option<ExprId>| -> Option<Operand> {
+                        e.map(|e| {
+                            let t = this.temp(USIZE);
+                            this.expr_into(e, Some(&Place::local(t)));
+                            Operand::Copy(Place::local(t))
+                        })
+                    };
+                    let lo = bound(self, lo_e).unwrap_or(Operand::Const(Const::Int(0, IntTy::Usize)));
+                    let hi = bound(self, hi_e);
+                    (lo, hi, inclusive)
                 };
-                let bound = |this: &mut Self, e: Option<ExprId>| -> Option<Operand> {
-                    e.map(|e| {
-                        let t = this.temp(USIZE);
-                        this.expr_into(e, Some(&Place::local(t)));
-                        Operand::Copy(Place::local(t))
-                    })
-                };
-                let lo = bound(self, lo_e).unwrap_or(Operand::Const(Const::Int(0, IntTy::Usize)));
-                let hi = bound(self, hi_e);
                 // The temporary holds the slice place itself (bare `[T]`
                 // or `str` type, a fat value in codegen).
                 let slice = match self.kind(self.ty(e)) {
@@ -3247,6 +3254,121 @@ impl<'p> Lower<'p> {
         self.call_into(CallTarget::Builtin(b), vec![Operand::Move(Place::local(t)), stag, sval, etag, eval, dest_op], d, span);
     }
 
+    /// `[T]::get` and `get_mut` with a range index: the receiver
+    /// reference and the bounds as four words, like drain. The
+    /// mutable form reserves two-phase only on a slice place, as
+    /// in `copy_within_into`.
+    fn get_range_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], derefs: u8, dest: Option<&Place>, span: Span, mutable: bool) {
+        let Res::BuiltinMethod { b, .. } = self.ck.res(e) else { return };
+        let Some(form) = self.ck.drain_range(e) else { return };
+        let root = self.deref_steps(e, recv, span);
+        let root_ty = match &root {
+            Some(pl) => self.body.locals[pl.local as usize].ty,
+            None => self.ty(recv),
+        };
+        let recv_ty = self.peel(root_ty, derefs);
+        let pl = Self::derefs(
+            match &root {
+                Some(pl) => pl.clone(),
+                None if mutable => self.place_for_mut(recv),
+                None => self.place(recv),
+            },
+            derefs,
+        );
+        let rt = self.ref_ty(mutable, recv_ty);
+        let t = self.temp(rt);
+        let two_phase =
+            mutable && root.is_none() && matches!(self.kind(recv_ty), TyKind::Slice(_)) && !pl.proj.iter().any(|x| matches!(x, Proj::Index(_)));
+        let bounds = if two_phase {
+            let st = self.ref_ty(false, recv_ty);
+            let reserve = self.temp(st);
+            self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+            let bounds = self.slice_index_bounds(e, args[0], form, span);
+            self.push(StmtKind::FakeRead(reserve), span);
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            bounds
+        } else {
+            self.assign(Place::local(t), Rvalue::Ref(mutable, pl), span);
+            self.slice_index_bounds(e, args[0], form, span)
+        };
+        let (stag, sval, etag, eval) = bounds;
+        let d = self.call_dest(dest, self.ty(e));
+        let recv_op = if mutable { Operand::Move(Place::local(t)) } else { Operand::Copy(Place::local(t)) };
+        self.call_into(CallTarget::Builtin(b), vec![recv_op, stag, sval, etag, eval], d, span);
+    }
+
+    /// The four bound words of a `SliceIndex` range argument:
+    /// drain's words, except a `RangeInclusive` value, whose
+    /// exhausted flag moves the start to `end + 1` (core's
+    /// `into_slice_range`), which drain's `RangeBounds` reading
+    /// does not do.
+    fn slice_index_bounds(
+        &mut self,
+        e: ExprId,
+        arg: ExprId,
+        form: crate::check::DrainRange,
+        span: Span,
+    ) -> (Operand, Operand, Operand, Operand) {
+        if let crate::check::DrainRange::Value(crate::check::DrainForm::RangeInclusive) = form {
+            let z = Operand::Const(Const::Int(0, IntTy::Usize));
+            let aty = self.ty(arg);
+            let t = self.temp(aty);
+            self.expr_into(arg, Some(&Place::local(t)));
+            let pl = Place::local(t);
+            let lo = self.inclusive_lo(pl.clone(), span);
+            return (z.clone(), lo, z, Operand::Copy(pl.project(Proj::Field(1))));
+        }
+        self.drain_bounds(e, arg, form, span)
+    }
+
+    /// The start of a `RangeInclusive` place as a slice range:
+    /// `end + 1` (wrapping; the caller's length check rejects the
+    /// wrapped case first) when exhausted, else `start`.
+    fn inclusive_lo(&mut self, pl: Place, span: Span) -> Operand {
+        let lo = self.temp(USIZE);
+        let (tb, fb, join) = (self.new_block(), self.new_block(), self.new_block());
+        let b = &mut self.body.blocks[self.cur.0 as usize];
+        b.term = Terminator::If(Operand::Copy(pl.project(Proj::Field(2))), tb, fb);
+        b.term_span = span;
+        self.cur = tb;
+        self.call_into(
+            CallTarget::Builtin(Builtin::WrappingAdd),
+            vec![Operand::Copy(pl.project(Proj::Field(1))), Operand::Const(Const::Int(1, IntTy::Usize))],
+            Place::local(lo),
+            span,
+        );
+        self.goto(join, span);
+        self.cur = fb;
+        self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(pl.project(Proj::Field(0)))), span);
+        self.goto(join, span);
+        Operand::Copy(Place::local(lo))
+    }
+
+    /// The (lo, hi, inclusive) of a range value used as an index
+    /// (`v[r]`, check/slice.rs): the value's fields, as a syntactic
+    /// range's bounds. `(Bound, Bound)` pairs never reach here
+    /// (rejected in check).
+    fn range_value_bounds(&mut self, index: ExprId, form: crate::check::DrainForm, span: Span) -> (Operand, Option<Operand>, bool) {
+        use crate::check::DrainForm as F;
+        let z = Operand::Const(Const::Int(0, IntTy::Usize));
+        let aty = self.ty(index);
+        let t = self.temp(aty);
+        self.expr_into(index, Some(&Place::local(t)));
+        let pl = Place::local(t);
+        let f = |i: u32| Operand::Copy(pl.project(Proj::Field(i)));
+        match form {
+            F::Range => (f(0), Some(f(1)), false),
+            F::RangeInclusive => {
+                let hi = f(1);
+                (self.inclusive_lo(pl, span), Some(hi), true)
+            }
+            F::RangeFrom => (f(0), None, false),
+            F::RangeTo => (z, Some(f(0)), false),
+            F::RangeToInclusive => (z, Some(f(0)), true),
+            F::RangeFull | F::Bounds | F::BoundsRef => (z, None, false),
+        }
+    }
+
     /// The four bound words of a `drain` argument, by its form
     /// (check/iter.rs `drain_range_form`).
     fn drain_bounds(&mut self, e: ExprId, arg: ExprId, form: crate::check::DrainRange, span: Span) -> (Operand, Operand, Operand, Operand) {
@@ -3835,6 +3957,13 @@ impl<'p> Lower<'p> {
         }
         if let Res::BuiltinMethod { b: Builtin::SliceCopyWithin, derefs, .. } = self.ck.res(e) {
             self.copy_within_into(e, recv, args, derefs, dest, span);
+            return;
+        }
+        if let Res::BuiltinMethod { b, derefs, .. } = self.ck.res(e)
+            && matches!(b, Builtin::SliceGetRange | Builtin::SliceGetRangeMut)
+        {
+            let mutable = b == Builtin::SliceGetRangeMut;
+            self.get_range_into(e, recv, args, derefs, dest, span, mutable);
             return;
         }
         if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
