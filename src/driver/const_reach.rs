@@ -10,8 +10,9 @@
 // fn whose name is in the set, until nothing changes. A const fn whose name
 // is not in the set runs in no evaluator, so an edit of its body is a plain
 // body edit (`patch::apply`). Names, not defs: a collision only costs the
-// fast path. No evaluator runs a method with a `self` parameter (each
-// answers it as outside the bound), so those never count as reached.
+// fast path. A method call names its method too (`Flags::A.bits()` holds
+// the identifier `bits`), so const methods with a `self` parameter count
+// like any const fn.
 //
 // A reached const fn may still feed only const and static values: then
 // the kept program evaluates every value again and compares
@@ -70,7 +71,7 @@ impl ConstReach {
             .enumerate()
             .filter_map(|(i, &(item, sub))| {
                 let def = fn_def_at(&front.ast, item, sub);
-                (def.qual.is_const && def.self_param.is_none()).then_some((i, def.name))
+                def.qual.is_const.then_some((i, def.name))
             })
             .collect();
         let mut r = ConstReach {
@@ -108,7 +109,7 @@ impl ConstReach {
     pub(crate) fn reaches(&self, front: &Front, i: usize) -> bool {
         let (item, sub) = front.fn_loc[i];
         let def = fn_def_at(&front.ast, item, sub);
-        def.self_param.is_none() && self.names.contains(&def.name)
+        self.names.contains(&def.name)
     }
 
     /// True when the results of fns `fns` (`Front::fn_loc` indexes) can

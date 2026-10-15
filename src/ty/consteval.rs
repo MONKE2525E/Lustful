@@ -87,7 +87,8 @@ pub enum CallTarget {
 /// The parts of a const fn the evaluator runs.
 pub struct ConstFnBody {
     /// Parameters as (name, mutable, pattern): a plain `name: Ty` parameter
-    /// has no pattern and binds by name.
+    /// has no pattern and binds by name. A method's receiver comes
+    /// first, as `self` (`param_tys[0]` is `Self` or `&Self`).
     pub params: Vec<(Sym, bool, Option<PatId>)>,
     pub param_tys: Vec<Ty>,
     pub ret: Ty,
@@ -97,12 +98,16 @@ pub struct ConstFnBody {
     pub owner: Option<Sym>,
     /// Whether the fn is generic, and which bounds its type args need.
     pub generic: ConstGeneric,
+    /// The fn's `LocalDefId` index, for `ConstCx::bounds_hold`.
+    pub def: u32,
+    /// True for a method: `params[0]` is its receiver, named `self`.
+    pub has_self: bool,
 }
 
 /// A const fn's generics, for a call in const position. The evaluator
-/// has no trait solver (const items evaluate before the impl index is
-/// built), so a bounded generic fn is outside the bound, except std's
-/// lazy constructors, whose one bound it checks itself.
+/// has no trait solver of its own: a bounded generic fn runs when the
+/// context proves its bounds (`ConstCx::bounds_hold`), and std's lazy
+/// constructors' one bound it checks itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConstGeneric {
     /// Not generic.
@@ -112,7 +117,7 @@ pub enum ConstGeneric {
     /// `LazyLock::new` / `LazyCell::new` (std source, W-STD-C): params
     /// `T` (0) and `F` (1), bound `F: FnOnce() -> T`.
     LazyCtor,
-    /// Generic with bounds: outside the bound.
+    /// Generic with bounds: runs when `ConstCx::bounds_hold` proves them.
     Bounded,
 }
 
@@ -139,6 +144,35 @@ pub trait ConstCx<'a> {
     }
     /// A call target for a callee expression already known to be a path.
     fn call_target(&mut self, callee: ExprId) -> CallTarget;
+    /// The inherent method `name` of type `recv` (references peeled),
+    /// for a method call in const position: a `ConstFn` with the
+    /// receiver as its first parameter, `NonConst` for a method that
+    /// is not `const`, `Unknown` when the type has no such inherent
+    /// method (the primitive methods answer then).
+    fn method_target(&mut self, _recv: Ty, _name: Sym) -> CallTarget {
+        CallTarget::Unknown
+    }
+    /// True when the inherent method `name` of `recv` is private to
+    /// the module whose const expression the evaluator runs (asked
+    /// only outside a called const fn's body, like
+    /// `named_field_private`).
+    fn method_private(&mut self, _recv: Ty, _name: Sym) -> bool {
+        false
+    }
+    /// Whether every where-clause of generic const fn `def` holds with
+    /// its type params bound to `binds` (by param index), for the call
+    /// at `span`. None when the context cannot prove them: the call is
+    /// then outside the bound. A context may defer a closed trait goal
+    /// to a later proof that reports at `span`.
+    fn bounds_hold(&mut self, _def: u32, _binds: &[Option<Ty>], _span: Span) -> Option<bool> {
+        None
+    }
+    /// The instance of generic Adt `adt` whose type params are `binds`
+    /// (by param index), for a constructor call with no expected type.
+    /// None when a param is unbound or not a type param.
+    fn adt_instance(&mut self, _adt: AdtId, _binds: &[Option<Ty>]) -> Option<Ty> {
+        None
+    }
     /// A path used as a value: a unit variant, if it names one.
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)>;
     /// A static item by name at a use site: its index and type.
@@ -289,6 +323,12 @@ fn projection_root(ast: &Ast, mut e: ExprId) -> ExprId {
     e
 }
 
+/// A written path as text (`Type::f`), for diagnostics: the census
+/// and readers find the item an error names by its backticked path.
+fn path_text<'a, C: ConstCx<'a>>(cx: &C, segs: &[ast::PathSeg]) -> String {
+    segs.iter().map(|s| crate::intern::source_name(cx.sym_text(s.name))).collect::<Vec<_>>().join("::")
+}
+
 fn outside(span: Span, what: &str) -> Diag {
     Diag::new(
         C_OUTSIDE,
@@ -371,8 +411,8 @@ pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
                 && a.extern_c == b.extern_c
                 && b.free_slots == 0
                 && ai.len() == bi.len()
-                && ai.iter().zip(bi).all(|(&x, &y)| const_ty_compatible(tys, y, x) && static_marks_fit(tys, x, y, true, false))
-                && const_ty_compatible(tys, a.output, b.output)
+                && ai.iter().zip(bi).all(|(&x, &y)| same_but_regions(tys, x, y) && static_marks_fit(tys, x, y, true, false))
+                && same_but_regions(tys, a.output, b.output)
                 && static_marks_fit(tys, a.output, b.output, false, false)
         }
         (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
@@ -382,6 +422,44 @@ pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
                     (super::GenericArg::Ty(x), super::GenericArg::Ty(y)) => const_ty_compatible(tys, *x, *y),
                     _ => x == y,
                 })
+        }
+        _ => false,
+    }
+}
+
+/// True when two types are equal up to their regions: the parts of fn
+/// pointer signatures, where only subtyping applies (no `&mut` to `&`
+/// or array to slice coercion). `static_marks_fit` judges the regions.
+fn same_but_regions<T: TyIntern>(tys: &T, a: Ty, b: Ty) -> bool {
+    if a == b || a == ERROR || b == ERROR {
+        return true;
+    }
+    match (tys.kind(a), tys.kind(b)) {
+        (TyKind::Ref(_, m1, x), TyKind::Ref(_, m2, y)) => m1 == m2 && same_but_regions(tys, x, y),
+        (TyKind::RawPtr(m1, x), TyKind::RawPtr(m2, y)) => m1 == m2 && same_but_regions(tys, x, y),
+        (TyKind::Slice(x), TyKind::Slice(y)) => same_but_regions(tys, x, y),
+        (TyKind::Array(x, n1), TyKind::Array(y, n2)) => n1 == n2 && same_but_regions(tys, x, y),
+        (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+            let (x, y) = (tys.tys_of(x), tys.tys_of(y));
+            x.len() == y.len() && x.iter().zip(y).all(|(&p, &q)| same_but_regions(tys, p, q))
+        }
+        (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
+            let (x, y) = (tys.args(a1), tys.args(a2));
+            x.len() == y.len()
+                && x.iter().zip(y).all(|(p, q)| match (p, q) {
+                    (super::GenericArg::Ty(p), super::GenericArg::Ty(q)) => same_but_regions(tys, *p, *q),
+                    (super::GenericArg::Lifetime(_), super::GenericArg::Lifetime(_)) => true,
+                    _ => p == q,
+                })
+        }
+        (TyKind::FnPtr(s1), TyKind::FnPtr(s2)) => {
+            let (p, q) = (tys.sig(s1).value, tys.sig(s2).value);
+            let (pi, qi) = (tys.tys_of(p.inputs), tys.tys_of(q.inputs));
+            p.is_unsafe == q.is_unsafe
+                && p.extern_c == q.extern_c
+                && pi.len() == qi.len()
+                && pi.iter().zip(qi).all(|(&x, &y)| same_but_regions(tys, x, y))
+                && same_but_regions(tys, p.output, q.output)
         }
         _ => false,
     }
@@ -795,6 +873,8 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
         dead_seen: std::collections::HashSet::new(),
         flex_debt: Vec::new(),
         local_debt: Vec::new(),
+        self_sym: None,
+        ref_bind: false,
     };
     let mut env: Env = Vec::new();
     let span = cx.ast().expr_span(e);
@@ -862,6 +942,12 @@ struct Evaluator {
     flex_debt: Vec<ExprId>,
     /// Which local names carry which flex debts.
     local_debt: Vec<(Sym, ExprId)>,
+    /// The name a method body's receiver is bound under (`self`),
+    /// set by the first method call: `Expr::SelfValue` reads it.
+    self_sym: Option<Sym>,
+    /// True while `match_pat` matches below a reference it went
+    /// through: bindings there bind by reference.
+    ref_bind: bool,
 }
 
 /// Steps one blob byte grants. A hash loop body (index, xor or
@@ -1051,6 +1137,16 @@ impl Evaluator {
             }
             Expr::Unit => (ConstValue::Unit, UNIT),
             Expr::Path(segs) => return Ok(Flow::Val(self.path_value(cx, env, segs, span, expected)?)),
+            // A method body's receiver, bound as a local named `self`.
+            Expr::SelfValue => {
+                let Some(slot) = self.self_sym.and_then(|s| env.iter_mut().rev().find(|(n, _, _, _)| *n == s)) else {
+                    return Err(outside(span, "`self` here"));
+                };
+                if self.move_read {
+                    slot.3 = true;
+                }
+                return Ok(Flow::Val(slot.1.clone()));
+            }
             Expr::QPath { self_ty, trait_path, segs } if segs.len() == 1 && !trait_path.is_empty() => {
                 return match cx.qpath_const(*self_ty, trait_path, segs[0].name) {
                     Some(v) => Ok(Flow::Val(v)),
@@ -1807,9 +1903,9 @@ impl Evaluator {
     }
 
     /// Evaluates a branch the live path did not take, only to
-    /// surface its E0493 drops: rustc's const drop check is
-    /// static, so a destructor in dead code still rejects, while
-    /// its panics and overflows do not. The environment, step
+    /// surface its E0493 drops and E0015 non-const calls: rustc
+    /// checks both statically, so they still reject in dead code,
+    /// while its panics and overflows do not. The environment, step
     /// count, and drop-temporary count are restored afterwards.
     fn scan_dead_block<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &Env, b: ast::BlockId) -> Result<(), Diag> {
         if !self.dead_seen.insert((true, b.0)) {
@@ -1824,7 +1920,7 @@ impl Evaluator {
         self.flex_debt.truncate(flex);
         self.local_debt.truncate(local);
         match r {
-            Err(d) if is_drop_diag(&d) => Err(d),
+            Err(d) if is_drop_diag(&d) || is_nonconst_call_diag(&d) => Err(d),
             _ => Ok(()),
         }
     }
@@ -1843,7 +1939,7 @@ impl Evaluator {
         self.flex_debt.truncate(flex);
         self.local_debt.truncate(local);
         match r {
-            Err(d) if is_drop_diag(&d) => Err(d),
+            Err(d) if is_drop_diag(&d) || is_nonconst_call_diag(&d) => Err(d),
             _ => Ok(()),
         }
     }
@@ -1978,7 +2074,17 @@ impl Evaluator {
                     let Some(init) = init else { return Err(outside(cx.ast().pat_span(*pat), "an uninitialized binding")) };
                     let exp = ty.map(|t| cx.resolve_ty(t));
                     let debt_before = self.flex_debt.clone();
-                    let v = self.value_moved(cx, env, *init, exp)?;
+                    let mut v = self.value_moved(cx, env, *init, exp)?;
+                    // The initializer coerces to the written type, or
+                    // the binding is a mismatch (rustc E0308).
+                    if let Some(t) = exp {
+                        if !const_ty_compatible(cx.tys_ref(), v.1, t) {
+                            return Err(const_ty_mismatch(cx.ast().expr_span(*init), "this `let` initializer"));
+                        }
+                        if t != ERROR {
+                            v.1 = t;
+                        }
+                    }
                     // A drop value that is not bound whole is
                     // destroyed by the binding itself: a `_` pattern
                     // drops it at once, and a destructuring pattern
@@ -2121,7 +2227,7 @@ impl Evaluator {
         if let Some(v) = cx.fn_item(segs, span) {
             return Ok(v);
         }
-        Err(outside(span, "this path"))
+        Err(outside(span, &format!("the path `{}`", path_text(cx, segs))))
     }
 
     /// `f64::NAN`, `std::f64::consts::PI`, and friends, by written names.
@@ -2761,17 +2867,28 @@ impl Evaluator {
                     let what = cx.ne_ctor_what(adt, variant);
                     self.check_ne(what, NeKind::Ctor, span)?;
                 }
+                // A generic Adt with no expected or written args takes
+                // them from the argument types (`W(5u32)`).
+                let infer = inst.is_none() && adt.0 < u32::MAX - 1 && fields.iter().any(|&f| cx.tys_ref().flags(f).contains_param());
+                let mut binds: Vec<Option<Ty>> = Vec::new();
                 let mut vals = Vec::new();
                 for (i, &a) in args.iter().enumerate() {
                     let want = fields.get(i).copied();
-                    let (v, vt) = self.value_moved(cx, env, a, want)?;
-                    if let Some(want) = want
-                        && !const_ty_compatible(cx.tys_ref(), vt, want)
-                    {
-                        return Err(const_ty_mismatch(cx.ast().expr_span(a), "this constructor argument"));
+                    let want_now = if infer { want.map(|w| subst_binds(cx.tys(), w, &binds)) } else { want };
+                    let (v, vt) = self.value_moved(cx, env, a, want_now)?;
+                    if let Some(want) = want {
+                        let ok = if infer { bind_params(cx.tys(), want, vt, &mut binds) } else { const_ty_compatible(cx.tys_ref(), vt, want) };
+                        if !ok {
+                            return Err(const_ty_mismatch(cx.ast().expr_span(a), "this constructor argument"));
+                        }
                     }
                     vals.push(v);
                 }
+                let ty = if infer {
+                    cx.adt_instance(adt, &binds).ok_or_else(|| outside(span, "this constructor call (type annotations needed)"))?
+                } else {
+                    ty
+                };
                 // A tuple struct builds an aggregate, like its struct
                 // literal form; only enum variants (and the shims,
                 // whose layout is enum-shaped) build a variant value.
@@ -2781,213 +2898,262 @@ impl Evaluator {
                     Ok((ConstValue::Aggregate(vals), ty))
                 }
             }
-            CallTarget::ConstFn(body) => {
-                if args.len() != body.params.len() {
-                    return Err(outside(span, "this call (wrong number of arguments)"));
-                }
-                // Arguments evaluate in the caller's module, so they
-                // evaluate before the call depth moves.
-                // A generic fn's type args come from the expected type
-                // and the argument types (`binds`, by param index); its
-                // result has its return type with them substituted.
-                let generic = body.generic != ConstGeneric::No;
-                if body.generic == ConstGeneric::Bounded {
-                    return Err(outside(span, "a call to a generic const fn with bounds"));
-                }
-                let mut binds: Vec<Option<Ty>> = Vec::new();
-                if generic && let Some(e) = expected {
-                    let _ = bind_params(cx.tys(), body.ret, e, &mut binds);
-                }
-                let mut arg_vals: Vec<TypedValue> = Vec::new();
-                for (i, &a) in args.iter().enumerate() {
-                    let want = body.param_tys.get(i).copied();
-                    let want_now = if generic { want.map(|w| subst_binds(cx.tys(), w, &binds)) } else { want };
-                    let (v0, vt) = self.value_moved(cx, env, a, want_now)?;
-                    if let Some(want) = want {
-                        let ok = if generic { bind_params(cx.tys(), want, vt, &mut binds) } else { const_ty_compatible(cx.tys_ref(), vt, want) };
-                        if !ok {
-                            return Err(const_ty_mismatch(cx.ast().expr_span(a), "this call argument"));
-                        }
-                    }
-                    // The parameter has its declared type inside the body,
-                    // whatever width the argument literal was written at.
-                    arg_vals.push((v0, body.param_tys.get(i).copied().unwrap_or(vt)));
-                }
-                // A `&mut` argument's value is a cloned cell: writes
-                // through the parameter land in the clone, so after
-                // the body they are copied back to the caller's
-                // place (or the caller's own `&mut` cell, for a
-                // reborrow passed on). A write-back target is
-                // (arg index, target expr, target-is-a-place).
-                let mut wb_targets: Vec<(usize, ExprId, bool)> = Vec::new();
-                for (i, &a) in args.iter().enumerate() {
-                    let Some(want) = body.param_tys.get(i).copied() else { continue };
-                    if body.params[i].2.is_some()
-                        || !matches!(cx.tys_ref().kind(want), TyKind::Ref(_, super::Mut::Mut, _))
-                        || !matches!(arg_vals[i].0, ConstValue::Ref(_))
-                    {
-                        continue;
-                    }
-                    match cx.ast().expr(a) {
-                        Expr::Ref { mutable: true, expr: place, .. } => {
-                            if matches!(cx.ast().expr(*place), Expr::Path(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_)) {
-                                wb_targets.push((i, *place, true));
-                            }
-                        }
-                        _ => wb_targets.push((i, a, false)),
-                    }
-                }
-                // Parameter patterns and the body are the callee's
-                // code, checked in its own module: run both below
-                // depth 0 so the privacy hooks stay out.
-                // Rustc caps const evaluation at 128 stack frames,
-                // the item itself included, so 127 nested const fn
-                // frames is the most this evaluator may enter.
-                if self.call_depth >= 127 {
-                    return Err(Diag::new(
-                        C_OUTSIDE,
-                        span,
-                        "reached the maximum number of const stack frames",
-                        "Make the const computation shallower, for example with a loop.",
-                    ));
-                }
-                self.call_depth += 1;
-                let mut fenv: Env = Vec::new();
-                let mut bind_err: Option<Diag> = None;
-                let mut param_fenv_idx: Vec<Option<usize>> = Vec::new();
-                for (i, v) in arg_vals.into_iter().enumerate() {
-                    let (name, mutable, pat) = body.params[i];
-                    match pat {
-                        Some(pat) => {
-                            // Destructuring a drop parameter destroys
-                            // what it does not move out (E0493).
-                            if cx.needs_drop(v.1) && !pat_is_whole_binding(cx.ast(), pat) {
-                                bind_err = Some(drop_diag(cx, v.1, span));
-                                break;
-                            }
-                            let mut binds = Vec::new();
-                            match self.match_pat(cx, &mut fenv, pat, &v.0.clone(), v.1, true, &mut binds) {
-                                Ok(true) => fenv.extend(binds),
-                                Ok(false) => {
-                                    bind_err = Some(outside(span, "this call (argument pattern)"));
-                                    break;
-                                }
-                                Err(d) => {
-                                    bind_err = Some(d);
-                                    break;
-                                }
-                            }
-                        }
-                        None => {
-                            param_fenv_idx.push(Some(fenv.len()));
-                            fenv.push((name, v, mutable, false));
-                            continue;
-                        }
-                    }
-                    param_fenv_idx.push(None);
-                }
-                // The write-back slots: fenv index, the param cell's
-                // address (a body that reassigns the parameter
-                // itself replaces the cell, and then no write-back
-                // is sound), target expr, target-is-a-place.
-                let wb_slots: Vec<(usize, usize, ExprId, bool)> = wb_targets
-                    .iter()
-                    .filter_map(|&(i, target, is_place)| {
-                        let fidx = param_fenv_idx.get(i).copied().flatten()?;
-                        match &fenv.get(fidx)?.1.0 {
-                            ConstValue::Ref(cell) => Some((fidx, cell.as_ref() as *const ConstValue as usize, target, is_place)),
-                            _ => None,
-                        }
-                    })
-                    .collect();
-                // Every type arg must be known, and the lazy
-                // constructors' `F: FnOnce() -> T` must hold.
-                let call_ret = if generic {
-                    // (A bound type may hold the caller's own params, in a
-                    // generic const fn body: those are fine.)
-                    let r = subst_binds(cx.tys(), body.ret, &binds);
-                    let mut used = Vec::new();
-                    for &t in body.param_tys.iter().chain([&body.ret]) {
-                        params_in(cx.tys_ref(), t, &mut used);
-                    }
-                    if used.iter().any(|&i| binds.get(i as usize).copied().flatten().is_none()) {
-                        return Err(outside(span, "this generic const fn call (type annotations needed)"));
-                    }
-                    if body.generic == ConstGeneric::LazyCtor {
-                        let holds = match (binds.first().copied().flatten(), binds.get(1).copied().flatten()) {
-                            (Some(t), Some(f)) => match cx.tys_ref().kind(f) {
-                                TyKind::FnPtr(sig) => {
-                                    let b = cx.tys_ref().sig(sig);
-                                    cx.tys_ref().tys_of(b.value.inputs).is_empty() && b.value.output == t && !b.value.is_unsafe && !b.value.extern_c
-                                }
-                                _ => false,
-                            },
-                            _ => false,
-                        };
-                        if !holds {
-                            return Err(outside(span, "this lazy constructor's init fn"));
-                        }
-                    }
-                    r
-                } else {
-                    body.ret
-                };
-                cx.enter_const_fn(body.owner);
-                let flow = match bind_err {
-                    Some(d) => Err(d),
-                    None => self.block(cx, &mut fenv, body.body, Some(body.ret)),
-                };
-                cx.exit_const_fn();
-                self.call_depth -= 1;
-                // A parameter of a drop type that the body did not
-                // move out is destroyed by the call (E0493).
-                if flow.is_ok() {
-                    self.check_scope_drops(cx, &fenv, 0, span)?;
-                }
-                let flow = flow?;
-                if matches!(flow, Flow::Val(_) | Flow::Return(_)) {
-                    for &(fidx, addr, target, is_place) in &wb_slots {
-                        let new_v = match fenv.get(fidx).map(|s| &s.1.0) {
-                            Some(ConstValue::Ref(cell)) if cell.as_ref() as *const ConstValue as usize == addr => (**cell).clone(),
-                            _ => continue,
-                        };
-                        if is_place {
-                            self.assign_place(cx, env, target, new_v, span)?;
-                        } else if let Ok(slot) = self.place_slot(cx, env, target, span)
-                            && let ConstValue::Ref(cell) = slot
-                        {
-                            **cell = new_v;
-                        }
-                    }
-                }
-                match flow {
-                    // The fn body is type-checked as a fn; its value has the
-                    // declared return type here. A wide (unsuffixed-literal)
-                    // integer result is range-checked against it first:
-                    // this is where an untyped local meets its real type.
-                    Flow::Val(v) | Flow::Return(v) => {
-                        if let (ConstValue::Int(i), Some(it)) = (&v.0, self.int_ty_of(cx, body.ret))
-                            && v.1 != body.ret
-                        {
-                            let ok = if it.bits() >= 128 {
-                                true
-                            } else if it.signed() {
-                                fits(*i, it)
-                            } else {
-                                *i >= 0 && (*i as u128) <= it.max128()
-                            };
-                            if !ok {
-                                return Err(outside(span, "this const fn result (overflow)"));
-                            }
-                            return Ok((ConstValue::Int(int_from_bits(int_bits(*i, it), it)), body.ret));
-                        }
-                        Ok((v.0, call_ret))
-                    }
-                    _ => Err(outside(span, "control flow out of a const fn")),
+            CallTarget::ConstFn(body) => self.run_const_fn(cx, env, body, None, args, span, expected),
+            CallTarget::NonConst => Err(nonconst(span, "this function")),
+            CallTarget::Unknown => match cx.ast().expr(callee) {
+                Expr::Path(segs) => Err(outside(span, &format!("the call of `{}`", path_text(cx, segs)))),
+                _ => Err(outside(span, "this call")),
+            },
+        }
+    }
+
+    /// Runs const fn `body` on `args` (evaluated in the caller's
+    /// module, before the call depth moves) and returns its value at
+    /// the declared return type. `recv` is a method call's receiver,
+    /// already adjusted to the `self` parameter's type: it is the
+    /// first argument, and `args` fill the parameters after it.
+    #[allow(clippy::too_many_arguments)]
+    fn run_const_fn<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        body: ConstFnBody,
+        recv: Option<TypedValue>,
+        args: &[ExprId],
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Result<TypedValue, Diag> {
+        let off = usize::from(recv.is_some());
+        if args.len() + off != body.params.len() {
+            return Err(outside(span, "this call (wrong number of arguments)"));
+        }
+        // Arguments evaluate in the caller's module, so they
+        // evaluate before the call depth moves.
+        // A generic fn's type args come from the expected type
+        // and the argument types (`binds`, by param index); its
+        // result has its return type with them substituted.
+        let generic = body.generic != ConstGeneric::No;
+        let mut binds: Vec<Option<Ty>> = Vec::new();
+        if generic && let Some(e) = expected {
+            let _ = bind_params(cx.tys(), body.ret, e, &mut binds);
+        }
+        let mut arg_vals: Vec<TypedValue> = Vec::new();
+        if let Some((v0, vt)) = recv {
+            if let Some(&want) = body.param_tys.first() {
+                let ok = if generic { bind_params(cx.tys(), want, vt, &mut binds) } else { const_ty_compatible(cx.tys_ref(), vt, want) };
+                if !ok {
+                    return Err(const_ty_mismatch(span, "this method receiver"));
                 }
             }
-            CallTarget::NonConst => Err(nonconst(span, "this function")),
-            CallTarget::Unknown => Err(outside(span, "this call")),
+            arg_vals.push((v0, body.param_tys.first().copied().unwrap_or(vt)));
+        }
+        for (i, &a) in args.iter().enumerate() {
+            let i = i + off;
+            let want = body.param_tys.get(i).copied();
+            let want_now = if generic { want.map(|w| subst_binds(cx.tys(), w, &binds)) } else { want };
+            let (v0, vt) = self.value_moved(cx, env, a, want_now)?;
+            if let Some(want) = want {
+                let ok = if generic { bind_params(cx.tys(), want, vt, &mut binds) } else { const_ty_compatible(cx.tys_ref(), vt, want) };
+                if !ok {
+                    return Err(const_ty_mismatch(cx.ast().expr_span(a), "this call argument"));
+                }
+            }
+            // The parameter has its declared type inside the body,
+            // whatever width the argument literal was written at.
+            arg_vals.push((v0, body.param_tys.get(i).copied().unwrap_or(vt)));
+        }
+        // A `&mut` argument's value is a cloned cell: writes
+        // through the parameter land in the clone, so after
+        // the body they are copied back to the caller's
+        // place (or the caller's own `&mut` cell, for a
+        // reborrow passed on). A write-back target is
+        // (arg index, target expr, target-is-a-place).
+        let mut wb_targets: Vec<(usize, ExprId, bool)> = Vec::new();
+        for (i, &a) in args.iter().enumerate() {
+            let i = i + off;
+            let Some(want) = body.param_tys.get(i).copied() else { continue };
+            if body.params[i].2.is_some()
+                || !matches!(cx.tys_ref().kind(want), TyKind::Ref(_, super::Mut::Mut, _))
+                || !matches!(arg_vals[i].0, ConstValue::Ref(_))
+            {
+                continue;
+            }
+            match cx.ast().expr(a) {
+                Expr::Ref { mutable: true, expr: place, .. } => {
+                    if matches!(cx.ast().expr(*place), Expr::Path(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_)) {
+                        wb_targets.push((i, *place, true));
+                    }
+                }
+                _ => wb_targets.push((i, a, false)),
+            }
+        }
+        // Parameter patterns and the body are the callee's
+        // code, checked in its own module: run both below
+        // depth 0 so the privacy hooks stay out.
+        // Rustc caps const evaluation at 128 stack frames,
+        // the item itself included, so 127 nested const fn
+        // frames is the most this evaluator may enter.
+        if self.call_depth >= 127 {
+            return Err(Diag::new(
+                C_OUTSIDE,
+                span,
+                "reached the maximum number of const stack frames",
+                "Make the const computation shallower, for example with a loop.",
+            ));
+        }
+        self.call_depth += 1;
+        if body.has_self {
+            self.self_sym = Some(body.params[0].0);
+        }
+        let mut fenv: Env = Vec::new();
+        let mut bind_err: Option<Diag> = None;
+        let mut param_fenv_idx: Vec<Option<usize>> = Vec::new();
+        for (i, v) in arg_vals.into_iter().enumerate() {
+            let (name, mutable, pat) = body.params[i];
+            match pat {
+                Some(pat) => {
+                    // Destructuring a drop parameter destroys
+                    // what it does not move out (E0493).
+                    if cx.needs_drop(v.1) && !pat_is_whole_binding(cx.ast(), pat) {
+                        bind_err = Some(drop_diag(cx, v.1, span));
+                        break;
+                    }
+                    let mut binds = Vec::new();
+                    match self.match_pat(cx, &mut fenv, pat, &v.0.clone(), v.1, true, &mut binds) {
+                        Ok(true) => fenv.extend(binds),
+                        Ok(false) => {
+                            bind_err = Some(outside(span, "this call (argument pattern)"));
+                            break;
+                        }
+                        Err(d) => {
+                            bind_err = Some(d);
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    param_fenv_idx.push(Some(fenv.len()));
+                    fenv.push((name, v, mutable, false));
+                    continue;
+                }
+            }
+            param_fenv_idx.push(None);
+        }
+        // The write-back slots: fenv index, the param cell's
+        // address (a body that reassigns the parameter
+        // itself replaces the cell, and then no write-back
+        // is sound), target expr, target-is-a-place.
+        let wb_slots: Vec<(usize, usize, ExprId, bool)> = wb_targets
+            .iter()
+            .filter_map(|&(i, target, is_place)| {
+                let fidx = param_fenv_idx.get(i).copied().flatten()?;
+                match &fenv.get(fidx)?.1.0 {
+                    ConstValue::Ref(cell) => Some((fidx, cell.as_ref() as *const ConstValue as usize, target, is_place)),
+                    _ => None,
+                }
+            })
+            .collect();
+        // Every type arg must be known, and the lazy
+        // constructors' `F: FnOnce() -> T` must hold.
+        let call_ret = if generic {
+            // (A bound type may hold the caller's own params, in a
+            // generic const fn body: those are fine.)
+            let r = subst_binds(cx.tys(), body.ret, &binds);
+            let mut used = Vec::new();
+            for &t in body.param_tys.iter().chain([&body.ret]) {
+                params_in(cx.tys_ref(), t, &mut used);
+            }
+            if used.iter().any(|&i| binds.get(i as usize).copied().flatten().is_none()) {
+                return Err(outside(span, "this generic const fn call (type annotations needed)"));
+            }
+            if body.generic == ConstGeneric::LazyCtor {
+                let holds = match (binds.first().copied().flatten(), binds.get(1).copied().flatten()) {
+                    (Some(t), Some(f)) => match cx.tys_ref().kind(f) {
+                        TyKind::FnPtr(sig) => {
+                            let b = cx.tys_ref().sig(sig);
+                            cx.tys_ref().tys_of(b.value.inputs).is_empty() && b.value.output == t && !b.value.is_unsafe && !b.value.extern_c
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !holds {
+                    return Err(outside(span, "this lazy constructor's init fn"));
+                }
+            }
+            // A bounded fn runs when the context proves every bound
+            // at these type args (stable const fns cannot call trait
+            // methods, so the bounds only gate the call).
+            if body.generic == ConstGeneric::Bounded {
+                match cx.bounds_hold(body.def, &binds, span) {
+                    Some(true) => {}
+                    Some(false) => {
+                        return Err(Diag::new(
+                            "L0612",
+                            span,
+                            "a trait bound of this const fn call is not satisfied",
+                            "Call it with types that meet the fn's bounds.",
+                        ));
+                    }
+                    None => return Err(outside(span, "a call to a generic const fn with these bounds")),
+                }
+            }
+            r
+        } else {
+            body.ret
+        };
+        cx.enter_const_fn(body.owner);
+        let flow = match bind_err {
+            Some(d) => Err(d),
+            None => self.block(cx, &mut fenv, body.body, Some(body.ret)),
+        };
+        cx.exit_const_fn();
+        self.call_depth -= 1;
+        // A parameter of a drop type that the body did not
+        // move out is destroyed by the call (E0493).
+        if flow.is_ok() {
+            self.check_scope_drops(cx, &fenv, 0, span)?;
+        }
+        let flow = flow?;
+        if matches!(flow, Flow::Val(_) | Flow::Return(_)) {
+            for &(fidx, addr, target, is_place) in &wb_slots {
+                let new_v = match fenv.get(fidx).map(|s| &s.1.0) {
+                    Some(ConstValue::Ref(cell)) if cell.as_ref() as *const ConstValue as usize == addr => (**cell).clone(),
+                    _ => continue,
+                };
+                if is_place {
+                    self.assign_place(cx, env, target, new_v, span)?;
+                } else if let Ok(slot) = self.place_slot(cx, env, target, span)
+                    && let ConstValue::Ref(cell) = slot
+                {
+                    **cell = new_v;
+                }
+            }
+        }
+        match flow {
+            // The fn body is type-checked as a fn; its value has the
+            // declared return type here. A wide (unsuffixed-literal)
+            // integer result is range-checked against it first:
+            // this is where an untyped local meets its real type.
+            Flow::Val(v) | Flow::Return(v) => {
+                if let (ConstValue::Int(i), Some(it)) = (&v.0, self.int_ty_of(cx, body.ret))
+                    && v.1 != body.ret
+                {
+                    let ok = if it.bits() >= 128 {
+                        true
+                    } else if it.signed() {
+                        fits(*i, it)
+                    } else {
+                        *i >= 0 && (*i as u128) <= it.max128()
+                    };
+                    if !ok {
+                        return Err(outside(span, "this const fn result (overflow)"));
+                    }
+                    return Ok((ConstValue::Int(int_from_bits(int_bits(*i, it), it)), body.ret));
+                }
+                Ok((v.0, call_ret))
+            }
+            _ => Err(outside(span, "control flow out of a const fn")),
         }
     }
 
@@ -3105,8 +3271,9 @@ impl Evaluator {
         expected: Option<Ty>,
         span: Span,
     ) -> Result<TypedValue, Diag> {
-        let outside_err = || outside(span, "method calls");
+        let name_sym = name;
         let name = cx.sym_text(name).to_string();
+        let outside_err = || outside(span, &format!("the method call `{name}`"));
         // `len` of a local sequence, read in place (see `index_local`).
         if name == "len"
             && args.is_empty()
@@ -3117,6 +3284,33 @@ impl Evaluator {
         }
         let (rv, rt) = self.value_place(cx, env, recv_e, None)?;
         self.check_temp_drop(cx, env, recv_e, rt, span)?;
+        // An inherent method of a user type runs as a const fn call,
+        // with the receiver adjusted to its `self` parameter as
+        // rustc's autoref and autoderef do.
+        let mut base_t = rt;
+        let mut refs = 0u32;
+        while let TyKind::Ref(_, _, it) = cx.tys_ref().kind(base_t) {
+            base_t = it;
+            refs += 1;
+        }
+        if cx.tys_ref().local_adt(base_t).is_some() {
+            match cx.method_target(base_t, name_sym) {
+                CallTarget::Unknown => {}
+                target => {
+                    if self.call_depth == 0 && cx.method_private(base_t, name_sym) {
+                        return Err(Diag::new(
+                            "L0510",
+                            span,
+                            format!("method `{name}` is private"),
+                            "Make the method `pub(crate)` (the smallest widening that works).",
+                        ));
+                    }
+                    let CallTarget::ConstFn(body) = target else { return Err(nonconst(span, &name)) };
+                    let recv = self.method_receiver(cx, env, recv_e, (rv, rt), refs, &body, span)?;
+                    return self.run_const_fn(cx, env, body, Some(recv), args, span, expected);
+                }
+            }
+        }
         // An inherent integer method on an unpinned receiver is
         // ambiguous (rustc E0689), even where the surroundings
         // would pin the type later: the body checker reports the
@@ -3261,6 +3455,69 @@ impl Evaluator {
             }
             _ => Err(outside_err()),
         }
+    }
+
+    /// The receiver value a const method's `self` parameter takes:
+    /// `recv` (the value of `recv_e`, behind `refs` references) with
+    /// one shared borrow for `&self`, or by value for `self`. A by-value
+    /// receiver behind a reference must be `Copy` (rustc E0507); one
+    /// that is not moves out of its local, and any other non-`Copy`
+    /// place (a field, a static) stays outside the bound.
+    #[allow(clippy::too_many_arguments)]
+    fn method_receiver<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        recv_e: ExprId,
+        recv: TypedValue,
+        refs: u32,
+        body: &ConstFnBody,
+        span: Span,
+    ) -> Result<TypedValue, Diag> {
+        let by_ref = body.param_tys.first().is_some_and(|&t| matches!(cx.tys_ref().kind(t), TyKind::Ref(..)));
+        let (mut v, mut t) = recv;
+        let keep = usize::from(by_ref && refs > 0) as u32;
+        for _ in keep..refs {
+            match (v, cx.tys_ref().kind(t)) {
+                (ConstValue::Ref(inner), TyKind::Ref(_, _, it)) => (v, t) = (*inner, it),
+                _ => return Err(outside(span, "this method receiver")),
+            }
+        }
+        if by_ref {
+            // `&mut T` reborrows as `&T`.
+            let inner = match cx.tys_ref().kind(t) {
+                TyKind::Ref(_, _, it) => it,
+                _ => {
+                    v = ConstValue::Ref(Box::new(v));
+                    t
+                }
+            };
+            return Ok((v, cx.tys().mk_ref(false, inner)));
+        }
+        if cx.is_copy(t) {
+            return Ok((v, t));
+        }
+        if refs > 0 {
+            return Err(Diag::new(
+                "L0305",
+                span,
+                format!("cannot move out of a shared reference: `{}` is not `Copy`", cx.ty_text(t)),
+                "Take `&self` in the method, or clone the value first.",
+            ));
+        }
+        // A non-`Copy` receiver by value: a fresh value, or a move out
+        // of a local (or `self`).
+        let local = match cx.ast().expr(recv_e) {
+            Expr::Path(segs) if segs.len() == 1 && !segs[0].has_args() => Some(segs[0].name),
+            Expr::SelfValue => self.self_sym,
+            _ => None,
+        };
+        if let Some(slot) = local.and_then(|n| env.iter_mut().rev().find(|(m, _, _, _)| *m == n)) {
+            slot.3 = true;
+        } else if self.is_place(cx, env, recv_e) {
+            return Err(outside(span, "a by-value method receiver that moves out of a place"));
+        }
+        Ok((v, t))
     }
 
     /// One integer argument of a const method call, evaluated at
@@ -4103,7 +4360,42 @@ impl Evaluator {
     /// Matches a pattern against a value. On a match, appends the bindings
     /// (name, value, mutable) to `binds`. `in_match` is kept for parity with
     /// the checker's signature; refutable patterns simply do not match here.
+    /// The value a binding of `v` (type `t`) takes: `v` itself, or a
+    /// shared reference to it under a by-reference default binding
+    /// mode, where edition 2024 forbids a `mut` binding.
+    fn bind_value<'a, C: ConstCx<'a>>(&self, cx: &mut C, v: &ConstValue, t: Ty, mutable: bool, span: Span) -> Result<TypedValue, Diag> {
+        if !self.ref_bind {
+            return Ok((v.clone(), t));
+        }
+        if mutable {
+            return Err(outside(span, "a `mut` binding below a matched reference"));
+        }
+        Ok((ConstValue::Ref(Box::new(v.clone())), cx.tys().mk_ref(false, t)))
+    }
+
+    /// Matches `v` (of type `t`) against `pat`, pushing its bindings.
+    /// A struct, variant, or tuple pattern against a reference value
+    /// matches through it and binds by reference below it (rustc's
+    /// default binding mode, `ref_bind`).
+    #[allow(clippy::too_many_arguments)]
     fn match_pat<'a, C: ConstCx<'a>>(
+        &mut self,
+        cx: &mut C,
+        env: &mut Env,
+        pat: PatId,
+        v: &ConstValue,
+        t: Ty,
+        in_match: bool,
+        binds: &mut Vec<(Sym, TypedValue, bool, bool)>,
+    ) -> Result<bool, Diag> {
+        let prev = self.ref_bind;
+        let r = self.match_pat_at(cx, env, pat, v, t, in_match, binds);
+        self.ref_bind = prev;
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn match_pat_at<'a, C: ConstCx<'a>>(
         &mut self,
         cx: &mut C,
         env: &mut Env,
@@ -4133,21 +4425,25 @@ impl Evaluator {
                             || matches!(v, ConstValue::Aggregate(_)));
                     }
                 }
-                binds.push((*name, (v.clone(), t), *mutable, false));
+                binds.push((*name, self.bind_value(cx, v, t, *mutable, span)?, *mutable, false));
                 Ok(true)
             }
             Pat::At { name, mutable, by_ref, inner } => {
                 if *by_ref {
                     return Err(outside(span, "`ref` bindings in const"));
                 }
+                let bv = self.bind_value(cx, v, t, *mutable, span)?;
                 if self.match_pat(cx, env, *inner, v, t, _in_match, binds)? {
-                    binds.push((*name, (v.clone(), t), *mutable, false));
+                    binds.push((*name, bv, *mutable, false));
                     Ok(true)
                 } else {
                     Ok(false)
                 }
             }
             Pat::Paren(inner) => self.match_pat(cx, env, *inner, v, t, _in_match, binds),
+            // Edition 2024: no `&` pattern under a by-reference
+            // default binding mode.
+            Pat::Ref { .. } if self.ref_bind => Err(outside(span, "a `&` pattern below a matched reference")),
             Pat::Ref { inner, .. } => match v {
                 ConstValue::Ref(inner_v) => {
                     let it = match cx.tys_ref().kind(t) {
@@ -4244,6 +4540,17 @@ impl Evaluator {
                 Ok(false)
             }
             Pat::Tuple(elems) => {
+                let (v, t) = match v {
+                    ConstValue::Ref(inner) if matches!(cx.tys_ref().kind(t), TyKind::Ref(..)) => {
+                        let it = match cx.tys_ref().kind(t) {
+                            TyKind::Ref(_, _, it) => it,
+                            _ => ERROR,
+                        };
+                        self.ref_bind = true;
+                        (&**inner, it)
+                    }
+                    other => (other, t),
+                };
                 let vals = match v {
                     ConstValue::Aggregate(vals) => vals,
                     ConstValue::Unit if elems.is_empty() => return Ok(true),
@@ -4382,6 +4689,7 @@ impl Evaluator {
                             TyKind::Ref(_, _, it) => it,
                             _ => ERROR,
                         };
+                        self.ref_bind = true;
                         ((**inner).clone(), it)
                     }
                     other => (other.clone(), t),
@@ -5145,6 +5453,12 @@ fn check_macro_forms(ast: &Ast, e: ExprId) -> Result<(), Diag> {
 /// a dead-branch scan propagates).
 fn is_drop_diag(d: &Diag) -> bool {
     d.code == C_NONCONST && d.message.starts_with("destructor of ")
+}
+
+/// True for the E0015 of a call to a non-const fn or method. rustc
+/// checks it statically, so a dead branch scan keeps it too.
+fn is_nonconst_call_diag(d: &Diag) -> bool {
+    d.code == C_NONCONST && d.message.starts_with("cannot call non-const function")
 }
 
 /// The E0493 error for a destructor that would run during const

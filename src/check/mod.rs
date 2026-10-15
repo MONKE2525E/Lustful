@@ -20327,6 +20327,29 @@ struct CheckCx<'x, 'p> {
     cx: &'x mut Ctx<'p>,
 }
 
+impl CheckCx<'_, '_> {
+    /// The call target of const fn `f` (a path call or a method call).
+    /// The evaluator is about to run its body and bake the result into
+    /// the body being checked: that body depends on the const fn's
+    /// body, not only its signature. A `Checked` read records the
+    /// edge; its replay never matches, so the reader rechecks whenever
+    /// it is a walk candidate. Nested const calls inside the evaluated
+    /// body come back here and record their own edges, so the
+    /// dependency is transitive.
+    fn const_fn_call(&mut self, f: LocalDefId) -> crate::ty::consteval::CallTarget {
+        let p = self.cx.p;
+        let target = crate::check::collect::const_fn_target(p, f);
+        if p.fn_info(f).is_const && p.fn_info(f).def(&p.ast).body.is_some() {
+            self.cx.out.reads.record_checked(p.def_id(f), Fingerprint(0));
+        }
+        if matches!(target, crate::ty::consteval::CallTarget::ConstFn(_)) {
+            // The body names its own sibling items, not the caller's.
+            self.cx.next_const_fn_sibs = Some(p.fn_siblings.get(&f).cloned().unwrap_or_default());
+        }
+        target
+    }
+}
+
 /// rustc's `needs_drop::<T>()` for a concrete type: a written `Drop`
 /// impl (`drop_defs`: the Adt defs that have one), or a part that
 /// needs drop (`[T; 0]` never does). None for the types lust cannot
@@ -20518,7 +20541,7 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
         Some((i, ty))
     }
     fn call_target(&mut self, callee: ExprId) -> crate::ty::consteval::CallTarget {
-        use crate::ty::consteval::{CallTarget, ConstFnBody};
+        use crate::ty::consteval::CallTarget;
         let p = self.cx.p;
         let ast::Expr::Path(segs) = p.ast.expr(callee) else { return CallTarget::Unknown };
         let last = segs[segs.len() - 1].name;
@@ -20565,32 +20588,14 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
             }
         };
         if let Some(f) = fid {
-            let info = p.fn_info(f);
-            if !info.is_const {
-                return CallTarget::NonConst;
-            }
-            let Some(body) = info.def(&p.ast).body else { return CallTarget::NonConst };
-            // The evaluator is about to run this const fn's body and bake
-            // the result into the body being checked: that body depends
-            // on the const fn's body, not only its signature. A `Checked`
-            // read records the edge; its replay never matches, so the
-            // reader rechecks whenever it is a walk candidate. Nested
-            // const calls inside the evaluated body come back here and
-            // record their own edges, so the dependency is transitive.
-            self.cx.out.reads.record_checked(p.def_id(f), Fingerprint(0));
-            if info.self_kind.is_some() {
+            let target = self.const_fn_call(f);
+            if let CallTarget::ConstFn(b) = &target
+                && b.generic != crate::ty::consteval::ConstGeneric::No
+                && segs.iter().any(|s| !s.type_args().is_empty())
+            {
                 return CallTarget::Unknown;
             }
-            let params: Vec<(Sym, bool, Option<ast::PatId>)> =
-                info.def(&p.ast).params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
-            let owner = info.owner.map(|a| p.adt(a).name);
-            let generic = crate::check::collect::const_generic_kind(p, f);
-            if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
-                return CallTarget::Unknown;
-            }
-            // The body names its own sibling items, not the caller's.
-            self.cx.next_const_fn_sibs = Some(p.fn_siblings.get(&f).cloned().unwrap_or_default());
-            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner, generic });
+            return target;
         }
         if let Some(a) = self.cx.tuple_struct_ctor(last)
             && segs.len() == 1
@@ -20601,6 +20606,23 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
             return CallTarget::NonConst;
         }
         CallTarget::Unknown
+    }
+    fn method_target(&mut self, recv: Ty, name: Sym) -> crate::ty::consteval::CallTarget {
+        let p = self.cx.p;
+        match crate::check::collect::const_method_of(p, &self.cx.tys, recv, name) {
+            Some(f) => self.const_fn_call(f),
+            None => crate::ty::consteval::CallTarget::Unknown,
+        }
+    }
+    fn adt_instance(&mut self, adt: AdtId, binds: &[Option<Ty>]) -> Option<Ty> {
+        let (def, args) = crate::check::collect::const_adt_args(self.cx.p, adt, binds)?;
+        Some(self.cx.tys.mk_adt(def, &args))
+    }
+    fn method_private(&mut self, recv: Ty, name: Sym) -> bool {
+        match self.cx.tys.local_adt(recv) {
+            Some(a) => self.cx.assoc_private(a, name),
+            None => false,
+        }
     }
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)> {
         let p = self.cx.p;

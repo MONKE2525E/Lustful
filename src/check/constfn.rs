@@ -105,6 +105,9 @@ fn builtin_is_const(b: Builtin) -> bool {
             | StrLen
             | StrIsEmpty
             | StrIsCharBoundary
+            // `str::as_bytes`; the same builtin serves `AsRef<[u8]>`,
+            // which `call_res` tells apart by the written name.
+            | ConvStrBytes
             | StringLen
             | StringIsEmpty
             | StringAsStr

@@ -2663,6 +2663,16 @@ impl<'x> ScalarEval<'x> {
                 _ => None,
             }),
             Expr::Call { callee, args } => SFlow::V(self.call(env, *callee, args, depth)),
+            // `"lit".len()` (`str::len` is a const fn): the literal's
+            // byte length, a `usize`.
+            Expr::MethodCall { recv, name, generic_args, args, .. }
+                if args.is_empty() && generic_args.is_empty() && self.interner.get(*name) == "len" =>
+            {
+                SFlow::V(match self.ast.expr(*recv) {
+                    Expr::Str(i) => self.ast.strings.get(*i as usize).map(|s| SVal::Int(s.len() as i128, Some(IntTy::Usize))),
+                    _ => None,
+                })
+            }
             Expr::Path(segs) => SFlow::V(self.path_value(env, segs, e, exp, depth)),
             Expr::Macro { kind, args, .. } => SFlow::V(match kind {
                 // A panic in const evaluation is a const failure,
@@ -4904,7 +4914,7 @@ pub fn collect_reuse(
     // This runs before `finish_collect`: its template checks (and, in a
     // build, the instance checks in mono) read consts, statics, and assoc
     // consts from these tables, in generic and plain bodies alike.
-    eval_const_items(&mut p, &mut errs, &mut def_order.statics, &scope_of_stmt);
+    let const_goals = eval_const_items(&mut p, &mut errs, &mut def_order.statics, &scope_of_stmt);
     p.scope_of_stmt = scope_of_stmt;
     // The generic reuse cache holds while the trait system does (W-PERF);
     // the key needs the resolved trait of each impl, and the cache serves
@@ -4920,6 +4930,7 @@ pub fn collect_reuse(
         }
     }
     generics::finish_collect(&mut p, &mut errs);
+    prove_const_goals(&mut p, const_goals, &mut errs);
     if let Some(main) = p.main {
         let f = p.fn_info(main);
         // Rust's Termination for main: (), ExitCode, or Result<T, E>
@@ -5045,15 +5056,18 @@ fn zero_const_value(tys: &crate::ty::GlobalTys, ty: Ty) -> crate::ty::consteval:
     }
 }
 
+/// Returns the trait goals of bounded const fn calls, for
+/// `prove_const_goals` after `finish_collect`.
 fn eval_const_items(
     p: &mut Program,
     errs: &mut Vec<Diag>,
     static_order: &mut Vec<crate::def::DefPathHash>,
     scope_of_stmt: &HashMap<u32, Vec<u32>>,
-) {
-    let Some((pending, static_count, tmpls)) = eval_pending_items(p, errs, static_order, scope_of_stmt) else { return };
-    p.const_values = pending_values(&pending);
-    install_const_items(p, errs, pending, static_count, &tmpls);
+) -> Vec<(TraitRef, Span)> {
+    let Some(ev) = eval_pending_items(p, errs, static_order, scope_of_stmt) else { return Vec::new() };
+    p.const_values = pending_values(&ev.pending);
+    install_const_items(p, errs, ev.pending, ev.static_count, &ev.tmpls);
+    ev.goals
 }
 
 /// The values of evaluated pending items, in order (None: failed).
@@ -5076,21 +5090,23 @@ pub(crate) fn const_values_hold(p: &mut Program, static_order: &[crate::def::Def
     );
     let scope = std::mem::take(&mut p.scope_of_stmt);
     let (mut errs, mut order) = (Vec::new(), static_order.to_vec());
-    let values = eval_pending_items(p, &mut errs, &mut order, &scope).map(|(pending, ..)| pending_values(&pending)).unwrap_or_default();
+    let (values, goals) = match eval_pending_items(p, &mut errs, &mut order, &scope) {
+        Some(ev) => (pending_values(&ev.pending), ev.goals),
+        None => (Vec::new(), Vec::new()),
+    };
     p.scope_of_stmt = scope;
     (p.consts, p.const_names, p.statics, p.static_names, p.assoc_const_names) = tables;
-    errs.is_empty() && values == p.const_values
+    errs.is_empty() && values == p.const_values && prove_const_goals(p, goals, &mut errs)
 }
 
 /// Registers and evaluates every const and static item (the first half
-/// of `eval_const_items`): the pending list with each item's state, and
-/// the static count. None when there is no item.
+/// of `eval_const_items`). None when there is no item.
 fn eval_pending_items(
     p: &mut Program,
     errs: &mut Vec<Diag>,
     static_order: &mut Vec<crate::def::DefPathHash>,
     scope_of_stmt: &HashMap<u32, Vec<u32>>,
-) -> Option<(Vec<(PendingConst, PendingState)>, u32, Vec<Option<Generics>>)> {
+) -> Option<EvaluatedItems> {
     let ast_arc = p.ast.clone();
     let ast = &*ast_arc;
     let mut pending: Vec<(PendingConst, PendingState)> = Vec::new();
@@ -5294,12 +5310,24 @@ fn eval_pending_items(
         next_scope: None,
         module: None,
         errs,
+        goals: Vec::new(),
         tmpls,
     };
     for i in 0..n {
         cx.eval_pending(i);
     }
-    Some((cx.pending, static_count, cx.tmpls))
+    Some(EvaluatedItems { pending: cx.pending, static_count, tmpls: cx.tmpls, goals: cx.goals })
+}
+
+/// What `eval_pending_items` gives: each item with its state, the
+/// static count, the generic assoc const templates, and the trait
+/// goals of bounded const fn calls, proved once the impls are known
+/// (`prove_const_goals`).
+struct EvaluatedItems {
+    pending: Vec<(PendingConst, PendingState)>,
+    static_count: u32,
+    tmpls: Vec<Option<Generics>>,
+    goals: Vec<(TraitRef, Span)>,
 }
 
 /// Moves evaluated pending items into the program tables, in item order
@@ -5840,6 +5868,8 @@ struct CollectCx<'x> {
     /// tables, or an item the tables do not name): no check then.
     module: Option<crate::ty::defs::ModuleId>,
     errs: &'x mut Vec<Diag>,
+    /// Trait goals of bounded const fn calls (`const_fn_bounds_hold`).
+    goals: Vec<(TraitRef, Span)>,
     /// Per pending index: the impl or trait generics when this
     /// associated const's initializer names one of its parameters
     /// (a const param, a type param's associated const, `Self::X`
@@ -6238,6 +6268,172 @@ pub fn const_generic_kind(p: &Program, f: LocalDefId) -> crate::ty::consteval::C
     if lazy { ConstGeneric::LazyCtor } else { ConstGeneric::Bounded }
 }
 
+/// What a call of fn `f` in const position runs (`ConstCx::call_target`
+/// and `method_target` of every context): its body with a method's
+/// receiver as the first parameter, `NonConst` for a fn that is not
+/// `const`, and `Unknown` (outside the bound) for a `&mut self` or
+/// typed receiver.
+pub fn const_fn_target(p: &Program, f: LocalDefId) -> crate::ty::consteval::CallTarget {
+    use crate::ty::consteval::{CallTarget, ConstFnBody};
+    let info = p.fn_info(f);
+    let def = info.def(&p.ast);
+    if !info.is_const {
+        return CallTarget::NonConst;
+    }
+    let Some(body) = def.body else { return CallTarget::NonConst };
+    let mut params: Vec<(Sym, bool, Option<ast::PatId>)> = Vec::new();
+    if let Some(sp) = &def.self_param {
+        if !matches!(sp.kind, ast::SelfKind::Value | ast::SelfKind::Ref) {
+            return CallTarget::Unknown;
+        }
+        params.push((p.known.self_value, sp.mutable, None));
+    }
+    params.extend(def.params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)));
+    CallTarget::ConstFn(ConstFnBody {
+        params,
+        param_tys: info.params.clone(),
+        ret: info.ret,
+        body,
+        owner: info.owner.map(|a| p.adt(a).name),
+        generic: const_generic_kind(p, f),
+        def: f.0,
+        has_self: def.self_param.is_some(),
+    })
+}
+
+/// The one inherent method `name` of Adt type `recv` with a `self`
+/// parameter, for a method call in const position. Several inherent
+/// impls under disjoint Self patterns are outside the bound.
+pub fn const_method_of(p: &Program, tys: &impl TyIntern, recv: Ty, name: Sym) -> Option<LocalDefId> {
+    let a = tys.local_adt(recv)?;
+    if a.0 >= u32::MAX - 1 {
+        return None;
+    }
+    let fs = p.methods.get(&(a, name))?;
+    let [f] = fs.as_slice() else { return None };
+    p.fn_info(*f).self_kind.is_some().then_some(*f)
+}
+
+/// The def and args of generic Adt `adt` at `binds`
+/// (`ConstCx::adt_instance`): every param a type param, each one bound.
+pub fn const_adt_args(p: &Program, adt: AdtId, binds: &[Option<Ty>]) -> Option<(DefId, Vec<GenericArg>)> {
+    let g = p.gx.adt_generics.get(adt.0 as usize)?;
+    if g.params.iter().any(|q| q.kind != ParamKind::Type) {
+        return None;
+    }
+    let args: Option<Vec<GenericArg>> = (0..g.params.len()).map(|i| binds.get(i).copied().flatten().map(GenericArg::Ty)).collect();
+    Some((p.def_of_adt(adt), args?))
+}
+
+/// True when inherent item `name` of `adt` is not visible from `from`.
+pub(crate) fn assoc_item_is_private(p: &Program, adt: AdtId, name: Sym, from: crate::ty::defs::ModuleId) -> bool {
+    let Some(tables) = &p.resolved else { return false };
+    let def = p.def_of_adt(adt);
+    tables.assoc_vis.get(&def).and_then(|items| items.get(&name)).is_some_and(|(vis, def_mod)| !tables.visible(vis, *def_mod, from, &p.interner))
+}
+
+/// Whether the where-clauses of const fn `f` hold with its type params
+/// bound to `binds` (`ConstCx::bounds_hold`), in an empty param env:
+/// const and static items have no params in scope. A trait bound with
+/// closed args goes to `goals`, proved after `finish_collect` (std and
+/// derived impls are not indexed while const items evaluate;
+/// `prove_const_goals`). `T: 'static` (and `T: 'a` for a lifetime
+/// param, which the call picks) holds for a type with no reference,
+/// pointer, `dyn`, or lifetime in it. Any other predicate, a
+/// higher-ranked bound, or a param the call does not bind is None.
+pub fn const_fn_bounds_hold(p: &mut Program, f: u32, binds: &[Option<Ty>], span: Span, goals: &mut Vec<(TraitRef, Span)>) -> Option<bool> {
+    let Some(Some(t)) = p.gx.fn_templates.get(f as usize) else { return None };
+    let preds = t.generics.predicates.clone();
+    let args: Vec<GenericArg> = binds
+        .iter()
+        .enumerate()
+        .map(|(i, b)| GenericArg::Ty(b.unwrap_or_else(|| p.tys.intern(TyKind::Param(crate::ty::ParamId(i as u32))))))
+        .collect();
+    let closed = |p: &Program, t: Ty| !p.tys.flags(t).contains_param() && !p.tys.flags(t).contains_infer();
+    let mut found = Vec::new();
+    for pr in preds {
+        match pr {
+            Predicate::Trait(b) if b.count == 0 => {
+                let targs: Vec<GenericArg> = p.tys.args(b.value.args).to_vec();
+                let mut sub = Vec::with_capacity(targs.len());
+                for g in targs {
+                    sub.push(match g {
+                        GenericArg::Ty(t) => {
+                            let t = crate::ty::subst(&mut p.tys, t, &args);
+                            if !closed(p, t) {
+                                return None;
+                            }
+                            GenericArg::Ty(t)
+                        }
+                        GenericArg::Lifetime(_) => g,
+                        GenericArg::Const(_) => return None,
+                    });
+                }
+                if b.value.bindings != crate::ty::EMPTY_BINDINGS {
+                    return None;
+                }
+                let sub = p.tys.intern_args(&sub);
+                if b.value.def != p.gx.lang.sized {
+                    found.push((TraitRef { def: b.value.def, args: sub, bindings: b.value.bindings }, span));
+                }
+            }
+            Predicate::TypeOutlives(t, r) if matches!(r, crate::ty::Region::Static | crate::ty::Region::Param(_)) => {
+                let t = crate::ty::subst(&mut p.tys, t, &args);
+                if !closed(p, t) || !static_only(&p.tys, t) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    goals.extend(found);
+    Some(true)
+}
+
+/// Proves the trait goals bounded const fn calls left
+/// (`const_fn_bounds_hold`), on a program past `finish_collect`; each
+/// failed goal is rustc's E0277 at its call. True when all hold.
+pub(crate) fn prove_const_goals(p: &mut Program, goals: Vec<(TraitRef, Span)>, errs: &mut Vec<Diag>) -> bool {
+    let mut ok = true;
+    for (tr, span) in goals {
+        if !generics::prove_closed_goal(p, tr) {
+            ok = false;
+            let args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
+            let self_t = args.first().and_then(|g| g.as_ty()).map(|t| ty_name(p, &p.tys, t)).unwrap_or_default();
+            let tn = p.gx.index.trait_record(tr.def).map(|r| p.display_name(r.name).to_string()).unwrap_or_else(|| "the trait".to_string());
+            errs.push(Diag::new(
+                "L0612",
+                span,
+                format!("the trait bound `{self_t}: {tn}` of this const fn call is not satisfied (or lust cannot prove it)"),
+                "Call it with types that meet the fn's bounds.",
+            ));
+        }
+    }
+    ok
+}
+
+/// True when every region in a type is a written `'static` (a type
+/// with no reference, `dyn`, or lifetime argument is too): the type
+/// outlives `'static`. An erased region (an inferred borrow) does not
+/// count. A fn pointer type with no free region does: its own regions
+/// are late-bound or `'static` (`const_fn_bounds_hold`).
+fn static_only(tys: &GlobalTys, t: Ty) -> bool {
+    use crate::ty::Region;
+    match tys.kind(t) {
+        TyKind::Ref(r, _, e) => r == Region::Static && static_only(tys, e),
+        TyKind::RawPtr(_, e) | TyKind::Array(e, _) | TyKind::Slice(e) => static_only(tys, e),
+        TyKind::FnPtr(s) => tys.sig(s).value.free_slots == 0,
+        TyKind::Dyn(..) => false,
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| static_only(tys, e)),
+        TyKind::Adt(_, a) => tys.args(a).iter().all(|g| match g {
+            GenericArg::Ty(e) => static_only(tys, *e),
+            GenericArg::Lifetime(r) => *r == Region::Static,
+            GenericArg::Const(_) => true,
+        }),
+        _ => true,
+    }
+}
+
 /// True when a type holds no reference, raw pointer, fn pointer, trait
 /// object, or lifetime argument (`CollectCx::fn_item`).
 fn region_free(tys: &GlobalTys, t: Ty) -> bool {
@@ -6379,10 +6575,13 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
     }
     fn fn_item(&mut self, segs: &[ast::PathSeg], at: Span) -> Option<crate::ty::consteval::TypedValue> {
         // A plain safe Rust-ABI free fn with no generics. With params,
-        // none of its types may hold a reference or lifetime: the
-        // pointer type here has no late-bound regions, so a region
-        // mismatch rustc reports could not show. With no params every
-        // lifetime in the return type is `'static` (W-STD-C).
+        // its return type may not hold a reference or lifetime: the
+        // pointer type here keeps no link between an elided output
+        // lifetime and the input it comes from, so a region mismatch
+        // rustc reports could not show. Params may hold elided
+        // references only: each one is late-bound, as the written
+        // pointer type's are. With no params every lifetime in the
+        // return type is `'static` (W-STD-C).
         let [seg] = segs else { return None };
         if !seg.type_args().is_empty() {
             return None;
@@ -6407,7 +6606,15 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             return None;
         }
         let (params, ret) = (info.params.clone(), info.ret);
-        if !params.is_empty() && params.iter().chain([&ret]).any(|&t| !region_free(&self.p.tys, t)) {
+        if !params.is_empty() && !region_free(&self.p.tys, ret) {
+            return None;
+        }
+        // The fn's param types erase a written `'static` (and any
+        // other written lifetime), so only fully elided ones compare
+        // right; an `impl Trait` param is a hidden type param.
+        if info.def(&self.p.ast).params.iter().any(|pp| generics::names_lifetime(&self.p.ast, &self.p.interner, pp.ty))
+            || params.iter().any(|&t| self.p.tys.flags(t).contains_param())
+        {
             return None;
         }
         let inputs = self.p.tys.intern_tys(&params);
@@ -6419,7 +6626,7 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
         Some((crate::ty::consteval::ConstValue::FnPtr(f.0), t))
     }
     fn call_target(&mut self, callee: ast::ExprId) -> crate::ty::consteval::CallTarget {
-        use crate::ty::consteval::{CallTarget, ConstFnBody};
+        use crate::ty::consteval::CallTarget;
         let ast::Expr::Path(segs) = self.p.ast.expr(callee) else { return CallTarget::Unknown };
         let last = segs[segs.len() - 1].name;
         let ltext = self.p.interner.get(last).to_string();
@@ -6481,26 +6688,16 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             None
         };
         if let Some(f) = fid {
-            let info = self.p.fn_info(f);
-            if !info.is_const {
-                return CallTarget::NonConst;
+            let target = const_fn_target(self.p, f);
+            if let CallTarget::ConstFn(b) = &target {
+                // Written type args on a generic call are not matched yet.
+                if b.generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
+                    return CallTarget::Unknown;
+                }
+                // The body names its own sibling items, not the caller's.
+                self.next_scope = Some(self.p.fn_siblings.get(&f).cloned().unwrap_or_default());
             }
-            let Some(body) = info.def(&self.p.ast).body else { return CallTarget::NonConst };
-            let skip = if info.self_kind.is_some() { 1 } else { 0 };
-            if skip == 1 {
-                return CallTarget::Unknown;
-            }
-            let params: Vec<(Sym, bool, Option<ast::PatId>)> =
-                info.def(&self.p.ast).params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
-            let owner = info.owner.map(|a| self.p.adt(a).name);
-            let generic = const_generic_kind(self.p, f);
-            // Written type args on a generic call are not matched yet.
-            if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
-                return CallTarget::Unknown;
-            }
-            // The body names its own sibling items, not the caller's.
-            self.next_scope = Some(self.p.fn_siblings.get(&f).cloned().unwrap_or_default());
-            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner, generic });
+            return target;
         }
         if let Some((adt, variant, ty)) = self.variant_ctor(segs) {
             return CallTarget::VariantCtor { adt, variant, ty };
@@ -6511,6 +6708,27 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             return CallTarget::NonConst;
         }
         CallTarget::Unknown
+    }
+    fn method_target(&mut self, recv: Ty, name: Sym) -> crate::ty::consteval::CallTarget {
+        let Some(f) = const_method_of(self.p, &self.p.tys, recv, name) else { return crate::ty::consteval::CallTarget::Unknown };
+        let target = const_fn_target(self.p, f);
+        if matches!(target, crate::ty::consteval::CallTarget::ConstFn(_)) {
+            self.next_scope = Some(self.p.fn_siblings.get(&f).cloned().unwrap_or_default());
+        }
+        target
+    }
+    fn method_private(&mut self, recv: Ty, name: Sym) -> bool {
+        match (self.module, self.p.tys.local_adt(recv)) {
+            (Some(m), Some(a)) => assoc_item_is_private(self.p, a, name, m),
+            _ => false,
+        }
+    }
+    fn bounds_hold(&mut self, def: u32, binds: &[Option<Ty>], span: Span) -> Option<bool> {
+        const_fn_bounds_hold(self.p, def, binds, span, &mut self.goals)
+    }
+    fn adt_instance(&mut self, adt: AdtId, binds: &[Option<Ty>]) -> Option<Ty> {
+        let (def, args) = const_adt_args(self.p, adt, binds)?;
+        Some(self.p.tys.mk_adt(def, &args))
     }
     fn enter_const_fn(&mut self, owner: Option<Sym>) {
         self.self_stack.push((self.self_name, self.self_pat));
@@ -6561,8 +6779,24 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
         self.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
     }
     fn resolve_ty(&mut self, t: ast::TyId) -> Ty {
-        resolve_ty(&self.p.ast, &self.p.interner, &self.p.known, &self.p.type_names, &self.p.aliases, &mut self.p.tys, t, None)
-            .unwrap_or(ERROR)
+        // Scoped resolution first: a written type can apply a generic
+        // Adt (`let k: K<u8> = ..`), whose args the plain resolver
+        // rejects. A const context has no params in scope here.
+        let cx = self.p.gx.resolve_cx(&self.p.type_names, &self.p.aliases);
+        let scoped = crate::check::generics::resolve_scoped(
+            &self.p.ast,
+            &self.p.interner,
+            &self.p.known,
+            &cx,
+            &mut self.p.tys,
+            t,
+            &crate::check::generics::Scope::default(),
+        );
+        match scoped {
+            Ok(r) => r,
+            Err(_) => resolve_ty(&self.p.ast, &self.p.interner, &self.p.known, &self.p.type_names, &self.p.aliases, &mut self.p.tys, t, None)
+                .unwrap_or(ERROR),
+        }
     }
     fn layout(&mut self, t: Ty) -> Option<crate::ty::layout::Layout> {
         let p: &Program = self.p;

@@ -10478,6 +10478,28 @@ pub(crate) fn prove_inst_trait_ref(p: &Program, tr: TraitRef, args: &[GenericArg
     prove_trait_ref(p, &mut solver, &mut cx, &[], tr, 0, &mut Vec::new())
 }
 
+/// One closed trait goal in an empty param env, past `finish_collect`
+/// (a bounded const fn call in a const or static item,
+/// `collect::prove_const_goals`). A goal of a derive-family trait goes
+/// through the field prover, which decomposes the structural types
+/// core implements those traits for component-wise; any other trait
+/// has only its impls.
+pub(crate) fn prove_closed_goal(p: &mut Program, tr: TraitRef) -> bool {
+    match p.tys.args(tr.args) {
+        [GenericArg::Ty(t)] if tr.bindings == EMPTY_BINDINGS && p.gx.index.derive_family.contains(&tr.def) => {
+            let t = *t;
+            // `&T` is `Copy` and `Clone` whatever `T` is (the field
+            // prover follows the pointee).
+            let lang = p.gx.lang;
+            if (tr.def == lang.clone || tr.def == lang.copy) && matches!(p.tys.kind(t), TyKind::Ref(_, Mut::Shared, _)) {
+                return true;
+            }
+            prove_field_trait(p, &[], tr.def, t)
+        }
+        _ => prove_goal(p, &[], tr),
+    }
+}
+
 /// One trait goal with a fresh solver (collect-time proves are
 /// independent of each other).
 fn prove_goal(p: &Program, env: &[Predicate], tr: TraitRef) -> bool {

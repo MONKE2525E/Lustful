@@ -12,7 +12,7 @@ use crate::ast::{self, Ast};
 use crate::def::DefId;
 use crate::diag::{Diag, Span};
 use crate::intern::Sym;
-use crate::ty::consteval::{CallTarget, ConstCx, ConstFnBody, ConstValue, TypedValue};
+use crate::ty::consteval::{CallTarget, ConstCx, ConstValue, TypedValue};
 use crate::ty::*;
 
 /// One generic associated const instance to evaluate: the impl
@@ -335,21 +335,14 @@ impl<'a, T: TyIntern> ConstCx<'a> for InstCx<'a, T> {
             None
         };
         if let Some(f) = fid {
-            let info = p.fn_info(f);
-            if !info.is_const {
-                return CallTarget::NonConst;
-            }
-            let Some(body) = info.def(&p.ast).body else { return CallTarget::NonConst };
-            if info.self_kind.is_some() {
+            let target = super::collect::const_fn_target(p, f);
+            if let CallTarget::ConstFn(b) = &target
+                && b.generic != crate::ty::consteval::ConstGeneric::No
+                && segs.iter().any(|s| !s.type_args().is_empty())
+            {
                 return CallTarget::Unknown;
             }
-            let params: Vec<(Sym, bool, Option<ast::PatId>)> = info.def(&p.ast).params.iter().map(|pp| (pp.name, pp.mutable, pp.pat)).collect();
-            let owner = info.owner.map(|a| p.adt(a).name);
-            let generic = super::collect::const_generic_kind(p, f);
-            if generic != crate::ty::consteval::ConstGeneric::No && segs.iter().any(|s| !s.type_args().is_empty()) {
-                return CallTarget::Unknown;
-            }
-            return CallTarget::ConstFn(ConstFnBody { params, param_tys: info.params.clone(), ret: info.ret, body, owner, generic });
+            return target;
         }
         if let Some((adt, variant)) = self.variant_of(segs)
             && p.adt(adt).variants[variant as usize].shape == VariantShape::Tuple
