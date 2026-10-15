@@ -296,8 +296,6 @@ const KNOWN_ATTRS: &[&str] = &[
     "deprecated",
     "doc",
     "bench",
-    "ignore",
-    "should_panic",
     "global_allocator",
     "default",
     "target_feature",
@@ -1725,6 +1723,13 @@ impl<'a> Parser<'a> {
                 // `must_use` and `deprecated` are lints with no
                 // warning infrastructure in v1. No output changes.
                 _ if matches!(name_text.as_str(), "inline" | "cold" | "must_use" | "deprecated") => {}
+                // Test harness attributes: they change only how
+                // `lust test` runs a `#[test]` fn (src/testrun.rs
+                // reads them from the item). In a normal build the
+                // fn is removed, and on any other item rustc only
+                // warns, so accepting and ignoring is exact here.
+                // `attrs::check_input` judged the written form.
+                _ if matches!(name_text.as_str(), "ignore" | "should_panic") => {}
                 // `#[track_caller]` (check/caller.rs): the fn reports its
                 // caller's location in panics and `Location::caller()`.
                 _ if name_text == "track_caller" && matches!(attr.input, AttrInput::None) => {}

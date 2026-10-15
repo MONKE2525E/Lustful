@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Differential tests for `lust test` against `rustc --test` (the oracle).
 # For every tests/testrun/*.rs file, each #[test] must get the same result under both:
-# pass, fail, or timeout. Tests run one at a time on both sides, so one bad test
+# pass, fail, timeout, or ignored. Tests run one at a time on both sides, so one bad test
 # cannot hide the results of the others. The rustc side uses the default panic=unwind
 # test harness (rustc does not allow panic=abort with --test); a panic is a fail on
 # both sides, so the per-test results are comparable.
@@ -31,12 +31,18 @@ for f in "$root"/tests/testrun/*.rs; do
   : > "$work/$name.expected"
   "$work/$name.rt" --list 2>/dev/null | sed -n 's/: test$//p' > "$work/$name.names"
   while IFS= read -r t; do
-    timeout 1 "$work/$name.rt" --exact "$t" >/dev/null 2>&1
-    case $? in
-      0) echo "$t pass" ;;
-      124) echo "$t timeout" ;;
-      *) echo "$t fail" ;;
-    esac >> "$work/$name.expected"
+    timeout 1 "$work/$name.rt" --exact "$t" >"$work/$name.one.out" 2>&1
+    rc=$?
+    # An ignored test exits 0 without running; its line names it.
+    if grep -q "test $t ... ignored" "$work/$name.one.out"; then
+      echo "$t ignored"
+    else
+      case $rc in
+        0) echo "$t pass" ;;
+        124) echo "$t timeout" ;;
+        *) echo "$t fail" ;;
+      esac
+    fi >> "$work/$name.expected"
   done < "$work/$name.names"
   # Actual results from lust.
   "$lust" test "$f" --json --timeout 1 > "$work/$name.lust.json" 2>"$work/$name.lust.err"
@@ -64,7 +70,7 @@ elif summary["build"] != "ok":
     errors.append(f"summary build is {summary['build']}")
 if actual != expected:
     errors.append(f"rustc={expected} lust={actual}")
-want_exit = 0 if all(v == "pass" for v in expected.values()) else 101
+want_exit = 0 if all(v in ("pass", "ignored") for v in expected.values()) else 101
 if int(sys.argv[3]) != want_exit:
     errors.append(f"exit code {sys.argv[3]}, want {want_exit}")
 if summary is not None:

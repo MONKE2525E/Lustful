@@ -8,9 +8,11 @@
 // length, so every span still matches the user file); `rustc --test` ignores `main` the same way.
 //
 // Exit status follows cargo test: 0 when every selected test passes, 101 when the build fails or
-// any test fails or times out, 2 for bad arguments or an unreadable file. A skipped or filtered
-// test is never reported as a pass; it is counted in `filtered_out`.
-use crate::ast::{ItemKind, TyExpr};
+// any test fails or times out, 2 for bad arguments or an unreadable file. A filtered test is
+// never reported as a pass; it is counted in `filtered_out`. A `#[ignore]` test is reported as
+// ignored and never runs. A `#[should_panic]` test passes only when it panics with the
+// expected text, when one is written.
+use crate::ast::{Ast, Attr, AttrInput, Expr, ItemKind, TyExpr};
 use crate::diag::{self, Diag, FileId, SourceMap};
 use crate::driver::{self, Cmd, Request, SessionKey};
 use crate::intern::{Interner, Known};
@@ -64,7 +66,7 @@ fn parse_secs(s: &String) -> Result<Duration, String> {
 /// One test case result.
 struct Outcome {
     name: String,
-    status: &'static str, // "pass", "fail", or "timeout"
+    status: &'static str, // "pass", "fail", "timeout", or "ignored"
     duration_ms: f64,
     exit_code: Option<i32>,
     stdout: String,
@@ -129,11 +131,65 @@ fn millis(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+/// One `#[test]` fn and its harness attributes. `should_panic` is
+/// `Some(expected)` for `#[should_panic]`, where `expected` is the
+/// panic text it must contain, or `None` inside for the bare form.
+#[derive(Clone)]
+struct TestCase {
+    name: String,
+    ignored: bool,
+    should_panic: Option<Option<String>>,
+}
+
+/// The string literal in an attribute input, whichever of the three
+/// stored shapes holds it (`= "x"` trees, a parenthesized list, or an
+/// `Eq` expression from a cfg_attr expansion).
+fn attr_str(input: &AttrInput, ast: &Ast) -> Option<String> {
+    fn in_trees(trees: &[lexer::TokenTree], ast: &Ast) -> Option<String> {
+        trees.iter().find_map(|t| match t {
+            lexer::TokenTree::Token(tok) => match tok.tok {
+                lexer::Tok::Str(i, _) => ast.strings.get(i as usize).cloned(),
+                _ => None,
+            },
+            lexer::TokenTree::Delim(_, inner, _) => in_trees(inner, ast),
+        })
+    }
+    match input {
+        AttrInput::None => None,
+        AttrInput::Eq(e) => match ast.expr(*e) {
+            Expr::Str(i) => ast.strings.get(*i as usize).cloned(),
+            _ => None,
+        },
+        AttrInput::List(_, trees) => in_trees(trees, ast),
+    }
+}
+
+/// Reads `#[ignore]` and the first `#[should_panic]` from one item.
+/// A second `should_panic` does not change the result, as in rustc
+/// (probed: the first expected text wins). The parser already judged
+/// each written form, so a bare `should_panic` and one whose string
+/// this reader cannot find both count as no expected text.
+fn harness_attrs(attrs: &[Attr], ast: &Ast, interner: &Interner) -> (bool, Option<Option<String>>) {
+    let mut ignored = false;
+    let mut should_panic = None;
+    for a in attrs {
+        if a.path.len() != 1 {
+            continue;
+        }
+        match interner.get(a.path[0].name) {
+            "ignore" => ignored = true,
+            "should_panic" if should_panic.is_none() => should_panic = Some(attr_str(&a.input, ast)),
+            _ => {}
+        }
+    }
+    (ignored, should_panic)
+}
+
 /// The JSON summary record printed last in `--json` mode.
 fn summary_json(file: &str, hash: &str, build: &str, outcomes: &[Outcome], filtered_out: usize, start: Instant) -> String {
     let count = |s: &str| outcomes.iter().filter(|o| o.status == s).count();
     format!(
-        "{{\"schema\":{},\"kind\":\"summary\",\"file\":{},\"source_hash\":{},\"build\":\"{}\",\"total\":{},\"passed\":{},\"failed\":{},\"timed_out\":{},\"filtered_out\":{},\"duration_ms\":{:.3}}}",
+        "{{\"schema\":{},\"kind\":\"summary\",\"file\":{},\"source_hash\":{},\"build\":\"{}\",\"total\":{},\"passed\":{},\"failed\":{},\"timed_out\":{},\"ignored\":{},\"filtered_out\":{},\"duration_ms\":{:.3}}}",
         diag::SCHEMA,
         diag::json_str(file),
         diag::json_str(hash),
@@ -142,6 +198,7 @@ fn summary_json(file: &str, hash: &str, build: &str, outcomes: &[Outcome], filte
         count("pass"),
         count("fail"),
         count("timeout"),
+        count("ignored"),
         filtered_out,
         millis(start)
     )
@@ -196,7 +253,7 @@ pub fn run(args: &[String]) -> i32 {
         Ok(a) => a,
         Err(d) => return fail_build(diag::render(&mut [d], &map, &src, opts.json, opts.max_errors), 0),
     };
-    let mut tests: Vec<String> = Vec::new();
+    let mut tests: Vec<TestCase> = Vec::new();
     let mut fn_names: Vec<String> = Vec::new();
     let mut main_span = None;
     let mut bad: Vec<Diag> = Vec::new();
@@ -218,7 +275,8 @@ pub fn run(args: &[String]) -> i32 {
                             format!("Change the signature to `fn {name}() {{ ... }}`."),
                         ));
                     } else {
-                        tests.push(name);
+                        let (ignored, should_panic) = harness_attrs(&item.attrs, &ast, &interner);
+                        tests.push(TestCase { name, ignored, should_panic });
                     }
                 }
             }
@@ -235,14 +293,14 @@ pub fn run(args: &[String]) -> i32 {
     if !bad.is_empty() {
         return fail_build(diag::render(&mut bad, &map, &src, opts.json, opts.max_errors), 0);
     }
-    let selected: Vec<String> = match &opts.filter {
-        Some(f) => tests.iter().filter(|n| n.contains(f.as_str())).cloned().collect(),
+    let selected: Vec<TestCase> = match &opts.filter {
+        Some(f) => tests.iter().filter(|t| t.name.contains(f.as_str())).cloned().collect(),
         None => tests.clone(),
     };
     let filtered_out = tests.len() - selected.len();
     if opts.list {
         if opts.json {
-            let names: Vec<String> = selected.iter().map(|n| diag::json_str(n)).collect();
+            let names: Vec<String> = selected.iter().map(|t| diag::json_str(&t.name)).collect();
             println!(
                 "{{\"schema\":{},\"kind\":\"list\",\"file\":{},\"source_hash\":{},\"tests\":[{}],\"filtered_out\":{}}}",
                 diag::SCHEMA,
@@ -252,8 +310,8 @@ pub fn run(args: &[String]) -> i32 {
                 filtered_out
             );
         } else {
-            for n in &selected {
-                println!("{n}: test");
+            for t in &selected {
+                println!("{}: test", t.name);
             }
             println!("\n{} tests", selected.len());
         }
@@ -305,11 +363,11 @@ pub fn run(args: &[String]) -> i32 {
         harness.replace_range(span.lo as usize..span.hi as usize, replacement);
     }
     harness.push_str("\nfn main() {\n    let n = std::env::args().count();\n    if n == 1 {\n");
-    for t in &selected {
-        harness.push_str(&format!("        {t}();\n"));
+    for t in selected.iter().filter(|t| !t.ignored) {
+        harness.push_str(&format!("        {}();\n", t.name));
     }
     for (i, t) in selected.iter().enumerate() {
-        harness.push_str(&format!("    }} else if n == {} {{\n        {t}();\n", i + 2));
+        harness.push_str(&format!("    }} else if n == {} {{\n        {}();\n", i + 2, t.name));
     }
     harness.push_str("    }\n}\n");
     if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join("harness.rs"), &harness)) {
@@ -339,11 +397,33 @@ pub fn run(args: &[String]) -> i32 {
         println!("running {} tests", selected.len());
     }
     let mut outcomes: Vec<Outcome> = Vec::new();
-    for (i, name) in selected.iter().enumerate() {
-        let mut o = run_one(&bin, i, name, opts.timeout);
+    for (i, t) in selected.iter().enumerate() {
+        // An ignored test is reported, never run, as in rustc.
+        let mut o = if t.ignored {
+            Outcome {
+                name: t.name.clone(),
+                status: "ignored",
+                duration_ms: 0.0,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        } else {
+            run_one(&bin, i, &t.name, opts.timeout)
+        };
         // Panic messages name the harness file; its lines match the user file, so rename it back.
         o.stderr = o.stderr.replace(&harness_path.to_string_lossy().into_owned(), &path);
         o.stdout = o.stdout.replace(&harness_path.to_string_lossy().into_owned(), &path);
+        // A `should_panic` test passes only when it panics, and its
+        // output must hold the expected text when one is written.
+        // A timeout stays a timeout.
+        if let Some(expected) = &t.should_panic
+            && o.status != "timeout"
+            && o.status != "ignored"
+        {
+            let text_hit = expected.as_ref().is_none_or(|want| o.stdout.contains(want.as_str()) || o.stderr.contains(want.as_str()));
+            o.status = if o.exit_code != Some(0) && text_hit { "pass" } else { "fail" };
+        }
         if opts.json {
             println!(
                 "{{\"schema\":{},\"kind\":\"test\",\"name\":{},\"status\":\"{}\",\"duration_ms\":{:.3},\"exit_code\":{},\"stdout\":{},\"stderr\":{}}}",
@@ -359,19 +439,20 @@ pub fn run(args: &[String]) -> i32 {
             let word = match o.status {
                 "pass" => "ok",
                 "timeout" => "TIMEOUT",
+                "ignored" => "ignored",
                 _ => "FAILED",
             };
             println!("test {} ... {} ({:.1}ms)", o.name, word, o.duration_ms);
         }
         outcomes.push(o);
     }
-    let failed = outcomes.iter().filter(|o| o.status != "pass").count();
+    let failed = outcomes.iter().filter(|o| matches!(o.status, "fail" | "timeout")).count();
     if opts.json {
         println!("{}", summary_json(&path, &hash, "ok", &outcomes, filtered_out, start));
     } else {
         if failed > 0 {
             println!("\nfailures:");
-            for o in outcomes.iter().filter(|o| o.status != "pass") {
+            for o in outcomes.iter().filter(|o| matches!(o.status, "fail" | "timeout")) {
                 println!("---- {} ({}) ----", o.name, o.status);
                 if !o.stdout.is_empty() {
                     println!("stdout:\n{}", o.stdout);
@@ -381,14 +462,16 @@ pub fn run(args: &[String]) -> i32 {
                 }
             }
         }
-        let passed = outcomes.len() - failed;
+        let passed = outcomes.iter().filter(|o| o.status == "pass").count();
         let timed_out = outcomes.iter().filter(|o| o.status == "timeout").count();
+        let ignored = outcomes.iter().filter(|o| o.status == "ignored").count();
         println!(
-            "\ntest result: {}. {} passed; {} failed; {} timed out; {} filtered out",
+            "\ntest result: {}. {} passed; {} failed; {} timed out; {} ignored; {} filtered out",
             if failed == 0 { "ok" } else { "FAILED" },
             passed,
             failed - timed_out,
             timed_out,
+            ignored,
             filtered_out
         );
     }

@@ -1,6 +1,7 @@
 // Input and target checks for the built-in attributes the parser accepts
 // and otherwise ignores (`inline`, `cold`, `must_use`, `deprecated`,
-// `repr` targets, `test`, and the lint levels). rustc rejects a malformed
+// `repr` targets, `test`, `ignore`, `should_panic`, and the lint levels).
+// rustc rejects a malformed
 // input or a wrong target for these, so ignoring the attribute would be a
 // false accept. A lint raised to deny or forbid is L0531: rustc would
 // reject code that triggers the lint, and lust does not check lints.
@@ -32,6 +33,17 @@ pub(super) fn check_input(name: &str, attr: &Attr, interner: &Interner) -> PResu
         },
         "cold" | "test" | "non_exhaustive" => matches!(attr.input, AttrInput::None),
         "must_use" => matches!(&attr.input, AttrInput::None) || eq_str(&attr.input),
+        // `ignore` and `ignore = "reason"` are the only forms (probed).
+        "ignore" => matches!(attr.input, AttrInput::None) || eq_str(&attr.input),
+        // `should_panic`, `should_panic = "text"`, and
+        // `should_panic(expected = "text")` are the only forms.
+        "should_panic" => match &attr.input {
+            AttrInput::None => true,
+            AttrInput::List(Delim::Paren, t) => {
+                matches!(comma_pieces(t).as_slice(), [only] if key_str(only, interner).as_deref() == Some("expected"))
+            }
+            other => eq_str(other),
+        },
         // `#[path = "..."]` is the only form rustc accepts.
         "path" => eq_str(&attr.input),
         "deprecated" => match &attr.input {
@@ -72,6 +84,10 @@ pub(super) fn check_target(attrs: &[Attr], what: &str, flags: u8, interner: &Int
         let bad = match name {
             "inline" => flags & (T_FN | T_FIELD) == 0,
             "cold" => flags & T_PARAM != 0,
+            // The test harness attributes only warn on wrong item
+            // targets, but a function parameter takes only lint and
+            // cfg attributes, so there rustc rejects them (probed).
+            "ignore" | "should_panic" => flags & T_PARAM != 0,
             "repr" => flags & (T_ADT | T_UNION) == 0,
             "non_exhaustive" => flags & (T_ADT | T_VARIANT | T_FIELD) == 0,
             _ => false,
