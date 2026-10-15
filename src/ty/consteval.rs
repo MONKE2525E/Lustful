@@ -596,8 +596,125 @@ fn cmp_int(a: i128, b: i128, it: Option<IntTy>) -> std::cmp::Ordering {
     }
 }
 
+/// One binary integer operation in its operand type, as const
+/// evaluation runs it (rustc E0080): arithmetic overflow, division
+/// by zero, `MIN / -1`, and a shift amount at or past the bit width
+/// are `None`. Shift and bitwise results wrap to the type's width.
+/// Inputs and the result use the stored form (see `int_bits`), so
+/// u128 values at or above 2^127 stay correct. Both const
+/// evaluators (this one and the scalar one in collect) run integer
+/// arithmetic through here, so they cannot disagree.
+pub fn int_binop(op: BinOp, it: IntTy, x: i128, y: i128) -> Option<i128> {
+    if it.signed() {
+        let (x, y) = (truncate_to_int(x, it), truncate_to_int(y, it));
+        let r = match op {
+            BinOp::Add => x.checked_add(y),
+            BinOp::Sub => x.checked_sub(y),
+            BinOp::Mul => x.checked_mul(y),
+            BinOp::Div | BinOp::Rem => {
+                if y == 0 || (x == int_min(it) && y == -1) {
+                    None
+                } else if op == BinOp::Div {
+                    Some(x / y)
+                } else {
+                    Some(x % y)
+                }
+            }
+            BinOp::BitAnd => Some(int_from_bits(int_bits(x, it) & int_bits(y, it), it)),
+            BinOp::BitOr => Some(int_from_bits(int_bits(x, it) | int_bits(y, it), it)),
+            BinOp::BitXor => Some(int_from_bits(int_bits(x, it) ^ int_bits(y, it), it)),
+            BinOp::Shl | BinOp::Shr => {
+                let amt = u32::try_from(y).ok().filter(|&s| s < it.bits());
+                match (op, amt) {
+                    (BinOp::Shl, Some(s)) => Some(int_from_bits(int_bits(x, it) << s, it)),
+                    (BinOp::Shr, Some(s)) => Some(x >> s),
+                    _ => None,
+                }
+            }
+            _ => return None,
+        }?;
+        if !matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr) && !fits(r, it) {
+            return None;
+        }
+        Some(r)
+    } else {
+        let (x, y) = (int_bits(x, it), int_bits(y, it));
+        let max = it.max128();
+        let r = match op {
+            BinOp::Add => x.checked_add(y).filter(|&r| r <= max),
+            BinOp::Sub => x.checked_sub(y),
+            BinOp::Mul => x.checked_mul(y).filter(|&r| r <= max),
+            BinOp::Div => x.checked_div(y),
+            BinOp::Rem => x.checked_rem(y),
+            BinOp::BitAnd => Some(x & y),
+            BinOp::BitOr => Some(x | y),
+            BinOp::BitXor => Some(x ^ y),
+            BinOp::Shl | BinOp::Shr => {
+                let amt = u32::try_from(y).ok().filter(|&s| s < it.bits());
+                match (op, amt) {
+                    (BinOp::Shl, Some(s)) => Some((x << s) & max),
+                    (BinOp::Shr, Some(s)) => Some(x >> s),
+                    _ => None,
+                }
+            }
+            _ => return None,
+        }?;
+        Some(int_from_bits(r, it))
+    }
+}
+
+/// Compares two stored integers of one type (for the scalar evaluator).
+pub fn int_cmp(it: IntTy, a: i128, b: i128) -> std::cmp::Ordering {
+    cmp_int(a, b, Some(it))
+}
+
+/// Negation in a signed integer type: `None` on `MIN` and on every
+/// unsigned type (const overflow, rustc E0080).
+pub fn int_neg(it: IntTy, x: i128) -> Option<i128> {
+    if !it.signed() {
+        return None;
+    }
+    let x = truncate_to_int(x, it);
+    if x == int_min(it) { None } else { Some(-x) }
+}
+
+/// Bitwise not in an integer type, in stored form.
+pub fn int_not(it: IntTy, x: i128) -> i128 {
+    int_from_bits(!int_bits(x, it), it)
+}
+
+/// The stored form of raw bits at a type's width (for the scalar evaluator).
+pub fn int_stored(u: u128, it: IntTy) -> i128 {
+    int_from_bits(u, it)
+}
+
+/// A float-to-int `as` cast, saturating at the target type's range
+/// (NaN becomes 0), as Rust defines it. The host `as` casts have
+/// the same semantics, so each target goes through its own host
+/// type: casting to i128 first and truncating would wrap instead.
+pub fn float_to_int(bits: u64, f: FloatTy, it: IntTy) -> i128 {
+    let x: f64 = match f {
+        FloatTy::F64 => f64::from_bits(bits),
+        FloatTy::F32 => f32::from_bits(bits as u32) as f64,
+    };
+    match it {
+        IntTy::I8 => x as i8 as i128,
+        IntTy::I16 => x as i16 as i128,
+        IntTy::I32 => x as i32 as i128,
+        IntTy::I64 | IntTy::Isize => x as i64 as i128,
+        IntTy::I128 => x as i128,
+        IntTy::U8 => x as u8 as i128,
+        IntTy::U16 => x as u16 as i128,
+        IntTy::U32 => x as u32 as i128,
+        IntTy::U64 | IntTy::Usize => x as u64 as i128,
+        IntTy::U128 => (x as u128) as i128,
+    }
+}
+
 /// True when an expression is an unsuffixed int or float literal,
-/// possibly negated: the forms whose type a cast target decides.
+/// possibly negated or wrapped in statement-free blocks: the forms
+/// whose type a cast target decides (`{ 300 } as u8` is a `u8`
+/// literal out of range, as `300 as u8` is).
 pub fn is_unsuffixed_lit(ast: &Ast, e: ExprId) -> bool {
     match ast.expr(e) {
         Expr::Int(_, suffix) => suffix.is_none(),
@@ -606,6 +723,10 @@ pub fn is_unsuffixed_lit(ast: &Ast, e: ExprId) -> bool {
             !t.ends_with("f32") && !t.ends_with("f64")
         }
         Expr::Unary { op: UnOp::Neg, expr } => is_unsuffixed_lit(ast, *expr),
+        Expr::Block(b) | Expr::ConstBlock(b) => {
+            let b = ast.block(*b);
+            b.stmts.is_empty() && b.tail.is_some_and(|t| is_unsuffixed_lit(ast, t))
+        }
         _ => false,
     }
 }
@@ -645,11 +766,26 @@ pub fn flex_int_expr(ast: &Ast, e: ExprId) -> bool {
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
     check_macro_forms(cx.ast(), e)?;
-    let mut ev = Evaluator { steps: 0, extra_cap: 0, call_depth: 0, move_read: false, ref_drop_temps: Vec::new() };
+    let mut ev = Evaluator {
+        steps: 0,
+        extra_cap: 0,
+        call_depth: 0,
+        move_read: false,
+        ref_drop_temps: Vec::new(),
+        flex_debt: Vec::new(),
+        local_debt: Vec::new(),
+    };
     let mut env: Env = Vec::new();
     let span = cx.ast().expr_span(e);
     match ev.expr(cx, &mut env, e, expected)? {
         Flow::Val(v) => {
+            // An unpinned literal that no context ever pinned falls back
+            // to i32 in rustc: one outside i32's range is an error there,
+            // however it escaped (a cast of the local it was bound to, a
+            // tuple element nobody reads).
+            if let Some(&d) = ev.flex_debt.first() {
+                return Err(Diag::new(C_OUTSIDE, cx.ast().expr_span(d), "integer literal out of range in const", "Change the literal or the type."));
+            }
             // The final value stands for the item's whole life: a
             // borrow of a temporary inside it must be promotable
             // (E0492/E0764), and every borrowed drop temporary the
@@ -693,6 +829,14 @@ struct Evaluator {
     /// borrowed. Each one must end up in the final value, promoted;
     /// one that does not was dropped at its statement's end.
     ref_drop_temps: Vec<Ty>,
+    /// Unsuffixed literals evaluated wide (no pinning type) whose
+    /// magnitude does not fit i32, by expression. Evaluating the
+    /// same expression at a pinning type, or reading a local it
+    /// was bound to at a pinning type, clears the debt; a debt
+    /// left at the end of `eval` is rustc's i32 fallback error.
+    flex_debt: Vec<ExprId>,
+    /// Which local names carry which flex debts.
+    local_debt: Vec<(Sym, ExprId)>,
 }
 
 /// Steps one blob byte grants. A hash loop body (index, xor or
@@ -706,6 +850,28 @@ impl Evaluator {
             return Err(outside(span, "this const item (step limit reached)"));
         }
         Ok(())
+    }
+
+    /// Records an unpinned literal outside i32's range (see `flex_debt`).
+    fn note_flex_debt(&mut self, e: ExprId) {
+        if !self.flex_debt.contains(&e) {
+            self.flex_debt.push(e);
+        }
+    }
+
+    /// Clears one literal's flex debt (it was evaluated at a pinning type).
+    fn clear_flex_debt(&mut self, e: ExprId) {
+        self.flex_debt.retain(|&d| d != e);
+        self.local_debt.retain(|&(_, d)| d != e);
+    }
+
+    /// Clears the flex debts a local carries (it was read at a pinning type).
+    fn clear_local_debt(&mut self, name: Sym) {
+        let debts: Vec<ExprId> = self.local_debt.iter().filter(|(n, _)| *n == name).map(|&(_, d)| d).collect();
+        for d in debts {
+            self.flex_debt.retain(|&x| x != d);
+        }
+        self.local_debt.retain(|(n, _)| *n != name);
     }
 
     /// Records a blob value this evaluation touches, raising the
@@ -804,6 +970,16 @@ impl Evaluator {
                 let it = self.int_ty_of(cx, t).unwrap_or(IntTy::I128);
                 if *v > it.max128() {
                     return Err(Diag::new(C_OUTSIDE, span, "integer literal out of range in const", "Change the literal or the type."));
+                }
+                // A wide literal past i32's range owes a pinning
+                // type from some later use (see `flex_debt`); an
+                // evaluation at a real type settles it.
+                if suffix.is_none() {
+                    if expected.is_some_and(|t| self.int_ty_of(cx, t).is_some()) {
+                        self.clear_flex_debt(e);
+                    } else if *v > i32::MAX as u128 {
+                        self.note_flex_debt(e);
+                    }
                 }
                 (ConstValue::Int(int_from_bits(*v, it)), t)
             }
@@ -937,6 +1113,13 @@ impl Evaluator {
                         ));
                     }
                     let r = if v == (1u128 << 127) { i128::MIN } else { -(v as i128) };
+                    if suffix.is_none() {
+                        if expected.is_some_and(|t| self.int_ty_of(cx, t).is_some()) {
+                            self.clear_flex_debt(*expr);
+                        } else if v > (i32::MAX as u128) + 1 {
+                            self.note_flex_debt(*expr);
+                        }
+                    }
                     (ConstValue::Int(r), t)
                 } else {
                     let (v, t) = self.value(cx, env, *expr, expected)?;
@@ -1458,6 +1641,7 @@ impl Evaluator {
                 ast::Stmt::Let { pat, ty, init, els, .. } => {
                     let Some(init) = init else { return Err(outside(cx.ast().pat_span(*pat), "an uninitialized binding")) };
                     let exp = ty.map(|t| cx.resolve_ty(t));
+                    let debt_before = self.flex_debt.clone();
                     let v = self.value_moved(cx, env, *init, exp)?;
                     // A drop value that is not bound whole is
                     // destroyed by the binding itself: a `_` pattern
@@ -1465,6 +1649,20 @@ impl Evaluator {
                     // drops what it does not move out (E0493).
                     if cx.needs_drop(v.1) && !pat_is_whole_binding(cx.ast(), *pat) {
                         return Err(drop_diag(cx, v.1, cx.ast().pat_span(*pat)));
+                    }
+                    // A wide literal in the init (or carried by a
+                    // local the init reads) now rides on the new
+                    // bindings: reading one at a pinning type
+                    // settles it (see `flex_debt`).
+                    let mut debts: Vec<ExprId> = self.flex_debt.iter().copied().filter(|d| !debt_before.contains(d)).collect();
+                    if let Expr::Path(segs) = cx.ast().expr(*init)
+                        && segs.len() == 1
+                    {
+                        for &(n, d) in &self.local_debt {
+                            if n == segs[0].name && !debts.contains(&d) {
+                                debts.push(d);
+                            }
+                        }
                     }
                     let mut binds = Vec::new();
                     if !self.match_pat(cx, env, *pat, &v.0.clone(), v.1, true, &mut binds)? {
@@ -1477,6 +1675,11 @@ impl Evaluator {
                             return flow;
                         }
                         return Err(outside(cx.ast().pat_span(*pat), "a refutable pattern"));
+                    }
+                    for &(name, _, _, _) in &binds {
+                        for &d in &debts {
+                            self.local_debt.push((name, d));
+                        }
                     }
                     env.extend(binds);
                 }
@@ -1535,7 +1738,13 @@ impl Evaluator {
                 if self.move_read {
                     slot.3 = true;
                 }
-                return Ok(slot.1.clone());
+                let v = slot.1.clone();
+                // A read at a pinning integer type settles the
+                // local's wide literals (see `flex_debt`).
+                if expected.is_some_and(|t| self.int_ty_of(cx, t).is_some()) {
+                    self.clear_local_debt(name);
+                }
+                return Ok(v);
             }
             if let Some(v) = cx.const_item(name, span) {
                 return Ok(v);
@@ -1728,6 +1937,18 @@ impl Evaluator {
             (lv, lt) = self.value(cx, env, lhs, Some(super::I32))?;
             (rv, rt) = self.value(cx, env, rhs, Some(super::I32))?;
         }
+        // A typed operand pins a local on the other side, as
+        // inference does: settle its wide literals.
+        if both_int && !matches!(op, BinOp::Shl | BinOp::Shr) {
+            for (side, other_ty) in [(lhs, rt), (rhs, lt)] {
+                if self.int_ty_of(cx, other_ty).is_some()
+                    && let Expr::Path(segs) = cx.ast().expr(side)
+                    && segs.len() == 1
+                {
+                    self.clear_local_debt(segs[0].name);
+                }
+            }
+        }
         let _ = rt;
         if op.is_cmp() {
             // Only primitive scalars compare in const: rustc has no const
@@ -1845,63 +2066,13 @@ impl Evaluator {
         if !stored_fits(x) || (!matches!(op, BinOp::Shl | BinOp::Shr) && !stored_fits(y)) {
             return Err(over());
         }
-        let r: i128 = if it.signed() {
-            let (x, y) = (truncate_to_int(x, it), truncate_to_int(y, it));
-            let r = match op {
-                BinOp::Add => x.checked_add(y),
-                BinOp::Sub => x.checked_sub(y),
-                BinOp::Mul => x.checked_mul(y),
-                BinOp::Div | BinOp::Rem => {
-                    if y == 0 || (x == int_min(it) && y == -1) {
-                        None
-                    } else if op == BinOp::Div {
-                        Some(x / y)
-                    } else {
-                        Some(x % y)
-                    }
-                }
-                BinOp::BitAnd => Some(int_from_bits(int_bits(x, it) & int_bits(y, it), it)),
-                BinOp::BitOr => Some(int_from_bits(int_bits(x, it) | int_bits(y, it), it)),
-                BinOp::BitXor => Some(int_from_bits(int_bits(x, it) ^ int_bits(y, it), it)),
-                BinOp::Shl | BinOp::Shr => {
-                    let amt = u32::try_from(y).ok().filter(|&s| s < it.bits());
-                    match (op, amt) {
-                        (BinOp::Shl, Some(s)) => Some(int_from_bits(int_bits(x, it) << s, it)),
-                        (BinOp::Shr, Some(s)) => Some(x >> s),
-                        _ => None,
-                    }
-                }
-                _ => return Err(outside(span, "this operation")),
-            };
-            let r = r.ok_or_else(over)?;
-            if !matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr) && !fits(r, it) {
-                return Err(over());
-            }
-            r
-        } else {
-            let (x, y) = (int_bits(x, it), int_bits(y, it));
-            let max = it.max128();
-            let r = match op {
-                BinOp::Add => x.checked_add(y).filter(|&r| r <= max),
-                BinOp::Sub => x.checked_sub(y),
-                BinOp::Mul => x.checked_mul(y).filter(|&r| r <= max),
-                BinOp::Div => x.checked_div(y),
-                BinOp::Rem => x.checked_rem(y),
-                BinOp::BitAnd => Some(x & y),
-                BinOp::BitOr => Some(x | y),
-                BinOp::BitXor => Some(x ^ y),
-                BinOp::Shl | BinOp::Shr => {
-                    let amt = u32::try_from(y).ok().filter(|&s| s < it.bits());
-                    match (op, amt) {
-                        (BinOp::Shl, Some(s)) => Some((x << s) & max),
-                        (BinOp::Shr, Some(s)) => Some(x >> s),
-                        _ => None,
-                    }
-                }
-                _ => return Err(outside(span, "this operation")),
-            };
-            int_from_bits(r.ok_or_else(over)?, it)
-        };
+        if !matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        ) {
+            return Err(outside(span, "this operation"));
+        }
+        let r = int_binop(op, it, x, y).ok_or_else(over)?;
         Ok((ConstValue::Int(r), t))
     }
 
@@ -1916,19 +2087,7 @@ impl Evaluator {
                 };
                 Ok((ConstValue::Float(r, g), target))
             }
-            (ConstValue::Float(bits, f), TyKind::Int(it)) => {
-                let r: i128 = match f {
-                    FloatTy::F64 => {
-                        let x = f64::from_bits(bits);
-                        if it.signed() { (x as i128) } else { (x as u128) as i128 }
-                    }
-                    FloatTy::F32 => {
-                        let x = f32::from_bits(bits as u32);
-                        if it.signed() { (x as i128) } else { (x as u128) as i128 }
-                    }
-                };
-                Ok((ConstValue::Int(truncate_to_int(r, it)), target))
-            }
+            (ConstValue::Float(bits, f), TyKind::Int(it)) => Ok((ConstValue::Int(float_to_int(bits, f, it)), target)),
             (ConstValue::Int(i), TyKind::Float(g)) => {
                 // The source type decides the conversion: an unsigned
                 // source converts from its raw bits, never as a negative.
