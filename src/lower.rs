@@ -969,6 +969,23 @@ impl<'p> Lower<'p> {
                 self.call_into(CallTarget::Builtin(Builtin::CowDeref), vec![Operand::Copy(place)], Place::local(tmp), span);
                 Operand::Copy(Place::local(tmp))
             }
+            Coerce::CharPat => {
+                // A char as a str pattern: encode it into a temporary
+                // String (which drops at scope end) and take its &str.
+                let s = self.temp(STRING);
+                self.call_into(CallTarget::Builtin(Builtin::StringNew), Vec::new(), Place::local(s), span);
+                let mt = self.ref_ty(true, STRING);
+                let r = self.temp(mt);
+                self.assign(Place::local(r), Rvalue::Ref(true, Place::local(s)), span);
+                let u = self.temp(UNIT);
+                self.call_into(CallTarget::Builtin(Builtin::StringPush), vec![Operand::Move(Place::local(r)), op], Place::local(u), span);
+                let rt2 = self.ref_ty(false, STRING);
+                let r2 = self.temp(rt2);
+                self.assign(Place::local(r2), Rvalue::Ref(false, Place::local(s)), span);
+                let v = self.temp(REF_STR);
+                self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![Operand::Copy(Place::local(r2))], Place::local(v), span);
+                Operand::Copy(Place::local(v))
+            }
         }
     }
 
@@ -979,7 +996,7 @@ impl<'p> Lower<'p> {
         let ty = self.ty(e);
         match self.ck.coerce(e) {
             Coerce::None => ty,
-            Coerce::StrFromString => REF_STR,
+            Coerce::StrFromString | Coerce::CharPat => REF_STR,
             Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) | Coerce::ReifyFn(t) | Coerce::RefToPtr(t) => t,
             // A receiver-only coercion: `operand` leaves the value as is.
             Coerce::CowRecv(..) => ty,

@@ -999,7 +999,8 @@ impl<'p> Ctx<'p> {
         let (derefs, mode) = match c {
             // A raw pointer coercion (w-cinterop) borrows nothing past
             // the coercion site: the plain walk sees the borrow inside.
-            Coerce::None | Coerce::ReifyFn(_) | Coerce::RefToPtr(_) => return false,
+            // A char pattern reads the char by value, like a plain use.
+            Coerce::None | Coerce::ReifyFn(_) | Coerce::RefToPtr(_) | Coerce::CharPat => return false,
             Coerce::MutToShared => (1, CaptureMode::Ref),
             Coerce::Reborrow => (1, CaptureMode::MutRef),
             Coerce::Deref(n) => (n as usize + 1, CaptureMode::Ref),

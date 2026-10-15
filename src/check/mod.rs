@@ -1043,6 +1043,10 @@ pub enum Coerce {
     /// `&Cow<B>` (behind this many references in all) to `&B`, the
     /// payload's type (W-STD-B): the Cow's `Deref`.
     CowDeref(u8, Ty),
+    /// A `char` used as a str search pattern (`s.contains('x')`):
+    /// the value becomes the `&str` of its UTF-8 encoding in a
+    /// temporary String, which the search reads during the call.
+    CharPat,
     /// A method receiver through the Cow's `Deref` (W-STD-B): this many
     /// derefs reach the `Cow<B>` place, whose `&B` view (the payload's
     /// type) is the receiver the method's own adjustments start from.
@@ -12916,7 +12920,17 @@ impl<'p> Ctx<'p> {
                 // capacity rule (W-STD-B): `&&u8` is the generic path.
                 let derefs = if b == B::ToString { u8::from(matches!(self.tys.kind(rt), TyKind::Ref(..))) } else { derefs };
                 self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
-                self.check_args(&params, args, name_span);
+                // The str search methods take std's `Pattern`: a char
+                // in the pattern position becomes its encoding as a
+                // &str (`Coerce::CharPat`), which searches the same.
+                if matches!(b, B::StrContains | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix | B::StrReplace)
+                    && args.len() == params.len()
+                    && !args.is_empty()
+                {
+                    self.check_str_pattern_args(&params, args, name_span);
+                } else {
+                    self.check_args(&params, args, name_span);
+                }
                 ret
             }
             None => {
@@ -13369,6 +13383,31 @@ impl<'p> Ctx<'p> {
             (k.is_char_boundary, B::StrIsCharBoundary, vec![USIZE], BOOL),
         ];
         table.into_iter().find(|(n, ..)| *n == name).map(|(_, b, params, ret)| (b, Autoref::Ref, params, ret))
+    }
+
+    /// The arguments of a str search method, whose first is a
+    /// `Pattern`: a char there records `Coerce::CharPat` (its
+    /// encoding as the &str the builtin searches for, which finds
+    /// exactly that char's occurrences); anything else coerces to
+    /// &str as before. The rest check against their parameters.
+    fn check_str_pattern_args(&mut self, params: &[Ty], args: &[ExprId], span: Span) {
+        for (i, &a) in args.iter().enumerate() {
+            if i > 0 {
+                self.expect_expr(a, params[i]);
+            } else {
+                let at = self.expr(a, None);
+                self.run_obligations(false);
+                let deep = self.deep(at);
+                if self.kind(deep) == TyKind::Char {
+                    let ix = self.ei(a);
+                    self.out.coerce[ix] = Coerce::CharPat;
+                } else {
+                    self.coerce_expr(a, at, REF_STR);
+                }
+            }
+            self.reject_unsized_value(a);
+        }
+        let _ = span;
     }
 
     /// One binary operator through its operator trait, with the
