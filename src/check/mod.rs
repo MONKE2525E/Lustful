@@ -6793,6 +6793,11 @@ impl<'p> Ctx<'p> {
                             self.coerce_expr(*els, t2, d);
                             return d;
                         }
+                        if let Some(exp) = expected.filter(|e| !self.has_unbound_deep(*e)) {
+                            self.coerce_block_tail(*then, t1, exp);
+                            self.coerce_expr(*els, t2, exp);
+                            return exp;
+                        }
                         if expected.is_none()
                             && let Some(tail) = p.ast.block(*then).tail
                             && self.lub_flip(&[tail], t1, t2)
@@ -6823,6 +6828,11 @@ impl<'p> Ctx<'p> {
                             self.coerce_block_tail(*then, t1, d);
                             self.coerce_expr(*els, t2, d);
                             return d;
+                        }
+                        if let Some(exp) = expected.filter(|e| !self.has_unbound_deep(*e)) {
+                            self.coerce_block_tail(*then, t1, exp);
+                            self.coerce_expr(*els, t2, exp);
+                            return exp;
                         }
                         if expected.is_none()
                             && let Some(tail) = p.ast.block(*then).tail
@@ -6905,6 +6915,16 @@ impl<'p> Ctx<'p> {
                     if let Some(d) = self.dyn_ref_expectation(expected) {
                         self.coerce_expr(arm.body, bt, d);
                         result = Some(d);
+                        self.scopes.truncate(scope);
+                        continue;
+                    }
+                    // With a known expected type every arm is a
+                    // coercion site to it (`let r: &str = match ..
+                    // { Some(s) => s, .. }` deref-coerces `&String`
+                    // to `&str` per arm), as in rustc.
+                    if let Some(exp) = expected.filter(|e| !self.has_unbound_deep(*e)) {
+                        self.coerce_expr(arm.body, bt, exp);
+                        result = Some(exp);
                         self.scopes.truncate(scope);
                         continue;
                     }
@@ -7620,6 +7640,12 @@ impl<'p> Ctx<'p> {
                     if let Some(w) = self.dyn_ref_expectation(want) {
                         self.expect_expr(el, w);
                         out.push(w);
+                    } else if let Some(w) = want {
+                        // Every element under a known tuple type is a
+                        // coercion site (`&(1, &[true])` at
+                        // `&(u8, &[bool])` unsizes the inner array).
+                        let bt = self.expr(el, want);
+                        out.push(if self.coerce_expr(el, bt, w) { w } else { bt });
                     } else {
                         out.push(self.expr(el, want));
                     }
@@ -11477,17 +11503,17 @@ impl<'p> Ctx<'p> {
                 self.expect_expr(args[0], a[0]);
                 return self.tys.mk_option(a[0]);
             }
-            // Under an `Option<&dyn Tr>` expectation the argument is a
-            // coercion site for `&dyn Tr`, as rustc's expected inputs make it.
+            // Under an `Option<T>` expectation the argument is a
+            // coercion site for `T`, as rustc's expected inputs
+            // make it: this reaches dyn unsizing and the sites
+            // inside a tuple or struct argument alike
+            // (`Some((1, &[true]))` at `Option<(u8, &[bool])>`).
             let elem = expected.and_then(|t| self.tys.option_elem(self.resolve(t)));
-            if let Some(want) = elem.filter(|&t| self.dyn_ref_expectation(Some(t)).is_some()) {
+            if let Some(want) = elem {
                 self.expect_expr(args[0], want);
                 return self.tys.mk_option(want);
             }
-            // A dyn deeper in (`Option<(&dyn Tr, u8)>`): the expectation
-            // reaches the coercion sites inside the argument.
-            let hint = elem.filter(|&t| object::mentions_dyn(&self.tys, t) || self.conversion_call(args[0]));
-            let t = self.expr(args[0], hint);
+            let t = self.expr(args[0], None);
             return self.tys.mk_option(t);
         }
         if res == Res::ResOk || res == Res::ResErr {
@@ -11503,23 +11529,20 @@ impl<'p> Ctx<'p> {
                 Expr::Path(segs) => self.builtin_ctor_args(segs, 2, span).unwrap_or_default(),
                 _ => written_self.map(|t| self.builtin_self_args(t, 2)).unwrap_or_default(),
             };
-            // Under a `Result<&dyn Tr, _>` expectation the argument is a
-            // coercion site, as for `Some`; a dyn deeper in gets the hint.
-            let side = if turbo.len() == 2 { None } else { expected.and_then(|t| self.tys.result_args(self.resolve(t))) };
-            let side = side.map(|(ok, err)| if res == Res::ResOk { ok } else { err });
-            if let Some(want) = side.filter(|&t| self.dyn_ref_expectation(Some(t)).is_some()) {
-                self.expect_expr(args[0], want);
-                let other = self.new_var(false);
-                return if res == Res::ResOk { self.tys.mk_result(want, other) } else { self.tys.mk_result(other, want) };
-            }
             // Written args fix the side: the argument is a coercion site
             // for it (rustc E0308 for `Result::<u16, u8>::Ok(1u8)`).
             if turbo.len() == 2 {
                 self.expect_expr(args[0], if res == Res::ResOk { turbo[0] } else { turbo[1] });
                 return self.tys.mk_result(turbo[0], turbo[1]);
             }
-            let (want, other) = (side.filter(|&t| object::mentions_dyn(&self.tys, t) || self.conversion_call(args[0])), self.new_var(false));
-            let t = self.expr(args[0], want);
+            // Under a `Result<Ok, Err>` expectation the argument is
+            // a coercion site for its side, as for `Some`.
+            if let Some((ok, err)) = expected.and_then(|t| self.tys.result_args(self.resolve(t))) {
+                self.expect_expr(args[0], if res == Res::ResOk { ok } else { err });
+                return self.tys.mk_result(ok, err);
+            }
+            let other = self.new_var(false);
+            let t = self.expr(args[0], None);
             return if res == Res::ResOk { self.tys.mk_result(t, other) } else { self.tys.mk_result(other, t) };
         }
         match res {
