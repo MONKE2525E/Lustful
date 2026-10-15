@@ -575,16 +575,24 @@ pub fn package_cargo_env(pkg: &PackageInfo, target: &TargetInfo) -> Vec<(String,
 
 /// The per-unit feature sets from one `cargo check --message-format=json`
 /// run for the same request (section 1.1), keyed by (package id repr,
-/// target name). Cached per graph key in this process. Returns None when
-/// the run fails; the caller then falls back to resolve-node features and
-/// the session still works for single-package graphs.
-fn unit_features_via_check(req: &GraphRequest) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
+/// target name). Cached per graph key in this process, and on disk (see
+/// `features_disk_path`): the run compiles the whole package with rustc
+/// (ts_goport: about 16 minutes of CPU), and its answer does not depend on
+/// the sources. Returns None when the run fails; the caller then falls back
+/// to resolve-node features and the session still works for single-package
+/// graphs.
+fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
     let key = graph_key(req);
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, std::collections::HashMap<(String, String), Vec<String>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(v) = cache.lock().unwrap().get(&key) {
         return Some(v.clone());
+    }
+    let disk = features_disk_path(req, graph);
+    if let Some(map) = disk.as_deref().and_then(read_features_file) {
+        cache.lock().unwrap().insert(key, map.clone());
+        return Some(map);
     }
     let mut cmd = Command::new("cargo");
     if let Some(dir) = req.manifest_path.parent() {
@@ -623,8 +631,59 @@ fn unit_features_via_check(req: &GraphRequest) -> Option<std::collections::HashM
     if map.is_empty() {
         return None;
     }
+    if let Some(path) = disk {
+        write_features_file(&path, &map);
+    }
     cache.lock().unwrap().insert(key, map.clone());
     Some(map)
+}
+
+/// The disk cache file of `unit_features_via_check`:
+/// `$LUST_CACHE_DIR` (else `<workspace root>/.lust-cache`)`/features-<key>.txt`.
+/// The key is the graph key plus every workspace member manifest (a sibling
+/// member is not an ancestor of the named manifest, so the graph key alone
+/// misses it). None under `LUST_NO_CACHE`.
+fn features_disk_path(req: &GraphRequest, graph: &CrateGraph) -> Option<PathBuf> {
+    if matches!(std::env::var("LUST_NO_CACHE"), Ok(v) if !v.is_empty() && v != "0") {
+        return None;
+    }
+    let mut h = FxHasher::default();
+    "lust-features-v1".hash(&mut h);
+    graph_key(req).hash(&mut h);
+    for p in graph.packages.iter().filter(|p| graph.workspace_members.contains(&p.id_repr)) {
+        hash_bytes(&mut h, &p.manifest_path);
+    }
+    let dir = match std::env::var_os("LUST_CACHE_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => graph.workspace_root.join(".lust-cache"),
+    };
+    Some(dir.join(format!("features-{:016x}.txt", h.finish())))
+}
+
+/// One line per unit: package id, tab, target name, tab, comma-joined features.
+fn write_features_file(path: &Path, map: &std::collections::HashMap<(String, String), Vec<String>>) {
+    let mut text: String = map.iter().map(|((p, t), f)| format!("{p}\t{t}\t{}\n", f.join(","))).collect();
+    text.insert_str(0, "lust-features-v1\n");
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).is_ok() && std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn read_features_file(path: &Path) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "lust-features-v1" {
+        return None;
+    }
+    let mut map = std::collections::HashMap::new();
+    for line in lines {
+        let mut parts = line.splitn(3, '\t');
+        let (p, t, f) = (parts.next()?, parts.next()?, parts.next()?);
+        let feats = if f.is_empty() { Vec::new() } else { f.split(',').map(str::to_string).collect() };
+        map.insert((p.to_string(), t.to_string()), feats);
+    }
+    (!map.is_empty()).then_some(map)
 }
 
 /// Evaluates a Cargo dependency target string (`cfg(windows)`,
@@ -673,7 +732,7 @@ pub fn select_unit(
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
-    let check_map = if simple_graph { None } else { unit_features_via_check(req) };
+    let check_map = if simple_graph { None } else { unit_features_via_check(req, graph) };
     let features = check_map
         .as_ref()
         .and_then(|m| m.get(&(pkg.id_repr.clone(), target.name.clone())).cloned())
@@ -875,6 +934,20 @@ mod tests {
         assert_eq!(v.get("b").unwrap().get("c").unwrap().as_str(), Some("d\né"));
         assert_eq!(v.get("n"), Some(&Json::Num(-1500.0)));
         assert!(parse_json("{").is_err());
+    }
+
+    #[test]
+    fn features_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("lust-features-test-{}", std::process::id()));
+        let path = dir.join("features-0.txt");
+        let mut map = std::collections::HashMap::new();
+        map.insert(("path+file:///w#a@0.1.0".to_string(), "a".to_string()), vec!["default".to_string(), "std".to_string()]);
+        map.insert(("registry+x#b@1.0.0".to_string(), "b".to_string()), vec![]);
+        write_features_file(&path, &map);
+        assert_eq!(read_features_file(&path), Some(map));
+        std::fs::write(&path, "other-format\n").unwrap();
+        assert_eq!(read_features_file(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
