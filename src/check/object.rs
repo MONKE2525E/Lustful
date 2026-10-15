@@ -461,11 +461,22 @@ pub fn principal_of(tys: &impl TyIntern, t: Ty) -> Option<TraitRef> {
 }
 
 /// The auto traits a dyn type has: written bits plus the ones its
-/// principal's supertraits require.
+/// principal's supertraits require. Before `dyn_infos` exist (a static's
+/// `Sync` check at collect time) the supertraits are walked directly.
 pub fn dyn_auto(p: &Program, tys: &impl TyIntern, t: Ty) -> AutoTraits {
     let TyKind::Dyn(b, _) = tys.kind(t) else { return AutoTraits::default() };
     let b = tys.dyn_bounds(b);
-    let implied = b.principal.and_then(|pr| p.gx.dyn_infos.get(&pr.value.def)).map(|i| i.auto).unwrap_or_default();
+    let implied = match b.principal.map(|pr| pr.value.def) {
+        Some(d) => match p.gx.dyn_infos.get(&d) {
+            Some(i) => i.auto,
+            None => {
+                let l = &p.gx.lang;
+                let has = |want| principal_has_supertrait(p, d, want);
+                AutoTraits { send: has(l.send), sync: has(l.sync), unpin: has(l.unpin) }
+            }
+        },
+        None => AutoTraits::default(),
+    };
     AutoTraits { send: b.auto.send || implied.send, sync: b.auto.sync || implied.sync, unpin: b.auto.unpin || implied.unpin }
 }
 
@@ -588,27 +599,11 @@ fn implied_by_principal(p: &Program, principal: DefId, want: DefId, seen: &mut V
     info.supers.iter().any(|s| implied_by_principal(p, s.def, want, seen))
 }
 
-/// True when the AST type contains a `dyn` anywhere.
-fn ast_has_dyn(ast: &crate::ast::Ast, id: crate::ast::TyId) -> bool {
-    use crate::ast::{GenericArg as AstArg, GenericArgs, TyExpr};
-    match ast.ty(id) {
-        TyExpr::Dyn { .. } => true,
-        TyExpr::Ref { inner, .. } | TyExpr::Ptr { inner, .. } | TyExpr::Slice(inner) | TyExpr::Paren(inner) => ast_has_dyn(ast, *inner),
-        TyExpr::Array { inner, .. } => ast_has_dyn(ast, *inner),
-        TyExpr::Tuple(elems) => elems.iter().any(|&e| ast_has_dyn(ast, e)),
-        TyExpr::Path(segs) => segs.iter().any(|s| match &s.args {
-            GenericArgs::Angle(args) => args.iter().any(|a| matches!(a, AstArg::Type(t) if ast_has_dyn(ast, *t))),
-            _ => false,
-        }),
-        _ => false,
-    }
-}
-
 /// The dyn type checks over every signature collect resolved: fn and
 /// method signatures (trait methods included), fields, impl headers,
-/// and `impl dyn Trait` blocks. Const and static item types with a dyn
-/// type are not supported yet (their values would need vtables at
-/// compile time). Body types are checked as they resolve.
+/// and `impl dyn Trait` blocks. A dyn coercion in a const or static
+/// initializer is L0702 in `coerce_const_value` (the evaluator builds
+/// no vtables). Body types are checked as they resolve.
 pub fn check_signatures(p: &Program, errs: &mut Vec<Diag>) {
     use crate::check::generics::FnClass;
     // Every dyn type that resolves names a user trait, so a crate
@@ -680,16 +675,6 @@ pub fn check_signatures(p: &Program, errs: &mut Vec<Diag>) {
     }
     for &(t, span) in &p.gx.dyn_impl_sites {
         push(dyn_type_diag(p, &p.tys, t, span));
-    }
-    for item in &p.ast.items {
-        let ty = match &item.kind {
-            crate::ast::ItemKind::Const(c) => c.ty,
-            crate::ast::ItemKind::Static(s) => s.ty,
-            _ => continue,
-        };
-        if ast_has_dyn(&p.ast, ty) {
-            push(Some(crate::check::generics::dyn_not_yet(p.ast.ty_span(ty), "a `dyn` type in a const or static item")));
-        }
     }
 }
 

@@ -1736,15 +1736,17 @@ fn obj_default(tys: &mut impl TyIntern, t: Ty, under_ref: bool) -> Ty {
     }
 }
 
-/// `t` with every reference region `'static`: the region form of a type
-/// alias body, which may only use `'static` (W-BORROW, increment 1), and
-/// of a `thread_local!` value type (check/tls.rs).
+/// `t` with every reference region and dyn object lifetime `'static`:
+/// the region form of a type alias body, which may only use `'static`
+/// (W-BORROW, increment 1), and of a `thread_local!` value type
+/// (check/tls.rs), where every elided lifetime is `'static`.
 pub(crate) fn staticize(tys: &mut impl TyIntern, t: Ty) -> Ty {
     match tys.kind(t) {
         TyKind::Ref(_, m, inner) => {
             let i = staticize(tys, inner);
             tys.intern(TyKind::Ref(Region::Static, m, i))
         }
+        TyKind::Dyn(b, _) => tys.intern(TyKind::Dyn(b, Region::Static)),
         TyKind::Tuple(ts) => {
             let elems: Vec<Ty> = tys.tys_of(ts).to_vec().into_iter().map(|e| staticize(tys, e)).collect();
             let id = tys.intern_tys(&elems);
@@ -4512,8 +4514,9 @@ pub struct GenTables {
     /// Methods of `impl dyn Trait` blocks, by (the dyn type with an
     /// erased region, name).
     pub dyn_inherent: FxMap<(Ty, Sym), LocalDefId>,
-    /// The self type and span of each `impl dyn Trait` block, for
-    /// the dyn type checks.
+    /// The self type and span of each `impl dyn Trait` block and each
+    /// const or static item type that holds a dyn type, for the dyn
+    /// type checks.
     pub dyn_impl_sites: Vec<(Ty, Span)>,
     /// Impls whose header names a dyn type with a `'static` object
     /// lifetime (`impl dyn Tr`, `impl X for dyn Tr`), and their methods.

@@ -8,8 +8,9 @@
 // `OnceLock<T>`, so first access is thread-safe: `get_or_init` runs the
 // init closure exactly once, and only that closure takes `F` out of
 // `init` (through the privileged `core::intrinsics::once_take`), so the
-// take never races. Not modeled: `LazyLock: Sync` is structural here
-// (`OnceLock<T>: Sync` and `F: Sync`), where std asks `F: Send`.
+// take never races. `LazyLock: Sync` follows std's impl (`T: Send + Sync`,
+// `F: Send`), given by `auto_structural` in src/check/collect.rs; `Send`
+// is structural, as in std.
 
 /// Debug text of an empty lock: `<uninit>`.
 struct Uninit;

@@ -5112,6 +5112,11 @@ fn eval_pending_items(
                 continue;
             }
         };
+        // Dyn compatibility needs `dyn_infos`: checked with the
+        // signatures (`object::check_signatures`).
+        if crate::check::object::mentions_dyn(&p.tys, ty) {
+            p.gx.dyn_impl_sites.push((ty, ast.ty_span(ty_id)));
+        }
         if !is_sized_ty(&p.tys, ty) {
             errs.push(Diag::new(
                 "L0110",
@@ -6198,6 +6203,13 @@ fn coerce_const_value(
     }
     if matches!(&v, ConstValue::Variant(0, vals) if vals.is_empty()) && cx.p.tys.option_elem(ty).is_some() {
         return Ok(v);
+    }
+    // The evaluator builds no vtables: a value that becomes a dyn value
+    // here (`static D: &(dyn Tr + Sync) = &S;`) is valid Rust lust
+    // rejects. A dyn type in a runtime-built value (`LazyLock`, a
+    // `thread_local!` init, `None`) needs no const vtable and passes.
+    if crate::check::object::mentions_dyn(&cx.p.tys, ty) && !crate::check::object::mentions_dyn(&cx.p.tys, vt) {
+        return Err(crate::check::generics::dyn_not_yet(span, "a `dyn` coercion in a const or static initializer"));
     }
     Err(Diag::new(
         "L0110",
@@ -7388,6 +7400,24 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
                 }
                 seen.push((trait_def, t));
                 let args: Vec<GenericArg> = tys.adt_parts(t).map(|(_, a)| tys.args(a).to_vec()).unwrap_or_default();
+                // std's `unsafe impl<T: Sync + Send, F: Send> Sync for
+                // LazyLock<T, F>`: only one thread ever runs `F`.
+                let name = p.adt(a).name;
+                if trait_def == lang.sync
+                    && crate::intern::source_name(p.interner.get(name)) == "LazyLock"
+                    && p.display_path(name) == "std::sync::LazyLock"
+                {
+                    let (Some(v), Some(f)) = (args.first().and_then(|g| g.as_ty()), args.get(1).and_then(|g| g.as_ty())) else { return None };
+                    let mut unknown = false;
+                    for (tr, e) in [(lang.send, v), (lang.sync, v), (lang.send, f)] {
+                        match auto_structural(p, tys, env, tr, e, seen) {
+                            Some(false) => return Some(false),
+                            None => unknown = true,
+                            Some(true) => {}
+                        }
+                    }
+                    return if unknown { None } else { Some(true) };
+                }
                 // `PhantomData<T>` has T's auto traits (std source, W-STD-C).
                 if p.is_phantom_adt(a) {
                     let held: Vec<Ty> = args.iter().filter_map(|g| g.as_ty()).collect();

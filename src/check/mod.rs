@@ -4984,7 +4984,9 @@ impl<'p> Ctx<'p> {
         let (ed, _) = depth(self, expected);
         // The mutability a deref coercion through a smart pointer
         // may hand out: the reference directly on a `Box` bounds
-        // it; an `Rc` never hands out `&mut`.
+        // it; an `Rc` never hands out `&mut`; a guard does when it
+        // implements `DerefMut` (`RefMut`, `MutexGuard`, the write
+        // guard) and the reference on it is `&mut`.
         let box_ref_mut = |cx: &Self| -> Option<bool> {
             let mut t = found;
             loop {
@@ -4996,6 +4998,9 @@ impl<'p> Ctx<'p> {
                         }
                         if cx.tys.rc_elem(inner).is_some() {
                             return Some(false);
+                        }
+                        if let Some((_, gm)) = cx.tys.guard_elem(inner) {
+                            return Some(m.is_mut() && gm);
                         }
                         t = inner;
                     }
