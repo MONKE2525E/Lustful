@@ -1070,6 +1070,13 @@ impl<'p> Ctx<'p> {
         match self.cap_cat(e) {
             Cat::Place(mut pl) => {
                 for _ in 0..derefs {
+                    // Through `Rc`, a guard, or a `String` (`&Rc<T>` to
+                    // `&T`): the overloaded `deref` borrows the pointer.
+                    if let Some(has_mut) = self.cap_smart(pl.ty) {
+                        let m = if mode == CaptureMode::Ref || !has_mut { CaptureMode::Ref } else { mode };
+                        self.cap_use(pl, m, span, w);
+                        return true;
+                    }
                     if !self.cap_deref(&mut pl) {
                         self.cap_bad_if_upvar(e, w);
                         return true;
