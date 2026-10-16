@@ -46,6 +46,8 @@ run_timeout=${RUN_TIMEOUT:-30}
 source "$root/scripts/timeout-lib.sh"
 run_cc() { timeout "$case_timeout" "$@"; }
 seen=0
+# Extra lust build flags for the case at hand (a compat fixture's panic mode).
+lust_mode=()
 pass=0
 fail=0
 unsupported=0
@@ -135,7 +137,7 @@ fi
 lust_build() {
   # $1 entry file, $2 out binary, $3 flat name. Returns lust_cc's status: 0,
   # a clean reject status, or a timeout status (a hang; see is_timeout).
-  lust_cc "$LUST" build "$1" -o "$2" 2>"$work/$3.err"
+  lust_cc "$LUST" build "$1" -o "$2" "${lust_mode[@]}" 2>"$work/$3.err"
   local st=$?
   [ "$lust_cc_slow" = 1 ] && ! is_timeout "$st" && echo "slow: $3 lust build timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"
   return "$st"
@@ -144,7 +146,7 @@ lust_build() {
 lust_build_sanitized() {
   # $1 entry file, $2 out binary, $3 flat name. The entry is known to
   # build (lust_build just did), so a failure here is a real failure.
-  lust_cc "$LUST" build "$1" -o "$work/$3.tmp" --emit-c "$work/$3.san" 2>/dev/null
+  lust_cc "$LUST" build "$1" -o "$work/$3.tmp" --emit-c "$work/$3.san" "${lust_mode[@]}" 2>/dev/null
   local st=$?
   is_timeout "$st" && return "$st"
   [ "$lust_cc_slow" = 1 ] && echo "slow: $3 lust build --emit-c timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"
@@ -207,6 +209,10 @@ if [ -n "${LUST:-}" ]; then
   for f in "$root"/tests/compat/*.rs; do
     name=$(basename "$f" .rs)
     keep "compat/$name" || continue
+    # A fixture's `// panic-mode:` header holds for lust too, as for rustc.
+    mode=$(sed -n 's|// panic-mode: ||p' "$f" | head -1)
+    lust_mode=()
+    [ -n "$mode" ] && lust_mode=(-C "panic=$mode")
     if lust_build_or_note "compat/$name" "$f" "$work/$name.lust" "$name"; then
       run_case "compat/$name" "$work/$name.lust" "$root/tests/compat/$name.expected"
       if [ "${SANITIZE:-0}" = 1 ] && san_or_note "compat/$name/san" "$f" "$work/$name.sanbin" "$name"; then
