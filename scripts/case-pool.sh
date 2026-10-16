@@ -69,8 +69,11 @@ unsupported=0
 # mask_stderr <file>: a program's stderr without what differs per run: the OS thread id in
 # Rust's `thread '..' (<tid>)` lines, `timeout`'s note on a dumped core, and bash's job
 # note on a signal death ("line 54: <pid> Aborted  timeout ..."), which lands in the
-# redirected stderr of a function call. W-PANIC compares the rest byte for byte.
-mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
+# redirected stderr of a function call. A std source path in a panic location is
+# `@STD@/library/..`: boat's rustc prints `/rustc/<hash>/library/..`, a toolchain with
+# rust-src installed prints its local `lib/rustlib/src/rust/library/..`. W-PANIC compares
+# the rest byte for byte.
+mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
 
 # report ok|bad <name> [msg]: a case's result. Runs inside the case's subshell, in its dir.
 report() {

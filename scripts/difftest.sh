@@ -143,7 +143,7 @@ sanitize_case() {
 lust_stderr() {
   local n at
   n=$(wc -l <"$1")
-  at=$(sed -nE "s/^thread '[^']*' \([0-9]+\) panicked at (.*):$/\1/p" rustc.stderr | head -1)
+  at=$(mask_stderr rustc.stderr | sed -nE "s/^thread '[^']*' \(TID\) panicked at (.*):$/\1/p" | head -1)
   mask_stderr "$2" | sed "s|$1|@CASE@|g" | awk -v n="$n" -v at="$at" '
     at != "" && /^thread .* panicked at @CASE@:[0-9]+:[0-9]+:$/ {
       k = split($0, w, ":")
