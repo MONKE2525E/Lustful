@@ -3484,6 +3484,17 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.flow_all(caps, &dv);
     }
 
+    /// The region var of `dest`'s own reference when its type is a
+    /// reference with a region slot (`&'r T`), else None.
+    fn ref_lead_var(&mut self, dest: &Place) -> Option<u32> {
+        let (mut dv, mut d) = (Vec::new(), Vec::new());
+        let dt = self.place(dest, &mut dv, &mut d);
+        match self.body.tys.kind(dt) {
+            TyKind::Ref(r, _, _) if !bound(r) => dv.first().copied(),
+            _ => None,
+        }
+    }
+
     fn assign(&mut self, bi: usize, si: usize, dest: &Place, rv: &Rvalue) {
         if !self.cap_var.is_empty() {
             // Only the rvalues that move or copy a value into the result
@@ -3503,10 +3514,19 @@ impl<'b, 'p> Builder<'b, 'p> {
                     self.cap_flow(&ops, dest);
                 }
                 // A reference to an opaque value holds what it captures
-                // (`&'r Opaque<'s>` needs `'s: 'r`).
+                // (`&'r Opaque<'s>` needs `'s: 'r`): into the reference's
+                // own region only. The pointee's slots are the place's
+                // (the Ref rule relates them); a revealed closure's
+                // `'static` dyn capture there is no bound on `'s`.
                 Rvalue::Ref(_, pl) => {
                     if let Some(&c) = self.cap_var.get(&pl.local) {
-                        self.cap_into(&[c], dest);
+                        let lead = (!self.cap_var.contains_key(&dest.local) && !dest.proj.contains(&Proj::Deref))
+                            .then(|| self.ref_lead_var(dest))
+                            .flatten();
+                        match lead {
+                            Some(r) => self.edge(c, r),
+                            None => self.cap_into(&[c], dest),
+                        }
                     }
                 }
                 _ => {}
