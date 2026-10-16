@@ -717,6 +717,32 @@ pub fn reveal_plain(p: &mut Program) {
     reveal_plain_rets(p);
 }
 
+/// True when plain fn `f`'s own `impl Trait` return, revealed again from
+/// its edited body (driver/patch.rs `reuse_kept`), is what `reveal_plain`
+/// left in the program: the same hidden type, or no hidden type when the
+/// body has errors now and had them before. A fresh collect would then
+/// make the same program. The hidden type's closure types carry their
+/// capture types; their signatures and kinds are the discovery output
+/// `reuse_kept` compares.
+pub(crate) fn hidden_stands(p: &mut Program, f: LocalDefId) -> bool {
+    let opaque = p.gx.opaque_ret_of.get(&f).copied().unwrap_or(p.fn_info(f).ret);
+    let TyKind::Opaque(od, _) = p.tys.kind(opaque) else { return false };
+    if p.gx.opaques.get(&od).is_none_or(|o| o.owner != p.def_id(f)) {
+        return false;
+    }
+    let old = p.gx.opaque_ret_of.contains_key(&f).then(|| p.gx.opaque_hidden.get(&od).copied());
+    // As `reveal_plain` runs in collect: before mono.
+    let (counts, mono_done) = (p.gx.mono_counts, std::mem::replace(&mut p.gx.mono_done, false));
+    let owned = {
+        let (checked, errs) = check_fn_view(p, f);
+        let h = checked.opaque_hidden.first().map(|&(_, h)| h);
+        h.and_then(|h| crate::check::generics::snapshot_ty(&checked.tys, h)).filter(|_| errs.is_empty())
+    };
+    (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
+    let new = owned.map(|o| Some(crate::check::generics::build_owned_ty(p, &o)));
+    new == old
+}
+
 /// Reveals the opaque types left in revealed plain fns' `FnInfo::ret` (a
 /// hidden type that names another fn's opaque), so codegen sees concrete
 /// types. Runs again once the template check has the hidden types of

@@ -2869,6 +2869,21 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             changed.sort_unstable();
         }
     }
+    // A body edit of a fn that returns `impl Trait` (`Front::rpit_edit`):
+    // with no kept program that stands, the hidden type may have moved,
+    // and the users of the opaque type read it through the definer's
+    // `Sig` fingerprint. As a full resolve's full mode does, every
+    // unchanged passing body is a read-set candidate, and derived glue may
+    // move.
+    if std::mem::take(&mut front.rpit_edit) && kept.is_err() {
+        let mut listed = vec![false; fn_count];
+        changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
+        let cands: Vec<usize> = (0..fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !listed[i]).collect();
+        mention_only.extend_from_slice(&cands);
+        changed.extend_from_slice(&cands);
+        changed.sort_unstable();
+        caches.glue_stale = true;
+    }
     let kept = match kept {
         Ok((p, spans, errs)) => {
             visits.kept = "reuse";

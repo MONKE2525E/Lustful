@@ -33,9 +33,15 @@
 //   passes the cfg name check and expands alone, as the resolver checks
 //   and expands its file; the expansion must read nothing outside the
 //   body (no `Dep` but the cfg-disabled nodes it drops);
-// - the fn returns `impl Trait` (its body is part of its item), or its
-//   parameter patterns or signature expressions are not provably moved
-//   ahead of the new body (`sig_nodes.rs`); a `const fn` patches, but
+// - the fn's parameter patterns or signature expressions are not
+//   provably moved ahead of the new body (`sig_nodes.rs`). A fn that
+//   returns `impl Trait` patches, but its body decides the hidden type,
+//   so its item scan folds the body hash in (`ast_hash::item_scan`): the
+//   patch rescans the item as a full resolve would (`Front::items`,
+//   `env_hash`), and the tail keeps the program only when the new body
+//   reveals the same hidden type (`opaque::hidden_stands`); else it
+//   collects and walks every passing body's reads (`Front::rpit_edit`),
+//   so only the users of the opaque type check again. A `const fn` patches, but
 //   `const` values bake its body in, so when a const evaluation may run it
 //   (`const_reach.rs`) the request then collects and walks reads as a cold
 //   resolve of a const fn body edit does (`Patched::const_fn`);
@@ -352,6 +358,9 @@ struct NewBody {
     /// The nested fn whose own body the edit changed (`same_items`), in
     /// `Front::fn_loc` order.
     nested: Option<usize>,
+    /// For a fn that returns `impl Trait`: the old body's raw hash, which
+    /// its item scan folds in (`rescan_edited` proves the rest stands).
+    rpit: Option<u64>,
 }
 
 /// A collected program kept for later requests (W-INCR3), one per mode
@@ -390,6 +399,8 @@ struct KeptEdit {
     nested: Option<usize>,
     /// The old body's expression range (a template's picks key on it).
     old_exprs: (u32, u32),
+    /// The fn returns `impl Trait` (`reuse_kept` compares hidden types).
+    rpit: bool,
 }
 
 /// One edited fn's discovery output as the kept program was built with
@@ -420,6 +431,7 @@ pub(super) fn try_patch(
             items: e.body.as_ref().map_or_else(Vec::new, |b| b.items.clone()),
             nested: e.body.as_ref().and_then(|b| b.nested),
             old_exprs: e.body.as_ref().map_or((0, 0), |b| b.old_exprs),
+            rpit: e.body.as_ref().is_some_and(|b| b.rpit.is_some()),
         })
         .collect();
     // Everything above only read; from here the front state changes, and
@@ -596,9 +608,7 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         })
         .ok_or_else(|| outside_fn_reason(ast, file, a, b))?;
     let def = fn_def_at(ast, item, sub);
-    if def.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. })) {
-        return Err("impl Trait");
-    }
+    let rpit = def.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. })).then(|| super::ast_hash::body_scan(ast, def, None).0);
     if !matches!(ast.items[item].kind, ItemKind::Fn(_) | ItemKind::Impl(_)) {
         return Err("not in a fn body");
     }
@@ -697,7 +707,7 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         && plain_body(&old_body, &front.interner)
         && plain_body(&new_body, &front.interner)
         && plain_body(&hoisted, &front.interner);
-    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, items, sig, nested })
+    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, items, sig, nested, rpit })
 }
 
 /// The items (`stmt_items` indexes, in parse order) of the old fn body at
@@ -1147,6 +1157,13 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
             }
         }
     }
+    // A fn that returns `impl Trait` moved its item scan (`item_stands`):
+    // the environment hash follows, as a full resolve computes it, and the
+    // tail checks the hidden type.
+    if edits.iter().any(|e| e.body.as_ref().is_some_and(|b| b.rpit.is_some())) {
+        front.env_hash = Some(crate::scan::env_hash(front.items.iter()));
+        front.rpit_edit = true;
+    }
     let edited: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref()).flat_map(|b| std::iter::once(b.fn_index).chain(b.nested)).collect();
     // A const fn edit is a plain body edit when no const evaluation can
     // run that fn (`const_reach.rs`).
@@ -1199,7 +1216,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
 /// edits in that impl scan only the edited method, because a body hash
 /// reads structure only (never spans), so unchanged methods keep theirs.
 /// An item that holds body items rescans whole: its nested fns' hashes
-/// fold in its content (`nested_fn_hashes`).
+/// fold in its content (`nested_fn_hashes`). A fn that returns `impl
+/// Trait` folds its body hash into the item scan: the scan with the old
+/// body hash must be the stored one, and the new scan replaces it.
 fn rescan_edited(front: &mut Front, base: &mut PatchBase, e: &NewBody) -> Result<(u64, Vec<Sym>), &'static str> {
     if let (Some(sub), Some(stored)) = (e.sub, base.item_scans.get(&e.item).cloned()) {
         let (hash, idents, inner) = super::ast_hash::scan_body(&front.ast, fn_def_at(&front.ast, e.item, e.sub));
@@ -1207,17 +1226,13 @@ fn rescan_edited(front: &mut Front, base: &mut PatchBase, e: &NewBody) -> Result
             let mut hashes = stored;
             *hashes.get_mut(sub).ok_or("item scan")? = hash;
             let scan = super::ast_hash::scan_item_reuse(&front.ast, &front.ast.items[e.item], &hashes);
-            if front.items.get(e.item) != Some(&scan) {
-                return Err("item scan");
-            }
+            item_stands(front, e, scan, &hashes)?;
             base.item_scans.insert(e.item, hashes);
             return Ok((hash, idents));
         }
     }
     let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, &front.ast.items[e.item]);
-    if front.items.get(e.item) != Some(&scan) {
-        return Err("item scan");
-    }
+    item_stands(front, e, scan, &bodies.iter().map(|b| b.0).collect::<Vec<_>>())?;
     nested_fn_hashes(front, base, &scan, &bodies, &inner)?;
     if inner.is_empty() {
         base.item_scans.insert(e.item, bodies.iter().map(|b| b.0).collect());
@@ -1225,6 +1240,26 @@ fn rescan_edited(front: &mut Front, base: &mut PatchBase, e: &NewBody) -> Result
         base.item_scans.remove(&e.item);
     }
     bodies.into_iter().nth(e.sub.unwrap_or(0)).ok_or("item scan")
+}
+
+/// Proves the edited item's scan stands: `scan` (with the new body hashes
+/// `hashes`) is the stored one, or the fn returns `impl Trait` and the
+/// scan with its old body hash is; the new scan is then stored, as a full
+/// resolve's item scan would be.
+fn item_stands(front: &mut Front, e: &NewBody, scan: crate::scan::ItemScan, hashes: &[u64]) -> Result<(), &'static str> {
+    if front.items.get(e.item) == Some(&scan) {
+        return Ok(());
+    }
+    let old = e.rpit.ok_or("item scan")?;
+    let mut old_hashes = hashes.to_vec();
+    *old_hashes.get_mut(e.sub.unwrap_or(0)).ok_or("item scan")? = old;
+    let was = super::ast_hash::scan_item_reuse(&front.ast, &front.ast.items[e.item], &old_hashes);
+    if front.items.get(e.item) != Some(&was) || front.chunks[0].scan.items.get(e.item) != Some(&was) {
+        return Err("item scan");
+    }
+    front.items[e.item] = scan;
+    front.chunks[0].scan.items[e.item] = scan;
+    Ok(())
 }
 
 /// The body hashes of the fns nested anywhere in one edited item
@@ -1325,6 +1360,21 @@ pub(super) fn reuse_kept(
     for e in &mut edits {
         let (edit, ctxts) = (e.edit, &mut e.ctxts);
         spans += crate::check::prog_shift::shift_program(&mut p, &mut |s| edit.span(s, ctxts));
+    }
+    // An edited fn that returns `impl Trait`: collect reveals its hidden
+    // type from the new body, so the program stands only while that type
+    // does (`Front::rpit_edit` sends the request on to collect otherwise).
+    let mut rpit: Vec<usize> = edits.iter().filter(|e| e.rpit).filter_map(|e| e.fn_index).collect();
+    rpit.sort_unstable();
+    rpit.dedup();
+    for fn_index in rpit {
+        let (record_reads, unwind) = (p.record_reads, p.unwind);
+        (p.record_reads, p.unwind) = (true, false);
+        let stands = crate::check::opaque::hidden_stands(&mut p, LocalDefId(fn_index as u32));
+        (p.record_reads, p.unwind) = (record_reads, unwind);
+        if !stands {
+            return Err("hidden type");
+        }
     }
     // An edited template checks again as collect's template check does:
     // its old picks and closure call kinds go, the check records new ones.
@@ -2380,6 +2430,101 @@ pub fn run() -> i64 {
             ("    let h = |z: i64| z;\n    h(g(x))\n", "    g(x)\n", "closures"),
             ("    let mut n = 0;\n    m.each", "    let _z = 1;\n    let mut n = 0;\n    m.each", "reuse"),
             ("    let g = |y: i64| f(y) + 2;\n    g(x)\n", "    let mut n = 0;\n    let mut g = |y: i64| {\n        n += 1;\n        f(y) + n\n    };\n    g(x)\n", "closures"),
+        ];
+        for &(old, new, kept) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), "patch", "{new:?}: {v}");
+            if !kept.is_empty() {
+                assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
+            }
+        }
+        assert_eq!(run(&mut warm, &root, Cmd::Build).0, 0);
+        let bin = root.with_extension("bin");
+        let out = run_bin(&bin);
+        let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
+        assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
+        assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module whose fns return `impl Trait`: an iterator chain over
+    /// closures (gostd `table_ranges`), a closure, a value whose auto traits
+    /// a caller needs, a method, and a closure whose kind its body decides.
+    const RPIT: &str = "pub struct Table {
+    pub r16: &'static [(u16, u16, u16)],
+    pub r32: &'static [(u32, u32, u32)],
+}
+
+impl Table {
+    pub fn starts(&self) -> impl Iterator<Item = i64> + '_ {
+        self.r16.iter().map(|t| t.0 as i64)
+    }
+}
+
+pub fn ranges(x: &Table) -> impl Iterator<Item = (i64, i64, i64)> + '_ {
+    let a = x.r16.iter().map(|&(lo, hi, s)| (i64::from(lo), i64::from(hi), i64::from(s)));
+    let b = x.r32.iter().map(|&(lo, hi, s)| (lo as i64, hi as i64, s as i64));
+    a.chain(b)
+}
+
+pub fn adder(n: i64) -> impl Fn(i64) -> i64 {
+    move |x| x + n
+}
+
+pub fn token() -> impl Sized {
+    7u8
+}
+
+pub fn once(s: String) -> impl FnOnce() -> usize {
+    move || s.len()
+}
+
+fn need_send<T: Send>(_t: T) {}
+
+pub static T: Table = Table { r16: &[(1, 5, 1), (10, 20, 2)], r32: &[(0x10000, 0x10010, 1)] };
+
+pub fn run() -> i64 {
+    let mut n = 0;
+    for (lo, hi, s) in ranges(&T) {
+        n += (hi - lo) / s + 1;
+    }
+    need_send(adder(1));
+    need_send(token());
+    n + adder(2)(3) + T.starts().sum::<i64>() + once(String::from(\"ab\"))() as i64
+}
+";
+
+    /// A body edit of a fn that returns `impl Trait` takes the body patch.
+    /// The kept program stands while the new body reveals the same hidden
+    /// type; another hidden type (a caller loses `Send`, a closure captures
+    /// another type), a definer error, and its fix collect again and walk
+    /// the callers' reads. Each step gives the cold answer, and a build
+    /// prints what a cold build prints.
+    #[test]
+    fn rpit_body_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-rpit-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        std::fs::write(&m1, RPIT).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        // (old, new, expected kept=; "" for any)
+        let steps: &[(&str, &str, &str)] = &[
+            ("    let a = x.r16", "    let lust_bench_edit: u32 = 1;\n    let a = x.r16", "reuse"),
+            ("    a.chain(b)\n", "    b.chain(a)\n", "hidden_type"),
+            ("    b.chain(a)\n", "    a.chain(b)\n", "hidden_type"),
+            ("    let lust_bench_edit: u32 = 1;\n", "", "reuse"),
+            ("        self.r16.iter()", "        let _k = 2;\n        self.r16.iter()", "reuse"),
+            ("    7u8\n", "    std::rc::Rc::new(7u8)\n", "hidden_type"),
+            ("    std::rc::Rc::new(7u8)\n", "    7u16\n", "hidden_type"),
+            ("    7u16\n", "    7u8\n", "hidden_type"),
+            ("    move |x| x + n\n", "    move |x| x + n + \"a\"\n", "hidden_type"),
+            ("    move |x| x + n + \"a\"\n", "    move |x| x + n\n", "hidden_type"),
+            ("    move |x| x + n\n", "    let r = std::rc::Rc::new(n);\n    move |x| x + *r\n", "hidden_type"),
+            ("    let r = std::rc::Rc::new(n);\n    move |x| x + *r\n", "    move |x| x + n\n", "hidden_type"),
+            ("    move |x| x + n\n", "    let _z = 0;\n    move |x| x + n\n", "reuse"),
+            ("    move || s.len()\n", "    move || {\n        let t = s;\n        t.len()\n    }\n", ""),
+            ("    move || {\n        let t = s;\n        t.len()\n    }\n", "    move || s.len()\n", ""),
         ];
         for &(old, new, kept) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);

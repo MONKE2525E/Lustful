@@ -69,6 +69,11 @@ pub(crate) struct Front {
     /// can read (`ConstReach::revaluable`): the kept program must evaluate
     /// them again (`collect::const_values_hold`) before it stands.
     pub(crate) revalue_consts: bool,
+    /// Set by a body patch of a fn that returns `impl Trait`: unless the
+    /// kept program stands (same hidden type, `opaque::hidden_stands`),
+    /// every passing body is a read-set candidate, so the users of the
+    /// opaque type check again. Cleared by the request that collects.
+    pub(crate) rpit_edit: bool,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
     /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
@@ -367,6 +372,7 @@ impl Session {
                 prev_order_fragile: false,
                 prev_static_defs: None,
                 revalue_consts: false,
+                rpit_edit: false,
                 items: Vec::new(),
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),
