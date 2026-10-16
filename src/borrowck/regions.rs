@@ -4681,6 +4681,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     }
                 }
             }
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterPeek)) && self.call_peek(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if item_builtin(b) && self.call_item(b, &avs, dt, &dv)) => {}
             // `Type::from_iter(src)` whose items `call_item` cannot name
             // slot by slot (fx-fromiter): the conservative rule over the
@@ -4806,6 +4807,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
                 self.call_opaque(&avs[..1], dt, &dv)
             }
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterFlatMap)) && self.call_flat_map(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(_)) && matches!(self.body.tys.builtin_of(dt), Some(BuiltinTy::Iter(_))) => {
                 self.call_adapter(&avs, dt, &dv);
             }
@@ -5384,6 +5386,33 @@ impl<'b, 'p> Builder<'b, 'p> {
         let closure_f = avs.get(1).is_some_and(|(ft, _)| matches!(self.body.tys.kind(*ft), TyKind::Closure(..)));
         if !(closure_f && matches!(b, B::TlsWith | B::TlsTryWith | B::TlsWithBorrow | B::TlsWithBorrowMut)) {
             self.call_opaque(avs, dt, dv);
+        }
+        true
+    }
+
+    /// `it.flat_map(f)`, typed `Flatten<Map<I, F, B>, U>` (check/iter.rs):
+    /// the arguments make the inner `Map` as `it.map(f)` does
+    /// (`call_adapter`), and the front and back iterators `U` hold what
+    /// the map's parts hold. A `&mut` capture of `f` then stays apart from
+    /// the regions it points to (else a `RefMut` it borrows would stay
+    /// borrowed for the guard's whole life). False for another shape.
+    fn call_flat_map(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        use crate::ty::iter::IterKind as K;
+        let Some((K::Flatten, a)) = crate::ty::iter::iter_parts(&self.body.tys, dt) else { return false };
+        let [m, u] = a[..] else { return false };
+        if !matches!(crate::ty::iter::iter_parts(&self.body.tys, m), Some((K::Map, _))) || avs.len() != 2 {
+            return false;
+        }
+        let own = adt_regions(self.p, &self.body.tys, dt) as usize;
+        let (nm, nu) = (self.sc.slots(m) as usize, self.sc.slots(u) as usize);
+        if own != 0 || nm + nu != dv.len() {
+            return false;
+        }
+        let (mv, uv) = (dv[..nm].to_vec(), dv[nm..].to_vec());
+        self.call_adapter(avs, m, &mv);
+        self.flow_all(&mv, &uv);
+        if has_interior(&self.body.tys, u) {
+            self.flow_all(&uv, &mv);
         }
         true
     }
@@ -6009,6 +6038,26 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.flow_all(&item_vars, &ev);
         self.store_slots(&item_vars, table, &ev);
         true
+    }
+
+    /// `Peekable::peek(&'r mut self) -> Option<&'r Item>`: the outer
+    /// reference borrows the receiver; the item's slots are the
+    /// iterator's item slots (`item_slots`), which the `&mut` of the call
+    /// does not reach (a peeked `Ref` guard would else hold the iterator
+    /// borrowed until its drop). False when the item slots are unknown.
+    fn call_peek(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, Mut::Mut, it) = self.body.tys.kind(*t0) else { return false };
+        let Some((&r, iv)) = v0.split_first() else { return false };
+        let Some(o) = self.body.tys.option_elem(dt) else { return false };
+        let TyKind::Ref(_, Mut::Shared, item_ty) = self.body.tys.kind(o) else { return false };
+        let Some((&p, rv)) = dv.split_first() else { return false };
+        let Some(items) = self.item_slots(it, iv) else { return false };
+        if items.len() != rv.len() {
+            return false;
+        }
+        self.edge(r, p);
+        self.relate(item_ty, &items, item_ty, rv, Variance::Co)
     }
 
     /// The region slots of an iterator type's item, read off the
