@@ -265,10 +265,15 @@ class Bench:
     def setup(self):
         root = Path(self.target["src"]).resolve()
         files = self.files(root)
+        # Files another lib target or a build script also compiles stay out: an edit there
+        # would change (or break) a dependency or the build script, not only this target.
         other = set()
         for t in self.others:
             other |= set(self.files(Path(t["src"]).resolve()))
-        cands = [p for p in files if p != root]
+        for b in self.tree.rglob("build.rs"):
+            if "target" not in b.relative_to(self.tree).parts:
+                other |= set(self.files(b.resolve()))
+        cands = [p for p in files if p != root and p not in other]
         self.compiled = set(self.compiled_files(cands + [root]))
         print(f"tsedit: {self.label}: {len(files)} files in the module tree, {len(self.compiled)} compiled by rustc", flush=True)
         self.lines = sum(len(p.read_text().split("\n")) for p in self.compiled)
@@ -277,7 +282,7 @@ class Bench:
         fns, derives = self.scan()
         setup_edits = {}
         if "sigx" in kinds:
-            own = [f for f in fns if f["file"] not in other and f["file"] != root and self.body_ok(f, "d")]
+            own = [f for f in fns if f["file"] != root and self.body_ok(f, "d")]
             callers = self.spread(own, max(2, n))
             for f in sorted(callers, key=lambda f: (f["file"], -f["ol"])):
                 p = f["file"]
