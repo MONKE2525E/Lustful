@@ -816,6 +816,34 @@ impl FnGen<'_, '_> {
                 );
                 t
             }
+            // `recv_timeout`: the runtime's 1 is `Timeout` (variant 0),
+            // 2 `Disconnected` (tf-p6 R09).
+            S::ChanRecvTimeout => {
+                let el = match deref_cty(&tys[0]) {
+                    CTy::Sync(_, e) => *e,
+                    other => unreachable!("a Receiver operand, found {other:?}"),
+                };
+                let et = self.p.tys.local_adt_of(crate::check::generics::recv_timeout_error_def()).map_or(CTy::Unit, CTy::Adt);
+                let res = CTy::Result(Box::new(el.clone()), Box::new(et.clone()));
+                collect_types(&res, &mut self.sig_types);
+                let (secs, nanos) =
+                    if matches!(tys[1], CTy::Adt(_)) { (format!("({}).f0", vals[1]), format!("({}).f1", vals[1])) } else { (format!("({}).secs", vals[1]), format!("({}).nanos", vals[1])) };
+                let (t, r) = (self.tmp(), self.tmp());
+                let ok = variant_field(self.p, &res, &t, 0, 0);
+                let err = variant_field(self.p, &res, &t, 1, 0);
+                let _ = writeln!(
+                    self.out,
+                    "    {} {t}; int {r} = lust_chan_recv_timeout(*{}, &{ok}, {secs}, {nanos}); if ({r} == 0) {{ {} }} else {{ {} {} if ({r} == 2) {{ {} }} else {{ {} }} }}",
+                    ctype(&res),
+                    vals[0],
+                    disc_set(self.p, &res, &t, 0),
+                    disc_set(self.p, &res, &t, 1),
+                    zero_c(&err),
+                    disc_set(self.p, &et, &err, 1),
+                    disc_set(self.p, &et, &err, 0)
+                );
+                t
+            }
             _ => self.lock_builtin(op, vals, tys),
         }
     }

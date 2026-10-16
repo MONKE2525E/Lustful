@@ -9049,6 +9049,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
                     | crate::check::sync::SyncOp::PoisonGetMut
                     | crate::check::sync::SyncOp::ChanRecv
                     | crate::check::sync::SyncOp::ChanTryRecv
+                    | crate::check::sync::SyncOp::ChanRecvTimeout
                     | crate::check::sync::SyncOp::OnceGet
                     | crate::check::sync::SyncOp::OnceGetMut
                     | crate::check::sync::SyncOp::OnceTake

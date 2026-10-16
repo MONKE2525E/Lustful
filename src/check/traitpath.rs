@@ -46,6 +46,22 @@ impl<'p> Ctx<'p> {
     /// `self_from_expected_call`.
     pub(super) fn trait_path_head(&mut self, segs: &[ast::PathSeg]) -> Option<(DefId, DefId, usize)> {
         let p = self.p;
+        let tdef = self.trait_path_def(segs)?;
+        let last = segs.len() - 1;
+        let rec = p.gx.index.trait_record(tdef)?;
+        // A std path through another trait of the same bare name must
+        // not answer for this one: the record's own name is the seg's.
+        if rec.name != segs[last - 1].name && segs.len() > 2 {
+            return None;
+        }
+        let method = rec.method_by_name(segs[last].name)?;
+        Some((tdef, method, last - 1))
+    }
+
+    /// The trait def the type segments of `segs` (all but the item) name,
+    /// as `trait_path_head` reads them.
+    fn trait_path_def(&mut self, segs: &[ast::PathSeg]) -> Option<DefId> {
+        let p = self.p;
         if segs.len() < 2 {
             return None;
         }
@@ -68,14 +84,42 @@ impl<'p> Ctx<'p> {
             // `trait_def_of_path` reads it: by name, not by bare name.
             p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_name(&p.interner, segs[last - 1].name)?
         };
-        let rec = p.gx.index.trait_record(tdef)?;
-        // A std path through another trait of the same bare name must
-        // not answer for this one: the record's own name is the seg's.
-        if rec.name != segs[last - 1].name && segs.len() > 2 {
+        Some(tdef)
+    }
+
+    /// `Hash::hash(x, &mut state)` (`std::hash::Hash::hash` too): core's
+    /// `fn hash<H: Hasher>(&self, state: &mut H)` by path, which lust
+    /// has as the method form's `HashInto` builtin, not as a trait
+    /// signature. `x` is a coercion site for `&Self` (Self inferred from
+    /// it); the first argument is the receiver, by `&*x`. None for other
+    /// paths.
+    fn hash_path_call(&mut self, e: ExprId, segs: &[ast::PathSeg], args: &[ExprId], span: Span) -> Option<Ty> {
+        let lang = self.p.gx.lang;
+        if self.name(segs.last()?.name) != "hash" || segs.last()?.has_args() || self.trait_path_def(segs)? != lang.hash {
             return None;
         }
-        let method = rec.method_by_name(segs[last].name)?;
-        Some((tdef, method, last - 1))
+        if segs[segs.len() - 2].has_args() {
+            return None;
+        }
+        if args.len() != 2 {
+            self.err("L0105", span, "this function takes 2 arguments but a different number was given", "Pass `&value` and `&mut state`.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return Some(ERROR);
+        }
+        let (s, h) = (self.new_var(false), self.new_var(false));
+        let (rs, rh) = (self.tys.mk_ref(false, s), self.tys.mk_ref(true, h));
+        self.check_args(&[rs, rh], args, span);
+        let (s, h) = (self.deep(s), self.deep(h));
+        if !self.implements(lang.hasher, h) {
+            let tn = self.tn(h);
+            self.err("L0612", self.span(args[1]), format!("`hash` takes `&mut H` with `H: Hasher`, not `&mut {tn}`"), "Pass `&mut` a hasher.");
+            return Some(ERROR);
+        }
+        self.glue_hashable(s, span);
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::HashInto, derefs: 1, autoref: Autoref::Ref });
+        Some(UNIT)
     }
 
     /// True for a `ToString::to_string` path (bare or canonical).
@@ -124,6 +168,9 @@ impl<'p> Ctx<'p> {
     /// had no answer: typed by the trait method's signature like the
     /// value form, with the call itself deferred to body end.
     pub(super) fn trait_path_call(&mut self, e: ExprId, callee: ExprId, segs: &[ast::PathSeg], args: &[ExprId], span: Span) -> Option<Ty> {
+        if let Some(t) = self.hash_path_call(e, segs, args, span) {
+            return Some(t);
+        }
         if self.trait_path_head(segs).is_none() && self.is_to_string_path(segs) {
             let (tr, method) = self.to_string_ref(e, segs, span)?;
             let full: Vec<GenericArg> = self.tys.args(tr.args).to_vec();

@@ -3680,6 +3680,13 @@ pub fn collect_reuse(
                     vec![unit("Empty", 0), unit("Disconnected", 1)],
                     Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
+                // std: `#[derive(PartialEq, Eq, Clone, Copy, Debug)] pub
+                // enum RecvTimeoutError { Timeout, Disconnected }` (tf-p6).
+                29 => (
+                    generics::recv_timeout_error_def(),
+                    vec![unit("Timeout", 0), unit("Disconnected", 1)],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                ),
                 3 => {
                     let bytes = p.tys.mk_vec(int(IntTy::U8));
                     let error = p.tys.intern(TyKind::Adt(generics::utf8_error_def(), EMPTY_ARGS));
@@ -9573,6 +9580,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::from_utf8_error_def()
                         || d == generics::recv_error_def()
                         || d == generics::try_recv_error_def()
+                        || d == generics::recv_timeout_error_def()
                         || d == generics::location_def()
                         || d == generics::borrow_error_def()
                         || d == generics::borrow_mut_error_def()

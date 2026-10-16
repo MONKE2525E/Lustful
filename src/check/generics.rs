@@ -882,6 +882,12 @@ pub fn try_send_error_ty(tys: &mut impl TyIntern, t: Ty) -> Ty {
     tys.mk_adt(try_send_error_def(), &[GenericArg::Ty(t)])
 }
 
+/// The def of `std::sync::mpsc::RecvTimeoutError`, a synthetic enum
+/// (`Timeout`, `Disconnected`; tf-p6 R09).
+pub fn recv_timeout_error_def() -> DefId {
+    std_adt_table()[29].2
+}
+
 /// The def of `std::sync::WaitTimeoutResult` (TRIAGE T5): a
 /// synthetic tuple struct over its timed-out flag.
 pub fn wait_timeout_result_def() -> DefId {
@@ -934,14 +940,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 29] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 30] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 29] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 29]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 30] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 30]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -974,6 +980,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 29] {
             (26, "TrySendError", adt(&["std", "sync", "mpsc"], "TrySendError"), true),
             (27, "WaitTimeoutResult", adt(&["std", "sync"], "WaitTimeoutResult"), false),
             (28, "MaybeUninit", adt(&["core", "mem"], "MaybeUninit"), false),
+            (29, "RecvTimeoutError", adt(&["std", "sync", "mpsc"], "RecvTimeoutError"), true),
         ]
     })
 }
@@ -982,7 +989,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 29] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -1014,6 +1021,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("atomic", "Ordering", atomic_ordering_def()),
         ("mpsc", "RecvError", recv_error_def()),
         ("mpsc", "TryRecvError", try_recv_error_def()),
+        ("mpsc", "RecvTimeoutError", recv_timeout_error_def()),
         ("any", "TypeId", type_id_def()),
         ("ops", "Bound", bound_def()),
         ("num", "NonZero", nonzero_def()),

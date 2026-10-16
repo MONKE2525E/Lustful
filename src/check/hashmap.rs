@@ -180,7 +180,7 @@ impl<'p> Ctx<'p> {
 
     /// True when `t` implements `trait_def` here: an impl (core's, a
     /// derive, or the user's) or a bound.
-    fn implements(&mut self, trait_def: DefId, t: Ty) -> bool {
+    pub(super) fn implements(&mut self, trait_def: DefId, t: Ty) -> bool {
         let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
         let tr = TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS };
         matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_))
@@ -285,7 +285,7 @@ impl<'p> Ctx<'p> {
     /// A value hashed by the glue (`x.hash(..)`, `hash_one(x)`): `T:
     /// Hash` goes to the queue, and at finish its Hash must be core's or
     /// derived all the way down (`glue_hash_ok`).
-    fn glue_hashable(&mut self, t: Ty, span: Span) {
+    pub(super) fn glue_hashable(&mut self, t: Ty, span: Span) {
         self.require(self.p.gx.lang.hash, t, span);
         self.deferred_glue_hash.push((t, span));
     }

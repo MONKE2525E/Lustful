@@ -1086,12 +1086,12 @@ pub(crate) fn send_error_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 }
 
 pub(crate) fn prim_builtin_code(b: Builtin) -> Option<u32> {
-    PRIM_VALUE_BUILTINS.iter().position(|&x| x == b).map(|i| i as u32)
+    PRIM_VALUE_BUILTINS.iter().chain(ufcs::STD_VALUE_BUILTINS).position(|&x| x == b).map(|i| i as u32)
 }
 
 /// The builtin at a `PRIM_VALUE_BUILTINS` index, if in range.
 pub(crate) fn prim_builtin_of_code(code: u32) -> Option<Builtin> {
-    PRIM_VALUE_BUILTINS.get(code as usize).copied()
+    PRIM_VALUE_BUILTINS.iter().chain(ufcs::STD_VALUE_BUILTINS).nth(code as usize).copied()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3903,19 +3903,7 @@ impl<'p> Ctx<'p> {
         if let Some(k) = crate::ty::sync::sync_kind(&self.tys, self_ty) {
             use crate::check::sync::SyncOp;
             use crate::ty::sync::SyncTy;
-            let elem = self.tys.adt_first_ty_arg(self_ty).unwrap_or(ERROR);
-            let n = self.name(name);
-            let sig = match (k, n) {
-                (SyncTy::PoisonError, "into_inner") => Some((SyncOp::PoisonIntoInner, Autoref::None, elem)),
-                (SyncTy::PoisonError, "get_ref") => Some((SyncOp::PoisonGetRef, Autoref::Ref, self.tys.mk_ref(false, elem))),
-                (SyncTy::PoisonError, "get_mut") => Some((SyncOp::PoisonGetMut, Autoref::RefMut, self.tys.mk_ref(true, elem))),
-                (SyncTy::ArcWeak, "upgrade") => {
-                    let arc = crate::ty::sync::sync_ty(&mut self.tys, SyncTy::Arc, &[elem]);
-                    Some((SyncOp::ArcWeakUpgrade, Autoref::Ref, self.tys.mk_option(arc)))
-                }
-                _ => None,
-            };
-            if let Some((op, autoref, ret)) = sig {
+            if let Some((op, autoref, rest, ret)) = self.sync_path_method_sig(k, self_ty, name) {
                 let recv = match autoref {
                     Autoref::None => self_ty,
                     Autoref::Ref => self.tys.mk_ref(false, self_ty),
@@ -3929,9 +3917,14 @@ impl<'p> Ctx<'p> {
                 } else {
                     extra.to_vec()
                 };
-                return Some((Builtin::Sync(op), vec![recv], ret, extras));
+                let mut params = vec![recv];
+                params.extend(rest);
+                return Some((Builtin::Sync(op), params, ret, extras));
             }
             return None;
+        }
+        if let Some(sig) = self.cell_path_method_sig(self_ty, name, extra) {
+            return Some(sig);
         }
         // `RefCell::borrow` and `borrow_mut` by path and as values
         // (`.map(RefCell::borrow)`): `&RefCell<T>` to its guard, the
@@ -4107,8 +4100,12 @@ impl<'p> Ctx<'p> {
     /// over `ty::prim_fn_def` carrying the Self type, the method
     /// name and builtin code as consts, and the signature's extra
     /// types. `prim_item_res` decodes it.
-    fn prim_item_value(&mut self, b: Builtin, self_ty: Ty, name: Sym, span: Span) -> Ty {
-        let Some((_, _, _, extras)) = self.prim_assoc_sig(self_ty, name, &[]) else {
+    pub(super) fn prim_item_value(&mut self, b: Builtin, self_ty: Ty, name: Sym, span: Span) -> Ty {
+        let sig = match self.std_free_item_sig(b, self_ty) {
+            Some(_) => Some((b, Vec::new(), UNIT, Vec::new())),
+            None => self.prim_assoc_sig(self_ty, name, &[]),
+        };
+        let Some((_, _, _, extras)) = sig else {
             self.errs.push(unsupported(span, "this std function used as a value"));
             return ERROR;
         };
@@ -4149,6 +4146,9 @@ impl<'p> Ctx<'p> {
         let name = Sym(const_at(1)?);
         let code = const_at(2)?;
         let b = prim_builtin_of_code(code)?;
+        if let Some((params, ret)) = self.std_free_item_sig(b, self_ty) {
+            return Some((Res::PrimAssoc { b, self_ty, name }, params, ret));
+        }
         let extras: Vec<Ty> = gs.iter().skip(3).filter_map(|g| g.as_ty()).collect();
         let (b2, params, ret, _) = self.prim_assoc_sig(self_ty, name, &extras)?;
         if b2 != b {
@@ -4324,6 +4324,7 @@ impl<'p> Ctx<'p> {
         };
         use Builtin as B;
         matches!(prim_builtin_of_code(code), Some(B::SliceLen | B::SliceIsEmpty | B::StrLen | B::StrIsEmpty | B::VecLen | B::VecIsEmpty))
+            || prim_builtin_of_code(code).is_some_and(ufcs::no_panic_std_item)
     }
 
     /// True when `t` is a primitive builtin method item of an integer
@@ -11629,6 +11630,10 @@ impl<'p> Ctx<'p> {
                 if let Some((_, r)) = r {
                     return self.builtin_item_value(e, r, segs, span);
                 }
+                // The prelude's `drop` as a value (`.for_each(drop)`).
+                if let Some(t) = self.prelude_fn_value(e, &segs[0], span) {
+                    return t;
+                }
             }
             self.err(
                 "L0101",
@@ -11833,6 +11838,13 @@ impl<'p> Ctx<'p> {
             && let Some(base) = assoc_base.or_else(|| self.prim_ty_by_name(segs[0].name))
             && let Some(tr) = self.unique_item_trait(base, segs[1].name)
             && let Some(t) = self.trait_ref_fn_value(e, tr, segs[1].name, span)
+        {
+            self.errs.truncate(mark);
+            return t;
+        }
+        // `OnceCell::from`, `Arc::from` as values (check/ufcs.rs).
+        if matches!(resolved, None | Some(Res::Builtin(Builtin::OwnFrom(_))))
+            && let Some(t) = self.from_path_value(e, segs, assoc_base, span)
         {
             self.errs.truncate(mark);
             return t;
@@ -12366,11 +12378,11 @@ impl<'p> Ctx<'p> {
             return Some(Res::Builtin(Builtin::ArcNewUninit));
         }
         if let Some(r) = self.sync_assoc(&names, std_ty, span) {
-            return r;
+            return r.map(|r| self.written_prim_self(r, segs, span));
         }
         // `Rc::downgrade`, `Weak::new`, `RefCell::new`, and kin (check/cells.rs).
         if let Some(r) = self.cell_assoc(ty_name, item, std_ty, span) {
-            return r;
+            return r.map(|r| self.written_prim_self(r, segs, span));
         }
         if let Some(r) = self.exit_code_assoc(ty_name, item, std_ty, span) {
             return r;
@@ -12401,6 +12413,8 @@ impl<'p> Ctx<'p> {
                 Builtin::RcUnwrapOrClone
             } else if item == k.from {
                 Builtin::OwnFrom(own::Owner::Rc)
+            } else if self.name(item) == "default" {
+                Builtin::DefaultGlue
             } else {
                 self.err(
                     "L0104",
@@ -14496,6 +14510,7 @@ impl<'p> Ctx<'p> {
                             _ => None,
                         };
                         let base = written.unwrap_or_else(|| self.new_var(false));
+                        self.clone_path_unique(base, span);
                         self.deferred_clone.push((base, span));
                         let r = self.tys.mk_ref(false, base);
                         (vec![r], base)
@@ -14831,7 +14846,11 @@ impl<'p> Ctx<'p> {
                     Builtin::RcDowngrade | Builtin::RcNewCyclic | Builtin::RcPtrEq | Builtin::SmartAsPtr | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
                         self.cell_call_sig(b, callee)
                     }
-                    Builtin::DefaultGlue => match self.cow_default_sig(callee, span).or_else(|| self.box_default_sig(callee, span)) {
+                    Builtin::DefaultGlue => match self
+                        .cow_default_sig(callee, span)
+                        .or_else(|| self.box_default_sig(callee, span))
+                        .or_else(|| self.smart_default_sig(callee, span))
+                    {
                         Some(sig) => sig,
                         None => self.cell_default_sig(callee, span),
                     },
@@ -20296,7 +20315,7 @@ impl<'p> Ctx<'p> {
     }
 
     /// `trait_def` at Self `base` with fresh variables for its inputs.
-    fn fresh_trait_ref(&mut self, trait_def: DefId, base: Ty, n_inputs: usize) -> TraitRef {
+    pub(super) fn fresh_trait_ref(&mut self, trait_def: DefId, base: Ty, n_inputs: usize) -> TraitRef {
         let mut a = vec![GenericArg::Ty(base)];
         for _ in 0..n_inputs {
             a.push(GenericArg::Ty(self.new_var(false)));

@@ -136,6 +136,8 @@ pub enum SyncOp {
     ChanRecv,
     /// `Receiver::try_recv`.
     ChanTryRecv,
+    /// `Receiver::recv_timeout(dur)` (tf-p6 R09).
+    ChanRecvTimeout,
     /// `SyncSender::try_send` (TRIAGE T5).
     ChanTrySend,
     /// `Arc::new_cyclic(data_fn)` (TRIAGE T5).
@@ -199,7 +201,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 120] = [
+    pub const ALL: [SyncOp; 121] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -276,6 +278,7 @@ impl SyncOp {
         SyncOp::ChanSend,
         SyncOp::ChanRecv,
         SyncOp::ChanTryRecv,
+        SyncOp::ChanRecvTimeout,
         SyncOp::ChanTrySend,
         SyncOp::ArcNewCyclic,
         SyncOp::CondvarWaitTimeout,
@@ -405,6 +408,7 @@ impl SyncOp {
             SyncOp::ChanSend => (&["std::sync::mpsc::Sender<T>", "std::sync::mpsc::SyncSender<T>"], &["send"], m),
             SyncOp::ChanRecv => (&["std::sync::mpsc::Receiver<T>"], &["recv"], m),
             SyncOp::ChanTryRecv => (&["std::sync::mpsc::Receiver<T>"], &["try_recv"], m),
+            SyncOp::ChanRecvTimeout => (&["std::sync::mpsc::Receiver<T>"], &["recv_timeout"], m),
             SyncOp::ChanTrySend => (&["std::sync::mpsc::SyncSender<T>"], &["try_send"], m),
             SyncOp::ArcNewCyclic => (&["alloc::sync::Arc<T>"], &["new_cyclic"], a),
             SyncOp::CondvarWaitTimeout => (&["std::sync::Condvar"], &["wait_timeout"], m),
@@ -568,7 +572,7 @@ impl<'p> Ctx<'p> {
             (SyncTy::Arc, _, "new") => SyncOp::ArcNew,
             (SyncTy::Arc, _, "new_cyclic") => SyncOp::ArcNewCyclic,
             // `Arc::default()`: the default glue, as for `Rc` and `Box`.
-            (SyncTy::Arc, _, "default") => return None,
+            (SyncTy::Arc, _, "default") => return Some(Some(Res::Builtin(Builtin::DefaultGlue))),
             (SyncTy::Arc, _, "from") => return Some(Some(Res::Builtin(Builtin::OwnFrom(crate::check::own::Owner::Arc)))),
             (SyncTy::Arc, _, "strong_count") => SyncOp::ArcStrongCount,
             (SyncTy::Arc, _, "weak_count") => SyncOp::ArcWeakCount,
@@ -588,6 +592,21 @@ impl<'p> Ctx<'p> {
                 let elem = self.new_var(false);
                 let self_ty = sync_ty(&mut self.tys, SyncTy::ArcWeak, &[elem]);
                 return Some(Some(Res::PrimAssoc { b: Builtin::Sync(SyncOp::ArcWeakUpgrade), self_ty, name: item }));
+            }
+            // `Receiver::recv`/`try_recv`/`recv_timeout` and
+            // `JoinHandle::join` by path and as values
+            // (`.map(JoinHandle::join)`, tf-p6 R05/R09): a PrimAssoc
+            // over the method, as `Weak::upgrade`.
+            (SyncTy::Receiver, _, "recv" | "try_recv" | "recv_timeout") | (SyncTy::JoinHandle, _, "join") => {
+                let op = match i.as_str() {
+                    "recv" => SyncOp::ChanRecv,
+                    "try_recv" => SyncOp::ChanTryRecv,
+                    "recv_timeout" => SyncOp::ChanRecvTimeout,
+                    _ => SyncOp::JoinHandleJoin,
+                };
+                let elem = self.new_var(false);
+                let self_ty = sync_ty(&mut self.tys, k, &[elem]);
+                return Some(Some(Res::PrimAssoc { b: Builtin::Sync(op), self_ty, name: item }));
             }
             (SyncTy::ArcWeak, _, "strong_count") => SyncOp::ArcWeakStrongCount,
             (SyncTy::ArcWeak, _, "weak_count") => SyncOp::ArcWeakWeakCount,
@@ -629,6 +648,39 @@ impl<'p> Ctx<'p> {
             }
         };
         Some(Some(Res::Builtin(Builtin::Sync(op))))
+    }
+
+    /// The receiver form, other parameters, and return of a sync method
+    /// a path names (`PoisonError::into_inner`, `Weak::upgrade`,
+    /// `Receiver::recv_timeout`, `JoinHandle::join`): the method table's
+    /// signatures for `prim_assoc_sig`'s by-path calls and values.
+    pub(super) fn sync_path_method_sig(&mut self, k: SyncTy, self_ty: Ty, name: Sym) -> Option<(SyncOp, Autoref, Vec<Ty>, Ty)> {
+        let elem = self.tys.adt_first_ty_arg(self_ty).unwrap_or(ERROR);
+        let n = self.name(name).to_string();
+        Some(match (k, n.as_str()) {
+            (SyncTy::PoisonError, "into_inner") => (SyncOp::PoisonIntoInner, Autoref::None, vec![], elem),
+            (SyncTy::PoisonError, "get_ref") => (SyncOp::PoisonGetRef, Autoref::Ref, vec![], self.tys.mk_ref(false, elem)),
+            (SyncTy::PoisonError, "get_mut") => (SyncOp::PoisonGetMut, Autoref::RefMut, vec![], self.tys.mk_ref(true, elem)),
+            (SyncTy::ArcWeak, "upgrade") => {
+                let arc = sync_ty(&mut self.tys, SyncTy::Arc, &[elem]);
+                (SyncOp::ArcWeakUpgrade, Autoref::Ref, vec![], self.tys.mk_option(arc))
+            }
+            (SyncTy::Receiver, "recv" | "try_recv" | "recv_timeout") => {
+                let (op, def) = match n.as_str() {
+                    "recv" => (SyncOp::ChanRecv, generics::recv_error_def()),
+                    "try_recv" => (SyncOp::ChanTryRecv, generics::try_recv_error_def()),
+                    _ => (SyncOp::ChanRecvTimeout, generics::recv_timeout_error_def()),
+                };
+                let er = self.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
+                let rest = if op == SyncOp::ChanRecvTimeout { vec![self.duration_ty()] } else { vec![] };
+                (op, Autoref::Ref, rest, self.tys.mk_result(elem, er))
+            }
+            (SyncTy::JoinHandle, "join") => {
+                let err = self.box_any_send();
+                (SyncOp::JoinHandleJoin, Autoref::None, vec![], self.tys.mk_result(elem, err))
+            }
+            _ => return None,
+        })
     }
 
     /// The `Duration` type a sync call takes: the std source
@@ -1116,6 +1168,17 @@ impl<'p> Ctx<'p> {
                     let er = self.tys.intern(TyKind::Adt(crate::check::generics::try_recv_error_def(), EMPTY_ARGS));
                     (SyncOp::ChanTryRecv, Autoref::Ref, self.tys.mk_result(el, er))
                 }
+                // `recv_timeout(&self, timeout: Duration) -> Result<T,
+                // RecvTimeoutError>` (tf-p6 R09).
+                (SyncTy::Receiver, "recv_timeout") => {
+                    let er = self.tys.intern(TyKind::Adt(crate::check::generics::recv_timeout_error_def(), EMPTY_ARGS));
+                    let r = self.tys.mk_result(el, er);
+                    let d = self.duration_ty();
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::ChanRecvTimeout), derefs, autoref: Autoref::Ref });
+                    self.check_args(&[d], args, span);
+                    return Some(r);
+                }
                 (SyncTy::Receiver, "iter" | "try_iter" | "into_iter") => {
                     let (u, kind, autoref) = match n.as_str() {
                         "iter" => (0, crate::ty::iter::IterKind::RecvIter, Autoref::Ref),
@@ -1132,7 +1195,7 @@ impl<'p> Ctx<'p> {
                     self.check_args(&[el], args, span);
                     return Some(r);
                 }
-                (_, "send_timeout" | "recv_timeout" | "recv_deadline") => {
+                (_, "send_timeout" | "recv_deadline") => {
                     self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `send`, `recv`, or `try_recv`.");
                     return Some(self.iter_bail(args));
                 }

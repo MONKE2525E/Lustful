@@ -65,7 +65,25 @@ impl<'p> Ctx<'p> {
             "String" if !STRING_ITEMS.contains(&item.as_str()) => return None,
             _ => {}
         }
-        let at = self.expr(recv, None);
+        if item == "clone"
+            && let Some(t) = self.builtin_clone_by_path(e, segs, written, args, span)
+        {
+            return Some(t);
+        }
+        // A by-value `self` of `Vec` takes its argument as `Vec<T>` exactly
+        // (no autoref or deref), so that type guides the argument's own
+        // inference (`Vec::leak(it.collect())`).
+        let hint = match (ty_name.as_str(), item.as_str()) {
+            ("Vec", "leak" | "into_boxed_slice" | "into_flattened") => Some(match written {
+                Some(w) => w,
+                None => {
+                    let v = self.new_var(false);
+                    self.tys.mk_vec(v)
+                }
+            }),
+            _ => None,
+        };
+        let at = self.expr(recv, hint);
         let err_mark = self.errs.len();
         let deref_mark = (self.out.deref_recv.len(), self.deref_sites.len());
         let ret = self.method_call_with_rt(e, recv, at, name, name_span, rest, &[], expected);
@@ -107,6 +125,165 @@ impl<'p> Ctx<'p> {
             return Some(ERROR);
         }
         Some(ret)
+    }
+
+    /// The prelude's `drop` used as a value (`.for_each(drop)`), when no
+    /// binding takes the name: the fn item `mem::drop::<T>`, as a prim
+    /// item over `T` (`prim_item_value`; `std_free_item_sig` gives its
+    /// signature). None for any other name.
+    pub(super) fn prelude_fn_value(&mut self, e: ExprId, seg: &ast::PathSeg, span: Span) -> Option<Ty> {
+        if self.name(seg.name) != "drop" {
+            return None;
+        }
+        let written = match &seg.args {
+            ast::GenericArgs::Angle(a) => a.len(),
+            ast::GenericArgs::None => 0,
+            _ => 2,
+        };
+        let t = match seg.type_args().as_slice() {
+            [] if written == 0 => self.new_var(false),
+            [a] if written == 1 => self.resolve_written(*a),
+            _ => {
+                self.err("L0107", span, "`drop` takes one generic argument", "Write `drop::<T>`.");
+                return Some(ERROR);
+            }
+        };
+        self.set_res(e, Res::PrimAssoc { b: Builtin::MemDrop, self_ty: t, name: seg.name });
+        Some(self.prim_item_value(Builtin::MemDrop, t, seg.name, span))
+    }
+
+    /// A method of a std type by path as a `PrimAssoc` (`Weak::upgrade`):
+    /// its Self agrees with the type the path writes (`Receiver::<u16>::
+    /// recv`, an alias's type), as the item's own Self does in rustc
+    /// (E0308 on a mismatch). Other resolutions pass through.
+    pub(super) fn written_prim_self(&mut self, r: Res, segs: &[ast::PathSeg], span: Span) -> Res {
+        if let Res::PrimAssoc { self_ty, .. } = r
+            && let Some(want) = self.written_builtin_self(segs, span)
+            && !self.unify(self_ty, want)
+        {
+            self.mismatch(span, want, self_ty);
+        }
+        r
+    }
+
+    /// `Type::from` as a value (`.map(OnceCell::from)`, `.map(Arc::from)`),
+    /// when the path names no inherent `from`: `<Type<..> as From<_>>::from`
+    /// with its input open, as rustc's probe takes the one trait in scope
+    /// with that item (traitpath.rs selects the impl at body end, by the
+    /// input the uses give). `base` is the path's type, its omitted args
+    /// fresh. None when another trait in scope also has a `from` that may
+    /// apply (rustc E0034: the caller reports), or for another item.
+    pub(super) fn from_path_value(&mut self, e: ExprId, segs: &[ast::PathSeg], base: Option<Ty>, span: Span) -> Option<Ty> {
+        let name = segs.last()?.name;
+        if name != self.p.known.from || segs.len() < 2 {
+            return None;
+        }
+        let base = match base {
+            Some(b) => b,
+            None => self.builtin_path_base(segs, span, None)?,
+        };
+        let from = self.p.gx.lang.from;
+        if !self.only_trait_item(from, base, name) {
+            return None;
+        }
+        let tr = self.fresh_trait_ref(from, base, 1);
+        self.trait_ref_fn_value(e, tr, name, span)
+    }
+
+    /// True when trait `tdef` is in scope at `base` and no other trait in
+    /// scope has an item `name` that may apply to `base` (rustc's probe
+    /// after the inherent items: two such traits are E0034).
+    fn only_trait_item(&mut self, tdef: DefId, base: Ty, name: Sym) -> bool {
+        let p = self.p;
+        if !method::trait_in_scope_at(self, tdef, base) {
+            return false;
+        }
+        for other in p.gx.traits_by_method.get(&name).cloned().unwrap_or_default() {
+            if other == tdef || !method::trait_in_scope_at(self, other, base) {
+                continue;
+            }
+            let Some(rec) = p.gx.index.trait_record(other) else { return false };
+            let n_inputs = rec.generics.params.len().saturating_sub(1);
+            let (snap, obl_len) = (self.snapshot_vars(), self.obl_len());
+            let tr = self.fresh_trait_ref(other, base, n_inputs);
+            let sel = self.select_obligation(tr);
+            self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
+            if !matches!(sel, Selection::NoImpl) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `Vec::clone(x)`, `HashMap::clone(&arc_map)` on a builtin type
+    /// path: `<Type<..> as Clone>::clone(x)`, its argument a coercion
+    /// site for `&Type<..>` (a deref coercion from `&Arc<Type>` too), as
+    /// the trait fn takes it. The method probe would pick `Clone for &T`
+    /// on a `&Type` argument instead. None when another trait in scope has
+    /// a `clone` for the type (the method form then decides).
+    fn builtin_clone_by_path(&mut self, e: ExprId, segs: &[ast::PathSeg], written: Option<Ty>, args: &[ExprId], span: Span) -> Option<Ty> {
+        let base = match written {
+            Some(w) => w,
+            None => self.builtin_path_base(segs, span, None)?,
+        };
+        self.clone_call_at(e, base, args, span)
+    }
+
+    /// `<base as Clone>::clone(args)` for `builtin_clone_by_path` and an
+    /// alias's `A::clone(x)` (`std_trait_assoc_call`).
+    pub(super) fn clone_call_at(&mut self, e: ExprId, base: Ty, args: &[ExprId], span: Span) -> Option<Ty> {
+        let name = self.p.known.clone;
+        let clone = self.p.gx.lang.clone;
+        if !self.only_trait_item(clone, base, name) {
+            if !self.clone_path_unique(base, span) {
+                for &a in args {
+                    self.expr(a, None);
+                }
+                return Some(ERROR);
+            }
+            return None;
+        }
+        let tr = self.fresh_trait_ref(clone, base, 0);
+        self.trait_ref_call(e, tr, name, args, span)
+    }
+
+    /// `Type::clone(x)` on a builtin type: false, after reporting L0720
+    /// (rustc E0034, the method form's code), when another trait in scope
+    /// has a `clone` that may apply to `base` too.
+    pub(super) fn clone_path_unique(&mut self, base: Ty, span: Span) -> bool {
+        let (clone, name) = (self.p.gx.lang.clone, self.p.known.clone);
+        if !method::trait_in_scope_at(self, clone, base) || self.only_trait_item(clone, base, name) {
+            return true;
+        }
+        self.err("L0720", span, "multiple trait methods named `clone` apply here", "Name the trait: `Clone::clone(x)` or `<T as Trait>::clone(x)`.");
+        false
+    }
+
+    /// `Rc::default()` and `Arc::default()`: `() -> Rc<T>` with `T:
+    /// Default` (std's `impl<T: Default> Default for Rc<T>`), the element
+    /// inferred or written (`Rc::<u8>::default()`, `unify_builtin_self`);
+    /// the default glue builds the value. None for other paths.
+    pub(super) fn smart_default_sig(&mut self, callee: ExprId, span: Span) -> Option<(Vec<Ty>, Ty)> {
+        let Expr::Path(segs) = self.p.ast.expr(callee) else { return None };
+        let [.., ty_seg, _] = segs.as_slice() else { return None };
+        let elem = self.new_var(false);
+        let t = match self.name(ty_seg.name) {
+            "Rc" => self.tys.mk_rc(elem),
+            "Arc" => crate::ty::sync::sync_ty(&mut self.tys, crate::ty::sync::SyncTy::Arc, &[elem]),
+            _ => return None,
+        };
+        self.deferred_default.push((t, span));
+        Some((vec![], t))
+    }
+
+    /// The (params, return) of a std free fn kept as a prim item over
+    /// one type `t` (see `prelude_fn_value`): `drop::<T>(T)`.
+    pub(super) fn std_free_item_sig(&mut self, b: Builtin, t: Ty) -> Option<(Vec<Ty>, Ty)> {
+        match b {
+            Builtin::MemDrop => Some((vec![t], UNIT)),
+            _ => None,
+        }
     }
 
     /// True when a receiver of type `at` adjusted by `derefs` and
@@ -167,6 +344,35 @@ impl<'p> Ctx<'p> {
             _ => true,
         }
     }
+}
+
+/// More builtins a path names as a fn value (`.map(JoinHandle::join)`),
+/// after `PRIM_VALUE_BUILTINS` in the item code space (a value's type
+/// carries its builtin by index: append only). None is
+/// `#[track_caller]` (`RefCell::replace` is a path call only: a value's
+/// panic would report another location).
+pub(crate) const STD_VALUE_BUILTINS: &[Builtin] = &[
+    Builtin::Sync(crate::check::sync::SyncOp::ChanRecv),
+    Builtin::Sync(crate::check::sync::SyncOp::ChanTryRecv),
+    Builtin::Sync(crate::check::sync::SyncOp::ChanRecvTimeout),
+    Builtin::Sync(crate::check::sync::SyncOp::JoinHandleJoin),
+    Builtin::MemDrop,
+    Builtin::WeakUpgrade,
+    Builtin::WeakStrongCount,
+    Builtin::WeakWeakCount,
+    Builtin::RefCellIntoInner,
+    Builtin::RefCellGetMut,
+    Builtin::CellSet,
+    Builtin::CellReplace,
+    Builtin::CellIntoInner,
+    Builtin::CellGetMut,
+];
+
+/// True for a `STD_VALUE_BUILTINS` item that cannot panic itself, so a
+/// fn pointer to it needs no def site for a panic location (`drop`'s
+/// value's own `Drop` panics at its impl, as through rustc's pointer).
+pub(crate) fn no_panic_std_item(b: Builtin) -> bool {
+    STD_VALUE_BUILTINS.contains(&b)
 }
 
 /// The std types whose methods are builtin (or std source methods no path

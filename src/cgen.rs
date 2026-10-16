@@ -4213,7 +4213,9 @@ impl FnGen<'_, '_> {
             _ => 0,
         };
         let loc = std_loc(0, line as u64, 5);
-        let ops: Vec<Operand> = (1..=ins.len()).map(|i| Operand::Move(Place::local(i as Local))).collect();
+        // The shim's params have no drop flags: the builtin takes each by
+        // a plain read (a by-value one, `drop`'s, is consumed there).
+        let ops: Vec<Operand> = (1..=ins.len()).map(|i| Operand::Copy(Place::local(i as Local))).collect();
         let mut g = FnGen::new(p, &body, self.map, self.base_line, self.slots);
         let mut post: Vec<String> = Vec::new();
         let value = if b == Builtin::PrimFromCast {

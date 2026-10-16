@@ -1109,7 +1109,11 @@ void lust_scope_wait(lust_Scope *sc) LUST_BODY({
    and wakes all). Values move in and out by memcpy of `esize` bytes.
    `cap` is -1 for `channel()` and the bound for `sync_channel(n)`; a
    bound of 0 is a rendezvous: a sender places its value only while a
-   receiver waits, then waits until that value is taken. The channel is
+   receiver waits, then waits until that value is taken. A rendezvous
+   sender that waits counts itself in `tx_waiting`, so `try_recv` and an
+   expired `recv_timeout` still pair with it, as std's zero-capacity
+   channel does; such a receiver counts in `rx_claim`, which `try_send`
+   does not see (it pairs only with a blocked receiver). The channel is
    freed when the last sender and the receiver are gone; values still
    queued then drop through `drop_elem`. */
 typedef struct lust_Chan {
@@ -1118,6 +1122,8 @@ typedef struct lust_Chan {
     uint64_t senders;
     uint32_t rx_alive;
     uint32_t rx_waiting;
+    uint32_t tx_waiting;
+    uint32_t rx_claim;
     int64_t cap;
     uint64_t esize;
     uint64_t ealign;
@@ -1174,6 +1180,22 @@ static void lust_chan_free(lust_Chan *c) {
 }
 #endif
 
+#ifdef LUST_IMPL
+/* A receiver that does not block (`try_recv`, an expired
+   `recv_timeout`) on a rendezvous channel with a waiting sender: that
+   sender is committed (std pairs with it at once), so wait for its
+   value and take it. The lock is held on entry and released here. */
+static void lust_chan_claim(lust_Chan *c, void *out) {
+    c->rx_claim++;
+    lust_chan_changed(c);
+    while (c->len == 0) lust_chan_wait(c);
+    lust_chan_pop(c, out);
+    c->rx_claim--;
+    lust_chan_changed(c);
+    lust_mutex_unlock(&c->lock);
+}
+#endif
+
 lust_Chan *lust_chan_new(uint64_t esize, uint64_t ealign, int64_t cap, void (*drop_elem)(void *)) LUST_BODY({
     lust_Chan *c = (lust_Chan *)calloc(1, sizeof(lust_Chan));
     if (!c) lust_oom();
@@ -1190,7 +1212,9 @@ lust_Chan *lust_chan_new(uint64_t esize, uint64_t ealign, int64_t cap, void (*dr
 int lust_chan_send(lust_Chan *c, const void *v) LUST_BODY({
     lust_mutex_lock(&c->lock);
     if (c->cap == 0) {
-        while (c->rx_alive && (c->rx_waiting == 0 || c->len > 0)) lust_chan_wait(c);
+        c->tx_waiting++;
+        while (c->rx_alive && (c->rx_waiting + c->rx_claim == 0 || c->len > 0)) lust_chan_wait(c);
+        c->tx_waiting--;
         if (!c->rx_alive) { lust_mutex_unlock(&c->lock); return 1; }
         uint64_t ticket = c->taken;
         lust_chan_push(c, v);
@@ -1241,7 +1265,12 @@ int lust_chan_recv(lust_Chan *c, void *out, int block) LUST_BODY({
             return 0;
         }
         if (c->senders == 0) { c->rx_waiting--; lust_mutex_unlock(&c->lock); return block ? 1 : 2; }
-        if (!block) { c->rx_waiting--; lust_mutex_unlock(&c->lock); return 1; }
+        if (!block) {
+            c->rx_waiting--;
+            if (c->cap == 0 && c->tx_waiting > 0) { lust_chan_claim(c, out); return 0; }
+            lust_mutex_unlock(&c->lock);
+            return 1;
+        }
         lust_chan_wait(c);
     }
 })
@@ -1383,6 +1412,65 @@ int lust_cv_wait_timeout(uint32_t *cv, uint32_t *m, uint64_t secs, uint32_t nano
     }
     lust_mutex_lock(m);
     return timed;
+})
+
+/* `Receiver::recv_timeout`: 0 received into out; 1 timed out; 2 every
+   sender is gone and nothing is queued. std's order: a queued value
+   first, then disconnection, then the deadline (`Instant::now() +
+   timeout`, monotonic). A deadline past what `Instant` holds (tv_sec
+   overflows i64) is std's plain `recv`. */
+int lust_chan_recv_timeout(lust_Chan *c, void *out, uint64_t secs, uint32_t nanos) LUST_BODY({
+    long dl[2];
+    lust_mono_now(dl);
+    if (secs > (uint64_t)(0x7fffffffffffffffL - dl[0])) return lust_chan_recv(c, out, 1) ? 2 : 0;
+    dl[0] += (long)secs;
+    dl[1] += (long)nanos;
+    if (dl[1] >= 1000000000L) {
+        if (dl[0] == 0x7fffffffffffffffL) return lust_chan_recv(c, out, 1) ? 2 : 0;
+        dl[0] += 1;
+        dl[1] -= 1000000000L;
+    }
+    lust_mutex_lock(&c->lock);
+    c->rx_waiting++;
+    lust_chan_changed(c);
+    for (;;) {
+        if (c->len > 0) {
+            lust_chan_pop(c, out);
+            c->rx_waiting--;
+            lust_chan_changed(c);
+            lust_mutex_unlock(&c->lock);
+            return 0;
+        }
+        if (c->senders == 0) { c->rx_waiting--; lust_mutex_unlock(&c->lock); return 2; }
+        long now[2];
+        lust_mono_now(now);
+        long rs = dl[0] - now[0];
+        long rn = dl[1] - now[1];
+        if (rn < 0) {
+            rs -= 1;
+            rn += 1000000000L;
+        }
+        if (rs < 0 || (rs == 0 && rn == 0)) {
+            c->rx_waiting--;
+            if (c->cap == 0 && c->tx_waiting > 0) { lust_chan_claim(c, out); return 0; }
+            lust_mutex_unlock(&c->lock);
+            return 1;
+        }
+        uint32_t s;
+        __atomic_load(&c->seq, &s, 5);
+        lust_mutex_unlock(&c->lock);
+#ifdef LUST_SYS_FUTEX
+        {
+            long rel[2];
+            rel[0] = rs;
+            rel[1] = rn;
+            syscall(LUST_SYS_FUTEX, &c->seq, 128 /* FUTEX_WAIT_PRIVATE */, s, rel, (void *)0, 0);
+        }
+#else
+        sched_yield();
+#endif
+        lust_mutex_lock(&c->lock);
+    }
 })
 
 typedef struct lust_Barrier {

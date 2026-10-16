@@ -201,6 +201,14 @@ impl<'p> Ctx<'p> {
         args: &[ExprId],
         span: Span,
     ) -> Option<Ty> {
+        // `M::clone(&m)` through `type M = HashMap<..>`: the Clone call
+        // with a coercion site for `&M` (check/ufcs.rs).
+        if name == self.p.known.clone
+            && builtin_std_path(&self.tys, base).is_some()
+            && let Some(t) = self.clone_call_at(e, base, args, span)
+        {
+            return Some(t);
+        }
         self.assoc_call(e, callee, base, None, name, args, span)
     }
 
@@ -252,7 +260,7 @@ impl<'p> Ctx<'p> {
             return false;
         }
         let path: Vec<&str> = segs[..n - 1].iter().map(|s| self.name(s.name)).collect();
-        if n == 2 { named.last() == path.last() } else { named == path }
+        if n == 2 { named.last() == path.last() } else { named == path || std_reexport(&path) == Some(named.as_slice()) }
     }
 
     /// A generic builtin type by its name with a fresh variable for each
@@ -265,6 +273,17 @@ impl<'p> Ctx<'p> {
             "Option" => self.tys.mk_option(v),
             "Box" => self.tys.mk_boxed(v),
             "Rc" => self.tys.mk_rc(v),
+            "RefCell" => self.tys.mk_builtin1(|d| d.refcell, v),
+            "Cell" => self.tys.mk_builtin1(|d| d.cell, v),
+            "Arc" => crate::ty::sync::sync_ty(&mut self.tys, crate::ty::sync::SyncTy::Arc, &[v]),
+            "HashMap" => {
+                let (w, s) = (self.new_var(false), self.new_var(false));
+                crate::ty::hash::mk_hash(&mut self.tys, crate::ty::hash::HashTy::HashMap, &[v, w, s])
+            }
+            "HashSet" => {
+                let s = self.new_var(false);
+                crate::ty::hash::mk_hash(&mut self.tys, crate::ty::hash::HashTy::HashSet, &[v, s])
+            }
             "Result" => {
                 let e = self.new_var(false);
                 self.tys.mk_result(v, e)
@@ -412,6 +431,17 @@ pub(super) fn builtin_std_path(tys: &impl TyIntern, t: Ty) -> Option<Vec<&'stati
         _ => return None,
     }
     Some(path)
+}
+
+/// The canonical path (`builtin_std_path`'s) of a std re-export path of a
+/// builtin type: `std::collections::HashMap` is
+/// `std::collections::hash_map::HashMap`.
+fn std_reexport(path: &[&str]) -> Option<&'static [&'static str]> {
+    match path {
+        ["std", "collections", "HashMap"] => Some(&["std", "collections", "hash_map", "HashMap"]),
+        ["std", "collections", "HashSet"] => Some(&["std", "collections", "hash_set", "HashSet"]),
+        _ => None,
+    }
 }
 
 /// True when a segment writes generic args (`::<>` writes none).

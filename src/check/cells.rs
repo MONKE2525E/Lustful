@@ -38,6 +38,21 @@ impl<'p> Ctx<'p> {
                 let b = if i == "borrow" { Builtin::RefCellBorrow } else { Builtin::RefCellBorrowMut };
                 return Some(Some(Res::PrimAssoc { b, self_ty, name: item }));
             }
+            // `Weak::upgrade`, `RefCell::into_inner`, and kin by path and
+            // as values (`.filter_map(Weak::upgrade)`, tf-p6 R05): a
+            // PrimAssoc over the method (`cell_path_method_sig`).
+            ("Weak", "upgrade" | "strong_count" | "weak_count")
+            | ("RefCell", "into_inner" | "get_mut" | "replace")
+            | ("Cell", "set" | "replace" | "into_inner" | "get_mut") => {
+                let elem = self.new_var(false);
+                let self_ty = match t.as_str() {
+                    "Weak" => self.tys.mk_builtin1(|d| d.weak, elem),
+                    "RefCell" => self.tys.mk_builtin1(|d| d.refcell, elem),
+                    _ => self.tys.mk_builtin1(|d| d.cell, elem),
+                };
+                let (b, _, _, _) = self.cell_path_method_sig(self_ty, item, &[])?;
+                return Some(Some(Res::PrimAssoc { b, self_ty, name: item }));
+            }
             ("Weak" | "RefCell" | "Cell", _) => {
                 self.err(
                     "L0104",
@@ -58,8 +73,12 @@ impl<'p> Ctx<'p> {
     pub(super) fn cell_default_sig(&mut self, callee: ExprId, span: Span) -> (Vec<Ty>, Ty) {
         let elem = self.new_var(false);
         self.deferred_default.push((elem, span));
+        // An alias names its target (`type W = RefCell<Vec<u8>>; W::default()`).
         let refcell = match self.p.ast.expr(callee) {
-            Expr::Path(segs) if segs.len() >= 2 => self.name(segs[segs.len() - 2].name) == "RefCell",
+            Expr::Path(segs) if segs.len() >= 2 => match self.builtin_alias_ty(segs, span, false) {
+                Some(t) => self.tys.refcell_elem(t).is_some(),
+                None => self.name(segs[segs.len() - 2].name) == "RefCell",
+            },
             _ => true,
         };
         let t = if refcell { self.tys.mk_builtin1(|d| d.refcell, elem) } else { self.tys.mk_builtin1(|d| d.cell, elem) };
@@ -119,6 +138,59 @@ impl<'p> Ctx<'p> {
             Builtin::RefCellNew => (vec![elem], mk(self, |d| d.refcell)),
             _ => (vec![elem], mk(self, |d| d.cell)),
         }
+    }
+
+    /// The by-path form of a `Weak`, `RefCell`, or `Cell` method that
+    /// `cell_assoc` gives as a PrimAssoc: (builtin, params with the
+    /// receiver first, return, the item's extra types), as
+    /// `prim_assoc_sig` gives. The receiver form and types are
+    /// `cell_method`'s. None for any other type or name.
+    pub(super) fn cell_path_method_sig(&mut self, self_ty: Ty, name: Sym, extra: &[Ty]) -> Option<(Builtin, Vec<Ty>, Ty, Vec<Ty>)> {
+        use Builtin as B;
+        let n = self.name(name).to_string();
+        let (b, autoref, rest, ret) = if let Some(el) = self.tys.weak_elem(self_ty) {
+            match n.as_str() {
+                "upgrade" => {
+                    let rc = self.tys.mk_rc(el);
+                    (B::WeakUpgrade, Autoref::Ref, vec![], self.tys.mk_option(rc))
+                }
+                "strong_count" => (B::WeakStrongCount, Autoref::Ref, vec![], USIZE),
+                "weak_count" => (B::WeakWeakCount, Autoref::Ref, vec![], USIZE),
+                _ => return None,
+            }
+        } else if let Some(el) = self.tys.refcell_elem(self_ty) {
+            match n.as_str() {
+                "into_inner" => (B::RefCellIntoInner, Autoref::None, vec![], el),
+                "get_mut" => (B::RefCellGetMut, Autoref::RefMut, vec![], self.tys.mk_ref(true, el)),
+                "replace" => (B::RefCellReplace, Autoref::Ref, vec![el], el),
+                _ => return None,
+            }
+        } else if let Some(el) = self.tys.cell_elem(self_ty) {
+            match n.as_str() {
+                "set" => (B::CellSet, Autoref::Ref, vec![el], UNIT),
+                "replace" => (B::CellReplace, Autoref::Ref, vec![el], el),
+                "into_inner" => (B::CellIntoInner, Autoref::None, vec![], el),
+                "get_mut" => (B::CellGetMut, Autoref::RefMut, vec![], self.tys.mk_ref(true, el)),
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        let recv = match autoref {
+            Autoref::None => self_ty,
+            Autoref::RefMut => self.tys.mk_ref(true, self_ty),
+            _ => self.tys.mk_ref(false, self_ty),
+        };
+        let extras = if extra.is_empty() {
+            let mut out = Vec::new();
+            self.collect_infer_tys(self_ty, &mut out);
+            out
+        } else {
+            extra.to_vec()
+        };
+        let mut params = vec![recv];
+        params.extend(rest);
+        Some((b, params, ret, extras))
     }
 
     /// Methods on `Weak<T>`, `RefCell<T>`, and `Cell<T>` receivers

@@ -426,6 +426,12 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut 
             lit("receiving on a closed channel"),
             lit("receiving on an empty channel")
         ),
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::recv_timeout_error_def()) == Some(*a) => format!(
+            "  return {} ? lust_f_pad(f, {}) : lust_f_pad(f, {});\n",
+            disc_call(p, t, "p"),
+            lit("channel is empty and sending half is closed"),
+            lit("timed out waiting on channel")
+        ),
         // std's UTF-8 errors (W-STD-A): their Display writes with
         // `write!`, a fresh default Formatter over the same sink, so the
         // caller's width and fill do not apply.

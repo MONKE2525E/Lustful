@@ -1408,7 +1408,7 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
 
 /// The std types under `std::sync::mpsc` lust knows by name besides the
 /// sync types (ty/sync.rs): the synthetic error Adts (W-THREADS).
-pub const STD_MPSC_ADTS: &[&str] = &["RecvError", "TryRecvError"];
+pub const STD_MPSC_ADTS: &[&str] = &["RecvError", "TryRecvError", "RecvTimeoutError"];
 
 /// True when the glob `use` of `path` (`std::rc` in `use std::rc::*;`)
 /// brings the std type `name` into scope. The sync types and
@@ -1684,6 +1684,7 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/sync/mpsc/TrySendError",
     "std/sync/WaitTimeoutResult",
     "std/sync/mpsc/TryRecvError",
+    "std/sync/mpsc/RecvTimeoutError",
     "alloc/string/FromUtf8Error",
     "std/string/FromUtf8Error",
     "core/any/TypeId",
@@ -2174,6 +2175,8 @@ const STD_VARIANT_PATHS: &[&str] = &[
     "std/sync/atomic/Ordering/SeqCst",
     "std/sync/mpsc/TryRecvError/Empty",
     "std/sync/mpsc/TryRecvError/Disconnected",
+    "std/sync/mpsc/RecvTimeoutError/Timeout",
+    "std/sync/mpsc/RecvTimeoutError/Disconnected",
 ];
 
 /// True for a trait of the Rust 2024 prelude (and the prelude's

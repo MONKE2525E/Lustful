@@ -980,6 +980,7 @@ fn tn_std_adt(p: &Program, tys: &mut impl TyIntern, t: Ty, def: DefId, open: boo
         25 => tn_apply("core::num::nonzero::NonZero", vec![tn_first(p, tys, t, open, in_sig)?]),
         26 => tn_apply("std::sync::mpsc::TrySendError", vec![tn_first(p, tys, t, open, in_sig)?]),
         27 => return plain("std::sync::WaitTimeoutResult"),
+        29 => return plain("std::sync::mpsc::RecvTimeoutError"),
         _ => return plain("core::char::convert::CharErrorKind"),
     }))
 }
