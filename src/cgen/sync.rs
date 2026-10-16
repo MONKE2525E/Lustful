@@ -884,7 +884,8 @@ impl FnGen<'_, '_> {
 
     /// `thread::available_parallelism` (TRIAGE T5): Ok of the
     /// count as a NonZero, or Err of the errno as an io::Error
-    /// (its Repr::Os form, like fmt's io_result_of).
+    /// (its Repr::Os form, like fmt's io_result_of), or std's
+    /// `UNKNOWN_THREAD_COUNT` (runtime/sync.c lust_avail_parallelism).
     pub(super) fn avail_par(&mut self, dest: &CTy, loc: &str, post: &mut Vec<String>) -> String {
         let _ = (loc, post);
         let (nz, err_a) = match dest {
@@ -909,7 +910,25 @@ impl FnGen<'_, '_> {
             disc_set(self.p, dest, &t, 1),
             ctype(&err_a),
         );
-        let _ = writeln!(self.out, "    if ({n} == 0) {{ {osf} = {e}; {} }}", disc_set(self.p, &repr_cty, &format!("{errv}.f0"), os));
+        let repr_place = format!("{errv}.f0");
+        // `*err == -1` is std's `io::Error::UNKNOWN_THREAD_COUNT`: a
+        // SimpleMessage of kind NotFound.
+        let simple = self.p.adt(repr_a).variants.iter().position(|v| self.p.interner.get(v.name) == "SimpleMessage").expect("io::Error Repr has a SimpleMessage variant");
+        let kind_cty = cty(&self.p.tys, self.p.adt(repr_a).variants[simple].fields[0].ty);
+        let CTy::Adt(kind_a) = kind_cty else { return "0".into() };
+        let not_found = self.p.adt(kind_a).variants.iter().position(|v| self.p.interner.get(v.name) == "NotFound").expect("ErrorKind has NotFound");
+        let kf = variant_field(self.p, &repr_cty, &repr_place, simple, 0);
+        let mf = variant_field(self.p, &repr_cty, &repr_place, simple, 1);
+        let msg = "the number of hardware threads is not known for the target platform";
+        let _ = writeln!(
+            self.out,
+            "    if ({n} == 0 && {e} == -1) {{ {} {mf} = ((lust_str){{(uint8_t*){}, {}}}); {} }} else if ({n} == 0) {{ {osf} = {e}; {} }}",
+            disc_set(self.p, &kind_cty, &kf, not_found),
+            c_string_lit(msg.as_bytes()),
+            msg.len(),
+            disc_set(self.p, &repr_cty, &repr_place, simple),
+            disc_set(self.p, &repr_cty, &repr_place, os)
+        );
         t
     }
 

@@ -449,6 +449,9 @@ fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
                             match interner.get(m) {
                                 "env" => item != "args",
                                 "process" => !matches!(item, "exit" | "abort"),
+                                // They return `io::Result`: `std::io::Error` is
+                                // in the platform crate (mentions_std_platform).
+                                "thread" => matches!(item, "available_parallelism" | "Builder"),
                                 m => super::imports::STD_PLATFORM_MODULES.contains(&m),
                             }
                         }

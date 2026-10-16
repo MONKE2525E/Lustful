@@ -603,66 +603,429 @@ int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST
     return 0;
 })
 
-/* `thread::available_parallelism`: the cgroup quota when one
-   applies (rounded up, at least 1), else the affinity count,
-   as std computes it on Linux. 0 with *err set on failure. */
-static uint64_t lust_cgroup_quota(void) LUST_BODY({
-    /* cgroup v2 cpu.max: "<quota|max> <period>". */
-    FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
-    if (f) {
-        char buf[128];
-        char *got = fgets(buf, sizeof buf, f);
-        fclose(f);
-        if (got && buf[0] >= '0' && buf[0] <= '9') {
-            uint64_t quota = 0, period = 0;
-            const char *p = buf;
-            while (*p >= '0' && *p <= '9') quota = quota * 10 + (uint64_t)(*p++ - '0');
-            while (*p == ' ') p++;
-            while (*p >= '0' && *p <= '9') period = period * 10 + (uint64_t)(*p++ - '0');
-            if (quota > 0 && period > 0) {
-                uint64_t q = (quota + period - 1) / period;
-                return q ? q : 1;
-            }
-        }
-        return 0;
+/* ---------- `thread::available_parallelism` ----------
+   A port of std 1.99's Linux code (library/std/src/sys/thread/unix.rs:
+   `available_parallelism` and `mod cgroups`), step for step, so the
+   answer is rustc's on the same box: min(affinity count, cgroup quota),
+   the quota rounded down and at least 1, sysconf as the fallback. Paths
+   follow Rust's `PathBuf` push/pop/starts_with/strip_prefix on Unix. */
+#ifdef LUST_IMPL
+int access(const char *path, int mode);
+long sysconf(int name);
+#if defined(__APPLE__)
+#define LUST_SC_NPROCESSORS_ONLN 58
+#else
+#define LUST_SC_NPROCESSORS_ONLN 84
+#endif
+
+/* A growable byte path (`PathBuf`). */
+typedef struct { char *p; size_t n, cap; } lust_pb;
+
+static void lust_pb_add(lust_pb *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        b->cap = (b->n + n + 1) * 2;
+        b->p = (char *)realloc(b->p, b->cap);
     }
-    /* cgroup v1 cpu.cfs_quota_us / cpu.cfs_period_us. */
-    long quota = -2, period = -2;
-    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
-    if (!f) return 0;
-    if (fscanf(f, "%ld", &quota) != 1) quota = -2;
-    fclose(f);
-    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
-    if (!f) return 0;
-    if (fscanf(f, "%ld", &period) != 1) period = -2;
-    fclose(f);
-    if (quota > 0 && period > 0) {
-        uint64_t q = ((uint64_t)quota + (uint64_t)period - 1) / (uint64_t)period;
-        return q ? q : 1;
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+
+/* `PathBuf::push`: an absolute path replaces; else a separator first
+   when the buffer is not empty and does not end in one. */
+static void lust_pb_push(lust_pb *b, const char *s, size_t n) {
+    int need_sep = b->n > 0 && b->p[b->n - 1] != '/';
+    if (n > 0 && s[0] == '/') b->n = 0;
+    else if (need_sep) lust_pb_add(b, "/", 1);
+    lust_pb_add(b, s, n);
+}
+
+/* Bytes before the body of a path: the root `/`, or a leading `.` that
+   is its own component (`Components::len_before_body`). */
+static size_t lust_path_front(const char *p, size_t n) {
+    if (n > 0 && p[0] == '/') return 1;
+    if (n > 0 && p[0] == '.' && (n == 1 || p[1] == '/')) return 1;
+    return 0;
+}
+
+/* The last body component of p[lb..end) from the back: its start; *sep
+   gets the index of the separator before it (or lb when there is none). */
+static size_t lust_path_back(const char *p, size_t lb, size_t end, size_t *cut) {
+    size_t s = end;
+    while (s > lb && p[s - 1] != '/') s--;
+    *cut = s > lb ? s - 1 : lb;
+    return s;
+}
+
+static int lust_path_skip(const char *c, size_t n) { return n == 0 || (n == 1 && c[0] == '.'); }
+
+/* The end of a path slice after `Components::trim_right`. */
+static size_t lust_path_trim_right(const char *p, size_t lb, size_t end) {
+    while (end > lb) {
+        size_t cut, s = lust_path_back(p, lb, end, &cut);
+        if (!lust_path_skip(p + s, end - s)) break;
+        end = cut;
+    }
+    return end;
+}
+
+/* `PathBuf::pop`: 0 when the last component is the root or there is none. */
+static int lust_pb_pop(lust_pb *b) {
+    size_t lb = lust_path_front(b->p, b->n), end = b->n;
+    for (;;) {
+        if (end <= lb) return 0;
+        size_t cut, s = lust_path_back(b->p, lb, end, &cut);
+        int skip = lust_path_skip(b->p + s, end - s);
+        end = cut;
+        if (!skip) break;
+    }
+    b->n = lust_path_trim_right(b->p, lb, end);
+    b->p[b->n] = 0;
+    return 1;
+}
+
+/* One forward component of a path: kind 0 root, 1 cur dir, 2 normal
+   (`..` is a normal string here: it compares equal only to `..`). */
+typedef struct { const char *p; size_t n, i; int started; } lust_pcomps;
+
+static int lust_pcomp_next(lust_pcomps *c, int *kind, const char **s, size_t *len) {
+    if (!c->started) {
+        c->started = 1;
+        if (c->n > 0 && c->p[0] == '/') { c->i = 1; *kind = 0; *s = c->p; *len = 1; return 1; }
+        if (c->n > 0 && c->p[0] == '.' && (c->n == 1 || c->p[1] == '/')) { c->i = 1; *kind = 1; *s = c->p; *len = 1; return 1; }
+    }
+    while (c->i < c->n) {
+        size_t a = c->i;
+        while (c->i < c->n && c->p[c->i] != '/') c->i++;
+        size_t e = c->i;
+        if (c->i < c->n) c->i++;
+        if (!lust_path_skip(c->p + a, e - a)) { *kind = 2; *s = c->p + a; *len = e - a; return 1; }
     }
     return 0;
-})
+}
 
+/* `Path::strip_prefix` (`starts_with` when `rest` is null): 1 when every
+   component of `base` matches the front of `p`; *rest is the remainder
+   as `Components::as_path` gives it (both ends trimmed). */
+static int lust_path_strip(const char *p, size_t n, const char *base, size_t bn, const char **rest, size_t *rest_n) {
+    lust_pcomps a = {p, n, 0, 0}, b = {base, bn, 0, 0};
+    int ka, kb;
+    const char *sa, *sb;
+    size_t la, lbn;
+    while (lust_pcomp_next(&b, &kb, &sb, &lbn)) {
+        if (!lust_pcomp_next(&a, &ka, &sa, &la) || ka != kb || la != lbn || memcmp(sa, sb, la) != 0) return 0;
+    }
+    if (rest) {
+        size_t i = a.started ? a.i : 0;
+        /* trim_left: separators and `.` components before the next one,
+           once a component was taken (an untouched iterator keeps all). */
+        for (; a.started;) {
+            while (i < n && p[i] == '/') i++;
+            if (i < n && p[i] == '.' && (i + 1 == n || p[i + 1] == '/')) { i++; continue; }
+            break;
+        }
+        size_t end = lust_path_trim_right(p, i, n);
+        *rest = p + i;
+        *rest_n = end > i ? end - i : 0;
+    }
+    return 1;
+}
+
+static int lust_path_starts(const char *p, size_t n, const char *base) {
+    return lust_path_strip(p, n, base, strlen(base), 0, 0);
+}
+
+/* `File::open(path)` then `read_to_string` (or `read_to_end` when
+   `text` is 0). 1 on success with the bytes in *out (malloc'd). */
+static int lust_read_file(const char *path, int text, char **out, size_t *len) {
+    FILE *f = fopen(path, "re");
+    if (!f) return 0;
+    size_t cap = 256, n = 0;
+    char *buf = (char *)malloc(cap);
+    for (;;) {
+        if (n == cap) buf = (char *)realloc(buf, cap *= 2);
+        size_t got = fread(buf + n, 1, cap - n, f);
+        n += got;
+        if (got == 0) break;
+    }
+    int bad = ferror(f);
+    fclose(f);
+    uint64_t up;
+    uint8_t el;
+    if (bad || (text && !lust_utf8_check((const uint8_t *)buf, n, &up, &el))) {
+        free(buf);
+        return 0;
+    }
+    *out = buf;
+    *len = n;
+    return 1;
+}
+
+/* `str::parse::<usize>`: an optional `+`, then one or more ASCII digits,
+   with no overflow. */
+static int lust_parse_usize(const char *s, size_t n, uint64_t *v) {
+    if (n > 0 && s[0] == '+') { s++; n--; }
+    if (n == 0) return 0;
+    uint64_t r = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+        uint64_t d = (uint64_t)(s[i] - '0');
+        if (r > (UINT64_MAX - d) / 10) return 0;
+        r = r * 10 + d;
+    }
+    *v = r;
+    return 1;
+}
+
+static int lust_path_exists(const lust_pb *b) { return access(b->p, 0) == 0; }
+
+/* `quota_v2`: the smallest cpu.max quota of the cgroup and its parents. */
+static uint64_t lust_quota_v2(const char *group, size_t gn) {
+    uint64_t quota = UINT64_MAX;
+    const char *mount = "/sys/fs/cgroup";
+    lust_pb path = {0, 0, 0};
+    lust_pb_push(&path, mount, strlen(mount));
+    lust_pb_push(&path, group, gn);
+    lust_pb_push(&path, "cgroup.controllers", 18);
+    if (!lust_path_exists(&path)) { free(path.p); return UINT64_MAX; }
+    lust_pb_pop(&path);
+    while (lust_path_starts(path.p, path.n, mount)) {
+        lust_pb_push(&path, "cpu.max", 7);
+        char *buf;
+        size_t n;
+        if (lust_read_file(path.p, 1, &buf, &n)) {
+            /* `read_buf.lines().next()?`, then two ' '-split fields; a
+               missing one ends the whole walk (the `?` leaves the try block). */
+            if (n == 0) { free(buf); break; }
+            size_t e = 0;
+            while (e < n && buf[e] != '\n') e++;
+            if (e < n && e > 0 && buf[e - 1] == '\r') e--; /* `\r` only before `\n` */
+            size_t sp = 0;
+            while (sp < e && buf[sp] != ' ') sp++;
+            if (sp == e) { free(buf); break; }
+            size_t pe = sp + 1;
+            while (pe < e && buf[pe] != ' ') pe++;
+            uint64_t limit, period;
+            if (lust_parse_usize(buf, sp, &limit) && lust_parse_usize(buf + sp + 1, pe - sp - 1, &period) && period > 0) {
+                uint64_t q = limit / period;
+                if (q < quota) quota = q;
+            }
+            free(buf);
+        }
+        lust_pb_pop(&path);
+        lust_pb_pop(&path);
+    }
+    free(path.p);
+    return quota;
+}
+
+/* `parse_file` of quota_v1: <dir>/<name> trimmed, as a usize. */
+static int lust_v1_file(lust_pb *path, const char *name, uint64_t *v) {
+    lust_pb_push(path, name, strlen(name));
+    char *buf;
+    size_t n;
+    int ok = lust_read_file(path->p, 1, &buf, &n);
+    lust_pb_pop(path);
+    if (!ok) return 0;
+    lust_str t = lust_str_trim((lust_str){(uint8_t *)buf, n});
+    ok = lust_parse_usize((const char *)t.ptr, t.len, v);
+    free(buf);
+    return ok;
+}
+
+/* Field `idx` of `s` split on ' '. */
+static void lust_field(const char *s, size_t n, size_t idx, const char **f, size_t *fn) {
+    size_t a = 0, k = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i == n || s[i] == ' ') {
+            if (k++ == idx) { *f = s + a; *fn = i - a; return; }
+            a = i + 1;
+        }
+    }
+    *f = s + n;
+    *fn = 0;
+}
+
+/* `find_mountpoint`: a cgroup v1 mount with the cpu controller whose
+   root holds `group`. 1 with *mount (malloc'd) and the group path
+   below it; 0 for std's None. */
+static int lust_v1_mountpoint(const char *group, size_t gn, char **mount, const char **sub, size_t *sub_n) {
+    char *buf;
+    size_t n;
+    /* read_line fails on bytes that are not UTF-8: read all of it, and
+       stop at the first line that is not valid. */
+    if (!lust_read_file("/proc/self/mountinfo", 0, &buf, &n)) return 0;
+    int found = 0;
+    size_t at = 0;
+    while (at < n) {
+        size_t e = at;
+        while (e < n && buf[e] != '\n') e++;
+        size_t next = e < n ? e + 1 : e;
+        uint64_t up;
+        uint8_t el;
+        if (!lust_utf8_check((const uint8_t *)buf + at, next - at, &up, &el)) break;
+        lust_str line = lust_str_trim((lust_str){(uint8_t *)buf + at, e - at});
+        at = next;
+        /* Fields split on ' ': sub_path = [3], mount_point = [4],
+           mount_opts = last, filesystem_type = third from last. */
+        const char *L = (const char *)line.ptr;
+        size_t k = 1;
+        for (size_t i = 0; i < line.len; i++) k += L[i] == ' ';
+        if (k < 8) break;
+        const char *sp, *mp, *opts, *fs;
+        size_t spn, mpn, optn, fsn;
+        lust_field(L, line.len, 3, &sp, &spn);
+        lust_field(L, line.len, 4, &mp, &mpn);
+        lust_field(L, line.len, k - 1, &opts, &optn);
+        lust_field(L, line.len, k - 3, &fs, &fsn);
+        int cpu = 0;
+        for (size_t i = 0, b = 0; i <= optn; i++) {
+            if (i == optn || opts[i] == ',') {
+                if (i - b == 3 && memcmp(opts + b, "cpu", 3) == 0) cpu = 1;
+                b = i + 1;
+            }
+        }
+        if (fsn != 6 || memcmp(fs, "cgroup", 6) != 0 || !cpu) continue;
+        const char *rel;
+        size_t reln;
+        if (!lust_path_strip(sp, spn, "/", 1, &rel, &reln)) break;
+        const char *rest;
+        size_t restn;
+        if (!lust_path_strip(group, gn, rel, reln, &rest, &restn)) continue;
+        *mount = (char *)malloc(mpn + 1);
+        memcpy(*mount, mp, mpn);
+        (*mount)[mpn] = 0;
+        *sub = rest;
+        *sub_n = restn;
+        found = 1;
+        break;
+    }
+    free(buf);
+    return found;
+}
+
+/* `quota_v1`: the first cpu-controller mount that holds the cgroup,
+   walked up to the mount's root. */
+static uint64_t lust_quota_v1(const char *group, size_t gn) {
+    uint64_t quota = UINT64_MAX;
+    lust_pb path = {0, 0, 0};
+    for (int m = 0; m < 3; m++) {
+        char *owned = 0;
+        const char *mount, *g = group;
+        size_t g_n = gn;
+        if (m == 0) mount = "/sys/fs/cgroup/cpu";
+        else if (m == 1) mount = "/sys/fs/cgroup/cpu,cpuacct";
+        else if (lust_v1_mountpoint(group, gn, &owned, &g, &g_n)) mount = owned;
+        else continue;
+        path.n = 0;
+        lust_pb_push(&path, mount, strlen(mount));
+        lust_pb_push(&path, g, g_n);
+        if (!lust_path_exists(&path)) { free(owned); continue; }
+        while (lust_path_starts(path.p, path.n, mount)) {
+            uint64_t limit, period;
+            int has_l = lust_v1_file(&path, "cpu.cfs_quota_us", &limit);
+            int has_p = lust_v1_file(&path, "cpu.cfs_period_us", &period);
+            if (has_l && has_p && period > 0 && limit / period < quota) quota = limit / period;
+            lust_pb_pop(&path);
+        }
+        free(owned);
+        break;
+    }
+    free(path.p);
+    return quota;
+}
+
+/* `cgroups::quota`: the CPU quota in whole cores (rounded down), or
+   UINT64_MAX when there is none or it cannot be read. */
+static uint64_t lust_cgroup_quota(void) {
+    char *buf;
+    size_t n;
+    if (!lust_read_file("/proc/self/cgroup", 0, &buf, &n)) return UINT64_MAX;
+    /* The fold over the lines: (path, version) of the last v1 line with
+       the cpu controller, else of the last v2 line; a matching line
+       with no third field resets it (the `?` in the closure). */
+    int have = 0, v1 = 0;
+    size_t ps = 0, pn = 0;
+    for (size_t at = 0;;) {
+        size_t e = at;
+        while (e < n && buf[e] != '\n') e++;
+        const char *c1 = memchr(buf + at, ':', e - at);
+        if (c1) {
+            const char *f1 = c1 + 1;
+            const char *c2 = memchr(f1, ':', (size_t)(buf + e - f1));
+            size_t f1n = (size_t)((c2 ? c2 : buf + e) - f1);
+            int ver = 0; /* 2: v2, 1: v1 */
+            if (f1n == 0) ver = 2;
+            else {
+                uint64_t up;
+                uint8_t el;
+                if (lust_utf8_check((const uint8_t *)f1, f1n, &up, &el)) {
+                    for (size_t i = 0, b = 0; i <= f1n; i++) {
+                        if (i == f1n || f1[i] == ',') {
+                            if (i - b == 3 && memcmp(f1 + b, "cpu", 3) == 0) ver = 1;
+                            b = i + 1;
+                        }
+                    }
+                }
+            }
+            if (ver && !(have && ver == 2)) {
+                if (!c2) have = 0;
+                else {
+                    size_t f2 = (size_t)(c2 + 1 - buf), f2n = e - f2;
+                    if (f2n == 0) {
+                        free(buf);
+                        lust_panic_std("range start index 1 out of range for slice of length 0", "std/src/sys/thread/unix.rs:843:31");
+                        return UINT64_MAX;
+                    }
+                    have = 1;
+                    v1 = ver == 1;
+                    ps = f2 + 1;
+                    pn = f2n - 1;
+                }
+            }
+        }
+        if (e >= n) break;
+        at = e + 1;
+    }
+    uint64_t q = UINT64_MAX;
+    if (have) q = v1 ? lust_quota_v1(buf + ps, pn) : lust_quota_v2(buf + ps, pn);
+    free(buf);
+    return q;
+}
+
+#endif
+
+/* `thread::available_parallelism` on Linux: the count (> 0), or 0 with
+   *err an errno (`last_os_error`) or -1 (`UNKNOWN_THREAD_COUNT`). */
 uint64_t lust_avail_parallelism(int32_t *err) LUST_BODY({
     *err = 0;
-    uint64_t quota = lust_cgroup_quota();
-    if (quota > 0) return quota;
+    uint64_t quota = UINT64_MAX;
+#if defined(__linux__)
+    quota = lust_cgroup_quota();
+    if (lust_unw_pending && lust_unw_mine()) return 1;
+    if (quota < 1) quota = 1;
 #ifdef LUST_SYS_SCHED_GETAFFINITY
+    /* glibc's cpu_set_t is 128 bytes; the wrapper zeroes what the
+       kernel does not write, as the zeroed mask here. */
     uint64_t mask[16] = {0};
-    long r = syscall(LUST_SYS_SCHED_GETAFFINITY, 0, sizeof mask, mask);
-    if (r < 0) {
+    if (syscall(LUST_SYS_SCHED_GETAFFINITY, 0, sizeof mask, mask) >= 0) {
+        uint64_t count = 0;
+        for (int i = 0; i < 16; i++) count += (uint64_t)__builtin_popcountll(mask[i]);
+        if (count > quota) count = quota;
+        if (count > 0) return count;
+    }
+#endif
+#endif
+    long cpus = sysconf(LUST_SC_NPROCESSORS_ONLN);
+    if (cpus == -1) {
         *err = errno;
         return 0;
     }
-    uint64_t n = 0;
-    for (int i = 0; i < 16; i++) n += (uint64_t)__builtin_popcountll(mask[i]);
-    if (n > 0) return n;
-    *err = 0;
-    return 1;
-#else
-    *err = 38; /* ENOSYS */
-    return 0;
-#endif
+    if (cpus == 0) {
+        *err = -1;
+        return 0;
+    }
+    return (uint64_t)cpus < quota ? (uint64_t)cpus : quota;
 })
 
 /* Waits for the thread; the caller then moves the result out and calls
