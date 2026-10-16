@@ -7,7 +7,7 @@
 use super::*;
 
 impl<'p> Ctx<'p> {
-    /// The associated fns `Rc::downgrade`, `Rc::ptr_eq`, `Weak::new`,
+    /// The associated fns `Rc::downgrade`, `Rc::new_cyclic`, `Rc::ptr_eq`, `Weak::new`,
     /// `Weak::ptr_eq`, `RefCell::new`, and `Cell::new`. None when
     /// `ty_name::item` is none of these (the caller goes on); a known
     /// type with an item lust lacks rejects here. A user type of the
@@ -20,6 +20,7 @@ impl<'p> Ctx<'p> {
         }
         let b = match (t.as_str(), i.as_str()) {
             ("Rc", "downgrade") => Builtin::RcDowngrade,
+            ("Rc", "new_cyclic") => Builtin::RcNewCyclic,
             ("Rc", "ptr_eq") => Builtin::RcPtrEq,
             ("Rc", "as_ptr") => Builtin::SmartAsPtr,
             ("Weak", "new") => Builtin::WeakNew,
@@ -79,6 +80,16 @@ impl<'p> Ctx<'p> {
                 let rc = self.tys.mk_rc(elem);
                 let r = self.tys.mk_ref(false, rc);
                 (vec![r], mk(self, |d| d.weak))
+            }
+            // `Rc::new_cyclic<F: FnOnce(&Weak<T>) -> T>(data_fn)`, in
+            // std's `impl<T> Rc<T>` (a sized `T`).
+            Builtin::RcNewCyclic => {
+                let span = self.p.ast.expr_span(callee);
+                self.deferred_sized.push((elem, span));
+                let w = mk(self, |d| d.weak);
+                let wref = self.tys.mk_ref(false, w);
+                let f = self.fn_once_param(&[wref], elem, span);
+                (vec![f], self.tys.mk_rc(elem))
             }
             Builtin::RcPtrEq => {
                 let rc = self.tys.mk_rc(elem);

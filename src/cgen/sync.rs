@@ -849,15 +849,16 @@ impl FnGen<'_, '_> {
         t
     }
 
-    /// `Arc::new_cyclic(data_fn)` (TRIAGE T5): allocate the counted
-    /// header with strong count 0 (so `upgrade` inside `data_fn`
-    /// fails, as in std), run the closure with a Weak to it, store
-    /// its value, then publish strong count 1 and drop the
-    /// temporary Weak. A panic in `data_fn` under unwind leaves the
+    /// `Arc::new_cyclic(data_fn)` (TRIAGE T5) and `Rc::new_cyclic`
+    /// (`atomic` false): allocate the counted header with strong
+    /// count 0 (so `upgrade` inside `data_fn` fails, as in std), run
+    /// the closure with a Weak to it, store its value, then publish
+    /// strong count 1; the Weak's count becomes the strong refs'
+    /// implicit one. A panic in `data_fn` under unwind leaves the
     /// allocation uninitialized with strong 0: std drops it once
     /// the last Weak goes; lust's weak drop only frees through the
     /// header, so it can leak in that case.
-    pub(super) fn arc_new_cyclic(&mut self, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
+    pub(super) fn new_cyclic(&mut self, ops: &[Operand], loc: &str, post: &mut Vec<String>, atomic: bool) -> String {
         let callee = self.callee_of(&ops[0]);
         let once = !matches!(callee, Callee::Closure(_, false));
         let (env, env_ty) = self.operand(&ops[0], loc, post);
@@ -873,7 +874,8 @@ impl FnGen<'_, '_> {
         let (h, ev, w) = (self.tmp(), self.tmp(), self.tmp());
         let _ = writeln!(
             self.out,
-            "    {it} *{h} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {h}->strong = 0; {h}->weak = 1; lust_arc_downgrade((uint64_t*){h}); {} {ev} = {env}; {it} *{w} = {h};",
+            "    {it} *{h} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {h}->strong = 0; {h}->weak = 1;{} {} {ev} = {env}; {it} *{w} = {h};",
+            if atomic { format!(" lust_arc_downgrade((uint64_t*){h});") } else { String::new() },
             ctype(&env_ty)
         );
         let mut body = String::new();
@@ -883,7 +885,11 @@ impl FnGen<'_, '_> {
             self.want(Glue::Drop, &env_ty);
             let _ = writeln!(self.out, "    drop_{}(&{ev});", mangle(&env_ty));
         }
-        let _ = writeln!(self.out, "    {h}->v = {v}; lust_arc_inc(&({h})->strong); (void)lust_arc_dec(&({h})->weak);");
+        if atomic {
+            let _ = writeln!(self.out, "    {h}->v = {v}; lust_arc_inc(&({h})->strong); (void)lust_arc_dec(&({h})->weak);");
+        } else {
+            let _ = writeln!(self.out, "    {h}->v = {v}; {h}->strong = 1;");
+        }
         let _ = loc;
         format!("({h})")
     }

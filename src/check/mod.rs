@@ -727,6 +727,9 @@ pub enum Builtin {
     SliceBinarySearchBy,
     SliceBinarySearchByKey,
     RcDowngrade,
+    /// `Rc::new_cyclic(data_fn)`: `data_fn` gets a Weak to the value
+    /// it builds (cgen/sync.rs `new_cyclic`).
+    RcNewCyclic,
     RcPtrEq,
     WeakNew,
     WeakUpgrade,
@@ -14356,7 +14359,7 @@ impl<'p> Ctx<'p> {
                         let opt = self.tys.mk_option(r);
                         (vec![rm], opt)
                     }
-                    Builtin::RcDowngrade | Builtin::RcPtrEq | Builtin::SmartAsPtr | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
+                    Builtin::RcDowngrade | Builtin::RcNewCyclic | Builtin::RcPtrEq | Builtin::SmartAsPtr | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
                         self.cell_call_sig(b, callee)
                     }
                     Builtin::DefaultGlue => match self.cow_default_sig(callee, span) {

@@ -4223,8 +4223,8 @@ impl FnGen<'_, '_> {
         if b == B::Sync(crate::check::sync::SyncOp::CatchUnwind) {
             return self.catch_unwind_call(ops, loc, post);
         }
-        if b == B::Sync(crate::check::sync::SyncOp::ArcNewCyclic) {
-            return self.arc_new_cyclic(ops, loc, post);
+        if b == B::Sync(crate::check::sync::SyncOp::ArcNewCyclic) || b == B::RcNewCyclic {
+            return self.new_cyclic(ops, loc, post, b != B::RcNewCyclic);
         }
         let mut vals = Vec::new();
         let mut tys = Vec::new();
@@ -4271,7 +4271,7 @@ impl FnGen<'_, '_> {
             }
         };
         match b {
-            B::Sync(_) => unreachable!("sync builtins emit in cgen/sync.rs"),
+            B::Sync(_) | B::RcNewCyclic => unreachable!("sync builtins and new_cyclic emit in cgen/sync.rs"),
             B::OwnFrom(_) | B::OwnIntoString => unreachable!("owning pointer builtins emit in cgen/own.rs"),
             B::IntToLeBytes | B::IntToBeBytes | B::IntToNeBytes | B::IntFromLeBytes | B::IntFromBeBytes | B::IntFromNeBytes => {
                 unreachable!("byte conversions emit in cgen/bytes.rs")
