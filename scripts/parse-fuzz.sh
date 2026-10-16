@@ -32,7 +32,9 @@ known = [b"(", b"", b"pub(", b"fn", b"{", b"'", b'"', b"/*", b"r#", b"r#self",
          b"struct S {", b"match x {", b"#[",
          b"fn main() { let x = " + b"(" * 5000 + b"1",
          b"fn main() { let x: i64 = 1" + b" + 1" * 5000 + b"; }",
-         b"fn main() { let x: i64 = " + b"-" * 5000 + b"1; }"]
+         b"fn main() { let x: i64 = " + b"-" * 5000 + b"1; }",
+         # fx-parsehang: an error-typed argument against a blanket `&T` impl took minutes.
+         b"fn f<P: AsRef<std::path::Path>>(p: P) {} fn main() { " + b"f(&target); " * 16 + b"}"]
 
 def write(i, data):
     with open(os.path.join(work, "case-%05d.rs" % i), "wb") as f:

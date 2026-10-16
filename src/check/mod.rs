@@ -4355,6 +4355,19 @@ impl<'p> Ctx<'p> {
             TraitRef { args, ..tr }
         };
         let self_ty = self.deep(self.tys.args(tr.args)[0].as_ty().unwrap_or(ERROR));
+        // An input with the error type (a name that did not resolve) has its
+        // diagnostic already, and it matches every impl header: `&{error}: AsRef<P>`
+        // picked the blanket `&T` impl with `T` unbound, which queued fresh nested
+        // obligations each round, so a few of them took minutes (fx-parsehang). The
+        // obligation holds instead, as in rustc.
+        for i in 0..self.tys.args(tr.args).len() {
+            if let Some(t) = self.tys.args(tr.args)[i].as_ty() {
+                let t = self.deep(t);
+                if self.has_error_kind(t) {
+                    return Selection::ParamEvidence(usize::MAX);
+                }
+            }
+        }
         // A projection that cannot normalize while an input is still a
         // variable (`<u32 as TryInto<?T>>::Error: Debug` from
         // `x.try_into().unwrap()` before a later use names `?T`) waits
