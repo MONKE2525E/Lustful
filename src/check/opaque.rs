@@ -233,19 +233,24 @@ impl Ctx<'_> {
         }
         let p = self.p;
         let mut found: Vec<Ty> = Vec::new();
-        collect_opaques(&self.tys, t, &mut found);
+        collect_opaques_deep(&p.gx.opaque_hidden, &mut self.tys, t, &mut found);
         for o in found {
             if let TyKind::Opaque(od, _) = self.tys.kind(o)
                 && let Some(info) = p.gx.opaques.get(&od)
             {
                 let _ = p.sig_of(&mut self.out.reads, info.owner);
                 if let TyKind::Opaque(_, args) = self.tys.kind(o)
-                    && p.gx.opaque_hidden.contains_key(&od)
+                    && let Some(&h) = p.gx.opaque_hidden.get(&od)
                 {
-                    let h = reveal(&p.gx.opaque_hidden, &mut self.tys, o, 0);
+                    // The closures of this opaque's own hidden type (not of
+                    // the opaques nested in it: `found` has those with their
+                    // own args), as the full reveal names them.
+                    let a: Vec<GenericArg> = self.tys.args(args).to_vec();
+                    let h = subst(&mut self.tys, h, &a);
                     let mut cts = Vec::new();
                     collect_closures(&self.tys, h, &mut cts);
                     for ct in cts {
+                        let ct = reveal(&p.gx.opaque_hidden, &mut self.tys, ct, 0);
                         if let TyKind::Closure(d, _) = self.tys.kind(ct)
                             && !self.opaque_closure_args.contains(&(d, args, ct))
                         {
@@ -277,7 +282,7 @@ impl Ctx<'_> {
         for t in std::mem::take(&mut self.opaque_calls) {
             self.default_literal_vars(t);
             let t = self.deep(t);
-            collect_opaques(&self.tys, t, &mut found);
+            collect_opaques_deep(&p.gx.opaque_hidden, &mut self.tys, t, &mut found);
         }
         let mut map: Vec<(Ty, DefId)> = Vec::new();
         // Per generic opaque met: its args and its hidden closure types.
@@ -725,6 +730,27 @@ pub(crate) fn ty_contains(tys: &impl TyIntern, t: Ty, inner: Ty) -> bool {
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| ty_contains(tys, e, inner)),
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Projection(_, a) => in_args(a),
         _ => false,
+    }
+}
+
+/// The opaque types in `t` and, at every depth, in their hidden types,
+/// outermost first, each once. A plain `fn outer() -> impl Iterator`
+/// whose body returns `inner::<u32>()` has the hidden type
+/// `Opaque(inner, [u32])`: the closures that `outer()`'s value holds are
+/// `inner::<u32>`'s, which only this walk finds (`callee_ret`,
+/// `build_closure_map`).
+fn collect_opaques_deep(hidden: &FxMap<DefId, Ty>, tys: &mut impl TyIntern, t: Ty, out: &mut Vec<Ty>) {
+    collect_opaques(tys, t, out);
+    let mut i = 0;
+    while i < out.len() && i < 64 {
+        if let TyKind::Opaque(od, a) = tys.kind(out[i])
+            && let Some(&h) = hidden.get(&od)
+        {
+            let args: Vec<GenericArg> = tys.args(a).to_vec();
+            let h = subst(tys, h, &args);
+            collect_opaques(tys, h, out);
+        }
+        i += 1;
     }
 }
 
