@@ -113,6 +113,35 @@ def cargo_scenario(srcdir, name, work, env, daemon):
     return problems, notes
 
 
+def daemon_env(srcdir):
+    """`daemon_env` in a scenario dir: K=V lines for the daemon only (for
+    example LUST_GUARD_HOLD_MS, which keeps guard checks in flight while
+    later versions are written)."""
+    path = os.path.join(srcdir, "daemon_env")
+    if not os.path.exists(path):
+        return {}
+    pairs = (l.strip().partition("=") for l in open(path) if l.strip())
+    return {k.strip(): v.strip() for k, _, v in pairs}
+
+
+def guard_problems(log_path, name, wait=120):
+    """Waits until every started background guard check is done, then
+    returns one problem per `guard:` line (a warm answer that a fresh
+    session disagreed with, or a panic), as the fuzz gate counts them."""
+    t0 = time.time()
+    while True:
+        text = open(log_path).read()
+        started = len(re.findall(r"^guard-check: start ", text, re.M))
+        done = len(re.findall(r"^guard-check: done ", text, re.M))
+        if done >= started or time.time() - t0 > wait:
+            break
+        time.sleep(0.05)
+    problems = [f"{name}: {l.strip()[:300]}" for l in text.splitlines() if l.startswith("guard:")]
+    if done < started:
+        problems.append(f"{name}: {started - done} guard check(s) still running after {wait} s")
+    return problems
+
+
 def scenario(srcdir):
     """Returns (name, problems, notes). One temp dir and one daemon per
     scenario; versions are applied in order with strictly rising mtimes."""
@@ -123,7 +152,7 @@ def scenario(srcdir):
     env.pop("LUST_NO_DAEMON", None)
     oracle_path = oracle_log.setup(env, work)
     log = open(os.path.join(work, "daemon.log"), "w")
-    daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=env, stderr=log,
+    daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=dict(env, **daemon_env(srcdir)), stderr=log,
                               start_new_session=True)
     main = os.path.join(work, "main.rs")
     problems, notes = [], []
@@ -145,12 +174,19 @@ def scenario(srcdir):
             mtime += 2
             vpath = os.path.join(srcdir, v)
             if os.path.isdir(vpath):
+                new = set(os.listdir(vpath))
                 for f in os.listdir(work):
-                    if f.endswith(".rs"):
+                    if f.endswith(".rs") and f not in new:
                         os.remove(os.path.join(work, f))
-                for f in os.listdir(vpath):
+                # A file with the same bytes is left alone, as an editor
+                # would (guard01 edits only a module file).
+                for f in new:
                     dst = os.path.join(work, f)
-                    shutil.copyfile(os.path.join(vpath, f), dst)
+                    src = open(os.path.join(vpath, f), "rb").read()
+                    if os.path.exists(dst) and open(dst, "rb").read() == src:
+                        continue
+                    with open(dst, "wb") as out:
+                        out.write(src)
                     os.utime(dst, (mtime, mtime))
             else:
                 shutil.copyfile(vpath, main)
@@ -199,6 +235,9 @@ def scenario(srcdir):
                 problems.append(f"{tag}: {hits[oracle_seen][:300]}")
                 oracle_seen = len(hits)
     finally:
+        # Every scenario, cargo mode too (the returned tuple holds this same list).
+        log.flush()
+        problems.extend(guard_problems(os.path.join(work, "daemon.log"), name))
         try:
             os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
         except Exception:
