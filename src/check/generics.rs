@@ -1661,20 +1661,10 @@ fn dyn_args_have_regions(ast: &Ast, interner: &Interner, path: &[ast::PathSeg]) 
             AstArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => has_ref(ast, *t),
             _ => false,
         }),
-        GenericArgs::Parenthesized { inputs, output } => {
-            inputs.iter().any(|&t| names_lifetime_beyond_static_refs(ast, interner, t))
-                || output.is_some_and(|t| names_lifetime_beyond_static_refs(ast, interner, t))
-        }
+        // `Fn` sugar keeps its written lifetimes (R11).
+        GenericArgs::Parenthesized { .. } => false,
         _ => false,
     })
-}
-
-/// `names_lifetime` that lets `'static` on a reference pass (`&'static
-/// Message`): fn pointer types and `dyn Fn*` sugar keep it
-/// (`Scope::static_refs`). A `'static` lifetime arg of an Adt there still
-/// names a lifetime: erased Adts carry no lifetime args to keep it in.
-fn names_lifetime_beyond_static_refs(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
-    names_lifetime_with(ast, interner, id, true)
 }
 
 /// The one lifetime of the enclosing item that fn pointer type `id`
@@ -2744,6 +2734,7 @@ fn resolve_trait_path_args(
                 s.late_out = Some(match one {
                     Some(Region::Static) => Region::Static,
                     Some(Region::Bound(_)) | None => crate::ty::DYN_LATE,
+                    Some(r @ Region::Param(_)) if matches!(scope.regions, RegionMode::Keep { .. }) => r,
                     Some(_) => Region::Erased,
                 });
                 out_scope = s;
@@ -3016,7 +3007,11 @@ pub fn resolve_scoped(
             None => Err(not_yet("L0602", span, "`impl Trait` types in this position")),
         },
         TyExpr::Dyn { binder, bounds, lifetime } => {
-            let ty = resolve_dyn(ast, interner, known, cx, tys, &scope.erased(), binder, bounds, *lifetime, span)?;
+            // The trait args keep the scope's region mode (R11): a written
+            // lifetime there is a free region of the object.
+            let mut ds = scope.clone();
+            ds.fn_ptr_free = false;
+            let ty = resolve_dyn(ast, interner, known, cx, tys, &ds, binder, bounds, *lifetime, span)?;
             keep_object_lifetime(interner, tys, scope, ty, bounds, *lifetime, span)
         }
         TyExpr::FnPtr { qual, inputs, variadic, ret, binder } => {
@@ -3288,7 +3283,7 @@ fn resolve_dyn(
                     return Err(Diag::new(
                         "L0203",
                         span,
-                        "a type with lifetime parameters in the arguments of a `dyn Fn` type is not supported yet",
+                        "a std type with a lifetime (`Chars`, a guard, a borrowing iterator) in the arguments of a `dyn Fn` type is not supported yet",
                         "Use a reference to an owned type, or a generic `F: Fn(..)` parameter.",
                     ));
                 }
@@ -3311,13 +3306,15 @@ fn resolve_dyn(
     Ok(tys.intern(TyKind::Dyn(bounds_id, region)))
 }
 
-/// True when a `dyn Fn*` principal's inputs or output hold an Adt with
-/// lifetime params (`Chars`, `V<'_>`), also inside nested `dyn` args.
+/// True when a `dyn Fn*` principal's inputs or output hold a builtin Adt
+/// with a lifetime (`Chars`, `Ref<T>`), also inside nested `dyn` args:
+/// its lifetime has no arg to keep (a user Adt's does, R11).
 fn sugar_has_adt_regions(cx: &ResolveCx, tys: &impl TyIntern, tr: TraitRef) -> bool {
     fn go(cx: &ResolveCx, tys: &impl TyIntern, t: Ty) -> bool {
         match tys.kind(t) {
             TyKind::Adt(_, a) => {
-                crate::borrowck::adt_region_count(cx.adt_lifetimes, tys, t) > 0 || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| go(cx, tys, e)))
+                (tys.builtin_of(t).is_some() && crate::borrowck::adt_region_count(cx.adt_lifetimes, tys, t) > 0)
+                    || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| go(cx, tys, e)))
             }
             TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => go(cx, tys, e),
             TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(cx, tys, e)),
@@ -3993,19 +3990,25 @@ pub(crate) fn resolve_path_ty(
         if n_lts > 0 && matches!(scope.regions, RegionMode::Keep { .. }) {
             let mut all: Vec<GenericArg> = Vec::with_capacity(n_lts + gargs.len());
             for i in 0..n_lts {
-                all.push(GenericArg::Lifetime(scope_region(interner, scope, written.get(i).copied(), span)?));
+                // In a dyn's `Fn*` sugar an elided one is the object's (R11).
+                all.push(GenericArg::Lifetime(ref_region(interner, scope, written.get(i).copied(), span)?));
             }
             all.extend(gargs);
             return Ok(tys.mk_adt(def, &all));
         }
-        // In a dyn's `Fn*` sugar (R11) an elided lifetime is the object's
-        // own, late-bound: the erased Adt keeps its lifetime args then,
-        // `DYN_LATE` there (a written one stays free, `Erased`).
-        if n_lts > 0 && scope.late_elided && (written.is_empty() || written.iter().any(|lt| interner.get(lt.name) == "_")) {
+        // In a dyn's trait args (R11) an elided lifetime of `Fn*` sugar is
+        // the object's own, late-bound: the erased Adt keeps its lifetime
+        // args then, `DYN_LATE` there, and so it does for a written
+        // `'static` (a written named one is free, `Erased`).
+        let kept = |lt: &ast::Lifetime| matches!(interner.get(lt.name), "_" | "static");
+        if n_lts > 0 && scope.dyn_args && ((scope.late_elided && written.is_empty()) || written.iter().any(kept)) {
             let mut all: Vec<GenericArg> = Vec::with_capacity(n_lts + gargs.len());
             for i in 0..n_lts {
-                let named = written.get(i).is_some_and(|lt| interner.get(lt.name) != "_");
-                all.push(GenericArg::Lifetime(if named { Region::Erased } else { crate::ty::DYN_LATE }));
+                all.push(GenericArg::Lifetime(match written.get(i).map(|lt| interner.get(lt.name)) {
+                    Some("static") => Region::Static,
+                    Some(n) if n != "_" => Region::Erased,
+                    _ => ref_region(interner, scope, None, span)?,
+                }));
             }
             all.extend(gargs);
             return Ok(tys.mk_adt(def, &all));

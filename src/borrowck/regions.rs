@@ -1047,8 +1047,17 @@ fn regions_walk(tys: &impl TyIntern, t: Ty, fn_ptrs: bool, out: &mut Vec<Region>
     let regions_of = |tys: &_, t, out: &mut Vec<Region>| regions_walk(tys, t, fn_ptrs, out);
     match tys.kind(t) {
         TyKind::Ref(r, _, inner) => {
-            out.push(r);
+            if !bound(r) {
+                out.push(r);
+            }
             regions_of(tys, inner, out);
+        }
+        // The free regions of a dyn's trait args (R11); its object
+        // lifetime is not counted here.
+        TyKind::Dyn(..) => {
+            for e in dyn_arg_tys(tys, t) {
+                regions_of(tys, e, out);
+            }
         }
         TyKind::Adt(_, args) => {
             if tys.is_chars_ty(t) {
@@ -1057,8 +1066,8 @@ fn regions_walk(tys: &impl TyIntern, t: Ty, fn_ptrs: bool, out: &mut Vec<Region>
             for g in tys.args(args).to_vec() {
                 match g {
                     GenericArg::Ty(e) => regions_of(tys, e, out),
-                    GenericArg::Lifetime(r) => out.push(r),
-                    GenericArg::Const(_) => {}
+                    GenericArg::Lifetime(r) if !bound(r) => out.push(r),
+                    _ => {}
                 }
             }
         }

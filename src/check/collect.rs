@@ -4579,6 +4579,8 @@ pub fn collect_reuse(
             }
         }
         let mut scope = parent_gen.scope.clone();
+        // `impl Tr + 'a` arguments take `T: 'a` like written params do.
+        scope.type_outlives |= matches!(loc, FnLoc::Item(_) | FnLoc::Nested(_));
         scope.lifetimes.extend(own_scope.lifetimes.iter().copied());
         scope.region_facts.extend(own_scope.region_facts.iter().copied());
         scope.type_params.extend(own_scope.type_params.iter().copied());
