@@ -2374,6 +2374,14 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
                         "Rename the parameter: this name is an enum variant, so it would be a pattern, not a binding.",
                     );
                 }
+                PatIdent::Variant(a, _) if p.adt(a).variants[0].shape != VariantShape::Unit => {
+                    cx.err(
+                        "L0110",
+                        param.span,
+                        "function parameters cannot shadow tuple structs",
+                        "Rename the parameter: this name is a tuple struct here.",
+                    );
+                }
                 PatIdent::Variant(a, _) => {
                     // A unit struct name as a parameter is a unit
                     // pattern: legal only against its own type.
@@ -2823,13 +2831,11 @@ impl<'p> Ctx<'p> {
         if self.type_layers.is_empty() && self.overlay_base.0.is_empty() && self.overlay_base.1.is_empty() && self.overlay_base.2.is_empty() {
             return;
         }
-        let (mut types, mut aliases, mut traits) = self.overlay_base.clone();
+        let mut acc = self.overlay_base.clone();
         for layer in &self.type_layers {
-            let (t, a, tr) = crate::check::collect::overlay_of_items(self.p, layer.clone());
-            types.extend(t);
-            aliases.extend(a);
-            traits.extend(tr);
+            crate::check::collect::overlay_extend(&mut acc, crate::check::collect::overlay_of_items(self.p, layer.clone()));
         }
+        let (types, aliases, traits) = acc;
         self.body_scope.local_types = types;
         self.body_scope.local_aliases = aliases;
         self.body_scope.local_traits = traits;
@@ -3029,6 +3035,9 @@ impl<'p> Ctx<'p> {
     /// a fresh binding. A block's items come first: a body const or
     /// static is one; a body fn is not, and it hides module items.
     fn names_pattern_item(&mut self, name: Sym) -> bool {
+        if self.local_ctor_of(name).is_some() {
+            return true;
+        }
         match self.body_item_of(name) {
             Some(crate::check::collect::BodyItem::Fn(_)) => false,
             Some(_) => true,
@@ -3046,6 +3055,13 @@ impl<'p> Ctx<'p> {
         use crate::check::collect::BodyItem;
         if self.lookup(name, span.ctxt).is_some() {
             return false;
+        }
+        // A `mut` or `ref` binding over a unit or tuple struct or an
+        // imported variant (a block struct first, R18).
+        if !plain && (self.local_ctor_of(name).is_some() || matches!(self.pat_ident(name), PatIdent::Variant(..))) {
+            let n = self.name(name).to_string();
+            self.err("L0110", span, "bindings cannot shadow unit structs, tuple structs, or variants", format!("Rename the binding: `{n}` names an item here."));
+            return true;
         }
         let what = match self.body_item_of(name) {
             Some(BodyItem::Static(_)) => "statics",
@@ -3079,6 +3095,10 @@ impl<'p> Ctx<'p> {
     fn pat_ident(&mut self, name: Sym) -> PatIdent {
         use crate::resolve::imports::{BindState, Target};
         let p = self.p;
+        // A unit or tuple struct of an enclosing block (R18).
+        if let Some(a) = self.local_ctor_of(name) {
+            return PatIdent::Variant(a, 0);
+        }
         if let BindingRes::Def(def) = self.binding(Namespace::Value, name) {
             let flat = p.resolved.as_ref().and_then(|t| t.def_info.get(&def)).map(|i| i.flat);
             match p.binding_kind(def) {
@@ -19317,7 +19337,7 @@ impl<'p> Ctx<'p> {
         // static is rejected at the binding below).
         if let Pat::Binding { name, mutable: false, by_ref: false } = p.ast.pat(pat)
             && self.lookup(*name, span.ctxt).is_none()
-            && self.body_item_of(*name).is_none()
+            && (self.local_ctor_of(*name).is_some() || self.body_item_of(*name).is_none())
             && self.const_param(*name).is_none()
         {
             match self.pat_ident(*name) {

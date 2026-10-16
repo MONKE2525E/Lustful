@@ -3975,6 +3975,54 @@ pub fn collect_reuse(
         check_generic_aliases(&mut p, &mut errs);
     }
 
+    // Pass 1.6: type aliases inside function bodies (R18), by the same
+    // fixpoint: each resolves in the overlay of the blocks around it
+    // (the Adts pass 1 numbered and the aliases resolved so far), so a
+    // later sweep picks up an alias that names a later alias; the
+    // enclosing fns' generic params are the E0401 error there. A
+    // generic alias in a body is not supported yet.
+    {
+        let mut pending: Vec<u32> = Vec::new();
+        for (si, item) in ast.stmt_items.iter().enumerate() {
+            let ItemKind::Type(a) = &item.kind else { continue };
+            if a.generics.params.is_empty() {
+                pending.push(si as u32);
+            } else {
+                errs.push(not_yet("L0820", item.span, "generic type aliases inside function bodies"));
+            }
+        }
+        let total = pending.len();
+        for _ in 0..=total {
+            if pending.is_empty() {
+                break;
+            }
+            let mut progress = false;
+            let mut first_err: Option<Diag> = None;
+            pending.retain(|&si| {
+                let item = &ast.stmt_items[si as usize];
+                let ItemKind::Type(a) = &item.kind else { return false };
+                let mut scope = generics::Scope::default();
+                apply_stmt_overlay(&p, &mut scope, item.span);
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                match generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, a.ty, &scope) {
+                    Ok(t) => {
+                        p.body_type_items.insert(si, BodyTypeItem::Alias(t));
+                        progress = true;
+                        false
+                    }
+                    Err(d) => {
+                        first_err.get_or_insert(d);
+                        true
+                    }
+                }
+            });
+            if !progress {
+                errs.extend(first_err);
+                break;
+            }
+        }
+    }
+
     // Generic pass 1.5: trait generics, method templates. Fields
     // and fn signatures after this can name traits in bounds.
     crate::driver::laps::mark("collect/adts");
@@ -5015,7 +5063,7 @@ pub fn collect_reuse(
             }
             ItemKind::Use(_) => {}
             ItemKind::Const(_) | ItemKind::Static(_) => {}
-            ItemKind::Struct(_) | ItemKind::Enum(_) => {}
+            ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Type(_) => {}
             _ => {
                 errs.push(not_yet("L0820", item.span, "type items inside function bodies"));
             }
@@ -6055,37 +6103,51 @@ fn stmt_type_overlay(
     overlay_of_items(p, visible_stmt_items(&p.item_blocks, at))
 }
 
-/// The overlay entries of the given stmt items, in order.
-pub(crate) fn overlay_of_items(
-    p: &Program,
-    idxs: Vec<u32>,
-) -> (Vec<(Sym, AdtId, Option<ast::Generics>)>, Vec<(Sym, Ty)>, Vec<(Sym, DefId)>) {
-    let (mut types, mut aliases, mut traits) = (Vec::new(), Vec::new(), Vec::new());
-    for si in idxs {
-        let Some(bti) = p.body_type_items.get(&si) else { continue };
-        let item = &p.ast.stmt_items[si as usize];
-        match *bti {
-            BodyTypeItem::Adt(id) => {
-                let (name, g) = match &item.kind {
-                    ItemKind::Struct(s) => (s.name, Some(s.generics.clone())),
-                    ItemKind::Enum(e) => (e.name, Some(e.generics.clone())),
-                    _ => continue,
-                };
-                types.push((name, id, g));
-            }
-            BodyTypeItem::Alias(t) => {
-                if let ItemKind::Type(a) = &item.kind {
-                    aliases.push((a.name, t));
-                }
-            }
-            BodyTypeItem::Trait(d) => {
-                if let ItemKind::Trait(t) = &item.kind {
-                    traits.push((t.name, d));
-                }
-            }
-        }
+/// One block layer's type tables (`generics::Scope::local_types`,
+/// `local_aliases`, `local_traits`).
+pub(crate) type TypeOverlay = (Vec<(Sym, AdtId, Option<ast::Generics>)>, Vec<(Sym, Ty)>, Vec<(Sym, DefId)>);
+
+/// Appends an inner block's overlay to `acc`. The three tables share
+/// the type namespace, so an inner entry first drops every outer entry
+/// of its name from all three: each name keeps only its innermost
+/// item, whatever kind the outer one was.
+pub(crate) fn overlay_extend(acc: &mut TypeOverlay, inner: TypeOverlay) {
+    let names: Vec<Sym> = inner.0.iter().map(|e| e.0).chain(inner.1.iter().map(|e| e.0)).chain(inner.2.iter().map(|e| e.0)).collect();
+    if !names.is_empty() {
+        acc.0.retain(|e| !names.contains(&e.0));
+        acc.1.retain(|e| !names.contains(&e.0));
+        acc.2.retain(|e| !names.contains(&e.0));
     }
-    (types, aliases, traits)
+    acc.0.extend(inner.0);
+    acc.1.extend(inner.1);
+    acc.2.extend(inner.2);
+}
+
+/// The overlay entries of the given stmt items, in order, an inner
+/// block's entries replacing outer ones of the same name
+/// (`overlay_extend`: `visible_stmt_items` lists the outermost block
+/// first, and one block holds one item per name, rustc E0428).
+pub(crate) fn overlay_of_items(p: &Program, idxs: Vec<u32>) -> TypeOverlay {
+    let mut acc: TypeOverlay = Default::default();
+    for si in idxs {
+        let mut one: TypeOverlay = Default::default();
+        overlay_item(p, si, &mut one);
+        overlay_extend(&mut acc, one);
+    }
+    acc
+}
+
+/// One stmt item's overlay entry, if it is a collected type item.
+fn overlay_item(p: &Program, si: u32, (types, aliases, traits): &mut TypeOverlay) {
+    let Some(bti) = p.body_type_items.get(&si) else { return };
+    let item = &p.ast.stmt_items[si as usize];
+    match (*bti, &item.kind) {
+        (BodyTypeItem::Adt(id), ItemKind::Struct(s)) => types.push((s.name, id, Some(s.generics.clone()))),
+        (BodyTypeItem::Adt(id), ItemKind::Enum(e)) => types.push((e.name, id, Some(e.generics.clone()))),
+        (BodyTypeItem::Alias(t), ItemKind::Type(a)) => aliases.push((a.name, t)),
+        (BodyTypeItem::Trait(d), ItemKind::Trait(t)) => traits.push((t.name, d)),
+        _ => {}
+    }
 }
 
 /// Sets the body-local overlay of `scope` for an item or signature

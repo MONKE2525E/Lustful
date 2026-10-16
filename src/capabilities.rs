@@ -1517,7 +1517,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("`dyn` for traits with associated types or std supertraits other than `Debug` and `Display`", "L0702"),
     ("`dyn` coercions in const and static initializers", "L0702"),
     ("`Box<dyn Trait>`, `Rc<dyn Trait>`, `Arc<dyn Trait>`", "L0641"),
-    ("items other than `use` inside function bodies", "L0820"),
+    ("traits, impls, unions, and generic type aliases inside function bodies", "L0820"),
     ("closures as `dyn Fn` values", "L0820"),
     ("captured-variable uses outside the closure capture analysis (named in the message)", "L0820"),
     ("format spec forms other than {} and {:?} (named in the message)", "L0641"),

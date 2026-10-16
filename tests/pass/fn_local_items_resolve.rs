@@ -88,4 +88,32 @@ fn main() {
     let mk = Pair;
     println!("{:?} {:?} {:?}", Unit, Pair(1, 2), mk(3, 4));
     println!("{:?}", Kind::Root);
+    aliases();
+}
+
+// Type aliases in bodies, block struct field types from other modules,
+// and a block type item that shadows builtin and module names.
+mod more {
+    #[derive(Debug, Default, Clone)]
+    pub struct Thing(pub u8);
+}
+use more::Thing;
+#[allow(dead_code)]
+type Count = u64;
+pub fn aliases() {
+    type V = Vec<A>;
+    type A = (u8, Thing);
+    #[derive(Debug, Default)]
+    struct Holder { a: Thing, b: more::Thing, c: Vec<crate::more::Thing> }
+    let v: V = vec![(1, Thing(2))];
+    type Count = u8;
+    let c: Count = 255;
+    {
+        type Count = i8;
+        let d: Count = -1;
+        #[derive(Debug)]
+        struct String(i32);
+        println!("{} {:?}", d, String(4));
+    }
+    println!("{:?} {} {:?} {}", v, c, Holder::default(), std::mem::size_of::<Count>());
 }

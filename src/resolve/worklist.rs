@@ -4768,6 +4768,9 @@ struct Frame {
     /// through one stays written, as for `items`: check resolves it
     /// through its block type overlay (R18).
     types: Vec<(Sym, u32)>,
+    /// The unit and tuple structs among `types`: a binding pattern of
+    /// one of these names is a path pattern to it (`binding_pat`).
+    ctors: Vec<Sym>,
     /// Function-local imports of block items (`use E::V;`, `use E::*;`,
     /// `use S as T;` for a block-local `E` or `S`): (name, namespace
     /// index) to the written path the name stands for. A use site
@@ -6090,6 +6093,50 @@ impl Rewrite<'_> {
                     self.expr(ast, v, module, &mut scopes);
                 }
             }
+            // A block struct, enum, or alias: its field and target types
+            // name module items through imports and module paths as a
+            // module item's do, and see the block items around it
+            // (R18). Their generics stay their own (`gen_floor`).
+            ItemKind::Struct(s) => {
+                let mut s = s.clone();
+                let mark = self.push_params(&s.generics);
+                self.generics(ast, &mut s.generics, &mut s.where_clause, module);
+                if let VariantFields::Struct(fs) | VariantFields::Tuple(fs) = &s.fields {
+                    for t in fs.iter().map(|f| f.ty).collect::<Vec<_>>() {
+                        self.ty(ast, t, module, outer);
+                    }
+                }
+                self.gen_params.truncate(mark);
+                ast.stmt_items[idx as usize].kind = ItemKind::Struct(s);
+            }
+            ItemKind::Enum(e) => {
+                let mut e = e.clone();
+                let mark = self.push_params(&e.generics);
+                self.generics(ast, &mut e.generics, &mut e.where_clause, module);
+                let mut discs = Vec::new();
+                for v in &e.variants {
+                    if let VariantFields::Struct(fs) | VariantFields::Tuple(fs) = &v.fields {
+                        for t in fs.iter().map(|f| f.ty).collect::<Vec<_>>() {
+                            self.ty(ast, t, module, outer);
+                        }
+                    }
+                    discs.extend(v.discriminant);
+                }
+                self.gen_params.truncate(mark);
+                for d in discs {
+                    let mut scopes = outer.to_vec();
+                    self.expr(ast, d, module, &mut scopes);
+                }
+                ast.stmt_items[idx as usize].kind = ItemKind::Enum(e);
+            }
+            ItemKind::Type(a) => {
+                let mut a = a.clone();
+                let mark = self.push_params(&a.generics);
+                self.generics(ast, &mut a.generics, &mut a.where_clause, module);
+                self.ty(ast, a.ty, module, outer);
+                self.gen_params.truncate(mark);
+                ast.stmt_items[idx as usize].kind = ItemKind::Type(a);
+            }
             _ => {}
         }
     }
@@ -6180,6 +6227,7 @@ impl Rewrite<'_> {
                 frame.types.push((name, idx));
                 if ctor {
                     frame.items.push(name);
+                    frame.ctors.push(name);
                 }
             }
         }
@@ -6911,6 +6959,15 @@ impl Rewrite<'_> {
             let path = self.local_use_path(&u, name, span, scopes)?;
             return Some(Pat::Path(path.iter().map(|s| PathSeg::plain(*s)).collect()));
         }
+        // A block unit or tuple struct of the name (the innermost value
+        // binding of it) makes the pattern a path pattern, as rustc
+        // reads it: `let S = 5u8;` under `struct S;` is a type error.
+        if let Some(f) = scopes.iter().rev().find(|f| f.locals.contains(&name) || f.items.contains(&name))
+            && !f.locals.contains(&name)
+            && f.ctors.contains(&name)
+        {
+            return Some(Pat::Path(vec![PathSeg::plain(name)]));
+        }
         let (res, local) = self.resolve(&[name], Namespace::Value, module, scopes);
         if local {
             return None;
@@ -7098,7 +7155,20 @@ impl Rewrite<'_> {
                     self.diags.push(crate::resolve::imports::std_glob_name_diag(self.interner.get(name), span));
                 }
                 self.binding_over_block_import(name, !mutable && !by_ref, span, scopes);
-                let replacement = if !mutable && !by_ref { self.binding_pat(name, span, module, scopes) } else { None };
+                let replacement = self.binding_pat(name, span, module, scopes);
+                // A `mut` or `ref` binding may not reuse the name of a unit
+                // or tuple struct, a variant, or a const in scope (rustc
+                // E0530): only a plain one reads as their path pattern.
+                if (mutable || by_ref) && replacement.is_some() {
+                    let n = self.interner.get(name);
+                    self.diags.push(Diag::new(
+                        "L0110",
+                        span,
+                        format!("bindings cannot shadow `{n}`: it names a struct, variant, or constant here"),
+                        format!("Rename the binding: `{n}` names an item here."),
+                    ));
+                }
+                let replacement = if !mutable && !by_ref { replacement } else { None };
                 ast.pats[id.0 as usize] = replacement.unwrap_or(Pat::Binding { name, mutable, by_ref });
             }
             Pat::Path(mut segs) => {

@@ -3633,6 +3633,18 @@ pub(crate) fn resolve_path_ty(
                 .ok_or_else(|| Diag::new("L0102", span, "`Self` is only valid inside an impl or trait", "Write the type name."));
         }
     }
+    // A type item of an enclosing function-body block (R18) shadows the
+    // builtin, std, and module types of its name, primitives included:
+    // an alias answers here, an Adt takes the Adt path below.
+    let local_block = segs.len() == 1 && (scope.local_types.iter().any(|e| e.0 == name) || scope.local_aliases.iter().any(|e| e.0 == name));
+    if local_block && let Some(&(_, alias_ty)) = scope.local_aliases.iter().rev().find(|(n, _)| *n == name) {
+        return if seg.has_args() {
+            Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
+        } else {
+            Ok(alias_ty)
+        };
+    }
+    if !local_block {
     let no_generics = |t: Ty| -> Result<Ty, Diag> {
         if !seg.has_args() {
             Ok(t)
@@ -3916,6 +3928,7 @@ pub(crate) fn resolve_path_ty(
             ));
         }
         return Ok(subst(tys, alias_ty, &args));
+    }
     }
     // A type item declared in an enclosing function-body block
     // shadows the flat module table (R18).
