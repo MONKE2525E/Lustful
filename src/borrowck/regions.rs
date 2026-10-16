@@ -4429,9 +4429,10 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         self.flow_all(&srcs, &dv);
         // `catch_unwind(f)` returns what `f` returns, or a `'static`
-        // payload: the closure's borrows reach the result only through its
-        // output (W-UNWIND).
-        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::CatchUnwind)) = target {
+        // payload, and `b.then(f)` what `f` returns, or None: the
+        // closure's borrows reach the result only through its output
+        // (W-UNWIND; ts-rust compilerhost.rs `then(|| .. as Rc<dyn Fn()>)`).
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::CatchUnwind) | crate::check::Builtin::BoolThen) = target {
             return;
         }
         if matches!(target, CallTarget::Dyn(_)) && self.call_dyn_fn(&avs, dt, &dv) {
