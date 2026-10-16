@@ -1585,6 +1585,57 @@ pub(super) fn dyn_probe(
 /// rustc's receiver-type probe order. Returns Hit/Miss/Failed
 /// like a single probe.
 #[allow(clippy::too_many_arguments)]
+/// `Iterator` methods lust has no port of that other std traits also
+/// name (`PartialEq::eq`, `PartialOrd::partial_cmp`, `Ord::max`, ...).
+const ITER_SHADOWED: &[&str] = &["eq", "ne", "lt", "le", "gt", "ge", "partial_cmp", "cmp", "max", "min"];
+
+/// True when the receiver type `step` (the first autoderef step) is an
+/// iterator Adt, or a `&mut` or `Box` of one (core's impls make those
+/// iterators too), and `name` is one of its by-value `Iterator` methods
+/// in `ITER_SHADOWED`: rustc's by-value probe finds it before the
+/// autoref'd comparison traits (`it.eq(&other)` is `Iterator::eq`), so
+/// the search must not go on to them. A `&I` receiver is no iterator:
+/// there `PartialEq::eq` takes the step as is. `max` and `min` are
+/// lust's own iterator consumers unless the type is also `Ord` (then
+/// rustc reports the two by-value candidates, E0034).
+fn iterator_shadows(cx: &mut Ctx, step: Ty, name: Sym) -> bool {
+    let n = cx.p.interner.get(name);
+    if !ITER_SHADOWED.contains(&n) {
+        return false;
+    }
+    let step = match cx.tys.kind(step) {
+        TyKind::Ref(_, Mut::Mut, inner) => cx.resolve(inner),
+        _ => cx.tys.boxed_elem(step).map_or(step, |e| cx.resolve(e)),
+    };
+    if cx.tys.local_adt(step).is_none() {
+        return false;
+    }
+    let holds = |cx: &mut Ctx, def: DefId| {
+        let args = cx.tys.intern_args(&[GenericArg::Ty(step)]);
+        matches!(cx.select_obligation(TraitRef { def, args, bindings: EMPTY_BINDINGS }), Selection::Impl { .. } | Selection::ParamEvidence(_))
+    };
+    let lang = cx.p.gx.lang;
+    holds(cx, lang.iterator) && (!matches!(n, "max" | "min") || holds(cx, lang.ord))
+}
+
+/// The reject for an `iterator_shadows` call (L0640: the `Iterator`
+/// method is declared, lust has no port; L0104 for rustc's E0034).
+fn iterator_shadow_reject(cx: &mut Ctx, step: Ty, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
+    let n = cx.p.interner.get(name).to_string();
+    let tn = cx.tn(step);
+    if matches!(n.as_str(), "max" | "min") {
+        let msg = format!("multiple applicable items in scope: `{n}` of `Iterator` and of `Ord` for `{tn}`");
+        cx.err("L0104", name_span, msg, format!("Call it as `Iterator::{n}(x)` or `Ord::{n}(x, y)`."));
+    } else {
+        let msg = format!("the iterator method `{n}` (Rust picks `Iterator::{n}` on `{tn}`) is not implemented yet");
+        cx.err("L0640", name_span, msg, "Compare with `==` or the comparison trait's path, such as `PartialEq::eq(&a, &b)`.");
+    }
+    for &a in args {
+        cx.expr(a, None);
+    }
+    Probe::Failed
+}
+
 pub(super) fn generic_method_search(
     cx: &mut Ctx,
     e: ExprId,
@@ -1701,8 +1752,12 @@ pub(super) fn generic_method_search(
         let autoref_self = |pr: RcvProbe| RcvProbe { self_ty: pr.recv_ty, filter: ReceiverForm::Value, ..pr };
         // `&mut str` from a `String` place is not lowered: no `&mut` probe there.
         let refmut_group = if unsize && step == STR { Vec::new() } else { vec![refmut_probe, autoref_self(refmut_probe)] };
+        let iter_shadow = !unsize && derefs == 0 && iterator_shadows(cx, step, name);
         let groups = [by_value, vec![ref_probe, autoref_self(ref_probe)], refmut_group];
-        for group in &groups {
+        for (gi, group) in groups.iter().enumerate() {
+            if gi == 1 && iter_shadow {
+                return iterator_shadow_reject(cx, step, name, name_span, args);
+            }
             for &probe in group {
                 match dyn_probe(cx, e, probe, derefs, name, name_span, args, None) {
                     Probe::Miss => {}

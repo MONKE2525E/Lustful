@@ -16,6 +16,8 @@ use crate::ty::iter::{self as it, IterKind};
 /// Iterator methods Rust declares that lust does not implement yet:
 /// a call rejects with L0640 naming the method, never L0104.
 const DECLARED_ONLY: &[&str] = &[
+    "eq",
+    "ne",
     "next_chunk",
     "advance_by",
     "flat_map",
