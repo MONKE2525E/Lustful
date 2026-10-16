@@ -451,7 +451,13 @@ impl Ex<'_, '_> {
                             self.assign(dest, Rvalue::Cast(op, ty));
                             return Ok(());
                         }
+                        // The adapters call it as `FnMut::call_mut`: a
+                        // `#[track_caller]` panic reports that shim's
+                        // line in core/src/ops/function.rs, as rustc's
+                        // fn item shim does.
+                        let saved = std::mem::replace(&mut self.span, Span::std_site(15, 166, 5));
                         self.call(CallTarget::Builtin(bf), args, dest);
+                        self.span = saved;
                         return Ok(());
                     }
                 }

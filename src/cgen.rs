@@ -446,7 +446,7 @@ fn is128(i: IntTy) -> bool {
 /// core/src/iter/traits/accum.rs, 8 core/src/iter/range.rs, 9
 /// core/src/cell.rs, 10 std/src/thread/local.rs, 11 core/src/ops/arith.rs, 12
 /// core/src/slice/index.rs, 13 core/src/iter/traits/exact_size.rs, 14
-/// core/src/slice/mod.rs),
+/// core/src/slice/mod.rs, 15 core/src/ops/function.rs),
 /// plus 0x40 for `pow`. Lowering names one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFF_FF00u64 + file) << 40) | (line << 20) | col)
