@@ -2011,11 +2011,14 @@ struct Ctx<'p> {
     /// call expression: a generic method's closure arguments read it
     /// (`expected_output_first`).
     pub(super) call_expected: Option<(ExprId, Ty)>,
-    /// Variables inside a generic call's return type (not the whole of
-    /// it) that only the call's expected type fixed
-    /// (`expected_output_first`): rustc does not know them in a closure
-    /// argument's body (`ClosureCx::expect_only_output`).
-    pub(super) expect_only_vars: Vec<u32>,
+    /// Variables of a generic call's return type that only the call's
+    /// expected type fixed (`expected_output_first`), and whether the
+    /// variable is the whole return type: rustc does not know them in a
+    /// closure argument's body (`expect_only_output`).
+    pub(super) expect_only_vars: Vec<(u32, bool)>,
+    /// `return` expressions checked so far (a closure body compares it
+    /// before and after, `closure_expr`).
+    pub(super) returns_seen: u32,
     /// User `Deref` steps the method lookup is inside (a bound on
     /// `Deref` chains).
     deref_depth: u8,
@@ -2329,6 +2332,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         scope_closure_vars: Vec::new(),
         closure_bound_outputs: std::collections::HashMap::new(),
         expect_only_vars: Vec::new(),
+        returns_seen: 0,
         closure_bound_inputs: std::collections::HashMap::new(),
         closure_call_outs: std::collections::HashSet::new(),
         open_binops: Vec::new(),
@@ -7323,13 +7327,12 @@ impl<'p> Ctx<'p> {
             return;
         }
         let mut open = Vec::new();
-        if !matches!(self.kind(ret_deep), TyKind::Infer(_)) {
-            self.unbound_vars(ret_deep, &mut open);
-        }
+        self.unbound_vars(ret_deep, &mut open);
+        let whole = matches!(self.kind(ret_deep), TyKind::Infer(_));
         let snap = self.snapshot_vars();
         let obl_len = self.obl_len();
         if self.unify(ret, want) {
-            self.expect_only_vars.extend(open);
+            self.expect_only_vars.extend(open.into_iter().map(|v| (v, whole)));
         } else {
             self.rollback_vars(snap);
             self.obl_truncate(obl_len);
@@ -9184,6 +9187,7 @@ impl<'p> Ctx<'p> {
                 NEVER
             }
             Expr::Return(val) => {
+                self.returns_seen += 1;
                 let ret = self.closure_rets.last().copied().unwrap_or(self.fn_ret);
                 match val {
                     Some(v) => {

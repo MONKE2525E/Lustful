@@ -335,16 +335,19 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// True when the closure output `o` (before `deep`) holds a variable
-    /// that only the outer call's expected type fixed
-    /// (`expect_only_vars`).
-    fn expect_only_output(&self, o: Ty) -> bool {
+    /// How the closure output `o` (before `deep`) holds a variable that
+    /// only the outer call's expected type fixed (`expect_only_vars`):
+    /// `Some(true)` when each such variable is the call's whole result
+    /// (`fn ap<U>(f: impl FnOnce() -> U) -> U`), `Some(false)` when one
+    /// sits inside it (`Option<U>`), None for neither.
+    fn expect_only_output(&self, o: Ty) -> Option<bool> {
         if self.expect_only_vars.is_empty() || !self.tys.flags(o).contains_infer() {
-            return false;
+            return None;
         }
         let mut vs = Vec::new();
         self.chain_vars(o, &mut vs);
-        vs.iter().any(|v| self.expect_only_vars.contains(v))
+        let hits: Vec<bool> = self.expect_only_vars.iter().filter(|(v, _)| vs.contains(v)).map(|&(_, whole)| whole).collect();
+        (!hits.is_empty()).then(|| hits.iter().all(|&w| w))
     }
 
     /// Every variable on the binding chains inside `t`, bound ones too.
@@ -586,14 +589,14 @@ impl<'p> Ctx<'p> {
         let bound_output = bound_output.or_else(|| self.fn_ptr_bound_output(to_fn_ptr?.0));
         // The bound's types normalize here: `F: Fn(A::Item)` gives a
         // projection over the call's impl args (check/project.rs).
-        let mut expect_only = false;
+        let mut expect_only = None;
         let sig = match to_fn_ptr {
             Some((_, tuple, out)) => Some((tuple, Some(out))),
             None => match dyn_sig.or_else(|| self.expected_closure_sig(expected)) {
                 Some((ins, out)) => {
                     let ins = self.deep(ins);
                     let ins = self.normalize_use(ins, span);
-                    expect_only = out.is_some_and(|o| self.expect_only_output(o));
+                    expect_only = out.and_then(|o| self.expect_only_output(o));
                     let out = out.map(|o| {
                         let o = self.deep(o);
                         self.normalize_use(o, span)
@@ -715,9 +718,11 @@ impl<'p> Ctx<'p> {
         // a type a body could coerce to, is open in the body, as in
         // rustc: the body's type must then be that output exactly
         // (`Some(1).map(|_| &v)` with `v: &Vec<u8>` is no
-        // `Option<&Vec<u8>>`, E0308).
-        let ret = if expect_only && ret.is_none() && self.coerce_target(output) { self.new_var(false) } else { output };
+        // `Option<&Vec<u8>>`, E0308), or coerce to it when it is the
+        // call's whole result (rustc coerces the call's result then).
+        let ret = if expect_only.is_some() && ret.is_none() && self.coerce_target(output) { self.new_var(false) } else { output };
         let saved_loops = std::mem::take(&mut self.loops);
+        let returns_before = self.returns_seen;
         self.closure_rets.push(ret);
         let bt = self.expr(body, (ret == output).then_some(ret));
         // Edition 2024 never-type fallback: a body that only diverges
@@ -728,9 +733,16 @@ impl<'p> Ctx<'p> {
             self.unify(output, NEVER);
         }
         self.coerce_expr(body, bt, ret);
-        if ret != output && !self.unify(ret, output) {
-            let span = self.span(body);
-            self.mismatch(span, output, ret);
+        if ret != output {
+            // A `return` in the body coerced to `ret` only, so the
+            // result's own coercion is for a body without one.
+            if expect_only == Some(true) && self.returns_seen == returns_before {
+                let rt = self.resolve(ret);
+                self.coerce_expr(body, rt, output);
+            } else if !self.unify(ret, output) {
+                let span = self.span(body);
+                self.mismatch(span, output, ret);
+            }
         }
         self.reject_unsized_value(body);
         self.closure_rets.pop();
