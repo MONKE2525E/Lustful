@@ -591,6 +591,12 @@ impl Program {
     pub fn is_manually_drop_adt(&self, a: AdtId) -> bool {
         self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::mem::ManuallyDrop"
     }
+    /// True when Adt `a` is std's `core::cmp::Reverse` (std source,
+    /// library/core/src/cmp.rs): the compare glue orders its `T` with
+    /// the operands swapped, as each of its written methods does.
+    pub fn is_reverse_adt(&self, a: AdtId) -> bool {
+        self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::cmp::Reverse"
+    }
     /// True when Adt `a` is std's `core::ops::ControlFlow` (std source,
     /// W-STD-C): `?` on it returns its `Break` from the enclosing fn
     /// (`try_expr` in check, `try_into` in lower).
@@ -8174,6 +8180,14 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                             && match_impl_pat(p, tys, rec.self_ty(&p.tys), t, &mut Vec::new())
                     })
                 });
+            // std's `Reverse<T>`: `T`'s order, swapped (`is_reverse_adt`).
+            if let Some(a) = tys.local_adt(t)
+                && p.is_reverse_adt(a)
+                && let Some((_, args)) = tys.adt_parts(t)
+                && let Some(inner) = tys.args(args).first().and_then(|g| g.as_ty())
+            {
+                return glue_cmp_mode(p, tys, inner, total, seen, pcmp);
+            }
             match tys.local_adt(t) {
                 // A written non-generic `PartialOrd` (and no `Ord`): the
                 // glue calls its `partial_cmp`.

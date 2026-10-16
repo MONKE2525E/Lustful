@@ -1857,16 +1857,20 @@ impl<'p> Ctx<'p> {
         };
         match k {
             // core's `range_exact_iter_impl!` list: not the 64-bit,
-            // 128-bit, or `char` ranges. An integer variable is checked
-            // once it is known (`deferred_exact_range`).
-            K::Range => match self.kind(self.resolve(a[0])) {
-                TyKind::Int(i) => exact_range_int(i),
-                k if k.is_int_infer() => {
-                    self.deferred_exact_range.push((a[0], span));
-                    true
+            // 128-bit, or `char` ranges (inclusive: 8 and 16 bits only).
+            // An integer variable is checked once it is known
+            // (`deferred_exact_range`).
+            K::Range | K::RangeInclusive => {
+                let incl = k == K::RangeInclusive;
+                match self.kind(self.resolve(a[0])) {
+                    TyKind::Int(i) => exact_range_int(i, incl),
+                    k if k.is_int_infer() => {
+                        self.deferred_exact_range.push((a[0], incl, span));
+                        true
+                    }
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
             K::SliceIter
             | K::SliceIterMut
             | K::VecIntoIter
@@ -2793,6 +2797,11 @@ pub fn by_next_fns(p: &Program, src: &dyn crate::ty::TyIntern, t: Ty) -> Result<
 
 /// The integer types core's `range_exact_iter_impl!` makes
 /// `Range<T>: ExactSizeIterator`.
-pub(super) fn exact_range_int(i: IntTy) -> bool {
+pub(super) fn exact_range_int(i: IntTy, inclusive: bool) -> bool {
+    if inclusive {
+        // core's `range_incl_exact_iter_impl!` list: a wider inclusive
+        // range can hold `usize::MAX + 1` items.
+        return matches!(i, IntTy::U8 | IntTy::U16 | IntTy::I8 | IntTy::I16);
+    }
     matches!(i, IntTy::Usize | IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::Isize | IntTy::I8 | IntTy::I16 | IntTy::I32)
 }

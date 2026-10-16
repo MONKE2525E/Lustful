@@ -9393,6 +9393,13 @@ fn glue_def_value(
             };
             let cow = (fmt::cow_view(p, t, "a", "va"), fmt::cow_view(p, t, "b", "vb"));
             match t {
+                // std's `Reverse<T>` orders its `T` with the operands
+                // swapped, as its written methods do (library/core/src/cmp.rs).
+                CTy::Adt(adt_id) if p.is_reverse_adt(*adt_id) => {
+                    let ft = cty(&p.tys, p.adt(*adt_id).variants[0].fields[0].ty);
+                    let c = cmp_of(&ft, "b->f0", "a->f0", &mut need);
+                    let _ = writeln!(body, "  return {c};");
+                }
                 // `Cow<B>` orders the `B` views (W-STD-B).
                 _ if cow.0.is_some() => {
                     let ((rb, da), (_, db)) = (cow.0.clone().unwrap(), cow.1.clone().unwrap());

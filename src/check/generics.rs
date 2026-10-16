@@ -8531,8 +8531,17 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
             }
         }
-        // `RangeInclusive` is double-ended but not exact size in
-        // std (its length can overflow `usize`).
+        // `RangeInclusive` is double-ended; it is exact size over core's
+        // `range_incl_exact_iter_impl!` list only (a wider one can hold
+        // `usize::MAX + 1` items).
+        {
+            use crate::ty::IntTy as I;
+            for i in [I::U8, I::I8, I::U16, I::I16] {
+                let t = p.tys.intern(TyKind::Int(i));
+                let self_pat = mk_iter(&mut p.tys, K::RangeInclusive, &[t]);
+                insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+            }
+        }
         let ri = mk_iter(&mut p.tys, K::RangeInclusive, &[p0]);
         insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, ri, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         let sd = mk_iter(&mut p.tys, K::StringDrain, &[]);

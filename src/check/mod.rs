@@ -1844,7 +1844,7 @@ struct Ctx<'p> {
     deferred_copy: Vec<(Ty, Span)>,
     /// `Range<{integer}>::len` and kin: the element must end as one of
     /// core's exact-size range integers (check/iter.rs `exact_size`).
-    deferred_exact_range: Vec<(Ty, Span)>,
+    deferred_exact_range: Vec<(Ty, bool, Span)>,
     /// The expression of the expression statement being checked (`e;`):
     /// `Vec::splice` is taken only there, where its `Splice` drops at once.
     stmt_expr: Option<ExprId>,
@@ -22357,13 +22357,24 @@ impl<'p> Ctx<'p> {
                 self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
             }
         }
-        for (t, span) in std::mem::take(&mut self.deferred_exact_range) {
+        for (t, incl, span) in std::mem::take(&mut self.deferred_exact_range) {
             let t = self.deep(t);
-            if let TyKind::Int(i) = self.kind(t)
-                && !iter::exact_range_int(i)
+            // An integer variable still open falls back to `i32`.
+            let int = match self.kind(t) {
+                TyKind::Int(i) => Some(i),
+                k if k.is_int_infer() => Some(crate::ty::IntTy::I32),
+                _ => None,
+            };
+            if let Some(i) = int
+                && !iter::exact_range_int(i, incl)
             {
+                let t = if matches!(self.kind(t), TyKind::Int(_)) { t } else { self.tys.intern(TyKind::Int(i)) };
                 let tn = self.tn(t);
-                self.err("L0612", span, format!("no impl of `ExactSizeIterator` for `std::ops::Range<{tn}>`"), "Use a range of `usize` or of a 32-bit or narrower integer.");
+                if incl {
+                    self.err("L0612", span, format!("no impl of `ExactSizeIterator` for `std::ops::RangeInclusive<{tn}>`"), "Use an inclusive range of an 8-bit or 16-bit integer.");
+                } else {
+                    self.err("L0612", span, format!("no impl of `ExactSizeIterator` for `std::ops::Range<{tn}>`"), "Use a range of `usize` or of a 32-bit or narrower integer.");
+                }
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_default) {

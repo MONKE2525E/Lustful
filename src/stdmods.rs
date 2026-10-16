@@ -82,6 +82,14 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["MaybeUninit", "ManuallyDrop"],
     },
     StdModule {
+        name: "__lust_core_cmp",
+        rel: "core/src/cmp.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "cmp"), ("std", "cmp")],
+        full: false,
+        triggers: &["Reverse"],
+    },
+    StdModule {
         name: "__lust_core_char",
         rel: "core/src/char.rs",
         krate: ShippedCrate::Core,
