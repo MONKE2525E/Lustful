@@ -320,7 +320,15 @@ impl Ctx<'_> {
                 self.out.closure_map_pending = true;
                 continue;
             };
-            map.extend(instance_closure_map(p, &self.tys, h, template, p.def_id(inst)));
+            // An instance another body made this round is not checked
+            // yet, so its closures have no kind or signature (`std::iter::
+            // from_fn(..)` could not select `next`): check again after it.
+            let m = instance_closure_map(p, &self.tys, h, template, p.def_id(inst));
+            if m.iter().any(|(_, d)| p.gx.closures.get(d).is_none()) {
+                self.out.closure_map_pending = true;
+                continue;
+            }
+            map.extend(m);
         }
         self.closure_map = map;
     }
@@ -730,6 +738,43 @@ pub(crate) fn ty_contains(tys: &impl TyIntern, t: Ty, inner: Ty) -> bool {
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| ty_contains(tys, e, inner)),
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Projection(_, a) => in_args(a),
         _ => false,
+    }
+}
+
+/// After mono: each `impl Trait` fn's revealed return type (`FnInfo::ret`,
+/// which its C signature uses) with the closures of the generic opaques
+/// nested in its hidden type mapped to their instances' closures, as the
+/// fn's body and callers see them (`build_closure_map`). `reveal_plain`
+/// and `fn_instance` reveal the return before those instances exist, so
+/// `fn pass() -> impl Iterator { def(5u8) }` kept `def`'s template closure.
+pub(crate) fn map_nested_ret_closures(p: &mut Program) {
+    let mut fns: Vec<(LocalDefId, Ty)> = p.gx.opaque_ret_of.iter().map(|(&f, &o)| (f, o)).collect();
+    fns.sort_by_key(|(f, _)| f.0);
+    for (f, opaque) in fns {
+        let ret = p.fns[f.0 as usize].ret;
+        if !mentions_template_closure(p, &p.tys, ret) {
+            continue;
+        }
+        let hidden = std::mem::take(&mut p.gx.opaque_hidden);
+        let mut found: Vec<Ty> = Vec::new();
+        collect_opaques_deep(&hidden, &mut p.tys, opaque, &mut found);
+        let mut map: Vec<(Ty, DefId)> = Vec::new();
+        for o in found {
+            let TyKind::Opaque(od, args) = p.tys.kind(o) else { continue };
+            let Some(template) = p.gx.opaques.get(&od).and_then(|info| p.local_def(info.owner.hash)) else { continue };
+            if p.gx.fn_templates.get(template.0 as usize).is_none_or(|t| t.is_none()) {
+                continue;
+            }
+            let args: Vec<GenericArg> = p.tys.args(args).to_vec();
+            let Some(inst) = generics::instance_for(p, &p.tys, template, &args).filter(|&i| i != template) else { continue };
+            let h = reveal(&hidden, &mut p.tys, o, 0);
+            let h = generics::normalize_global(p, h);
+            map.extend(instance_closure_map(p, &p.tys, h, template, p.def_id(inst)));
+        }
+        p.gx.opaque_hidden = hidden;
+        if !map.is_empty() {
+            p.fns[f.0 as usize].ret = map_closure_defs(&mut p.tys, ret, &map);
+        }
     }
 }
 

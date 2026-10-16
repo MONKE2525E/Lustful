@@ -11568,8 +11568,12 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     let mut drop_created = 0usize;
     let mut reuse = std::mem::take(&mut p.gx.reuse);
     let mut lang_checked: Vec<LocalDefId> = Vec::new();
-    // Bodies checked again once (`Checked::closure_map_pending`).
-    let mut rechecked: Vec<LocalDefId> = Vec::new();
+    // Bodies checked again (`Checked::closure_map_pending`), with their
+    // count. Each `impl Trait` fn a definer's opaque passes through can
+    // take one more round before the definer's instance is made and
+    // checked; `lust check` makes no instances, so it checks again once.
+    let mut rechecked: FxMap<LocalDefId, u32> = FxMap::default();
+    let recheck_limit = if p.gx.walk_instances { 8 } else { 1 };
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -11607,8 +11611,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 // is not stored: its requests miss the ones that name
                 // the definer's closures, and a replay in a later build
                 // would never make those instances (daemon warm builds).
-                if checked.closure_map_pending && !rechecked.contains(&fid) {
-                    rechecked.push(fid);
+                let n = rechecked.entry(fid).or_insert(0);
+                if checked.closure_map_pending && *n < recheck_limit {
+                    *n += 1;
                     recheck.push(fid);
                 } else if discarded.is_empty() && !checked.closure_map_pending {
                     reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
@@ -11720,6 +11725,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         queue = next_queue;
     }
     p.gx.reuse = reuse;
+    crate::check::opaque::map_nested_ret_closures(p);
     p.gx.mono_done = true;
     // W-SHIM: instances whose behavior lust cannot make exact. A
     // `write_fmt` slot of an eager vtable runs only through a `dyn`
