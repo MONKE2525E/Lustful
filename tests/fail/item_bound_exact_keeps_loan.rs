@@ -1,4 +1,4 @@
-// expect: L0505
+// expect: L0311
 // rustc E0505: through `I: Iterator<Item = T>` the result is the
 // iterator's item, a borrow of `v`, so `v` cannot move while it lives.
 fn first<T, I: Iterator<Item = T>>(mut i: I) -> T {
