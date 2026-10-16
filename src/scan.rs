@@ -1,5 +1,5 @@
-// Token-level scan for incremental compilation. Finds every function body (top level and in impl
-// blocks) without parsing, and hashes:
+// Token-level scan for incremental compilation. Finds every function body (top level, in impl
+// blocks, and nested in any block) without parsing, and hashes:
 //   - each body's tokens (what can change without affecting any other function), and
 //   - every token outside the bodies (the "environment": types, signatures, item order).
 // Hashes ignore positions, so moving code around does not invalidate anything.
@@ -74,6 +74,49 @@ pub fn fold_outer(nested: u64, outer: u64) -> u64 {
     h.finish()
 }
 
+/// The scan of the fn item whose `fn` keyword is at token `k`: its body hash
+/// (the caller folds in the enclosing body or item) and the identifiers its
+/// body uses. A `;` before any body (a fn with no body) gives None.
+fn nested_fn_scan(lexed: &Lexed, k: usize) -> Option<(FnScan, Vec<Sym>)> {
+    let toks = &lexed.tokens;
+    let mut j = k;
+    let mut nest = 0usize;
+    while j < toks.len() && toks[j].tok != Tok::LBrace {
+        match toks[j].tok {
+            Tok::LParen | Tok::LBracket => nest += 1,
+            Tok::RParen | Tok::RBracket => nest = nest.saturating_sub(1),
+            Tok::Semi if nest == 0 => return None,
+            Tok::Eof => return None,
+            _ => {}
+        }
+        j += 1;
+    }
+    let mut end = j;
+    let mut d = 0usize;
+    let mut body = FxHasher::default();
+    let mut idents: Vec<Sym> = Vec::new();
+    while end < toks.len() {
+        match toks[end].tok {
+            Tok::LBrace => d += 1,
+            Tok::RBrace => d -= 1,
+            Tok::Ident(s) => idents.push(s),
+            Tok::Eof => return None,
+            _ => {}
+        }
+        hash_tok(&mut body, &toks[end].tok, &lexed.strings);
+        if d == 0 {
+            break;
+        }
+        end += 1;
+    }
+    if d != 0 || end >= toks.len() {
+        return None;
+    }
+    idents.sort_unstable();
+    idents.dedup();
+    Some((FnScan { body_hash: body.finish(), nested: true, fn_offset: toks[k].span.lo, body: j..end + 1 }, idents))
+}
+
 /// Scans one lexed chunk. Chunks start at top-level items, so brace depth starts at 0.
 pub fn scan(lexed: &Lexed) -> ChunkScan {
     let toks = &lexed.tokens;
@@ -88,6 +131,12 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
     let mut depth = 0usize;
     let mut impl_pending = false;
     let mut in_impl = false;
+    let mut trait_pending = false;
+    let mut in_trait = false;
+    // Nested fns outside any counted fn body (in a trait default method
+    // body, say), by index in `nested_fns`: their hashes fold in the
+    // hash of the top-level item that holds them when it ends.
+    let mut item_nested: Vec<usize> = Vec::new();
     let mut complete = true;
     let mut i = 0;
     while i < toks.len() {
@@ -125,42 +174,11 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
                 // outer walk continues over its tokens, so deeper nesting
                 // records too and the outer hash still covers everything.
                 // A name must follow: a `fn(...)` pointer type is not an item.
-                if toks[k].tok == Tok::Fn && k > j && matches!(toks.get(k + 1).map(|t| t.tok), Some(Tok::Ident(_))) {
-                    let mut j2 = k;
-                    while j2 < toks.len() && toks[j2].tok != Tok::LBrace && toks[j2].tok != Tok::Eof {
-                        j2 += 1;
-                    }
-                    if j2 < toks.len() && toks[j2].tok == Tok::LBrace {
-                        let mut k2 = j2;
-                        let mut d2 = 0usize;
-                        let mut nbody = FxHasher::default();
-                        let mut nidents: Vec<Sym> = Vec::new();
-                        while k2 < toks.len() {
-                            match toks[k2].tok {
-                                Tok::LBrace => d2 += 1,
-                                Tok::RBrace => d2 -= 1,
-                                Tok::Ident(s2) => nidents.push(s2),
-                                Tok::Eof => break,
-                                _ => {}
-                            }
-                            hash_tok(&mut nbody, &toks[k2].tok, &lexed.strings);
-                            if d2 == 0 {
-                                break;
-                            }
-                            k2 += 1;
-                        }
-                        if d2 == 0 {
-                            nidents.sort_unstable();
-                            nidents.dedup();
-                            nested_fns.push(FnScan {
-                                body_hash: nbody.finish(),
-                                nested: true,
-                                fn_offset: toks[k].span.lo,
-                                body: j2..k2 + 1,
-                            });
-                            nested_idents.push(nidents);
-                        }
-                    }
+                if toks[k].tok == Tok::Fn && k > j && matches!(toks.get(k + 1).map(|t| t.tok), Some(Tok::Ident(_)))
+                    && let Some((f, nidents)) = nested_fn_scan(lexed, k)
+                {
+                    nested_fns.push(f);
+                    nested_idents.push(nidents);
                 }
                 match toks[k].tok {
                     Tok::LBrace => d += 1,
@@ -208,13 +226,34 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
         if *t == Tok::Eof {
             break;
         }
+        // A fn item in a block outside the bodies above: in a trait
+        // default method body (a direct trait member is the method
+        // itself), or in a block in a type or an initializer. The parser
+        // puts it in `stmt_items` like any nested fn, so it is scanned
+        // as one; its tokens stay in the environment too.
+        if *t == Tok::Fn
+            && depth > 0
+            && !(depth == 1 && in_trait)
+            && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Ident(_)))
+            && let Some((f, nidents)) = nested_fn_scan(lexed, i)
+        {
+            item_nested.push(nested_fns.len());
+            nested_fns.push(f);
+            nested_idents.push(nidents);
+        }
         hash_tok(&mut env, t, &lexed.strings);
+        let mut item_end = false;
         match t {
             Tok::Impl if depth == 0 => impl_pending = true,
+            Tok::Trait if depth == 0 => trait_pending = true,
             Tok::LBrace => {
                 if depth == 0 && impl_pending {
                     in_impl = true;
                     impl_pending = false;
+                }
+                if depth == 0 && trait_pending {
+                    in_trait = true;
+                    trait_pending = false;
                 }
                 depth += 1;
             }
@@ -222,11 +261,22 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     in_impl = false;
-                    items.push(ItemScan { hash: std::mem::take(&mut env).finish(), fn_name: None });
+                    in_trait = false;
+                    item_end = true;
                 }
             }
-            Tok::Semi if depth == 0 => items.push(ItemScan { hash: std::mem::take(&mut env).finish(), fn_name: None }),
+            Tok::Semi if depth == 0 => item_end = true,
             _ => {}
+        }
+        if item_end {
+            let hash = std::mem::take(&mut env).finish();
+            // Such a nested fn reads the names of the blocks around it,
+            // and no recorded read covers them: any edit to its item
+            // rechecks it (as `fold_outer` does for fn bodies).
+            for k in item_nested.drain(..) {
+                nested_fns[k].body_hash = fold_outer(nested_fns[k].body_hash, hash);
+            }
+            items.push(ItemScan { hash, fn_name: None });
         }
         i += 1;
     }
@@ -235,7 +285,7 @@ pub fn scan(lexed: &Lexed) -> ChunkScan {
         items.push(ItemScan { hash: env.finish(), fn_name: None });
         complete = false;
     }
-    let ends_at_boundary = complete && depth == 0 && !in_impl && !impl_pending;
+    let ends_at_boundary = complete && depth == 0 && !in_impl && !impl_pending && !trait_pending;
     // Collect's order is the parser's `stmt_items` order, which is body
     // completion order: a fn nested inside a nested fn is pushed before
     // its enclosing fn. Encounter order here is the reverse for that

@@ -5210,6 +5210,10 @@ pub fn collect_reuse(
             _ => {}
         }
     }
+    // Trait default methods parent the items nested in their bodies too.
+    for (b, hash, _) in crate::def::trait_body_paths(p.stable_crate, ast, interner) {
+        top_hashes.insert(b, hash);
+    }
     // Items inside function bodies: nested fns join the fn table (their
     // names are block-scoped, so they stay out of `fn_names`); nested
     // consts and statics evaluate with the top-level pass below. Type
@@ -6308,6 +6312,9 @@ pub(crate) fn top_fn_hashes(ast: &Ast, interner: &Interner, stable: crate::def::
             }
             _ => {}
         }
+    }
+    for (b, hash, _) in crate::def::trait_body_paths(stable, ast, interner) {
+        out.insert(b, hash);
     }
     out
 }

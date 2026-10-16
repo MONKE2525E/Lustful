@@ -297,22 +297,50 @@ pub fn method_hash(impl_hash: DefPathHash, name: &str) -> DefPathHash {
     child_hash(impl_hash, DefKind::Method, name, 0)
 }
 
+/// The path of each trait default method, by its body block: the trait's
+/// path (its name, with its ordinal among same-name traits as the
+/// disambiguator, as `collect_trait_defs` numbers them) plus the method name.
+/// These parent the items nested in default bodies, next to the top-level fns
+/// and impl methods (`collect::top_fn_hashes`, the driver's `fn_keys`).
+pub fn trait_body_paths(
+    krate: StableCrateHash,
+    ast: &crate::ast::Ast,
+    interner: &crate::intern::Interner,
+) -> Vec<(crate::ast::BlockId, DefPathHash, String)> {
+    let mut ordinals: crate::intern::FxMap<crate::intern::Sym, u32> = Default::default();
+    let mut out = Vec::new();
+    for item in &ast.items {
+        let crate::ast::ItemKind::Trait(t) = &item.kind else { continue };
+        let ordinal = ordinals.entry(t.name).or_insert(0);
+        let (thash, ttext) = item_path(krate, &[], DefKind::Trait, interner.get(t.name), *ordinal);
+        *ordinal += 1;
+        for f in &t.fns {
+            if let Some(b) = f.body {
+                let (hash, text) = child_path(thash, &ttext, DefKind::Method, interner.get(f.name), 0);
+                out.push((b, hash, text));
+            }
+        }
+    }
+    out
+}
+
 /// The fn whose body holds a fn nested in a body (see `nested_fn_parents`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NestParent {
-    /// A top-level fn or an impl method, by its body block.
+    /// A top-level fn, an impl method, or a trait default method, by its
+    /// body block.
     Top(crate::ast::BlockId),
     /// Another nested fn, by its `Ast::stmt_items` index.
     Nested(u32),
     /// No fn body holds it by span: a fn from a macro expansion, or one in a
-    /// const initializer or a trait default body.
+    /// const or static initializer.
     Unknown,
 }
 
 /// The parent and the disambiguator of each fn nested in a body (section 1.7),
 /// by `Ast::stmt_items` index; other entries are `(Unknown, 0)`. The parent is
-/// the innermost top-level fn, impl method, or nested fn whose body span holds
-/// the item's span. The disambiguator counts the same-name fns of that parent
+/// the innermost top-level fn, impl method, trait default method, or nested fn
+/// whose body span holds the item's span. The disambiguator counts the same-name fns of that parent
 /// before it, in body item order. A nested fn's identity is its parent's
 /// identity plus its name and disambiguator, so an item added to one body does
 /// not move the identity of the fns nested in other bodies. Spans only find the
@@ -340,6 +368,7 @@ pub fn nested_fn_parents(ast: &crate::ast::Ast) -> Vec<(NestParent, u32)> {
         match &item.kind {
             ItemKind::Fn(f) => body(&mut spans, f, None),
             ItemKind::Impl(imp) => imp.fns.iter().for_each(|f| body(&mut spans, f, None)),
+            ItemKind::Trait(t) => t.fns.iter().for_each(|f| body(&mut spans, f, None)),
             _ => {}
         }
     }

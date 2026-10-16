@@ -1575,10 +1575,14 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
         }
     }
     if nested_at.iter().any(Option::is_some) {
+        // Trait default methods have no slot of their own, but parent the
+        // fns nested in their bodies.
+        let trait_tops: FxMap<crate::ast::BlockId, (def::DefPathHash, String)> =
+            def::trait_body_paths(stable, ast, interner).into_iter().map(|(b, hash, path)| (b, (hash, path))).collect();
         let ids = def::nested_fn_ids(
             ast,
             interner,
-            |b| top_at.get(&b).map(|&i| (keys[i].disk.hash, keys[i].path.clone())),
+            |b| top_at.get(&b).map(|&i| (keys[i].disk.hash, keys[i].path.clone())).or_else(|| trait_tops.get(&b).cloned()),
             |(hash, path), name, disamb| def::child_path(*hash, path, def::DefKind::Fn, name, disamb),
             |seg, name| def::free_fn_path(stable, &[seg], name),
         );
