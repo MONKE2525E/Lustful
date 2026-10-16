@@ -816,6 +816,12 @@ impl<'p> Lower<'p> {
                     Some(root) => root,
                     None => self.place(*base),
                 };
+                // `SendError(pub T)` is the value itself in C: `.0` is the
+                // same place (check/mod.rs `send_error_elem`).
+                let bt = self.peel(self.ty(*base), derefs);
+                if index == 0 && crate::check::send_error_elem(&self.body.tys, bt).is_some() {
+                    return Self::derefs(b, derefs);
+                }
                 Self::derefs(b, derefs).project(Proj::Field(index))
             }
             (Expr::Index { base, index }, Res::SliceIndex { derefs }) => {

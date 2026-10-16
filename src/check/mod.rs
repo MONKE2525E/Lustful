@@ -1036,6 +1036,12 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
+/// The `T` of an `mpsc::SendError<T>`: a builtin whose C form is the
+/// value, so its one public field `.0` is the same place.
+pub(crate) fn send_error_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    (crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::SendError)).then(|| tys.adt_first_ty_arg(t)).flatten()
+}
+
 pub(crate) fn prim_builtin_code(b: Builtin) -> Option<u32> {
     PRIM_VALUE_BUILTINS.iter().position(|&x| x == b).map(|i| i as u32)
 }
@@ -9497,6 +9503,7 @@ impl<'p> Ctx<'p> {
                 for _ in 0..4 {
                     let has = match self.kind(inner) {
                         TyKind::Tuple(ts) => (*index as usize) < self.tys.tys_of(ts).len(),
+                        _ if *index == 0 && send_error_elem(&self.tys, inner).is_some() => true,
                         _ => self.tys.local_adt(inner).is_some_and(|a| {
                             !p.adt(a).is_enum && p.adt(a).variants[0].shape == VariantShape::Tuple && (*index as usize) < p.adt(a).variants[0].fields.len()
                         }),
@@ -9510,6 +9517,9 @@ impl<'p> Ctx<'p> {
                 }
                 let field_ty = match self.kind(inner) {
                     TyKind::Tuple(ts) => self.tys.tys_of(ts).get(*index as usize).copied(),
+                    // `mpsc::SendError<T>(pub T)`: its field is the value
+                    // itself (lower.rs keeps the place, cgen/sync.rs).
+                    _ if *index == 0 && send_error_elem(&self.tys, inner).is_some() => send_error_elem(&self.tys, inner),
                     _ => match self.tys.local_adt(inner) {
                         Some(a) if !p.adt(a).is_enum && p.adt(a).variants[0].shape == VariantShape::Tuple => {
                             // As for named fields: a generic Adt's field is
