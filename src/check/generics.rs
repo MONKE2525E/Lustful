@@ -3557,6 +3557,21 @@ fn dyn_lifetime_unwritten(ast: &Ast, t: ast::TyId) -> bool {
     }
 }
 
+/// A region signature's type arg `elem` of a std type whose param has a
+/// lifetime bound (`MutexGuard<'a, T: ?Sized + 'a>`, the `RwLock` guards,
+/// `Cow<'a, B: ?Sized + 'a>`; not the `RefCell` guards, whose arm says
+/// why): a `dyn` written there
+/// with no lifetime bound has that lifetime `r` as its object lifetime
+/// (rustc's default from the containing type's bound), not `'static`.
+fn bounded_arg_default(ast: &Ast, tys: &mut impl TyIntern, seg: &ast::PathSeg, elem: Ty, r: Region) -> Ty {
+    let TyKind::Dyn(b, _) = tys.kind(elem) else { return elem };
+    let GenericArgs::Angle(a) = &seg.args else { return elem };
+    match a.iter().find_map(|g| if let AstArg::Type(t) = g { Some(*t) } else { None }) {
+        Some(t) if dyn_lifetime_unwritten(ast, t) => tys.intern(TyKind::Dyn(b, r)),
+        _ => elem,
+    }
+}
+
 /// The reject for a `dyn` form the subset has no vtable for yet.
 pub fn dyn_not_yet(span: Span, what: &str) -> Diag {
     Diag::new(
@@ -3966,6 +3981,11 @@ pub(crate) fn resolve_path_ty(
                 all.push(GenericArg::Lifetime(scope_region(interner, scope, written.get(i).copied(), span)?));
             }
             if k.arity() > 0 {
+                // A lock guard's `T: ?Sized + 'a`: a dyn arg's object
+                // lifetime defaults to the guard's.
+                if let Some(GenericArg::Lifetime(r)) = all.first().copied() {
+                    elem = bounded_arg_default(ast, tys, seg, elem, r);
+                }
                 all.push(GenericArg::Ty(elem));
             }
             return Ok(tys.mk_adt(def, &all));
@@ -3990,8 +4010,11 @@ pub(crate) fn resolve_path_ty(
         // `Weak<dyn Tr>` is cgen/own.rs's; their object lifetime
         // defaults as for `Box<dyn Tr>`.
         // A guard over `dyn Tr` (`RefMut<'_, dyn Tr>`) takes the same
-        // default: rustc's is the guard's lifetime, so `'static` only
-        // narrows what lust accepts (R26).
+        // default here and in region signatures. rustc's is the guard's
+        // lifetime (`T: ?Sized + 'b`); lust keeps `'static` because the
+        // guards' unsizing coercion (`RefMut<'b, dyn Tr + 'static>` to
+        // `RefMut<'b, dyn Tr + 'b>`) is not modeled. Known gap (R26,
+        // tf-dynlife-2 report): a guard's object is taken as `'static`.
         let dyn_cell = matches!(n, "RefCell" | "Weak" | "Ref" | "RefMut") && matches!(tys.kind(elem), TyKind::Dyn(..));
         if dyn_cell
             && scope.infer_cell.is_none()
@@ -4299,7 +4322,8 @@ fn resolve_cow_path(
     }
     if matches!(scope.regions, RegionMode::Keep { .. }) {
         let r = scope_region(interner, scope, written.first().copied(), span)?;
-        return Ok(tys.mk_adt(cow_def(), &[GenericArg::Lifetime(r), args[0]]));
+        let elem = args[0].as_ty().map_or(args[0], |t| GenericArg::Ty(bounded_arg_default(ast, tys, seg, t, r)));
+        return Ok(tys.mk_adt(cow_def(), &[GenericArg::Lifetime(r), elem]));
     }
     Ok(tys.mk_adt(cow_def(), &args))
 }
