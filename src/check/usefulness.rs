@@ -9,15 +9,26 @@
 //! domain: only a half-open `X..` (or `..X` for `isize`) covers the values
 //! past `MAX` (and before `MIN`).
 //!
+//! A structural const pattern (a struct, enum, tuple, array, or slice
+//! const) is read as the patterns of its value, as rustc's
+//! const-to-pattern does: its parts become `Cell::Val` cells.
+//!
 //! Where lust cannot read a pattern (a const of unknown value, a byte
-//! string) the row matches nothing, and a type whose values cannot be
+//! string, a float or `&str` part of a const) the row matches nothing, and a type whose values cannot be
 //! listed (floats, `str`, generics) needs a wildcard. Both can only make
 //! lust reject a match that rustc accepts, never the reverse.
 
 use super::*;
 
-/// A row cell: a pattern, or `None` for a wildcard made by specialization.
-type Cell = Option<PatId>;
+/// A row cell.
+#[derive(Clone, Copy)]
+enum Cell<'p> {
+    /// A wildcard made by specialization.
+    Wild,
+    Pat(PatId),
+    /// A part of a structural const pattern's value, at its type.
+    Val(&'p crate::ty::consteval::ConstValue, Ty),
+}
 
 /// A point in the extended integer order: `(0, 0)` is below `MIN`
 /// (only `isize` reaches it), `(1, k)` is the value whose order key
@@ -45,17 +56,17 @@ enum Col {
 }
 
 /// What a row's first cell matches.
-enum Head {
+enum Head<'p> {
     Wild,
     /// Matches nothing the check can name: the row never covers a
     /// constructor and is not a wildcard either.
     Opaque,
     /// Constructor `i` with its field cells.
-    Ctor(u32, Vec<Cell>),
+    Ctor(u32, Vec<Cell<'p>>),
     Range(Bound, Bound),
     /// A slice pattern: prefix, suffix, and whether a `..` middle sits
     /// between them.
-    Slice(Vec<PatId>, Vec<PatId>, bool),
+    Slice(Vec<Cell<'p>>, Vec<Cell<'p>>, bool),
 }
 
 /// One constructor from the split of a column, with the field count
@@ -81,7 +92,7 @@ impl<'p> Ctx<'p> {
     /// (`match *r`, `let Ok(x) = *r`), empty constructors do
     /// not count there, as in rustc.
     pub(super) fn covers_behind(&self, pats: &[PatId], behind: bool) -> bool {
-        let rows: Vec<Vec<Cell>> = pats.iter().map(|&p| vec![Some(p)]).collect();
+        let rows: Vec<Vec<Cell<'p>>> = pats.iter().map(|&p| vec![Cell::Pat(p)]).collect();
         let fuel = std::cell::Cell::new(FUEL);
         self.rows_cover_all(rows, vec![behind], &fuel)
     }
@@ -104,7 +115,7 @@ impl<'p> Ctx<'p> {
     /// their columns. `behind[i]` says column `i`'s place sits
     /// behind a dereference, where empty constructors do not
     /// count.
-    fn rows_cover_all(&self, rows: Vec<Vec<Cell>>, behind: Vec<bool>, fuel: &std::cell::Cell<u32>) -> bool {
+    fn rows_cover_all(&self, rows: Vec<Vec<Cell<'p>>>, behind: Vec<bool>, fuel: &std::cell::Cell<u32>) -> bool {
         if fuel.get() == 0 {
             return false;
         }
@@ -115,19 +126,29 @@ impl<'p> Ctx<'p> {
         if rows[0].is_empty() {
             return true;
         }
-        let mut flat: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+        let mut flat: Vec<Vec<Cell<'p>>> = Vec::with_capacity(rows.len());
         for row in rows {
             self.expand_or_head(row, &mut flat);
         }
         let rows = flat;
-        let head_pat = rows.iter().find_map(|r| r[0].filter(|&p| !self.cell_is_wild(p)));
-        let ty = head_pat.map(|p| self.pat_ty_of(self.pat_unwrap(p)));
-        let behind_col = behind.first().copied().unwrap_or(false) || head_pat.is_some_and(|p| self.pat_behind_ref(p));
+        let head_cell = rows.iter().map(|r| r[0]).find(|&c| !self.is_wild(c));
+        let ty = head_cell.map(|c| match c {
+            Cell::Pat(p) => self.pat_ty_of(self.pat_unwrap(p)),
+            Cell::Val(_, t) => t,
+            Cell::Wild => ERROR,
+        });
+        // A const value column counts as behind a reference: empty
+        // constructors then need rows, which can only reject more.
+        let behind_col = behind.first().copied().unwrap_or(false)
+            || head_cell.is_some_and(|c| match c {
+                Cell::Pat(p) => self.pat_behind_ref(p),
+                _ => true,
+            });
         let splits = match ty {
             None => None,
             Some(t) => {
                 let col = self.column(t, behind_col);
-                let heads: Vec<Head> = rows.iter().map(|r| r[0].map_or(Head::Wild, |p| self.head(p, &col))).collect();
+                let heads: Vec<Head<'p>> = rows.iter().map(|r| self.cell_head(r[0], &col)).collect();
                 self.split(&col, &heads).map(|s| (s, heads))
             }
         };
@@ -135,12 +156,11 @@ impl<'p> Ctx<'p> {
             // Some constructor is in no head (or the column is all
             // wildcards): the rows cover it only through their wildcard
             // heads, and then cover everything only if those rows do.
-            let default: Vec<Vec<Cell>> =
-                rows.iter().filter(|r| r[0].is_none_or(|p| self.cell_is_wild(p))).map(|r| r[1..].to_vec()).collect();
+            let default: Vec<Vec<Cell<'p>>> = rows.iter().filter(|r| self.is_wild(r[0])).map(|r| r[1..].to_vec()).collect();
             return self.rows_cover_all(default, behind[1.min(behind.len())..].to_vec(), fuel);
         };
         splits.into_iter().all(|s| {
-            let spec: Vec<Vec<Cell>> = rows.iter().zip(&heads).filter_map(|(r, h)| self.specialize(r, h, s)).collect();
+            let spec: Vec<Vec<Cell<'p>>> = rows.iter().zip(&heads).filter_map(|(r, h)| self.specialize(r, h, s)).collect();
             let n = match s {
                 Split::Ctor(_, n) | Split::Len(n) | Split::MinLen(n) => n,
                 Split::Range(..) => 0,
@@ -153,13 +173,13 @@ impl<'p> Ctx<'p> {
 
     /// Pushes `row`, or one row per alternative when its head is an
     /// or-pattern (nested alternatives too).
-    fn expand_or_head(&self, row: Vec<Cell>, out: &mut Vec<Vec<Cell>>) {
-        if let Some(p) = row[0]
+    fn expand_or_head(&self, row: Vec<Cell<'p>>, out: &mut Vec<Vec<Cell<'p>>>) {
+        if let Cell::Pat(p) = row[0]
             && let Pat::Or(alts) = self.p.ast.pat(self.pat_unwrap(p))
         {
             for &a in alts {
                 let mut r = row.clone();
-                r[0] = Some(a);
+                r[0] = Cell::Pat(a);
                 self.expand_or_head(r, out);
             }
         } else {
@@ -169,6 +189,24 @@ impl<'p> Ctx<'p> {
 
     fn pat_ty_of(&self, pat: PatId) -> Ty {
         self.out.pat_ty[(pat.0 - self.out.pat_base) as usize]
+    }
+
+    /// True when the cell matches any value (see `cell_is_wild`).
+    fn is_wild(&self, c: Cell<'p>) -> bool {
+        match c {
+            Cell::Wild => true,
+            Cell::Pat(p) => self.cell_is_wild(p),
+            Cell::Val(..) => false,
+        }
+    }
+
+    /// Reads a cell as a head for a column of kind `col`.
+    fn cell_head(&self, c: Cell<'p>, col: &Col) -> Head<'p> {
+        match c {
+            Cell::Wild => Head::Wild,
+            Cell::Pat(p) => self.head(p, col),
+            Cell::Val(v, t) => self.val_head(v, t, col),
+        }
     }
 
     /// True when the pattern matches any value: `_`, a plain binding,
@@ -319,7 +357,7 @@ impl<'p> Ctx<'p> {
     }
 
     /// Reads a cell pattern as a head for a column of kind `col`.
-    fn head(&self, pat: PatId, col: &Col) -> Head {
+    fn head(&self, pat: PatId, col: &Col) -> Head<'p> {
         let p = self.p;
         if self.cell_is_wild(pat) {
             return Head::Wild;
@@ -337,22 +375,25 @@ impl<'p> Ctx<'p> {
                 _ => Head::Opaque,
             }
         };
+        if let Some(v) = self.structural_const_value(pi) {
+            return self.val_head(v, self.pat_ty_of(pat), col);
+        }
         if let Some(v) = self.const_pat_value(pat) {
             return point(v);
         }
         // The field cells of a constructor with `n` fields, from tuple
         // elements that may hold one `..`.
-        let positional = |elems: &[PatId], n: usize| -> Option<Vec<Cell>> {
+        let positional = |elems: &[PatId], n: usize| -> Option<Vec<Cell<'p>>> {
             match elems.iter().position(|&e| matches!(p.ast.pat(e), Pat::Rest)) {
-                None => (elems.len() == n).then(|| elems.iter().map(|&e| Some(e)).collect()),
+                None => (elems.len() == n).then(|| elems.iter().map(|&e| Cell::Pat(e)).collect()),
                 Some(r) => {
                     let after = elems.len() - r - 1;
                     if r + after > n {
                         return None;
                     }
-                    let mut cells: Vec<Cell> = elems[..r].iter().map(|&e| Some(e)).collect();
-                    cells.resize(n - after, None);
-                    cells.extend(elems[r + 1..].iter().map(|&e| Some(e)));
+                    let mut cells: Vec<Cell<'p>> = elems[..r].iter().map(|&e| Cell::Pat(e)).collect();
+                    cells.resize(n - after, Cell::Wild);
+                    cells.extend(elems[r + 1..].iter().map(|&e| Cell::Pat(e)));
                     Some(cells)
                 }
             }
@@ -363,7 +404,7 @@ impl<'p> Ctx<'p> {
                 _ => None,
             }
         };
-        let ctor = |i: u32, cells: Option<Vec<Cell>>| -> Head {
+        let ctor = |i: u32, cells: Option<Vec<Cell<'p>>>| -> Head<'p> {
             match (arity(i), cells) {
                 (Some(n), Some(cells)) if cells.len() == n => Head::Ctor(i, cells),
                 _ => Head::Opaque,
@@ -415,10 +456,10 @@ impl<'p> Ctx<'p> {
             Pat::Struct { fields, .. } => match (self.out.pat_res[pi], index) {
                 (PatRes::Variant(a, v), Some(i)) => {
                     let defs = &p.adt(a).variants[v as usize].fields;
-                    let mut cells: Vec<Cell> = vec![None; defs.len()];
+                    let mut cells: Vec<Cell<'p>> = vec![Cell::Wild; defs.len()];
                     for &(fname, sub) in fields {
                         match defs.iter().position(|f| f.name == fname) {
-                            Some(j) => cells[j] = Some(sub),
+                            Some(j) => cells[j] = Cell::Pat(sub),
                             None => return Head::Opaque,
                         }
                     }
@@ -427,9 +468,105 @@ impl<'p> Ctx<'p> {
                 _ => Head::Opaque,
             },
             Pat::Slice { prefix, middle, suffix } => match col {
-                Col::Slice(_) => Head::Slice(prefix.clone(), suffix.clone(), middle.is_some()),
+                Col::Slice(_) => Head::Slice(
+                    prefix.iter().map(|&x| Cell::Pat(x)).collect(),
+                    suffix.iter().map(|&x| Cell::Pat(x)).collect(),
+                    middle.is_some(),
+                ),
                 _ => Head::Opaque,
             },
+            _ => Head::Opaque,
+        }
+    }
+
+    /// The value of a structural const pattern (a const item whose
+    /// value is not a scalar), read as patterns by `val_head`.
+    fn structural_const_value(&self, pi: usize) -> Option<&'p crate::ty::consteval::ConstValue> {
+        use crate::ty::consteval::ConstValue as CV;
+        let p = self.p;
+        let v = match self.out.pat_res[pi] {
+            PatRes::ConstItem(idx) => &p.consts[idx as usize].value,
+            PatRes::BodyConst(ci) => &p.body_consts[ci as usize].value,
+            _ => return None,
+        };
+        (!matches!(v, CV::Int(_) | CV::Char(_) | CV::Bool(_) | CV::Float(..) | CV::Str(_))).then_some(v)
+    }
+
+    /// Reads a part of a structural const pattern's value at type `t`
+    /// as the pattern rustc's const-to-pattern makes of it: a scalar
+    /// point, a constructor with value cells, or array and slice
+    /// elements, through references. Floats, `&str`, byte data, and
+    /// anything else are opaque (rustc compares floats and strings as
+    /// opaque values too; byte data only rejects more here).
+    fn val_head(&self, v: &'p crate::ty::consteval::ConstValue, t: Ty, col: &Col) -> Head<'p> {
+        use crate::ty::consteval::ConstValue as CV;
+        let p = self.p;
+        let mut t = self.resolve(t);
+        let mut v = v;
+        while let TyKind::Ref(_, _, inner) = self.kind(t) {
+            t = self.resolve(inner);
+            // A slice reference holds its backing array in place.
+            if let CV::Ref(x) = v {
+                v = x;
+            }
+        }
+        let ctor = |i: u32, cells: Vec<Cell<'p>>| -> Head<'p> {
+            match col {
+                Col::Ctors(c) if c.get(i as usize).is_some_and(|&(n, _)| n == cells.len()) => Head::Ctor(i, cells),
+                _ => Head::Opaque,
+            }
+        };
+        let point = |x: i128| -> Head<'p> {
+            match col {
+                Col::Ints(_, max) => match self.scalar_key(x, t) {
+                    Some(k) => Head::Range((1, k), next_bound((1, k), *max)),
+                    None => Head::Opaque,
+                },
+                _ => Head::Opaque,
+            }
+        };
+        match (self.kind(t), v) {
+            (TyKind::Int(_), CV::Int(x)) => point(*x),
+            (TyKind::Char, CV::Char(c)) => point(*c as i128),
+            (TyKind::Bool, CV::Bool(b)) => ctor(*b as u32, Vec::new()),
+            (TyKind::Unit, _) => ctor(0, Vec::new()),
+            (TyKind::Tuple(ts), CV::Aggregate(vals)) => {
+                let ts = self.tys.tys_of(ts);
+                if ts.len() != vals.len() {
+                    return Head::Opaque;
+                }
+                ctor(0, vals.iter().zip(ts).map(|(x, &ft)| Cell::Val(x, ft)).collect())
+            }
+            (TyKind::Array(el, _) | TyKind::Slice(el), CV::Aggregate(vals)) if matches!(col, Col::Slice(_)) => {
+                Head::Slice(vals.iter().map(|x| Cell::Val(x, el)).collect(), Vec::new(), false)
+            }
+            (TyKind::Array(el, _) | TyKind::Slice(el), CV::Repeat(x, n)) if matches!(col, Col::Slice(_)) && *n <= 4096 => {
+                Head::Slice(vec![Cell::Val(&**x, el); *n as usize], Vec::new(), false)
+            }
+            (_, CV::Variant(i, vals)) if self.tys.option_elem(t).is_some() => {
+                let el = self.tys.option_elem(t).unwrap_or(ERROR);
+                ctor(*i, vals.iter().map(|x| Cell::Val(x, el)).collect())
+            }
+            (_, CV::Variant(i, vals)) if self.tys.result_args(t).is_some() => {
+                let (ok, err) = self.tys.result_args(t).unwrap_or((ERROR, ERROR));
+                let ft = if *i == 0 { ok } else { err };
+                ctor(*i, vals.iter().map(|x| Cell::Val(x, ft)).collect())
+            }
+            (_, CV::Aggregate(vals) | CV::Variant(_, vals)) => {
+                let Some(a) = self.tys.local_adt(t) else { return Head::Opaque };
+                let i = match v {
+                    CV::Variant(i, _) if p.adt(a).is_enum => *i,
+                    _ if !p.adt(a).is_enum => 0,
+                    _ => return Head::Opaque,
+                };
+                let Some(variant) = p.adt(a).variants.get(i as usize) else { return Head::Opaque };
+                if variant.fields.len() != vals.len() {
+                    return Head::Opaque;
+                }
+                // A template Adt's field types may name its params:
+                // such a cell's column is open, so it only rejects.
+                ctor(i, vals.iter().zip(&variant.fields).map(|(x, f)| Cell::Val(x, f.ty)).collect())
+            }
             _ => Head::Opaque,
         }
     }
@@ -447,7 +584,7 @@ impl<'p> Ctx<'p> {
     /// The constructors to check for a column, split so that each one
     /// is either inside or outside every head. `None` when some
     /// constructor of the type is in no head.
-    fn split(&self, col: &Col, heads: &[Head]) -> Option<Vec<Split>> {
+    fn split(&self, col: &Col, heads: &[Head<'p>]) -> Option<Vec<Split>> {
         match col {
             Col::Open => None,
             Col::Ctors(ctors) => {
@@ -518,16 +655,16 @@ impl<'p> Ctx<'p> {
     /// The row specialized to constructor `s`: the head's field cells
     /// then the rest of the row, or `None` when the head does not
     /// match `s`.
-    fn specialize(&self, row: &[Cell], head: &Head, s: Split) -> Option<Vec<Cell>> {
-        let mut out: Vec<Cell> = match (head, s) {
-            (Head::Wild, Split::Ctor(_, n) | Split::Len(n) | Split::MinLen(n)) => vec![None; n],
+    fn specialize(&self, row: &[Cell<'p>], head: &Head<'p>, s: Split) -> Option<Vec<Cell<'p>>> {
+        let mut out: Vec<Cell<'p>> = match (head, s) {
+            (Head::Wild, Split::Ctor(_, n) | Split::Len(n) | Split::MinLen(n)) => vec![Cell::Wild; n],
             (Head::Wild, Split::Range(..)) => Vec::new(),
             (Head::Ctor(i, cells), Split::Ctor(j, _)) if *i == j => cells.clone(),
             (Head::Range(lo, hi), Split::Range(a, b)) if *lo <= a && b <= *hi => Vec::new(),
             (Head::Slice(pre, suf, _), Split::Len(n) | Split::MinLen(n)) if slice_head_fits(head, s) => {
-                let mut cells: Vec<Cell> = pre.iter().map(|&x| Some(x)).collect();
-                cells.resize(n - suf.len(), None);
-                cells.extend(suf.iter().map(|&x| Some(x)));
+                let mut cells: Vec<Cell<'p>> = pre.clone();
+                cells.resize(n - suf.len(), Cell::Wild);
+                cells.extend(suf.iter().copied());
                 cells
             }
             _ => return None,
@@ -550,7 +687,7 @@ fn next_bound(b: Bound, max: u128) -> Bound {
 /// True when a slice head matches every slice of the split's lengths:
 /// a fixed pattern only its own length, a `..` pattern every length
 /// that fits its prefix and suffix.
-fn slice_head_fits(h: &Head, s: Split) -> bool {
+fn slice_head_fits(h: &Head<'_>, s: Split) -> bool {
     match (h, s) {
         (Head::Slice(a, b, false), Split::Len(n)) => a.len() + b.len() == n,
         (Head::Slice(a, b, true), Split::Len(n) | Split::MinLen(n)) => a.len() + b.len() <= n,
