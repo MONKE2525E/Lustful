@@ -1914,12 +1914,19 @@ pub fn names_lifetime_beyond_static_refs(ast: &Ast, interner: &Interner, id: ast
 
 /// True when a written type names a type alias with no lifetime params
 /// (`alias` looks one up by name) whose body holds a reference or a dyn
-/// type (`type R = &'static u32`). Those
+/// type, or an Adt with a lifetime (`type R = &'static u32`, `type A =
+/// Q<'static>`). Those
 /// regions are `'static` (`staticize`), so a body annotation that names
 /// the alias binds them as a written `'static` would (rustc E0597 for
 /// `let x: R = &local`).
-pub fn names_static_alias(ast: &Ast, alias: &dyn Fn(Sym) -> Option<Ty>, tys: &mut impl TyIntern, id: ast::TyId) -> bool {
-    let mut go = |t: ast::TyId| names_static_alias(ast, alias, tys, t);
+pub fn names_static_alias(
+    ast: &Ast,
+    adt_lifetimes: &FxMap<DefId, Vec<Sym>>,
+    alias: &dyn Fn(Sym) -> Option<Ty>,
+    tys: &mut impl TyIntern,
+    id: ast::TyId,
+) -> bool {
+    let mut go = |t: ast::TyId| names_static_alias(ast, adt_lifetimes, alias, tys, t);
     match ast.ty(id) {
         TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) => go(*inner),
         TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => go(*inner),
@@ -1936,7 +1943,8 @@ pub fn names_static_alias(ast: &Ast, alias: &dyn Fn(Sym) -> Option<Ty>, tys: &mu
             if args.into_iter().any(&mut go) {
                 return true;
             }
-            segs.len() == 1 && alias(segs[0].name).is_some_and(|t| staticize(tys, t) != t)
+            segs.len() == 1
+                && alias(segs[0].name).is_some_and(|t| staticize(tys, t) != t || alias_holds_region(adt_lifetimes, tys, t, false))
         }
         _ => false,
     }
@@ -2191,31 +2199,78 @@ fn mentions_ref(tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
-/// The resolved body of an alias with no lifetime params at one use
-/// (W-BORROW). Its regions are `'static` (`staticize`) in a region
-/// signature and a recorded body annotation (`Ctx::annotation_has_regions`).
-/// Elsewhere in a body (a cast target, a turbofish) the checker would
-/// erase them and the borrow checker never see them, so an alias that
-/// holds a reference is the same reject as a written `'static` there.
-fn alias_at_use(tys: &mut impl TyIntern, scope: &Scope, alias_ty: Ty, span: Span) -> Result<Ty, Diag> {
-    fn holds_ref(tys: &impl TyIntern, t: Ty) -> bool {
-        match tys.kind(t) {
-            TyKind::Ref(..) => true,
-            TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => holds_ref(tys, e),
-            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| holds_ref(tys, e)),
-            TyKind::Adt(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| holds_ref(tys, e))),
-            _ => false,
+/// True when an alias body `t` (erased) holds a region: a reference, or
+/// (`adt_only`: only) an Adt with lifetime params (`Q<'static>`,
+/// `Chars<'static>`), which an alias body can only write as `'static`.
+pub(crate) fn alias_holds_region(adt_lifetimes: &FxMap<DefId, Vec<Sym>>, tys: &impl TyIntern, t: Ty, adt_only: bool) -> bool {
+    let go = |e: Ty| alias_holds_region(adt_lifetimes, tys, e, adt_only);
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) => !adt_only || go(e),
+        TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => go(e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(e)),
+        TyKind::Adt(_, a) => {
+            crate::borrowck::adt_region_count(adt_lifetimes, tys, t) > 0 || tys.args(a).iter().any(|g| g.as_ty().is_some_and(go))
         }
+        _ => false,
     }
+}
+
+/// The resolved body of an alias with no lifetime params at one use
+/// (W-BORROW). In a region signature or a recorded body annotation
+/// (`Ctx::annotation_has_regions`) its regions are `'static`: `staticize`,
+/// or for a body with an Adt lifetime (`type A = Q<'static>`, which an
+/// erased type cannot carry) the module alias's written `body` resolved
+/// again with regions kept. Elsewhere in a body (a cast target, a
+/// turbofish) the checker would erase them and the borrow checker never
+/// see them, so an alias that holds a region is the same reject as a
+/// written `'static` there, and so is a block-local alias over an Adt
+/// lifetime in an annotation.
+#[allow(clippy::too_many_arguments)]
+fn alias_at_use(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    alias_ty: Ty,
+    body: AliasBody,
+    span: Span,
+) -> Result<Ty, Diag> {
+    let not_here = Diag::new(
+        "L0203",
+        span,
+        "a type alias with a `'static` lifetime is not supported here inside a body yet",
+        "Write the aliased type with `'_`, or bind the value with a `let` annotation that names a module-level alias.",
+    );
     match scope.regions {
+        RegionMode::Keep { .. } if alias_holds_region(cx.adt_lifetimes, tys, alias_ty, true) => match body {
+            AliasBody::Module(Some(b)) => {
+                resolve_scoped(ast, interner, known, cx, tys, b, &Scope { regions: scope.regions.clone(), ..Scope::default() })
+            }
+            AliasBody::Module(None) => Ok(staticize(tys, alias_ty)),
+            AliasBody::Local => Err(not_here),
+        },
         RegionMode::Keep { .. } => Ok(staticize(tys, alias_ty)),
-        RegionMode::Erase if scope.infer_cell.is_some() && !scope.annotation && holds_ref(tys, alias_ty) => Err(Diag::new(
-            "L0203",
-            span,
-            "a type alias with a `'static` reference is not supported here inside a body yet",
-            "Write the aliased type with `'_`, or bind the value with a `let` annotation that names the alias.",
-        )),
+        RegionMode::Erase if scope.infer_cell.is_some() && !scope.annotation => {
+            if alias_holds_region(cx.adt_lifetimes, tys, alias_ty, false) { Err(not_here) } else { Ok(alias_ty) }
+        }
         RegionMode::Erase => Ok(alias_ty),
+    }
+}
+
+/// Where an alias used in `alias_at_use` comes from: a module alias with
+/// its written body when it has no generic params, or a block-local one.
+enum AliasBody {
+    Module(Option<ast::TyId>),
+    Local,
+}
+
+/// The written body of the module type alias `name`, for `alias_at_use`.
+fn module_alias_body(ast: &Ast, cx: &ResolveCx, name: Sym) -> Option<ast::TyId> {
+    match &ast.items.get(*cx.item_index.get(&name)? as usize)?.kind {
+        ast::ItemKind::Type(a) if a.name == name && a.generics.params.is_empty() => Some(a.ty),
+        _ => None,
     }
 }
 
@@ -3904,7 +3959,7 @@ pub(crate) fn resolve_path_ty(
         return if seg.has_args() {
             Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
         } else {
-            alias_at_use(tys, scope, alias_ty, span)
+            alias_at_use(ast, interner, known, cx, tys, scope, alias_ty, AliasBody::Local, span)
         };
     }
     if !local_block {
@@ -4143,7 +4198,7 @@ pub(crate) fn resolve_path_ty(
         return if seg.has_args() {
             Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
         } else {
-            alias_at_use(tys, scope, alias_ty, span)
+            alias_at_use(ast, interner, known, cx, tys, scope, alias_ty, AliasBody::Local, span)
         };
     }
     if segs.len() == 1
@@ -4165,7 +4220,8 @@ pub(crate) fn resolve_path_ty(
                 })
                 .collect()
         });
-        let alias_ty = alias_at_use(tys, scope, alias_ty, span)?;
+        let body = AliasBody::Module(module_alias_body(ast, cx, name));
+        let alias_ty = alias_at_use(ast, interner, known, cx, tys, scope, alias_ty, body, span)?;
         if kinds.is_empty() {
             return if seg.has_args() {
                 Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))

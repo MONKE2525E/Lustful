@@ -1153,6 +1153,7 @@ impl super::Ctx<'_> {
         let alias = |n: crate::intern::Sym| {
             local.iter().rev().find(|(m, _)| *m == n).map(|&(_, t)| t).or_else(|| p.aliases.get(&n).copied())
         };
-        super::generics::names_lifetime(&p.ast, &p.interner, t) || super::generics::names_static_alias(&p.ast, &alias, &mut self.tys, t)
+        super::generics::names_lifetime(&p.ast, &p.interner, t)
+            || super::generics::names_static_alias(&p.ast, &p.gx.adt_lifetimes, &alias, &mut self.tys, t)
     }
 }
