@@ -2102,7 +2102,10 @@ pub(super) fn reuse_kept(
         if !p.gx.user_generics && walk_instances {
             return Err("lang generics");
         }
-        if p.gx.user_generics {
+        // A header delta's replay (`kept_delta::replay_discovery`) has
+        // checked every plain body against its base already, a pending
+        // closure map included, as collect does.
+        if p.gx.user_generics && headers.is_empty() {
             // As collect runs discovery: before the driver sets these.
             let (record_reads, unwind) = (p.record_reads, p.unwind);
             (p.record_reads, p.unwind) = (true, false);
@@ -2113,10 +2116,12 @@ pub(super) fn reuse_kept(
                 let f = LocalDefId(*fn_index as u32);
                 let (checked, discarded) = crate::check::check_fn(&p, f);
                 if checked.closure_map_pending {
+                    crate::check::derive_delta::log(&|| format!("kept bases {}: closure map pending\n", p.display_name(p.fn_def(f).name)));
                     return Err("discovery");
                 }
                 let out = crate::check::generics::discovery_out(&p, &checked, &discarded);
                 if !base.as_ref().is_some_and(|b| b.same(&p, &out, walk_instances)) {
+                    crate::check::derive_delta::log(&|| format!("kept bases {}: output differs\n", p.display_name(p.fn_def(f).name)));
                     return Err("discovery");
                 }
                 if discarded.is_empty() {
