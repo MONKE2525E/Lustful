@@ -1632,7 +1632,7 @@ impl<'p> Lower<'p> {
                 // `Some`, `Ok`, `Err`, `Box::new`, `Rc::new`, or
                 // `String::from` used as a value (W-CHECK-G): a
                 // zero-sized item, as for a user constructor above.
-                Res::OptSome | Res::ResOk | Res::ResErr | Res::Builtin(_) if matches!(self.kind(ty), TyKind::FnDef(..)) => {
+                Res::OptSome | Res::ResOk | Res::ResErr | Res::Builtin(_) | Res::PrimAssoc { .. } if matches!(self.kind(ty), TyKind::FnDef(..)) => {
                     self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span)
                 }
                 _ => {}
@@ -1932,6 +1932,18 @@ impl<'p> Lower<'p> {
                         | crate::check::sync::SyncOp::PanicAny),
                     )) => self.unwind_call(op, args, ops, dest, ty, span),
                     Res::Builtin(b) => {
+                        let d = self.call_dest(dest, ty);
+                        self.call_into(CallTarget::Builtin(b), ops, d, span);
+                    }
+                    Res::PrimAssoc { b: Builtin::PrimFromCast, .. } => {
+                        // A primitive `T::from(x)` widening: the
+                        // same cast as `x.into()` to a scalar.
+                        match ops.into_iter().next() {
+                            Some(op) => self.set_or_temp(dest, Rvalue::Cast(op, ty), ty, span),
+                            None => {}
+                        }
+                    }
+                    Res::PrimAssoc { b, .. } => {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Builtin(b), ops, d, span);
                     }

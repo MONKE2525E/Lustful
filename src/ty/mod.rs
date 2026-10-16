@@ -611,6 +611,14 @@ fn builtin_def(module: &[&str], name: &str) -> DefId {
     DefId { krate: BUILTIN_CRATE, hash: crate::def::item_hash(builtin_crate_hash(), module, crate::def::DefKind::Adt, name, 0) }
 }
 
+/// The marker def a primitive builtin method's item type names
+/// (`u8::is_ascii_digit` used as a value, TRIAGE T12): its `FnDef`
+/// args are `[Ty(self), Const(name sym), Const(builtin code),
+/// extra tys..]` (check's `prim_item_value` and `prim_item_res`).
+pub fn prim_fn_def() -> DefId {
+    builtin_def(&["__lust"], "PrimFn")
+}
+
 /// The defs of the types that were closed `TyKind` cases before S3a. They become real
 /// std-crate defs when source std lands (ARCH 3.1); until then the builtin code paths
 /// in check, lower, and cgen recognize them through the `TyIntern` compat helpers.

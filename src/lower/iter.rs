@@ -428,6 +428,29 @@ impl Ex<'_, '_> {
                     self.call(CallTarget::Builtin(bf), args, dest);
                     return Ok(());
                 }
+                // A primitive builtin method item
+                // (`take_while(u8::is_ascii_digit)`, TRIAGE T12):
+                // its `FnDef` args carry the builtin code third
+                // (`prim_item_value`).
+                if def == crate::ty::prim_fn_def() {
+                    let code = match self.body.tys.args(fargs).get(2) {
+                        Some(GenericArg::Const(c)) => match self.body.tys.const_kind(*c) {
+                            ConstKind::Int(v) => v as u32,
+                            _ => u32::MAX,
+                        },
+                        _ => u32::MAX,
+                    };
+                    if let Some(bf) = crate::check::prim_builtin_of_code(code) {
+                        if bf == Builtin::PrimFromCast {
+                            let ty = self.place_ty(&dest)?;
+                            let op = args.into_iter().next().ok_or("iterator expansion: a conversion takes one argument")?;
+                            self.assign(dest, Rvalue::Cast(op, ty));
+                            return Ok(());
+                        }
+                        self.call(CallTarget::Builtin(bf), args, dest);
+                        return Ok(());
+                    }
+                }
                 if let Some(a) = self.p.adt_by_def(def) {
                     let v = match self.body.tys.args(fargs).first() {
                         Some(GenericArg::Const(c)) => match self.body.tys.const_kind(*c) {

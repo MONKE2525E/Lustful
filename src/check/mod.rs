@@ -598,6 +598,10 @@ pub enum Builtin {
     /// between builtin types (check/convert.rs `std_from`, W-STD-B):
     /// lower/iter.rs expands it per conversion.
     ConvInto,
+    /// A primitive `T::from(x)` widening (TRIAGE T12): the same
+    /// cast as `x.into()` to a scalar target, lowered as
+    /// `Rvalue::Cast` (lower.rs).
+    PrimFromCast,
     /// The cmp glue's three-way code for two references to one
     /// structurally ordered type (-1, 0, 1, or 2 for unordered), as
     /// an `i8`: `partial_cmp` and `cmp` read it once.
@@ -835,6 +839,58 @@ pub enum Builtin {
     RangeInclEnd,
 }
 
+
+/// The builtins a primitive method item value can name (TRIAGE
+/// T12), by index: `prim_item_value` writes the index as a const
+/// arg of the `FnDef`, `prim_item_res` and lower read it back.
+/// Every builtin the primitive method tables (`int_method`,
+/// `float_method`, `char_method`, `str_method`, and the String
+/// and bool arms of `prim_assoc_sig`) can return must be here.
+pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
+    Builtin::Abs, Builtin::BitWidth, Builtin::BoolThenSome, Builtin::BorrowingSub, Builtin::CarryingAdd, Builtin::CarryingMul,
+    Builtin::CarryingMulAdd, Builtin::CastSigned, Builtin::CastUnsigned, Builtin::CharEncodeUtf16, Builtin::CharEncodeUtf8, Builtin::CharFromDigit,
+    Builtin::CharFromU32, Builtin::CharIsAlphabetic, Builtin::CharIsAlphabeticUnicode, Builtin::CharIsAlphanumeric, Builtin::CharIsAlphanumericUnicode, Builtin::CharIsAscii,
+    Builtin::CharIsAsciiControl, Builtin::CharIsAsciiGraphic, Builtin::CharIsAsciiHexdigit, Builtin::CharIsAsciiPunctuation, Builtin::CharIsControlUnicode, Builtin::CharIsDigit,
+    Builtin::CharIsDigitRadix, Builtin::CharIsLowercase, Builtin::CharIsLowercaseUnicode, Builtin::CharIsNumericUnicode, Builtin::CharIsUppercase, Builtin::CharIsUppercaseUnicode,
+    Builtin::CharIsWhitespace, Builtin::CharIsWhitespaceUnicode, Builtin::CharLenUtf16, Builtin::CharLenUtf8, Builtin::CharToDigit, Builtin::CharToLowercase,
+    Builtin::CharToUppercase, Builtin::CheckedAbs, Builtin::CheckedAdd, Builtin::CheckedDiv, Builtin::CheckedIsqrt, Builtin::CheckedMul,
+    Builtin::CheckedNeg, Builtin::CheckedNextMultipleOf, Builtin::CheckedPow, Builtin::CheckedRem, Builtin::CheckedShl, Builtin::CheckedShr,
+    Builtin::CheckedSignedDiff, Builtin::CheckedSub, Builtin::ConvStrBytes, Builtin::CountOnes, Builtin::CountZeros, Builtin::DivCeil,
+    Builtin::DivEuclid, Builtin::FloatAbs, Builtin::FloatCeil, Builtin::FloatCopysign, Builtin::FloatExp, Builtin::FloatFloor,
+    Builtin::FloatFract, Builtin::FloatIsFinite, Builtin::FloatIsInfinite, Builtin::FloatIsNan, Builtin::FloatIsSignNegative, Builtin::FloatIsSignPositive,
+    Builtin::FloatLn, Builtin::FloatLog, Builtin::FloatLog10, Builtin::FloatLog2, Builtin::FloatMax, Builtin::FloatMin,
+    Builtin::FloatMulAdd, Builtin::FloatPowf, Builtin::FloatPowi, Builtin::FloatRecip, Builtin::FloatRound, Builtin::FloatSignum,
+    Builtin::FloatSqrt, Builtin::FloatToBits, Builtin::FloatTrunc, Builtin::HighestOne, Builtin::IsMultipleOf, Builtin::IsNegative,
+    Builtin::IsPositive, Builtin::IsPowerOfTwo, Builtin::IsolateHighestOne, Builtin::IsolateLowestOne, Builtin::Isqrt, Builtin::LeadingOnes,
+    Builtin::LeadingZeros, Builtin::LowestOne, Builtin::MakeAsciiLowercase, Builtin::MakeAsciiUppercase, Builtin::Max, Builtin::Min,
+    Builtin::MixedCheckedAdd, Builtin::MixedCheckedSub, Builtin::MixedOverflowingAdd, Builtin::MixedOverflowingSub, Builtin::MixedSaturatingAdd, Builtin::MixedSaturatingSub,
+    Builtin::MixedStrictAdd, Builtin::MixedStrictSub, Builtin::MixedWrappingAdd, Builtin::MixedWrappingSub, Builtin::NextMultipleOf, Builtin::OverflowingAbs,
+    Builtin::OverflowingAdd, Builtin::OverflowingDiv, Builtin::OverflowingMul, Builtin::OverflowingNeg, Builtin::OverflowingPow, Builtin::OverflowingRem,
+    Builtin::OverflowingShl, Builtin::OverflowingShr, Builtin::OverflowingSub, Builtin::Pow, Builtin::RemEuclid, Builtin::ReverseBits,
+    Builtin::RotateLeft, Builtin::RotateRight, Builtin::SaturatingAbs, Builtin::SaturatingAdd, Builtin::SaturatingDiv, Builtin::SaturatingMul,
+    Builtin::SaturatingNeg, Builtin::SaturatingPow, Builtin::SaturatingSub, Builtin::Signum, Builtin::StrAsPtr, Builtin::StrBytes,
+    Builtin::StrCharIndices, Builtin::StrChars, Builtin::StrContains, Builtin::StrEndsWith, Builtin::StrFind, Builtin::StrIsCharBoundary,
+    Builtin::StrIsEmpty, Builtin::StrLen, Builtin::StrRepeat, Builtin::StrReplace, Builtin::StrRfind, Builtin::StrStartsWith,
+    Builtin::StrStripPrefix, Builtin::StrStripSuffix, Builtin::StrToLowercase, Builtin::StrToString, Builtin::StrToUppercase, Builtin::StrTrim,
+    Builtin::StrTrimEnd, Builtin::StrTrimStart, Builtin::StrictAbs, Builtin::StrictAdd, Builtin::StrictDiv, Builtin::StrictDivEuclid,
+    Builtin::StrictMul, Builtin::StrictNeg, Builtin::StrictPow, Builtin::StrictRem, Builtin::StrictRemEuclid, Builtin::StrictShl,
+    Builtin::StrictShr, Builtin::StrictSub, Builtin::StringAsBytes, Builtin::StringAsMutStr, Builtin::StringAsStr, Builtin::StringCapacity,
+    Builtin::StringIntoBytes, Builtin::StringIsEmpty, Builtin::StringLen, Builtin::SwapBytes, Builtin::ToString, Builtin::TrailingOnes,
+    Builtin::TrailingZeros, Builtin::UnboundedShl, Builtin::UnboundedShr, Builtin::UnsignedAbs, Builtin::WrappingAbs, Builtin::WrappingAdd,
+    Builtin::WrappingDiv, Builtin::WrappingMul, Builtin::WrappingNeg, Builtin::WrappingPow, Builtin::WrappingRem, Builtin::WrappingShl,
+    Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast,
+];
+
+/// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
+pub(crate) fn prim_builtin_code(b: Builtin) -> Option<u32> {
+    PRIM_VALUE_BUILTINS.iter().position(|&x| x == b).map(|i| i as u32)
+}
+
+/// The builtin at a `PRIM_VALUE_BUILTINS` index, if in range.
+pub(crate) fn prim_builtin_of_code(code: u32) -> Option<Builtin> {
+    PRIM_VALUE_BUILTINS.get(code as usize).copied()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Res {
     None,
@@ -858,6 +914,15 @@ pub enum Res {
         b: Builtin,
         derefs: u8,
         autoref: Autoref,
+    },
+    /// A primitive type's builtin method named by a path
+    /// (`u8::is_ascii_digit`, `str::len`, TRIAGE T12): called with
+    /// the receiver as its first argument, or used as a value
+    /// (an `FnDef` over `ty::prim_fn_def`).
+    PrimAssoc {
+        b: Builtin,
+        self_ty: Ty,
+        name: Sym,
     },
     Field {
         derefs: u8,
@@ -1599,6 +1664,10 @@ struct Ctx<'p> {
     /// (`.map(String::from)`), re-tested at finish: lust's
     /// `String::from` takes `&str`, `char`, or `String`.
     deferred_string_from: Vec<(Ty, Span)>,
+    /// (Target, input) of a primitive `T::from` used as a value
+    /// (`map(u64::from)`, TRIAGE T12), re-tested at finish
+    /// against `std_from`, like `deferred_string_from`.
+    deferred_prim_from: Vec<(Ty, Ty, Span)>,
     /// Types a `std::any::type_name::<T>()` call names, tested at
     /// finish: lust must be able to print rustc's exact string for
     /// each (`any::type_name_of`), else the call is a reject.
@@ -1974,6 +2043,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         format_args_ok: Vec::new(),
         deferred_clone: Vec::new(),
         deferred_string_from: Vec::new(),
+        deferred_prim_from: Vec::new(),
         deferred_type_names: Vec::new(),
         deferred_trait_fn_values: Vec::new(),
         deferred_trait_fn_calls: Vec::new(),
@@ -3235,6 +3305,210 @@ impl<'p> Ctx<'p> {
         })
     }
 
+    /// The full signature (receiver first) of a primitive type's
+    /// builtin method named by a path (`u8::is_ascii_digit`,
+    /// `str::len`, `String::as_str`; TRIAGE T12), from the same
+    /// tables the method-call probe uses. The returned extra
+    /// types are the signature's own inference variables (the `T`
+    /// of `bool::then_some`): an item value carries them in its
+    /// `FnDef` args, and a decode passes them back in `extra` so
+    /// the same variables are reused.
+    fn prim_assoc_sig(&mut self, self_ty: Ty, name: Sym, extra: &[Ty]) -> Option<(Builtin, Vec<Ty>, Ty, Vec<Ty>)> {
+        use Builtin as B;
+        let k = &*self.p.known;
+        // `u64::from(x)` and `map(u64::from)`: std's `From` for a
+        // primitive target, as the conversion builtin. The input
+        // type is the one extra; its legality is checked where the
+        // call is checked (and deferred for an item value, like
+        // `String::from`).
+        if name == k.from && matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool) {
+            let src = match extra.first() {
+                Some(&t) => t,
+                None => self.new_var(false),
+            };
+            return Some((B::PrimFromCast, vec![src], self_ty, vec![src]));
+        }
+        let (b, autoref, params, ret) = match self.kind(self_ty) {
+            TyKind::Int(i) => self.int_method(name, self_ty, i)?,
+            TyKind::Float(f) => self.float_method(name, self_ty, f)?,
+            TyKind::Char => self.char_method(name)?,
+            TyKind::Bool if name == k.then_some => {
+                let t = match extra.first() {
+                    Some(&t) => t,
+                    None => self.new_var(false),
+                };
+                let o = self.tys.mk_option(t);
+                (B::BoolThenSome, Autoref::None, vec![t], o)
+            }
+            TyKind::Str => {
+                if name == k.len {
+                    (B::StrLen, Autoref::Ref, vec![], USIZE)
+                } else if name == k.is_empty {
+                    (B::StrIsEmpty, Autoref::Ref, vec![], BOOL)
+                } else if name == k.to_string || name == k.to_owned {
+                    (B::StrToString, Autoref::Ref, vec![], STRING)
+                } else if self.name(name) == "as_ptr" {
+                    (B::StrAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, int(IntTy::U8))))
+                } else {
+                    self.str_method(name)?
+                }
+            }
+            _ if self_ty == STRING => {
+                if name == k.as_str {
+                    (B::StringAsStr, Autoref::Ref, vec![], REF_STR)
+                } else if self.name(name) == "as_mut_str" {
+                    let r = self.tys.mk_ref(true, STR);
+                    (B::StringAsMutStr, Autoref::RefMut, vec![], r)
+                } else if name == k.len {
+                    (B::StringLen, Autoref::Ref, vec![], USIZE)
+                } else if name == k.is_empty {
+                    (B::StringIsEmpty, Autoref::Ref, vec![], BOOL)
+                } else if name == k.capacity {
+                    (B::StringCapacity, Autoref::Ref, vec![], USIZE)
+                } else if name == k.as_bytes {
+                    let sl = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
+                    let r = self.tys.mk_ref(false, sl);
+                    (B::StringAsBytes, Autoref::Ref, vec![], r)
+                } else if name == k.into_bytes {
+                    let v = self.tys.mk_vec(int(IntTy::U8));
+                    (B::StringIntoBytes, Autoref::None, vec![], v)
+                } else if name == k.to_string {
+                    (B::ToString, Autoref::Ref, vec![], STRING)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let recv = match autoref {
+            Autoref::None => self_ty,
+            Autoref::Ref => self.tys.mk_ref(false, self_ty),
+            Autoref::RefMut => self.tys.mk_ref(true, self_ty),
+            Autoref::SliceRef | Autoref::SliceRefMut => return None,
+        };
+        let mut full = vec![recv];
+        full.extend(params);
+        let extras = if extra.is_empty() {
+            let mut out = Vec::new();
+            for &t in full.iter().chain([&ret]) {
+                self.collect_infer_tys(t, &mut out);
+            }
+            out
+        } else {
+            extra.to_vec()
+        };
+        Some((b, full, ret, extras))
+    }
+
+    /// Collect the distinct inference-variable types inside `t`.
+    fn collect_infer_tys(&self, t: Ty, out: &mut Vec<Ty>) {
+        match self.kind(t) {
+            TyKind::Infer(_) => {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+            TyKind::Ref(_, _, inner) | TyKind::RawPtr(_, inner) | TyKind::Slice(inner) | TyKind::Array(inner, _) => {
+                self.collect_infer_tys(inner, out)
+            }
+            TyKind::Tuple(ts) => {
+                for u in self.tys.tys_of(ts).to_vec() {
+                    self.collect_infer_tys(u, out);
+                }
+            }
+            TyKind::Adt(_, args) | TyKind::FnDef(_, args) | TyKind::Closure(_, args) | TyKind::Projection(_, args) | TyKind::Opaque(_, args) => {
+                for g in self.tys.args(args).to_vec() {
+                    if let Some(u) = g.as_ty() {
+                        self.collect_infer_tys(u, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The item type of a primitive builtin method used as a value
+    /// (`take_while(u8::is_ascii_digit)`, TRIAGE T12): an `FnDef`
+    /// over `ty::prim_fn_def` carrying the Self type, the method
+    /// name and builtin code as consts, and the signature's extra
+    /// types. `prim_item_res` decodes it.
+    fn prim_item_value(&mut self, b: Builtin, self_ty: Ty, name: Sym, span: Span) -> Ty {
+        let Some((_, _, _, extras)) = self.prim_assoc_sig(self_ty, name, &[]) else {
+            self.errs.push(unsupported(span, "this std function used as a value"));
+            return ERROR;
+        };
+        if b == Builtin::PrimFromCast
+            && let Some(&src) = extras.first()
+        {
+            self.deferred_prim_from.push((self_ty, src, span));
+        }
+        let Some(code) = prim_builtin_code(b) else {
+            self.errs.push(unsupported(span, "this std function used as a value"));
+            return ERROR;
+        };
+        let mut args = vec![
+            GenericArg::Ty(self_ty),
+            GenericArg::Const(self.tys.intern_const(ConstKind::Int(name.0 as u128))),
+            GenericArg::Const(self.tys.intern_const(ConstKind::Int(code as u128))),
+        ];
+        args.extend(extras.into_iter().map(GenericArg::Ty));
+        let args = self.tys.intern_args(&args);
+        self.tys.intern(TyKind::FnDef(crate::ty::prim_fn_def(), args))
+    }
+
+    /// The call a primitive method item makes (see
+    /// `prim_item_value`), with the item's (params, return).
+    fn prim_item_res(&mut self, def: DefId, args: ArgsId) -> Option<(Res, Vec<Ty>, Ty)> {
+        if def != crate::ty::prim_fn_def() {
+            return None;
+        }
+        let gs = self.tys.args(args).to_vec();
+        let self_ty = gs.first().and_then(|g| g.as_ty())?;
+        let const_at = |i: usize| match gs.get(i) {
+            Some(GenericArg::Const(c)) => match self.tys.const_kind(*c) {
+                ConstKind::Int(v) => Some(v as u32),
+                _ => None,
+            },
+            _ => None,
+        };
+        let name = Sym(const_at(1)?);
+        let code = const_at(2)?;
+        let b = prim_builtin_of_code(code)?;
+        let extras: Vec<Ty> = gs.iter().skip(3).filter_map(|g| g.as_ty()).collect();
+        let (b2, params, ret, _) = self.prim_assoc_sig(self_ty, name, &extras)?;
+        if b2 != b {
+            return None;
+        }
+        Some((Res::PrimAssoc { b, self_ty, name }, params, ret))
+    }
+
+    /// The primitive type a two-segment path's first segment names
+    /// (`u8`, `str`, `String`; TRIAGE T12), if it names one.
+    fn prim_ty_by_name(&mut self, ty_name: Sym) -> Option<Ty> {
+        let it = match self.name(ty_name) {
+            "i8" => Some(int(IntTy::I8)),
+            "i16" => Some(int(IntTy::I16)),
+            "i32" => Some(int(IntTy::I32)),
+            "i64" => Some(int(IntTy::I64)),
+            "i128" => Some(int(IntTy::I128)),
+            "isize" => Some(int(IntTy::Isize)),
+            "u8" => Some(int(IntTy::U8)),
+            "u16" => Some(int(IntTy::U16)),
+            "u32" => Some(int(IntTy::U32)),
+            "u64" => Some(int(IntTy::U64)),
+            "u128" => Some(int(IntTy::U128)),
+            "usize" => Some(int(IntTy::Usize)),
+            "f32" => Some(self.tys.float_ty(FloatTy::F32)),
+            "f64" => Some(self.tys.float_ty(FloatTy::F64)),
+            "char" => Some(CHAR),
+            "bool" => Some(BOOL),
+            "str" => Some(STR),
+            "String" => Some(STRING),
+            _ => None,
+        };
+        it
+    }
+
     /// The variant a constructor `FnDef` type names, from its const arg.
     fn ctor_variant(&self, args: ArgsId) -> u32 {
         match self.tys.args(args).first() {
@@ -3256,7 +3530,7 @@ impl<'p> Ctx<'p> {
                 Some((self.tys.tys_of(s.inputs).to_vec(), s.output))
             }
             TyKind::FnDef(def, args) => {
-                if let Some((_, params, ret)) = self.builtin_item_res(def, args) {
+                if let Some((_, params, ret)) = self.builtin_item_res(def, args).or_else(|| self.prim_item_res(def, args)) {
                     return Some((params, ret));
                 }
                 // A trait method as a value (`Into::into`,
@@ -3322,6 +3596,14 @@ impl<'p> Ctx<'p> {
             TyKind::FnDef(def, _) => self.p.is_fn_item_def(def),
             _ => false,
         }
+    }
+
+    /// True when `t` is a primitive builtin method item (TRIAGE
+    /// T12): it has no body fn, so it cannot reify to a function
+    /// pointer (like `Box::new` today); calls through it decode
+    /// to the builtin instead.
+    fn is_prim_item(&self, t: Ty) -> bool {
+        matches!(self.kind(t), TyKind::FnDef(def, _) if def == crate::ty::prim_fn_def())
     }
 
     /// The free fn a value binding names, if it names one.
@@ -5268,7 +5550,7 @@ impl<'p> Ctx<'p> {
             }
             // A plain fn item coerces to a function pointer with the
             // same signature (the value materializes as its trampoline).
-            (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(found) && self.fn_item_ptr_unifies(found, expected) => {
+            (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(found) && !self.is_prim_item(found) && self.fn_item_ptr_unifies(found, expected) => {
                 // A path to the fn gets the pointer type, so lowering
                 // materializes the trampoline value for it. Any other
                 // expression keeps its zero-sized item type, and the
@@ -7608,7 +7890,7 @@ impl<'p> Ctx<'p> {
                 // `i32` and the cast then fails). The real check
                 // is deferred to `finish`.
                 let fn_cast = match (self.kind(t), self.kind(target)) {
-                    (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(t) => {
+                    (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(t) && !self.is_prim_item(t) => {
                         if self.has_unbound_deep(target) {
                             let snap = self.snapshot_vars();
                             let ok = self.fn_item_ptr_unifies(t, target) && self.coerce_at(t, target, span, Some(*expr));
@@ -9809,6 +10091,9 @@ impl<'p> Ctx<'p> {
             if matches!(r, Res::OptSome | Res::ResOk | Res::ResErr | Res::Builtin(Builtin::BoxNew | Builtin::RcNew | Builtin::StringFrom | Builtin::StringAsStr)) {
                 return self.builtin_item_value(e, r, segs, span);
             }
+            if let Res::PrimAssoc { b, self_ty, name } = r {
+                return self.prim_item_value(b, self_ty, name, span);
+            }
             // Other std fns (`String::new`, `Vec::from`) have no value
             // form yet. An error type without a diagnostic would reach
             // codegen, so report every one.
@@ -9966,19 +10251,14 @@ impl<'p> Ctx<'p> {
                 return Some(Res::Builtin(Builtin::F32FromBits));
             }
         }
-        // `char::from_u32`, `char::from_digit`, and the Unicode predicate
-        // associated calls (`char::is_alphabetic(&c)`).
+        // `char::from_u32` and `char::from_digit` (associated fns
+        // without a receiver). The Unicode predicate paths
+        // (`char::is_alphabetic(c)`) resolve through the primitive
+        // method table below (`prim_assoc_sig`), as values too.
         if names.len() == 2 && names[0] == k.char {
             let b = match names[1] {
                 n if n == k.from_u32 => Some(Builtin::CharFromU32),
                 n if n == k.from_digit => Some(Builtin::CharFromDigit),
-                n if n == k.is_alphabetic => Some(Builtin::CharIsAlphabeticUnicode),
-                n if n == k.is_numeric => Some(Builtin::CharIsNumericUnicode),
-                n if n == k.is_alphanumeric => Some(Builtin::CharIsAlphanumericUnicode),
-                n if n == k.is_lowercase => Some(Builtin::CharIsLowercaseUnicode),
-                n if n == k.is_uppercase => Some(Builtin::CharIsUppercaseUnicode),
-                n if n == k.is_whitespace => Some(Builtin::CharIsWhitespaceUnicode),
-                n if n == k.is_control => Some(Builtin::CharIsControlUnicode),
                 _ => None,
             };
             if let Some(b) = b {
@@ -10111,6 +10391,35 @@ impl<'p> Ctx<'p> {
         if ty_name == k.String || ty_name == k.str {
             if let Some(r) = self.utf8_assoc(ty_name == k.String, item, span) {
                 return r;
+            }
+        }
+        // A primitive type's method by path (`u8::is_ascii_digit`,
+        // `str::len`, `char::to_lowercase`; TRIAGE T12): a std source
+        // inherent fn when one is registered, else the builtin
+        // method table as a `PrimAssoc`. Associated consts
+        // (`u8::MAX`) resolve elsewhere and fall through.
+        if let Some(self_ty) = self.prim_ty_by_name(ty_name) {
+            if let Some(fs) = p.gx.prim_inherent_methods.get(&(self_ty, item)).filter(|fs| !fs.is_empty()) {
+                let written: Vec<LocalDefId> = fs.iter().copied().filter(|f| !p.gx.instances.contains_key(f)).collect();
+                if let [f] = written.as_slice() {
+                    return Some(Res::Fn(*f));
+                }
+                if written.is_empty() {
+                    return Some(Res::Fn(fs[0]));
+                }
+            }
+            if let Some((b, _, _, _)) = self.prim_assoc_sig(self_ty, item, &[]) {
+                return Some(Res::PrimAssoc { b, self_ty, name: item });
+            }
+            if self_ty != STRING && self.name(item).chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') {
+                let tn = self.name(ty_name).to_string();
+                self.err(
+                    "L0104",
+                    span,
+                    format!("no variant or associated function `{}` on `{tn}`", self.name(item)),
+                    "Check the name.",
+                );
+                return None;
             }
         }
         if ty_name == k.String {
@@ -11344,7 +11653,11 @@ impl<'p> Ctx<'p> {
             TyKind::FnDef(def, cargs) if def == self.tys.builtins().string => self.builtin_item_res(def, cargs).map(|(r, _, _)| r),
             TyKind::FnDef(def, cargs) => match self.p.adt_by_def(def) {
                 Some(a) => Some(Res::Variant(a, self.ctor_variant(cargs))),
-                None => self.builtin_item_res(def, cargs).map(|(r, _, _)| r).or_else(|| self.p.local_def(def.hash).map(Res::Fn)),
+                None => self
+                    .builtin_item_res(def, cargs)
+                    .or_else(|| self.prim_item_res(def, cargs))
+                    .map(|(r, _, _)| r)
+                    .or_else(|| self.p.local_def(def.hash).map(Res::Fn)),
             },
             _ => None,
         }
@@ -12064,6 +12377,61 @@ impl<'p> Ctx<'p> {
                 match self.callable_sig(ct) {
                     Some((params, ret)) => {
                         self.check_args(&params, args, span);
+                        ret
+                    }
+                    None => ERROR,
+                }
+            }
+            Res::PrimAssoc { self_ty, name, .. } => {
+                // A primitive builtin method called by path
+                // (`u8::is_ascii_digit(&b)`; TRIAGE T12): the
+                // receiver is the first argument, checked against
+                // the method table's own signature. The str search
+                // methods take std's `Pattern` in the second
+                // argument, as in the method form.
+                match self.prim_assoc_sig(self_ty, name, &[]) {
+                    Some((b, params, ret, _)) if b == Builtin::PrimFromCast => {
+                        // `u64::from(x)` called by path: the one
+                        // argument converts, as `std_from` answers
+                        // (check/convert.rs), with a literal source
+                        // narrowed like an owner's `from`.
+                        self.check_args(&params, args, span);
+                        if params.len() == 1 && args.len() == 1 {
+                            let src = self.deep(params[0]);
+                            if !self.has_error_kind(src)
+                                && !matches!(self.kind(src), TyKind::Infer(_))
+                                && !Self::numeric_from_ok(self.kind(src), self.kind(self_ty))
+                            {
+                                let (dn, sn) = (self.tn(self_ty), self.tn(src));
+                                self.err(
+                                    "L0612",
+                                    span,
+                                    format!("the trait bound `{dn}: From<{sn}>` is not satisfied"),
+                                    "Check the conversion: `From` between primitives only widens.",
+                                );
+                            }
+                        }
+                        ret
+                    }
+                    Some((b, params, ret, _)) => {
+                        if matches!(
+                            b,
+                            Builtin::StrContains
+                                | Builtin::StrFind
+                                | Builtin::StrRfind
+                                | Builtin::StrStartsWith
+                                | Builtin::StrEndsWith
+                                | Builtin::StrStripPrefix
+                                | Builtin::StrStripSuffix
+                                | Builtin::StrReplace
+                        ) && params.len() >= 2
+                            && args.len() == params.len()
+                        {
+                            self.check_args(&params[..1], &args[..1], span);
+                            self.check_str_pattern_args(&params[1..], &args[1..], span);
+                        } else {
+                            self.check_args(&params, args, span);
+                        }
                         ret
                     }
                     None => ERROR,
@@ -13871,69 +14239,7 @@ impl<'p> Ctx<'p> {
                     None
                 }
             }
-            (None, TyKind::Char) if name != k.to_string => {
-                let b = [
-                    (k.is_ascii_digit, B::CharIsDigit),
-                    (k.is_ascii_alphabetic, B::CharIsAlphabetic),
-                    (k.is_ascii_alphanumeric, B::CharIsAlphanumeric),
-                    (k.is_ascii_whitespace, B::CharIsWhitespace),
-                    (k.is_ascii_uppercase, B::CharIsUppercase),
-                    (k.is_ascii_lowercase, B::CharIsLowercase),
-                ];
-                // The Unicode predicates take `self`, not `&self`.
-                let u = [
-                    (k.is_alphabetic, B::CharIsAlphabeticUnicode),
-                    (k.is_numeric, B::CharIsNumericUnicode),
-                    (k.is_alphanumeric, B::CharIsAlphanumericUnicode),
-                    (k.is_lowercase, B::CharIsLowercaseUnicode),
-                    (k.is_uppercase, B::CharIsUppercaseUnicode),
-                    (k.is_whitespace, B::CharIsWhitespaceUnicode),
-                    (k.is_control, B::CharIsControlUnicode),
-                ];
-                if let Some(&(_, b)) = u.iter().find(|(n, _)| *n == name) {
-                    Some((b, Autoref::None, vec![], BOOL))
-                } else if let Some(&(_, b)) = b.iter().find(|(n, _)| *n == name) {
-                    Some((b, Autoref::Ref, vec![], BOOL))
-                } else if name == k.to_ascii_uppercase {
-                    Some((B::CharToUppercase, Autoref::Ref, vec![], CHAR))
-                } else if name == k.to_ascii_lowercase {
-                    Some((B::CharToLowercase, Autoref::Ref, vec![], CHAR))
-                } else if name == k.make_ascii_lowercase {
-                    Some((B::MakeAsciiLowercase, Autoref::RefMut, vec![], UNIT))
-                } else if name == k.make_ascii_uppercase {
-                    Some((B::MakeAsciiUppercase, Autoref::RefMut, vec![], UNIT))
-                } else if name == k.to_digit {
-                    let o = self.tys.mk_option(int(IntTy::U32));
-                    Some((B::CharToDigit, Autoref::None, vec![int(IntTy::U32)], o))
-                } else if name == k.is_digit {
-                    Some((B::CharIsDigitRadix, Autoref::None, vec![int(IntTy::U32)], BOOL))
-                } else if name == k.len_utf8 {
-                    Some((B::CharLenUtf8, Autoref::None, vec![], USIZE))
-                } else if name == k.len_utf16 {
-                    Some((B::CharLenUtf16, Autoref::None, vec![], USIZE))
-                } else if name == k.encode_utf8 {
-                    let sl = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
-                    let dst = self.tys.mk_ref(true, sl);
-                    let ret = self.tys.mk_ref(true, STR);
-                    Some((B::CharEncodeUtf8, Autoref::None, vec![dst], ret))
-                } else if name == k.encode_utf16 {
-                    let sl = self.tys.intern(TyKind::Slice(int(IntTy::U16)));
-                    let dst = self.tys.mk_ref(true, sl);
-                    Some((B::CharEncodeUtf16, Autoref::None, vec![dst], dst))
-                } else if name == k.is_ascii {
-                    Some((B::CharIsAscii, Autoref::Ref, vec![], BOOL))
-                } else if name == k.is_ascii_punctuation {
-                    Some((B::CharIsAsciiPunctuation, Autoref::Ref, vec![], BOOL))
-                } else if name == k.is_ascii_graphic {
-                    Some((B::CharIsAsciiGraphic, Autoref::Ref, vec![], BOOL))
-                } else if name == k.is_ascii_hexdigit {
-                    Some((B::CharIsAsciiHexdigit, Autoref::Ref, vec![], BOOL))
-                } else if name == k.is_ascii_control {
-                    Some((B::CharIsAsciiControl, Autoref::Ref, vec![], BOOL))
-                } else {
-                    None
-                }
-            }
+            (None, TyKind::Char) if name != k.to_string => self.char_method(name),
             (None, TyKind::Int(i)) => self.int_method(name, base, i),
             (None, TyKind::Float(f)) => self.float_method(name, base, f),
             // Trait methods work on a float of unknown width; inherent
@@ -14089,6 +14395,78 @@ impl<'p> Ctx<'p> {
             }
         }
     }
+
+
+    /// Inherent `char` methods (the ASCII family, the Unicode
+    /// predicates, encoding; TRIAGE T8/T12). The receiver form
+    /// follows std: ASCII predicates and case maps take `&self`,
+    /// the Unicode predicates take `self`.
+    fn char_method(&mut self, name: Sym) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
+        use Builtin as B;
+        let k = &*self.p.known;
+
+        let b = [
+            (k.is_ascii_digit, B::CharIsDigit),
+            (k.is_ascii_alphabetic, B::CharIsAlphabetic),
+            (k.is_ascii_alphanumeric, B::CharIsAlphanumeric),
+            (k.is_ascii_whitespace, B::CharIsWhitespace),
+            (k.is_ascii_uppercase, B::CharIsUppercase),
+            (k.is_ascii_lowercase, B::CharIsLowercase),
+        ];
+        // The Unicode predicates take `self`, not `&self`.
+        let u = [
+            (k.is_alphabetic, B::CharIsAlphabeticUnicode),
+            (k.is_numeric, B::CharIsNumericUnicode),
+            (k.is_alphanumeric, B::CharIsAlphanumericUnicode),
+            (k.is_lowercase, B::CharIsLowercaseUnicode),
+            (k.is_uppercase, B::CharIsUppercaseUnicode),
+            (k.is_whitespace, B::CharIsWhitespaceUnicode),
+            (k.is_control, B::CharIsControlUnicode),
+        ];
+        if let Some(&(_, b)) = u.iter().find(|(n, _)| *n == name) {
+            Some((b, Autoref::None, vec![], BOOL))
+        } else if let Some(&(_, b)) = b.iter().find(|(n, _)| *n == name) {
+            Some((b, Autoref::Ref, vec![], BOOL))
+        } else if name == k.to_ascii_uppercase {
+            Some((B::CharToUppercase, Autoref::Ref, vec![], CHAR))
+        } else if name == k.to_ascii_lowercase {
+            Some((B::CharToLowercase, Autoref::Ref, vec![], CHAR))
+        } else if name == k.make_ascii_lowercase {
+            Some((B::MakeAsciiLowercase, Autoref::RefMut, vec![], UNIT))
+        } else if name == k.make_ascii_uppercase {
+            Some((B::MakeAsciiUppercase, Autoref::RefMut, vec![], UNIT))
+        } else if name == k.to_digit {
+            let o = self.tys.mk_option(int(IntTy::U32));
+            Some((B::CharToDigit, Autoref::None, vec![int(IntTy::U32)], o))
+        } else if name == k.is_digit {
+            Some((B::CharIsDigitRadix, Autoref::None, vec![int(IntTy::U32)], BOOL))
+        } else if name == k.len_utf8 {
+            Some((B::CharLenUtf8, Autoref::None, vec![], USIZE))
+        } else if name == k.len_utf16 {
+            Some((B::CharLenUtf16, Autoref::None, vec![], USIZE))
+        } else if name == k.encode_utf8 {
+            let sl = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
+            let dst = self.tys.mk_ref(true, sl);
+            let ret = self.tys.mk_ref(true, STR);
+            Some((B::CharEncodeUtf8, Autoref::None, vec![dst], ret))
+        } else if name == k.encode_utf16 {
+            let sl = self.tys.intern(TyKind::Slice(int(IntTy::U16)));
+            let dst = self.tys.mk_ref(true, sl);
+            Some((B::CharEncodeUtf16, Autoref::None, vec![dst], dst))
+        } else if name == k.is_ascii {
+            Some((B::CharIsAscii, Autoref::Ref, vec![], BOOL))
+        } else if name == k.is_ascii_punctuation {
+            Some((B::CharIsAsciiPunctuation, Autoref::Ref, vec![], BOOL))
+        } else if name == k.is_ascii_graphic {
+            Some((B::CharIsAsciiGraphic, Autoref::Ref, vec![], BOOL))
+        } else if name == k.is_ascii_hexdigit {
+            Some((B::CharIsAsciiHexdigit, Autoref::Ref, vec![], BOOL))
+        } else if name == k.is_ascii_control {
+            Some((B::CharIsAsciiControl, Autoref::Ref, vec![], BOOL))
+        } else {
+            None
+        }
+        }
 
     /// Inherent integer methods (`checked_add`, `count_ones`, and kin).
     /// All take the receiver by value. The 128-bit checked, saturating,
@@ -20142,6 +20520,25 @@ impl<'p> Ctx<'p> {
                     let what = format!("`String::from` as a value with input `{tn}` (lust takes `&str`, `char`, or `String` there)");
                     self.errs.push(unsupported(span, &what));
                 }
+            }
+        }
+        for (dst, src, span) in std::mem::take(&mut self.deferred_prim_from) {
+            let src = self.deep(src);
+            if self.has_error_kind(src) {
+                continue;
+            }
+            if matches!(self.kind(src), TyKind::Infer(_)) {
+                self.err("L0610", span, "type annotations needed: the input of this `from` is not known", "Annotate the input's type.");
+                continue;
+            }
+            if !Self::numeric_from_ok(self.kind(src), self.kind(dst)) {
+                let (dn, sn) = (self.tn(dst), self.tn(src));
+                self.err(
+                    "L0612",
+                    span,
+                    format!("the trait bound `{dn}: From<{sn}>` is not satisfied"),
+                    "Check the conversion: `From` between primitives only widens.",
+                );
             }
         }
         // `type_name::<T>()` calls: with every constraint in, lust
