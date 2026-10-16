@@ -127,7 +127,7 @@ Release builds go through the real Rust toolchain on the same source, and lust p
 
 Not yet: generics, traits, closures, iterators beyond `chars()`, `Result` and `?`, `HashMap`, floats, tuples, arrays, slices, modules, `const`, `let`-else, and moving one field out of a struct while keeping the rest. Each one gives error `L9001`.
 
-Lust rejects on purpose: lifetime syntax (`L0203`) and references in struct fields (`L0201`).
+Lust rejects on purpose: lifetime syntax (`L0203`), references in struct fields (`L0201`), and a glob-imported name whose binding depends on rustc's import order (`L0509`; import the item explicitly).
 
 ## Tests
 

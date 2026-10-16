@@ -58,6 +58,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0506](L0506.md) | unresolved import |
 | [L0507](L0507.md) | ambiguous name from glob imports |
 | [L0508](L0508.md) | dependency crate has no lust form yet |
+| [L0509](L0509.md) | glob name whose binding depends on rustc's import order (subset rule) |
 | [L0510](L0510.md) | item is private |
 | [L0511](L0511.md) | visibility names no enclosing module |
 | [L0520](L0520.md) | unknown cfg name |

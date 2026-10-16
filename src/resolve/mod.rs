@@ -7,6 +7,7 @@ pub mod cfg;
 pub mod imports;
 pub mod macro_scope;
 pub mod modules;
+pub mod order;
 pub mod probe;
 pub mod stdpaths;
 pub mod worklist;

@@ -43,7 +43,7 @@ prints "reserved, not yet emitted".
 | L0505 | Modules and imports | W-RESOLVE | in use | Module-path forms lust cannot place yet (source-dependency items work; see L0508) |
 | L0506-L0507 | Modules and imports | W-RESOLVE | in use | L0506 unresolved import, L0507 ambiguous glob name used |
 | L0508 | Modules and imports | W-RESOLVE | in use | Dependency crate has no lust source, adapter, or shim form yet |
-| L0509 | Modules and imports | W-RESOLVE | reserved | |
+| L0509 | Modules and imports | W-RESOLVE | in use | Glob name whose binding depends on rustc's import order (subset rule) |
 | L0510 | Visibility | W-RESOLVE | in use | Item or field is private |
 | L0511 | Visibility | W-RESOLVE | in use | Restricted visibility names no enclosing module |
 | L0512-L0519 | Visibility | W-RESOLVE | reserved | |

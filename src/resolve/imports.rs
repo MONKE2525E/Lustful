@@ -292,6 +292,11 @@ pub struct ResolvedTables {
     /// when nothing uses it (E0659); `run_imports` reports the ones
     /// whose source is still ambiguous when the fixpoint ends.
     pub ambig_single: Vec<(Import, Namespace, ModuleId, Sym)>,
+    /// The glob-bound names whose binding depends on rustc's glob event
+    /// order, with every binding rustc may end with (`resolve::order`).
+    /// Filled after the fixpoint; a read with an order-dependent answer
+    /// is `PathRes::OrderDep` (L0509, a lust subset rule).
+    pub order_dep: FxMap<(ModuleId, u8, Sym), crate::resolve::order::OrderSet>,
     /// The binding each `macro_rules!` definition leaves in its own
     /// module's macro namespace (`bind_outline_macros`). rustc has no
     /// such binding: no path import may read it, and a one-segment
@@ -434,6 +439,7 @@ impl ResolvedTables {
             single_binds: Vec::new(),
             ambig_vis: FxMap::default(),
             ambig_single: Vec::new(),
+            order_dep: FxMap::default(),
             macro_textual_binds: FxMap::default(),
             macro_scopes: FxMap::default(),
             adapters: Vec::new(),
@@ -641,7 +647,7 @@ impl ResolvedTables {
     /// The set of modules a visibility reaches, as a region for the
     /// re-export subset check: everywhere (pub), the whole crate, or one
     /// module subtree.
-    fn vis_region(&self, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (u8, Option<ModuleId>) {
+    pub(super) fn vis_region(&self, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (u8, Option<ModuleId>) {
         match vis {
             VisKind::Pub => (2, None),
             VisKind::Crate => (1, None),
@@ -659,7 +665,7 @@ impl ResolvedTables {
 
     /// True when the region of `vis` (at `def_module`) is inside the
     /// region of `outer` (at `outer_module`).
-    fn vis_within(&self, vis: &VisKind, def_module: ModuleId, outer: &VisKind, outer_module: ModuleId, interner: &Interner) -> bool {
+    pub(super) fn vis_within(&self, vis: &VisKind, def_module: ModuleId, outer: &VisKind, outer_module: ModuleId, interner: &Interner) -> bool {
         let (ra, ma) = self.vis_region(vis, def_module, interner);
         let (rb, mb) = self.vis_region(outer, outer_module, interner);
         if rb == 2 {
@@ -731,7 +737,7 @@ impl ResolvedTables {
     /// else the source binding's own narrower visibility at its own
     /// module. So `pub use inner::*` of a `pub(super)` item binds it as
     /// that `pub(super)`, not as `pub`.
-    fn glob_vis(&self, imp: &Import, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (VisKind, ModuleId) {
+    pub(super) fn glob_vis(&self, imp: &Import, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (VisKind, ModuleId) {
         if self.vis_within(&imp.vis, imp.module, vis, def_module, interner) {
             (imp.vis.clone(), imp.module)
         } else {
@@ -1305,6 +1311,24 @@ impl ResolvedTables {
                 vis(h, &info.vis);
             });
         }
+        for (&(m, ns, name), set) in &self.order_dep {
+            fold!(0x4b, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(m.0 as u64);
+                h.write_u64(ns as u64);
+                h.write_u64(name.0 as u64);
+                h.write_u64(set.absent as u64);
+                h.write_u64(set.entries.len() as u64);
+                for (v, dm, item) in &set.entries {
+                    vis(h, v);
+                    h.write_u64(dm.0 as u64);
+                    match item {
+                        AmbItem::Item(t) => target(h, t),
+                        AmbItem::Std(path) => path.iter().for_each(|s| h.write_u64(s.0 as u64)),
+                        AmbItem::Amb { .. } => h.write_u64(7),
+                    }
+                }
+            });
+        }
         for (i, d) in self.module_defs.iter().enumerate() {
             fold!(0x44, |h: &mut crate::intern::FxHasher| {
                 h.write_u64(i as u64);
@@ -1390,6 +1414,9 @@ pub enum PathRes {
     Done(Target),
     Partial(Target, usize),
     Ambiguous,
+    /// The name's binding depends on rustc's glob order
+    /// (`ResolvedTables::order_dependent`, L0509).
+    OrderDep,
     Private,
     /// The first segment names a std prelude item. Callers leave the
     /// written path to the std compat handling.
@@ -1697,10 +1724,11 @@ impl ResolvedTables {
     /// does not shadow the `core` crate in any other module.
     fn first_segment(&self, from: ModuleId, name: Sym, ns: Namespace, _mode: PathMode, interner: &Interner) -> PathRes {
         match self.lookup(from, ns, name) {
+            Some(BindState::Ambiguous) => return PathRes::Ambiguous,
+            _ if self.order_dependent(from, ns, name, from, interner) => return PathRes::OrderDep,
             Some(BindState::One(b)) => {
                 return if self.visible(&b.vis, b.def_module, from, interner) { PathRes::Done(b.target) } else { PathRes::Private };
             }
-            Some(BindState::Ambiguous) => return PathRes::Ambiguous,
             None => {}
         }
         let name_str = interner.get(name);
@@ -1725,6 +1753,9 @@ impl ResolvedTables {
         let name_str = interner.get(name);
         let own: Option<(SegBind, bool)> = match self.lookup(from, ns, name) {
             Some(BindState::Ambiguous) => return SegInfo { bind: SegBind::Ambiguous, glob: false },
+            // An order-dependent glob name (L0509) is no safe answer
+            // either; import paths report it as ambiguous.
+            _ if self.order_dependent(from, ns, name, from, interner) => return SegInfo { bind: SegBind::Ambiguous, glob: false },
             Some(BindState::One(b)) if self.visible(&b.vis, b.def_module, from, interner) => {
                 Some((SegBind::Target(b.target), b.rank <= 1))
             }
@@ -1789,6 +1820,8 @@ impl ResolvedTables {
     /// Resolves one segment inside a module target, with visibility.
     fn segment_in(&self, module: ModuleId, name: Sym, ns: Namespace, from: ModuleId, interner: &Interner) -> PathRes {
         match self.lookup(module, ns, name) {
+            Some(BindState::Ambiguous) => PathRes::Ambiguous,
+            _ if self.order_dependent(module, ns, name, from, interner) => PathRes::OrderDep,
             Some(BindState::One(b)) => {
                 if self.visible(&b.vis, b.def_module, from, interner) {
                     PathRes::Done(b.target)
@@ -1796,7 +1829,6 @@ impl ResolvedTables {
                     PathRes::Private
                 }
             }
-            Some(BindState::Ambiguous) => PathRes::Ambiguous,
             None => PathRes::Absent,
         }
     }
@@ -2081,6 +2113,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     tables.pending_single.clear();
     tables.ambig_single.clear();
     tables.single_binds.clear();
+    tables.order_dep.clear();
     tables.import_stall = false;
     for imp in imports {
         if let ImportKind::Single { name, path } = &imp.kind
@@ -2175,8 +2208,10 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
         }
     }
     tables.pending_single.clear();
-    report_ambig_single(tables, interner, &mut diags);
-    finalize_singles(tables, interner, &mut diags);
+    crate::resolve::order::compute_order_dep(tables, imports, interner);
+    let order_spans = crate::resolve::order::report_order_imports(tables, imports, interner, &mut diags);
+    report_ambig_single(tables, interner, &mut diags, order_spans.clone());
+    finalize_singles(tables, interner, &mut diags, order_spans);
     for (i, imp) in &pending {
         if resolved[*i] {
             continue;
@@ -3054,8 +3089,8 @@ fn same_std_item(a: &[Sym], b: &[Sym]) -> bool {
 /// L0507 for each single import that read an ambiguous name
 /// (`ambig_single`) whose source is still ambiguous now, L0510 when the
 /// source settled to an item the import cannot see; once per import.
-fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>) {
-    let mut seen: Vec<Span> = Vec::new();
+/// `seen` holds the imports already reported (L0509).
+fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>, mut seen: Vec<Span>) {
     for (imp, ns, src, last) in std::mem::take(&mut tables.ambig_single) {
         let state = match (ns, &imp.kind) {
             (Namespace::Macro, ImportKind::Single { path, .. }) => tables.macro_import_lookup(&imp, src, path.len() == 1, last),
@@ -3136,8 +3171,8 @@ fn single_pending_for(tables: &ResolvedTables, src: ModuleId, name: Sym, from: M
 /// import replaces it (an import cycle the pending rule does not
 /// order). The final source binding decides: private is L0510,
 /// ambiguous is L0507, and another item is a reject, never a pick.
-fn finalize_singles(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>) {
-    let mut seen: Vec<Span> = Vec::new();
+/// `seen` holds the imports already reported (L0509).
+fn finalize_singles(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>, mut seen: Vec<Span>) {
     for (span, module, src, last, ns, target) in std::mem::take(&mut tables.single_binds) {
         if seen.contains(&span) {
             continue;

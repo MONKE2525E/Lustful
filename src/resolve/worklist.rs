@@ -5458,6 +5458,10 @@ impl Rewrite<'_> {
                 let name = segs.last().map(|s| self.interner.get(s.name).to_string()).unwrap_or_default();
                 self.diags.push(ambiguous_diag(&name, span));
             }
+            PathRes::OrderDep => {
+                let name: Vec<&str> = segs.iter().map(|s| self.interner.get(s.name)).collect();
+                self.diags.push(crate::resolve::order::order_diag(&name.join("::"), span));
+            }
             PathRes::Private => {
                 let name = segs.last().map(|s| self.interner.get(s.name).to_string()).unwrap_or_default();
                 self.diags.push(private_diag(&name, span));
@@ -6441,6 +6445,10 @@ impl Rewrite<'_> {
                             }
                             PathRes::Done(Target::Module(src)) => self.glob_from_module(ast, src, module, scopes, span),
                             PathRes::Ambiguous => {}
+                            PathRes::OrderDep => {
+                                let text: Vec<&str> = path.iter().map(|s| self.interner.get(*s)).collect();
+                                self.diags.push(crate::resolve::order::order_diag(&text.join("::"), span));
+                            }
                             _ => self.push_unresolved_use(span, &path),
                         }
                         continue;
@@ -6637,6 +6645,10 @@ impl Rewrite<'_> {
             }
             PathRes::Ambiguous => {
                 self.diags.push(ambiguous_diag(self.interner.get(name), span));
+                None
+            }
+            PathRes::OrderDep => {
+                self.diags.push(crate::resolve::order::order_diag(self.interner.get(name), span));
                 None
             }
             PathRes::Private => {

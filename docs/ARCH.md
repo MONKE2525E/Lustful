@@ -3144,6 +3144,11 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
   Fn*` to the elided form (`parser/hrtb.rs`); check rejects a
   binder name that shadows one in scope (E0496).
 - GATs (L0620), async (milestone 8b), as before.
+- L0509: a name that two or more glob imports (or a glob and a
+  re-export) bring with an answer that depends on rustc's glob
+  event order: the same item with different visibility, or an
+  ambiguity carried on by a further glob (`resolve/order.rs`).
+  An explicit import of the item fixes it.
 
 ### 5.6 Negative corpus
 
