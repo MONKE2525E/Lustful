@@ -1428,7 +1428,11 @@ impl<'p> Ctx<'p> {
                 // A target only a later use fixes: checked at finish. A
                 // `FromIterator` ADT found then is still rejected there
                 // (its route above is picked here).
-                if matches!(self.kind(tr), TyKind::Infer(_)) && !self.kind(tr).is_int_infer() && !self.kind(tr).is_float_infer() {
+                // So is a `Box`, `Rc`, or `Arc` whose pointee is still open
+                // (`Box::leak(it.collect())` coerced to `&[T]` later).
+                let open_pointee = matches!(self.tys.builtin_of(tr), Some(BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc)))
+                    && self.tys.adt_first_ty_arg(tr).is_some_and(|e| matches!(self.kind(self.resolve(e)), TyKind::Infer(_)));
+                if (matches!(self.kind(tr), TyKind::Infer(_)) && !self.kind(tr).is_int_infer() && !self.kind(tr).is_float_infer()) || open_pointee {
                     self.deferred_collect.push((target, item, span));
                 } else if !self.collect_target_ok(target, item, span) {
                     return self.iter_bail(args);
@@ -1852,11 +1856,37 @@ impl<'p> Ctx<'p> {
         Some(it::mk_iter(&mut self.tys, ik, &args))
     }
 
+    /// The deferred collects whose target a later use made a `Vec`: that
+    /// target has one `FromIterator` impl, so rustc's obligation pass
+    /// before the next method call has already unified its element with
+    /// the items (`let rs = it.collect(); wait(rs).into_iter().flatten()`).
+    /// True when one settled.
+    fn settle_vec_collects(&mut self) -> bool {
+        let mut settled = false;
+        for (target, item, span) in std::mem::take(&mut self.deferred_collect) {
+            let t = self.resolve(target);
+            if self.tys.vec_elem(t).is_some() {
+                self.collect_target_ok(t, item, span);
+                settled = true;
+            } else {
+                self.deferred_collect.push((target, item, span));
+            }
+        }
+        settled
+    }
+
     /// The `IntoIter` of a `flatten` or `flat_map` inner value: what
     /// `zip` takes, or `option::IntoIter` for an Option. Anything else is
     /// L0612, and None.
     fn flat_inner(&mut self, t: Ty, span: Span) -> Option<Ty> {
-        let t = self.deep(t);
+        let mut t = self.deep(t);
+        let mut core = t;
+        while let TyKind::Ref(_, _, inner) = self.kind(core) {
+            core = inner;
+        }
+        if matches!(self.kind(core), TyKind::Infer(_)) && self.settle_vec_collects() {
+            t = self.deep(t);
+        }
         if let Some(el) = self.tys.option_elem(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::OptionIntoIter, &[el]));
         }
@@ -2115,6 +2145,31 @@ impl<'p> Ctx<'p> {
                 self.mismatch(span, el, item);
                 return false;
             }
+            return true;
+        }
+        // A pointee no use fixed: rustc takes the one impl the item fits,
+        // `[Item]` (`Box<str>` also fits the str items, so those stay
+        // ambiguous, E0283).
+        if let Some(k) = match self.tys.builtin_of(dt) {
+            Some(BuiltinTy::Boxed) => Some(crate::check::own::Owner::Box),
+            Some(BuiltinTy::Rc) => Some(crate::check::own::Owner::Rc),
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc)) => Some(crate::check::own::Owner::Arc),
+            _ => None,
+        } && let Some(e) = self.tys.adt_first_ty_arg(dt)
+            && matches!(self.kind(self.resolve(e)), TyKind::Infer(_))
+        {
+            let it_t = self.deep(item);
+            let str_item = it_t == CHAR
+                || it_t == STRING
+                || matches!(self.kind(it_t), TyKind::Ref(_, Mut::Shared, x) if self.resolve(x) == CHAR || self.resolve(x) == STR)
+                || crate::check::own::own_parts(&self.tys, it_t).is_some_and(|(_, e)| self.kind(e) == TyKind::Str)
+                || crate::check::collect::cow_arg(&self.tys, it_t).is_some_and(|b| self.kind(b) == TyKind::Str);
+            if k == crate::check::own::Owner::Box && str_item {
+                self.err("L0610", span, "type annotations needed: the `collect` target type must be known here", "Annotate the target, such as `Box<[T]>` or `Box<str>`.");
+                return false;
+            }
+            let sl = self.tys.intern(TyKind::Slice(item));
+            self.unify(e, sl);
             return true;
         }
         // alloc's `FromIterator<T>` for `Rc<[T]>` and `Arc<[T]>`
