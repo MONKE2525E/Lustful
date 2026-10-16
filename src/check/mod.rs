@@ -17496,9 +17496,15 @@ impl<'p> Ctx<'p> {
         if let Expr::Range { lo, hi, inclusive } = p.ast.expr(iter)
             && !(lo.is_some() && hi.is_none() && !inclusive)
         {
+            // `..hi`, `..=hi`, and `..` are no iterators (rustc E0277).
             let (Some(lo), Some(hi)) = (*lo, *hi) else {
                 let s = self.span(iter);
-                self.errs.push(unsupported(s, "open ranges"));
+                let kind = match (hi.is_some(), *inclusive) {
+                    (false, _) => "RangeFull",
+                    (true, false) => "RangeTo",
+                    (true, true) => "RangeToInclusive",
+                };
+                self.err("L0612", s, format!("`std::ops::{kind}` is not an iterator"), "Give the range a start: `0..n`.");
                 return ERROR;
             };
             let lt = self.expr(lo, None);

@@ -1489,7 +1489,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("match guards over a by-value slice-pattern middle", "L9001"),
     ("ranges outside `for` loops", "L9001"),
     ("std items lust does not have yet, by module path (named in the message)", "L0505"),
-    ("open ranges", "L9001"),
     ("refutable patterns here (in `let` and parameters)", "L9001"),
     ("`mem::take` on this type", "L9001"),
     ("`cmp::max`/`cmp::min` on this type", "L9001"),
