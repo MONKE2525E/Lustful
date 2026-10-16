@@ -2684,7 +2684,12 @@ impl<'a> Parser<'a> {
                 };
                 self.expect(Tok::Colon, "`:`")?;
                 let ty = self.ty()?;
-                params.push(Param { name: pname, mutable, pat: None, ty, attrs: pattrs.attrs, span: pspan.to(self.prev_span()) });
+                // A type from another context (a macro's `$ty` fragment)
+                // must not move the binding's context to the call site:
+                // the span stays the name's then.
+                let end = self.prev_span();
+                let span = if end.ctxt == pspan.ctxt { pspan.to(end) } else { pspan };
+                params.push(Param { name: pname, mutable, pat: None, ty, attrs: pattrs.attrs, span });
             } else {
                 let pat = self.pattern_no_top_alt("function parameters require top-level or-patterns in parentheses")?;
                 self.expect(Tok::Colon, "`:`")?;

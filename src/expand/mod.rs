@@ -2886,7 +2886,24 @@ impl<'a> Expander<'a> {
                         "End the `let` with `;` inside the macro expansion.",
                     ));
                 }
-                if should_wrap(&expanded, &out, tok_at(&trees, next).map(|t| t.tok), trees.get(next), self.ctx.interner) {
+                // A `{}` call at a statement boundary is a statement of its
+                // own in rustc (see `brace_stmt` below), never an operand.
+                let brace_call_stmt = stmt_list && !item_list && stmt_boundary && call.delim == Delim::Brace && !begins_item;
+                if !brace_call_stmt && should_wrap(&expanded, &out, tok_at(&trees, next).map(|t| t.tok), trees.get(next), self.ctx.interner) {
+                    expanded = vec![Tt::Delim(Delim::Paren, expanded, call.span)];
+                }
+                // A `()` or `[]` call in statement position is an
+                // expression in rustc, so an operator after it continues
+                // it: `matches!(x, 1) || y`. A block-like expansion
+                // (`match x { .. }`) would end the statement in the flat
+                // stream, so it gets parens.
+                if stmt_list
+                    && !item_list
+                    && stmt_boundary
+                    && call.delim != Delim::Brace
+                    && starts_block_like(&expanded)
+                    && continues_expr(tok_at(&trees, next).map(|t| t.tok))
+                {
                     expanded = vec![Tt::Delim(Delim::Paren, expanded, call.span)];
                 }
                 // A brace-delimited call in statement position is a
@@ -2905,48 +2922,19 @@ impl<'a> Expander<'a> {
                     && !next_is_semi
                     && !matches!(expanded.last(), Some(Tt::Tok(t)) if t.tok == Tok::Semi)
                     && !matches!(expanded.first(), Some(Tt::Tok(t)) if t.tok == Tok::Let)
-                    && matches!(
-                        tok_at(&trees, next).map(|t| t.tok),
-                        Some(
-                            Tok::Minus
-                                | Tok::Plus
-                                | Tok::Star
-                                | Tok::Slash
-                                | Tok::Percent
-                                | Tok::EqEq
-                                | Tok::Ne
-                                | Tok::Lt
-                                | Tok::Le
-                                | Tok::Gt
-                                | Tok::Ge
-                                | Tok::AndAnd
-                                | Tok::OrOr
-                                | Tok::Amp
-                                | Tok::Pipe
-                                | Tok::Caret
-                                | Tok::Shl
-                                | Tok::Shr
-                                | Tok::Dot
-                                | Tok::Question
-                                | Tok::As
-                                | Tok::DotDot
-                                | Tok::DotDotEq
-                                | Tok::Eq
-                                | Tok::PlusEq
-                                | Tok::MinusEq
-                                | Tok::StarEq
-                                | Tok::SlashEq
-                                | Tok::PercentEq
-                                | Tok::AmpEq
-                                | Tok::PipeEq
-                                | Tok::CaretEq
-                                | Tok::ShlEq
-                                | Tok::ShrEq
-                        )
-                    );
-                out.extend(expanded);
-                if brace_stmt {
-                    out.push(Tt::Tok(Token { tok: Tok::Semi, span: call.span }));
+                    && continues_expr(tok_at(&trees, next).map(|t| t.tok));
+                // An expansion with no statements is one expression
+                // statement there, which rustc types as `()` unless a `.`
+                // or `?` continues it (`m!{x}.max(3)`): a block gives the
+                // parser both rules. Other expansions end with a `;`.
+                if brace_stmt && !expanded.iter().any(|t| t.is_tok(Tok::Semi)) {
+                    expanded = vec![Tt::Delim(Delim::Brace, expanded, call.span)];
+                    out.extend(expanded);
+                } else {
+                    out.extend(expanded);
+                    if brace_stmt {
+                        out.push(Tt::Tok(Token { tok: Tok::Semi, span: call.span }));
+                    }
                 }
                 i = next;
                 pending_macro_use = false;
@@ -3538,6 +3526,62 @@ fn ends_with_unfinished_let(expanded: &[Tt]) -> bool {
 /// operators, so expression-shaped output is wrapped. Item and
 /// statement sequences, single trees, and type-looking positions are
 /// left alone.
+/// True when a token after an expression continues it (a binary or
+/// assignment operator, `.`, `?`, `as`, or a range): at statement start,
+/// rustc reads `m!(..) op ..` as one expression.
+fn continues_expr(t: Option<Tok>) -> bool {
+    matches!(
+        t,
+        Some(
+            Tok::Minus
+                | Tok::Plus
+                | Tok::Star
+                | Tok::Slash
+                | Tok::Percent
+                | Tok::EqEq
+                | Tok::Ne
+                | Tok::Lt
+                | Tok::Le
+                | Tok::Gt
+                | Tok::Ge
+                | Tok::AndAnd
+                | Tok::OrOr
+                | Tok::Amp
+                | Tok::Pipe
+                | Tok::Caret
+                | Tok::Shl
+                | Tok::Shr
+                | Tok::Dot
+                | Tok::Question
+                | Tok::As
+                | Tok::DotDot
+                | Tok::DotDotEq
+                | Tok::Eq
+                | Tok::PlusEq
+                | Tok::MinusEq
+                | Tok::StarEq
+                | Tok::SlashEq
+                | Tok::PercentEq
+                | Tok::AmpEq
+                | Tok::PipeEq
+                | Tok::CaretEq
+                | Tok::ShlEq
+                | Tok::ShrEq
+        )
+    )
+}
+
+/// True when an expansion starts with a block-like expression (`match`,
+/// `if`, a loop, `unsafe`, or a `{ }` block), which the parser ends a
+/// statement at.
+fn starts_block_like(expanded: &[Tt]) -> bool {
+    match expanded.first() {
+        Some(Tt::Tok(t)) => matches!(t.tok, Tok::Match | Tok::If | Tok::Loop | Tok::While | Tok::For | Tok::Unsafe),
+        Some(Tt::Delim(Delim::Brace, _, _)) => true,
+        _ => false,
+    }
+}
+
 fn should_wrap(expanded: &[Tt], prev_out: &[Tt], next_tok: Option<Tok>, next_tree: Option<&Tt>, interner: &Interner) -> bool {
     if expanded.len() <= 1 || starts_item(expanded, interner) {
         return false;
