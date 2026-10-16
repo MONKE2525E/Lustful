@@ -483,12 +483,15 @@ impl<'p> Ctx<'p> {
     ) -> Option<Ty> {
         let p = self.p;
         let lang = &p.gx.lang;
-        if self.name(name) != "try_into" {
+        // A turbofish on `try_into` is rustc E0107 (the target is
+        // the trait's parameter): the normal path reports it.
+        if self.name(name) != "try_into" || !turbofish.is_empty() {
             return None;
         }
         // The src type the `TryFrom` pair is read on: a written
-        // slice reference as itself; a slice place or array as a
-        // shared slice of itself.
+        // slice reference as itself; a slice place as a shared
+        // slice of itself. An array receiver has no slice pair
+        // (rustc finds no `TryFrom<[T; N]>` there).
         let src = match self.kind(rt) {
             TyKind::Ref(_, _, i) if matches!(self.kind(i), TyKind::Slice(_)) => rt,
             _ => match self.kind(base) {
@@ -496,27 +499,15 @@ impl<'p> Ctx<'p> {
                     let sl = self.tys.intern(TyKind::Slice(el));
                     self.tys.mk_ref(false, sl)
                 }
-                TyKind::Array(el, _) => {
-                    let sl = self.tys.intern(TyKind::Slice(el));
-                    self.tys.mk_ref(false, sl)
-                }
                 _ => return None,
             },
         };
-        let from_turbofish = match turbofish.first() {
-            Some(ast::GenericArg::Type(t)) => Some(self.resolve_written(*t)),
-            _ => None,
-        };
-        if turbofish.len() > 1 {
-            self.err("L0105", name_span, "this method takes 1 type argument", "Write one target type.");
-            return Some(ERROR);
-        }
         let replayed = self
             .replayed_trait_ref(e, lang.try_into)
             .and_then(|r| self.tys.args(r.args).get(1).and_then(|g| g.as_ty()))
             .map(|t| self.deep(t));
         let exp_pair = expected.map(|t| self.deep(t)).and_then(|t| self.tys.result_args(t));
-        let known = from_turbofish.or(replayed).or_else(|| exp_pair.map(|(ok, _)| self.deep(ok)));
+        let known = replayed.or_else(|| exp_pair.map(|(ok, _)| self.deep(ok)));
         if let Some(dst) = known {
             // A target that is no array form is another conversion's.
             let arrayish = match self.kind(dst) {
@@ -542,7 +533,13 @@ impl<'p> Ctx<'p> {
         }
         // The target is a later use's to fix: as the scalar form,
         // with the slice as the obligation's Self (the pair the
-        // selection answers).
+        // selection answers). Only in a template, where the
+        // instance re-checks with the target known: in a concrete
+        // body the deferred projection does not normalize into
+        // the IR types (the scalar form has the same limit).
+        if !self.generic_mode() {
+            return None;
+        }
         if !args.is_empty() {
             self.check_args(&[], args, name_span);
         }

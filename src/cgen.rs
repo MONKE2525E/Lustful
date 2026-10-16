@@ -5206,6 +5206,14 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    {et} {tv} = {};", vals[1]);
                 if is_copy_c(self.p, &e) {
                     let _ = writeln!(self.out, "    for (uint64_t {i} = 0; {i} < {len}; {i}++) {ptr}[{i}] = {tv};");
+                } else if e == CTy::String {
+                    // `String::clone_from` reuses each element's
+                    // buffer (clear, then copy in): capacities stay.
+                    let sv = self.tmp();
+                    let _ = writeln!(
+                        self.out,
+                        "    lust_str {sv} = lust_string_as_str(&{tv});\n    for (uint64_t {i} = 0; {i} + 1 < {len}; {i}++) {{ {ptr}[{i}].len = 0; lust_string_push_str(&{ptr}[{i}], {sv}); }}\n    if ({len} > 0) {{ lust_string_drop(&{ptr}[{len} - 1]); {ptr}[{len} - 1] = {tv}; }} else {{ lust_string_drop(&{tv}); }}"
+                    );
                 } else {
                     self.want(Glue::Clone, &e);
                     let tc = self.tmp();
