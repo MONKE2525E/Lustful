@@ -156,7 +156,7 @@ def main():
     ap.add_argument("--only", default=",".join(DEFAULT))
     ap.add_argument("--max-rounds", type=int, default=200)
     ap.add_argument("--rustc", action="store_true", help="also prune until cargo check accepts each target")
-    ap.add_argument("--save-clean", default="", help="write the changed files of the pruned copy to this tar.gz")
+    ap.add_argument("--save-clean", default="", help="write the changed files of the pruned copy to this tar.gz (relative to --work)")
     a = ap.parse_args()
     prune.build_items_tool()
     work = a.work.resolve()
@@ -178,7 +178,7 @@ def main():
         if len(removed) == pass_start:
             break
     if a.save_clean:
-        save_clean(a.fork.resolve(), copy, Path(a.save_clean).resolve())
+        save_clean(a.fork.resolve(), copy, work / a.save_clean)
     report(removed, status, copy, work)
 
 

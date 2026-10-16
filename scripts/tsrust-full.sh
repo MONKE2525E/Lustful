@@ -82,7 +82,7 @@ if [ $boat = 1 ]; then
   # GB on /tmp); it keeps results, logs and the lust-built bins.
   "${BOAT_RUN:-/tmp/lust-wt/boat-run.sh}" --hours "${TSRUST_BOAT_HOURS:-3}" --up "$W/ts-rust.tgz" --fetch "$name" -- \
     "scripts/build.sh >/dev/null 2>&1 || { scripts/build.sh 2>&1 | tail -30; exit 8; }; scripts/tsrust-full.sh $deep --out ~/w/$name$q; rc=\$?;" \
-    "rm -rf ~/w/$name/cargo-target ~/w/$name/lust-cargo-target ~/w/$name/lust-cache ~/w/$name/fork; exit \$rc"
+    "rm -rf ~/w/$name/cargo-target ~/w/$name/rustc-target ~/w/$name/lust-cargo-target ~/w/$name/lust-cache ~/w/$name/fork; exit \$rc"
   rc=$?; rm -rf "$W"; exit $rc
 fi
 
