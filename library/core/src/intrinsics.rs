@@ -9,6 +9,7 @@
 // Implemented (callable from std source, or from the named adapter):
 //
 //     pub fn exit(code: i32) -> !;
+//     pub fn alloc_error(size: usize) -> !;                    // std: handle_alloc_error's hook text, abort
 //     pub fn xxh3_64(input: &[u8], seed: u64) -> u64;          // xxhash-rust
 //     pub fn xxh3_128(input: &[u8], seed: u64) -> u128;        // xxhash-rust
 //     pub fn ryu_js_fmt_f64(out: &mut String, value: f64);     // ryu-js

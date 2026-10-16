@@ -10,10 +10,6 @@
 
 #define LH_WIDTH ((uint64_t)LUST_HASH_GROUP_WIDTH)
 
-static void lust_hash_oom(void) {
-    fputs("memory allocation failed\n", stderr);
-    abort();
-}
 static void lust_hash_capacity_overflow(void) {
     static const char msg[] = "Hash table capacity overflow";
     lust_panic_at((const uint8_t *)msg, sizeof msg - 1, "/rust/deps/hashbrown-0.17.1/src/raw.rs", 36, 40);
@@ -85,7 +81,7 @@ static void lh_alloc_buckets(lust_hash_table *t, uint64_t buckets) {
     uint64_t total = ctrl_offset + buckets + LH_WIDTH;
     if (total > (uint64_t)INT64_MAX - (ctrl_align - 1)) lust_hash_capacity_overflow();
     void *raw = malloc((size_t)(total + ctrl_align));
-    if (!raw) lust_hash_oom();
+    if (!raw) lust_oom_size(total); /* hashbrown's table layout */
     uintptr_t base = lh_align_up((uint64_t)(uintptr_t)raw, ctrl_align);
     t->alloc_base = raw;
     t->data = (uint8_t *)base;
@@ -927,7 +923,7 @@ static void li_entries_alloc(lust_index_table *t, uint64_t new_cap) {
         if (new_cap > UINT64_MAX / t->entry_size) lust_hash_capacity_overflow();
         uint64_t bytes = new_cap * t->entry_size;
         raw = malloc((size_t)(bytes + t->entry_align));
-        if (!raw) lust_hash_oom();
+        if (!raw) lust_oom_size(bytes); /* indexmap's entries Vec */
         base = (uint8_t *)lh_align_up((uint64_t)(uintptr_t)raw, t->entry_align);
         if (t->len) memcpy(base, t->entries, (size_t)(t->len * t->entry_size));
     }
@@ -1368,7 +1364,7 @@ void lust_index_move_index(lust_index_table *t, uint64_t from, uint64_t to) {
     if (from == to) return;
     uint64_t hash = li_entry_hash_at(t, from);
     uint8_t *tmp = (uint8_t *)malloc((size_t)t->entry_size);
-    if (!tmp) lust_hash_oom();
+    if (!tmp) lust_oom();
     memcpy(tmp, li_entry(t, from), (size_t)t->entry_size);
     if (from < to) {
         li_shift_stored(t, from + 1, to + 1, -1);

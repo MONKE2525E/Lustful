@@ -155,10 +155,10 @@ static void lust_default_hook(const uint8_t *msg, uint64_t len, const char *file
     lust_cur_thread_name(&tn, &tl);
     fprintf(stderr, "\nthread '%.*s' (%llu) panicked at %.*s:%u:%u:\n%.*s\n", (int)tl, (const char *)tn, lust_os_tid(), (int)flen, file, (unsigned)line, (unsigned)col, (int)len,
             (const char *)msg);
-    /* A panic while panicking prints a full backtrace in Rust; lust has no
-       frames to print, only the header. */
-    if (count >= 2) fputs("stack backtrace:\n", stderr);
-    else if (lust_first_panic_take()) fputs("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n", stderr);
+    /* A panic while panicking prints a full backtrace in Rust; FIRST_PANIC
+       is only taken when the style is Off. */
+    int32_t bt = count >= 2 ? 3 : lust_bt_style();
+    lust_bt_tail(bt, bt == 1 && lust_first_panic_take());
     fflush(stderr);
 }
 
@@ -477,8 +477,10 @@ void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t 
     const uint8_t *tn;
     uint64_t tl;
     lust_cur_thread_name(&tn, &tl);
-    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at %s:%u:%u:\n%.*s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
-            (int)tl, (const char *)tn, lust_os_tid(), file, (unsigned)line, (unsigned)col, (int)len, (const char *)msg);
+    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at %s:%u:%u:\n%.*s\n", (int)tl, (const char *)tn, lust_os_tid(), file, (unsigned)line, (unsigned)col, (int)len,
+            (const char *)msg);
+    int32_t bt = lust_bt_style();
+    lust_bt_tail(bt, bt == 1 && lust_first_panic_take());
     fflush(stderr);
     abort();
 })
@@ -655,8 +657,9 @@ static void lust_panic_std_kind(uint32_t kind, const char *msg, const char *wher
     const uint8_t *tn;
     uint64_t tl;
     lust_cur_thread_name(&tn, &tl);
-    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at " LUST_STD_SRC "%s:\n%s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
-            (int)tl, (const char *)tn, lust_os_tid(), where, msg);
+    fprintf(stderr, "\nthread '%.*s' (%llu) panicked at " LUST_STD_SRC "%s:\n%s\n", (int)tl, (const char *)tn, lust_os_tid(), where, msg);
+    int32_t bt = lust_bt_style();
+    lust_bt_tail(bt, bt == 1 && lust_first_panic_take());
     fflush(stderr);
     abort();
 }

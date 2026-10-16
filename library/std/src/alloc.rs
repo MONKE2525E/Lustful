@@ -1,5 +1,5 @@
-// `std::alloc` overlay (docs/ARCH.md section 3.1): `System`, `Layout`
-// and `LayoutError`. `std::alloc::X` walks into this module only for
+// `std::alloc` overlay (docs/ARCH.md section 3.1): `System`, `Layout`,
+// `LayoutError`, and `handle_alloc_error`. `std::alloc::X` walks into this module only for
 // the names it defines (`STD_MODULES` in src/stdmods.rs); `GlobalAlloc`
 // stays a compiler-rejected path, as before.
 //
@@ -103,4 +103,11 @@ impl Layout {
     pub const fn align(&self) -> usize {
         self.align
     }
+}
+
+/// std's `handle_alloc_error` with the default alloc error hook: prints
+/// `memory allocation of N bytes failed` (and the RUST_BACKTRACE note)
+/// and aborts.
+pub fn handle_alloc_error(layout: Layout) -> ! {
+    core::intrinsics::alloc_error(layout.size)
 }

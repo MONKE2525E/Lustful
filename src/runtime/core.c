@@ -5,7 +5,39 @@
 void *aligned_alloc(size_t alignment, size_t size);
 int posix_memalign(void **memptr, size_t alignment, size_t size);
 
-void lust_oom(void) LUST_BODY({ fputs("memory allocation failed\n", stderr); abort(); })
+/* std's get_backtrace_style (panic.rs), read once per process: 1 Off
+   (RUST_BACKTRACE unset or "0"), 2 Short (any other value), 3 Full
+   ("full"). The default panic hook and the alloc error hook share it. */
+#ifdef LUST_IMPL
+static int32_t lust_bt_style_v;
+#endif
+int32_t lust_bt_style(void) LUST_BODY({
+    int32_t s, zero = 0;
+    __atomic_load(&lust_bt_style_v, &s, 0);
+    if (s) return s;
+    const char *e = getenv("RUST_BACKTRACE");
+    s = !e || !strcmp(e, "0") ? 1 : !strcmp(e, "full") ? 3 : 2;
+    if (!__atomic_compare_exchange(&lust_bt_style_v, &zero, &s, 0, 0, 0)) s = zero;
+    return s;
+})
+
+/* The backtrace part of std's default hooks for `style`. lust has no
+   frames, so Short and Full print only std's header (and Short its last
+   note); difftest drops frame lines on both sides. Off prints the
+   RUST_BACKTRACE note when `off_note` is set. */
+void lust_bt_tail(int32_t style, int32_t off_note) LUST_BODY({
+    if (style == 1 && off_note) fputs("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n", stderr);
+    else if (style == 2) fputs("stack backtrace:\nnote: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.\n", stderr);
+    else if (style == 3) fputs("stack backtrace:\n", stderr);
+})
+
+/* An allocation failure inside the runtime itself, where the size is not
+   known. */
+void lust_oom(void) LUST_BODY({
+    fputs("memory allocation failed\n", stderr);
+    lust_bt_tail(lust_bt_style(), 1);
+    abort();
+})
 
 /* Rust's `capacity overflow` panic (RawVec, raw_vec/mod.rs:28:5): a requested byte size above
    isize::MAX, or a length sum that wraps usize. Defined before the
@@ -14,8 +46,13 @@ void lust_panic_std(const char *msg, const char *where); /* panic.c, included be
 void lust_panic_std_lit(const char *msg, const char *where);
 void lust_vec_capacity_overflow(void) LUST_BODY({ lust_panic_std_lit("capacity overflow", "alloc/src/raw_vec/mod.rs:28:5"); })
 
+/* std's rust_oom with the default alloc error hook (std/src/alloc.rs):
+   `handle_alloc_error` for a layout of `n` bytes. The hook prints the
+   RUST_BACKTRACE note on every call, not only the first. */
 void lust_oom_size(uint64_t n) LUST_BODY({
     fprintf(stderr, "memory allocation of %llu bytes failed\n", (unsigned long long)n);
+    lust_bt_tail(lust_bt_style(), 1);
+    fflush(stderr);
     abort();
 })
 

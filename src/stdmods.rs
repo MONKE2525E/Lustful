@@ -135,7 +135,7 @@ pub const STD_MODULES: &[StdModule] = &[
         krate: ShippedCrate::Std,
         paths: &[("std", "alloc")],
         full: false,
-        triggers: &["System", "Layout", "LayoutError"],
+        triggers: &["System", "Layout", "LayoutError", "handle_alloc_error"],
     },
     StdModule {
         name: "__lust_std_unix_net",

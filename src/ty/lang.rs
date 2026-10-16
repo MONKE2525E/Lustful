@@ -693,6 +693,8 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         implemented: false,
     },
     IntrinsicDef { name: "exit", c_symbol: "lust_exit", params: &[S::I32], ret: S::Never, allowed: ONLY_STD, implemented: true },
+    // std::alloc::handle_alloc_error: std's alloc error hook text for a layout of `size` bytes, then abort.
+    IntrinsicDef { name: "alloc_error", c_symbol: "lust_oom_size", params: &[S::Usize], ret: S::Never, allowed: ONLY_STD, implemented: true },
     // Specialization predicates (section 3.4). Mono evaluates them as
     // constants after substitution; the signature here is the erased form.
     IntrinsicDef { name: "is_trusted_random_access", c_symbol: "", params: &[], ret: S::Bool, allowed: CORE_ALLOC, implemented: false },
