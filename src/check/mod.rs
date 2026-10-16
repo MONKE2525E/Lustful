@@ -6546,7 +6546,8 @@ impl<'p> Ctx<'p> {
     /// way `sig_pos_mismatch` does not see (rustc E0308): `f` returns its
     /// one input's borrow in an output slot where `e`'s slot was filled by
     /// a type argument (`FnSig::out_substituted`: `fn(&u8) -> &u8` passed
-    /// for `fn(&u8) -> T` with `T = &u8`), or the other way round when
+    /// for `fn(&u8) -> T` with `T = &u8`; known only when `f` has more such
+    /// slots than `e` writes), or the other way round when
     /// `invariant`; or an input slot of `f` is a free region where `e`'s
     /// is higher-ranked. Slots line up: the two types unified.
     fn ptr_out_tied_lost(&mut self, f: Ty, e: Ty, invariant: bool) -> bool {
@@ -6570,10 +6571,13 @@ impl<'p> Ctx<'p> {
         let n = slots.len();
         // A substituted side's slots are no binder's; an exact one's are
         // its `own_out` bits.
+        // A substitution keeps the written own slots but moves them, so
+        // a substituted side has that many own slots somewhere: more
+        // tied slots on the other side cannot all meet one.
         let tied = |s: &crate::ty::FnSig| if s.out_substituted(n) || s.out_slots == u8::MAX { None } else { Some(s.own_out) };
         match (tied(&sf), tied(&se)) {
-            (Some(a), None) if se.out_substituted(n) => a != 0,
-            (None, Some(b)) if invariant && sf.out_substituted(n) => b != 0,
+            (Some(a), None) if se.out_substituted(n) => a.count_ones() > se.own_out.count_ones(),
+            (None, Some(b)) if invariant && sf.out_substituted(n) => b.count_ones() > sf.own_out.count_ones(),
             _ => false,
         }
     }

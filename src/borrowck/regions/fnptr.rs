@@ -151,8 +151,9 @@ impl Builder<'_, '_> {
     /// (a var), written `'static` is var 0, each other input slot a
     /// binder of its own (`Ph` for a target, `Late` for a source; ids
     /// from `base`), and each other output slot the one input slot's,
-    /// except slots a type argument filled (`FnSig::out_substituted`):
-    /// a var each. None when an output slot has no one input to take.
+    /// except slots a type argument filled (`FnSig::out_substituted`, an
+    /// output with no own slot written): a var each. None when an output
+    /// slot has no one input to take.
     pub(super) fn ptr_nodes(&mut self, t: Ty, free: Option<u32>, target: bool, base: u32) -> Option<(Vec<Node>, Vec<Node>)> {
         let TyKind::FnPtr(s) = self.body.tys.kind(t) else { return None };
         let s = self.body.tys.sig(s).value;
@@ -176,7 +177,9 @@ impl Builder<'_, '_> {
         }
         let mut outs = Vec::new();
         let out_rs = self.sig_slot_regions(s.output);
-        let substituted = s.out_substituted(out_rs.len());
+        // Where a substitution moved written own slots (`fn(&u8) -> (T,
+        // &u8)`) their places are unknown: the one input's, as before.
+        let substituted = s.out_substituted(out_rs.len()) && s.own_out == 0;
         for r in out_rs {
             outs.push(if s.free_slots >> j & 1 == 1 {
                 free_node(self)
