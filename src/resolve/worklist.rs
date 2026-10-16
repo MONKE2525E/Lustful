@@ -4771,6 +4771,9 @@ struct Frame {
     /// may bring any name, and it shadows outer scopes for those names
     /// (`Rewrite::std_glob_check`).
     std_mod_glob: bool,
+    /// The paths of the block's std globs (modules and enums), for
+    /// `Rewrite::std_glob_ambiguous`.
+    std_glob_paths: Vec<Vec<Sym>>,
 }
 
 #[derive(Clone, Copy)]
@@ -5535,6 +5538,35 @@ impl Rewrite<'_> {
         true
     }
 
+    /// Expands a path through a crate module to a std alias that module
+    /// binds (`mod m { pub use std::thread::spawn; }` read as
+    /// `m::spawn`, or `m::mem::swap` after `pub use std::mem;`): the
+    /// longest module prefix whose next segment is a std alias there,
+    /// visible from `module`, is replaced by the alias's std path.
+    /// Callers try it only for a path that resolves to nothing else.
+    fn expand_module_std_alias(&self, segs: &mut Vec<PathSeg>, names: &[Sym], ns: Namespace, module: ModuleId) -> bool {
+        for plen in (1..names.len()).rev() {
+            let PathRes::Done(Target::Module(m)) = self.tables.resolve_module_path(module, &names[..plen], false, self.interner) else {
+                continue;
+            };
+            let seg = names[plen];
+            let asked = if plen + 1 == names.len() { ns } else { Namespace::Type };
+            let key = (m, ns_index(asked) as u8, seg);
+            let Some((vis, path)) = self.tables.std_aliases.get(&key) else { return false };
+            if !self.tables.visible(vis, self.tables.std_alias_def_module(key), module, self.interner) {
+                return false;
+            }
+            let mut out: Vec<PathSeg> = path.iter().map(|s| PathSeg::plain(*s)).collect();
+            if let Some(last) = out.last_mut() {
+                last.args = segs[plen].args.clone();
+            }
+            out.extend(segs[plen + 1..].iter().cloned());
+            *segs = out;
+            return true;
+        }
+        false
+    }
+
     /// A module import does not shadow a primitive type in a type
     /// position: `use std::str;` keeps `&str` the primitive.
     fn module_keeps_primitive(&self, names: &[Sym], ns: Namespace, alias: &[Sym]) -> bool {
@@ -5675,6 +5707,10 @@ impl Rewrite<'_> {
             return;
         }
         let (res, local) = self.resolve(&names, ns, module, scopes);
+        if self.std_glob_ambiguous(&names, ns, module, scopes) {
+            self.diags.push(crate::resolve::imports::ambiguous_diag(self.interner.get(names[0]), span));
+            return;
+        }
         if self.std_glob_check(&names, ns, module, scopes) {
             self.diags.push(crate::resolve::imports::std_glob_name_diag(self.interner.get(names[0]), span));
             return;
@@ -5697,7 +5733,7 @@ impl Rewrite<'_> {
                 }
                 return;
             }
-            if self.expand_std_alias(segs, &names, ns, module, scopes) {
+            if self.expand_std_alias(segs, &names, ns, module, scopes) || (res == PathRes::Absent && self.expand_module_std_alias(segs, &names, ns, module)) {
                 // An alias of a std module whose item the shipped
                 // platform crate defines (`use std::io; io::stdout()`)
                 // resolves into that crate (W-SHIM).
@@ -5712,11 +5748,11 @@ impl Rewrite<'_> {
                 }
                 // An alias of a std module whose item a std source module
                 // defines (`use std::panic; panic::set_hook(..)`,
-                // `use std::sync; sync::LazyLock`) walks into it, as the
-                // full path does (W-UNWIND).
+                // `use std::sync; sync::LazyLock`, `cell::OnceCell::new`)
+                // walks into it, as the full path does (W-UNWIND).
                 if !self.tables.std_modules.is_empty() && full.len() >= 3 {
                     let res = self.tables.resolve_path(module, &full, ns, PathMode::Lexical, true, self.interner);
-                    if matches!(res, PathRes::Done(t) if !matches!(t, Target::Extern(_))) {
+                    if matches!(res, PathRes::Done(t) if !matches!(t, Target::Extern(_))) || matches!(res, PathRes::Partial(Target::Def(_), _)) {
                         self.apply(segs, res, span, module, ns, scopes);
                     }
                 }
@@ -6437,6 +6473,21 @@ impl Rewrite<'_> {
                                     continue;
                                 }
                                 frame.std_mod_glob |= crate::ty::lang::std_enum_variants(&p).is_empty();
+                                frame.std_glob_paths.push(path.clone());
+                                // The std source overlay's items (`use
+                                // std::panic::*;` brings AssertUnwindSafe)
+                                // and the std items lust knows by path.
+                                let overlay = self.tables.std_overlay_items(i, &path, self.interner);
+                                for &(ns, name) in overlay.iter().flat_map(|(_, items)| items) {
+                                    let mut full = path.clone();
+                                    full.push(name);
+                                    frame.std_imports.entry((name, ns_index(ns))).or_insert(full);
+                                }
+                                for (ns, name) in self.tables.std_glob_alias_items(&path, overlay.as_ref(), self.interner) {
+                                    let mut full = path.clone();
+                                    full.push(name);
+                                    frame.std_imports.entry((name, ns_index(ns))).or_insert(full);
+                                }
                                 for n in crate::ty::lang::std_glob_names() {
                                     if crate::ty::lang::std_glob_imports(&p, n) {
                                         let name = self.interner.intern(n);
@@ -6445,13 +6496,6 @@ impl Rewrite<'_> {
                                         self.record_use_trait_std(ast, span, &full);
                                         frame.std_imports.entry((name, ns_index(Namespace::Type))).or_insert(full);
                                     }
-                                }
-                                // The std free fns of the module (`fence`).
-                                for f in crate::ty::lang::std_glob_fns(&p) {
-                                    let name = self.interner.intern(f);
-                                    let mut full = path.clone();
-                                    full.push(name);
-                                    frame.std_imports.entry((name, ns_index(Namespace::Value))).or_insert(full);
                                 }
                                 // A glob of a std enum's variants (`Ordering::*`).
                                 for v in crate::ty::lang::std_enum_variants(&p) {
@@ -6624,9 +6668,10 @@ impl Rewrite<'_> {
     ///   module binding) may be the glob's instead;
     /// - in a module with a std glob, a name from a user glob may be
     ///   ambiguous with it (rustc E0659).
-    /// Names the block itself binds, generic params, and names lust
-    /// finds nowhere (the prelude, the std types a glob is known to
-    /// bring) are fine.
+    /// Both apply only to names std 1.99 has in a glob's module (its
+    /// path table). Names the block itself binds, generic params, names
+    /// lust finds nowhere (the prelude, the std items a glob binds), and
+    /// a std glob's own copy of an overlay item are fine.
     fn std_glob_check(&self, segs: &[Sym], ns: Namespace, module: ModuleId, scopes: &[Frame]) -> bool {
         let Some(&first) = segs.first() else { return false };
         if matches!(self.interner.get(first), "crate" | "self" | "super" | "Self" | "::") || self.gen_params.iter().any(|(n, _)| *n == first) {
@@ -6648,12 +6693,80 @@ impl Rewrite<'_> {
                     && !(asked != Namespace::Type && (frame.locals.contains(&first) || frame.items.contains(&first)));
                 return frame.std_mod_glob && glob_only;
             }
-            if frame.std_mod_glob {
+            // A block std glob that does not have the name (std 1.99's
+            // path table) leaves it to the outer scopes.
+            if frame.std_mod_glob && self.std_globs_bring(&frame.std_glob_paths, first) {
                 return scopes[..i].iter().any(binds) || self.tables.lookup(module, asked, first).is_some();
             }
         }
-        self.tables.has_std_glob(module, false, self.interner)
-            && matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank <= 1)
+        // A glob copy of a std overlay item (`use std::cell::*;` binds
+        // OnceCell) is the std glob's own name; two std globs that bring
+        // different items are `std_glob_ambiguous`.
+        let from_std = |key| self.tables.glob_src.get(&key).is_some_and(|src| self.tables.std_modules.iter().any(|&(_, m)| m == *src));
+        matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank <= 1)
+            && !from_std((module, ns_index(asked) as u8, first))
+            && self.std_globs_bring(self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p), first)
+    }
+
+    /// True when one of the std globs `paths` brings `name` (std 1.99's
+    /// path table), in any namespace.
+    fn std_globs_bring<'p>(&self, paths: impl IntoIterator<Item = &'p Vec<Sym>>, name: Sym) -> bool {
+        paths.into_iter().any(|p| {
+            let mut full: Vec<&str> = p.iter().map(|s| self.interner.get(*s)).collect();
+            full.push(self.interner.get(name));
+            crate::resolve::stdpaths::std_has(&full).is_some()
+        })
+    }
+
+    /// True when two std globs in scope bring different std items named
+    /// like the path's first segment (rustc E0659: `use std::rc::*; use
+    /// std::sync::*;` and `Weak`, `use std::mem::*; use std::ptr::*;`
+    /// and `swap`). The std 1.99 path table says what each glob brings,
+    /// also the items lust has no form for. The innermost scope with a
+    /// binding of the name decides: a local, an item, or an explicit
+    /// import wins over globs; a block whose std globs bring the name
+    /// hides the outer scopes.
+    fn std_glob_ambiguous(&self, segs: &[Sym], ns: Namespace, module: ModuleId, scopes: &[Frame]) -> bool {
+        let Some(&first) = segs.first() else { return false };
+        let n_globs = scopes.iter().map(|f| f.std_glob_paths.len()).sum::<usize>() + self.tables.std_globs.iter().filter(|(m, _)| *m == module).count();
+        if n_globs < 2 || matches!(self.interner.get(first), "crate" | "self" | "super" | "Self" | "::") || self.gen_params.iter().any(|(n, _)| *n == first) {
+            return false;
+        }
+        let asked = if segs.len() > 1 { Namespace::Type } else { ns };
+        let key = (first, ns_index(asked));
+        let name = self.interner.get(first);
+        let disagree = |paths: &mut dyn Iterator<Item = &Vec<Sym>>| -> Option<bool> {
+            let mut seen: Option<Vec<&str>> = None;
+            for p in paths {
+                let mut full: Vec<&str> = p.iter().map(|s| self.interner.get(*s)).collect();
+                full.push(name);
+                if crate::resolve::stdpaths::std_has(&full).is_none() {
+                    continue;
+                }
+                match &seen {
+                    None => seen = Some(full),
+                    Some(old) if *old == full || (old.len() > 1 && old.len() == full.len() && old[1..] == full[1..]) => {}
+                    Some(_) => return Some(true),
+                }
+            }
+            seen.map(|_| false)
+        };
+        for frame in scopes.iter().rev() {
+            if (asked != Namespace::Type && (frame.locals.contains(&first) || frame.items.contains(&first))) || frame.explicit.contains(&key) {
+                return false;
+            }
+            if let Some(amb) = disagree(&mut frame.std_glob_paths.iter()) {
+                return amb;
+            }
+            if frame.imports.contains_key(&key) || frame.std_imports.contains_key(&key) {
+                return false;
+            }
+        }
+        let mkey = (module, ns_index(asked) as u8, first);
+        if matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank >= 2) || self.tables.explicit_std_alias(mkey) {
+            return false;
+        }
+        disagree(&mut self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p)).unwrap_or(false)
     }
 
     /// True when an uppercase binding name sits under a glob of a std

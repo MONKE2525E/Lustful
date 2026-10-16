@@ -1583,6 +1583,55 @@ impl ResolvedTables {
         self.std_modules.iter().find(|(n, _)| interner.get(*n) == row.name).map(|(_, m)| (*m, row.full))
     }
 
+    /// The std source overlay module of the std module `path` under std
+    /// extern `i` (`std::panic`), with the items of it that a glob of
+    /// `path` brings: those std 1.99 has at that path (`std_paths.txt`),
+    /// so a lust helper (`__lust_run_hook`) or an item of the other
+    /// crate's copy (`set_hook` under `core::panic`) stays unbound.
+    pub fn std_overlay_items(&self, i: u32, path: &[Sym], interner: &Interner) -> Option<(ModuleId, Vec<(Namespace, Sym)>)> {
+        let [_, seg] = path else { return None };
+        let (m, false) = self.std_module_at(i, *seg, interner)? else { return None };
+        let mut items = Vec::new();
+        for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+            for &name in self.maps[m.0 as usize][ns_index(ns)].keys() {
+                let full = [interner.get(path[0]), interner.get(*seg), interner.get(name)];
+                if crate::resolve::stdpaths::std_has(&full).is_some() {
+                    items.push((ns, name));
+                }
+            }
+        }
+        items.sort_by(|a, b| (ns_index(a.0), interner.get(a.1)).cmp(&(ns_index(b.0), interner.get(b.1))));
+        Some((m, items))
+    }
+
+    /// The std items lust knows by path that a glob of the std module
+    /// `path` brings, with the namespaces an explicit import of each binds
+    /// (`use std::mem::*;` brings `swap`, `use std::collections::*;`
+    /// brings `HashSet` and the module `hash_map`), less the names its
+    /// overlay module (`std_overlay_items`) defines. Macros stay with
+    /// macro resolution.
+    pub fn std_glob_alias_items(&self, path: &[Sym], overlay: Option<&(ModuleId, Vec<(Namespace, Sym)>)>, interner: &Interner) -> Vec<(Namespace, Sym)> {
+        if path.len() < 2 {
+            return Vec::new();
+        }
+        let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+        let mut out = Vec::new();
+        for item in crate::resolve::stdpaths::std_items(&strs) {
+            let name = interner.intern(item);
+            if overlay.is_some_and(|(_, items)| items.iter().any(|&(_, n)| n == name)) {
+                continue;
+            }
+            let mut full = path.to_vec();
+            full.push(name);
+            for ns in std_import_namespaces(interner, &full).unwrap_or_default() {
+                if ns != Namespace::Macro {
+                    out.push((ns, name));
+                }
+            }
+        }
+        out
+    }
+
     /// The std source module a std path walks into at segment `seg`
     /// under std extern `i`, given the segment after it (`next`, read in
     /// `next_ns`): a whole module always, an overlay only when it
@@ -2556,6 +2605,26 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 let mut full = path.clone();
                                 full.push(name);
                                 changed |= tables.insert_glob_std_alias(imp.module, Namespace::Value, name, imp.vis.clone(), imp.module, full);
+                            }
+                            // `use std::panic::*;`: the items of the std
+                            // source overlay module (AssertUnwindSafe), then
+                            // the std items lust knows by path (catch_unwind,
+                            // mem::swap, HashSet) bind at glob rank, as their
+                            // explicit imports would.
+                            let overlay = tables.std_overlay_items(i, path, interner);
+                            if let Some((m, items)) = &overlay {
+                                let mut only: Vec<Sym> = items.iter().map(|&(_, n)| n).collect();
+                                only.sort();
+                                only.dedup();
+                                changed |= copy_glob(tables, imp, *m, Some(&only), interner);
+                            }
+                            for (ns, name) in tables.std_glob_alias_items(path, overlay.as_ref(), interner) {
+                                let mut full = path.clone();
+                                full.push(name);
+                                changed |= tables.insert_glob_std_alias(imp.module, ns, name, imp.vis.clone(), imp.module, full);
+                            }
+                            if overlay.is_some() {
+                                return TryOut::Stay { changed, resolved: true };
                             }
                         }
                         TryOut::Done(changed)

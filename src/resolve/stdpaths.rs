@@ -43,6 +43,12 @@ fn items_of(path: &str) -> Option<&'static str> {
     None
 }
 
+/// The names std 1.99 has in the module or enum at `path` (what a glob
+/// of it brings), with no kind suffix. Empty for any other path.
+pub fn std_items(path: &[&str]) -> Vec<&'static str> {
+    items_of(&path.join("::")).map_or_else(Vec::new, |items| items.split(' ').filter(|it| !it.is_empty()).map(|it| it.split('/').next().unwrap_or(it)).collect())
+}
+
 /// What std 1.99 has at `path` (`["std", "task", "Poll"]`), or None.
 pub fn std_has(path: &[&str]) -> Option<StdHas> {
     match path {
