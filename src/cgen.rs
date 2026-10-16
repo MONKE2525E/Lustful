@@ -2991,7 +2991,10 @@ impl FnGen<'_, '_> {
                     Some(v) => v,
                     None => match self.bytes_builtin(b, args, dest_cty, loc, post) {
                         Some(v) => v,
-                        None => self.builtin(b, args, loc, post),
+                        None => match self.slice_split_builtin(b, args, dest_cty, loc, post) {
+                            Some(v) => v,
+                            None => self.builtin(b, args, loc, post),
+                        },
                     },
                 },
             },
@@ -4331,6 +4334,7 @@ impl FnGen<'_, '_> {
             // `by_ref`: the `&mut Self` receiver is the result.
             B::IterByRef => vals[0].clone(),
             B::OwnFrom(_) | B::OwnIntoString | B::OwnSliceAlloc(_) | B::OwnSlicePush => unreachable!("owning pointer builtins emit in cgen/own.rs"),
+            B::SliceSplitAt(_) | B::SliceSplitEnd(_) => unreachable!("dest-typed: cgen/slices.rs slice_split_builtin"),
             B::IntToLeBytes | B::IntToBeBytes | B::IntToNeBytes | B::IntFromLeBytes | B::IntFromBeBytes | B::IntFromNeBytes => {
                 unreachable!("byte conversions emit in cgen/bytes.rs")
             }

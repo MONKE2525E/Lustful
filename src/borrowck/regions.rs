@@ -4599,8 +4599,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CloneFrom)) && self.call_clone_from(&avs) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::ConvDeref | crate::check::Builtin::ConvRcInner))
                 && self.call_conv_deref(&avs, dt, &dv) => {}
-            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::MemReplace | crate::check::Builtin::MemSwap))
-                && self.call_mem(&avs, dt, &dv) => {}
+            _ if let CallTarget::Builtin(b @ (crate::check::Builtin::MemReplace | crate::check::Builtin::MemSwap)) = target
+                && self.call_mem(b == crate::check::Builtin::MemSwap, &avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterFold)) && self.call_fold(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterTryFold)) && self.call_try_fold(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if own_region_builtin(b)) && self.call_own_region(&avs, dt, &dv) => {}
@@ -4892,13 +4892,16 @@ impl<'b, 'p> Builder<'b, 'p> {
         (iv.is_empty() && dvi.is_empty()) || self.relate(inner, iv, di, dvi, Variance::Co)
     }
 
-    /// `mem::replace(dest, src)` and `mem::swap(a, b)`: values trade places
-    /// through the `&mut`, whose own region reaches neither. The old value
-    /// (the pointee's regions) is the result, and the new one takes the
-    /// pointee's regions. False when the shapes differ.
-    fn call_mem(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+    /// `mem::replace(dest, src)` (also `mem::take`, which lowers to it)
+    /// and `mem::swap(a, b)`: values trade places through the `&mut`,
+    /// whose own region reaches neither. The old value (the pointee's
+    /// regions) is the result, and the new one takes the pointee's
+    /// regions. `swap` is the builtin's, not the argument shape's: a
+    /// replace of a `&mut U` place has a `&mut` second argument too.
+    /// False when the shapes differ.
+    fn call_mem(&mut self, swap: bool, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         match avs {
-            [(rt, rv), (st, sv)] if matches!(self.body.tys.kind(*st), TyKind::Ref(_, Mut::Mut, _)) => {
+            [(rt, rv), (st, sv)] if swap => {
                 // swap
                 let (TyKind::Ref(_, _, a), TyKind::Ref(_, _, b)) = (self.body.tys.kind(*rt), self.body.tys.kind(*st)) else { return false };
                 let (Some((_, av)), Some((_, bv))) = (rv.split_first(), sv.split_first()) else { return false };
@@ -8412,6 +8415,8 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
     matches!(
         b,
         B::VecGet
+            | B::SliceSplitAt(_)
+            | B::SliceSplitEnd(_)
             | B::VecFirst
             | B::VecLast
             | B::VecGetMut

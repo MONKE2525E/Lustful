@@ -544,6 +544,9 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::OwnIntoString,
     Builtin::OwnSliceAlloc(crate::check::own::Owner::Rc),
     Builtin::OwnSlicePush,
+    // One row stands for both forms of each.
+    Builtin::SliceSplitAt(false),
+    Builtin::SliceSplitEnd(false),
     Builtin::BoxSliceIntoIter,
     Builtin::StringFromUtf8,
     Builtin::StrFromUtf8,
@@ -1318,6 +1321,16 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::OwnIntoString => (&["Box<str>"], vec![i.intern("into_string")], Call::Method),
         // Internal steps of `collect` into `Rc<[T]>`/`Arc<[T]>`, never called by name.
         B::OwnSliceAlloc(_) | B::OwnSlicePush => (&[], vec![], Call::Method),
+        B::SliceSplitAt(_) => (
+            &["[T]", "[T; n]", "Vec<T>"],
+            vec![i.intern("split_at"), i.intern("split_at_mut"), i.intern("split_at_checked"), i.intern("split_at_mut_checked")],
+            Call::Method,
+        ),
+        B::SliceSplitEnd(_) => (
+            &["[T]", "[T; n]", "Vec<T>"],
+            vec![i.intern("split_first"), i.intern("split_first_mut"), i.intern("split_last"), i.intern("split_last_mut")],
+            Call::Method,
+        ),
         B::BoxSliceIntoIter => (&["Box<[T]>"], vec![i.intern("into_iter")], Call::Method),
         B::StringFromUtf8 => (&["String"], vec![i.intern("from_utf8")], Call::Associated),
         B::StringFromUtf8Lossy => (&["String"], vec![i.intern("from_utf8_lossy")], Call::Associated),

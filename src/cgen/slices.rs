@@ -12,23 +12,73 @@ use super::*;
 /// `lust_std_files`).
 const SLICE_MOD_RS: u64 = 14;
 
+/// The (element type, data pointer, length) C expressions of a slice
+/// operand in any receiver form: `&Vec<T>`, `&[T]` (the fat value),
+/// `&&[T]`, `&[T; N]`, or a by-value array.
+fn slice_parts(t: &CTy, val: &str) -> (CTy, String, String) {
+    match t {
+        CTy::Ref(inner) => match &**inner {
+            CTy::Vec(e) => ((**e).clone(), format!("(({}*){val}->ptr)", ctype(e)), format!("{val}->len")),
+            CTy::Slice(e) => ((**e).clone(), format!("{val}->ptr"), format!("{val}->len")),
+            CTy::Array(e, n) => ((**e).clone(), format!("{val}->v"), format!("((uint64_t){n})")),
+            _ => unreachable!(),
+        },
+        CTy::Slice(e) => ((**e).clone(), format!("{val}.ptr"), format!("{val}.len")),
+        CTy::Array(e, n) => ((**e).clone(), format!("{val}.v"), format!("((uint64_t){n})")),
+        _ => unreachable!(),
+    }
+}
+
 impl FnGen<'_, '_> {
+    /// `SliceSplitAt` and `SliceSplitEnd` (core's `split_at` family) into
+    /// their tuple or `Option` of a tuple; None for any other call.
+    pub(super) fn slice_split_builtin(&mut self, b: Builtin, ops: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> Option<String> {
+        if !matches!(b, Builtin::SliceSplitAt(_) | Builtin::SliceSplitEnd(_)) {
+            return None;
+        }
+        let (v, vt) = self.operand(&ops[0], loc, post);
+        let (e, ptr, len) = slice_parts(&vt, &v);
+        let st = ctype(&CTy::Slice(Box::new(e.clone())));
+        collect_types(dest, &mut self.sig_types);
+        let dc = ctype(dest);
+        let (t, p, n) = (self.tmp(), self.tmp(), self.tmp());
+        let _ = writeln!(self.out, "    {} *{p} = {ptr}; uint64_t {n} = {len};", ctype(&e));
+        match b {
+            Builtin::SliceSplitAt(checked) => {
+                let (mid, _) = self.operand(&ops[1], loc, post);
+                let m = self.tmp();
+                let _ = writeln!(self.out, "    uint64_t {m} = {mid};");
+                let pair_ty = match dest {
+                    CTy::Option(pt) if checked => ctype(pt),
+                    _ => dc.clone(),
+                };
+                let pair = format!("(({pair_ty}){{ (({st}){{ {p}, {m} }}), (({st}){{ {p} + {m}, {n} - {m} }}) }})");
+                if checked {
+                    let (some, none) = (self.make_variant(dest, 1, &[pair]), self.make_variant(dest, 0, &[]));
+                    let _ = writeln!(self.out, "    {dc} {t} = {m} <= {n} ? {some} : {none};");
+                } else {
+                    let _ = writeln!(self.out, "    if ({m} > {n}) lust_panic_cstr(\"mid > len\", {loc});\n    {dc} {t} = {pair};");
+                }
+            }
+            Builtin::SliceSplitEnd(last) => {
+                let CTy::Option(pt) = dest else { unreachable!("split_first returns an Option") };
+                let pair = if last {
+                    format!("(({}){{ &{p}[{n} - 1], (({st}){{ {p}, {n} - 1 }}) }})", ctype(pt))
+                } else {
+                    format!("(({}){{ &{p}[0], (({st}){{ {p} + 1, {n} - 1 }}) }})", ctype(pt))
+                };
+                let (some, none) = (self.make_variant(dest, 1, &[pair]), self.make_variant(dest, 0, &[]));
+                let _ = writeln!(self.out, "    {dc} {t} = {n} > 0 ? {some} : {none};");
+            }
+            _ => unreachable!(),
+        }
+        Some(t)
+    }
+
     /// The R4 builtins; None for any other call.
     pub(super) fn slices_builtin(&mut self, b: Builtin, ops: &[Operand], vals: &[String], tys: &[CTy]) -> Option<String> {
         use Builtin as B;
-        let slice_like = |t: &CTy, val: &str| -> (CTy, String, String) {
-            match t {
-                CTy::Ref(inner) => match &**inner {
-                    CTy::Vec(e) => ((**e).clone(), format!("(({}*){val}->ptr)", ctype(e)), format!("{val}->len")),
-                    CTy::Slice(e) => ((**e).clone(), format!("{val}->ptr"), format!("{val}->len")),
-                    CTy::Array(e, n) => ((**e).clone(), format!("{val}->v"), format!("((uint64_t){n})")),
-                    _ => unreachable!(),
-                },
-                CTy::Slice(e) => ((**e).clone(), format!("{val}.ptr"), format!("{val}.len")),
-                CTy::Array(e, n) => ((**e).clone(), format!("{val}.v"), format!("((uint64_t){n})")),
-                _ => unreachable!(),
-            }
-        };
+        let slice_like = slice_parts;
         let vec_elem = |t: &CTy| -> CTy {
             let CTy::Ref(v) = t else { unreachable!() };
             let CTy::Vec(e) = &**v else { unreachable!() };

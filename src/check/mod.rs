@@ -527,6 +527,12 @@ pub enum Builtin {
     /// x)` writes the next item.
     OwnSliceAlloc(own::Owner),
     OwnSlicePush,
+    /// core's `[T]::split_at` and `split_at_mut` (false; `mid > len`
+    /// panics at the caller) and their `_checked` forms (true).
+    SliceSplitAt(bool),
+    /// core's `[T]::split_first` (false) and `split_last` (true), and
+    /// their `_mut` forms.
+    SliceSplitEnd(bool),
     /// The `core::mem` byte-move family and `core::cmp::max`/`min`
     /// free fns (ARCH 4.4). `MemTake` only survives to lowering,
     /// which fills the freed slot with a synthesized default and
@@ -16370,7 +16376,7 @@ impl<'p> Ctx<'p> {
                 } else if self.name(name) == "as_mut_ptr" {
                     Some((B::SeqAsPtr, Autoref::RefMut, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, elem))))
                 } else {
-                    None
+                    self.slice_split_method(name, elem)
                 }
             }
             (None, TyKind::Slice(_)) | (None, TyKind::Array(..)) => {
@@ -16431,7 +16437,7 @@ impl<'p> Ctx<'p> {
                     let r = self.tys.mk_ref(false, elem);
                     Some((B::VecContains, Autoref::Ref, vec![r], BOOL))
                 } else {
-                    None
+                    self.slice_split_method(name, elem)
                 }
             }
             (Some(BuiltinTy::Chars), _) => {
@@ -17298,6 +17304,41 @@ impl<'p> Ctx<'p> {
             "cast_const" => Some((B::PtrCast, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, inner)))),
             _ => None,
         }
+    }
+
+    /// core's `[T]::split_at`, `split_at_mut`, their `_checked` forms,
+    /// and `split_first`/`split_last` (and `_mut`) on `[T]`, `[T; N]`,
+    /// and `Vec<T>`. Both parts borrow the receiver's loan, as core's
+    /// signatures say (borrowck `receiver_builtin`).
+    fn slice_split_method(&mut self, name: Sym, elem: Ty) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
+        let n = self.name(name);
+        let (b, mutable) = match n {
+            "split_at" => (Builtin::SliceSplitAt(false), false),
+            "split_at_mut" => (Builtin::SliceSplitAt(false), true),
+            "split_at_checked" => (Builtin::SliceSplitAt(true), false),
+            "split_at_mut_checked" => (Builtin::SliceSplitAt(true), true),
+            "split_first" => (Builtin::SliceSplitEnd(false), false),
+            "split_first_mut" => (Builtin::SliceSplitEnd(false), true),
+            "split_last" => (Builtin::SliceSplitEnd(true), false),
+            "split_last_mut" => (Builtin::SliceSplitEnd(true), true),
+            _ => return None,
+        };
+        let sl = self.tys.intern(TyKind::Slice(elem));
+        let part = self.tys.mk_ref(mutable, sl);
+        let autoref = if mutable { Autoref::RefMut } else { Autoref::Ref };
+        Some(match b {
+            Builtin::SliceSplitAt(checked) => {
+                let pair = self.tys.intern_tys(&[part, part]);
+                let pair = self.tys.intern(TyKind::Tuple(pair));
+                (b, autoref, vec![USIZE], if checked { self.tys.mk_option(pair) } else { pair })
+            }
+            _ => {
+                let one = self.tys.mk_ref(mutable, elem);
+                let pair = self.tys.intern_tys(&[one, part]);
+                let pair = self.tys.intern(TyKind::Tuple(pair));
+                (b, autoref, vec![], self.tys.mk_option(pair))
+            }
+        })
     }
 
     fn str_method(&mut self, name: Sym) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
