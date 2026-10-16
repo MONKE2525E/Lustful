@@ -255,14 +255,18 @@ impl<'p> Ctx<'p> {
 
     /// The output of fn pointer type `t` with every region the one input
     /// region's (`ClosureInfo::bound_output`), when it has exactly one
-    /// higher-ranked input slot and every output slot is that one
-    /// (`for<'a> fn(&'a D) -> Option<L<'a>>`, or the elided form). None
-    /// when an output slot is `'static` or the enclosing item's lifetime
-    /// (`FnSig::free_slots`): a closure body must not return its argument
-    /// there.
+    /// higher-ranked input slot and the type writes every output slot as
+    /// that one (`FnSig::own_out`: `for<'a> fn(&'a D) -> Option<L<'a>>`,
+    /// or the elided form). None when an output slot is `'static`, the
+    /// enclosing item's lifetime (`FnSig::free_slots`), or a substituted
+    /// type parameter's (`fn(&u8) -> T` with `T = &'x u8`): a closure body
+    /// must not return its argument there.
     fn fn_ptr_bound_output(&mut self, t: Ty) -> Option<Ty> {
         let TyKind::FnPtr(sig) = self.kind(t) else { return None };
         let s = self.tys.sig(sig).value;
+        if !s.own_out {
+            return None;
+        }
         let al = &self.p.gx.adt_lifetimes;
         let mut ins = Vec::new();
         for &i in self.tys.tys_of(s.inputs) {

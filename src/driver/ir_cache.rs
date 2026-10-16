@@ -490,7 +490,7 @@ enum TyTree {
     Array(u32, ConstKind),
     Tuple(Vec<u32>),
     Adt(DefId, Vec<ArgTree>),
-    FnPtr { count: u32, is_unsafe: bool, extern_c: bool, free_slots: u32, free_region: Region, inputs: Vec<u32>, output: u32 },
+    FnPtr { count: u32, is_unsafe: bool, extern_c: bool, free_slots: u32, free_region: Region, own_out: bool, inputs: Vec<u32>, output: u32 },
     FnDef(DefId, Vec<ArgTree>),
     Closure(DefId, Vec<ArgTree>),
     Dyn { region: Region, principal: Option<(u32, TraitRefTree)>, supertraits: Vec<(u32, TraitRefTree)>, auto: (bool, bool, bool) },
@@ -712,6 +712,7 @@ impl TreeBuilder<'_> {
                     extern_c: sig.value.extern_c,
                     free_slots: sig.value.free_slots,
                     free_region: sig.value.free_region,
+                    own_out: sig.value.own_out,
                     inputs,
                     output: self.ty(sig.value.output),
                 }
@@ -810,14 +811,14 @@ impl TreeIntern<'_> {
                 let a = self.args(tys, a)?;
                 tys.intern(TyKind::Adt(*def, a))
             }
-            TyTree::FnPtr { count, is_unsafe, extern_c, free_slots, free_region, inputs, output } => {
+            TyTree::FnPtr { count, is_unsafe, extern_c, free_slots, free_region, own_out, inputs, output } => {
                 let mut out = Vec::with_capacity(inputs.len());
                 for t in inputs {
                     out.push(self.ty(tys, *t)?);
                 }
                 let inputs = tys.intern_tys(&out);
                 let output = self.ty(tys, *output)?;
-                let sig = tys.intern_sig(Binder { count: *count, value: FnSig { inputs, output, is_unsafe: *is_unsafe, extern_c: *extern_c, free_slots: *free_slots, free_region: *free_region } });
+                let sig = tys.intern_sig(Binder { count: *count, value: FnSig { inputs, output, is_unsafe: *is_unsafe, extern_c: *extern_c, free_slots: *free_slots, free_region: *free_region, own_out: *own_out } });
                 tys.intern(TyKind::FnPtr(sig))
             }
             TyTree::FnDef(def, a) => {

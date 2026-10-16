@@ -1748,6 +1748,37 @@ fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId) -> Result<Opt
     Ok(w.found)
 }
 
+/// `FnSig::own_out` of a fn pointer type with output `ret` (erased: `out`):
+/// the output resolves again with regions kept (an elided lifetime is the
+/// one input's, `Region::Bound(0)`), and every slot must be such a
+/// signature region: not `'static`, and not an erased region of a type
+/// parameter, projection, or alias argument.
+#[allow(clippy::too_many_arguments)]
+fn fn_ptr_own_output(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    ret: Option<ast::TyId>,
+    out: Ty,
+) -> bool {
+    let Some(r) = ret else { return false };
+    let f = tys.flags(out);
+    if f.contains_param() || f.contains_projection() || f.contains_infer() {
+        return false;
+    }
+    let mut ts = scope.clone();
+    ts.fn_ptr_free = false;
+    ts.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, r, &ts) else { return false };
+    let mut slots: Vec<Region> = Vec::new();
+    crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, twin, out, &mut slots)
+        && !slots.is_empty()
+        && slots.iter().all(|r| !matches!(r, Region::Erased | Region::Static))
+}
+
 /// The `FnSig::free_slots` of a fn pointer type whose free lifetime is
 /// `lt` (W-BORROW3): its inputs `in_tys` and output `ret` resolve again
 /// with regions kept, `lt` as a marker, and each slot of the erased
@@ -2985,8 +3016,9 @@ pub fn resolve_scoped(
                 Some((lt, r)) => (fn_ptr_free_mask(ast, interner, known, cx, tys, outer, &in_tys, *ret, lt, &ins, out)?, r),
                 None => (0, Region::Erased),
             };
+            let own_out = free_slots == 0 && fn_ptr_own_output(ast, interner, known, cx, tys, outer, *ret, out);
             let inputs = tys.intern_tys(&ins);
-            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, ..FnSig::plain(inputs, out) }));
+            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, ..FnSig::plain(inputs, out) }));
             Ok(tys.intern(TyKind::FnPtr(sig)))
         }
         TyExpr::QPath { self_ty, trait_path, segs } => {

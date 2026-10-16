@@ -410,12 +410,19 @@ pub struct FnSig {
     /// The free region of `free_slots`: `Erased` in check's types, the
     /// item's lifetime (`Region::Param`) in region signatures.
     pub free_region: Region,
+    /// True when every region slot of the output is the signature's one
+    /// higher-ranked input region, as the pointer type writes it (elided,
+    /// or `for<'a> fn(&'a D) -> L<'a>`): a closure coerced to it may
+    /// return borrows of that input (`ClosureInfo::bound_output`). False
+    /// when the written output holds a type parameter or a projection,
+    /// whose substituted regions are not the pointer's own.
+    pub own_out: bool,
 }
 
 impl FnSig {
     /// A signature with no free region (`free_slots` 0).
     pub fn plain(inputs: TysId, output: Ty) -> FnSig {
-        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased }
+        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased, own_out: false }
     }
 }
 
