@@ -8994,6 +8994,18 @@ impl<'p> Ctx<'p> {
                     }
                     return self.tys.intern(TyKind::Array(elem, c));
                 }
+                // `[x; Self::D]` where `D` uses a generic parameter of the
+                // impl: rustc's "constant expression depends on a generic
+                // parameter" (one that uses none is only a warning there).
+                if self.len_names_generic_self(*len) {
+                    self.err(
+                        "L0110",
+                        span,
+                        "array repeat length must be a constant integer: it depends on a generic parameter",
+                        "Use a const parameter directly (`[0; N]`), or a literal length.",
+                    );
+                    return ERROR;
+                }
                 // The scalar subset first; then the full bounded
                 // evaluator, so size_of calls, const items, and const
                 // fn calls all give lengths in expression position.
@@ -10466,6 +10478,36 @@ impl<'p> Ctx<'p> {
     /// the template's generics, its declared type, and in an instance
     /// its value from the instance's args (None in the template). None
     /// when `name` names no const param here.
+    /// True when the array length `e` reads `Self::D` (through operators,
+    /// casts, and calls) for an inherent associated const `D` whose value
+    /// uses a generic parameter of its impl (`p.gx.assoc_const_tmpls`):
+    /// rustc rejects such a length, as an anonymous const may not use
+    /// generic parameters.
+    fn len_names_generic_self(&mut self, e: ExprId) -> bool {
+        let p = self.p;
+        match p.ast.expr(e) {
+            Expr::Path(segs) if segs.len() == 2 && segs[0].name == p.known.self_type => {
+                let segs = segs.clone();
+                let Some((adt, item)) = self.assoc_const_key(&segs) else { return false };
+                let Some(base) = self.assoc_const_base(&segs, None) else { return false };
+                matches!(self.inherent_assoc_pick(adt, item, base, None), Some(Some((idx, _))) if p.gx.assoc_const_tmpls.contains_key(&idx))
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                let (l, r) = (*lhs, *rhs);
+                self.len_names_generic_self(l) || self.len_names_generic_self(r)
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
+                let x = *expr;
+                self.len_names_generic_self(x)
+            }
+            Expr::Call { args, .. } | Expr::MethodCall { args, .. } => {
+                let args = args.clone();
+                args.iter().any(|&a| self.len_names_generic_self(a))
+            }
+            _ => false,
+        }
+    }
+
     fn const_param(&mut self, name: Sym) -> Option<(u32, Ty, Option<ConstKind>)> {
         let p = self.p;
         let decl = |tl: LocalDefId, i: u32| -> Option<Ty> {
@@ -18821,6 +18863,18 @@ impl<'p> Ctx<'p> {
             _ => return None,
         };
         let generics = p.gx.adt_generics.get(a.0 as usize).cloned().unwrap_or_default();
+        // `S::<3>::D` on a type with fewer type or const parameters
+        // (rustc E0107): no base, so the const does not resolve.
+        let written = match &segs[0].args {
+            ast::GenericArgs::Angle(gs) => gs.iter().filter(|g| matches!(g, ast::GenericArg::Type(_) | ast::GenericArg::Const(_))).count(),
+            _ => 0,
+        };
+        if written > generics.params.iter().filter(|g| g.kind != ParamKind::Lifetime).count() {
+            if let Some(s) = span {
+                self.err("L0110", s, "too many generic arguments for this type", "Remove the extra arguments.");
+            }
+            return None;
+        }
         if generics.params.is_empty() {
             return Some(self.tys.adt_ty(a));
         }

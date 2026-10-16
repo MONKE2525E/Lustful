@@ -390,6 +390,9 @@ fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
     for (i, t) in toks.iter().enumerate() {
         match t.tok {
             Tok::Mod | Tok::Use | Tok::Static | Tok::Extern | Tok::Crate | Tok::Super => return true,
+            // `pub(in self::m)`: only the resolver checks that the path
+            // names an enclosing module (rustc E0433, E0742).
+            Tok::In if i >= 2 && toks[i - 1].tok == Tok::LParen && toks[i - 2].tok == Tok::Pub => return true,
             Tok::PathSep => {
                 // A leading `::` (not a segment join): the token before
                 // it is not a path segment end.
