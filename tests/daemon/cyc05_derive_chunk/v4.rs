@@ -1,0 +1,20 @@
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct P {
+    x: i64,
+}
+
+fn same<T: PartialEq>(a: &T, b: &T) -> bool {
+    a == b
+}
+
+fn show(xs: &[i64]) {
+    println!("{}", xs.len());
+}
+
+fn main() {
+    let p = P { x: 5 };
+    let q = p;
+    let pair = (p, Some(q));
+    show(&[p.x, q.x]);
+    println!("{:?} {}", pair, same(&p, &q));
+}
