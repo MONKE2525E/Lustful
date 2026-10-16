@@ -2438,7 +2438,11 @@ impl Evaluator {
                         return Ok(other);
                     }
                 },
-                ast::Stmt::Item(_) | ast::Stmt::Macro { .. } => {
+                // An item (a local `const` or `fn`) does nothing when the
+                // block runs; a path to it evaluates where it is used, or
+                // rejects there.
+                ast::Stmt::Item(_) => {}
+                ast::Stmt::Macro { .. } => {
                     return Err(outside(cx.ast().block(b).span, "items in a const block"));
                 }
             }
