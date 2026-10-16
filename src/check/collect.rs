@@ -109,6 +109,9 @@ pub struct ConstItem {
     pub name: Sym,
     pub ty: Ty,
     pub value: crate::ty::consteval::ConstValue,
+    /// rustc's promotion qualifs of the value (`ty::constqual`): `&C`
+    /// is promoted when neither holds.
+    pub qualif: crate::ty::constqual::Qualif,
 }
 
 /// What one item inside a function body resolved to, by `Ast::stmt_items`
@@ -5858,7 +5861,7 @@ fn eval_const_items(
 ) -> Vec<(TraitRef, Span)> {
     let Some(ev) = eval_pending_items(p, errs, static_order, scope_of_stmt) else { return Vec::new() };
     p.const_values = pending_values(&ev.pending);
-    install_const_items(p, errs, ev.pending, ev.static_count, &ev.tmpls);
+    install_const_items(p, errs, ev.pending, ev.static_count, &ev.tmpls, &ev.quals);
     ev.goals
 }
 
@@ -6108,11 +6111,12 @@ fn eval_pending_items(
         errs,
         goals: Vec::new(),
         tmpls,
+        quals: HashMap::default(),
     };
     for i in 0..n {
         cx.eval_pending(i);
     }
-    Some(EvaluatedItems { pending: cx.pending, static_count, tmpls: cx.tmpls, goals: cx.goals })
+    Some(EvaluatedItems { pending: cx.pending, static_count, tmpls: cx.tmpls, goals: cx.goals, quals: cx.quals })
 }
 
 /// What `eval_pending_items` gives: each item with its state, the
@@ -6124,6 +6128,8 @@ struct EvaluatedItems {
     static_count: u32,
     tmpls: Vec<Option<Generics>>,
     goals: Vec<(TraitRef, Span)>,
+    /// The promotion qualifs of evaluated items, by pending index.
+    quals: HashMap<usize, crate::ty::constqual::Qualif>,
 }
 
 /// Moves evaluated pending items into the program tables, in item order
@@ -6134,10 +6140,13 @@ fn install_const_items(
     pending: Vec<(PendingConst, PendingState)>,
     static_count: u32,
     tmpls: &[Option<Generics>],
+    quals: &HashMap<usize, crate::ty::constqual::Qualif>,
 ) {
     let mut statics: Vec<Option<StaticItem>> = (0..static_count).map(|_| None).collect();
     for (pi, (item, state)) in pending.into_iter().enumerate() {
         let PendingState::Done(value) = state else { continue };
+        // Not computed (a generic template): qualifies by its type.
+        let qualif = quals.get(&pi).copied().unwrap_or(crate::ty::constqual::Qualif::ALL);
         if let Some(assoc) = item.assoc {
             // An associated const is a const item with a child def,
             // found only through its assoc table.
@@ -6151,7 +6160,7 @@ fn install_const_items(
             let def = DefId { krate: p.krate, hash };
             p.defs.insert(def, DefData::skeleton(DefsKind::Const, Some(parent), name, Vis::Priv, item.span));
             p.const_defs.push(def);
-            p.consts.push(ConstItem { name, ty: item.ty, value });
+            p.consts.push(ConstItem { name, ty: item.ty, value, qualif });
             if let Some(generics) = &tmpls[pi] {
                 p.gx.assoc_const_tmpls.insert(idx, (item.expr, generics.clone()));
             }
@@ -6173,7 +6182,7 @@ fn install_const_items(
             None if item.stmt_idx.is_some() => {
                 if let Some(name) = item.name {
                     let idx = p.body_consts.len() as u32;
-                    p.body_consts.push(ConstItem { name, ty: item.ty, value });
+                    p.body_consts.push(ConstItem { name, ty: item.ty, value, qualif });
                     p.body_items.insert(item.stmt_idx.unwrap(), BodyItem::Const(idx));
                 }
             }
@@ -6186,7 +6195,7 @@ fn install_const_items(
                     let def = DefId { krate: p.krate, hash };
                     p.defs.insert(def, DefData::skeleton(DefsKind::Const, None, name, Vis::Priv, item.span));
                     p.const_defs.push(def);
-                    p.consts.push(ConstItem { name, ty: item.ty, value });
+                    p.consts.push(ConstItem { name, ty: item.ty, value, qualif });
                 }
             }
             Some(mutable) => {
@@ -6930,6 +6939,9 @@ struct CollectCx<'x> {
     /// The scope `enter_const_fn` installs next: the sibling items of
     /// the const fn `call_target` just resolved (empty for a module fn).
     next_scope: Option<Vec<u32>>,
+    /// The promotion qualifs of evaluated items (`ty::constqual`), by
+    /// pending index; an item with none qualifies by its type.
+    quals: HashMap<usize, crate::ty::constqual::Qualif>,
     /// Pending inherent associated consts by (flat type name,
     /// const name), for `Type::CONST` reads in initializers.
     assoc_by_key: HashMap<(Sym, Sym), Vec<usize>>,
@@ -7216,6 +7228,11 @@ impl CollectCx<'_> {
         // the scope of the item that asked for this value.
         let prev_scope = std::mem::replace(&mut self.cur_scope, self.pending[idx].0.scope.clone());
         let evaluated = crate::ty::consteval::eval(self, expr, Some(ty));
+        if evaluated.is_ok() && self.pending[idx].0.is_static.is_none() {
+            let q = crate::ty::constqual::of_const(self, expr, ty);
+            self.next_scope = None;
+            self.quals.insert(idx, q);
+        }
         self.cur_scope = prev_scope;
         self.module = prev_module;
         self.self_name = prev_self;
@@ -7590,6 +7607,27 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             let c = &self.p.consts[i as usize];
             (c.value.clone(), c.ty)
         })
+    }
+    fn const_item_qualif(&mut self, name: Sym, at: Span) -> Option<crate::ty::constqual::Qualif> {
+        // The same lookup as `const_item`.
+        let i = match self.span_lookup(name, at).or_else(|| self.scope_lookup(name)) {
+            Some(ScopeItem::Pending(i)) => i,
+            Some(_) => return None,
+            None => match self.by_name.get(&name) {
+                Some(&i) => i,
+                None => return self.p.const_names.get(&name).map(|&i| self.p.consts[i as usize].qualif),
+            },
+        };
+        // A static is no const operand; an item still evaluating is a
+        // cycle that `eval` reports where it reads the value.
+        if self.pending[i].0.is_static.is_some() || matches!(self.pending[i].1, PendingState::Doing) {
+            return None;
+        }
+        self.eval_pending(i)?;
+        Some(self.quals.get(&i).copied().unwrap_or(crate::ty::constqual::Qualif::ALL))
+    }
+    fn adt_has_drop(&self, adt: AdtId) -> bool {
+        self.p.drop_adts.contains(&adt)
     }
     fn const_item_ref(&self, name: Sym, at: Span) -> Option<(&crate::ty::consteval::ConstValue, Ty)> {
         // The same lookup as `const_item`.

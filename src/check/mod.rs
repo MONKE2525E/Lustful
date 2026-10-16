@@ -1591,6 +1591,10 @@ pub struct Checked<'g> {
     /// The const value of an expression the checker evaluated (a const item
     /// reference or an inline const block), parallel to `expr_ty`.
     pub const_exprs: Vec<Option<crate::ty::consteval::ConstValue>>,
+    /// The promotion qualifs of const item paths (`ty::constqual`),
+    /// by expression; a const path with none qualifies by its type
+    /// (a trait associated const: rustc does not look inside it).
+    pub const_quals: crate::intern::FxMap<ExprId, crate::ty::constqual::Qualif>,
     pub expr_res: Vec<Res>,
     pub coerce: Vec<Coerce>,
     pub pat_ty: Vec<Ty>,
@@ -2351,6 +2355,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             pat_base: def.pats.0,
             expr_ty: vec![ERROR; n_exprs],
             const_exprs: vec![None; n_exprs],
+            const_quals: Default::default(),
             expr_res: vec![Res::None; n_exprs],
             coerce: vec![Coerce::None; n_exprs],
             pat_ty: vec![ERROR; n_pats],
@@ -11410,6 +11415,7 @@ impl<'p> Ctx<'p> {
                     let (v, t) = (c.value.clone(), c.ty);
                     let i = self.ei(e);
                     self.out.const_exprs[i] = Some(v);
+                    self.out.const_quals.insert(e, c.qualif);
                     return self.deep(t);
                 }
                 Some(crate::check::collect::BodyItem::Static(idx)) => {
@@ -11489,6 +11495,7 @@ impl<'p> Ctx<'p> {
                             let (v, t) = (c.value.clone(), c.ty);
                             let i = self.ei(e);
                             self.out.const_exprs[i] = Some(v);
+                            self.out.const_quals.insert(e, c.qualif);
                             // The value lives in the global store; rebuild the
                             // type in this body's overlay so unification sees it.
                             return self.deep(t);
@@ -11705,6 +11712,7 @@ impl<'p> Ctx<'p> {
                     let t = p.consts[idx as usize].ty;
                     let i = self.ei(e);
                     self.out.const_exprs[i] = Some(v);
+                    self.out.const_quals.insert(e, p.consts[idx as usize].qualif);
                     self.deep(t)
                 }
                 None => ERROR,
@@ -19764,6 +19772,7 @@ impl<'p> Ctx<'p> {
                     let t = p.consts[idx as usize].ty;
                     let i = self.ei(e);
                     self.out.const_exprs[i] = Some(v);
+                    self.out.const_quals.insert(e, p.consts[idx as usize].qualif);
                     self.deep(t)
                 }
                 None => ERROR,

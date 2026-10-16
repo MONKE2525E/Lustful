@@ -1417,6 +1417,8 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
             0u8.hash(&mut h);
             hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
             hash_const_value(&mut h, p, &item.value, 0);
+            // Whether `&C` is promoted (lower `promotable`).
+            item.qualif.hash(&mut h);
         } else if let Some(item) = p.static_by_def(def).map(|i| &p.statics[i as usize]) {
             1u8.hash(&mut h);
             item.mutable.hash(&mut h);

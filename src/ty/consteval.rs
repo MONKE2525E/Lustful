@@ -364,6 +364,15 @@ pub trait ConstCx<'a> {
     fn interior_mut(&self, _t: Ty) -> bool {
         false
     }
+    /// The promotion qualifs of the const item `name` names here
+    /// (`constqual`), None when this context does not track them.
+    fn const_item_qualif(&mut self, _name: Sym, _at: Span) -> Option<super::constqual::Qualif> {
+        None
+    }
+    /// True when the Adt has a written `Drop` impl (`constqual`).
+    fn adt_has_drop(&self, _adt: AdtId) -> bool {
+        true
+    }
     /// A short display name of a type, for drop diagnostics.
     fn ty_text(&self, _t: Ty) -> String {
         "this type".to_string()

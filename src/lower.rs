@@ -6,6 +6,7 @@ use crate::check::{Autoref, BindMode, Builtin, Checked, CmpVia, Coerce, OrdPickK
 use crate::diag::Span;
 use crate::ir::*;
 use crate::ty::*;
+use crate::ty::constqual::Qualif;
 
 mod any;
 mod closure;
@@ -266,11 +267,12 @@ impl<'p> Lower<'p> {
     /// const path check folded, arithmetic over those (never a fn call), a
     /// unit variant or unit struct, a shared borrow of a promotable value,
     /// or a tuple, array, array repeat, struct literal, or constructor
-    /// call of those, whose type needs
-    /// no drop and has no interior mutability (`promotable_ty`).
+    /// call of those, of a type this handles (`promotable_ty`), whose
+    /// value needs no drop and has no interior mutability
+    /// (`value_qualif`: `&None::<String>` is promoted).
     fn promotable(&mut self, e: ExprId) -> bool {
         let ty = self.ty(e);
-        if !self.promotable_ty(ty, 0) {
+        if !self.promotable_ty(ty, 0) || self.value_qualif(e).any() {
             return false;
         }
         match self.p.ast.expr(e) {
@@ -318,12 +320,13 @@ impl<'p> Lower<'p> {
         }
     }
 
-    /// True when a value of type `t` may be promoted: no drop, no
-    /// interior mutability (scalars, raw and fn pointers, `&str`, shared
-    /// refs to such, and tuples, arrays, `Option`, `Result`, and this
-    /// crate's Adts built of them).
+    /// True when a value of type `t` may be promoted by its shape:
+    /// scalars, raw and fn pointers, `&str`, shared refs to such, and tuples,
+    /// arrays, `Option`, `Result`, this crate's Adts built of them, and
+    /// std Adts. Drops and interior mutability are the value's
+    /// question (`value_qualif`).
     fn promotable_ty(&mut self, t: Ty, depth: u32) -> bool {
-        if depth > 8 || self.needs_drop_ty(t) {
+        if depth > 8 {
             return false;
         }
         match self.kind(t) {
@@ -340,9 +343,10 @@ impl<'p> Lower<'p> {
                 if let Some((ok, err)) = self.body.tys.result_args(t) {
                     return self.promotable_ty(ok, depth + 1) && self.promotable_ty(err, depth + 1);
                 }
-                let Some(a) = self.body.tys.local_adt(t) else { return false };
+                // A std Adt (`String`, `Cell`): its fields are std's.
+                let Some(a) = self.body.tys.local_adt(t) else { return matches!(self.kind(t), TyKind::Adt(..)) };
                 if self.p.is_std_adt(a) {
-                    return false;
+                    return true;
                 }
                 let args: Vec<GenericArg> = match self.kind(t) {
                     TyKind::Adt(_, a) => self.body.tys.args(a).to_vec(),
@@ -355,6 +359,43 @@ impl<'p> Lower<'p> {
                 })
             }
         }
+    }
+
+    /// rustc's promotion qualifs (NeedsDrop, HasMutInterior) of the
+    /// value `e` builds, by value as rustc's promote_consts computes
+    /// them: an aggregate by its parts (plus NeedsDrop for an Adt with
+    /// a `Drop` impl), a const item path by its initializer
+    /// (`ty::constqual`, recorded by check), anything else by its type.
+    fn value_qualif(&mut self, e: ExprId) -> Qualif {
+        let ty = self.ty(e);
+        let by_ty = Qualif { drop: self.needs_drop_ty(ty), cell: crate::check::collect::interior_mut(self.p, &self.body.tys, ty) };
+        if !by_ty.any() {
+            return Qualif::NONE;
+        }
+        let parts = |s: &mut Self, es: &[ExprId]| es.iter().fold(Qualif::NONE, |q, &x| q.or(s.value_qualif(x)));
+        let inherent = |s: &mut Self| match s.body.tys.local_adt(ty) {
+            Some(a) => Qualif { drop: s.p.gx.drop_methods.contains_key(&a) || s.p.drop_adts.contains(&a), cell: false },
+            None => Qualif::NONE,
+        };
+        let q = match self.p.ast.expr(e) {
+            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Unit => Qualif::NONE,
+            Expr::Tuple(es) | Expr::Array(es) => parts(self, &es.clone()),
+            Expr::ArrayRepeat { value, .. } => self.value_qualif(*value),
+            Expr::Call { args, .. } if matches!(self.ck.res(e), Res::Variant(..) | Res::OptSome | Res::ResOk | Res::ResErr) => {
+                let args = args.clone();
+                inherent(self).or(parts(self, &args))
+            }
+            Expr::StructLit { fields, update: None, .. } => {
+                let fs: Vec<ExprId> = fields.iter().map(|f| f.2).collect();
+                inherent(self).or(parts(self, &fs))
+            }
+            Expr::Path(_) if self.ck.const_value(e).is_some() => self.ck.const_quals.get(&e).copied().unwrap_or(Qualif::ALL),
+            Expr::Path(_) if matches!(self.ck.res(e), Res::OptNone) => Qualif::NONE,
+            Expr::Path(_) if matches!(self.ck.res(e), Res::Variant(..)) => inherent(self),
+            Expr::Ref { expr, .. } => self.value_qualif(*expr),
+            _ => Qualif::ALL,
+        };
+        q.and(by_ty)
     }
 
     /// Whether a value of type `ty` needs a drop (cached per body type).
