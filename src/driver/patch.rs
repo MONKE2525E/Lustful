@@ -50,6 +50,15 @@
 //   scan moved (errors then come from the full path, in cold order);
 // - the last full resolve's tables are shared, or patches grew the Ast
 //   arenas past twice their resolved size.
+//
+// The item patch (sigedit P1.3, path "item"): an edit strictly inside a
+// free fn or inherent method that touches its header re-parses and
+// rewrites that fn whole (`find_item_edit`), when its outline stands
+// (driver/item_outline.rs: everything name resolution reads from it). The
+// item rescans, and the compile tail runs the resolve path's slot update
+// in signatures mode with the fn's name as the changed name, then
+// collects in full (the kept programs go). A method is only ever called
+// by name, so a method's header edit also takes signatures mode (P1.5).
 use super::compile::{fn_def_at, fn_text_hash};
 use super::session::{Caches, Front};
 use super::span_shift::{self, Edit, FileRanges};
@@ -339,6 +348,11 @@ pub(super) struct Patched {
     pub revalue: bool,
     /// The edited const fns (`Front::fn_loc` indexes).
     pub const_edits: Vec<usize>,
+    /// With an item edit (path "item"): the new item scans, which the
+    /// compile tail's slot update takes in signatures mode with
+    /// `item_names` as the changed names.
+    pub item_scans: Option<Vec<crate::scan::ItemScan>>,
+    pub item_names: Vec<Sym>,
     /// Files whose text changed, Ast nodes the patch built, bodies
     /// re-parsed, and spans moved.
     pub files: usize,
@@ -359,6 +373,27 @@ struct BodyEdit {
     needs: (StdNeeds, bool),
     /// The new fn body; None when no Ast node changes.
     body: Option<NewBody>,
+    /// The new fn or method, when the edit touches its header
+    /// (`find_item_edit`); `body` is then None.
+    item: Option<NewItem>,
+}
+
+/// The item side of a `BodyEdit` (the item patch, sigedit P1.3): one
+/// free fn or inherent method whose header changed and whose outline
+/// (`item_outline.rs`) stands, parsed and rewritten whole.
+struct NewItem {
+    /// The fn's index in `Front::fn_loc` order and its location.
+    fn_index: usize,
+    item: usize,
+    sub: Option<usize>,
+    /// The old fn's byte range (its first attribute through its body).
+    old: (u32, u32),
+    /// The new fn, parsed and rewritten into an Ast of its own: a free
+    /// fn's item, or a method inside a placeholder impl (`apply` takes
+    /// the method and blanks the placeholder's self type).
+    item_ast: Ast,
+    /// The written name of a method, for the changed-name list.
+    name: Sym,
 }
 
 /// The fn body side of a `BodyEdit`.
@@ -486,10 +521,17 @@ pub(super) fn try_patch(
             }
         }
     }
+    // An item edit moves fn signatures: v1 drops the kept programs (the
+    // tail collects; sigedit P2 keeps them through `kept_delta.rs`).
+    let item_edit = edits.iter().any(|e| e.item.is_some());
     let mut ctxts: Vec<FxMap<u32, CtxtId>> = Vec::new();
     let out = apply(front, caches, edits, reads, &mut ctxts);
     if out.is_err() {
         front.patch = None;
+    } else if item_edit {
+        if caches.persistent && kept.iter().any(Option::is_some) {
+            let _ = crate::pool::thread("lust-drop").spawn(move || drop(kept));
+        }
     } else {
         for (slot, k) in kept.into_iter().enumerate() {
             if let Some(mut k) = k {
@@ -573,19 +615,23 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         let old = front.map.text(file).ok_or("no text")?;
         let (p, s) = super::compile::common_ends(old.as_bytes(), text.as_bytes());
         let edit = Edit { file, a: p as u32, b: (old.len() - s) as u32, d: text.len() as i64 - old.len() as i64 };
-        let body = match find_body_edit(front, &text, edit) {
-            Ok(body) => Some(body),
-            // No active fn body holds the edit: it may sit in code the
-            // expander dropped.
-            Err(why @ ("not in a fn body" | "no active item")) => {
-                find_inactive_edit(front, &text, edit).map_err(|inactive| inactive.unwrap_or(why))?;
-                None
-            }
+        let (body, item) = match find_body_edit(front, &text, edit) {
+            Ok(body) => (Some(body), None),
+            // No fn body holds the edit: it may sit in a fn's header (the
+            // item patch), or in code the expander dropped.
+            Err(why @ ("not in a fn body" | "no active item")) => match find_item_edit(front, &text, edit) {
+                Ok(item) => (None, Some(item)),
+                Err(Some(item_why)) => return Err(item_why),
+                Err(None) => {
+                    find_inactive_edit(front, &text, edit).map_err(|inactive| inactive.unwrap_or(why))?;
+                    (None, None)
+                }
+            },
             Err(why) => return Err(why),
         };
         // The root's own needs: its text before the splice.
         let own = if file == FileId(0) { splice_of(front, front.patch.as_ref().ok_or("no base")?).map_or(text.len(), |sp| text.len() - sp.len()) } else { text.len() };
-        edits.push(BodyEdit { file, needs: file_needs(&text[..own]), text, edit, body });
+        edits.push(BodyEdit { file, needs: file_needs(&text[..own]), text, edit, body, item });
     }
     // The std splice and the platform crate follow every file's needs;
     // they stand when the union over files does. The new union folds
@@ -757,6 +803,202 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         && plain_body(&new_body, &front.interner)
         && plain_body(&hoisted, &front.interner);
     Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, items, sig, nested, rpit })
+}
+
+/// The byte range of one top-level fn or method: from its first token
+/// (attributes and doc comments included) through its body. A method's
+/// start is the first token after the member before it in its impl.
+fn fn_range(ast: &Ast, item: usize, sub: Option<usize>, old: &str, interner: &crate::intern::Interner) -> Option<(u32, u32)> {
+    let it = &ast.items[item];
+    let def = fn_def_at(ast, item, sub);
+    let hi = ast.blocks[def.body?.0 as usize].span.hi;
+    let Some(_) = sub else { return Some((it.span.lo, hi)) };
+    let lexed = lexer::lex(old.get(it.span.lo as usize..it.span.hi as usize)?, it.span.file, it.span.lo, interner).ok()?;
+    let name = lexed.tokens.iter().position(|t| t.span == def.name_span)?;
+    // Walk back to the boundary at the impl's own depth: its `{`, the
+    // end of the member before (`}` or `;`).
+    let mut depth = 0i32;
+    for k in (0..name).rev() {
+        match lexed.tokens[k].tok {
+            Tok::RBrace | Tok::RParen | Tok::RBracket => depth += 1,
+            Tok::LBrace | Tok::LParen | Tok::LBracket if depth > 0 => depth -= 1,
+            Tok::LBrace => return Some((lexed.tokens[k + 1].span.lo, hi)),
+            Tok::Semi if depth == 0 => return Some((lexed.tokens[k + 1].span.lo, hi)),
+            _ => {}
+        }
+        if depth == 1 && lexed.tokens[k].tok == Tok::RBrace {
+            // The previous member's body ends here.
+            return Some((lexed.tokens[k + 1].span.lo, hi));
+        }
+    }
+    None
+}
+
+/// The item patch (sigedit P1.3): proves that `edit` sits strictly
+/// inside one free fn or inherent method, touches its header, and
+/// leaves its outline (`item_outline::fn_outline`) as it was, then
+/// parses and rewrites the new fn whole against the frozen tables.
+/// `Err(None)` when no fn holds the edit; `Err(Some(why))` when one
+/// does but the patch cannot prove the edit (the caller resolves).
+/// Refused (R2, R5, and v1 limits): a header with a macro call, `$`,
+/// an attribute after `fn`, or an APIT; attributes the expander acts
+/// on; a body that needs the expander, or holds items; a const fn; a
+/// fn from a macro expansion; a trait impl's method.
+fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Option<&'static str>> {
+    let base = front.patch.as_ref().ok_or(Some("no base"))?;
+    let file = edit.file;
+    let old = front.map.text(file).ok_or(Some("no text"))?;
+    let ast = &front.ast;
+    let (a, b, d) = (edit.a, edit.b, edit.d);
+    let holds = |&(item, sub): &(usize, Option<usize>)| {
+        if item == usize::MAX || item >= ast.items.len() || ast.items[item].span.file != file {
+            return false;
+        }
+        let it = &ast.items[item];
+        let in_item = it.span.lo < a && b < it.span.hi;
+        in_item && matches!((&it.kind, sub), (ItemKind::Fn(_), None) | (ItemKind::Impl(_), Some(_)))
+    };
+    // The item that holds the edit, then the fn in it.
+    let cands: Vec<(usize, (usize, Option<usize>))> = front.fn_loc.iter().copied().enumerate().filter(|(_, l)| holds(l)).collect();
+    let mut found = None;
+    for (fn_index, (item, sub)) in cands {
+        let (lo, hi) = fn_range(ast, item, sub, old, &front.interner).ok_or(Some("item range"))?;
+        if lo < a && b < hi {
+            found = Some((fn_index, item, sub, lo, hi));
+            break;
+        }
+    }
+    let (fn_index, item, sub, lo, hi) = found.ok_or(None)?;
+    let def = fn_def_at(ast, item, sub);
+    if let ItemKind::Impl(imp) = &ast.items[item].kind
+        && imp.trait_ref.is_some()
+    {
+        return Err(Some("item: trait impl"));
+    }
+    if def.qual.is_const {
+        return Err(Some("item: const fn"));
+    }
+    let root = |s: crate::diag::Span| s.ctxt == CtxtId::ROOT && s.file == file;
+    if !root(def.name_span) || !def.body.is_some_and(|bl| root(ast.blocks[bl.0 as usize].span)) {
+        return Err(Some("item: expansion"));
+    }
+    // No body items in the old fn (the new one is checked after the parse).
+    if ast.stmt_items.iter().any(|it| it.span.file == file && lo <= it.span.lo && it.span.hi <= hi) {
+        return Err(Some("item: body items"));
+    }
+    let new_hi = (hi as i64 + d) as u32;
+    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo, &front.interner).ok()).ok_or(Some("item lex"));
+    let (old_lx, new_lx) = (lex(old.get(lo as usize..hi as usize))?, lex(text.get(lo as usize..new_hi as usize))?);
+    let (ot, nt) = (&old_lx.tokens[..old_lx.tokens.len() - 1], &new_lx.tokens[..new_lx.tokens.len() - 1]);
+    // The new range starts and ends on a token edge, so no text outside
+    // it lexes another way (the edit is strictly inside).
+    if nt.first().is_none_or(|t| t.span.lo != lo) || nt.last().is_none_or(|t| t.span.hi != new_hi || t.tok != Tok::RBrace) {
+        return Err(Some("item lex"));
+    }
+    let outline = |toks: &[lexer::Token], t: &str| super::item_outline::fn_outline(toks, t);
+    match (outline(ot, old), outline(nt, text)) {
+        (Some(x), Some(y)) if x == y => {}
+        (Some(_), Some(_)) => return Err(Some("item: outline")),
+        _ => return Err(Some("item: header macro")),
+    }
+    // Header checks: from `fn` to the body's `{` at depth 0.
+    let open = |toks: &[lexer::Token]| {
+        let mut depth = 0i32;
+        toks.iter().position(|t| {
+            match t.tok {
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen | Tok::RBracket => depth -= 1,
+                _ => {}
+            }
+            depth == 0 && t.tok == Tok::LBrace
+        })
+    };
+    let (oo, no) = (open(ot).ok_or(Some("item lex"))?, open(nt).ok_or(Some("item lex"))?);
+    let at_fn = nt.iter().position(|t| t.tok == Tok::Fn).ok_or(Some("item lex"))?;
+    if nt[at_fn..no].iter().any(|t| matches!(t.tok, Tok::Pound | Tok::DocStr(_)))
+        || super::item_outline::has_apit(&nt[..=no])
+        || super::item_outline::has_apit(&ot[..=oo])
+    {
+        return Err(Some("item: header"));
+    }
+    if crate::expand::needs_expansion(&nt[..no], &front.interner) {
+        return Err(Some("item: attrs"));
+    }
+    // The body: the body patch's token rules, and no expander work.
+    let body_lx = |lx: &lexer::Lexed, k: usize| lexer::Lexed { tokens: lx.tokens[k..].to_vec(), strings: lx.strings.clone() };
+    let (ob, nb) = (body_lx(&old_lx, oo), body_lx(&new_lx, no));
+    let (oc, op) = body_tokens_ok(&ob, ot[oo].span.lo as usize, hi as usize, &front.interner).map_err(Some)?;
+    let (nc, np) = body_tokens_ok(&nb, nt[no].span.lo as usize, new_hi as usize, &front.interner).map_err(Some)?;
+    if op || np || (oc || nc) && base.shadowed || nb.tokens.iter().any(|t| t.tok == Tok::Static) {
+        return Err(Some("item: body macro"));
+    }
+    // Parse: a free fn as an item, a method inside a placeholder impl.
+    let mut toks: Vec<lexer::Token> = Vec::with_capacity(nt.len() + 5);
+    let edge = crate::diag::Span { file, lo, hi: lo, ctxt: CtxtId::ROOT };
+    let placeholder = front.interner.intern("__LustItemPatch");
+    if sub.is_some() {
+        for tok in [Tok::Impl, Tok::Ident(placeholder), Tok::LBrace] {
+            toks.push(lexer::Token { tok, span: edge });
+        }
+    }
+    toks.extend_from_slice(nt);
+    if sub.is_some() {
+        toks.push(lexer::Token { tok: Tok::RBrace, span: crate::diag::Span { lo: new_hi, hi: new_hi, ..edge } });
+    }
+    toks.push(lexer::Token { tok: Tok::Eof, span: crate::diag::Span { lo: new_hi, hi: new_hi, ..edge } });
+    let lexed = lexer::Lexed { tokens: toks, strings: new_lx.strings.clone() };
+    let mut item_ast =
+        crate::parser::parse_items(&lexed, 0..lexed.tokens.len(), &front.interner, &front.known).map_err(|_| Some("item parse"))?;
+    if item_ast.items.len() != 1 || !item_ast.stmt_items.is_empty() || !item_ast.inner_attrs.is_empty() {
+        return Err(Some("item: body items"));
+    }
+    // The new fn takes the old one's flat name and the scope's allows
+    // the whole parse seeded after its own attributes.
+    let own_old = match sub {
+        None => ast.items[item].attrs.len(),
+        Some(_) => 0,
+    };
+    let mut new_item = item_ast.items.pop().ok_or(Some("item parse"))?;
+    let name;
+    {
+        let new_def: &mut FnDef = match (&mut new_item.kind, sub) {
+            (ItemKind::Fn(f), None) => f,
+            (ItemKind::Impl(imp), Some(_)) if imp.fns.len() == 1 && imp.consts.is_empty() && imp.types.is_empty() => &mut imp.fns[0],
+            _ => return Err(Some("item parse")),
+        };
+        name = new_def.name;
+        let own = if sub.is_some() { new_def.attrs.len() } else { own_old };
+        if own > def.attrs.len() || sub.is_none() && new_item.attrs.len() != own_old {
+            return Err(Some("item: attrs"));
+        }
+        new_def.attrs.extend_from_slice(&def.attrs[own..]);
+        new_def.name = def.name;
+        if new_def.qual.is_const {
+            return Err(Some("item: const fn"));
+        }
+        let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
+        let outer = match &ast.items[item].kind {
+            ItemKind::Impl(imp) => Some(&imp.generics),
+            _ => None,
+        };
+        let mut scratch = std::mem::replace(new_def, def.clone());
+        let diags = crate::resolve::worklist::rewrite_fn_item(
+            &base.tables,
+            &front.interner,
+            base.local_names.as_ref().ok_or(Some("state"))?,
+            base.tables.std_splice_lo,
+            &mut item_ast,
+            &mut scratch,
+            outer,
+            module,
+        );
+        if !diags.is_empty() {
+            return Err(Some("item rewrite"));
+        }
+        *new_def = scratch;
+    }
+    item_ast.items.push(new_item);
+    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name })
 }
 
 /// The items (`stmt_items` indexes, in parse order) of the old fn body at
@@ -1087,6 +1329,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         if let Some(body) = &e.body {
             span_shift::blank_nodes_extras(Arc::make_mut(&mut front.ast), e.file, body.old_body, ranges, extras);
         }
+        if let Some(it) = &e.item {
+            span_shift::blank_nodes_extras(Arc::make_mut(&mut front.ast), e.file, it.old, ranges, extras);
+        }
         // Spans next: the new body is lexed at the new positions.
         let mut memo = FxMap::default();
         spans += span_shift::shift_ast_extras(Arc::make_mut(&mut front.ast), e.edit, ranges, extras, &mut memo);
@@ -1192,6 +1437,88 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         chunk.scan.fns.get_mut(e.fn_index).ok_or("state")?.body_hash = h;
         *chunk.scan.body_idents.get_mut(e.fn_index).ok_or("state")? = idents;
     }
+    // Item edits: the new fn takes the old one's place, and its item
+    // rescans whole (its scan may move: the tail runs in signatures mode).
+    let mut item_names: Vec<Sym> = Vec::new();
+    let mut item_fns: Vec<usize> = Vec::new();
+    for e in edits.iter_mut() {
+        let file = e.file;
+        let Some(it) = e.item.as_mut() else { continue };
+        let ast = &front.ast;
+        let before = (ast.exprs.len(), ast.pats.len(), ast.tys.len(), ast.blocks.len(), ast.stmt_items.len());
+        let ast = Arc::make_mut(&mut front.ast);
+        let (mut new_items, _, _) = ast.append_chunk(std::mem::take(&mut it.item_ast), before.4 as u32);
+        let new_item = new_items.pop().ok_or("item parse")?;
+        let crate::ast::Item { vis, attrs, kind, span } = new_item;
+        match (kind, it.sub) {
+            (ItemKind::Fn(f), None) => {
+                ast.items[it.item] = crate::ast::Item { vis, attrs, kind: ItemKind::Fn(f), span };
+            }
+            (ItemKind::Impl(imp), Some(k)) => {
+                // The placeholder impl's self type is unreachable now.
+                ast.tys[imp.self_ty.0 as usize] = TyExpr::Infer;
+                let def = imp.fns.into_iter().next().ok_or("item parse")?;
+                let ItemKind::Impl(old) = &mut ast.items[it.item].kind else { return Err("state") };
+                *old.fns.get_mut(k).ok_or("state")? = def;
+            }
+            _ => return Err("item parse"),
+        }
+        if let Some(r) = base.ranges.as_mut().and_then(|r| r.get_mut(file.0 as usize)) {
+            let ast = &front.ast;
+            r.exprs.push(before.0..ast.exprs.len());
+            r.pats.push(before.1..ast.pats.len());
+            r.tys.push(before.2..ast.tys.len());
+            r.blocks.push(before.3..ast.blocks.len());
+        }
+        if base.extras.is_some() {
+            let ast = &front.ast;
+            let only = FileRanges {
+                exprs: vec![before.0..ast.exprs.len()],
+                pats: vec![before.1..ast.pats.len()],
+                tys: vec![before.2..ast.tys.len()],
+                blocks: vec![before.3..ast.blocks.len()],
+                items: vec![it.item..it.item + 1],
+                stmt_items: Vec::new(),
+            };
+            let n = front.map.file_count();
+            let probed = span_shift::probe_extras_in(Arc::make_mut(&mut front.ast), n, &only);
+            for (x, p) in base.extras.as_mut().unwrap().iter_mut().zip(probed) {
+                x.exprs.extend(p.exprs);
+                x.pats.extend(p.pats);
+                x.tys.extend(p.tys);
+                x.blocks.extend(p.blocks);
+                x.items.extend(p.items);
+                x.stmt_items.extend(p.stmt_items);
+            }
+        }
+        // The whole item's scan, and every fn of it (a method's impl).
+        let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, &front.ast.items[it.item]);
+        if !inner.is_empty() {
+            return Err("item: body items");
+        }
+        let fns: Vec<usize> = front.fn_loc.iter().enumerate().filter(|(_, l)| l.0 == it.item).map(|(j, _)| j).collect();
+        if fns.len() != bodies.len() {
+            return Err("state");
+        }
+        for (&j, (hash, idents)) in fns.iter().zip(bodies) {
+            let (item, sub) = front.fn_loc[j];
+            let def = fn_def_at(&front.ast, item, sub);
+            let line = front.map.line_col(def.name_span).0;
+            let h = fn_text_hash(&front.ast, &front.map, def, line, hash);
+            base.body_hashes[j] = h;
+            base.fn_lines[j] = line;
+            let chunk = &mut front.chunks[0];
+            chunk.scan.fns.get_mut(j).ok_or("state")?.body_hash = h;
+            *chunk.scan.body_idents.get_mut(j).ok_or("state")? = idents;
+        }
+        base.item_scans.remove(&it.item);
+        front.chunks[0].scan.items[it.item] = scan;
+        item_fns.push(it.fn_index);
+        // The changed name: a free fn's flat name (its item scan's
+        // `fn_name`), or a method's written name (P1.5: a method is only
+        // ever called by name, so its callers mention it).
+        item_names.push(if it.sub.is_some() { it.name } else { fn_def_at(&front.ast, it.item, None).name });
+    }
     // Fn lines in the edited files: an edit that adds or drops lines
     // moves every fn after it in that file, and no fn in any other.
     for e in &edits {
@@ -1213,7 +1540,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         front.env_hash = Some(crate::scan::env_hash(front.items.iter()));
         front.rpit_edit = true;
     }
-    let edited: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref()).flat_map(|b| std::iter::once(b.fn_index).chain(b.nested)).collect();
+    let bodies = edits.iter().filter_map(|e| e.body.as_ref());
+    let mut edited: Vec<usize> = bodies.flat_map(|b| std::iter::once(b.fn_index).chain(b.nested)).collect();
+    edited.extend_from_slice(&item_fns);
     // A const fn edit is a plain body edit when no const evaluation can
     // run that fn (`const_reach.rs`).
     let is_const = |i: usize| {
@@ -1233,8 +1562,11 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         None => Vec::new(),
     };
     let revalue = !reached.is_empty() && base.reach.as_ref().is_some_and(|r| r.revaluable(front, &reached));
-    let changed = slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots);
-    let edits_len = edits.iter().filter(|e| e.body.is_some()).count();
+    // With an item edit the compile tail runs the full slot update in
+    // signatures mode (`Patched::item_scans`).
+    let changed = if item_fns.is_empty() { slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots) } else { Vec::new() };
+    let item_scans = (!item_fns.is_empty()).then(|| front.chunks[0].scan.items.clone());
+    let edits_len = edits.iter().filter(|e| e.body.is_some() || e.item.is_some()).count();
     let out = Patched {
         map: front.map.clone(),
         changed,
@@ -1248,6 +1580,8 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         const_fn: !reached.is_empty() && !revalue,
         revalue,
         const_edits,
+        item_scans,
+        item_names,
         files,
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
         bodies: edits_len,
@@ -2740,6 +3074,39 @@ pub fn run() -> i64 {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A header edit of a free fn or an inherent method takes the item
+    /// patch (path "item"): a where clause, a parameter type, a return
+    /// type, each with an error state and the undo, all give the cold
+    /// answer; the request after a collect error resolves (R9 v1). An
+    /// outline edit (a new generic param) resolves.
+    #[test]
+    fn item_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-item-{}", std::process::id()));
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str, &str)] = &[
+            ("pub fn helper(x: i64) -> i64 {", "pub fn helper(x: i64) -> i64 where u32: Copy {", "item"),
+            ("pub fn helper(x: i64) -> i64 where u32: Copy {", "pub fn helper(x: i64) -> i64 where String: Copy {", "item"),
+            // A collect error clears the item state (R9 v1): the fix resolves.
+            ("pub fn helper(x: i64) -> i64 where String: Copy {", "pub fn helper(x: i64) -> i64 {", "resolve"),
+            ("pub fn helper(x: i64) -> i64 {", "pub fn helper(x: i32) -> i64 {", "item"),
+            ("pub fn helper(x: i32) -> i64 {", "pub fn helper(x: i64) -> i64 {", "item"),
+            ("    pub fn add(&mut self, x: i64) {", "    pub fn add(&mut self, x: i64) where u8: Copy {", "item"),
+            ("    pub fn add(&mut self, x: i64) where u8: Copy {", "    pub fn add(&mut self, x: u8) {", "item"),
+            // A body error (not a collect error) keeps the item state.
+            ("    pub fn add(&mut self, x: u8) {", "    pub fn add(&mut self, x: i64) {", "item"),
+            ("pub fn helper(x: i64) -> i64 {", "pub fn helper<T>(x: i64) -> i64 {", "resolve"),
+            ("pub fn helper<T>(x: i64) -> i64 {", "pub fn helper(x: i64) -> i64 {", "resolve"),
+        ];
+        for &(old, new, path) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A module whose fn bodies call pure builtin macros the expander owns.
     const MACROS: &str = "use std::fmt::Write;
 
@@ -2869,6 +3236,9 @@ pub fn run() -> i64 {
         let all: usize = field(&warm.front.last_visits, "checked").parse().unwrap();
         let v = warm_equals_cold(&mut warm, &root, &m1, "pub fn base() -> i64 {", "pub fn base() -> i64 {\n    let _k = 1;");
         assert_eq!(field(&v, "path"), "patch", "{v}");
+        // A signature edit takes the item patch; with no patch base it
+        // resolves in full, which this test is about.
+        warm.front.patch = None;
         let v = warm_equals_cold(&mut warm, &root, &m1, "pub fn twice<T: Copy>(x: T) -> (T, T) {", "pub fn twice<T: Copy + Clone>(x: T) -> (T, T) {");
         assert_eq!(field(&v, "path"), "resolve", "{v}");
         let checked: usize = field(&v, "checked").parse().unwrap();

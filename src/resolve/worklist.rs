@@ -7483,6 +7483,39 @@ pub fn rewrite_fn_body(
     rw.diags
 }
 
+/// The item patch's rewrite of one whole fn or method (signature types
+/// and body), as the full rewrite's `items` pass does it for that fn:
+/// `Rewrite::fn_def` under the impl's generics (`outer`), against frozen
+/// tables. Returns the rewrite's diagnostics; any means the patch gives up.
+#[allow(clippy::too_many_arguments)]
+pub fn rewrite_fn_item(
+    tables: &ResolvedTables,
+    interner: &Interner,
+    local_names: &FxMap<Sym, u8>,
+    std_splice_lo: Option<u32>,
+    ast: &mut Ast,
+    def: &mut FnDef,
+    outer: Option<&Generics>,
+    module: ModuleId,
+) -> Vec<Diag> {
+    let no_lists = FxMap::default();
+    let mut rw = Rewrite {
+        tables,
+        interner,
+        list_module: &no_lists,
+        local_names,
+        diags: Vec::new(),
+        gen_params: Vec::new(),
+        std_splice_lo,
+        gen_floor: 0,
+    };
+    if let Some(g) = outer {
+        rw.push_params(g);
+    }
+    rw.fn_def(ast, def, module);
+    rw.diags
+}
+
 /// True when an `if`/`while` condition holds a `let` (directly or in a
 /// `&&` chain).
 fn has_let(ast: &Ast, e: ExprId) -> bool {

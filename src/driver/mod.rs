@@ -11,6 +11,7 @@ mod const_reach;
 pub(crate) mod kept_delta;
 pub(crate) mod laps;
 mod item_oracle;
+mod item_outline;
 pub(crate) mod gen_reuse;
 pub mod graph;
 mod patch;
