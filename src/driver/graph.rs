@@ -975,6 +975,12 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
             hash_region(h, r);
         }
     }
+    (rs.item_bounds.len() as u64).hash(h);
+    for &(j, d, t) in &rs.item_bounds {
+        j.hash(h);
+        hash_def_pub(h, p, d);
+        hash_regions_deep(h, p, t, &mut seen);
+    }
 }
 
 /// The fingerprint of a `Binding` node's answer (section 8.1: the resolved

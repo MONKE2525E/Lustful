@@ -331,6 +331,12 @@ pub struct Body<'g> {
     /// suffix element loans beside it are disjoint from it.
     /// Only borrowck reads it; a cached body has none.
     pub pat_subslice: Vec<Local>,
+    /// The temporaries that hold a `&mut dyn Tr` coerced to a `&mut dyn
+    /// Tr` at a rustc coercion site (check's `Coerce::Unsize`, lowering's
+    /// `unsize`). Only there may borrowck shorten the object lifetime
+    /// (`dyn Tr + 'a` to `dyn Tr + 'b`); elsewhere `&mut` keeps it
+    /// invariant. Only borrowck reads it; a cached body has none.
+    pub dyn_coerce: Vec<Local>,
     /// Edges only borrowck sees, as rustc's `FalseEdge`: from the point
     /// where a match arm's pattern has matched (before its bindings) to
     /// the next arm's start, so arms after an irrefutable one are still

@@ -64,6 +64,7 @@ pub fn lower_closure<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -
         pat_back_index: Vec::new(),
         pat_front_index: Vec::new(),
         pat_subslice: Vec::new(),
+        dyn_coerce: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
         opaque_nodrop: Vec::new(),

@@ -156,6 +156,7 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         pat_back_index: Vec::new(),
         pat_front_index: Vec::new(),
         pat_subslice: Vec::new(),
+        dyn_coerce: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
         opaque_nodrop: Vec::new(),

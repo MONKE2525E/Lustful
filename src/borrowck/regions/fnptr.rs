@@ -454,12 +454,14 @@ impl Builder<'_, '_> {
 
     /// A fn pointer value of type `a` (free slot var `fa`) flowing into one
     /// of type `b` (`fb`) at variance `v` (`walk`): the coercion proof, in
-    /// the direction the variance gives.
+    /// the direction the variance gives. Invariant means a subtype both
+    /// ways: `for<'r> fn(&'r u8)` and `fn(&'b u8)` are two types there
+    /// (rustc E0308 "one type is more general than the other").
     pub(super) fn ptr_to_ptr(&mut self, a: Ty, fa: Option<u32>, b: Ty, fb: Option<u32>, v: Variance) {
         let dirs: &[(bool, bool)] = match v {
             Variance::Co => &[(false, false)],
             Variance::Contra => &[(true, false)],
-            Variance::Inv => &[(false, true)],
+            Variance::Inv => &[(false, true), (true, true)],
             Variance::Bi => &[],
         };
         for &(swap, invariant) in dirs {

@@ -6260,8 +6260,9 @@ fn region_sig(
     }
     let fn_bounds = fn_bounds_in(ast, interner, known, tys, cx, scope, &bounded);
     let trait_bounds = trait_lts_in(interner, known, cx, scope, &bounded);
+    let item_bounds = item_bounds_in(ast, interner, known, tys, cx, scope, &bounded);
     let header = scope.header_regioned.clone();
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds, opaque_caps, header })
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds, item_bounds, opaque_caps, header })
 }
 
 /// The lifetime args of one written trait ref, for a trait with lifetime
@@ -6596,6 +6597,38 @@ fn fn_bounds_in(
                 None => None,
             };
             out.push(crate::borrowck::FnBound { param: j, inputs, output: out_ty });
+        }
+    }
+    out
+}
+
+/// The `I: Tr<Item = X>` bounds of `bounded` with `X` resolved, regions
+/// kept (`RegionSig::item_bounds`; an elided region is `Region::Bound`).
+fn item_bounds_in(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    tys: &mut impl TyIntern,
+    cx: &ResolveCx,
+    scope: &Scope,
+    bounded: &[(u32, &[TraitBound])],
+) -> Vec<(u32, DefId, Ty)> {
+    let mut bs = scope.clone();
+    bs.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    let mut out = Vec::new();
+    for &(j, bounds) in bounded {
+        for b in bounds {
+            let TraitBound::Trait { trait_ref, .. } = b else { continue };
+            let Some(GenericArgs::Angle(args)) = trait_ref.path.last().map(|s| &s.args) else { continue };
+            for a in args {
+                if let AstArg::Binding { name, kind: ast::BindingKind::EqTy(t), .. } = a
+                    && interner.get(*name) == "Item"
+                    && let Ok(trait_def) = trait_def_of_path(cx, interner, known, &trait_ref.path, Span::default())
+                    && let Ok(t) = resolve_scoped(ast, interner, known, cx, tys, *t, &bs)
+                {
+                    out.push((j, trait_def, t));
+                }
+            }
         }
     }
     out

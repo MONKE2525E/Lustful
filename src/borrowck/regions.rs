@@ -33,6 +33,7 @@ use crate::ir::*;
 use crate::ty::*;
 
 mod fnptr;
+mod store;
 pub(crate) use fnptr::{lub_items_fit, lub_shapes_fit, paired_slot_regions, ptr_free};
 
 /// The variance of a type position.
@@ -119,6 +120,10 @@ pub struct RegionSig {
     /// its trait's, and `impl Tr<'a>` arguments) for traits with lifetime
     /// params, with the written lifetime args (see `TraitLts`).
     pub trait_bounds: Vec<TraitLts>,
+    /// The `I: Tr<Item = X>` bounds on type params (`param`, trait, `X`
+    /// with regions; an elided region is `Region::Bound`). A call relates
+    /// the `Iterator`/`IntoIterator` ones (`item_bound_equate`).
+    pub item_bounds: Vec<(u32, DefId, Ty)>,
     /// The universals (`Region::Param` indices) a return-position `impl
     /// Trait` with a `use<..>` list captures (check/use_caps.rs); None
     /// when it captures every one.
@@ -689,11 +694,19 @@ fn adt_late_marks(tys: &impl TyIntern, args: ArgsId) -> Vec<bool> {
 }
 
 /// The pointees of two pointers whose object lifetime a coercion may
-/// shorten (`Builder::relate`): `&`/`&mut dyn Tr` with free regions, or,
-/// with `guards`, the same `RefCell` guard (`Ref`, `RefMut`) over `dyn Tr`.
-fn outer_dyn_pointees(tys: &impl TyIntern, a: Ty, b: Ty, guards: bool) -> Option<(Ty, Ty)> {
+/// shorten (`Builder::relate`): with `refs`, `&`/`&mut dyn Tr` with free
+/// regions, also through a `RefCell` or lock whose value is the dyn
+/// (`&RefCell<dyn Tr + 'a>` to `&RefCell<dyn Tr + 'b>`: std's unsizing
+/// goes through a struct's last field; neither has region slots of its
+/// own); with `guards`, the same `RefCell` guard (`Ref`, `RefMut`) over
+/// `dyn Tr`.
+fn outer_dyn_pointees(tys: &impl TyIntern, a: Ty, b: Ty, refs: bool, guards: bool) -> Option<(Ty, Ty)> {
+    let cell = |t: Ty| tys.refcell_elem(t).or_else(|| tys.lock_elem(t).map(|(_, e)| e));
     let (ai, bi) = match (tys.kind(a), tys.kind(b)) {
-        (TyKind::Ref(ra, _, ai), TyKind::Ref(rb, _, bi)) if !bound(ra) && !bound(rb) => (ai, bi),
+        (TyKind::Ref(ra, _, ai), TyKind::Ref(rb, _, bi)) if refs && !bound(ra) && !bound(rb) => match (cell(ai), cell(bi)) {
+            (Some(x), Some(y)) if tys.adt_parts(ai).map(|p| p.0) == tys.adt_parts(bi).map(|p| p.0) => (x, y),
+            _ => (ai, bi),
+        },
         (TyKind::Adt(da, xa), TyKind::Adt(db, xb))
             if guards && da == db && matches!(tys.builtin_of(a), Some(BuiltinTy::RefGuard | BuiltinTy::RefMutGuard)) =>
         {
@@ -2521,6 +2534,11 @@ pub(super) struct Builder<'b, 'p> {
     /// `call_cell`). Elsewhere a guard stays invariant: lust cannot tell a
     /// coercion site from a move into an inferred place (`let o = Some(g)`).
     guard_coerce: bool,
+    /// True while a value flows into a `Body::dyn_coerce` temporary: a
+    /// `&mut dyn Tr` coerced at a rustc coercion site, where its object
+    /// lifetime may shorten (`relate`). Elsewhere (`let g = c`, `Some(g)`,
+    /// a generic argument) `&mut` keeps it invariant.
+    dyn_coerce: bool,
     /// The capture var of each local that may hold an `impl Trait` value
     /// (`Body::opaque_locals`): the regions the opaque type captures
     /// (edition 2024: every argument region of the defining call), which
@@ -2566,6 +2584,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             bind_tys: FxMap::default(),
             dyn_walk: None,
             guard_coerce: false,
+            dyn_coerce: false,
             inst_inv: (false, None),
             inst_ret: false,
             seed_binds: Vec::new(),
@@ -2897,15 +2916,15 @@ impl<'b, 'p> Builder<'b, 'p> {
         if av.is_empty() && bv.is_empty() {
             return true;
         }
-        // A value flowing into a place is a coercion site: rustc may
-        // shorten the object lifetime of the outermost `&`/`&mut dyn`
-        // (`&'r mut (dyn Tr + 'a)` to `&'r mut (dyn Tr + 'b)`, `'a: 'b`),
-        // which plain `&mut` invariance would equate. The `RefCell` guards
-        // coerce the same way (`RefMut<'r, dyn Tr + 'a>`, std's
-        // `CoerceUnsized`), here only at a written target (`guard_coerce`);
-        // their one region slot comes first too.
+        // At a coercion site rustc may shorten the object lifetime of the
+        // outermost `&`/`&mut dyn` (`&'r mut (dyn Tr + 'a)` to `&'r mut
+        // (dyn Tr + 'b)`, `'a: 'b`), which plain `&mut` invariance would
+        // equate: a `dyn_coerce` temporary, or a written target
+        // (`guard_coerce`). The `RefCell` guards coerce the same way
+        // (`RefMut<'r, dyn Tr + 'a>`, std's `CoerceUnsized`), only at a
+        // written target; their one region slot comes first too.
         if v == Variance::Co
-            && let Some((ai, bi)) = outer_dyn_pointees(&self.body.tys, a, b, self.guard_coerce)
+            && let Some((ai, bi)) = outer_dyn_pointees(&self.body.tys, a, b, self.dyn_coerce || self.guard_coerce, self.guard_coerce)
             && !av.is_empty()
             && !bv.is_empty()
         {
@@ -2917,7 +2936,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.equate_all(av, bv);
             return false;
         }
-        if a == b && a != ERROR && av.len() == bv.len() {
+        // The same type pairs slot by slot; a fn pointer's free slot needs
+        // its signature's variances (`walk`, `ptr_to_ptr`).
+        if a == b && a != ERROR && av.len() == bv.len() && !store::has_fn_ptr(&self.body.tys, a) {
             let mut pairs: Vec<(u32, Variance)> = Vec::with_capacity(av.len());
             self.sc.each_slot(a, v, 0, &mut |i, var| pairs.push((i, var)));
             for (i, var) in pairs {
@@ -3435,8 +3456,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 let dt = self.place(dest, &mut dv, &mut d);
                 self.guard_coerce = dest.local == 0 && dest.proj.is_empty();
+                self.dyn_coerce = dest.proj.is_empty() && self.body.dyn_coerce.contains(&dest.local);
                 self.relate(ot, &ov, dt, &dv, Variance::Co);
                 self.guard_coerce = false;
+                self.dyn_coerce = false;
             }
             // A fn item coerced to a fn pointer (W-BORROW3, `fnptr`).
             Rvalue::FnValue(f, ty) if matches!(self.body.tys.kind(*ty), TyKind::FnPtr(_)) => {
@@ -4646,7 +4669,22 @@ impl<'b, 'p> Builder<'b, 'p> {
                     from.append(&mut rest);
                     self.equate_all(&from, &[]);
                 } else {
-                    self.flow_all(&from, &dv);
+                    // The item's parts that are parts of the iterator relate
+                    // at their variance in the iterator's type (an invariant
+                    // `T` stays equal; the `&mut` the call takes is only the
+                    // borrow `next` needs); the sources reach the other slots.
+                    let mut filled = vec![false; dv.len()];
+                    for (t, v) in &avs {
+                        let f = match self.body.tys.kind(*t) {
+                            TyKind::Ref(_, _, inner) if !v.is_empty() => self.store_into(inner, &v[1..], dt, &dv),
+                            _ => self.store_into(*t, v, dt, &dv),
+                        };
+                        for (x, y) in filled.iter_mut().zip(f) {
+                            *x |= y;
+                        }
+                    }
+                    let rest: Vec<u32> = dv.iter().zip(&filled).filter(|(_, f)| !**f).map(|(&x, _)| x).collect();
+                    self.flow_all(&from, &rest);
                 }
                 // An item that can write through shared memory (`&RefCell`)
                 // is its source's own regions, both ways.
@@ -5323,11 +5361,8 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let (s0, n) = ranges[j];
                 let part = dv[s0..s0 + n].to_vec();
                 let okb = self.by_next_part(*t, v, comps[j], &part);
-                    if !okb {
-                    self.flow_all(v, dv);
-                    if interior {
-                        self.flow_all(dv, v);
-                    }
+                if !okb {
+                    self.adapter_fallback(*t, v, dt, dv, interior);
                 }
                 continue;
             }
@@ -5337,21 +5372,27 @@ impl<'b, 'p> Builder<'b, 'p> {
                     let (s0, n) = ranges[j];
                     let part = dv[s0..s0 + n].to_vec();
                     if !self.relate(*t, v, comps[j], &part, Variance::Co) {
-                        self.flow_all(v, dv);
-                        if interior {
-                            self.flow_all(dv, v);
-                        }
+                        self.adapter_fallback(*t, v, dt, dv, interior);
                     }
                 }
-                None => {
-                    self.flow_all(v, dv);
-                    if interior {
-                        self.flow_all(dv, v);
-                    }
-                }
+                None => self.adapter_fallback(*t, v, dt, dv, interior),
             }
         }
     }
+    /// `call_adapter`'s rule for a source it cannot pair with a part: the
+    /// parts of the source the adapter holds relate at their variance
+    /// (`store_into`: `vec.into_iter()` of an invariant `T`); every source
+    /// region may reach the adapter's other slots (both ways when the
+    /// adapter can write through shared memory).
+    fn adapter_fallback(&mut self, t: Ty, v: &[u32], dt: Ty, dv: &[u32], interior: bool) {
+        let filled = self.store_into(t, v, dt, dv);
+        let rest: Vec<u32> = dv.iter().zip(&filled).filter(|(_, f)| !**f).map(|(&x, _)| x).collect();
+        self.flow_all(v, &rest);
+        if interior {
+            self.flow_all(&rest, v);
+        }
+    }
+
 
     /// The vars of the slots of `t` (laid out from `*at` in `vars`) that do
     /// not sit inside a closure type, plus the captured sources of the
@@ -5816,8 +5857,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                         let mut srcs = Vec::new();
                         self.closure_sources(*t1, v1, &mut 0, &mut srcs);
                         self.flow_all(&srcs, &hvv);
+                        self.store_flat(&srcs, vt, &hvv);
                     } else {
                         self.flow_all(v1, &hvv);
+                        self.store_flat(v1, vt, &hvv);
                     }
                 }
             }
@@ -5826,6 +5869,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             && let Some((_, v1)) = avs.get(1)
         {
             self.flow_all(v1, &hvv);
+            self.store_flat(v1, vt, &hvv);
         }
         true
     }
@@ -5858,6 +5902,10 @@ impl<'b, 'p> Builder<'b, 'p> {
         let n: usize = targs.iter().take(parts).map(|&t| self.sc.slots(t) as usize).sum();
         let Some(ev) = v0.get(1..1 + n) else { return false };
         let ev = ev.to_vec();
+        // Fn pointer items have no slots to flow: prove them (`store_into`).
+        if store::has_fn_ptr(&self.body.tys, table) {
+            self.store_into(*it, iv, table, &v0[1..]);
+        }
         // A Vec, array, slice, map, or set argument: its elements' slots
         // lead its own (after the borrow for `&C`, whose items are copied).
         let tys = &self.body.tys;
@@ -5875,6 +5923,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             let Some(part) = iv.get(skip..skip + n) else { return false };
             let part = part.to_vec();
             self.flow_all(&part, &ev);
+            self.store_slots(&part, table, &ev);
             return true;
         }
         let Some(item_vars) = self.item_slots(*it, iv) else { return false };
@@ -5894,6 +5943,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             item_vars
         };
         self.flow_all(&item_vars, &ev);
+        self.store_slots(&item_vars, table, &ev);
         true
     }
 
@@ -6809,7 +6859,7 @@ impl<'b, 'p> Builder<'b, 'p> {
 
     /// `call_opaque` where only the vars `into_dest` reach the result
     /// (`captured_vars`); a `&mut` argument may still take any
-    /// argument's regions.
+    /// argument's regions, at their variance (`store_into`).
     fn call_opaque_from(&mut self, avs: &[(Ty, Vec<u32>)], into_dest: &[u32], dt: Ty, dv: &[u32]) {
         let all = into_dest;
         if has_mut_ref(&self.body.tys, dt) || has_interior(&self.body.tys, dt) {
@@ -6818,11 +6868,19 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.flow_all(&all, dv);
         }
         for (i, (t, v)) in avs.iter().enumerate() {
-            if let TyKind::Ref(_, Mut::Mut, _) = self.body.tys.kind(*t)
-                && v.len() > 1
+            if let TyKind::Ref(_, Mut::Mut, pt) = self.body.tys.kind(*t)
+                && !v.is_empty()
+                && (v.len() > 1 || store::has_fn_ptr(&self.body.tys, pt))
             {
                 let others: Vec<u32> = avs.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, (_, v))| v.iter().copied()).collect();
                 self.flow_all(&others, &v[1..]);
+                // Exact variance for what it may store (`store_into`).
+                let pv = v[1..].to_vec();
+                for (j, (at, av)) in avs.iter().enumerate() {
+                    if j != i {
+                        self.store_into(*at, av, pt, &pv);
+                    }
+                }
             }
         }
     }
@@ -6887,7 +6945,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             let mut pv = Vec::new();
             ok &= self.inst(sig.params[i], et, &univ, &mut binds, &mut pv);
             if !av.is_empty() {
-                self.guard_coerce = !has_param(params[i]) && outer_dyn_pointees(&self.p.tys, params[i], params[i], true).is_some();
+                self.guard_coerce = !has_param(params[i]) && outer_dyn_pointees(&self.p.tys, params[i], params[i], true, true).is_some();
                 ok &= self.relate(*at, av, et, &pv, Variance::Co);
                 self.guard_coerce = false;
             }
@@ -6905,6 +6963,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.edge(x, y);
         }
         self.item_bound_exact = ok && self.item_bound_flows(preds, &binds);
+        if ok {
+            self.item_bound_equate(sig, &binds, &univ);
+        }
         // `T: Tr<'a>` for a trait with lifetime params: the type bound to
         // `T` implements `Tr` with exactly those lifetimes (trait args are
         // invariant), so its own (this body's bound on a type param, or the

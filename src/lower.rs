@@ -137,6 +137,7 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         pat_back_index: Vec::new(),
         pat_front_index: Vec::new(),
         pat_subslice: Vec::new(),
+        dyn_coerce: Vec::new(),
         false_edges: Vec::new(),
         opaque_locals: Vec::new(),
         opaque_nodrop: Vec::new(),
@@ -1501,6 +1502,9 @@ impl<'p> Lower<'p> {
             _ => Rvalue::MakeDyn { ptr, src, dyn_ty },
         };
         let out = self.temp(target);
+        if m && matches!(rv, Rvalue::Use(_)) {
+            self.body.dyn_coerce.push(out);
+        }
         self.assign(Place::local(out), rv, span);
         if m { Operand::Move(Place::local(out)) } else { Operand::Copy(Place::local(out)) }
     }

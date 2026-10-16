@@ -1162,7 +1162,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
         };
         blocks.push(BlockData { stmts, term, term_span: blk.term_span });
     }
-    Some(Body { fn_id, tys, locals, blocks, arg_count: cached.arg_count, reads: graph::Reads::new(), lower_errs: Vec::new(), annotations: Vec::new(), promoted: Vec::new(), index_exprs: Vec::new(), pat_back_index: Vec::new(), pat_front_index: Vec::new(), pat_subslice: Vec::new(), false_edges: Vec::new(), opaque_locals: Vec::new(), opaque_nodrop: Vec::new(), stmt_unwind: cached.stmt_unwind.clone() })
+    Some(Body { fn_id, tys, locals, blocks, arg_count: cached.arg_count, reads: graph::Reads::new(), lower_errs: Vec::new(), annotations: Vec::new(), promoted: Vec::new(), index_exprs: Vec::new(), pat_back_index: Vec::new(), pat_front_index: Vec::new(), pat_subslice: Vec::new(), dyn_coerce: Vec::new(), false_edges: Vec::new(), opaque_locals: Vec::new(), opaque_nodrop: Vec::new(), stmt_unwind: cached.stmt_unwind.clone() })
 }
 
 #[cfg(test)]
