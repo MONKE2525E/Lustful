@@ -636,6 +636,8 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
                 | IterKind::ChunksMut
                 | IterKind::ChunksExact
                 | IterKind::ChunksExactMut
+                | IterKind::SliceSplit
+                | IterKind::SliceSplitMut
                 | IterKind::Utf8Chunks
                 | IterKind::Utf8Chunk
                 | IterKind::CharIndices
@@ -5264,6 +5266,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             // The chunk items are `&'a [T]` (or `&'a mut [T]`), like
             // a window; a `Utf8Chunk` item is its one region.
             K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => cat(&[&own, &args[0]]),
+            // A slice split's item is `&'a [T]` (or `&'a mut [T]`), like a chunk.
+            K::SliceSplit | K::SliceSplitMut => cat(&[&own, &args[0]]),
             K::Utf8Chunks => own.clone(),
             K::Utf8Chunk => return None,
             K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => args[0].clone(),
@@ -5769,7 +5773,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             | K::Flatten
             | K::OptionIntoIter
             | K::EncodeUtf16
-            | K::ResultIntoIter => false,
+            | K::ResultIntoIter
+            | K::SliceSplit
+            | K::SliceSplitMut => false,
         }
     }
 

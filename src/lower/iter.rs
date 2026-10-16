@@ -87,6 +87,7 @@ fn expands(b: Builtin) -> bool {
             | B::IterRposition
             | B::IterWindows
             | B::IterChunks
+            | B::IterSliceSplit
             | B::IterUtf8Chunks
             | B::IterRemainder
             | B::IterNextBack
@@ -583,6 +584,30 @@ impl Ex<'_, '_> {
             // `assert_ne!(size, 0)`-through-`NonZero` panic first,
             // then the stored fields. The exact forms split the
             // remainder off at creation, as std does.
+            // A slice split: (v, pred, finished, count) as core's
+            // constructors set them (`SplitInclusive` starts finished on
+            // an empty slice; the N forms take the count first).
+            B::IterSliceSplit => {
+                use crate::ty::iter::SliceSplitMode as M;
+                let r = arg()?;
+                let (_, a) = self.kind_args(dest_ty).ok_or("iterator expansion: bad slice split")?;
+                let mode = it::slice_split_mode(&self.body.tys, a[2]).ok_or("iterator expansion: bad slice split mode")?;
+                let count = if matches!(mode, M::SplitN | M::RSplitN) { arg()? } else { Self::usize_c(0) };
+                let pred = arg()?;
+                let rt = self.op_ty(&r)?;
+                let rp = self.op_place(r, rt);
+                let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad slice split")?;
+                let s = self.local(fields[0]);
+                self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
+                let finished = if mode == M::SplitInclusive {
+                    let len = self.local(USIZE);
+                    self.assign(Place::local(len), Rvalue::LenOf(Place::local(s).deref()));
+                    self.cmp(crate::ast::BinOp::Eq, Operand::Copy(Place::local(len)), Self::usize_c(0))
+                } else {
+                    Operand::Const(Const::Bool(false))
+                };
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s)), pred, finished, count]));
+            }
             B::IterChunks => {
                 let (r, n) = (arg()?, arg()?);
                 let nl = self.local(USIZE);
@@ -1860,6 +1885,8 @@ impl Ex<'_, '_> {
                 self.none(&dest, opt);
                 self.goto(join);
             }
+            // The slice splits (core slice/iter.rs): see `slice_split_next`.
+            K::SliceSplit | K::SliceSplitMut => self.slice_split_next(&itp, k, &a, back, &dest, opt, join)?,
             // `env::Args`: the argument at the front (or back) index while
             // the indexes differ, taken first, then checked as UTF-8 as
             // std's `into_string().unwrap()` does (runtime `lust_env_arg`).
@@ -2810,6 +2837,177 @@ impl Ex<'_, '_> {
     }
 
     /// The integer 1 of a range element type.
+    /// One `next` (or `next_back`) of a slice split into `dest`, ending
+    /// in `join`: core's `Split`, `RSplit` (`Split` from the other
+    /// end), `SplitInclusive`, and `GenericSplitN` over `Split` or
+    /// `RSplit`, with their `_mut` twins. Fields (v, pred, finished,
+    /// count). The predicate sees `&v[i]` in core's search order
+    /// (`position` front to back, `rposition` back to front).
+    #[allow(clippy::too_many_arguments)]
+    fn slice_split_next(&mut self, itp: &Place, k: IterKind, a: &[Ty], back: bool, dest: &Place, opt: Ty, join: Bb) -> R {
+        use crate::ast::BinOp::*;
+        use crate::ty::iter::SliceSplitMode as M;
+        let mode = it::slice_split_mode(&self.body.tys, a[2]).ok_or("iterator expansion: bad slice split mode")?;
+        let f = |i: u32| itp.project(Proj::Field(i));
+        if matches!(mode, M::SplitN | M::RSplitN) {
+            // `GenericSplitN::next`: no item once the count is 0; the
+            // last counted item is the inner iterator's `finish`.
+            let c = self.cmp(Eq, Operand::Copy(f(3)), Self::usize_c(0));
+            let (spent, go) = self.branch(c);
+            self.cur = spent;
+            self.none(dest, opt);
+            self.goto(join);
+            self.cur = go;
+            self.assign(f(3), Rvalue::Bin(Sub, Operand::Copy(f(3)), Self::usize_c(1)));
+            let c = self.cmp(Eq, Operand::Copy(f(3)), Self::usize_c(0));
+            let (last, more) = self.branch(c);
+            self.cur = last;
+            self.slice_split_finish(itp, dest, opt, join);
+            self.cur = more;
+            return self.slice_split_step(itp, k, a, mode == M::RSplitN, false, dest, opt, join);
+        }
+        self.slice_split_step(itp, k, a, back != (mode == M::RSplit), mode == M::SplitInclusive, dest, opt, join)
+    }
+
+    /// `SplitIter::finish`: `None` once finished, else the rest of the
+    /// slice (and finished).
+    fn slice_split_finish(&mut self, itp: &Place, dest: &Place, opt: Ty, join: Bb) {
+        let f = |i: u32| itp.project(Proj::Field(i));
+        let (done, go) = self.branch(Operand::Copy(f(2)));
+        self.cur = done;
+        self.none(dest, opt);
+        self.goto(join);
+        self.cur = go;
+        self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
+        self.some(dest, opt, Operand::Copy(f(0)));
+        self.goto(join);
+    }
+
+    /// One step of `Split::next` (`from_back`: `next_back`) or of
+    /// `SplitInclusive` (`inclusive`), as core writes them.
+    #[allow(clippy::too_many_arguments)]
+    fn slice_split_step(&mut self, itp: &Place, k: IterKind, a: &[Ty], from_back: bool, inclusive: bool, dest: &Place, opt: Ty, join: Bb) -> R {
+        use crate::ast::BinOp::*;
+        let m = k == IterKind::SliceSplitMut;
+        let f = |i: u32| itp.project(Proj::Field(i));
+        let (done, go) = self.branch(Operand::Copy(f(2)));
+        self.cur = done;
+        self.none(dest, opt);
+        self.goto(join);
+        self.cur = go;
+        let sd = f(0).deref();
+        let len = self.local(USIZE);
+        self.assign(Place::local(len), Rvalue::LenOf(sd.clone()));
+        // The search: `i` is the matching index on `found`.
+        let i = self.local(USIZE);
+        let (head, found, miss) = (self.block(), self.block(), self.block());
+        if from_back {
+            // `rposition`; `SplitInclusive` skips the last element,
+            // which the previous step already matched.
+            if inclusive {
+                let c = self.cmp(Eq, Operand::Copy(Place::local(len)), Self::usize_c(0));
+                let (empty, some) = self.branch(c);
+                let set = self.block();
+                self.cur = empty;
+                self.assign(Place::local(i), Rvalue::Use(Self::usize_c(0)));
+                self.goto(set);
+                self.cur = some;
+                self.assign(Place::local(i), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Self::usize_c(1)));
+                self.goto(set);
+                self.cur = set;
+            } else {
+                self.assign(Place::local(i), Rvalue::Use(Operand::Copy(Place::local(len))));
+            }
+            self.goto(head);
+            self.cur = head;
+            let c = self.cmp(Lt, Self::usize_c(0), Operand::Copy(Place::local(i)));
+            let body = self.block();
+            self.term(Terminator::If(c, body, miss));
+            self.cur = body;
+            self.assign(Place::local(i), Rvalue::Bin(Sub, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+            let r = self.ref_to(false, sd.project(Proj::Index(i)), a[0]);
+            let b = self.local(BOOL);
+            self.call_fn(a[1], f(1), vec![Operand::Move(Place::local(r))], Place::local(b))?;
+            self.term(Terminator::If(Operand::Copy(Place::local(b)), found, head));
+        } else {
+            // `position`.
+            self.assign(Place::local(i), Rvalue::Use(Self::usize_c(0)));
+            self.goto(head);
+            self.cur = head;
+            let c = self.cmp(Lt, Operand::Copy(Place::local(i)), Operand::Copy(Place::local(len)));
+            let body = self.block();
+            self.term(Terminator::If(c, body, miss));
+            self.cur = body;
+            let r = self.ref_to(false, sd.project(Proj::Index(i)), a[0]);
+            let b = self.local(BOOL);
+            self.call_fn(a[1], f(1), vec![Operand::Move(Place::local(r))], Place::local(b))?;
+            let next = self.block();
+            self.term(Terminator::If(Operand::Copy(Place::local(b)), found, next));
+            self.cur = next;
+            self.assign(Place::local(i), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+            self.goto(head);
+        }
+        let st = self.place_ty(&f(0))?;
+        let sub = |lo: Operand, hi: Option<Operand>| Rvalue::Subslice { base: sd.clone(), lo, hi, inclusive: false, mutable: m };
+        let (ret, rest) = (self.local(st), self.local(st));
+        if inclusive {
+            // The split point `idx`: one past the match, or the end
+            // (front) or 0 (back) on a miss; the iterator finishes
+            // when it reaches that end.
+            let idx = self.local(USIZE);
+            let set = self.block();
+            self.cur = found;
+            self.assign(Place::local(idx), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+            self.goto(set);
+            self.cur = miss;
+            let end = if from_back { Self::usize_c(0) } else { Operand::Copy(Place::local(len)) };
+            self.assign(Place::local(idx), Rvalue::Use(end.clone()));
+            self.goto(set);
+            self.cur = set;
+            let c = self.cmp(Eq, Operand::Copy(Place::local(idx)), end);
+            let (fin, keep) = self.branch(c);
+            let cont = self.block();
+            self.cur = fin;
+            self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
+            self.goto(cont);
+            self.cur = keep;
+            self.goto(cont);
+            self.cur = cont;
+            let at = Operand::Copy(Place::local(idx));
+            if from_back {
+                self.assign(Place::local(ret), sub(at.clone(), None));
+                self.assign(Place::local(rest), sub(Self::usize_c(0), Some(at)));
+            } else {
+                self.assign(Place::local(ret), sub(Self::usize_c(0), Some(at.clone())));
+                self.assign(Place::local(rest), sub(at, None));
+            }
+            self.assign(f(0), Rvalue::Use(Operand::Move(Place::local(rest))));
+            self.some(dest, opt, Operand::Move(Place::local(ret)));
+            self.goto(join);
+            return Ok(());
+        }
+        // `Split`: a miss is `finish`; a match splits around index `i`.
+        self.cur = miss;
+        self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
+        self.some(dest, opt, Operand::Copy(f(0)));
+        self.goto(join);
+        self.cur = found;
+        let after = self.local(USIZE);
+        self.assign(Place::local(after), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+        let (left, right) = (sub(Self::usize_c(0), Some(Operand::Copy(Place::local(i)))), sub(Operand::Copy(Place::local(after)), None));
+        if from_back {
+            self.assign(Place::local(ret), right);
+            self.assign(Place::local(rest), left);
+        } else {
+            self.assign(Place::local(ret), left);
+            self.assign(Place::local(rest), right);
+        }
+        self.assign(f(0), Rvalue::Use(Operand::Move(Place::local(rest))));
+        self.some(dest, opt, Operand::Move(Place::local(ret)));
+        self.goto(join);
+        Ok(())
+    }
+
     fn one(t: Ty, tys: &Tys) -> Result<Operand, String> {
         match tys.kind(t) {
             TyKind::Int(i) => Ok(Operand::Const(Const::Int(1, i))),
@@ -3972,6 +4170,39 @@ impl Ex<'_, '_> {
                 let n = self.size(itp.clone(), ty)?;
                 set_exact(self, n);
             }
+            // The slice splits: `(0, Some(0))` once finished, else
+            // `(1, Some(len + 1))` (`SplitInclusive`: `max(1, len)`);
+            // the N forms cap both bounds at the count left.
+            K::SliceSplit | K::SliceSplitMut => {
+                use crate::ty::iter::SliceSplitMode as M;
+                let mode = it::slice_split_mode(&self.body.tys, a[2]).ok_or("iterator expansion: bad slice split mode")?;
+                let up = self.local(USIZE);
+                let (done, go) = self.branch(Operand::Copy(f(2)));
+                let set = self.block();
+                self.cur = done;
+                self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                self.assign(Place::local(up), Rvalue::Use(Self::usize_c(0)));
+                self.goto(set);
+                self.cur = go;
+                self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(1)));
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(f(0).deref()));
+                if mode == M::SplitInclusive {
+                    self.call_builtin(Builtin::Max, vec![Self::usize_c(1), Operand::Copy(Place::local(len))], Place::local(up));
+                } else {
+                    self.assign(Place::local(up), Rvalue::Bin(Add, Operand::Copy(Place::local(len)), Self::usize_c(1)));
+                }
+                self.goto(set);
+                self.cur = set;
+                if matches!(mode, M::SplitN | M::RSplitN) {
+                    let (l2, u2) = (self.local(USIZE), self.local(USIZE));
+                    self.call_builtin(Builtin::Min, vec![Operand::Copy(f(3)), Operand::Copy(Place::local(lo))], Place::local(l2));
+                    self.call_builtin(Builtin::Min, vec![Operand::Copy(f(3)), Operand::Copy(Place::local(up))], Place::local(u2));
+                    self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(l2))));
+                    self.assign(Place::local(up), Rvalue::Use(Operand::Copy(Place::local(u2))));
+                }
+                self.some(&Place::local(hi), ou, Operand::Copy(Place::local(up)));
+            }
             // `env::Args`: exact, back index minus front index.
             K::Args => {
                 let n = self.local(USIZE);
@@ -4493,8 +4724,8 @@ impl Ex<'_, '_> {
             // `ProcessResults` is not `TrustedLen` (a failure can
             // end it early), whatever the source is.
             K::TryCollect => false,
-            // `env::Args` is not `TrustedLen` in std.
-            K::Args => false,
+            // `env::Args` and the slice splits are not `TrustedLen` in std.
+            K::Args | K::SliceSplit | K::SliceSplitMut => false,
         }
     }
 

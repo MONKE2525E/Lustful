@@ -403,6 +403,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::MapIntoValues | K::ByNext => cty(tys, a[1]),
         K::StrSplit => CTy::Ref(Box::new(CTy::Str)),
         K::Args => CTy::String,
+        K::SliceSplit | K::SliceSplitMut => CTy::Slice(Box::new(cty(tys, a[0]))),
         _ => iter_item_cty(tys, a[0]),
     }
 }
@@ -5244,6 +5245,7 @@ impl FnGen<'_, '_> {
             | B::IterRposition
             | B::IterWindows
             | B::IterChunks
+            | B::IterSliceSplit
             | B::IterUtf8Chunks
             | B::IterRemainder
             | B::IterFlatten

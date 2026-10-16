@@ -197,6 +197,15 @@ pub enum IterKind {
     /// check the UTF-8 of the argument they take and panic as std's
     /// `into_string().unwrap()` does (runtime `lust_env_arg`).
     Args,
+    /// The slice splits over a predicate (`split`, `rsplit`, `splitn`,
+    /// `rsplitn`, `split_inclusive`), by `SliceSplitMode`. Args
+    /// `[T, P, M]`: the element, the predicate's type, and the mode as
+    /// `[u8; mode]` (a marker, never a value). Item `&[T]`. Fields
+    /// (v, pred, finished, count), as core's `Split` and
+    /// `GenericSplitN` store them (`count` serves the N forms only).
+    SliceSplit,
+    /// The `_mut` forms of `SliceSplit`: item `&mut [T]`.
+    SliceSplitMut,
 }
 
 /// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
@@ -281,6 +290,62 @@ pub fn matches_mode(tys: &impl TyIntern, marker: Ty) -> Option<MatchesMode> {
     MatchesMode::ALL.get(n as usize).copied()
 }
 
+/// Which core struct a `SliceSplit` (or `SliceSplitMut`) is: its
+/// `[u8; mode]` type argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliceSplitMode {
+    Split,
+    RSplit,
+    SplitN,
+    RSplitN,
+    SplitInclusive,
+}
+
+impl SliceSplitMode {
+    const ALL: [SliceSplitMode; 5] =
+        [SliceSplitMode::Split, SliceSplitMode::RSplit, SliceSplitMode::SplitN, SliceSplitMode::RSplitN, SliceSplitMode::SplitInclusive];
+
+    /// The mode a slice method builds, with its mutability; None for
+    /// other names.
+    pub fn of_method(name: &str) -> Option<(SliceSplitMode, bool)> {
+        use SliceSplitMode as M;
+        Some(match name {
+            "split" => (M::Split, false),
+            "split_mut" => (M::Split, true),
+            "rsplit" => (M::RSplit, false),
+            "rsplit_mut" => (M::RSplit, true),
+            "splitn" => (M::SplitN, false),
+            "splitn_mut" => (M::SplitN, true),
+            "rsplitn" => (M::RSplitN, false),
+            "rsplitn_mut" => (M::RSplitN, true),
+            "split_inclusive" => (M::SplitInclusive, false),
+            "split_inclusive_mut" => (M::SplitInclusive, true),
+            _ => return None,
+        })
+    }
+
+    /// True for the forms with `next_back` (not the N forms).
+    pub fn double_ended(self) -> bool {
+        !matches!(self, SliceSplitMode::SplitN | SliceSplitMode::RSplitN)
+    }
+}
+
+/// A `SliceSplit` (or, `mutable`, `SliceSplitMut`) type over element
+/// `t` and predicate type `p` in `mode`.
+pub fn mk_slice_split(tys: &mut impl TyIntern, t: Ty, p: Ty, mode: SliceSplitMode, mutable: bool) -> Ty {
+    let c = tys.intern_const(ConstKind::Int(mode as u128));
+    let marker = tys.intern(TyKind::Array(int(IntTy::U8), c));
+    let k = if mutable { IterKind::SliceSplitMut } else { IterKind::SliceSplit };
+    mk_iter(tys, k, &[t, p, marker])
+}
+
+/// The mode of a `SliceSplit` type's marker argument.
+pub fn slice_split_mode(tys: &impl TyIntern, marker: Ty) -> Option<SliceSplitMode> {
+    let TyKind::Array(_, c) = tys.kind(marker) else { return None };
+    let ConstKind::Int(n) = tys.const_kind(c) else { return None };
+    SliceSplitMode::ALL.get(n as usize).copied()
+}
+
 /// One stored field of a builtin iterator, over the type's args.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -315,7 +380,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 63] = [
+    pub const ALL: [IterKind; 65] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -379,6 +444,8 @@ impl IterKind {
         IterKind::Utf8Chunk,
         IterKind::TryCollect,
         IterKind::Args,
+        IterKind::SliceSplit,
+        IterKind::SliceSplitMut,
     ];
 
     /// True for the hashed-collection iterators.
@@ -463,6 +530,8 @@ impl IterKind {
             K::Utf8Chunk => (&["core", "str"], "Utf8Chunk"),
             K::TryCollect => (&["core", "iter", "lust"], "TryCollect"),
             K::Args => (&["std", "env"], "Args"),
+            K::SliceSplit => (&["core", "slice"], "Split"),
+            K::SliceSplitMut => (&["core", "slice"], "SplitMut"),
         }
     }
 
@@ -487,7 +556,7 @@ impl IterKind {
     pub fn n_args(self) -> usize {
         use IterKind as K;
         match self {
-            K::Map | K::FilterMap | K::TryCollect => 3,
+            K::Map | K::FilterMap | K::TryCollect | K::SliceSplit | K::SliceSplitMut => 3,
             K::Flatten => 2,
             K::Filter
             | K::Chain
@@ -581,6 +650,8 @@ impl IterKind {
             K::Utf8Chunk => "std::str::Utf8Chunk",
             K::TryCollect => "",
             K::Args => "std::env::Args",
+            K::SliceSplit => "std::slice::Split",
+            K::SliceSplitMut => "std::slice::SplitMut",
         }
     }
 
@@ -588,7 +659,7 @@ impl IterKind {
     /// lust adds stay hidden).
     pub fn shown_args(self) -> usize {
         match self {
-            IterKind::Map | IterKind::FilterMap => 2,
+            IterKind::Map | IterKind::FilterMap | IterKind::SliceSplit | IterKind::SliceSplitMut => 2,
             IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten | IterKind::StrSplit | IterKind::StrMatches => 1,
             // The `u8` arg of the UTF-8 kinds is lust's own marker.
             IterKind::Utf8Chunks | IterKind::Utf8Chunk => 0,
@@ -660,6 +731,8 @@ impl IterKind {
             K::RangeFull => &[F::Bool],
             K::TryCollect => &[F::Arg(0), F::OptArg(1)],
             K::Args => &[F::Usize, F::Usize],
+            K::SliceSplit => &[F::SliceRef(0, false), F::Arg(1), F::Bool, F::Usize],
+            K::SliceSplitMut => &[F::SliceRef(0, true), F::Arg(1), F::Bool, F::Usize],
         }
     }
 }
@@ -775,6 +848,10 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::EncodeUtf16 => int(IntTy::U16),
         K::TryCollect => a[2],
         K::Args => STRING,
+        K::SliceSplit | K::SliceSplitMut => {
+            let s = tys.intern(TyKind::Slice(a[0]));
+            tys.mk_ref(k == K::SliceSplitMut, s)
+        }
     })
 }
 

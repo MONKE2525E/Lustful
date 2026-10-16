@@ -8261,6 +8261,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     let s = p.tys.intern(TyKind::Slice(ps[0]));
                     p.tys.mk_ref(false, s)
                 }
+                K::SliceSplit | K::SliceSplitMut => {
+                    let s = p.tys.intern(TyKind::Slice(ps[0]));
+                    p.tys.mk_ref(k == K::SliceSplitMut, s)
+                }
                 K::ChunksMut | K::ChunksExactMut => {
                     let s = p.tys.intern(TyKind::Slice(ps[0]));
                     p.tys.mk_ref(true, s)

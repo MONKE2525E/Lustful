@@ -367,6 +367,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::IterRposition,
     Builtin::IterWindows,
     Builtin::IterChunks,
+    Builtin::IterSliceSplit,
     Builtin::IterUtf8Chunks,
     Builtin::Utf8ChunksNext,
     Builtin::IterRemainder,
@@ -1008,6 +1009,25 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::IterChunks => (
             &["Vec<T>", "[T]", "[T; n]"],
             vec![i.intern("chunks"), i.intern("chunks_mut"), i.intern("chunks_exact"), i.intern("chunks_exact_mut")],
+            Call::Method,
+        ),
+        B::IterSliceSplit => (
+            &["Vec<T>", "[T]", "[T; n]"],
+            [
+                "split",
+                "split_mut",
+                "rsplit",
+                "rsplit_mut",
+                "splitn",
+                "splitn_mut",
+                "rsplitn",
+                "rsplitn_mut",
+                "split_inclusive",
+                "split_inclusive_mut",
+            ]
+            .iter()
+            .map(|n| i.intern(n))
+            .collect(),
             Call::Method,
         ),
         B::IterUtf8Chunks => (&["[u8]", "[u8; n]", "Vec<u8>"], vec![i.intern("utf8_chunks")], Call::Method),

@@ -137,6 +137,8 @@ fn has_lifetime(k: IterKind) -> bool {
             | K::ResultIter
             | K::ResultIterMut
             | K::StrSplit
+            | K::SliceSplit
+            | K::SliceSplitMut
             | K::MapIter
             | K::MapIterMut
             | K::MapKeys

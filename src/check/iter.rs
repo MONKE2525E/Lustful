@@ -127,8 +127,32 @@ impl<'p> Ctx<'p> {
                 "chunks_exact" => "chunks_exact",
                 "chunks_exact_mut" => "chunks_exact_mut",
                 "utf8_chunks" => "utf8_chunks",
+                "split" => "split",
+                "split_mut" => "split_mut",
+                "rsplit" => "rsplit",
+                "rsplit_mut" => "rsplit_mut",
+                "splitn" => "splitn",
+                "splitn_mut" => "splitn_mut",
+                "rsplitn" => "rsplitn",
+                "rsplitn_mut" => "rsplitn_mut",
+                "split_inclusive" => "split_inclusive",
+                "split_inclusive_mut" => "split_inclusive_mut",
                 _ => return None,
             };
+            if let Some((mode, mutable)) = it::SliceSplitMode::of_method(n) {
+                // The slice splits (core slice/iter.rs): the slice by
+                // reference (mutable for the `_mut` forms) and
+                // `F: FnMut(&T) -> bool`, after the count for the N forms.
+                let elem_ref = self.tys.mk_ref(false, el);
+                let pred = self.fn_mut_param_ref(&[elem_ref], BOOL, name_span);
+                let ret = it::mk_slice_split(&mut self.tys, el, pred, mode, mutable);
+                let autoref = if mutable { Autoref::RefMut } else { Autoref::Ref };
+                self.set_res(e, Res::BuiltinMethod { b: Builtin::IterSliceSplit, derefs, autoref });
+                let counted = matches!(mode, it::SliceSplitMode::SplitN | it::SliceSplitMode::RSplitN);
+                let params: Vec<Ty> = if counted { vec![USIZE, pred] } else { vec![pred] };
+                self.check_args(&params, args, name_span);
+                return Some(ret);
+            }
             if n == "utf8_chunks" {
                 // `[u8]::utf8_chunks` (tf-slice): bytes only.
                 if el != int(IntTy::U8) {
@@ -1791,6 +1815,8 @@ impl<'p> Ctx<'p> {
             // double-ended searcher (not a string needle), as in std.
             K::StrMatches => !crate::check::split::str_needle(&self.tys, a[0]),
             K::EncodeUtf16 => false,
+            // The slice splits: every form but the N ones, as core's impls.
+            K::SliceSplit | K::SliceSplitMut => it::slice_split_mode(&self.tys, a[2]).is_some_and(|m| m.double_ended()),
             K::StrSplit => match it::split_mode(&self.tys, a[1]) {
                 Some(it::SplitMode::SplitN | it::SplitMode::RSplitN) | None => false,
                 Some(it::SplitMode::SplitWhitespace | it::SplitMode::SplitAsciiWhitespace | it::SplitMode::Lines) => true,

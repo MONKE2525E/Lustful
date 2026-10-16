@@ -533,6 +533,10 @@ pub enum Builtin {
     /// `chunks_exact_mut` (tf-slice): the dest kind tells which;
     /// panics on a zero size as std does.
     IterChunks,
+    /// `slice::split(pred)` and kin (`split_mut`, `rsplit`, `splitn`,
+    /// `rsplitn`, `split_inclusive` and their `_mut` forms): the dest
+    /// kind and mode tell which; the N forms take the count first.
+    IterSliceSplit,
     /// `slice::utf8_chunks` on `[u8]` (tf-slice): a `Utf8Chunks`
     /// iterator over the source bytes.
     IterUtf8Chunks,
