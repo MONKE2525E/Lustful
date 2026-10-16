@@ -1,0 +1,13 @@
+# `Alias::default()` and `Alias::default` as a fn value for aliases of Rc,
+# Arc, and Box whose pointee's Default comes from a dependency crate: a
+# derived Default, a written `impl Default`, and an alias the dependency
+# exports itself (snapshotfs.rs:398 in ts_goport, fx-aliasdef).
+[package]
+name = "alias-smart-default-dep"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dmap = { path = "dmap" }
+
+[workspace]
