@@ -9560,6 +9560,21 @@ fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId 
     p.gx.adt_instance_of[at] = Some((def, args_id));
     p.gx.adt_created.push(id);
     p.gx.mono_counts.1 += 1;
+    // The Adt instances this one's fields name (`In<u8>` inside
+    // `Out<u8>`): a body that only builds `Out<u8>` by `Default` glue and
+    // prints it names no `In<u8>`, and codegen then lowered the field
+    // through the template (`In(())`). After the registration above, so
+    // a recursive type finds itself; the depth guard stops a type that
+    // grows its args at each level.
+    thread_local!(static FIELD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    if FIELD_DEPTH.get() < 8 {
+        FIELD_DEPTH.set(FIELD_DEPTH.get() + 1);
+        let tys: Vec<Ty> = p.adts[at].variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+        for t in tys {
+            ensure_global_adt_instances(p, t, 0);
+        }
+        FIELD_DEPTH.set(FIELD_DEPTH.get() - 1);
+    }
     id
 }
 
