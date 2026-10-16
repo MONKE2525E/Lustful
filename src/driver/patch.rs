@@ -1937,7 +1937,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     let const_edits: Vec<usize> = edited.iter().copied().filter(|&i| is_const(i)).collect();
     match &mut base.reach {
         Some(r) => r.update(front, &edited),
-        None if !const_edits.is_empty() => base.reach = Some(super::const_reach::ConstReach::build(front)),
+        // A header edit reads it too (`kept_delta::untouched_refusals`):
+        // built once here, later patches update it.
+        None if !const_edits.is_empty() || !item_fns.is_empty() => base.reach = Some(super::const_reach::ConstReach::build(front)),
         None => {}
     }
     // One that only const and static values can read keeps the program
