@@ -7021,11 +7021,14 @@ impl<'p> Ctx<'p> {
         // the vtable's call entry), a fn item, or a fn pointer; `R` is its
         // `Output`. A type param with an Fn bound (`hooks.push(Box::new(f))`
         // for `f: F`) checks here and builds the vtable in each instance.
-        // A tuple constructor there is not supported yet.
+        // A tuple constructor there is not supported yet. An `impl Fn..`
+        // value checks by its bounds in the opaque view; the revealed
+        // check (which codegen gets) sees its hidden type here instead.
         if lang.is_fn_family(to.def) {
             let fn_value = match self.kind(x) {
                 TyKind::FnDef(def, _) => p.is_fn_item_def(def),
                 TyKind::Closure(..) | TyKind::Param(_) | TyKind::FnPtr(_) => true,
+                TyKind::Opaque(..) => self.opaque_mode == opaque::OpaqueMode::View,
                 _ => false,
             };
             if !fn_value {
@@ -23175,6 +23178,11 @@ impl<'p> Ctx<'p> {
         let clean = !self.errs.iter().any(|d| d.severity == "error");
         for (x, y, span) in std::mem::take(&mut self.vtable_sites) {
             let (x, y) = (self.zonk(x), self.zonk(y));
+            // An `impl Trait` source in the opaque view: the revealed
+            // check asks for its hidden type's vtable.
+            if self.opaque_mode == opaque::OpaqueMode::View && matches!(self.kind(x), TyKind::Opaque(..)) {
+                continue;
+            }
             // After mono, a concrete body's every coercion has its
             // vtable; a miss is a compiler gap, reported, never emitted.
             if self.p.gx.mono_done

@@ -9444,8 +9444,12 @@ fn add_trait_method_stubs(p: &mut Program) {
 /// method's stub, and its pick is recorded for the instances.
 /// Closure templates are checked in place by their enclosing body.
 fn template_check(p: &mut Program) -> Vec<Diag> {
-    let templates: Vec<LocalDefId> =
+    let mut templates: Vec<LocalDefId> =
         (0..p.fns.len() as u32).map(LocalDefId).filter(|&f| p.gx.fn_class.get(f.0 as usize) == Some(&FnClass::Template)).collect();
+    // A generic fn with its own `impl Trait` return checks first: a body
+    // that uses the opaque value asks for its hidden type's auto traits
+    // (`Send` leakage), wherever the definer sits in the source.
+    templates.sort_by_key(|&f| !p.gx.opaques.contains_key(&opaque_def(p.def_id(f))));
     for &t in &templates {
         p.gx.template_checks.insert(t, t);
     }
