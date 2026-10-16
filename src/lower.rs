@@ -1243,9 +1243,13 @@ impl<'p> Lower<'p> {
                     place = place.deref();
                     t = inner;
                 }
-                // Through an `Rc<String>` the builtin still wants
-                // the `&String`: form it from the pointee place.
-                if let Some(elem) = self.body.tys.rc_elem(t) {
+                // Through an `Rc<String>`, an `Arc<String>` or a guard
+                // (`Ref`, `RefMut`, a lock guard) the builtin still
+                // wants the `&String`: form it from the pointee place.
+                // Check picks this coercion for every `smart_elem`.
+                if self.body.tys.boxed_elem(t).is_none()
+                    && let Some(elem) = self.body.tys.smart_elem(t)
+                {
                     let sp = place.deref();
                     let rt = self.ref_ty(false, elem);
                     let sr = self.temp(rt);
