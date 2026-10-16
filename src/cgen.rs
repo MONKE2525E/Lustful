@@ -5199,6 +5199,100 @@ impl FnGen<'_, '_> {
                 );
                 t
             }
+            B::SliceJoinStr | B::SliceConcatStr => {
+                // Core's exact capacity: the sum of the parts (and
+                // separators) is reserved once, then copied in.
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let view = |el: &str| -> String {
+                    match &e {
+                        CTy::String => format!("lust_string_as_str(&{el})"),
+                        _ => el.to_string(),
+                    }
+                };
+                let (t, i, tot) = (self.tmp(), self.tmp(), self.tmp());
+                let sep = if b == B::SliceJoinStr { vals[1].clone() } else { "((lust_str){ (const uint8_t*)\"\", 0 })".to_string() };
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {tot} = 0;\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) {tot} += {}.len;\n    if ({len} > 1) {tot} += ({sep}).len * ({len} - 1);\n    lust_String {t} = lust_string_with_capacity({tot});\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) {{ if ({i}) lust_string_push_str(&{t}, {sep}); lust_string_push_str(&{t}, {}); }}",
+                    view(&format!("{ptr}[{i}]")),
+                    view(&format!("{ptr}[{i}]"))
+                );
+                t
+            }
+            B::SliceConcatVec | B::SliceJoinVecElem | B::SliceJoinVecSlice => {
+                // The `Vec<T>` join/concat family: with_capacity of
+                // the exact total, then each part cloned in order
+                // (separators interleaved, as core's extend does).
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let inner = match &e {
+                    CTy::Vec(i) | CTy::Slice(i) | CTy::BoxSlice(i) | CTy::Array(i, _) => (**i).clone(),
+                    _ => unreachable!(),
+                };
+                let iet = ctype(&inner);
+                // The (data, len) C text of one part element.
+                let part = |el: &str| -> (String, String) {
+                    match &e {
+                        CTy::Vec(_) => (format!("(({iet}*){el}.ptr)"), format!("{el}.len")),
+                        CTy::Array(_, n) => (format!("{el}.v"), format!("((uint64_t){n})")),
+                        _ => (format!("{el}.ptr"), format!("{el}.len")),
+                    }
+                };
+                let copy_inner = is_copy_c(self.p, &inner);
+                let cloned = |src: String| -> String {
+                    if copy_inner {
+                        src
+                    } else {
+                        format!("clone_{}(&{src})", mangle(&inner))
+                    }
+                };
+                if !copy_inner {
+                    self.want(Glue::Clone, &inner);
+                }
+                let (t, i, j, tot) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let (sp1, sl1) = part(&format!("{ptr}[{i}]"));
+                let mut body = String::new();
+                let _ = writeln!(body, "    uint64_t {tot} = 0;");
+                let _ = writeln!(body, "    for (uint64_t {i} = 0; {i} < {len}; {i}++) {tot} += {sl1};");
+                match b {
+                    B::SliceJoinVecElem => {
+                        let _ = writeln!(body, "    if ({len} > 1) {tot} += {len} - 1;");
+                    }
+                    B::SliceJoinVecSlice => {
+                        let (_, _, seplen) = slice_like(&tys[1], &vals[1]);
+                        let _ = writeln!(body, "    if ({len} > 1) {tot} += ({seplen}) * ({len} - 1);");
+                    }
+                    _ => {}
+                }
+                let _ = writeln!(body, "    lust_Vec {t} = lust_vec_with_capacity({tot}, sizeof({iet}), _Alignof({iet}));");
+                let _ = writeln!(body, "    for (uint64_t {i} = 0; {i} < {len}; {i}++) {{");
+                match b {
+                    B::SliceJoinVecElem => {
+                        let sepv = if copy_inner {
+                            format!("(*{})", vals[1])
+                        } else {
+                            format!("clone_{}({})", mangle(&inner), vals[1])
+                        };
+                        let _ = writeln!(body, "      if ({i}) (({iet}*){t}.ptr)[{t}.len++] = {sepv};");
+                    }
+                    B::SliceJoinVecSlice => {
+                        let (_, sepptr, seplen) = slice_like(&tys[1], &vals[1]);
+                        let sj = self.tmp();
+                        let _ = writeln!(
+                            body,
+                            "      if ({i}) for (uint64_t {sj} = 0; {sj} < {seplen}; {sj}++) (({iet}*){t}.ptr)[{t}.len++] = {};",
+                            cloned(format!("{sepptr}[{sj}]"))
+                        );
+                    }
+                    _ => {}
+                }
+                let _ = writeln!(
+                    body,
+                    "      for (uint64_t {j} = 0; {j} < {sl1}; {j}++) (({iet}*){t}.ptr)[{t}.len++] = {};\n    }}",
+                    cloned(format!("{sp1}[{j}]"))
+                );
+                let _ = write!(self.out, "{body}");
+                t
+            }
             B::VecClear | B::VecTruncate => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };

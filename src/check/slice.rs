@@ -44,8 +44,13 @@ impl<'p> Ctx<'p> {
             "copy_within" => "copy_within",
             "get" => "get",
             "get_mut" => "get_mut",
+            "join" => "join",
+            "concat" => "concat",
             _ => return None,
         };
+        if n == "join" || n == "concat" {
+            return self.slice_join_concat(e, recv, elem, derefs, name_span, args, n == "join");
+        }
         if n == "copy_within" {
             return Some(self.copy_within_method(e, recv, elem, derefs, name_span, args, turbofish));
         }
@@ -198,6 +203,87 @@ impl<'p> Ctx<'p> {
                 None
             }
         }
+    }
+
+    /// `[S]::join` and `concat`: core's two families, over the
+    /// element shapes lust takes. The `Borrow<str>` family (String
+    /// and `&str` elements) answers a String and takes a `&str`
+    /// separator; the `Borrow<[T]>` family (Vec, array, slice, and
+    /// boxed-slice elements, `T: Clone`) answers a `Vec<T>` and
+    /// takes a `&T` or `&[T]` separator. Any other element shape
+    /// falls through to the normal dispatch (a user `Borrow` type
+    /// or a plain no-method error, as rustc decides).
+    #[allow(clippy::too_many_arguments)]
+    fn slice_join_concat(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        elem: Ty,
+        derefs: u8,
+        name_span: Span,
+        args: &[ExprId],
+        is_join: bool,
+    ) -> Option<Ty> {
+        use Builtin as B;
+        let str_family = elem == STRING || matches!(self.kind(elem), TyKind::Ref(_, Mut::Shared, i) if self.kind(i) == TyKind::Str);
+        if str_family {
+            let b = if is_join { B::SliceJoinStr } else { B::SliceConcatStr };
+            self.check_packed_borrow(recv, name_span);
+            self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+            if is_join {
+                self.check_args(&[REF_STR], args, name_span);
+            } else {
+                self.check_args(&[], args, name_span);
+            }
+            return Some(STRING);
+        }
+        let inner = match self.kind(elem) {
+            TyKind::Array(el, _) => Some(el),
+            TyKind::Ref(_, _, i) => match self.kind(i) {
+                TyKind::Slice(el) => Some(el),
+                _ => None,
+            },
+            _ => self.tys.vec_elem(elem).or_else(|| self.tys.boxed_slice_elem(elem)),
+        }?;
+        self.deferred_clone.push((inner, name_span));
+        let ret = self.tys.mk_vec(inner);
+        self.check_packed_borrow(recv, name_span);
+        if !is_join {
+            self.set_res(e, Res::BuiltinMethod { b: B::SliceConcatVec, derefs, autoref: Autoref::Ref });
+            self.check_args(&[], args, name_span);
+            return Some(ret);
+        }
+        if args.len() != 1 {
+            let p0 = self.tys.mk_ref(false, inner);
+            self.check_args(&[p0], args, name_span);
+            return Some(ERROR);
+        }
+        let arg = args[0];
+        let t = self.expr(arg, None);
+        let t = self.deep(t);
+        let slice_of_inner = |this: &mut Self, u: Ty| this.unify(u, inner);
+        let (b, param): (B, Ty) = match self.kind(t) {
+            TyKind::Ref(_, _, u) if matches!(self.kind(u), TyKind::Slice(_) | TyKind::Array(..)) => {
+                let uel = match self.kind(u) {
+                    TyKind::Slice(el) | TyKind::Array(el, _) => el,
+                    _ => unreachable!(),
+                };
+                if slice_of_inner(self, uel) {
+                    let sl = self.tys.intern(TyKind::Slice(inner));
+                    (B::SliceJoinVecSlice, self.tys.mk_ref(false, sl))
+                } else {
+                    (B::SliceJoinVecElem, self.tys.mk_ref(false, inner))
+                }
+            }
+            TyKind::Ref(_, _, u) if self.tys.vec_elem(u).is_some_and(|el| el == inner) => {
+                let sl = self.tys.intern(TyKind::Slice(inner));
+                (B::SliceJoinVecSlice, self.tys.mk_ref(false, sl))
+            }
+            _ => (B::SliceJoinVecElem, self.tys.mk_ref(false, inner)),
+        };
+        self.coerce_expr(arg, t, param);
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+        Some(ret)
     }
 
     /// Checks the arguments with no expectations and answers the

@@ -322,6 +322,15 @@ pub enum Builtin {
     /// (check/slice.rs, runtime `lust_range_bounds_get`).
     SliceGetRange,
     SliceGetRangeMut,
+    /// `[S]::join(sep)` and `concat` for `S: Borrow<str>` shapes
+    /// lust takes (String and &str elements), and the `Vec<T>`
+    /// forms for `V: Borrow<[T]>` shapes (Vec, arrays, slices,
+    /// boxed slices), with core's exact capacities (tf-slice).
+    SliceJoinStr,
+    SliceConcatStr,
+    SliceConcatVec,
+    SliceJoinVecElem,
+    SliceJoinVecSlice,
     VecFrom,
     MemDrop,
     /// `mem::forget(v)`: takes ownership and never drops (W-STD-C).
