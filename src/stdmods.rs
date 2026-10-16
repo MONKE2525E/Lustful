@@ -170,6 +170,14 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["once", "once_with", "from_fn", "successors", "Once", "OnceWith", "FromFn", "Successors"],
     },
     StdModule {
+        name: "__lust_std_backtrace",
+        rel: "std/src/backtrace.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "backtrace")],
+        full: true,
+        triggers: &["backtrace"],
+    },
+    StdModule {
         name: "__lust_std_fs_time",
         rel: "std/src/fs_time.rs",
         krate: ShippedCrate::Std,
