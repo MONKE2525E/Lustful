@@ -347,6 +347,20 @@ pub fn cargo_env_of(client: &[(String, String)]) -> Vec<(String, String)> {
     env
 }
 
+/// Gives `cmd` a client's Cargo env (`GraphRequest::env`; None keeps
+/// this process's): this process's steering vars are replaced by the
+/// client's. Vars a command sets itself, such as the probe's
+/// `RUSTC_WRAPPER`, do not steer and stay.
+pub fn apply_cargo_env(cmd: &mut Command, env: Option<&[(String, String)]>) {
+    let Some(env) = env else { return };
+    for (k, _) in std::env::vars_os() {
+        if k.to_str().is_some_and(steers_cargo) {
+            cmd.env_remove(k);
+        }
+    }
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
+}
+
 impl GraphRequest {
     /// One env var as Cargo sees it for this request.
     fn var(&self, name: &str) -> Option<String> {
@@ -354,19 +368,6 @@ impl GraphRequest {
             Some(env) => env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
             None => std::env::var(name).ok(),
         }
-    }
-
-    /// Gives `cmd` the request's Cargo env: this process's steering vars
-    /// are replaced by the client's (vars a command sets itself, such
-    /// as the probe's `RUSTC_WRAPPER`, do not steer and stay).
-    fn apply_env(&self, cmd: &mut Command) {
-        let Some(env) = &self.env else { return };
-        for (k, _) in std::env::vars_os() {
-            if k.to_str().is_some_and(steers_cargo) {
-                cmd.env_remove(k);
-            }
-        }
-        cmd.envs(env.iter().map(|(k, v)| (k, v)));
     }
 }
 
@@ -541,7 +542,7 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
         cmd.args(["--filter-platform", filter]);
     }
     cmd.args(req.cargo_net.args());
-    req.apply_env(&mut cmd);
+    apply_cargo_env(&mut cmd, req.env.as_deref());
     let out = cmd.output().map_err(|e| format!("cannot run `cargo metadata`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -713,11 +714,12 @@ pub fn package_cargo_env(pkg: &PackageInfo, target: &TargetInfo) -> Vec<(String,
 /// Cargo's build dir for `manifest` (`build_directory` of `cargo metadata`,
 /// else `target_directory` for a Cargo without build-dir): the probe of
 /// `resolve::probe` needs its deps dir. None when the call fails.
-pub fn build_dir(manifest: &Path) -> Option<PathBuf> {
+pub fn build_dir(manifest: &Path, env: Option<&[(String, String)]>) -> Option<PathBuf> {
     let mut cmd = Command::new("cargo");
     if let Some(dir) = manifest.parent() {
         cmd.current_dir(dir);
     }
+    apply_cargo_env(&mut cmd, env);
     let out = cmd.args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"]).arg(manifest).output().ok()?;
     let root = parse_json(&String::from_utf8_lossy(&out.stdout)).ok()?;
     let dir = root.get("build_directory").or_else(|| root.get("target_directory"))?.as_str()?;
@@ -745,7 +747,7 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         cache.lock().unwrap().insert(key, map.clone());
         return Some(map);
     }
-    let mut cmd = crate::resolve::probe::check_command(&req.manifest_path, &req.target_triple);
+    let mut cmd = crate::resolve::probe::check_command(&req.manifest_path, &req.target_triple, req.env.as_deref());
     if let Some(pkg) = &req.package {
         cmd.args(["-p", pkg]);
     }
@@ -759,7 +761,6 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         cmd.arg("--all-features");
     }
     cmd.args(req.cargo_net.args());
-    req.apply_env(&mut cmd);
     let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut map = std::collections::HashMap::new();

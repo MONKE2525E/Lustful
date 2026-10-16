@@ -31,11 +31,14 @@ const FAKE_DIR_ENV: &str = "LUST_PROBE_FAKE_DIR";
 /// A `cargo check --message-format=json --manifest-path <manifest>` command
 /// in the manifest's dir, for `triple` (empty: no `--target`, as a plain
 /// `cargo check`). Callers add the package, feature, and network flags.
+/// `env`: the client's Cargo env (`cargo::apply_cargo_env`), for this
+/// command and the build dir lookup.
 /// Falls back to a plain check (same messages, full cost) when lust-core
 /// cannot be the wrapper: a process that is not lust-core (unit tests), or
 /// no build dir from `cargo metadata`.
-pub fn check_command(manifest: &Path, triple: &str) -> Command {
+pub fn check_command(manifest: &Path, triple: &str, env: Option<&[(String, String)]>) -> Command {
     let mut cmd = Command::new("cargo");
+    super::cargo::apply_cargo_env(&mut cmd, env);
     if let Some(dir) = manifest.parent() {
         cmd.current_dir(dir);
     }
@@ -45,7 +48,7 @@ pub fn check_command(manifest: &Path, triple: &str) -> Command {
     }
     let exe = std::env::current_exe().ok().filter(|p| p.file_name().is_some_and(|n| n == "lust-core"));
     if let Some(exe) = exe
-        && let Some(build) = super::cargo::build_dir(manifest)
+        && let Some(build) = super::cargo::build_dir(manifest, env)
     {
         // Cargo's layout: `<build dir>/[<triple>/]debug/deps` holds the
         // dev profile's units.

@@ -349,7 +349,7 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
     if let Ok(bytes) = std::fs::read(script) {
         let _ = std::fs::write(script, bytes);
     }
-    let out = crate::resolve::probe::check_command(&manifest_dir.join("Cargo.toml"), "")
+    let out = crate::resolve::probe::check_command(&manifest_dir.join("Cargo.toml"), "", None)
         .arg("--offline")
         .env("CARGO_TERM_COLOR", "never")
         .output()

@@ -74,7 +74,8 @@ def cargo_scenario(srcdir, name, work, env, daemon):
     versions = sorted(f for f in os.listdir(srcdir) if f.startswith("v") and os.path.isdir(os.path.join(srcdir, f)))
     mtime = int(time.time())
     for v in versions:
-        mtime += 2
+        # Rising, and ahead of the clock: Cargo calls a file older than its last build fresh.
+        mtime = max(mtime + 2, int(time.time()) + 2)
         vcmd, venv = apply_overlay(os.path.join(srcdir, v), work, mtime)
         cmd = vcmd or cmd
         root, flags = cmd[0], ["--manifest-path", "Cargo.toml"] + cmd[1:]
