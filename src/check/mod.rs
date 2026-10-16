@@ -15900,10 +15900,25 @@ impl<'p> Ctx<'p> {
         // builtin compat dispatch below runs.
         let head = Head::of(&self.tys, base);
         // Turbofish args of the method (`x.m::<U>(..)`), resolved
-        // in this body's scope for the generic probes below.
+        // in this body's scope for the generic probes below. A `'static`
+        // on a reference in the turbofish of a `core::any` method
+        // (`downcast_ref::<&'static str>()`) is the elided form, since
+        // `T: 'static` there; it resolves, and a call that turns out to be
+        // another method reports it below (L0203). With no user method
+        // of that name, every std one bounds its `T` by `'static`
+        // (`Any`, `Error`).
+        let p = self.p;
+        let any_static = matches!(self.name(name), "is" | "downcast_ref" | "downcast_mut" | "downcast")
+            && !p.methods.keys().any(|(_, m)| *m == name)
+            && !p.gx.traits_by_method.get(&name).is_some_and(|ts| ts.iter().any(|t| p.gx.index.trait_record(*t).is_some_and(|r| r.local)))
+            && turbofish.iter().any(|a| {
+                matches!(a, ast::GenericArg::Type(t) if generics::names_lifetime(&p.ast, &p.interner, *t)
+                    && !generics::names_lifetime_beyond_static_refs(&p.ast, &p.interner, *t))
+            });
         let explicit: Vec<Option<GenericArg>> = turbofish
             .iter()
             .map(|a| match a {
+                ast::GenericArg::Type(t) if any_static => Some(GenericArg::Ty(self.resolve_annotation(*t))),
                 ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
                 ast::GenericArg::Const(e2) => Some(self.const_call_arg(*e2)),
                 _ => None,
@@ -15954,6 +15969,13 @@ impl<'p> Ctx<'p> {
         // `type_id`, `is`, and the downcasts of `core::any` (check/any.rs).
         if let Some(ret) = self.any_method(e, rt, name, name_span, args, turbofish, &explicit, expected) {
             return ret;
+        }
+        if any_static {
+            for a in turbofish {
+                if let ast::GenericArg::Type(t) = a {
+                    self.resolve_written(*t);
+                }
+            }
         }
         // `LocalKey` methods on a `thread_local!` static (check/tls.rs).
         if let Some(ret) = self.tls_method(e, recv, base, derefs, name, name_span, args) {

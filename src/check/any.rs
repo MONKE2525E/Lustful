@@ -546,7 +546,8 @@ impl<'p> Ctx<'p> {
         if matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
             return true;
         }
-        let named = written.is_some_and(|w| generics::names_lifetime(&p.ast, &p.interner, w));
+        // A `'static` written on a reference is the elided form here.
+        let named = written.is_some_and(|w| generics::names_lifetime_beyond_static_refs(&p.ast, &p.interner, w));
         if named || (!refs_ok && contains_ref(&self.tys, t)) {
             let tn = self.tn(t);
             self.err(

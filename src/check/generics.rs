@@ -1906,6 +1906,12 @@ pub fn names_lifetime(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
     names_lifetime_with(ast, interner, id, false)
 }
 
+/// True when a written type names a lifetime other than `'_`, not
+/// counting a `'static` written on a reference (`&'static str`).
+pub fn names_lifetime_beyond_static_refs(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
+    names_lifetime_with(ast, interner, id, true)
+}
+
 /// `names_lifetime`; with `static_refs`, a `'static` written on a
 /// reference does not count (`names_lifetime_beyond_static_refs`).
 fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_refs: bool) -> bool {
