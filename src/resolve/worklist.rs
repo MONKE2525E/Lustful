@@ -23,6 +23,7 @@
 // construction (the mangled name carries the module path in the hash).
 use super::cfg::{self, CfgEnv};
 use super::imports::*;
+use super::macro_scope::{FileMacroScope, ScopeEvent};
 use super::modules;
 use crate::ast::*;
 use crate::def::{self, CrateIds, DefId, DefPathHash};
@@ -1848,6 +1849,7 @@ fn bind_outline_macros(
                 m.name,
                 Bind { target: Target::Def(def), vis: VisKind::Priv, rank: 2, def_module: module },
             );
+            tables.macro_textual_binds.insert((module, m.name), def);
             if m.exported {
                 tables.insert(
                     job.root_module,
@@ -1982,6 +1984,9 @@ struct UseSite {
     /// True for `use a::b::*`: `segs` is the glob target's written
     /// path and `alias` is unused.
     glob: bool,
+    /// Byte offset of the `use` keyword in its file's stream (the
+    /// textual scope point of a `use name;`).
+    lo: u32,
 }
 
 /// The symbol a path-segment token stands for in a `use` tree.
@@ -2016,12 +2021,14 @@ fn comma_chunks(trees: &[crate::lexer::TokenTree]) -> Vec<Vec<crate::lexer::Toke
 /// into single-name and glob sites under `prefix`. The expander does
 /// not track a glob macro import inside one file, but a public glob
 /// re-export must still seed dependent crates and other files.
+#[allow(clippy::too_many_arguments)]
 fn parse_use_trees(
     trees: &[crate::lexer::TokenTree],
     prefix: &[Sym],
     leading: bool,
     module: &[Sym],
     pubish: bool,
+    lo: u32,
     interner: &Interner,
     out: &mut Vec<UseSite>,
 ) {
@@ -2049,12 +2056,12 @@ fn parse_use_trees(
                 match trees.get(i) {
                     Some(TokenTree::Delim(Delim::Brace, inner, _)) => {
                         for chunk in comma_chunks(inner) {
-                            parse_use_trees(&chunk, &segs, leading, module, pubish, interner, out);
+                            parse_use_trees(&chunk, &segs, leading, module, pubish, lo, interner, out);
                         }
                         return;
                     }
                     Some(TokenTree::Token(t)) if t.tok == Tok::Star => {
-                        out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias: Sym(0), glob: true });
+                        out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias: Sym(0), glob: true, lo });
                         return;
                     }
                     _ => continue,
@@ -2077,7 +2084,7 @@ fn parse_use_trees(
     let self_sym = interner.intern("self");
     let alias = alias
         .unwrap_or_else(|| if segs.len() > 1 && *segs.last().unwrap() == self_sym { segs[segs.len() - 2] } else { *segs.last().unwrap() });
-    out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias, glob: false });
+    out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias, glob: false, lo });
 }
 
 /// Scans one file's item-level `use` items (top level and inline
@@ -2105,7 +2112,11 @@ fn scan_use_sites(trees: &[crate::lexer::TokenTree], module: &[Sym], interner: &
                 while end < trees.len() && tok(trees, end) != Some(Tok::Semi) {
                     end += 1;
                 }
-                parse_use_trees(&trees[start..end], &[], false, module, pubish, interner, out);
+                let lo = match &trees[i] {
+                    TokenTree::Token(t) => t.span.lo,
+                    _ => 0,
+                };
+                parse_use_trees(&trees[start..end], &[], false, module, pubish, lo, interner, out);
                 i = end + 1;
                 pubish = false;
             }
@@ -2245,6 +2256,9 @@ struct MacroEnv {
     /// Per disc: extra seeds for macros this file's glob imports
     /// bring into plain-name scope (`use crate::prelude::*;`).
     glob_seeds: Vec<Vec<crate::expand::MacroSeed>>,
+    /// Per disc: the textual macro scope for `use name;` imports, by
+    /// owned source index.
+    scopes: Vec<FileMacroScope<usize>>,
 }
 
 impl MacroEnv {
@@ -2263,9 +2277,6 @@ impl MacroEnv {
         // exported definitions of direct source dependencies.
         let mut owned: Vec<OwnedMacroSource> = Vec::new();
         let mut srcs: Vec<MacroSrc> = Vec::new();
-        // (module path, name) -> owned index, for textual definitions
-        // a same-module re-export names.
-        let mut module_defs: FxMap<(Vec<Sym>, Sym), usize> = FxMap::default();
         // One source per definition occurrence, by (disc, byte
         // offset): the same definition seen through the original and
         // the expanded outline is one source, but two definitions of
@@ -2284,7 +2295,6 @@ impl MacroEnv {
                     }
                     let key = (mod_path, m.name);
                     let (lo, hi) = macro_tok_range(&lexed.tokens, m.container.1);
-                    module_defs.insert(key.clone(), owned.len());
                     srcs.push(MacroSrc {
                         name: m.name,
                         exported: m.exported,
@@ -2343,6 +2353,7 @@ impl MacroEnv {
         // the token trees (the expensive part) are not built.
         let no_sources = srcs.is_empty() && dep_exports.iter().all(|(_, s)| s.is_empty());
         let mut sites: Vec<UseSite> = Vec::new();
+        let mut site_disc: Vec<usize> = Vec::new();
         let mut sites_by_disc: Vec<Vec<UseSite>> = Vec::with_capacity(discs.len());
         for (di, disc) in discs.iter().enumerate() {
             let mut mine: Vec<UseSite> = Vec::new();
@@ -2362,8 +2373,26 @@ impl MacroEnv {
                 }
             }
             sites.extend(mine.iter().cloned());
+            site_disc.extend(std::iter::repeat_n(di, mine.len()));
             sites_by_disc.push(mine);
         }
+        let owned_names: Vec<Sym> = owned.iter().map(|o| o.name).collect();
+        let (inherited, after_mods, scopes) = textual_env(job, discs, expanded, &srcs, &dep_owned, &owned_names, tables, interner);
+        // The macro a one-segment `use name;` names through textual
+        // scope at its `use` (rustc reads that scope before the module's
+        // namespace; a `macro_rules!` definition is not in the latter).
+        let site_textual: Vec<Option<usize>> = sites
+            .iter()
+            .zip(&site_disc)
+            .map(|(site, &di)| {
+                if site.glob || site.leading || site.segs.len() != 1 {
+                    return None;
+                }
+                let base = &tables.modules[discs[di].module.0 as usize].path;
+                let container = site.module.strip_prefix(base.as_slice())?;
+                scopes[di].at(container, site.lo, site.segs[0])
+            })
+            .collect();
         let crate_sym = interner.intern("crate");
         let self_sym = interner.intern("self");
         let super_sym = interner.intern("super");
@@ -2372,6 +2401,7 @@ impl MacroEnv {
         let resolve_use = |segs: &[Sym],
                            leading: bool,
                            from: &[Sym],
+                           textual: Option<usize>,
                            bindings: &FxMap<(Vec<Sym>, Sym), usize>,
                            ambiguous: &FxMap<(Vec<Sym>, Sym), ()>|
          -> Option<usize> {
@@ -2381,9 +2411,8 @@ impl MacroEnv {
                 let key = (m.to_vec(), last);
                 if ambiguous.contains_key(&key) { None } else { bindings.get(&key).copied() }
             };
-            let md = |m: &[Sym]| module_defs.get(&(m.to_vec(), last)).copied();
             if segs.len() == 1 && !leading {
-                return md(from).or_else(|| by(from));
+                return textual.or_else(|| by(from));
             }
             if segs[0] == crate_sym {
                 let m = &middle[1.min(middle.len())..];
@@ -2392,7 +2421,7 @@ impl MacroEnv {
             if segs[0] == self_sym {
                 let mut m = from.to_vec();
                 m.extend_from_slice(&middle[1.min(middle.len())..]);
-                return by(&m).or_else(|| md(&m));
+                return by(&m);
             }
             if segs[0] == super_sym {
                 let supers = segs.iter().take_while(|&&s| s == super_sym).count();
@@ -2406,7 +2435,7 @@ impl MacroEnv {
             }
             let mut m = from.to_vec();
             m.extend_from_slice(middle);
-            by(&m).or_else(|| by(middle)).or_else(|| md(&m))
+            by(&m).or_else(|| by(middle))
         };
         // The bindings-space module path a glob target names.
         let resolve_glob_module = |segs: &[Sym], leading: bool, from: &[Sym], bindings: &FxMap<(Vec<Sym>, Sym), usize>| -> Vec<Sym> {
@@ -2487,7 +2516,7 @@ impl MacroEnv {
                     }
                     continue;
                 }
-                if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, &bindings, &ambiguous) {
+                if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, site_textual[si], &bindings, &ambiguous) {
                     let key = (site.module.clone(), site.alias);
                     let may = match writer.get(&key) {
                         None => true,
@@ -2587,8 +2616,7 @@ impl MacroEnv {
             }
             glob_seeds.push(extra);
         }
-        let (inherited, after_mods) = textual_env(job, discs, expanded, &srcs, &dep_owned, tables, interner);
-        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods, glob_seeds }
+        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods, glob_seeds, scopes }
     }
 
     /// The macro sources dependent crates see at this crate's root:
@@ -2760,6 +2788,7 @@ fn resolve_one(
         inherited: Vec::new(),
         after_mods: Vec::new(),
         glob_seeds: Vec::new(),
+        scopes: Vec::new(),
     };
     for round in 0..8 {
         expanded.resize_with(discs.len(), || None);
@@ -2854,6 +2883,18 @@ fn resolve_one(
                 std_asks,
             });
         }
+    }
+    // Each file's textual macro scope by definition, for `use name;`
+    // imports (`macro_scope`). A dependency's macro has no local def.
+    let mut def_of: Vec<Option<DefId>> = vec![None; menv.owned_all.len()];
+    for s in &menv.srcs {
+        if let Some(module) = tables.module_by_path_in(job.root_module, &s.module_path) {
+            let hash = macro_hash(input, &job.flat_prefix, interner, module, tables, s.name);
+            def_of[s.owned] = Some(DefId { krate: input.crate_ids.local, hash });
+        }
+    }
+    for (di, scope) in menv.scopes.iter().enumerate() {
+        tables.macro_scopes.insert(discs[di].file_id, (discs[di].module, scope.map(|i| def_of[i])));
     }
     let seen = seen_of(&discs);
     let (map, _all) = make_map(&seen);
@@ -3494,14 +3535,16 @@ fn textual_env(
     expanded: &[Option<lexer::Lexed>],
     srcs: &[MacroSrc],
     dep_owned: &FxMap<String, Vec<usize>>,
+    owned_names: &[Sym],
     tables: &ResolvedTables,
     interner: &Interner,
-) -> (Vec<Vec<usize>>, Vec<Vec<(u32, Vec<usize>, bool)>>) {
+) -> (Vec<Vec<usize>>, Vec<Vec<(u32, Vec<usize>, bool)>>, Vec<FileMacroScope<usize>>) {
     // With no textual macro source anywhere, every file inherits
     // nothing and no `#[macro_use]` join has sources to add: the
     // result is one empty list per disc.
     if srcs.is_empty() && dep_owned.values().all(|v| v.is_empty()) {
-        return (vec![Vec::new(); discs.len()], vec![Vec::new(); discs.len()]);
+        let empty = FileMacroScope { inherited: Vec::new(), events: Vec::new() };
+        return (vec![Vec::new(); discs.len()], vec![Vec::new(); discs.len()], vec![empty; discs.len()]);
     }
     struct Cx<'a> {
         job: &'a CrateJob,
@@ -3564,7 +3607,7 @@ fn textual_env(
             }
             let decls = self.decls[di].clone();
             for decl in &decls {
-                if decl.macro_use && decl.span.lo < lo && path_prefix_of(&decl.container, container) {
+                if decl.macro_use && decl.span.lo < lo && path_prefix_of(&decl.container, container) && !inside_decl(decl, container) {
                     if let Some(child) = self.child_module(di, decl) {
                         events.push((decl.span.lo, self.exports_of(child)));
                     }
@@ -3649,6 +3692,31 @@ fn textual_env(
     for di in 0..discs.len() {
         inherited.push(cx.inherited(di));
     }
+    // Each file's textual scope for `use name;` imports: the inherited
+    // macros, then its definitions and `#[macro_use]` joins in order.
+    let named = |idxs: &[usize]| -> Vec<(Sym, usize)> { idxs.iter().map(|&i| (owned_names[i], i)).collect() };
+    let mut scopes = Vec::with_capacity(discs.len());
+    for di in 0..discs.len() {
+        let mut events: Vec<ScopeEvent<usize>> = Vec::new();
+        for s in srcs.iter().filter(|s| s.disc == di) {
+            events.push(ScopeEvent { lo: s.lo, container: s.container.clone(), skip_inside: None, macros: vec![(s.name, s.owned)] });
+        }
+        for decl in cx.decls[di].clone().iter().filter(|d| d.macro_use) {
+            if let Some(child) = cx.child_module(di, decl) {
+                let mut inside = decl.container.clone();
+                inside.push(decl.name);
+                let macros = named(&cx.exports_of(child));
+                events.push(ScopeEvent { lo: decl.span.lo, container: decl.container.clone(), skip_inside: Some(inside), macros });
+            }
+        }
+        for (elo, name) in cx.extern_events[di].clone() {
+            if let Some(idxs) = dep_owned.get(&name) {
+                events.push(ScopeEvent { lo: elo, container: Vec::new(), skip_inside: None, macros: named(idxs) });
+            }
+        }
+        events.sort_by_key(|e| e.lo);
+        scopes.push(FileMacroScope { inherited: named(&inherited[di]), events });
+    }
     // `#[macro_use]` file modules in the original outline: their
     // exported textual macros join the parent file after the `mod`.
     // A macro-generated `#[macro_use] mod` is not in the original
@@ -3674,7 +3742,14 @@ fn textual_env(
             }
         }
     }
-    (inherited, after_mods)
+    (inherited, after_mods, scopes)
+}
+
+/// True when `container` is inside the inline module one `mod`
+/// declaration opens: a `#[macro_use]` join on that module applies
+/// after it, not inside it.
+fn inside_decl(decl: &scan::ModDecl, container: &[Sym]) -> bool {
+    decl.inline && container.len() > decl.container.len() && container.starts_with(&decl.container) && container[decl.container.len()] == decl.name
 }
 
 /// Adds one extern crate to one crate's prelude tables, if that crate

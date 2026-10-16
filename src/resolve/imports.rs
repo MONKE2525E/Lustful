@@ -228,11 +228,18 @@ pub struct ResolvedTables {
     /// rustc resolves the name through the source's final binding.
     /// Fixpoint state only; the final answer stays in `maps`.
     pub glob_src: FxMap<(ModuleId, u8, Sym), ModuleId>,
-    /// Macros a module already re-exported with the self `use` idiom
-    /// (`macro_rules! m` then `pub(crate) use m;` in one module):
-    /// rustc allows that one `use` even though the macro definition
-    /// binds the name in the same module, and rejects a second one.
-    pub macro_self_uses: FxMap<(ModuleId, Sym), ()>,
+    /// The binding each `macro_rules!` definition leaves in its own
+    /// module's macro namespace (`bind_outline_macros`). rustc has no
+    /// such binding: no path import may read it, and a one-segment
+    /// `use` reads textual scope instead (`macro_scopes`). A `use` that
+    /// binds the macro name in that module replaces it with a real
+    /// binding and removes the entry.
+    pub macro_textual_binds: FxMap<(ModuleId, Sym), DefId>,
+    /// The textual macro scope of each file, with the file's module
+    /// (`macro_scope`), for `use name;` in the macro namespace. A macro
+    /// with no local definition (a dependency's) is None. Set by the
+    /// worklist before the import fixpoint.
+    pub macro_scopes: FxMap<crate::diag::FileId, (ModuleId, crate::resolve::macro_scope::FileMacroScope<Option<DefId>>)>,
     /// The adapter crates of the session (ARCH 3.6) and the files each
     /// one read. Check reads it for intrinsic privilege and to keep
     /// layout queries off adapter types whose layout is not exact.
@@ -357,7 +364,8 @@ impl ResolvedTables {
             std_aliases: BTreeMap::new(),
             std_glob_aliases: FxMap::default(),
             glob_src: FxMap::default(),
-            macro_self_uses: FxMap::default(),
+            macro_textual_binds: FxMap::default(),
+            macro_scopes: FxMap::default(),
             adapters: Vec::new(),
             std_globs: Vec::new(),
             std_platform: None,
@@ -793,6 +801,50 @@ impl ResolvedTables {
     /// the raw table read; `Program::binding` layers the fallbacks.
     pub fn lookup(&self, module: ModuleId, ns: Namespace, name: Sym) -> Option<&BindState> {
         self.maps.get(module.0 as usize).and_then(|m| m[ns_index(ns)].get(&name))
+    }
+
+    /// The macro-namespace binding one import of `name` from module
+    /// `src` reads. A `macro_rules!` definition's own binding is
+    /// textual only (`macro_textual_binds`), so no import path reads
+    /// it. A one-segment relative `use name;` (`one_seg`) reads the
+    /// macros textually in scope at the `use` first, as rustc does; a
+    /// different macro in the module's namespace makes it ambiguous
+    /// (rustc E0659).
+    pub fn macro_import_lookup(&self, imp: &Import, src: ModuleId, one_seg: bool, name: Sym) -> Option<BindState> {
+        let module_bind = match self.lookup(src, Namespace::Macro, name) {
+            Some(BindState::One(b)) if self.is_textual_bind(src, name, b) => None,
+            other => other.cloned(),
+        };
+        if !one_seg || imp.leading_colon {
+            return module_bind;
+        }
+        match self.textual_macro_at(imp, name) {
+            None => module_bind,
+            // A dependency's macro through `#[macro_use] extern crate`:
+            // lust does not import it by path.
+            Some(None) => None,
+            Some(Some(def)) => match module_bind {
+                Some(BindState::One(b)) if b.target != Target::Def(def) => Some(BindState::Ambiguous),
+                Some(BindState::Ambiguous) => Some(BindState::Ambiguous),
+                _ => Some(BindState::One(Bind { target: Target::Def(def), vis: VisKind::Priv, rank: 2, def_module: imp.module })),
+            },
+        }
+    }
+
+    /// True when `b`, module `module`'s macro binding of `name`, is a
+    /// `macro_rules!` definition's textual-only binding.
+    pub fn is_textual_bind(&self, module: ModuleId, name: Sym, b: &Bind) -> bool {
+        matches!(b.target, Target::Def(d) if self.macro_textual_binds.get(&(module, name)) == Some(&d))
+    }
+
+    /// The macro named `name` in textual scope at one import (Some(None)
+    /// for a dependency's macro), or None when the import's file has
+    /// no recorded scope or no such macro.
+    fn textual_macro_at(&self, imp: &Import, name: Sym) -> Option<Option<DefId>> {
+        let (file_module, scope) = self.macro_scopes.get(&imp.span.file)?;
+        let base = &self.modules[file_module.0 as usize].path;
+        let container = self.modules[imp.module.0 as usize].path.strip_prefix(base.as_slice())?;
+        scope.at(container, imp.span.lo, name)
     }
 
     /// True when `module` has an explicit std alias (not a glob one)
@@ -2108,8 +2160,11 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             let mut names: Vec<(&Sym, &BindState)> = tables.maps[src.0 as usize][ns_index(ns)].iter().collect();
                             names.sort_by(|a, b| interner.get(*a.0).cmp(interner.get(*b.0)));
                             for (name, state) in names {
+                                // A `macro_rules!` definition is not in its
+                                // module's namespace, so no glob copies it.
                                 if let BindState::One(b) = state
                                     && tables.visible(&b.vis, b.def_module, imp.module, interner)
+                                    && !(ns == Namespace::Macro && tables.is_textual_bind(src, *name, b))
                                 {
                                     let (vis, def_module) = tables.glob_vis(imp, &b.vis, b.def_module, interner);
                                     entries.push((ns, *name, Bind { target: b.target, vis, rank: 1, def_module }));
@@ -2403,7 +2458,11 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     let mut found: Vec<(Namespace, Bind)> = Vec::new();
                     let mut alias_paths: Vec<Vec<Sym>> = Vec::new();
                     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
-                        match tables.lookup(src, ns, last) {
+                        let state = match ns {
+                            Namespace::Macro => tables.macro_import_lookup(imp, src, mod_path.is_empty(), last),
+                            _ => tables.lookup(src, ns, last).cloned(),
+                        };
+                        match state {
                             Some(BindState::One(b)) => {
                                 if tables.visible(&b.vis, b.def_module, imp.module, interner) {
                                     any = true;
@@ -2483,14 +2542,13 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         // The macro self re-export idiom: `macro_rules! m`
                         // plus one `use m;` in the defining module is one
                         // binding in rustc, and the `use` sets how far the
-                        // macro name reaches. It replaces the definition's
-                        // private binding instead of duplicating it.
-                        let is_macro_self_use = ns == Namespace::Macro
-                            && bind_name == *name
-                            && matches!(bind.target, Target::Def(d) if tables.def_info.get(&d).is_some_and(|i| i.kind == ResKind::Macro && i.module == imp.module))
-                            && !tables.macro_self_uses.contains_key(&(imp.module, bind_name));
+                        // macro name reaches. A definition's own binding
+                        // is textual only (rustc has none), so any `use`
+                        // that binds the name replaces it instead of
+                        // duplicating it; a second `use` is a duplicate.
+                        let is_macro_self_use = ns == Namespace::Macro && tables.macro_textual_binds.contains_key(&(imp.module, bind_name));
                         if is_macro_self_use {
-                            tables.macro_self_uses.insert((imp.module, bind_name), ());
+                            tables.macro_textual_binds.remove(&(imp.module, bind_name));
                             let changed_now = !matches!(tables.lookup(imp.module, ns, bind_name), Some(BindState::One(old)) if old.vis == bind.vis && old.target == bind.target);
                             tables.maps[imp.module.0 as usize][ns_index(ns)].insert(bind_name, BindState::One(bind));
                             changed |= changed_now;

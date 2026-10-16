@@ -5,6 +5,7 @@ pub mod adapters;
 pub mod cargo;
 pub mod cfg;
 pub mod imports;
+pub mod macro_scope;
 pub mod modules;
 pub mod stdpaths;
 pub mod worklist;
