@@ -12,7 +12,7 @@
 use super::*;
 
 /// The step index of `char::MAX`.
-const CMAX: u32 = 0x10F7FF;
+pub(super) const CMAX: u32 = 0x10F7FF;
 
 impl Ex<'_, '_> {
     /// True for `Range<char>` and `RangeInclusive<char>`.
@@ -21,7 +21,7 @@ impl Ex<'_, '_> {
     }
 
     /// A new `u32` local: the step index of a char.
-    fn char_idx(&mut self, c: Operand) -> Local {
+    pub(super) fn char_idx(&mut self, c: Operand) -> Local {
         let u32t = int(IntTy::U32);
         let v = self.cast_local(c, u32t);
         let hi = self.cmp(crate::ast::BinOp::Ge, Operand::Copy(Place::local(v)), Self::u32_c(0xE000));
@@ -37,7 +37,7 @@ impl Ex<'_, '_> {
     }
 
     /// A new `char` local: the char of a `u32` step index.
-    fn char_of_idx(&mut self, i: Operand) -> Local {
+    pub(super) fn char_of_idx(&mut self, i: Operand) -> Local {
         let v = self.copy_local(i, int(IntTy::U32));
         let hi = self.cmp(crate::ast::BinOp::Ge, Operand::Copy(Place::local(v)), Self::u32_c(0xD800));
         let (up, keep) = self.branch(hi);

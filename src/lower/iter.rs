@@ -22,6 +22,7 @@ use crate::ty::iter::{self as it, IterKind};
 use crate::ty::*;
 
 mod char_range;
+mod range_from;
 mod splice;
 
 type R = Result<(), String>;
@@ -2337,6 +2338,10 @@ impl Ex<'_, '_> {
                 self.call_builtin(b, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
+            K::RangeFrom if !back => {
+                self.range_from_next(itp, a[0], dest)?;
+                self.goto(join);
+            }
             K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => {
                 return Err("iterator expansion: next on an open-ended range kind".into());
             }
@@ -3169,6 +3174,10 @@ impl Ex<'_, '_> {
         let join = self.block();
         let f = |i: u32| itp.project(Proj::Field(i));
         match k {
+            K::RangeFrom => {
+                self.range_from_nth(itp, a[0], n, dest)?;
+                self.goto(join);
+            }
             K::Range => {
                 // `spec_nth`: `start + n` checked, else `start = end`.
                 let (w, _) = self.wide_ty(a[0])?;
@@ -4307,7 +4316,12 @@ impl Ex<'_, '_> {
                 self.assign(Place::local(lo), Rvalue::Bin(Div, Operand::Copy(Place::local(b3)), Self::usize_c(4)));
                 self.some(&Place::local(hi), ou, Operand::Copy(Place::local(bytes)));
             }
-            K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => {
+            // `(usize::MAX, None)`.
+            K::RangeFrom => {
+                self.assign(Place::local(lo), Rvalue::Use(Operand::Const(Const::Int(u128::from(u64::MAX), IntTy::Usize))));
+                self.none(&Place::local(hi), ou);
+            }
+            K::RangeTo | K::RangeFull | K::RangeToInclusive => {
                 return Err("iterator expansion: size_hint of an open-ended range kind".into());
             }
             K::RangeInclusive => {
@@ -4769,7 +4783,9 @@ impl Ex<'_, '_> {
             // std's impls: an outer TrustedLen over arrays (or references
             // to arrays) of a fixed size.
             K::Flatten => self.trusted_len(a[0]) && self.item_const_size(a[0]).is_some(),
-            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
+            // `TrustedLen for RangeFrom<A: TrustedStep>` (ints and char).
+            K::RangeFrom => true,
+            K::StringDrain | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
             // `ProcessResults` is not `TrustedLen` (a failure can
             // end it early), whatever the source is.
             K::TryCollect => false,

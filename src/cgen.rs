@@ -389,7 +389,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::CharIndices => CTy::Tuple(vec![CTy::Int(IntTy::Usize), CTy::Char]),
         K::Flatten => iter_item_cty(tys, a[1]),
         K::OptionIntoIter => cty(tys, a[0]),
-        K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => cty(tys, a[0]),
+        K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::VecDrain => cty(tys, a[0]),
         K::StringDrain => CTy::Char,
         K::Map | K::FilterMap => cty(tys, a[2]),
         K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),

@@ -5462,7 +5462,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::SliceSplit | K::SliceSplitMut => cat(&[&own, &args[0]]),
             K::Utf8Chunks => own.clone(),
             K::Utf8Chunk => return None,
-            K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => args[0].clone(),
+            K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::VecDrain => args[0].clone(),
             K::Map | K::FilterMap | K::TryCollect => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
@@ -5483,7 +5483,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             // (usize, char): no regions.
             K::CharIndices | K::StringDrain | K::Args => Vec::new(),
             // Range kinds that are `RangeBounds` values here, not iterators.
-            K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
+            K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
             K::Flatten => self.item_slots(a[1], &args[1])?,
             K::OptionIntoIter | K::ResultIntoIter => args[0].clone(),
             // `&'a str` of the haystack (W-STD-B); the matches forms
@@ -5824,7 +5824,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            K::VecIntoIter | K::Range | K::RangeInclusive | K::RecvIntoIter => match vars.get(..n0) {
+            K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::RecvIntoIter => match vars.get(..n0) {
                 Some(v) => {
                     out.push(v.to_vec());
                     true
@@ -5840,7 +5840,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk | K::Args => false,
+            K::StringDrain | K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk | K::Args => false,
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
                 vars.get(..n0).is_some_and(|v| self.iter_items(a0, v, out))
             }

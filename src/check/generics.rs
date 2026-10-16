@@ -8369,7 +8369,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 K::OptionIntoIter | K::ResultIntoIter => ps[0],
                 K::OptionIter | K::ResultIter => p.tys.mk_ref(false, ps[0]),
                 K::OptionIterMut | K::ResultIterMut => p.tys.mk_ref(true, ps[0]),
-                K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => ps[0],
+                K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::VecDrain => ps[0],
                 K::StringDrain => CHAR,
                 K::Map | K::FilterMap => ps[2],
                 K::Copied | K::Cloned => ps[1],

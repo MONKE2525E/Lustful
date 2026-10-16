@@ -540,7 +540,7 @@ impl IterKind {
     pub fn is_iterator(self) -> bool {
         !matches!(
             self,
-            IterKind::RangeFrom | IterKind::RangeTo | IterKind::RangeFull | IterKind::RangeToInclusive | IterKind::Utf8Chunk
+            IterKind::RangeTo | IterKind::RangeFull | IterKind::RangeToInclusive | IterKind::Utf8Chunk
         )
     }
 
@@ -780,9 +780,9 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
     Some(match k {
         K::SliceIter => tys.mk_ref(false, a[0]),
         K::SliceIterMut => tys.mk_ref(true, a[0]),
-        K::VecIntoIter | K::Range | K::RangeInclusive | K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::VecDrain => a[0],
+        K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::VecDrain => a[0],
         K::StringDrain => CHAR,
-        K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk => return None,
+        K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk => return None,
         K::Map | K::FilterMap => a[2],
         K::Filter | K::Rev | K::Take | K::Skip | K::Chain | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect => {
             item_ty(tys, a[0])?

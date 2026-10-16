@@ -10,6 +10,7 @@ use crate::ty::*;
 mod any;
 mod closure;
 pub mod iter;
+mod range_fmt;
 pub mod tls;
 mod unwind;
 
@@ -6659,6 +6660,18 @@ impl<'p> Lower<'p> {
                     let (value, ty) = borrowed[index].clone();
                     let count = |c: Option<u32>| c.map(|c| borrowed[&(c as usize)].0.clone());
                     let (width, prec) = (count(spec.width_arg), count(spec.precision_arg));
+                    // A range's Debug, part by part (lower/range_fmt.rs).
+                    if *debug
+                        && let Some(rparts) = self.range_debug_parts(&value, ty, *spec, width.clone(), prec.clone())
+                    {
+                        for part in rparts {
+                            match part {
+                                FmtPart::Lit(s) => push_lit(&mut parts, &s),
+                                other => parts.push(other),
+                            }
+                        }
+                        continue;
+                    }
                     parts.push(FmtPart::Arg { value, ty, debug: *debug, spec: *spec, width, prec });
                 }
             }

@@ -17480,7 +17480,10 @@ impl<'p> Ctx<'p> {
 
     fn for_iter(&mut self, for_e: ExprId, iter: ExprId) -> Ty {
         let p = self.p;
-        if let Expr::Range { lo, hi, .. } = p.ast.expr(iter) {
+        // `lo..` loops through its `RangeFrom` iterator (below).
+        if let Expr::Range { lo, hi, inclusive } = p.ast.expr(iter)
+            && !(lo.is_some() && hi.is_none() && !inclusive)
+        {
             let (Some(lo), Some(hi)) = (*lo, *hi) else {
                 let s = self.span(iter);
                 self.errs.push(unsupported(s, "open ranges"));
@@ -17723,7 +17726,17 @@ impl<'p> Ctx<'p> {
                 }
             }
             FmtKind::Debug => {
-                if has_debug(self.p, &self.tys, t) || self.require_fmt(t, FmtKind::Debug, span) {
+                // A range under plain references: its bounds' Debug
+                // (lowering writes the parts, lower/range_fmt.rs).
+                let dt = self.deep(t);
+                let range = crate::check::fmt::range_fmt_kind(&self.tys, dt);
+                if let Some((k, elem, _)) = range {
+                    if k == crate::ty::iter::IterKind::RangeFull || has_debug(self.p, &self.tys, elem) {
+                        None
+                    } else {
+                        Some("Debug")
+                    }
+                } else if has_debug(self.p, &self.tys, t) || self.require_fmt(t, FmtKind::Debug, span) {
                     None
                 } else {
                     Some("Debug")
