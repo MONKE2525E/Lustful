@@ -363,7 +363,37 @@ impl Solver {
         let obl_bindings: Vec<(DefId, GenericArg)> = cx.tys().bindings(obl.bindings).to_vec();
         for (assoc, ga) in obl_bindings {
             let GenericArg::Ty(want) = ga else { continue };
-            let pat = rec.assoc_ty(assoc)?;
+            // A binding that names a supertrait's associated item
+            // (`ExactSizeIterator<Item = ..>`) is not this impl's to
+            // set: it defers to an equality on that supertrait's
+            // projection, with the supertrait ref's own args.
+            let pat = match rec.assoc_ty(assoc) {
+                Some(pat) => pat,
+                None => {
+                    let want = self.normalize_inner(cx, index, env, want, 0);
+                    let tdef = index.trait_of_assoc(assoc)?;
+                    let mut found: Option<ArgsId> = None;
+                    let mut seen: Vec<DefId> = Vec::new();
+                    let mut stack = vec![obl];
+                    while let Some(tr) = stack.pop() {
+                        if seen.contains(&tr.def) {
+                            continue;
+                        }
+                        seen.push(tr.def);
+                        for pred in index.supertraits_of(cx.tys(), &tr) {
+                            let Predicate::Trait(b) = pred else { continue };
+                            if b.value.def == tdef {
+                                found = Some(b.value.args);
+                            } else {
+                                stack.push(b.value);
+                            }
+                        }
+                    }
+                    let trait_args = found?;
+                    deferred.push(Predicate::AssocEq(Binder::plain(AssocEqData { assoc, trait_args, ty: want })));
+                    continue;
+                }
+            };
             let have = subst(cx.tys(), pat, &inst);
             let have = self.normalize_inner(cx, index, env, have, 0);
             let want = self.normalize_inner(cx, index, env, want, 0);

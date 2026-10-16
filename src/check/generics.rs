@@ -2692,7 +2692,7 @@ fn resolve_trait_path_args(
                         inputs.push(GenericArg::Const(c));
                     }
                     AstArg::Binding { name, span: bspan, kind } => {
-                        let assoc = rec.and_then(|r| r.assoc_by_name(*name)).ok_or_else(|| {
+                        let assoc = assoc_in_supers(cx, tys, trait_def, *name).ok_or_else(|| {
                             Diag::new(
                                 "L0102",
                                 *bspan,
@@ -2974,6 +2974,42 @@ fn assoc_projection(
             "Name the trait: write `<Type as Trait>::Item`.",
         )),
     }
+}
+
+/// The def of the associated item `name` of a trait, looking
+/// through its supertraits as rustc does for a trait reference's
+/// binding (`ExactSizeIterator<Item = ..>` names
+/// `Iterator::Item`). A qualified path must name the defining
+/// trait instead (rustc E0576), so `projection_of` does not use
+/// this. None when no supertrait path names it, or when two
+/// different items of the name are reachable (rustc reports
+/// that binding ambiguous).
+fn assoc_in_supers(cx: &ResolveCx, tys: &impl TyIntern, trait_def: DefId, name: Sym) -> Option<DefId> {
+    let mut found: Option<DefId> = None;
+    let mut seen: Vec<DefId> = Vec::new();
+    let mut stack = vec![trait_def];
+    while let Some(def) = stack.pop() {
+        if seen.contains(&def) {
+            continue;
+        }
+        seen.push(def);
+        let rec = cx.index.trait_record(def)?;
+        if let Some(d) = rec.assoc_by_name(name) {
+            match found {
+                None => found = Some(d),
+                Some(prev) if prev == d => {}
+                Some(_) => return None,
+            }
+        }
+        for pred in &rec.generics.predicates {
+            let Predicate::Trait(b) = pred else { continue };
+            let is_self = tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| tys.kind(t) == TyKind::Param(ParamId(0)));
+            if is_self {
+                stack.push(b.value.def);
+            }
+        }
+    }
+    found
 }
 
 /// The projection type for the assoc item `segs[0]` of one trait ref.
