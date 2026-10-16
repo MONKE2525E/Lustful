@@ -18069,7 +18069,18 @@ impl<'p> Ctx<'p> {
         // right operand fixes it (a literal, a typed value).
         let lk = self.kind(self.resolve(lt));
         let number = matches!(lk, TyKind::Int(_) | TyKind::Float(_)) || lk.is_int_infer() || lk.is_float_infer();
-        let expect = (!self.unbound_general(lt) && !(number && !op.is_cmp())).then_some(lt);
+        // `String + x`: std's one impl is `Add<&str>`, so selection fixes
+        // `Rhs = &str` before the right operand is checked (`s + if c {
+        // "" } else { ">" }`, `s + &t`). `Cow<str>` has two `Add` impls,
+        // so its right operand gets no expected type.
+        let lt_deep = self.deep(lt);
+        let expect = if op == BinOp::Add && self.tys.is_string_ty(lt_deep) {
+            Some(REF_STR)
+        } else if op == BinOp::Add && crate::check::collect::cow_arg(&self.tys, lt_deep) == Some(STR) {
+            None
+        } else {
+            (!self.unbound_general(lt) && !(number && !op.is_cmp())).then_some(lt)
+        };
         let rt = self.expr(rhs, expect);
         // ARCH 2.12 run point: an operator on a non-scalar must know the left
         // operand type. The scalar path above and below needs no trait search.
