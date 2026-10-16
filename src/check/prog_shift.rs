@@ -156,6 +156,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         dyn_impl_sites,
         static_dyn_impls: _,
         static_dyn_fns: _,
+        eager_dyn_traits: _,
         mono_done: _,
         inst_order: _,
         template_rows: _,

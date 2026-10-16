@@ -5531,6 +5531,11 @@ pub struct GenTables {
     /// Using one needs the dyn value to be `'static` (`check::object`).
     pub static_dyn_impls: Vec<DefId>,
     pub static_dyn_fns: Vec<LocalDefId>,
+    /// The traits the eager vtable pass took from the `dyn` types of the
+    /// source (`mono::vtable::dyn_named_traits`, sorted): the header delta
+    /// takes a header with a `dyn` type only while the new Ast names the
+    /// same set (driver/kept_delta.rs).
+    pub eager_dyn_traits: Vec<DefId>,
     /// True once mono's materialize pass is done: every vtable a
     /// concrete body needs exists from then on.
     pub mono_done: bool,
@@ -5642,6 +5647,7 @@ impl Default for GenTables {
             dyn_impl_sites: Vec::new(),
             static_dyn_impls: Vec::new(),
             static_dyn_fns: Vec::new(),
+            eager_dyn_traits: Vec::new(),
             mono_done: false,
             inst_order: Default::default(),
             template_rows: None,

@@ -30,8 +30,9 @@
 // that a body revealing an opaque type names, unless that body reveals
 // again with the same hidden type (a plain fn's, or a template's check in
 // a check only): then the auto traits callers read through it, and any
-// opaque type that names it, stand too; a header with a `dyn` or macro type (eager vtables scan the Ast
-// for `dyn`); programs without user generics (collect's whole-Ast flag
+// opaque type that names it, stand too; a header with a macro type, or
+// with a `dyn` type when the Ast's `dyn` types no longer name the traits
+// the eager vtables started from; programs without user generics (collect's whole-Ast flag
 // scans may turn them on); and any diagnostic. The full path answers
 // then. A refusal before any write, or a diagnostic of a new signature
 // (its old records go back, `delta_audit::undo`), leaves the program as
@@ -366,19 +367,31 @@ fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'sta
     // (`delta_audit::reveal_again`, or the template check); the new header
     // must keep one (`redo_sig`). Other bodies that reveal one and name
     // the fn: `rpit_namers`.
-    // Collect's eager vtables scan every written `dyn` type.
+    // Collect's eager vtables scan every written `dyn` type: a header
+    // with one stands while the Ast names the traits the program's pass
+    // took (`dyn_stands`). A macro type may expand to anything.
     if let Some(body) = def.body {
         let (lo, hi, file) = (def.name_span.lo, p.ast.blocks[body.0 as usize].span.lo, def.name_span.file);
-        let dyn_in_header = p.ast.tys.iter().zip(&p.ast.ty_spans).any(|(t, s)| {
-            s.file == file && s.lo >= lo && s.hi <= hi && matches!(t, crate::ast::TyExpr::Dyn { .. } | crate::ast::TyExpr::MacroCall(_))
-        });
-        if dyn_in_header {
+        let in_header = |s: &crate::diag::Span| s.file == file && s.lo >= lo && s.hi <= hi;
+        let tys = || p.ast.tys.iter().zip(&p.ast.ty_spans).filter(|(_, s)| in_header(s)).map(|(t, _)| t);
+        if tys().any(|t| matches!(t, crate::ast::TyExpr::MacroCall(_))) {
+            return Err("sig dyn");
+        }
+        if tys().any(|t| matches!(t, crate::ast::TyExpr::Dyn { .. })) && !dyn_stands(p) {
             return Err("sig dyn");
         }
     } else {
         return Err("sig loc");
     }
     Ok(())
+}
+
+/// True when the `dyn` types of the new Ast name the traits the program's
+/// eager vtable pass started from (`GenTables::eager_dyn_traits`): a cold
+/// collect then builds the same eager vtables. The patch blanked the old
+/// header's nodes, so the scan sees the live ones only.
+fn dyn_stands(p: &Program) -> bool {
+    p.gx.mono_done && crate::mono::vtable::dyn_named_traits(p) == p.gx.eager_dyn_traits
 }
 
 /// The nodes a header delta of `fns` can move: the edited fns'

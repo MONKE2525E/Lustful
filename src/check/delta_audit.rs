@@ -182,6 +182,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         dyn_impl_sites: _,        // same
         static_dyn_impls: _,      // same
         static_dyn_fns,           // same (impl headers)
+        eager_dyn_traits,         // same (a `dyn` header stands only while the Ast names this set)
         mono_done: _,             // rerun
         inst_order: _,            // the driver's order
         template_rows: _,         // rerun
@@ -207,6 +208,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         ("template_checks", h(&sorted(template_checks.iter()))),
         ("dyn_inherent", h(&sorted(dyn_inherent.iter()))),
         ("static_dyn_fns", h(static_dyn_fns)),
+        ("eager_dyn_traits", h(eager_dyn_traits)),
         ("opaques", h(&sorted(opaques.iter()))),
         ("opaque_ret_of", h(&sorted(opaque_ret_of.iter()))),
         ("opaque_hidden", h(&sorted(opaque_hidden.iter()))),

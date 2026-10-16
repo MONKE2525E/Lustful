@@ -23,19 +23,8 @@ use crate::ty::*;
 /// that. Generic and blanket impls still get their vtables from the
 /// requests of checked bodies.
 pub fn eager_vtables(p: &mut Program, made: &mut Vec<LocalDefId>) {
-    let mut wanted: Vec<crate::def::DefId> = Vec::new();
-    for t in &p.ast.tys {
-        let crate::ast::TyExpr::Dyn { bounds, .. } = t else { continue };
-        for b in bounds {
-            if let crate::ast::TraitBound::Trait { trait_ref, .. } = b
-                && let Some(seg) = trait_ref.path.last()
-                && let Some(&def) = p.gx.trait_names.get(&seg.name)
-                && !wanted.contains(&def)
-            {
-                wanted.push(def);
-            }
-        }
-    }
+    let mut wanted = dyn_named_traits(p);
+    p.gx.eager_dyn_traits = wanted.clone();
     // Supertraits, for upcasts and supertrait calls.
     let mut i = 0;
     while i < wanted.len() {
@@ -68,6 +57,29 @@ pub fn eager_vtables(p: &mut Program, made: &mut Vec<LocalDefId>) {
         let principal = TraitRef { bindings: EMPTY_BINDINGS, ..object::with_self(&mut p.tys, tr, DYN_SELF) };
         ensure_vtable(p, self_ty, principal, made);
     }
+}
+
+/// The traits that some `dyn` type in the source names as a bound (by
+/// last path segment), sorted: the eager vtable pass's start set. Every
+/// node of the Ast counts: a patch blanks the nodes of the text it
+/// replaced (`span_shift::blank_nodes`), so a warm Ast names what a cold
+/// one does.
+pub fn dyn_named_traits(p: &Program) -> Vec<crate::def::DefId> {
+    let mut wanted: Vec<crate::def::DefId> = Vec::new();
+    for t in &p.ast.tys {
+        let crate::ast::TyExpr::Dyn { bounds, .. } = t else { continue };
+        for b in bounds {
+            if let crate::ast::TraitBound::Trait { trait_ref, .. } = b
+                && let Some(seg) = trait_ref.path.last()
+                && let Some(&def) = p.gx.trait_names.get(&seg.name)
+                && !wanted.contains(&def)
+            {
+                wanted.push(def);
+            }
+        }
+    }
+    wanted.sort_unstable_by_key(|d| (d.krate, d.hash.0));
+    wanted
 }
 
 /// The vtable for `self_ty` (a concrete, sized type in the global
