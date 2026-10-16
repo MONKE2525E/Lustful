@@ -14318,15 +14318,10 @@ impl<'p> Ctx<'p> {
                 return ret;
             }
         }
-        if assoc_fn_seen {
-            self.err(
-                "L0104",
-                name_span,
-                format!("`{}` is an associated function, not a method", self.name(name)),
-                "Call it as `Type::name(...)`.",
-            );
-            return ERROR;
-        }
+        // An associated fn of the name (no `self`) is no method
+        // candidate: the probe goes on (trait methods, later deref
+        // steps such as `LazyLock<HashMap<..>>::get`), as in rustc, and
+        // only a miss reports it (E0599's note).
         // `clone` on a reference to a non-Clone type clones the reference.
         if name == k.clone {
             if !has_clone(p, &self.tys, base) && derefs > 0 {
@@ -14917,6 +14912,15 @@ impl<'p> Ctx<'p> {
                 }
                 if let Some(&(_, a)) = self.private_inherent.iter().find(|(x, _)| *x == e) {
                     self.check_assoc_vis(a, name, "method", name_span);
+                    return ERROR;
+                }
+                if assoc_fn_seen {
+                    self.err(
+                        "L0104",
+                        name_span,
+                        format!("`{}` is an associated function, not a method", self.name(name)),
+                        "Call it as `Type::name(...)`.",
+                    );
                     return ERROR;
                 }
                 let tn = self.tn(base);

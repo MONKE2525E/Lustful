@@ -283,6 +283,15 @@ fn method_explicit(cx: &Ctx, template: LocalDefId, explicit: &[Option<GenericArg
 /// receiver unify in `confirm_method` keeps only the ones whose
 /// impl Self pattern matches this receiver.
 #[allow(clippy::too_many_arguments)]
+/// The inherent fns of `(adt_def, name)` that take `self`: an
+/// associated fn (`fn get(this: &LazyLock<T, F>)`) is no method
+/// candidate in rustc, so the probe goes on past it (to a deref
+/// target's `get`). None when no method of the name remains.
+fn inherent_method_cands(p: &Program, adt_def: DefId, name: Sym) -> Option<Vec<LocalDefId>> {
+    let cands: Vec<LocalDefId> = p.gx.inherent_methods.get(&(adt_def, name))?.iter().copied().filter(|&f| p.fn_info(f).self_kind.is_some()).collect();
+    (!cands.is_empty()).then_some(cands)
+}
+
 pub(super) fn inherent_template_probe(
     cx: &mut Ctx,
     e: ExprId,
@@ -298,7 +307,7 @@ pub(super) fn inherent_template_probe(
     if cx.private_inherent.iter().any(|&(x, a)| x == e && p.def_of_adt(a) == adt_def) {
         return Probe::Miss;
     }
-    let Some(templates) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return Probe::Miss };
+    let Some(templates) = inherent_method_cands(p, adt_def, name) else { return Probe::Miss };
     let templates: Vec<(LocalDefId, crate::check::generics::FnTemplate)> = templates
         .into_iter()
         .filter_map(|t| p.gx.fn_templates.get(t.0 as usize).cloned().flatten().map(|tmpl| (t, tmpl)))
@@ -328,7 +337,7 @@ pub(super) fn inherent_template_probe(
 pub(super) fn inherent_template_fits(cx: &mut Ctx, e: ExprId, probe: RcvProbe, name: Sym, name_span: Span) -> usize {
     let p = cx.p;
     let Some((adt_def, _)) = cx.tys.adt_parts(probe.self_ty) else { return 0 };
-    let Some(templates) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return 0 };
+    let Some(templates) = inherent_method_cands(p, adt_def, name) else { return 0 };
     let mut n = 0;
     for template in templates {
         let snap_vars = cx.snapshot_vars();
@@ -358,7 +367,7 @@ pub(super) fn inherent_template_fits(cx: &mut Ctx, e: ExprId, probe: RcvProbe, n
 pub(super) fn lang_plain_probe(cx: &mut Ctx, e: ExprId, probe: RcvProbe, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
     let p = cx.p;
     let Some((adt_def, _)) = cx.tys.adt_parts(probe.self_ty) else { return Probe::Miss };
-    let Some(cands) = p.gx.inherent_methods.get(&(adt_def, name)).cloned() else { return Probe::Miss };
+    let Some(cands) = inherent_method_cands(p, adt_def, name) else { return Probe::Miss };
     for f in cands {
         if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
             continue;
@@ -1084,7 +1093,7 @@ pub(super) fn finish_deferred_lang_methods(cx: &mut Ctx) {
         // Option<&str> = x.as_deref()` picks the String impl): try
         // each candidate against receiver and result together.
         let Some((def, _)) = cx.tys.adt_parts(base) else { continue };
-        let Some(cands) = p.gx.inherent_methods.get(&(def, d.name)).cloned() else { continue };
+        let Some(cands) = inherent_method_cands(p, def, d.name) else { continue };
         let mut winners: Vec<LocalDefId> = Vec::new();
         for cand in cands {
             let snap_vars = cx.snapshot_vars();

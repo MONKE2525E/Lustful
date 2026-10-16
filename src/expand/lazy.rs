@@ -77,7 +77,7 @@ struct Hoist {
 }
 
 /// The hoist for the `static` keyword at `at`, when the item has the
-/// shape `static NAME: TY = PATH(<move> || BODY);`.
+/// shape `static NAME: TY = PATH(<move> || BODY<,>);` (a trailing comma is allowed).
 fn hoistable(toks: &[Token], at: usize, interner: &Interner) -> Option<Hoist> {
     let Tok::Ident(name) = toks.get(at + 1)?.tok else { return None }; // `static mut` stays
     if toks.get(at + 2)?.tok != Tok::Colon {
@@ -107,19 +107,22 @@ fn hoistable(toks: &[Token], at: usize, interner: &Interner) -> Option<Hoist> {
     }
     let span = toks[k].span;
     k += 1;
+    // One argument only: the first `,` at depth 0 inside the call may
+    // only be a trailing one (`PATH(|| BODY,)`).
+    let end = match scan_to(toks, k, |t| t == Tok::Comma) {
+        Some(c) if c + 1 == close => c,
+        Some(c) if c < close => return None,
+        _ => close,
+    };
     let (ret, body) = if toks.get(k)?.tok == Tok::Arrow {
         // `|| -> R { .. }`: the body is the block after the written type.
         let lb = scan_to(toks, k + 1, |t| t == Tok::LBrace)?;
-        if lb >= close || matching_close(toks, lb)? != close - 1 {
+        if lb >= end || matching_close(toks, lb)? != end - 1 {
             return None;
         }
-        (toks[k + 1..lb].to_vec(), lb..close)
+        (toks[k + 1..lb].to_vec(), lb..end)
     } else {
-        // One argument only: no `,` at depth 0 inside the call.
-        if scan_to(toks, k, |t| t == Tok::Comma).is_some_and(|c| c < close) {
-            return None;
-        }
-        (lazy_value_ty(&toks[ty_start..eq], interner)?, k..close)
+        (lazy_value_ty(&toks[ty_start..eq], interner)?, k..end)
     };
     if body.is_empty() {
         return None;
