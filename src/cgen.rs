@@ -913,6 +913,38 @@ pub struct FnOut {
     /// A code generation failure the driver must report instead of
     /// using `code` (see `FnGen::bad_move`).
     pub error: Option<String>,
+    /// Every fn slot `code` prints (`lust_fns[slot]`, `lust_tramps[slot]`,
+    /// names built from a slot), its own included. Sorted, deduplicated.
+    /// The daemon's slot-moved re-emit and dead-callee checks read it.
+    pub used: Vec<u32>,
+}
+
+/// The LocalDefId to slot table cgen prints from, with a record of every
+/// slot it gave out (`FnOut::used`, `GlueSet::used`). Read slots only
+/// through `of`, so the record is complete.
+pub(crate) struct Slots<'s> {
+    map: &'s [u32],
+    used: std::cell::RefCell<Vec<u32>>,
+}
+
+impl<'s> Slots<'s> {
+    fn new(map: &'s [u32]) -> Self {
+        Slots { map, used: Default::default() }
+    }
+
+    /// The slot of fn `f`, recorded as used.
+    fn of(&self, f: LocalDefId) -> u32 {
+        let s = self.map[f.0 as usize];
+        self.used.borrow_mut().push(s);
+        s
+    }
+
+    fn into_used(self) -> Vec<u32> {
+        let mut v = self.used.into_inner();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
 }
 
 struct FnGen<'b, 'p> {
@@ -955,7 +987,7 @@ struct FnGen<'b, 'p> {
     /// an unchanged function stays valid when code above it moves.
     base_line: u32,
     /// LocalDefId to table slot. Slots are stable across edits; local ids are not.
-    slots: &'b [u32],
+    slots: &'b Slots<'b>,
     tmp: u32,
     /// This function's return value uses the out-pointer ABI (`ret_is_large`).
     ret_large: bool,
@@ -1682,7 +1714,8 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         Ok(None) => body,
         Err(e) => return FnOut { error: Some(e), ..Default::default() },
     };
-    let mut g = FnGen::new(p, body, map, base_line, slots);
+    let slots = Slots::new(slots);
+    let mut g = FnGen::new(p, body, map, base_line, &slots);
     g.collect_move_paths();
     if g.bad_move {
         return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
@@ -1697,7 +1730,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     if !g.prelude.is_empty() {
         g.out = std::mem::take(&mut g.prelude) + &g.out;
     }
-    g.out.push_str(&trampoline(p, body.fn_id, g.slots[body.fn_id.0 as usize]));
+    g.out.push_str(&trampoline(p, body.fn_id, slots.of(body.fn_id)));
     // A `main` returning `Result` gets a Termination entry in its
     // unit (see `fn_unit`): it needs the error type's Debug glue
     // and the Result's own drop glue.
@@ -1717,13 +1750,14 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     for (_, t) in &g.glue {
         collect_types(t, &mut types);
     }
-    FnOut { code: g.out, glue: g.glue, types, error: None }
+    let (code, glue) = (g.out, g.glue);
+    FnOut { code, glue, types, error: None, used: slots.into_used() }
 }
 
 impl<'b, 'p> FnGen<'b, 'p> {
     /// A generator for `body` with nothing emitted yet (`gen_fn`; an
     /// `ItemShim` builtin method's one-call body, `prim_shim`).
-    fn new(p: &'p Program, body: &'b Body<'p>, map: &'b SourceMap, base_line: u32, slots: &'b [u32]) -> Self {
+    fn new(p: &'p Program, body: &'b Body<'p>, map: &'b SourceMap, base_line: u32, slots: &'b Slots<'b>) -> Self {
         let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
         let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
         let n_locals = local_cty.len();
@@ -1842,7 +1876,7 @@ impl FnGen<'_, '_> {
         }
         let (l, c) = self.map.line_display_col(span);
         let rel = l.saturating_sub(self.base_line).min(0xFFFFF) as u64;
-        let slot = self.slots[self.body.fn_id.0 as usize] as u64;
+        let slot = self.slots.of(self.body.fn_id) as u64;
         format!("{}u", (slot << 40) | (rel << 20) | c.min(0xFFFFF) as u64)
     }
     fn tmp(&mut self) -> String {
@@ -1856,7 +1890,7 @@ impl FnGen<'_, '_> {
     fn function(&mut self) {
         let p = self.p;
         let fid = self.body.fn_id;
-        let slot = self.slots[fid.0 as usize];
+        let slot = self.slots.of(fid);
         let _ = writeln!(self.out, "/* {} */\nstatic {} {{", p.display_path(p.fn_info(fid).name), fn_sig(p, fid, slot));
         // Locals grouped by C type. No initializers: the borrow checker proves every read is
         // after a write. Drop flags start at 0, except for parameters, which own their values.
@@ -2824,11 +2858,10 @@ impl FnGen<'_, '_> {
                     let t = self.tmp();
                     let ret = ctype(&cty(&self.p.tys, info.ret));
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
-                    let _ =
-                        writeln!(self.out, "    {ret} {t}; ({}lust_fns[{}])(&{t}{pre});", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
+                    let _ = writeln!(self.out, "    {ret} {t}; ({}lust_fns[{}])(&{t}{pre});", fn_ptr_cast(self.p, f), self.slots.of(f));
                     t
                 } else {
-                    format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots[f.0 as usize], args.join(", "))
+                    format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots.of(f), args.join(", "))
                 }
             }
             // `mpsc::channel()`: the element type comes from the pair.
@@ -3444,7 +3477,7 @@ impl FnGen<'_, '_> {
                     CTy::FnPtr(..) => {
                         self.note_callee(*f);
                         collect_types(&t, &mut self.sig_types);
-                        format!("(({})lust_tramps[{}])", ctype(&t), self.slots[f.0 as usize])
+                        format!("(({})lust_tramps[{}])", ctype(&t), self.slots.of(*f))
                     }
                     // A bare fn item value is a zero-sized type.
                     CTy::Unit => "((lust_Unit){})".into(),
@@ -3558,7 +3591,7 @@ impl FnGen<'_, '_> {
         let p = self.p;
         let vt = p.gx.vtables[vid as usize].clone();
         let supers: Vec<String> = vt.supers.iter().map(|&s| self.vtable_sym(s)).collect();
-        let fslot = self.slots[self.body.fn_id.0 as usize];
+        let fslot = self.slots.of(self.body.fn_id);
         let name = format!("vt{fslot}_{vid}");
         let ct = cty(&p.tys, vt.self_ty);
         let drop = if needs_drop_c(p, &ct) {
@@ -3649,7 +3682,7 @@ impl FnGen<'_, '_> {
                 for t in &params {
                     collect_types(t, &mut self.sig_types);
                 }
-                let call = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), self.slots[f.0 as usize]);
+                let call = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), self.slots.of(f));
                 (params, cty(&p.tys, info.ret), call)
             }
         };
@@ -3686,7 +3719,7 @@ impl FnGen<'_, '_> {
         let name = format!("{vt_name}_m{j}");
         let ret = ctype(&cty(&p.tys, info.ret));
         let cast = fn_ptr_cast(p, f);
-        let slot = self.slots[f.0 as usize];
+        let slot = self.slots.of(f);
         let recv = ctype(&cty(&p.tys, info.params[0]));
         let recv_dropped = param_dropped(p, &cty(&p.tys, info.params[0]));
         let mut decls: Vec<String> = Vec::new();
@@ -3924,7 +3957,7 @@ impl FnGen<'_, '_> {
             collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
         }
         let v = self.tmp();
-        let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
+        let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, f), self.slots.of(f));
         // A dropped parameter (a zero-sized env taken by value, or a
         // zero-sized argument) is not in the C signature, so it is
         // not passed here either (see `param_dropped`).
@@ -4003,7 +4036,7 @@ impl FnGen<'_, '_> {
     /// reverse order of creation, as Rust's temporaries do).
     fn sort_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<(sync::Callee, u8, CTy)>) -> String {
         use Builtin as B;
-        let name = format!("lust_less_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
+        let name = format!("lust_less_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
         self.adapters += 1;
         let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
         let (a, bb) = (format!("(({pt})a)"), format!("(({pt})b)"));
@@ -4054,7 +4087,7 @@ impl FnGen<'_, '_> {
         if let Some(n) = self.shims.get(&key) {
             return n.clone();
         }
-        let name = format!("lust_ctor_{}_{}", self.slots[self.body.fn_id.0 as usize], self.shims.len());
+        let name = format!("lust_ctor_{}_{}", self.slots.of(self.body.fn_id), self.shims.len());
         self.shims.insert(key, name.clone());
         let mut decls: Vec<String> = Vec::new();
         let mut vals: Vec<String> = Vec::new();
@@ -4113,7 +4146,7 @@ impl FnGen<'_, '_> {
         if let Some(n) = self.shims.get(&key) {
             return n.clone();
         }
-        let name = format!("lust_prim_{}_{}", self.slots[self.body.fn_id.0 as usize], self.shims.len());
+        let name = format!("lust_prim_{}_{}", self.slots.of(self.body.fn_id), self.shims.len());
         self.shims.insert(key, name.clone());
         let TyKind::FnPtr(sig) = tys.kind(fp_ty) else { unreachable!("ItemShim to a non fn pointer type") };
         let sig = tys.sig(sig).value;
@@ -4191,7 +4224,7 @@ impl FnGen<'_, '_> {
     /// `f(p)` as an Ordering, or `f(p).cmp(b)` with ctx `{&f, b}`.
     fn search_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<(sync::Callee, u8, CTy)>) -> String {
         use Builtin as B;
-        let name = format!("lust_bcmp_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
+        let name = format!("lust_bcmp_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
         self.adapters += 1;
         let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
         let p = format!("(({pt})p)");
@@ -4715,7 +4748,7 @@ impl FnGen<'_, '_> {
                 let p = self.p;
                 let a = p.tys.local_adt_of(crate::check::generics::location_def()).expect("Location is a std Adt");
                 let ct = ctype(&CTy::Adt(a));
-                let fslot = self.slots[self.body.fn_id.0 as usize];
+                let fslot = self.slots.of(self.body.fn_id);
                 let (t, l, n) = (self.tmp(), self.tmp(), self.tmp());
                 let node = format!("lc{fslot}_{n}");
                 let _ = writeln!(self.prelude, "static struct {node} {{ lust_loc k; struct {node} *next; {ct} v; }} *{node}_head;");
@@ -7520,6 +7553,9 @@ pub struct GlueSet {
     /// Fn slots as of the last `add` or `refresh`: fn pointers in static
     /// data (`ConstValue::FnPtr`) name their slot's trampoline.
     slots: Vec<u32>,
+    /// The fn slots each key's definition prints (a written method it
+    /// calls, see `glue_callee`), as `FnOut::used`.
+    used: HashMap<(Glue, CTy), Vec<u32>>,
 }
 
 impl GlueSet {
@@ -7579,7 +7615,9 @@ impl GlueSet {
             let mut proto = String::new();
             let mut def = String::new();
             let mut types = Vec::new();
-            glue_def(p, slots, &g.0, &g.1, &mut proto, &mut def, &mut more, &mut types);
+            let rec = Slots::new(slots);
+            glue_def(p, &rec, &g.0, &g.1, &mut proto, &mut def, &mut more, &mut types);
+            self.used.insert(g.clone(), rec.into_used());
             let changed = is_new
                 || self.def_map.get(&g) != Some(&def)
                 || self.protos.get(&g) != Some(&proto)
@@ -7604,6 +7642,13 @@ impl GlueSet {
             self.defs = self.def_map.values().cloned().collect();
         }
         ((shared_changed, regenerated), seen)
+    }
+
+    /// True when a live definition (stale ones are emitted nowhere)
+    /// prints a slot `dead` names. The driver refreshes the glue then:
+    /// that callee's identity moved to a new slot since the text was made.
+    pub fn prints_slot(&self, dead: impl Fn(u32) -> bool) -> bool {
+        self.used.iter().any(|(k, used)| !self.stale.contains(k) && used.iter().any(|&s| dead(s)))
     }
 
     /// The glue keys a set of direct needs reaches, deps included.
@@ -9241,7 +9286,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
 /// returns for `args` (the method's C arguments, comma separated),
 /// called through the fn table with the large-return out pointer
 /// when the method uses one (see `FnGen::call_value`).
-fn written_glue_call(p: &Program, slots: &[u32], f: LocalDefId, args: &str, types: &mut Vec<CTy>) -> String {
+fn written_glue_call(p: &Program, slots: &Slots, f: LocalDefId, args: &str, types: &mut Vec<CTy>) -> String {
     let callee = glue_callee(p, slots, f, types);
     if ret_is_large(p, f) {
         let ret = ctype(&cty(&p.tys, p.fn_info(f).ret));
@@ -9255,11 +9300,11 @@ fn written_glue_call(p: &Program, slots: &[u32], f: LocalDefId, args: &str, type
 /// `(CAST lust_fns[SLOT])`, the callee text for glue that calls written fn `f`. Adds the C
 /// types of `f`'s signature to `types` (see `GlueSet::types`): the glue can be a static copy
 /// in a unit whose own fns never name them.
-fn glue_callee(p: &Program, slots: &[u32], f: LocalDefId, types: &mut Vec<CTy>) -> String {
+fn glue_callee(p: &Program, slots: &Slots, f: LocalDefId, types: &mut Vec<CTy>) -> String {
     let info = p.fn_info(f);
     types.push(cty(&p.tys, info.ret));
     types.extend(info.params.iter().map(|&t| cty(&p.tys, t)));
-    format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots[f.0 as usize])
+    format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots.of(f))
 }
 
 /// Generates the prototype and definition of glue `g` for `t`. Pushes the glue keys the
@@ -9271,7 +9316,7 @@ const UNW_DSTEP: &str = "  if (lust_unw_pending) lust_unw_dstep(&ex, &u);\n";
 
 fn glue_def(
     p: &Program,
-    slots: &[u32],
+    slots: &Slots,
     g: &Glue,
     t: &CTy,
     protos: &mut String,
@@ -9314,7 +9359,7 @@ fn zst_out_glue(g: &Glue, t: &CTy, def: &str, protos: &mut String, defs: &mut St
 #[allow(clippy::too_many_arguments)]
 fn glue_def_value(
     p: &Program,
-    slots: &[u32],
+    slots: &Slots,
     g: &Glue,
     t: &CTy,
     protos: &mut String,

@@ -162,7 +162,7 @@ fn builder_list(n: &str, elem: &str, et: &CTy, need: &mut dyn FnMut(Glue, &CTy))
 }
 
 /// The body of `dbg_<m>`: Rust's Debug for `t`, through the builders.
-pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
     // `NonZero<T>` prints its integer, with no wrapper name.
     if let CTy::Adt(a) = t
         && p.def_of_adt(*a) == crate::ty::nonzero_def()
@@ -330,7 +330,7 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
 
 /// The body of `disp_<m>`: only types with a user Display impl reach
 /// Display glue (every other Display type is a leaf in `fmt_expr`).
-pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
     // `NonZero<T>` displays its integer, with no wrapper name.
     if let CTy::Adt(a) = t
         && p.def_of_adt(*a) == crate::ty::nonzero_def()
@@ -463,7 +463,7 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut 
 /// the `&self` argument: the glue's `p`, or `*p` for an unsized
 /// newtype, whose reference is its fat value. Adds the method's
 /// signature types to `types` (see `glue_callee`).
-fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &[u32], this: &str, types: &mut Vec<CTy>) -> Option<String> {
+fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &Slots, this: &str, types: &mut Vec<CTy>) -> Option<String> {
     let m = *p.gx.fmt_methods.get(&(a, kind as u8))?;
     let ret = cty(&p.tys, p.fn_info(m).ret);
     let rt = ctype(&ret);
@@ -652,7 +652,7 @@ impl FnGen<'_, '_> {
                 }
             }
         }
-        let name = format!("lust_fa_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
+        let name = format!("lust_fa_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
         self.adapters += 1;
         let outer = std::mem::take(&mut self.out);
         let _ = writeln!(self.out, "    const {} *env = (const {0} *)envp;", ctype(&env_ct));

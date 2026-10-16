@@ -1205,7 +1205,7 @@ impl FnGen<'_, '_> {
                 }
                 self.note_callee(*f);
                 let v = self.tmp();
-                let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, *f), self.slots[f.0 as usize]);
+                let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, *f), self.slots.of(*f));
                 if ret_is_large(self.p, *f) {
                     let pre: String = args.iter().map(|a| format!(", {a}")).collect();
                     let _ = writeln!(out, "  {} {v}; {call}(&{v}{pre});", ctype(&rt));
@@ -1299,7 +1299,7 @@ impl FnGen<'_, '_> {
         let pk = format!("struct {{ lust_JoinHdr h; {} ret; {} env; }}", ctype(&ret), ctype(&env_ty));
         let n = self.adapters;
         self.adapters += 1;
-        let slot = self.slots[self.body.fn_id.0 as usize];
+        let slot = self.slots.of(self.body.fn_id);
         let (run, drop) = (format!("lust_thr_{slot}_{n}"), format!("lust_thrdrop_{slot}_{n}"));
         let mut body = String::new();
         let v = self.callee_call_c(&mut body, &callee, "k->env", &[]);

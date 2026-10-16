@@ -254,10 +254,6 @@ pub(crate) struct Caches {
     pub(crate) derive_dirty: Option<Vec<bool>>,
     /// This request's edits are all derive list edits (`Patched::derive_only`).
     pub(crate) derive_only: bool,
-    /// Slots each slot's generated C references (itself plus its `Fn` call
-    /// targets), collected from the IR at codegen. Read by the dead-callee
-    /// checks.
-    pub(crate) slot_used: Vec<Vec<u32>>,
     /// The cached IR body per slot, in the translatable form of
     /// `ir_cache::CachedBody`. Set when the slot's body is lowered;
     /// read when a slot renumber makes its C stale and the C must be
@@ -433,7 +429,6 @@ impl Session {
                 read_index: Default::default(),
                 derive_dirty: None,
                 derive_only: false,
-                slot_used: Vec::new(),
                 slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,

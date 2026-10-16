@@ -2119,7 +2119,7 @@ pub(super) fn fn_def_at_mut(ast: &mut Ast, item: usize, sub: Option<usize>) -> &
 /// The dead-slot rule (the only part that walks per-fn state) runs for
 /// the edited fns only. For any other fn it was settled by the last
 /// request's slot update, and nothing since then can flip it: slot
-/// assignment and the fn's own `slot_used` change only when that fn is
+/// assignment and the fn's own `FnOut::used` change only when that fn is
 /// regenerated, instance slots only grow, and the compile tail's work
 /// preparation re-evaluates the same rule for builds before it reuses
 /// any C. The hash and ok scan stays: two word compares per fn, and
@@ -2131,7 +2131,8 @@ fn slot_update(front: &mut Front, caches: &mut Caches, hashes: &[u64], edited: &
     for (i, &hash) in hashes.iter().enumerate().take(n) {
         let slot = front.fn_slot[i] as usize;
         if edited.contains(&i)
-            && caches.slot_used[slot]
+            && caches.out[slot]
+                .used
                 .iter()
                 .any(|&u| !live.get(u as usize).copied().unwrap_or(false) && !front.inst_slot.get(u as usize).copied().unwrap_or(false))
         {

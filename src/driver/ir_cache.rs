@@ -444,37 +444,6 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
     h.finish()
 }
 
-/// Every fn slot one body's C can reference, as stable disk ids:
-/// direct call targets and fn-pointer values (whose C prints the
-/// trampoline slot). Sorted, deduplicated.
-pub(crate) fn used_disk_targets(p: &Program, body: &Body) -> Vec<DiskDefId> {
-    fn rvalue_targets(p: &Program, tys: &impl TyIntern, r: &Rvalue, out: &mut Vec<DiskDefId>) {
-        if let Rvalue::FnValue(f, _) = r {
-            out.push(p.disk_id(*f));
-        }
-        // A vtable's method shims print `lust_fns[slot]` for each entry.
-        if let Rvalue::MakeDyn { src, dyn_ty, .. } = r
-            && let Some(vid) = crate::check::generics::vtable_for(p, tys, *src, *dyn_ty)
-        {
-            out.extend(vtable_fns(p, vid).into_iter().map(|f| p.disk_id(f)));
-        }
-    }
-    let mut out = Vec::new();
-    for b in &body.blocks {
-        for s in &b.stmts {
-            if let StmtKind::Assign(_, r) = &s.kind {
-                rvalue_targets(p, &body.tys, r, &mut out);
-            }
-        }
-        if let Terminator::Call { target: CallTarget::Fn(f), .. } = &b.term {
-            out.push(p.disk_id(*f));
-        }
-    }
-    out.sort_by_key(|d| (d.krate.0, d.hash.0));
-    out.dedup();
-    out
-}
-
 // ---------- Cached body translation ----------
 
 /// A structural type tree: one entry per distinct `Ty` in a cached
@@ -1246,11 +1215,8 @@ fn main() {
             let slots: Vec<u32> = (0..bodies.len() as u32).collect();
             for (i, body) in bodies.iter().enumerate() {
                 let fp = ir_fingerprint(p, body, map, 1);
-                let targets = used_disk_targets(p, body);
-                let pairs: Vec<(DiskDefId, u32)> = targets
-                    .iter()
-                    .map(|d| (*d, slots[p.local_def(d.hash).unwrap().0 as usize]))
-                    .collect();
+                let used = crate::cgen::gen_fn(p, body, map, 1, &slots).used;
+                let pairs: Vec<(DiskDefId, u32)> = used.iter().map(|&u| (p.disk_id(LocalDefId(u)), u)).collect();
                 let cached = cache_body(p, body, 7, i as u32, pairs, fp);
                 // Rebuild against a fresh collect of the same source.
                 lowered(SRC, |p2, map2, _| {
@@ -1332,5 +1298,65 @@ fn main() {
             assert!(get(&base).is_some(), "{name} is lowered");
             assert_ne!(get(&base), get(&tc), "#[track_caller] on g moves {name}'s fingerprint");
         }
+    }
+
+    /// `FnOut::used` holds every slot a fn's C prints: the daemon's
+    /// slot-moved re-emit and dead-callee checks read it. The IR-only
+    /// list it replaced missed closures an adapter chain calls through
+    /// `closure_call_c` (fx-unitcache). Builds one program with adapter
+    /// chains, a generic fn taking a closure, a fn pointer, a `dyn` call,
+    /// and `sort_by_key`, then checks each fn's C against its list.
+    #[test]
+    fn fn_out_used_covers_every_printed_slot() {
+        use crate::driver::compile::compile;
+        use crate::driver::session::Session;
+        use crate::protocol::{Cmd, Request, SessionKey};
+        let dir = std::env::temp_dir().join(format!("lust-used-slots-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("used.rs");
+        std::fs::write(
+            &file,
+            "trait Area {\n    fn area(&self) -> u64;\n}\nstruct Sq(u64);\nimpl Area for Sq {\n    fn area(&self) -> u64 {\n        self.0 * self.0\n    }\n}\n\
+             fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 {\n    f(x)\n}\nfn twice(x: u64) -> u64 {\n    x * 2\n}\n\
+             fn main() {\n    let v: Vec<u32> = (1..=9).collect();\n\
+             \x20   let n = v.iter().copied().inspect(|x| if *x < 2 { println!(\"pull {x}\") }).skip(1).filter(|x| *x % 3 != 0).map(|x| x * 7).count();\n\
+             \x20   let fp: fn(u64) -> u64 = twice;\n    let d: Box<dyn Area> = Box::new(Sq(3));\n\
+             \x20   let mut s = v.clone();\n    s.sort_by_key(|x| (*x * 5) % 4);\n\
+             \x20   println!(\"{n} {} {} {} {s:?}\", apply(|x| x + 1, 4), fp(5), d.area());\n}\n",
+        )
+        .unwrap();
+        let key = SessionKey::synthetic(&file, false);
+        let req = Request {
+            cmd: Cmd::Build,
+            file: key.krate.root.clone(),
+            session: key.clone(),
+            out: dir.join("used.bin"),
+            json: false,
+            timings: false,
+            debug: false,
+            emit_c: None,
+            max_errors: 20,
+            run_args: None,
+            harness: false,
+            client: Default::default(),
+        };
+        let mut s = Session::new(dir.join("obj"), false, key);
+        let r = compile(&req, &mut s);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (slot, out) in s.caches.out.iter().enumerate() {
+            for table in ["lust_fns[", "lust_tramps["] {
+                for (at, _) in out.code.match_indices(table) {
+                    let digits: String = out.code[at + table.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let printed: u32 = digits.parse().unwrap();
+                    assert!(out.used.binary_search(&printed).is_ok(), "slot {slot} prints {table}{printed}] but its used list is {:?}", out.used);
+                }
+            }
+        }
+        // main prints its own slot, the adapter closures, the sort key
+        // closure, `apply`'s instance, `twice`'s trampoline, and a shim.
+        let most = s.caches.out.iter().map(|o| o.used.len()).max();
+        assert!(most >= Some(7), "main prints the slots of the fns it reaches: {most:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

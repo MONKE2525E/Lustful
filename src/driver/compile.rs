@@ -432,7 +432,6 @@ fn wipe_slot(caches: &mut Caches, s: usize) {
     caches.has_out[s] = true;
     caches.ok[s] = true;
     caches.slot_reads[s] = None;
-    caches.slot_used[s].clear();
     caches.slot_ir[s] = None;
 }
 
@@ -1224,7 +1223,6 @@ fn slot_update(
         out: Vec<FnOut>,
         has_out: Vec<bool>,
         reads: Vec<Option<crate::driver::graph::Reads>>,
-        used: Vec<Vec<u32>>,
         ir: Vec<Option<super::ir_cache::CachedBody>>,
         hash: Vec<u64>,
         head: Vec<u64>,
@@ -1236,7 +1234,6 @@ fn slot_update(
             out: std::mem::take(&mut caches.out),
             has_out: std::mem::take(&mut caches.has_out),
             reads: std::mem::take(&mut caches.slot_reads),
-            used: std::mem::take(&mut caches.slot_used),
             ir: std::mem::take(&mut caches.slot_ir),
             hash: std::mem::take(&mut front.slot_hash),
             head: std::mem::take(&mut front.slot_head),
@@ -1276,7 +1273,6 @@ fn slot_update(
         caches.out.clear();
         caches.has_out.clear();
         caches.slot_reads.clear();
-        caches.slot_used.clear();
         caches.slot_ir.clear();
         front.slot_hash.clear();
         front.slot_head.clear();
@@ -1338,7 +1334,6 @@ fn slot_update(
     caches.has_out.resize(n_slots, false);
     caches.out.resize_with(n_slots, FnOut::default);
     caches.slot_reads.resize_with(n_slots, || None);
-    caches.slot_used.resize_with(n_slots, Vec::new);
     caches.slot_ir.resize_with(n_slots, || None);
     front.slot_hash.resize(n_slots, 0);
     front.slot_head.resize(n_slots, 0);
@@ -1357,7 +1352,6 @@ fn slot_update(
             caches.has_out[new_slot] = old.has_out[old_slot];
             caches.out[new_slot] = std::mem::take(&mut old.out[old_slot]);
             caches.slot_reads[new_slot] = old.reads[old_slot].take();
-            caches.slot_used[new_slot] = std::mem::take(&mut old.used[old_slot]);
             caches.slot_ir[new_slot] = old.ir[old_slot].take();
             front.slot_hash[new_slot] = old.hash[old_slot];
             front.slot_head[new_slot] = old.head[old_slot];
@@ -1393,7 +1387,6 @@ fn slot_update(
         caches.has_out[slot] = true;
         caches.ok[slot] = true;
         caches.slot_reads[slot] = None;
-        caches.slot_used[slot].clear();
         caches.slot_ir[slot] = None;
         // A fn of the same identity and text can come back (an edit
         // undone, a nested fn's ordinal among same-name fns of its
@@ -1456,7 +1449,7 @@ fn slot_update(
         // keeps its body item index, which moves when an earlier body
         // gains or loses an item; see `def::nested_fn_parents`). No
         // read covers it.
-        let calls_dead = caches.slot_used[slot].iter().any(|&u| live.get(u as usize) == Some(&false) && !front.inst_slot[u as usize]);
+        let calls_dead = caches.out[slot].used.iter().any(|&u| live.get(u as usize) == Some(&false) && !front.inst_slot[u as usize]);
         if calls_dead {
             caches.ok[slot] = false;
         }
@@ -3228,7 +3221,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.has_out.resize(n_slots, false);
         caches.out.resize_with(n_slots, FnOut::default);
         caches.slot_reads.resize_with(n_slots, || None);
-        caches.slot_used.resize_with(n_slots, Vec::new);
             caches.slot_ir.resize_with(n_slots, || None);
         front.slot_hash.resize(n_slots, 0);
         front.inst_slot.resize(n_slots, false);
@@ -3266,7 +3258,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 caches.has_out[s] = true;
                 caches.ok[s] = true;
                 caches.slot_reads[s] = None;
-                caches.slot_used[s].clear();
             }
         }
     } else {
@@ -3495,7 +3486,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         work = Vec::new();
         for i in (0..program.fns.len()).filter(|&i| concrete(i)) {
             let s = front.fn_slot[i] as usize;
-            let calls_dead = build && caches.slot_used[s].iter().any(|&u| !held.get(u as usize).copied().unwrap_or(false));
+            let calls_dead = build && caches.out[s].used.iter().any(|&u| !held.get(u as usize).copied().unwrap_or(false));
             let mut recheck = regenerate_all || !caches.ok[s] || (build && !caches.has_out[s]) || calls_dead;
             if !recheck && i < fn_count {
                 recheck = body_changed[i];
@@ -3728,33 +3719,24 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // the dead C (and any symbol only it named) leaves the link.
     dirty_slots.extend(std::mem::take(&mut caches.wiped_slots).into_iter().map(|s| s as usize));
     let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
+    // The stable id of each fn whose slot the new C prints (`FnOut::used`),
+    // by slot: the pairs below are the next renumber's re-emit trigger.
+    let mut wanted = vec![false; front.slot_of.len()];
+    outs.iter().flat_map(|o| &o.used).for_each(|&u| wanted[u as usize] = true);
+    let disk_at: FxMap<u32, DiskDefId> = (front.fn_slot.iter().enumerate())
+        .filter(|&(_, &u)| wanted[u as usize])
+        .map(|(l, &u)| (u, program.disk_id(LocalDefId(l as u32))))
+        .collect();
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);
         // The IR fingerprint a slot-moved re-emit checks its rebuilt
         // body against (see `ir_cache::CachedBody`).
         let base_line = line_base_of(front, *i);
         let fp = super::ir_cache::ir_fingerprint(&program, body, &map, base_line);
+        let used_pairs: Vec<(DiskDefId, u32)> = out.used.iter().filter_map(|&u| Some((*disk_at.get(&u)?, u))).collect();
         caches.out[s] = out;
         caches.has_out[s] = true;
         dirty_slots.push(s);
-        // The slots this fn's C references: itself (its register store)
-        // plus every direct call target and fn-pointer value (printed
-        // as `lust_fns[slot]` / `lust_tramps[slot]`). The unit's
-        // used-slots hash is built from these (section 4.2); the disk
-        // pairs are the next renumber's re-emit trigger.
-        let targets = super::ir_cache::used_disk_targets(&program, body);
-        let mut used_slots = vec![s as u32];
-        let mut used_pairs: Vec<(DiskDefId, u32)> = Vec::with_capacity(targets.len());
-        for d in &targets {
-            if let Some(l) = program.local_def(d.hash).filter(|l| program.disk_id(*l) == *d) {
-                let ts = front.fn_slot[l.0 as usize];
-                used_slots.push(ts);
-                used_pairs.push((*d, ts));
-            }
-        }
-        if let Some(used) = caches.slot_used.get_mut(s) {
-            *used = used_slots;
-        }
         let file = program.fn_def(LocalDefId(*i as u32)).name_span.file;
         let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
         if let Some(slot_ir) = caches.slot_ir.get_mut(s) {
@@ -3830,7 +3812,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // the old glue then calls an empty slot (a run-time segfault,
     // W-STD-C daemon probes). Refresh the glue when those slots move.
     let glue_slots_fp = crate::driver::graph::glue_method_slots_fp(&program, &front.fn_slot);
-    let glue_slots_changed = caches.glue_slots_fp != glue_slots_fp;
+    // Glue whose text prints a slot no fn holds now (its callee's identity
+    // moved to a new slot) refreshes the same way.
+    let mut held = vec![false; front.slot_of.len()];
+    front.fn_slot.iter().for_each(|&s| held[s as usize] = true);
+    let glue_slots_changed =
+        caches.glue_slots_fp != glue_slots_fp || caches.glue.prints_slot(|s| !held.get(s as usize).copied().unwrap_or(false));
     caches.glue_slots_fp = glue_slots_fp;
     let (shared_changed, regenerated) = if caches.glue_stale || glue_slots_changed || caches.objects != Some(req.debug) {
         caches.glue_stale = false;

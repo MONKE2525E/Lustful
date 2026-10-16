@@ -82,7 +82,7 @@ fn default_place(p: &Program, t: &CTy, dl: &str, sl: &str, need: &mut dyn FnMut(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn clonefrom_glue(
     p: &Program,
-    slots: &[u32],
+    slots: &Slots,
     t: &CTy,
     protos: &mut String,
     defs: &mut String,

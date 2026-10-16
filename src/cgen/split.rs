@@ -274,7 +274,7 @@ impl FnGen<'_, '_> {
     /// predicate closure's body (its env is the stored closure), or,
     /// without `env`, a plain fn item that takes the char alone.
     fn split_adapter(&mut self, f: LocalDefId, env: bool) -> String {
-        let name = format!("lust_splitp_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
+        let name = format!("lust_splitp_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
         self.adapters += 1;
         let mut body = String::new();
         let (r, _) = if env {

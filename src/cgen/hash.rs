@@ -97,7 +97,7 @@ pub(super) fn hasher_cty(p: &Program, s: &CTy) -> CTy {
 
 /// The C expression of a fresh hasher from the builder at `s` (a
 /// `S*`): `BuildHasher::build_hasher`.
-fn build_expr(p: &Program, slots: &[u32], s_cty: &CTy, s: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+fn build_expr(p: &Program, slots: &Slots, s_cty: &CTy, s: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     match s_cty {
         CTy::Hash(HashTy::RandomState, _) => format!("lust_sip13_new_with_keys(({s})->k0, ({s})->k1)"),
         CTy::Hash(HashTy::BuildHasherDefault, a) => match a.first() {
@@ -109,7 +109,7 @@ fn build_expr(p: &Program, slots: &[u32], s_cty: &CTy, s: &str, need: &mut dyn F
             None => "0".into(),
         },
         CTy::Adt(a) => match p.gx.build_hashers.get(a) {
-            Some(&(f, _)) => format!("(({}lust_fns[{}])({s}))", fn_ptr_cast(p, f), slots[f.0 as usize]),
+            Some(&(f, _)) => format!("(({}lust_fns[{}])({s}))", fn_ptr_cast(p, f), slots.of(f)),
             None => "0".into(),
         },
         _ => "0".into(),
@@ -119,13 +119,13 @@ fn build_expr(p: &Program, slots: &[u32], s_cty: &CTy, s: &str, need: &mut dyn F
 /// `H var = <build_expr>;`, or for a user `build_hasher` whose return is
 /// passed through an out pointer (a large hasher, such as
 /// DefaultHasher) the call that fills `var`.
-fn build_into(p: &Program, slots: &[u32], s_cty: &CTy, s: &str, var: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+fn build_into(p: &Program, slots: &Slots, s_cty: &CTy, s: &str, var: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let ht = ctype(&hasher_cty(p, s_cty));
     if let CTy::Adt(a) = s_cty
         && let Some(&(f, _)) = p.gx.build_hashers.get(a)
         && super::ret_is_large(p, f)
     {
-        return format!("{ht} {var}; (({}lust_fns[{}])(&{var}, {s}));", fn_ptr_cast(p, f), slots[f.0 as usize]);
+        return format!("{ht} {var}; (({}lust_fns[{}])(&{var}, {s}));", fn_ptr_cast(p, f), slots.of(f));
     }
     format!("{ht} {var} = {};", build_expr(p, slots, s_cty, s, need))
 }
@@ -141,7 +141,7 @@ fn bytes_cty() -> CTy {
 /// method, else core's default for it: `write_<uint>` writes the
 /// value's native-endian bytes, `write_<int>` defers to the unsigned
 /// method of the same width.
-fn hasher_call(p: &Program, slots: &[u32], hc: &CTy, m: usize, h: &str, arg: &str) -> String {
+fn hasher_call(p: &Program, slots: &Slots, hc: &CTy, m: usize, h: &str, arg: &str) -> String {
     let name = HASHER_METHODS[m];
     let int_of = |m: usize| crate::check::hashmap::hasher_write_arg(HASHER_METHODS[m]).flatten();
     match hc {
@@ -155,12 +155,8 @@ fn hasher_call(p: &Program, slots: &[u32], hc: &CTy, m: usize, h: &str, arg: &st
         },
         CTy::Adt(a) => {
             if let Some(&f) = p.gx.hasher_methods.get(&(*a, m as u8)) {
-                let call = format!(
-                    "(({}lust_fns[{}])({h}{}{arg}))",
-                    fn_ptr_cast(p, f),
-                    slots[f.0 as usize],
-                    if arg.is_empty() { "" } else { ", " }
-                );
+                let call =
+                    format!("(({}lust_fns[{}])({h}{}{arg}))", fn_ptr_cast(p, f), slots.of(f), if arg.is_empty() { "" } else { ", " });
                 return if name == "finish" { call } else { format!("{call};") };
             }
             match name {
@@ -212,7 +208,7 @@ pub(super) fn hv_key(t: &CTy, hc: &CTy) -> CTy {
 
 /// C statements that hash the value `v` points at (a `ctype(t)*`) into
 /// the hasher `h` (an `H*`), as core's `Hash` impl of `t` does.
-fn hash_stmts(p: &Program, slots: &[u32], t: &CTy, hc: &CTy, h: &str, v: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+fn hash_stmts(p: &Program, slots: &Slots, t: &CTy, hc: &CTy, h: &str, v: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let call = |m: usize, arg: &str| hasher_call(p, slots, hc, m, h, arg);
     let write = HASHER_METHODS.iter().position(|n| *n == "write").unwrap_or(1);
     let bytes = |ptr: &str, len: &str| format!("(({}){{ (uint8_t*)({ptr}), {len} }})", ctype(&bytes_cty()));
@@ -267,7 +263,7 @@ fn hash_stmts(p: &Program, slots: &[u32], t: &CTy, hc: &CTy, h: &str, v: &str, n
 /// derived Adt: a discriminant for an enum of more than one variant
 /// (its repr type, `isize` by default; the variant's value), then the
 /// fields in order. Everything else is `hash_stmts`.
-pub(super) fn hash_value_body(p: &Program, slots: &[u32], key: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+pub(super) fn hash_value_body(p: &Program, slots: &Slots, key: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let CTy::Tuple(parts) = key else { return String::new() };
     let (t, hc) = (&parts[0], &parts[1]);
     let isize_call = |disc: &str| hasher_call(p, slots, hc, write_int(IntTy::Isize), "h", &format!("(int64_t)({disc})"));
@@ -303,7 +299,7 @@ pub(super) fn hash_value_body(p: &Program, slots: &[u32], key: &CTy, need: &mut 
         }
         // A written impl: its `hash::<H>` instance (`gx.hash_impls`).
         CTy::Adt(a) if let Some(&(_, f)) = p.gx.hash_impls.get(a).and_then(|v| v.iter().find(|(h, _)| cty(&p.tys, *h) == *hc)) => {
-            let _ = writeln!(body, "  ({}lust_fns[{}])(p, h);", fn_ptr_cast(p, f), slots[f.0 as usize]);
+            let _ = writeln!(body, "  ({}lust_fns[{}])(p, h);", fn_ptr_cast(p, f), slots.of(f));
         }
         CTy::Adt(a) => {
             let adt = p.adt(*a);
@@ -351,13 +347,13 @@ pub(super) fn hash_value_sig(key: &CTy) -> String {
 
 /// The body of `uint64_t hk_<map>(S *s, K *k)`: one key hashed with a
 /// fresh hasher from the map's builder, as `make_hash` does.
-pub(super) fn hash_key_body(p: &Program, slots: &[u32], map: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+pub(super) fn hash_key_body(p: &Program, slots: &Slots, map: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     hash_with_builder(p, slots, &builder_cty(map), k_cty, need)
 }
 
 /// The body that hashes the key at `k` (a `K*`) with a fresh hasher
 /// from the builder at `s` (an `S*`): `make_hash`, and `hash_one`.
-fn hash_with_builder(p: &Program, slots: &[u32], s_cty: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+fn hash_with_builder(p: &Program, slots: &Slots, s_cty: &CTy, k_cty: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let s_cty = s_cty.clone();
     let hc = hasher_cty(p, &s_cty);
     let build = build_into(p, slots, &s_cty, "s", "h", need);
@@ -386,7 +382,7 @@ pub(super) fn glue_hasher(p: &Program, g: &Glue, t: &CTy) -> Option<CTy> {
 }
 
 /// One hash glue function: (signature, body).
-pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> (String, String) {
+pub(super) fn glue(p: &Program, slots: &Slots, g: &Glue, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> (String, String) {
     let m = mangle(t);
     match g {
         Glue::HashValue => (hash_value_sig(t), hash_value_body(p, slots, t, need)),
@@ -453,7 +449,7 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
                 let key = key_of(map, &format!("({e}*)elem"));
                 let borrowed = borrow_expr(p, slots, &k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
-                let call = format!("({}lust_fns[{}])(*(lust_dyn*)ctx, *{borrowed})", fn_ptr_cast(p, dk.eq), slots[dk.eq.0 as usize]);
+                let call = format!("({}lust_fns[{}])(*(lust_dyn*)ctx, *{borrowed})", fn_ptr_cast(p, dk.eq), slots.of(dk.eq));
                 (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("  return {call};\n"))
             } else {
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
@@ -479,7 +475,7 @@ fn dyn_key<'p>(p: &'p Program, map: &CTy, q: &CTy) -> Option<&'p crate::check::g
 /// The `hkq_` body of a dyn lookup: a fresh hasher, the written
 /// `<dyn K as Hash>::hash::<H>` instance on the probe (a fat value), then
 /// `finish`, as `make_hash` runs for any key.
-fn dyn_hash_body(p: &Program, slots: &[u32], map: &CTy, dk: &crate::check::generics::DynKey, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+fn dyn_hash_body(p: &Program, slots: &Slots, map: &CTy, dk: &crate::check::generics::DynKey, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let s_cty = builder_cty(map);
     let hc = hasher_cty(p, &s_cty);
     let Some(&(_, f)) = dk.hash_insts.iter().find(|&&(h, _)| cty(&p.tys, h) == hc) else {
@@ -493,7 +489,7 @@ fn dyn_hash_body(p: &Program, slots: &[u32], map: &CTy, dk: &crate::check::gener
     } else {
         String::new()
     };
-    let call = format!("({}lust_fns[{}])(*k, &h);", fn_ptr_cast(p, f), slots[f.0 as usize]);
+    let call = format!("({}lust_fns[{}])(*k, &h);", fn_ptr_cast(p, f), slots.of(f));
     format!("  {build}\n  {call}\n  uint64_t r = {finish};{drop}\n  return r;\n")
 }
 
@@ -501,14 +497,14 @@ fn dyn_hash_body(p: &Program, slots: &[u32], map: &CTy, dk: &crate::check::gener
 /// (a `K*`): String to str, Vec<T> to [T], one deref of Box/Rc/&T, a
 /// written impl's `borrow` (`gx.borrow_impls`), or the key itself. The
 /// result points at a temporary for the fat forms.
-fn borrow_expr(p: &Program, slots: &[u32], k: &CTy, q: &CTy, kp: &str) -> String {
+fn borrow_expr(p: &Program, slots: &Slots, k: &CTy, q: &CTy, kp: &str) -> String {
     if k == q {
         return kp.to_string();
     }
     if let CTy::Adt(a) = k
         && let Some((_, &f)) = p.gx.borrow_impls.iter().find(|((b, t), _)| b == a && cty(&p.tys, *t) == *q)
     {
-        let call = format!("({}lust_fns[{}])({kp})", fn_ptr_cast(p, f), slots[f.0 as usize]);
+        let call = format!("({}lust_fns[{}])({kp})", fn_ptr_cast(p, f), slots.of(f));
         // `&str`, `&[T]` and `&dyn Tr` come back as fat values: point at a temporary.
         return match q {
             CTy::Str => format!("((lust_str[]){{ {call} }})"),
