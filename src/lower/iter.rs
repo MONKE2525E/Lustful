@@ -101,6 +101,7 @@ fn expands(b: Builtin) -> bool {
             | B::StrParse
             | B::IterSizeHint
             | B::IterFold
+            | B::IterTryFold
             | B::IterForEach
             | B::IterMin
             | B::IterMax
@@ -1190,6 +1191,16 @@ impl Ex<'_, '_> {
                 self.assign(Place::local(fl), Rvalue::Use(f));
                 self.fold(Place::local(owned), ty, init, Place::local(fl), fty, dest, dest_ty)?;
                 self.drop_local(owned);
+                self.drop_local(fl);
+            }
+            B::IterTryFold => {
+                let (r, init, f) = (arg()?, arg()?, arg()?);
+                let (itp, ty) = self.deref_arg(r)?;
+                let (itp, ty) = self.user_iter(itp, ty)?;
+                let fty = self.op_ty(&f)?;
+                let fl = self.local(fty);
+                self.assign(Place::local(fl), Rvalue::Use(f));
+                self.try_fold(itp, ty, init, Place::local(fl), fty, dest, dest_ty)?;
                 self.drop_local(fl);
             }
             B::IterArrayIntoIter => {
@@ -5181,6 +5192,56 @@ impl Ex<'_, '_> {
         })?;
         let aa = self.take(Place::local(acc), dest_ty);
         self.assign(dest, Rvalue::Use(aa));
+        Ok(())
+    }
+
+    /// `dest = itp.try_fold(init, f)` for an `Option` or `Result` result:
+    /// each `Some`/`Ok` payload is the next accumulator, the first
+    /// `None`/`Err` is the result as it is (the rest stays in the
+    /// iterator), and the end wraps the accumulator. The pulls are std's
+    /// `try_fold` steps, as in `search`.
+    #[allow(clippy::too_many_arguments)]
+    fn try_fold(&mut self, itp: Place, ty: Ty, init: Operand, fpl: Place, fty: Ty, dest: Place, dest_ty: Ty) -> R {
+        let (acc_ty, is_res) = match self.body.tys.option_elem(dest_ty) {
+            Some(t) => (t, false),
+            None => (self.body.tys.result_args(dest_ty).ok_or("iterator expansion: `try_fold` result is not an Option or a Result")?.0, true),
+        };
+        // `Some` is discriminant 1 and `Ok` 0; the payload is field 0.
+        let (go_d, go_v) = if is_res { (0, 0) } else { (1, 1) };
+        let acc = self.local(acc_ty);
+        self.assign(Place::local(acc), Rvalue::Use(init));
+        let join = self.block();
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let saved = std::mem::replace(&mut self.fold, true);
+        let pulled = self.pull(&itp, ty);
+        self.fold = saved;
+        let (_, n, x, item) = pulled?;
+        let aa = self.take(Place::local(acc), acc_ty);
+        let ax = self.take(Place::local(x), item);
+        let r = self.local(dest_ty);
+        self.call_fn(fty, fpl, vec![aa, ax], Place::local(r))?;
+        let d = self.local(int(IntTy::U32));
+        self.assign(Place::local(d), Rvalue::Discriminant(Place::local(r)));
+        let (go, stop) = (self.block(), self.block());
+        self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(go_d, go)], stop));
+        self.cur = go;
+        let v = self.take(Place::local(r).project(Proj::Downcast(go_v)).project(Proj::Field(0)), acc_ty);
+        self.assign(Place::local(acc), Rvalue::Use(v));
+        self.goto(lp);
+        self.cur = stop;
+        self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(r))));
+        self.goto(join);
+        self.cur = n;
+        let aa = self.take(Place::local(acc), acc_ty);
+        if is_res {
+            self.assign(dest, Rvalue::Res(dest_ty, true, aa));
+        } else {
+            self.some(&dest, dest_ty, aa);
+        }
+        self.goto(join);
+        self.cur = join;
         Ok(())
     }
 

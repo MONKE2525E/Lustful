@@ -490,6 +490,8 @@ pub enum Builtin {
     IterFlatten,
     IterFlatMap,
     IterFold,
+    /// `try_fold(init, f)` with an `Option` or `Result` closure result.
+    IterTryFold,
     IterForEach,
     IterMin,
     IterMax,

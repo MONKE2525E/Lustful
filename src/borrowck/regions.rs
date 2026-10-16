@@ -3780,6 +3780,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::MemReplace | crate::check::Builtin::MemSwap))
                 && self.call_mem(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterFold)) && self.call_fold(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterTryFold)) && self.call_try_fold(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if own_region_builtin(b)) && self.call_own_region(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if receiver_builtin(b)) && self.call_receiver(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone))
@@ -3870,6 +3871,21 @@ impl<'b, 'p> Builder<'b, 'p> {
         let mut roles = Vec::new();
         closure_roles(&mut self.sc, args, &mut roles);
         self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, dt, dv, Variance::Co))
+    }
+
+    /// `try_fold(init, f)` into `Option<B>` or `Result<B, E>`: as `fold`,
+    /// the accumulator `B` (the result's leading slots) is the initial
+    /// value or what the body returns, and `E` only what the body returns;
+    /// the `&mut` borrow of the iterator reaches neither. False when the
+    /// shapes differ or the closure's body does not solve.
+    fn call_try_fold(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let [_, (it, iv), (ct, _)] = avs else { return false };
+        let TyKind::Closure(def, args) = self.body.tys.kind(*ct) else { return false };
+        let Some(acc) = self.body.tys.option_elem(dt).or_else(|| self.body.tys.result_args(dt).map(|(t, _)| t)) else { return false };
+        let Some(av) = dv.get(..self.sc.slots(acc) as usize) else { return false };
+        let mut roles = Vec::new();
+        closure_roles(&mut self.sc, args, &mut roles);
+        self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, acc, av, Variance::Co))
     }
 
     /// `as_ref`, `borrow`, and `deref` to a pointee (`ConvDeref`,
@@ -4884,12 +4900,15 @@ impl<'b, 'p> Builder<'b, 'p> {
                     continue;
                 }
                 // `fold`'s accumulator: the initial value, then what the
-                // body returns (`closure_reqs`), round after round.
+                // body returns (`closure_reqs`), round after round. A
+                // `try_fold` body returns it as the leading slots of its
+                // `Option` or `Result`.
+                let folds = matches!(b, Some(crate::check::Builtin::IterFold | crate::check::Builtin::IterTryFold));
                 if k == 2
                     && pi == 0
-                    && b == Some(crate::check::Builtin::IterFold)
+                    && folds
                     && let Some((it0, iv0)) = avs.get(1)
-                    && self.sc.slots(c_output) as usize == n
+                    && (self.sc.slots(c_output) as usize == n || b == Some(crate::check::Builtin::IterTryFold) && self.sc.slots(c_output) as usize >= n)
                     && let Some(reqs) = self.closure_reqs(def, &roles)
                 {
                     let pv: Vec<u32> = vars.get(range.clone()).map(<[u32]>::to_vec).unwrap_or_default();
@@ -4909,7 +4928,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                         continue;
                     }
                 }
-                let item_param = k > 0 && !cands.is_empty() && !(b == Some(crate::check::Builtin::IterFold) && pi == 0);
+                let item_param = k > 0 && !cands.is_empty() && !(folds && pi == 0);
                 if item_param {
                     let want = cands[0].len();
                     let (ity, skip) = match self.body.tys.kind(pt) {

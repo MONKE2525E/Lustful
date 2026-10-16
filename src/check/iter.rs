@@ -29,7 +29,6 @@ const DECLARED_ONLY: &[&str] = &[
     "partition",
     "partition_in_place",
     "is_partitioned",
-    "try_fold",
     "try_for_each",
     "reduce",
     "try_reduce",
@@ -239,7 +238,7 @@ impl<'p> Ctx<'p> {
             // call takes it by reference, also through `&I` or `&mut I`,
             // and the expansion wraps the reference (lower/iter.rs
             // `user_iter`). The rest move it into the wrapper.
-            let borrowing = matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "position" | "size_hint" | "len");
+            let borrowing = matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "try_fold" | "position" | "size_hint" | "len");
             if (derefs > 0 && !borrowing) || n == "next" || !ITER_METHODS.contains(&n.as_str()) {
                 return None;
             }
@@ -881,7 +880,7 @@ impl<'p> Ctx<'p> {
         let item = self.iter_item(base);
         let by_value = !matches!(
             n,
-            "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek" | "size_hint" | "len"
+            "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "try_fold" | "position" | "rposition" | "peek" | "size_hint" | "len"
                 | "as_slice" | "as_mut_slice" | "as_str" | "remainder"
         );
         // A by-value method through a reference would use `&mut I:
@@ -1142,6 +1141,48 @@ impl<'p> Ctx<'p> {
                 }
                 return acc;
             }
+            // `try_fold<B, F, R>(&mut self, init: B, f: F) -> R` with
+            // `F: FnMut(B, Item) -> R` and `R: Try<Output = B>`: `R` is
+            // whatever the closure returns, then its output must be the
+            // accumulator, as rustc's projection fixes it before the
+            // literal fallback (`try_fold(0, |v, &c| ..)` -> `Option<u32>`
+            // makes `0` a `u32`). Only `Option` and `Result` are modeled.
+            "try_fold" => {
+                if args.len() != 2 {
+                    self.err("L0105", span, "`try_fold` takes 2 arguments", "Pass the initial value and the closure.");
+                    return self.iter_bail(args);
+                }
+                let acc = self.expr(args[0], None);
+                let ret = self.new_var(false);
+                let f = self.fn_mut_param(&[acc, item], ret, span);
+                self.set_res(e, Res::BuiltinMethod { b: B::IterTryFold, derefs, autoref: Autoref::RefMut });
+                self.check_packed_borrow(recv, span);
+                self.expect_expr(args[1], f);
+                let ft = self.deep(f);
+                if matches!(self.kind(ft), TyKind::Dyn(..) | TyKind::Ref(..)) || self.tys.boxed_elem(ft).is_some() {
+                    let s = self.span(args[1]);
+                    self.errs.push(generics::dyn_not_yet(s, "a `dyn Fn` value or a reference to a callable as an iterator adapter's callable"));
+                    return ERROR;
+                }
+                // A fn item or fn pointer's output is an obligation's.
+                if matches!(self.kind(ret), TyKind::Infer(_)) {
+                    self.run_obligations(false);
+                }
+                let r = self.resolve(ret);
+                let out = self.tys.option_elem(r).or_else(|| self.tys.result_args(r).map(|(t, _)| t));
+                let Some(out) = out else {
+                    if r != ERROR {
+                        let tn = self.tn(r);
+                        self.err("L0640", span, format!("`try_fold` with a closure result of type `{tn}` is not implemented yet"), "Return an `Option` or a `Result` from the closure.");
+                    }
+                    return ERROR;
+                };
+                if !self.unify(out, acc) {
+                    self.mismatch(span, acc, out);
+                    return ERROR;
+                }
+                return ret;
+            }
             "for_each" => {
                 let f = self.fn_mut_param(&[item], UNIT, span);
                 (B::IterForEach, vec![f], UNIT)
@@ -1365,6 +1406,7 @@ impl<'p> Ctx<'p> {
                 | "count"
                 | "last"
                 | "fold"
+                | "try_fold"
                 | "for_each"
                 | "min"
                 | "max"
@@ -2400,6 +2442,7 @@ const ITER_METHODS: &[&str] = &[
     "find_map",
     "position",
     "fold",
+    "try_fold",
     "for_each",
     "min",
     "max",

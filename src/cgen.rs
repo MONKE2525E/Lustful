@@ -5142,6 +5142,7 @@ impl FnGen<'_, '_> {
             | B::StrCharIndices
             | B::StrBytes
             | B::IterFold
+            | B::IterTryFold
             | B::IterForEach
             | B::IterMin
             | B::IterMax
