@@ -81,6 +81,9 @@ fn expands(b: Builtin) -> bool {
             | B::IterPosition
             | B::IterRposition
             | B::IterWindows
+            | B::IterChunks
+            | B::IterUtf8Chunks
+            | B::IterRemainder
             | B::IterNextBack
             | B::StrCharIndices
             | B::StrBytes
@@ -540,6 +543,95 @@ impl Ex<'_, '_> {
                 let s = self.local(fields[0]);
                 self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s)), Operand::Copy(Place::local(nl))]));
+            }
+            // `slice.chunks(size)` and kin (tf-slice): std's
+            // `assert_ne!(size, 0)`-through-`NonZero` panic first,
+            // then the stored fields. The exact forms split the
+            // remainder off at creation, as std does.
+            B::IterChunks => {
+                let (r, n) = (arg()?, arg()?);
+                let nl = self.local(USIZE);
+                self.assign(Place::local(nl), Rvalue::Use(n));
+                let c = self.cmp(crate::ast::BinOp::Eq, Operand::Copy(Place::local(nl)), Self::usize_c(0));
+                let (zero, go) = self.branch(c);
+                self.cur = zero;
+                self.term(Terminator::Panic(vec![FmtPart::Lit("chunk size must be non-zero".into())]));
+                self.cur = go;
+                let (k, _) = self.kind_args(dest_ty).ok_or("iterator expansion: bad chunks iterator")?;
+                let m = matches!(k, IterKind::ChunksMut | IterKind::ChunksExactMut);
+                let rt = self.op_ty(&r)?;
+                let rp = self.op_place(r, rt);
+                let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad chunks iterator")?;
+                let s = self.local(fields[0]);
+                self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
+                if matches!(k, IterKind::ChunksExact | IterKind::ChunksExactMut) {
+                    let sd = Place::local(s).deref();
+                    let len = self.local(USIZE);
+                    self.assign(Place::local(len), Rvalue::LenOf(sd.clone()));
+                    let rem = self.local(USIZE);
+                    self.assign(
+                        Place::local(rem),
+                        Rvalue::Bin(crate::ast::BinOp::Rem, Operand::Copy(Place::local(len)), Operand::Copy(Place::local(nl))),
+                    );
+                    let fst_len = self.local(USIZE);
+                    self.assign(
+                        Place::local(fst_len),
+                        Rvalue::Bin(crate::ast::BinOp::Sub, Operand::Copy(Place::local(len)), Operand::Copy(Place::local(rem))),
+                    );
+                    let (fst, snd) = (self.local(fields[0]), self.local(fields[1]));
+                    self.assign(
+                        Place::local(fst),
+                        Rvalue::Subslice {
+                            base: sd.clone(),
+                            lo: Self::usize_c(0),
+                            hi: Some(Operand::Copy(Place::local(fst_len))),
+                            inclusive: false,
+                            mutable: m,
+                        },
+                    );
+                    self.assign(
+                        Place::local(snd),
+                        Rvalue::Subslice {
+                            base: sd,
+                            lo: Operand::Copy(Place::local(fst_len)),
+                            hi: None,
+                            inclusive: false,
+                            mutable: m,
+                        },
+                    );
+                    self.assign(
+                        dest,
+                        Rvalue::TupleAgg(
+                            dest_ty,
+                            vec![Operand::Move(Place::local(fst)), Operand::Move(Place::local(snd)), Operand::Copy(Place::local(nl))],
+                        ),
+                    );
+                } else {
+                    self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s)), Operand::Copy(Place::local(nl))]));
+                }
+            }
+            // `[u8]::utf8_chunks` (tf-slice): the source bytes, whole.
+            B::IterUtf8Chunks => {
+                let r = arg()?;
+                let rt = self.op_ty(&r)?;
+                let rp = self.op_place(r, rt);
+                let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad utf8_chunks iterator")?;
+                let s = self.local(fields[0]);
+                self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s))]));
+            }
+            // `ChunksExact::remainder` and
+            // `ChunksExactMut::into_remainder` (tf-slice): field 1,
+            // through the reference or by value.
+            B::IterRemainder => {
+                let r = arg()?;
+                let rt = self.op_ty(&r)?;
+                let rp = self.op_place(r, rt);
+                let base = match self.body.tys.kind(rt) {
+                    TyKind::Ref(..) => rp.deref(),
+                    _ => rp,
+                };
+                self.assign(dest, Rvalue::Use(Operand::Copy(base.project(Proj::Field(1)))));
             }
             B::IterIter | B::IterIterMut => {
                 let r = arg()?;
@@ -1706,6 +1798,149 @@ impl Ex<'_, '_> {
                 self.none(&dest, opt);
                 self.goto(join);
             }
+            // `Chunks` and `ChunksMut` (tf-slice): the first (or
+            // last) at most `size` elements while any remain; the
+            // back chunk is the remainder when the length does not
+            // divide evenly, as std computes it.
+            K::Chunks | K::ChunksMut => {
+                let m = k == K::ChunksMut;
+                let sd = f(0).deref();
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(sd.clone()));
+                let c = self.cmp(Eq, Operand::Copy(Place::local(len)), Self::usize_c(0));
+                let (empty, s) = self.branch(c);
+                self.cur = s;
+                let st = self.place_ty(&f(0))?;
+                let (w, rest) = (self.local(st), self.local(st));
+                if back {
+                    let rem = self.local(USIZE);
+                    self.assign(Place::local(rem), Rvalue::Bin(Rem, Operand::Copy(Place::local(len)), Operand::Copy(f(1))));
+                    let csz = self.local(USIZE);
+                    let c2 = self.cmp(Eq, Operand::Copy(Place::local(rem)), Self::usize_c(0));
+                    let (even, uneven) = self.branch(c2);
+                    let go = self.block();
+                    self.cur = even;
+                    self.assign(Place::local(csz), Rvalue::Use(Operand::Copy(f(1))));
+                    self.goto(go);
+                    self.cur = uneven;
+                    self.assign(Place::local(csz), Rvalue::Use(Operand::Copy(Place::local(rem))));
+                    self.goto(go);
+                    self.cur = go;
+                    let lo = self.local(USIZE);
+                    self.assign(Place::local(lo), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Operand::Copy(Place::local(csz))));
+                    self.assign(
+                        Place::local(w),
+                        Rvalue::Subslice { base: sd.clone(), lo: Operand::Copy(Place::local(lo)), hi: None, inclusive: false, mutable: m },
+                    );
+                    self.assign(
+                        Place::local(rest),
+                        Rvalue::Subslice {
+                            base: sd,
+                            lo: Self::usize_c(0),
+                            hi: Some(Operand::Copy(Place::local(lo))),
+                            inclusive: false,
+                            mutable: m,
+                        },
+                    );
+                } else {
+                    let csz = self.local(USIZE);
+                    let c2 = self.cmp(Lt, Operand::Copy(Place::local(len)), Operand::Copy(f(1)));
+                    let (short, full) = self.branch(c2);
+                    let go = self.block();
+                    self.cur = short;
+                    self.assign(Place::local(csz), Rvalue::Use(Operand::Copy(Place::local(len))));
+                    self.goto(go);
+                    self.cur = full;
+                    self.assign(Place::local(csz), Rvalue::Use(Operand::Copy(f(1))));
+                    self.goto(go);
+                    self.cur = go;
+                    self.assign(
+                        Place::local(w),
+                        Rvalue::Subslice {
+                            base: sd.clone(),
+                            lo: Self::usize_c(0),
+                            hi: Some(Operand::Copy(Place::local(csz))),
+                            inclusive: false,
+                            mutable: m,
+                        },
+                    );
+                    self.assign(
+                        Place::local(rest),
+                        Rvalue::Subslice { base: sd, lo: Operand::Copy(Place::local(csz)), hi: None, inclusive: false, mutable: m },
+                    );
+                }
+                self.assign(f(0), Rvalue::Use(Operand::Move(Place::local(rest))));
+                self.some(&dest, opt, Operand::Move(Place::local(w)));
+                self.goto(join);
+                self.cur = empty;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            // `ChunksExact` and `ChunksExactMut` (tf-slice): one
+            // full chunk from either end while one remains; the
+            // remainder (field 1) never yields.
+            K::ChunksExact | K::ChunksExactMut => {
+                let m = k == K::ChunksExactMut;
+                let size_field = f(2);
+                let sd = f(0).deref();
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(sd.clone()));
+                let c = self.cmp(Lt, Operand::Copy(Place::local(len)), Operand::Copy(size_field.clone()));
+                let (short, s) = self.branch(c);
+                self.cur = s;
+                let st = self.place_ty(&f(0))?;
+                let (w, rest) = (self.local(st), self.local(st));
+                if back {
+                    let lo = self.local(USIZE);
+                    self.assign(Place::local(lo), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Operand::Copy(size_field)));
+                    self.assign(
+                        Place::local(w),
+                        Rvalue::Subslice { base: sd.clone(), lo: Operand::Copy(Place::local(lo)), hi: None, inclusive: false, mutable: m },
+                    );
+                    self.assign(
+                        Place::local(rest),
+                        Rvalue::Subslice {
+                            base: sd,
+                            lo: Self::usize_c(0),
+                            hi: Some(Operand::Copy(Place::local(lo))),
+                            inclusive: false,
+                            mutable: m,
+                        },
+                    );
+                } else {
+                    self.assign(
+                        Place::local(w),
+                        Rvalue::Subslice {
+                            base: sd.clone(),
+                            lo: Self::usize_c(0),
+                            hi: Some(Operand::Copy(size_field.clone())),
+                            inclusive: false,
+                            mutable: m,
+                        },
+                    );
+                    self.assign(
+                        Place::local(rest),
+                        Rvalue::Subslice { base: sd, lo: Operand::Copy(size_field), hi: None, inclusive: false, mutable: m },
+                    );
+                }
+                self.assign(f(0), Rvalue::Use(Operand::Move(Place::local(rest))));
+                self.some(&dest, opt, Operand::Move(Place::local(w)));
+                self.goto(join);
+                self.cur = short;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
+            // `Utf8Chunks` (tf-slice): one runtime step over the
+            // bytes left (forward only).
+            K::Utf8Chunks => {
+                if back {
+                    return Err("iterator expansion: Utf8Chunks is forward-only here".into());
+                }
+                let r = self.ref_to(true, itp, ty);
+                self.call_builtin(Builtin::Utf8ChunksNext, vec![Operand::Move(Place::local(r))], dest);
+                self.goto(join);
+            }
+            K::Utf8Chunk => return Err("iterator expansion: Utf8Chunk is not an iterator".into()),
             // `Flatten` (W-STD-B), as std's FlattenCompat::next: the front
             // inner iterator's items, then the next inner value from the
             // outer iterator, then the back inner iterator's. The outer is a
@@ -3348,6 +3583,7 @@ impl Ex<'_, '_> {
             // `array::IntoIter` is random access in Rust 1.99 (a zip with
             // it pulls only `min` items from a mapped side).
             K::SliceIter | K::SliceIterMut | K::ArrayIntoIter | K::Windows => true,
+            K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => true,
             K::Range => matches!(
                 self.body.tys.kind(a[0]),
                 TyKind::Int(IntTy::Usize | IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::U64 | IntTy::Isize | IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64)
@@ -3413,6 +3649,31 @@ impl Ex<'_, '_> {
                 self.assign(Place::local(out), Rvalue::Use(Self::usize_c(0)));
                 self.goto(join);
                 self.cur = join;
+            }
+            // `Chunks`: the ceiling of len / size, computed as
+            // std's `div_ceil` so a huge `len` cannot overflow.
+            K::Chunks | K::ChunksMut => {
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(f(0).deref()));
+                let c = self.cmp(Eq, Operand::Copy(Place::local(len)), Self::usize_c(0));
+                let (empty, s) = self.branch(c);
+                let join = self.block();
+                self.cur = s;
+                let d = self.local(USIZE);
+                self.assign(Place::local(d), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Self::usize_c(1)));
+                let q = self.local(USIZE);
+                self.assign(Place::local(q), Rvalue::Bin(Div, Operand::Copy(Place::local(d)), Operand::Copy(f(1))));
+                self.assign(Place::local(out), Rvalue::Bin(Add, Operand::Copy(Place::local(q)), Self::usize_c(1)));
+                self.goto(join);
+                self.cur = empty;
+                self.assign(Place::local(out), Rvalue::Use(Self::usize_c(0)));
+                self.goto(join);
+                self.cur = join;
+            }
+            K::ChunksExact | K::ChunksExactMut => {
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(f(0).deref()));
+                self.assign(Place::local(out), Rvalue::Bin(Div, Operand::Copy(Place::local(len)), Operand::Copy(f(2))));
             }
             // The `option` and `result` iterators: 0 or 1.
             K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
@@ -3506,6 +3767,15 @@ impl Ex<'_, '_> {
             K::ArrayIntoIter | K::RepeatN | K::Windows => {
                 let n = self.size(itp.clone(), ty)?;
                 set_exact(self, n);
+            }
+            K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => {
+                let n = self.size(itp.clone(), ty)?;
+                set_exact(self, n);
+            }
+            // `Utf8Chunks`: std's default `(0, None)`.
+            K::Utf8Chunks | K::Utf8Chunk => {
+                self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                self.none(&Place::local(hi), ou);
             }
             // The wrapped iterator's own `size_hint`, else the trait's
             // default `(0, None)` (W-STD-B).
@@ -3997,6 +4267,8 @@ impl Ex<'_, '_> {
             K::Windows | K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
                 true
             }
+            K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => true,
+            K::Utf8Chunks | K::Utf8Chunk => false,
             // std's impls: an outer TrustedLen over arrays (or references
             // to arrays) of a fixed size.
             K::Flatten => self.trusted_len(a[0]) && self.item_const_size(a[0]).is_some(),

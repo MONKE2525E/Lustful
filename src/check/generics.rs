@@ -7724,6 +7724,15 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     let s = p.tys.intern(TyKind::Slice(ps[0]));
                     p.tys.mk_ref(false, s)
                 }
+                K::Chunks | K::ChunksExact => {
+                    let s = p.tys.intern(TyKind::Slice(ps[0]));
+                    p.tys.mk_ref(false, s)
+                }
+                K::ChunksMut | K::ChunksExactMut => {
+                    let s = p.tys.intern(TyKind::Slice(ps[0]));
+                    p.tys.mk_ref(true, s)
+                }
+                K::Utf8Chunks => mk_iter(&mut p.tys, K::Utf8Chunk, &[ps[0]]),
                 K::CharIndices => {
                     let ts = p.tys.intern_tys(&[USIZE, CHAR]);
                     p.tys.intern(TyKind::Tuple(ts))
@@ -7775,6 +7784,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 K::ArrayIntoIter
                 | K::RepeatN
                 | K::Windows
+                | K::Chunks
+                | K::ChunksMut
+                | K::ChunksExact
+                | K::ChunksExactMut
                 | K::OptionIter
                 | K::OptionIterMut
                 | K::OptionIntoIter
@@ -7803,6 +7816,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
             }
             let double_ended: Option<Vec<Predicate>> = match k {
                 K::Windows
+                | K::Chunks
+                | K::ChunksMut
+                | K::ChunksExact
+                | K::ChunksExactMut
                 | K::CharIndices
                 | K::ArrayIntoIter
                 | K::RepeatN

@@ -167,6 +167,23 @@ pub enum IterKind {
     RangeFull,
     /// `core::ops::RangeToInclusive<T>`: args `[T]`. A `RangeBounds` value.
     RangeToInclusive,
+    /// `core::slice::Chunks<T>` (tf-slice): args `[T]`, item `&[T]`;
+    /// (the slice left, the chunk size), as std stores it.
+    Chunks,
+    /// `core::slice::ChunksMut<T>`: item `&mut [T]`.
+    ChunksMut,
+    /// `core::slice::ChunksExact<T>`: (full chunks left, remainder,
+    /// chunk size), as std stores it.
+    ChunksExact,
+    /// `core::slice::ChunksExactMut<T>`: item `&mut [T]`.
+    ChunksExactMut,
+    /// `core::str::Utf8Chunks`: args `[u8]` (never shown), item
+    /// `Utf8Chunk`; (the bytes left).
+    Utf8Chunks,
+    /// `core::str::Utf8Chunk`: args `[u8]` (never shown); (valid
+    /// `&str`, invalid `&[u8]`). Not an iterator: the item type of
+    /// `Utf8Chunks`, carried here like the range kinds.
+    Utf8Chunk,
 }
 
 /// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
@@ -285,7 +302,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 55] = [
+    pub const ALL: [IterKind; 61] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -341,6 +358,12 @@ impl IterKind {
         IterKind::RangeTo,
         IterKind::RangeFull,
         IterKind::RangeToInclusive,
+        IterKind::Chunks,
+        IterKind::ChunksMut,
+        IterKind::ChunksExact,
+        IterKind::ChunksExactMut,
+        IterKind::Utf8Chunks,
+        IterKind::Utf8Chunk,
     ];
 
     /// True for the hashed-collection iterators.
@@ -417,13 +440,22 @@ impl IterKind {
             K::RangeTo => (&["core", "ops"], "RangeTo"),
             K::RangeFull => (&["core", "ops"], "RangeFull"),
             K::RangeToInclusive => (&["core", "ops"], "RangeToInclusive"),
+            K::Chunks => (&["core", "slice"], "Chunks"),
+            K::ChunksMut => (&["core", "slice"], "ChunksMut"),
+            K::ChunksExact => (&["core", "slice"], "ChunksExact"),
+            K::ChunksExactMut => (&["core", "slice"], "ChunksExactMut"),
+            K::Utf8Chunks => (&["core", "str"], "Utf8Chunks"),
+            K::Utf8Chunk => (&["core", "str"], "Utf8Chunk"),
         }
     }
 
     /// True for the kinds that are iterators in lust. The four
     /// open-ended range kinds are `RangeBounds` values only.
     pub fn is_iterator(self) -> bool {
-        !matches!(self, IterKind::RangeFrom | IterKind::RangeTo | IterKind::RangeFull | IterKind::RangeToInclusive)
+        !matches!(
+            self,
+            IterKind::RangeFrom | IterKind::RangeTo | IterKind::RangeFull | IterKind::RangeToInclusive | IterKind::Utf8Chunk
+        )
     }
 
     /// True for the six `core::ops` range kinds.
@@ -524,6 +556,12 @@ impl IterKind {
             K::RangeTo => "std::ops::RangeTo",
             K::RangeFull => "std::ops::RangeFull",
             K::RangeToInclusive => "std::ops::RangeToInclusive",
+            K::Chunks => "std::slice::Chunks",
+            K::ChunksMut => "std::slice::ChunksMut",
+            K::ChunksExact => "std::slice::ChunksExact",
+            K::ChunksExactMut => "std::slice::ChunksExactMut",
+            K::Utf8Chunks => "std::str::Utf8Chunks",
+            K::Utf8Chunk => "std::str::Utf8Chunk",
         }
     }
 
@@ -533,6 +571,8 @@ impl IterKind {
         match self {
             IterKind::Map | IterKind::FilterMap => 2,
             IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten | IterKind::StrSplit | IterKind::StrMatches => 1,
+            // The `u8` arg of the UTF-8 kinds is lust's own marker.
+            IterKind::Utf8Chunks | IterKind::Utf8Chunk => 0,
             k => k.n_args(),
         }
     }
@@ -589,6 +629,12 @@ impl IterKind {
             // container's buffer (std's Drain bookkeeping).
             K::VecDrain => &[F::VecRefMut(0), F::Usize, F::Usize, F::Usize, F::Usize, F::Usize],
             K::StringDrain => &[F::StringRefMut, F::Usize, F::Usize, F::Usize, F::Usize, F::Usize],
+            K::Chunks => &[F::SliceRef(0, false), F::Usize],
+            K::ChunksMut => &[F::SliceRef(0, true), F::Usize],
+            K::ChunksExact => &[F::SliceRef(0, false), F::SliceRef(0, false), F::Usize],
+            K::ChunksExactMut => &[F::SliceRef(0, true), F::SliceRef(0, true), F::Usize],
+            K::Utf8Chunks => &[F::SliceRef(0, false)],
+            K::Utf8Chunk => &[F::Str, F::SliceRef(0, false)],
             K::RangeFrom | K::RangeTo | K::RangeToInclusive => &[F::Arg(0)],
             // No stored value; one dummy field, as `RangeInclusive`
             // stores its flag.
@@ -642,7 +688,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::SliceIterMut => tys.mk_ref(true, a[0]),
         K::VecIntoIter | K::Range | K::RangeInclusive | K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::VecDrain => a[0],
         K::StringDrain => CHAR,
-        K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
+        K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk => return None,
         K::Map | K::FilterMap => a[2],
         K::Filter | K::Rev | K::Take | K::Skip | K::Chain | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect => {
             item_ty(tys, a[0])?
@@ -680,6 +726,15 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
             let s = tys.intern(TyKind::Slice(a[0]));
             tys.mk_ref(false, s)
         }
+        K::Chunks | K::ChunksExact => {
+            let s = tys.intern(TyKind::Slice(a[0]));
+            tys.mk_ref(false, s)
+        }
+        K::ChunksMut | K::ChunksExactMut => {
+            let s = tys.intern(TyKind::Slice(a[0]));
+            tys.mk_ref(true, s)
+        }
+        K::Utf8Chunks => mk_iter(tys, K::Utf8Chunk, &[a[0]]),
         K::CharIndices => {
             let ts = tys.intern_tys(&[USIZE, CHAR]);
             tys.intern(TyKind::Tuple(ts))
@@ -855,6 +910,12 @@ pub fn iter_holds_ref(k: IterKind, args: &[Ty], arg_holds: &dyn Fn(Ty) -> bool) 
         IterKind::SliceIter
             | IterKind::SliceIterMut
             | IterKind::Windows
+            | IterKind::Chunks
+            | IterKind::ChunksMut
+            | IterKind::ChunksExact
+            | IterKind::ChunksExactMut
+            | IterKind::Utf8Chunks
+            | IterKind::Utf8Chunk
             | IterKind::CharIndices
             | IterKind::StrSplit
             | IterKind::MapIter

@@ -519,6 +519,48 @@ lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, 
    the copied range leaves (`dest is out of bounds` at the caller,
    core's `#[track_caller]` assert), then moves the bytes, overlap
    included. */
+/* One `Utf8Chunks` step (core's `str::lossy` scan, byte for byte):
+   writes the valid prefix length and the total inspected length
+   (valid + the broken sequence, at most 3 more bytes) of `p[..len]`.
+   The caller guarantees `len > 0`. A read past the end answers 0,
+   which fails every continuation test, as core's `safe_get` does. */
+void lust_utf8_chunk_step(const uint8_t *p, uint64_t len, uint64_t *valid, uint64_t *used) LUST_BODY({
+    uint64_t i = 0;
+    uint64_t valid_up_to = 0;
+    while (i < len) {
+        uint8_t byte = p[i];
+        i += 1;
+        if (byte >= 128) {
+            uint8_t b1 = i < len ? p[i] : 0;
+            if (byte >= 0xC2 && byte <= 0xDF) {
+                if ((b1 & 192) != 128) break;
+                i += 1;
+            } else if (byte >= 0xE0 && byte <= 0xEF) {
+                int ok = (byte == 0xE0 && b1 >= 0xA0 && b1 <= 0xBF) || (byte >= 0xE1 && byte <= 0xEC && b1 >= 0x80 && b1 <= 0xBF) ||
+                         (byte == 0xED && b1 >= 0x80 && b1 <= 0x9F) || (byte >= 0xEE && b1 >= 0x80 && b1 <= 0xBF);
+                if (!ok) break;
+                i += 1;
+                if (((i < len ? p[i] : 0) & 192) != 128) break;
+                i += 1;
+            } else if (byte >= 0xF0 && byte <= 0xF4) {
+                int ok = (byte == 0xF0 && b1 >= 0x90 && b1 <= 0xBF) || (byte >= 0xF1 && byte <= 0xF3 && b1 >= 0x80 && b1 <= 0xBF) ||
+                         (byte == 0xF4 && b1 >= 0x80 && b1 <= 0x8F);
+                if (!ok) break;
+                i += 1;
+                if (((i < len ? p[i] : 0) & 192) != 128) break;
+                i += 1;
+                if (((i < len ? p[i] : 0) & 192) != 128) break;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        valid_up_to = i;
+    }
+    *valid = valid_up_to;
+    *used = i;
+})
+
 /* The `start..end` of a `SliceIndex` range argument (same tags as
    `lust_range_bounds_check`), or 0 when core's `get` would answer
    `None`: the end bound against the length first, then the start

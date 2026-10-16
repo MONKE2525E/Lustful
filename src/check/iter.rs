@@ -118,8 +118,39 @@ impl<'p> Ctx<'p> {
                 "binary_search_by" => "binary_search_by",
                 "binary_search_by_key" => "binary_search_by_key",
                 "windows" => "windows",
+                "chunks" => "chunks",
+                "chunks_mut" => "chunks_mut",
+                "chunks_exact" => "chunks_exact",
+                "chunks_exact_mut" => "chunks_exact_mut",
+                "utf8_chunks" => "utf8_chunks",
                 _ => return None,
             };
+            if n == "utf8_chunks" {
+                // `[u8]::utf8_chunks` (tf-slice): bytes only.
+                if el != int(IntTy::U8) {
+                    return None;
+                }
+                let ret = it::mk_iter(&mut self.tys, IterKind::Utf8Chunks, &[el]);
+                self.set_res(e, Res::BuiltinMethod { b: Builtin::IterUtf8Chunks, derefs, autoref: Autoref::Ref });
+                self.check_args(&[], args, name_span);
+                return Some(ret);
+            }
+            if let Some(kind) = match n {
+                "chunks" => Some(IterKind::Chunks),
+                "chunks_mut" => Some(IterKind::ChunksMut),
+                "chunks_exact" => Some(IterKind::ChunksExact),
+                "chunks_exact_mut" => Some(IterKind::ChunksExactMut),
+                _ => None,
+            } {
+                // The chunk family (tf-slice): the slice by
+                // reference (mutable for the `_mut` forms).
+                let mutable = matches!(kind, IterKind::ChunksMut | IterKind::ChunksExactMut);
+                let ret = it::mk_iter(&mut self.tys, kind, &[el]);
+                let autoref = if mutable { Autoref::RefMut } else { Autoref::Ref };
+                self.set_res(e, Res::BuiltinMethod { b: Builtin::IterChunks, derefs, autoref });
+                self.check_args(&[USIZE], args, name_span);
+                return Some(ret);
+            }
             if n == "windows" {
                 // `slice::windows(size)` (W-STD-B): the slice by reference.
                 let ret = it::mk_iter(&mut self.tys, IterKind::Windows, &[el]);
@@ -797,7 +828,7 @@ impl<'p> Ctx<'p> {
         let by_value = !matches!(
             n,
             "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "position" | "rposition" | "peek" | "size_hint" | "len"
-                | "as_slice" | "as_mut_slice" | "as_str"
+                | "as_slice" | "as_mut_slice" | "as_str" | "remainder"
         );
         // A by-value method through a reference would use `&mut I:
         // Iterator` (`by_ref`), which lust does not model yet.
@@ -865,6 +896,19 @@ impl<'p> Ctx<'p> {
             "as_str" => {
                 let Some((K::StringDrain, _)) = it::iter_parts(&self.tys, base) else { return self.iter_unknown(n, span, base, args) };
                 (B::StrDrainAsStr, vec![], REF_STR)
+            }
+            "remainder" | "into_remainder" => {
+                // `ChunksExact::remainder` and
+                // `ChunksExactMut::into_remainder` (tf-slice): the
+                // stored remainder slice.
+                let (el, m) = match (n, it::iter_parts(&self.tys, base)) {
+                    ("remainder", Some((K::ChunksExact, a))) => (a[0], false),
+                    ("into_remainder", Some((K::ChunksExactMut, a))) => (a[0], true),
+                    _ => return self.iter_unknown(n, span, base, args),
+                };
+                let sl = self.tys.intern(TyKind::Slice(el));
+                let r = self.tys.mk_ref(m, sl);
+                (B::IterRemainder, vec![], r)
             }
             "map" => {
                 let out = self.new_var(false);
@@ -1138,7 +1182,7 @@ impl<'p> Ctx<'p> {
         let autoref = match (by_value, n) {
             (true, _) => Autoref::None,
             // `size_hint(&self)`, and the drain views (`len`, `as_slice`, `as_str`).
-            (false, "size_hint" | "len" | "as_slice" | "as_str") => Autoref::Ref,
+            (false, "size_hint" | "len" | "as_slice" | "as_str" | "remainder") => Autoref::Ref,
             (false, _) => Autoref::RefMut,
         };
         if autoref != Autoref::None {
@@ -1497,6 +1541,7 @@ impl<'p> Ctx<'p> {
         use IterKind as K;
         match it::iter_parts(&self.tys, t) {
             Some((K::SliceIter | K::SliceIterMut | K::ArrayIntoIter | K::Windows, _)) => true,
+            Some((K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut, _)) => true,
             Some((k, _)) if it::is_opt_res(k) => true,
             Some((K::Map | K::Copied | K::Cloned, a)) => self.rposition_ok(a[0]),
             _ => false,
@@ -1518,6 +1563,10 @@ impl<'p> Ctx<'p> {
             | K::Range
             | K::RangeInclusive
             | K::Windows
+            | K::Chunks
+            | K::ChunksMut
+            | K::ChunksExact
+            | K::ChunksExactMut
             | K::CharIndices
             | K::VecDrain
             | K::StringDrain => true,
@@ -1526,7 +1575,7 @@ impl<'p> Ctx<'p> {
             // These need ExactSizeIterator too: lust keeps them forward-only for now.
             K::Enumerate | K::Take | K::Skip | K::Zip | K::StepBy => false,
             K::TakeWhile | K::SkipWhile => false,
-            K::RecvIter | K::RecvTryIter | K::RecvIntoIter => false,
+            K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::Utf8Chunks | K::Utf8Chunk => false,
             // hashbrown's iterators are forward-only.
             K::MapIter
             | K::MapIterMut
@@ -1590,6 +1639,10 @@ impl<'p> Ctx<'p> {
             | K::ArrayIntoIter
             | K::RepeatN
             | K::Windows
+            | K::Chunks
+            | K::ChunksMut
+            | K::ChunksExact
+            | K::ChunksExactMut
             | K::OptionIter
             | K::OptionIterMut
             | K::OptionIntoIter

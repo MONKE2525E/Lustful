@@ -624,6 +624,12 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
                 | IterKind::RecvIter
                 | IterKind::RecvTryIter
                 | IterKind::Windows
+                | IterKind::Chunks
+                | IterKind::ChunksMut
+                | IterKind::ChunksExact
+                | IterKind::ChunksExactMut
+                | IterKind::Utf8Chunks
+                | IterKind::Utf8Chunk
                 | IterKind::CharIndices
                 | IterKind::VecDrain
                 | IterKind::StringDrain
@@ -3745,6 +3751,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::MemReplace | crate::check::Builtin::MemSwap))
                 && self.call_mem(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::IterFold)) && self.call_fold(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(b) if own_region_builtin(b)) && self.call_own_region(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if receiver_builtin(b)) && self.call_receiver(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone))
                 && let [(at, av)] = avs.as_slice()
@@ -3901,6 +3908,33 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// by the receiver borrow's region. The other arguments do not flow
     /// into the result. False (nothing added) when the receiver is not a
     /// reference.
+    /// Like `call_receiver`, for the builtins whose result borrows
+    /// the receiver type's own region (its `'a`), not the `&self`
+    /// loan: `ChunksExact::remainder` and the `Utf8Chunk` views
+    /// (tf-slice). The result walk takes the pointee's first slot
+    /// (its region param) as the borrowed region.
+    fn call_own_region(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, x) = self.body.tys.kind(*t0) else { return false };
+        let Some((_, xv)) = v0.split_first() else { return false };
+        let Some(&own) = xv.first() else { return false };
+        let tys = &self.body.tys;
+        let comp = crate::ty::iter::iter_parts(tys, x).and_then(|(_, a)| a.first().copied());
+        let comp_vars: Vec<u32> = match comp {
+            Some(e) => {
+                let n = self.sc.slots(e) as usize;
+                if n > xv.len() {
+                    return false;
+                }
+                xv[xv.len() - n..].to_vec()
+            }
+            None => Vec::new(),
+        };
+        let mut at = 0usize;
+        self.receiver_walk(dt, dv, &mut at, own, comp, &comp_vars);
+        true
+    }
+
     fn call_receiver(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         let Some((t0, v0)) = avs.first() else { return false };
         let TyKind::Ref(_, _, x) = self.body.tys.kind(*t0) else { return false };
@@ -4552,6 +4586,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::SliceIter | K::SliceIterMut | K::Windows | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut => {
                 cat(&[&own, &args[0]])
             }
+            // The chunk items are `&'a [T]` (or `&'a mut [T]`), like
+            // a window; a `Utf8Chunk` item is its one region.
+            K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => cat(&[&own, &args[0]]),
+            K::Utf8Chunks => own.clone(),
+            K::Utf8Chunk => return None,
             K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => args[0].clone(),
             K::Map | K::FilterMap => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
@@ -4918,7 +4957,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
+            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk => false,
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
                 vars.get(..n0).is_some_and(|v| self.iter_items(a0, v, out))
             }
@@ -5030,6 +5069,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::ArrayIntoIter
             | K::RepeatN
             | K::Windows
+            | K::Chunks
+            | K::ChunksMut
+            | K::ChunksExact
+            | K::ChunksExactMut
+            | K::Utf8Chunks
             | K::CharIndices
             | K::Flatten
             | K::OptionIntoIter
@@ -6670,6 +6714,14 @@ fn opaque_static_ret(p: &Program, ret: Ty) -> bool {
 /// pointer that borrows its base (see `Builder::local_slots`).
 fn fat_local(tys: &impl TyIntern, t: Ty) -> bool {
     matches!(tys.kind(t), TyKind::Slice(_) | TyKind::Str)
+}
+
+/// The builtins whose result borrows the receiver type's own
+/// region (its `'a`), not the `&self` loan (see
+/// `Builder::call_own_region`).
+fn own_region_builtin(b: crate::check::Builtin) -> bool {
+    use crate::check::Builtin as B;
+    matches!(b, B::IterRemainder | B::Utf8ChunkValid | B::Utf8ChunkInvalid)
 }
 
 /// The builtins that borrow into their receiver (or move elements out of

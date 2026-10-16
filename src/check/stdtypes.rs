@@ -54,6 +54,12 @@ pub fn iter_by_path(path: &[&str]) -> Option<StdIterPath> {
         ["std" | "core", "slice", "Iter"] => S::Kind(K::SliceIter),
         ["std" | "core", "slice", "IterMut"] => S::Kind(K::SliceIterMut),
         ["std" | "core", "slice", "Windows"] => S::Kind(K::Windows),
+        ["std" | "core", "slice", "Chunks"] => S::Kind(K::Chunks),
+        ["std" | "core", "slice", "ChunksMut"] => S::Kind(K::ChunksMut),
+        ["std" | "core", "slice", "ChunksExact"] => S::Kind(K::ChunksExact),
+        ["std" | "core", "slice", "ChunksExactMut"] => S::Kind(K::ChunksExactMut),
+        ["std" | "core", "str", "Utf8Chunks"] => S::Kind(K::Utf8Chunks),
+        ["std" | "core", "str", "Utf8Chunk"] => S::Kind(K::Utf8Chunk),
         ["std" | "alloc", "vec", "IntoIter"] => S::Kind(K::VecIntoIter),
         ["std" | "alloc", "vec", "Drain"] => S::Kind(K::VecDrain),
         ["std" | "alloc", "string", "Drain"] => S::Kind(K::StringDrain),
@@ -116,6 +122,12 @@ fn has_lifetime(k: IterKind) -> bool {
             | K::RecvIter
             | K::RecvTryIter
             | K::Windows
+            | K::Chunks
+            | K::ChunksMut
+            | K::ChunksExact
+            | K::ChunksExactMut
+            | K::Utf8Chunks
+            | K::Utf8Chunk
             | K::CharIndices
             | K::VecDrain
             | K::StringDrain
@@ -372,6 +384,8 @@ pub fn resolve_iter_path(
                         None => return Err(unsupported("over an iterator whose items are not shared references")),
                     }
                 }
+                // The one lust arg is the fixed `u8` element marker.
+                K::Utf8Chunks | K::Utf8Chunk => extra.push(int(IntTy::U8)),
                 // The second lust arg is the inner items' iterator.
                 K::Flatten => {
                     let u = item_ty(tys, erased_args[0]).and_then(|it| crate::ty::iter::as_iter_ty(tys, it));

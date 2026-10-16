@@ -68,6 +68,22 @@ impl<'p> Ctx<'p> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn utf8_method(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name: Sym, span: Span, args: &[ExprId]) -> Option<Ty> {
         use Builtin as B;
+        // `Utf8Chunk::valid` and `invalid` (tf-slice): the two
+        // fields of the chunk an `utf8_chunks` step yields.
+        if let Some((crate::ty::iter::IterKind::Utf8Chunk, _)) = crate::ty::iter::iter_parts(&self.tys, base) {
+            let (b, ret) = match self.name(name) {
+                "valid" => (B::Utf8ChunkValid, REF_STR),
+                "invalid" => {
+                    let sl = self.tys.intern(TyKind::Slice(int(IntTy::U8)));
+                    (B::Utf8ChunkInvalid, self.tys.mk_ref(false, sl))
+                }
+                _ => return None,
+            };
+            self.check_packed_borrow(recv, span);
+            self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+            self.check_args(&[], args, span);
+            return Some(ret);
+        }
         let def = self.tys.adt_parts(base).map(|(d, _)| d)?;
         let n = self.name(name).to_string();
         let (b, autoref, ret) = if n == "to_string" && (def == generics::from_utf8_error_def() || def == generics::utf8_error_def()) {

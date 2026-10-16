@@ -453,6 +453,22 @@ pub enum Builtin {
     /// `slice::windows(size)` (W-STD-B): a `Windows` iterator; panics on
     /// a zero size as std does.
     IterWindows,
+    /// `slice::chunks`, `chunks_mut`, `chunks_exact`, and
+    /// `chunks_exact_mut` (tf-slice): the dest kind tells which;
+    /// panics on a zero size as std does.
+    IterChunks,
+    /// `slice::utf8_chunks` on `[u8]` (tf-slice): a `Utf8Chunks`
+    /// iterator over the source bytes.
+    IterUtf8Chunks,
+    /// One step of `Utf8Chunks` (tf-slice): the next chunk from
+    /// the bytes left, by the runtime's UTF-8 scan.
+    Utf8ChunksNext,
+    /// `ChunksExact::remainder`, `ChunksExactMut::remainder` and
+    /// `remainder_mut`, and `into_remainder` (tf-slice): field 1.
+    IterRemainder,
+    /// `Utf8Chunk::valid` and `invalid` (tf-slice): fields 0 and 1.
+    Utf8ChunkValid,
+    Utf8ChunkInvalid,
     /// `DoubleEndedIterator::next_back` (W-STD-B).
     IterNextBack,
     /// `Iterator::size_hint` (W-STD-B).

@@ -5037,6 +5037,9 @@ impl FnGen<'_, '_> {
             | B::IterPosition
             | B::IterRposition
             | B::IterWindows
+            | B::IterChunks
+            | B::IterUtf8Chunks
+            | B::IterRemainder
             | B::IterFlatten
             | B::IterFlatMap
             | B::HashFromArray
@@ -5572,6 +5575,28 @@ impl FnGen<'_, '_> {
                 t
             }
             B::CharsCount => format!("lust_chars_count({})", vals[0]),
+            // `Utf8Chunks::next` (tf-slice): the iterator is a
+            // one-field tuple of the bytes left; a chunk is the
+            // (valid, invalid) pair the runtime scan splits off.
+            B::Utf8ChunksNext => {
+                let it = &vals[0];
+                let chunk = CTy::Tuple(vec![CTy::Ref(Box::new(CTy::Str)), CTy::Slice(Box::new(CTy::Int(IntTy::U8)))]);
+                let opt = CTy::Option(Box::new(chunk.clone()));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, vl, us) = (self.tmp(), self.tmp(), self.tmp());
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(
+                    self.out,
+                    "    if ({it}->f0.len > 0) {{ uint64_t {vl} = 0, {us} = 0;\n      lust_utf8_chunk_step({it}->f0.ptr, {it}->f0.len, &{vl}, &{us});\n      {field}.f0 = (lust_str){{ {it}->f0.ptr, {vl} }};\n      {field}.f1 = ({}){{ {it}->f0.ptr + {vl}, {us} - {vl} }};{some}\n      {it}->f0.ptr += {us}; {it}->f0.len -= {us}; }}",
+                    ctype(&CTy::Slice(Box::new(CTy::Int(IntTy::U8))))
+                );
+                t
+            }
+            B::Utf8ChunkValid => format!("(*{}).f0", vals[0]),
+            B::Utf8ChunkInvalid => format!("(*{}).f1", vals[0]),
             B::CharIsDigit => format!("(*{0} >= '0' && *{0} <= '9')", vals[0]),
             B::CharIsAlphabetic => format!("((*{0} | 32) >= 'a' && (*{0} | 32) <= 'z')", vals[0]),
             B::CharIsAlphanumeric => format!("((*{0} >= '0' && *{0} <= '9') || ((*{0} | 32) >= 'a' && (*{0} | 32) <= 'z'))", vals[0]),
