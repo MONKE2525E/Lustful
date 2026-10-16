@@ -8497,8 +8497,9 @@ impl<'p> Ctx<'p> {
                     };
                     if !matches!(
                         p.adt(a).repr.kind,
-                        crate::ty::layout::ReprKind::C | crate::ty::layout::ReprKind::Packed | crate::ty::layout::ReprKind::Transparent
-                    ) {
+                        crate::ty::layout::ReprKind::C | crate::ty::layout::ReprKind::Transparent
+                    ) && p.adt(a).repr.pack.is_none()
+                    {
                         self.err(
                             "L0650",
                             span,
@@ -9105,8 +9106,8 @@ impl<'p> Ctx<'p> {
     /// A reference to a packed field could be unaligned (ARCH 4.4): any borrow
     /// of a field place whose base is a packed Adt, explicit or implicit
     /// (method autoref, format arguments), is an error at the borrow, unless
-    /// the field type has alignment 1, when every address is aligned for it
-    /// and Rust allows the reference.
+    /// the field type's alignment is at or under the pack bound, when the
+    /// field is always aligned for it and Rust allows the reference.
     fn check_packed_borrow(&mut self, place_e: ExprId, span: Span) {
         let base = match self.p.ast.expr(place_e) {
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => *base,
@@ -9115,10 +9116,13 @@ impl<'p> Ctx<'p> {
         let bt = self.out.expr_ty[self.ei(base)];
         let (_, inner) = self.autoderef(bt);
         if let Some(a) = self.tys.local_adt(inner)
-            && self.p.adt(a).repr.kind == crate::ty::layout::ReprKind::Packed
+            && let Some(pack) = self.p.adt(a).repr.pack
         {
+            // rustc E0793: a reference to a field whose alignment the
+            // pack bound caps may be unaligned; at or under the bound
+            // the field is aligned and the reference is allowed.
             let ft = self.deep(self.out.expr_ty[self.ei(place_e)]);
-            if crate::ty::layout::layout_of_ty(&self.tys, self.p, ft).is_ok_and(|l| l.align <= 1) {
+            if crate::ty::layout::layout_of_ty(&self.tys, self.p, ft).is_ok_and(|l| l.align <= pack) {
                 return;
             }
             self.err("L0651", span, "reference to a packed field is not allowed", "Copy the field value into a local first.");

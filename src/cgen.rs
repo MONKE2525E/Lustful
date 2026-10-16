@@ -8380,9 +8380,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 let adt = p.adt(*a);
                 let an = a.0;
                 let _ = writeln!(out, "/* {} */", p.display_path(adt.name));
-                let packed = adt.repr.kind == ReprKind::Packed;
-                if packed {
-                    out.push_str("#pragma pack(push, 1)\n");
+                let packed = adt.repr.pack;
+                if let Some(n) = packed {
+                    let _ = writeln!(out, "#pragma pack(push, {n})");
                 }
                 let layout = c_layout(p, t);
                 if adt.is_enum {
@@ -8443,7 +8443,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                         }
                     }
                 }
-                if packed {
+                if packed.is_some() {
                     out.push_str("#pragma pack(pop)\n");
                 }
             }

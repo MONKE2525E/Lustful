@@ -878,7 +878,7 @@ impl<'p> Ctx<'p> {
             // `restrict_repr_packed_field_ref_capture`).
             let packed = pl.projs.iter().position(|(pr, before)| {
                 matches!(pr, CProj::Field(_))
-                    && self.tys.local_adt(self.resolve(*before)).is_some_and(|a| self.p.adt(a).repr.kind == crate::ty::layout::ReprKind::Packed)
+                    && self.tys.local_adt(self.resolve(*before)).is_some_and(|a| self.p.adt(a).repr.pack.is_some())
             });
             if let Some(i) = packed {
                 truncate_place(&mut pl, &mut mode, i, &self.tys);

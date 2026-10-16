@@ -2742,11 +2742,12 @@ fn truncate_to_int(v: i128, it: IntTy) -> i128 {
 
 /// Parses the `repr` attributes of an item into layout terms. Unknown or
 /// unsupported forms are errors: this is where the 4.4 grammar cut lands
-/// for `repr(simd)` and `repr(packed(N))` with N other than 1. Conflicting
-/// hints are rustc's errors, not a cut: more than one integer hint, `Rust`
-/// with `C` or an integer, and `transparent` with any other hint all
-/// reject. `packed` combines with `C` or `Rust` (and wins the kind, in
-/// either order); several `align` hints take the largest.
+/// for `repr(simd)`. Conflicting hints are rustc's errors, not a cut:
+/// more than one integer hint, `Rust` with `C` or an integer, a second
+/// `packed` hint, and `transparent` with any other hint all reject.
+/// `packed(N)` combines with `C` or `Rust` in either order and caps
+/// field alignments at N (a power of two up to 2^29, as in rustc);
+/// several `align` hints take the largest.
 fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::layout::Repr, Diag> {
     use crate::ast::AttrInput;
     use crate::lexer::{Tok, TokenTree};
@@ -2789,13 +2790,28 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                         "Rust" => seen_rust = true,
                         "transparent" => seen_transparent = true,
                         "packed" => {
+                            if seen_packed {
+                                return Err(conflict("type has conflicting packed representation hints"));
+                            }
                             seen_packed = true;
+                            repr.pack = Some(1);
                             if let Some(TokenTree::Delim(_, inner, _)) = trees.get(i + 1) {
-                                let ok = matches!(inner.as_slice(), [TokenTree::Token(t2)] if matches!(t2.tok, Tok::Int(1, None, _)));
-                                if !ok {
-                                    return Err(bad("packed(N)"));
+                                let invalid = Diag::new(
+                                    "L0110",
+                                    attr.span,
+                                    "invalid alignment value in `repr(packed(N))`",
+                                    "Use a power of two up to 2^29, such as `packed(2)` or `packed(4)`.",
+                                );
+                                match inner.as_slice() {
+                                    [TokenTree::Token(t2)] => match t2.tok {
+                                        Tok::Int(n, None, _) if n > 0 && n <= (1 << 29) && n.is_power_of_two() => {
+                                            repr.pack = Some(n as u64);
+                                            i += 1;
+                                        }
+                                        _ => return Err(invalid),
+                                    },
+                                    _ => return Err(invalid),
                                 }
-                                i += 1;
                             }
                         }
                         "align" => match trees.get(i + 1) {
@@ -2850,9 +2866,7 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
             "Remove one of the conflicting hints.",
         ));
     }
-    repr.kind = if seen_packed {
-        ReprKind::Packed
-    } else if seen_transparent {
+    repr.kind = if seen_transparent {
         ReprKind::Transparent
     } else if seen_c {
         ReprKind::C
@@ -4062,15 +4076,15 @@ pub fn collect_reuse(
                     "Use `repr(C)` or the integer repr alone; fieldless enums have no payload for `repr(C)` to order.",
                 ));
             }
-            if adt.repr.kind == ReprKind::Packed && adt.repr.align.is_some() {
+            if adt.repr.pack.is_some() && adt.repr.align.is_some() {
                 errs.push(Diag::new(
                     "L0110",
                     adt.span,
                     "`#[repr(packed)]` and `#[repr(align(...))]` conflict",
-                    "Remove one of them: a packed type has alignment 1.",
+                    "Remove one of them: packed caps alignment, align raises it.",
                 ));
             }
-            if adt.is_enum && adt.repr.kind == ReprKind::Packed {
+            if adt.is_enum && adt.repr.pack.is_some() {
                 errs.push(Diag::new(
                     "L0110",
                     adt.span,

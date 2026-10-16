@@ -785,10 +785,10 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(
         crate::ty::layout::ReprKind::Default => 0u8.hash(h),
         crate::ty::layout::ReprKind::C => 1u8.hash(h),
         crate::ty::layout::ReprKind::Transparent => 2u8.hash(h),
-        crate::ty::layout::ReprKind::Packed => 3u8.hash(h),
     }
     adt.repr.int.hash(h);
     adt.repr.align.hash(h);
+    adt.repr.pack.hash(h);
     let d = adt.derives;
     (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(h);
     // `#[non_exhaustive]` changes match exhaustiveness answers over

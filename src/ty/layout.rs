@@ -60,8 +60,10 @@ impl Layout {
     }
 }
 
-/// The `repr` of an Adt, in layout terms. `packed` means `repr(packed)` or
-/// `repr(packed(1))`; any other packed bound is outside the grammar.
+/// The `repr` of an Adt, in layout terms. The kind is the base
+/// layout (Rust, C, or transparent); `pack` is the `repr(packed(N))`
+/// bound (`repr(packed)` is N = 1), which caps every field's
+/// alignment at N under either base layout.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Repr {
     pub kind: ReprKind,
@@ -69,6 +71,8 @@ pub struct Repr {
     pub int: Option<(u32, bool)>,
     /// `repr(align(n))`.
     pub align: Option<u64>,
+    /// `repr(packed)` or `repr(packed(N))`: the alignment bound.
+    pub pack: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,7 +81,6 @@ pub enum ReprKind {
     Default,
     C,
     Transparent,
-    Packed,
 }
 
 impl Repr {
@@ -218,7 +221,13 @@ enum UnivKind {
 /// alignment derived from the field's align and size, so a `[u8; 4]`
 /// groups with align-4 fields and a `[u8; 6]` with align-2 fields. The
 /// niche bias caps or drops the size part for niche-carrying fields.
-fn alignment_group_key(f: &Layout, max_field_align: u64, largest_niche_free: u128, bias: NicheBias) -> u64 {
+fn alignment_group_key(f: &Layout, max_field_align: u64, largest_niche_free: u128, bias: NicheBias, packed: bool) -> u64 {
+    // Under `repr(packed(N))` the group is the capped alignment
+    // alone: the size part does not count, so `packed(1)` keeps
+    // declaration order and a large low-align field does not lead.
+    if packed {
+        return f.align.trailing_zeros() as u64;
+    }
     let niche_free = f.niche.map_or(0, |n| n.free);
     let mut key = f.align.max(f.size).trailing_zeros();
     if largest_niche_free > 0 {
@@ -252,7 +261,7 @@ fn univariant_biased(fields: &[Layout], repr: Repr, kind: UnivKind, bias: NicheB
                 NicheBias::Start => f.niche.map_or(0, |n| n.offset),
                 NicheBias::End => f.niche.map_or(0, |n| !(f.size - n.scalar_size - n.offset)),
             };
-            (std::cmp::Reverse(alignment_group_key(f, max_field_align, largest_niche_free, bias)), niche_key, inner_key)
+            (std::cmp::Reverse(alignment_group_key(f, max_field_align, largest_niche_free, bias, repr.pack.is_some())), niche_key, inner_key)
         });
     }
     let (end_off, offsets) = place_in_order(fields, &order);
@@ -309,6 +318,24 @@ pub fn tuple_layout(fields: &[Layout]) -> Result<Layout, ()> {
 /// The layout of a struct (or one enum variant's fields) with the given
 /// field layouts and repr. Tuple types use `tuple_layout` instead.
 pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
+    // `repr(packed(N))`: every field's effective alignment is capped
+    // at N, then the base layout (C order or Rust reorder) runs as
+    // usual. At N = 1 that is declaration order with no padding.
+    let capped: Vec<Layout>;
+    let fields = match repr.pack {
+        Some(n) => {
+            capped = fields
+                .iter()
+                .map(|f| {
+                    let mut f = f.clone();
+                    f.align = f.align.min(n);
+                    f
+                })
+                .collect();
+            &capped[..]
+        }
+        None => fields,
+    };
     match repr.kind {
         ReprKind::Transparent => {
             let mut out = zst_layout(fields.iter().map(|f| f.align).max().unwrap_or(1));
@@ -319,20 +346,6 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
                 }
             }
             out.field_offsets = vec![0; fields.len()];
-            out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
-            return finish(out, repr);
-        }
-        ReprKind::Packed => {
-            let mut offsets = Vec::with_capacity(fields.len());
-            let mut cur = 0u64;
-            for f in fields {
-                offsets.push(cur);
-                cur += f.size;
-            }
-            let order: Vec<usize> = (0..fields.len()).collect();
-            let niche = best_niche(fields, &offsets, &order);
-            let mut out = Layout::simple(cur, 1, niche);
-            out.field_offsets = offsets;
             out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
             return finish(out, repr);
         }
@@ -550,8 +563,9 @@ fn tagged_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> R
         l.enum_tag = Some(EnumTag::Explicit { size: tag_w, signed });
         return finish(l, repr);
     }
-    if repr.kind == ReprKind::Packed {
+    if repr.pack.is_some() {
         // Tag first, then fields in declaration order, no padding anywhere.
+        // (Packed enums reject in collect; this stays for shape queries.)
         let mut size = 0u64;
         let mut variant_offsets = Vec::new();
         for v in variants {
@@ -666,7 +680,7 @@ fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Op
     if variants.len() < 2 {
         return None;
     }
-    let vrepr = Repr { kind: ReprKind::Default, int: None, align: repr.align };
+    let vrepr = Repr { kind: ReprKind::Default, int: None, align: repr.align, pack: None };
     let mut layouts: Vec<Layout> = Vec::with_capacity(variants.len());
     for v in variants {
         layouts.push(univariant_layout(v, vrepr, UnivKind::AlwaysSized).ok()?);
@@ -988,8 +1002,19 @@ mod tests {
         assert_eq!(sz(&c), (24, 8));
         assert_eq!(c.field_offsets, vec![0, 8, 16]);
         // repr(packed): no padding, align 1.
-        let p = struct_layout(&ints(&[IntTy::U8, IntTy::U64, IntTy::U8]), Repr { kind: ReprKind::Packed, ..Repr::default() }).unwrap();
+        let p = struct_layout(&ints(&[IntTy::U8, IntTy::U64, IntTy::U8]), Repr { pack: Some(1), ..Repr::default() }).unwrap();
         assert_eq!(sz(&p), (10, 1));
+        assert_eq!(p.field_offsets, vec![0, 1, 9]);
+        // repr(packed(4)): Rust reorder by capped alignment alone:
+        // the u64 (capped to 4) leads, size rounds to the align.
+        let p = struct_layout(&ints(&[IntTy::U8, IntTy::U64, IntTy::U8]), Repr { pack: Some(4), ..Repr::default() }).unwrap();
+        assert_eq!(sz(&p), (12, 4));
+        assert_eq!(p.field_offsets, vec![8, 0, 9]);
+        // repr(C, packed(4)): declaration order, capped alignments.
+        let p =
+            struct_layout(&ints(&[IntTy::U8, IntTy::U64, IntTy::U8]), Repr { kind: ReprKind::C, pack: Some(4), ..Repr::default() }).unwrap();
+        assert_eq!(sz(&p), (16, 4));
+        assert_eq!(p.field_offsets, vec![0, 4, 12]);
     }
 
     #[test]

@@ -1705,8 +1705,9 @@ impl Evaluator {
                     };
                     if !matches!(
                         cx.adt_repr(adt).kind,
-                        super::layout::ReprKind::C | super::layout::ReprKind::Packed | super::layout::ReprKind::Transparent
-                    ) {
+                        super::layout::ReprKind::C | super::layout::ReprKind::Transparent
+                    ) && cx.adt_repr(adt).pack.is_none()
+                    {
                         return Err(Diag::new(
                             "L0650",
                             span,
