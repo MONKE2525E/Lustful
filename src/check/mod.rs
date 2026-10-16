@@ -3985,6 +3985,75 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True when `t` is an item that coerces to a fn pointer: a plain
+    /// fn item (not a primitive builtin method) or a constructor.
+    fn reifies(&self, t: Ty) -> bool {
+        (self.is_fn_item(t) && !self.is_prim_item(t)) || self.is_ctor_item(t) || self.is_int_prim_item(t)
+    }
+
+    /// True when `t` is a primitive builtin method item of an integer
+    /// type (`u32::isqrt`, `i32::pow`): codegen writes its fn
+    /// (`Rvalue::ItemShim`), whose panics report core's `int_impl!`
+    /// line as rustc's fn pointer does. Other primitives' items have
+    /// no known def site yet.
+    fn is_int_prim_item(&self, t: Ty) -> bool {
+        let TyKind::FnDef(def, args) = self.kind(t) else { return false };
+        def == crate::ty::prim_fn_def() && matches!(self.tys.args(args).first().map(|g| g.as_ty().map(|x| self.kind(x))), Some(Some(TyKind::Int(_))))
+    }
+
+    /// True when `t` is a tuple struct or tuple variant constructor
+    /// item: a user Adt's (`ctor_value_ty`), or `Some`, `Ok`, `Err`
+    /// (`builtin_item_value`).
+    fn is_ctor_item(&self, t: Ty) -> bool {
+        let TyKind::FnDef(def, args) = self.kind(t) else { return false };
+        let b = self.tys.builtins();
+        let variant_first = matches!(self.tys.args(args).first(), Some(GenericArg::Const(_)));
+        self.p.adt_by_def(def).is_some() || ((def == b.option || def == b.result) && variant_first)
+    }
+
+    /// True in the check of a generic fn's instance. The fn pointer
+    /// region rules of `coerce_at` hold for the template's written types
+    /// (its check ran them); an instance's type args may hold references
+    /// (`T = &i32`) that are no binder of the pointer type.
+    fn is_instance_check(&self) -> bool {
+        self.p.gx.fn_class.get(self.fid.0 as usize) == Some(&generics::FnClass::Instance)
+    }
+
+    /// True when fn pointer type `t` names a region anywhere: a
+    /// reference, a lifetime argument, a `dyn` type, or a nested fn
+    /// pointer (or a type whose regions are not known yet).
+    fn fn_ptr_has_region(&self, t: Ty) -> bool {
+        let mut stack = vec![t];
+        let mut first = true;
+        while let Some(t) = stack.pop() {
+            let t = self.resolve(t);
+            match self.kind(t) {
+                TyKind::FnPtr(s) if first => {
+                    let s = self.tys.sig(s).value;
+                    stack.extend(self.tys.tys_of(s.inputs).iter().copied());
+                    stack.push(s.output);
+                }
+                TyKind::Ref(..) | TyKind::Dyn(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Closure(..) => return true,
+                TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Error => return true,
+                TyKind::Adt(d, _) if self.p.gx.adt_lifetimes.get(&d).is_some_and(|v| !v.is_empty()) => return true,
+                TyKind::Adt(_, args) => {
+                    for &g in self.tys.args(args) {
+                        match g {
+                            GenericArg::Ty(x) => stack.push(x),
+                            GenericArg::Lifetime(_) => return true,
+                            GenericArg::Const(_) => {}
+                        }
+                    }
+                }
+                TyKind::RawPtr(_, x) | TyKind::Slice(x) | TyKind::Array(x, _) => stack.push(x),
+                TyKind::Tuple(ts) => stack.extend(self.tys.tys_of(ts).iter().copied()),
+                _ => {}
+            }
+            first = false;
+        }
+        false
+    }
+
     /// True when `t` is a primitive builtin method item (TRIAGE
     /// T12): it has no body fn, so it cannot reify to a function
     /// pointer (like `Box::new` today); calls through it decode
@@ -6088,6 +6157,45 @@ impl<'p> Ctx<'p> {
                     None => Coerce::None,
                 }
             }
+            // A tuple struct or variant constructor (`JsxEmit`, `Some`,
+            // `Ok`) coerces to a fn pointer with its signature: codegen
+            // writes a small C fn that builds the value (`Rvalue::ItemShim`).
+            // Only for a pointer type with no lifetime in it: such a
+            // constructor has no region signature for borrowck to prove.
+            (TyKind::FnDef(..), TyKind::FnPtr(_)) if e.is_some() && self.is_ctor_item(found) && self.fn_item_ptr_unifies(found, expected) => {
+                if !self.is_instance_check() && self.fn_ptr_has_region(expected) {
+                    self.err(
+                        "L0203",
+                        span,
+                        "this constructor cannot become a fn pointer type with references or lifetimes yet",
+                        "Wrap it in a closure, such as `|x| Ctor(x)`.",
+                    );
+                }
+                Coerce::ReifyFn(expected)
+            }
+            // A primitive builtin method of an integer type (`u32::isqrt`):
+            // codegen writes its fn too. Its lifetimes are all late-bound
+            // and elided, so any input lifetimes are fine, but an output
+            // lifetime needs the elision proof lust does not have yet.
+            (TyKind::FnDef(..), TyKind::FnPtr(_)) if e.is_some() && self.is_int_prim_item(found) && self.fn_item_ptr_unifies(found, expected) => {
+                let out_region = match self.kind(expected) {
+                    TyKind::FnPtr(s) => {
+                        let o = self.tys.sig(s).value.output;
+                        let fp = self.fn_ptr_ty(&[], o);
+                        self.fn_ptr_has_region(fp)
+                    }
+                    _ => false,
+                };
+                if out_region && !self.is_instance_check() {
+                    self.err(
+                        "L0203",
+                        span,
+                        "this builtin method cannot become a fn pointer type whose return type has a lifetime yet",
+                        "Wrap it in a closure.",
+                    );
+                }
+                Coerce::ReifyFn(expected)
+            }
             // A closure value that captures nothing coerces to a fn
             // pointer with its signature: lowering reads the zero-sized
             // value, then takes its body fn's trampoline.
@@ -6417,7 +6525,7 @@ impl<'p> Ctx<'p> {
     /// True when the fn item to fn pointer coercion takes `f` to `e`.
     /// Pure: no unification (the same test `coerce_at` applies).
     fn fn_coercible(&mut self, f: Ty, e: Ty) -> bool {
-        if !matches!(self.kind(e), TyKind::FnPtr(_)) || !self.is_fn_item(f) {
+        if !matches!(self.kind(e), TyKind::FnPtr(_)) || !self.reifies(f) {
             return false;
         }
         // Part by part, as `unify` compares fn pointers: a written
@@ -8623,7 +8731,7 @@ impl<'p> Ctx<'p> {
                 // `i32` and the cast then fails). The real check
                 // is deferred to `finish`.
                 let fn_cast = match (self.kind(t), self.kind(target)) {
-                    (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.is_fn_item(t) && !self.is_prim_item(t) => {
+                    (TyKind::FnDef(..), TyKind::FnPtr(_)) if self.reifies(t) => {
                         if self.has_unbound_deep(target) {
                             let snap = self.snapshot_vars();
                             let ok = self.fn_item_ptr_unifies(t, target) && self.coerce_at(t, target, span, Some(*expr));
@@ -9615,7 +9723,7 @@ impl<'p> Ctx<'p> {
                 // Fn items join as a fn pointer only when they
                 // differ (`[a, b]`); `[a, a]` keeps the item type,
                 // which is zero-sized (rustc's LUB coercion).
-                if elems.len() > 1 && self.is_fn_item(elt) {
+                if elems.len() > 1 && self.reifies(elt) {
                     let rest: Vec<Ty> = elems[1..].iter().map(|&el_e| self.expr(el_e, None)).collect();
                     for (&el_e, &t) in elems[1..].iter().zip(&rest) {
                         if self.coerces_to_hint(el_e) && self.kind(self.resolve(t)) != TyKind::Never && !self.same_fn_item(elt, t) {
@@ -9631,7 +9739,14 @@ impl<'p> Ctx<'p> {
                         return ERROR;
                     };
                     let fp = self.fn_ptr_ty(&params, ret);
-                    self.set(first, fp);
+                    // A fn path takes the pointer type (lowering then
+                    // makes its trampoline); a constructor or builtin
+                    // method item coerces.
+                    if self.is_ctor_item(elt) || self.is_int_prim_item(elt) {
+                        self.coerce_expr(first, elt, fp);
+                    } else {
+                        self.set(first, fp);
+                    }
                     for (&el_e, &t) in elems[1..].iter().zip(&rest) {
                         self.coerce_expr(el_e, t, fp);
                     }
@@ -9799,7 +9914,7 @@ impl<'p> Ctx<'p> {
         }
         // Two plain fn items (or an item and a pointer) with one
         // signature join as a function pointer.
-        if self.is_fn_item(a) || self.is_fn_item(b) || matches!(self.kind(a), TyKind::FnPtr(_)) {
+        if self.reifies(a) || self.reifies(b) || matches!(self.kind(a), TyKind::FnPtr(_)) {
             if let (Some(sa), Some(sb)) = (self.callable_sig(a), self.callable_sig(b))
                 && sa == sb
             {

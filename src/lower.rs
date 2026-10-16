@@ -380,7 +380,7 @@ impl<'p> Lower<'p> {
                     Rvalue::Use(o) | Rvalue::Opt(_, Some(o)) | Rvalue::Res(_, _, o) => op_indexed(o),
                     Rvalue::Ref(_, pl) | Rvalue::Discriminant(pl) | Rvalue::SliceOf(pl) | Rvalue::LenOf(pl) => indexed(pl),
                     Rvalue::Aggregate(_, _, os) | Rvalue::TupleAgg(_, os) | Rvalue::ArrayAgg(_, os) => os.iter().any(op_indexed),
-                    Rvalue::Opt(_, None) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) => false,
+                    Rvalue::Opt(_, None) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) | Rvalue::ItemShim(..) => false,
                     Rvalue::MakeDyn { ptr, .. } | Rvalue::DynUpcast { ptr, .. } | Rvalue::DynMeta { ptr, .. } | Rvalue::DynData { ptr, .. } => {
                         op_indexed(ptr)
                     }
@@ -1281,6 +1281,13 @@ impl<'p> Lower<'p> {
         }
     }
 
+    /// The fn pointer type of `dest`, when it is a whole local of one.
+    fn fn_ptr_dest(&self, dest: Option<&Place>) -> Option<Ty> {
+        let d = dest.filter(|d| d.proj.is_empty())?;
+        let dt = self.body.locals[d.local as usize].ty;
+        matches!(self.kind(dt), TyKind::FnPtr(_)).then_some(dt)
+    }
+
     /// Lowers a fn item value, or a closure value that captures
     /// nothing, to the fn pointer `target`: the zero-sized operand is
     /// read (for its side effects), then the slot trampoline of the
@@ -1296,6 +1303,14 @@ impl<'p> Lower<'p> {
             return Operand::Copy(Place::local(t));
         }
         let TyKind::FnDef(def, args) = self.kind(found) else { unreachable!("ReifyFn on a non fn item type") };
+        // A constructor or primitive builtin method has no fn: codegen
+        // writes one (`ItemShim`).
+        let b = self.body.tys.builtins();
+        if self.p.adt_by_def(def).is_some() || def == b.option || def == b.result || def == crate::ty::prim_fn_def() {
+            let t = self.temp(target);
+            self.assign(Place::local(t), Rvalue::ItemShim(found, target), span);
+            return Operand::Copy(Place::local(t));
+        }
         let f = self.p.local_def(def.hash).expect("ReifyFn names a local fn");
         let args = self.body.tys.args(args).to_vec();
         let f = if args.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &args).unwrap_or(f) };
@@ -1646,6 +1661,14 @@ impl<'p> Lower<'p> {
                         let op = if self.view_moved(e) { Operand::Move(pl) } else { self.operand_from(pl, ty) };
                         self.assign(d.clone(), Rvalue::Use(op), span);
                     }
+                }
+                // A constructor (or primitive builtin method) written straight into a fn pointer place
+                // (the first arm of a `match` whose arms join as a fn
+                // pointer): its codegen fn, as for the reify coercion.
+                Res::Variant(..) | Res::OptSome | Res::ResOk | Res::ResErr | Res::PrimAssoc { .. }
+                    if matches!(self.kind(ty), TyKind::FnDef(..)) && let Some(dt) = self.fn_ptr_dest(dest) =>
+                {
+                    self.set_or_temp(dest, Rvalue::ItemShim(ty, dt), ty, span)
                 }
                 Res::Variant(a, v) => {
                     if matches!(self.kind(ty), TyKind::FnDef(..)) {

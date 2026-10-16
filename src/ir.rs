@@ -149,6 +149,13 @@ pub enum Rvalue {
     /// then yields the slot trampoline address). Proposed by W-CGEN
     /// for W-CORELANG's fn-pointer lowering.
     FnValue(LocalDefId, Ty),
+    /// A constructor item (its `FnDef` type, `.0`: a tuple struct or
+    /// variant, `Some`, `Ok`, `Err`) or an integer type's primitive
+    /// builtin method item (`u32::isqrt`) coerced to fn pointer type
+    /// `.1`. Codegen writes a small static C fn that builds the value
+    /// or calls the builtin on its args (one per body and item), and
+    /// the value is its address.
+    ItemShim(Ty, Ty),
     /// A dyn reference from a thin one (ARCH 2.8): `ptr` is `&T` or
     /// `&mut T`, `src` is `T`, and `dyn_ty` the target dyn type. The
     /// result pairs the data pointer with the vtable of (`src`, the dyn

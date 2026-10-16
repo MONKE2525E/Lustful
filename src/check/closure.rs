@@ -2285,7 +2285,7 @@ impl<'p> Ctx<'p> {
             match cx.kind(t) {
                 TyKind::Closure(_, caps) if cx.tys.args(caps).is_empty() => cx.closure_facts(t).map(|(_, i, o)| (i, o)),
                 TyKind::FnPtr(_) => cx.callable_sig(t),
-                TyKind::FnDef(..) if cx.is_fn_item(t) => cx.callable_sig(t),
+                TyKind::FnDef(..) if cx.reifies(t) => cx.callable_sig(t),
                 _ => None,
             }
         };

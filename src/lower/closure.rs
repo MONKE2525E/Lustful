@@ -406,6 +406,6 @@ fn rewrite_rvalue(up: &Upvars, rv: &mut Rvalue) -> bool {
         Rvalue::Subslice { base, lo, hi, .. } => {
             rewrite_place(up, base, false) & rewrite_operand(up, lo) & hi.as_mut().is_none_or(|h| rewrite_operand(up, h))
         }
-        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) => true,
+        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) | Rvalue::ItemShim(..) => true,
     }
 }

@@ -264,6 +264,11 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
             hash_def(h, p, p.def_id(*f));
             ty(h, *t, seen);
         }
+        Rvalue::ItemShim(item, t) => {
+            50u8.hash(h);
+            ty(h, *item, seen);
+            ty(h, *t, seen);
+        }
         Rvalue::MakeDyn { ptr, src, dyn_ty } => {
             23u8.hash(h);
             hash_operand(h, p, tys, ptr, seen);
@@ -610,6 +615,7 @@ enum CachedRvalue {
     StaticLoad(DefId),
     StaticRef(DefId),
     FnValue(DiskDefId, u32),
+    ItemShim(u32, u32),
     MakeDyn(CachedOperand, u32, u32),
     DynUpcast(CachedOperand, Vec<u32>),
     DynMeta(CachedOperand, u32),
@@ -938,6 +944,7 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::StaticLoad(i) => CachedRvalue::StaticLoad(p.static_defs[*i as usize]),
         Rvalue::StaticRef(i) => CachedRvalue::StaticRef(p.static_defs[*i as usize]),
         Rvalue::FnValue(f, t) => CachedRvalue::FnValue(p.disk_id(*f), b.ty(*t)),
+        Rvalue::ItemShim(item, t) => CachedRvalue::ItemShim(b.ty(*item), b.ty(*t)),
         Rvalue::MakeDyn { ptr, src, dyn_ty } => CachedRvalue::MakeDyn(cache_operand(b, p, ptr), b.ty(*src), b.ty(*dyn_ty)),
         Rvalue::DynUpcast { ptr, path } => CachedRvalue::DynUpcast(cache_operand(b, p, ptr), path.clone()),
         Rvalue::DynMeta { ptr, word } => CachedRvalue::DynMeta(cache_operand(b, p, ptr), *word),
@@ -1128,6 +1135,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             CachedRvalue::StaticLoad(def) => Rvalue::StaticLoad(p.static_by_def(*def)?),
             CachedRvalue::StaticRef(def) => Rvalue::StaticRef(p.static_by_def(*def)?),
             CachedRvalue::FnValue(disk, t) => Rvalue::FnValue(local_of(disk)?, intern.ty(tys, *t)?),
+            CachedRvalue::ItemShim(item, t) => Rvalue::ItemShim(intern.ty(tys, *item)?, intern.ty(tys, *t)?),
             CachedRvalue::MakeDyn(o, src, dyn_ty) => {
                 Rvalue::MakeDyn { ptr: operand(intern, tys, strings, o)?, src: intern.ty(tys, *src)?, dyn_ty: intern.ty(tys, *dyn_ty)? }
             }

@@ -943,6 +943,9 @@ struct FnGen<'b, 'p> {
     prelude: String,
     /// Comparator adapters emitted so far (`sort_adapter`), for names.
     adapters: u32,
+    /// Constructor fns this function's `ItemShim` values use, by item
+    /// key (variant and fn pointer type), to their C names (`item_shim`).
+    shims: HashMap<String, String>,
     /// panic=unwind state (cgen/unwind.rs); all empty under abort.
     /// The cleanup blocks, the cleanup entry of each statement by
     /// (block, index), and the action of the statement or call being
@@ -1644,36 +1647,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         Ok(None) => body,
         Err(e) => return FnOut { error: Some(e), ..Default::default() },
     };
-    let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
-    let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
-    let n_locals = local_cty.len();
-    let mut g = FnGen {
-        p,
-        body,
-        out: String::new(),
-        glue: HashSet::new(),
-        local_cty,
-        local_drop,
-        move_paths: vec![Vec::new(); n_locals],
-        bad_move: false,
-        bad_callee: None,
-        const_index: crate::borrowck::const_index_locals(body),
-        index_spans: index_spans(body),
-        map,
-        sig_types: HashSet::new(),
-        base_line,
-        slots,
-        tmp: 0,
-        ret_large: ret_is_large(p, body.fn_id),
-        vtables: HashMap::new(),
-        prelude: String::new(),
-        adapters: 0,
-        cleanup: if p.unwind { unwind::cleanup_blocks(body) } else { Vec::new() },
-        byte_blobs: crate::ir::byte_blob_locals(body),
-        stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
-        unw: None,
-        unw_call: false,
-    };
+    let mut g = FnGen::new(p, body, map, base_line, slots);
     g.collect_move_paths();
     if g.bad_move {
         return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
@@ -1709,6 +1683,64 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         collect_types(t, &mut types);
     }
     FnOut { code: g.out, glue: g.glue, types, error: None }
+}
+
+impl<'b, 'p> FnGen<'b, 'p> {
+    /// A generator for `body` with nothing emitted yet (`gen_fn`; an
+    /// `ItemShim` builtin method's one-call body, `prim_shim`).
+    fn new(p: &'p Program, body: &'b Body<'p>, map: &'b SourceMap, base_line: u32, slots: &'b [u32]) -> Self {
+        let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
+        let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
+        let n_locals = local_cty.len();
+        FnGen {
+            p,
+            body,
+            out: String::new(),
+            glue: HashSet::new(),
+            local_cty,
+            local_drop,
+            move_paths: vec![Vec::new(); n_locals],
+            bad_move: false,
+            bad_callee: None,
+            const_index: crate::borrowck::const_index_locals(body),
+            index_spans: index_spans(body),
+            map,
+            sig_types: HashSet::new(),
+            base_line,
+            slots,
+            tmp: 0,
+            ret_large: ret_is_large(p, body.fn_id),
+            vtables: HashMap::new(),
+            prelude: String::new(),
+            adapters: 0,
+            shims: HashMap::new(),
+            cleanup: if p.unwind { unwind::cleanup_blocks(body) } else { Vec::new() },
+            byte_blobs: crate::ir::byte_blob_locals(body),
+            stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
+            unw: None,
+            unw_call: false,
+        }
+    }
+}
+
+/// The line of `ty`'s `int_impl!` or `uint_impl!` invocation in
+/// core/src/num/mod.rs (rustc 1.99, 64-bit targets): where a panic in
+/// one of its methods called through a fn pointer is reported.
+fn int_impl_line(ty: IntTy) -> u32 {
+    match ty {
+        IntTy::I8 => 379,
+        IntTy::I16 => 404,
+        IntTy::I32 => 429,
+        IntTy::I64 => 454,
+        IntTy::I128 => 479,
+        IntTy::Isize => 559,
+        IntTy::U8 => 586,
+        IntTy::U16 => 1234,
+        IntTy::U32 => 1290,
+        IntTy::U64 => 1322,
+        IntTy::U128 => 1354,
+        IntTy::Usize => 1452,
+    }
 }
 
 /// The driver-facing message for `FnGen::bad_move`.
@@ -3277,6 +3309,15 @@ impl FnGen<'_, '_> {
                     _ => "0".into(),
                 }
             }
+            Rvalue::ItemShim(item, ty) => {
+                let t = cty(&self.body.tys, *ty);
+                collect_types(&t, &mut self.sig_types);
+                let name = match self.body.tys.kind(*item) {
+                    TyKind::FnDef(def, _) if def == crate::ty::prim_fn_def() => self.prim_shim(*item, *ty, &t),
+                    _ => self.item_shim(*item, &t),
+                };
+                format!("(({}){name})", ctype(&t))
+            }
             Rvalue::MakeDyn { ptr, src, dyn_ty } => {
                 let (v, ct) = self.operand(ptr, loc, post);
                 // An Rc or Arc points the fat value at its value, after the counts.
@@ -3832,6 +3873,160 @@ impl FnGen<'_, '_> {
         }
         let _ = writeln!(self.prelude, "static uint8_t {name}(void *ctx, const void *a, const void *b) {{
 {body}}}");
+        name
+    }
+
+    /// The C fn behind a constructor item coerced to fn pointer type
+    /// `fp` (`Rvalue::ItemShim`): it takes the pointer's C params (a
+    /// zero-sized one is dropped, as in every fn pointer call) and
+    /// builds the variant from them. Emitted once per function and
+    /// item (named by this function's slot), ahead of the function.
+    fn item_shim(&mut self, item: Ty, fp: &CTy) -> String {
+        let CTy::FnPtr(ps, ret) = fp else { unreachable!("ItemShim to a non fn pointer type") };
+        let variant = match self.body.tys.kind(item) {
+            TyKind::FnDef(_, args) => match self.body.tys.args(args).first() {
+                Some(GenericArg::Const(c)) => match self.body.tys.const_kind(*c) {
+                    ConstKind::Int(v) => v as usize,
+                    _ => 0,
+                },
+                _ => 0,
+            },
+            _ => unreachable!("ItemShim of a non item type"),
+        };
+        let key = format!("{variant}_{}", mangle(fp));
+        if let Some(n) = self.shims.get(&key) {
+            return n.clone();
+        }
+        let name = format!("lust_ctor_{}_{}", self.slots[self.body.fn_id.0 as usize], self.shims.len());
+        self.shims.insert(key, name.clone());
+        let mut decls: Vec<String> = Vec::new();
+        let mut vals: Vec<String> = Vec::new();
+        for (i, t) in ps.iter().enumerate() {
+            if param_dropped(self.p, t) {
+                vals.push(zero_lit(self.p, t));
+            } else {
+                decls.push(format!("{} p{i}", ctype(t)));
+                vals.push(format!("p{i}"));
+            }
+        }
+        let value = match &**ret {
+            CTy::Adt(a) if !self.p.adt(*a).is_enum => {
+                if vals.is_empty() {
+                    zero_lit(self.p, ret)
+                } else {
+                    let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
+                    format!("((A{}){{ {} }})", a.0, fields.join(", "))
+                }
+            }
+            _ => self.make_variant(ret, variant, &vals),
+        };
+        let rt = ctype(ret);
+        if ret_by_out(self.p, ret) {
+            decls.insert(0, format!("{rt} *out"));
+            let _ = writeln!(self.prelude, "static void {name}({}) {{ *out = {value}; }}", decls.join(", "));
+        } else {
+            let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
+            let _ = writeln!(self.prelude, "static {rt} {name}({params}) {{ return {value}; }}");
+        }
+        name
+    }
+
+    /// The C fn behind an integer type's primitive builtin method item
+    /// coerced to fn pointer type `fp_ty` (`Rvalue::ItemShim`): it calls
+    /// the builtin on its params. The call is emitted by a generator over
+    /// a one-call body (locals: the return value, then the params). A
+    /// panic reports the type's `int_impl!` / `uint_impl!` line in core,
+    /// where rustc's fn pointer shim locates a `#[track_caller]` method.
+    fn prim_shim(&mut self, item: Ty, fp_ty: Ty, fp: &CTy) -> String {
+        let p = self.p;
+        let CTy::FnPtr(ps, ret) = fp else { unreachable!("ItemShim to a non fn pointer type") };
+        let tys = &self.body.tys;
+        let TyKind::FnDef(_, args) = tys.kind(item) else { unreachable!("ItemShim of a non item type") };
+        let gs = tys.args(args).to_vec();
+        let self_ty = gs.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+        let code = match gs.get(2) {
+            Some(GenericArg::Const(c)) => match tys.const_kind(*c) {
+                ConstKind::Int(v) => v as u32,
+                _ => u32::MAX,
+            },
+            _ => u32::MAX,
+        };
+        let b = crate::check::prim_builtin_of_code(code).expect("internal: an ItemShim of an unknown builtin");
+        let key = format!("p{code}_{}_{}", mangle(&cty(tys, self_ty)), mangle(fp));
+        if let Some(n) = self.shims.get(&key) {
+            return n.clone();
+        }
+        let name = format!("lust_prim_{}_{}", self.slots[self.body.fn_id.0 as usize], self.shims.len());
+        self.shims.insert(key, name.clone());
+        let TyKind::FnPtr(sig) = tys.kind(fp_ty) else { unreachable!("ItemShim to a non fn pointer type") };
+        let sig = tys.sig(sig).value;
+        let ins: Vec<Ty> = tys.tys_of(sig.inputs).to_vec();
+        let decl = |ty: Ty| crate::ir::LocalDecl { ty, mutable: false, name: None };
+        let mut locals = vec![decl(sig.output)];
+        locals.extend(ins.iter().map(|&t| decl(t)));
+        let body = Body {
+            fn_id: self.body.fn_id,
+            tys: self.body.tys.clone(),
+            locals,
+            blocks: Vec::new(),
+            arg_count: ins.len(),
+            reads: Default::default(),
+            lower_errs: Vec::new(),
+            annotations: Vec::new(),
+            promoted: Vec::new(),
+            index_exprs: Vec::new(),
+            pat_back_index: Vec::new(),
+            pat_front_index: Vec::new(),
+            pat_subslice: Vec::new(),
+            false_edges: Vec::new(),
+            opaque_locals: Vec::new(),
+            opaque_nodrop: Vec::new(),
+            stmt_unwind: Vec::new(),
+        };
+        let line = match tys.kind(self_ty) {
+            TyKind::Int(it) => int_impl_line(it),
+            _ => 0,
+        };
+        let loc = std_loc(0, line as u64, 5);
+        let ops: Vec<Operand> = (1..=ins.len()).map(|i| Operand::Move(Place::local(i as Local))).collect();
+        let mut g = FnGen::new(p, &body, self.map, self.base_line, self.slots);
+        let mut post: Vec<String> = Vec::new();
+        let value = if b == Builtin::PrimFromCast {
+            g.rvalue(&Rvalue::Cast(ops[0].clone(), sig.output), &loc, &mut post)
+        } else {
+            g.call_value(CallTarget::Builtin(b), &ops, ret, &loc, &mut post)
+        };
+        let mut decls: Vec<String> = Vec::new();
+        let mut inits = String::new();
+        for (i, t) in ps.iter().enumerate() {
+            if param_dropped(p, t) {
+                let _ = write!(inits, "  {} l{} = {};", ctype(t), i + 1, zero_lit(p, t));
+            } else {
+                decls.push(format!("{} l{}", ctype(t), i + 1));
+            }
+        }
+        let rt = ctype(ret);
+        let (head, tail) = if ret_by_out(p, ret) {
+            decls.insert(0, format!("{rt} *out"));
+            (format!("static void {name}({})", decls.join(", ")), format!("*out = r;"))
+        } else {
+            let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
+            (format!("static {rt} {name}({params})"), "return r;".to_string())
+        };
+        let exc = if p.unwind { "  lust_exc ex; (void)ex;" } else { "" };
+        let _ = writeln!(
+            self.prelude,
+            "{}{head} {{{exc}{inits}\n{}  {rt} r = {value};\n{}  {tail}\n}}",
+            std::mem::take(&mut g.prelude),
+            g.out,
+            post.iter().map(|x| format!("  {x}\n")).collect::<String>()
+        );
+        self.glue.extend(g.glue);
+        self.sig_types.extend(g.sig_types);
+        self.vtables.extend(g.vtables);
+        if self.bad_callee.is_none() {
+            self.bad_callee = g.bad_callee;
+        }
         name
     }
 
@@ -9754,7 +9949,7 @@ fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: 
                 op(h);
             }
         }
-        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) => {}
+        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) | Rvalue::ItemShim(..) => {}
     }
 }
 
