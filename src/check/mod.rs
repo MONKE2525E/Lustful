@@ -1417,6 +1417,9 @@ pub struct Checked<'g> {
     /// The range form of each range-value index (`v[r]`), by the
     /// index expression (check/slice.rs).
     pub index_ranges: Vec<(ExprId, DrainForm)>,
+    /// Comparisons between different sequence forms (slice, array,
+    /// Vec) that lower as slice comparisons (check/slice.rs).
+    pub seq_cmps: Vec<ExprId>,
     /// The `into_iter` method instance of each `Coerce::IntoIterCall`
     /// (an `extend` or `from_iter` argument), by coerced expression.
     pub into_iter_calls: Vec<(ExprId, LocalDefId)>,
@@ -1490,6 +1493,11 @@ impl Checked<'_> {
     /// The range form of a range-value index (check/slice.rs).
     pub fn index_range(&self, e: ExprId) -> Option<DrainForm> {
         self.index_ranges.iter().find(|(x, _)| *x == e).map(|(_, d)| *d)
+    }
+    /// True for a comparison between different sequence forms
+    /// (check/slice.rs `seq_cmp`).
+    pub fn is_seq_cmp(&self, e: ExprId) -> bool {
+        self.seq_cmps.contains(&e)
     }
     /// The `into_iter` instance of a `Coerce::IntoIterCall` on `e`.
     pub fn into_iter_call(&self, e: ExprId) -> Option<LocalDefId> {
@@ -1989,6 +1997,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             deref_recv: Vec::new(),
             drain_ranges: Vec::new(),
             index_ranges: Vec::new(),
+            seq_cmps: Vec::new(),
             into_iter_calls: Vec::new(),
             deref_coerce: Vec::new(),
             index_recv: Vec::new(),
@@ -15643,6 +15652,12 @@ impl<'p> Ctx<'p> {
                 }
                 self.set_res(e, Res::Bin { ld, rd });
                 return BOOL;
+            }
+            // Comparisons across sequence forms (`&[u8] == &[u8; N]`,
+            // `Vec<T> == [T; N]`; check/slice.rs): core's asymmetric
+            // slice/array/Vec `PartialEq` impls, as slice compares.
+            if let Some(t) = self.seq_cmp(e, op, lt, rt, ld, lb, rd, rb, span) {
+                return t;
             }
             // A written `PartialEq<Rhs>` or `PartialOrd<Rhs>` whose
             // Rhs is the right operand's type as written (`PathBuf

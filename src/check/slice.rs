@@ -286,6 +286,128 @@ impl<'p> Ctx<'p> {
         Some(ret)
     }
 
+    /// A comparison across sequence forms (slice, array, Vec) as
+    /// core's asymmetric `PartialEq` impls allow them (and the
+    /// slice `PartialOrd` coercions at equal reference depth):
+    /// recorded as a slice comparison for lowering. None when the
+    /// pair is not one of core's, so the caller's normal path
+    /// answers (the same-type path, a written impl, or its error).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn seq_cmp(
+        &mut self,
+        e: ExprId,
+        op: BinOp,
+        lt: Ty,
+        rt: Ty,
+        ld: u8,
+        lb: Ty,
+        rd: u8,
+        rb: Ty,
+        span: Span,
+    ) -> Option<Ty> {
+        use BinOp::*;
+        /// One side's sequence form.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Form {
+            Slice,
+            Array,
+            Vec,
+        }
+        let form = |this: &Self, b: Ty| -> Option<(Form, Ty, Option<crate::ty::ConstId>)> {
+            match this.kind(b) {
+                TyKind::Slice(el) => Some((Form::Slice, el, None)),
+                TyKind::Array(el, c) => Some((Form::Array, el, Some(c))),
+                _ => this.tys.vec_elem(b).map(|el| (Form::Vec, el, None)),
+            }
+        };
+        let (lf, le, lc) = form(self, lb)?;
+        let (rf, re, rc) = form(self, rb)?;
+        // The same-type path already answers these.
+        if ld == rd && self.deep(lb) == self.deep(rb) {
+            return None;
+        }
+        if lf == Form::Array && rf == Form::Array {
+            let same_n = match (lc, rc) {
+                (Some(a), Some(b)) if a == b => true,
+                (Some(a), Some(b)) => match (self.tys.const_kind(a), self.tys.const_kind(b)) {
+                    (crate::ty::ConstKind::Int(x), crate::ty::ConstKind::Int(y)) => x == y,
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !same_n {
+                return None;
+            }
+        }
+        let eq_op = matches!(op, Eq | Ne);
+        let last_mut = |this: &Self, t: Ty| this.ref_layers(t).last().copied().unwrap_or(false);
+        let allowed = if eq_op {
+            if ld == rd {
+                matches!(
+                    (lf, rf),
+                    (Form::Slice, Form::Slice)
+                        | (Form::Array, Form::Array)
+                        | (Form::Vec, Form::Vec)
+                        | (Form::Array, Form::Slice)
+                        | (Form::Slice, Form::Array)
+                        | (Form::Vec, Form::Slice)
+                        | (Form::Slice, Form::Vec)
+                        | (Form::Vec, Form::Array)
+                )
+            } else if rd == ld + 1 {
+                match (lf, rf) {
+                    (Form::Array, Form::Slice) | (Form::Vec, Form::Slice) => true,
+                    // `Vec<T>: PartialEq<&[U; N]>` exists; the
+                    // `&mut [U; N]` form is the omitted one.
+                    (Form::Vec, Form::Array) => !last_mut(self, rt),
+                    _ => false,
+                }
+            } else if ld == rd + 1 {
+                matches!((lf, rf), (Form::Slice, Form::Array) | (Form::Slice, Form::Vec))
+            } else {
+                false
+            }
+        } else {
+            // Ordering needs the same mutability layers, as the
+            // caller's own check has it.
+            ld == rd
+                && self.ref_layers(lt) == self.ref_layers(rt)
+                && (matches!((lf, rf), (Form::Slice, Form::Slice) | (Form::Array, Form::Array) | (Form::Vec, Form::Vec))
+                    || (ld >= 1 && lf == Form::Slice && rf != Form::Slice))
+        };
+        if !allowed {
+            return None;
+        }
+        let snap = self.snapshot_vars();
+        if !self.unify(le, re) {
+            self.rollback_vars(snap);
+            return None;
+        }
+        let lbd = self.deep(lb);
+        let ok = if eq_op {
+            crate::check::collect::has_eq(self.p, &self.tys, lbd)
+        } else {
+            crate::check::collect::has_ord(self.p, &self.tys, lbd)
+        };
+        if !ok {
+            let tn = self.tn(lbd);
+            let fix = if eq_op {
+                "Add #[derive(PartialEq)] to the type."
+            } else {
+                "Add #[derive(PartialOrd)] to the type, or implement `PartialOrd` for it."
+            };
+            self.err("L0112", span, format!("type `{tn}` cannot be compared with `{}`", op.symbol()), fix);
+            self.set_res(e, Res::Bin { ld, rd });
+            return Some(BOOL);
+        }
+        let le = self.deep(le);
+        let sl = self.tys.intern(TyKind::Slice(le));
+        self.record_glue_reads(self.p.gx.lang.partial_eq, sl);
+        self.out.seq_cmps.push(e);
+        self.set_res(e, Res::Bin { ld, rd });
+        Some(BOOL)
+    }
+
     /// Checks the arguments with no expectations and answers the
     /// error type: the bail-out of a slice method already reported.
     fn slice_bail(&mut self, args: &[ExprId]) -> Ty {

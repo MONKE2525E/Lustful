@@ -4430,6 +4430,31 @@ impl<'p> Lower<'p> {
         };
         let lt = self.ty(lhs);
         let base = self.peel(lt, ld);
+        if self.ck.is_seq_cmp(e) {
+            // A comparison across sequence forms (check/slice.rs):
+            // both sides as fat slices, compared as `[T]`.
+            let elem = match self.kind(base) {
+                TyKind::Slice(el) | TyKind::Array(el, _) => el,
+                _ => self.body.tys.vec_elem(base).unwrap_or(ERROR),
+            };
+            let sty = self.body.tys.intern(TyKind::Slice(elem));
+            let rt = self.ref_ty(false, sty);
+            let fat = |this: &mut Self, side: ExprId, d: u8| -> Operand {
+                let pl = Self::derefs(this.place(side), d);
+                let t = this.temp(rt);
+                this.assign(Place::local(t), Rvalue::SliceOf(pl), span);
+                Operand::Move(Place::local(t))
+            };
+            let a = fat(self, lhs, ld);
+            let b = fat(self, rhs, rd);
+            let rv = if matches!(op, BinOp::Eq | BinOp::Ne) {
+                Rvalue::Eq { a, b, ty: sty, ne: op == BinOp::Ne }
+            } else {
+                Rvalue::Cmp { op, a, b, ty: sty }
+            };
+            self.assign(out, rv, span);
+            return;
+        }
         if op.is_cmp() && !matches!(op, BinOp::Eq | BinOp::Ne) && matches!(self.kind(base), TyKind::Tuple(_) | TyKind::Unit) && self.expands_ord(base) {
             // Tuple ordering is lexicographic: the first unequal field
             // decides, equal tuples order by the operator's reflexivity.
