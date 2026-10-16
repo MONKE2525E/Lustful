@@ -527,6 +527,7 @@ static const char *const lust_std_files[] = {
     LUST_STD_SRC "core/src/io/borrowed_buf.rs",
     LUST_STD_SRC "alloc/src/rc.rs",
     LUST_STD_SRC "alloc/src/sync.rs",
+    LUST_STD_SRC "core/src/str/mod.rs",
 };
 #endif
 

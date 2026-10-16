@@ -549,6 +549,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     // One row stands for both forms of each.
     Builtin::SliceSplitAt(false),
     Builtin::SliceSplitEnd(false),
+    Builtin::StrSplitAt(false),
     Builtin::BoxSliceIntoIter,
     Builtin::StringFromUtf8,
     Builtin::StrFromUtf8,
@@ -1354,6 +1355,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
             vec![i.intern("split_at"), i.intern("split_at_mut"), i.intern("split_at_checked"), i.intern("split_at_mut_checked")],
             Call::Method,
         ),
+        B::StrSplitAt(_) => (&["str"], vec![i.intern("split_at"), i.intern("split_at_checked")], Call::Method),
         B::SliceSplitEnd(_) => (
             &["[T]", "[T; n]", "Vec<T>"],
             vec![i.intern("split_first"), i.intern("split_first_mut"), i.intern("split_last"), i.intern("split_last_mut")],

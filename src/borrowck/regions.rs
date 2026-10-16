@@ -8777,6 +8777,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
         b,
         B::VecGet
             | B::SliceSplitAt(_)
+            | B::StrSplitAt(_)
             | B::SliceSplitEnd(_)
             | B::VecFirst
             | B::VecLast

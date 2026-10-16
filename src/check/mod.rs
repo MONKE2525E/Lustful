@@ -531,6 +531,9 @@ pub enum Builtin {
     /// core's `[T]::split_at` and `split_at_mut` (false; `mid > len`
     /// panics at the caller) and their `_checked` forms (true).
     SliceSplitAt(bool),
+    /// `str::split_at` (false) and `split_at_checked` (true): core's
+    /// char-boundary checks, both parts borrow the receiver.
+    StrSplitAt(bool),
     /// core's `[T]::split_first` (false) and `split_last` (true), and
     /// their `_mut` forms.
     SliceSplitEnd(bool),
@@ -17587,6 +17590,13 @@ impl<'p> Ctx<'p> {
             "eq_ignore_ascii_case" => return Some((B::StrEqIgnoreAsciiCase, Autoref::Ref, vec![REF_STR], BOOL)),
             "make_ascii_uppercase" => return Some((B::StrMakeAsciiUppercase, Autoref::RefMut, vec![], UNIT)),
             "make_ascii_lowercase" => return Some((B::StrMakeAsciiLowercase, Autoref::RefMut, vec![], UNIT)),
+            "split_at" | "split_at_checked" => {
+                let pair = self.tys.intern_tys(&[REF_STR, REF_STR]);
+                let pair = self.tys.intern(TyKind::Tuple(pair));
+                let checked = n == "split_at_checked";
+                let ret = if checked { self.tys.mk_option(pair) } else { pair };
+                return Some((B::StrSplitAt(checked), Autoref::Ref, vec![USIZE], ret));
+            }
             _ => {}
         }
         let table = [

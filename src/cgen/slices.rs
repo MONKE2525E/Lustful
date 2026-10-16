@@ -12,6 +12,9 @@ use super::*;
 /// `lust_std_files`).
 const SLICE_MOD_RS: u64 = 14;
 
+/// `std_loc` file index of core/src/str/mod.rs (`stdloc::STD_FILES`).
+const STR_MOD_RS: u64 = 32;
+
 /// The (element type, data pointer, length) C expressions of a slice
 /// operand in any receiver form: `&Vec<T>`, `&[T]` (the fat value),
 /// `&&[T]`, `&[T; N]`, or a by-value array.
@@ -33,6 +36,9 @@ impl FnGen<'_, '_> {
     /// `SliceSplitAt` and `SliceSplitEnd` (core's `split_at` family) into
     /// their tuple or `Option` of a tuple; None for any other call.
     pub(super) fn slice_split_builtin(&mut self, b: Builtin, ops: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> Option<String> {
+        if let Builtin::StrSplitAt(checked) = b {
+            return Some(self.str_split_at(checked, ops, dest, loc, post));
+        }
         if !matches!(b, Builtin::SliceSplitAt(_) | Builtin::SliceSplitEnd(_)) {
             return None;
         }
@@ -73,6 +79,34 @@ impl FnGen<'_, '_> {
             _ => unreachable!(),
         }
         Some(t)
+    }
+
+    /// `str::split_at(mid)` and `split_at_checked(mid)`. The unchecked form
+    /// fails as core's `slice_error_fail(self, 0, mid)` does, with its text
+    /// and at its site in core/src/str/mod.rs; the checked one gives None
+    /// for a `mid` past the end or inside a char.
+    fn str_split_at(&mut self, checked: bool, ops: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> String {
+        let (v, vt) = self.operand(&ops[0], loc, post);
+        let sv = str_of(&v, &vt);
+        let (mid, _) = self.operand(&ops[1], loc, post);
+        collect_types(dest, &mut self.sig_types);
+        let dc = ctype(dest);
+        let (t, sa, m) = (self.tmp(), self.tmp(), self.tmp());
+        let _ = writeln!(self.out, "    lust_str {sa} = {sv}; uint64_t {m} = {mid};");
+        let pair_ty = match dest {
+            CTy::Option(pt) if checked => ctype(pt),
+            _ => dc.clone(),
+        };
+        let pair = format!("(({pair_ty}){{ ((lust_str){{ {sa}.ptr, {m} }}), ((lust_str){{ {sa}.ptr + {m}, {sa}.len - {m} }}) }})");
+        if checked {
+            let (some, none) = (self.make_variant(dest, 1, &[pair]), self.make_variant(dest, 0, &[]));
+            let ok = format!("({m} == {sa}.len || ({m} < {sa}.len && ({sa}.ptr[{m}] & 0xC0) != 0x80))");
+            let _ = writeln!(self.out, "    {dc} {t} = {ok} ? {some} : {none};");
+        } else {
+            let at = std_loc(STR_MOD_RS, 862, 21);
+            let _ = writeln!(self.out, "    (void)lust_str_range({sa}.ptr, 0, {m}, 0, {sa}.len, {at});\n    {dc} {t} = {pair};");
+        }
+        t
     }
 
     /// The R4 builtins; None for any other call.
