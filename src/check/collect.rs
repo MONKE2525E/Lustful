@@ -8635,9 +8635,11 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
     if crate::check::own::own_parts(tys, t).is_some_and(|(k, e)| k == crate::check::own::Owner::Box && e == STR) {
         return true;
     }
-    // `Box<[T]>` clones its elements.
+    // `Box<[T]>` clones its elements. The same walk (not a fresh
+    // `has_clone`): a recursive `Tree<T> { Node(Box<[Tree<T>]>) }`
+    // must meet itself on the stack, or the walk never ends.
     if let Some(e) = tys.boxed_slice_elem(t) {
-        return has_clone(p, tys, e);
+        return glue_clone(p, tys, e, seen);
     }
     // Hash tables clone their args; the std hashers are Clone (W-STD-B).
     if let Some((k, a)) = crate::ty::hash::hash_parts(tys, t) {
