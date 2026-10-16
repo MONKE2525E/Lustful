@@ -1719,7 +1719,7 @@ impl<'p> Ctx<'p> {
                     // receiver like any other method call.
                     // Through a user `Deref` impl, the receiver is borrowed
                     // for the `deref` call (its `Res` applies to the target).
-                    Res::Method { .. } | Res::BuiltinMethod { .. } | Res::DynMethod { .. }
+                    Res::Method { .. } | Res::BuiltinMethod { .. } | Res::DynMethod { .. } | Res::Any { .. }
                         if let Some((before, mutable)) =
                             self.out.deref_recv.iter().filter(|(x, _)| *x == e).min_by_key(|(_, d)| d.depth).map(|(_, d)| (d.before, d.mutable)) =>
                     {
@@ -1727,7 +1727,11 @@ impl<'p> Ctx<'p> {
                     }
                     Res::Method { derefs, autoref, .. }
                     | Res::BuiltinMethod { derefs, autoref, .. }
-                    | Res::DynMethod { derefs, autoref, .. } => {
+                    | Res::DynMethod { derefs, autoref, .. }
+                    // `Any`'s methods (`is`, `downcast_ref`, `type_id`; R26)
+                    // borrow their receiver, and `Box<dyn Any>::downcast`
+                    // takes it by value (no autoref).
+                    | Res::Any { derefs, autoref, .. } => {
                         self.cap_receiver(*recv, derefs, autoref, w);
                     }
                     // `cmp`, `partial_cmp`, `lt`, and kin take `&self`.
