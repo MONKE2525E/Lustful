@@ -4292,14 +4292,20 @@ fn resolve_generic_alias(
     if scope.alias_depth > 32 {
         return Err(Diag::new("L0601", span, format!("cycle detected in type alias `{alias}`"), "An alias must not name itself, directly or through other aliases."));
     }
+    // In a dyn's `Fn*` sugar an elided or `'_` alias arg is the object's
+    // own late-bound lifetime (`&dyn Fn(&mut Cb<'_>)`, R11), as for an
+    // Adt's (`resolve_path_ty`).
     let mut regions = Vec::with_capacity(la.lifetimes.len());
     for i in 0..la.lifetimes.len() {
-        regions.push(scope_region(interner, scope, written.get(i).copied(), span)?);
+        regions.push(ref_region(interner, scope, written.get(i).copied(), span)?);
     }
+    // Inside a dyn's trait args the body's dyn types stay the object's
+    // (`dyn_args`, R11), as they do written out.
     let mut body = Scope {
         regions: scope.regions.clone(),
         alias_lifetimes: la.lifetimes.iter().copied().zip(regions).collect(),
         alias_depth: scope.alias_depth + 1,
+        dyn_args: scope.dyn_args,
         ..Scope::default()
     };
     // Type args resolve where they are written; a default resolves in the
