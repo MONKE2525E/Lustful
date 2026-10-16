@@ -10317,7 +10317,10 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
             closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
         }
     }
-    let (body_errs, picks, calls, reads, hidden) = {
+    // Lowering, borrowck and check_fn's tail passes read derive lists too
+    // (Copy operands, moves): their notes join the stored reads, as in the
+    // compile tail, so a derive toggle checks the template again.
+    let ((body_errs, picks, calls, mut reads, hidden), noted) = crate::check::derive_delta::scoped(p.record_reads, || {
         let (c, mut e) = crate::check::check_fn(p, t);
         let picks = c.trait_picks.clone();
         let hidden: Vec<(DefId, OwnedTy)> =
@@ -10334,7 +10337,8 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
             }
         }
         (e, picks, calls, reads, hidden)
-    };
+    });
+    crate::check::derive_delta::record(p, &mut reads, &noted);
     for (od, owned) in hidden {
         let h = build_owned_ty(p, &owned);
         p.gx.opaque_hidden.insert(od, h);

@@ -534,7 +534,9 @@ fn replay_bodies(
     let out = (|| {
         let reuse = &mut caches.gen_reuse;
         let mut again = Vec::new();
-        for t in (0..fn_count as u32).map(LocalDefId) {
+        // Every template: the trait default bodies come after the AST fns
+        // (`generics::append_trait_default_templates`).
+        for t in (0..p.fns.len() as u32).map(LocalDefId) {
             if p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Template) || p.is_lang_method(t) || fns.contains(&(t.0 as usize)) {
                 continue;
             }
@@ -554,7 +556,10 @@ fn replay_bodies(
             }
             // A template with no stored check (one with closures) stands
             // while its body does not name an edited fn.
-            let named = idents.get(t.0 as usize).is_none_or(|ids| ids.iter().any(|s| names.contains(s)));
+            let named = match idents.get(t.0 as usize) {
+                Some(ids) if (t.0 as usize) < fn_count => ids.iter().any(|s| names.contains(s)),
+                _ => super::ast_hash::body_scan(&p.ast, p.fn_def(t), None).1.iter().any(|s| names.contains(s)),
+            };
             if !reuse.template_holds(p, t).unwrap_or(!named) {
                 again.push(t);
             }

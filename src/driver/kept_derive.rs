@@ -166,9 +166,13 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
         }
     }
     let mut moves = crate::driver::graph::DeriveMoves::new(reach);
-    // The AST fns (instances and closures share their names or have none).
-    for i in 0..fn_count.min(p.fns.len()) {
+    // The AST fns, trait default bodies and trait method stubs (instances
+    // and closures share their names or have none).
+    for i in 0..p.fns.len() {
         let f = LocalDefId(i as u32);
+        if i >= fn_count && !matches!(p.gx.fn_class.get(i), Some(FnClass::Template | FnClass::Stub)) {
+            continue;
+        }
         if p.sig_moves(&mut moves, p.def_id(f)) {
             add(p.fn_def(f).name);
         }
@@ -178,8 +182,9 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
     out
 }
 
-/// Mono's template checks after a derive delta: a template whose stored
-/// check no longer holds checks again as collect's template check does,
+/// Mono's template checks after a derive delta: a template (trait default
+/// bodies included) whose stored check no longer holds checks again as
+/// collect's template check does,
 /// and must pass with the same hidden type (`kept_delta::recheck_template`).
 /// A template with no stored check (one with closures) checks again when
 /// its body mentions a name of `reach_names`, or its own signature moves.
@@ -221,7 +226,9 @@ fn replay_templates(
     (p.record_reads, p.unwind) = (true, false);
     let out = (|| {
         let mut again = Vec::new();
-        for t in (0..fn_count as u32).map(LocalDefId) {
+        // Every template: the trait default bodies come after the AST fns
+        // (`generics::append_trait_default_templates`).
+        for t in (0..p.fns.len() as u32).map(LocalDefId) {
             if p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Template) || p.is_lang_method(t) {
                 continue;
             }
@@ -240,7 +247,10 @@ fn replay_templates(
                 Some(true) => continue,
                 Some(false) => {}
                 None => {
-                    let named = idents.get(t.0 as usize).is_none_or(|ids| ids.iter().any(|s| names.contains_key(s)));
+                    let named = match idents.get(t.0 as usize) {
+                        Some(ids) if (t.0 as usize) < fn_count => ids.iter().any(|s| names.contains_key(s)),
+                        _ => super::ast_hash::body_scan(&p.ast, p.fn_def(t), None).1.iter().any(|s| names.contains_key(s)),
+                    };
                     if !named && !p.sig_moves(&mut moves, p.def_id(t)) {
                         continue;
                     }
