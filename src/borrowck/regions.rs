@@ -5166,12 +5166,17 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.contract_edges(roles, caps);
         }
         let vars = self.make_arg_vars(def, roles, caps, reqs.is_none());
+        let hr_out = self.bound_hr_out_slots(def);
         for &(a, b) in reqs.iter().flat_map(|r| r.iter()) {
             let var = |e: End| match e {
                 End::Static => Some(0),
                 End::Cap(i) => caps.get(i as usize).copied(),
                 End::Arg(j) => vars.as_ref().and_then(|v| v.get(j as usize)).copied(),
-                // What a call's result holds: the call's rule.
+                // What a call's result holds: the call's rule, except an
+                // output slot the closure's bound makes its input's
+                // (`ClosureEntry::bound_output`): that is any region a
+                // caller passes, so what it holds outlives `'static`.
+                End::Out(k) if hr_out.contains(&k) => Some(0),
                 End::Out(_) => None,
             };
             if let (Some(x), Some(y)) = (var(a), var(b)) {
@@ -5179,6 +5184,17 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
         }
         vars
+    }
+
+    /// The output slots of closure `def` that its bound output makes the
+    /// one higher-ranked input's (`ClosureEntry::bound_output`).
+    fn bound_hr_out_slots(&mut self, def: DefId) -> Vec<u32> {
+        let Some((bo, out_t)) = self.p.gx.closures.get(&def).and_then(|c| c.bound_output.map(|b| (b, c.output))) else { return Vec::new() };
+        let mut named: Vec<Region> = Vec::new();
+        if !regioned_slots(&mut self.sc, bo, out_t, &mut named) {
+            return Vec::new();
+        }
+        named.iter().enumerate().filter(|(_, r)| matches!(r, Region::Bound(_))).map(|(k, _)| k as u32).collect()
     }
 
     /// The argument slot vars of closure `def` (`closure_created` at its
