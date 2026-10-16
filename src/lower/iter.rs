@@ -1511,6 +1511,16 @@ impl Ex<'_, '_> {
             F::VecFromBoxSlice => one(self, Builtin::BoxSliceIntoVec, x, dest),
             F::BoxSliceFromVec => one(self, Builtin::VecIntoBoxedSlice, x, dest),
             F::Own(k) => one(self, Builtin::OwnFrom(k), x, dest),
+            F::OwnFromBox(k) => {
+                // The box moves through a `Box` of the target's pointee
+                // first: a `dyn` one may differ in its object lifetime
+                // only, which this move gives the borrow checker.
+                let e = self.body.tys.rc_elem(dst).ok_or("conversion: no Rc or Arc pointee")?;
+                let bt = self.body.tys.mk_boxed(e);
+                let b = self.local(bt);
+                self.assign(Place::local(b), Rvalue::Use(x));
+                one(self, Builtin::OwnFrom(k), Operand::Move(Place::local(b)), dest);
+            }
             F::StringFromBoxStr => one(self, Builtin::OwnIntoString, x, dest),
             F::Some => self.some(&dest, dst, x),
             F::BoxNew => one(self, Builtin::BoxNew, x, dest),

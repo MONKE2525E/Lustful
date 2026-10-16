@@ -536,6 +536,9 @@ impl FnGen<'_, '_> {
     }
 
     fn own_from(&mut self, k: Owner, v: &str, src: &CTy) -> String {
+        if let Some(r) = self.own_from_box(v, src) {
+            return r;
+        }
         // (element type, data pointer, length, whether elements move,
         // statement that frees the source's buffer)
         let byte = CTy::Int(IntTy::U8);
@@ -613,6 +616,34 @@ impl FnGen<'_, '_> {
             let _ = writeln!(self.out, "    {free}");
         }
         r
+    }
+
+    /// alloc's `From<Box<T>>` for `Rc<T>` and `Arc<T>` (check/own.rs
+    /// `own_from_box`; both owners share the layout): the value's bytes
+    /// move into a new counted allocation (the counts, then the value at
+    /// the offset its alignment gives, as `RcI_T` lays it out), a `dyn`
+    /// value keeps its vtable, and the box's memory is freed with no
+    /// drop. None for the other sources.
+    fn own_from_box(&mut self, v: &str, src: &CTy) -> Option<String> {
+        let t = self.tmp();
+        match src {
+            CTy::Boxed(e) => {
+                let (it, et, b) = (format!("RcI_{}", mangle(e)), ctype(e), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    {et} *{b} = {v}; {it} *{t} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {t}->v = *{b}; lust_dealloc((void*){b}, sizeof({et}), _Alignof({et}));"
+                );
+            }
+            CTy::BoxDyn => {
+                let off = counts_off(&CTy::Dyn, &t);
+                let _ = writeln!(
+                    self.out,
+                    "    lust_dyn {t} = {v}; {{ uint64_t s_ = (uint64_t)(uintptr_t){t}.vt[1], o_ = {off}; char *a_ = (char *)lust_alloc(o_ + s_, o_); ((uint64_t *)a_)[0] = 1; ((uint64_t *)a_)[1] = 1; if (s_) lust_memcpy((void *)(a_ + o_), {t}.data, s_); lust_dealloc({t}.data, s_, (uint64_t)(uintptr_t){t}.vt[2]); {t}.data = (void *)(a_ + o_); }}"
+                );
+            }
+            _ => return None,
+        }
+        Some(t)
     }
 }
 

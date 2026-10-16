@@ -79,6 +79,27 @@ pub fn own_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Ow
     ok.then_some(k)
 }
 
+/// The owner of alloc's `impl<T: ?Sized> From<Box<T>> for Rc<T>` (and
+/// `Arc<T>`) when it builds `dst` from `src` and `T` is sized or a plain
+/// `dyn` (`str` and `[T]` are `own_from`'s; a `RefCell<dyn Tr>` or a
+/// user type with an unsized tail is not built). A `dyn` pointee may
+/// differ in its object lifetime only (`'static` against an inferred
+/// one): lowering moves the box through a `Box` of the target's pointee
+/// first, so the borrow checker relates the two (lower/iter.rs `conv`).
+pub fn own_from_box(tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Owner> {
+    let k = match tys.builtin_of(dst)? {
+        BuiltinTy::Rc => Owner::Rc,
+        BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc) => Owner::Arc,
+        _ => return None,
+    };
+    let (e, b) = (tys.rc_elem(dst)?, tys.boxed_elem(src)?);
+    let ok = match (tys.kind(e), tys.kind(b)) {
+        (TyKind::Dyn(x, _), TyKind::Dyn(y, _)) => x == y,
+        _ => e == b && crate::check::collect::is_sized_ty(tys, e),
+    };
+    ok.then_some(k)
+}
+
 impl<'p> Ctx<'p> {
     /// The signature of `Box::from(x)`, `Rc::from(x)`, or `Arc::from(x)`
     /// (owner `k`). The target is the written Self (`Rc::<str>::from`),
@@ -140,6 +161,7 @@ impl<'p> Ctx<'p> {
         // and so does an open element (`Rc::<[u8]>::from(vec![])`).
         if self.std_from_arg(dst, at).is_none() {
             self.unify_open_elem(dst, at);
+            self.unify_open_box(dst, at);
         }
         let lit = if self.std_from_arg(dst, at).is_none() { self.std_from_literal_src(dst, at) } else { None };
         let at = self.deep(at);
@@ -179,7 +201,9 @@ impl<'p> Ctx<'p> {
 
 /// std's impls for the owning pointers to `str` and `[T]`, as synthetic
 /// impl records for trait selection (`T: Into<Rc<str>>` bounds, derives
-/// over such fields): the `From` impls `own_from` answers, `Clone` of
+/// over such fields): the `From` impls `own_from` answers, alloc's
+/// `From<Box<T>>` for `Rc<T>` and `Arc<T>` (`own_from_box`) and
+/// `From<T> for Arc<T>`, `Clone` of
 /// `Box<str>` and `Box<[T]>` (T: Clone), and `Default` of each but
 /// `Box<[T]>` (the generic `Box<T>`, `Rc<T>`, and `Arc<T>` records need
 /// a `T: Default`, which `str` and `[T]` are not).
@@ -210,20 +234,23 @@ pub fn add_own_impls(p: &mut Program, ordinal: &mut u32, span: Span) {
     let box_slice = mk(p, Owner::Box, slice_p0);
     for k in [Owner::Box, Owner::Rc, Owner::Arc] {
         let (s, sl) = (mk(p, k, STR), mk(p, k, slice_p0));
-        let mut str_srcs = vec![ref_str, mut_str, STRING];
-        if k != Owner::Box {
-            str_srcs.push(box_str);
-        }
-        for src in str_srcs {
+        for src in [ref_str, mut_str, STRING] {
             insert_synthetic(p, ordinal, lang.from, s, &[src], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         for src in [ref_slice, mut_slice] {
             insert_synthetic(p, ordinal, lang.from, sl, &[src], cloned.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         if k != Owner::Box {
-            for src in [vec_p0, box_slice] {
-                insert_synthetic(p, ordinal, lang.from, sl, &[src], one.clone(), Vec::new(), Synthetic::Lang, false, span);
-            }
+            insert_synthetic(p, ordinal, lang.from, sl, &[vec_p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+            // alloc's `impl<T: ?Sized> From<Box<T>>` (`Box<str>`,
+            // `Box<[T]>`, `Box<dyn Tr>`, a sized box: `own_from_box`).
+            let (ptr, boxed) = (mk(p, k, p0), mk(p, Owner::Box, p0));
+            insert_synthetic(p, ordinal, lang.from, ptr, &[boxed], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        // `impl<T> From<T> for Arc<T>` (`Rc<T>`'s is generics.rs's).
+        if k == Owner::Arc {
+            let ptr = mk(p, k, p0);
+            insert_synthetic(p, ordinal, lang.from, ptr, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         insert_synthetic(p, ordinal, lang.default, s, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         // `Box<[T]>`'s Default is generics.rs's (fx-defaults).
@@ -353,6 +380,23 @@ impl<'p> Ctx<'p> {
     /// as `({integer}, String)`) to the element of the slice pointer
     /// `dst` (`Rc<[T]>`), the one std `From` impl that can apply. Rolls
     /// back when they do not unify.
+    /// `Rc::<i32>::from(Box::new(5))`: alloc's `From<Box<T>>` fixes an
+    /// open pointee of a `Box` source to the target's when `From<T>` (the
+    /// `Rc<Box<_>>` reading) cannot apply, as rustc's one candidate does.
+    fn unify_open_box(&mut self, dst: Ty, src: Ty) {
+        let src = self.deep(src);
+        let (Some(want), Some(have)) = (self.tys.rc_elem(dst), self.tys.boxed_elem(src)) else { return };
+        if !self.tys.flags(have).contains_infer() {
+            return;
+        }
+        let snap = self.snapshot_vars();
+        let as_value = self.unify(want, src);
+        self.rollback_vars(snap);
+        if as_value || !self.unify(have, want) {
+            self.rollback_vars(snap);
+        }
+    }
+
     fn unify_open_elem(&mut self, dst: Ty, src: Ty) {
         let Some(want) = shared_unsized_elem(&self.tys, dst).or_else(|| self.tys.boxed_elem(dst)) else { return };
         let TyKind::Slice(want) = self.kind(want) else { return };

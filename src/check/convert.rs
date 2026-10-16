@@ -60,6 +60,11 @@ pub enum FromConv {
     Own(crate::check::own::Owner),
     /// String from `Box<str>`: its buffer.
     StringFromBoxStr,
+    /// `Rc<T>` or `Arc<T>` from `Box<T>` for a sized or `dyn` `T`
+    /// (alloc's `impl<T: ?Sized> From<Box<T>>`; `str` and `[T]` are
+    /// `Own`): the value moves into a new counted allocation, the
+    /// vtable stays, and the box is freed without a drop.
+    OwnFromBox(crate::check::own::Owner),
 }
 
 /// The std `From` impl `dst: From<src>` between builtin types, if std
@@ -130,6 +135,9 @@ pub fn std_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Fr
     }
     if let Some(k) = crate::check::own::own_from(p, tys, dst, src) {
         return Some(F::Own(k));
+    }
+    if let Some(k) = crate::check::own::own_from_box(tys, dst, src) {
+        return Some(F::OwnFromBox(k));
     }
     if tys.option_elem(dst) == Some(src) {
         return Some(F::Some);
@@ -754,7 +762,8 @@ impl<'p> Ctx<'p> {
 
     /// `std_into_method`'s source when it still has an integer or float
     /// variable: the variable unified with the element the target fixes
-    /// (`Option<T>`, `Box<T>`, `Rc<T>` from T; `Vec<T>`, `Box<[T]>`,
+    /// (`Option<T>`, `Box<T>`, `Rc<T>` from T; `Rc<T>`, `Arc<T>` from
+    /// `Box<T>`; `Vec<T>`, `Box<[T]>`,
     /// `Rc<[T]>`, `Arc<[T]>`, `Cow<[T]>` from `[T; N]`, `&[T; N]`,
     /// `&[T]`, `Vec<T>`). None for any other
     /// shape, and when the unification fails (nothing stays bound).
@@ -770,8 +779,12 @@ impl<'p> Ctx<'p> {
                 _ => cx.tys.vec_elem(t).map(|e| cx.resolve(e)),
             }
         };
+        let boxed_lit = self.tys.boxed_elem(src).map(|b| self.resolve(b)).filter(|&b| lit(self, b));
         let (have, want) = if lit(self, src) {
             (src, self.tys.option_elem(dst).or_else(|| self.tys.boxed_elem(dst)).or_else(|| self.tys.rc_elem(dst))?)
+        } else if let Some(b) = boxed_lit {
+            // `Box::new(5).into()` as an `Rc<i32>` (alloc's `From<Box<T>>`).
+            (b, self.tys.rc_elem(dst)?)
         } else {
             // An element with a literal anywhere (`({integer}, String)`).
             let e = elem_of_seq(self, src).filter(|&e| lit(self, e) || self.tys.flags(e).contains_infer())?;
