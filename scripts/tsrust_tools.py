@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""The ts-rust codegen tools under lust: the first fork targets that check and build.
+"""The ts-rust fork targets that check and build under lust, kept there by the gate.
 
-Gate form (no argument): the pinned copy in bench/tsrust-tools (the fork's two tool crates,
-their inputs, and a workspace manifest; no dependencies) is checked by lust (both libs and
-both bins), the two bins are built by lust and by Cargo, and the parity runner's tool runs
-(tsrust_parity.TOOL_RUNS) must give the same exit code, stdout, stderr and files.
+Gate form (no argument):
+  tools  the pinned copy in bench/tsrust-tools (the fork's two tool crates, their inputs, and a
+         workspace manifest; no dependencies) is checked by lust (both libs and both bins), the
+         two bins are built by lust and by Cargo, and the parity runner's tool runs
+         (tsrust_parity.TOOL_RUNS) must give the same exit code, stdout, stderr and files.
+  libs   lust checks the fork libs in LIBS from the pinned fork tree: third_party/ts-rust when it
+         is checked out at the pin, else the tar <pin>.tgz in ~/fork-tar (remote-gate.sh copies
+         it to the gate box) or in FORK_TARS. No tree is a failure, never a skip.
 A lust timeout is a hang: a failure, never a reject.
 Last line: "tsrust-tools: <ok> passed, <bad> failed".
 
@@ -27,6 +31,10 @@ import tsrust_parity  # noqa: E402
 
 ROOT = HERE.parent
 PINNED = ROOT / "bench/tsrust-tools"
+# Fork libs that check under lust; ts_goport takes about 100 s cold.
+LIBS = ["goport_util", "goport_lsproto", "ts_goport"]
+FORK_TARS = Path("/home/theo/lust-scratch/tsrust-full/fork-tars")
+FORK_MIRROR = Path("/home/theo/lust-scratch/tsrust-full/fork-mirror.git")
 TOOLS = ["ts_ast_codegen", "ts_diagnostics_codegen"]
 # Fork files the tool runs read (tsrust_parity.TOOL_RUNS), at the same relative paths.
 INPUTS = [
@@ -59,6 +67,60 @@ def refresh():
     r = subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=PINNED)
     print(f"tsrust-tools: refreshed {PINNED.relative_to(ROOT)} from fork {head_rev[:9]}")
     return r.returncode
+
+
+def fork_pin():
+    r = subprocess.run(["git", "-C", str(ROOT), "ls-tree", "HEAD", "third_party/ts-rust"], capture_output=True, text=True)
+    return r.stdout.split()[2] if r.returncode == 0 and r.stdout.split() else None
+
+
+def fork_tree(tmp):
+    """The pinned fork tree: the checked-out submodule at the pin, else an unpacked <pin>.tgz.
+    (None, reason) when there is none."""
+    pin = fork_pin()
+    if pin is None:
+        return None, "no third_party/ts-rust pin in HEAD"
+    sub = ROOT / "third_party/ts-rust"
+    if (sub / "Cargo.toml").exists():
+        r = subprocess.run(["git", "-C", str(sub), "rev-parse", "HEAD"], capture_output=True, text=True)
+        if r.stdout.strip() == pin:
+            return sub, None
+    # A local gate (no remote-gate.sh upload): make the cached tar from the fork mirror.
+    if not (FORK_TARS / f"{pin}.tgz").exists() and FORK_MIRROR.exists():
+        FORK_TARS.mkdir(parents=True, exist_ok=True)
+        tmp_tar = FORK_TARS / f".new-{pin}-{os.getpid()}"
+        r = subprocess.run(f"set -o pipefail; git -C {FORK_MIRROR} archive --format=tar {pin} | gzip -1 > {tmp_tar}", shell=True, executable="/bin/bash")
+        if r.returncode == 0:
+            os.replace(tmp_tar, FORK_TARS / f"{pin}.tgz")
+        else:
+            tmp_tar.unlink(missing_ok=True)
+    for d in (Path.home() / "fork-tar", FORK_TARS):
+        tar = d / f"{pin}.tgz"
+        if tar.exists():
+            dest = tmp / "ts-rust"
+            dest.mkdir()
+            if subprocess.run(["tar", "-xzf", str(tar), "-C", str(dest)]).returncode != 0:
+                return None, f"cannot unpack {tar}"
+            return dest, None
+    return None, f"no fork tree at pin {pin[:9]} (no checked-out submodule, no {pin[:9]}.tgz in ~/fork-tar or {FORK_TARS})"
+
+
+def check_libs(lust, timeout, out):
+    """lust check of each LIBS target from the pinned fork tree: (ok count, failure lines)."""
+    fork, why = fork_tree(out)
+    if fork is None:
+        return 0, [f"libs: {why}"]
+    by_name = {t["name"]: t for t in tsrust_full.targets(fork)}
+    ok, bad = 0, []
+    for name in LIBS:
+        r = tsrust_full.run_lust(lust, "check", by_name[name], out, timeout)
+        line = f"check {name}: {r['status']} ({r.get('secs', '?')}s)"
+        print(f"tsrust-tools: {line}", flush=True)
+        if r["status"] == "ok":
+            ok += 1
+        else:
+            bad.append(line + f" {r['diags'][0]['message'][:120] if r['diags'] else r['stderr'][-200:]}")
+    return ok, bad
 
 
 def gate(lust, timeout):
@@ -95,6 +157,9 @@ def gate(lust, timeout):
                     ok += 1
                 else:
                     bad.append(f"parity {tag}: {res}")
+        lib_ok, lib_bad = check_libs(lust, timeout, out)
+        ok += lib_ok
+        bad += lib_bad
     for b in bad:
         print(f"tsrust-tools: FAIL {b}")
     print(f"tsrust-tools: {ok} passed, {len(bad)} failed")

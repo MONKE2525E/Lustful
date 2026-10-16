@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tsrust-tools.sh [--refresh]: gate lane for the ts-rust codegen tools (scripts/tsrust_tools.py).
+# tsrust-tools.sh [--refresh]: gate lane for the ts-rust fork targets that check under lust
+# (scripts/tsrust_tools.py): the codegen tools (pinned copy) and the fork libs (pinned fork tree).
 # lust checks both tool crates (lib and bin), builds both bins, and their runs on the fork's
 # schema and catalog inputs must equal the Cargo builds' (tsrust_parity TOOL_RUNS). The source
 # is the pinned copy bench/tsrust-tools (gate boxes have no fork submodule); --refresh copies it
