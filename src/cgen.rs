@@ -4504,6 +4504,15 @@ impl FnGen<'_, '_> {
             B::StrTrimStart => format!("lust_str_trim_start({})", str_of(&vals[0], &tys[0])),
             B::StrTrimEnd => format!("lust_str_trim_end({})", str_of(&vals[0], &tys[0])),
             B::StrReplace => format!("lust_str_replace({}, {}, {})", str_of(&vals[0], &tys[0]), vals[1], vals[2]),
+            B::StrReplacen => format!("lust_str_replacen({}, {}, {}, {})", str_of(&vals[0], &tys[0]), vals[1], vals[2], vals[3]),
+            B::StrIsAscii => {
+                let s = str_of(&vals[0], &tys[0]);
+                format!("lust_bytes_is_ascii({s}.ptr, {s}.len)")
+            }
+            B::StrEqIgnoreAsciiCase => {
+                let s = str_of(&vals[0], &tys[0]);
+                format!("lust_bytes_eq_ignore_ascii_case({s}.ptr, {s}.len, {}.ptr, {}.len)", vals[1], vals[1])
+            }
             B::StrRepeat => format!("lust_str_repeat({}, {}, {loc})", str_of(&vals[0], &tys[0]), vals[1]),
             B::StrGetRange => {
                 // `[T]::get`'s bounds, then both ends on char boundaries.

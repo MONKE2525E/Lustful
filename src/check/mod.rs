@@ -425,6 +425,12 @@ pub enum Builtin {
     StrTrimStart,
     StrTrimEnd,
     StrReplace,
+    /// `str::replacen(pat, to, n)` (tf-small-a, R3): alloc's form, a
+    /// String of capacity 32 and the first `n` matches replaced.
+    StrReplacen,
+    /// `str::is_ascii` and `str::eq_ignore_ascii_case` (R3).
+    StrIsAscii,
+    StrEqIgnoreAsciiCase,
     StrRepeat,
     StrIsCharBoundary,
     StrGetRange,
@@ -15129,7 +15135,7 @@ impl<'p> Ctx<'p> {
                 // The str search methods take std's `Pattern`: a char
                 // in the pattern position becomes its encoding as a
                 // &str (`Coerce::CharPat`), which searches the same.
-                if matches!(b, B::StrContains | B::StrFind | B::StrRfind | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix | B::StrReplace)
+                if matches!(b, B::StrContains | B::StrFind | B::StrRfind | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix | B::StrReplace | B::StrReplacen)
                     && args.len() == params.len()
                     && !args.is_empty()
                 {
@@ -15887,6 +15893,13 @@ impl<'p> Ctx<'p> {
                 crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::CharIndices, &[])
             };
             return Some((if n == "bytes" { B::StrBytes } else { B::StrCharIndices }, Autoref::Ref, vec![], ret));
+        }
+        // R3 (tf-small-a).
+        match n {
+            "replacen" => return Some((B::StrReplacen, Autoref::Ref, vec![REF_STR, REF_STR, USIZE], STRING)),
+            "is_ascii" => return Some((B::StrIsAscii, Autoref::Ref, vec![], BOOL)),
+            "eq_ignore_ascii_case" => return Some((B::StrEqIgnoreAsciiCase, Autoref::Ref, vec![REF_STR], BOOL)),
+            _ => {}
         }
         let table = [
             // The `&[u8]` view, as `AsRef<[u8]>` gives it (W-STD-B).

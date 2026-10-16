@@ -558,12 +558,10 @@ impl<'p> Ctx<'p> {
         self.check_packed_borrow(recv, name_span);
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
         self.check_args(&params, args, name_span);
-        // Codegen calls these callables as closures (cgen/slices.rs).
-        if matches!(b, B::SlicePartitionPoint | B::VecDedupBy | B::VecDedupByKey)
-            && let Some(&f) = args.first()
-            && !matches!(self.kind(self.resolve(self.out.expr_ty[self.ei(f)])), TyKind::Closure(..) | TyKind::Error)
-        {
-            self.errs.push(not_yet("L0641", self.span(f), "a callable that is not a closure here"));
+        // A `dyn FnMut` callable has no adapter call (cgen/slices.rs,
+        // lower/iter.rs `call_fn`).
+        if matches!(b, B::SlicePartitionPoint | B::VecDedupBy | B::VecDedupByKey | B::VecResizeWith) && self.adapter_callable_gap(args, &params, false) {
+            return Some(ERROR);
         }
         Some(ret)
     }

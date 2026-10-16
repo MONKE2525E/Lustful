@@ -67,8 +67,8 @@ impl FnGen<'_, '_> {
                 // never answers Equal, so the search ends in Err(i).
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let size = c_size_align(self.p, &e).0;
-                let f = self.closure_arg(&ops[1]);
-                let adapter = self.partition_adapter(&e, f);
+                let f = self.adapter_callee(&ops[1]);
+                let adapter = self.partition_adapter(&e, &f);
                 let (c, r) = (self.tmp(), self.tmp());
                 let _ = writeln!(self.out, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
                 let _ = writeln!(self.out, "    int64_t {r} = lust_binary_search({ptr}, {len}, {size}, (void*)&{c}, {adapter});");
@@ -110,7 +110,7 @@ impl FnGen<'_, '_> {
                 let e = vec_elem(&tys[0]);
                 let et = ctype(&e);
                 let vv = &vals[0];
-                let f = self.closure_arg(&ops[1]);
+                let f = self.adapter_callee(&ops[1]);
                 let (c, w, r) = (self.tmp(), self.tmp(), self.tmp());
                 let mut body = String::new();
                 let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
@@ -118,10 +118,10 @@ impl FnGen<'_, '_> {
                 let cur = format!("(&(({et}*){vv}->ptr)[{r}])");
                 let prev = format!("(&(({et}*){vv}->ptr)[{w} - 1])");
                 let same = if b == B::VecDedupBy {
-                    self.closure_call_c(&mut body, f, &format!("&{c}"), &[cur, prev]).0
+                    self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[cur, prev]).0
                 } else {
-                    let (ka, kt) = self.closure_call_c(&mut body, f, &format!("&{c}"), &[cur]);
-                    let (kb, _) = self.closure_call_c(&mut body, f, &format!("&{c}"), &[prev]);
+                    let (ka, kt) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[cur]);
+                    let (kb, _) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[prev]);
                     let eq = self.eq_expr(&kt, &format!("(&{ka})"), &format!("(&{kb})"));
                     let s = self.tmp();
                     let _ = writeln!(body, "      uint8_t {s} = {eq};");
@@ -154,12 +154,12 @@ impl FnGen<'_, '_> {
 
     /// The `cmp(ctx, p)` adapter of `partition_point`: `pred(p)` as
     /// `Less` (-1) or `Greater` (1); ctx is the closure.
-    fn partition_adapter(&mut self, elem: &CTy, f: LocalDefId) -> String {
+    fn partition_adapter(&mut self, elem: &CTy, f: &(sync::Callee, u8, CTy)) -> String {
         let name = format!("lust_bcmp_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
         self.adapters += 1;
         let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
         let mut body = String::new();
-        let (r, _) = self.closure_call_c(&mut body, f, "ctx", &[format!("(({pt})p)")]);
+        let (r, _) = self.adapter_call_c(&mut body, f, "ctx", &[format!("(({pt})p)")]);
         let _ = writeln!(body, "  return {r} ? -1 : 1;");
         let _ = writeln!(self.prelude, "static int32_t {name}(void *ctx, const void *p) {{\n{body}}}");
         name

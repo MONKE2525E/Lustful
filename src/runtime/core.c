@@ -533,6 +533,13 @@ uint8_t lust_bytes_eq_ignore_ascii_case(const uint8_t *a, uint64_t an, const uin
     return 1;
 })
 
+/* `[u8]::is_ascii` and `str::is_ascii`: no byte at or above 0x80. */
+uint8_t lust_bytes_is_ascii(const uint8_t *p, uint64_t n) LUST_BODY({
+    for (uint64_t i = 0; i < n; i++)
+        if (p[i] >= 0x80) return 0;
+    return 1;
+})
+
 /* `[T]::rotate_left(mid)` over `len` elements of `elem` bytes, after the
    caller's assert: three reversals, elements moved as bytes. */
 void lust_slice_rotate_left(void *ptr, uint64_t len, uint64_t elem, uint64_t mid) LUST_BODY({
@@ -1540,6 +1547,40 @@ lust_str lust_str_trim_end(lust_str s) LUST_BODY({
    else the result starts at `s.len` when the pattern is no longer
    than `to` (0 otherwise) and grows by push_str of each piece
    (segment, `to`, ..., tail), with no exact or no-match fast path. */
+/* `str::replacen(from, to, count)`: alloc's form, a String of capacity
+   32 grown by `push_str`, the first `count` non-overlapping matches left
+   to right replaced (an empty `from` matches at every char boundary,
+   both ends included). */
+lust_String lust_str_replacen(lust_str s, lust_str from, lust_str to, uint64_t count) LUST_BODY({
+    lust_String r = lust_string_with_capacity(32);
+    uint64_t last = 0, done = 0;
+    if (from.len == 0) {
+        uint64_t i = 0;
+        while (done < count) {
+            lust_string_push_bytes(&r, s.ptr + last, i - last);
+            lust_string_push_str(&r, to);
+            last = i;
+            done++;
+            if (i >= s.len) break;
+            lust_utf8_next(s.ptr, &i);
+        }
+    } else {
+        for (uint64_t i = 0; done < count && i + from.len <= s.len;) {
+            if (s.ptr[i] == from.ptr[0] && memcmp(s.ptr + i, from.ptr, from.len) == 0) {
+                lust_string_push_bytes(&r, s.ptr + last, i - last);
+                lust_string_push_str(&r, to);
+                i += from.len;
+                last = i;
+                done++;
+            } else {
+                i++;
+            }
+        }
+    }
+    lust_string_push_bytes(&r, s.ptr + last, s.len - last);
+    return r;
+})
+
 lust_String lust_str_replace(lust_str s, lust_str from, lust_str to) LUST_BODY({
     if (from.len == 1 && to.len == 1) {
         lust_String r = lust_string_with_capacity(s.len);
