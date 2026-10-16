@@ -4243,7 +4243,7 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.prelude, "static struct {node} {{ lust_loc k; struct {node} *next; {ct} v; }} *{node}_head;");
                 let _ = writeln!(
                     self.out,
-                    "    lust_loc {l} = (lust_loc)({loc}); struct {node} *{n} = {node}_head; while ({n} && {n}->k != {l}) {n} = {n}->next;\n    if (!{n}) {{ {n} = (struct {node}*)lust_alloc(sizeof(struct {node}), _Alignof(struct {node})); {n}->k = {l}; {n}->next = {node}_head; {node}_head = {n}; uint64_t fl = 0; while (lust_file[fl]) fl++; {n}->v.f0 = (lust_str){{(uint8_t*)lust_file, fl}}; {n}->v.f1 = (uint32_t)(lust_fn_line[{l} >> 40] + (({l} >> 20) & 0xFFFFF)); {n}->v.f2 = (uint32_t)({l} & 0xFFFFF); }}\n    {ct} *{t} = &{n}->v;"
+                    "    lust_loc {l} = (lust_loc)({loc}); struct {node} *{n} = {node}_head; while ({n} && {n}->k != {l}) {n} = {n}->next;\n    if (!{n}) {{ {n} = (struct {node}*)lust_alloc(sizeof(struct {node}), _Alignof(struct {node})); {n}->k = {l}; {n}->next = {node}_head; {node}_head = {n}; const char *fp; uint32_t ln; lust_loc_where({l}, &fp, &ln); uint64_t fl = 0; while (fp[fl]) fl++; {n}->v.f0 = (lust_str){{(uint8_t*)fp, fl}}; {n}->v.f1 = ln; {n}->v.f2 = (uint32_t)({l} & 0xFFFFF); }}\n    {ct} *{t} = &{n}->v;"
                 );
                 t
             }

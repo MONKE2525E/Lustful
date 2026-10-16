@@ -1,0 +1,4 @@
+# Location::caller() in a module file names that file, as the panic line
+# does (tf-build: it named the crate root). Also through a #[track_caller]
+# chain and a closure, and from a lib target's module.
+stderr=exact

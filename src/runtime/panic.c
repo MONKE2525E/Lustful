@@ -667,6 +667,20 @@ void lust_panic_box(lust_dyn b, lust_loc loc) LUST_BODY({
     else lust_panic_kind(LUST_EXC_STR, t.ptr, t.len, loc);
 })
 
+/* The file and line of a packed location, as the panic messages above
+   print them: `Location::caller()` builds its value from these (cgen
+   `B::LocationCaller`), so a lib fn's location names its own file. */
+void lust_loc_where(lust_loc loc, const char **file, uint32_t *line) LUST_BODY({
+    uint32_t slot = (uint32_t)(loc >> 40);
+    if (slot >= LUST_STD_SLOT) {
+        *file = lust_std_files[(slot - LUST_STD_SLOT) & ~LUST_STD_POW];
+        *line = (loc >> 20) & 0xFFFFF;
+    } else {
+        *file = lust_slot_file ? lust_files[lust_slot_file[slot]] : lust_file;
+        *line = lust_fn_line[slot] + ((loc >> 20) & 0xFFFFF);
+    }
+})
+
 /* ---------- Stdout as Rust's LineWriter ----------
    Rust's stdout is a LineWriter with a 1024-byte buffer over fd 1, tty
    or not: a write that holds a newline sends everything up to its last
