@@ -361,14 +361,16 @@ fn static_key(p: &Program, cx: &StaticCx, v: &crate::ty::consteval::ConstValue, 
 
 /// rustc's equality of constants as a key (runtime/kconst.c `lust_kkey`
 /// does the same at run time): a 4, 8, 16 or 32 byte image is its
-/// bytes; any other is its bytes and init classes, where more than 16
-/// init and uninit chunks make all of it init.
+/// bytes, unless it is a C string (all init, one zero byte, at the end;
+/// LLVM puts it in a string section); any other is its bytes and init
+/// classes, where more than 16 init and uninit chunks make all of it init.
 fn image_key(b: Vec<u8>, mut cls: Vec<u8>) -> Vec<u8> {
     let n = b.len();
+    let cstr = cls.iter().all(|&c| c == 1) && b.iter().position(|&x| x == 0) == Some(n - 1);
     let mut key = vec![b'B'];
     key.extend((n as u64).to_le_bytes());
     key.extend(&b);
-    if matches!(n, 4 | 8 | 16 | 32) {
+    if matches!(n, 4 | 8 | 16 | 32) && !cstr {
         return key;
     }
     let chunks = 1 + cls.windows(2).filter(|w| w[0] != w[1]).count();

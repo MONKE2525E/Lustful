@@ -6,7 +6,9 @@
    bytes, the same uninit runs, and pointers at the same places. The
    linker also merges 4, 8, 16 and 32 byte constants that hold no
    pointer by their bytes (an uninit byte is 0 in the object file), in
-   any unit. lust gives every constant of the program that address:
+   any unit (LLVM's .rodata.cstN). A fully init constant whose only zero
+   byte is its last one is a C string to LLVM (.rodata.str1.A), so it is
+   not in that set. lust gives every constant of the program that address:
    each site interns its bytes here at its first run and keeps the
    canonical address in a slot of its own (cgen/kconst.rs), and the glue
    unit registers the pointees
@@ -37,7 +39,8 @@ void lust_kreg(const void *p, uint64_t n, uint64_t align, const uint64_t *desc);
 
 #ifdef LUST_IMPL
 /* One interned constant: `kind` 1 is a mergeable 4/8/16/32 byte constant
-   with no pointer (the key is its bytes), 0 any other (the key is its
+   with no pointer that is not a C string (the key is its bytes), 0 any
+   other (the key is its
    bytes, then its byte classes: 0 uninit, 1 init, 2 pointer). `align`
    is the alignment its storage guarantees. */
 typedef struct lust_kent {
@@ -148,7 +151,9 @@ static void lust_kwalk(const uint8_t *v, uint8_t *cls, const uint64_t *d, uint64
 
 /* The key of the `n` bytes at `p` into `key` (2n bytes); returns the kind.
    `key[0..n)` are the bytes with uninit ones 0; for kind 0, `key[n..2n)`
-   are the classes. As rustc (const_alloc_to_llvm), a run of bytes
+   are the classes. A C string (`cstr`: all init, one zero byte, at the
+   end) is kind 0, as LLVM puts it in a string section (getKindForGlobal).
+   As rustc (const_alloc_to_llvm), a run of bytes
    between pointers with more than 16 init and uninit chunks is all init. */
 static uint8_t lust_kkey(const void *p, uint64_t n, const uint64_t *desc, uint8_t *key) {
     uint8_t *cls = key + n;
@@ -159,12 +164,15 @@ static uint8_t lust_kkey(const void *p, uint64_t n, const uint64_t *desc, uint8_
     } else {
         memset(cls, 1, n);
     }
-    int reloc = 0;
+    int reloc = 0, uninit = 0;
+    uint64_t zeros = 0;
     for (uint64_t i = 0; i < n; i++) {
-        if (!cls[i]) key[i] = 0;
+        if (!cls[i]) key[i] = 0, uninit = 1;
         if (cls[i] == 2) reloc = 1;
+        zeros += !key[i];
     }
-    if (!reloc && (n == 4 || n == 8 || n == 16 || n == 32)) return 1;
+    int cstr = !uninit && !reloc && zeros == 1 && !key[n - 1];
+    if (!reloc && !cstr && (n == 4 || n == 8 || n == 16 || n == 32)) return 1;
     for (uint64_t s = 0; s < n;) {
         if (cls[s] == 2) {
             s++;
