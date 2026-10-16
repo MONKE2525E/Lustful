@@ -937,9 +937,18 @@ pub fn serve(sock: &Path) -> ! {
             let mut reader = BufReader::new(&conn);
             protocol::read_request(&mut reader)
         };
+        // A client of another lust build (a rebuilt or replaced binary at
+        // an explicit LUST_DAEMON_SOCKET) must never get this compiler's
+        // answer: it gets a head it drops, compiles cold, and this daemon
+        // exits so the next command starts one of the client's build.
+        if req.as_ref().err() == Some(&protocol::ReadError::OtherBuild) {
+            let _ = protocol::write_other_build(&mut conn);
+            drop(conn);
+            shutdown(sock, &base, &sessions, "a client of another lust build connected");
+        }
         *BUSY.lock().unwrap_or_else(|e| e.into_inner()) = Some((conn.as_raw_fd(), std::time::Instant::now()));
         let resp = match req {
-            Some(req) => {
+            Ok(req) => {
                 // A daemon never runs user code in memory: that run forks,
                 // and guard compiles run on other threads here (src/tcc.rs).
                 assert!(req.run_args.is_none(), "the daemon wire carries no run arguments");
@@ -958,7 +967,7 @@ pub fn serve(sock: &Path) -> ! {
                 }
                 compile_guarded(entry, &req, &mut jobs)
             }
-            None => Response { stderr: "error: bad request\n".into(), code: 2, ..Default::default() },
+            Err(_) => Response { stderr: "error: bad request\n".into(), code: 2, ..Default::default() },
         };
         let _ = protocol::write_response(&mut conn, &resp);
         *BUSY.lock().unwrap_or_else(|e| e.into_inner()) = None;

@@ -251,6 +251,53 @@ def scenario(srcdir):
     return name, problems, notes
 
 
+def rebuilt_binary():
+    """A daemon must never answer a client of another lust build (tf-borrow
+    08:10: an older daemon at an explicit socket kept answering after a
+    rebuild). Copies lust and lust-core, warms a daemon from the copy, then
+    replaces the copy's lust-core (a rebuild at the same path) and checks
+    again: the answer must be cold and right, the old daemon gone."""
+    name = "binary01_rebuilt_daemon"
+    work = tempfile.mkdtemp(prefix=f"lust-scen-{name}-")
+    problems = []
+    try:
+        for b in ("lust", "lust-core"):
+            shutil.copy2(os.path.join(os.path.dirname(LUST), b), os.path.join(work, b))
+        lust = os.path.join(work, "lust")
+        main = os.path.join(work, "main.rs")
+        with open(main, "w") as f:
+            f.write("fn main() {\n    let x: u8 = true;\n}\n")
+        env = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(work, "d.sock"), LUST_NO_CACHE="1")
+        env.pop("LUST_NO_DAEMON", None)
+        log = open(os.path.join(work, "daemon.log"), "w")
+        daemon = subprocess.Popen([lust, "daemon"], cwd=work, env=env, stderr=log, start_new_session=True)
+        t0 = time.time()
+        while not os.path.exists(env["LUST_DAEMON_SOCKET"]) and time.time() - t0 < 10:
+            time.sleep(0.005)
+        rc1, _, err1 = run([lust, "check", main], work, env)
+        # The rebuild: a new file at the same path (new inode and mtime).
+        core = os.path.join(work, "lust-core")
+        shutil.copy2(core, core + ".new")
+        os.replace(core + ".new", core)
+        rc2, _, err2 = run([lust, "check", main], work, env)
+        try:
+            daemon.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            problems.append(f"{name}: the old daemon still runs after a client of another build")
+            os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
+        log.close()
+        text = open(os.path.join(work, "daemon.log")).read()
+        if (rc1, first_code(err1)) != (rc2, first_code(err2)) or rc1 == 0:
+            problems.append(f"{name}: answers differ: before rc={rc1} {err1[:160]!r}, after rc={rc2} {err2[:160]!r}")
+        if "another lust build" not in text:
+            problems.append(f"{name}: the daemon did not see the other build: {text[-300:]!r}")
+        if text.count("new session") != 1:
+            problems.append(f"{name}: the old daemon compiled the rebuilt client's request")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return name, problems, []
+
+
 def main():
     if not os.path.exists(LUST):
         print(f"{LUST} missing; run: cargo build --release", file=sys.stderr)
@@ -262,6 +309,9 @@ def main():
     jobs = int(os.environ.get("DAEMON_SCENARIO_JOBS", "8"))
     with ProcessPoolExecutor(max_workers=jobs) as pool:
         results = list(pool.map(scenario, dirs))
+    if not names:
+        results.append(rebuilt_binary())
+        dirs.append(None)
     results.sort()
     bad = 0
     notes = 0

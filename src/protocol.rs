@@ -3,7 +3,7 @@
 //
 // Wire format. Request: a header line with no user data in it,
 //   cmd json timings debug max_errors test default_features all_features
-//   panic_abort overflow_checks debug_assertions feature_count env_count offline locked
+//   panic_abort overflow_checks debug_assertions feature_count env_count offline locked build
 // followed by length-prefixed fields, each as "<byte len>\n<bytes>": file, out,
 // emit_c, then the crate selector (package id, manifest path, target kind,
 // target name, crate root, target triple), then one field per feature,
@@ -11,9 +11,12 @@
 // and when the header's env count is not "-", that many name and value fields.
 // Length prefixes carry any byte a path can hold, including tabs and newlines; emit_c
 // and the manifest path use len 0 for None. Run arguments never cross the wire
-// (see `Request::run_args`). The socket name holds the build hash, so a client
-// only ever talks to a daemon of the same build: the wire needs no compat mode.
-// Response: "<code> <stdout len> <stderr len>\n" followed by the two byte strings.
+// (see `Request::run_args`). The default socket name holds the build hash, but an
+// explicit `LUST_DAEMON_SOCKET` can name a daemon of another build, so both directions
+// carry `build_id`: a daemon that reads another build's request answers and exits
+// (`ReadError::OtherBuild`), and a client drops an answer from another build or from a
+// daemon that predates the field (`request`). A stale compiler never answers warm.
+// Response: "<code> <stdout len> <stderr len> <build>\n" followed by the two byte strings.
 // Both binaries include this module and each uses only part of it.
 #![allow(dead_code)]
 
@@ -729,13 +732,41 @@ fn get_field(r: &mut impl BufRead) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// This build's identity on the daemon wire: the build hash (compiler and
+/// shipped library sources, tcc; see build.rs) and the file identity of the
+/// `lust-core` binary (device, inode, size, mtime), so a rebuild or a binary
+/// replaced at the same path differs even when its sources hash the same.
+/// The client names its sibling `lust-core`; `lust-core` names itself. A
+/// daemon computes it once, so it keeps the identity of the binary it runs.
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use std::os::unix::fs::MetadataExt;
+        let core = std::env::current_exe().map(|e| if e.file_name().is_some_and(|n| n == "lust-core") { e } else { e.with_file_name("lust-core") });
+        let file = core.and_then(std::fs::metadata).map_or_else(
+            |_| "-".to_string(),
+            |m| format!("{:x}.{:x}.{:x}.{:x}.{:x}", m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()),
+        );
+        format!("{}.{file}", env!("LUST_BUILD_HASH"))
+    })
+}
+
+/// Why `read_request` gives no request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// EOF, a bad header, or a short read.
+    Bad,
+    /// A client of another lust build (or one that predates the build field).
+    OtherBuild,
+}
+
 pub fn encode(r: &Request) -> Vec<u8> {
     let b = |x: bool| if x { "1" } else { "0" };
     let cmd = if r.cmd == Cmd::Check { "check" } else { "build" };
     let s = &r.session;
     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -748,7 +779,8 @@ pub fn encode(r: &Request) -> Vec<u8> {
         b(s.profile.debug_assertions),
         s.features.len(),
         b(s.cargo_net.offline),
-        b(s.cargo_net.locked)
+        b(s.cargo_net.locked),
+        build_id()
     )
     .into_bytes();
     let path_field = |out: &mut Vec<u8>, p: Option<&Path>| put_field(out, p.map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()));
@@ -772,16 +804,24 @@ pub fn encode(r: &Request) -> Vec<u8> {
     out
 }
 
-/// Reads one request. None on EOF, a bad header, or a short read.
-pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
+/// Reads one request. A header of another build is `OtherBuild` before any
+/// field is read: its fields may mean something else.
+pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
     let mut head = String::new();
-    if r.read_line(&mut head).ok()? == 0 {
-        return None;
+    if r.read_line(&mut head).map_err(|_| ReadError::Bad)? == 0 {
+        return Err(ReadError::Bad);
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 15 {
-        return None;
+    if f.len() != 16 || f[15] != build_id() {
+        // The first word is always a command, so a short header of a known
+        // command is a client from before this field.
+        return Err(if matches!(f.first(), Some(&"check" | &"build")) { ReadError::OtherBuild } else { ReadError::Bad });
     }
+    read_fields(r, &f).ok_or(ReadError::Bad)
+}
+
+/// The length-prefixed fields after a request header `f`.
+fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
     #[allow(unused_imports)]
     use std::os::unix::ffi::OsStringExt as _;
     let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(bytes));
@@ -853,18 +893,34 @@ pub fn read_request(r: &mut impl BufRead) -> Option<Request> {
 }
 
 pub fn write_response(w: &mut impl Write, r: &Response) -> std::io::Result<()> {
-    write!(w, "{} {} {}\n{}{}", r.code, r.stdout.len(), r.stderr.len(), r.stdout, r.stderr)
+    write!(w, "{} {} {} {}\n{}{}", r.code, r.stdout.len(), r.stderr.len(), build_id(), r.stdout, r.stderr)
 }
 
-/// Sends a request to a running daemon. None if no daemon answers.
+/// The whole answer to a request of another build: a head no client takes
+/// for a response (older clients need three numbers), then the daemon exits.
+pub fn write_other_build(w: &mut impl Write) -> std::io::Result<()> {
+    write!(w, "- - - {}\n", build_id())
+}
+
+/// Sends a request to a running daemon. None if no daemon answers, or if the
+/// one that answers is another lust build: that answer is dropped and the
+/// caller compiles cold. A daemon of another build that knows the build
+/// field exits by itself; an older one is stopped by removing its socket
+/// (its stop request), so the next command starts a daemon of this build.
 pub fn request(sock: &Path, req: &Request) -> Option<Response> {
     let mut conn = UnixStream::connect(sock).ok()?;
     conn.write_all(&encode(req)).ok()?;
     let mut reader = BufReader::new(conn);
     let mut head = String::new();
     reader.read_line(&mut head).ok()?;
-    let nums: Vec<usize> = head.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-    if nums.len() != 3 {
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let nums: Vec<usize> = words.iter().take(3).filter_map(|x| x.parse().ok()).collect();
+    if nums.len() == 3 && words.len() == 3 {
+        // A daemon from before the build field: stop it.
+        let _ = std::fs::remove_file(sock);
+        return None;
+    }
+    if nums.len() != 3 || words.len() != 4 || words[3] != build_id() {
         return None;
     }
     let mut out = vec![0; nums[1]];
@@ -1394,7 +1450,14 @@ mod tests {
         assert_eq!(back.client, req.client);
         // A truncated wire form never reads as a request.
         let bytes = encode(&req);
-        assert!(read_request(&mut std::io::Cursor::new(&bytes[..bytes.len() - 3])).is_none());
+        assert_eq!(read_request(&mut std::io::Cursor::new(&bytes[..bytes.len() - 3])).err(), Some(ReadError::Bad));
+        // Another build's header (here: one from before the build field) is
+        // refused before its fields are read.
+        let text = String::from_utf8(encode(&req)).unwrap();
+        let old = text.replacen(&format!(" {}\n", build_id()), "\n", 1);
+        assert_eq!(read_request(&mut std::io::Cursor::new(old.as_bytes())).err(), Some(ReadError::OtherBuild));
+        let other = text.replacen(&format!(" {}\n", build_id()), " 0123.other\n", 1);
+        assert_eq!(read_request(&mut std::io::Cursor::new(other.as_bytes())).err(), Some(ReadError::OtherBuild));
     }
 
     /// Project dev config: `dev-exclude-features` turns the package
