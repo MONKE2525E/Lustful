@@ -5982,6 +5982,12 @@ impl<'p> Ctx<'p> {
         true
     }
     fn occurs(&self, v: u32, t: Ty) -> bool {
+        // A type with no inference variable holds none: without this a
+        // type that doubles its args per level (`((T, T), (T, T))`)
+        // makes the walk exponential.
+        if !self.tys.flags(t).contains_infer() {
+            return false;
+        }
         match self.kind(t) {
             TyKind::Infer(w) => w.index() == v,
             TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.occurs(v, e),
@@ -23354,22 +23360,23 @@ impl<'p> Ctx<'p> {
     }
 
     fn has_error_kind(&self, t: Ty) -> bool {
-        match self.kind(t) {
-            TyKind::Error => true,
-            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.has_error_kind(e),
-            TyKind::Adt(_, a) => (0..self.tys.args(a).len()).any(|i| match self.tys.args(a)[i].as_ty() {
-                Some(e) => self.has_error_kind(e),
-                None => false,
-            }),
-            TyKind::Tuple(ts) => {
-                let n = self.tys.tys_of(ts).len();
-                (0..n).any(|i| {
-                    let e = self.tys.tys_of(ts)[i];
-                    self.has_error_kind(e)
-                })
+        // Each distinct type once: a type that doubles its args per
+        // level (`((T, T), (T, T))`) is a tree exponential in its depth.
+        let mut seen: crate::intern::FxMap<Ty, ()> = crate::intern::FxMap::default();
+        let mut stack = vec![t];
+        while let Some(t) = stack.pop() {
+            if seen.insert(t, ()).is_some() {
+                continue;
             }
-            _ => false,
+            match self.kind(t) {
+                TyKind::Error => return true,
+                TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => stack.push(e),
+                TyKind::Adt(_, a) => stack.extend(self.tys.args(a).iter().filter_map(|g| g.as_ty())),
+                TyKind::Tuple(ts) => stack.extend(self.tys.tys_of(ts).iter().copied()),
+                _ => {}
+            }
         }
+        false
     }
 }
 
