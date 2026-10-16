@@ -185,7 +185,9 @@ impl Builder<'_, '_> {
                 free_node(self)
             } else if r == Region::Static {
                 Node::Var(0)
-            } else if substituted {
+            } else if substituted || ins.is_empty() {
+                // With no input slot an output slot is no binder's either
+                // (`fn() -> T` with `T = Vec<&'static str>`).
                 Node::Var(self.fresh())
             } else if let [one] = ins[..] {
                 one
