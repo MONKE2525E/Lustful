@@ -9,6 +9,9 @@
 // through the `AdtShapes` trait so this file does not depend on collect's tables.
 #![allow(dead_code)] // Wired into size_of/align_of by check and into codegen by W-CGEN.
 
+use super::hash::HashTy;
+use super::iter::IterKind;
+use super::sync::SyncTy;
 use super::{AdtId, BuiltinTy, FloatTy, IntTy, Ty, TyIntern, TyKind};
 
 /// A niche: a scalar range inside a type whose unused values can hold enum tags
@@ -133,12 +136,6 @@ pub fn raw_ptr_layout() -> Layout {
 /// non-null niche.
 pub fn fat_ptr_layout() -> Layout {
     Layout::simple(16, 8, Some(Niche { offset: 0, scalar_size: 8, free: 1, start: 0 }))
-}
-
-/// A value inside an `UnsafeCell`: the same size, alignment and
-/// inhabitedness, but no niche and no field or tag detail.
-fn hide_niche(l: Layout) -> Layout {
-    Layout { niche: None, field_offsets: Vec::new(), variant_offsets: Vec::new(), enum_tag: None, ..l }
 }
 
 /// A zero-sized type with the given alignment.
@@ -924,21 +921,6 @@ fn compute(
                 Some(_) => Ok(ptr_layout()),
                 None => Err(()),
             },
-            // `Cell<T>` is a transparent `UnsafeCell<T>`: `T`'s size and
-            // alignment, with no niche.
-            Some(BuiltinTy::Cell) => {
-                let e = tys.adt_first_ty_arg(t).ok_or(())?;
-                Ok(hide_niche(go(tys, shapes, e, env, frames, memo, active)?))
-            }
-            // `RefCell<T>` is `{ borrow: Cell<isize>, value: UnsafeCell<T> }`
-            // (std's `debug_refcell` field is off): no niche.
-            Some(BuiltinTy::RefCell) => {
-                let e = tys.adt_first_ty_arg(t).ok_or(())?;
-                let value = hide_niche(go(tys, shapes, e, env, frames, memo, active)?);
-                let mut l = struct_layout(&[int_layout(IntTy::Isize), value], Repr::default())?;
-                l.field_offsets.clear();
-                Ok(l)
-            }
             // `Ref<T>` and `RefMut<T>` are `{ value: NonNull<T>, borrow: &Cell<isize> }`
             // (RefMut adds a PhantomData): two pointers, the first fat for an unsized `T`.
             Some(BuiltinTy::RefGuard | BuiltinTy::RefMutGuard) => {
@@ -986,13 +968,6 @@ fn compute(
                 let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
                 struct_layout(&[int_layout(IntTy::Isize), v], Repr::default())
             }
-            // `rc::Weak<T>`: a `NonNull` to the allocation (fat for an
-            // unsized `T`), as `Rc<T>`.
-            Some(BuiltinTy::Weak) => match tys.adt_first_ty_arg(t).map(|e| tys.kind(e)) {
-                Some(TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) => Ok(fat_ptr_layout()),
-                Some(_) => Ok(ptr_layout()),
-                None => Err(()),
-            },
             // The futex locks (Linux): `Mutex<T>` is `{ futex: AtomicU32,
             // poison: AtomicBool, data: UnsafeCell<T> }`, `RwLock<T>` the
             // same with an 8-byte state (two `AtomicU32`).
@@ -1006,6 +981,55 @@ fn compute(
                 let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
                 let state = if k == crate::ty::sync::SyncTy::Mutex { 4 } else { 8 };
                 struct_layout(&[Layout::simple(state, 4, None), Layout::simple(1, 1, None), v], Repr::default())
+            }
+            // The std types below as Rust 1.99 lays them out on 64-bit
+            // Linux (checked with size_of and Option niches, tf-build): the
+            // field lists give rustc's reordering and largest niche.
+            Some(b @ (BuiltinTy::Hash(_) | BuiltinTy::Sync(_) | BuiltinTy::Iter(_) | BuiltinTy::Chars | BuiltinTy::ExitCode)) => {
+                let arg = |i: usize| tys.adt_parts(t).and_then(|(_, a)| tys.args(a).get(i).and_then(|g| g.as_ty()));
+                let usize_l = || int_layout(IntTy::Usize);
+                let fields: Vec<Layout> = match b {
+                    // hashbrown: the hasher, then RawTableInner { ctrl:
+                    // NonNull<u8>, bucket_mask, growth_left, items }.
+                    BuiltinTy::Hash(HashTy::HashMap | HashTy::HashSet) => {
+                        let s = arg(if b == BuiltinTy::Hash(HashTy::HashMap) { 2 } else { 1 }).ok_or(())?;
+                        vec![go(tys, shapes, s, env, frames, memo, active)?, ptr_layout(), usize_l(), usize_l(), usize_l()]
+                    }
+                    BuiltinTy::Hash(HashTy::RandomState) => return Ok(Layout::simple(16, 8, None)),
+                    // SipHasher13: k0, k1, length, v0..v3, tail, ntail.
+                    BuiltinTy::Hash(HashTy::DefaultHasher) => return Ok(Layout::simple(72, 8, None)),
+                    BuiltinTy::Hash(HashTy::BuildHasherDefault) => return Ok(zst_layout(1)),
+                    // JoinInner { native: pthread_t, thread: Thread, packet: Arc<..> }.
+                    BuiltinTy::Sync(SyncTy::JoinHandle) => vec![int_layout(IntTy::U64), ptr_layout(), ptr_layout()],
+                    BuiltinTy::Sync(SyncTy::Thread) => return Ok(ptr_layout()),
+                    BuiltinTy::Sync(SyncTy::ThreadId) => return Ok(nonzero_layout(IntTy::U64)),
+                    // The mpmc flavor enum: a u8 tag (3 variants) and a pointer.
+                    BuiltinTy::Sync(SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver) => {
+                        return Ok(Layout::simple(16, 8, Some(Niche { offset: 0, scalar_size: 1, free: 253, start: 3 })));
+                    }
+                    BuiltinTy::Sync(SyncTy::Condvar) => return Ok(Layout::simple(4, 4, None)),
+                    // { lock: Mutex<BarrierState>, cvar: Condvar, num_threads }.
+                    BuiltinTy::Sync(SyncTy::Barrier) => return Ok(Layout::simple(40, 8, None)),
+                    BuiltinTy::Sync(SyncTy::BarrierWaitResult) => return Ok(bool_layout()),
+                    BuiltinTy::Iter(IterKind::Range) => {
+                        let e = go(tys, shapes, arg(0).ok_or(())?, env, frames, memo, active)?;
+                        vec![e.clone(), e]
+                    }
+                    BuiltinTy::Iter(IterKind::RangeInclusive) => {
+                        let e = go(tys, shapes, arg(0).ok_or(())?, env, frames, memo, active)?;
+                        vec![e.clone(), e, bool_layout()]
+                    }
+                    // slice::Iter<u8> { ptr: NonNull<u8>, end_or_len }.
+                    BuiltinTy::Chars => vec![ptr_layout(), raw_ptr_layout()],
+                    BuiltinTy::Iter(IterKind::CharIndices) => vec![usize_l(), ptr_layout(), raw_ptr_layout()],
+                    // { buf: NonNull<T>, cap, ptr: NonNull<T>, end }.
+                    BuiltinTy::Iter(IterKind::VecIntoIter) => vec![ptr_layout(), usize_l(), ptr_layout(), raw_ptr_layout()],
+                    BuiltinTy::ExitCode => return Ok(int_layout(IntTy::U8)),
+                    _ => return Err(()),
+                };
+                let mut l = struct_layout(&fields, Repr::default())?;
+                l.field_offsets.clear();
+                Ok(l)
             }
             Some(_) => Err(()),
             // `core::num::NonZero<T>` (TRIAGE T5): the integer
