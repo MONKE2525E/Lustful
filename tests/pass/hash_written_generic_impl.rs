@@ -1,6 +1,5 @@
-// expect: L0640
-// Valid Rust: a map key with a generic written Hash impl. The hash glue
-// calls written impls of non-generic impls only, so lust rejects it.
+// A map key with a generic written Hash impl: the hash glue calls its
+// `hash::<H>` instance at the key type (gx.generic_hash).
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
