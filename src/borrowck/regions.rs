@@ -1330,6 +1330,23 @@ fn type_params_in(tys: &impl TyIntern, t: Ty, out: &mut Vec<u32>) {
 /// callee's bound and the argument's signature, `entail_bound`); a type
 /// param or projection on either side (an instantiation) pairs nothing.
 /// False when the shapes differ.
+/// True when builtin iterator type `t`, or an iterator inside it, is a
+/// library or user one (`IterKind::ByNext`), or `t` is no builtin one.
+fn by_next_inside(tys: &impl TyIntern, t: Ty) -> bool {
+    match crate::ty::iter::iter_parts(tys, t) {
+        None => !tys.is_chars_ty(t),
+        Some((crate::ty::iter::IterKind::ByNext, _)) => true,
+        Some((_, a)) => a.into_iter().any(|x| crate::ty::iter::iter_parts(tys, x).is_some_and(|_| by_next_inside(tys, x)) || adt_iterish(tys, x)),
+    }
+}
+
+/// True for an Adt type that is no builtin iterator but may be a user one
+/// (`by_next_inside`): any user Adt. Coarse: a user element type
+/// (`slice::Iter<'_, Node>`) also skips the item check.
+fn adt_iterish(tys: &impl TyIntern, t: Ty) -> bool {
+    matches!(tys.kind(t), TyKind::Adt(..)) && tys.builtin_of(t).is_none()
+}
+
 /// The regions of `b` in the places where `a` (the same shape, as for
 /// `region_pairs`) has a type param or a projection.
 fn param_covered_regions(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<Region>) {
@@ -5218,9 +5235,10 @@ impl<'b, 'p> Builder<'b, 'p> {
     }
 
     /// The returned iterator's items outlive the regions its `Iterator<Item
-    /// = T>` bound writes in `T` (`OwnSig::ret_vars`): per candidate item
-    /// (`iter_items`) whose slots pair with `T`'s, each slot of a named
-    /// lifetime or `'static` outlives that universal.
+    /// = T>` bound writes in `T` (`OwnSig::ret_vars`): for a returned
+    /// `Map` (or `FilterMap`), whose `B` slots hold what its closure
+    /// returns and pair with `T`'s, each slot of a named lifetime or
+    /// `'static` outlives that universal.
     fn rpit_item_edges(&mut self, item: Ty) {
         let t = self.body.locals[0].ty;
         let n = self.sc.slots(t) as usize;
@@ -5228,7 +5246,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let vars: Vec<u32> = (0..n as u32).map(|i| base + i).collect();
         let mut rs = Vec::new();
         regions_of(&self.p.tys, item, &mut rs);
-        let mut cands = Vec::new();
+        let mut cands: Vec<Vec<u32>> = Vec::new();
         // `Map<I, F, B>`'s items are its `B` slots, which the closure's
         // output flows into at the `map` call.
         let parts = crate::ty::iter::iter_parts(&self.body.tys, t);
@@ -5241,7 +5259,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 Some(v) => cands.push(v.to_vec()),
                 None => return,
             }
-        } else if !self.iter_items(t, &vars, &mut cands) {
+        } else if by_next_inside(&self.body.tys, t) || !self.iter_items(t, &vars, &mut cands) {
+            // A library or user iterator's items come through flows lust
+            // keeps coarse (a generic method's result holds its receiver's
+            // loan): not checked.
             return;
         }
         for c in cands {
