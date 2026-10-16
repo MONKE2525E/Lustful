@@ -26,6 +26,12 @@
 #                  user trait's impl (concrete and generic), and an inherent
 #                  impl with an associated const; callers through the type,
 #                  a generic bound, UFCS and the trait path; two edits, back
+#   sig_apit       a fn with an `impl Trait` param (APIT): header edits that
+#                  keep the APITs (the item patch keeps their lowering) and
+#                  ones that change, move, or add one (a full resolve)
+#   sig_umacro     a fn whose body calls a user macro: header edits with the
+#                  same body (the item patch reuses the body's expansion),
+#                  then a macro input or macro definition edit
 # `External` adds verdicts from rustc 1.99 and a pinned baseline lust for
 # the op states (`--rustc`, `--baseline`): a state where the warm answer
 # disagrees with rustc fails unless the baseline gives the same answer
@@ -34,7 +40,8 @@
 import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
-       "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl"]
+       "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl",
+       "sig_apit", "sig_umacro"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -325,6 +332,80 @@ def sig_impl(rng, fs):
     s1 = edit(a)
     s2 = edit(s1)
     return [a, s1, s2, a, fs]
+def _header_walk(rng, fs, items, head, edits, extra=()):
+    """A: `items` at the end of the root file; then two header edits in a
+    row (`head` replaced by a pick of `edits`, the second on the first's
+    text), back to A; with `extra`, one other text swap, a header edit on
+    top of it, back to A; then the files."""
+    root = _root(fs)
+    a = dict(fs)
+    a[root] = fs[root] + items
+    def swap(cur, old, new):
+        out = dict(cur)
+        out[root] = cur[root].replace(old, new, 1)
+        return out
+    h1 = rng.choice(edits)
+    s1 = swap(a, head, h1)
+    s2 = swap(s1, h1, rng.choice([e for e in edits if e != h1] or edits))
+    states = [a, s1, s2, a]
+    if extra:
+        old, new = rng.choice(extra)
+        b = swap(a, old, new)
+        states += [b, swap(b, head, rng.choice(edits)), a]
+    return states + [fs]
+
+
+def sig_apit(rng, fs):
+    """A fn with an APIT (sometimes after generics whose bound holds
+    parens) and its caller; header edits that keep the APIT or change,
+    move, or add one."""
+    k = rng.randrange(10**6)
+    gen = rng.choice(["", "<F: Fn(u8) -> u8>"])
+    fparam = ", f: F" if gen else ""
+    farg = ", |b| b + 1" if gen else ""
+    apit = "mut test: impl FnMut(u32) -> bool"
+    def h(params=None, ret="bool", where=""):
+        p = params if params is not None else f"xs: &[u32], {apit}{fparam}"
+        return f"fn za{k}_any{gen}({p}) -> {ret}{where} {{"
+    head = h()
+    items = (f"\n#[allow(dead_code)]\n{head}\n    xs.iter().any(|&x| test(x))\n}}\n"
+             f"#[allow(dead_code)]\nfn za{k}_use() -> bool {{ za{k}_any(&[1, 2], |x| x > 1{farg}) }}\n")
+    edits = [h(where=" where u32: Copy"), h(where=" where String: Copy"), h(where=" where i64: Clone + Default"),
+             h(params=f"xs: &[u32], {apit}{fparam}, _k: u8"), h(params=f"xs: &[u64], {apit}{fparam}"), h(ret="Option<bool>"),
+             # APIT changes: a full resolve.
+             h(params=f"xs: &[u32], mut test: impl Fn(u32) -> bool{fparam}"),
+             h(params=f"xs: &[u32], {apit} + Copy{fparam}"),
+             h(params=f"{apit}, xs: &[u32]{fparam}"),
+             h(params=f"xs: &[u32], {apit}{fparam}, _y: impl Copy")]
+    return _header_walk(rng, fs, items, head, edits)
+
+
+def sig_umacro(rng, fs):
+    """A fn whose body calls a user macro, and one whose macro binds a
+    hygienic local; header edits with the same body, then a macro input
+    or macro definition edit with a header edit on top."""
+    k = rng.randrange(10**6)
+    mdef = "{ vec![$($x.to_string()),*] }"
+    items = (f"\nmacro_rules! zu{k}_args {{\n    ($($x:expr),* $(,)?) => {mdef};\n}}\n"
+             f"macro_rules! zu{k}_tw {{\n    ($e:expr) => {{{{ let t = $e; t + t }}}};\n}}\n"
+             f"#[allow(dead_code)]\nfn zu{k}_chain(d: &str, n: usize) -> Vec<String> {{\n    let mut v = zu{k}_args![d, n];\n"
+             f"    v.push(String::new());\n    v\n}}\n"
+             f"#[allow(dead_code)]\nfn zu{k}_twice(t: i64) -> i64 {{\n    zu{k}_tw!(t)\n}}\n"
+             f"#[allow(dead_code)]\nfn zu{k}_use() -> i64 {{ zu{k}_chain(\"a\", 2).len() as i64 + zu{k}_twice(3) }}\n")
+    if rng.random() < 0.3:
+        head = f"fn zu{k}_twice(t: i64) -> i64 {{"
+        edits = [f"fn zu{k}_twice(t: i64) -> i64 where i64: Copy {{", f"fn zu{k}_twice(t: i64) -> i64 where String: Copy {{",
+                 f"fn zu{k}_twice(t: i32) -> i32 {{", f"fn zu{k}_twice(u: i64) -> i64 {{", f"fn zu{k}_twice(t: u8) -> i64 {{"]
+    else:
+        c = f"fn zu{k}_chain"
+        head = f"{c}(d: &str, n: usize) -> Vec<String> {{"
+        edits = [f"{c}(d: &str, n: usize) -> Vec<String> where u32: Copy {{", f"{c}(d: &str, n: usize) -> Vec<String> where String: Copy {{",
+                 f"{c}(d: &str, n: usize, _k: u8) -> Vec<String> {{", f"{c}(e: &str, n: usize) -> Vec<String> {{",
+                 f"{c}(d: &str, n: u8) -> Vec<String> {{", f"{c}(d: &String, n: usize) -> Vec<String> {{"]
+    extra = [(f"zu{k}_args![d, n]", f"zu{k}_args![d, n, 1]"),
+             (mdef, "{ [$(format!(\"{}\", $x)),*].to_vec() }"),
+             (mdef, "{ vec![$($x),*] }")]
+    return _header_walk(rng, fs, items, head, edits, extra)
 
 
 def sig_states(rng, fs):

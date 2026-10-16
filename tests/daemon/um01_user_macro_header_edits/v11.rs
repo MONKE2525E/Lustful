@@ -1,0 +1,21 @@
+macro_rules! args {
+    ($($x:expr),* $(,)?) => { vec![$($x.to_string()),*] };
+}
+
+macro_rules! tw {
+    ($e:expr) => {{ let t = $e; t + t }};
+}
+
+fn chain(d: &str, n: u8) -> Vec<String> {
+    let mut v = args![d, n, 1];
+    v.push(String::new());
+    v
+}
+
+fn twice(t: i64) -> i64 {
+    tw!(t)
+}
+
+fn main() {
+    println!("{:?} {}", chain("a", 2), twice(3));
+}
