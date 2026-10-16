@@ -228,19 +228,49 @@ impl<'p> Ctx<'p> {
         // from the expected type when it applies the same builtin
         // the path names (never when a user type of the name is the
         // binding here, which the trait probe above already tried).
-        let want = self.resolve(expected?);
-        let (def, _) = self.tys.adt_parts(want)?;
-        if builtin_std_path(&self.tys, want).is_none() {
-            return None;
+        // Else fresh variables, as rustc infers a path's omitted args
+        // (`Vec::from_json(v)` for a user trait implemented for `Vec<T>`).
+        if let Some(want) = expected.map(|t| self.resolve(t))
+            && self.builtin_names_path(want, segs)
+        {
+            return Some(want);
         }
+        let name = self.name(segs[n - 2].name).to_string();
+        let fresh = self.fresh_builtin_self(&name)?;
+        self.builtin_names_path(fresh, segs).then_some(fresh)
+    }
+
+    /// True when builtin Adt type `want` is the type that the path
+    /// `segs` (type segments, then the item) names: its std path or,
+    /// for a bare name, its name with no user type of that name bound.
+    fn builtin_names_path(&mut self, want: Ty, segs: &[ast::PathSeg]) -> bool {
+        let n = segs.len();
+        let Some((def, _)) = self.tys.adt_parts(want) else { return false };
+        let Some(named) = builtin_std_path(&self.tys, want) else { return false };
         let ty_name = segs[n - 2].name;
         if n == 2 && matches!(self.binding(Namespace::Type, ty_name), BindingRes::Def(d) if d != def) {
-            return None;
+            return false;
         }
         let path: Vec<&str> = segs[..n - 1].iter().map(|s| self.name(s.name)).collect();
-        let named = builtin_std_path(&self.tys, want)?;
-        let same = if n == 2 { named.last() == path.last() } else { named == path };
-        same.then_some(want)
+        if n == 2 { named.last() == path.last() } else { named == path }
+    }
+
+    /// A generic builtin type by its name with a fresh variable for each
+    /// type arg (`Vec` gives `Vec<?T>`), for `builtin_path_base`; it
+    /// checks the path and binding after.
+    fn fresh_builtin_self(&mut self, name: &str) -> Option<Ty> {
+        let v = self.new_var(false);
+        Some(match name {
+            "Vec" => self.tys.mk_vec(v),
+            "Option" => self.tys.mk_option(v),
+            "Box" => self.tys.mk_boxed(v),
+            "Rc" => self.tys.mk_rc(v),
+            "Result" => {
+                let e = self.new_var(false);
+                self.tys.mk_result(v, e)
+            }
+            _ => return None,
+        })
     }
 
     /// The `n` type args of a written builtin Self type (`Option<u8>`

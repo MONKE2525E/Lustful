@@ -363,6 +363,18 @@ impl<'p> Ctx<'p> {
         if let Some(r) = self.ord_pick_path(tr.def, name, self_ty) {
             return r;
         }
+        // `Debug::fmt(s, f)` and `<str as Display>::fmt(s, f)` at a
+        // Self with no written impl (a builtin type, or a derived
+        // Debug): the method form's `FmtCall*` (`s.fmt(f)`), which
+        // formats as `{:?}` does with the caller's Formatter.
+        if self.name(name) == "fmt" && (tr.def == lang.debug || tr.def == lang.display) && known(self, self_ty) {
+            if tr.def == lang.display && has_display(p, &self.tys, self_ty) {
+                return TraitFnRes::Builtin(Builtin::FmtCallDisplay);
+            }
+            if tr.def == lang.debug && has_debug(p, &self.tys, self_ty) {
+                return TraitFnRes::Builtin(Builtin::FmtCallDebug);
+            }
+        }
         TraitFnRes::Failed
     }
 
@@ -657,7 +669,7 @@ impl<'p> Ctx<'p> {
             "L0641",
             span,
             format!("`{tn}::{}` as a function is not supported yet", self.name(name)),
-            "Call it through a value or a qualified path, such as `<Type as Trait>::name`, or wrap it in a closure.",
+            "Call it as a method (`value.name(..)`) with the trait in scope, or wrap that call in a closure.",
         );
     }
 }
