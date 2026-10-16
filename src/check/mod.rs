@@ -880,6 +880,8 @@ pub enum Builtin {
     MapGetMut,
     MapContainsKey,
     MapRemove,
+    /// `HashMap::remove_entry(&q) -> Option<(K, V)>`: the stored key and value.
+    MapRemoveEntry,
     MapEntry,
     EntryOrInsert,
     EntryOrDefault,

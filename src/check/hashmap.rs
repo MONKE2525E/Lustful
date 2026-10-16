@@ -49,7 +49,6 @@ const DECLARED_ONLY: &[&str] = &[
     "shrink_to",
     "get_key_value",
     "get_many_mut",
-    "remove_entry",
     "hasher",
     "union",
     "intersection",
@@ -425,7 +424,7 @@ impl<'p> Ctx<'p> {
                 let ov = self.tys.mk_option(v);
                 Some((B::MapInsert, Autoref::RefMut, vec![k, v], ov, None))
             }
-            (HashTy::HashMap, "get" | "get_mut" | "contains_key" | "remove") => {
+            (HashTy::HashMap, "get" | "get_mut" | "contains_key" | "remove" | "remove_entry") => {
                 let (q, rq) = lookup(self);
                 let (b, autoref, ret) = match n {
                     "get" => {
@@ -437,6 +436,11 @@ impl<'p> Ctx<'p> {
                         (B::MapGetMut, Autoref::RefMut, self.tys.mk_option(r))
                     }
                     "contains_key" => (B::MapContainsKey, Autoref::Ref, BOOL),
+                    "remove_entry" => {
+                        let ts = self.tys.intern_tys(&[k, v]);
+                        let kv = self.tys.intern(TyKind::Tuple(ts));
+                        (B::MapRemoveEntry, Autoref::RefMut, self.tys.mk_option(kv))
+                    }
                     _ => (B::MapRemove, Autoref::RefMut, self.tys.mk_option(v)),
                 };
                 Some((b, autoref, vec![rq], ret, Some(q)))

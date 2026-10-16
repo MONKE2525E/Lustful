@@ -4343,6 +4343,7 @@ impl FnGen<'_, '_> {
             | B::MapGetMut
             | B::MapContainsKey
             | B::MapRemove
+            | B::MapRemoveEntry
             | B::MapEntry
             | B::EntryOrInsert
             | B::EntryOrDefault

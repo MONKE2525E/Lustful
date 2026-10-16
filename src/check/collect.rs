@@ -8484,8 +8484,11 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
 /// part is a shared slice or `&str`, an index or flag, a Copy value (a
 /// closure with Copy captures, a Copy pattern, a Copy item in a
 /// `Peekable` slot), or such an iterator. Owning and mutable iterators
-/// (`vec::IntoIter`, `IterMut`, the drains, the hash iterators, `Args`)
-/// and core's slice `SplitN`/`RSplitN` (not Clone) stay false.
+/// (`vec::IntoIter`, `IterMut`, the drains, the owning and `mut` hash
+/// iterators, `Args`) and core's slice `SplitN`/`RSplitN` (not Clone)
+/// stay false. The shared hash iterators (`Iter`, `Keys`, `Values`, set
+/// `Iter`) hold only the raw scan state (`lust_hash_iter`), as
+/// hashbrown's Clone `RawIter` does.
 pub fn iter_clone_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     use crate::ty::iter::{Field, IterKind as K, SliceSplitMode};
     if tys.is_chars_ty(t) {
@@ -8498,6 +8501,7 @@ pub fn iter_clone_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         K::Copied | K::Cloned | K::FilterMap | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::RepeatN | K::ByNext => true,
         K::Windows | K::CharIndices | K::Flatten | K::OptionIntoIter | K::OptionIter | K::ResultIter | K::ResultIntoIter => true,
         K::StrSplit | K::StrMatches | K::EncodeUtf16 | K::Chunks | K::ChunksExact | K::Utf8Chunks => true,
+        K::MapIter | K::MapKeys | K::MapValues | K::SetIter => true,
         K::SliceSplit => {
             a.get(2).and_then(|&m| crate::ty::iter::slice_split_mode(tys, m)).is_some_and(|m| !matches!(m, SliceSplitMode::SplitN | SliceSplitMode::RSplitN))
         }

@@ -8222,7 +8222,7 @@ fn sort_by_builtin(b: crate::check::Builtin) -> bool {
 /// returned.
 fn hash_lookup_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
-    matches!(b, B::MapGet | B::MapGetMut | B::MapContainsKey | B::MapRemove | B::SetContains | B::SetRemove | B::SetGet)
+    matches!(b, B::MapGet | B::MapGetMut | B::MapContainsKey | B::MapRemove | B::MapRemoveEntry | B::SetContains | B::SetRemove | B::SetGet)
 }
 
 /// `map.entry(k)` and the Entry methods that return the value or the

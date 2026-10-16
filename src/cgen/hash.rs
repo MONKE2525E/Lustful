@@ -636,6 +636,7 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::MapGetMut
             | B::MapContainsKey
             | B::MapRemove
+            | B::MapRemoveEntry
             | B::MapEntry
             | B::EntryOrInsert
             | B::EntryOrDefault
@@ -838,7 +839,7 @@ impl FnGen<'_, '_> {
                     }
                 })
             }
-            B::MapRemove | B::SetRemove => {
+            B::MapRemove | B::MapRemoveEntry | B::SetRemove => {
                 let (q, qp) = self.q_arg(&tys[1], &vals[1]);
                 let mk = self.want_q(&recv, &q);
                 let ec = elem_cty(&recv);
@@ -853,6 +854,13 @@ impl FnGen<'_, '_> {
                         let _ = writeln!(self.out, "    if ({o}_hit) drop_{}(&{o});", mangle(&ec));
                     }
                     return Some(format!("((uint8_t){o}_hit)"));
+                }
+                // `remove_entry` hands back the stored pair (key and value).
+                if b == B::MapRemoveEntry {
+                    let some = self.make_variant(dest, 1, &[o.clone()]);
+                    let none = self.make_variant(dest, 0, &[]);
+                    let _ = writeln!(self.out, "    {dc} {t} = {o}_hit ? {some} : {none};");
+                    return Some(t);
                 }
                 let kc = key_cty(&recv);
                 if needs_drop_c(self.p, &kc) {
