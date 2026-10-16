@@ -4359,8 +4359,9 @@ impl<'p> Ctx<'p> {
         // diagnostic already, and it matches every impl header: `&{error}: AsRef<P>`
         // picked the blanket `&T` impl with `T` unbound, which queued fresh nested
         // obligations each round, so a few of them took minutes (fx-parsehang). The
-        // obligation holds instead, as in rustc.
-        for i in 0..self.tys.args(tr.args).len() {
+        // obligation holds instead, as in rustc. Only after an error is reported: an
+        // error type with no diagnostic behind it must not make a bound hold.
+        for i in 0..if self.errs.is_empty() { 0 } else { self.tys.args(tr.args).len() } {
             if let Some(t) = self.tys.args(tr.args)[i].as_ty() {
                 let t = self.deep(t);
                 if self.has_error_kind(t) {
