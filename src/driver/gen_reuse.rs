@@ -710,7 +710,9 @@ pub struct TraitKey {
 /// associated const or type and no `dyn` Self: method probes and every
 /// direct inherent table lookup record `MethodSet` reads
 /// (`Program::inherent_reads`), whose fingerprints cover each method's
-/// signature.
+/// signature. For the same reason an inherent impl with associated items
+/// and no `dyn` Self joins without its methods (the header delta,
+/// driver/kept_delta.rs, keeps the key through their head edits).
 pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> TraitKey {
     use crate::ast::{ItemKind, TyExpr};
     let user_trait = |d: &DefId| p.impls_read_covered(*d);
@@ -725,6 +727,11 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> TraitKey {
         let derives = match &item.kind {
             ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(user_trait) => continue,
             ItemKind::Impl(imp) if plain_inherent(imp) => continue,
+            ItemKind::Impl(imp) if imp.trait_ref.is_none() && !matches!(p.ast.ty(imp.self_ty), TyExpr::Dyn { .. }) => {
+                let bare = crate::ast::Item { kind: ItemKind::Impl(crate::ast::ImplDef { fns: Vec::new(), ..imp.clone() }), ..item.clone() };
+                (1u8, crate::driver::ast_hash::item_hash(&p.ast, &bare)).hash(&mut h);
+                continue;
+            }
             ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Type(_) | ItemKind::Const(_) => {
                 (0u8, crate::driver::ast_hash::item_hash(&p.ast, item)).hash(&mut h);
                 continue;

@@ -24,8 +24,7 @@
 // program with generic associated consts (its instances would keep their
 // old signatures); const fns and any fn const evaluation may reach
 // through const fn bodies (`ConstReach`, transitive); trait methods and
-// trait impl methods; methods of inherent impls with associated items
-// (the trait-system key hashes their heads); lang and shipped std fns;
+// trait impl methods; lang and shipped std fns;
 // main and #[test] fns; an `impl Trait` return that comes or goes; a fn
 // that a body revealing an opaque type names, unless that body reveals
 // again with the same hidden type (a plain fn's, or a template's check in
@@ -342,14 +341,6 @@ fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'sta
         // impl methods answer to their trait's signature.
         FnLoc::Impl(item, _) if p.gx.inherent_self_pats.contains_key(&f) && p.impl_parents.contains_key(&item) => {}
         _ => return Err("sig loc"),
-    }
-    // The trait-system key hashes the method heads of an inherent impl
-    // with associated items (`gen_reuse::trait_key`); the delta keeps the key.
-    if let FnLoc::Impl(item, _) = info.loc
-        && let crate::ast::ItemKind::Impl(imp) = &p.ast.items[item as usize].kind
-        && (!imp.consts.is_empty() || !imp.types.is_empty())
-    {
-        return Err("sig trait key");
     }
     if p.is_lang_method(f) || p.fn_shipped_crate(f).is_some() || p.std_source_span(def.name_span) {
         return Err("sig std");
