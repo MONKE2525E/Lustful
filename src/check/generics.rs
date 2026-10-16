@@ -12406,6 +12406,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     add_synthetic_impls(p);
     compute_glue_methods(p);
     compute_written_hash(p);
+    crate::driver::laps::mark("collect/finish impls+glue");
     // Dyn compatibility needs the finished trait tables; the dyn
     // type checks over signatures run before mono builds vtables.
     p.gx.dyn_infos = crate::check::object::compute_dyn_infos(p);
@@ -12416,12 +12417,15 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     check_copy_impls(p, errs);
     check_derive_bounds(p, errs);
     check_deferred_debug_fields(p, errs);
+    crate::driver::laps::mark("collect/finish item checks");
     // Well-formedness reads the written projections (each owes its
     // trait ref, where clauses included); normalization comes after.
     check_written_wf(p, errs);
     crate::check::outlives::check_all(p, errs);
+    crate::driver::laps::mark("collect/finish wf+outlives");
     normalize_signatures(p);
     crate::check::coherence_std::add_std_shadow_impls(p);
+    crate::driver::laps::mark("collect/finish normalize");
     // Local to the user crate: std source module items (`Duration`,
     // `std::error::Error`) and shipped crates are upstream, so an
     // upstream release may add impls for them (no negative reasoning).
@@ -12532,8 +12536,11 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     // Mono runs last: it checks bodies against the finished
     // tables and appends every reachable instance. Plain fns that
     // return `impl Trait` get their hidden types first.
+    crate::driver::laps::mark("collect/finish overlap");
     if errs.is_empty() {
         crate::check::opaque::reveal_plain(p);
+        crate::driver::laps::mark("collect/finish reveal");
         errs.extend(materialize(p));
+        crate::driver::laps::mark("collect/finish materialize");
     }
 }

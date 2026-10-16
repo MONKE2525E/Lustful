@@ -3253,6 +3253,7 @@ pub fn collect_reuse(
     p.gx.item_index = crate::check::defaults::item_index(ast);
     generics::init_lang(&mut p);
     generics::collect_trait_defs(&mut p, &mut errs);
+    crate::driver::laps::mark("collect/setup+traits");
 
     // Type items inside function bodies (R18): their identities are
     // the enclosing fn's hash folded with their name (`def::
@@ -3970,7 +3971,9 @@ pub fn collect_reuse(
 
     // Generic pass 1.5: trait generics, method templates. Fields
     // and fn signatures after this can name traits in bounds.
+    crate::driver::laps::mark("collect/adts");
     generics::build_trait_tables(&mut p, &mut errs);
+    crate::driver::laps::mark("collect/trait tables");
 
     // Pass 2: fields, variants, derives. Type items inside
     // function bodies take the same pass (R18): the work list pairs
@@ -4577,6 +4580,7 @@ pub fn collect_reuse(
     // W-BORROW: each lifetime alias's body, checked once like rustc does
     // (an unused alias with an unknown type is still an error), and its
     // erased form kept for the driver's fingerprints.
+    crate::driver::laps::mark("collect/fields+impls");
     let mut aliases: Vec<(Sym, generics::GenericAlias)> = p.gx.generic_aliases.iter().map(|(&n, a)| (n, a.clone())).collect();
     aliases.sort_by_key(|(_, a)| a.ty.0);
     for (name, la) in aliases {
@@ -5111,7 +5115,9 @@ pub fn collect_reuse(
     // This runs before `finish_collect`: its template checks (and, in a
     // build, the instance checks in mono) read consts, statics, and assoc
     // consts from these tables, in generic and plain bodies alike.
+    crate::driver::laps::mark("collect/fns+items");
     let const_goals = eval_const_items(&mut p, &mut errs, &mut def_order.statics, &scope_of_stmt);
+    crate::driver::laps::mark("collect/const eval");
     p.scope_of_stmt = scope_of_stmt;
     // The generic reuse cache holds while the trait system does (W-PERF);
     // the key needs the resolved trait of each impl, and the cache serves
@@ -5126,8 +5132,10 @@ pub fn collect_reuse(
             p.std_fns.push((def.path.iter().map(|s| interner.intern(s)).collect(), f));
         }
     }
+    crate::driver::laps::mark("collect/trait key");
     generics::finish_collect(&mut p, &mut errs);
     prove_const_goals(&mut p, const_goals, &mut errs);
+    crate::driver::laps::mark("collect/const goals");
     if errs.is_empty() {
         crate::check::delta_audit::self_test_if_asked(&mut p);
     }

@@ -43,6 +43,7 @@ use std::path::PathBuf;
 /// binding table set, one detached module subtree per crate, so
 /// `dep::Item` paths and cross-crate visibility use the same code as
 /// same-crate paths.
+#[derive(Clone)]
 pub struct CrateInput {
     pub root_path: PathBuf,
     pub root_text: String,

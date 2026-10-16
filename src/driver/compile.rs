@@ -156,6 +156,11 @@ impl Timer {
         self.stages.push((rest, ((now - self.last).as_secs_f64() * 1e3 - covered).max(0.0)));
         self.last = now;
     }
+    /// Records sub-stage times of a stage that already has its own lap
+    /// (`laps.rs`: collect's phases), shown after it, nested by name.
+    fn note_parts(&mut self, parts: Vec<(&'static str, f64)>) {
+        self.stages.extend(parts);
+    }
     fn render(&self, out: &mut String) {
         for (name, ms) in &self.stages {
             let _ = writeln!(out, "  {name:<24} {ms:>9.2} ms");
@@ -1593,7 +1598,7 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
 }
 
 /// LocalDefId order: top-level functions and impl methods, in item order. Same as `collect`.
-fn fn_locations(ast: &Ast) -> Vec<(usize, Option<usize>)> {
+pub(super) fn fn_locations(ast: &Ast) -> Vec<(usize, Option<usize>)> {
     let mut out = Vec::new();
     for (i, item) in ast.items.iter().enumerate() {
         match &item.kind {
@@ -1888,6 +1893,7 @@ fn resolved_setup(
     };
     let mut root_lexed = root_lexed;
     let mut passes = 0;
+    let mut oracle_input = None;
     let resolved = loop {
         passes += 1;
         root_text.clone_from(&unspliced_root);
@@ -1919,6 +1925,9 @@ fn resolved_setup(
             display_root: front.display_root.clone(),
         };
         let out = worklist::resolve_crate_with(&input, &front.interner, &front.known, &mut front.resolve_cache, plan.platform);
+        if super::item_oracle::on() {
+            oracle_input = Some(super::item_oracle::ColdInput { input: input.clone(), platform: plan.platform });
+        }
         let (user, platform) = match &out {
             Ok(r) => (r.std_asks, r.platform_asks),
             Err(e) => (e.std_asks, e.platform_asks),
@@ -2075,6 +2084,9 @@ fn resolved_setup(
             request_start,
             patch_expand,
         ));
+        if let Some(b) = front.patch.as_mut() {
+            b.oracle_input = oracle_input;
+        }
     }
     Ok((map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines, body_hashes, Some(tables)))
 }
@@ -2971,6 +2983,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             &std_routes,
         )
     };
+    super::laps::start();
     let collected = match kept {
         Some(r) => r,
         None => match collect(front, caches) {
@@ -3006,6 +3019,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // entries made under them: the next full resolve drops it.
             if nested_statics {
                 front.prev_static_defs = None;
+            }
+            if super::item_oracle::on() {
+                let (build, tables) = (req.cmd == Cmd::Build, resolved_tables.as_ref());
+                let (lines, hashes) = (&fn_lines_all, &body_hashes_all);
+                super::item_oracle::check(front, caches, Err(&ds), &[], fn_count, hashes, lines, visits.path, crate_ids, build, tables);
             }
             front.last_visits.clear();
             visits.render(&mut front.last_visits);
@@ -3151,6 +3169,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("collect");
+    t.note_parts(super::laps::take());
     if visits.kept != "reuse" {
         visits.collect = front.ast.items.len() + front.ast.stmt_items.len() + program.fns.len();
     }
@@ -3356,6 +3375,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // A skipped slot keeps its last marks; one that needed a check lost
     // its C above, so the next build checks it.
     work.retain(|&i| !program.check_skips(LocalDefId(i as u32)));
+    if super::item_oracle::on() {
+        let (build, tables) = (req.cmd == Cmd::Build, resolved_tables.as_ref());
+        let (lines, hashes) = (&fn_lines_all, &body_hashes_all);
+        super::item_oracle::check(front, caches, Ok(&program), &work, fn_count, hashes, lines, visits.path, crate_ids, build, tables);
+    }
     let results = par_map(&work, |&i| {
         let f = LocalDefId(i as u32);
         // Lowering and borrowck read derive lists too (Copy operands,

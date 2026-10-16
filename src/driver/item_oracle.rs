@@ -1,0 +1,356 @@
+// The patch oracle (`LUST_CHECK_ITEMPATCH=1`; sigedit PLAN, P1.1). After
+// each request on a patch path (`path=patch`, the body patch, and later
+// `path=item`, the item patch), a cold resolve and collect of the same
+// text, in the same interner, must agree with the warm state:
+// - resolve: the rewrite epoch, the item scans, and every fn's body hash
+//   and line;
+// - collect: the same errors, or a program with the same `Digest` (Sig
+//   and Layout per def, ImplSet buckets, fn classes, hidden types);
+// - the dirty set: an AST fn the warm request does not check again must
+//   have stored reads that are clean against the cold program, or, with
+//   no stored reads, the cold digest must equal the last request's;
+// - the response: a one-shot compile of the same check request gives the
+//   same bytes (`compare_response`).
+// Any difference appends one line to the file `LUST_ITEMPATCH_LOG` names
+// and panics. A daemon answers a panicked request again from a fresh
+// session, so the sweeps fail on a non-empty log, not on the answers.
+// Requests on other paths only store the warm digest for the next one.
+use super::session::{Caches, Front, Session};
+use crate::check::collect::Program;
+use crate::check::generics::FnClass;
+use crate::def::{DefId, LocalDefId};
+use crate::diag::Diag;
+use crate::driver::graph::{Fingerprint, Head, ImplSetKey, ReadKey};
+use crate::intern::FxMap;
+use crate::protocol::{Cmd, Request, Response};
+use crate::resolve::imports::ResolvedTables;
+use std::sync::Arc;
+
+/// True when `LUST_CHECK_ITEMPATCH` is set (and not `0`).
+pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LUST_CHECK_ITEMPATCH").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// What the cold resolve of a patched request needs: the last full
+/// resolve's crate input (the root text, splice start, and client view
+/// come from the patched front) and its std platform choice.
+pub(crate) struct ColdInput {
+    pub(crate) input: crate::resolve::worklist::CrateInput,
+    pub(crate) platform: bool,
+}
+
+/// One def's caller-visible facts.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct DefFacts {
+    sig: Fingerprint,
+    layout: Option<Fingerprint>,
+    class: Option<FnClass>,
+}
+
+/// The program facts the oracle compares, keyed by stable ids.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct Digest {
+    defs: FxMap<DefId, DefFacts>,
+    impl_sets: FxMap<(DefId, Head), Fingerprint>,
+    hidden: FxMap<DefId, u64>,
+    /// Def names, for messages only (not compared).
+    names: FxMap<DefId, String>,
+}
+
+impl Digest {
+    /// The digest of `p` over its first `fn_count` fns (the AST fns),
+    /// its Adts, traits, consts, statics, and user trait impl buckets.
+    fn of(p: &Program, fn_count: usize) -> Digest {
+        let mut d = Digest::default();
+        let sig = |def: DefId| p.read_fingerprint(&ReadKey::Sig(def)).fingerprint;
+        let layout = |def: DefId| p.read_fingerprint(&ReadKey::Layout(def)).fingerprint;
+        for i in 0..fn_count.min(p.fns.len()) {
+            let f = LocalDefId(i as u32);
+            let def = p.def_id(f);
+            d.names.insert(def, format!("fn {}", p.interner.get(p.fn_def(f).name)));
+            d.defs.insert(def, DefFacts { sig: sig(def), layout: None, class: p.gx.fn_class.get(i).copied() });
+        }
+        for a in 0..p.adts.len() {
+            // Generic Adt instances share their template's def; std
+            // Adts may have none.
+            let Some(def) = p.defs.def_of_adt(crate::ty::AdtId(a as u32)) else { continue };
+            if p.adt_by_def(def) != Some(crate::ty::AdtId(a as u32)) {
+                continue;
+            }
+            d.names.insert(def, format!("type {}", p.interner.get(p.adts[a].name)));
+            d.defs.insert(def, DefFacts { sig: sig(def), layout: Some(layout(def)), class: None });
+        }
+        for rec in p.gx.index.trait_records() {
+            d.names.insert(rec.def, format!("trait {}", p.interner.get(rec.name)));
+            d.defs.insert(rec.def, DefFacts { sig: sig(rec.def), layout: None, class: None });
+            if !p.impls_read_covered(rec.def) {
+                continue;
+            }
+            let mut heads = vec![Head::Unknown];
+            for &id in p.gx.index.impls_of_trait(rec.def) {
+                heads.push(Head::of(&p.tys, p.gx.index.get(id).self_ty(&p.tys)));
+            }
+            for head in heads {
+                let key = ImplSetKey { trait_: rec.def, head };
+                d.impl_sets.insert((rec.def, head), p.read_fingerprint(&ReadKey::ImplSet(key)).fingerprint);
+            }
+        }
+        for &def in p.const_defs.iter().chain(&p.static_defs) {
+            d.names.entry(def).or_insert_with(|| "const or static".to_string());
+            d.defs.insert(def, DefFacts { sig: sig(def), layout: None, class: None });
+        }
+        for (&od, &t) in &p.gx.opaque_hidden {
+            let mut h = crate::intern::FxHasher::default();
+            crate::driver::graph::hash_ty_deep(&mut h, p, &p.tys, t, &mut Default::default());
+            d.hidden.insert(od, std::hash::Hasher::finish(&h));
+        }
+        d
+    }
+
+    /// The first few differences between `self` (warm) and `cold`.
+    fn diff(&self, cold: &Digest) -> Vec<String> {
+        let name = |d: &DefId| cold.names.get(d).or_else(|| self.names.get(d)).cloned().unwrap_or_else(|| format!("{d:?}"));
+        let mut out = Vec::new();
+        for (d, c) in &cold.defs {
+            match self.defs.get(d) {
+                None => out.push(format!("{} only in cold", name(d))),
+                Some(w) if w != c => out.push(format!("{}: warm {w:?}, cold {c:?}", name(d))),
+                _ => {}
+            }
+        }
+        out.extend(self.defs.keys().filter(|d| !cold.defs.contains_key(d)).map(|d| format!("{} only in warm", name(d))));
+        for (k, c) in &cold.impl_sets {
+            if self.impl_sets.get(k) != Some(c) {
+                out.push(format!("impl set of {} for {:?}", name(&k.0), k.1));
+            }
+        }
+        out.extend(
+            self.impl_sets
+                .keys()
+                .filter(|k| !cold.impl_sets.contains_key(k))
+                .map(|k| format!("impl set of {} for {:?} only in warm", name(&k.0), k.1)),
+        );
+        if self.hidden != cold.hidden {
+            out.push(format!("hidden types: warm {} entries, cold {}", self.hidden.len(), cold.hidden.len()));
+        }
+        out.sort();
+        out.truncate(8);
+        out
+    }
+}
+
+/// Appends one line to the file `LUST_ITEMPATCH_LOG` names, if set.
+fn log(line: &str) {
+    if let Some(log) = std::env::var_os("LUST_ITEMPATCH_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// Reports one oracle failure: a log line, then a panic. Passing checks
+/// log `itempatch oracle: ok ...`, so a sweep can count them; every
+/// other line is a failure.
+fn fail(what: &str, path: &str, detail: &str) -> ! {
+    let line = format!("itempatch oracle: {what} (path={path}): {detail}");
+    log(&line);
+    panic!("{line}");
+}
+
+/// The oracle check of one request (see the module docs), called by the
+/// compile tail with the warm collect result and the fns it will check
+/// (`work`). On a path that is not a patch it only stores the digest.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check(
+    front: &Front,
+    caches: &Caches,
+    warm: Result<&Program, &[Diag]>,
+    work: &[usize],
+    fn_count: usize,
+    body_hashes: &[u64],
+    fn_lines: &[u32],
+    path: &str,
+    crate_ids: crate::def::CrateIds,
+    build: bool,
+    tables: Option<&Arc<ResolvedTables>>,
+) {
+    let warm_digest = warm.ok().map(|p| Digest::of(p, fn_count));
+    let patched = matches!(path, "patch" | "item");
+    let Some(base) = front.patch.as_ref() else { return };
+    let prev = std::mem::replace(&mut *base.oracle_prev.lock().unwrap_or_else(|e| e.into_inner()), warm_digest.clone());
+    if !patched {
+        // A full collect: the warm program is the cold one, so only the
+        // dirty set needs a check (signatures mode reuses bodies).
+        if let (Ok(p), Some(d)) = (warm, warm_digest.as_ref()) {
+            dirty_check(front, caches, p, p, work, fn_count, body_hashes, prev.as_ref(), d, path);
+            log(&format!("itempatch oracle: ok dirty path={path}"));
+        }
+        return;
+    }
+    base.oracle_due.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (Some(cold_in), Some(tables)) = (base.oracle_input.as_ref(), tables) else { return };
+    let mut input = cold_in.input.clone();
+    input.root_text.clone_from(&front.src);
+    input.client = front.client.clone();
+    input.std_splice_lo = base.std_ranges().first().map(|r| r.0);
+    let platform = cold_in.platform;
+    let (std_ranges, std_routes) = (base.std_ranges().to_vec(), base.std_routes().to_vec());
+    let mut cache = crate::resolve::worklist::ResolveCache::default();
+    let cold = match crate::resolve::worklist::resolve_crate_with(&input, &front.interner, &front.known, &mut cache, platform) {
+        Ok(r) => r,
+        Err(e) => fail("cold resolve rejects", path, &e.diags.first().map_or(String::new(), |d| d.message.clone())),
+    };
+    // Resolve: epoch, item scans, fn hashes and lines.
+    let (we, ce) = (tables.rewrite_epoch(), cold.tables.rewrite_epoch());
+    if we != ce {
+        fail("rewrite epoch differs", path, &format!("warm {we:x}, cold {ce:x}"));
+    }
+    let mut cold_items = cold.scans.items.clone();
+    cold_items.push(crate::scan::ItemScan { hash: cold.structure_hash, fn_name: None });
+    if cold_items != front.items {
+        let k = cold_items.iter().zip(&front.items).position(|(a, b)| a != b).unwrap_or(cold_items.len().min(front.items.len()));
+        fail("item scans differ", path, &format!("first at item {k} of {} (warm {})", cold_items.len(), front.items.len()));
+    }
+    let locs = super::compile::fn_locations(&cold.ast);
+    if locs.len() != fn_count || cold.fn_lines.len() != fn_count {
+        fail("fn count differs", path, &format!("warm {fn_count}, cold {}", locs.len()));
+    }
+    for (i, ((&(item, sub), b), &line)) in locs.iter().zip(&cold.scans.bodies).zip(&cold.fn_lines).enumerate() {
+        let def = super::compile::fn_def_at(&cold.ast, item, sub);
+        let h = super::compile::fn_text_hash(&cold.ast, &cold.map, def, line, b.0);
+        if body_hashes.get(i) != Some(&h) || fn_lines.get(i) != Some(&line) {
+            let warm = (body_hashes.get(i).copied().unwrap_or(0), fn_lines.get(i).copied().unwrap_or(0));
+            let detail = format!("fn {} (#{i}): warm {:x} line {}, cold {h:x} line {line}", front.interner.get(def.name), warm.0, warm.1);
+            fail("fn body hash or line differs", path, &detail);
+        }
+    }
+    // Collect, as the compile tail runs it over a full resolve.
+    let mut ast = cold.ast;
+    ast.shipped.clone_from(&std_ranges);
+    ast.lang_methods = front.ast.lang_methods;
+    let mut cold_tables = cold.tables;
+    cold_tables.std_ranges.clone_from(&std_ranges);
+    let mut reuse = crate::driver::gen_reuse::GenReuse::default();
+    let mut order = crate::check::collect::DefOrder::default();
+    let collected = crate::check::collect::collect_reuse(
+        Arc::new(ast),
+        front.interner.clone(),
+        front.known.clone(),
+        crate_ids,
+        build,
+        &mut order,
+        Some(Arc::new(cold_tables)),
+        &mut reuse,
+        &std_routes,
+    );
+    let mut cold_p = match (warm, collected) {
+        (Err(w), Err(c)) => {
+            let key = |d: &Diag| (d.code, d.message.clone(), d.span.file, d.span.lo, d.span.hi);
+            let (wk, ck): (Vec<_>, Vec<_>) = (w.iter().map(key).collect(), c.iter().map(key).collect());
+            if wk != ck {
+                fail("collect errors differ", path, &format!("warm {:?}, cold {:?}", wk.first(), ck.first()));
+            }
+            log(&format!("itempatch oracle: ok errors path={path}"));
+            return;
+        }
+        (Ok(_), Err(c)) => fail("cold collect rejects", path, &format!("{} {}", c[0].code, c[0].message)),
+        (Err(w), Ok(_)) => fail("warm collect rejects", path, &format!("{} {}", w[0].code, w[0].message)),
+        (Ok(_), Ok(p)) => p,
+    };
+    let warm = warm.ok().expect("warm program");
+    cold_p.shipped_ranges.clone_from(&warm.shipped_ranges);
+    cold_p.std_fns.clone_from(&warm.std_fns);
+    let cold_digest = Digest::of(&cold_p, fn_count);
+    let diff = warm_digest.as_ref().map(|w| w.diff(&cold_digest)).unwrap_or_default();
+    if !diff.is_empty() {
+        fail("program digest differs", path, &diff.join("; "));
+    }
+    let reused = dirty_check(front, caches, warm, &cold_p, work, fn_count, body_hashes, prev.as_ref(), &cold_digest, path);
+    // The cold collect marked laps of its own.
+    let _ = super::laps::take();
+    log(&format!("itempatch oracle: ok program path={path} reused={reused}"));
+}
+
+/// The dirty set half (see the module docs): every AST fn the request
+/// does not check again (`work`) saw its current body at its last check,
+/// and its stored reads are clean against `cold`; with no stored reads,
+/// the digest (`now`) must equal the last request's (`prev`). Returns
+/// how many fns it reuses.
+#[allow(clippy::too_many_arguments)]
+fn dirty_check(
+    front: &Front,
+    caches: &Caches,
+    warm: &Program,
+    cold_p: &Program,
+    work: &[usize],
+    fn_count: usize,
+    body_hashes: &[u64],
+    prev: Option<&Digest>,
+    now: &Digest,
+    path: &str,
+) -> usize {
+    let mut checked = vec![false; fn_count];
+    work.iter().filter(|&&i| i < fn_count).for_each(|&i| checked[i] = true);
+    for i in 0..fn_count {
+        let f = LocalDefId(i as u32);
+        let concrete = matches!(warm.gx.fn_class.get(i), Some(FnClass::Plain) | None);
+        let slot = front.fn_slot[i] as usize;
+        if checked[i] || !concrete || warm.check_skips(f) || !caches.ok.get(slot).copied().unwrap_or(false) {
+            continue;
+        }
+        let name = || format!("fn {} (#{i})", front.interner.get(warm.fn_def(f).name));
+        // Its last check saw this body (`slot_hash`, set at that check).
+        if front.slot_hash.get(slot) != body_hashes.get(i) {
+            fail("reused fn's body changed since its check", path, &name());
+        }
+        match caches.slot_reads.get(slot).and_then(Option::as_ref) {
+            Some(reads) => {
+                // A `Checked` read names a body: dirty when that body checks again.
+                let dirty: Vec<String> = reads
+                    .iter()
+                    .filter(|(k, stored)| match k {
+                        ReadKey::Checked(d) => warm.local_def(d.hash).is_some_and(|l| checked.get(l.0 as usize).copied().unwrap_or(false)),
+                        _ => cold_p.read_fingerprint(k) != **stored,
+                    })
+                    .map(|(k, _)| format!("{k:?}"))
+                    .take(3)
+                    .collect();
+                if !dirty.is_empty() {
+                    fail("reused fn has dirty reads", path, &format!("{}: {}", name(), dirty.join(", ")));
+                }
+            }
+            None if prev.is_some_and(|p| p != now) => {
+                fail("reused fn with no stored reads after a digest change", path, &name());
+            }
+            None => {}
+        }
+    }
+    (0..fn_count).filter(|&i| !checked[i]).count()
+}
+
+/// The response half of the oracle: a patched check request compiles
+/// again in a one-shot session, which must answer the same bytes.
+pub(crate) fn compare_response(req: &Request, session: &mut Session, warm: &Response) {
+    let due = session.front.patch.as_ref().is_some_and(|b| b.oracle_due.swap(false, std::sync::atomic::Ordering::Relaxed));
+    if !due || req.cmd != Cmd::Check || req.timings || std::env::var_os("LUST_STATS").is_some() {
+        return;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("lust-itempatch-{}-{n}", std::process::id()));
+    let mut cold = Session::new(dir.clone(), false, req.session.clone());
+    let resp = super::compile::compile(req, &mut cold);
+    drop(cold);
+    let _ = std::fs::remove_dir_all(&dir);
+    if resp.code != warm.code || resp.stdout != warm.stdout || resp.stderr != warm.stderr {
+        let first = |s: &str| s.lines().next().unwrap_or("").chars().take(160).collect::<String>();
+        fail(
+            "response differs from a one-shot compile",
+            "patch",
+            &format!("warm {} `{}`, cold {} `{}`", warm.code, first(&warm.stderr), resp.code, first(&resp.stderr)),
+        );
+    }
+    log("itempatch oracle: ok response");
+}
