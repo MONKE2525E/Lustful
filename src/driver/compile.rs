@@ -54,11 +54,12 @@ fn expand_tokens(
     file: &std::path::Path,
     src: &str,
     test: bool,
-    unwind: bool,
+    profile: crate::protocol::ProfileFlags,
 ) -> Result<(lexer::Lexed, Vec<expand::Dep>), Diag> {
     let mut ctx = expand::ExpandCtx::for_file(&front.interner, &front.known, file, src, test);
     ctx.client = &front.client;
-    ctx.cfg.panic_unwind = unwind;
+    ctx.cfg.panic_unwind = !profile.panic_abort;
+    ctx.cfg.debug_assertions = profile.debug_assertions;
     expand::expand_lexed_with_deps(lexed, &ctx)
 }
 
@@ -2112,6 +2113,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             ..Default::default()
         };
     }
+    // Lust builds always check integer overflow. A dev profile that turns the
+    // checks off would wrap where lust panics, so it is a clear error.
+    if !req.session.profile.overflow_checks && !matches!(req.cmd, crate::protocol::Cmd::Check) {
+        return Response {
+            stderr: "error: the dev profile sets `overflow-checks = false`: lust dev builds always check overflow\n".into(),
+            code: 2,
+            ..Default::default()
+        };
+    }
     let path = req.file.to_string_lossy().to_string();
     let mut src = match std::fs::read_to_string(&req.file) {
         Ok(s) => s,
@@ -2370,7 +2380,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let test_mode = req.harness || req.session.krate.test;
     let fresh = par_map(&need, |&i| {
         let (a, b) = ranges[i];
-        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, !req.session.profile.panic_abort)).map(
+        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile)).map(
             |(l, deps)| {
                 let mut sc = scan::scan(&l);
                 fold_fn_text(&mut sc, &l, &src);
@@ -2397,7 +2407,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // A chunk cut a comment or string the scanner did not see, or the text is bad, or the
         // file has an inner attribute (`has_inner_attr`): lex the whole file. Its error is the
         // answer; if it lexes, compile as one chunk. Never panic.
-        match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, !req.session.profile.panic_abort)) {
+        match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile)) {
             Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
             Ok((whole, deps)) => {
                 let mut sc = scan::scan(&whole);
@@ -2758,7 +2768,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         } else {
             // Re-parse serially for an exact error.
             let whole =
-                match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, !req.session.profile.panic_abort)) {
+                match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile)) {
                     Ok((w, _deps)) => w,
                     Err(mut d) => {
                         front.env_hash = None;

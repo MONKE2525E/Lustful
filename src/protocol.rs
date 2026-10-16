@@ -46,9 +46,10 @@ pub struct CrateKey {
 }
 
 /// The profile values that can change program output (section 1.1). They enter
-/// every session and cache key. Lust dev builds always use the dev values
-/// today; the fields exist now so a profile change can never reuse a session
-/// or a disk entry built under other flags.
+/// every session and cache key, so a profile change never reuses a session or
+/// a disk entry built under other flags. A single-file compile uses `DEV`; a
+/// Cargo package (`--manifest-path` and the other crate flags) uses the dev
+/// profile Cargo would apply (`dev_profile`), with `-C panic=` on top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProfileFlags {
     pub panic_abort: bool,
@@ -57,8 +58,10 @@ pub struct ProfileFlags {
 }
 
 impl ProfileFlags {
-    /// The dev profile lust compiles with (the rustc parity flags in DESIGN.md).
+    /// The single-file dev profile (the rustc parity flags in DESIGN.md).
     pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true };
+    /// Cargo's default dev profile: as `DEV`, but panics unwind.
+    pub const DEV_UNWIND: ProfileFlags = ProfileFlags { panic_abort: false, ..ProfileFlags::DEV };
 }
 
 /// Daemon routing key (section 1.8): the crate plus the resolver inputs that
@@ -548,8 +551,8 @@ fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey 
         None => format!("pkg:{package} {version}"),
     };
     key.krate.manifest_path = manifest.as_ref().map(|m| m.path.clone()).or(flags.manifest_path);
-    // Cargo's dev profile unwinds unless the workspace sets `panic = "abort"`.
-    key.profile.panic_abort = key.krate.manifest_path.as_deref().is_some_and(dev_profile_aborts);
+    // A package compiles under the dev profile Cargo would use (it unwinds by default).
+    key.profile = key.krate.manifest_path.as_deref().map_or(ProfileFlags::DEV_UNWIND, dev_profile);
     if flags.lib {
         key.krate.target_kind = "lib".into();
         key.krate.target_name = package;
@@ -917,36 +920,100 @@ fn toml_value(line: &str) -> Option<String> {
     Some(v.trim_end_matches(|c: char| c == ',' || c.is_whitespace()).to_string())
 }
 
-/// Reads package name, package version, and `[[bin]]` tables from manifest
-/// text. Section-gated on purpose: a `name` in `[dependencies]` or a profile
-/// table must never match.
-/// True when the dev profile that applies to the package at `manifest`
-/// sets `panic = "abort"`. Cargo reads profiles from the workspace root
-/// only: the manifest itself when it has `[workspace]`, else the nearest
-/// manifest above it that has one.
-fn dev_profile_aborts(manifest: &Path) -> bool {
-    let is_root = |t: &str| t.lines().any(|l| l.trim() == "[workspace]");
+/// One TOML line without its comment (a `#` outside quotes).
+fn toml_strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, '#') => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// A dotted TOML key or table name in plain form: `profile . "dev"` is `profile.dev`.
+fn toml_dotted(key: &str) -> String {
+    key.split('.').map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'')).collect::<Vec<_>>().join(".")
+}
+
+/// The value of the dotted key `path` (for example `profile.dev.panic`) in
+/// TOML text, in any form Cargo reads: under its table header, as a dotted
+/// key under a parent table or at top level, or inside a one-line inline
+/// table (`[profile] dev = { panic = "abort" }`). Strings and bare values
+/// (bools) only, which is what profile settings are.
+fn toml_lookup(text: &str, path: &str) -> Option<String> {
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = toml_strip_comment(raw).trim();
+        if line.starts_with("[[") {
+            section = "[[array]]".into();
+            continue;
+        }
+        if let Some(head) = line.strip_prefix('[') {
+            section = toml_dotted(head.trim_end_matches(']'));
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let key = if section.is_empty() { toml_dotted(k) } else { format!("{section}.{}", toml_dotted(k)) };
+        if key == path {
+            return toml_value(line);
+        }
+        // An inline table whose key is a prefix of `path`.
+        if let (Some(rest), Some(body)) = (path.strip_prefix(&format!("{key}.")), v.trim().strip_prefix('{')) {
+            let body = body.trim_end().trim_end_matches('}');
+            return body.split(',').find(|kv| kv.split_once('=').is_some_and(|(ik, _)| toml_dotted(ik) == rest)).and_then(toml_value);
+        }
+    }
+    None
+}
+
+/// The dev profile Cargo applies to the package at `manifest`, read from
+/// the sources Cargo merges, highest first: `CARGO_PROFILE_DEV_<KEY>`
+/// env vars, the `.cargo/config.toml` (or legacy `.cargo/config`) chain
+/// from the manifest dir up (nearer wins; lust runs Cargo there), then
+/// `$CARGO_HOME/config.toml`, then the workspace root manifest (Cargo
+/// reads profiles from the root only: the manifest itself when it has
+/// `[workspace]`, else the nearest manifest above it that has one).
+/// A dev profile that leaves a key unset keeps Cargo's dev default.
+fn dev_profile(manifest: &Path) -> ProfileFlags {
+    let is_root = |t: &str| t.lines().any(|l| toml_strip_comment(l).trim().strip_prefix('[').is_some_and(|h| toml_dotted(h.trim_end_matches(']')) == "workspace"));
     let own = std::fs::read_to_string(manifest).unwrap_or_default();
-    let text = if is_root(&own) {
+    let root = if is_root(&own) {
         own
     } else {
         let above = manifest.parent().into_iter().flat_map(|d| d.ancestors().skip(1));
         above.filter_map(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok()).find(|t| is_root(t)).unwrap_or(own)
     };
-    let mut section = "";
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            section = line.trim_matches(|c| c == '[' || c == ']').trim();
-            continue;
-        }
-        if section == "profile.dev" && line.split('=').next().is_some_and(|k| k.trim() == "panic") {
-            return toml_value(line).as_deref() == Some("abort");
+    let mut texts = Vec::new();
+    for d in manifest.parent().into_iter().flat_map(Path::ancestors) {
+        // Cargo reads the legacy name when both files exist.
+        if let Some(t) = [".cargo/config", ".cargo/config.toml"].iter().find_map(|n| std::fs::read_to_string(d.join(n)).ok()) {
+            texts.push(t);
         }
     }
-    false
+    let home = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo")));
+    if let Some(t) = home.and_then(|h| ["config", "config.toml"].iter().find_map(|n| std::fs::read_to_string(h.join(n)).ok())) {
+        texts.push(t);
+    }
+    texts.push(root);
+    let get = |key: &str| {
+        let env = format!("CARGO_PROFILE_DEV_{}", key.to_uppercase().replace('-', "_"));
+        std::env::var(env).ok().or_else(|| texts.iter().find_map(|t| toml_lookup(t, &format!("profile.dev.{key}"))))
+    };
+    let dev = ProfileFlags::DEV_UNWIND;
+    ProfileFlags {
+        panic_abort: get("panic").map_or(dev.panic_abort, |v| v == "abort"),
+        overflow_checks: get("overflow-checks").map_or(dev.overflow_checks, |v| v == "true"),
+        debug_assertions: get("debug-assertions").map_or(dev.debug_assertions, |v| v == "true"),
+    }
 }
 
+/// Reads package name, package version, and `[[bin]]` tables from manifest
+/// text. Section-gated on purpose: a `name` in `[dependencies]` or a profile
+/// table must never match.
 fn parse_manifest(text: &str) -> (Option<String>, Option<String>, Vec<(String, Option<String>)>) {
     let mut package = None;
     let mut version = None;
@@ -1354,6 +1421,41 @@ mod tests {
         std::fs::remove_file(dir.join(".lust.toml")).unwrap();
         let req = compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib"]);
         assert!(req.session.features.is_empty() && req.session.default_features);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every TOML form Cargo reads for a dev profile key.
+    #[test]
+    fn toml_lookup_profile_forms() {
+        let get = |t: &str| toml_lookup(t, "profile.dev.panic");
+        assert_eq!(get("[profile.dev]\npanic = \"abort\" # x\n").as_deref(), Some("abort"));
+        assert_eq!(get("[ profile . \"dev\" ]\npanic='abort'\n").as_deref(), Some("abort"));
+        assert_eq!(get("[profile]\ndev.panic = \"abort\"\n").as_deref(), Some("abort"));
+        assert_eq!(get("profile.dev.panic = \"abort\"\n[package]\n").as_deref(), Some("abort"));
+        assert_eq!(get("[profile]\ndev = { opt-level = 1, panic = \"abort\" }\n").as_deref(), Some("abort"));
+        assert_eq!(get("[profile.release]\npanic = \"abort\"\n[profile.dev.package.x]\npanic = \"abort\"\n"), None);
+        assert_eq!(get("[[bin]]\npanic = \"abort\"\n# [profile.dev]\n"), None);
+        assert_eq!(toml_lookup("[profile.dev]\ndebug-assertions = false\n", "profile.dev.debug-assertions").as_deref(), Some("false"));
+    }
+
+    /// Cargo's precedence: a `.cargo/config.toml` beats the workspace root
+    /// manifest, a member manifest's profile is ignored, and a package
+    /// with no setting unwinds.
+    #[test]
+    fn dev_profile_follows_cargo_precedence() {
+        let dir = std::env::temp_dir().join(format!("lust-devprofile-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("m/src")).unwrap();
+        let member = dir.join("m/Cargo.toml");
+        std::fs::write(&member, "[package]\nname = \"m\"\n\n[profile.dev]\npanic = \"abort\"\n").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[workspace] # root\nmembers = [\"m\"]\n").unwrap();
+        assert_eq!(dev_profile(&member), ProfileFlags::DEV_UNWIND, "member profiles are ignored");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\n\n[profile.dev]\npanic = \"abort\"\noverflow-checks = false\n").unwrap();
+        let p = dev_profile(&member);
+        assert!(p.panic_abort && !p.overflow_checks && p.debug_assertions);
+        std::fs::create_dir_all(dir.join("m/.cargo")).unwrap();
+        std::fs::write(dir.join("m/.cargo/config.toml"), "[profile.dev]\npanic = \"unwind\"\n").unwrap();
+        assert!(!dev_profile(&member).panic_abort, "config beats the manifest");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

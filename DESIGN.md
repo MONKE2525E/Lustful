@@ -179,7 +179,7 @@ Why:
 ### The exact contract
 
 - Oracle: `rustc 1.99.0`, edition 2024, targets `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`.
-- Dev oracle flags: `-C panic=abort -C overflow-checks=on -A unconditional_panic`. Release oracle flags: `-C panic=abort -C overflow-checks=off -O -A unconditional_panic`. Without `-A unconditional_panic`, rustc rejects code like `[1, 2][5]` at compile time, but lust aborts at run time.
+- Dev oracle flags: `-C panic=abort -C overflow-checks=on -A unconditional_panic`. This is the single-file oracle (`lust build main.rs`, difftest). A Cargo crate target (`lust build src/main.rs --manifest-path Cargo.toml`) is compared with `cargo build` instead: it follows the dev profile's `panic` setting (Cargo's default is unwind) and its `debug-assertions`, and rejects `overflow-checks = false`. Release oracle flags: `-C panic=abort -C overflow-checks=off -O -A unconditional_panic`. Without `-A unconditional_panic`, rustc rejects code like `[1, 2][5]` at compile time, but lust aborts at run time.
 - **Compared:** stdout, and exit status (success or abort).
 - **Not compared:** panic message text and location, `HashMap` and `HashSet` iteration order, thread interleaving, `{:p}` output.
 - Corpus programs must not let map order reach the output in any way. This includes `keys().next()` and the drop order of map values. Check: run the rustc binary 3 times. Rust seeds `HashMap` per process, so if the outputs differ, the program is not allowed in the corpus.
@@ -359,7 +359,7 @@ struct Parser<'a> {
 ## Semantics
 
 - **Ownership and moves:** same as Rust.
-- **Panics:** abort. No unwinding. A panic in any thread ends the process.
+- **Panics:** a single-file build aborts: a panic in any thread ends the process. A Cargo crate target uses the dev profile's `panic` setting, unwind by default: `catch_unwind` catches a panic, drops run on unwind, and an uncaught panic in `main` exits 101, as with `cargo build`. `-C panic=unwind|abort` overrides both.
 - **Integer overflow** on `+`, `-`, `*`, unary `-`, `pow`, and `abs`: panic in dev, wrap in release. Same as Rust.
 - **Shifts** by the bit width or more: panic in dev, mask in release. Same as Rust.
 - **Always panic, in both modes:** division or remainder by zero, `MIN / -1`, `MIN % -1`, and out-of-bounds indexing.

@@ -100,8 +100,11 @@ per-unit features. Dependency kinds and target cfgs filter edges:
 a dev-dependency or a `cfg(windows)` dependency of a Linux build
 is in the graph data but is not a selected unit. The profile
 values that change output (panic strategy, overflow checks,
-debug assertions) come from the same request and enter every
-cache key. They must match the rustc parity build in tests.
+debug assertions) enter every session and cache key. A Cargo
+crate target reads them as Cargo does for its dev profile
+(`protocol::dev_profile`: `CARGO_PROFILE_DEV_*`, then the
+`.cargo/config.toml` chain, then the workspace root manifest);
+a single file uses the rustc parity flags (panic=abort).
 
 Terms:
 

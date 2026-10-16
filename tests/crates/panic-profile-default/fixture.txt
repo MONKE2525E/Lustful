@@ -1,0 +1,3 @@
+# Cargo's default dev profile unwinds: catch_unwind catches the panic and the
+# drop runs. Then debug_assert! fails, and the uncaught panic exits 101.
+stderr=exact

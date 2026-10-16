@@ -87,6 +87,15 @@ lust capabilities [--json]
 lust daemon                             # serve this directory yourself (not needed: see below)
 ```
 
+Panic strategy: a single file builds with panic=abort (`-C panic=unwind`
+switches it). A Cargo crate target (`--manifest-path` and the other crate
+flags) builds with the dev profile Cargo would use: `panic` (default
+unwind, so `catch_unwind` works), `debug-assertions`, and
+`overflow-checks`, read from `CARGO_PROFILE_DEV_*`, the `.cargo/config.toml`
+chain, and the workspace root `Cargo.toml`, in Cargo's order.
+`overflow-checks = false` is an error (lust dev builds always check
+overflow). `lust test` runs each test in its own process with panic=abort.
+
 A project can pin the feature set for lust dev builds (for example, dev
 builds without a `jemalloc` feature, while Cargo release builds keep it):
 set `dev-exclude-features` or `dev-features` under

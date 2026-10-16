@@ -1,0 +1,3 @@
+# An inline [profile] table: panic aborts, and debug-assertions = false turns
+# off cfg(debug_assertions) in the root crate.
+stderr=exact

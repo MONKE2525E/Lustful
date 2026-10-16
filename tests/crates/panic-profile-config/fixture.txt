@@ -1,0 +1,3 @@
+# panic = "abort" from .cargo/config.toml: Cargo config overrides the manifest
+# (which says unwind here).
+stderr=exact

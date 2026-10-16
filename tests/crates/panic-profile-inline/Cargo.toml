@@ -1,0 +1,9 @@
+[package]
+name = "panic-profile-inline"
+version = "0.1.0"
+edition = "2024"
+
+[profile]
+dev = { panic = "abort", debug-assertions = false } # inline table
+
+[workspace]
