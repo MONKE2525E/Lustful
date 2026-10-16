@@ -16,6 +16,7 @@
 // session, so the sweeps fail on a non-empty log, not on the answers.
 // Requests on other paths only store the warm digest for the next one.
 use super::session::{Caches, Front, Session};
+use crate::ast::ItemKind;
 use crate::check::collect::Program;
 use crate::check::generics::FnClass;
 use crate::def::{DefId, LocalDefId};
@@ -214,7 +215,25 @@ pub(super) fn check(
     cold_items.push(crate::scan::ItemScan { hash: cold.structure_hash, fn_name: None });
     if cold_items != front.items {
         let k = cold_items.iter().zip(&front.items).position(|(a, b)| a != b).unwrap_or(cold_items.len().min(front.items.len()));
-        fail("item scans differ", path, &format!("first at item {k} of {} (warm {})", cold_items.len(), front.items.len()));
+        let name = |a: &crate::ast::Ast| {
+            a.items.get(k).map_or_else(String::new, |it| match &it.kind {
+                ItemKind::Fn(f) => format!("fn {}", front.interner.get(f.name)),
+                ItemKind::Struct(st) => format!("struct {}", front.interner.get(st.name)),
+                ItemKind::Enum(e) => format!("enum {}", front.interner.get(e.name)),
+                ItemKind::Impl(_) => "impl".to_string(),
+                _ => "other".to_string(),
+            })
+        };
+        let detail = format!(
+            "first at item {k} of {} (warm {}): warm {} {:?}, cold {} {:?}",
+            cold_items.len(),
+            front.items.len(),
+            name(&front.ast),
+            front.items.get(k).map(|s| (s.hash, s.fn_name.is_some())),
+            name(&cold.ast),
+            cold_items.get(k).map(|s| (s.hash, s.fn_name.is_some()))
+        );
+        fail("item scans differ", path, &detail);
     }
     let locs = super::compile::fn_locations(&cold.ast);
     if locs.len() != fn_count || cold.fn_lines.len() != fn_count {
