@@ -26,6 +26,21 @@ Edit kinds (each probe edits one fn or item, then goes back to the base text):
   generic  a body edit in a generic fn named in other files; reject: `Option<T>::cloned`
   rpit     a fn that returns `impl Trait`: body edit, `+ Sized` bound; reject: `+ Copy`
 
+Manifest kinds (stale Cargo view probes; not in the default list, `--kinds manifest` runs them all).
+Each state edits what Cargo reads besides the sources, and often a cfg-gated bad `let` in one body:
+  mfeat     a new feature `_lust_f` gates a bad `let`; on (package `default`, or the .lust.toml
+            `dev-features` list when it has one), then off
+  medition  the package edition becomes 2021 (lust rejects: L0530)
+  mlints    `non_ascii_idents = "deny"` (package `[lints.rust]`, or `[workspace.lints.rust]` when
+            the package inherits its lints; lust rejects: L0531), then `warn`
+  mprofile  `#[cfg(debug_assertions)]` gates a bad `let`; the workspace root's `[profile.dev]`
+            gets `debug-assertions = false`, then loses it
+  mdeps     a registry dependency's version requirement: `=X.Y.Z` to `X.Y` (same lock), then a
+            version no registry has (both reject)
+  mtarget   target discovery: a new build.rs sets cfg `_lust_bs`, a body gates a bad `let` on it,
+            then build.rs goes (lust rejects the unknown cfg: L0520). A package that has a build.rs
+            gets a new `src/bin` and `examples` target instead.
+
 Setup (not measured): the bench adds helper fns (oblig: one `_lust_need_*` fn per trait at
 the end of a file; sigx: `_lust_sigx` at the crate root and calls in other modules), finds the
 files rustc compiles (one cargo check with a `compile_error!` in every candidate file), and
@@ -73,6 +88,8 @@ import speed_slice  # noqa: E402
 import tsrust_full  # noqa: E402
 
 KINDS = ["body", "infer", "sig", "sigx", "oblig", "derive", "generic", "rpit"]
+MANIFEST_KINDS = ["mfeat", "medition", "mlints", "mprofile", "mdeps", "mtarget"]
+ALL_KINDS = KINDS + MANIFEST_KINDS
 # Traits the oblig kind can ask for, with the path its helper names.
 NEED = {"Clone": "::std::clone::Clone", "Copy": "::std::marker::Copy", "Debug": "::std::fmt::Debug",
         "Default": "::std::default::Default", "Hash": "::std::hash::Hash", "PartialEq": "::std::cmp::PartialEq",
@@ -129,9 +146,56 @@ def add_where(text, fn, bound):
     return insert_at(text, fn["ol"], fn["oc"] - 1, f"where {bound} ")
 
 
+def toml_add(text, section, line):
+    """`line` as the first line of `[section]`; the section is appended when missing."""
+    lines = text.split("\n")
+    for i, l in enumerate(lines):
+        if l.strip() == f"[{section}]":
+            return "\n".join(lines[:i + 1] + [line] + lines[i + 1:])
+    return text.rstrip("\n") + f"\n\n[{section}]\n{line}\n"
+
+
+def toml_section(text, section):
+    """The lines of `[section]` (empty when missing)."""
+    out, on = [], False
+    for l in text.split("\n"):
+        if l.strip().startswith("["):
+            on = l.strip() == f"[{section}]"
+        elif on:
+            out.append(l)
+    return out
+
+
+def toml_list_add(text, section, key, item):
+    """`item` added to the one-line list `key = [..]` of `[section]` ("" = the top level), or a new
+    `key = [item]` line when there is none."""
+    lines, on = text.split("\n"), section == ""
+    for i, l in enumerate(lines):
+        if l.strip().startswith("["):
+            on = l.strip() == f"[{section}]"
+        elif on and (m := re.match(rf"(\s*{re.escape(key)}\s*=\s*\[)\s*(.*)$", l)):
+            rest = m.group(2)
+            lines[i] = m.group(1) + f'"{item}"' + ("" if rest.startswith("]") else ", ") + rest
+            return "\n".join(lines)
+    if section == "":
+        return f'{key} = ["{item}"]\n' + text
+    return toml_add(text, section, f'{key} = ["{item}"]')
+
+
 def ret_text(text, fn):
     lines = text.split("\n")
     return "\n".join(lines[fn["sig"] - 1:fn["rl"]])
+
+
+def write_file(path, text):
+    """Writes `text` to `path` (None deletes it). Returns the dirs it had to make."""
+    if text is None:
+        path.unlink(missing_ok=True)
+        return []
+    made = [d for d in reversed(path.parents) if not d.exists()]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return made
 
 
 def pct(xs, p):
@@ -171,6 +235,10 @@ class Bench:
             head = Path(a.fork) / ".fork-head"
             self.tsrust_commit = head.read_text().strip() if head.exists() else subprocess.run(
                 ["git", "-C", a.fork, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        # The package manifest of the target and the workspace root's (manifest kinds).
+        self.pkg_manifest = Path(self.target["manifest"]).resolve()
+        root_manifest = self.tree / "Cargo.toml"
+        self.ws_manifest = root_manifest if root_manifest.exists() and "[workspace]" in root_manifest.read_text() else self.pkg_manifest
         self.env = dict(os.environ, LUST_DAEMON_SOCKET=str(self.work / "s.sock"), LUST_CACHE_DIR=str(self.work / "cache"),
                         LUST_DAEMON_IDLE="7200s", CARGO_TARGET_DIR=str(self.work / "lust-cargo-target"), LUST_STATS="1")
         self.env.pop("LUST_NO_DAEMON", None)
@@ -403,6 +471,68 @@ class Bench:
                         states.append(("accept", f["file"], insert_at(t, f["rl"], f["rc"] - 1, " + Sized")))
                         states.append(("reject", f["file"], insert_at(t, f["rl"], f["rc"] - 1, " + Copy")))
                     out.append((kind, lbl(f), states))
+            elif kind in MANIFEST_KINDS:
+                out += self.manifest_probes(kind, n, lbl)
+        return out
+
+    def manifest_probes(self, kind, n, lbl):
+        """Probes of one manifest kind (module doc). A state is (variant, {path: text or None}, None):
+        the whole text of every file it changes (None deletes the file), on top of the last state."""
+        pm, wm = self.pkg_manifest, self.ws_manifest
+        ptext, wtext = pm.read_text(), wm.read_text()
+        pdir = pm.parent
+        bad = 'let _lust_m: u32 = "lust";'
+        sites = self.spread([f for f in self.fns if self.body_ok(f)], n)
+        out = []
+        if kind == "mfeat":
+            lt = self.tree / ".lust.toml"
+            exact = lt.exists() and re.search(r"^dev-features\s*=", lt.read_text(), re.M)
+            for f in sites:
+                t = self.base[f["file"]]
+                decl = toml_add(ptext, "features", "_lust_f = []")
+                on = {lt: toml_list_add(lt.read_text(), "", "dev-features", "_lust_f")} if exact else {pm: toml_list_add(decl, "features", "default", "_lust_f")}
+                off = {lt: lt.read_text()} if exact else {pm: decl}
+                out.append((kind, lbl(f), [("accept", {pm: decl, f["file"]: in_body(t, f, f'#[cfg(feature = "_lust_f")] {bad}')}, None),
+                                           ("reject", on, None), ("accept", off, None)]))
+        elif kind == "medition":
+            new = re.sub(r'^edition(\.workspace\s*=\s*true|\s*=\s*"2024")', 'edition = "2021"', ptext, count=1, flags=re.M)
+            if new != ptext:
+                out.append((kind, f"{os.path.relpath(pm, self.tree)} edition 2021", [("edit", {pm: new}, None)]))
+        elif kind == "mlints":
+            inherit = any(re.match(r"\s*workspace\s*=\s*true", l) for l in toml_section(ptext, "lints"))
+            if inherit or not toml_section(ptext, "lints"):
+                path, text, sec = (wm, wtext, "workspace.lints.rust") if inherit else (pm, ptext, "lints.rust")
+                out.append((kind, f"{os.path.relpath(path, self.tree)} [{sec}]",
+                            [("edit", {path: toml_add(text, sec, 'non_ascii_idents = "deny"')}, None),
+                             ("accept", {path: toml_add(text, sec, 'non_ascii_idents = "warn"')}, None)]))
+        elif kind == "mprofile" and not any(l.strip().startswith("debug-assertions") for l in toml_section(wtext, "profile.dev")):
+            for f in sites:
+                t = self.base[f["file"]]
+                out.append((kind, lbl(f), [("reject", {f["file"]: in_body(t, f, f"#[cfg(debug_assertions)] {bad}")}, None),
+                                           ("accept", {wm: toml_add(wtext, "profile.dev", "debug-assertions = false")}, None),
+                                           ("reject", {wm: wtext}, None)]))
+        elif kind == "mdeps":
+            for l in toml_section(ptext, "dependencies"):
+                m = re.match(r'\s*([\w-]+)\s*=\s*"=(\d+)\.(\d+)\.(\d+)"\s*$', l)
+                if m:
+                    name = m.group(1)
+                    loose = ptext.replace(l, f'{name} = "{m.group(2)}.{m.group(3)}"', 1)
+                    out.append((kind, f"{os.path.relpath(pm, self.tree)} {name}",
+                                [("accept", {pm: loose}, None), ("reject", {pm: ptext.replace(l, f'{name} = "=99.0.0"', 1)}, None)]))
+                    if len(out) >= n:
+                        break
+        elif kind == "mtarget":
+            if not (pdir / "build.rs").exists():
+                script = 'fn main() {\n    println!("cargo::rustc-check-cfg=cfg(_lust_bs)");\n    println!("cargo::rustc-cfg=_lust_bs");\n}\n'
+                for f in sites:
+                    t = self.base[f["file"]]
+                    out.append((kind, lbl(f), [("accept", {pdir / "build.rs": script}, None),
+                                               ("reject", {f["file"]: in_body(t, f, f"#[cfg(_lust_bs)] {bad}")}, None),
+                                               ("edit", {pdir / "build.rs": None}, None)]))
+            else:
+                main = "fn main() {}\n"
+                out.append((kind, f"{os.path.relpath(pdir, self.tree)} new targets",
+                            [("accept", {pdir / "src/bin/_lust_x.rs": main}, None), ("accept", {pdir / "examples/_lust_x.rs": main}, None)]))
         return out
 
     # ---- states
@@ -460,10 +590,19 @@ class Bench:
         print(f"tsedit: {self.label}: {self.lines} lines; daemon first check {first_ms:.0f} ms, no-op {statistics.median(noop):.1f} ms", flush=True)
         plan = self.probes()
         for kind, site, states in plan:
+            # A state names one file (path, text) or several ({path: text or None}, None).
+            old, made = {}, []
             for i, (variant, path, text) in enumerate(states):
-                path.write_text(text)
+                for p, t in (path if isinstance(path, dict) else {path: text}).items():
+                    if p not in old:
+                        old[p] = p.read_text() if p.exists() else None
+                    made += write_file(p, t)
                 self.measure(kind, site, variant, i + 1)
-            path.write_text(self.base[path])
+            for p, t in old.items():
+                write_file(p, t)
+            for d in reversed(made):
+                if d.exists() and not any(d.iterdir()):
+                    d.rmdir()
             self.measure(kind, site, "revert", len(states) + 1)
         self.kill_daemon()
         return self.report(first_ms, noop, time.time() - t0)
@@ -543,7 +682,7 @@ def merge_shards(results):
         m = by.setdefault(res["tree"], dict(res, rows=[], states=[]))
         rows = {r["kind"]: r for r in m["rows"]}
         rows.update({r["kind"]: r for r in res["rows"]})
-        m["rows"] = [rows[k] for k in KINDS if k in rows]
+        m["rows"] = [rows[k] for k in ALL_KINDS if k in rows]
         m["states"] = m["states"] + res["states"]
     return list(by.values())
 
@@ -575,7 +714,7 @@ def main():
     ap.add_argument("--census-only", help="targets the --clean auto census prunes (default: --target)")
     ap.add_argument("--slice")
     ap.add_argument("--lust", default=str(ROOT / "target/release/lust"))
-    ap.add_argument("--kinds", default=",".join(KINDS))
+    ap.add_argument("--kinds", default=",".join(KINDS), help="comma list; `manifest` adds every manifest kind")
     ap.add_argument("--probes", type=int, default=8, help="probes per kind (default 8)")
     ap.add_argument("--quick", action="store_true", help="2 probes per kind")
     ap.add_argument("--seed", type=int, default=1)
@@ -596,9 +735,9 @@ def main():
         return
     if bool(a.slice) == bool(a.fork and a.target):
         sys.exit("tsedit: give --slice DIR or --fork DIR --target NAME")
-    a.kinds = [k for k in a.kinds.split(",") if k]
-    if bad := [k for k in a.kinds if k not in KINDS]:
-        sys.exit(f"tsedit: unknown kinds {bad} (have {KINDS})")
+    a.kinds = [m for k in a.kinds.split(",") if k for m in (MANIFEST_KINDS if k == "manifest" else [k])]
+    if bad := [k for k in a.kinds if k not in ALL_KINDS]:
+        sys.exit(f"tsedit: unknown kinds {bad} (have {ALL_KINDS}, manifest)")
     if a.quick:
         a.probes = 2
     a.lust = Path(a.lust).resolve()
