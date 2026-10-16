@@ -560,6 +560,7 @@ pub(super) struct ArgTrial {
     wait_assign_ops: usize,
     sum: usize,
     fmt: usize,
+    extends: usize,
 }
 
 impl ArgTrial {
@@ -582,6 +583,7 @@ impl ArgTrial {
             wait_assign_ops: cx.wait_assign_ops.len(),
             sum: cx.deferred_sum.len(),
             fmt: cx.deferred_fmt.len(),
+            extends: cx.deferred_extend.len(),
         }
     }
 
@@ -603,6 +605,7 @@ impl ArgTrial {
         cx.wait_assign_ops.truncate(self.wait_assign_ops);
         cx.deferred_sum.truncate(self.sum);
         cx.deferred_fmt.truncate(self.fmt);
+        cx.deferred_extend.truncate(self.extends);
     }
 }
 

@@ -1606,6 +1606,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("`unsafe` blocks and functions", "L0404"),
     ("`async` functions and blocks", "L0405"),
     ("moving a field out of a struct or enum", "L9001"),
+    ("`extend` with items of type `&T` into a VecDeque, BTreeSet, BTreeMap, IndexMap, or IndexSet whose element a later use fixes to `T` (their `Extend<&T>`)", "L9001"),
     ("destructuring in `let` without an initializer", "L9001"),
     ("non-scalar const patterns", "L9001"),
     ("match guards over a by-value slice-pattern middle", "L9001"),

@@ -1999,6 +1999,9 @@ struct Ctx<'p> {
     /// finish: lust must be able to print rustc's exact string for
     /// each (`any::type_name_of`), else the call is a reject.
     deferred_type_names: Vec<(Ty, Span)>,
+    /// `extend` calls that both `Extend<T>` and `Extend<&T>` fitted,
+    /// decided at finish (check/extend.rs `finish_deferred_extends`).
+    deferred_extend: Vec<extend::DeferredExtend>,
     /// Trait fn values (`Into::into` in `.map(..)`, check/traitpath.rs)
     /// and calls through them: body end selects what each calls
     /// (`finish_trait_fn_values`, `finish_trait_fn_calls`).
@@ -2519,6 +2522,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_prim_from: Vec::new(),
         deferred_own_from: Vec::new(),
         deferred_type_names: Vec::new(),
+        deferred_extend: Vec::new(),
         deferred_trait_fn_values: Vec::new(),
         deferred_trait_fn_calls: Vec::new(),
         deferred_eq: Vec::new(),
@@ -16100,10 +16104,13 @@ impl<'p> Ctx<'p> {
             }
             return ERROR;
         }
-        // `extend` on a std source collection with an open item type
-        // (check/extend.rs): rustc E0283, before the impl probe picks one.
-        if self.name(name) == "extend" && self.std_extend_item_open(base, args) {
-            return ERROR;
+        // `extend` on a source-written collection whose item or element
+        // type is open (check/extend.rs): rustc E0283/E0282, before the
+        // impl probe picks one.
+        if self.name(name) == "extend"
+            && let Some(ret) = self.source_extend(e, base, derefs, args)
+        {
+            return ret;
         }
         // User methods, through the method-set probes of section 2.10: every
         // form is probed in order and recorded, hit or miss, before the
@@ -23781,6 +23788,7 @@ impl<'p> Ctx<'p> {
         // selects them as soon as the variable is known.
         self.finish_wait_binops();
         self.finish_deferred_sums();
+        self.finish_deferred_extends();
         self.run_obligations(false);
         self.literal_fallback_in_obligations();
         // Coercion casts with an open operand, after literal fallback

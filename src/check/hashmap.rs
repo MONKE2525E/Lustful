@@ -717,6 +717,17 @@ impl<'p> Ctx<'p> {
         } else {
             k
         };
+        // Both forms fit an open element: a later use decides
+        // (check/extend.rs `finish_deferred_extends`).
+        let map = kind == HashTy::HashMap;
+        if matches!(self.extend_pick(want, item, map), super::extend::ExtendPick::Both) {
+            let d = super::extend::DeferredExtend { elem: want, item, map, by_ref: true, span: self.span(*a) };
+            self.deferred_extend.push(d);
+            self.require_hash_key(k, s, span);
+            self.check_packed_borrow(recv, span);
+            self.set_res(e, Res::BuiltinMethod { b: Builtin::HashExtend, derefs, autoref: Autoref::RefMut });
+            return UNIT;
+        }
         // std's `Extend<&T>` for HashSet<T: Copy> and `Extend<(&K, &V)>`
         // for HashMap<K: Copy, V: Copy> (W-STD-B): the items copied in.
         let by_ref = {
