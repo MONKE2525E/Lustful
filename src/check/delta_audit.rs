@@ -288,16 +288,27 @@ pub(crate) fn reveal_again(p: &mut Program, f: LocalDefId, old_ret: crate::ty::T
     Ok(())
 }
 
-/// A test hook (`LUST_SIGDELTA_SELFTEST=1`, or `v` to print counts and
-/// timing): after a clean collect, redoes the signature of every plain or
-/// template free fn and inherent method on the same Ast (`redo_sig`). The
-/// digest must stay the same, no diagnostic may appear, and a plain fn's
-/// `impl Trait` return must reveal the same hidden type; it panics
-/// otherwise. Nested fns and lang methods are left out (a header delta
+/// A test hook (`LUST_SIGDELTA_SELFTEST=1`, or `v` to print counts,
+/// timing, and the refusal census): after a clean collect, redoes the
+/// signature of every plain or template free fn and inherent method on the
+/// same Ast (`redo_sig`). The digest must stay the same, no diagnostic may
+/// appear, and a plain fn's `impl Trait` return must reveal the same hidden
+/// type. A failure appends one line to the file `LUST_SIGDELTA_LOG` names
+/// (a daemon answers a panicked request again, so sweeps read the log),
+/// then panics. Nested fns and lang methods are left out (a header delta
 /// refuses them).
 pub fn self_test_if_asked(p: &mut Program) {
     static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(mode) = ON.get_or_init(|| std::env::var("LUST_SIGDELTA_SELFTEST").ok().filter(|v| v == "1" || v == "v")) else { return };
+    let fail = |msg: String| -> ! {
+        if let Ok(path) = std::env::var("LUST_SIGDELTA_LOG") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = f.write_all(format!("{msg}\n").as_bytes());
+            }
+        }
+        panic!("{msg}");
+    };
     let before = digest(p);
     let mut redone = 0usize;
     let (mut total, mut worst) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
@@ -321,19 +332,20 @@ pub fn self_test_if_asked(p: &mut Program) {
         let r = redo_sig(p, f, rpit, &mut errs).and_then(|()| if reveal { reveal_again(p, f, old_ret) } else { Ok(()) });
         let dt = t0.elapsed();
         (total, worst) = (total + dt, worst.max(dt));
-        assert!(
-            r.is_ok() && errs.is_empty(),
-            "sigdelta selftest: fn {i} ({}): {r:?} {:?}",
-            p.display_name(p.fns[i].name),
-            errs.first().map(|d| &d.message)
-        );
+        if r.is_err() || !errs.is_empty() {
+            let name = p.display_name(p.fns[i].name);
+            fail(format!("sigdelta selftest: fn {i} ({name}): {r:?} {:?}", errs.first().map(|d| &d.message)));
+        }
         redone += 1;
     }
     let after = digest(p);
     let moved: Vec<&str> = before.iter().zip(&after).filter(|(a, b)| a != b).map(|(a, _)| a.0).collect();
-    assert!(moved.is_empty(), "sigdelta selftest: {redone} fns redone, digest fields moved: {moved:?}");
+    if !moved.is_empty() {
+        fail(format!("sigdelta selftest: {redone} fns redone, digest fields moved: {moved:?}"));
+    }
     if mode == "v" {
         let mean = total.as_secs_f64() * 1e3 / redone.max(1) as f64;
         eprintln!("sigdelta selftest: {redone} fns redone, digest stands; mean {mean:.3} ms, max {:.3} ms", worst.as_secs_f64() * 1e3);
+        eprintln!("sigdelta census: {:?}", crate::driver::kept_delta::census(p));
     }
 }

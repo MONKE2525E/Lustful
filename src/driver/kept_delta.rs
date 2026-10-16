@@ -73,8 +73,15 @@ pub(crate) fn apply_headers(
     let mut fns: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
     fns.sort_unstable();
     fns.dedup();
+    let opaque_idents = opaque_body_idents(p);
     for &i in &fns {
-        refusal(p, front, reach, i, walk_instances)?;
+        if i >= front.fn_loc.len() {
+            return Err("sig class");
+        }
+        refusal(p, &opaque_idents, LocalDefId(i as u32), walk_instances)?;
+        if reach.reaches(front, i) {
+            return Err("sig const");
+        }
     }
     // The node answers of the last collect describe the old signatures.
     caches.gen_reuse.forget_answers();
@@ -128,15 +135,34 @@ fn recheck_template(p: &mut Program, f: LocalDefId, old: &[(u32, u32)], caches: 
     Ok(())
 }
 
-/// Why fn `i` cannot take a header delta, if anything (see the module
-/// docs). Reads the new Ast and the old program.
-fn refusal(p: &Program, front: &Front, reach: &ConstReach, i: usize, walk_instances: bool) -> Result<(), &'static str> {
-    let f = LocalDefId(i as u32);
+/// The identifier sets of the bodies that define an opaque type, by
+/// owner def (`refusal` reads them).
+fn opaque_body_idents(p: &Program) -> Vec<(crate::def::DefId, Vec<crate::intern::Sym>)> {
+    p.gx.opaques
+        .values()
+        .map(|o| {
+            let ids = p.local_def(o.owner.hash).map(|g| super::ast_hash::body_scan(&p.ast, p.fn_def(g), None).1);
+            (o.owner, ids.unwrap_or_default())
+        })
+        .collect()
+}
+
+/// Why fn `f` cannot take a header delta, if anything (see the module
+/// docs; `apply_headers` adds the const reach). Reads the new Ast and the
+/// old program. An owner in `opaque_idents` with no body names nothing,
+/// so a missing owner refuses below.
+fn refusal(
+    p: &Program,
+    opaque_idents: &[(crate::def::DefId, Vec<crate::intern::Sym>)],
+    f: LocalDefId,
+    walk_instances: bool,
+) -> Result<(), &'static str> {
+    let i = f.0 as usize;
     // A template's instances keep their old signatures: only a check that
     // walks none (no build, no generic associated consts) takes it.
     match p.gx.fn_class.get(i) {
-        Some(FnClass::Plain) if i < front.fn_loc.len() => {}
-        Some(FnClass::Template) if i < front.fn_loc.len() && !walk_instances && p.gx.assoc_const_tmpls.is_empty() => {}
+        Some(FnClass::Plain) => {}
+        Some(FnClass::Template) if !walk_instances && p.gx.assoc_const_tmpls.is_empty() => {}
         _ => return Err("sig class"),
     }
     let info = p.fn_info(f);
@@ -162,7 +188,7 @@ fn refusal(p: &Program, front: &Front, reach: &ConstReach, i: usize, walk_instan
     if p.main == Some(f) || def.name == p.known.main || def.is_test {
         return Err("sig main");
     }
-    if info.is_const || def.qual.is_const || reach.reaches(front, i) {
+    if info.is_const || def.qual.is_const {
         return Err("sig const");
     }
     if p.gx.static_dyn_fns.contains(&f) || p.gx.dyn_inherent.values().any(|&g| g == f) {
@@ -174,13 +200,8 @@ fn refusal(p: &Program, front: &Front, reach: &ConstReach, i: usize, walk_instan
     let fdef = p.def_id(f);
     // Another body that reveals an opaque type and names this fn: its
     // hidden type (and the auto traits callers read through it) may move.
-    let idents = &front.chunks[0].scan.body_idents;
-    for info in p.gx.opaques.values() {
-        if info.owner == fdef {
-            continue;
-        }
-        let Some(g) = p.local_def(info.owner.hash) else { return Err("sig rpit") };
-        if idents.get(g.0 as usize).is_none_or(|ids| ids.contains(&def.name)) {
+    for (owner, ids) in opaque_idents {
+        if *owner != fdef && (p.local_def(owner.hash).is_none() || ids.contains(&def.name)) {
             return Err("sig rpit");
         }
     }
@@ -254,5 +275,32 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
         Ok(())
     })();
     (p.record_reads, p.unwind) = (record_reads, unwind);
+    out
+}
+
+/// The header delta's answer for every user fn of `p` (a census for
+/// `LUST_SIGDELTA_SELFTEST=v`): the number of fns per refusal reason, and
+/// "ok" for those it takes. Const reach is not counted (it needs the
+/// patch base); std and lang fns are left out.
+pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
+    let opaque_idents = opaque_body_idents(p);
+    let mut out: Vec<(&'static str, usize)> = Vec::new();
+    for i in 0..p.fns.len() {
+        let f = LocalDefId(i as u32);
+        if !matches!(p.gx.fn_class[i], FnClass::Plain | FnClass::Template)
+            || p.gx.closure_fns.contains_key(&f)
+            || p.is_lang_method(f)
+            || p.fn_shipped_crate(f).is_some()
+            || p.std_source_span(p.fn_def(f).name_span)
+        {
+            continue;
+        }
+        let why = refusal(p, &opaque_idents, f, false).err().unwrap_or("ok");
+        match out.iter_mut().find(|e| e.0 == why) {
+            Some(e) => e.1 += 1,
+            None => out.push((why, 1)),
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1));
     out
 }
