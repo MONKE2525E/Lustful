@@ -253,6 +253,29 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The output of fn pointer type `t` with every region the one input
+    /// region's (`ClosureInfo::bound_output`), when it has exactly one
+    /// higher-ranked input slot and every output slot is that one
+    /// (`for<'a> fn(&'a D) -> Option<L<'a>>`, or the elided form). None
+    /// when an output slot is `'static` or the enclosing item's lifetime
+    /// (`FnSig::free_slots`): a closure body must not return its argument
+    /// there.
+    fn fn_ptr_bound_output(&mut self, t: Ty) -> Option<Ty> {
+        let TyKind::FnPtr(sig) = self.kind(t) else { return None };
+        let s = self.tys.sig(sig).value;
+        let al = &self.p.gx.adt_lifetimes;
+        let mut ins = Vec::new();
+        for &i in self.tys.tys_of(s.inputs) {
+            crate::borrowck::paired_slot_regions(al, &self.tys, i, i, &mut ins);
+        }
+        let mut outs = Vec::new();
+        crate::borrowck::paired_slot_regions(al, &self.tys, s.output, s.output, &mut outs);
+        let free = |k: usize| k < 32 && s.free_slots >> k & 1 == 1;
+        let hr = ins.iter().enumerate().filter(|&(k, r)| *r != Region::Static && !free(k)).count();
+        let out_ok = !outs.is_empty() && !outs.contains(&Region::Static) && (ins.len()..ins.len() + outs.len()).all(|k| !free(k));
+        (hr == 1 && out_ok).then(|| self.rebind_bound(s.output))
+    }
+
     /// The parts of a `dyn Fn(A, B) -> R` type (any of the Fn family):
     /// the trait, the input tuple `(A, B)`, and `R`. None for another
     /// type.
@@ -338,6 +361,7 @@ impl<'p> Ctx<'p> {
             let o = self.deep(dyn_out?);
             Some(self.rebind_bound(o))
         });
+        let bound_output = bound_output.or_else(|| self.fn_ptr_bound_output(to_fn_ptr?.0));
         // The bound's types normalize here: `F: Fn(A::Item)` gives a
         // projection over the call's impl args (check/project.rs).
         let sig = match to_fn_ptr {
