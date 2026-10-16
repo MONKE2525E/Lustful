@@ -1746,17 +1746,34 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         front.chunks[0].scan.items[dv.item] = scan;
     }
     // Fn lines in the edited files: an edit that adds or drops lines
-    // moves every fn after it in that file, and no fn in any other.
+    // moves every fn after it in that file, and no fn in any other. A fn
+    // after the edit whose name's line holds the edit's end also moves in
+    // its line, and its text hash reads that line from its start
+    // (`fn_text_hash`): it hashes again, so its C (which embeds columns)
+    // is made again.
     for e in &edits {
         let after = (e.edit.b as i64 + e.edit.d) as u32;
-        if let Some(fns) = base.fns_by_file.get(e.file.0 as usize) {
-            for &j in fns {
-                let (item, sub) = front.fn_loc[j as usize];
-                let span = fn_def_at(&front.ast, item, sub).name_span;
-                if span.lo >= after {
-                    base.fn_lines[j as usize] = front.map.line_col(span).0;
-                }
+        let fns = base.fns_by_file.get(e.file.0 as usize).cloned().unwrap_or_default();
+        for j in fns.into_iter().map(|j| j as usize) {
+            let (item, sub) = front.fn_loc[j];
+            let def = fn_def_at(&front.ast, item, sub);
+            let span = def.name_span;
+            if span.lo < after {
+                continue;
             }
+            let line = front.map.line_col(span).0;
+            base.fn_lines[j] = line;
+            let text = front.map.text(e.file).ok_or("state")?;
+            if text[..span.lo as usize].rfind('\n').map_or(0, |i| i + 1) >= after as usize {
+                continue;
+            }
+            // A body item's fn folds its item's content (`nested_fn_hashes`).
+            if item == usize::MAX {
+                return Err("fn on the edit's line");
+            }
+            let h = fn_text_hash(&front.ast, &front.map, def, line, super::ast_hash::body_scan(&front.ast, def, None).0);
+            base.body_hashes[j] = h;
+            front.chunks[0].scan.fns.get_mut(j).ok_or("state")?.body_hash = h;
         }
     }
     // A fn that returns `impl Trait` moved its item scan (`item_stands`):
