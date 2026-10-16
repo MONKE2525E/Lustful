@@ -3606,6 +3606,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                     let linked = std::mem::take(&mut self.bound_linked);
                     self.link_closure_args(&avs, None, &linked);
                 } else {
+                    if self.has_type_outlives(f) {
+                        self.type_outlives_unproved();
+                    }
                     let mut srcs: Vec<u32> = Vec::new();
                     for &i in &tied {
                         let (t, v) = &avs[i];
@@ -5481,6 +5484,28 @@ impl<'b, 'p> Builder<'b, 'p> {
                     self.edge(v, 0);
                 }
             }
+            // `T: 'a` (fns and inherent methods): the regions bound to `T`
+            // outlive the call's `'a`, and so do this body's type params
+            // inside `T`'s type, by this body's own bounds.
+            if let Predicate::TypeOutlives(t, Region::Param(k)) = pred
+                && let TyKind::Param(j) = self.p.tys.kind(*t)
+            {
+                let a = self.inst_region(Region::Param(*k), &univ);
+                match (binds.get(&j.0).cloned(), self.bind_tys.get(&j.0).copied()) {
+                    (Some(vs), Some(actual)) => {
+                        for &v in &vs {
+                            self.edge(v, a);
+                        }
+                        self.params_outlive(actual, a);
+                    }
+                    // `T` only in a bound (`F: FnOnce() -> T`): the output of
+                    // what `F` binds to, when it has no slots of its own.
+                    _ => match self.bound_output_actual(j.0, preds) {
+                        Some(actual) if self.sc.slots(actual) == 0 => self.params_outlive(actual, a),
+                        _ => self.type_outlives_unproved(),
+                    },
+                }
+            }
             // `P: Tr` proves more through trait selection: `Tr` (or a
             // supertrait) bounded by `'static` makes `P` `'static`, and the
             // impl selected for `P`'s type adds its own `X: 'static`
@@ -5515,6 +5540,89 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
         }
         ok
+    }
+
+    /// The type params of this body inside `t` (a callee's `T: 'a` at a
+    /// call, `a` its var) outlive `a`: each must have a `P: 'static` bound,
+    /// or `P: 'r` facts (bounds, implied bounds), and then every such `'r`
+    /// outlives `a` (rustc needs one; requiring all only restricts). A
+    /// param without facts, a projection, or a closure body is
+    /// `type_outlives_unproved`.
+    fn params_outlive(&mut self, t: Ty, a: u32) {
+        let tys = &self.body.tys;
+        if !tys.flags(t).contains_param() {
+            return;
+        }
+        if tys.flags(t).contains_projection() || self.own.closure {
+            return self.type_outlives_unproved();
+        }
+        let mut ps = Vec::new();
+        params_in(tys, t, &mut ps);
+        let p = self.p;
+        let f = self.body.fn_id;
+        let bounds = crate::check::outlives::param_bounds(p, p.regions.body_sig(p, f), fn_env(p, f));
+        for j in ps {
+            if bounds.contains(&(j, Region::Static)) {
+                continue;
+            }
+            let rs: Vec<u32> = bounds.iter().filter(|(k, _)| *k == j).filter_map(|&(_, r)| if let Region::Param(i) = r { Some(i + 1) } else { None }).collect();
+            if rs.is_empty() {
+                self.type_outlives_unproved();
+            }
+            for u in rs {
+                self.edge(u, a);
+            }
+        }
+    }
+
+    /// True when fn `f` (its template) has a `T: 'a` bound on a named
+    /// lifetime: a call that does not pair its signature cannot prove it.
+    fn has_type_outlives(&self, f: LocalDefId) -> bool {
+        let p = self.p;
+        let src = p.gx.instances.get(&f).and_then(|i| i.template_local).unwrap_or(f);
+        p.gx.fn_templates
+            .get(src.0 as usize)
+            .and_then(|t| t.as_ref())
+            .is_some_and(|t| t.generics.predicates.iter().any(|q| matches!(q, Predicate::TypeOutlives(_, Region::Param(_)))))
+    }
+
+    /// The type a call gives callee param `j` when `j` is only the output
+    /// of an Fn-family bound on another param `F` (`F: FnOnce() -> T`):
+    /// the output of the closure `F` binds to, or of this body's own
+    /// Fn-family bound when `F` binds to a param of this body.
+    fn bound_output_actual(&self, j: u32, preds: &[Predicate]) -> Option<Ty> {
+        let p = self.p;
+        let lang = p.gx.lang;
+        let out_assoc = lang.output_of(lang.fn_once)?;
+        let output_of = |pred: &Predicate| -> Option<(Ty, Ty)> {
+            let Predicate::Trait(b) = pred else { return None };
+            if b.count != 0 || !lang.is_fn_family(b.value.def) {
+                return None;
+            }
+            let self_t = p.tys.args(b.value.args).first()?.as_ty()?;
+            let out = p.tys.bindings(b.value.bindings).iter().find(|(d, _)| *d == out_assoc)?.1.as_ty()?;
+            Some((self_t, out))
+        };
+        let f = preds.iter().filter_map(output_of).find_map(|(st, out)| match (p.tys.kind(st), p.tys.kind(out)) {
+            (TyKind::Param(f), TyKind::Param(o)) if o.0 == j => Some(f.0),
+            _ => None,
+        })?;
+        let ft = *self.bind_tys.get(&f)?;
+        match self.body.tys.kind(ft) {
+            TyKind::Closure(def, _) => p.gx.closures.get(&def).map(|c| c.output),
+            TyKind::Param(_) => fn_env(p, self.body.fn_id).iter().filter_map(output_of).find_map(|(st, out)| (st == ft).then_some(out)),
+            _ => None,
+        }
+    }
+
+    /// A callee's `T: 'a` bound that this call cannot prove (L0203).
+    fn type_outlives_unproved(&mut self) {
+        self.errs.push(Diag::new(
+            "L0203",
+            self.span,
+            "lust cannot prove the callee's `T: 'a` bound at this call yet",
+            "Give the caller the same bound (`T: 'a` on its own type parameter), or bound the type by `'static`.",
+        ));
     }
 
     /// The vars a call takes for the lifetime params of the callee's trait

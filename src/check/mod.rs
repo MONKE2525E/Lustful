@@ -3011,6 +3011,22 @@ impl<'p> Ctx<'p> {
         self.tys.intern(TyKind::FnPtr(sig))
     }
 
+    /// A fn with a `T: 'a` bound on a named lifetime as a value: only its
+    /// calls prove the bound (borrowck `call_sig_with`), so a fn pointer or
+    /// `Fn` value of it is not supported yet (L0203).
+    fn reject_type_outlives_value(&mut self, f: LocalDefId, span: Span) {
+        let has = self
+            .p
+            .gx
+            .fn_templates
+            .get(f.0 as usize)
+            .and_then(|t| t.as_ref())
+            .is_some_and(|t| t.generics.predicates.iter().any(|q| matches!(q, Predicate::TypeOutlives(_, Region::Param(_)))));
+        if has {
+            self.err("L0203", span, "a fn with a `T: 'a` bound used as a value is not supported yet", "Call it, or wrap the call in a closure.");
+        }
+    }
+
     /// The zero-sized fn-item type of a fn used as a value. A generic
     /// fn named by a plain path instantiates as a call does (turbofish
     /// args or fresh variables, bounds queued, the site recorded for
@@ -3018,6 +3034,7 @@ impl<'p> Ctx<'p> {
     /// (`<S as Tr>::mk`) to generic fns are not supported yet.
     fn fn_value_ty(&mut self, e: ExprId, f: LocalDefId, span: Span) -> Ty {
         self.reject_track_caller_value(f, span);
+        self.reject_type_outlives_value(f, span);
         if let Some(Some(tmpl)) = self.p.gx.fn_templates.get(f.0 as usize).cloned() {
             if !matches!(self.p.ast.expr(e), Expr::Path(_)) {
                 self.errs.push(not_yet("L0614", span, "generic functions as values through a qualified path"));
@@ -3063,6 +3080,7 @@ impl<'p> Ctx<'p> {
     /// (`<S as Tr>::conv::<u32>`), else fresh variables.
     fn fn_value_ty_prefixed(&mut self, e: ExprId, f: LocalDefId, prefix: &[GenericArg], span: Span) -> Ty {
         self.reject_track_caller_value(f, span);
+        self.reject_type_outlives_value(f, span);
         let Some(Some(tmpl)) = self.p.gx.fn_templates.get(f.0 as usize).cloned() else {
             return self.tys.intern(TyKind::FnDef(self.p.def_id(f), EMPTY_ARGS));
         };

@@ -108,6 +108,8 @@ fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, 
     for q in preds {
         match q {
             Predicate::AssocEq(b) if b.count == 0 => env.eqs.push((b.value.assoc, b.value.trait_args, b.value.ty)),
+            // A written `T: 'a` bound (fns and inherent methods).
+            Predicate::TypeOutlives(x, r @ Region::Param(_)) => env.ty.push((*x, *r)),
             Predicate::Trait(b) if b.count == 0 => {
                 for &(d, g) in tys.bindings(b.value.bindings) {
                     if let GenericArg::Ty(x) = g {
@@ -175,7 +177,7 @@ pub fn check_body_ty(
 /// The diagnostic for a requirement `g: r` that does not hold.
 /// What a fn knows of its type params' lifetimes: `(param index,
 /// region)` for each bound its signature implies (region signature
-/// `sig`) or its env `preds` states as `T: 'static`. Borrowck's dyn
+/// `sig`) or its env `preds` states (`T: 'static`, `T: 'a`). Borrowck's dyn
 /// coercions read it (`OwnSig::param_univs`).
 pub fn param_bounds(p: &Program, sig: Option<&crate::borrowck::RegionSig>, preds: &[Predicate]) -> Vec<(u32, Region)> {
     let mut out: Vec<(u32, Region)> = Vec::new();
@@ -183,6 +185,14 @@ pub fn param_bounds(p: &Program, sig: Option<&crate::borrowck::RegionSig>, preds
     for t in statics_of(preds) {
         if let TyKind::Param(j) = tys.kind(t) {
             out.push((j.0, Region::Static));
+        }
+    }
+    // Written `T: 'a` bounds (fns and inherent methods).
+    for q in preds {
+        if let Predicate::TypeOutlives(x, r @ Region::Param(_)) = q
+            && let TyKind::Param(j) = tys.kind(*x)
+        {
+            out.push((j.0, *r));
         }
     }
     let Some(sig) = sig else { return out };

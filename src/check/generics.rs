@@ -1240,6 +1240,11 @@ pub struct Scope {
     /// Declared `'a: 'b` facts between those params, by universal index
     /// (`'a: 'static` has `STATIC_FACT` as its target).
     pub region_facts: Vec<(u32, u32)>,
+    /// W-BORROW: a `T: 'a` bound on a named lifetime is allowed here and
+    /// becomes `TypeOutlives(T, Region::Param(a))`. Set for free fns and
+    /// inherent methods, whose calls prove it (borrowck `call_sig_with`);
+    /// every other item keeps the L0203 reject.
+    pub type_outlives: bool,
     /// The regioned `Self` type of an impl, for signatures resolved in
     /// `RegionMode::Keep` (`self_ty` stays the erased one).
     pub self_ty_regioned: Option<Ty>,
@@ -3827,8 +3832,15 @@ pub(crate) fn bound_predicates(
         TraitBound::Lifetime(lt) => match check_lifetime(interner, scope, *lt) {
             Err(d) => errs.push(d),
             Ok(_) if interner.get(lt.name) == "static" => out.push(Predicate::TypeOutlives(lhs, Region::Static)),
-            // `T: 'a` would be a type-outlives obligation at every use;
-            // lust proves only `'static` ones yet (W-BORROW).
+            // `T: 'a` on a fn or inherent method: its calls prove it.
+            Ok(_) if scope.type_outlives
+                && matches!(tys.kind(lhs), TyKind::Param(_))
+                && let Some(&(_, i)) = scope.lifetimes.iter().find(|(n, _)| *n == lt.name) =>
+            {
+                out.push(Predicate::TypeOutlives(lhs, Region::Param(i)))
+            }
+            // Elsewhere `T: 'a` would be a type-outlives obligation at
+            // every use; lust proves only `'static` ones there (W-BORROW).
             Ok(_) if interner.get(lt.name) != "_" => errs.push(Diag::new(
                 "L0203",
                 lt.span,

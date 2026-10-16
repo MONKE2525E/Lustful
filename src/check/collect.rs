@@ -4305,6 +4305,10 @@ pub fn collect_reuse(
      -> LocalDefId {
         let shift = parent_gen.generics.params.len() as u32;
         let std = p.in_lang_methods(def.name_span);
+        // `T: 'a` bounds: free fns and inherent methods (`ParentGen::scope`
+        // of an inherent impl allows them; see `Scope::type_outlives`).
+        let mut seed = parent_gen.scope.clone();
+        seed.type_outlives |= matches!(loc, FnLoc::Item(_) | FnLoc::Nested(_));
         let (own_generics, own_scope) = {
             let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             generics::build_generics_shifted(
@@ -4316,7 +4320,7 @@ pub fn collect_reuse(
                 &def.generics,
                 &def.where_clause,
                 shift,
-                &parent_gen.scope,
+                &seed,
                 errs,
             )
         };
@@ -4756,6 +4760,8 @@ pub fn collect_reuse(
                         });
                     }
                 }
+                let mut impl_scope = impl_scope;
+                impl_scope.type_outlives = trait_ref.is_none();
                 let parent_gen =
                     ParentGen { generics: impl_generics.clone(), scope: impl_scope, ast_generics: Some((&imp.generics, &imp.where_clause)) };
                 let mut method_ids: Vec<LocalDefId> = Vec::new();
