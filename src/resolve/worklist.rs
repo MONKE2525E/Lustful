@@ -734,8 +734,10 @@ struct CachedFile {
     /// The outline scanned from `raw`.
     outline: Option<scan::Outline>,
     /// The expanded token stream the parser consumes (cfg-name
-    /// checking and expansion already applied to `raw`).
-    expanded: Option<lexer::Lexed>,
+    /// checking and expansion already applied to `raw`), with the
+    /// hash of every other input that expansion read
+    /// (`expansion_input_hash`) and the outside reads it recorded.
+    expanded: Option<(u64, lexer::Lexed, Vec<crate::expand::Dep>, u64)>,
     /// The parsed Ast with the hash of the expanded token stream
     /// it was parsed from. Expansion answers depend on the whole
     /// crate's macro environment, so own text alone cannot key a
@@ -937,13 +939,21 @@ impl ResolveCache {
         }
     }
 
-    /// The cached expanded token stream for one file, cloned out.
-    fn expanded(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<lexer::Lexed> {
-        self.peek(key, text_hash, file_id).and_then(|e| e.expanded.as_ref()).map(clone_lexed)
+    /// The cached expansion of one file whose other inputs hash to
+    /// `input_hash` (`expansion_input_hash`), cloned out, with the
+    /// stream's own `hash_lexed`.
+    fn expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64) -> Option<(lexer::Lexed, Vec<crate::expand::Dep>, u64)> {
+        match self.peek(key, text_hash, file_id).and_then(|e| e.expanded.as_ref()) {
+            Some((h, l, deps, exp_hash)) if *h == input_hash => Some((clone_lexed(l), deps.clone(), *exp_hash)),
+            _ => None,
+        }
     }
 
-    fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, lexed: &lexer::Lexed) {
-        self.entry(key, text_hash, file_id).expanded = Some(clone_lexed(lexed));
+    /// Stores one file's expansion; returns the stream's `hash_lexed`.
+    fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64, lexed: &lexer::Lexed, deps: &[crate::expand::Dep]) -> u64 {
+        let exp_hash = hash_lexed(lexed);
+        self.entry(key, text_hash, file_id).expanded = Some((input_hash, clone_lexed(lexed), deps.to_vec(), exp_hash));
+        exp_hash
     }
 
     /// The cached parsed Ast for one expanded token stream, cloned out.
@@ -980,14 +990,19 @@ impl ResolveCache {
 /// cache, because expansion output is exactly what the parser
 /// consumes, whatever macro environment produced it.
 fn hash_lexed(l: &lexer::Lexed) -> u64 {
+    hash_tokens(&l.tokens, &l.strings)
+}
+
+/// `hash_lexed` over a token list and its string table.
+fn hash_tokens(tokens: &[crate::lexer::Token], strings: &[String]) -> u64 {
     use crate::lexer::Tok;
     use std::hash::{Hash, Hasher};
     let mut h = crate::intern::FxHasher::default();
     "expanded-v1".hash(&mut h);
-    for s in &l.strings {
+    for s in strings {
         s.hash(&mut h);
     }
-    for t in &l.tokens {
+    for t in tokens {
         std::mem::discriminant(&t.tok).hash(&mut h);
         match t.tok {
             Tok::Ident(s) | Tok::Reserved(s) | Tok::Lifetime(s) => h.write_u64(s.0 as u64),
@@ -1000,12 +1015,66 @@ fn hash_lexed(l: &lexer::Lexed) -> u64 {
         }
         // Strings, including a literal's written text.
         for i in t.tok.string_indices() {
-            l.strings.get(i as usize).map_or("", String::as_str).hash(&mut h);
+            strings.get(i as usize).map_or("", String::as_str).hash(&mut h);
         }
         h.write_u64(t.span.file.0 as u64);
         h.write_u64(t.span.lo as u64);
         h.write_u64(t.span.hi as u64);
     }
+    h.finish()
+}
+
+/// Hash of the expansion inputs every file of one round shares: the
+/// macro seeds, the crate's `$crate` magic, name, Cargo env, display
+/// root, and the client's shown root (`file!`). The cfg environment
+/// keys the whole `ResolveCache` already.
+fn expansion_env_hash(menv: &MacroEnv, job: &CrateJob, input: &OneInput, client: &crate::expand::ClientView) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::intern::FxHasher::default();
+    "expansion-env-v1".hash(&mut h);
+    for s in &menv.seeds {
+        seed_hash(&mut h, s);
+    }
+    h.write_u64(job.magic.0 as u64);
+    input.crate_name.hash(&mut h);
+    input.cargo_env.hash(&mut h);
+    input.display_root.hash(&mut h);
+    client.shown_root.hash(&mut h);
+    h.finish()
+}
+
+fn seed_hash(h: &mut crate::intern::FxHasher, s: &crate::expand::MacroSeed) {
+    use std::hash::{Hash, Hasher};
+    s.path.iter().for_each(|p| h.write_u64(p.0 as u64));
+    h.write_u64(hash_tokens(&s.tokens, &s.strings));
+    s.import_into.as_ref().map(|v| v.iter().map(|p| p.0).collect::<Vec<_>>()).hash(h);
+    s.ambiguous.hash(h);
+    s.visible_in.as_ref().map(|v| v.iter().map(|p| p.0).collect::<Vec<_>>()).hash(h);
+}
+
+/// Hash of everything one file's expansion reads besides its own text
+/// (`ResolveCache::expanded`): the round's shared inputs, the macro
+/// sources spliced into it (`MacroEnv::splice`), its extra glob seeds,
+/// its module path, and its path.
+fn expansion_input_hash(env_hash: u64, menv: &MacroEnv, owned_hashes: &[u64], di: usize, module_path: &[Sym], path: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::intern::FxHasher::default();
+    h.write_u64(env_hash);
+    for &i in menv.inherited.get(di).map(Vec::as_slice).unwrap_or(&[]) {
+        h.write_u64(owned_hashes[i]);
+    }
+    h.write_u64(u64::MAX);
+    for (pos, srcs, ext) in menv.after_mods.get(di).map(Vec::as_slice).unwrap_or(&[]) {
+        h.write_u32(*pos);
+        srcs.iter().for_each(|&i| h.write_u64(owned_hashes[i]));
+        ext.hash(&mut h);
+    }
+    h.write_u64(u64::MAX);
+    for s in menv.glob_seeds.get(di).map(Vec::as_slice).unwrap_or(&[]) {
+        seed_hash(&mut h, s);
+    }
+    module_path.iter().for_each(|p| h.write_u64(p.0 as u64));
+    path.hash(&mut h);
     h.finish()
 }
 
@@ -2876,6 +2945,9 @@ fn resolve_one(
     // environment the outlines now prove, then look for module edges
     // the expansions generated; repeat until a round adds no file.
     let mut expanded: Vec<Option<lexer::Lexed>> = Vec::new();
+    // The `hash_lexed` of each expanded stream, when the expansion
+    // cache knows it (a hit, or a store this round).
+    let mut exp_known: Vec<Option<u64>> = Vec::new();
     // Outside inputs the latest round's expansion of each file read.
     let mut file_deps: Vec<Vec<crate::expand::Dep>> = Vec::new();
     let mut menv = MacroEnv {
@@ -2899,7 +2971,34 @@ fn resolve_one(
         // landing); the first error in disc order is the answer.
         let module_paths: Vec<Vec<Sym>> = discs.iter().map(|d| tables.modules[d.module.0 as usize].path.clone()).collect();
         let indices: Vec<usize> = (0..discs.len()).collect();
+        // A daemon session keeps each file's expansion: a file whose
+        // text and other expansion inputs stand takes it back instead
+        // of expanding again (a signature edit used to re-expand every
+        // file of the crate). Files that read outside data never do.
+        let keep = !cache.one_shot;
+        let env_hash = if keep { expansion_env_hash(&menv, job, input, client) } else { 0 };
+        let owned_hashes: Vec<u64> = if keep { menv.owned_all.iter().map(|o| hash_tokens(&o.tokens, &o.strings) ^ o.magic.0 as u64).collect() } else { Vec::new() };
+        let exp_keys: Vec<Option<(String, u64, u64)>> = discs
+            .iter()
+            .enumerate()
+            .map(|(di, d)| {
+                (keep && d.lexed.is_some() && !reads_outside(&d.text)).then(|| {
+                    let key = job.file_key(&cache.canon(&d.path), d.module);
+                    (key, hash_str(&d.text), expansion_input_hash(env_hash, &menv, &owned_hashes, di, &module_paths[di], &d.path))
+                })
+            })
+            .collect();
+        let exp_hits: Vec<std::sync::Mutex<Option<(lexer::Lexed, Vec<crate::expand::Dep>, u64)>>> = exp_keys
+            .iter()
+            .enumerate()
+            .map(|(di, k)| std::sync::Mutex::new(k.as_ref().and_then(|(key, th, ih)| cache.expanded(key, *th, discs[di].file_id, *ih))))
+            .collect();
+        exp_known.clear();
+        exp_known.extend(exp_hits.iter().map(|h| h.lock().unwrap().as_ref().map(|x| x.2)));
         let results = par_map(&indices, |&di| -> Result<(Option<lexer::Lexed>, Vec<crate::expand::Dep>), Diag> {
+            if let Some((l, deps, _)) = exp_hits[di].lock().unwrap().take() {
+                return Ok((Some(l), deps));
+            }
             let (orig, text, path) = match &discs[di].lexed {
                 Some(l) => (l.clone(), discs[di].text.clone(), discs[di].path.clone()),
                 None => return Ok((None, Vec::new())),
@@ -2930,6 +3029,11 @@ fn resolve_one(
         for (di, r) in results.into_iter().enumerate() {
             match r {
                 Ok((l, deps)) => {
+                    if let (Some((key, th, ih)), Some(l)) = (&exp_keys[di], &l)
+                        && exp_known[di].is_none()
+                    {
+                        exp_known[di] = Some(cache.put_expanded(key, *th, discs[di].file_id, *ih, l, &deps));
+                    }
                     expanded[di] = l;
                     file_deps[di] = deps;
                 }
@@ -3008,9 +3112,10 @@ fn resolve_one(
     order.sort_by_key(|&di| discs[di].file_id.0);
     let keep = !cache.one_shot;
     let exp_hashes = if keep {
-        par_map(&order, |&di| match (expanded[di].as_ref(), discs[di].lexed.as_ref()) {
-            (Some(l), _) | (None, Some(l)) => hash_lexed(l),
-            (None, None) => hash_lexed(&lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }),
+        par_map(&order, |&di| match (exp_known.get(di).copied().flatten(), expanded[di].as_ref(), discs[di].lexed.as_ref()) {
+            (Some(h), Some(_), _) => h,
+            (_, Some(l), _) | (_, None, Some(l)) => hash_lexed(l),
+            (_, None, None) => hash_lexed(&lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }),
         })
     } else {
         vec![0; order.len()]
