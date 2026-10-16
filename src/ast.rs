@@ -150,6 +150,19 @@ impl std::fmt::Debug for ByteBlob {
 }
 
 impl Ast {
+    /// Reserves the node arrays for a parse of `n` tokens (an upper
+    /// estimate; untouched capacity costs no memory). Growing them by
+    /// doubling copied every array several times, and each copy touched
+    /// fresh pages in the parallel parse.
+    pub fn reserve_for_tokens(&mut self, n: usize) {
+        self.exprs.reserve(n / 2);
+        self.expr_spans.reserve(n / 2);
+        self.pats.reserve(n / 8);
+        self.pat_spans.reserve(n / 8);
+        self.tys.reserve(n / 8);
+        self.ty_spans.reserve(n / 8);
+        self.blocks.reserve(n / 16);
+    }
     pub fn expr(&self, id: ExprId) -> &Expr {
         &self.exprs[id.0 as usize]
     }

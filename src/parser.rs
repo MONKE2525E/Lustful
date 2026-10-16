@@ -232,6 +232,7 @@ fn parse_tokens(
         split: None,
     };
     p.ast.strings = strings;
+    p.ast.reserve_for_tokens(toks.len());
     // Inner attributes are permitted only here, before the first item
     // (and before any outer attribute): they scope over the whole file.
     // A seeded piece with no inner run of its own keeps the seed, so its
