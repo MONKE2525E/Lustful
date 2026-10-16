@@ -7713,8 +7713,9 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// The vars of `<T as Deref>::Target` (assoc `a`, args `pa`) at
     /// erased type `e` when `T` is a bound param whose erased type is a
     /// builtin pointer (`&`, `&mut`, Box, Rc, Arc, Cow, a RefCell or lock
-    /// guard): the pointee's own vars inside `T`'s, after the pointer's
-    /// regions. None for anything else (a user impl's target).
+    /// guard) or a Vec (`[T]`): the pointee's own vars inside `T`'s,
+    /// after the pointer's regions. None for anything else (a user
+    /// impl's target).
     fn deref_target_vars(&mut self, a: crate::ty::AssocId, pa: crate::ty::ArgsId, e: Ty, binds: &FxMap<u32, Vec<u32>>) -> Option<Vec<u32>> {
         let p = self.p;
         if a.0 != p.gx.lang.assoc_target {
@@ -7726,6 +7727,8 @@ impl<'b, 'p> Builder<'b, 'p> {
         let tys = &self.body.tys;
         let (off, inner) = match tys.kind(et) {
             TyKind::Ref(r, _, inner) => (u32::from(!bound(r)), inner),
+            // `Vec<T>` derefs to `[T]`: the same slots as `T`.
+            _ if tys.vec_elem(et).is_some_and(|el| matches!(tys.kind(e), TyKind::Slice(x) if x == el)) => (adt_regions(p, tys, et), e),
             _ if tys.smart_elem(et).is_some() || crate::check::collect::cow_arg(tys, et).is_some() => {
                 let inner = tys.smart_elem(et).or_else(|| crate::check::collect::cow_arg(tys, et))?;
                 // The pointee is the first type arg, after the Adt's regions.
