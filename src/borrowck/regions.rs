@@ -7171,8 +7171,17 @@ impl<'b, 'p> Builder<'b, 'p> {
         // check mode, a stub) has no slots where its params are: the
         // call's own types give them, so the params bind their slots.
         let has_param = |t: Ty| self.p.tys.flags(t).contains_param();
+        // A constant at a type param's position (`map_or("", f)`'s `U`)
+        // holds only `'static` data: its params bind at their other uses
+        // first (the return's `&str`), and a slot count that differs
+        // there is no pairing failure.
+        let mut consts: Vec<usize> = Vec::new();
         for i in 0..avs.len() {
             let (at, av) = &avs[i];
+            if *at == ERROR && av.is_empty() && has_param(params[i]) {
+                consts.push(i);
+                continue;
+            }
             let et = if has_param(params[i]) { *at } else { params[i] };
             let mut pv = Vec::new();
             ok &= self.inst(sig.params[i], et, &univ, &mut binds, &mut pv);
@@ -7189,6 +7198,10 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.inst_ret = false;
         if !dv.is_empty() {
             ok &= self.relate(er, &rv, dt, dv, Variance::Co);
+        }
+        for i in consts {
+            let mut pv = Vec::new();
+            self.inst(sig.params[i], ERROR, &univ, &mut binds, &mut pv);
         }
         for &(a, b) in &sig.facts {
             let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
