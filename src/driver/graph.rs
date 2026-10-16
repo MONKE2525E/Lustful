@@ -1330,6 +1330,13 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
                 for pred in &o.bounds {
                     hash_predicate(&mut h, p, &p.tys, pred);
                 }
+                // Their written regions (`&'static` in `impl Fn(&u8) ->
+                // &'static u8`), which the bounds erase.
+                for b in &o.fn_outs {
+                    for &t in b.inputs.iter().chain(b.output.iter()) {
+                        hash_regions_deep(&mut h, p, t, &mut seen);
+                    }
+                }
             }
             None => u64::MAX.hash(&mut h),
         }

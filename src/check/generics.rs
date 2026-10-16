@@ -4905,6 +4905,10 @@ pub struct ClosureEntry {
 pub struct OpaqueInfo {
     pub owner: DefId,
     pub bounds: Vec<Predicate>,
+    /// Its `Fn*(..) -> R` bounds with regions (`FnBound`, param
+    /// `RPIT_PARAM`): a returned closure's output slots take theirs
+    /// (`rpit_bound_output`).
+    pub fn_outs: Vec<crate::borrowck::FnBound>,
 }
 
 /// The def of the return-position `impl Trait` of one fn.
@@ -5587,7 +5591,8 @@ pub fn resolve_fn_sig(
                     if let TyExpr::ImplTrait { captures: Some(c), .. } = ast.ty(t) {
                         super::use_caps::check_list(interner, &generics, c, errs);
                     }
-                    opaque = Some((od, OpaqueInfo { owner, bounds: preds }));
+                    let fn_outs = fn_bounds_in(ast, interner, known, tys, cx, &scope, &[(crate::borrowck::RPIT_PARAM, bounds.as_slice())]);
+                    opaque = Some((od, OpaqueInfo { owner, bounds: preds, fn_outs }));
                     oty
                 }
             }

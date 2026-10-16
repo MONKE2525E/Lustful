@@ -162,12 +162,17 @@ pub struct ImplHead {
 /// (`call_fn_bound`) follow it.
 #[derive(Clone, Debug)]
 pub struct FnBound {
-    /// The type param's index.
+    /// The type param's index, or `RPIT_PARAM` for a bound of the fn's
+    /// return-position `impl Fn*(..) -> R`.
     pub param: u32,
     pub inputs: Vec<Ty>,
     /// The written output type (`-> R`); `None` for `()`.
     pub output: Option<Ty>,
 }
+
+/// `FnBound::param` of a return-position `impl Fn*` bound
+/// (`OpaqueInfo::fn_outs`): no type param has it.
+pub const RPIT_PARAM: u32 = u32::MAX;
 
 /// The borrow checker's side table of region signatures (W-BORROW, ARCH 5),
 /// filled by collect. Read-only after collect, apart from the Adt tables that

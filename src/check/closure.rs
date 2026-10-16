@@ -396,6 +396,94 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The signature of the body's return-position `impl Fn*(..) -> R`
+    /// (`OpaqueInfo::fn_outs`) for a closure with `n` params that is the
+    /// body's result (`ret_exprs`), checked against that opaque's hidden
+    /// type: the erased input tuple, `R` with
+    /// regions (`ClosureInfo::bound_output`: only the output slots that are
+    /// the one higher-ranked input region may hold the argument's borrow;
+    /// `'static` ones are pinned, `output_region`), and `R` erased. None
+    /// when the inputs have several higher-ranked regions and the output
+    /// one. A named lifetime in `R` is L0203.
+    fn rpit_bound(&mut self, expected: Option<Ty>, n: usize, span: Span) -> Option<(Ty, Ty, Ty)> {
+        let TyKind::Infer(v) = self.kind(self.resolve(expected?)) else { return None };
+        let &(od, args, h) = self.own_opaques.iter().find(|&&(_, _, h)| matches!(self.kind(self.resolve(h)), TyKind::Infer(w) if w == v))?;
+        let p = self.p;
+        let b = p.gx.opaques.get(&od)?.fn_outs.iter().find(|b| b.inputs.len() == n)?.clone();
+        let out = b.output.unwrap_or(UNIT);
+        let mut ins = Vec::new();
+        for &t in &b.inputs {
+            crate::borrowck::regions_of(&p.tys, t, &mut ins);
+        }
+        let mut outs = Vec::new();
+        crate::borrowck::regions_of(&p.tys, out, &mut outs);
+        if outs.iter().any(|r| matches!(r, Region::Param(_))) {
+            self.err(
+                "L0203",
+                span,
+                "a named lifetime in the output of a returned `impl Fn*` closure type is not supported yet",
+                "Elide the lifetime, write `'static`, or return a `Box<dyn Fn..>`.",
+            );
+            return None;
+        }
+        if !(matches!(ins[..], [Region::Bound(_)]) || !outs.iter().any(|r| matches!(r, Region::Bound(_)))) {
+            return None;
+        }
+        let mut full: Vec<GenericArg> = self.tys.args(args).to_vec();
+        full.push(GenericArg::Ty(h));
+        let mut es = Vec::new();
+        for t in b.inputs {
+            let t = crate::ty::subst(&mut self.tys, t, &full);
+            es.push(crate::borrowck::erase(&mut self.tys, t));
+        }
+        let ts = self.tys.intern_tys(&es);
+        let tuple = self.tys.intern(TyKind::Tuple(ts));
+        let out = crate::ty::subst(&mut self.tys, out, &full);
+        let erased = crate::borrowck::erase(&mut self.tys, out);
+        Some((tuple, out, erased))
+    }
+
+    /// `t` with each `Region::Bound` `Erased` (an `output_region` from a
+    /// regioned bound output, `rpit_bound_output`).
+    fn bound_erased(&mut self, t: Ty) -> Ty {
+        let e = |r: Region| if matches!(r, Region::Bound(_)) { Region::Erased } else { r };
+        match self.kind(t) {
+            TyKind::Ref(r, m, x) => {
+                let x = self.bound_erased(x);
+                self.tys.intern(TyKind::Ref(e(r), m, x))
+            }
+            TyKind::Tuple(ts) => {
+                let es: Vec<Ty> = self.tys.tys_of(ts).to_vec().into_iter().map(|x| self.bound_erased(x)).collect();
+                let ts = self.tys.intern_tys(&es);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Slice(x) => {
+                let x = self.bound_erased(x);
+                self.tys.intern(TyKind::Slice(x))
+            }
+            TyKind::Array(x, n) => {
+                let x = self.bound_erased(x);
+                self.tys.intern(TyKind::Array(x, n))
+            }
+            TyKind::Adt(d, args) => {
+                let new: Vec<GenericArg> = self
+                    .tys
+                    .args(args)
+                    .to_vec()
+                    .into_iter()
+                    .map(|g| match g {
+                        GenericArg::Ty(x) => GenericArg::Ty(self.bound_erased(x)),
+                        GenericArg::Lifetime(r) => GenericArg::Lifetime(e(r)),
+                        c => c,
+                    })
+                    .collect();
+                let a = self.tys.intern_args(&new);
+                self.tys.intern(TyKind::Adt(d, a))
+            }
+            _ => t,
+        }
+    }
+
     /// The output of fn pointer type `t` with each region slot of
     /// `FnSig::own_out` the one input region's (`ClosureInfo::bound_output`),
     /// when it has exactly one higher-ranked input slot (`for<'a> fn(&'a D)
@@ -587,6 +675,9 @@ impl<'p> Ctx<'p> {
             Some(self.rebind_bound(o))
         });
         let bound_output = bound_output.or_else(|| self.fn_ptr_bound_output(to_fn_ptr?.0));
+        let rpit = if self.ret_exprs.contains(&e) { self.rpit_bound(expected, params.len(), span) } else { None };
+        let rpit_out = rpit.map(|r| r.1);
+        let bound_output = bound_output.or(rpit_out);
         // The bound's types normalize here: `F: Fn(A::Item)` gives a
         // projection over the call's impl args (check/project.rs).
         let mut expect_only = None;
@@ -603,7 +694,9 @@ impl<'p> Ctx<'p> {
                     });
                     Some((ins, out))
                 }
-                None => None,
+                // A closure the body returns as its `impl Fn*(..) -> R`
+                // takes the bound's signature, as rustc deduces it.
+                None => rpit.map(|r| (r.0, Some(r.2))),
             },
         };
         // W-BORROW: with no expected signature (a `let` closure), rustc
@@ -612,6 +705,9 @@ impl<'p> Ctx<'p> {
         // lifetime in an annotation is the closure's own (higher-ranked:
         // `Region::Bound` in `input_regions`).
         let no_sig = sig.is_none();
+        if no_sig {
+            self.free_sig_closures.push((def, params.iter().map(|prm| prm.ty.is_none()).collect()));
+        }
         let free_args = free_args.or_else(|| (no_sig && !params.is_empty()).then(|| vec![false; params.len()]));
         let expected_inputs: Option<Vec<Ty>> = sig.and_then(|(tup, _)| {
             let tup = self.deep(tup);
@@ -704,7 +800,9 @@ impl<'p> Ctx<'p> {
                 // annotation does.
                 // A written `'static` lifetime arg of an Adt (`W<'static,
                 // &u8>`) is only in the dyn's written output.
-                if let Some(w) = dyn_written_out.filter(|&w| self.has_static_region(w)) {
+                if let Some(o) = rpit_out.filter(|&o| self.has_static_region(o)) {
+                    output_region = Some(self.bound_erased(o));
+                } else if let Some(w) = dyn_written_out.filter(|&w| self.has_static_region(w)) {
                     output_region = Some(self.late_erased(w));
                 } else if (dyn_out.is_some() || to_fn_ptr.is_some()) && self.has_static_region(x) {
                     output_region = Some(self.deep(x));

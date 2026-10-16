@@ -106,9 +106,49 @@ impl Ctx<'_> {
                 );
                 continue;
             }
-            let _ = p;
+            if self.closure_not_general(od, h) {
+                self.err(
+                    "L0735",
+                    span,
+                    "the returned closure is not general enough for its `impl Fn*` type: an unannotated parameter takes one inferred lifetime, but the type is for any lifetime",
+                    "Write the closure as the returned value itself, or annotate its parameter (`|a: &u8|`).",
+                );
+                continue;
+            }
             self.out.opaque_hidden.push((od, h));
         }
+    }
+
+    /// True when hidden type `h` of opaque `od` is a closure checked with
+    /// no expected signature (`free_sig_closures`) whose unannotated
+    /// param holds a reference where an `Fn*` bound of the opaque takes a
+    /// higher-ranked one (`impl Fn(&u8) -> &u8` from `let f = |a| a; f`):
+    /// rustc "implementation of `Fn` is not general enough".
+    fn closure_not_general(&mut self, od: DefId, h: Ty) -> bool {
+        let TyKind::Closure(def, _) = self.kind(h) else { return false };
+        let Some(unannotated) = self.free_sig_closures.iter().find(|c| c.0 == def).map(|c| c.1.clone()) else { return false };
+        let p = self.p;
+        let Some(info) = p.gx.opaques.get(&od) else { return false };
+        let Some(inputs) = self.closures.iter().chain(&self.out.closures).find(|c| c.def == def).map(|c| c.inputs.clone()) else { return false };
+        for b in &info.fn_outs {
+            if b.inputs.len() != inputs.len() {
+                continue;
+            }
+            for (i, &bt) in b.inputs.iter().enumerate() {
+                let mut rs = Vec::new();
+                crate::borrowck::regions_of(&p.tys, bt, &mut rs);
+                if !unannotated.get(i).copied().unwrap_or(false) || !rs.iter().any(|r| matches!(r, Region::Bound(_))) {
+                    continue;
+                }
+                let t = self.deep(inputs[i]);
+                let mut ts = Vec::new();
+                crate::borrowck::regions_of(&self.tys, t, &mut ts);
+                if !ts.is_empty() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Rejects a value of an opaque type in a body that gets code

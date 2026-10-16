@@ -2019,6 +2019,15 @@ struct Ctx<'p> {
     /// `return` expressions checked so far (a closure body compares it
     /// before and after, `closure_expr`).
     pub(super) returns_seen: u32,
+    /// The fn body's own result expressions: its tail and each `return`
+    /// operand, through block tails. Only a closure among them takes the
+    /// return-position `impl Fn*` bound's signature (rustc's expectation
+    /// reaches no `if` or `match` arm; `ClosureCx::rpit_bound`).
+    pub(super) ret_exprs: Vec<ExprId>,
+    /// Closures checked with no expected signature, with the params that
+    /// have no type annotation: their argument regions are inferred, one
+    /// each, never higher-ranked (`finish_opaques`).
+    pub(super) free_sig_closures: Vec<(DefId, Vec<bool>)>,
     /// User `Deref` steps the method lookup is inside (a bound on
     /// `Deref` chains).
     deref_depth: u8,
@@ -2333,6 +2342,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         closure_bound_outputs: std::collections::HashMap::new(),
         expect_only_vars: Vec::new(),
         returns_seen: 0,
+        ret_exprs: Vec::new(),
+        free_sig_closures: Vec::new(),
         closure_bound_inputs: std::collections::HashMap::new(),
         closure_call_outs: std::collections::HashSet::new(),
         open_binops: Vec::new(),
@@ -2506,6 +2517,9 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
     let ret_span = def.ret.map_or(def.name_span, |t| p.ast.ty_span(t));
     if let Some(body) = def.body {
         let fn_ret = cx.fn_ret;
+        if let Some(tail) = p.ast.block(body).tail {
+            cx.note_ret_expr(tail);
+        }
         let body_ty = cx.block(body, Some(fn_ret));
         let body_span = p.ast.block(body).span;
         if let Some(tail) = p.ast.block(body).tail {
@@ -6542,6 +6556,20 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// Records `e` and the tails of the blocks it is (`ret_exprs`).
+    fn note_ret_expr(&mut self, mut e: ExprId) {
+        loop {
+            self.ret_exprs.push(e);
+            match self.p.ast.expr(e) {
+                Expr::Block(b) | Expr::UnsafeBlock(b) => match self.p.ast.block(*b).tail {
+                    Some(t) => e = t,
+                    None => return,
+                },
+                _ => return,
+            }
+        }
+    }
+
     /// True when fn pointer `f` is not as general as fn pointer `e` in a
     /// way `sig_pos_mismatch` does not see (rustc E0308): `f` returns its
     /// one input's borrow in an output slot where `e`'s slot was filled by
@@ -9231,6 +9259,11 @@ impl<'p> Ctx<'p> {
             }
             Expr::Return(val) => {
                 self.returns_seen += 1;
+                if self.closure_rets.is_empty()
+                    && let Some(v) = val
+                {
+                    self.note_ret_expr(*v);
+                }
                 let ret = self.closure_rets.last().copied().unwrap_or(self.fn_ret);
                 match val {
                     Some(v) => {
