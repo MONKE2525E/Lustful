@@ -2128,6 +2128,13 @@ impl<'p> Ctx<'p> {
             _ => None,
         };
         if let Some((tt, iu, errs)) = shunt {
+            // The expansion sums one level (lower/iter.rs `sum_try`).
+            let tt_r = self.resolve(tt);
+            if self.tys.option_elem(tt_r).is_some() || self.tys.result_args(tt_r).is_some() {
+                let tn = self.tn(t);
+                self.err("L0640", span, format!("`{n}` into the nested `{tn}` is not implemented yet"), "Sum the inner values first.");
+                return false;
+            }
             let errs_ok = errs.is_none_or(|(a, b)| self.unify(a, b));
             let Some(iu) = iu.filter(|_| errs_ok) else {
                 let (tn, iname) = (self.tn(t), self.tn(item));
