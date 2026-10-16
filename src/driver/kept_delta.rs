@@ -80,9 +80,10 @@ pub(crate) fn apply_headers(
         fns.dedup();
         caches.header_moves = Some(Touched::new(p, &fns));
     }
-    // A program kept after a diagnostic keeps the outputs its callers'
-    // bodies have now (`own_bases`).
-    if let Err((why @ ("sig diag" | "hidden diag"), true)) = out {
+    // A program kept after a refusal or a diagnostic keeps the outputs its
+    // callers' bodies have now (`own_bases`): the collect that answers this
+    // request may store new entries for them.
+    if let Err((why, true)) = out {
         let mut fns: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
         fns.sort_unstable();
         fns.dedup();
@@ -129,26 +130,21 @@ fn apply(
             return Err((why, true));
         }
     }
-    let half = |e: &'static str| (e, false);
     super::laps::mark("collect/delta redo");
-    // Until a template checks again, a failed reveal writes nothing the
-    // records do not hold: the old ones go back and `p` stands.
-    let mut undos = Some(undos);
-    let fail = |p: &mut Program, undos: &mut Option<Vec<crate::check::delta_audit::SigUndo>>, why: &'static str| match undos.take() {
-        Some(us) => {
-            us.into_iter().rev().for_each(|u| crate::check::delta_audit::undo(p, u));
-            (why, true)
-        }
-        None => (why, false),
-    };
+    // Until the replay stores its outputs, every write has an undo: the
+    // old records and template checks go back and `p` stands. A template
+    // with closures registers new closure fns, so after its check `p` is
+    // half edited.
+    let mut undos = Some(Undos { sigs: undos, templates: Vec::new() });
     for (&i, &(rpit, old_ret)) in fns.iter().zip(&old_rets) {
         let f = LocalDefId(i as u32);
         if p.gx.fn_class[i] == FnClass::Template {
             let ranges: Vec<(u32, u32)> = edits.iter().filter(|e| e.fn_index == i).map(|e| e.old_exprs).collect();
-            undos = None;
-            recheck_template(p, f, &ranges, caches).map_err(half)?;
+            if let Err(why) = recheck_undoable(p, f, &ranges, caches, &mut undos) {
+                return Err(fail(p, caches, &mut undos, why));
+            }
         } else if rpit && let Err(why) = crate::check::delta_audit::reveal_again(p, f, old_ret) {
-            return Err(fail(p, &mut undos, why));
+            return Err(fail(p, caches, &mut undos, why));
         }
     }
     // A plain fn that reveals an opaque type and names an edited fn: its
@@ -162,20 +158,95 @@ fn apply(
         (p.record_reads, p.unwind) = (record_reads, unwind);
         match again {
             crate::check::opaque::HiddenAgain::Stands => {}
-            crate::check::opaque::HiddenAgain::Errors => return Err(fail(p, &mut undos, "hidden diag")),
-            crate::check::opaque::HiddenAgain::Moved => return Err(fail(p, &mut undos, "hidden type")),
+            crate::check::opaque::HiddenAgain::Errors => return Err(fail(p, caches, &mut undos, "hidden diag")),
+            crate::check::opaque::HiddenAgain::Moved => return Err(fail(p, caches, &mut undos, "hidden type")),
         }
     }
     // A template that does: its check runs again (the hidden type must
     // stand), as for a template that calls an edited fn.
     for t in template_namers {
         let (lo, hi) = p.fn_def(t).exprs;
-        recheck_template(p, t, &[(lo, hi)], caches).map_err(half)?;
+        if let Err(why) = recheck_undoable(p, t, &[(lo, hi)], caches, &mut undos) {
+            return Err(fail(p, caches, &mut undos, why));
+        }
     }
     super::laps::mark("collect/delta reveal");
-    let out = replay_bodies(p, front, caches, &fns, walk_instances, start, bases).map_err(half);
+    let out = replay_bodies(p, front, caches, &fns, walk_instances, start, bases, &mut undos).map_err(|why| fail(p, caches, &mut undos, why));
     super::laps::mark("collect/delta replay");
     out
+}
+
+/// What a header delta wrote before its replay stored anything: the old
+/// records of the edited fns and the template checks it ran again, in
+/// order. `None` once a write has no undo (`p` is half edited).
+struct Undos {
+    sigs: Vec<crate::check::delta_audit::SigUndo>,
+    templates: Vec<TemplateUndo>,
+}
+
+/// The delta's error for `why`: with every write undone (newest first)
+/// `p` is as it was and stays for the next request (sigedit R9), else it
+/// is half edited.
+fn fail(p: &mut Program, caches: &mut Caches, undos: &mut Option<Undos>, why: &'static str) -> (&'static str, bool) {
+    let Some(u) = undos.take() else { return (why, false) };
+    u.templates.into_iter().rev().for_each(|t| undo_template(p, caches, t));
+    u.sigs.into_iter().rev().for_each(|s| crate::check::delta_audit::undo(p, s));
+    (why, true)
+}
+
+/// What one template check writes (`recheck_template`): its picks, closure
+/// call kinds, the hidden type of its `impl Trait`, and its output
+/// fingerprint for instances (`GenReuse::tpl_out_of`). The entry it may
+/// store stays: a later use compares its reads with the program's.
+struct TemplateUndo {
+    t: LocalDefId,
+    picks: Vec<(crate::ast::ExprId, crate::check::picks::TraitPick)>,
+    closures: Vec<((LocalDefId, crate::ast::ExprId), (crate::check::closure::ClosureKind, Vec<generics::CaptureShape>))>,
+    calls: Vec<((LocalDefId, crate::ast::ExprId), crate::check::closure::ClosureKind)>,
+    hidden: (crate::def::DefId, Option<crate::ty::Ty>),
+    tpl_out: Option<u64>,
+}
+
+/// `recheck_template` that first takes its undo into `undos`. A template
+/// whose body has closures has none (its check may register closure fns):
+/// `undos` becomes `None`.
+fn recheck_undoable(p: &mut Program, t: LocalDefId, old: &[(u32, u32)], caches: &mut Caches, undos: &mut Option<Undos>) -> Result<(), &'static str> {
+    if let Some(u) = undos.as_mut() {
+        if generics::fn_has_closures(p, t) || p.gx.closures.values().any(|c| c.parent == t) {
+            *undos = None;
+        } else {
+            let in_old = |e: crate::ast::ExprId| old.iter().any(|r| e.0 >= r.0 && e.0 < r.1);
+            u.templates.push(TemplateUndo {
+                t,
+                picks: p.gx.trait_picks.iter().filter(|(e, _)| in_old(**e)).map(|(e, k)| (*e, *k)).collect(),
+                closures: p.gx.template_closures.iter().filter(|(k, _)| k.0 == t).map(|(k, v)| (*k, v.clone())).collect(),
+                calls: p.gx.template_calls.iter().filter(|(k, _)| k.0 == t).map(|(k, v)| (*k, *v)).collect(),
+                hidden: {
+                    let od = generics::opaque_def(p.def_id(t));
+                    (od, p.gx.opaque_hidden.get(&od).copied())
+                },
+                tpl_out: caches.gen_reuse.tpl_out_of(t),
+            });
+        }
+    }
+    recheck_template(p, t, old, caches)
+}
+
+/// Writes back what `recheck_undoable` took: the check's new picks (in the
+/// template's current body) go, the old ones return.
+fn undo_template(p: &mut Program, caches: &mut Caches, u: TemplateUndo) {
+    let (lo, hi) = p.fn_def(u.t).exprs;
+    p.gx.trait_picks.retain(|e, _| !(e.0 >= lo && e.0 < hi));
+    p.gx.trait_picks.extend(u.picks);
+    p.gx.template_closures.retain(|k, _| k.0 != u.t);
+    p.gx.template_closures.extend(u.closures);
+    p.gx.template_calls.retain(|k, _| k.0 != u.t);
+    p.gx.template_calls.extend(u.calls);
+    match u.hidden.1 {
+        Some(h) => p.gx.opaque_hidden.insert(u.hidden.0, h),
+        None => p.gx.opaque_hidden.remove(&u.hidden.0),
+    };
+    caches.gen_reuse.set_tpl_out(u.t, u.tpl_out);
 }
 
 /// The edited fns of `edits`, sorted, or the first refusal that needs no
@@ -393,14 +464,24 @@ fn rpit_namers(
     let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
     let (mut plain, mut tmpl) = (Vec::new(), Vec::new());
     for (owner, ids) in opaque_idents {
-        let Some(g) = p.local_def(owner.hash) else { return Err("sig rpit") };
+        let Some(g) = p.local_def(owner.hash) else {
+            crate::check::derive_delta::log(&|| format!("sig rpit: opaque owner {owner:?} has no local fn\n"));
+            return Err("sig rpit");
+        };
         if fns.contains(&(g.0 as usize)) || !ids.iter().any(|s| names.contains(s)) {
             continue;
         }
         match p.gx.fn_class.get(g.0 as usize) {
             Some(FnClass::Plain) if p.gx.opaque_ret_of.contains_key(&g) => plain.push(g),
             Some(FnClass::Template) if !walk_instances && p.gx.assoc_const_tmpls.is_empty() && !p.is_lang_method(g) => tmpl.push(g),
-            _ => return Err("sig rpit"),
+            c => {
+                crate::check::derive_delta::log(&|| {
+                    let lang = p.is_lang_method(g);
+                    let std = p.std_source_span(p.fn_def(g).name_span) || p.fn_shipped_crate(g).is_some();
+                    format!("sig rpit: namer {} class {c:?} lang {lang} std {std}\n", p.display_name(p.fn_def(g).name))
+                });
+                return Err("sig rpit");
+            }
         }
     }
     for v in [&mut plain, &mut tmpl] {
@@ -414,7 +495,9 @@ fn rpit_namers(
 /// generic reuse runs them (`materialize`, `template_check`): a stored
 /// result that no longer holds checks again, and a plain body must give
 /// the discovery output collect built the program with. `start` is the
-/// store stamp when the delta began: entries after it are its own.
+/// store stamp when the delta began: entries after it are its own. A
+/// template checked again takes its undo into `undos` (`recheck_undoable`).
+#[allow(clippy::too_many_arguments)]
 fn replay_bodies(
     p: &mut Program,
     front: &Front,
@@ -423,6 +506,7 @@ fn replay_bodies(
     walk_instances: bool,
     start: u64,
     bases: &Bases,
+    undos: &mut Option<Undos>,
 ) -> Result<(), &'static str> {
     let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
     let idents = &front.chunks[0].scan.body_idents;
@@ -468,7 +552,7 @@ fn replay_bodies(
         }
         for t in again {
             let (lo, hi) = p.fn_def(t).exprs;
-            recheck_template(p, t, &[(lo, hi)], caches)?;
+            recheck_undoable(p, t, &[(lo, hi)], caches, undos)?;
         }
         super::laps::mark("collect/delta replay templates");
         replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers))
@@ -490,7 +574,9 @@ fn replay_bodies(
 /// (`bases`). Every other body checks again and must give the output
 /// collect built the program with (`GenReuse::out_copy`). A check still
 /// pending gives it too, as collect's last check of that body was; it is
-/// kept, not stored, as collect keeps it.
+/// kept, not stored, as collect keeps it. Outputs are stored only when
+/// every body passes, so an Err leaves the stored entries as they were
+/// (the header delta then undoes its writes, `fail`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn replay_discovery(
     p: &mut Program,
@@ -505,6 +591,8 @@ pub(super) fn replay_discovery(
 ) -> Result<(), &'static str> {
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
+    // (body, its reads when it is stored, its output).
+    let mut outs: Vec<(LocalDefId, Option<crate::driver::graph::Reads>, crate::driver::gen_reuse::Discovered)> = Vec::new();
     let out = (|| {
         let reuse = &mut caches.gen_reuse;
         for g in (0..fn_count as u32).map(LocalDefId) {
@@ -526,24 +614,26 @@ pub(super) fn replay_discovery(
                 crate::check::derive_delta::log(&|| format!("discovery {}: no output kept\n", p.display_name(p.fn_def(g).name)));
                 return Err("discovery");
             };
-            let (checked, discarded) = crate::check::check_fn(p, g);
+            let (mut checked, discarded) = crate::check::check_fn(p, g);
             let pending = checked.closure_map_pending;
             let out = generics::discovery_out(p, &checked, &discarded);
             if !base.same(p, &out, walk_instances) {
                 crate::check::derive_delta::log(&|| format!("discovery {}: output differs (pending {pending})\n", p.display_name(p.fn_def(g).name)));
                 return Err("discovery");
             }
-            let (adt_tys, reqs, closures, vts) = &out;
-            if discarded.is_empty() && !pending {
-                reuse.store_discovered(p, g, &checked.reads, adt_tys, reqs, closures, vts);
-            } else {
-                reuse.note_unstored(p, g, adt_tys, reqs, closures, vts);
-            }
+            let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
             reuse.discovery_checked += 1;
             drop((checked, discarded));
             // Every body type enters the global store, as discovery does.
             for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
                 generics::build_owned_ty(p, t);
+            }
+            outs.push((g, reads, out));
+        }
+        for (g, reads, (adt_tys, reqs, closures, vts)) in &outs {
+            match reads {
+                Some(r) => reuse.store_discovered(p, *g, r, adt_tys, reqs, closures, vts),
+                None => reuse.note_unstored(p, *g, adt_tys, reqs, closures, vts),
             }
         }
         Ok(())

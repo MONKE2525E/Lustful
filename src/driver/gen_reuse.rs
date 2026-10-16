@@ -358,6 +358,19 @@ impl GenReuse {
         self.tpl_out.insert(t, h.finish());
     }
 
+    /// Template `t`'s output fingerprint (`note_template_out`), and its
+    /// write back when a header delta undoes a template check.
+    pub(crate) fn tpl_out_of(&self, t: LocalDefId) -> Option<u64> {
+        self.tpl_out.get(&t).copied()
+    }
+
+    pub(crate) fn set_tpl_out(&mut self, t: LocalDefId, out: Option<u64>) {
+        match out {
+            Some(h) => self.tpl_out.insert(t, h),
+            None => self.tpl_out.remove(&t),
+        };
+    }
+
     /// Records the closures one discovery check registers, by def (the
     /// first record of a def wins, as in `register_closures`).
     pub fn note_closures(&mut self, closures: &[OwnedClosure]) {

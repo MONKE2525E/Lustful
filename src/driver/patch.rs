@@ -479,10 +479,12 @@ pub(crate) struct KeptProgram {
     /// None while the program shares the front's Ast.
     edits: Option<Vec<KeptEdit>>,
     bases: Vec<KeptBase>,
-    /// Put back by `reuse_kept` after a header edit that made a body error
-    /// (`hidden diag`): this request's collect may succeed and still give
-    /// an error answer, and its program (with no hidden type for that
-    /// fn) would refuse the fix, so `keep` leaves this one in place.
+    /// Put back by `reuse_kept` after a header delta that failed with the
+    /// program as it was: this request's collect may succeed and still give
+    /// an error answer, and its program (whose callers hold error outputs,
+    /// or no hidden type for an edited fn) would refuse the fix, so
+    /// `keep_err` leaves this one in place. A clean answer's program
+    /// replaces it (`keep`).
     prefer: bool,
 }
 
@@ -501,10 +503,16 @@ pub(crate) fn keep(front: &mut Front, mut program: crate::check::collect::Progra
     // The request is done: every entry stored so far agrees with the
     // program (its collect stored or replayed it, `kept_delta`).
     program.reuse_stamp = crate::driver::gen_reuse::stamp_now();
-    if front.kept[slot].as_ref().is_some_and(|k| k.prefer) {
+    front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new(), prefer: false });
+}
+
+/// `keep` for a request that answers with errors: a program `reuse_kept`
+/// put back (`KeptProgram::prefer`) stays.
+pub(crate) fn keep_err(front: &mut Front, program: crate::check::collect::Program) {
+    if front.kept[usize::from(program.gx.walk_instances)].as_ref().is_some_and(|k| k.prefer) {
         return;
     }
-    front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new(), prefer: false });
+    keep(front, program);
 }
 
 /// One patch edit under a detached kept program.
@@ -2017,8 +2025,7 @@ pub(super) fn reuse_kept(
             // for the next request, which redoes these headers with its
             // own (sigedit R9: a rejected header edit, then its fix).
             if intact {
-                let prefer = why == "hidden diag";
-                front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer });
+                front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true });
             }
             return Err(why);
         }

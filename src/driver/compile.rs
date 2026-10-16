@@ -3929,7 +3929,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         } else {
             drop(results);
             program.verified = verified;
-            super::patch::keep(front, program);
+            super::patch::keep_err(front, program);
         }
         return resp;
     }
