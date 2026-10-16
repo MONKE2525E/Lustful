@@ -60,7 +60,11 @@
 // program stands when the signature delta redoes each edited header on it
 // (`reuse_kept`, driver/kept_delta.rs); else the tail collects in full. A
 // method is only ever called by name, so a method's header edit also
-// takes signatures mode (P1.5).
+// takes signatures mode (P1.5). An edit of only the names in a struct's
+// or enum's `#[derive(..)]` lists (P1.4, `find_derive_edit`) patches the
+// item's attributes and derives the same way, in full mode: any body may
+// read the derives (`ReadKey::Derives`), and the kept program does not
+// stand.
 use super::compile::{fn_def_at, fn_text_hash};
 use super::session::{Caches, Front};
 use super::span_shift::{self, Edit, FileRanges};
@@ -355,6 +359,8 @@ pub(super) struct Patched {
     /// `item_names` as the changed names.
     pub item_scans: Option<Vec<crate::scan::ItemScan>>,
     pub item_names: Vec<Sym>,
+    /// A derive list edit came with it: the slot update runs in full mode.
+    pub item_full: bool,
     /// Files whose text changed, Ast nodes the patch built, bodies
     /// re-parsed, and spans moved.
     pub files: usize,
@@ -378,7 +384,23 @@ struct BodyEdit {
     /// The new fn or method, when the edit touches its header
     /// (`find_item_edit`); `body` is then None.
     item: Option<NewItem>,
+    /// The new derive lists of a struct or enum (`find_derive_edit`).
+    derive: Option<NewDerive>,
 }
+
+/// The derive side of a `BodyEdit` (sigedit P1.4): one top-level struct
+/// or enum whose `#[derive(..)]` lists changed and nothing else.
+struct NewDerive {
+    item: usize,
+    /// The item's new attributes (their derive lists are new, the rest
+    /// token for token the old ones) and derive names, parsed at the new
+    /// positions.
+    attrs: Vec<crate::ast::Attr>,
+    derives: Vec<(Sym, crate::diag::Span)>,
+    /// The `derive` name.
+    derive: Sym,
+}
+
 
 /// The item side of a `BodyEdit` (the item patch, sigedit P1.3): one
 /// free fn or inherent method whose header changed and whose outline
@@ -473,6 +495,8 @@ struct KeptEdit {
     /// An item patch edit of the fn's header (`kept_delta::apply_headers`
     /// redoes it on the program).
     header: bool,
+    /// A derive list edit: the kept program does not stand (no delta yet).
+    derive: bool,
 }
 
 /// One edited fn's discovery output as the kept program was built with
@@ -506,6 +530,7 @@ pub(super) fn try_patch(
             old_exprs: e.body.as_ref().map(|b| b.old_exprs).or(e.item.as_ref().map(|i| i.old_exprs)).unwrap_or((0, 0)),
             rpit: e.body.as_ref().is_some_and(|b| b.rpit.is_some()),
             header: e.item.is_some(),
+            derive: e.derive.is_some(),
         })
         .collect();
     // Everything above only read; from here the front state changes, and
@@ -619,23 +644,27 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         let old = front.map.text(file).ok_or("no text")?;
         let (p, s) = super::compile::common_ends(old.as_bytes(), text.as_bytes());
         let edit = Edit { file, a: p as u32, b: (old.len() - s) as u32, d: text.len() as i64 - old.len() as i64 };
-        let (body, item) = match find_body_edit(front, &text, edit) {
-            Ok(body) => (Some(body), None),
+        let (body, item, derive) = match find_body_edit(front, &text, edit) {
+            Ok(body) => (Some(body), None, None),
             // No fn body holds the edit: it may sit in a fn's header (the
-            // item patch), or in code the expander dropped.
+            // item patch), in a derive list, or in code the expander dropped.
             Err(why @ ("not in a fn body" | "no active item")) => match find_item_edit(front, &text, edit) {
-                Ok(item) => (None, Some(item)),
+                Ok(item) => (None, Some(item), None),
                 Err(Some(item_why)) => return Err(item_why),
-                Err(None) => {
-                    find_inactive_edit(front, &text, edit).map_err(|inactive| inactive.unwrap_or(why))?;
-                    (None, None)
-                }
+                Err(None) => match find_derive_edit(front, &text, edit) {
+                    Ok(derive) => (None, None, Some(derive)),
+                    Err(Some(derive_why)) => return Err(derive_why),
+                    Err(None) => {
+                        find_inactive_edit(front, &text, edit).map_err(|inactive| inactive.unwrap_or(why))?;
+                        (None, None, None)
+                    }
+                },
             },
             Err(why) => return Err(why),
         };
         // The root's own needs: its text before the splice.
         let own = if file == FileId(0) { splice_of(front, front.patch.as_ref().ok_or("no base")?).map_or(text.len(), |sp| text.len() - sp.len()) } else { text.len() };
-        edits.push(BodyEdit { file, needs: file_needs(&text[..own]), text, edit, body, item });
+        edits.push(BodyEdit { file, needs: file_needs(&text[..own]), text, edit, body, item, derive });
     }
     // The std splice and the platform crate follow every file's needs;
     // they stand when the union over files does. The new union folds
@@ -836,6 +865,89 @@ fn fn_range(ast: &Ast, item: usize, sub: Option<usize>, old: &str, interner: &cr
         }
     }
     None
+}
+
+/// The derive-list patch (sigedit P1.4): proves that `edit` changes only
+/// the names inside the `#[derive(..)]` lists of one top-level struct or
+/// enum (the item's other tokens stand, so its outline does; resolve
+/// never reads derive lists), and parses the item's new attributes.
+/// `Err(None)` when no struct or enum holds the edit.
+fn find_derive_edit(front: &Front, text: &str, edit: Edit) -> Result<NewDerive, Option<&'static str>> {
+    let file = edit.file;
+    let old = front.map.text(file).ok_or(Some("no text"))?;
+    let ast = &front.ast;
+    let (a, b, d) = (edit.a, edit.b, edit.d);
+    let item = ast
+        .items
+        .iter()
+        .position(|it| {
+            let adt = matches!(it.kind, ItemKind::Struct(_) | ItemKind::Enum(_));
+            adt && it.span.file == file && it.span.ctxt == CtxtId::ROOT && it.span.lo < a && b < it.span.hi
+        })
+        .ok_or(None)?;
+    let (lo, hi) = (ast.items[item].span.lo, ast.items[item].span.hi);
+    let new_hi = (hi as i64 + d) as u32;
+    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo, &front.interner).ok()).ok_or(Some("derive lex"));
+    let (old_lx, new_lx) = (lex(old.get(lo as usize..hi as usize))?, lex(text.get(lo as usize..new_hi as usize))?);
+    let (ot, nt) = (&old_lx.tokens[..old_lx.tokens.len() - 1], &new_lx.tokens[..new_lx.tokens.len() - 1]);
+    if nt.first().is_none_or(|t| t.span.lo != lo) || nt.last().is_none_or(|t| t.span.hi != new_hi) {
+        return Err(Some("derive lex"));
+    }
+    // Each version's tokens with the derive lists' contents taken out;
+    // the contents may hold names, `,` and `::` only.
+    let derive = front.interner.intern("derive");
+    let outline = |toks: &[lexer::Token], t: &str| -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < toks.len() {
+            let tok = &toks[i];
+            out.push(t.get(tok.span.lo as usize..tok.span.hi as usize)?.to_owned());
+            let opens = i >= 2
+                && toks[i - 2].tok == Tok::LBracket
+                && toks[i - 1].tok == Tok::Ident(derive)
+                && tok.tok == Tok::LParen
+                && toks.get(i.wrapping_sub(3)).is_some_and(|t| t.tok == Tok::Pound);
+            i += 1;
+            if opens {
+                while i < toks.len() && toks[i].tok != Tok::RParen {
+                    if !matches!(toks[i].tok, Tok::Ident(_) | Tok::Comma | Tok::PathSep) {
+                        return None;
+                    }
+                    i += 1;
+                }
+            }
+        }
+        Some(out)
+    };
+    match (outline(ot, old), outline(nt, text)) {
+        (Some(x), Some(y)) if x == y => {}
+        (Some(_), Some(_)) => return Err(Some("derive: outline")),
+        _ => return Err(Some("derive: tokens")),
+    }
+    if crate::expand::needs_expansion(nt, &front.interner) || nt.iter().any(|t| matches!(t.tok, Tok::Bang | Tok::Dollar)) {
+        return Err(Some("derive: attrs"));
+    }
+    let mut toks = nt.to_vec();
+    toks.push(lexer::Token { tok: Tok::Eof, span: crate::diag::Span { file, lo: new_hi, hi: new_hi, ctxt: CtxtId::ROOT } });
+    let lexed = lexer::Lexed { tokens: toks, strings: new_lx.strings.clone() };
+    let mut parsed =
+        crate::parser::parse_items(&lexed, 0..lexed.tokens.len(), &front.interner, &front.known).map_err(|_| Some("derive parse"))?;
+    let it = parsed.items.pop().filter(|_| parsed.items.is_empty()).ok_or(Some("derive parse"))?;
+    // The derive attributes hold names only (no node of the parse's Ast).
+    let is_derive = |x: &crate::ast::Attr| x.path.len() == 1 && x.path[0].name == derive;
+    let names_only = |x: &crate::ast::Attr| match &x.input {
+        crate::ast::AttrInput::List(_, trees) => trees.iter().all(|t| matches!(t, lexer::TokenTree::Token(_))),
+        _ => false,
+    };
+    if it.attrs.iter().any(|x| is_derive(x) && !names_only(x)) {
+        return Err(Some("derive: attrs"));
+    }
+    let derives = match it.kind {
+        ItemKind::Struct(s) => s.derives,
+        ItemKind::Enum(e) => e.derives,
+        _ => return Err(Some("derive parse")),
+    };
+    Ok(NewDerive { item, attrs: it.attrs, derives, derive })
 }
 
 /// The item patch (sigedit P1.3): proves that `edit` sits strictly
@@ -1524,6 +1636,33 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         // ever called by name, so its callers mention it).
         item_names.push(if it.sub.is_some() { it.name } else { fn_def_at(&front.ast, it.item, None).name });
     }
+    // Derive edits: the item's attributes and derive lists, then its scan
+    // (the tail runs in full mode: any body may read the derives).
+    let mut derive_edit = false;
+    for e in edits.iter_mut() {
+        let Some(dv) = e.derive.take() else { continue };
+        derive_edit = true;
+        let ast = Arc::make_mut(&mut front.ast);
+        let it = &mut ast.items[dv.item];
+        // The other attributes are token for token the old ones (and may
+        // hold nodes of the new parse's own Ast): only derive lists move.
+        if it.attrs.len() != dv.attrs.len() {
+            return Err("derive: attrs");
+        }
+        let derive = dv.derive;
+        for (old, new) in it.attrs.iter_mut().zip(dv.attrs) {
+            if new.path.len() == 1 && new.path[0].name == derive {
+                *old = new;
+            }
+        }
+        match &mut it.kind {
+            ItemKind::Struct(s) => s.derives = dv.derives,
+            ItemKind::Enum(en) => en.derives = dv.derives,
+            _ => return Err("state"),
+        }
+        let (scan, _, _) = super::ast_hash::scan_item(&front.ast, &front.ast.items[dv.item]);
+        front.chunks[0].scan.items[dv.item] = scan;
+    }
     // Fn lines in the edited files: an edit that adds or drops lines
     // moves every fn after it in that file, and no fn in any other.
     for e in &edits {
@@ -1569,9 +1708,10 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     let revalue = !reached.is_empty() && base.reach.as_ref().is_some_and(|r| r.revaluable(front, &reached));
     // With an item edit the compile tail runs the full slot update in
     // signatures mode (`Patched::item_scans`).
-    let changed = if item_fns.is_empty() { slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots) } else { Vec::new() };
-    let item_scans = (!item_fns.is_empty()).then(|| front.chunks[0].scan.items.clone());
-    let edits_len = edits.iter().filter(|e| e.body.is_some() || e.item.is_some()).count();
+    let item_level = !item_fns.is_empty() || derive_edit;
+    let changed = if item_level { Vec::new() } else { slot_update(front, caches, &base.body_hashes, &edited, &base.live_slots) };
+    let item_scans = item_level.then(|| front.chunks[0].scan.items.clone());
+    let edits_len = edits.iter().filter(|e| e.body.is_some() || e.item.is_some() || e.derive.is_some()).count();
     let out = Patched {
         map: front.map.clone(),
         changed,
@@ -1587,6 +1727,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         const_edits,
         item_scans,
         item_names,
+        item_full: derive_edit,
         files,
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
         bodies: edits_len,
@@ -1706,6 +1847,9 @@ pub(super) fn reuse_kept(
         None if Arc::ptr_eq(&k.program.ast, &front.ast) => Vec::new(),
         None => return Err("ast"),
     };
+    if edits.iter().any(|e| e.derive) {
+        return Err("derive");
+    }
     let mut p = k.program;
     // The edits below change what fingerprints read.
     p.fp_memo.off();
@@ -3120,6 +3264,34 @@ pub fn run() -> i64 {
         ];
         for &(old, new, path) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
+            assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A derive list edit takes the item patch in full mode: a trait out
+    /// (an error, then its fix) and in, each the cold answer. An edit
+    /// outside the derive list's names (an attribute) resolves.
+    #[test]
+    fn derive_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-derive-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "/// A point.\n#[derive(Clone, Copy, Debug, PartialEq)]\npub struct P {\n    x: i64,\n}\n\n\
+                   fn twice(p: P) -> (P, P) {\n    (p, p)\n}\n\npub fn run() -> i64 {\n    let (a, b) = twice(P { x: 2 });\n    \
+                   println!(\"{:?}\", a == b);\n    a.x\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str, &str)] = &[
+            ("#[derive(Clone, Copy, Debug, PartialEq)]", "#[derive(Clone, Debug, PartialEq)]", "item"),
+            ("#[derive(Clone, Debug, PartialEq)]", "#[derive(Clone, Copy, Debug, PartialEq)]", "item"),
+            ("#[derive(Clone, Copy, Debug, PartialEq)]", "#[derive(Clone, Copy, Debug, PartialEq, Default)]", "item"),
+            ("#[derive(Clone, Copy, Debug, PartialEq, Default)]", "#[derive(Clone, Copy, Debug, PartialEq)]", "item"),
+            ("#[derive(Clone, Copy, Debug, PartialEq)]", "#[derive(Clone, Copy, Debug, PartialEq)]\n#[repr(C)]", "resolve"),
+        ];
+        for &(old, new, path) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
             assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
         }
         let _ = std::fs::remove_dir_all(&dir);

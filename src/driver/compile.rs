@@ -1842,7 +1842,10 @@ fn resolved_setup(
             let fn_at: Vec<(usize, usize)> = (0..p.fn_count).map(|i| (0, i)).collect();
             let (hashes, lines) = (p.body_hashes.clone(), p.fn_lines.clone());
             let scan_of = |_: &Front, i: usize| (hashes[i], lines[i]);
-            let slots = slot_update(front, caches, scans, env, Some(names), &fn_at, crate_ids, &scan_of, t);
+            // A derive list edit: full mode (any body may read the derives).
+            let names = (!p.item_full).then_some(names);
+            let mode = if p.item_full { "full" } else { "signatures" };
+            let slots = slot_update(front, caches, scans, env, names, &fn_at, crate_ids, &scan_of, t);
             let (changed, mention_only, const_fn) = match slots {
                 Ok(c) => c,
                 Err(e) => {
@@ -1850,7 +1853,7 @@ fn resolved_setup(
                     return Err(Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() });
                 }
             };
-            return Ok((p.map, changed, mention_only, const_fn, p.fn_count, "signatures", p.fn_lines, p.body_hashes, Some(p.tables)));
+            return Ok((p.map, changed, mention_only, const_fn, p.fn_count, mode, p.fn_lines, p.body_hashes, Some(p.tables)));
         }
         Ok(p) => {
             (*std_ranges, *std_routes, *std_methods) = (p.std_ranges, p.std_routes, p.std_methods);
