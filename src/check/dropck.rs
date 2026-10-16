@@ -581,7 +581,7 @@ impl Dropck<'_, '_> {
 
 /// `ty_name`, or `_` for a type too large to print: a doubling type
 /// argument (`(T, T)` at each level) has an exponential printed size.
-fn short_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
+pub(crate) fn short_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
     fn small(tys: &impl TyIntern, t: Ty, budget: &mut u32) -> bool {
         if *budget == 0 {
             return false;

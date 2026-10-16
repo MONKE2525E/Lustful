@@ -18,6 +18,8 @@ use crate::def::DefId;
 use crate::intern::FxMap;
 use crate::ty::*;
 
+pub mod eval;
+
 /// The shared depth cap of selection, the clause filter, and
 /// normalization (section 2.4 step 7). Re-entering one trait ref on
 /// the stack, or passing the cap, is an overflow.
@@ -1086,6 +1088,11 @@ impl<'g> PureCx<'g> {
     }
 
     fn occurs(&self, var: u32, t: Ty) -> bool {
+        // A type with no variable in it is a DAG that a walk would visit
+        // as a tree: exponential on a doubling type (`((T, T), (T, T))`).
+        if !self.tys.flags(t).contains_infer() {
+            return false;
+        }
         let t = self.resolve_shallow(t);
         match self.tys.kind(t) {
             TyKind::Infer(v) => v.index() == var,

@@ -49,6 +49,7 @@ pub mod sync;
 pub mod unwind;
 mod use_caps;
 pub mod variance;
+pub mod where_overflow;
 
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
@@ -5154,7 +5155,10 @@ impl<'p> Ctx<'p> {
                         Selection::Ambiguous => pending.push(ob),
                         Selection::NoImpl => {
                             progress = true;
-                            let tn = self.tn(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
+                            // A doubling type (`G<(T, T)>` at each level) prints
+                            // at exponential length: such a name is `_`.
+                            let self_ty = self.resolve(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
+                            let tn = if dropck::short_name(self.p, &self.tys, self_ty) == "_" { "_".to_string() } else { self.tn(self_ty) };
                             let tr_name = self.trait_name(trait_ref.def);
                             self.err("L0612", span, format!("no impl of `{tr_name}` for `{tn}`"), "Add the impl, or change the bound.");
                         }

@@ -1,0 +1,64 @@
+// rustc E0275 at an impl's well-formedness check: each where clause of a
+// written impl is proved under the impl's own param env, and when an impl
+// header matches it as well as the env, rustc evaluates that impl's
+// predicates too (traits::solve::eval). A where clause that asks the
+// same trait at a growing type overflows there, whether or not anything
+// uses the impl.
+use crate::check::collect::Program;
+use crate::diag::{Diag, Span};
+use crate::traits::solve::{PureCx, Solver, eval::Evaluator};
+use crate::ty::*;
+
+/// The crate's `#![recursion_limit = "N"]`, else rustc's default 128.
+/// expand rejects a malformed value and one below 128.
+pub fn recursion_limit(p: &Program) -> usize {
+    for a in &p.ast.inner_attrs {
+        if a.path.len() == 1
+            && p.interner.get(a.path[0].name) == "recursion_limit"
+            && let crate::ast::AttrInput::Eq(e) = &a.input
+            && let crate::ast::Expr::Str(i) = p.ast.expr(*e)
+            && let Some(n) = p.ast.strings.get(*i as usize).and_then(|s| s.parse::<usize>().ok())
+        {
+            return n;
+        }
+    }
+    128
+}
+
+/// Reports every written impl with a where clause whose evaluation passes
+/// the recursion limit (L0611, rustc E0275).
+pub fn check_impls(p: &mut Program, errs: &mut Vec<Diag>) {
+    use crate::traits::index::Synthetic;
+    let limit = recursion_limit(p);
+    let lang_sized = p.gx.lang.sized;
+    let records: Vec<(Span, Vec<Predicate>)> =
+        p.gx.index
+            .all_impls()
+            .filter(|(_, r)| r.synthetic == Synthetic::None && r.local)
+            .filter(|(_, r)| {
+                r.generics.predicates.iter().any(|q| matches!(q, Predicate::Trait(b) if b.count == 0 && b.value.def != lang_sized))
+            })
+            .map(|(_, r)| (r.span, r.generics.predicates.clone()))
+            .collect();
+    for (span, preds) in records {
+        let env = crate::check::generics::elaborate_env(&mut p.tys, &p.gx.index, &preds);
+        let mut cx = PureCx::new(&p.tys);
+        let mut solver = Solver::new();
+        let mut ev = Evaluator::new(limit);
+        let over = preds.iter().find_map(|q| match q {
+            Predicate::Trait(b) if b.count == 0 && b.value.def != lang_sized => {
+                ev.where_clause_overflows(&mut solver, &mut cx, &p.gx.index, &env, b.value).then_some(b.value.def)
+            }
+            _ => None,
+        });
+        if let Some(def) = over {
+            let tname = p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
+            errs.push(Diag::new(
+                "L0611",
+                span,
+                format!("overflow evaluating a `{tname}` where clause of this impl: the impls it needs recurse past the recursion limit"),
+                "Remove the where clause that asks the trait at a growing type.",
+            ));
+        }
+    }
+}
