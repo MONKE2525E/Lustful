@@ -656,7 +656,9 @@ impl<'b, 'p> Ck<'b, 'p> {
     fn debug_dump(&self) {
         eprintln!("== borrowck {}", self.p.display_name(self.p.fn_info(self.body.fn_id).name));
         for (i, l) in self.body.locals.iter().enumerate() {
-            eprintln!("  _{i}: {:?} {:?}", l.name, self.body.tys.kind(l.ty));
+            let mut rs = Vec::new();
+            regions::regions_of(&self.body.tys, l.ty, &mut rs);
+            eprintln!("  _{i}: {:?} {} {rs:?}", l.name, crate::check::collect::ty_name(self.p, &self.body.tys, l.ty));
         }
         for (bi, b) in self.body.blocks.iter().enumerate() {
             eprintln!("  bb{bi}:");

@@ -538,21 +538,40 @@ impl<'p> Lower<'p> {
         if self.p.gx.fn_templates.get(f.0 as usize).is_none_or(|t| t.is_none()) {
             return f;
         }
+        match self.site_args(e, f) {
+            Some(args) if !args.is_empty() => crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f),
+            _ => f,
+        }
+    }
+
+    /// The type args check recorded for template `f` called at `e`.
+    fn site_args(&self, e: ExprId, f: LocalDefId) -> Option<&[GenericArg]> {
         let ei = (e.0 - self.ck.expr_base) as usize;
         // Two sites can share one expression (a `for` head call and
         // the loop's `next`): the per-template table wins there.
         if let Some((_, _, args)) = self.ck.generic_site_args.iter().find(|(i, t, _)| *i == ei && *t == f) {
-            if !args.is_empty() {
-                return crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f);
-            }
-            return f;
+            return Some(args);
         }
-        let Some(args) = self.ck.generic_args.get(ei) else { return f };
-        if args.is_empty() {
-            return f;
-        }
-        crate::check::generics::instance_for(self.p, &self.body.tys, f, args).unwrap_or(f)
+        self.ck.generic_args.get(ei).map(|a| a.as_slice())
     }
+
+    /// The return type of template `template` called at `e` (`f` is
+    /// `resolve_generic_fn(e, template)`), regions erased: with no
+    /// instance yet (`lust check`), the site's type args go in, as check
+    /// typed the call. The written regions are the callee's lifetimes,
+    /// none of this body.
+    fn site_ret_ty(&mut self, e: ExprId, template: LocalDefId, f: LocalDefId) -> Ty {
+        let ret = self.p.fn_info(f).ret;
+        let ret = match self.site_args(e, template) {
+            Some(args) if f == template && !args.is_empty() => {
+                let args = args.to_vec();
+                subst(&mut self.body.tys, ret, &args)
+            }
+            _ => ret,
+        };
+        crate::borrowck::erase(&mut self.body.tys, ret)
+    }
+
     /// Emits a call terminator that writes its result to `dest` and continues
     /// in a fresh block. The unwind successor is a cleanup path that drops
     /// every enclosing scope's locals, innermost first, through the same
@@ -5277,7 +5296,7 @@ impl<'p> Lower<'p> {
                 (self.ty(iter), it)
             } else {
                 let into_f = self.resolve_generic_fn(for_e, into_iter);
-                let iter_ty = p.fn_info(into_f).ret;
+                let iter_ty = self.site_ret_ty(for_e, into_iter, into_f);
                 let src = self.temp(self.ty(iter));
                 self.expr_into(iter, Some(&Place::local(src)));
                 let it = self.temp(iter_ty);
@@ -5289,13 +5308,23 @@ impl<'p> Lower<'p> {
             // `it: &mut I` stepped by `I`'s own `next` (core's `impl
             // Iterator for &mut I`, check `for_trait_iter`): the reference
             // itself, reborrowed, is the receiver.
+            let next_recv = next_f.and_then(|f| p.fn_info(f).params.first().map(|&t| (f, t))).map(|(f, t)| {
+                let t = match self.site_args(for_e, next) {
+                    Some(args) if f == next && !args.is_empty() => {
+                        let args = args.to_vec();
+                        subst(&mut self.body.tys, t, &args)
+                    }
+                    _ => t,
+                };
+                crate::borrowck::erase(&mut self.body.tys, t)
+            });
             let by_mut = matches!(self.kind(iter_ty), TyKind::Ref(_, Mut::Mut, _))
-                && next_f.is_none_or(|f| p.fn_info(f).params.first().is_none_or(|&t| !matches!(self.kind(t), TyKind::Ref(_, Mut::Mut, x) if x == iter_ty)));
+                && next_recv.is_none_or(|t| !matches!(self.kind(t), TyKind::Ref(_, Mut::Mut, x) if x == iter_ty));
             let (mt, recv) = if by_mut { (iter_ty, Place::local(it).deref()) } else { (self.ref_ty(true, iter_ty), Place::local(it)) };
             let r = self.temp(mt);
             self.assign(Place::local(r), Rvalue::Ref(true, recv), span);
             let (ot, target) = match next_f {
-                Some(f) => (p.fn_info(f).ret, CallTarget::Fn(f)),
+                Some(f) => (self.site_ret_ty(for_e, next, f), CallTarget::Fn(f)),
                 None => (self.body.tys.mk_option(item_ty), CallTarget::Builtin(Builtin::IterNext)),
             };
             let nx = self.temp(ot);
