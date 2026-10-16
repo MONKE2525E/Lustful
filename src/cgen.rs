@@ -4523,6 +4523,29 @@ impl FnGen<'_, '_> {
             B::StrTrimEnd => format!("lust_str_trim_end({})", str_of(&vals[0], &tys[0])),
             B::StrReplace => format!("lust_str_replace({}, {}, {})", str_of(&vals[0], &tys[0]), vals[1], vals[2]),
             B::StrRepeat => format!("lust_str_repeat({}, {}, {loc})", str_of(&vals[0], &tys[0]), vals[1]),
+            B::StrGetRange => {
+                // `[T]::get`'s bounds, then both ends on char boundaries.
+                let a = str_of(&vals[0], &tys[0]);
+                let opt = CTy::Option(Box::new(CTy::Ref(Box::new(CTy::Str))));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, sa, s0, e0) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let some = if some.is_empty() { String::new() } else { format!(" {some}") };
+                let bound = |i: &str| format!("({i} == {sa}.len || ({sa}.ptr[{i}] & 0xC0) != 0x80)");
+                let _ = writeln!(self.out, "    {} {t}; {} lust_str {sa} = {a};", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(
+                    self.out,
+                    "    {{ uint64_t {s0} = 0, {e0} = 0;\n      if (lust_range_bounds_get({sa}.len, {}, {}, {}, {}, &{s0}, &{e0}) && {} && {}) {{ {field} = (lust_str){{ {sa}.ptr + {s0}, {e0} - {s0} }};{some} }} }}",
+                    vals[1],
+                    vals[2],
+                    vals[3],
+                    vals[4],
+                    bound(&s0),
+                    bound(&e0)
+                );
+                t
+            }
             B::StrIsCharBoundary => {
                 let sa = self.tmp();
                 let a = str_of(&vals[0], &tys[0]);

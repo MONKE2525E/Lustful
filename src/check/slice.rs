@@ -30,6 +30,11 @@ impl<'p> Ctx<'p> {
         turbofish: &[ast::GenericArg],
     ) -> Option<Ty> {
         use Builtin as B;
+        // `str::get` with a range (on `str` and, through its deref,
+        // `String`): its own builtin, with char boundary checks.
+        if (base == STR || base == STRING) && self.name(name) == "get" {
+            return Some(self.str_get_method(e, recv, derefs, name_span, args));
+        }
         let elem = match self.kind(base) {
             TyKind::Slice(el) | TyKind::Array(el, _) => el,
             _ => self.tys.vec_elem(base)?,
@@ -170,6 +175,38 @@ impl<'p> Ctx<'p> {
         let sl = self.tys.intern(TyKind::Slice(elem));
         let r = self.tys.mk_ref(mutable, sl);
         self.tys.mk_option(r)
+    }
+
+    /// `str::get` (TRIAGE R26): any `SliceIndex<str>` range form, as
+    /// for `[T]::get`, answering `Option<&str>`: `None` when a bound is
+    /// out of range or not on a char boundary. A `usize` is no
+    /// `SliceIndex<str>`, as in rustc.
+    fn str_get_method(&mut self, e: ExprId, recv: ExprId, derefs: u8, name_span: Span, args: &[ExprId]) -> Ty {
+        if args.len() != 1 {
+            self.err("L0105", name_span, "`get` takes 1 argument", "Pass a range, such as `s.get(1..3)`.");
+            return self.slice_bail(args);
+        }
+        let arg = args[0];
+        let form = if matches!(self.p.ast.expr(arg), Expr::Range { .. }) {
+            self.drain_range_form(e, arg, name_span)
+        } else {
+            let t = self.expr(arg, None);
+            let t = self.deep(t);
+            match self.drain_form_of(t, name_span) {
+                Some(f) => Some(DrainRange::Value(f)),
+                None if t == ERROR => return ERROR,
+                None => {
+                    let tn = self.tn(t);
+                    self.err("L0612", name_span, format!("the type `str` cannot be indexed by `{tn}`"), "Pass a range, such as `s.get(1..3)`.");
+                    return ERROR;
+                }
+            }
+        };
+        let Some(form) = form else { return ERROR };
+        self.check_packed_borrow(recv, name_span);
+        self.out.drain_ranges.push((e, form));
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::StrGetRange, derefs, autoref: Autoref::Ref });
+        self.tys.mk_option(REF_STR)
     }
 
     /// An index expression `base[index]` whose index is a range

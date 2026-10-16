@@ -7000,6 +7000,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::StrDrainAsStr
             | B::SliceGetRange
             | B::SliceGetRangeMut
+            | B::StrGetRange
     )
 }
 

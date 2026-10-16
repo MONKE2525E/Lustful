@@ -406,6 +406,7 @@ pub enum Builtin {
     StrReplace,
     StrRepeat,
     StrIsCharBoundary,
+    StrGetRange,
     BoxNew,
     BoxLeak,
     RcNew,

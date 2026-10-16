@@ -4154,7 +4154,7 @@ impl<'p> Lower<'p> {
             return;
         }
         if let Res::BuiltinMethod { b, derefs, .. } = self.ck.res(e)
-            && matches!(b, Builtin::SliceGetRange | Builtin::SliceGetRangeMut)
+            && matches!(b, Builtin::SliceGetRange | Builtin::SliceGetRangeMut | Builtin::StrGetRange)
         {
             let mutable = b == Builtin::SliceGetRangeMut;
             self.get_range_into(e, recv, args, derefs, dest, span, mutable);
