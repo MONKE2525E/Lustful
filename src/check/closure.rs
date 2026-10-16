@@ -2136,8 +2136,11 @@ impl<'p> Ctx<'p> {
     }
 
     /// Builtin Fn-family selection for a closure Self type (the
-    /// `SolveCx::closure_select` hook).
-    pub(super) fn closure_select_impl(&mut self, obl: TraitRef) -> Option<bool> {
+    /// `SolveCx::closure_select` hook). An input that is still an open
+    /// projection (`<X as TryInto<?T>>::Error` before a later use binds
+    /// `?T`) is ambiguous: the queued obligation asks again once it is
+    /// known, instead of a no against a type it cannot compare yet.
+    pub(super) fn closure_select_impl(&mut self, obl: TraitRef) -> Option<Selection> {
         let lang = self.p.gx.lang;
         if !lang.is_fn_family(obl.def) {
             return None;
@@ -2147,7 +2150,7 @@ impl<'p> Ctx<'p> {
         let (kind, inputs) = match self.fn_like_facts(self_ty, 0) {
             Some((kind, inputs, _)) => (kind, inputs),
             // An unsafe or `extern "C"` fn implements no Fn trait.
-            None if matches!(self.kind(self_ty), TyKind::FnPtr(_) | TyKind::FnDef(..)) => return Some(false),
+            None if matches!(self.kind(self_ty), TyKind::FnPtr(_) | TyKind::FnDef(..)) => return Some(Selection::NoImpl),
             None => return None,
         };
         let need = if obl.def == lang.fn_ {
@@ -2158,13 +2161,13 @@ impl<'p> Ctx<'p> {
             ClosureKind::FnOnce
         };
         if kind > need {
-            return Some(false);
+            return Some(Selection::NoImpl);
         }
         let want = args.get(1).and_then(|g| g.as_ty()).unwrap_or(UNIT);
         let want = self.resolve(want);
         // `Fn()` sugar builds an empty tuple; `()` is the same type.
         if inputs.is_empty() {
-            return Some(match self.kind(want) {
+            let ok = match self.kind(want) {
                 TyKind::Unit => true,
                 TyKind::Tuple(ts) => self.tys.tys_of(ts).is_empty(),
                 _ => {
@@ -2172,11 +2175,19 @@ impl<'p> Ctx<'p> {
                     let empty = self.tys.intern(TyKind::Tuple(ts));
                     self.unify(want, empty)
                 }
-            });
+            };
+            return Some(if ok { Selection::Builtin } else { Selection::NoImpl });
         }
         let ts = self.tys.intern_tys(&inputs);
         let tuple = self.tys.intern(TyKind::Tuple(ts));
-        Some(self.unify(want, tuple))
+        let snap = self.snapshot_vars();
+        if self.unify(want, tuple) {
+            return Some(Selection::Builtin);
+        }
+        self.rollback_vars(snap);
+        let open = self.deep(want);
+        let flags = self.tys.flags(open);
+        Some(if flags.contains_projection() && flags.contains_infer() { Selection::Ambiguous } else { Selection::NoImpl })
     }
 
     /// The fn pointer two branch types join as when each is a closure

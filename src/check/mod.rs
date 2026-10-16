@@ -22645,7 +22645,7 @@ impl<'p> SolveCx for Ctx<'p> {
             }
         }
     }
-    fn closure_select(&mut self, obl: TraitRef) -> Option<bool> {
+    fn closure_select(&mut self, obl: TraitRef) -> Option<Selection> {
         self.closure_select_impl(obl)
     }
     fn closure_output(&mut self, assoc: DefId, self_ty: Ty) -> Option<Ty> {

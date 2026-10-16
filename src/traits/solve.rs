@@ -56,11 +56,12 @@ pub trait SolveCx {
     fn record_impl_set(&mut self, trait_def: DefId, self_ty: Ty, failed: bool);
     /// Builtin selection for a closure Self type (ARCH 2.9): a closure
     /// implements the Fn traits its kind allows, with no impl in the
-    /// index. `Some(true)` confirms and unifies the input tuple with the
-    /// closure's parameters; `Some(false)` is a definite no; `None` (the
-    /// default, and for traits outside the Fn family) leaves the
-    /// obligation to the impl index.
-    fn closure_select(&mut self, _obl: TraitRef) -> Option<bool> {
+    /// index. `Some(Builtin)` confirms and unifies the input tuple with
+    /// the closure's parameters; `Some(NoImpl)` is a definite no;
+    /// `Some(Ambiguous)` waits for an input that is still an open
+    /// projection; `None` (the default, and for traits outside the Fn
+    /// family) leaves the obligation to the impl index.
+    fn closure_select(&mut self, _obl: TraitRef) -> Option<Selection> {
         None
     }
     /// The `FnOnce::Output` of a closure Self type, for normalization.
@@ -619,9 +620,9 @@ impl Solver {
             if matches!(
                 cx.tys().kind(deep),
                 TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Dyn(..) | TyKind::Ref(..) | TyKind::Adt(..)
-            ) && let Some(ok) = cx.closure_select(obl)
+            ) && let Some(sel) = cx.closure_select(obl)
             {
-                return if ok { Selection::Builtin } else { Selection::NoImpl };
+                return sel;
             }
         }
 
@@ -751,8 +752,8 @@ impl Solver {
             let snap = cx.snapshot();
             let answer = cx.closure_select(tr);
             cx.rollback(snap);
-            if let Some(ok) = answer {
-                return !ok;
+            if let Some(sel) = answer {
+                return matches!(sel, Selection::NoImpl);
             }
         }
         // An integer or float literal variable is one of a closed set
