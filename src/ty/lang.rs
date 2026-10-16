@@ -2034,6 +2034,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/sync/atomic/compiler_fence",
     "core/hint/spin_loop",
     "std/hint/spin_loop",
+    "core/hint/black_box",
+    "std/hint/black_box",
     "std/thread/spawn",
     "std/thread/current",
     "std/thread/yield_now",

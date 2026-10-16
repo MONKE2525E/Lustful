@@ -494,6 +494,8 @@ pub enum Builtin {
     MemTake,
     CmpMax,
     CmpMin,
+    /// `hint::black_box(x)`: `x` itself (`fn<T>(T) -> T`).
+    HintBlackBox,
     IterIter,
     IterIterMut,
     IterVecIntoIter,
@@ -10915,6 +10917,7 @@ impl<'p> Ctx<'p> {
                 ("mem", "take") => Some(Builtin::MemTake),
                 ("cmp", "max") => Some(Builtin::CmpMax),
                 ("cmp", "min") => Some(Builtin::CmpMin),
+                ("hint", "black_box") => Some(Builtin::HintBlackBox),
                 ("str", "from_utf8") => Some(Builtin::StrFromUtf8),
                 ("iter", "repeat_n") => Some(Builtin::IterRepeatN),
                 ("array", "from_fn") => Some(Builtin::ArrayFromFn),
@@ -13444,6 +13447,10 @@ impl<'p> Ctx<'p> {
                     Builtin::CmpMax | Builtin::CmpMin => {
                         let t = self.callee_turbo_ty(callee, span);
                         (vec![t, t], t)
+                    }
+                    Builtin::HintBlackBox => {
+                        let t = self.callee_turbo_ty(callee, span);
+                        (vec![t], t)
                     }
                     // `slice::from_ref(&T) -> &[T]`, `from_mut(&mut T)
                     // -> &mut [T]` (fx-option-rest): the written name
