@@ -7395,6 +7395,46 @@ pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     glue_clone(p, tys, t, &mut GlueSeen::default())
 }
 
+/// True when a `clone_from` of `t` by structure would run a hash
+/// table's `clone_from`: `t` holds a `HashMap` or `HashSet` by
+/// value, through fields and owning containers (not through a
+/// reference or a shared `Rc`/`Arc`, whose `clone_from` only
+/// moves the count). The check side rejects those calls (L0640):
+/// a table's own `clone_from` reuses its bucket array in ways the
+/// `clonefrom` glue does not model.
+pub fn mentions_hash_table(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    fn walk(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
+        use crate::ty::hash::HashTy;
+        if let Some((k, _)) = crate::ty::hash::hash_parts(tys, t) {
+            return matches!(k, HashTy::HashMap | HashTy::HashSet);
+        }
+        match tys.kind(t) {
+            TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| walk(p, tys, e, seen)),
+            TyKind::Array(e, _) => return walk(p, tys, e, seen),
+            _ => {}
+        }
+        // Shared pointers never clone the table behind them.
+        if tys.rc_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
+            return false;
+        }
+        if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.refcell_elem(t)).or_else(|| tys.boxed_slice_elem(t)) {
+            return walk(p, tys, e, seen);
+        }
+        if let Some((a, b)) = tys.result_args(t) {
+            return walk(p, tys, a, seen) || walk(p, tys, b, seen);
+        }
+        // A `Box<T>` (not the shared forms above) clones into its pointee.
+        if let Some(e) = tys.smart_elem(t) {
+            return walk(p, tys, e, seen);
+        }
+        match tys.local_adt(t) {
+            Some(a) => !adt_instance_fields_all(p, a, t, GlueKey::HashTable, seen, &mut |f, seen| !walk(p, tys, f, seen)),
+            None => false,
+        }
+    }
+    walk(p, tys, t, &mut GlueSeen::default())
+}
+
 /// The walk behind `has_clone`; `seen` stops recursive generic types.
 fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     // `Cow<B>` clones its Owned value (`B: ToOwned` holds by its WF).
@@ -7641,6 +7681,7 @@ enum GlueKey {
     TotalEq,
     Eq,
     Debug,
+    HashTable,
 }
 
 /// The state of one glue walk (`has_clone`, `has_default`, ...): the

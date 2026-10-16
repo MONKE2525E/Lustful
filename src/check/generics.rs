@@ -480,7 +480,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
     vec![
         rec(lang.sized, "Sized", 0, vec![], vec![], &[]),
         rec(lang.copy, "Copy", 0, vec![self_pred(tys, lang.clone, &[])], vec![], &[]),
-        rec(lang.clone, "Clone", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["clone"]),
+        rec(lang.clone, "Clone", 0, vec![self_pred(tys, lang.sized, &[])], vec![], &["clone", "clone_from"]),
         rec(lang.debug, "Debug", 0, vec![], vec![], &["fmt"]),
         rec(lang.display, "Display", 0, vec![], vec![], &["fmt"]),
         rec(lang.partial_eq, "PartialEq", 1, vec![], vec![], &["eq", "ne"]),
@@ -1067,6 +1067,9 @@ pub fn lang_method_sigs(
             let sig = match (rec.def, name) {
                 (d, "clone") if d == lang.clone => {
                     LangMethodSig { self_kind: Some(Ref), params: vec![r0], ret: p0, ret_borrows_from: None }
+                }
+                (d, "clone_from") if d == lang.clone => {
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0, r0], ret: UNIT, ret_borrows_from: None }
                 }
                 (d, "next") if d == lang.iterator => {
                     let item = proj(tys, lang.assoc_item, &[p0]);
@@ -4594,6 +4597,11 @@ pub struct GenTables {
     /// derived bodies call the field type's impl (iface: W-CGEN
     /// reads this, like `drop_methods`).
     pub glue_methods: FxMap<(AdtId, DefId), LocalDefId>,
+    /// The written `Clone::clone_from` methods of impls on local
+    /// Adts, by Adt: cgen's `clonefrom` glue calls them, as a derived
+    /// or default `clone_from` calls each field's (iface: W-CGEN
+    /// reads this, like `glue_methods`).
+    pub clone_from_methods: FxMap<AdtId, LocalDefId>,
     /// The written `PartialOrd::partial_cmp` methods cgen's `PCmp`
     /// glue may call: like `glue_methods`, but an `Ord` impl may also
     /// exist (the `Cmp` glue then means `Ord::cmp` and cannot serve
@@ -4754,6 +4762,7 @@ impl Default for GenTables {
             traits_by_method: FxMap::default(),
             drop_methods: FxMap::default(),
             glue_methods: FxMap::default(),
+            clone_from_methods: FxMap::default(),
             pcmp_methods: FxMap::default(),
             fmt_methods: FxMap::default(),
             deferred_debug_fields: Vec::new(),
@@ -6658,6 +6667,7 @@ fn lang_provided(lang: &LangTraits, tr: DefId, name: &str) -> bool {
         "len" => tr == lang.exact_size_iterator,
         "size_hint" => tr == lang.iterator,
         "clone_into" => tr == lang.to_owned,
+        "clone_from" => tr == lang.clone,
         "hash_one" => tr == lang.build_hasher,
         "hash_slice" => tr == lang.hash,
         "contains" => tr == lang.range_bounds,
@@ -9783,6 +9793,14 @@ fn ensure_glue_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
         let f = iter_fn_instance(p, local, &impl_args, queue);
         if to_glue {
             p.gx.glue_methods.entry((adt, trait_def)).or_insert(f);
+            // The same impl's written `clone_from`, at this instance.
+            if trait_def == lang.clone
+                && let Some(cf) =
+                    record.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "clone_from"))
+            {
+                let cf = iter_fn_instance(p, cf, &impl_args, queue);
+                p.gx.clone_from_methods.entry(adt).or_insert(cf);
+            }
         }
         if to_pcmp {
             p.gx.pcmp_methods.entry((adt, trait_def)).or_insert(f);
@@ -10974,6 +10992,7 @@ fn compute_glue_methods(p: &mut Program) {
     use crate::traits::index::Synthetic;
     let lang = p.gx.lang;
     let mut out: FxMap<(AdtId, DefId), LocalDefId> = FxMap::default();
+    let mut cf_out: FxMap<AdtId, LocalDefId> = FxMap::default();
     let mut pcmp_out: FxMap<(AdtId, DefId), LocalDefId> = FxMap::default();
     for (_, rec) in p.gx.index.all_impls() {
         if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
@@ -11043,8 +11062,17 @@ fn compute_glue_methods(p: &mut Program) {
             continue;
         }
         out.insert((a, rec.trait_def), f);
+        // A written `clone_from` next to the `clone` just recorded:
+        // the `clonefrom` glue calls it on the same terms.
+        if rec.trait_def == lang.clone
+            && let Some(cf) = rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == "clone_from"))
+            && !p.gx.fn_templates.get(cf.0 as usize).is_some_and(|t| t.is_some())
+        {
+            cf_out.insert(a, cf);
+        }
     }
     p.gx.glue_methods = out;
+    p.gx.clone_from_methods = cf_out;
     p.gx.pcmp_methods = pcmp_out;
 }
 

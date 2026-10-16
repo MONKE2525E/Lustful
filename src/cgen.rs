@@ -12,6 +12,7 @@ use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+mod clonefrom;
 mod fmt;
 mod sync;
 mod hash;
@@ -159,6 +160,9 @@ enum Step {
 pub enum Glue {
     Drop,
     Clone,
+    /// `void clonefrom_T(T *d, T *s)`: `Clone::clone_from` by
+    /// structure or core's body (cgen/clonefrom.rs).
+    CloneFrom,
     Eq,
     Debug,
     /// Three-way comparison by structure: `int8_t cmp_T(T *a, T *b)`
@@ -4499,6 +4503,12 @@ impl FnGen<'_, '_> {
                     format!("clone_{}({})", mangle(inner), vals[0])
                 }
             }
+            B::CloneFrom => {
+                let CTy::Ref(inner) = &tys[0] else { unreachable!() };
+                self.want(Glue::CloneFrom, inner);
+                let _ = writeln!(self.out, "    clonefrom_{}({}, {});", mangle(inner), vals[0], vals[1]);
+                "((lust_Unit){})".into()
+            }
             B::ToString => {
                 match tys[0].clone() {
                     CTy::Ref(inner) => self.to_string_value(&inner, &vals[0], loc),
@@ -8550,6 +8560,12 @@ fn glue_def_value(
     // shaped glue arms below (unused strings for other shapes).
     let disc_p = disc_call(p, t, "p");
     let pf = variant_field(p, t, "(*p)", 1, 0);
+    // The `clonefrom` glue handles every shape itself (an owning
+    // fat pointer takes the default body there).
+    if matches!(g, Glue::CloneFrom) {
+        clonefrom::clonefrom_glue(p, slots, t, protos, defs, &mut need, types);
+        return;
+    }
     // Owning fat pointers' glue (cgen/own.rs).
     if let CTy::Own(k, x) = t {
         own::own_glue_def(p, *g, *k, x, protos, defs, &mut need);
@@ -8569,6 +8585,7 @@ fn glue_def_value(
         return;
     }
     match g {
+        Glue::CloneFrom => unreachable!("clonefrom glue returns above"),
         Glue::Drop => {
             let _ = writeln!(protos, "void drop_{m}({ct} *p);");
             match t {

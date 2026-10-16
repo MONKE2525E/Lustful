@@ -139,6 +139,9 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
             Glue::Display => (format!("int disp_{m}(lust_Formatter *f, {ct} *p)"), format!("disp_{rm}(f, p)")),
             Glue::Default => (format!("{ct} default_{m}(void)"), format!("default_{rm}()")),
             Glue::Drop | Glue::Clone => unreachable!("Arc's own drop and clone"),
+            // `clonefrom` never forwards here: clonefrom.rs handles
+            // every shape itself, sync types by the default body.
+            Glue::CloneFrom => unreachable!("clonefrom glue is in clonefrom.rs"),
             Glue::TlsInit | Glue::TlsDtor => unreachable!("TLS glue is per thread_local! key"),
             // No hash glue reaches an Arc (its keys are not hashable here,
             // `has_hash`).

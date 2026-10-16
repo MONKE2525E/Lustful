@@ -150,9 +150,11 @@ impl<'p> Ctx<'p> {
             "to_owned" => (Builtin::Clone, Autoref::Ref, base, Vec::new()),
             // `Add` and `AddAssign` for `Cow<str>` are checked
             // above, ahead of this match.
-            // `Clone::clone_from` (and with it the blanket
-            // `clone_into`) has no lust form yet, on any type.
-            "clone_from" | "clone_into" => {
+            // Cow's own `clone_from` is the derived-enum body over
+            // its two variants, which the `clonefrom` glue is.
+            "clone_from" => (Builtin::CloneFrom, Autoref::RefMut, UNIT, vec![self.tys.mk_ref(false, base)]),
+            // The blanket `ToOwned::clone_into` has no lust form yet.
+            "clone_into" => {
                 self.err("L0640", name_span, format!("`{n}` is not implemented yet"), "Assign a clone instead: `*dst = src.clone()`.");
                 for &a in args {
                     self.expr(a, None);

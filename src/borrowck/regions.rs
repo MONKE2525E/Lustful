@@ -3762,6 +3762,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
             }
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::Clone)) && self.call_clone(&avs, dt, &dv) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CloneFrom)) && self.call_clone_from(&avs) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::ConvDeref | crate::check::Builtin::ConvRcInner))
                 && self.call_conv_deref(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::MemReplace | crate::check::Builtin::MemSwap))
@@ -3914,6 +3915,17 @@ impl<'b, 'p> Builder<'b, 'p> {
         let [(t0, v0)] = avs else { return false };
         let TyKind::Ref(_, _, x) = self.body.tys.kind(*t0) else { return false };
         !v0.is_empty() && self.relate(x, &v0[1..], dt, dv, Variance::Co)
+    }
+
+    /// `Clone::clone_from(&mut self, source: &Self)`: the two `Self`
+    /// region slots are one instantiation, so they equate (a Cow
+    /// that becomes `Borrowed` keeps the source's lifetime); the
+    /// two borrows themselves reach nothing past the call.
+    fn call_clone_from(&mut self, avs: &[(Ty, Vec<u32>)]) -> bool {
+        let [(dt0, dv), (st0, sv)] = avs else { return false };
+        let TyKind::Ref(_, Mut::Mut, dx) = self.body.tys.kind(*dt0) else { return false };
+        let TyKind::Ref(_, _, sx) = self.body.tys.kind(*st0) else { return false };
+        dx == sx && !dv.is_empty() && !sv.is_empty() && self.relate(dx, &dv[1..], sx, &sv[1..], Variance::Inv)
     }
 
     /// A builtin that borrows into its receiver (`v.get(i)`, `v.last_mut()`,

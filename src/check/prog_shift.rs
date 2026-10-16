@@ -122,6 +122,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         traits_by_method: _,
         drop_methods: _,
         glue_methods: _,
+        clone_from_methods: _,
         pcmp_methods: _,
         fmt_methods: _,
         deferred_debug_fields,

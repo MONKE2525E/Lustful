@@ -847,6 +847,10 @@ pub enum Builtin {
     RangeContains,
     RangeInclStart,
     RangeInclEnd,
+    /// `Clone::clone_from` with no written fn at the receiver: the
+    /// `clonefrom` glue (derived and core bodies) or the default
+    /// (clone, drop, assign) in cgen.
+    CloneFrom,
 }
 
 
@@ -13735,7 +13739,9 @@ impl<'p> Ctx<'p> {
                 _ => {}
             }
         }
-        let (derefs, base) = if name == k.clone {
+        // `clone_from` is the smart pointer's own method too, like
+        // `clone`: it keeps the unpeeled receiver.
+        let (derefs, base) = if name == k.clone || self.name(name) == "clone_from" {
             // A `RefCell` guard has no `clone` method of its own (only
             // the associated `Ref::clone`): the call clones the value.
             let (mut d, mut b) = self.autoderef(rt);
@@ -14027,6 +14033,26 @@ impl<'p> Ctx<'p> {
                 self.check_args(&[], args, name_span);
                 return base;
             }
+        }
+        // `clone_from` with no written fn: the `clonefrom` glue
+        // (derived and core bodies) at a `Clone` receiver. A hash
+        // table's own `clone_from` reuses its bucket array in ways
+        // the glue does not model, so a receiver holding one stays
+        // a precise reject instead of a wrong capacity or order.
+        if self.name(name) == "clone_from" && has_clone(p, &self.tys, base) && mentions_hash_table(p, &self.tys, base) {
+            self.errs.push(not_yet("L0640", name_span, "`clone_from` on a type holding a hash table"));
+            for &a in args {
+                self.expr(a, None);
+            }
+            return ERROR;
+        }
+        if self.name(name) == "clone_from" && has_clone(p, &self.tys, base) {
+            self.record_glue_reads(p.gx.lang.clone, base);
+            self.check_packed_borrow(recv, name_span);
+            self.set_res(e, Res::BuiltinMethod { b: Builtin::CloneFrom, derefs, autoref: Autoref::RefMut });
+            let src = self.tys.mk_ref(false, base);
+            self.check_args(&[src], args, name_span);
+            return UNIT;
         }
         // Comparison trait methods on a scalar receiver
         // (`partial_cmp`, `cmp`, `eq`, `lt`, and kin in method

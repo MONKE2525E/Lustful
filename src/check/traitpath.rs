@@ -339,6 +339,9 @@ impl<'p> Ctx<'p> {
         if tr.def == lang.clone && self.name(name) == "clone" && has_clone(p, &self.tys, self_ty) {
             return TraitFnRes::Builtin(Builtin::Clone);
         }
+        if tr.def == lang.clone && self.name(name) == "clone_from" && has_clone(p, &self.tys, self_ty) {
+            return TraitFnRes::Builtin(Builtin::CloneFrom);
+        }
         if tr.def == lang.default && self.name(name) == "default" && has_default(p, &self.tys, self_ty) {
             self.record_glue_reads(lang.default, self_ty);
             return TraitFnRes::Default;
