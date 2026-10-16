@@ -143,6 +143,12 @@ pub enum Builtin {
     RotateRight,
     SwapBytes,
     ReverseBits,
+    IntToLeBytes,
+    IntToBeBytes,
+    IntToNeBytes,
+    IntFromLeBytes,
+    IntFromBeBytes,
+    IntFromNeBytes,
     DivCeil,
     DivEuclid,
     RemEuclid,
@@ -904,7 +910,8 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::StrTrimEnd, Builtin::StrTrimStart, Builtin::StrictAbs, Builtin::StrictAdd, Builtin::StrictDiv, Builtin::StrictDivEuclid,
     Builtin::StrictMul, Builtin::StrictNeg, Builtin::StrictPow, Builtin::StrictRem, Builtin::StrictRemEuclid, Builtin::StrictShl,
     Builtin::StrictShr, Builtin::StrictSub, Builtin::StringAsBytes, Builtin::StringAsMutStr, Builtin::StringAsStr, Builtin::StringCapacity,
-    Builtin::StringIntoBytes, Builtin::StringIsEmpty, Builtin::StringLen, Builtin::SwapBytes, Builtin::ToString, Builtin::TrailingOnes,
+    Builtin::StringIntoBytes, Builtin::StringIsEmpty, Builtin::StringLen, Builtin::SwapBytes, Builtin::IntToLeBytes, Builtin::IntToBeBytes, Builtin::IntToNeBytes, Builtin::IntFromLeBytes,
+    Builtin::IntFromBeBytes, Builtin::IntFromNeBytes, Builtin::ToString, Builtin::TrailingOnes,
     Builtin::TrailingZeros, Builtin::UnboundedShl, Builtin::UnboundedShr, Builtin::UnsignedAbs, Builtin::WrappingAbs, Builtin::WrappingAdd,
     Builtin::WrappingDiv, Builtin::WrappingMul, Builtin::WrappingNeg, Builtin::WrappingPow, Builtin::WrappingRem, Builtin::WrappingShl,
     Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet, Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetRef), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetMut), Builtin::Sync(crate::check::sync::SyncOp::ArcWeakUpgrade),
@@ -3449,6 +3456,19 @@ impl<'p> Ctx<'p> {
                 None => self.new_var(false),
             };
             return Some((B::PrimFromCast, vec![src], self_ty, vec![src]));
+        }
+        // `u32::from_le_bytes([u8; 4])` and the `be`/`ne` forms (TRIAGE R26).
+        if let TyKind::Int(i) = self.kind(self_ty) {
+            let from_bytes = match self.name(name) {
+                "from_le_bytes" => Some(B::IntFromLeBytes),
+                "from_be_bytes" => Some(B::IntFromBeBytes),
+                "from_ne_bytes" => Some(B::IntFromNeBytes),
+                _ => None,
+            };
+            if let Some(b) = from_bytes {
+                let arr = self.int_bytes_ty(i);
+                return Some((b, vec![arr], self_ty, Vec::new()));
+            }
         }
         let (b, autoref, params, ret) = match self.kind(self_ty) {
             TyKind::Int(i) => self.int_method(name, self_ty, i)?,
@@ -14987,6 +15007,13 @@ impl<'p> Ctx<'p> {
     /// All take the receiver by value. The 128-bit checked, saturating,
     /// and overflowing families (plus euclid division) are not
     /// implemented yet and answer None, like a missing method.
+    /// `[u8; N]` with N the byte size of `i`: what `to_le_bytes`
+    /// returns and `from_le_bytes` takes.
+    fn int_bytes_ty(&mut self, i: IntTy) -> Ty {
+        let n = self.tys.intern_const(ConstKind::Int((i.bits() / 8) as u128));
+        self.tys.intern(TyKind::Array(int(IntTy::U8), n))
+    }
+
     fn int_method(&mut self, name: Sym, t: Ty, i: IntTy) -> Option<(Builtin, Autoref, Vec<Ty>, Ty)> {
         use Builtin as B;
         let k = &*self.p.known;
@@ -15182,6 +15209,18 @@ impl<'p> Ctx<'p> {
         }
         if n == k.reverse_bits {
             return un(B::ReverseBits);
+        }
+        // `to_le_bytes`, `to_be_bytes`, `to_ne_bytes` (TRIAGE R26): the
+        // value's bytes, `[u8; size_of::<Self>()]`.
+        let to_bytes = match self.name(n) {
+            "to_le_bytes" => Some(B::IntToLeBytes),
+            "to_be_bytes" => Some(B::IntToBeBytes),
+            "to_ne_bytes" => Some(B::IntToNeBytes),
+            _ => None,
+        };
+        if let Some(b) = to_bytes {
+            let arr = self.int_bytes_ty(i);
+            return Some((b, Autoref::None, vec![], arr));
         }
         if n == k.to_string {
             return Some((B::ToString, Autoref::Ref, vec![], STRING));

@@ -171,6 +171,12 @@ fn builtin_is_const(b: Builtin) -> bool {
             | RotateRight
             | SwapBytes
             | ReverseBits
+            | IntToLeBytes
+            | IntToBeBytes
+            | IntToNeBytes
+            | IntFromLeBytes
+            | IntFromBeBytes
+            | IntFromNeBytes
             | DivEuclid
             | RemEuclid
             | Signum

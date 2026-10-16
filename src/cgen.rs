@@ -17,6 +17,7 @@ mod fmt;
 mod sync;
 mod hash;
 mod split;
+mod bytes;
 mod unwind;
 mod own;
 use unwind::Unw;
@@ -2758,7 +2759,10 @@ impl FnGen<'_, '_> {
                 Some(v) => v,
                 None => match self.split_builtin(b, args, dest_cty, loc, post) {
                     Some(v) => v,
-                    None => self.builtin(b, args, loc, post),
+                    None => match self.bytes_builtin(b, args, dest_cty, loc, post) {
+                        Some(v) => v,
+                        None => self.builtin(b, args, loc, post),
+                    },
                 },
             },
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
@@ -3863,6 +3867,9 @@ impl FnGen<'_, '_> {
         match b {
             B::Sync(_) => unreachable!("sync builtins emit in cgen/sync.rs"),
             B::OwnFrom(_) | B::OwnIntoString => unreachable!("owning pointer builtins emit in cgen/own.rs"),
+            B::IntToLeBytes | B::IntToBeBytes | B::IntToNeBytes | B::IntFromLeBytes | B::IntFromBeBytes | B::IntFromNeBytes => {
+                unreachable!("byte conversions emit in cgen/bytes.rs")
+            }
             // Emitted by `fmt_builtin` above (cgen/fmt.rs).
             B::FmtWriteStr
             | B::FmtWriteChar
