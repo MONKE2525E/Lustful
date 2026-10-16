@@ -54,7 +54,11 @@
 // The item patch (sigedit P1.3, path "item"): an edit strictly inside a
 // free fn or inherent method that touches its header re-parses and
 // rewrites that fn whole (`find_item_edit`), when its outline stands
-// (driver/item_outline.rs: everything name resolution reads from it). The
+// (driver/item_outline.rs: everything name resolution reads from it) and
+// so do its `impl Trait` params (collect lowers the same ones to the same
+// synthetic generics). A body that calls a user macro and whose text
+// stands takes its stored expansion (`kept_body`), so only the header is
+// new; a change in the body or the macro resolves in full. The
 // item rescans, and the compile tail runs the resolve path's slot update
 // in signatures mode with the fn's name as the changed name. A kept
 // program stands when the signature delta redoes each edited header on it
@@ -160,6 +164,18 @@ pub(crate) struct PatchBase {
     reach: Option<super::const_reach::ConstReach>,
     /// Under the patch oracle (`item_oracle.rs`): the cold resolve input.
     pub(super) oracle_input: Option<super::item_oracle::ColdInput>,
+    /// `ResolveCache::expansions` at the full resolve: while it stands,
+    /// a file's stored expansion is the one this Ast was parsed from
+    /// (a failed resolve after it can store another; see `kept_body`).
+    expansions: u64,
+    /// The bodies the last patch's item edits took from a stored
+    /// expansion, at their new places (`kept_body`). Only the last
+    /// patch's: any other edit since may have moved what their contexts
+    /// name (a macro definition in another file).
+    kept_bodies: Vec<KeptBody>,
+    /// Some patch applied an edit since the full resolve: its stored
+    /// expansions may name contexts the patches moved since.
+    edited: bool,
 }
 
 /// One cfg-disabled node the last full resolve dropped (`Dep::Dropped`).
@@ -323,6 +339,9 @@ impl PatchBase {
             dropped,
             reach: None,
             oracle_input: None,
+            expansions: front.resolve_cache.expansions(),
+            kept_bodies: Vec::new(),
+            edited: false,
         }
     }
 
@@ -433,6 +452,10 @@ struct NewItem {
     /// sigedit R10), or a const fn (const and static values that call
     /// it move, and the bodies that read them need not name it; R5).
     full: bool,
+    /// The body's stored expansion at its new place, when the body is a
+    /// user macro's unchanged one (`kept_body`; the next request's header
+    /// edit of the same fn takes it from `PatchBase::kept_bodies`).
+    kept: Option<KeptBody>,
 }
 
 /// The fn body side of a `BodyEdit`.
@@ -729,6 +752,9 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     if new_union != old_union {
         return Err("std needs");
     }
+    if edits.len() > 1 && edits.iter().any(|e| e.item.as_ref().is_some_and(|i| i.kept.is_some())) {
+        return Err("item: body macro");
+    }
     let base = front.patch.as_mut().ok_or("no base")?;
     for (k, st) in fresh_stamps {
         base.stamps[k] = st;
@@ -977,9 +1003,10 @@ fn find_derive_edit(front: &Front, text: &str, edit: Edit) -> Result<NewDerive, 
 /// `Err(None)` when no fn holds the edit; `Err(Some(why))` when one
 /// does but the patch cannot prove the edit (the caller resolves).
 /// Refused (R2, R5, and v1 limits): a header with a macro call, `$`,
-/// an attribute after `fn`, or an APIT; attributes the expander acts
-/// on; a body that needs more than pure builtin macros, or holds items;
-/// a fn from a macro expansion. A trait impl's method and a const fn take the patch
+/// an attribute after `fn`, or an APIT list that changed (the same list
+/// keeps collect's synthetic params); attributes the expander acts on;
+/// a body that needs more than pure builtin macros, or holds items; a fn
+/// from a macro expansion. A trait impl's method and a const fn take the patch
 /// with `NewItem::full`.
 fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Option<&'static str>> {
     let base = front.patch.as_ref().ok_or(Some("no base"))?;
@@ -1046,11 +1073,14 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     };
     let (oo, no) = (open(ot).ok_or(Some("item lex"))?, open(nt).ok_or(Some("item lex"))?);
     let at_fn = nt.iter().position(|t| t.tok == Tok::Fn).ok_or(Some("item lex"))?;
-    if nt[at_fn..no].iter().any(|t| matches!(t.tok, Tok::Pound | Tok::DocStr(_)))
-        || super::item_outline::has_apit(&nt[..=no])
-        || super::item_outline::has_apit(&ot[..=oo])
-    {
+    if nt[at_fn..no].iter().any(|t| matches!(t.tok, Tok::Pound | Tok::DocStr(_))) {
         return Err(Some("item: header"));
+    }
+    // APITs stand: collect lowers them to the same synthetic params.
+    let apits = |toks: &[lexer::Token], t: &str| super::item_outline::apit_params(toks, t);
+    match (apits(&ot[..=oo], old), apits(&nt[..=no], text)) {
+        (Some(x), Some(y)) if x == y => {}
+        _ => return Err(Some("item: apit")),
     }
     if crate::expand::needs_expansion(&nt[..no], &front.interner) {
         return Err(Some("item: attrs"));
@@ -1058,11 +1088,21 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     // The body: the body patch's token rules, and no expander work.
     let body_lx = |lx: &lexer::Lexed, k: usize| lexer::Lexed { tokens: lx.tokens[k..].to_vec(), strings: lx.strings.clone() };
     let (ob, nb) = (body_lx(&old_lx, oo), body_lx(&new_lx, no));
-    let (oc, op) = body_tokens_ok(&ob, ot[oo].span.lo as usize, hi as usize, &front.interner).map_err(Some)?;
-    let (nc, np) = body_tokens_ok(&nb, nt[no].span.lo as usize, new_hi as usize, &front.interner).map_err(Some)?;
     // A body with pure builtin macros or attributes expands as the body
-    // patch's does (`expand_pure`); a `static` would hoist into an item.
-    if (oc || nc) && base.shadowed || (op || np) && base.expand.is_none() || nb.tokens.iter().any(|t| t.tok == Tok::Static) {
+    // patch's does (`expand_pure`). A body the patch cannot expand alone
+    // (a user macro) takes its stored expansion when its text stands.
+    let same_body = old.get(ot[oo].span.lo as usize..hi as usize) == text.get(nt[no].span.lo as usize..new_hi as usize);
+    let plain = body_tokens_ok(&ob, ot[oo].span.lo as usize, hi as usize, &front.interner).and_then(|(oc, op)| {
+        let (nc, np) = body_tokens_ok(&nb, nt[no].span.lo as usize, new_hi as usize, &front.interner)?;
+        if (oc || nc) && base.shadowed || (op || np) && base.expand.is_none() { Err("item: body macro") } else { Ok(np) }
+    });
+    let kept = match plain {
+        Err("body macro" | "item: body macro") if same_body => Some(kept_body(front, base, fn_index, edit, (ot[oo].span.lo, hi)).map_err(Some)?),
+        Err(why) => return Err(Some(why)),
+        Ok(_) => None,
+    };
+    // A `static` would hoist into an item.
+    if nb.tokens.iter().any(|t| t.tok == Tok::Static) {
         return Err(Some("item: body macro"));
     }
     // Parse: a free fn as an item, a method inside a placeholder impl.
@@ -1077,12 +1117,19 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     // The expander keeps the input's string table and appends to it, so
     // the header's tokens index the expanded strings as before.
     let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
-    let (body, strings) = match np {
-        true => {
+    let (body, strings) = match (&kept, plain) {
+        (Some(k), _) => {
+            // The body's strings follow the header's.
+            let off = new_lx.strings.len() as u32;
+            let mut toks = k.tokens.clone();
+            toks.iter_mut().for_each(|t| t.tok.shift_strings(off));
+            (toks, new_lx.strings.iter().chain(&k.strings).cloned().collect())
+        }
+        (None, Ok(true)) => {
             let out = expand_pure(front, base, file, text, module, nb).map_err(Some)?;
             (out.tokens[..out.tokens.len() - 1].to_vec(), out.strings)
         }
-        false => (nt[no..].to_vec(), new_lx.strings.clone()),
+        _ => (nt[no..].to_vec(), new_lx.strings.clone()),
     };
     toks.extend_from_slice(&nt[..no]);
     toks.extend(body);
@@ -1142,7 +1189,8 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     }
     item_ast.items.push(new_item);
     let old_exprs = def.exprs;
-    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs, full })
+    let kept = kept.map(|body| KeptBody { fn_index, file, span: (nt[no].span.lo, new_hi), body });
+    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs, full, kept })
 }
 
 /// Where the std splice starts in the new text: the new body or fn is
@@ -1441,6 +1489,63 @@ fn expand_pure(
     }
 }
 
+/// The expanded tokens of an unchanged fn body (the old text's bytes
+/// `body`, `{` through `}`) at their new positions, for a header edit
+/// (`edit`) of fn `fn_index` whose body the patch cannot expand alone
+/// (a user macro). They come from the last request's item patch of the
+/// same body at the same place (`PatchBase::kept_bodies`), or from the
+/// full resolve's stored expansion of the file when no patch came since
+/// (`ResolveCache::expansion_of`): what a cold expansion of the same body
+/// text gives. Only while that expansion is this Ast's own
+/// (`PatchBase::expansions`), and as the request's only edit (another
+/// edit may move a macro definition its contexts name); `find_edits`
+/// refuses an expansion that read a token position. Contexts move as the Ast's do (`Edit::span`, with a
+/// memo of its own: the body's expansions are its own). The returned
+/// strings hold only the ones the tokens name.
+fn kept_body(front: &Front, base: &PatchBase, fn_index: usize, edit: Edit, body: (u32, u32)) -> Result<lexer::Lexed, &'static str> {
+    let file = edit.file;
+    let (tokens, strings) = match base.kept_bodies.iter().find(|k| k.fn_index == fn_index && k.file == file && k.span == body) {
+        Some(k) => (&k.body.tokens[..], &k.body.strings[..]),
+        None => {
+            let cache = &front.resolve_cache;
+            let old = front.map.text(file).ok_or("no text")?;
+            let own = if file == FileId(0) { base.root_unspliced.as_str() } else { old };
+            let stored = match cache.expansion_of(file, own).or_else(|| cache.expansion_of(file, old)) {
+                Some(l) if cache.expansions() == base.expansions && !base.edited => l,
+                _ => return Err("item: body macro"),
+            };
+            // The expander gives both delimiters of a group the group's span.
+            let at = |t: &lexer::Token, tok: Tok| t.tok == tok && t.span == crate::diag::Span { file, lo: body.0, hi: body.1, ctxt: CtxtId::ROOT };
+            let i0 = stored.tokens.iter().position(|t| at(t, Tok::LBrace)).ok_or("item: body macro")?;
+            let n = stored.tokens[i0..].iter().position(|t| at(t, Tok::RBrace)).ok_or("item: body macro")?;
+            (&stored.tokens[i0..=i0 + n], &stored.strings[..])
+        }
+    };
+    let mut memo = FxMap::default();
+    let mut remap: FxMap<u32, u32> = FxMap::default();
+    let mut out = lexer::Lexed { tokens: tokens.to_vec(), strings: Vec::new() };
+    for t in &mut out.tokens {
+        t.span = edit.span(t.span, &mut memo);
+        for i in t.tok.string_indices_mut().into_iter().flatten() {
+            let s = strings.get(*i as usize).ok_or("item: body macro")?;
+            *i = *remap.entry(*i).or_insert_with(|| {
+                out.strings.push(s.clone());
+                out.strings.len() as u32 - 1
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// One fn body's expanded tokens, as an item patch built them
+/// (`kept_body`): fn `fn_index`, whose body spans `span` of `file`.
+struct KeptBody {
+    fn_index: usize,
+    file: FileId,
+    span: (u32, u32),
+    body: lexer::Lexed,
+}
+
 /// Checks one lexed body (`{` at `lo` through `}` ending at `hi`, then
 /// `Eof`): one balanced brace group, no `$`, macro the expander owns but
 /// `PURE_MACROS`, or item keyword but `fn`, `static`, `const`, `use`.
@@ -1458,7 +1563,7 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
     }
     let (macro_rules, union) = (interner.intern("macro_rules"), interner.intern("union"));
     let mut depth = 0usize;
-    let (mut calls, mut pure) = (false, false);
+    let (mut calls, mut pure, mut user) = (false, false, false);
     for (i, t) in toks[..n].iter().enumerate() {
         match t.tok {
             Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
@@ -1481,12 +1586,14 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
             Tok::Pound | Tok::DocStr(_) => pure = true,
             Tok::Dollar => return Err("body attr"),
             Tok::Ident(s) if s == macro_rules || s == union => return Err("body item"),
-            // A macro call: `name!`, never path-qualified.
+            // A macro call: `name!`, never path-qualified. A user macro
+            // is the last reason (`find_item_edit` can take its stored
+            // expansion when no other rule refuses the body).
             Tok::Bang if i > 0 => match toks[i - 1].tok {
-                Tok::Ident(s) if i > 1 && toks[i - 2].tok == Tok::PathSep => return Err("body macro"),
+                Tok::Ident(_) if i > 1 && toks[i - 2].tok == Tok::PathSep => user = true,
                 Tok::Ident(s) if crate::expand::builtin::is_passthrough(interner.get(s)) => calls = true,
                 Tok::Ident(s) if PURE_MACROS.contains(&interner.get(s)) => pure = true,
-                Tok::Ident(_) | Tok::SelfUpper | Tok::SelfLower | Tok::Crate | Tok::Super => return Err("body macro"),
+                Tok::Ident(_) | Tok::SelfUpper | Tok::SelfLower | Tok::Crate | Tok::Super => user = true,
                 _ => {}
             },
             _ => {}
@@ -1496,7 +1603,7 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
     if depth != 0 {
         return Err("body shape");
     }
-    if !pure && crate::expand::needs_expansion(&toks[..n], interner) {
+    if user || !pure && crate::expand::needs_expansion(&toks[..n], interner) {
         return Err("body macro");
     }
     Ok((calls, pure))
@@ -1725,6 +1832,11 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         // `fn_name`), or a method's written name (P1.5: a method is only
         // ever called by name, so its callers mention it).
         item_names.push(if it.sub.is_some() { it.name } else { fn_def_at(&front.ast, it.item, None).name });
+    }
+    // A request with no edit keeps the last patch's bodies.
+    if !edits.is_empty() {
+        base.kept_bodies = edits.iter_mut().filter_map(|e| e.item.as_mut().and_then(|it| it.kept.take())).collect();
+        base.edited = true;
     }
     // Derive edits: the item's attributes and derive lists, then its scan
     // (the tail runs in full mode: any body may read the derives).
@@ -3409,6 +3521,121 @@ pub fn run() -> i64 {
         for &(old, new, path) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
             assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A header edit of a fn with `impl Trait` params (APIT) takes the
+    /// item patch when the APITs stand (the same synthetic generics): a
+    /// where clause, an error and its fix, a new plain param, also after
+    /// generics whose bounds hold parens and on a method. A changed,
+    /// added, or moved APIT resolves. Each state is the cold answer.
+    #[test]
+    fn apit_item_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-apit-item-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "pub fn any_of(xs: &[u32], mut test: impl FnMut(u32) -> bool) -> bool {\n    xs.iter().any(|&x| test(x))\n}\n\n\
+                   pub fn show<F: Fn(u8) -> u8>(f: F, x: impl std::fmt::Debug) -> String {\n    format!(\"{:?} {}\", x, f(1))\n}\n\n\
+                   pub struct Acc(i64);\n\nimpl Acc {\n    pub fn each(&self, f: impl Fn(i64) -> i64) -> i64 {\n        f(self.0)\n    }\n}\n\n\
+                   pub fn run() -> i64 {\n    let n = any_of(&[1, 2], |x| x > 1) as i64;\n    let _ = show(|x| x + 1, 5u8);\n    \
+                   n + Acc(2).each(|v| v * 2)\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let any = "pub fn any_of(xs: &[u32], mut test: impl FnMut(u32) -> bool) -> bool {";
+        let any_w = "pub fn any_of(xs: &[u32], mut test: impl FnMut(u32) -> bool) -> bool where u32: Copy {";
+        let any_bad = "pub fn any_of(xs: &[u32], mut test: impl FnMut(u32) -> bool) -> bool where String: Copy {";
+        let any_k = "pub fn any_of(xs: &[u32], mut test: impl FnMut(u32) -> bool, _k: u8) -> bool {";
+        let any_fn = "pub fn any_of(xs: &[u32], mut test: impl Fn(u32) -> bool) -> bool {";
+        let any_moved = "pub fn any_of(mut test: impl FnMut(u32) -> bool, xs: &[u32]) -> bool {";
+        let show = "pub fn show<F: Fn(u8) -> u8>(f: F, x: impl std::fmt::Debug) -> String {";
+        let show_w = "pub fn show<F: Fn(u8) -> u8>(f: F, x: impl std::fmt::Debug) -> String where u8: Copy {";
+        let show_2 = "pub fn show<F: Fn(u8) -> u8>(f: F, x: impl std::fmt::Debug, _y: impl Copy) -> String {";
+        let each = "    pub fn each(&self, f: impl Fn(i64) -> i64) -> i64 {";
+        let each_r = "    pub fn each(&self, f: impl Fn(i64) -> i64) -> i32 {";
+        let steps: &[(&str, &str, &str, i32)] = &[
+            (any, any_w, "item", 0),
+            (any_w, any_bad, "item", 1),
+            (any_bad, any, "item", 0),
+            (any, any_k, "item", 1),
+            (any_k, any, "item", 0),
+            (any, any_fn, "resolve", 0),
+            (any_fn, any, "resolve", 0),
+            (any, any_moved, "resolve", 1),
+            (any_moved, any, "resolve", 0),
+            (show, show_w, "item", 0),
+            (show_w, show, "item", 0),
+            (show, show_2, "resolve", 1),
+            (show_2, show, "resolve", 0),
+            (each, each_r, "item", 1),
+            (each_r, each, "item", 0),
+        ];
+        for &(old, new, path, code) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+            assert_eq!(check(&mut warm, &root).0, code, "{new:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A header edit of a fn whose body calls a user macro takes the item
+    /// patch when the body text stands: the body's stored expansion parses
+    /// and rewrites with the new header (a param rename, an error and its
+    /// fix, a hygienic local in the macro). A body edit in the macro's
+    /// input, a macro definition edit, a header and body edit together,
+    /// or another such fn's header edit after a patch resolve; the header
+    /// edit after the definition edit patches with the new expansion.
+    /// Each state is the cold answer.
+    #[test]
+    fn user_macro_body_item_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-umacro-item-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "macro_rules! args {\n    ($($x:expr),* $(,)?) => { vec![$($x.to_string()),*] };\n}\n\n\
+                   macro_rules! tw {\n    ($e:expr) => {{ let t = $e; t + t }};\n}\n\n\
+                   pub fn chain(d: &str, n: usize) -> Vec<String> {\n    let mut v = args![d, n];\n    v.push(String::new());\n    v\n}\n\n\
+                   pub fn twice(t: i64) -> i64 {\n    tw!(t)\n}\n\n\
+                   pub fn run() -> i64 {\n    chain(\"a\", 2).len() as i64 + twice(3)\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let ch = "pub fn chain(d: &str, n: usize) -> Vec<String> {";
+        let ch_w = "pub fn chain(d: &str, n: usize) -> Vec<String> where u32: Copy {";
+        let ch_bad = "pub fn chain(d: &str, n: usize) -> Vec<String> where String: Copy {";
+        let ch_k = "pub fn chain(d: &str, n: usize, _k: u8) -> Vec<String> {";
+        let ch_e = "pub fn chain(e: &str, n: usize) -> Vec<String> {";
+        let call = "    let mut v = args![d, n];";
+        let call_3 = "    let mut v = args![d, n, 1];";
+        let def = "{ vec![$($x.to_string()),*] }";
+        let def_2 = "{ [$(format!(\"{}\", $x)),*].to_vec() }";
+        let tw = "pub fn twice(t: i64) -> i64 {";
+        let tw_w = "pub fn twice(t: i64) -> i64 where i64: Copy {";
+        let steps: &[(&str, &str, &str, i32)] = &[
+            (ch, ch_w, "item", 0),
+            (ch_w, ch_bad, "item", 1),
+            (ch_bad, ch, "item", 0),
+            (ch, ch_k, "item", 1),
+            (ch_k, ch, "item", 0),
+            (ch, ch_e, "item", 1),
+            (ch_e, ch, "item", 0),
+            // Another fn's body after a patch: the stored expansion may
+            // name moved contexts, so it resolves; the undo patches.
+            (tw, tw_w, "resolve", 0),
+            (tw_w, tw, "item", 0),
+            (call, call_3, "resolve", 0),
+            (call_3, call, "resolve", 0),
+            (&format!("{ch}\n{call}"), &format!("{ch_w}\n{call_3}"), "resolve", 0),
+            (&format!("{ch_w}\n{call_3}"), &format!("{ch}\n{call}"), "resolve", 0),
+            (def, def_2, "resolve", 0),
+            (ch, ch_w, "item", 0),
+            (ch_w, ch, "item", 0),
+            (def_2, def, "resolve", 0),
+        ];
+        for (old, new, path, code) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert_eq!(field(&v, "path"), *path, "{new:?}: {v}");
+            assert_eq!(check(&mut warm, &root).0, *code, "{new:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

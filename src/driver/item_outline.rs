@@ -77,25 +77,84 @@ pub(crate) fn fn_outline(toks: &[Token], text: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// The tokens of an item's header (through the body's opening brace)
-/// hold an `impl` in a parameter type (APIT): it adds generic params
-/// the rewrite numbers, so the item patch leaves it to a full resolve.
-pub(crate) fn has_apit(toks: &[Token]) -> bool {
-    let Some(at_fn) = toks.iter().position(|t| t.tok == Tok::Fn) else { return true };
-    let Some(open) = toks[at_fn..].iter().position(|t| t.tok == Tok::LParen) else { return true };
-    let mut depth = 0usize;
-    for t in &toks[at_fn + open..] {
-        match t.tok {
-            Tok::LParen => depth += 1,
-            Tok::RParen => {
-                depth -= 1;
-                if depth == 0 {
-                    return false;
-                }
+/// The `impl Trait` parameters (APIT) of an item's header (its tokens
+/// through the body's opening brace), as (parameter index, type tokens
+/// as text) in written order, or None when the header has no parameter
+/// list. Collect gives each APIT a synthetic generic param numbered by
+/// this order after the written ones (`generics::apit_param`), so the
+/// item patch takes a header with APITs only when this list stands: the
+/// same synthetic params, each on the same parameter, with the same
+/// bounds. `text` is the file text the spans index.
+pub(crate) fn apit_params(toks: &[Token], text: &str) -> Option<Vec<(usize, String)>> {
+    let at_fn = toks.iter().position(|t| t.tok == Tok::Fn)?;
+    // The list starts after the name and its generic params (whose
+    // bounds may hold parens: `<F: Fn(u8)>`).
+    let mut open = at_fn + 2;
+    if toks.get(open)?.tok == Tok::Lt {
+        let mut angle = 0i32;
+        for t in &toks[open..] {
+            open += 1;
+            angle += match t.tok {
+                Tok::Lt => 1,
+                Tok::Shl => 2,
+                Tok::Gt => -1,
+                Tok::Shr => -2,
+                _ => 0,
+            };
+            if angle <= 0 {
+                break;
             }
-            Tok::Impl => return true,
-            _ => {}
         }
     }
-    true
+    if toks.get(open)?.tok != Tok::LParen {
+        return None;
+    }
+    // Paren depth, and `<..>` depth inside the list: a `,` at depth 1 out
+    // of any `<..>` ends a parameter (`HashMap<K, V>` holds one).
+    let (mut depth, mut angle) = (0usize, 0i32);
+    let (mut param, mut start) = (0usize, open + 1);
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate().skip(open) {
+        let end = match t.tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                depth += 1;
+                false
+            }
+            Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                depth = depth.checked_sub(1)?;
+                depth == 0
+            }
+            Tok::Lt if depth == 1 => {
+                angle += 1;
+                false
+            }
+            Tok::Shl if depth == 1 => {
+                angle += 2;
+                false
+            }
+            Tok::Gt if depth == 1 => {
+                angle -= 1;
+                false
+            }
+            Tok::Shr if depth == 1 => {
+                angle -= 2;
+                false
+            }
+            Tok::Comma => depth == 1 && angle <= 0,
+            _ => false,
+        };
+        if !end {
+            continue;
+        }
+        let p = &toks[start..i];
+        if p.iter().any(|t| t.tok == Tok::Impl) {
+            let words: Vec<&str> = p.iter().map(|t| text.get(t.span.lo as usize..t.span.hi as usize)).collect::<Option<_>>()?;
+            out.push((param, words.join(" ")));
+        }
+        if depth == 0 {
+            return Some(out);
+        }
+        (param, start, angle) = (param + 1, i + 1, 0);
+    }
+    None
 }

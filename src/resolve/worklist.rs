@@ -731,6 +731,10 @@ pub struct ResolveCache {
     /// A root token list from routing (`seed_root`), stored by `begin`
     /// after its environment check: (key, text hash, tokens).
     seed: Option<(String, u64, lexer::Lexed)>,
+    /// Counts the expansions stored (`put_expanded`, `begin`'s clear): a
+    /// reader that saw this value when it read a file's expansion knows
+    /// the entry is still that expansion while the value stands.
+    expansions: u64,
 }
 
 struct CachedFile {
@@ -882,6 +886,7 @@ impl ResolveCache {
         if self.env_fp != fp {
             self.env_fp = fp;
             self.files.clear();
+            self.expansions += 1;
         }
         if let Some((key, text_hash, lexed)) = self.seed.take() {
             self.entry(&key, text_hash, FileId(0)).raw = Some(lexed);
@@ -964,8 +969,22 @@ impl ResolveCache {
     /// Stores one file's expansion; returns the stream's `hash_lexed`.
     fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64, lexed: &lexer::Lexed, deps: &[crate::expand::Dep]) -> u64 {
         let exp_hash = hash_lexed(lexed);
+        self.expansions += 1;
         self.entry(key, text_hash, file_id).expanded = Some((input_hash, clone_lexed(lexed), deps.to_vec(), exp_hash));
         exp_hash
+    }
+
+    /// The `expansions` count (see there).
+    pub fn expansions(&self) -> u64 {
+        self.expansions
+    }
+
+    /// The stored expansion of the file lexed as `file_id` with text
+    /// `text`, if any. The item patch takes an unchanged body's expanded
+    /// tokens from it (driver/patch.rs `kept_body`).
+    pub fn expansion_of(&self, file_id: FileId, text: &str) -> Option<&lexer::Lexed> {
+        let text_hash = hash_str(text);
+        self.files.values().find(|e| e.file_id == file_id && e.text_hash == text_hash).and_then(|e| e.expanded.as_ref()).map(|e| &e.1)
     }
 
     /// The cached parsed Ast for one expanded token stream, cloned out.
