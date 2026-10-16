@@ -335,6 +335,64 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True when the closure output `o` (before `deep`) holds a variable
+    /// that only the outer call's expected type fixed
+    /// (`expect_only_vars`).
+    fn expect_only_output(&self, o: Ty) -> bool {
+        if self.expect_only_vars.is_empty() || !self.tys.flags(o).contains_infer() {
+            return false;
+        }
+        let mut vs = Vec::new();
+        self.chain_vars(o, &mut vs);
+        vs.iter().any(|v| self.expect_only_vars.contains(v))
+    }
+
+    /// Every variable on the binding chains inside `t`, bound ones too.
+    fn chain_vars(&self, t: Ty, out: &mut Vec<u32>) {
+        if !self.tys.flags(t).contains_infer() {
+            return;
+        }
+        match self.tys.kind(t) {
+            TyKind::Infer(v) => {
+                out.push(v.index());
+                if let Some(b) = self.vars[v.index() as usize].bound {
+                    self.chain_vars(b, out);
+                }
+            }
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.chain_vars(e, out),
+            TyKind::Tuple(ts) => {
+                for &e in self.tys.tys_of(ts) {
+                    self.chain_vars(e, out);
+                }
+            }
+            TyKind::Adt(_, a) | TyKind::Projection(_, a) => {
+                for g in self.tys.args(a) {
+                    if let Some(e) = g.as_ty() {
+                        self.chain_vars(e, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// True when a value could coerce to `t` from another type: `t`
+    /// holds a reference, raw or fn pointer, dyn, or smart pointer.
+    fn coerce_target(&mut self, t: Ty) -> bool {
+        let t = self.deep(t);
+        match self.kind(t) {
+            TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(_) | TyKind::Dyn(..) => true,
+            TyKind::Slice(e) | TyKind::Array(e, _) => self.coerce_target(e),
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).to_vec().into_iter().any(|e| self.coerce_target(e)),
+            TyKind::Adt(_, a) => {
+                self.tys.boxed_elem(t).is_some()
+                    || self.tys.rc_elem(t).is_some()
+                    || self.tys.args(a).to_vec().into_iter().any(|g| g.as_ty().is_some_and(|e| self.coerce_target(e)))
+            }
+            _ => false,
+        }
+    }
+
     /// The output of fn pointer type `t` with each region slot of
     /// `FnSig::own_out` the one input region's (`ClosureInfo::bound_output`),
     /// when it has exactly one higher-ranked input slot (`for<'a> fn(&'a D)
@@ -528,12 +586,14 @@ impl<'p> Ctx<'p> {
         let bound_output = bound_output.or_else(|| self.fn_ptr_bound_output(to_fn_ptr?.0));
         // The bound's types normalize here: `F: Fn(A::Item)` gives a
         // projection over the call's impl args (check/project.rs).
+        let mut expect_only = false;
         let sig = match to_fn_ptr {
             Some((_, tuple, out)) => Some((tuple, Some(out))),
             None => match dyn_sig.or_else(|| self.expected_closure_sig(expected)) {
                 Some((ins, out)) => {
                     let ins = self.deep(ins);
                     let ins = self.normalize_use(ins, span);
+                    expect_only = out.is_some_and(|o| self.expect_only_output(o));
                     let out = out.map(|o| {
                         let o = self.deep(o);
                         self.normalize_use(o, span)
@@ -651,9 +711,15 @@ impl<'p> Ctx<'p> {
             (None, None) => self.new_var(false),
         };
         // The body: a new frame for `return`, and no outer loop labels.
+        // An output that only the outer call's expected type fixed, with
+        // a type a body could coerce to, is open in the body, as in
+        // rustc: the body's type must then be that output exactly
+        // (`Some(1).map(|_| &v)` with `v: &Vec<u8>` is no
+        // `Option<&Vec<u8>>`, E0308).
+        let ret = if expect_only && ret.is_none() && self.coerce_target(output) { self.new_var(false) } else { output };
         let saved_loops = std::mem::take(&mut self.loops);
-        self.closure_rets.push(output);
-        let bt = self.expr(body, Some(output));
+        self.closure_rets.push(ret);
+        let bt = self.expr(body, (ret == output).then_some(ret));
         // Edition 2024 never-type fallback: a body that only diverges
         // (`|| { ..; panic!(); }`) leaves the return type open, and rustc
         // makes it `!`. Without this the closure's signature zonks to
@@ -661,7 +727,11 @@ impl<'p> Ctx<'p> {
         if matches!(self.kind(self.resolve(bt)), TyKind::Never) && matches!(self.kind(self.resolve(output)), TyKind::Infer(v) if !v.is_int() && !v.is_float()) {
             self.unify(output, NEVER);
         }
-        self.coerce_expr(body, bt, output);
+        self.coerce_expr(body, bt, ret);
+        if ret != output && !self.unify(ret, output) {
+            let span = self.span(body);
+            self.mismatch(span, output, ret);
+        }
         self.reject_unsized_value(body);
         self.closure_rets.pop();
         self.loops = saved_loops;

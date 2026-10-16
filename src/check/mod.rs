@@ -2011,6 +2011,11 @@ struct Ctx<'p> {
     /// call expression: a generic method's closure arguments read it
     /// (`expected_output_first`).
     pub(super) call_expected: Option<(ExprId, Ty)>,
+    /// Variables inside a generic call's return type (not the whole of
+    /// it) that only the call's expected type fixed
+    /// (`expected_output_first`): rustc does not know them in a closure
+    /// argument's body (`ClosureCx::expect_only_output`).
+    pub(super) expect_only_vars: Vec<u32>,
     /// User `Deref` steps the method lookup is inside (a bound on
     /// `Deref` chains).
     deref_depth: u8,
@@ -2323,6 +2328,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         iter_closure_args: std::collections::HashMap::new(),
         scope_closure_vars: Vec::new(),
         closure_bound_outputs: std::collections::HashMap::new(),
+        expect_only_vars: Vec::new(),
         closure_bound_inputs: std::collections::HashMap::new(),
         closure_call_outs: std::collections::HashSet::new(),
         open_binops: Vec::new(),
@@ -7316,9 +7322,15 @@ impl<'p> Ctx<'p> {
         if object::mentions_dyn(&self.tys, want) || matches!(self.kind(want), TyKind::Infer(_) | TyKind::Never | TyKind::Error) {
             return;
         }
+        let mut open = Vec::new();
+        if !matches!(self.kind(ret_deep), TyKind::Infer(_)) {
+            self.unbound_vars(ret_deep, &mut open);
+        }
         let snap = self.snapshot_vars();
         let obl_len = self.obl_len();
-        if !self.unify(ret, want) {
+        if self.unify(ret, want) {
+            self.expect_only_vars.extend(open);
+        } else {
             self.rollback_vars(snap);
             self.obl_truncate(obl_len);
         }
