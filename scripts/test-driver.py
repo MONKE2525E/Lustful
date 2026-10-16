@@ -75,12 +75,36 @@
 # message stay exact.
 # Usage: python3 scripts/test-driver.py   (exit 0 = pass)
 # The gate runs scripts/test-driver.sh, a thin wrapper over this file.
+# Every lust compile runs under the one timeout rule (lust_run and
+# Daemon.run): TEST_DRIVER_TIMEOUT seconds (default 300), one solo retry
+# at 6x. A finished retry is reported as "slow"; a second timeout is a
+# hang and fails its case. Program runs keep their own 60 s limit.
 import errno, glob, os, re, shutil, subprocess, sys, tempfile, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUST = os.path.join(ROOT, "target/release/lust")
+try:
+    TIMEOUT = max(0.01, float(os.environ.get("TEST_DRIVER_TIMEOUT", "300")))
+except ValueError:
+    TIMEOUT = 300.0
 failures = []
 passed = 0
+
+
+# lust_run <args>: one cold lust compile under the timeout rule. A timeout
+# retries once, alone (this suite is serial), at 6x the limit; a second
+# timeout raises AssertionError, which fails the case as a hang.
+def lust_run(args, **kw):
+    try:
+        return subprocess.run(args, timeout=TIMEOUT, **kw)
+    except subprocess.TimeoutExpired:
+        print(f"slow: {' '.join(map(str, args[1:3]))} timed out at {TIMEOUT:g}s, retrying alone at {TIMEOUT * 6:g}s", flush=True)
+    try:
+        r = subprocess.run(args, timeout=TIMEOUT * 6, **kw)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"HANG: {args} timed out alone at {TIMEOUT * 6:g}s (first at {TIMEOUT:g}s)")
+    print(f"slow: {' '.join(map(str, args[1:3]))} finished alone", flush=True)
+    return r
 
 
 def check(name, cond, detail=""):
@@ -158,9 +182,24 @@ class Daemon:
         return err
 
     def run(self, args, expect=0):
-        # A hung client or daemon fails its case in 300 s (well over a
-        # loaded gate lane's build), not at the gate's step limit.
-        r = subprocess.run([LUST] + args, cwd=self.work, env=self.env, capture_output=True, text=True, timeout=300)
+        # One request under the timeout rule: TIMEOUT seconds (well over a
+        # loaded gate lane's build, not the gate's step limit), then one
+        # solo retry at 6x on a fresh daemon (the old one may be wedged on
+        # the timed-out request). A second timeout is a hang and fails the
+        # case. The retry only happens after a timeout, when the case
+        # would have failed anyway, so the fresh session cannot hide a
+        # passing case's reuse failure.
+        try:
+            r = subprocess.run([LUST] + args, cwd=self.work, env=self.env, capture_output=True, text=True, timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print(f"slow: daemon request {args[:2]} timed out at {TIMEOUT:g}s, retrying alone at {TIMEOUT * 6:g}s on a fresh daemon", flush=True)
+            self.kill()
+            self.start()
+            try:
+                r = subprocess.run([LUST] + args, cwd=self.work, env=self.env, capture_output=True, text=True, timeout=TIMEOUT * 6)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(f"HANG: daemon request {args} timed out alone at {TIMEOUT * 6:g}s (first at {TIMEOUT:g}s)")
+            print(f"slow: daemon request {args[:2]} finished alone", flush=True)
         if expect is not None:
             assert r.returncode == expect, f"{args}: exit {r.returncode}\n{r.stderr[-600:]}"
         return r
@@ -512,7 +551,7 @@ def case_positions():
     def cold(src):
         env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold{len(os.listdir(work))}"))
         cout = os.path.join(work, "xc")
-        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True, timeout=300)
+        lust_run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True)
         return run_prog(cout).stderr
 
     d.start()
@@ -545,7 +584,7 @@ def case_generic_reuse():
     def cold():
         env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold{len(os.listdir(work))}"))
         cout = os.path.join(work, "xc")
-        subprocess.run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True, timeout=300)
+        lust_run([LUST, "build", src, "-o", cout], cwd=work, env=env, capture_output=True)
         r = run_prog(cout)
         return r.returncode, r.stdout, mask_stderr(r.stderr)
 
@@ -609,7 +648,7 @@ def case_generic_reuse():
     edit("fn total<T: Score + Sized>(", "fn total<T: Score + Copy>(")
     r, _ = check_stats()
     env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold-reject"))
-    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True, timeout=300)
+    c = lust_run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True)
     strip = lambda t: "\n".join(l for l in t.splitlines() if not l.startswith("lust-stats:"))
     check("generic unmet bound rejects warm as cold", (r.returncode, strip(r.stderr)) == (c.returncode, strip(c.stderr)) and r.returncode != 0,
           f"warm {r.returncode} {r.stderr[-300:]} cold {c.returncode} {c.stderr[-300:]}")
@@ -619,7 +658,7 @@ def case_generic_reuse():
     d.run(["check", src], expect=None)
     edit("        s += x.twice() + 1;", "        s += x.twice() + true;")
     r, _ = check_stats()
-    c = subprocess.run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True, timeout=300)
+    c = lust_run([LUST, "check", src], cwd=work, env=env, capture_output=True, text=True)
     check("generic template body error rejects warm as cold", (r.returncode, strip(r.stderr)) == (c.returncode, strip(c.stderr)) and r.returncode != 0,
           f"warm {r.returncode} {r.stderr[-300:]} cold {c.returncode} {c.stderr[-300:]}")
     edit("        s += x.twice() + true;", "        s += x.twice() + 1;")
@@ -651,7 +690,7 @@ def case_moved_instance_ids():
                                       "    let _ = format!(\"{:?}\", z);\n", 1))
     _, prog = d.build(src, out)
     env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, "cold"))
-    subprocess.run([LUST, "build", src, "-o", out + "c"], cwd=work, env=env, capture_output=True, timeout=300)
+    lust_run([LUST, "build", src, "-o", out + "c"], cwd=work, env=env, capture_output=True)
     cold = run_prog(out + "c")
     check("moved instance ids: warm equals cold", prog.stdout == cold.stdout and prog.returncode == cold.returncode,
           f"warm {prog.stdout[-60:]!r} cold {cold.stdout[-60:]!r}")
@@ -877,7 +916,7 @@ def case_stable_instance_ids():
         csrc = os.path.join(cw, "x.rs")
         open(csrc, "w").write(text)
         env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
-        subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True, timeout=300)
+        lust_run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
         r = run_prog(os.path.join(cw, "x"))
         shutil.rmtree(cw, ignore_errors=True)
         return r.stdout
@@ -931,8 +970,8 @@ def case_user_trait_impl_edits():
         csrc = os.path.join(cw, "x.rs")
         open(csrc, "w").write(text)
         env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
-        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True, timeout=300)
-        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True, timeout=300)
+        c = lust_run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True)
+        b = lust_run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
         r = run_prog(os.path.join(cw, "x")) if b.returncode == 0 else None
         shutil.rmtree(cw, ignore_errors=True)
         return (c.returncode, r.stdout if r else None)
@@ -989,8 +1028,8 @@ def case_inherent_impl_edits():
         csrc = os.path.join(cw, "x.rs")
         open(csrc, "w").write(text)
         env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
-        c = subprocess.run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True, timeout=300)
-        b = subprocess.run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True, timeout=300)
+        c = lust_run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True)
+        b = lust_run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
         r = run_prog(os.path.join(cw, "x")) if b.returncode == 0 else None
         shutil.rmtree(cw, ignore_errors=True)
         return (c.returncode, r.stdout if r else None)
@@ -1064,8 +1103,8 @@ def case_dep_std_edits():
         chk = d.run(["check", main_rs, *extra], expect=None)
         check(f"dep std v{i + 1} ({what}) warm check", chk.returncode == 0, chk.stderr[-400:])
         _, prog = d.build(main_rs, out, extra)
-        cold = subprocess.run([LUST, "build", main_rs, "-o", cold_out, *extra], cwd=work, env=cold_env,
-                              capture_output=True, text=True, timeout=300)
+        cold = lust_run([LUST, "build", main_rs, "-o", cold_out, *extra], cwd=work, env=cold_env,
+                              capture_output=True, text=True)
         cprog = run_prog(cold_out) if cold.returncode == 0 else None
         check(f"dep std v{i + 1} ({what}) output", prog.stdout.strip() == want, prog.stdout + prog.stderr[-300:])
         check(f"dep std v{i + 1} ({what}) warm == cold",

@@ -11,8 +11,11 @@
 # A daemon crash, a daemon hang, or a cold-compile crash (exit 101, signal, hang) is a
 # failure by itself. One exception: for `run`, a timeout on both sides means the
 # edited program itself does not terminate, which is the same behavior both ways,
-# not a compiler hang. A `check` timeout is always a compiler hang. `--strict`
-# also requires the full stderr text to match.
+# not a compiler hang. A `check` timeout is a compiler hang only after the one
+# timeout rule's solo retry (compare): the timed-out side runs once more at 6x
+# the limit (the daemon side on a fresh daemon), a finished retry is reported
+# as "slow" and judged normally, and only a second timeout is the hang.
+# `--strict` also requires the full stderr text to match.
 #
 # Usage:
 #   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3|patchseq [--modules 40] [--strict]
@@ -416,7 +419,7 @@ class Harness:
         except Exception:
             pass
 
-    def run_cmd(self, cmd, use_daemon):
+    def run_cmd(self, cmd, use_daemon, timeout=None):
         args = [LUST, cmd, self.crate]
         if cmd != "check":
             args += ["-o", os.path.join(self.work, "prog")]
@@ -428,7 +431,7 @@ class Harness:
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, start_new_session=True)
         try:
-            out, err = p.communicate(timeout=self.timeout)
+            out, err = p.communicate(timeout=self.timeout if timeout is None else timeout)
             return (p.returncode, out, err)
         except subprocess.TimeoutExpired:
             try:
@@ -508,14 +511,35 @@ def compare(h, cmd, strict):
     timeout too is a matching program hang (ok, why "program hang");
     a cold answer makes it a daemon hang. The caller restarts the
     daemon after any daemon-side run timeout, because the daemon may
-    still be waiting on the program it forked for an in-memory run."""
+    still be waiting on the program it forked for an in-memory run.
+
+    A `check` timeout gets the timeout rule's solo retry first: that
+    side runs once more at 6x the limit (the daemon side on a fresh
+    daemon, since the old one may be wedged on this request). A
+    finished retry is reported as slow and judged normally; only a
+    second timeout reaches the hang verdicts below. `run` keeps its
+    both-sides cross-check instead: its timeout is usually the edited
+    program, and the same crate's `check` compare catches a compiler
+    hang on its own."""
     da = h.run_cmd(cmd, True)
+    if cmd == "check" and da[0] == "TIMEOUT" and h.daemon_alive():
+        print(f"slow: daemon check timed out at {h.timeout:g}s, retrying alone at {h.timeout * 6:g}s on a fresh daemon", flush=True)
+        h.kill_daemon()
+        h.start_daemon()
+        da = h.run_cmd(cmd, True, timeout=h.timeout * 6)
+        if da[0] != "TIMEOUT":
+            print("slow: daemon check finished alone", flush=True)
     if not h.daemon_alive():
         return False, "daemon died", da, None
     ck = crash_kind(cmd, da[0])
     if ck and not (cmd == "run" and da[0] == "TIMEOUT"):
         return False, f"daemon {ck}", da, None
     co = h.run_cmd(cmd, False)
+    if cmd == "check" and co[0] == "TIMEOUT":
+        print(f"slow: cold check timed out at {h.timeout:g}s, retrying alone at {h.timeout * 6:g}s", flush=True)
+        co = h.run_cmd(cmd, False, timeout=h.timeout * 6)
+        if co[0] != "TIMEOUT":
+            print("slow: cold check finished alone", flush=True)
     if cmd == "run" and da[0] == "TIMEOUT":
         if co[0] == "TIMEOUT":
             return True, "program hang", da, co

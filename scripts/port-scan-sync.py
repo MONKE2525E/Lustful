@@ -395,6 +395,8 @@ def run_probes(paths, lust, tmp, env, jobs):
             retry["secs"] = round(r.get("secs", 0) + retry["secs"], 2)
             retry["retried"] = True
             results[i] = retry
+            if retry["verdict"] != "timeout":
+                print(f"slow: {retry['file']} timed out under load, judged alone: {retry['verdict']}")
     return sorted(results, key=lambda r: r["file"])
 
 

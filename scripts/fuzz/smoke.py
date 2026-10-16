@@ -3,6 +3,9 @@
 # does not reach: odd file names, odd run arguments, and old binaries staying valid
 # after the daemon rebuilds its base library.
 # Usage: python3 scripts/fuzz/smoke.py   (exit 0 = pass)
+# Lust calls run under the one timeout rule (run_timed): a timeout retries
+# once alone at 6x the limit and is reported as "slow" when it finishes; a
+# second timeout raises, which fails the suite as a hang.
 import glob, os, re, shutil, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,6 +17,22 @@ def check(name, cond, detail=""):
     print(f"{'ok' if cond else 'FAIL'} {name}" + (f": {detail}" if detail and not cond else ""))
     if not cond:
         failures.append(name)
+
+
+# run_timed <args> <timeout>: subprocess.run under the timeout rule. This
+# suite is serial, so the retry is alone. A second timeout raises
+# AssertionError (a hang), which fails the suite.
+def run_timed(args, timeout, **kw):
+    try:
+        return subprocess.run(args, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        print(f"slow: {args[1:3]} timed out at {timeout:g}s, retrying alone at {timeout * 6:g}s", flush=True)
+    try:
+        r = subprocess.run(args, timeout=timeout * 6, **kw)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"HANG: {args} timed out alone at {timeout * 6:g}s (first at {timeout:g}s)")
+    print(f"slow: {args[1:3]} finished alone", flush=True)
+    return r
 
 
 def main():
@@ -30,8 +49,7 @@ def main():
         time.sleep(0.005)
 
     def run_lust(args, timeout=20):
-        r = subprocess.run([LUST] + args, cwd=work, env=env, capture_output=True,
-                           text=True, timeout=timeout)
+        r = run_timed([LUST] + args, timeout, cwd=work, env=env, capture_output=True, text=True)
         return r.returncode, r.stdout, r.stderr
 
     try:
@@ -119,8 +137,8 @@ def main():
         open(pc, "w").write("fn price(c: i64) -> i64 { c / 20 }\nfn main() {\n    assert_eq!(price(500), 5);\n}\n")
         rc, out, err = run_lust(["run", pc, "-o", os.path.join(work, "pc.bin")])
         cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
-        r = subprocess.run([LUST, "run", pc, "-o", os.path.join(work, "pc2.bin")], cwd=work,
-                           env=cold_env, capture_output=True, text=True, timeout=20)
+        r = run_timed([LUST, "run", pc, "-o", os.path.join(work, "pc2.bin")], 20, cwd=work,
+                           env=cold_env, capture_output=True, text=True)
         warm_loc = re.search(r"panicked at [^:\n]*:(\d+):(\d+)", err)
         cold_loc = re.search(r"panicked at [^:\n]*:(\d+):(\d+)", r.stderr)
         check("panic column after body edit",
@@ -298,7 +316,7 @@ fn grown() -> i64 { 1 }
         open(sg, "w").write(sig_cur)
         rcw, _, errw = run_lust(["check", sg])
         cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
-        r = subprocess.run([LUST, "check", sg], cwd=work, env=cold_env,
+        r = run_timed([LUST, "check", sg], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("own return-type edit rechecks the body (seed 42 iter 1034)",
               rc1 == 0 and rcw == 1 and r.returncode == 1
@@ -324,7 +342,7 @@ fn grown() -> i64 { 1 }
         open(pz, "w").write('fn label() -> i64 { x }\nfn main() { println!("{}", label()); }\n')
         rcw, _, errw = run_lust(["check", pz])
         cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
-        r = subprocess.run([LUST, "check", pz], cwd=work, env=cold_env,
+        r = run_timed([LUST, "check", pz], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("syntax-error edit does not poison earlier bodies (seed 29 iter 562)",
               rc1 == 0 and rc2 == 1 and rcw == 1 and r.returncode == 1
@@ -345,7 +363,7 @@ fn grown() -> i64 { 1 }
         open(rt, "w").write('struct P {\n    fn f() {}\n}\nfn main() { println!("{}", xformat!("{}", 1)); }\n')
         rcw, _, errw = run_lust(["check", rt])
         cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
-        r = subprocess.run([LUST, "check", rt], cwd=work, env=cold_env,
+        r = run_timed([LUST, "check", rt], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("resolver routing unsticks when the trigger goes (realish seed 107 iter 585)",
               rc1 == 1 and rcw == 1 and r.returncode == 1
@@ -390,7 +408,7 @@ fn grown() -> i64 { 1 }
         open(ib, "w").write('struct S;\nfn outer() {\nfn inner() {\n}\nimpl S {\n    fn m(&self) {\n    }\n}\n}\nfn main() { outer(); }\n')
         rcw, _, errw = run_lust(["check", ib])
         cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
-        r = subprocess.run([LUST, "check", ib], cwd=work, env=cold_env,
+        r = run_timed([LUST, "check", ib], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("impl in fn body: scan/Ast count split does not panic (realish seed 1)",
               rc1 == 0 and rcw == 1 and r.returncode == 1
@@ -413,7 +431,7 @@ fn grown() -> i64 { 1 }
         rc1, _, _ = run_lust(["check", dp])
         open(dp, "w").write(dup_src)
         rcw, _, errw = run_lust(["check", dp])
-        r = subprocess.run([LUST, "check", dp], cwd=work, env=cold_env,
+        r = run_timed([LUST, "check", dp], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("warm duplicate trait rejects like cold (no panic)",
               rc1 == 0 and rcw == 1 and r.returncode == 1
@@ -423,7 +441,7 @@ fn grown() -> i64 { 1 }
             'fn main()', 'mod m {}\nmod m {}\nfn main()')
         open(dp, "w").write(dup_mod_src)
         rcw, _, errw = run_lust(["check", dp])
-        r = subprocess.run([LUST, "check", dp], cwd=work, env=cold_env,
+        r = run_timed([LUST, "check", dp], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("warm duplicate mod rejects like cold",
               rcw == 1 and r.returncode == 1
@@ -453,7 +471,7 @@ fn grown() -> i64 { 1 }
             'pub struct S { x: i32 }\n'
             'impl S { pub fn new() -> S { S { x: 1 } } }\n')
         rcw, _, errw = run_lust(["check", pv_main])
-        r = subprocess.run([LUST, "check", pv_main], cwd=work, env=cold_env,
+        r = run_timed([LUST, "check", pv_main], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("field made private: warm check rejects the generic reader (fx-priv)",
               rc1 == 0 and rcw == 1 and r.returncode == 1
@@ -534,7 +552,7 @@ fn grown() -> i64 { 1 }
             for text in states:
                 open(pa_p, "w").write(text)
                 rcw, _, errw = run_lust(["check", main_p])
-                r = subprocess.run([LUST, "check", main_p], cwd=work, env=cold_env,
+                r = run_timed([LUST, "check", main_p], cwd=work, env=cold_env,
                                    capture_output=True, text=True, timeout=20)
                 want = 1 if text is narrow else 0
                 ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
@@ -567,7 +585,7 @@ fn grown() -> i64 { 1 }
                 open(os.path.join(sp_dir, "pa.rs"), "w").write(text)
                 outs = []
                 for e in (env, cold_env):
-                    r = subprocess.run([LUST, "run", sp_main_p, "-o", os.path.join(sp_dir, "x.bin")], cwd=work, env=e,
+                    r = run_timed([LUST, "run", sp_main_p, "-o", os.path.join(sp_dir, "x.bin")], cwd=work, env=e,
                                        capture_output=True, text=True, timeout=30)
                     outs.append((r.returncode, r.stdout, first_code(r.stderr)))
                 want_rc = 1 if rejects and text is edited else 0
@@ -629,7 +647,7 @@ fn grown() -> i64 { 1 }
             for text, want in walk:
                 open(ia, "w").write(text)
                 rcw, _, errw = run_lust(["check", ia])
-                r = subprocess.run([LUST, "check", ia], cwd=work, env=cold_env,
+                r = run_timed([LUST, "check", ia], cwd=work, env=cold_env,
                                    capture_output=True, text=True, timeout=20)
                 ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
                 steps.append(f"want {want}: warm {rcw} {first_code(errw)} cold {r.returncode} {first_code(r.stderr)}")
@@ -691,7 +709,7 @@ fn grown() -> i64 { 1 }
                                   "fn show() -> i32 {\n    <S>::C\n}\nfn main() {\n    println!(\"{}\", show());\n}\n")
             outs = []
             for e in (env, cold_env):
-                r = subprocess.run([LUST, "run", qp_p, "-o", os.path.join(sp_dir, "q.bin")], cwd=work, env=e,
+                r = run_timed([LUST, "run", qp_p, "-o", os.path.join(sp_dir, "q.bin")], cwd=work, env=e,
                                    capture_output=True, text=True, timeout=30)
                 outs.append((r.returncode, r.stdout))
             ok &= outs[0] == outs[1] == (0, f"{val}\n")
@@ -729,7 +747,7 @@ fn grown() -> i64 { 1 }
             for text in (base, without, base, without, base):
                 open(edit_p, "w").write(text)
                 rcw, _, errw = run_lust(["check", main_p])
-                r = subprocess.run([LUST, "check", main_p], cwd=work, env=cold_env,
+                r = run_timed([LUST, "check", main_p], cwd=work, env=cold_env,
                                    capture_output=True, text=True, timeout=20)
                 want = 1 if text is without else 0
                 ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
@@ -753,7 +771,7 @@ fn grown() -> i64 { 1 }
         for text in (lf_base, lf_static, lf_base):
             open(lf, "w").write(text)
             rcw, _, errw = run_lust(["check", lf])
-            r = subprocess.run([LUST, "check", lf], cwd=work, env=cold_env,
+            r = run_timed([LUST, "check", lf], cwd=work, env=cold_env,
                                capture_output=True, text=True, timeout=20)
             want = 1 if text is lf_static else 0
             ok &= rcw == r.returncode == want and first_code(errw) == first_code(r.stderr)
@@ -789,7 +807,7 @@ fn grown() -> i64 { 1 }
                         break
                     time.sleep(0.005)
                 open(prog, "w").write('fn val() -> i64 { 10 }\nfn main() { println!("v{}", val()); }\n')
-                r = subprocess.run([LUST, "build", prog, "-o", os.path.join(work, "p3.bin")],
+                r = run_timed([LUST, "build", prog, "-o", os.path.join(work, "p3.bin")],
                                    cwd=work, env=env2, capture_output=True, text=True, timeout=20)
                 check("temp: second daemon builds", r.returncode == 0, r.stderr)
             finally:

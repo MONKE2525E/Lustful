@@ -185,8 +185,13 @@ try:
             return {"file": path.name, "feature": "slow.retry", "form": "", "verdict": verdict, "detail": "x"}
 
         pss.probe_one = flaky
-        got = pss.run_probes([src], Path("/bin/lust"), tmp / "pool", {}, jobs=4)
+        import contextlib, io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = pss.run_probes([src], Path("/bin/lust"), tmp / "pool", {}, jobs=4)
         check("timed-out probe is retried once and can pass", got[0]["verdict"] == "pass" and len(calls) == 2, str(got))
+        check("a judged retry is reported as slow", "slow: retry.rs timed out under load, judged alone: pass" in buf.getvalue(), buf.getvalue())
         check(
             "retry uses the long timeouts",
             calls == [pss.COMPILE_TIMEOUT, pss.RETRY_COMPILE_TIMEOUT] and pss.RETRY_COMPILE_TIMEOUT >= 180,

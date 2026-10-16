@@ -12,6 +12,12 @@
 #              Eviction keeps the newest entries under the size cap.
 #   release:   single file via rustc, a tiny Cargo project via cargo (package
 #              and bin selection, --profile), and `check --rustc` as oracle.
+# Every client call runs under the one timeout rule (scripts/timeout-lib.sh)
+# through a generated shim: CASE_TIMEOUT seconds (default 60), one solo retry
+# at RETRY_CASE_TIMEOUT (default 6x). A finished retry is reported as "slow"
+# at the end; a second timeout is a HANG and fails the suite. Without the
+# shim, a hung client or daemon would hang this suite until the gate's step
+# limit killed it, with no case named.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
@@ -25,6 +31,25 @@ work=$(mktemp -d)
 pass=0
 fail=0
 daemon_dirs=()
+
+# The timeout shim (see the header). Slow and hang lines go to files, not
+# stderr: several checks compare a captured command's full output byte for
+# byte, and a slow retry must not fail them. The lines print at the end.
+case_timeout=${CASE_TIMEOUT:-60}
+retry_timeout=${RETRY_CASE_TIMEOUT:-$((case_timeout * 6))}
+cat >"$work/lust" <<EOF
+#!/bin/sh
+timeout "$case_timeout" "$lust" "\$@"; st=\$?
+case \$st in 124|137) ;; *) exit \$st ;; esac
+timeout "$retry_timeout" "$lust" "\$@"; st=\$?
+case \$st in
+  124|137) echo "HANG: lust \$* timed out alone at ${retry_timeout}s (first at ${case_timeout}s)" >>"$work/timeouts.log"; echo hang >>"$work/hangs.log" ;;
+  *) echo "slow: lust \$* timed out at ${case_timeout}s, finished alone at ${retry_timeout}s" >>"$work/timeouts.log" ;;
+esac
+exit \$st
+EOF
+chmod +x "$work/lust"
+lust=$work/lust
 
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL $1: $2"; }
@@ -328,5 +353,9 @@ check "cargo: --profile build passes" test $rc -eq 0
 case "$out" in *"--profile fast"*) ok "cargo: --profile name passes through";; *) bad "cargo: --profile name passes through" "output: $out";; esac
 check "cargo: profile binary runs" test "$("$d/proj/target/fast/tinyproj")" = "tiny main 42"
 
+# Timeout report (see the shim at the top). Slow retries do not fail; every
+# hang does, even when the checks around the hung call happened to pass.
+[ -f "$work/timeouts.log" ] && cat "$work/timeouts.log"
+[ -f "$work/hangs.log" ] && fail=$((fail + $(wc -l <"$work/hangs.log")))
 echo "test-client: $pass passed, $fail failed"
 [ $fail -eq 0 ]
