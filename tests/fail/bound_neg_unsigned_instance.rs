@@ -1,4 +1,4 @@
-// expect: L0610
+// expect: L0612
 // rustc E0277: `u8` has no `Neg` impl, so the bound does not hold.
 use std::ops::Neg;
 

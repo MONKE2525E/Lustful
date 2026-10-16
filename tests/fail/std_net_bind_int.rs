@@ -1,4 +1,4 @@
-// expect: L0610
+// expect: L0612
 // An integer is not a socket address.
 use std::net::TcpListener;
 fn main() {

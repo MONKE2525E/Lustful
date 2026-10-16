@@ -2503,6 +2503,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
     out.tys = tys;
     out.queue_work = obl.work();
     let mut errs = errs;
+    drop_followon_infer(&mut errs);
     // A `const fn` body must also pass the const-context rules: the
     // const evaluator only sees the calls made from const items, so a
     // body that is never const-evaluated needs its own check. Std
@@ -2514,6 +2515,31 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         errs.extend(constfn::check_const_fn(p, &out, f, prior_errs));
     }
     (out, errs)
+}
+
+/// Drops each inference failure (L0610 "type annotations needed", L0111
+/// "cannot infer the type of") that follows another error of the body,
+/// as rustc does (`tainted_by_errors`: no E0282/E0283/E0284 once the body
+/// has an error). Such a failure is most often a follow-on of that error
+/// (a missing method leaves its result and closure params unknown).
+/// "Follows" is in check order or in source order: lust checks a call's
+/// arguments before it reports the call's own miss, where rustc checks
+/// them after it. A body with inference failures only keeps them all, so
+/// this never turns a reject into an accept.
+fn drop_followon_infer(errs: &mut Vec<Diag>) {
+    let is_infer = |d: &Diag| d.code == "L0610" || (d.code == "L0111" && d.message.starts_with("cannot infer the type of"));
+    let Some(first) = errs.iter().position(|d| !is_infer(d)) else { return };
+    // The first other error's position in each file.
+    let mut min_lo: std::collections::HashMap<crate::diag::FileId, u32> = std::collections::HashMap::new();
+    for d in errs.iter().filter(|d| !is_infer(d)) {
+        let lo = min_lo.entry(d.span.file).or_insert(d.span.lo);
+        *lo = (*lo).min(d.span.lo);
+    }
+    let mut i = 0;
+    errs.retain(|d| {
+        i += 1;
+        !is_infer(d) || (i <= first && min_lo.get(&d.span.file).is_none_or(|&lo| d.span.lo < lo))
+    });
 }
 
 /// True if Rust can compare two string-like operands for equality. `ld` and `rd` are the
