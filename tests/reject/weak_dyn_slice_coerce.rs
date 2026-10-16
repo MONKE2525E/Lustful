@@ -1,5 +1,7 @@
-// expect: L0641
-// Valid Rust: a Weak of a slice is not built yet.
+// expect: L0110
+// Valid Rust: lust has `Weak<[u8]>` (from an `Rc<[u8]>`), but no unsizing
+// coercion from `Weak<[u8; 3]>` (a dangling `Weak::new()` would need a fat
+// dangling form).
 use std::rc::{Rc, Weak};
 fn main() {
     let s = Rc::new([1u8, 2, 3]);
