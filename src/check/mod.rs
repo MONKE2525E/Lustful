@@ -2654,9 +2654,11 @@ struct KLint {
     stmt_allow_panic: u32,
 }
 
-/// True when an attribute is `#[allow(<name>)]` (possibly one of several).
+/// True when an attribute is `#[allow(<name>)]` or `#[expect(<name>)]`
+/// (possibly one of several): both silence the lint, and an expectation
+/// the code does not meet is only a warning in rustc.
 pub fn allow_attr(attr: &ast::Attr, interner: &Interner, name: &str) -> bool {
-    if attr.path.len() != 1 || interner.get(attr.path[0].name) != "allow" {
+    if attr.path.len() != 1 || !matches!(interner.get(attr.path[0].name), "allow" | "expect") {
         return false;
     }
     let ast::AttrInput::List(_, trees) = &attr.input else { return false };

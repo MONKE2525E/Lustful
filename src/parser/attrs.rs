@@ -51,7 +51,7 @@ pub(super) fn check_input(name: &str, attr: &Attr, interner: &Interner) -> PResu
             AttrInput::List(Delim::Paren, t) => deprecated_list(t, interner),
             other => eq_str(other),
         },
-        "allow" | "warn" | "deny" | "forbid" => return lint_list(name, attr, interner),
+        "allow" | "expect" | "warn" | "deny" | "forbid" => return lint_list(name, attr, interner),
         _ => true,
     };
     if ok { Ok(()) } else { Err(malformed(name, attr)) }

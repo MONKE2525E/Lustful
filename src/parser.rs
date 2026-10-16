@@ -1789,7 +1789,9 @@ impl<'a> Parser<'a> {
                 _ if item_level && (name_text == TLS_ATTR || name_text == TLS_CONST_ATTR) => {}
                 _ if name_text == "repr" => {}
                 // `attrs::check_input` judged the lint list (L0531 for deny and forbid).
-                _ if first == k.allow || first == k.warn || first == k.deny || name_text == "forbid" => {}
+                // `expect` silences its lints as `allow` does; an unmet
+                // expectation is only a warning in rustc.
+                _ if first == k.allow || first == k.warn || first == k.deny || name_text == "forbid" || name_text == "expect" => {}
                 // Advisory attributes are accepted and ignored, as
                 // ARCH 1.6 gives them: `inline` and `cold` are hints,
                 // `must_use` and `deprecated` are lints with no
