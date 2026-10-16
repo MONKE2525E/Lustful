@@ -733,6 +733,11 @@ impl<'b, 'p> Ck<'b, 'p> {
                 };
                 // A promoted temporary (`&[]`) is `'static`: no loan.
                 let loan_src = loan_src.filter(|(_, place)| !self.body.promoted.contains(&place.local));
+                // A reference to a slice pattern's subslice temporary (a
+                // `tail @ ..` binding) is no loan of the temporary: it is
+                // the subslice's own loan of the base place (regions.rs
+                // takes that loan's var for it).
+                let loan_src = loan_src.filter(|(_, place)| !(place.proj.is_empty() && self.body.pat_subslice.contains(&place.local)));
                 if let (StmtKind::Assign(dest, _), Some((m, place))) = (&s.kind, loan_src) {
                     self.loan_block.push(bi as u32);
                     self.loan_stmt.push(si as u32);

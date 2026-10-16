@@ -3267,6 +3267,22 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
     }
 
+    /// The loan of the `Subslice` statement that assigns the slice pattern
+    /// temporary `t` (`Body::pat_subslice`), or `u32::MAX`.
+    fn subslice_loan(&self, t: Local) -> u32 {
+        for (bi, b) in self.body.blocks.iter().enumerate() {
+            for (si, s) in b.stmts.iter().enumerate() {
+                if let StmtKind::Assign(dest, Rvalue::Subslice { .. }) = &s.kind
+                    && dest.local == t
+                    && dest.proj.is_empty()
+                {
+                    return self.loan_at[self.stmt_base[bi] + si];
+                }
+            }
+        }
+        u32::MAX
+    }
+
     /// Carries the capture vars (`cap_var`) of the opaque locals `srcs`
     /// moves or copies into `dest`: into the dest local's capture var,
     /// or into every slot of a dest that has none (a reference to an
@@ -3361,7 +3377,17 @@ impl<'b, 'p> Builder<'b, 'p> {
                 self.fn_item_to_ptr(*f, *ty, &dv);
             }
             Rvalue::Ref(_, place) | Rvalue::SliceOf(place) | Rvalue::Subslice { base: place, .. } => {
-                let li = self.loan_at[self.stmt_base[bi] + si];
+                let mut li = self.loan_at[self.stmt_base[bi] + si];
+                // A reference to a slice pattern's subslice temporary holds
+                // the subslice's loan of the base place (borrowck/mod.rs
+                // `collect_loans` makes no loan of the temporary).
+                if li == u32::MAX
+                    && matches!(rv, Rvalue::Ref(..))
+                    && place.proj.is_empty()
+                    && self.body.pat_subslice.contains(&place.local)
+                {
+                    li = self.subslice_loan(place.local);
+                }
                 if li == u32::MAX {
                     return;
                 }
