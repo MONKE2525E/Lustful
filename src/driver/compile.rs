@@ -3085,7 +3085,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // and the next edit (usually the fix) stays a body edit. So
             // does a body patch's: its items are the last full resolve's,
             // and only a body moved (a const fn body that fails const
-            // evaluation, say); the next request collects again.
+            // evaluation, say); the next request collects again. So does
+            // an item patch's: its slot update set the item state from
+            // the item rescan (sigedit PLAN R9), and the next request
+            // collects again.
             // The per-slot caches still match this request's slot update
             // (bodies it changed lost their passing mark there), so the
             // next slot update keeps them and walks every passing body
@@ -3102,7 +3105,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             front.walk_pending.dedup();
             front.const_fn_pending |= const_fn_changed;
             caches.gen_reuse.forget_failed_gate();
-            if caches.gen_reuse.template_errors != ds.len() && visits.path != "patch" {
+            if caches.gen_reuse.template_errors != ds.len() && !matches!(visits.path, "patch" | "item") {
                 front.env_hash = None;
                 front.walk_after_reject = true;
             }
