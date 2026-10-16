@@ -732,6 +732,12 @@ fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Op
     finish(l, repr).ok()
 }
 
+/// `l` behind an `UnsafeCell`: the same size and alignment, with no
+/// niche for an enclosing enum to use.
+fn no_niche(l: Layout) -> Layout {
+    Layout::simple(l.size, l.align, None)
+}
+
 /// Applies `repr(align(n))` and the final size round-up.
 fn finish(mut l: Layout, repr: Repr) -> Result<Layout, ()> {
     if let Some(a) = repr.align {
@@ -928,6 +934,30 @@ fn compute(
                 Ok(fat_ptr_layout())
             }
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => Ok(ptr_layout()),
+            // `Cell<T>` is `UnsafeCell<T>`: T's size and alignment, its
+            // niche hidden.
+            Some(BuiltinTy::Cell) => Ok(no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?)),
+            // `RefCell<T>`: `{ borrow: Cell<isize>, value: UnsafeCell<T> }`,
+            // laid out as a Rust struct.
+            Some(BuiltinTy::RefCell) => {
+                let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
+                struct_layout(&[int_layout(IntTy::Isize), v], Repr::default())
+            }
+            // `rc::Weak<T>`: a `NonNull` to the allocation (fat for an
+            // unsized `T`), as `Rc<T>`.
+            Some(BuiltinTy::Weak) => match tys.adt_first_ty_arg(t).map(|e| tys.kind(e)) {
+                Some(TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) => Ok(fat_ptr_layout()),
+                Some(_) => Ok(ptr_layout()),
+                None => Err(()),
+            },
+            // The futex locks (Linux): `Mutex<T>` is `{ futex: AtomicU32,
+            // poison: AtomicBool, data: UnsafeCell<T> }`, `RwLock<T>` the
+            // same with an 8-byte state (two `AtomicU32`).
+            Some(BuiltinTy::Sync(k @ (crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::RwLock))) => {
+                let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
+                let state = if k == crate::ty::sync::SyncTy::Mutex { 4 } else { 8 };
+                struct_layout(&[Layout::simple(state, 4, None), Layout::simple(1, 1, None), v], Repr::default())
+            }
             Some(_) => Err(()),
             // `core::num::NonZero<T>` (TRIAGE T5): the integer
             // itself, with zero as the niche.
