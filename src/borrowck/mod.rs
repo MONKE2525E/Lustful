@@ -15,6 +15,7 @@
 //    relations the signature does not give are L0733.
 mod regions;
 pub use regions::{FnBound, ImplHead, RPIT_PARAM, RegionSig, RegionTables, TraitLts, elision_regions, erase, impl_trait_method, regions_of};
+pub(crate) use regions::dyn_arg_tys;
 pub(crate) use regions::{adt_region_count, lub_items_fit, lub_shapes_fit, paired_slot_regions};
 
 use crate::check::collect::*;
@@ -399,15 +400,28 @@ fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
     regions::OwnSig::build(p, body, sig, closure, check)
 }
 
+/// True when a local of `body` mentions an `impl Trait` type that the
+/// region pass does not track: one lowering did not mark in
+/// `Body::opaque_locals` (held by value, a capture var per region the
+/// opaque captures), unless the view holds no region of it.
+fn untracked_opaque(p: &Program, body: &Body) -> bool {
+    body.locals.iter().enumerate().any(|(i, l)| {
+        mentions_opaque(&body.tys, l.ty)
+            && crate::check::opaque::view_hold(p, &body.tys, l.ty) != crate::check::opaque::Hold::None
+            && !body.opaque_locals.contains(&(i as Local))
+    })
+}
+
 /// What a closure body needs between its captured and free argument
 /// regions and `'static`, and what its output slots may hold (rustc's
 /// closure requirements; `regions::End`), for its creator. A `call_out`
 /// closure also gives what its output slots must outlive (`(Out(k),
 /// x)`), which only `flow_closure_output` proves; every other creator
 /// path skips those pairs, and `Builder::out_reqs_unproved` reports them. None when the
-/// body has lowering errors or an `impl Trait` value.
+/// body has lowering errors or an `impl Trait` value the region pass does not
+/// track (`untracked_opaque`).
 fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, regions::End)>> {
-    if !body.lower_errs.is_empty() || body.locals.iter().any(|l| mentions_opaque(&body.tys, l.ty)) {
+    if !body.lower_errs.is_empty() || untracked_opaque(p, body) {
         return None;
     }
     let mut ck = Ck::new(p, body);
@@ -487,12 +501,7 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     // bounds say `Copy` (regions.rs `cap_var`). A local that mentions
     // an opaque without that mark (lowering did not hold it by value)
     // keeps the reject: its borrows would not be seen.
-    if body
-        .locals
-        .iter()
-        .enumerate()
-        .any(|(i, l)| mentions_opaque(&body.tys, l.ty) && crate::check::opaque::view_hold(p, &body.tys, l.ty) != crate::check::opaque::Hold::None && !body.opaque_locals.contains(&(i as Local)))
-    {
+    if untracked_opaque(p, body) {
         return vec![Diag::new(
             "L0602",
             p.fn_def(body.fn_id).name_span,

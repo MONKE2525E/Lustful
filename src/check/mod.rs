@@ -4957,8 +4957,9 @@ impl<'p> Ctx<'p> {
     /// higher-ranked outer reference (the bound writes it), unless the
     /// callee's regioned bound (`fn_bounds`, `RegionSig::fn_bounds`)
     /// names that lifetime (`&'static Message`, `&'a T`: free, and
-    /// borrowck ties it); any other input with regions makes every
-    /// argument higher-ranked (no entry).
+    /// borrowck ties it), as is an input whose every region the bound
+    /// names; any other input with regions makes every argument
+    /// higher-ranked (no entry).
     fn note_closure_bounds(&mut self, preds: &[Predicate], subst_args: &[GenericArg], fn_bounds: &[crate::borrowck::FnBound]) {
         let p = self.p;
         for pred in preds {
@@ -4998,6 +4999,14 @@ impl<'p> Ctx<'p> {
             let named_ref = |i: usize| {
                 regioned.and_then(|ins| ins.get(i)).is_some_and(|&rt| matches!(p.tys.kind(rt), TyKind::Ref(Region::Static | Region::Param(_), _, _)))
             };
+            // Every region of the regioned input is one the bound names
+            // (`Box<dyn FnOnce() + Send + 'a>`, the callee's `'a`): free,
+            // and borrowck ties each slot to it (`link_bound_closure`).
+            let named_only = |i: usize| {
+                let Some(&rt) = regioned.and_then(|ins| ins.get(i)) else { return false };
+                let mut rs = Vec::new();
+                bound_input_regions(p, rt, &mut rs).is_some() && !rs.is_empty() && rs.iter().all(|r| matches!(r, Region::Static | Region::Param(_)))
+            };
             let mut flags = Vec::new();
             let mut ok = true;
             for (i, &t) in p.tys.tys_of(ts).iter().enumerate() {
@@ -5005,6 +5014,7 @@ impl<'p> Ctx<'p> {
                     TyKind::Ref(_, _, inner) if opaque(inner) && named_ref(i) => flags.push(false),
                     TyKind::Ref(_, _, inner) if opaque(inner) => flags.push(true),
                     _ if opaque(t) => flags.push(false),
+                    _ if named_only(i) => flags.push(false),
                     _ => ok = false,
                 }
             }
@@ -24009,6 +24019,49 @@ impl<'p> SolveCx for Ctx<'p> {
 /// position of its own (a reference, an Adt with lifetime params, a
 /// borrowing builtin, `dyn`, a closure or fn pointer), not counting type
 /// params and projections.
+/// The regions of a regioned closure bound input `t` (`Box<dyn FnOnce() +
+/// Send + 'a>`), a dyn's object lifetime included, for `named_only` in
+/// `note_closure_bounds`. None for a type whose regions are not all
+/// written slots here (fn pointers, closures, fn items, `impl Trait`).
+fn bound_input_regions(p: &Program, t: Ty, out: &mut Vec<Region>) -> Option<()> {
+    match p.tys.kind(t) {
+        TyKind::Ref(r, _, inner) => {
+            out.push(r);
+            bound_input_regions(p, inner, out)
+        }
+        TyKind::Dyn(_, r) => {
+            out.push(r);
+            for e in crate::borrowck::dyn_arg_tys(&p.tys, t) {
+                bound_input_regions(p, e, out)?;
+            }
+            Some(())
+        }
+        TyKind::Adt(_, args) => {
+            // A std type with hidden regions (`Chars`, slice iterators).
+            if p.tys.builtin_of(t).is_some_and(|b| matches!(b, BuiltinTy::Chars | BuiltinTy::Iter(_))) {
+                return None;
+            }
+            for g in p.tys.args(args).to_vec() {
+                match g {
+                    GenericArg::Lifetime(r) => out.push(r),
+                    GenericArg::Ty(e) => bound_input_regions(p, e, out)?,
+                    GenericArg::Const(_) => {}
+                }
+            }
+            Some(())
+        }
+        TyKind::Tuple(ts) => {
+            for e in p.tys.tys_of(ts).to_vec() {
+                bound_input_regions(p, e, out)?;
+            }
+            Some(())
+        }
+        TyKind::Array(e, _) | TyKind::Slice(e) => bound_input_regions(p, e, out),
+        TyKind::FnPtr(_) | TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::Opaque(..) => None,
+        _ => Some(()),
+    }
+}
+
 fn bound_type_has_regions(p: &Program, t: Ty) -> bool {
     use crate::ty::iter::IterKind;
     match p.tys.kind(t) {
