@@ -1607,18 +1607,23 @@ impl Ast {
         let cells: Vec<(std::sync::Mutex<&mut Ast>, Shift)> =
             chunks.iter_mut().zip(&shifts).skip(1).map(|(c, &s)| (std::sync::Mutex::new(c), s)).collect();
         crate::pool::par_map(&cells, |(c, s)| c.lock().unwrap().shift(*s));
+        // Room past the merged size: the daemon's body and item patches
+        // append nodes, and an exact fit copied every arena on the first
+        // patch after each full resolve (sigedit P1.2). Untouched
+        // capacity costs no memory.
+        let room = |n: u32| n as usize + n as usize / 16 + 1024;
         let mut out = Ast {
             inner_attrs: Vec::new(),
             items: Vec::with_capacity(chunks.iter().map(|c| c.items.len()).sum()),
-            stmt_items: Vec::with_capacity(sh.si as usize),
-            exprs: Vec::with_capacity(sh.e as usize),
-            expr_spans: Vec::with_capacity(sh.e as usize),
-            pats: Vec::with_capacity(sh.p as usize),
-            pat_spans: Vec::with_capacity(sh.p as usize),
-            tys: Vec::with_capacity(sh.t as usize),
-            ty_spans: Vec::with_capacity(sh.t as usize),
-            blocks: Vec::with_capacity(sh.b as usize),
-            strings: Vec::with_capacity(sh.s as usize),
+            stmt_items: Vec::with_capacity(room(sh.si)),
+            exprs: Vec::with_capacity(room(sh.e)),
+            expr_spans: Vec::with_capacity(room(sh.e)),
+            pats: Vec::with_capacity(room(sh.p)),
+            pat_spans: Vec::with_capacity(room(sh.p)),
+            tys: Vec::with_capacity(room(sh.t)),
+            ty_spans: Vec::with_capacity(room(sh.t)),
+            blocks: Vec::with_capacity(room(sh.b)),
+            strings: Vec::with_capacity(room(sh.s)),
             blobs: Vec::with_capacity(sh.bl as usize),
             shipped: Vec::new(),
             lang_methods: (0, 0),

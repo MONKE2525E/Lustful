@@ -97,8 +97,12 @@ pub(crate) struct PatchBase {
     /// when no user or dependency macro can take a builtin's name (no
     /// dependency crate, and no file `shadows_builtin`).
     expand: Option<(crate::resolve::cfg::CfgEnv, String)>,
-    /// `ResolvedTables::local_named_set`, built on the first patch.
+    /// `ResolvedTables::local_named_set`, for the patch's path rewrites.
     local_names: Option<FxMap<Sym, u8>>,
+    /// The thread that builds `local_names` right after the full resolve
+    /// (sigedit P1.2), so the first patch does not wait for it. It holds
+    /// a share of `tables`; `find_edits` joins it first.
+    local_names_job: Option<std::thread::JoinHandle<FxMap<Sym, u8>>>,
     std_ranges: Vec<(u32, u32, ShippedCrate)>,
     std_routes: Vec<&'static StdFnDef>,
     std_methods: (u32, u32),
@@ -281,6 +285,10 @@ impl PatchBase {
             user_macros,
             shadowed,
             expand,
+            local_names_job: {
+                let t = tables.clone();
+                crate::pool::thread("lust-patch-base").spawn(move || t.local_named_set()).ok()
+            },
             tables,
             local_names: None,
             std_ranges: std_out.0.to_vec(),
@@ -498,6 +506,12 @@ pub(super) fn try_patch(
 /// unchanged files read from disk because their stat was not trusted,
 /// or why some edit is not a provable body edit. Reads only.
 fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemTime) -> Result<(Vec<BodyEdit>, usize), &'static str> {
+    // The side thread's share of the tables ends with it.
+    if let Some(b) = front.patch.as_mut()
+        && let Some(job) = b.local_names_job.take()
+    {
+        b.local_names = job.join().ok();
+    }
     let base = front.patch.as_ref().ok_or("no base")?;
     if base.inputs != inputs {
         return Err("inputs");
