@@ -244,7 +244,8 @@ pub(super) fn in_template_env(cx: &mut Ctx, trait_def: DefId) -> bool {
 /// instantiate it, unify the receiver, check the args, and
 /// record the resolution. `prefix` are the already-known leading
 /// generic args (impl or trait args from selection); `explicit`
-/// are the method's own turbofish args.
+/// are the method's own turbofish args. `confirm_method_args` also
+/// gives the template's instantiated generic args.
 #[allow(clippy::too_many_arguments)]
 fn confirm_method(
     cx: &mut Ctx,
@@ -258,6 +259,22 @@ fn confirm_method(
     args: &[ExprId],
     name_span: Span,
 ) -> Option<Ty> {
+    confirm_method_args(cx, e, template, generics, prefix, explicit, probe, derefs, args, name_span).map(|(t, _)| t)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_method_args(
+    cx: &mut Ctx,
+    e: ExprId,
+    template: LocalDefId,
+    generics: &Generics,
+    prefix: &[GenericArg],
+    explicit: &[Option<GenericArg>],
+    probe: RcvProbe,
+    derefs: u8,
+    args: &[ExprId],
+    name_span: Span,
+) -> Option<(Ty, Vec<GenericArg>)> {
     let snap_vars = cx.snapshot_vars();
     let obl_len = cx.obl_len();
     let sites_len = cx.generic_sites.len();
@@ -279,7 +296,7 @@ fn confirm_method(
         let generics = generics.clone();
         cx.check_turbofish_min(&generics, offset, supplied, name_span);
     }
-    let (mut params, ret, _) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
+    let (mut params, ret, targs) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
     if !prefix.is_empty() {
         cx.obl.deepen_from(obl_len, 1);
     }
@@ -301,7 +318,36 @@ fn confirm_method(
         cx.expected_output_first(ret, Some(want), args);
     }
     cx.check_args(&params[1.min(params.len())..], args, name_span);
-    Some(cx.normalize_use(ret, name_span))
+    Some((cx.normalize_use(ret, name_span), targs))
+}
+
+/// rustc types a call to a trait impl's method with the trait item's
+/// signature, so the trait item's bounds hold at the call even when the
+/// impl method states looser ones (`trait fn take<T: Clone>`, `impl fn
+/// take<T>`: `A.take(NoClone)` is E0277). Pushes the trait item's
+/// predicates with the trait ref's args (`tr_args`, Self first) and the
+/// impl method's own args (`own`), matched by position over type and
+/// const params (an impl may differ in its lifetime params).
+pub(super) fn push_trait_item_bounds(cx: &mut Ctx, tmpl: &TraitMethodTemplate, tr_args: &[GenericArg], own: &[GenericArg], span: Span) {
+    let tr_args: Vec<GenericArg> = tr_args
+        .iter()
+        .map(|&g| match g {
+            GenericArg::Ty(t) => GenericArg::Ty(cx.deep(t)),
+            other => other,
+        })
+        .collect();
+    let mut own_tc = own.iter().copied().filter(|g| !matches!(g, GenericArg::Lifetime(_)));
+    let mut args: Vec<GenericArg> = Vec::with_capacity(tmpl.generics.params.len());
+    for (i, param) in tmpl.generics.params.iter().enumerate() {
+        args.push(match (tr_args.get(i), &param.kind) {
+            (Some(&g), _) => g,
+            (None, ParamKind::Lifetime) => GenericArg::Lifetime(Region::Erased),
+            (None, ParamKind::Type) => own_tc.next().filter(|g| matches!(g, GenericArg::Ty(_))).unwrap_or_else(|| GenericArg::Ty(cx.new_var(false))),
+            (None, ParamKind::Const(_)) => own_tc.next().filter(|g| matches!(g, GenericArg::Const(_))).unwrap_or_else(|| GenericArg::Const(cx.fresh_const_var())),
+        });
+    }
+    let preds = tmpl.generics.predicates.clone();
+    cx.push_predicates_with(&preds, &args, span, &[]);
 }
 
 /// The method-call turbofish args aligned to a template's combined
@@ -1033,7 +1079,7 @@ pub(super) fn trait_probe_for(
     match hits.len() {
         0 => Probe::Miss,
         1 => {
-            let (trait_def, _tmpl, local, prefix, zonked, probe, bridge) = hits.into_iter().next().unwrap();
+            let (trait_def, tmpl, local, prefix, zonked, probe, bridge) = hits.into_iter().next().unwrap();
             // `Drop::drop` may not be called by hand (rustc
             // E0040); the drop glue calls it, never a method
             // call. A user trait method also named `drop` is a
@@ -1066,6 +1112,7 @@ pub(super) fn trait_probe_for(
             let args_id = cx.tys.intern_args(&tr_args);
             let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
             let mut env_pick: Option<usize> = None;
+            let mut impl_method = false;
             let prefix: Vec<GenericArg> = if let Some((u, from_step)) = bridge {
                 // Bookkeep the `Into` obligation, then take the
                 // instantiation prefix from the `From` impl whose
@@ -1089,6 +1136,7 @@ pub(super) fn trait_probe_for(
                         // Impl methods take impl args; trait defaults
                         // take the trait ref args.
                         if p.gx.index.impls_of_trait(trait_def).iter().any(|_| true) && local_is_impl_method(p, local, name) {
+                            impl_method = true;
                             impl_args
                         } else {
                             let raw: Vec<GenericArg> = cx.tys.args(tr.args).to_vec();
@@ -1118,12 +1166,18 @@ pub(super) fn trait_probe_for(
                     }
                     cx.set_res(e, Res::Method { f: local, derefs: derefs + probe.extra_derefs, autoref: probe.autoref });
                     cx.check_args(&params[1..], args, name_span);
+                    if impl_method && let Some(t) = &tmpl {
+                        push_trait_item_bounds(cx, t, &tr_args, &[], name_span);
+                    }
                     cx.record_pick_probe(e, trait_def, derefs + probe.extra_derefs, probe, None);
                     return Probe::Hit(cx.normalize_here(ret));
                 }
             };
-            match confirm_method(cx, e, local, &generics, &prefix, explicit, probe, derefs, args, name_span) {
-                Some(ret) => {
+            match confirm_method_args(cx, e, local, &generics, &prefix, explicit, probe, derefs, args, name_span) {
+                Some((ret, targs)) => {
+                    if impl_method && let Some(t) = &tmpl {
+                        push_trait_item_bounds(cx, t, &tr_args, &targs[prefix.len().min(targs.len())..], name_span);
+                    }
                     cx.record_pick_probe(e, trait_def, derefs + probe.extra_derefs, probe, env_pick);
                     Probe::Hit(ret)
                 }
