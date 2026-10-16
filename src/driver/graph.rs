@@ -986,6 +986,48 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
         hash_def_pub(h, p, d);
         hash_regions_deep(h, p, t, &mut seen);
     }
+    hash_preds_regions(h, p, &rs.bounds, &mut seen);
+}
+
+/// Folds regioned predicates into `h` (`RegionSig::bounds`,
+/// `ImplRegions::preds`): a caller's borrow check replays the impls they
+/// select with these regions.
+fn hash_preds_regions(h: &mut FxHasher, p: &Program, preds: &[Predicate], seen: &mut DeepMemo) {
+    let args = |h: &mut FxHasher, a: crate::ty::ArgsId, seen: &mut DeepMemo| {
+        for g in p.tys.args(a) {
+            match *g {
+                GenericArg::Ty(t) => hash_regions_deep(h, p, t, seen),
+                GenericArg::Lifetime(r) => hash_region(h, r),
+                _ => 9u8.hash(h),
+            }
+        }
+    };
+    (preds.len() as u64).hash(h);
+    for pred in preds {
+        match *pred {
+            Predicate::Trait(b) => {
+                (0u8, b.count).hash(h);
+                hash_def_pub(h, p, b.value.def);
+                args(h, b.value.args, seen);
+            }
+            Predicate::AssocEq(b) => {
+                (1u8, b.count).hash(h);
+                hash_def_pub(h, p, b.value.assoc);
+                args(h, b.value.trait_args, seen);
+                hash_regions_deep(h, p, b.value.ty, seen);
+            }
+            Predicate::Outlives(a, b) => {
+                2u8.hash(h);
+                hash_region(h, a);
+                hash_region(h, b);
+            }
+            Predicate::TypeOutlives(t, r) => {
+                3u8.hash(h);
+                hash_regions_deep(h, p, t, seen);
+                hash_region(h, r);
+            }
+        }
+    }
 }
 
 /// The fingerprint of a `Binding` node's answer (section 8.1: the resolved
@@ -1125,6 +1167,16 @@ fn impl_content(p: &Program, def: DefId) -> u64 {
     hash_trait_ref(&mut h, p, &p.tys, &rec.trait_ref);
     // A header's regions for a trait with lifetime params (W-BORROW):
     // callers' borrow checks replay them.
+    // Any trait impl's regioned header and where-clauses (tf-borrow r9):
+    // a bound that selects the impl replays them.
+    if let Some(ir) = p.regions.impl_regions.get(&def) {
+        let mut seen = DeepMemo::default();
+        for &t in ir.header.iter().chain(ir.assoc.iter().map(|(_, t)| t)) {
+            hash_regions_deep(&mut h, p, t, &mut seen);
+        }
+        ir.facts.hash(&mut h);
+        hash_preds_regions(&mut h, p, &ir.preds, &mut seen);
+    }
     if let Some(head) = p.regions.impl_heads.get(&def) {
         let mut seen = DeepMemo::default();
         hash_regions_deep(&mut h, p, head.self_ty, &mut seen);

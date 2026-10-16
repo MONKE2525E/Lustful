@@ -4949,6 +4949,21 @@ pub fn collect_reuse(
                         let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                         generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &impl_scope, &imp.generics, &imp.where_clause, &[])
                     };
+                    if imp.trait_ref.is_some() {
+                        let preds = {
+                            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+                            generics::regioned_bound_preds(ast, interner, known, &cx, &mut p.tys, &impl_scope, &imp.generics, &imp.where_clause, &[]).1
+                        };
+                        let head = crate::borrowck::ImplRegions {
+                            header: impl_scope.header_regioned.clone(),
+                            facts: impl_scope.region_facts.clone(),
+                            preds,
+                            assoc: impl_scope.assoc_regioned.clone(),
+                        };
+                        if head.wanted(&p.tys) {
+                            p.regions.impl_regions.insert(impl_def, head);
+                        }
+                    }
                     required.extend(impl_scope.assoc_regioned.iter().map(|&(_, t)| t));
                     let item = crate::check::outlives::Item {
                         implied: impl_scope.header_regioned.clone(),
@@ -5653,6 +5668,7 @@ pub(crate) fn fn_record(
             let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
             rs.trait_bounds.extend(generics::trait_lts_of(ast, interner, known, &cx, &scope, g, w));
+            rs.bounds.extend(generics::regioned_bound_preds(ast, interner, known, &cx, &mut p.tys, &scope, g, w, &[]).1);
         }
         rs
     });

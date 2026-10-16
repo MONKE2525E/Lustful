@@ -6381,19 +6381,22 @@ fn region_sig(
     // `impl Trait` args (`f: impl Fn(&'a u8)`, `w: &mut impl Tr<'d>`)
     // bound their synthetic type params like declared ones.
     let mut bounded = param_bounds(ast, scope, &def.generics, &def.where_clause);
+    let mut apit: Vec<(Ty, &[TraitBound])> = Vec::new();
     let top = def.params.iter().zip(params.get(skip..).unwrap_or_default()).map(|(p, &t)| (p.ty, t));
     for (n, t) in top.chain(scope.apit.iter().copied()) {
         if let TyExpr::ImplTrait { bounds, .. } = ast.ty(n)
             && let TyKind::Param(j) = tys.kind(t)
         {
             bounded.push((j.0, bounds));
+            apit.push((t, bounds));
         }
     }
+    let bounds = regioned_bound_preds(ast, interner, known, cx, tys, scope, &def.generics, &def.where_clause, &apit).1;
     let fn_bounds = fn_bounds_in(ast, interner, known, tys, cx, scope, &bounded);
     let trait_bounds = trait_lts_in(interner, known, cx, scope, &bounded);
     let item_bounds = item_bounds_in(ast, interner, known, tys, cx, scope, &bounded);
     let header = scope.header_regioned.clone();
-    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds, item_bounds, opaque_caps, header })
+    Some(crate::borrowck::RegionSig { n_univ, params: rparams, ret: rret, facts, names, early, fn_bounds, trait_bounds, item_bounds, opaque_caps, header, bounds })
 }
 
 /// The lifetime args of one written trait ref, for a trait with lifetime
@@ -6467,9 +6470,35 @@ pub fn regioned_bound_tys(
     where_clause: &ast::WhereClause,
     extra: &[(Ty, &[TraitBound])],
 ) -> Vec<Ty> {
+    let (mut out, preds) = regioned_bound_preds(ast, interner, known, cx, tys, scope, generics, where_clause, extra);
+    for pred in preds {
+        if let Predicate::Trait(b) = pred {
+            crate::check::outlives::trait_ref_wf_tys(tys, b.value, &mut out);
+        }
+    }
+    out
+}
+
+/// The predicates the bounds of a generics list, a where clause, and
+/// `extra` bounds put on types, with regions kept (an elided one is
+/// `Region::Bound`), and the left-hand types of the where clause. Borrowck
+/// replays the impl a trait predicate selects (`RegionSig::bounds`,
+/// `ImplRegions::preds`). A bound that does not resolve is left out.
+#[allow(clippy::too_many_arguments)]
+pub fn regioned_bound_preds(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    generics: &ast::Generics,
+    where_clause: &ast::WhereClause,
+    extra: &[(Ty, &[TraitBound])],
+) -> (Vec<Ty>, Vec<Predicate>) {
     let bounded = generics.params.iter().any(|gp| matches!(gp, ast::GenericParam::Type { bounds, .. } if !bounds.is_empty()));
     if !bounded && where_clause.preds.is_empty() && extra.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut ks = scope.clone();
     ks.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
@@ -6481,12 +6510,12 @@ pub fn regioned_bound_tys(
             lhs_bounds.push((tys.intern(TyKind::Param(ParamId(j))), bounds));
         }
     }
-    let mut out = Vec::new();
+    let mut lhs_tys = Vec::new();
     for pred in &where_clause.preds {
         if let ast::WherePred::Type { ty, bounds, .. } = pred
             && let Ok(lhs) = resolve_scoped(ast, interner, known, cx, tys, *ty, &ks)
         {
-            out.push(lhs);
+            lhs_tys.push(lhs);
             lhs_bounds.push((lhs, bounds));
         }
     }
@@ -6496,12 +6525,7 @@ pub fn regioned_bound_tys(
             bound_predicates(ast, interner, known, cx, tys, &ks, lhs, b, &mut preds, &mut relaxed, &mut errs);
         }
     }
-    for pred in preds {
-        if let Predicate::Trait(b) = pred {
-            crate::check::outlives::trait_ref_wf_tys(tys, b.value, &mut out);
-        }
-    }
-    out
+    (lhs_tys, preds)
 }
 
 /// The types a fn may assume well-formed (`check::outlives`): its params
@@ -7043,6 +7067,23 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                         &tdef.where_clause,
                     ));
                     rs.trait_bounds.extend(trait_lts_of(&ast, &p.interner, &p.known, &cx, &mscope, &tdef.generics, &tdef.where_clause));
+                    // The trait's bounds and supertraits, and the implicit
+                    // `Self: Tr<P..>` of its methods, with regions.
+                    let self_param = p.tys.intern(TyKind::Param(ParamId(0)));
+                    let extra: Vec<(Ty, &[TraitBound])> = vec![(self_param, &tdef.bounds)];
+                    let (_, preds) =
+                        regioned_bound_preds(&ast, &p.interner, &p.known, &cx, &mut p.tys, &mscope, &tdef.generics, &tdef.where_clause, &extra);
+                    rs.bounds.extend(preds);
+                    let mut args = vec![GenericArg::Ty(self_param)];
+                    for gp in &tdef.generics.params {
+                        if let ast::GenericParam::Type { name, .. } = gp
+                            && let Some(j) = scope.param_of(*name)
+                        {
+                            args.push(GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(j)))));
+                        }
+                    }
+                    let args = p.tys.intern_args(&args);
+                    rs.bounds.push(Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS })));
                 }
                 p.regions.trait_methods.insert(method_def, rs);
             }

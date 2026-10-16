@@ -29,10 +29,12 @@ use super::bit_iter;
 use crate::check::collect::*;
 use crate::diag::{Diag, Span};
 use crate::intern::FxMap;
+type FxSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<crate::intern::FxHasher>>;
 use crate::ir::*;
 use crate::ty::*;
 
 mod fnptr;
+mod replay;
 mod store;
 pub(crate) use fnptr::{lub_items_fit, lub_shapes_fit, paired_slot_regions, ptr_free};
 
@@ -132,6 +134,10 @@ pub struct RegionSig {
     /// regioned: their outlives requirements are implied bounds of the
     /// method too (`check::outlives`).
     pub header: Vec<Ty>,
+    /// The trait and assoc-eq bounds of the fn, its impl, and its trait
+    /// (a trait method also has its implicit `Self: Tr<P..>`), regions
+    /// kept. A call replays the impl each one selects (`replay_bounds`).
+    pub bounds: Vec<Predicate>,
 }
 
 /// A bound `T: Tr<'a, ..>` on type param `param` for a trait with lifetime
@@ -158,6 +164,22 @@ pub struct ImplHead {
     /// params (`impl<'a, T: Tr<'a>> Tr<'a> for Wrap<T>`), replayed
     /// through the parts of Self they name (`trait_lts_for`).
     pub where_lts: Vec<TraitLts>,
+}
+
+/// One trait impl's header and where-clauses with regions kept, for any
+/// trait: a bound that selects the impl gives the bound's types the
+/// header's regions (`impl Tk<&'static u32> for S`; `impl<'x> Tk<&'x u32,
+/// &'x u32> for S` ties two). Collect keeps the impls `wanted` says.
+#[derive(Clone, Debug)]
+pub struct ImplRegions {
+    /// Self, then the trait's type args.
+    pub header: Vec<Ty>,
+    /// `'a: 'b` between the impl's lifetimes (`b == STATIC_FACT`: `'static`).
+    pub facts: Vec<(u32, u32)>,
+    /// The impl's trait, assoc-eq and outlives where-clauses.
+    pub preds: Vec<Predicate>,
+    /// The impl's associated type values, by name.
+    pub assoc: Vec<(crate::intern::Sym, Ty)>,
 }
 
 /// A `F: Fn*(A..) -> R` bound on a type param, with regions: a lifetime
@@ -199,6 +221,8 @@ pub struct RegionTables {
     pub adt_fields: FxMap<DefId, Vec<Vec<Ty>>>,
     /// The headers of impls of traits with lifetime params, by impl def.
     pub impl_heads: FxMap<DefId, ImplHead>,
+    /// Trait impls whose header or where-clauses may tie regions, by impl def.
+    pub impl_regions: FxMap<DefId, ImplRegions>,
     /// Declared outlives facts between an Adt's lifetime params
     /// (`struct H<'a, 'b: 'a>`), by def: `(x, y)` is `'x: 'y` by param
     /// index, `y == STATIC_FACT` is `'static`. Every use of the type must
@@ -218,6 +242,9 @@ pub struct RegionTables {
     /// Per trait, its impls with `X: 'static` where-clauses (the impl and
     /// those params), built on first use (`Builder::impl_static_edges`).
     static_impls: std::sync::OnceLock<FxMap<DefId, Vec<(crate::traits::index::ImplId, Vec<u32>)>>>,
+    /// The traits whose impl selection may tie regions, built on first
+    /// use (`replay_traits`).
+    replay_traits: std::sync::OnceLock<FxSet<DefId>>,
 }
 
 /// Per user Adt template: variance and drop mode of each generic param, by
@@ -3759,6 +3786,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                         }
                     }
                     let args: Vec<u32> = if fits { dv[usize::from(refs.1) + 1..].to_vec() } else { Vec::new() };
+                    if obj.is_some() {
+                        self.replay_dyn(*src, &data, *dyn_ty, &args);
+                    }
                     if !fits && n_obj > 1 {
                         self.dyn_args_cut();
                     } else {
@@ -7390,6 +7420,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.item_bound_exact = ok && self.item_bound_flows(preds, &binds);
         if ok {
             self.item_bound_equate(sig, &binds, &univ);
+            self.replay_bounds(sig, &univ, &binds);
         }
         // `T: Tr<'a>` for a trait with lifetime params: the type bound to
         // `T` implements `Tr` with exactly those lifetimes (trait args are
