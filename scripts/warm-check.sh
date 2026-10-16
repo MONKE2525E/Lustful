@@ -10,7 +10,7 @@
 # and state dependence in collect, mono, and codegen (fx-scanfa round 2: a warm build said
 # "`take` (Template) has no generated body" because a pending discovery was stored for replay).
 # Run after scripts/build.sh. Env: STRIDE=n checks every n-th case (default 1), CASES=<glob>.
-# Exit 0 = all same, 1 = a difference, 2 = setup error.
+# Exit 0 = all same, 1 = a difference or a case whose cold build fails, 2 = setup error.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
@@ -20,15 +20,18 @@ stride=${STRIDE:-1}
 work=$(mktemp -d "${TMPDIR:-/tmp}/warm-check.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 unset LUST_DAEMON_SOCKET LUST_CACHE_DIR
-export LUST_NO_CACHE=1 lust work
+extras=$(cd "$root/tests/pass" && ls | grep -v '\.rs$' | tr '\n' ' ')
+export LUST_NO_CACHE=1 lust work root extras
 
-# one <case>: prints "ok <name>", "skip <name>" (cold build failed: difftest's job), or
+# one <case>: prints "ok <name>", "skip <name>" (cold build failed), or
 # "bad <name>: <why>".
 one() {
   local f=$1 name d out
   name=$(basename "$f" .rs)
   d=$work/$name
   mkdir -p "$d" && cp "$f" "$d/main.rs" || { echo "bad $name: setup"; return; }
+  # The files a case includes (`include_bytes!`, `#[path]` modules) sit next to it.
+  for x in $extras; do ln -s "$root/tests/pass/$x" "$d/$x"; done
   cd "$d" || return
   run() { ( timeout 20 "./$1" > "$1.out" 2>/dev/null ) 2>/dev/null; echo "exit=$?" >> "$1.out"; }
   if ! LUST_NO_DAEMON=1 timeout 120 "$lust" build main.rs -o cold > cold.err 2>&1; then
@@ -59,6 +62,7 @@ printf '%s\n' $cases | xargs -P "$jobs" -I{} bash -c 'one {}' > "$work/results.t
 ok=$(grep -c '^ok ' "$work/results.txt")
 skip=$(grep -c '^skip ' "$work/results.txt")
 bad=$(grep -c '^bad ' "$work/results.txt")
-grep '^bad ' "$work/results.txt" | sort
+grep -E '^(bad|skip) ' "$work/results.txt" | sort
 echo "warm-check: $ok same, $bad different, $skip skipped (cold build failed)"
-[ "$bad" -eq 0 ]
+# A tests/pass case must build: a skip fails too.
+[ "$bad" -eq 0 ] && [ "$skip" -eq 0 ]
