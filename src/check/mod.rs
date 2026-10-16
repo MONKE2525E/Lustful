@@ -8904,7 +8904,14 @@ impl<'p> Ctx<'p> {
                 // An unsuffixed literal takes its type from the cast
                 // target: `300 as u8` is a u8 literal out of range,
                 // and `3000000000 as u64` needs no i32 fit first.
-                let exp = if crate::ty::consteval::is_unsuffixed_lit(&p.ast, *expr) { Some(target) } else { None };
+                // A closure cast to a fn pointer (`(|a| a + 1) as fn(u8) ->
+                // u8`) takes the pointer's signature, as rustc deduces it from
+                // the cast's expectation; capturing nothing, it becomes that
+                // pointer (`closure_expr`).
+                let closure_ptr = matches!(p.ast.expr(*expr), Expr::Closure { .. })
+                    && matches!(self.kind(target), TyKind::FnPtr(_))
+                    && !self.has_unbound_deep(target);
+                let exp = if crate::ty::consteval::is_unsuffixed_lit(&p.ast, *expr) || closure_ptr { Some(target) } else { None };
                 let t = self.expr(*expr, exp);
                 let coerce_cast = matches!(
                     (self.kind(t), self.kind(target)),
