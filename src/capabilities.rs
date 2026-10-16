@@ -542,6 +542,8 @@ const ALL_BUILTINS: &[Builtin] = &[
     // One row stands for the three owners (check/own.rs).
     Builtin::OwnFrom(crate::check::own::Owner::Rc),
     Builtin::OwnIntoString,
+    Builtin::OwnSliceAlloc(crate::check::own::Owner::Rc),
+    Builtin::OwnSlicePush,
     Builtin::BoxSliceIntoIter,
     Builtin::StringFromUtf8,
     Builtin::StrFromUtf8,
@@ -1314,6 +1316,8 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::BoxSliceIntoVec => (&["Box<[T]>"], vec![i.intern("into_vec")], Call::Method),
         B::OwnFrom(_) => (&["Box<str>", "Rc<str>", "Rc<[T]>", "std::sync::Arc<str>", "std::sync::Arc<[T]>"], vec![k.from], Call::Associated),
         B::OwnIntoString => (&["Box<str>"], vec![i.intern("into_string")], Call::Method),
+        // Internal steps of `collect` into `Rc<[T]>`/`Arc<[T]>`, never called by name.
+        B::OwnSliceAlloc(_) | B::OwnSlicePush => (&[], vec![], Call::Method),
         B::BoxSliceIntoIter => (&["Box<[T]>"], vec![i.intern("into_iter")], Call::Method),
         B::StringFromUtf8 => (&["String"], vec![i.intern("from_utf8")], Call::Associated),
         B::StringFromUtf8Lossy => (&["String"], vec![i.intern("from_utf8_lossy")], Call::Associated),

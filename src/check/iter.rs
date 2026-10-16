@@ -2117,6 +2117,31 @@ impl<'p> Ctx<'p> {
             }
             return true;
         }
+        // alloc's `FromIterator<T>` for `Rc<[T]>` and `Arc<[T]>`
+        // (`ToRcSlice`, lowering mirrors it). `Rc<str>` and `Arc<str>`
+        // have no impl (rustc E0277).
+        if let Some((k, e)) = crate::check::own::own_parts(&self.tys, dt).filter(|&(k, _)| k != crate::check::own::Owner::Box) {
+            let e = self.resolve(e);
+            if let TyKind::Slice(el) = self.kind(e) {
+                if !self.unify(el, item) {
+                    self.mismatch(span, el, item);
+                    return false;
+                }
+                return true;
+            }
+            if self.kind(e) == TyKind::Str {
+                let n = if k == crate::check::own::Owner::Rc { "Rc<str>" } else { "Arc<str>" };
+                let it_t = self.deep(item);
+                let tn = self.tn(it_t);
+                self.err("L0612", span, format!("a value of type `{n}` cannot be built from an iterator over `{tn}`"), "Collect into a `String`, then convert it with `.into()`.");
+                return false;
+            }
+        }
+        // alloc's `FromIterator` for `Box<str>`: a `String` collect,
+        // then `into_boxed_str` (lowering mirrors it).
+        if crate::check::own::own_parts(&self.tys, dt).is_some_and(|(k, e)| k == crate::check::own::Owner::Box && self.kind(e) == TyKind::Str) {
+            return self.string_items_ok(item, span, "Box<str>");
+        }
         if let Some(el) = self.tys.vec_elem(t) {
             if !self.unify(el, item) {
                 let want = self.tys.mk_vec(item);
@@ -2137,15 +2162,7 @@ impl<'p> Ctx<'p> {
             return true;
         }
         if self.tys.is_string_ty(t) {
-            let it_t = self.deep(item);
-            let ok = it_t == CHAR
-                || it_t == STRING
-                || matches!(self.kind(it_t), TyKind::Ref(_, Mut::Shared, x) if self.resolve(x) == CHAR || self.resolve(x) == STR);
-            if !ok {
-                let tn = self.tn(it_t);
-                self.err("L0612", span, format!("a `String` cannot be built from an iterator over `{tn}`"), "Collect into a `Vec` instead.");
-            }
-            return ok;
+            return self.string_items_ok(item, span, "String");
         }
         if let Some(ok) = self.hash_collect_target(t, item, span) {
             return ok;
@@ -2157,6 +2174,20 @@ impl<'p> Ctx<'p> {
             self.err("L0640", span, format!("`collect` into `{tn}` is not implemented yet"), "Collect into a `Vec` or a `String`.");
         }
         false
+    }
+
+    /// Whether `item` is one of the `String` collect items lust builds
+    /// (`char`, `&char`, `&str`, `String`), else L0612 naming `target`.
+    fn string_items_ok(&mut self, item: Ty, span: Span, target: &str) -> bool {
+        let it_t = self.deep(item);
+        let ok = it_t == CHAR
+            || it_t == STRING
+            || matches!(self.kind(it_t), TyKind::Ref(_, Mut::Shared, x) if self.resolve(x) == CHAR || self.resolve(x) == STR);
+        if !ok {
+            let tn = self.tn(it_t);
+            self.err("L0612", span, format!("a `{target}` cannot be built from an iterator over `{tn}`"), "Collect into a `Vec` instead.");
+        }
+        ok
     }
 
     /// Body end: a `sum` or `product` whose item or result type was open
@@ -2682,21 +2713,13 @@ impl<'p> Ctx<'p> {
                 _ => None,
             };
         }
-        match self.tys.builtin_of(t) {
-            Some(BuiltinTy::Boxed) => self.tys.boxed_elem(t).and_then(|e| self.unsized_from_iter(e)),
-            Some(BuiltinTy::Rc) => self.tys.rc_elem(t).and_then(|e| self.unsized_from_iter(e)),
-            _ if t == UNIT => Some(FromIterClass::Unsupported),
-            _ => None,
+        // `Box<str>`, `Rc<[T]>`, and `Arc<[T]>` collect (`Rc<str>` and
+        // `Arc<str>` too: the collect check rejects them as rustc does);
+        // a sized pointee has no impl (the ordinary flow's L0104).
+        if crate::check::own::own_parts(&self.tys, dt).is_some_and(|(_, e)| matches!(self.kind(self.resolve(e)), TyKind::Slice(_) | TyKind::Str)) {
+            return Some(FromIterClass::Collect);
         }
-    }
-
-    /// `Box<str>` and the Rc unsized forms have rustc `FromIterator`
-    /// impls lust does not build yet (`Box<[T]>` is the `Collect`
-    /// arm above); a sized element has none (the ordinary flow's
-    /// L0104).
-    fn unsized_from_iter(&self, e: Ty) -> Option<FromIterClass> {
-        let e = self.resolve(e);
-        matches!(self.kind(e), TyKind::Slice(_) | TyKind::Str).then_some(FromIterClass::Unsupported)
+        (t == UNIT).then_some(FromIterClass::Unsupported)
     }
 
     /// A range expression used as a value: one of the six

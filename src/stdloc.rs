@@ -56,6 +56,8 @@ pub const STD_FILES: &[&str] = &[
     "alloc/src/io/read.rs",
     "alloc/src/io/impls.rs",
     "core/src/io/borrowed_buf.rs",
+    "alloc/src/rc.rs",
+    "alloc/src/sync.rs",
 ];
 
 /// One marker: an index into `STD_FILES` with std's line and column, a

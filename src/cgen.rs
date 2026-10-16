@@ -463,6 +463,11 @@ fn is128(i: IntTy) -> bool {
 /// core/src/slice/mod.rs, 15 core/src/ops/function.rs, 16 std/src/env.rs,
 /// and the std source markers' files after them: `stdloc::STD_FILES`),
 /// plus 0x40 for `pow`. Lowering names one with `Span::std_site`.
+/// `stdloc::STD_FILES` indexes of alloc's rc.rs and sync.rs (`collect`
+/// into `Rc<[T]>` and `Arc<[T]>` panics there).
+const STD_RC_RS: u64 = 30;
+const STD_SYNC_RS: u64 = 31;
+
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFF_FF00u64 + file) << 40) | (line << 20) | col)
 }
@@ -4325,7 +4330,7 @@ impl FnGen<'_, '_> {
             B::ExtendParam => unreachable!("extend on a type parameter exists only in template checks"),
             // `by_ref`: the `&mut Self` receiver is the result.
             B::IterByRef => vals[0].clone(),
-            B::OwnFrom(_) | B::OwnIntoString => unreachable!("owning pointer builtins emit in cgen/own.rs"),
+            B::OwnFrom(_) | B::OwnIntoString | B::OwnSliceAlloc(_) | B::OwnSlicePush => unreachable!("owning pointer builtins emit in cgen/own.rs"),
             B::IntToLeBytes | B::IntToBeBytes | B::IntToNeBytes | B::IntFromLeBytes | B::IntFromBeBytes | B::IntFromNeBytes => {
                 unreachable!("byte conversions emit in cgen/bytes.rs")
             }

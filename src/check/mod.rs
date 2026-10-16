@@ -519,6 +519,14 @@ pub enum Builtin {
     OwnFrom(own::Owner),
     /// `String` from `Box<str>` (`From`, `into_string`): the buffer.
     OwnIntoString,
+    /// Lowering-only steps of `collect` into `Rc<[T]>` or `Arc<[T]>`
+    /// from a `TrustedLen` source (alloc's `from_iter_exact`):
+    /// `OwnSliceAlloc(&mut slot, n)` writes a new pointer with room for
+    /// `n` items and length 0 (std's layout panics, then one
+    /// allocation of std's `RcInner` size); `OwnSlicePush(&mut slot,
+    /// x)` writes the next item.
+    OwnSliceAlloc(own::Owner),
+    OwnSlicePush,
     /// The `core::mem` byte-move family and `core::cmp::max`/`min`
     /// free fns (ARCH 4.4). `MemTake` only survives to lowering,
     /// which fills the freed slot with a synthesized default and

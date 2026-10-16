@@ -284,6 +284,15 @@ impl FnGen<'_, '_> {
         use Builtin as B;
         match b {
             B::OwnFrom(k) => return Some(self.own_from(k, &vals[0], &tys[0])),
+            B::OwnSliceAlloc(k) => return Some(self.own_slice_alloc(k, vals, tys)),
+            B::OwnSlicePush => {
+                let CTy::Ref(r) = &tys[0] else { unreachable!("OwnSlicePush takes &mut Rc<[T]>") };
+                let CTy::Own(_, s) = &**r else { unreachable!("OwnSlicePush takes &mut Rc<[T]>") };
+                let CTy::Slice(e) = &**s else { unreachable!("OwnSlicePush takes &mut Rc<[T]>") };
+                let et = ctype(e);
+                let _ = writeln!(self.out, "    {{ {et} x_ = {}; ({p})->ptr[({p})->len++] = x_; }}", vals[1], p = vals[0]);
+                return Some("((lust_Unit){})".into());
+            }
             // `RefCell<dyn Tr>::borrow` and `borrow_mut`: the flag is the
             // cell's first word; the guard is the same fat value.
             B::RefCellBorrow | B::RefCellBorrowMut if tys.first() == Some(&CTy::DynCell) => {
@@ -495,6 +504,37 @@ impl FnGen<'_, '_> {
     /// value of `src`: `&str`, `String`, `Box<str>`, `&[T]` (cloned),
     /// `Vec<T>`, `Box<[T]>`, or `[T; N]` (moved). Moved sources give up
     /// their buffers. Returns the temporary that holds the fat value.
+    /// `OwnSliceAlloc`: alloc's `Rc::<[T]>::allocate_for_slice(n)` (and
+    /// Arc's): `Layout::array::<T>(n).unwrap()`, then the `RcInner`
+    /// layout (`capacity overflow` past `isize::MAX`), both panicking at
+    /// std's lines, then one allocation of that size (its OOM message
+    /// names it). The data sits after the two counts, as `own_from`.
+    fn own_slice_alloc(&mut self, k: Owner, vals: &[String], tys: &[CTy]) -> String {
+        let CTy::Ref(r) = &tys[0] else { unreachable!("OwnSliceAlloc takes &mut Rc<[T]>") };
+        let CTy::Own(_, s) = &**r else { unreachable!("OwnSliceAlloc takes &mut Rc<[T]>") };
+        let CTy::Slice(e) = &**s else { unreachable!("OwnSliceAlloc takes &mut Rc<[T]>") };
+        let et = ctype(e);
+        collect_types(s, &mut self.sig_types);
+        // (file, `Layout::array` unwrap line, `rc_inner_layout_for_value_layout` line)
+        let (file, unwrap_line, extend_line) = match k {
+            Owner::Arc => (super::STD_SYNC_RS, 2277, 416),
+            _ => (super::STD_RC_RS, 2326, 299),
+        };
+        let (bad_layout, overflow) = (super::std_loc(file, unwrap_line, 41), super::std_loc(file, extend_line, 29));
+        let _ = writeln!(
+            self.out,
+            "    {{ uint64_t n_ = {n}, s_ = sizeof({et}), a_ = _Alignof({et}), m_ = 0x7fffffffffffffffull;\n\
+             \x20     if (s_ && n_ > (m_ - (a_ - 1)) / s_) lust_panic_cstr(\"called `Result::unwrap()` on an `Err` value: LayoutError\", {bad_layout});\n\
+             \x20     uint64_t al_ = a_ > 8 ? a_ : 8, off_ = (16 + a_ - 1) & ~(a_ - 1);\n\
+             \x20     if (off_ + n_ * s_ > m_ - (al_ - 1)) lust_panic_cstr(\"capacity overflow\", {overflow});\n\
+             \x20     uint64_t *h_ = (uint64_t *)lust_alloc((off_ + n_ * s_ + al_ - 1) & ~(al_ - 1), 16); h_[0] = 1; h_[1] = 1;\n\
+             \x20     ({p})->ptr = ({et}*)(h_ + 2); ({p})->len = 0; }}",
+            n = vals[1],
+            p = vals[0],
+        );
+        "((lust_Unit){})".into()
+    }
+
     fn own_from(&mut self, k: Owner, v: &str, src: &CTy) -> String {
         // (element type, data pointer, length, whether elements move,
         // statement that frees the source's buffer)

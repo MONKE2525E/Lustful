@@ -6324,6 +6324,10 @@ impl Ex<'_, '_> {
         if let Some((c, err_ty, inner, is_result)) = try_parts {
             return self.collect_try(itp, ty, dest, dest_ty, c, err_ty, inner, is_result);
         }
+        // `Box<[T]>` is the `Vec` arm below.
+        if let Some((k, pointee)) = crate::check::own::own_parts(&self.body.tys, dest_ty).filter(|_| self.body.tys.boxed_slice_elem(dest_ty).is_none()) {
+            return self.collect_own(itp, ty, dest, dest_ty, k, pointee);
+        }
         let join = self.block();
         if self.body.tys.is_string_ty(dest_ty) {
             let s = self.local(STRING);
@@ -6545,6 +6549,56 @@ impl Ex<'_, '_> {
             (None, Some(_)) => self.call_builtin(Builtin::VecIntoBoxedSlice, vec![Operand::Move(Place::local(v))], dest),
             (None, None) => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(v)))),
         }
+        Ok(())
+    }
+
+    /// `collect` into `Box<str>`, `Rc<[T]>`, or `Arc<[T]>` (alloc's
+    /// impls). `Box<str>` is a `String` collect, then `into_boxed_str`.
+    /// The shared slices are `ToRcSlice`: a `TrustedLen` source fills
+    /// one allocation of its size hint's upper bound through `next`
+    /// (`from_iter_exact`; no upper bound panics before any pull), any
+    /// other source collects a `Vec` and converts it (`From<Vec<T>>`).
+    fn collect_own(&mut self, itp: Place, ty: Ty, dest: Place, dest_ty: Ty, k: crate::check::own::Owner, pointee: Ty) -> R {
+        let el = match self.body.tys.kind(pointee) {
+            TyKind::Slice(el) if k != crate::check::own::Owner::Box => el,
+            TyKind::Str if k == crate::check::own::Owner::Box => {
+                let s = self.local(STRING);
+                self.collect(itp, ty, Place::local(s), STRING)?;
+                self.call_builtin(Builtin::OwnFrom(k), vec![Operand::Move(Place::local(s))], dest);
+                return Ok(());
+            }
+            _ => return Err("iterator expansion: collect into an unsupported owning pointer".into()),
+        };
+        if !self.trusted_len(ty) {
+            let vt = self.body.tys.mk_vec(el);
+            let v = self.local(vt);
+            self.collect(itp, ty, Place::local(v), vt)?;
+            self.call_builtin(Builtin::OwnFrom(k), vec![Operand::Move(Place::local(v))], dest);
+            return Ok(());
+        }
+        let (_, hi) = self.hint(itp.clone(), ty)?;
+        let (some, none) = self.switch_opt(&Place::local(hi));
+        self.cur = none;
+        self.term(Terminator::Panic(vec![FmtPart::Lit("capacity overflow".into())]));
+        // rc.rs and sync.rs (`stdloc::STD_FILES` 30 and 31).
+        let (file, line) = if k == crate::check::own::Owner::Rc { (30, 3174) } else { (31, 4241) };
+        self.body.blocks[self.cur.0 as usize].term_span = crate::diag::Span::std_site(file, line, 13);
+        self.cur = some;
+        let r = self.local(dest_ty);
+        let rr = self.ref_to(true, Place::local(r), dest_ty);
+        let u = self.local(UNIT);
+        self.call_builtin(Builtin::OwnSliceAlloc(k), vec![Operand::Move(Place::local(rr)), Operand::Copy(Self::payload(&Place::local(hi)))], Place::local(u));
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let (_, done, x, _) = self.pull(&itp, ty)?;
+        let rr = self.ref_to(true, Place::local(r), dest_ty);
+        let ax = self.take(Place::local(x), el);
+        let u = self.local(UNIT);
+        self.call_builtin(Builtin::OwnSlicePush, vec![Operand::Move(Place::local(rr)), ax], Place::local(u));
+        self.goto(lp);
+        self.cur = done;
+        self.assign(dest, Rvalue::Use(Operand::Move(Place::local(r))));
         Ok(())
     }
 
