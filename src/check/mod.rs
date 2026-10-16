@@ -19284,7 +19284,20 @@ impl<'p> Ctx<'p> {
                 p.local_def(name_sym.hash)
             },
         )?;
+        // rustc checks a call through a trait impl against the trait
+        // item: its bounds hold even where the impl method states looser
+        // ones (check/method.rs push_trait_item_bounds).
+        let item_tmpl = record
+            .items
+            .contains(&p.def_id(local))
+            .then(|| p.gx.index.trait_record(record.trait_def).and_then(|r| r.methods.iter().find(|(_, n)| p.name(*n) == name).map(|(d, _)| *d)))
+            .flatten()
+            .and_then(|d| p.gx.trait_methods.get(&d).cloned());
         let Some(Some(tmpl)) = p.gx.fn_templates.get(local.0 as usize).cloned() else {
+            if let Some(t) = &item_tmpl {
+                let tr_args: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+                method::push_trait_item_bounds(self, t, &tr_args, &[], span);
+            }
             let info = p.fn_info(local);
             return Some((local, info.params.clone(), p.ret_view(local)));
         };
@@ -19305,7 +19318,11 @@ impl<'p> Ctx<'p> {
             impl_args
         };
         let explicit: Vec<Option<GenericArg>> = prefix.iter().map(|&g| Some(g)).collect();
-        let (mut params, ret, _) = self.instantiate_template(site, local, &tmpl.generics.clone(), &explicit, span);
+        let (mut params, ret, targs) = self.instantiate_template(site, local, &tmpl.generics.clone(), &explicit, span);
+        if let Some(t) = &item_tmpl {
+            let tr_args: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
+            method::push_trait_item_bounds(self, t, &tr_args, &targs[prefix.len().min(targs.len())..], span);
+        }
         self.normalize_params(&mut params, span);
         Some((local, params, ret))
     }
