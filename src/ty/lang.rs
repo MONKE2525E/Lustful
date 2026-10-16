@@ -2041,6 +2041,9 @@ const STD_FN_PATHS: &[&str] = &[
     "std/sync/mpsc/channel",
     "std/sync/mpsc/sync_channel",
     "std/thread/sleep",
+    "std/panic/catch_unwind",
+    "std/panic/resume_unwind",
+    "std/panic/panic_any",
     "core/any/type_name",
     "std/any/type_name",
 ];
