@@ -31,6 +31,8 @@ pub(super) fn struct_fields(t: &CTy) -> String {
         // An owning iterator's `it.t` points at its own `t`: re-pointed
         // before each use, since the struct moves.
         CTy::Hash(k, _) if k.is_owning_iter() => "lust_hash_table t; lust_hash_iter it;".to_string(),
+        // A drain also keeps the map's table slot, to put the table back.
+        CTy::Hash(k, _) if k.is_drain() => "lust_hash_table t; lust_hash_table *orig; lust_hash_iter it;".to_string(),
         CTy::Hash(k, _) if k.is_iter_form() => "lust_hash_iter it;".to_string(),
         _ => format!("lust_hash_table t; {} s;", ctype(&builder_cty(t))),
     }
@@ -712,7 +714,9 @@ fn is_hash_builtin(b: Builtin) -> bool {
 
 /// The drop glue body of an owning hash iterator: the elements not yet
 /// yielded, in iteration order, then the allocation (hashbrown's
-/// `RawIntoIter` drop).
+/// `RawIntoIter` drop). A drain instead empties the table (control
+/// bytes reset, tombstones too, allocation kept: `clear_no_drop`) and
+/// puts it back in the map (hashbrown's `RawDrain` drop).
 pub(super) fn iter_drop_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let ec = elem_cty(t);
     let mut body = String::from("  p->it.t = &p->t;\n");
@@ -720,7 +724,13 @@ pub(super) fn iter_drop_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &C
         need(Glue::Drop, &ec);
         let _ = writeln!(body, "  {{ void *e; while ((e = lust_hash_iter_next(&p->it, 0))) drop_{}(({}*)e); }}", mangle(&ec), ctype(&ec));
     }
-    body.push_str("  lust_hash_drop_table(&p->t, 0, 0);\n");
+    if matches!(t, CTy::Hash(k, _) if k.is_drain()) {
+        // `lust_hash_drain_finish` with no drop fn and nothing left is
+        // the runtime's `clear_no_drop`.
+        body.push_str("  { lust_hash_drain z; lust_hash_drain_init(&z, &p->t); z.left = 0; lust_hash_drain_finish(&z, 0, 0); }\n  *p->orig = p->t;\n");
+    } else {
+        body.push_str("  lust_hash_drop_table(&p->t, 0, 0);\n");
+    }
     body
 }
 
@@ -1165,6 +1175,16 @@ impl FnGen<'_, '_> {
                 // one takes the table, and the map's builder drops now
                 // (the map is consumed by `into_iter`).
                 let CTy::Hash(k, _) = dest else { return None };
+                // A drain takes the map's table and leaves the map an
+                // empty table with no allocation (hashbrown's
+                // `RawTableInner::NEW`) until the drain drops.
+                if k.is_drain() {
+                    let _ = writeln!(
+                        self.out,
+                        "    {dc} {t}; {t}.t = {r}->t; {t}.orig = &{r}->t; lust_hash_init(&{r}->t, {t}.t.elem_size, {t}.t.elem_align); lust_hash_iter_init(&{t}.it, &{t}.t);"
+                    );
+                    return Some(t);
+                }
                 if !k.is_owning_iter() {
                     let _ = writeln!(self.out, "    {dc} {t}; lust_hash_iter_init(&{t}.it, &{r}->t);");
                     return Some(t);
@@ -1198,7 +1218,7 @@ impl FnGen<'_, '_> {
                 let ec = elem_cty(&recv);
                 let e = ctype(&ec);
                 let f = self.tmp();
-                let repoint = if k.is_owning_iter() { format!("{r}->it.t = &{r}->t; ") } else { String::new() };
+                let repoint = if k.is_owning_iter() || k.is_drain() { format!("{r}->it.t = &{r}->t; ") } else { String::new() };
                 let _ = writeln!(self.out, "    {repoint}{e} *{f} = ({e}*)lust_hash_iter_next(&{r}->it, 0);");
                 let map = a.len() == 2;
                 // The part of an owned element an item leaves behind drops
@@ -1219,7 +1239,7 @@ impl FnGen<'_, '_> {
                     HashTy::IterKeys if map => format!("(&{f}->f0)"),
                     HashTy::IterKeys => f.clone(),
                     HashTy::IterValues => format!("(&{f}->f1)"),
-                    HashTy::IntoPairs => format!("(*{f})"),
+                    HashTy::IntoPairs | HashTy::DrainPairs | HashTy::DrainKeys => format!("(*{f})"),
                     HashTy::IntoKeys if map => {
                         drop_part(self, 1);
                         format!("({f}->f0)")

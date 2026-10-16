@@ -40,6 +40,11 @@ pub enum HashTy {
     IntoKeys,
     /// Owning, item `V` (`into_values`).
     IntoValues,
+    /// A map's `drain` (R20): item `(K, V)`; holds the map's table and a
+    /// pointer back to the map's slot for it.
+    DrainPairs,
+    /// A set's `drain`: item `T`.
+    DrainKeys,
 }
 
 impl HashTy {
@@ -77,6 +82,8 @@ impl HashTy {
             K::MapValues | K::MapValuesMut => HashTy::IterValues,
             K::MapIntoIter => HashTy::IntoPairs,
             K::MapIntoKeys | K::SetIntoIter => HashTy::IntoKeys,
+            K::MapDrain => HashTy::DrainPairs,
+            K::SetDrain => HashTy::DrainKeys,
             _ => HashTy::IntoValues,
         }
     }
@@ -84,6 +91,11 @@ impl HashTy {
     /// True for the iterator C forms.
     pub fn is_iter_form(self) -> bool {
         self as usize >= HashTy::IterPairs as usize
+    }
+
+    /// True for the drain C forms.
+    pub fn is_drain(self) -> bool {
+        matches!(self, HashTy::DrainPairs | HashTy::DrainKeys)
     }
 
     /// True for the owning iterator C forms.

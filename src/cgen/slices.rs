@@ -40,7 +40,7 @@ impl FnGen<'_, '_> {
         if let Builtin::StrSplitAt(checked) = b {
             return Some(self.str_split_at(checked, ops, dest, loc, post));
         }
-        if !matches!(b, Builtin::SliceSplitAt(_) | Builtin::SliceSplitEnd(_) | Builtin::SliceStrip(_) | Builtin::SliceTrimAscii(_)) {
+        if !matches!(b, Builtin::SliceSplitAt(_) | Builtin::SliceSplitEnd(_) | Builtin::SliceStrip(_) | Builtin::SliceTrimAscii(_) | Builtin::SliceAsChunks(_)) {
             return None;
         }
         let (v, vt) = self.operand(&ops[0], loc, post);
@@ -105,6 +105,32 @@ impl FnGen<'_, '_> {
                     let _ = writeln!(self.out, "    while ({n} > 0 && {}) {n}--;", ws(&format!("{p}[{n} - 1]")));
                 }
                 let _ = writeln!(self.out, "    {dc} {t} = (({st}){{ {p}, {n} }});");
+            }
+            // core's `as_chunks` (`len / N` arrays, then the rest) and
+            // `as_rchunks` (the rest, then the arrays); `N` of 0 is
+            // core's assert, at the caller (`#[track_caller]`).
+            Builtin::SliceAsChunks(rev) => {
+                let CTy::Tuple(parts) = dest else { unreachable!("as_chunks returns a pair") };
+                let arr = parts.iter().find_map(|x| match x {
+                    CTy::Slice(a) if matches!(**a, CTy::Array(..)) => Some((**a).clone()),
+                    _ => None,
+                });
+                let Some(arr @ CTy::Array(_, cn)) = arr else { unreachable!("as_chunks returns a slice of arrays") };
+                let at = ctype(&CTy::Slice(Box::new(arr.clone())));
+                let ac = ctype(&arr);
+                if cn == 0 {
+                    let _ = writeln!(self.out, "    lust_panic_cstr(\"chunk size must be non-zero\", {loc});");
+                }
+                let q = self.tmp();
+                let cn = cn.max(1);
+                let _ = writeln!(self.out, "    uint64_t {q} = {n} / {cn};");
+                let (chunks, rest) = if rev {
+                    (format!("(({at}){{ ({ac}*)({p} + ({n} - {q} * {cn})), {q} }})"), format!("(({st}){{ {p}, {n} - {q} * {cn} }})"))
+                } else {
+                    (format!("(({at}){{ ({ac}*){p}, {q} }})"), format!("(({st}){{ {p} + {q} * {cn}, {n} - {q} * {cn} }})"))
+                };
+                let pair = if rev { format!("{rest}, {chunks}") } else { format!("{chunks}, {rest}") };
+                let _ = writeln!(self.out, "    {dc} {t} = (({dc}){{ {pair} }});");
             }
             _ => unreachable!(),
         }

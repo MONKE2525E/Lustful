@@ -209,6 +209,18 @@ pub enum IterKind {
     /// `MapWhile<I, P>` (R22): args `[I, P, B]` with `P` returning
     /// `Option<B>`; fields (iter, predicate), as core's. Not fused.
     MapWhile,
+    /// `hash_map::Drain<'a, K, V>` (R20): args `[K, V]`, item `(K, V)`.
+    /// A hash iterator (cgen/hash.rs): it holds the map's table, moved
+    /// out as hashbrown's `RawDrain` does, and puts it back emptied
+    /// when it drops.
+    MapDrain,
+    /// `hash_set::Drain<'a, T>`: args `[T]`, item `T`.
+    SetDrain,
+    /// `slice::ChunkBy<'a, T, P>` (R13): args `[T, P]`, item `&[T]`;
+    /// fields (slice, predicate), as core's.
+    ChunkBy,
+    /// `slice::ChunkByMut<'a, T, P>`: item `&mut [T]`.
+    ChunkByMut,
 }
 
 /// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
@@ -383,7 +395,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 66] = [
+    pub const ALL: [IterKind; 70] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -450,11 +462,21 @@ impl IterKind {
         IterKind::SliceSplit,
         IterKind::SliceSplitMut,
         IterKind::MapWhile,
+        IterKind::MapDrain,
+        IterKind::SetDrain,
+        IterKind::ChunkBy,
+        IterKind::ChunkByMut,
     ];
 
     /// True for the hashed-collection iterators.
     pub fn is_hash(self) -> bool {
-        (IterKind::MapIter as usize..=IterKind::SetIntoIter as usize).contains(&(self as usize))
+        (IterKind::MapIter as usize..=IterKind::SetIntoIter as usize).contains(&(self as usize)) || self.is_hash_drain()
+    }
+
+    /// True for the hash drains: they hold the map's table and give it
+    /// back emptied when they drop.
+    pub fn is_hash_drain(self) -> bool {
+        matches!(self, IterKind::MapDrain | IterKind::SetDrain)
     }
 
     /// True for the hash iterators that own their table (by-value
@@ -537,6 +559,10 @@ impl IterKind {
             K::SliceSplit => (&["core", "slice"], "Split"),
             K::SliceSplitMut => (&["core", "slice"], "SplitMut"),
             K::MapWhile => (ADAPT, "MapWhile"),
+            K::MapDrain => (HMAP, "Drain"),
+            K::SetDrain => (HSET, "Drain"),
+            K::ChunkBy => (&["core", "slice"], "ChunkBy"),
+            K::ChunkByMut => (&["core", "slice"], "ChunkByMut"),
         }
     }
 
@@ -582,7 +608,10 @@ impl IterKind {
             | K::MapValuesMut
             | K::MapIntoIter
             | K::MapIntoKeys
-            | K::MapIntoValues => 2,
+            | K::MapIntoValues
+            | K::MapDrain
+            | K::ChunkBy
+            | K::ChunkByMut => 2,
             K::CharIndices | K::StringDrain | K::RangeFull | K::EncodeUtf16 | K::Args => 0,
             _ => 1,
         }
@@ -658,6 +687,10 @@ impl IterKind {
             K::SliceSplit => "std::slice::Split",
             K::SliceSplitMut => "std::slice::SplitMut",
             K::MapWhile => "std::iter::MapWhile",
+            K::MapDrain => "std::collections::hash_map::Drain",
+            K::SetDrain => "std::collections::hash_set::Drain",
+            K::ChunkBy => "std::slice::ChunkBy",
+            K::ChunkByMut => "std::slice::ChunkByMut",
         }
     }
 
@@ -706,7 +739,9 @@ impl IterKind {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => &[],
+            | K::SetIntoIter
+            | K::MapDrain
+            | K::SetDrain => &[],
             // (array, front, back): elements in `front..back` remain.
             K::ArrayIntoIter => &[F::Arg(1), F::Usize, F::Usize],
             // (element, count left).
@@ -739,6 +774,8 @@ impl IterKind {
             K::Args => &[F::Usize, F::Usize],
             K::SliceSplit => &[F::SliceRef(0, false), F::Arg(1), F::Bool, F::Usize],
             K::SliceSplitMut => &[F::SliceRef(0, true), F::Arg(1), F::Bool, F::Usize],
+            K::ChunkBy => &[F::SliceRef(0, false), F::Arg(1)],
+            K::ChunkByMut => &[F::SliceRef(0, true), F::Arg(1)],
         }
     }
 }
@@ -824,11 +861,11 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::MapKeys | K::SetIter => tys.mk_ref(false, a[0]),
         K::MapValues => tys.mk_ref(false, a[1]),
         K::MapValuesMut => tys.mk_ref(true, a[1]),
-        K::MapIntoIter => {
+        K::MapIntoIter | K::MapDrain => {
             let ts = tys.intern_tys(&[a[0], a[1]]);
             tys.intern(TyKind::Tuple(ts))
         }
-        K::MapIntoKeys | K::SetIntoIter => a[0],
+        K::MapIntoKeys | K::SetIntoIter | K::SetDrain => a[0],
         K::MapIntoValues => a[1],
         K::ArrayIntoIter | K::RepeatN => a[0],
         K::ByNext => a[1],
@@ -867,6 +904,10 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::SliceSplit | K::SliceSplitMut => {
             let s = tys.intern(TyKind::Slice(a[0]));
             tys.mk_ref(k == K::SliceSplitMut, s)
+        }
+        K::ChunkBy | K::ChunkByMut => {
+            let s = tys.intern(TyKind::Slice(a[0]));
+            tys.mk_ref(k == K::ChunkByMut, s)
         }
     })
 }

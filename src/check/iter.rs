@@ -143,8 +143,24 @@ impl<'p> Ctx<'p> {
                 "rsplitn_mut" => "rsplitn_mut",
                 "split_inclusive" => "split_inclusive",
                 "split_inclusive_mut" => "split_inclusive_mut",
+                "chunk_by" => "chunk_by",
+                "chunk_by_mut" => "chunk_by_mut",
                 _ => return None,
             };
+            if n == "chunk_by" || n == "chunk_by_mut" {
+                // core's `chunk_by` (R13): the slice by reference and
+                // `F: FnMut(&T, &T) -> bool`, both references
+                // higher-ranked.
+                let mutable = n == "chunk_by_mut";
+                let elem_ref = self.tys.mk_ref(false, el);
+                let pred = self.fn_mut_param_ref(&[elem_ref, elem_ref], BOOL, name_span);
+                let k = if mutable { IterKind::ChunkByMut } else { IterKind::ChunkBy };
+                let ret = it::mk_iter(&mut self.tys, k, &[el, pred]);
+                let autoref = if mutable { Autoref::RefMut } else { Autoref::Ref };
+                self.set_res(e, Res::BuiltinMethod { b: Builtin::IterChunkBy, derefs, autoref });
+                self.check_args(&[pred], args, name_span);
+                return Some(ret);
+            }
             if let Some((mode, mutable)) = it::SliceSplitMode::of_method(n) {
                 // The slice splits (core slice/iter.rs): the slice by
                 // reference (mutable for the `_mut` forms) and
@@ -2073,7 +2089,9 @@ impl<'p> Ctx<'p> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => false,
+            | K::SetIntoIter
+            | K::MapDrain
+            | K::SetDrain => false,
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator with a `DoubleEndedIterator` impl.
             // Through `&mut I` (core: `impl<I: DoubleEndedIterator + ?Sized>
@@ -2095,6 +2113,7 @@ impl<'p> Ctx<'p> {
             K::EncodeUtf16 => false,
             // The slice splits: every form but the N ones, as core's impls.
             K::SliceSplit | K::SliceSplitMut => it::slice_split_mode(&self.tys, a[2]).is_some_and(|m| m.double_ended()),
+            K::ChunkBy | K::ChunkByMut => true,
             K::StrSplit => match it::split_mode(&self.tys, a[1]) {
                 Some(it::SplitMode::SplitN | it::SplitMode::RSplitN) | None => false,
                 Some(it::SplitMode::SplitWhitespace | it::SplitMode::SplitAsciiWhitespace | it::SplitMode::Lines) => true,
@@ -2168,6 +2187,8 @@ impl<'p> Ctx<'p> {
             | K::MapIntoValues
             | K::SetIter
             | K::SetIntoIter
+            | K::MapDrain
+            | K::SetDrain
             | K::Args => true,
             K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::StepBy | K::Copied | K::Cloned | K::Peekable | K::Inspect => {
                 self.exact_size(a[0], span)

@@ -67,8 +67,20 @@ impl<'p> Ctx<'p> {
             "trim_ascii_start" => "trim_ascii_start",
             "trim_ascii_end" => "trim_ascii_end",
             "trim_ascii" => "trim_ascii",
+            "map" => "map",
+            "as_chunks" => "as_chunks",
+            "as_chunks_mut" => "as_chunks_mut",
+            "as_rchunks" => "as_rchunks",
+            "as_rchunks_mut" => "as_rchunks_mut",
             _ => return None,
         };
+        if n.starts_with("as_") {
+            return Some(self.slice_as_chunks(e, recv, elem, derefs, n, name_span, args, turbofish));
+        }
+        if n == "map" {
+            let TyKind::Array(_, len) = self.kind(base) else { return None };
+            return Some(self.array_map_method(e, elem, len, derefs, name_span, args, turbofish));
+        }
         if n == "strip_prefix" || n == "strip_suffix" {
             return Some(self.slice_strip_method(e, recv, elem, derefs, name_span, args, turbofish, n == "strip_suffix"));
         }
@@ -181,6 +193,82 @@ impl<'p> Ctx<'p> {
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
         self.check_args(&params, args, name_span);
         Some(ret)
+    }
+
+    /// `[T]::as_chunks::<N>()` and `as_rchunks`, and their `_mut` forms
+    /// (R13): `(&[[T; N]], &[T])` (the rest first for `as_rchunks`). `N`
+    /// comes from the turbofish, else from later uses; a known 0 is
+    /// rustc's deny-by-default `unconditional_panic` (L0541).
+    #[allow(clippy::too_many_arguments)]
+    fn slice_as_chunks(&mut self, e: ExprId, recv: ExprId, elem: Ty, derefs: u8, n: &str, name_span: Span, args: &[ExprId], turbofish: &[ast::GenericArg]) -> Ty {
+        let mutable = n.ends_with("_mut");
+        let rev = n.starts_with("as_r");
+        let mut len_c = None;
+        // rustc's lint sees a literal 0, not a const parameter's value:
+        // that one panics at run time (cgen/slices.rs).
+        let mut from_param = false;
+        match turbofish {
+            [] => {}
+            [ast::GenericArg::Const(c)] => {
+                let scope = self.body_scope.clone();
+                match generics::resolve_const_arg(&self.p.ast, &self.p.interner, &self.p.known, &mut self.tys, &scope, *c, name_span) {
+                    Ok(c) => len_c = Some(c),
+                    Err(d) => {
+                        self.errs.push(d);
+                        return self.slice_bail(args);
+                    }
+                }
+            }
+            // `_` at the const slot parses as a type: inferred.
+            [ast::GenericArg::Type(t)] if matches!(self.p.ast.ty(*t), ast::TyExpr::Infer) => {}
+            // A const parameter parses as a type path.
+            [ast::GenericArg::Type(t)] if let Some(c) = self.const_param_path(*t) => {
+                len_c = Some(c);
+                from_param = true;
+            }
+            _ => {
+                self.errs.push(not_yet("L0721", name_span, "this turbofish on `as_chunks`"));
+                return self.slice_bail(args);
+            }
+        }
+        let len_c = len_c.unwrap_or_else(|| self.fresh_const_var());
+        if !from_param && let ConstKind::Int(0) = self.tys.const_kind(len_c) {
+            self.err("L0541", name_span, format!("const parameter `N` of `{n}` is zero: this operation will panic at runtime"), "Use a chunk size of 1 or more.");
+            return self.slice_bail(args);
+        }
+        let arr = self.tys.intern(TyKind::Array(elem, len_c));
+        let (sa, se) = (self.tys.intern(TyKind::Slice(arr)), self.tys.intern(TyKind::Slice(elem)));
+        let (ra, re) = (self.tys.mk_ref(mutable, sa), self.tys.mk_ref(mutable, se));
+        let parts = if rev { [re, ra] } else { [ra, re] };
+        let ts = self.tys.intern_tys(&parts);
+        let ret = self.tys.intern(TyKind::Tuple(ts));
+        self.check_packed_borrow(recv, name_span);
+        let autoref = if mutable { Autoref::RefMut } else { Autoref::Ref };
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::SliceAsChunks(rev), derefs, autoref });
+        self.check_args(&[], args, name_span);
+        ret
+    }
+
+    /// `[T; N]::map(self, f: impl FnMut(T) -> U) -> [U; N]` (R22). Through
+    /// a reference the array is copied out, so `T: Copy` (rustc E0507
+    /// otherwise).
+    #[allow(clippy::too_many_arguments)]
+    fn array_map_method(&mut self, e: ExprId, elem: Ty, len: ConstId, derefs: u8, name_span: Span, args: &[ExprId], turbofish: &[ast::GenericArg]) -> Ty {
+        if !turbofish.is_empty() {
+            self.errs.push(not_yet("L0721", name_span, "turbofish on `map`"));
+            return self.slice_bail(args);
+        }
+        if derefs > 0 {
+            self.deferred_copy.push((elem, name_span));
+        }
+        let out = self.new_var(false);
+        let f = self.fn_mut_param(&[elem], out, name_span);
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::ArrayMap, derefs, autoref: Autoref::None });
+        self.check_args(&[f], args, name_span);
+        if self.adapter_callable_gap(args, &[f], false) {
+            return ERROR;
+        }
+        self.tys.intern(TyKind::Array(out, len))
     }
 
     /// `[T]::strip_prefix` and `strip_suffix` (R13): `prefix: &P` with

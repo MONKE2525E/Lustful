@@ -546,6 +546,10 @@ pub enum Builtin {
     /// core's `[u8]::trim_ascii_start` (0), `trim_ascii_end` (1), and
     /// `trim_ascii` (2).
     SliceTrimAscii(u8),
+    /// core's `[T]::as_chunks::<N>` (false) and `as_rchunks` (true), and
+    /// their `_mut` forms: the dest tuple's array type carries `N`; `N`
+    /// of 0 panics at the caller (only a generic `N` gets there).
+    SliceAsChunks(bool),
     /// The `core::mem` byte-move family and `core::cmp::max`/`min`
     /// free fns (ARCH 4.4). `MemTake` only survives to lowering,
     /// which fills the freed slot with a synthesized default and
@@ -611,6 +615,9 @@ pub enum Builtin {
     /// `rsplitn`, `split_inclusive` and their `_mut` forms): the dest
     /// kind and mode tell which; the N forms take the count first.
     IterSliceSplit,
+    /// `slice::chunk_by(pred)` and `chunk_by_mut` (R13): the dest kind
+    /// tells which.
+    IterChunkBy,
     /// `slice::utf8_chunks` on `[u8]` (tf-slice): a `Utf8Chunks`
     /// iterator over the source bytes.
     IterUtf8Chunks,
@@ -890,6 +897,9 @@ pub enum Builtin {
     /// `std::array::from_fn(f)` (fx-defaults): `[f(0), .., f(N - 1)]`,
     /// expanded as an array aggregate (lower/iter.rs).
     ArrayFromFn,
+    /// `[T; N]::map(f)` (R22): each element moved out in order through
+    /// an `array::IntoIter`, expanded like `ArrayFromFn` (lower/iter.rs).
+    ArrayMap,
     /// The hashed collections (W-STD-B, check/hashmap.rs, cgen/hash.rs):
     /// constructors (the result type tells map, set, or hasher), table
     /// queries, map and set methods, and the Entry methods.
@@ -7295,6 +7305,23 @@ impl<'p> Ctx<'p> {
         let y = object::erase_dyn_region(&mut self.tys, y);
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
+    }
+
+    /// A single-segment type path with no args that names a const
+    /// parameter of the body and no type parameter: the const (its
+    /// value in an instance check).
+    fn const_param_path(&mut self, t: ast::TyId) -> Option<ConstId> {
+        let ast::TyExpr::Path(segs) = self.p.ast.ty(t) else { return None };
+        let [seg] = segs.as_slice() else { return None };
+        if seg.has_args() || self.body_scope.param_tys.iter().any(|(n, _)| *n == seg.name) {
+            return None;
+        }
+        // An instance check sees the parameter's value.
+        if let Some(&(_, c)) = self.body_scope.const_values.iter().find(|(n, _)| *n == seg.name) {
+            return Some(c);
+        }
+        let &(_, i, _) = self.body_scope.const_params.iter().find(|(n, ..)| *n == seg.name)?;
+        Some(self.tys.intern_const(ConstKind::Param(i)))
     }
 
     fn coerce_expr(&mut self, e: ExprId, found: Ty, expected: Ty) -> bool {
@@ -16126,6 +16153,9 @@ impl<'p> Ctx<'p> {
             .iter()
             .map(|a| match a {
                 ast::GenericArg::Type(t) if any_static => Some(GenericArg::Ty(self.resolve_annotation(*t))),
+                // `x.m::<N>()` with `N` a const parameter of the body: the
+                // parser reads it as a type path (tf-p5, `as_chunks::<N>`).
+                ast::GenericArg::Type(t) if let Some(c) = self.const_param_path(*t) => Some(GenericArg::Const(c)),
                 ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
                 ast::GenericArg::Const(e2) => Some(self.const_call_arg(*e2)),
                 _ => None,

@@ -563,7 +563,14 @@ impl AdtTables {
                     HashTy::OccupiedEntry => (Variance::Inv, DropMode::None),
                     HashTy::RandomState | HashTy::DefaultHasher => (Variance::Inv, DropMode::Owned),
                     // The C forms of the iterators are never types (no def).
-                    HashTy::IterPairs | HashTy::IterKeys | HashTy::IterValues | HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues => {
+                    HashTy::IterPairs
+                    | HashTy::IterKeys
+                    | HashTy::IterValues
+                    | HashTy::IntoPairs
+                    | HashTy::IntoKeys
+                    | HashTy::IntoValues
+                    | HashTy::DrainPairs
+                    | HashTy::DrainKeys => {
                         (Variance::Inv, DropMode::All)
                     }
                 };
@@ -663,6 +670,8 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
                 | IterKind::ChunksExact
                 | IterKind::ChunksExactMut
                 | IterKind::SliceSplit
+                | IterKind::ChunkBy
+                | IterKind::ChunkByMut
                 | IterKind::SliceSplitMut
                 | IterKind::Utf8Chunks
                 | IterKind::Utf8Chunk
@@ -5777,7 +5786,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some((_, margs)) = crate::ty::hash::hash_parts(&self.body.tys, map) else { return false };
         let (Some((&r, mv)), Some((&i, iv))) = (v0.split_first(), dv.split_first()) else { return false };
         let parts: Vec<(Ty, usize)> =
-            margs.iter().take(if ik == K::SetIter { 1 } else { 2 }).map(|&t| (t, self.sc.slots(t) as usize)).collect();
+            margs.iter().take(if matches!(ik, K::SetIter | K::SetDrain) { 1 } else { 2 }).map(|&t| (t, self.sc.slots(t) as usize)).collect();
         let n: usize = parts.iter().map(|p| p.1).sum();
         if mv.len() < n || iv.len() < n {
             return false;
@@ -5785,7 +5794,8 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.edge(r, i);
         let mut at = 0;
         for (j, (t, n)) in parts.into_iter().enumerate() {
-            let var = if j == 1 && matches!(ik, K::MapIterMut | K::MapValuesMut) { Variance::Inv } else { Variance::Co };
+            // A drain holds the map's table under its `&'a mut` loan.
+            let var = if (j == 1 && matches!(ik, K::MapIterMut | K::MapValuesMut)) || ik.is_hash_drain() { Variance::Inv } else { Variance::Co };
             let (a, b) = (mv[at..at + n].to_vec(), iv[at..at + n].to_vec());
             self.relate(t, &a, t, &b, var);
             at += n;
@@ -6158,7 +6168,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             // a window; a `Utf8Chunk` item is its one region.
             K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => cat(&[&own, &args[0]]),
             // A slice split's item is `&'a [T]` (or `&'a mut [T]`), like a chunk.
-            K::SliceSplit | K::SliceSplitMut => cat(&[&own, &args[0]]),
+            K::SliceSplit | K::SliceSplitMut | K::ChunkBy | K::ChunkByMut => cat(&[&own, &args[0]]),
             K::Utf8Chunks => own.clone(),
             K::Utf8Chunk => return None,
             K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::VecDrain => args[0].clone(),
@@ -6176,8 +6186,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::MapIter | K::MapIterMut => cat(&[&own, &args[0], &own, &args[1]]),
             K::MapKeys | K::SetIter => cat(&[&own, &args[0]]),
             K::MapValues | K::MapValuesMut => cat(&[&own, &args[1]]),
-            K::MapIntoIter => cat(&[&args[0], &args[1]]),
-            K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => args[0].clone(),
+            K::MapIntoIter | K::MapDrain => cat(&[&args[0], &args[1]]),
+            K::MapIntoKeys | K::SetIntoIter | K::SetDrain | K::RepeatN | K::ArrayIntoIter => args[0].clone(),
             K::MapIntoValues | K::ByNext => args[1].clone(),
             // (usize, char): no regions.
             K::CharIndices | K::StringDrain | K::Args => Vec::new(),
@@ -6663,7 +6673,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => match self.item_slots(t, vars) {
+            | K::SetIntoIter
+            | K::MapDrain
+            | K::SetDrain => match self.item_slots(t, vars) {
                 Some(v) => {
                     out.push(v);
                     true
@@ -6687,7 +6699,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             | K::EncodeUtf16
             | K::ResultIntoIter
             | K::SliceSplit
-            | K::SliceSplitMut => false,
+            | K::SliceSplitMut
+            | K::ChunkBy
+            | K::ChunkByMut => false,
         }
     }
 
@@ -9031,6 +9045,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::SliceSplitEnd(_)
             | B::SliceStrip(_)
             | B::SliceTrimAscii(_)
+            | B::SliceAsChunks(_)
             | B::VecFirst
             | B::VecLast
             | B::VecGetMut

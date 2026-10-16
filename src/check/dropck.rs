@@ -525,12 +525,12 @@ impl Dropck<'_, '_> {
             | K::StrSplit
             | K::StrMatches => at(0),
             K::Map | K::Filter | K::Chain | K::Zip | K::FilterMap | K::MapWhile | K::TakeWhile | K::SkipWhile | K::Inspect | K::Flatten => two(0, 1),
-            K::SliceSplit | K::SliceSplitMut => at(1),
-            K::MapIntoIter | K::MapIntoKeys | K::MapIntoValues => {
+            K::SliceSplit | K::SliceSplitMut | K::ChunkBy | K::ChunkByMut => at(1),
+            K::MapIntoIter | K::MapIntoKeys | K::MapIntoValues | K::MapDrain => {
                 let pair = self.tuple(tys);
                 vec![Item::Ty(pair)]
             }
-            K::SetIntoIter => match tys.first() {
+            K::SetIntoIter | K::SetDrain => match tys.first() {
                 Some(&t) => vec![Item::Ty(self.tuple(&[t, crate::ty::UNIT]))],
                 None => Vec::new(),
             },

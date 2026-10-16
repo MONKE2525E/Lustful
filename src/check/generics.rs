@@ -9057,6 +9057,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
                     let s = p.tys.intern(TyKind::Slice(ps[0]));
                     p.tys.mk_ref(k == K::SliceSplitMut, s)
                 }
+                K::ChunkBy | K::ChunkByMut => {
+                    let s = p.tys.intern(TyKind::Slice(ps[0]));
+                    p.tys.mk_ref(k == K::ChunkByMut, s)
+                }
                 K::ChunksMut | K::ChunksExactMut => {
                     let s = p.tys.intern(TyKind::Slice(ps[0]));
                     p.tys.mk_ref(true, s)
@@ -9085,11 +9089,11 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 K::MapKeys | K::SetIter => p.tys.mk_ref(false, ps[0]),
                 K::MapValues => p.tys.mk_ref(false, ps[1]),
                 K::MapValuesMut => p.tys.mk_ref(true, ps[1]),
-                K::MapIntoIter => {
+                K::MapIntoIter | K::MapDrain => {
                     let ts = p.tys.intern_tys(&[ps[0], ps[1]]);
                     p.tys.intern(TyKind::Tuple(ts))
                 }
-                K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => ps[0],
+                K::MapIntoKeys | K::SetIntoIter | K::SetDrain | K::RepeatN | K::ArrayIntoIter => ps[0],
                 K::MapIntoValues | K::ByNext => ps[1],
                 K::Args => STRING,
                 K::Enumerate => {
@@ -9134,6 +9138,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 | K::MapIntoValues
                 | K::SetIter
                 | K::SetIntoIter
+                | K::MapDrain
+                | K::SetDrain
                 | K::Args => Some(Vec::new()),
                 K::Map | K::Copied | K::Cloned | K::Rev | K::Enumerate | K::Inspect | K::Take | K::Skip | K::StepBy | K::Peekable => {
                     Some(vec![pred_on(p, lang.exact_size_iterator, ps[0])])

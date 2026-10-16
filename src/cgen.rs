@@ -438,12 +438,12 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::MapIter | K::MapIterMut => CTy::Tuple(vec![CTy::Ref(Box::new(cty(tys, a[0]))), CTy::Ref(Box::new(cty(tys, a[1])))]),
         K::MapKeys | K::SetIter => CTy::Ref(Box::new(cty(tys, a[0]))),
         K::MapValues | K::MapValuesMut => CTy::Ref(Box::new(cty(tys, a[1]))),
-        K::MapIntoIter => CTy::Tuple(vec![cty(tys, a[0]), cty(tys, a[1])]),
-        K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => cty(tys, a[0]),
+        K::MapIntoIter | K::MapDrain => CTy::Tuple(vec![cty(tys, a[0]), cty(tys, a[1])]),
+        K::MapIntoKeys | K::SetIntoIter | K::SetDrain | K::RepeatN | K::ArrayIntoIter => cty(tys, a[0]),
         K::MapIntoValues | K::ByNext => cty(tys, a[1]),
         K::StrSplit => CTy::Ref(Box::new(CTy::Str)),
         K::Args => CTy::String,
-        K::SliceSplit | K::SliceSplitMut => CTy::Slice(Box::new(cty(tys, a[0]))),
+        K::SliceSplit | K::SliceSplitMut | K::ChunkBy | K::ChunkByMut => CTy::Slice(Box::new(cty(tys, a[0]))),
         // As `ty::iter::item_ty`: the chunk slices, the matches' `&str`
         // (with the byte offset for the indexed modes), UTF-16 units.
         K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => CTy::Slice(Box::new(cty(tys, a[0]))),
@@ -863,6 +863,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::Hash(k, a) => {
             hash::is_table(*k)
                 || k.is_owning_iter()
+                || k.is_drain()
                 || (*k == crate::ty::hash::HashTy::Entry && a.first().is_some_and(|k| needs_drop_c(p, k)))
         }
         CTy::Option(e) => needs_drop_c(p, e),
@@ -1163,6 +1164,8 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                     // `{ lust_hash_iter it; }`, owning: `{ table; it; }`.
                     HashTy::IterPairs | HashTy::IterKeys | HashTy::IterValues => Some(plain_layout(40, 8)),
                     HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues => Some(plain_layout(104, 8)),
+                    // `{ table; orig; it; }`.
+                    HashTy::DrainPairs | HashTy::DrainKeys => Some(plain_layout(112, 8)),
                 }
             }
             CTy::ExitCode => Some(plain_layout(1, 1)),
@@ -1457,6 +1460,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 crate::ty::hash::HashTy::DefaultHasher => (72, 8),
                 crate::ty::hash::HashTy::BuildHasherDefault => (0, 1),
                 k if k.is_owning_iter() => (104, 8),
+                k if k.is_drain() => (112, 8),
                 k if k.is_iter_form() => (40, 8),
                 crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry => {
                     // `{ table ptr, hash, slot ptr, K key }`
@@ -4421,7 +4425,7 @@ impl FnGen<'_, '_> {
             // `by_ref`: the `&mut Self` receiver is the result.
             B::IterByRef => vals[0].clone(),
             B::OwnFrom(_) | B::OwnIntoString | B::OwnSliceAlloc(_) | B::OwnSlicePush => unreachable!("owning pointer builtins emit in cgen/own.rs"),
-            B::SliceSplitAt(_) | B::SliceSplitEnd(_) | B::StrSplitAt(_) | B::SliceStrip(_) | B::SliceTrimAscii(_) => {
+            B::SliceSplitAt(_) | B::SliceSplitEnd(_) | B::StrSplitAt(_) | B::SliceStrip(_) | B::SliceTrimAscii(_) | B::SliceAsChunks(_) => {
                 unreachable!("dest-typed: cgen/slices.rs slice_split_builtin")
             }
             B::IntToLeBytes | B::IntToBeBytes | B::IntToNeBytes | B::IntFromLeBytes | B::IntFromBeBytes | B::IntFromNeBytes => {
@@ -4541,7 +4545,7 @@ impl FnGen<'_, '_> {
             B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce | B::StrMatchesNext | B::StrMatchesNextBack | B::StrPatFind | B::StrPatRfind | B::StrPatContains | B::StrPatStartsWith | B::StrPatEndsWith | B::StrPatStripPrefix | B::StrPatStripSuffix | B::StrTrimMatches | B::StrTrimStartMatches | B::StrTrimEndMatches | B::StrPatReplace | B::StrPatReplacen => {
                 unreachable!("split builtins emit in cgen/split.rs")
             }
-            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice | B::ArrayFromFn | B::StrMatches | B::StrEncodeUtf16 | B::StrParse => {
+            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice | B::ArrayFromFn | B::ArrayMap | B::StrMatches | B::StrEncodeUtf16 | B::StrParse => {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
             B::ConvInto => unreachable!("expanded per conversion (lower/iter.rs)"),
@@ -5773,6 +5777,7 @@ impl FnGen<'_, '_> {
             | B::IterWindows
             | B::IterChunks
             | B::IterSliceSplit
+            | B::IterChunkBy
             | B::IterUtf8Chunks
             | B::IterRemainder
             | B::IterFlatten
@@ -9482,7 +9487,7 @@ fn glue_def_value(
             match t {
                 CTy::String => body.push_str("  lust_string_drop(p);\n"),
                 CTy::Hash(k, _) if hash::is_table(*k) => body.push_str(&hash::drop_body(p, t, &mut need)),
-                CTy::Hash(k, _) if k.is_owning_iter() => body.push_str(&hash::iter_drop_body(p, t, &mut need)),
+                CTy::Hash(k, _) if k.is_owning_iter() || k.is_drain() => body.push_str(&hash::iter_drop_body(p, t, &mut need)),
                 // An occupied Entry dropped its key at `entry()`.
                 CTy::Hash(crate::ty::hash::HashTy::Entry, a) => {
                     need(Glue::Drop, &a[0]);

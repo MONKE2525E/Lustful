@@ -9738,9 +9738,10 @@ fn needs_drop_sub(p: &Program, tys: &impl TyIntern, t: Ty, args: &[GenericArg], 
         // `vec::IntoIter` owns its buffer. Other kinds drop what their
         // args hold (an over-count for the `Map` item arg is harmless:
         // the drop glue only drops stored fields).
-        // A hash iterator owns its table only when made by value.
+        // A hash iterator owns its table only when made by value; a
+        // drain drops what it has not yielded and gives the table back.
         if k.is_hash() {
-            return k.is_hash_owning();
+            return k.is_hash_owning() || k.is_hash_drain();
         }
         return matches!(
             k,

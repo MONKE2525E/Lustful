@@ -46,7 +46,6 @@ fn table_kind(k: HashTy) -> bool {
 }
 
 const DECLARED_ONLY: &[&str] = &[
-    "drain",
     "extract_if",
     "try_reserve",
     "shrink_to_fit",
@@ -414,7 +413,7 @@ impl<'p> Ctx<'p> {
         }
         let n = self.p.interner.get(name);
         if table_kind(kind)
-            && matches!(n, "iter" | "iter_mut" | "keys" | "values" | "values_mut" | "into_iter" | "into_keys" | "into_values")
+            && matches!(n, "iter" | "iter_mut" | "keys" | "values" | "values_mut" | "into_iter" | "into_keys" | "into_values" | "drain")
             && let Some(t) = self.hash_iter_source(e, recv, rt, kind, &targs, derefs, n, name_span, args)
         {
             return Some(t);
@@ -626,6 +625,9 @@ impl<'p> Ctx<'p> {
             "keys" if !set => (K::MapKeys, Autoref::Ref, derefs),
             "values" if !set => (K::MapValues, Autoref::Ref, derefs),
             "values_mut" if !set => (K::MapValuesMut, Autoref::RefMut, derefs),
+            // hashbrown's `drain` (R20): the `&mut self` loan lasts as long
+            // as the `Drain`.
+            "drain" => (if set { K::SetDrain } else { K::MapDrain }, Autoref::RefMut, derefs),
             "into_keys" | "into_values" if !set && derefs == 0 => {
                 (if n == "into_keys" { K::MapIntoKeys } else { K::MapIntoValues }, Autoref::None, 0)
             }

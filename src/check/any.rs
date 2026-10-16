@@ -917,6 +917,8 @@ fn tn_iter(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::iter::Iter
         K::MapIntoValues => two(tys, "std::collections::hash::map::IntoValues"),
         K::SetIter => lt_one(tys, "std::collections::hash::set::Iter"),
         K::SetIntoIter => one(tys, "std::collections::hash::set::IntoIter"),
+        K::MapDrain => Some(tn_apply("std::collections::hash::map::Drain", vec!["'_".into(), arg(tys, 0)?, arg(tys, 1)?])),
+        K::SetDrain => lt_one(tys, "std::collections::hash::set::Drain"),
         K::StrSplit => tn_str_split(p, tys, &args, open, in_sig),
         K::Args => Some("std::env::Args".into()),
         _ => None,

@@ -94,6 +94,7 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::IterWindows
             | B::IterChunks
             | B::IterSliceSplit
+            | B::IterChunkBy
             | B::IterUtf8Chunks
             | B::IterRemainder
             | B::IterNextBack
@@ -132,6 +133,7 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::ArrayIterAsSlice
             | B::IterRepeatN
             | B::ArrayFromFn
+            | B::ArrayMap
             | B::IterOptRes
             | B::IterLen
             | B::ConvInto
@@ -650,6 +652,15 @@ impl Ex<'_, '_> {
                     Operand::Const(Const::Bool(false))
                 };
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s)), pred, finished, count]));
+            }
+            B::IterChunkBy => {
+                let (r, pred) = (arg()?, arg()?);
+                let rt = self.op_ty(&r)?;
+                let rp = self.op_place(r, rt);
+                let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad chunk_by")?;
+                let s = self.local(fields[0]);
+                self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s)), pred]));
             }
             B::IterChunks => {
                 let (r, n) = (arg()?, arg()?);
@@ -1448,6 +1459,62 @@ impl Ex<'_, '_> {
                 }
                 self.drop_local(fl);
             }
+            // `[T; N]::map(f)` (core's `try_map` over a draining
+            // iterator): the array moves into an `array::IntoIter`, each
+            // element goes to `f` front to back, and the outputs collect
+            // in a `Vec`, as for `from_fn`. Locals are made in core's
+            // unwind drop order, reversed: on a panic in `f` the outputs
+            // so far drop first, then the inputs not yet taken, then
+            // `f`.
+            B::ArrayMap => {
+                let (arr, f) = (arg()?, arg()?);
+                let f_ty = self.op_ty(&f)?;
+                let fl = self.local(f_ty);
+                self.assign(Place::local(fl), Rvalue::Use(f));
+                let arr_ty = self.op_ty(&arr)?;
+                let (elem, n) = match self.body.tys.kind(arr_ty) {
+                    TyKind::Array(e, c) => match self.body.tys.const_kind(c) {
+                        ConstKind::Int(n) => (e, n as u64),
+                        _ => return Err("iterator expansion: `map` on an array of unknown length".into()),
+                    },
+                    _ => return Err("iterator expansion: `map` on a non-array".into()),
+                };
+                let out = match self.body.tys.kind(dest_ty) {
+                    TyKind::Array(u, _) => u,
+                    _ => return Err("iterator expansion: `map` into a non-array".into()),
+                };
+                let it_ty = it::mk_iter(&mut self.body.tys, IterKind::ArrayIntoIter, &[elem, arr_ty]);
+                let itl = self.local(it_ty);
+                self.assign(Place::local(itl), Rvalue::TupleAgg(it_ty, vec![arr, Self::usize_c(0), Self::usize_c(n)]));
+                let vec_ty = self.body.tys.mk_vec(out);
+                let v = self.local(vec_ty);
+                self.assign(Place::local(v), Rvalue::VecLit(out, Vec::new()));
+                let opt_in = self.body.tys.mk_option(elem);
+                for _ in 0..n {
+                    let t = self.local(opt_in);
+                    self.next(Place::local(itl), it_ty, Place::local(t), false)?;
+                    let x = self.take(Self::payload(&Place::local(t)), elem);
+                    let y = self.local(out);
+                    self.call_fn(f_ty, Place::local(fl), vec![x], Place::local(y))?;
+                    let rv = self.ref_to(true, Place::local(v), vec_ty);
+                    let u = self.local(UNIT);
+                    let ay = self.take(Place::local(y), out);
+                    self.call_builtin(Builtin::VecPush, vec![Operand::Move(Place::local(rv)), ay], Place::local(u));
+                }
+                let opt_out = self.body.tys.mk_option(out);
+                let mut ops = Vec::new();
+                for _ in 0..n {
+                    let o = self.local(opt_out);
+                    let rv = self.ref_to(true, Place::local(v), vec_ty);
+                    self.call_builtin(Builtin::VecPop, vec![Operand::Move(Place::local(rv))], Place::local(o));
+                    ops.push(Operand::Move(Self::payload(&Place::local(o))));
+                }
+                ops.reverse();
+                self.assign(dest.clone(), Rvalue::ArrayAgg(dest_ty, ops));
+                self.drop_local(v);
+                self.drop_local(itl);
+                self.drop_local(fl);
+            }
             B::VecExtend | B::StringExtend => {
                 // `v.extend(src)` (W-STD-B): `src` through `IntoIterator`.
                 let (r, src) = (arg()?, arg()?);
@@ -1996,6 +2063,7 @@ impl Ex<'_, '_> {
             }
             // The slice splits (core slice/iter.rs): see `slice_split_next`.
             K::SliceSplit | K::SliceSplitMut => self.slice_split_next(&itp, k, &a, back, &dest, opt, join)?,
+            K::ChunkBy | K::ChunkByMut => self.chunk_by_next(&itp, k, &a, back, &dest, opt, join)?,
             // `env::Args`: the argument at the front (or back) index while
             // the indexes differ, taken first, then checked as UTF-8 as
             // std's `into_string().unwrap()` does (runtime `lust_env_arg`).
@@ -2419,7 +2487,9 @@ impl Ex<'_, '_> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => {
+            | K::SetIntoIter
+            | K::MapDrain
+            | K::SetDrain => {
                 let r = self.ref_to(true, itp, ty);
                 self.call_builtin(Builtin::HashIterNext, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
@@ -3101,6 +3171,70 @@ impl Ex<'_, '_> {
             return self.slice_split_step(itp, k, a, mode == M::RSplitN, false, dest, opt, join);
         }
         self.slice_split_step(itp, k, a, back != (mode == M::RSplit), mode == M::SplitInclusive, dest, opt, join)
+    }
+
+    /// One `next` (or `next_back`) of `ChunkBy` or `ChunkByMut`, as core
+    /// writes it: the run grows while the predicate holds for the pair
+    /// at its edge (`windows(2)` from the front or the back), then the
+    /// run splits off. Fields (slice, predicate).
+    #[allow(clippy::too_many_arguments)]
+    fn chunk_by_next(&mut self, itp: &Place, k: IterKind, a: &[Ty], back: bool, dest: &Place, opt: Ty, join: Bb) -> R {
+        use crate::ast::BinOp::*;
+        let m = k == IterKind::ChunkByMut;
+        let f = |i: u32| itp.project(Proj::Field(i));
+        let sd = f(0).deref();
+        let len = self.local(USIZE);
+        self.assign(Place::local(len), Rvalue::LenOf(sd.clone()));
+        let c = self.cmp(Eq, Operand::Copy(Place::local(len)), Self::usize_c(0));
+        let (empty, go) = self.branch(c);
+        self.cur = empty;
+        self.none(dest, opt);
+        self.goto(join);
+        self.cur = go;
+        // `n` is the run length; the pair checked next is (n - 1, n)
+        // from the front, or (len - n - 1, len - n) from the back.
+        let n = self.local(USIZE);
+        self.assign(Place::local(n), Rvalue::Use(Self::usize_c(1)));
+        let (head, body, done) = (self.block(), self.block(), self.block());
+        self.goto(head);
+        self.cur = head;
+        let c = self.cmp(Lt, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(len)));
+        self.term(Terminator::If(c, body, done));
+        self.cur = body;
+        let (li, ri) = (self.local(USIZE), self.local(USIZE));
+        if back {
+            self.assign(Place::local(ri), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Operand::Copy(Place::local(n))));
+            self.assign(Place::local(li), Rvalue::Bin(Sub, Operand::Copy(Place::local(ri)), Self::usize_c(1)));
+        } else {
+            self.assign(Place::local(li), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Self::usize_c(1)));
+            self.assign(Place::local(ri), Rvalue::Use(Operand::Copy(Place::local(n))));
+        }
+        let l = self.ref_to(false, sd.project(Proj::Index(li)), a[0]);
+        let r = self.ref_to(false, sd.project(Proj::Index(ri)), a[0]);
+        let b = self.local(BOOL);
+        self.call_fn(a[1], f(1), vec![Operand::Move(Place::local(l)), Operand::Move(Place::local(r))], Place::local(b))?;
+        let grow = self.block();
+        self.term(Terminator::If(Operand::Copy(Place::local(b)), grow, done));
+        self.cur = grow;
+        self.assign(Place::local(n), Rvalue::Bin(Add, Operand::Copy(Place::local(n)), Self::usize_c(1)));
+        self.goto(head);
+        self.cur = done;
+        let st = self.place_ty(&f(0))?;
+        let sub = |lo: Operand, hi: Option<Operand>| Rvalue::Subslice { base: sd.clone(), lo, hi, inclusive: false, mutable: m };
+        let (ret, rest) = (self.local(st), self.local(st));
+        if back {
+            let at = self.local(USIZE);
+            self.assign(Place::local(at), Rvalue::Bin(Sub, Operand::Copy(Place::local(len)), Operand::Copy(Place::local(n))));
+            self.assign(Place::local(ret), sub(Operand::Copy(Place::local(at)), None));
+            self.assign(Place::local(rest), sub(Self::usize_c(0), Some(Operand::Copy(Place::local(at)))));
+        } else {
+            self.assign(Place::local(ret), sub(Self::usize_c(0), Some(Operand::Copy(Place::local(n)))));
+            self.assign(Place::local(rest), sub(Operand::Copy(Place::local(n)), None));
+        }
+        self.assign(f(0), Rvalue::Use(Operand::Move(Place::local(rest))));
+        self.some(dest, opt, Operand::Move(Place::local(ret)));
+        self.goto(join);
+        Ok(())
     }
 
     /// `SplitIter::finish`: `None` once finished, else the rest of the
@@ -4653,6 +4787,24 @@ impl Ex<'_, '_> {
                 }
                 self.some(&Place::local(hi), ou, Operand::Copy(Place::local(up)));
             }
+            // `ChunkBy`: `(0, Some(0))` when empty, else `(1, Some(len))`.
+            K::ChunkBy | K::ChunkByMut => {
+                let len = self.local(USIZE);
+                self.assign(Place::local(len), Rvalue::LenOf(f(0).deref()));
+                let c = self.cmp(Eq, Operand::Copy(Place::local(len)), Self::usize_c(0));
+                let lo1 = self.local(USIZE);
+                self.assign(Place::local(lo1), Rvalue::Use(Operand::Const(Const::Int(0, IntTy::Usize))));
+                let (empty, some) = self.branch(c);
+                let set = self.block();
+                self.cur = some;
+                self.assign(Place::local(lo1), Rvalue::Use(Self::usize_c(1)));
+                self.goto(set);
+                self.cur = empty;
+                self.goto(set);
+                self.cur = set;
+                self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(lo1))));
+                self.some(&Place::local(hi), ou, Operand::Copy(Place::local(len)));
+            }
             // `env::Args`: exact, back index minus front index.
             K::Args => {
                 let n = self.local(USIZE);
@@ -4701,7 +4853,9 @@ impl Ex<'_, '_> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => {
+            | K::SetIntoIter
+            | K::MapDrain
+            | K::SetDrain => {
                 let r = self.ref_to(false, itp, ty);
                 let n = self.local(USIZE);
                 self.call_builtin(Builtin::HashIterLen, vec![Operand::Move(Place::local(r))], Place::local(n));
@@ -5176,7 +5330,9 @@ impl Ex<'_, '_> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => false,
+            | K::SetIntoIter
+            | K::MapDrain
+            | K::SetDrain => false,
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator may implement the unstable TrustedLen only
             // in std itself: of the std source iterators, core's `Once`
@@ -5200,7 +5356,7 @@ impl Ex<'_, '_> {
             // end it early), whatever the source is.
             K::TryCollect => false,
             // `env::Args` and the slice splits are not `TrustedLen` in std.
-            K::Args | K::SliceSplit | K::SliceSplitMut => false,
+            K::Args | K::SliceSplit | K::SliceSplitMut | K::ChunkBy | K::ChunkByMut => false,
         }
     }
 
@@ -5929,7 +6085,8 @@ impl Ex<'_, '_> {
         let join = self.block();
         let f = |i: u32| itp.project(Proj::Field(i));
         match k {
-            K::Range | K::RangeInclusive => {
+            // core's `ChunkBy::last` is `next_back` too (R13).
+            K::Range | K::RangeInclusive | K::ChunkBy | K::ChunkByMut => {
                 self.next(itp, ty, dest.clone(), true)?;
                 self.goto(join);
             }

@@ -109,6 +109,8 @@ pub fn iter_by_path(path: &[&str]) -> Option<StdIterPath> {
         ["std", "collections", "hash_map", "IntoValues"] => S::Kind(K::MapIntoValues),
         ["std", "collections", "hash_set", "Iter"] => S::Kind(K::SetIter),
         ["std", "collections", "hash_set", "IntoIter"] => S::Kind(K::SetIntoIter),
+        ["std", "collections", "hash_map", "Drain"] => S::Kind(K::MapDrain),
+        ["std", "collections", "hash_set", "Drain"] => S::Kind(K::SetDrain),
         _ => return None,
     })
 }
@@ -139,6 +141,8 @@ fn has_lifetime(k: IterKind) -> bool {
             | K::ResultIterMut
             | K::StrSplit
             | K::SliceSplit
+            | K::ChunkBy
+            | K::ChunkByMut
             | K::SliceSplitMut
             | K::MapIter
             | K::MapIterMut
@@ -146,6 +150,8 @@ fn has_lifetime(k: IterKind) -> bool {
             | K::MapValues
             | K::MapValuesMut
             | K::SetIter
+            | K::MapDrain
+            | K::SetDrain
     )
 }
 
