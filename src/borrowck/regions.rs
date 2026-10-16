@@ -4564,8 +4564,13 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(b) if sort_by_builtin(b)) => {}
             // So does `retain`'s predicate, which takes `&T`: its captures
             // reach neither the Vec nor the unit result (`retain_mut` hands
-            // out `&mut T` and keeps the conservative rule).
-            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::VecRetain)) => {}
+            // out `&mut T` and keeps the conservative rule). A map's
+            // predicate takes `&mut V`: what it stores there is
+            // `link_closure_args`' edges to the map's slots.
+            _ if matches!(
+                target,
+                CallTarget::Builtin(crate::check::Builtin::VecRetain | crate::check::Builtin::SetRetain | crate::check::Builtin::MapRetain)
+            ) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if let CallTarget::Builtin(
@@ -8325,7 +8330,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
 /// `fn_mut_param_ref`): its outer reference is higher-ranked.
 fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
     use crate::check::Builtin as B;
-    matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey | B::VecRetain | B::VecRetainMut))
+    matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey | B::VecRetain | B::VecRetainMut | B::MapRetain | B::SetRetain))
         || b.is_some_and(sort_by_builtin)
 }
 

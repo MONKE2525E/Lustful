@@ -886,6 +886,10 @@ pub enum Builtin {
     MapRemove,
     /// `HashMap::remove_entry(&q) -> Option<(K, V)>`: the stored key and value.
     MapRemoveEntry,
+    /// `map.retain(f)` and `set.retain(f)`: hashbrown's retain, one
+    /// predicate call per element in iteration order (cgen/hash.rs).
+    MapRetain,
+    SetRetain,
     MapEntry,
     EntryOrInsert,
     EntryOrDefault,

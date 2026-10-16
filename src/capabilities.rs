@@ -578,6 +578,8 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::MapContainsKey,
     Builtin::MapRemove,
     Builtin::MapRemoveEntry,
+    Builtin::MapRetain,
+    Builtin::SetRetain,
     Builtin::MapEntry,
     Builtin::EntryOrInsert,
     Builtin::EntryOrDefault,
@@ -1205,6 +1207,8 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
             ],
             Call::Method,
         ),
+        B::MapRetain => (&["HashMap<K, V, S>"], vec![i.intern("retain")], Call::Method),
+        B::SetRetain => (&["HashSet<T, S>"], vec![i.intern("retain")], Call::Method),
         B::EntryOrInsert | B::EntryOrDefault | B::EntryKey => {
             (&["hash_map::Entry<K, V>"], vec![i.intern("or_insert"), i.intern("or_default"), i.intern("key")], Call::Method)
         }

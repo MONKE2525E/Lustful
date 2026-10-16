@@ -679,6 +679,8 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::MapContainsKey
             | B::MapRemove
             | B::MapRemoveEntry
+            | B::MapRetain
+            | B::SetRetain
             | B::MapEntry
             | B::EntryOrInsert
             | B::EntryOrDefault
@@ -913,6 +915,36 @@ impl FnGen<'_, '_> {
                 let none = self.make_variant(dest, 0, &[]);
                 let _ = writeln!(self.out, "    {dc} {t} = {o}_hit ? {some} : {none};");
                 Some(t)
+            }
+            B::MapRetain | B::SetRetain => {
+                // hashbrown's `retain`: the predicate runs once per element
+                // in iteration order; a rejected element is erased, then
+                // dropped (key before value), before the next call. The
+                // closure drops after the loop.
+                let ec = elem_cty(&recv);
+                let e = ctype(&ec);
+                let f = self.adapter_callee(&ops[1]);
+                let (c, it, s) = (self.tmp(), self.tmp(), self.tmp());
+                let mut body = String::new();
+                let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
+                let _ = writeln!(body, "    lust_hash_iter {it}; lust_hash_iter_init(&{it}, &{r}->t); uint64_t {it}_i; {e} *{s};");
+                let _ = writeln!(body, "    while (({s} = ({e}*)lust_hash_iter_next(&{it}, &{it}_i))) {{");
+                let args = if b == B::MapRetain { vec![format!("(&{s}->f0)"), format!("(&{s}->f1)")] } else { vec![s.clone()] };
+                let (keep, _) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &args);
+                let drop = if needs_drop_c(self.p, &ec) {
+                    self.want(Glue::Drop, &ec);
+                    format!(" drop_{}({s});", mangle(&ec))
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(body, "      if (!{keep}) {{ lust_hash_erase_at(&{r}->t, {it}_i, 0);{drop} }}");
+                let _ = writeln!(body, "    }}");
+                if needs_drop_c(self.p, &tys[1]) {
+                    self.want(Glue::Drop, &tys[1]);
+                    let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
+                }
+                let _ = write!(self.out, "{body}");
+                Some("((lust_Unit){})".into())
             }
             B::MapInsert | B::SetInsert => {
                 let m = mangle(&recv);

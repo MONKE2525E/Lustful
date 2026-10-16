@@ -43,7 +43,6 @@ pub fn hasher_write_arg(name: &str) -> Option<Option<IntTy>> {
 const DECLARED_ONLY: &[&str] = &[
     "drain",
     "extract_if",
-    "retain",
     "try_reserve",
     "shrink_to_fit",
     "shrink_to",
@@ -433,6 +432,18 @@ impl<'p> Ctx<'p> {
                 let ov = self.tys.mk_option(v);
                 Some((B::MapInsert, Autoref::RefMut, vec![k, v], ov, None))
             }
+            // std's `F: FnMut(&K, &mut V) -> bool` and `F: FnMut(&T) ->
+            // bool`, the references higher-ranked; no key bounds.
+            (HashTy::HashMap, "retain") => {
+                let (rk, rv) = (self.tys.mk_ref(false, k), self.tys.mk_ref(true, v));
+                let f = self.fn_mut_param_ref(&[rk, rv], BOOL, name_span);
+                Some((B::MapRetain, Autoref::RefMut, vec![f], UNIT, None))
+            }
+            (HashTy::HashSet, "retain") => {
+                let rk = self.tys.mk_ref(false, k);
+                let f = self.fn_mut_param_ref(&[rk], BOOL, name_span);
+                Some((B::SetRetain, Autoref::RefMut, vec![f], UNIT, None))
+            }
             (HashTy::HashMap, "get" | "get_mut" | "contains_key" | "remove" | "remove_entry") => {
                 let (q, rq) = lookup(self);
                 let (b, autoref, ret) = match n {
@@ -530,6 +541,9 @@ impl<'p> Ctx<'p> {
         }
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
         self.check_args(&params, args, name_span);
+        if matches!(b, B::MapRetain | B::SetRetain) && self.adapter_callable_gap(args, &params, false) {
+            return Some(ERROR);
+        }
         // The expansion calls a closure body directly (lower/iter.rs).
         if matches!(b, B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify)
             && let Some(&f) = params.first()
