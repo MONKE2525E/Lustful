@@ -308,7 +308,8 @@ pub(crate) fn def_crate_hash(p: &Program, def: DefId) -> u64 {
     if def.krate == p.krate {
         p.stable_crate.0
     } else if def.krate == BUILTIN_CRATE {
-        crate::def::stable_crate_hash("lust-builtin-v1", "lib", "builtin", false).0
+        static BUILTIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BUILTIN.get_or_init(|| crate::def::stable_crate_hash("lust-builtin-v1", "lib", "builtin", false).0)
     } else {
         def.krate.0 as u64
     }
@@ -586,27 +587,183 @@ fn collect_adt_defs(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<DefId
     }
 }
 
-/// Hashes one type deeply: the shallow structure (`hash_ty`) plus the
-/// layout fingerprint of every Adt it names, transitively. A signature
-/// that mentions a type only by name must still change when that type's
-/// fields, derives, or discriminants change, because bodies checked
-/// against the signature read those facts through the compat tables
-/// (field types, copy-ness, glue) without a separate recorded read for
-/// each one. `seen` is the cycle stack of Adt defs currently being
-/// folded (a recursive type folds its def hash only on the cycle).
-pub(crate) fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<DefId>) {
+/// Which deep walk a memo entry belongs to: Adt layouts
+/// (`hash_adt_layout`) or Adt regions (`hash_adt_regions`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Deep {
+    Layout,
+    Regions,
+}
+
+/// The deep Adt fingerprints one fingerprint computation has made, so a
+/// sub-type that many fields share is folded once (`adt_deep`). Callers
+/// of `hash_ty_deep` make one per fingerprint and pass it along. The
+/// program-wide `FpMemo` keeps the same values across computations.
+#[derive(Default)]
+pub(crate) struct DeepMemo(FxMap<(Deep, DefId), u64>);
+
+/// The program-wide memo of deep Adt fingerprints, by `AdtId`. It is on
+/// only while the program does not change: the driver turns it on after
+/// collect and the std splice (`on`), and a kept program turns it off
+/// before a patch edits it (`off`). Off, every fingerprint computation
+/// still walks each Adt once (`DeepMemo`). Walks that fill it hold
+/// `walk`: an Adt cycle publishes all its members before another walk
+/// can see one of them, so no walk takes a member for a finished leaf.
+#[derive(Default)]
+pub struct FpMemo {
+    layout: Vec<std::sync::OnceLock<u64>>,
+    regions: Vec<std::sync::OnceLock<u64>>,
+    walk: std::sync::Mutex<()>,
+}
+
+impl FpMemo {
+    /// Turns the memo on, empty, for a program with `adts` Adts.
+    pub fn on(&mut self, adts: usize) {
+        self.layout = (0..adts).map(|_| Default::default()).collect();
+        self.regions = (0..adts).map(|_| Default::default()).collect();
+    }
+
+    /// Turns the memo off and drops its values.
+    pub fn off(&mut self) {
+        *self = FpMemo::default();
+    }
+
+    fn slot(&self, p: &Program, kind: Deep, def: DefId) -> Option<&std::sync::OnceLock<u64>> {
+        let a = p.adt_by_def(def)?;
+        match kind {
+            Deep::Layout => self.layout.get(a.0 as usize),
+            Deep::Regions => self.regions.get(a.0 as usize),
+        }
+    }
+}
+
+impl DeepMemo {
+    fn get(&self, p: &Program, kind: Deep, def: DefId) -> Option<u64> {
+        self.0.get(&(kind, def)).copied().or_else(|| p.fp_memo.slot(p, kind, def).and_then(|s| s.get().copied()))
+    }
+
+    fn put(&mut self, p: &Program, kind: Deep, def: DefId, v: u64) {
+        self.0.insert((kind, def), v);
+        if let Some(s) = p.fp_memo.slot(p, kind, def) {
+            let _ = s.set(v);
+        }
+    }
+}
+
+/// Hashes one type shallowly (`hash_ty`), then calls `r` for every Adt
+/// def it names, in walk order.
+fn hash_ty_refs(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
     hash_ty(h, p, tys, t);
     let mut defs = Vec::new();
     collect_adt_defs(p, tys, t, &mut defs);
     for def in defs {
-        if seen.contains(&def) {
-            "layout-cycle".hash(h);
-            hash_def_pub(h, p, def);
-            continue;
+        r(h, def);
+    }
+}
+
+/// Hashes one type deeply: the shallow structure (`hash_ty`) plus the
+/// deep layout fingerprint of every Adt it names (`adt_deep`), which
+/// covers that Adt's layout and, transitively, every Adt its fields
+/// name. A signature that mentions a type only by name must still
+/// change when that type's fields, derives, or discriminants change,
+/// because bodies checked against the signature read those facts
+/// through the compat tables (field types, copy-ness, glue) without a
+/// separate recorded read for each one.
+pub(crate) fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, memo: &mut DeepMemo) {
+    hash_ty_refs(h, p, tys, t, &mut |h, def| adt_deep(p, Deep::Layout, def, memo).hash(h));
+}
+
+/// The deep fingerprint of one Adt in one walk: its own content
+/// (`hash_adt_layout` or `hash_adt_regions`), where each Adt it names
+/// folds in as that Adt's deep fingerprint. Adts that name each other
+/// in a cycle (one strongly connected component of the "names" graph)
+/// fold each other by def only, and each one's fingerprint covers the
+/// content of every member, sorted by stable def identity. So the
+/// value is a pure function of the reachable content, the same in
+/// every run and walk order, and the walk visits each Adt once.
+fn adt_deep(p: &Program, kind: Deep, def: DefId, memo: &mut DeepMemo) -> u64 {
+    if let Some(v) = memo.get(p, kind, def) {
+        return v;
+    }
+    let _walk = (!p.fp_memo.layout.is_empty()).then(|| p.fp_memo.walk.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Some(v) = memo.get(p, kind, def) {
+        return v;
+    }
+    let mut scc = Scc { p, kind, order: FxMap::default(), stack: Vec::new() };
+    scc.visit(def, memo);
+    memo.get(p, kind, def).unwrap_or_default()
+}
+
+/// Folds one Adt's own content for walk `kind` into `h`; `r` folds each
+/// Adt it names.
+fn hash_adt_own(h: &mut FxHasher, p: &Program, kind: Deep, def: DefId, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
+    match kind {
+        Deep::Layout => hash_adt_layout(h, p, def, r),
+        Deep::Regions => hash_adt_regions(h, p, def, r),
+    }
+}
+
+/// Tarjan's strongly connected components over the Adts one deep walk
+/// reaches (`adt_deep`). `order` holds (visit index, low link) for each
+/// def seen; a seen def without a memo value is still on `stack`.
+struct Scc<'p> {
+    p: &'p Program,
+    kind: Deep,
+    order: FxMap<DefId, (u32, u32)>,
+    stack: Vec<DefId>,
+}
+
+impl Scc<'_> {
+    fn visit(&mut self, v: DefId, memo: &mut DeepMemo) {
+        let (p, kind) = (self.p, self.kind);
+        let index = self.order.len() as u32;
+        self.order.insert(v, (index, index));
+        self.stack.push(v);
+        let mut succ: Vec<DefId> = Vec::new();
+        hash_adt_own(&mut FxHasher::default(), p, kind, v, &mut |_, d| {
+            if !succ.contains(&d) {
+                succ.push(d);
+            }
+        });
+        for w in succ {
+            if memo.get(p, kind, w).is_some() {
+                continue;
+            }
+            let low = match self.order.get(&w) {
+                Some(&(wi, _)) => wi,
+                None => {
+                    self.visit(w, memo);
+                    self.order[&w].1
+                }
+            };
+            let e = self.order.get_mut(&v).expect("visited");
+            e.1 = e.1.min(low);
         }
-        seen.push(def);
-        hash_adt_layout(h, p, def, seen);
-        seen.pop();
+        if self.order[&v].1 != index {
+            return;
+        }
+        let at = self.stack.iter().rposition(|d| *d == v).expect("on stack");
+        let mut members = self.stack.split_off(at);
+        members.sort_unstable_by_key(|d| (def_crate_hash(p, *d), d.hash.0));
+        let mut h = FxHasher::default();
+        (if kind == Deep::Layout { "adt-deep-layout-v1" } else { "adt-deep-regions-v1" }).hash(&mut h);
+        (members.len() as u64).hash(&mut h);
+        for &m in &members {
+            hash_adt_own(&mut h, p, kind, m, &mut |h, d| match members.contains(&d) {
+                true => {
+                    "scc-member".hash(h);
+                    hash_def_pub(h, p, d);
+                }
+                false => memo.get(p, kind, d).unwrap_or_default().hash(h),
+            });
+        }
+        let scc = h.finish();
+        for &m in &members {
+            let mut h = FxHasher::default();
+            scc.hash(&mut h);
+            hash_def_pub(&mut h, p, m);
+            memo.put(p, kind, m, h.finish());
+        }
     }
 }
 
@@ -614,11 +771,12 @@ pub(crate) fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t
 /// derives (every derived trait and the `#[default]` variant change
 /// what checking and codegen do with a value, so they are part of this
 /// fingerprint, not only of `Sig`), and per variant its name, shape, discriminant, and
-/// field names and deep field types. Builtin Adts (String, Vec, Option)
+/// field names and field types; `r` folds each Adt a type names (see
+/// `adt_deep`). Builtin Adts (String, Vec, Option)
 /// and unknown defs fold their def hash only: their layout is fixed by
 /// the compiler, never by a user edit.
-fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<DefId>) {
-    "adt-layout-v1".hash(h);
+fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
+    "adt-layout-v2".hash(h);
     hash_def_pub(h, p, def);
     let Some(a) = p.adt_by_def(def) else { return };
     let adt = p.adt(a);
@@ -655,7 +813,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
                 }
             }
             for &(_, t) in &rec.assoc_tys {
-                hash_ty_deep(h, p, &p.tys, t, seen);
+                hash_ty_refs(h, p, &p.tys, t, r);
             }
         }
     }
@@ -682,7 +840,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
             } else {
                 (i as u64).hash(h);
             }
-            hash_ty_deep(h, p, &p.tys, fd.ty, seen);
+            hash_ty_refs(h, p, &p.tys, fd.ty, r);
         }
     }
 }
@@ -694,38 +852,25 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<Def
 /// dirties them even when no signature that names the type changed text.
 pub(crate) fn layout_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let mut h = FxHasher::default();
-    "layout-v1".hash(&mut h);
-    let mut seen = vec![def];
-    hash_adt_layout(&mut h, p, def, &mut seen);
+    "layout-v2".hash(&mut h);
+    adt_deep(p, Deep::Layout, def, &mut DeepMemo::default()).hash(&mut h);
     Fingerprint(h.finish())
 }
 
 /// Folds the regions of one regioned type (W-BORROW, `p.regions`) into
-/// `h`: its structure with regions, then the regioned fields of every
-/// user Adt it names, transitively. Erased types hide what the borrow
+/// `h`: its structure with regions, then the deep regions fingerprint
+/// of every Adt it names (`adt_deep`). Erased types hide what the borrow
 /// checker reads here (`&'static str` and `&str` are one erased type;
 /// an Adt's variance comes from its fields' regions), so a region-only
 /// edit must move the `Sig` fingerprint of what it changed.
-fn hash_regions_deep(h: &mut FxHasher, p: &Program, t: Ty, seen: &mut Vec<DefId>) {
-    hash_ty(h, p, &p.tys, t);
-    let mut defs = Vec::new();
-    collect_adt_defs(p, &p.tys, t, &mut defs);
-    for def in defs {
-        if seen.contains(&def) {
-            "region-cycle".hash(h);
-            hash_def_pub(h, p, def);
-            continue;
-        }
-        seen.push(def);
-        hash_adt_regions(h, p, def, seen);
-        seen.pop();
-    }
+fn hash_regions_deep(h: &mut FxHasher, p: &Program, t: Ty, memo: &mut DeepMemo) {
+    hash_ty_refs(h, p, &p.tys, t, &mut |h, def| adt_deep(p, Deep::Regions, def, memo).hash(h));
 }
 
-/// Folds one Adt's lifetime params and regioned field types into `h`
-/// (see `hash_regions_deep`).
-fn hash_adt_regions(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<DefId>) {
-    "adt-regions-v1".hash(h);
+/// Folds one Adt's lifetime params and regioned field types into `h`;
+/// `r` folds each Adt a field type names (see `hash_regions_deep`).
+fn hash_adt_regions(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
+    "adt-regions-v2".hash(h);
     hash_def_pub(h, p, def);
     (p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len()) as u64).hash(h);
     p.regions.adt_facts.get(&def).hash(h);
@@ -734,7 +879,7 @@ fn hash_adt_regions(h: &mut FxHasher, p: &Program, def: DefId, seen: &mut Vec<De
     for fields in variants {
         (fields.len() as u64).hash(h);
         for &t in fields {
-            hash_regions_deep(h, p, t, seen);
+            hash_ty_refs(h, p, &p.tys, t, r);
         }
     }
 }
@@ -747,7 +892,7 @@ fn hash_region_sig(h: &mut FxHasher, p: &Program, rs: Option<&crate::borrowck::R
     let Some(rs) = rs else { return 0u8.hash(h) };
     1u8.hash(h);
     rs.n_univ.hash(h);
-    let mut seen: Vec<DefId> = Vec::new();
+    let mut seen = DeepMemo::default();
     (rs.params.len() as u64).hash(h);
     for &t in &rs.params {
         hash_regions_deep(h, p, t, &mut seen);
@@ -905,7 +1050,7 @@ fn impl_content(p: &Program, def: DefId) -> u64 {
     // A header's regions for a trait with lifetime params (W-BORROW):
     // callers' borrow checks replay them.
     if let Some(head) = p.regions.impl_heads.get(&def) {
-        let mut seen = Vec::new();
+        let mut seen = DeepMemo::default();
         hash_regions_deep(&mut h, p, head.self_ty, &mut seen);
         for &r in &head.trait_lifetimes {
             hash_region(&mut h, r);
@@ -1106,7 +1251,7 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     "sig-v4".hash(&mut h);
     hash_vis_facts(&mut h, p, def);
     hash_def_pub(&mut h, p, def);
-    let mut seen: Vec<DefId> = Vec::new();
+    let mut seen = DeepMemo::default();
     if let Some(local) = p.local_def(def.hash).filter(|l| p.def_id(*l) == def) {
         let f = p.fn_info(local);
         0u8.hash(&mut h);
@@ -1186,8 +1331,7 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         layout_fingerprint(p, def).0.hash(&mut h);
         // Lifetime params and field regions (W-BORROW): `&'a T` and
         // `&'static T` fields erase alike.
-        let mut seen = vec![def];
-        hash_adt_regions(&mut h, p, def, &mut seen);
+        adt_deep(p, Deep::Regions, def, &mut seen).hash(&mut h);
     } else if let Some(data) = p.defs.get(def) {
         2u8.hash(&mut h);
         // Const and static payloads are found by def; aliases by flat
@@ -2300,6 +2444,46 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
     /// The layout fingerprint is its own node: it moves on field and
     /// derive edits, not on a method edit of the same type, and
     /// `layout_of` records it so the walk replays it.
+    /// Deep fingerprints (`adt_deep`) over a type graph with a shared
+    /// sub-type and a cycle: the same values with the program memo on or
+    /// off, in any order, and for any item order in the source; an edit
+    /// moves every type that reaches it and no other.
+    #[test]
+    fn deep_fingerprints_are_memo_and_order_free() {
+        const SRC: &str = "struct A { b: Box<B>, c: C }\nstruct B { a: Option<Box<A>>, x: u8 }\nstruct C { x: u32 }\n\
+                           struct D { a: A, c: C, e: (C, [C; 2]) }\nfn main() {}\n";
+        fn fps(src: &str, memo: bool, rev: bool) -> Vec<(Fingerprint, Fingerprint)> {
+            let mut out = Vec::new();
+            with_program(src, |interner, p| {
+                if memo {
+                    p.fp_memo.on(p.adts.len());
+                }
+                let mut names = ["A", "B", "C", "D"];
+                if rev {
+                    names.reverse();
+                }
+                for n in names {
+                    let def = p.def_of_adt(p.type_names[&interner.intern(n)]);
+                    out.push((layout_fingerprint(p, def), sig_fingerprint(p, def)));
+                }
+                if rev {
+                    out.reverse();
+                }
+            });
+            out
+        }
+        let base = fps(SRC, false, false);
+        assert_eq!(fps(SRC, true, false), base, "the program memo keeps the values");
+        assert_eq!(fps(SRC, true, true), base, "walk order does not matter");
+        let moved = SRC.replace("struct C { x: u32 }\n", "").replace("fn main", "struct C { x: u32 }\nfn main");
+        assert_eq!(fps(&moved, true, false), base, "item order does not matter");
+        let layouts = |v: &[(Fingerprint, Fingerprint)]| v.iter().map(|x| x.0).collect::<Vec<_>>();
+        let (b, c) = (layouts(&base), layouts(&fps(&SRC.replace("x: u32", "x: u64"), true, false)));
+        assert!(b.iter().zip(&c).all(|(x, y)| x != y), "C's edit moves A, B (through A), C, and D");
+        let c = layouts(&fps(&SRC.replace("x: u8", "x: u16"), true, false));
+        assert_eq!((b[0] != c[0], b[1] != c[1], b[2] != c[2], b[3] != c[3]), (true, true, false, true), "B's edit moves its cycle and D");
+    }
+
     #[test]
     fn layout_fingerprint_tracks_layout_not_methods() {
         fn layout_of_src(src: &str) -> Fingerprint {

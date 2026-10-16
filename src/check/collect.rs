@@ -340,6 +340,9 @@ pub struct Program {
     /// kept program checks its values again with them (`const_values_hold`).
     pub const_values: Vec<Option<crate::ty::consteval::ConstValue>>,
     pub scope_of_stmt: HashMap<u32, Vec<u32>>,
+    /// Deep Adt fingerprints, kept while the driver holds the program
+    /// unchanged (driver/graph.rs `FpMemo`). Off after collect.
+    pub fp_memo: crate::driver::graph::FpMemo,
 }
 
 impl Program {
@@ -3068,6 +3071,7 @@ pub fn collect_reuse(
         record_reads: true,
         unwind: false,
         regions: Default::default(),
+        fp_memo: Default::default(),
     };
     let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;

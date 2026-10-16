@@ -86,7 +86,7 @@ fn hash_const(h: &mut FxHasher, p: &Program, c: &Const) {
     }
 }
 
-fn hash_operand(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, o: &Operand, seen: &mut Vec<DefId>) {
+fn hash_operand(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, o: &Operand, seen: &mut graph::DeepMemo) {
     match o {
         Operand::Copy(place) => {
             0u8.hash(h);
@@ -104,7 +104,7 @@ fn hash_operand(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, o: &Operand,
     let _ = (tys, seen);
 }
 
-fn hash_fmt(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, parts: &[FmtPart], seen: &mut Vec<DefId>) {
+fn hash_fmt(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, parts: &[FmtPart], seen: &mut graph::DeepMemo) {
     (parts.len() as u64).hash(h);
     for part in parts {
         match part {
@@ -125,9 +125,9 @@ fn hash_fmt(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, parts: &[FmtPart
     }
 }
 
-fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, seen: &mut Vec<DefId>) {
-    let ty = |h: &mut FxHasher, t: Ty, seen: &mut Vec<DefId>| graph::hash_ty_deep(h, p, tys, t, seen);
-    let ops = |h: &mut FxHasher, os: &[Operand], seen: &mut Vec<DefId>| {
+fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, seen: &mut graph::DeepMemo) {
+    let ty = |h: &mut FxHasher, t: Ty, seen: &mut graph::DeepMemo| graph::hash_ty_deep(h, p, tys, t, seen);
+    let ops = |h: &mut FxHasher, os: &[Operand], seen: &mut graph::DeepMemo| {
         (os.len() as u64).hash(h);
         for o in os {
             hash_operand(h, p, tys, o, seen);
@@ -343,7 +343,7 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
     // location in it (check/caller.rs).
     crate::check::caller::is_track_caller(p, body.fn_id).hash(&mut h);
     (body.arg_count as u64).hash(&mut h);
-    let mut seen: Vec<DefId> = Vec::new();
+    let mut seen = graph::DeepMemo::default();
     (body.locals.len() as u64).hash(&mut h);
     for l in &body.locals {
         graph::hash_ty_deep(&mut h, p, &body.tys, l.ty, &mut seen);

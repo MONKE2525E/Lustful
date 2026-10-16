@@ -1319,6 +1319,8 @@ pub(super) fn reuse_kept(
         None => return Err("ast"),
     };
     let mut p = k.program;
+    // The edits below change what fingerprints read.
+    p.fp_memo.off();
     p.ast = front.ast.clone();
     p.resolved = tables.cloned();
     caches.gen_reuse.begin_kept();

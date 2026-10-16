@@ -3010,6 +3010,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
     }
+    // The program stays unchanged from here on (until a patch takes it
+    // back), so deep Adt fingerprints can be kept across reads.
+    program.fp_memo.on(program.adts.len());
     if program.fns.len() < fn_count {
         // The scanner and the parser disagree (only possible with unusual syntax). Start over.
         front.env_hash = None;
