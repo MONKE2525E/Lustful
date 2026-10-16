@@ -811,13 +811,12 @@ pub fn erase_dyn_region(tys: &mut impl TyIntern, t: Ty) -> Ty {
 // trait bounded by `'static`, see `dyn_is_static`) or erased. An erased
 // one written in a signature (`d: &dyn Tr`, `-> &dyn Tr`) is a caller's
 // lifetime; one in a body annotation is inferred, and rustc may pick
-// `'static` for it. Uses that need `'static` queue a `DynStatic`
-// obligation. The borrow checker proves those whose object lifetime is a
-// region slot of the types involved (a coercion or subtyping into a
-// `'static` object, an `impl dyn Tr` method's receiver; region
-// signatures keep rustc's defaults). The others (an `impl X for dyn Tr`
-// picked by trait selection, a dyn call to a method with `where Self:
-// 'static`) pass at body end only when no dyn value in the body can come
+// `'static` for it. The borrow checker proves the `'static` uses whose
+// object lifetime is a region slot of the types involved (a coercion or
+// subtyping into a `'static` object, an `impl dyn Tr` method's receiver;
+// region signatures keep rustc's defaults). The others (an `impl X for
+// dyn Tr` picked by trait selection, a dyn call to a method with `where
+// Self: 'static`) queue a `DynStatic` obligation and pass at body end only when no dyn value in the body can come
 // from a non-`'static` source (`Ctx::dyn_static_clean`); otherwise they
 // are L0705. That rejects some programs rustc accepts, never the
 // reverse.
@@ -826,10 +825,6 @@ pub fn erase_dyn_region(tys: &mut impl TyIntern, t: Ty) -> Ty {
 /// reaches it has proved nothing, so it answers "cannot prove" (L0705
 /// or L0612), never "no error".
 pub const LIFETIME_WALK_LIMIT: u32 = 64;
-
-/// The path depth at which `reaches_erased_dyn_field` stops (a guard for
-/// the stack; its visited set already bounds the walk).
-const FIELD_WALK_LIMIT: u32 = 1024;
 
 /// True when a dyn type an impl header names as its Self type has a
 /// `'static` object lifetime: `impl dyn Tr` and `impl X for dyn Tr` (the
@@ -937,53 +932,6 @@ pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool
         }
         _ => go(p, tys, t, false, 0),
     }
-}
-
-/// True when `t` reaches a writable place that holds a dyn type with an
-/// erased object lifetime in an invariant position
-/// (`has_erased_dyn_invariant`) inside a user Adt's field (`struct St<'x>
-/// { v: Vec<&'x mut dyn Tr> }` behind `&mut St<'x>`): a place a body value
-/// may flow into invariantly with a caller's object lifetime
-/// (`Ctx::dyn_static_bck_clean`). Writable: owned or behind `&mut`, or
-/// inside a `Cell`, `RefCell`, or lock behind `&`, `Rc`, or `Arc`. Each
-/// Adt is visited once per writability; a path deeper than
-/// `FIELD_WALK_LIMIT` counts as such a place.
-pub fn reaches_erased_dyn_field(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    fn adt_holds(p: &Program, a: crate::ty::AdtId, writable: bool, seen: &mut Vec<(crate::ty::AdtId, bool)>, depth: u32) -> bool {
-        if seen.contains(&(a, writable)) {
-            return false;
-        }
-        if depth > FIELD_WALK_LIMIT {
-            return true;
-        }
-        seen.push((a, writable));
-        let fields: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
-        fields.into_iter().any(|f| (writable && has_erased_dyn_invariant(p, &p.tys, f)) || go(p, &p.tys, f, writable, seen, depth + 1))
-    }
-    fn go(p: &Program, tys: &impl TyIntern, t: Ty, writable: bool, seen: &mut Vec<(crate::ty::AdtId, bool)>, depth: u32) -> bool {
-        if depth > FIELD_WALK_LIMIT {
-            return true;
-        }
-        match tys.kind(t) {
-            TyKind::Ref(_, m, e) | TyKind::RawPtr(m, e) => go(p, tys, e, writable && m.is_mut(), seen, depth + 1),
-            TyKind::Slice(e) | TyKind::Array(e, _) => go(p, tys, e, writable, seen, depth + 1),
-            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(p, tys, e, writable, seen, depth + 1)),
-            TyKind::Adt(d, a) => {
-                let builtin = tys.builtin_of(t);
-                use crate::ty::sync::SyncTy;
-                // Shared owners give no write access; a cell or lock does.
-                let shared = matches!(builtin, Some(BuiltinTy::Rc | BuiltinTy::Weak | BuiltinTy::Sync(SyncTy::Arc | SyncTy::ArcWeak)));
-                let cell = matches!(builtin, Some(BuiltinTy::Cell | BuiltinTy::RefCell)) || matches!(builtin, Some(BuiltinTy::Sync(k)) if !matches!(k, SyncTy::Arc | SyncTy::ArcWeak));
-                let inner = (writable && !shared) || cell;
-                let own = builtin.is_none() && p.tys.local_adt_of(d).is_some_and(|id| adt_holds(p, id, writable, seen, depth + 1));
-                let args = tys.args(a);
-                own || (cell && args.iter().any(|g| g.as_ty().is_some_and(|e| has_erased_dyn_invariant(p, tys, e))))
-                    || args.iter().any(|g| g.as_ty().is_some_and(|e| go(p, tys, e, inner, seen, depth + 1)))
-            }
-            _ => false,
-        }
-    }
-    go(p, tys, t, true, &mut Vec::new(), 0)
 }
 
 /// True when a value of type `t` may hold a borrow, so a dyn value made
@@ -1100,24 +1048,6 @@ pub fn mentions_dyn(tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
-/// True when a user (non-builtin) Adt in `t` has a type arg that mentions
-/// a dyn type (`Own<dyn Tr>`). Codegen keys such an instance by its args,
-/// object lifetimes included, so a value may not move between two that
-/// differ only there; `Ctx::dyn_regions` keeps those to the body-level
-/// rule instead of the borrow checker.
-pub fn user_adt_over_dyn(tys: &impl TyIntern, t: Ty) -> bool {
-    match tys.kind(t) {
-        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => user_adt_over_dyn(tys, e),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| user_adt_over_dyn(tys, e)),
-        TyKind::Adt(_, a) => {
-            let args = tys.args(a);
-            (tys.builtin_of(t).is_none() && args.iter().any(|g| g.as_ty().is_some_and(|e| mentions_dyn(tys, e))))
-                || args.iter().any(|g| g.as_ty().is_some_and(|e| user_adt_over_dyn(tys, e)))
-        }
-        _ => false,
-    }
-}
-
 /// The full trait ref a dyn principal stands for at one concrete Self.
 pub fn with_self(tys: &mut impl TyIntern, tr: TraitRef, self_ty: Ty) -> TraitRef {
     let mut args: Vec<GenericArg> = tys.args(tr.args).to_vec();
@@ -1130,15 +1060,10 @@ pub fn with_self(tys: &mut impl TyIntern, tr: TraitRef, self_ty: Ty) -> TraitRef
 impl super::Ctx<'_> {
     /// The source `x` of an unsizing coercion to a `'static` dyn type
     /// that may borrow only through regions the borrow checker tracks
-    /// (`may_borrow_untracked_in`): the borrow checker proves the bound,
-    /// under the guard of `Ctx::dyn_static_bck_clean`. False when check
-    /// must decide it.
-    pub(super) fn bck_static_source(&mut self, x: Ty, span: Span) -> bool {
-        if may_borrow_untracked_in(self.p, &self.tys, self.env(), x) {
-            return false;
-        }
-        self.obl.push(super::obligations::Obligation::DynStatic { span, bck: true });
-        true
+    /// (`may_borrow_untracked_in`): the borrow checker proves the bound.
+    /// False when check must decide it.
+    pub(super) fn bck_static_source(&mut self, x: Ty) -> bool {
+        !may_borrow_untracked_in(self.p, &self.tys, self.env(), x)
     }
 }
 

@@ -3109,13 +3109,8 @@ impl<'p> Ctx<'p> {
         t
     }
     fn set_res(&mut self, e: ExprId, r: Res) {
-        // A method of an impl for a `'static` dyn type (`impl dyn Tr`).
-        if let Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } = r
-            && self.p.gx.static_dyn_fns.contains(&f)
-        {
-            let span = self.span(e);
-            self.obl.push(obligations::Obligation::DynStatic { span, bck: true });
-        }
+        // A method of an impl for a `'static` dyn type (`impl dyn Tr`)
+        // needs a `'static` receiver: the borrow checker proves it.
         let i = self.ei(e);
         self.out.expr_res[i] = r;
     }
@@ -5081,7 +5076,7 @@ impl<'p> Ctx<'p> {
         if let Selection::Impl { id, .. } = &sel
             && p.gx.static_dyn_impls.contains(&p.gx.index.get(*id).def)
         {
-            self.obl.push(obligations::Obligation::DynStatic { span, bck: false });
+            self.obl.push(obligations::Obligation::DynStatic { span });
         }
         if let Selection::Impl { nested, .. } = &sel {
             for pred in nested.clone() {
@@ -5432,12 +5427,12 @@ impl<'p> Ctx<'p> {
             }
         }
         if hard && !self.obl.is_empty() {
-            let mut dyn_static: Vec<(Span, bool)> = Vec::new();
+            let mut dyn_static: Vec<Span> = Vec::new();
             let mut type_static: Vec<(Ty, Span)> = Vec::new();
             let mut static_src: Vec<(Ty, Span)> = Vec::new();
             for ob in self.obl.take() {
                 match ob {
-                    obligations::Obligation::DynStatic { span, bck } => dyn_static.push((span, bck)),
+                    obligations::Obligation::DynStatic { span } => dyn_static.push(span),
                     obligations::Obligation::TypeStatic { ty, span } => type_static.push((ty, span)),
                     obligations::Obligation::StaticSource { ty, span } => static_src.push((ty, span)),
                     obligations::Obligation::Trait { trait_ref, span, .. } => {
@@ -5492,12 +5487,10 @@ impl<'p> Ctx<'p> {
             }
             for (ty, span) in static_src {
                 let ty = self.deep(ty);
-                if object::may_borrow_in(self.p, &self.tys, self.env(), ty) {
-                    if object::may_borrow_untracked_in(self.p, &self.tys, self.env(), ty) {
-                        self.static_source_err(ty, span);
-                    } else {
-                        dyn_static.push((span, true));
-                    }
+                // A source that borrows only through references and
+                // inferred object lifetimes is the borrow checker's.
+                if object::may_borrow_in(self.p, &self.tys, self.env(), ty) && object::may_borrow_untracked_in(self.p, &self.tys, self.env(), ty) {
+                    self.static_source_err(ty, span);
                 }
             }
             self.check_dyn_static(dyn_static);
@@ -5514,7 +5507,6 @@ impl<'p> Ctx<'p> {
             return;
         }
         let mut seen: Vec<Span> = Vec::new();
-        let mut bck: Vec<(Span, bool)> = Vec::new();
         for (ty, span) in items {
             let ty = self.deep(ty);
             if seen.contains(&span) {
@@ -5525,12 +5517,10 @@ impl<'p> Ctx<'p> {
             let mut err = self.static_bound_err(ty, 0);
             // Failing only on inferred object lifetimes: the borrow
             // checker proves the bound where it is used (a call's `F:
-            // 'static`, an impl's where-clause, an opaque's bound), under
-            // the guard of `dyn_static_bck_clean`.
+            // 'static`, an impl's where-clause, an opaque's bound).
             if err.is_some() && !spawn {
                 self.static_dyn_inferred_ok = true;
                 if self.static_bound_err(ty, 0).is_none() {
-                    bck.push((span, true));
                     err = None;
                 }
             }
@@ -5540,7 +5530,6 @@ impl<'p> Ctx<'p> {
                 self.err(code, span, msg, "Use a type that lives for `'static` here, or add a `'static` bound to the type parameter.");
             }
         }
-        self.check_dyn_static(bck);
     }
 
     /// Why `t` may fail a `'static` bound, as far as lust can tell. A
@@ -5698,14 +5687,8 @@ impl<'p> Ctx<'p> {
     /// this body cannot give them one (see `dyn_static_clean`). Concrete
     /// instances skip it: their caller proved the bound that picked the
     /// impl, and their params are the caller's types.
-    fn check_dyn_static(&mut self, items: Vec<(Span, bool)>) {
-        if items.is_empty() || matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
-            return;
-        }
-        let bck_ok = !items.iter().any(|&(_, bck)| bck) || self.dyn_static_bck_clean();
-        let clean = items.iter().all(|&(_, bck)| bck) || self.dyn_static_clean();
-        let mut spans: Vec<Span> = items.into_iter().filter(|&(_, bck)| if bck { !bck_ok } else { !clean }).map(|(s, _)| s).collect();
-        if spans.is_empty() {
+    fn check_dyn_static(&mut self, mut spans: Vec<Span>) {
+        if spans.is_empty() || matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) || self.dyn_static_clean() {
             return;
         }
         // A probe re-selection records no span; the call site does.
@@ -5723,47 +5706,6 @@ impl<'p> Ctx<'p> {
                 "Make the `dyn` value `'static` (`&'static dyn Tr` or `dyn Tr + 'static`), or write `impl dyn Tr + '_` for an impl that takes any lifetime.",
             );
         }
-    }
-
-    /// The part of `dyn_static_clean` the borrow checker does not replace,
-    /// for the `'static` uses it proves (`Obligation::DynStatic::bck`): no
-    /// dyn type with a caller's object lifetime sits in an invariant
-    /// position (under `&mut`, a user Adt, a fn pointer) of a parameter,
-    /// the return type, a callee's return type, or a closure's signature,
-    /// and no parameter or return type reaches a user Adt field that holds
-    /// one (`object::reaches_erased_dyn_field`).
-    /// The borrow checker lets any value flowing into a place shorten the
-    /// object lifetime of an outer `&mut dyn` (rustc does so only at a
-    /// coercion site with a known target type), so a `'static` object it
-    /// proved could still reach such a place (`let o = Some(d); o`).
-    fn dyn_static_bck_clean(&mut self) -> bool {
-        let p = self.p;
-        if self.f.params.iter().chain([&self.f.ret]).any(|&t| object::has_erased_dyn_invariant(p, &p.tys, t) || object::reaches_erased_dyn_field(p, &p.tys, t)) {
-            return false;
-        }
-        for i in 0..self.closures.len() {
-            let sig: Vec<Ty> = self.closures[i].inputs.iter().copied().chain([self.closures[i].output]).collect();
-            for t in sig {
-                let t = self.deep(t);
-                if object::has_erased_dyn_invariant(p, &self.tys, t) {
-                    return false;
-                }
-            }
-        }
-        for i in 0..self.out.expr_res.len() {
-            let invariant = match self.out.expr_res[i] {
-                Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn_invariant(p, &p.tys, p.fn_info(f).ret),
-                Res::DynMethod { .. } | Res::Indirect => {
-                    let t = self.deep(self.out.expr_ty[i]);
-                    object::has_erased_dyn_invariant(p, &self.tys, t)
-                }
-                _ => continue,
-            };
-            if invariant {
-                return false;
-            }
-        }
-        true
     }
 
     /// True when every dyn value in this body may have a `'static` object
@@ -6844,8 +6786,8 @@ impl<'p> Ctx<'p> {
 
     /// The object lifetime checks of a coercion whose types unified
     /// (`unify` ignores regions; see `check::object`). A `'static`
-    /// object lifetime the found type lacks needs proof: a `DynStatic`
-    /// obligation. Under `&mut`, `*mut`, a user Adt (lust computes no
+    /// object lifetime the found type lacks is the borrow checker's
+    /// (it relates the types' object lifetime slots). Under `&mut`, `*mut`, a user Adt (lust computes no
     /// variance), a fn pointer, or trait args (`invariant`), the object
     /// lifetimes must match; and a written `&'static` reference to a
     /// dyn value cannot come from a shorter one. lust cannot prove
@@ -6861,19 +6803,8 @@ impl<'p> Ctx<'p> {
         if !self.tys.flags(f).contains_static_region() && !self.tys.flags(e).contains_static_region() {
             return;
         }
-        let mut need_static = false;
-        match self.region_walk(f, e, invariant, &mut need_static, 0) {
-            Some(why) => self.err(
-                "L0705",
-                span,
-                why,
-                "Use the same object lifetime on both sides, or drop the `'static` bound from the `dyn` type.",
-            ),
-            None if need_static => {
-                let bck = !object::user_adt_over_dyn(&self.tys, e);
-                self.obl.push(obligations::Obligation::DynStatic { span, bck });
-            }
-            None => {}
+        if let Some(why) = self.region_walk(f, e, invariant, 0) {
+            self.err("L0705", span, why, "Use the same object lifetime on both sides, or drop the `'static` bound from the `dyn` type.");
         }
     }
 
@@ -6892,11 +6823,11 @@ impl<'p> Ctx<'p> {
         matches!((self.tys.kind(xf), self.tys.kind(xe)), (TyKind::Dyn(..), TyKind::Dyn(..))).then_some((xf, xe))
     }
 
-    /// `dyn_regions` over two unified types, in parallel. Sets
-    /// `need_static` for a `'static` object lifetime that needs proof;
+    /// `dyn_regions` over two unified types, in parallel. A `'static`
+    /// object lifetime the found type lacks is the borrow checker's; this
     /// returns the reason when the regions cannot match, or when the
     /// types nest past the walk limit (nothing is proved there).
-    fn region_walk(&mut self, f: Ty, e: Ty, invariant: bool, need_static: &mut bool, depth: u32) -> Option<String> {
+    fn region_walk(&mut self, f: Ty, e: Ty, invariant: bool, depth: u32) -> Option<String> {
         let p = self.p;
         if f == e {
             return None;
@@ -6907,9 +6838,7 @@ impl<'p> Ctx<'p> {
         match (self.tys.kind(f), self.tys.kind(e)) {
             (TyKind::Dyn(bf, _), TyKind::Dyn(be, _)) => {
                 let (fs, es) = (object::dyn_is_static(p, &self.tys, f), object::dyn_is_static(p, &self.tys, e));
-                if es && !fs {
-                    *need_static = true;
-                } else if fs && !es && invariant {
+                if fs && !es && invariant {
                     return Some(format!(
                         "`{}` and `{}` must have the same object lifetime here, and lust cannot prove that",
                         self.tn(f),
@@ -6917,7 +6846,7 @@ impl<'p> Ctx<'p> {
                     ));
                 }
                 match (self.tys.dyn_bounds(bf).principal, self.tys.dyn_bounds(be).principal) {
-                    (Some(pf), Some(pe)) if pf.value.def == pe.value.def => self.args_walk(pf.value.args, pe.value.args, true, need_static, depth),
+                    (Some(pf), Some(pe)) if pf.value.def == pe.value.def => self.args_walk(pf.value.args, pe.value.args, true, depth),
                     _ => None,
                 }
             }
@@ -6932,15 +6861,15 @@ impl<'p> Ctx<'p> {
                 if to_dyn && rf == Region::Static && re != Region::Static && invariant {
                     return Some(format!("`{}` and `{}` must have the same lifetime here, and lust cannot prove that", self.tn(f), self.tn(e)));
                 }
-                self.region_walk(xf, xe, invariant || me.is_mut(), need_static, depth + 1)
+                self.region_walk(xf, xe, invariant || me.is_mut(), depth + 1)
             }
-            (TyKind::RawPtr(_, xf), TyKind::RawPtr(me, xe)) => self.region_walk(xf, xe, invariant || me.is_mut(), need_static, depth + 1),
+            (TyKind::RawPtr(_, xf), TyKind::RawPtr(me, xe)) => self.region_walk(xf, xe, invariant || me.is_mut(), depth + 1),
             (TyKind::Slice(xf), TyKind::Slice(xe)) | (TyKind::Array(xf, _), TyKind::Array(xe, _)) => {
-                self.region_walk(xf, xe, invariant, need_static, depth + 1)
+                self.region_walk(xf, xe, invariant, depth + 1)
             }
             (TyKind::Tuple(a), TyKind::Tuple(b)) => {
                 let (a, b) = (self.tys.tys_of(a).to_vec(), self.tys.tys_of(b).to_vec());
-                a.into_iter().zip(b).find_map(|(x, y)| self.region_walk(x, y, invariant, need_static, depth + 1))
+                a.into_iter().zip(b).find_map(|(x, y)| self.region_walk(x, y, invariant, depth + 1))
             }
             // `Option`, `Result`, `Vec`, `Box`, `Rc`, `Arc`, and the
             // shared guards `Ref` and `RwLockReadGuard` are covariant.
@@ -6950,7 +6879,7 @@ impl<'p> Ctx<'p> {
                     Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::RefGuard)
                         | Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::RwLockReadGuard))
                 );
-                self.args_walk(af, ae, invariant || !covariant, need_static, depth)
+                self.args_walk(af, ae, invariant || !covariant, depth)
             }
             (TyKind::FnPtr(sf), TyKind::FnPtr(se)) => {
                 let (sf, se) = (self.tys.sig(sf).value, self.tys.sig(se).value);
@@ -6958,14 +6887,14 @@ impl<'p> Ctx<'p> {
                 inf.into_iter()
                     .chain([sf.output])
                     .zip(ine.into_iter().chain([se.output]))
-                    .find_map(|(x, y)| self.region_walk(x, y, true, need_static, depth + 1))
+                    .find_map(|(x, y)| self.region_walk(x, y, true, depth + 1))
             }
             (TyKind::FnDef(df, af), TyKind::FnDef(de, ae))
             | (TyKind::Closure(df, af), TyKind::Closure(de, ae))
             | (TyKind::Opaque(df, af), TyKind::Opaque(de, ae))
                 if df == de =>
             {
-                self.args_walk(af, ae, true, need_static, depth)
+                self.args_walk(af, ae, true, depth)
             }
             _ => None,
         }
@@ -7118,10 +7047,10 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    fn args_walk(&mut self, a: ArgsId, b: ArgsId, invariant: bool, need_static: &mut bool, depth: u32) -> Option<String> {
+    fn args_walk(&mut self, a: ArgsId, b: ArgsId, invariant: bool, depth: u32) -> Option<String> {
         let (a, b) = (self.tys.args(a).to_vec(), self.tys.args(b).to_vec());
         a.into_iter().zip(b).find_map(|(x, y)| match (x.as_ty(), y.as_ty()) {
-            (Some(x), Some(y)) => self.region_walk(x, y, invariant, need_static, depth + 1),
+            (Some(x), Some(y)) => self.region_walk(x, y, invariant, depth + 1),
             _ => None,
         })
     }
@@ -7274,9 +7203,7 @@ impl<'p> Ctx<'p> {
                 self.mismatch(span, expected, found);
                 return None;
             }
-            if object::dyn_is_static(p, &self.tys, y) && !object::dyn_is_static(p, &self.tys, x) {
-                self.obl.push(obligations::Obligation::DynStatic { span, bck: true });
-            }
+            // A `'static` target object lifetime: the borrow checker proves it.
             return Some(Coerce::Unsize(expected));
         }
         // A numeric literal falls back to i32 (f64), as no trait picks it.
@@ -7303,7 +7230,7 @@ impl<'p> Ctx<'p> {
             self.dyn_borrow_src = true;
         }
         let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
-        if to_static && borrows && !instance && !self.defer_static_source(x, span) && !self.bck_static_source(x, span) {
+        if to_static && borrows && !instance && !self.defer_static_source(x, span) && !self.bck_static_source(x) {
             self.static_source_err(x, span);
             return None;
         }
@@ -7457,9 +7384,7 @@ impl<'p> Ctx<'p> {
                 self.err("L0110", span, why, "Write `&'static` in both types, or elide it in both.");
                 return None;
             }
-            if to_static && !object::dyn_is_static(p, &self.tys, x) {
-                self.obl.push(obligations::Obligation::DynStatic { span, bck: true });
-            }
+            // A `'static` target object lifetime: the borrow checker proves it.
             return Some(Coerce::Unsize(expected));
         }
         if !self.sized_ok(x) {
@@ -7481,7 +7406,7 @@ impl<'p> Ctx<'p> {
         // An instance replays its template, which proved this under the
         // env's `'static` bounds (a `T: 'static` arg may be `&'static str`).
         let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
-        if to_static && borrows && !instance && !self.defer_static_source(x, span) && !self.bck_static_source(x, span) {
+        if to_static && borrows && !instance && !self.defer_static_source(x, span) && !self.bck_static_source(x) {
             self.static_source_err(x, span);
             return None;
         }
@@ -13814,7 +13739,7 @@ impl<'p> Ctx<'p> {
         let cand = u8::try_from(ci).expect("at most 256 object candidates");
         self.set_res(e, Res::DynMethod { owner: c.owner.def, cand, slot, derefs: 0, autoref: Autoref::None });
         if c.needs_static && !object::dyn_is_static(p, &self.tys, base) {
-            self.obl.push(obligations::Obligation::DynStatic { span, bck: false });
+            self.obl.push(obligations::Obligation::DynStatic { span });
         }
         self.check_args(&params, args, span);
         Some(self.normalize_here(ret))

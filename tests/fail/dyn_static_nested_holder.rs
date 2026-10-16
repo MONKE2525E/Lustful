@@ -1,5 +1,5 @@
-// expect: L0705
-// rustc: lifetime may not live long enough. A user Adt arg used to reach tcc as two structs.
+// expect: L0733
+// rustc: lifetime may not live long enough. The user Adt arg holds a shorter object lifetime.
 trait T { fn read(&self) -> u32; }
 struct S { n: u32 }
 impl T for S { fn read(&self) -> u32 { self.n } }

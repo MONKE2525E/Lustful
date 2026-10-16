@@ -1,5 +1,5 @@
-// expect: L0705
-// Valid Rust: `Some(d)` is a coercion site, so the object lifetime shortens. lust rejects a 'static use in a body whose return type holds `&mut dyn T` under `Option`.
+// `Some(d)` is a coercion site, so the object lifetime shortens from the `'static` that
+// `more_mut` needs to the caller's (the borrow checker relates both).
 trait T { fn read(&self) -> u32; }
 struct S { n: u32 }
 impl T for S { fn read(&self) -> u32 { self.n } }

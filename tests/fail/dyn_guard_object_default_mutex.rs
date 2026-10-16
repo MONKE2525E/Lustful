@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // rustc: lifetime may not live long enough. `MutexGuard<'b, dyn P>` is `MutexGuard<'b, dyn P + 'b>`.
 use std::sync::{Mutex, MutexGuard};
 trait P { fn id(&self) -> u32; }
