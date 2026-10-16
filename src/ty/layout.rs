@@ -135,6 +135,12 @@ pub fn fat_ptr_layout() -> Layout {
     Layout::simple(16, 8, Some(Niche { offset: 0, scalar_size: 8, free: 1, start: 0 }))
 }
 
+/// A value inside an `UnsafeCell`: the same size, alignment and
+/// inhabitedness, but no niche and no field or tag detail.
+fn hide_niche(l: Layout) -> Layout {
+    Layout { niche: None, field_offsets: Vec::new(), variant_offsets: Vec::new(), enum_tag: None, ..l }
+}
+
 /// A zero-sized type with the given alignment.
 pub fn zst_layout(align: u64) -> Layout {
     Layout::simple(0, align.max(1), None)
@@ -908,6 +914,40 @@ fn compute(
                 Ok(fat_ptr_layout())
             }
             Some(BuiltinTy::Boxed) | Some(BuiltinTy::Rc) => Ok(ptr_layout()),
+            // `rc::Weak<T>`: one `NonNull` pointer (null is its niche;
+            // `Weak::new` dangles at usize::MAX), fat for an unsized `T`.
+            Some(BuiltinTy::Weak) => match tys.adt_first_ty_arg(t).map(|e| tys.kind(peel_param(tys, e, env, frames).0)) {
+                Some(TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) => Ok(fat_ptr_layout()),
+                Some(_) => Ok(ptr_layout()),
+                None => Err(()),
+            },
+            // `Cell<T>` is a transparent `UnsafeCell<T>`: `T`'s size and
+            // alignment, with no niche.
+            Some(BuiltinTy::Cell) => {
+                let e = tys.adt_first_ty_arg(t).ok_or(())?;
+                Ok(hide_niche(go(tys, shapes, e, env, frames, memo, active)?))
+            }
+            // `RefCell<T>` is `{ borrow: Cell<isize>, value: UnsafeCell<T> }`
+            // (std's `debug_refcell` field is off): no niche.
+            Some(BuiltinTy::RefCell) => {
+                let e = tys.adt_first_ty_arg(t).ok_or(())?;
+                let value = hide_niche(go(tys, shapes, e, env, frames, memo, active)?);
+                let mut l = struct_layout(&[int_layout(IntTy::Isize), value], Repr::default())?;
+                l.field_offsets.clear();
+                Ok(l)
+            }
+            // `Ref<T>` and `RefMut<T>` are `{ value: NonNull<T>, borrow: &Cell<isize> }`
+            // (RefMut adds a PhantomData): two pointers, the first fat for an unsized `T`.
+            Some(BuiltinTy::RefGuard | BuiltinTy::RefMutGuard) => {
+                let e = tys.adt_first_ty_arg(t).ok_or(())?;
+                let value = match tys.kind(peel_param(tys, e, env, frames).0) {
+                    TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) => fat_ptr_layout(),
+                    _ => ptr_layout(),
+                };
+                let mut l = struct_layout(&[value, ptr_layout()], Repr::default())?;
+                l.field_offsets.clear();
+                Ok(l)
+            }
             Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => struct_layout(
                 &[ptr_layout(), int_layout(IntTy::Usize), cap_layout()],
                 Repr { kind: ReprKind::C, ..Repr::default() },
