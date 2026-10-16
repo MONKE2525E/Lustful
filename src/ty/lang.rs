@@ -1036,6 +1036,27 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // pread of up to `max` bytes at the offset, appended to the Vec: the
+    // count, or -errno (FileExt::read_at, tf-p6).
+    IntrinsicDef {
+        name: "sys_fd_pread",
+        c_symbol: "lust_sys_fd_pread",
+        params: &[S::I32, S::U64, S::I64, S::VecU8Mut],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // pwrite of the bytes at the offset: the count, or -errno.
+    IntrinsicDef {
+        name: "sys_fd_pwrite",
+        c_symbol: "lust_sys_fd_pwrite",
+        params: &[S::I32, S::Bytes, S::I64],
+        ret: S::I64,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // isatty: 1 for a terminal, else 0 (IsTerminal, tf-p6).
+    IntrinsicDef { name: "sys_fd_isatty", c_symbol: "lust_sys_fd_isatty", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
     // fstat as 8-byte fields, like sys_stat.
     IntrinsicDef {
         name: "sys_fd_stat",

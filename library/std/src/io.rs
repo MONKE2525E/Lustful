@@ -1512,6 +1512,68 @@ fn read_stdin(buf: &mut [u8]) -> Result<usize> {
     }
 }
 
+/// The private supertrait that seals `IsTerminal`, as std's.
+pub(crate) mod sealed_terminal {
+    pub trait Sealed {}
+    impl Sealed for crate::fs::File {}
+    impl Sealed for crate::os::fd::OwnedFd {}
+    impl Sealed for crate::os::fd::BorrowedFd<'_> {}
+    impl Sealed for super::Stdin {}
+    impl Sealed for super::StdinLock<'_> {}
+    impl Sealed for super::Stdout {}
+    impl Sealed for super::StdoutLock<'_> {}
+    impl Sealed for super::Stderr {}
+    impl Sealed for super::StderrLock<'_> {}
+}
+
+/// Whether a descriptor refers to a terminal (`isatty`, as std on
+/// Linux). Sealed: std's types only.
+pub trait IsTerminal: sealed_terminal::Sealed {
+    /// True when the descriptor is a terminal.
+    fn is_terminal(&self) -> bool;
+}
+
+/// `isatty` of a raw fd, for the `IsTerminal` impls.
+pub(crate) fn fd_is_terminal(fd: i32) -> bool {
+    core::intrinsics::sys_fd_isatty(fd) != 0
+}
+
+impl IsTerminal for Stdin {
+    fn is_terminal(&self) -> bool {
+        fd_is_terminal(0)
+    }
+}
+
+impl IsTerminal for StdinLock<'_> {
+    fn is_terminal(&self) -> bool {
+        fd_is_terminal(0)
+    }
+}
+
+impl IsTerminal for Stdout {
+    fn is_terminal(&self) -> bool {
+        fd_is_terminal(1)
+    }
+}
+
+impl IsTerminal for StdoutLock<'_> {
+    fn is_terminal(&self) -> bool {
+        fd_is_terminal(1)
+    }
+}
+
+impl IsTerminal for Stderr {
+    fn is_terminal(&self) -> bool {
+        fd_is_terminal(2)
+    }
+}
+
+impl IsTerminal for StderrLock<'_> {
+    fn is_terminal(&self) -> bool {
+        fd_is_terminal(2)
+    }
+}
+
 /// A handle to the global standard input stream of the current
 /// process. Its buffer lives in the runtime, so bytes one handle
 /// buffers are the next bytes every handle reads, as in std.

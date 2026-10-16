@@ -193,6 +193,30 @@ pub mod fd {
         }
     }
 
+    impl io::IsTerminal for OwnedFd {
+        fn is_terminal(&self) -> bool {
+            io::fd_is_terminal(self.fd)
+        }
+    }
+
+    impl io::IsTerminal for BorrowedFd<'_> {
+        fn is_terminal(&self) -> bool {
+            io::fd_is_terminal(self.fd)
+        }
+    }
+
+    impl io::IsTerminal for File {
+        fn is_terminal(&self) -> bool {
+            io::fd_is_terminal(self.__raw_fd())
+        }
+    }
+
+    impl From<OwnedFd> for crate::process::Stdio {
+        fn from(fd: OwnedFd) -> crate::process::Stdio {
+            crate::process::Stdio::from_fd(fd.into_raw_fd())
+        }
+    }
+
     impl From<OwnedFd> for File {
         fn from(fd: OwnedFd) -> File {
             File::__from_raw_fd(fd.into_raw_fd())
@@ -286,6 +310,78 @@ pub mod unix {
     /// Operating-system specific extensions.
     pub mod fs {
         use crate::fs::Metadata;
+
+        /// Unix-specific extensions to `fs::File`: positioned reads and
+        /// writes (`pread`/`pwrite`), as std's stable `FileExt` items.
+        pub trait FileExt {
+            /// Reads bytes at the offset; a short read is not an error.
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize>;
+            /// Reads exactly enough bytes at the offset to fill the buffer.
+            fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> crate::io::Result<()> {
+                while !buf.is_empty() {
+                    match self.read_at(buf, offset) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let tmp = buf;
+                            buf = &mut tmp[n..]; //@ std/src/os/unix/fs.rs:126:35
+                            offset += n as u64;
+                        }
+                        Err(e) => {
+                            if !e.is_interrupted() {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                if !buf.is_empty() {
+                    Err(crate::io::Error::simple_message(crate::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer"))
+                } else {
+                    Ok(())
+                }
+            }
+            /// Writes bytes at the offset; a short write is not an error.
+            fn write_at(&self, buf: &[u8], offset: u64) -> crate::io::Result<usize>;
+            /// Writes the whole buffer at the offset.
+            fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> crate::io::Result<()> {
+                while !buf.is_empty() {
+                    match self.write_at(buf, offset) {
+                        Ok(0) => {
+                            return Err(crate::io::Error::simple_message(crate::io::ErrorKind::WriteZero, "failed to write whole buffer"));
+                        }
+                        Ok(n) => {
+                            buf = &buf[n..]; //@ std/src/os/unix/fs.rs:349:31
+                            offset += n as u64
+                        }
+                        Err(e) => {
+                            if !e.is_interrupted() {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        impl FileExt for crate::fs::File {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+                let mut tmp: Vec<u8> = Vec::new();
+                let n = core::intrinsics::sys_fd_pread(self.__raw_fd(), buf.len() as u64, offset as i64, &mut tmp);
+                if n < 0 {
+                    return Err(crate::io::Error::from_raw_os_error(-n as i32));
+                }
+                let n = n as usize;
+                buf[..n].copy_from_slice(&tmp[..n]); //@ never
+                Ok(n)
+            }
+            fn write_at(&self, buf: &[u8], offset: u64) -> crate::io::Result<usize> {
+                let n = core::intrinsics::sys_fd_pwrite(self.__raw_fd(), buf, offset as i64);
+                if n < 0 {
+                    return Err(crate::io::Error::from_raw_os_error(-n as i32));
+                }
+                Ok(n as usize)
+            }
+        }
 
         /// Unix-specific extensions to `fs::DirBuilder`: the mode new
         /// directories get (before the umask).
@@ -452,17 +548,29 @@ pub mod unix {
             impl Sealed for crate::process::ExitStatus {}
         }
 
-        /// Unix-specific extensions to `process::Command` (only `exec`
-        /// here).
+        /// Unix-specific extensions to `process::Command` (`exec` and
+        /// `arg0` here).
         pub trait CommandExt: sealed::Sealed {
             /// Replaces this process with the command's program, as
             /// std's: returns only when the exec fails, with its error.
             fn exec(&mut self) -> io::Error;
+            /// Sets the child's argv[0] (the program path stays the one
+            /// that runs).
+            fn arg0<S>(&mut self, arg: S) -> &mut Command
+            where
+                S: AsRef<crate::ffi::OsStr>;
         }
 
         impl CommandExt for Command {
             fn exec(&mut self) -> io::Error {
                 self.exec_here()
+            }
+            fn arg0<S>(&mut self, arg: S) -> &mut Command
+            where
+                S: AsRef<crate::ffi::OsStr>,
+            {
+                self.set_arg0(arg.as_ref());
+                self
             }
         }
 

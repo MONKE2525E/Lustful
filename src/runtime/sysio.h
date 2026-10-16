@@ -30,6 +30,12 @@ int32_t lust_sys_fd_truncate(int32_t fd, uint64_t len);
 /* lseek(2) `off` from `whence` (0 start, 1 current, 2 end): the new
    position, or -errno. */
 int64_t lust_sys_fd_seek(int32_t fd, int64_t off, int32_t whence);
+/* pread of up to max bytes at off, appended to out: the count or -errno. */
+int64_t lust_sys_fd_pread(int32_t fd, uint64_t max, int64_t off, lust_Vec *out);
+/* pwrite of the bytes at off: the count or -errno. */
+int64_t lust_sys_fd_pwrite(int32_t fd, const uint8_t *p, uint64_t len, int64_t off);
+/* isatty: 1 or 0. */
+int32_t lust_sys_fd_isatty(int32_t fd);
 /* fstat(2) as 8-byte little-endian fields appended to the Vec (the
    same layout as lust_sys_stat): 0, or errno. */
 int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out);

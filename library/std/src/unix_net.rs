@@ -4,8 +4,8 @@
 // of `std::os::linux::net` (the same hidden module serves both
 // deep paths, src/stdmods.rs). Debug forms follow lust's
 // std::net forms (a plain fd field), not std's FileDesc form,
-// as with TcpStream. Not here: UnixDatagram, and the
-// std::os::fd conversions (OwnedFd has no lust form yet).
+// as with TcpStream. Not here: UnixDatagram. The OwnedFd
+// conversions of UnixStream are here (tf-p6 R11).
 
 use std::io;
 use std::path::Path;
@@ -44,7 +44,7 @@ fn set_timeout(fd: i32, opt: i32, timeout: Option<core::time::Duration>) -> io::
         None => 0,
         Some(d) => {
             if d == core::time::Duration::ZERO {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot set a 0 duration timeout"));
+                return Err(io::Error::__lust_adapter_simple_message(io::ErrorKind::InvalidInput, "cannot set a 0 duration timeout"));
             }
             timeout_us(d)
         }
@@ -115,7 +115,9 @@ fn unpack_unix_addr(raw: &[u8]) -> SocketAddr {
 /// The pathname length error, with std's text.
 fn sun_len_err(abstract_name: bool) -> io::Error {
     let what = if abstract_name { "abstract socket name must be shorter than SUN_LEN" } else { "path must be shorter than SUN_LEN" };
-    io::Error::new(io::ErrorKind::InvalidInput, what)
+    // std's `const_error!`: a static message (its Debug is `Error {
+    // kind, message }`, not the `Custom` form).
+    io::Error::__lust_adapter_simple_message(io::ErrorKind::InvalidInput, what)
 }
 
 /// Checks a pathname against SUN_LEN (108 with the terminator).
@@ -158,13 +160,19 @@ impl SocketAddr {
 pub trait SocketAddrExt {
     /// Creates an abstract address from a name (without the
     /// leading NUL byte the kernel form carries).
-    fn from_abstract_name(name: &[u8]) -> io::Result<SocketAddr>;
+    fn from_abstract_name<N>(name: N) -> io::Result<SocketAddr>
+    where
+        N: AsRef<[u8]>;
     /// The abstract name, for an abstract address.
     fn as_abstract_name(&self) -> Option<&[u8]>;
 }
 
 impl SocketAddrExt for SocketAddr {
-    fn from_abstract_name(name: &[u8]) -> io::Result<SocketAddr> {
+    fn from_abstract_name<N>(name: N) -> io::Result<SocketAddr>
+    where
+        N: AsRef<[u8]>,
+    {
+        let name = name.as_ref();
         if name.len() > 107 {
             return Err(sun_len_err(true));
         }
@@ -287,6 +295,20 @@ impl Drop for UnixStream {
         if self.fd >= 0 {
             let _ = core::intrinsics::sys_fd_close(self.fd);
         }
+    }
+}
+
+impl From<UnixStream> for std::os::fd::OwnedFd {
+    fn from(mut stream: UnixStream) -> std::os::fd::OwnedFd {
+        let fd = stream.fd;
+        stream.fd = -1;
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    }
+}
+
+impl From<std::os::fd::OwnedFd> for UnixStream {
+    fn from(fd: std::os::fd::OwnedFd) -> UnixStream {
+        UnixStream { fd: std::os::fd::IntoRawFd::into_raw_fd(fd) }
     }
 }
 

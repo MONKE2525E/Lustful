@@ -1212,7 +1212,7 @@ fn net_status(code: i32) -> io::Result<()> {
 
 /// std's error for a zero duration timeout.
 fn zero_timeout_err() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, "cannot set a 0 duration timeout")
+    io::Error::__lust_adapter_simple_message(io::ErrorKind::InvalidInput, "cannot set a 0 duration timeout")
 }
 
 /// A timeout duration in whole microseconds for the sys_net
@@ -1301,7 +1301,7 @@ fn str_to_addrs(s: &str) -> io::Result<Vec<SocketAddr>> {
     }
     let idx = match colon {
         Some(idx) => idx,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid socket address")),
+        None => return Err(io::Error::__lust_adapter_simple_message(io::ErrorKind::InvalidInput, "invalid socket address")),
     };
     let host = &s[..idx];
     let port_str = &s[idx + 1..];
@@ -1328,7 +1328,7 @@ fn str_to_addrs(s: &str) -> io::Result<Vec<SocketAddr>> {
             j += 1;
         }
         if bad {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid port value"));
+            return Err(io::Error::__lust_adapter_simple_message(io::ErrorKind::InvalidInput, "invalid port value"));
         }
         v as u16
     };
@@ -1498,7 +1498,7 @@ where
     }
     match last {
         Some(e) => Err(e),
-        None => Err(io::Error::new(io::ErrorKind::InvalidInput, "no socket addresses resolved")),
+        None => Err(io::Error::__lust_adapter_simple_message(io::ErrorKind::InvalidInput, "could not resolve to any addresses")),
     }
 }
 

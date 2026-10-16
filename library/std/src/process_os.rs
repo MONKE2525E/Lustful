@@ -300,6 +300,8 @@ fn nul_error() -> io::Error {
 /// working directory, and stdio configuration.
 pub struct Command {
     program: Vec<u8>,
+    /// `CommandExt::arg0`: the child's argv[0] when set (else the program).
+    arg0: Option<Vec<u8>>,
     args: Vec<Vec<u8>>,
     envs: Vec<EnvEntry>,
     clear: bool,
@@ -314,6 +316,7 @@ impl Command {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Command {
         Command {
             program: program.as_ref().as_encoded_bytes().to_vec(),
+            arg0: None,
             args: Vec::new(),
             envs: Vec::new(),
             clear: false,
@@ -396,6 +399,19 @@ impl Command {
     pub fn stderr(&mut self, cfg: Stdio) -> &mut Command {
         self.stderr = Some(cfg);
         self
+    }
+
+    /// `CommandExt::arg0` (os.rs): the child's argv[0].
+    pub(crate) fn set_arg0(&mut self, arg: &OsStr) {
+        self.arg0 = Some(arg.as_encoded_bytes().to_vec());
+    }
+
+    /// The child's argv[0]: arg0 when set, else the program.
+    fn argv0(&self) -> &Vec<u8> {
+        match &self.arg0 {
+            Some(a) => a,
+            None => &self.program,
+        }
     }
 
     /// The program.
@@ -483,11 +499,11 @@ impl Command {
     /// std's error for a NUL byte in the program, an argument, an
     /// environment change, or the working directory.
     fn checked_argv(&self) -> io::Result<(Vec<u8>, Vec<u8>)> {
-        if has_nul(&self.program) {
+        if has_nul(&self.program) || has_nul(self.argv0()) {
             return Err(nul_error());
         }
         let mut argv: Vec<u8> = Vec::new();
-        argv.extend_from_slice(&self.program);
+        argv.extend_from_slice(self.argv0());
         argv.push(0);
         for i in 0..self.args.len() {
             if has_nul(&self.args[i]) {
@@ -848,7 +864,7 @@ impl fmt::Debug for StdioField {
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if f.alternate() {
-            let mut args: Vec<OsString> = vec![os_string(&self.program)];
+            let mut args: Vec<OsString> = vec![os_string(self.argv0())];
             for i in 0..self.args.len() {
                 args.push(os_string(&self.args[i]));
             }
@@ -909,7 +925,11 @@ impl fmt::Debug for Command {
                 }
             }
         }
-        write!(f, "{:?}", os_string(&self.program))?;
+        // std prints a changed argv[0] after the program in brackets.
+        if *self.argv0() != self.program {
+            write!(f, "[{:?}] ", os_string(&self.program))?;
+        }
+        write!(f, "{:?}", os_string(self.argv0()))?;
         for i in 0..self.args.len() {
             write!(f, " {:?}", os_string(&self.args[i]))?;
         }

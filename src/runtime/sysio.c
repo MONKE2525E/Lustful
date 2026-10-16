@@ -68,6 +68,29 @@ int64_t lust_sys_fd_seek(int32_t fd, int64_t off, int32_t whence) {
     return r < 0 ? -(int64_t)errno : (int64_t)r;
 }
 
+int64_t lust_sys_fd_pread(int32_t fd, uint64_t max, int64_t off, lust_Vec *out) {
+    uint8_t none;
+    uint8_t *tmp = max ? malloc((size_t)max) : &none;
+    if (!tmp) lust_oom();
+    ssize_t n = pread(fd, tmp, (size_t)max, (off_t)off);
+    if (n < 0) {
+        int e = errno;
+        if (max) free(tmp);
+        return -(int64_t)e;
+    }
+    lust_sysio_push(out, tmp, (uint64_t)n);
+    if (max) free(tmp);
+    return (int64_t)n;
+}
+
+int64_t lust_sys_fd_pwrite(int32_t fd, const uint8_t *p, uint64_t len, int64_t off) {
+    ssize_t n = pwrite(fd, p, (size_t)len, (off_t)off);
+    if (n < 0) return -(int64_t)errno;
+    return (int64_t)n;
+}
+
+int32_t lust_sys_fd_isatty(int32_t fd) { return isatty(fd) ? 1 : 0; }
+
 /* The stat fields of sys.c's lust_sys_stat, for an open fd. */
 int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out) {
     struct stat st;
