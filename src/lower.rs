@@ -2638,6 +2638,17 @@ impl<'p> Lower<'p> {
                         _ => ty,
                     };
                     self.set_or_temp(dest, Rvalue::FnValue(f, want), ty, span)
+                } else if matches!(self.ck.res(e), Res::PrimAssoc { .. } | Res::OptSome | Res::ResOk | Res::ResErr)
+                    && matches!(self.kind(ty), TyKind::FnDef(..))
+                {
+                    // A primitive builtin method or builtin constructor through
+                    // a qualified path (`<[T]>::len`, `<Option<u8>>::Some`), as
+                    // on a plain path: its codegen fn in a fn pointer place,
+                    // else the zero-sized item.
+                    match self.fn_ptr_dest(dest) {
+                        Some(dt) => self.set_or_temp(dest, Rvalue::ItemShim(ty, dt), ty, span),
+                        None => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span),
+                    }
                 } else if matches!(self.ck.res(e), Res::Builtin(_)) && matches!(self.kind(ty), TyKind::FnDef(..)) || self.is_trait_marker_value(ty) {
                     // A builtin-marker trait fn value (`<i32 as
                     // Clone>::clone`): zero-sized, as on a plain path.

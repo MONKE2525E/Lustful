@@ -1039,7 +1039,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::WrappingDiv, Builtin::WrappingMul, Builtin::WrappingNeg, Builtin::WrappingPow, Builtin::WrappingRem, Builtin::WrappingShl,
     Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet, Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetRef), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetMut), Builtin::Sync(crate::check::sync::SyncOp::ArcWeakUpgrade),
     Builtin::RefCellBorrow, Builtin::RefCellBorrowMut,
-    Builtin::VecAsSlice, Builtin::VecAsMutSlice, Builtin::VecLen, Builtin::VecIsEmpty,
+    Builtin::VecAsSlice, Builtin::VecAsMutSlice, Builtin::VecLen, Builtin::VecIsEmpty, Builtin::SliceLen, Builtin::SliceIsEmpty,
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
@@ -3918,6 +3918,10 @@ impl<'p> Ctx<'p> {
                     self.str_method(name)?
                 }
             }
+            // `<[T]>::len` and `<[T]>::is_empty` by path and as values
+            // (ts-rust `owned_store_js_doc(file, host, <[Node]>::len)`).
+            TyKind::Slice(_) if name == k.len => (B::SliceLen, Autoref::Ref, vec![], USIZE),
+            TyKind::Slice(_) if name == k.is_empty => (B::SliceIsEmpty, Autoref::Ref, vec![], BOOL),
             // `Vec::as_slice` and kin as values (`opt.map(Vec::as_slice)`).
             _ if let Some(e) = self.tys.vec_elem(self_ty) => match self.name(name) {
                 "as_slice" => {
@@ -4211,7 +4215,23 @@ impl<'p> Ctx<'p> {
     /// True when `t` is an item that coerces to a fn pointer: a plain
     /// fn item (not a primitive builtin method) or a constructor.
     fn reifies(&self, t: Ty) -> bool {
-        (self.is_fn_item(t) && !self.is_prim_item(t)) || self.is_ctor_item(t) || self.is_int_prim_item(t)
+        (self.is_fn_item(t) && !self.is_prim_item(t)) || self.is_ctor_item(t) || self.is_int_prim_item(t) || self.is_nopanic_prim_item(t)
+    }
+
+    /// True when `t` is a primitive builtin method item that cannot
+    /// panic (`str::len`, `<[T]>::len`, `Vec::is_empty`): its fn pointer
+    /// shim has no panic location to match (`is_int_prim_item`).
+    fn is_nopanic_prim_item(&self, t: Ty) -> bool {
+        let TyKind::FnDef(def, args) = self.kind(t) else { return false };
+        let code = match self.tys.args(args).get(2) {
+            Some(GenericArg::Const(c)) if def == crate::ty::prim_fn_def() => match self.tys.const_kind(*c) {
+                ConstKind::Int(v) => v as u32,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        use Builtin as B;
+        matches!(prim_builtin_of_code(code), Some(B::SliceLen | B::SliceIsEmpty | B::StrLen | B::StrIsEmpty | B::VecLen | B::VecIsEmpty))
     }
 
     /// True when `t` is a primitive builtin method item of an integer
@@ -6511,11 +6531,14 @@ impl<'p> Ctx<'p> {
                 }
                 Coerce::ReifyFn(expected)
             }
-            // A primitive builtin method of an integer type (`u32::isqrt`):
-            // codegen writes its fn too. Its lifetimes are all late-bound
-            // and elided, so any input lifetimes are fine, but an output
-            // lifetime needs the elision proof lust does not have yet.
-            (TyKind::FnDef(..), TyKind::FnPtr(_)) if e.is_some() && self.is_int_prim_item(found) && self.fn_item_ptr_unifies(found, expected) => {
+            // A primitive builtin method of an integer type (`u32::isqrt`),
+            // or one that cannot panic (`<[T]>::len`): codegen writes its fn
+            // too. Its lifetimes are all late-bound and elided, so any input
+            // lifetimes are fine, but an output lifetime needs the elision
+            // proof lust does not have yet.
+            (TyKind::FnDef(..), TyKind::FnPtr(_))
+                if e.is_some() && (self.is_int_prim_item(found) || self.is_nopanic_prim_item(found)) && self.fn_item_ptr_unifies(found, expected) =>
+            {
                 let out_region = match self.kind(expected) {
                     TyKind::FnPtr(s) => {
                         let o = self.tys.sig(s).value.output;
@@ -13638,6 +13661,14 @@ impl<'p> Ctx<'p> {
                         written_self = Some(base);
                         break 'qpath r;
                     }
+                    // `<[u8]>::len(s)`: a slice's builtin method by path.
+                    if trait_path.is_empty()
+                        && let base_r = self.resolve(base)
+                        && matches!(self.kind(base_r), TyKind::Slice(_))
+                        && let Some((b, ..)) = self.prim_assoc_sig(base_r, segs[0].name, &[])
+                    {
+                        break 'qpath Res::PrimAssoc { b, self_ty: base_r, name: segs[0].name };
+                    }
                     let hint = if trait_path.is_empty() {
                         None
                     } else {
@@ -19490,23 +19521,47 @@ impl<'p> Ctx<'p> {
             }
             return t;
         }
+        // A slice's builtin method as a value (`<[Node]>::len`): the
+        // primitive item value, as `str::len` is.
+        if hint.is_none()
+            && let base_r = self.resolve(base)
+            && matches!(self.kind(base_r), TyKind::Slice(_))
+            && let Some((b, ..)) = self.prim_assoc_sig(base_r, name, &[])
+        {
+            self.set_res(e, Res::PrimAssoc { b, self_ty: base_r, name });
+            return self.prim_item_value(b, base_r, name, span);
+        }
         // An inherent associated function as a value
         // (`<S>::mk`), resolved as the plain two-segment path
         // is. A trait's function as a value through a qualified
         // path is not resolved yet.
+        // A longer type path (`m::S`, or `std::rc::Rc` from a `use`) that
+        // does not resolve this way falls through to the trait items.
         if hint.is_none()
             && let ast::TyExpr::Path(ty_segs) = p.ast.ty(self_ty)
-            && ty_segs.len() == 1
         {
             let mut segs2 = ty_segs.clone();
             segs2.push(segs[0].clone());
-            if let Some(r) = self.resolve_assoc(&segs2, span) {
+            let mark = self.errs.len();
+            let resolved = self.resolve_assoc(&segs2, span);
+            if resolved.is_none() && segs2.len() > 2 {
+                self.errs.truncate(mark);
+            } else if let Some(r) = resolved {
                 // Function items only: variant construction
                 // through a qualified path has no lowering yet,
                 // so it rejects with the error below instead.
                 if let Res::Fn(f) = r {
                     self.set_res(e, r);
                     return self.inherent_qpath_fn_value(e, f, base, span);
+                }
+                // A primitive's builtin method (`<str>::len`) or a builtin
+                // item (`<Box<u8>>::new`), as on the plain path.
+                if let Res::PrimAssoc { b, self_ty, name } = r {
+                    self.set_res(e, r);
+                    return self.prim_item_value(b, self_ty, name, span);
+                }
+                if matches!(r, Res::Builtin(Builtin::BoxNew | Builtin::RcNew | Builtin::StringFrom | Builtin::StringAsStr)) {
+                    return self.builtin_item_value(e, r, &segs2, span);
                 }
             } else {
                 return ERROR;

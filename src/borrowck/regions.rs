@@ -7814,6 +7814,7 @@ impl<'b, 'p> Builder<'b, 'p> {
     }
 
     /// A std trait method by path (`Clone::clone`, `ToString::to_string`)
+    /// or a primitive's builtin method item (`str::len`, `<[T]>::len`)
     /// has no region signature here. Its lifetimes are elided, so where
     /// each input of the bound (regioned `ins -> out`) holds only an
     /// outer reference and the output no region, it is `for<'r> fn(&'r
@@ -7825,7 +7826,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             t = inner;
         }
         let TyKind::FnDef(def, _) = self.body.tys.kind(t) else { return false };
-        if p.local_def(def.hash).is_some() || p.regions.trait_methods.contains_key(&def) || p.gx.index.trait_of_method(def).is_none() {
+        let prim_item = def == crate::ty::prim_fn_def();
+        if p.local_def(def.hash).is_some() || p.regions.trait_methods.contains_key(&def) || (p.gx.index.trait_of_method(def).is_none() && !prim_item) {
             return false;
         }
         // No region inside: none written, and a type param the call binds

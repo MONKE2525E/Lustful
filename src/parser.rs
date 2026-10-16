@@ -4209,10 +4209,13 @@ impl<'a> Parser<'a> {
     /// `Arc::new`, `Rc::downgrade`, `Ord::cmp`, `HashMap::default`. Only
     /// the last two segments count. None for every other path. Each fn
     /// here is safe and not `#[track_caller]`, so the closure behaves as
-    /// the fn item does (its panics, drops, and output are the same).
+    /// the fn item does (its panics, drops, and output are the same). Only
+    /// the `mem` fns have generics of their own, so only they keep a
+    /// turbofish on the item (`mem::take::<Vec<u8>>`); the closure's call
+    /// writes it.
     fn eta_arity(&self, path: &[PathSeg]) -> Option<usize> {
         let [.., ty, item] = path else { return None };
-        if !matches!(item.args, GenericArgs::None) {
+        if !matches!(item.args, GenericArgs::None) && self.interner.get(ty.name) != "mem" {
             return None;
         }
         let (t, i) = (self.interner.get(ty.name), self.interner.get(item.name));
@@ -4220,8 +4223,9 @@ impl<'a> Parser<'a> {
             ("Self", _) => return None,
             (_, "default") => 0,
             ("Vec" | "String" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "VecDeque" | "BinaryHeap" | "Weak", "new") => 0,
+            ("Vec" | "String", "with_capacity") => 1,
             ("Arc", "new") => 1,
-            ("Rc" | "Arc", "clone" | "as_ptr" | "downgrade" | "strong_count" | "weak_count") => 1,
+            ("Rc" | "Arc", "clone" | "as_ptr" | "downgrade" | "strong_count" | "weak_count" | "get_mut" | "unwrap_or_clone") => 1,
             ("Rc" | "Arc", "ptr_eq") => 2,
             // As a closure, borrowck's `upgrade` rule applies inside it: the
             // result shares `T` only, not the `&Weak` borrow
@@ -4256,12 +4260,13 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `path` used as a value, for a fn `eta_arity` lists: the closure
-    /// `|a0, .., an| path(a0, .., an)`, every node at the path's span.
+    /// `path` (a plain or qualified path expr) used as a value, for a fn
+    /// `eta_arity` lists: the closure `|a0, .., an| path(a0, .., an)`,
+    /// every node at the path's span.
     /// rustc gives the fn item type instead; the two differ only in type
     /// identity, so a `TypeId` of such a closure is a reject
     /// (check/any.rs, `ast::is_eta_closure`).
-    fn eta_closure(&mut self, path: Vec<PathSeg>, n: usize, span: Span) -> ExprId {
+    fn eta_closure(&mut self, path: Expr, n: usize, span: Span) -> ExprId {
         let mut params = Vec::with_capacity(n);
         let mut args = Vec::with_capacity(n);
         for i in 0..n {
@@ -4270,7 +4275,7 @@ impl<'a> Parser<'a> {
             params.push(ClosureParam { pat, ty: None, attrs: Vec::new(), span });
             args.push(self.push_expr(Expr::Path(vec![PathSeg::plain(name)]), span));
         }
-        let callee = self.push_expr(Expr::Path(path), span);
+        let callee = self.push_expr(path, span);
         let body = self.push_expr(Expr::Call { callee, args }, span);
         self.push_expr(Expr::Closure { is_move: false, is_async: false, params, ret: None, body }, span)
     }
@@ -5008,6 +5013,18 @@ impl<'a> Parser<'a> {
             Tok::Let => return Err(not_yet(C_CORE, start, "let chains outside conditions")),
             Tok::Lt => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
+                // `<Vec<u16>>::new` as a value eta-expands as `Vec::<u16>::new`
+                // does (`eta_arity`); the closure calls the qualified path.
+                if trait_path.is_empty()
+                    && self.peek() != Tok::LParen
+                    && let [item] = segs.as_slice()
+                    && let TyExpr::Path(ty_segs) = self.ast.ty(self_ty)
+                    && let Some(ty_seg) = ty_segs.last()
+                    && let Some(n) = self.eta_arity(&[ty_seg.clone(), item.clone()])
+                {
+                    let span = start.to(self.prev_span());
+                    return Ok(self.eta_closure(Expr::QPath { self_ty, trait_path, segs }, n, span));
+                }
                 Expr::QPath { self_ty, trait_path, segs }
             }
             Tok::Underscore => {
@@ -5041,7 +5058,7 @@ impl<'a> Parser<'a> {
                     && let Some(n) = self.eta_arity(&path)
                 {
                     let span = start.to(self.prev_span());
-                    return Ok(self.eta_closure(path, n, span));
+                    return Ok(self.eta_closure(Expr::Path(path), n, span));
                 }
                 Expr::Path(path)
             }
