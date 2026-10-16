@@ -6092,6 +6092,59 @@ impl Ex<'_, '_> {
                 self.next(itp, ty, dest.clone(), true)?;
                 self.goto(join);
             }
+            // core's `FlattenCompat::last`: `iter_fold(None, |last, it|
+            // it.last().or(last))` over the front iterator, each outer
+            // item's `IntoIter`, then the back iterator. Each inner
+            // iterator is consumed (and dropped) by its own `last`; a
+            // `Some` then replaces the running answer, which drops the
+            // older item after the newer inner run.
+            K::Flatten => {
+                let u = a[1];
+                let res = self.local(dest_ty);
+                self.none(&Place::local(res), dest_ty);
+                let fold = |this: &mut Self, inner: Operand| -> R {
+                    let ul = this.local(u);
+                    this.assign(Place::local(ul), Rvalue::Use(inner));
+                    let t = this.local(dest_ty);
+                    this.last(Place::local(ul), u, Place::local(t), dest_ty)?;
+                    this.drop_local(ul);
+                    let (s, n) = this.switch_opt(&Place::local(t));
+                    let j = this.block();
+                    this.cur = s;
+                    this.assign(Place::local(res), Rvalue::Use(Operand::Move(Place::local(t))));
+                    this.goto(j);
+                    this.cur = n;
+                    this.goto(j);
+                    this.cur = j;
+                    Ok(())
+                };
+                let ut = self.place_ty(&f(1))?;
+                for side in [1u32, 0, 2] {
+                    let (has, empty) = self.switch_opt(&f(side));
+                    let next = self.block();
+                    self.cur = empty;
+                    self.goto(next);
+                    self.cur = has;
+                    if side == 0 {
+                        self.each(&Self::payload(&f(0)), a[0], &mut |this, x, xt| {
+                            let xv = this.take(Place::local(x), xt);
+                            let uo = this.into_iter(xv, u)?;
+                            fold(this, uo)
+                        })?;
+                        let ot = self.place_ty(&f(0))?;
+                        self.none(&f(0), ot);
+                    } else {
+                        let o = self.local(ut);
+                        self.take_none(f(side), ut, Place::local(o));
+                        let inner = self.take(Self::payload(&Place::local(o)), u);
+                        fold(self, inner)?;
+                    }
+                    self.goto(next);
+                    self.cur = next;
+                }
+                self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(res))));
+                self.goto(join);
+            }
             K::Skip => {
                 // One inner `last` site for both paths (linear code in
                 // nested `Skip`s, fx-cgen-ice).

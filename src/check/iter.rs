@@ -2056,9 +2056,12 @@ impl<'p> Ctx<'p> {
         let lang = self.p.gx.lang;
         let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
         let tr = TraitRef { def: lang.into_iterator, args: args_id, bindings: EMPTY_BINDINGS };
-        let snap = self.snapshot_vars();
+        // A bail-out rolls back the variables and the obligations the
+        // selection queued.
+        let (snap, obl_len) = (self.snapshot_vars(), self.obl_len());
         let Selection::Impl { id, args: impl_args, unbound, .. } = self.select_obligation(tr) else {
             self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
             return None;
         };
         let rec = self.p.gx.index.get(id).clone();
@@ -2066,15 +2069,18 @@ impl<'p> Ctx<'p> {
         let f = rec.items.iter().find_map(|&d| self.p.local_def(d.hash).filter(|&l| self.p.fn_info(l).name == name));
         let (Some(f), Some(out)) = (f, rec.assoc_ty(lang.assoc_into_iter)) else {
             self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
             return None;
         };
         if rec.synthetic != Synthetic::None || !unbound.is_empty() {
             self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
             return None;
         }
         let prefix: Vec<GenericArg> = impl_args.into_iter().map(|g| if let GenericArg::Ty(x) = g { GenericArg::Ty(self.deep(x)) } else { g }).collect();
         if prefix.iter().any(|g| g.as_ty().is_some_and(|x| self.has_general_var(x))) {
             self.rollback_vars(snap);
+            self.obl_truncate(obl_len);
             return None;
         }
         if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|x| x.is_some()) {
