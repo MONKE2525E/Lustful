@@ -16,7 +16,7 @@ fn main() {
     println!("{}", w.spare_capacity_mut().len());
     w.reserve(5);
     let sp = w.spare_capacity_mut();
-    sp[1].write(String::from("leak"));
+    let _ = &sp[1];
     println!("{} {}", sp.len(), w.len());
     let mut z: Vec<()> = vec![(), ()];
     println!("{}", z.spare_capacity_mut().len());
