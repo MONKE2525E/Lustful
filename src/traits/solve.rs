@@ -294,6 +294,22 @@ fn split_projections<C: SolveCx>(cx: &mut C, t: Ty, out: &mut Vec<(Ty, Ty)>) -> 
     }
 }
 
+/// True when type `t` (deeply resolved) mentions one of the
+/// inference variables in `vars`.
+fn mentions_any<S: TyIntern>(tys: &S, t: Ty, vars: &[Ty]) -> bool {
+    if vars.contains(&t) {
+        return true;
+    }
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => mentions_any(tys, e, vars),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| mentions_any(tys, e, vars)))
+        }
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| mentions_any(tys, e, vars)),
+        _ => false,
+    }
+}
+
 /// Fresh instantiation arguments for one item's parameters: a fresh
 /// variable per type parameter, an erased region per lifetime, and
 /// a fresh const variable per const parameter.
@@ -444,10 +460,21 @@ impl Solver {
                 continue;
             }
             let eq = b.value;
-            // Only an equality whose right side is exactly one still
-            // free impl parameter variable can bind it.
+            // Only an equality whose right side holds a still free
+            // impl parameter variable can bind it: the variable itself,
+            // or a type around it (`F: FnMut() -> Option<T>` binds `T`
+            // from the closure's return type, as rustc's projection
+            // equality does).
             let rhs = cx.deep_resolve(eq.ty);
-            if !matches!(cx.tys().kind(rhs), TyKind::Infer(_)) || !inst.iter().any(|g| g.as_ty() == Some(rhs)) {
+            let mut free: Vec<Ty> = Vec::new();
+            for t in inst.iter().filter_map(|g| g.as_ty()) {
+                let t = cx.deep_resolve(t);
+                if matches!(cx.tys().kind(t), TyKind::Infer(_)) {
+                    free.push(t);
+                }
+            }
+            let exact = free.contains(&rhs);
+            if !exact && !mentions_any(cx.tys(), rhs, &free) {
                 continue;
             }
             let proj = cx.tys().intern(TyKind::Projection(AssocId(eq.assoc), eq.trait_args));
@@ -458,7 +485,16 @@ impl Solver {
             // only move the unknown, so it does not count.
             let normed = cx.deep_resolve(normed);
             if !matches!(cx.tys().kind(normed), TyKind::Projection(..)) && normed != rhs {
-                cx.unify(rhs, normed);
+                if exact {
+                    cx.unify(rhs, normed);
+                } else {
+                    // A structured side binds all or nothing; the nested
+                    // predicate still reports a mismatch.
+                    let snap = cx.snapshot();
+                    if !cx.unify(rhs, normed) {
+                        cx.rollback(snap);
+                    }
+                }
             }
         }
     }
