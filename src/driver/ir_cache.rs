@@ -4,11 +4,12 @@
 // and types hashed deeply (named Adt layouts fold in through
 // `graph::hash_ty_deep`), call targets by stable disk identity, and
 // statement locations relative to the fn's first line (the C the
-// backend emits embeds those). Object units key on these
-// fingerprints plus their used-slots hash only, never on C text: a
-// slot renumber changes the used-slots hash, the unit misses, and
-// its C is re-emitted from the cached IR here with no front-end
-// redo (no re-lex, re-parse, re-check, or re-lower).
+// backend emits embeds those). The fingerprint has no slot numbers:
+// a slot renumber (a compaction) moves a body's own slot or one in
+// its `CachedBody::used_at_gen` (the slots cgen recorded it prints,
+// `FnOut::used`), and the daemon re-emits its C from the cached IR
+// here with no front-end redo (no re-lex, re-parse, re-check, or
+// re-lower). Unit objects key on their C text (cache.rs).
 //
 // `CachedBody` is the session form of one IR body with every
 // session-local id translated out: types become structural trees,
@@ -494,8 +495,8 @@ pub(crate) struct CachedBody {
     /// while it stands.
     pub file_hash: u64,
     /// The slot this fn owned when its C was emitted, and the slots
-    /// its C referenced then. A difference against today's assignment
-    /// is the re-emit trigger.
+    /// its C printed then (`FnOut::used`), each with its fn's stable id.
+    /// A difference against today's assignment is the re-emit trigger.
     pub slot_at_gen: u32,
     pub used_at_gen: Vec<(DiskDefId, u32)>,
     /// `ir_fingerprint` of the source body; a rebuild must match it.
@@ -924,7 +925,7 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
 }
 
 /// Translates one lowered body into its cached form. `used_at_gen`
-/// pairs each used disk target with the slot it owns today.
+/// pairs each slot its C prints (`FnOut::used`) with that slot's fn.
 pub(crate) fn cache_body(p: &Program, body: &Body, file_hash: u64, slot: u32, used_at_gen: Vec<(DiskDefId, u32)>, ir_fp: u64) -> CachedBody {
     let mut b = TreeBuilder { tys: &body.tys, memo: FxMap::default(), out: Vec::new() };
     let locals = body.locals.iter().map(|l| (b.ty(l.ty), l.mutable, l.name.clone())).collect();
