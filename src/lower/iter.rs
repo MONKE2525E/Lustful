@@ -78,6 +78,8 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::IterPeek
             | B::IterInspect
             | B::IterCount
+            | B::IterEq
+            | B::IterNe
             | B::IterLast
             | B::IterNth
             | B::IterAny
@@ -1285,6 +1287,23 @@ impl Ex<'_, '_> {
                 let (owned, ty) = self.own(iv)?;
                 self.collect(Place::local(owned), ty, dest, dest_ty)?;
                 self.drop_local(owned);
+            }
+            B::IterEq | B::IterNe => {
+                let (a, other) = (arg()?, arg()?);
+                let (al, at) = self.own(a)?;
+                let ot = self.op_ty(&other)?;
+                let want = if it::is_iter(&self.body.tys, ot) {
+                    ot
+                } else {
+                    self.wrapper_inner(ot).or_else(|| it::as_iter_ty(&mut self.body.tys, ot)).ok_or("iterator expansion: bad `eq` argument")?
+                };
+                let bv = self.into_iter(other, want)?;
+                let bl = self.local(want);
+                self.assign(Place::local(bl), Rvalue::Use(bv));
+                self.iter_eq(Place::local(al), at, Place::local(bl), want, dest, b == B::IterNe)?;
+                // `iter_compare(a, b, f)` drops its params in reverse.
+                self.drop_local(bl);
+                self.drop_local(al);
             }
             B::IterCount | B::IterLast | B::IterMin | B::IterMax | B::IterCollect | B::IterSum | B::IterProduct => {
                 let i = arg()?;
@@ -6013,6 +6032,93 @@ impl Ex<'_, '_> {
             }
             _ => return Err("iterator expansion: sum into a non-numeric type".into()),
         })
+    }
+
+    /// `Iterator::eq` (`ne` negates): core 1.99's `SpecIterEq`. Two
+    /// `TrustedLen` sides whose upper bounds differ are unequal before
+    /// any pull; else `iter_eq`: `a`'s `try_fold` steps, one `b.next()`
+    /// per item (an end of `b` first is unequal, the item drops), the
+    /// pair compared and dropped (`y`, then `x`), and at the end of `a`
+    /// one more `b.next()` decides.
+    #[allow(clippy::too_many_arguments)]
+    fn iter_eq(&mut self, ap: Place, at: Ty, bp: Place, bt: Ty, dest: Place, ne: bool) -> R {
+        use crate::ast::BinOp::Eq;
+        let join = self.block();
+        let result = |this: &mut Self, v: bool| {
+            this.assign(dest.clone(), Rvalue::Use(Operand::Const(Const::Bool(v != ne))));
+            this.goto(join);
+        };
+        if self.trusted_len(at) && self.trusted_len(bt) {
+            let (_, ha) = self.hint(ap.clone(), at)?;
+            let (_, hb) = self.hint(bp.clone(), bt)?;
+            let go = self.block();
+            let (sa, na) = self.switch_opt(&Place::local(ha));
+            self.cur = sa;
+            let (sb, nb) = self.switch_opt(&Place::local(hb));
+            self.cur = sb;
+            let c = self.cmp(Eq, Operand::Copy(Self::payload(&Place::local(ha))), Operand::Copy(Self::payload(&Place::local(hb))));
+            let (same, diff) = self.branch(c);
+            self.cur = same;
+            self.goto(go);
+            self.cur = diff;
+            result(self, false);
+            self.cur = nb;
+            result(self, false);
+            self.cur = na;
+            let (sb2, nb2) = self.switch_opt(&Place::local(hb));
+            self.cur = sb2;
+            result(self, false);
+            self.cur = nb2;
+            self.goto(go);
+            self.cur = go;
+        }
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let saved = std::mem::replace(&mut self.fold, true);
+        let pulled = self.pull(&ap, at);
+        self.fold = saved;
+        let (_, a_end, x, xt) = pulled?;
+        let (_, b_end, y, _) = self.pull(&bp, bt)?;
+        let r = self.local(BOOL);
+        self.item_eq(x, xt, y, r);
+        self.drop_local(y);
+        self.drop_local(x);
+        let (yes, no) = self.branch(Operand::Copy(Place::local(r)));
+        self.cur = yes;
+        self.goto(lp);
+        self.cur = no;
+        result(self, false);
+        self.cur = b_end;
+        self.drop_local(x);
+        result(self, false);
+        self.cur = a_end;
+        let (_, b_end2, y2, _) = self.pull(&bp, bt)?;
+        self.drop_local(y2);
+        result(self, false);
+        self.cur = b_end2;
+        result(self, true);
+        self.cur = join;
+        Ok(())
+    }
+
+    /// `r = x == y` for two items of type `t` (check took one type):
+    /// through the references (`PartialEq for &A` compares the
+    /// pointees), a `&str` by its bytes, anything else by the eq glue.
+    fn item_eq(&mut self, x: Local, t: Ty, y: Local, r: Local) {
+        let (mut px, mut py, mut t) = (Place::local(x), Place::local(y), t);
+        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+            if inner == STR {
+                self.assign(Place::local(r), Rvalue::StrCmp(crate::ast::BinOp::Eq, Operand::Copy(px), Operand::Copy(py)));
+                return;
+            }
+            px = px.deref();
+            py = py.deref();
+            t = inner;
+        }
+        let ra = self.ref_to(false, px, t);
+        let rb = self.ref_to(false, py, t);
+        self.assign(Place::local(r), Rvalue::Eq { a: Operand::Move(Place::local(ra)), b: Operand::Move(Place::local(rb)), ty: t, ne: false });
     }
 
     /// `min`/`max` (key None) and `min_by_key`/`max_by_key`: Rust's

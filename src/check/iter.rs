@@ -1123,6 +1123,40 @@ impl<'p> Ctx<'p> {
                 self.set_res(e, Res::BuiltinMethod { b: if n == "chain" { B::IterChain } else { B::IterZip }, derefs, autoref: Autoref::None });
                 return mk(self, if n == "chain" { K::Chain } else { K::Zip }, &[base, other]);
             }
+            // core's `eq`/`ne`: `I: IntoIterator, Self::Item:
+            // PartialEq<I::Item>`. lust compares items of one type
+            // (the eq glue), known when the call is checked.
+            "eq" | "ne" => {
+                let [a] = args else {
+                    self.err("L0105", span, format!("`{n}` takes 1 argument"), "Pass the other iterator.");
+                    return self.iter_bail(args);
+                };
+                let at = self.expr(*a, None);
+                let at = self.deep(at);
+                let Some(other) = self.into_iter_ty(at) else {
+                    let tn = self.tn(at);
+                    self.err("L0612", self.span(*a), format!("`{tn}` is not an iterator lust can compare with yet"), "Pass an iterator, a `&Vec`, a slice, or a `Vec`.");
+                    return ERROR;
+                };
+                if it::iter_parts(&self.tys, other).is_some_and(|(k, _)| k == IterKind::ByNext) && !it::is_iter(&self.tys, at) {
+                    let i = self.ei(*a);
+                    self.out.coerce[i] = Coerce::ByNext(other);
+                }
+                let oi = self.iter_item(other);
+                let (x, y) = (self.deep(item), self.deep(oi));
+                if self.unbound_general(x) || self.unbound_general(y) {
+                    self.err("L0610", span, format!("type annotations needed: the item types of this `{n}` must be known here"), "Annotate the element types.");
+                    return ERROR;
+                }
+                if !self.unify(x, y) {
+                    let (xn, yn) = (self.tn(x), self.tn(y));
+                    self.err("L0640", span, format!("`{n}` between `{xn}` and `{yn}` items is not implemented yet"), "Map the items to one type first.");
+                    return ERROR;
+                }
+                self.deferred_eq.push((x, span));
+                self.set_res(e, Res::BuiltinMethod { b: if n == "eq" { B::IterEq } else { B::IterNe }, derefs, autoref: Autoref::None });
+                return BOOL;
+            }
             "copied" | "cloned" => {
                 let inner = match self.kind(self.resolve(item)) {
                     TyKind::Ref(_, _, t) => t,
@@ -1724,7 +1758,8 @@ impl<'p> Ctx<'p> {
     /// The iterator a `chain` or `zip` argument turns into through
     /// `IntoIterator`: an iterator as itself, `&X`/`&mut X` over a
     /// Vec, slice, or array as a slice iterator, a Vec by value as
-    /// `vec::IntoIter`. None for other types.
+    /// `vec::IntoIter`, a map or set (or a reference to one) as its
+    /// hash iterator. None for other types.
     pub(super) fn into_iter_ty(&mut self, t: Ty) -> Option<Ty> {
         // A collection iterator struct chains as its inner iterator.
         if let Some(inner) = self.p.collection_iter_inner(&mut self.tys, t) {
@@ -1750,6 +1785,9 @@ impl<'p> Ctx<'p> {
         if let TyKind::Array(el, _) = self.kind(t) {
             return Some(it::mk_iter(&mut self.tys, IterKind::ArrayIntoIter, &[el, t]));
         }
+        if let Some(h) = self.hash_into_iter_ty(t) {
+            return Some(h);
+        }
         let TyKind::Ref(_, m, inner) = self.kind(t) else { return None };
         let inner = self.resolve(inner);
         let el = match self.kind(inner) {
@@ -1758,6 +1796,27 @@ impl<'p> Ctx<'p> {
         };
         let k = if m.is_mut() { IterKind::SliceIterMut } else { IterKind::SliceIter };
         Some(it::mk_iter(&mut self.tys, k, &[el]))
+    }
+
+    /// std's `IntoIterator` for a map or set: by value the owning
+    /// iterator, `&` the shared one, `&mut` a map's `IterMut` (there is
+    /// no `IntoIterator for &mut HashSet`). None for other types.
+    fn hash_into_iter_ty(&mut self, t: Ty) -> Option<Ty> {
+        use crate::ty::hash::{HashTy, hash_parts};
+        let (by_ref, m, tab) = match self.kind(t) {
+            TyKind::Ref(_, m, inner) => (true, m.is_mut(), self.resolve(inner)),
+            _ => (false, false, t),
+        };
+        let (kind, a) = hash_parts(&self.tys, tab)?;
+        let (ik, args) = match (kind, by_ref, m) {
+            (HashTy::HashMap, false, _) => (IterKind::MapIntoIter, vec![a[0], a[1]]),
+            (HashTy::HashMap, true, false) => (IterKind::MapIter, vec![a[0], a[1]]),
+            (HashTy::HashMap, true, true) => (IterKind::MapIterMut, vec![a[0], a[1]]),
+            (HashTy::HashSet, false, _) => (IterKind::SetIntoIter, vec![a[0]]),
+            (HashTy::HashSet, true, false) => (IterKind::SetIter, vec![a[0]]),
+            _ => return None,
+        };
+        Some(it::mk_iter(&mut self.tys, ik, &args))
     }
 
     /// The `IntoIter` of a `flatten` or `flat_map` inner value: what
@@ -2660,6 +2719,8 @@ const ITER_VIEW_METHODS: &[&str] = &["peek", "as_slice", "as_mut_slice", "as_str
 /// The adapter and consumer methods `iter_call` answers, by name: the
 /// calls that wrap a `ByNext` iterator.
 const ITER_METHODS: &[&str] = &[
+    "eq",
+    "ne",
     "flatten",
     "flat_map",
     "map",

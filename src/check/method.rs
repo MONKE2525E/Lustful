@@ -1748,9 +1748,15 @@ fn iterator_shadows(cx: &mut Ctx, step: Ty, name: Sym) -> bool {
 }
 
 /// The reject for an `iterator_shadows` call (L0640: the `Iterator`
-/// method is declared, lust has no port; L0104 for rustc's E0034).
+/// method is declared, lust has no port; L0104 for rustc's E0034), or
+/// a miss for the ones lust's builtin iterator methods answer.
 fn iterator_shadow_reject(cx: &mut Ctx, step: Ty, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
     let n = cx.p.interner.get(name).to_string();
+    // `eq`/`ne` on the iterator Adt itself: lust's builtin `Iterator::eq`
+    // (check/iter.rs, through `ByNext`) takes it after this search.
+    if matches!(n.as_str(), "eq" | "ne") && cx.tys.local_adt(step).is_some() {
+        return Probe::Miss;
+    }
     let tn = cx.tn(step);
     if matches!(n.as_str(), "max" | "min") {
         let msg = format!("multiple applicable items in scope: `{n}` of `Iterator` and of `Ord` for `{tn}`");

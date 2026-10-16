@@ -5617,6 +5617,8 @@ impl FnGen<'_, '_> {
             | B::IterPeek
             | B::IterInspect
             | B::IterCount
+            | B::IterEq
+            | B::IterNe
             | B::IterLast
             | B::IterNth
             | B::IterAny

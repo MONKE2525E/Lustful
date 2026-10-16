@@ -545,6 +545,9 @@ pub enum Builtin {
     IterPeek,
     IterInspect,
     IterCount,
+    /// `Iterator::eq` and `ne` (core's `iter_eq`, lower/iter.rs).
+    IterEq,
+    IterNe,
     IterLast,
     IterNth,
     IterAny,
