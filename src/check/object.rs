@@ -458,6 +458,25 @@ pub fn principal_has_supertrait(p: &Program, principal: DefId, want: DefId) -> b
     go(p, principal, want, &mut Vec::new())
 }
 
+/// The vtable key of a dyn type: its principal, or for a dyn with only
+/// auto traits (`dyn Send + Sync`) the `Send` trait def with no args, a
+/// key no principal can have (auto traits are never principals). That
+/// vtable has no methods: drop, size, align, and empty fmt words.
+pub fn vtable_key(p: &Program, tys: &impl TyIntern, t: Ty) -> Option<TraitRef> {
+    match tys.kind(t) {
+        TyKind::Dyn(b, _) => Some(match tys.dyn_bounds(b).principal {
+            Some(pr) => pr.value,
+            None => auto_only_key(p),
+        }),
+        _ => None,
+    }
+}
+
+/// The vtable key of every dyn type with only auto traits (`vtable_key`).
+pub fn auto_only_key(p: &Program) -> TraitRef {
+    TraitRef { def: p.gx.lang.send, args: EMPTY_ARGS, bindings: EMPTY_BINDINGS }
+}
+
 /// The principal trait ref of a dyn type, if `t` is one.
 pub fn principal_of(tys: &impl TyIntern, t: Ty) -> Option<TraitRef> {
     match tys.kind(t) {

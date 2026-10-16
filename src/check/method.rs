@@ -1486,6 +1486,7 @@ pub(super) fn dyn_probe(
     name: Sym,
     name_span: Span,
     args: &[ExprId],
+    explicit: &[Option<GenericArg>],
     only: Option<DefId>,
 ) -> Probe {
     use crate::check::object::{self, DynRecv};
@@ -1542,9 +1543,21 @@ pub(super) fn dyn_probe(
         return Probe::Failed;
     }
     if let Some(f) = inherent {
-        if p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
-            cx.errs.push(crate::check::generics::dyn_not_yet(name_span, "generic methods in `impl dyn Trait` blocks"));
-            return Probe::Failed;
+        // A generic method of an `impl dyn Tr` block (`downcast_ref::<T>`):
+        // instantiated like an inherent template. Its impl has no params
+        // of its own here (the template's params are all the method's),
+        // so a turbofish binds them in order.
+        if let Some(Some(tmpl)) = p.gx.fn_templates.get(f.0 as usize).cloned() {
+            let own = p.fn_info(f).def(&p.ast).generics.params.iter().filter(|g| !matches!(g, ast::GenericParam::Lifetime { .. })).count();
+            if own != tmpl.generics.params.len() {
+                cx.errs.push(crate::check::generics::dyn_not_yet(name_span, "generic `impl dyn Trait` blocks"));
+                return Probe::Failed;
+            }
+            cx.check_dyn_method_vis(f, name_span);
+            return match confirm_method(cx, e, f, &tmpl.generics, &[], explicit, probe, derefs, args, name_span) {
+                Some(ret) => Probe::Hit(ret),
+                None => Probe::Miss,
+            };
         }
         cx.check_dyn_method_vis(f, name_span);
         let (params, ret) = {
@@ -1827,7 +1840,7 @@ fn method_search_steps(
                 return iterator_shadow_reject(cx, step, name, name_span, args);
             }
             for &probe in group {
-                match dyn_probe(cx, e, probe, derefs, name, name_span, args, None) {
+                match dyn_probe(cx, e, probe, derefs, name, name_span, args, explicit, None) {
                     Probe::Miss => {}
                     hit => return hit,
                 }

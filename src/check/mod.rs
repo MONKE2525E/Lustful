@@ -5451,6 +5451,7 @@ impl<'p> Ctx<'p> {
                             && self.unify_args(px.value.args, py.value.args)
                             && self.unify_bindings(px.value.bindings, py.value.bindings)
                     }
+                    (None, None) => bx.auto == by.auto,
                     _ => false,
                 }
             }
@@ -6159,6 +6160,95 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The unsizing coercion to a dyn type with only auto traits
+    /// (`Box<T>` to `Box<dyn Send>`, R25): a sized source that implements
+    /// each written auto trait (queued as obligations), `'static` when
+    /// the object lifetime is, and a vtable request for the method-less
+    /// vtable (`object::vtable_key`).
+    fn auto_only_unsize(&mut self, mut x: Ty, y: Ty, found: Ty, expected: Ty, span: Span, e: Option<ExprId>) -> Option<Coerce> {
+        let p = self.p;
+        if matches!(self.kind(expected), TyKind::Ref(Region::Static, ..))
+            && !matches!(self.kind(found), TyKind::Ref(Region::Static, ..))
+            && !e.is_some_and(|e| self.static_borrow(e))
+        {
+            let tn = self.tn(expected);
+            self.err(
+                "L0705",
+                span,
+                format!("lust cannot prove that this reference lives for `'static`, which `{tn}` requires"),
+                "Borrow a `static` item here, or use a shorter reference.",
+            );
+            return None;
+        }
+        // A dyn source drops its principal or some auto traits (`dyn Tr +
+        // Send` or `dyn Send + Sync` to `dyn Send`): it must have every
+        // target auto trait. Every vtable starts with drop, size, and
+        // align, so the fat pointer stays as it is (lower.rs `unsize`).
+        if matches!(self.kind(x), TyKind::Dyn(..)) {
+            let have = object::dyn_auto(p, &self.tys, x);
+            let want = match self.tys.kind(y) {
+                TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).auto,
+                _ => AutoTraits::default(),
+            };
+            if (want.send && !have.send) || (want.sync && !have.sync) || (want.unpin && !have.unpin) {
+                self.mismatch(span, expected, found);
+                return None;
+            }
+            if object::dyn_is_static(p, &self.tys, y) && !object::dyn_is_static(p, &self.tys, x) {
+                self.obl.push(obligations::Obligation::DynStatic { span });
+            }
+            return Some(Coerce::Unsize(expected));
+        }
+        // A numeric literal falls back to i32 (f64), as no trait picks it.
+        if let TyKind::Infer(v) = self.tys.kind(x)
+            && (v.is_int() || v.is_float())
+        {
+            let t = if v.is_int() { I32 } else { self.tys.float_ty(FloatTy::F64) };
+            self.unify(x, t);
+            x = t;
+        }
+        if !self.sized_ok(x) {
+            let tn = self.tn(x);
+            self.err(
+                "L0110",
+                span,
+                format!("the size for values of type `{tn}` cannot be known, so it cannot become a `dyn` value"),
+                "Only a sized type converts to a `dyn` value.",
+            );
+            return None;
+        }
+        let to_static = object::dyn_is_static(p, &self.tys, y);
+        let borrows = if to_static { object::may_borrow_in(p, &self.tys, self.env(), x) } else { object::may_borrow(p, &self.tys, x) };
+        if !to_static && borrows {
+            self.dyn_borrow_src = true;
+        }
+        let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
+        if to_static && borrows && !instance {
+            let tn = self.tn(x);
+            self.err(
+                "L0705",
+                span,
+                format!("lust cannot prove that `{tn}` lives for `'static`, which this `dyn` type requires"),
+                "Use a type without references here, or write a shorter object lifetime.",
+            );
+            return None;
+        }
+        let want = match self.tys.kind(y) {
+            TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).auto,
+            _ => AutoTraits::default(),
+        };
+        let lang = p.gx.lang;
+        for (on, def) in [(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)] {
+            if on {
+                let args = self.tys.intern_args(&[GenericArg::Ty(x)]);
+                self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
+            }
+        }
+        let y = object::erase_dyn_region(&mut self.tys, y);
+        self.vtable_sites.push((x, y, span));
+        Some(Coerce::Unsize(expected))
+    }
+
     fn coerce_expr(&mut self, e: ExprId, found: Ty, expected: Ty) -> bool {
         let span = self.span(e);
         self.coerce_at(found, expected, span, Some(e))
@@ -6196,6 +6286,9 @@ impl<'p> Ctx<'p> {
     fn unsize_coercion(&mut self, x: Ty, y: Ty, found: Ty, expected: Ty, span: Span, e: Option<ExprId>) -> Option<Coerce> {
         let p = self.p;
         let (mut x, y) = (self.deep(x), self.deep(y));
+        if matches!(self.tys.kind(y), TyKind::Dyn(b, _) if self.tys.dyn_bounds(b).principal.is_none()) {
+            return self.auto_only_unsize(x, y, found, expected, span, e);
+        }
         let to = object::principal_of(&self.tys, y)?;
         // A written `&'static dyn Tr` target: lust tracks no reference
         // lifetimes, so only a borrow of a static item (or a reference

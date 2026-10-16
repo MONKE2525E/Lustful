@@ -1274,6 +1274,9 @@ impl<'p> Lower<'p> {
                     let path = object::upcast_path(self.p, &mut self.body.tys, from, to).unwrap_or_default();
                     if path.is_empty() { Rvalue::Use(op) } else { Rvalue::DynUpcast { ptr: op, path } }
                 }
+                // A dyn source to a dyn with only auto traits: the same
+                // object type (check/mod.rs `auto_only_unsize`), a copy.
+                _ if matches!(self.body.tys.kind(src), TyKind::Dyn(..)) => Rvalue::Use(op),
                 _ => Rvalue::MakeDyn { ptr: op, src, dyn_ty },
             };
             let out = self.temp(target);
@@ -1293,6 +1296,7 @@ impl<'p> Lower<'p> {
                 let path = object::upcast_path(self.p, &mut self.body.tys, from, to).unwrap_or_default();
                 if path.is_empty() { Rvalue::Use(ptr) } else { Rvalue::DynUpcast { ptr, path } }
             }
+            _ if matches!(self.body.tys.kind(src), TyKind::Dyn(..)) => Rvalue::Use(ptr),
             _ => Rvalue::MakeDyn { ptr, src, dyn_ty },
         };
         let out = self.temp(target);

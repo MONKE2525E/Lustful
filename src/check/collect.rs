@@ -8246,6 +8246,10 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
             if let Some(r) = crate::check::sync::builtin_auto(p, tys, env, trait_def, t, seen) {
                 return r;
             }
+            // `Box<T>` is `Unpin` for every `T` (std's explicit impl).
+            if trait_def == lang.unpin && tys.boxed_elem(t).is_some() {
+                return Some(true);
+            }
             if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.boxed_elem(t)) {
                 seen.push((trait_def, t));
                 return auto_structural(p, tys, env, trait_def, e, seen);

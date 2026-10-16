@@ -81,6 +81,13 @@ pub fn ensure_vtable(p: &mut Program, self_ty: Ty, principal: TraitRef, made: &m
     if let Some(&id) = p.gx.vtable_by_key.get(&(self_ty, principal)) {
         return Some(id);
     }
+    // A dyn with only auto traits (`object::vtable_key`): no methods.
+    if principal == object::auto_only_key(p) {
+        let id = p.gx.vtables.len() as u32;
+        p.gx.vtables.push(VtableData { self_ty, principal, methods: Vec::new(), supers: Vec::new() });
+        p.gx.vtable_by_key.insert((self_ty, principal), id);
+        return Some(id);
+    }
     // A `dyn Fn`-family vtable (ARCH 2.9) has one call entry: the
     // closure's body fn, which `register_closures` made already.
     // A fn item's entry calls its fn (an instance for a generic one); a

@@ -307,7 +307,7 @@ pub(super) fn replay_method(
         // a supertrait of it) is the picked trait: the object candidate,
         // through the vtable (ARCH 2.8), never an `impl dyn` method.
         if matches!(cx.tys.kind(step), TyKind::Dyn(..)) {
-            match method::dyn_probe(cx, e, probe, pick.derefs, name, name_span, args, Some(pick.trait_def)) {
+            match method::dyn_probe(cx, e, probe, pick.derefs, name, name_span, args, &[], Some(pick.trait_def)) {
                 Probe::Hit(ret) => return Some(ret),
                 Probe::Failed => return Some(ERROR),
                 Probe::Miss => {}

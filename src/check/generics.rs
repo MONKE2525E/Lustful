@@ -3245,8 +3245,11 @@ fn resolve_dyn(
             }
         }
     }
-    if principal.is_none() {
-        return Err(dyn_not_yet(span, "`dyn` types with only auto traits"));
+    // `dyn Send`, `dyn Send + Sync`: no principal, only auto traits. Its
+    // vtable holds drop, size, and align (`object::vtable_key`). No trait
+    // at all (`dyn 'a`) is rustc E0224.
+    if principal.is_none() && !(auto.send || auto.sync || auto.unpin) {
+        return Err(Diag::new("L0110", span, "at least one trait is required for an object type", "Write a trait after `dyn`."));
     }
     let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto });
     Ok(tys.intern(TyKind::Dyn(bounds_id, region)))
@@ -8933,7 +8936,9 @@ pub fn vtable_for(p: &Program, src: &dyn TyIntern, concrete: Ty, dyn_ty: Ty) -> 
     // static (`&X as &(dyn Tr + 'static)`), and then only the eager
     // vtable of a plain impl exists for it.
     let TyKind::Dyn(b, _) = src.kind(dyn_ty) else { return None };
-    let pr = src.dyn_bounds(b).principal?.value;
+    let Some(pr) = src.dyn_bounds(b).principal.map(|pr| pr.value) else {
+        return p.gx.vtable_by_key.get(&(concrete, crate::check::object::auto_only_key(p))).copied();
+    };
     let mut args: Vec<GenericArg> = Vec::new();
     for g in src.args(pr.args).to_vec() {
         args.push(match g {
@@ -10487,7 +10492,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 let src = build_owned_ty(p, src);
                 let src = normalize_global(p, src);
                 let dyn_ty = build_owned_ty(p, dyn_ty);
-                let Some(principal) = crate::check::object::principal_of(&p.tys, dyn_ty) else { continue };
+                let Some(principal) = crate::check::object::vtable_key(p, &p.tys, dyn_ty) else { continue };
                 let mut made: Vec<LocalDefId> = Vec::new();
                 crate::mono::vtable::ensure_vtable(p, src, principal, &mut made);
                 for inst in made {
