@@ -6987,6 +6987,10 @@ impl<'p> Lower<'p> {
     /// An operand for a const value, building aggregates in a temporary.
     fn const_operand(&mut self, v: &crate::ty::consteval::ConstValue, ty: Ty, span: Span) -> Operand {
         use crate::ty::consteval::ConstValue as CV;
+        // A `Cell::new(v)` const is its value's (the same C form).
+        if let Some(inner) = self.body.tys.cell_elem(ty) {
+            return self.const_operand(v, inner, span);
+        }
         match v {
             CV::Int(i) if !self.body.tys.is_exit_code(ty) => {
                 let it = match self.kind(ty) {
@@ -7061,6 +7065,9 @@ impl<'p> Lower<'p> {
 
     fn const_into(&mut self, v: &crate::ty::consteval::ConstValue, ty: Ty, dest: &Place, span: Span) {
         use crate::ty::consteval::ConstValue as CV;
+        if let Some(inner) = self.body.tys.cell_elem(ty) {
+            return self.const_into(v, inner, dest, span);
+        }
         // `ExitCode::SUCCESS` and `FAILURE` build through `ExitCode::from`.
         if let CV::Int(i) = v
             && self.body.tys.is_exit_code(ty)

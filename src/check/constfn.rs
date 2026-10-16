@@ -99,6 +99,8 @@ fn builtin_is_const(b: Builtin) -> bool {
         // still a drop type, so destroying it here rejects elsewhere.
         StringNew
             | VecNew
+            // `Cell::new` (its const value is the inner value's, ty/consteval.rs).
+            | CellNew
             // `HashMap::with_hasher` and `HashSet::with_hasher` (const
             // since Rust 1.85); `new` and `default` are not.
             | HashWithHasher

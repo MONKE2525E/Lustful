@@ -8099,6 +8099,8 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             }
         }
         (CV::Bool(b), _) => (*b as u8).to_string(),
+        // A Cell's constant is its value's (its C form is the value's).
+        (_, CTy::Cell(inner)) => const_init(p, v, inner, pre, counter, slots, pos),
         // An atomic's constant is its value (cgen/sync.rs).
         // `Vec::new()` and `String::new()`: an empty buffer, its pointer
         // dangling at the element's alignment (W-THREADS).

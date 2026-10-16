@@ -2970,6 +2970,19 @@ impl Evaluator {
         {
             return Ok((ConstValue::Aggregate(Vec::new()), super::STRING));
         }
+        // `Cell::new(v)` is a const fn: the value is the cell's (a Cell's C
+        // form is its value's).
+        if let Expr::Path(segs) = cx.ast().expr(callee)
+            && let [arg] = args
+            && segs.iter().all(|s| s.type_args().is_empty())
+            && matches!(segs.iter().map(|s| cx.sym_text(s.name)).collect::<Vec<_>>().as_slice(), ["std" | "core", "cell", "Cell", "new"])
+        {
+            let want = expected.and_then(|t| cx.tys_ref().cell_elem(t));
+            let (v, vt) = self.value(cx, env, *arg, want)?;
+            let cell_def = cx.tys_ref().builtins().cell;
+            let t = cx.tys().mk_adt(cell_def, &[super::GenericArg::Ty(vt)]);
+            return Ok((v, t));
+        }
         // `AtomicUsize::new(v)` and the other atomics' `new` are const fns
         // (W-THREADS): the value is the atomic's (its C form is the value).
         if let Expr::Path(segs) = cx.ast().expr(callee)
