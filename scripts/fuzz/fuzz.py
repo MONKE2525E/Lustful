@@ -1677,6 +1677,7 @@ PATCHSEQ_SEED = {
 mod gated;
 mod items;
 mod macs;
+mod rpit;
 mod sigs;
 mod tmpl;
 
@@ -1688,7 +1689,7 @@ fn pick(o: Option<i64>) -> i64 {
 }
 
 fn main() {
-    let t = items::run() + gated::run() + consts::run() + tmpl::run() + macs::run() + sigs::run();
+    let t = items::run() + gated::run() + consts::run() + tmpl::run() + macs::run() + sigs::run() + rpit::run();
     // @r2
     println!("{}", t + pick(Some(2)));
 }
@@ -1932,6 +1933,55 @@ pub fn run() -> i64 {
 }
 """
 
+# W-RPIT-EDIT: fns that return `impl Trait`. A marked edit keeps the
+# hidden type (the kept program stands); the value edits below change it
+# (an iterator chain's order, a closure's capture type, a value that loses
+# `Send` for a caller, a definer error), so the callers check again.
+PATCHSEQ_SEED["rpit.rs"] = """pub struct Table {
+    pub r16: &'static [(u16, u16, u16)],
+    pub r32: &'static [(u32, u32, u32)],
+}
+
+impl Table {
+    pub fn starts(&self) -> impl Iterator<Item = i64> + '_ {
+        // @p1
+        self.r16.iter().map(|t| t.0 as i64)
+    }
+}
+
+pub fn ranges(x: &Table) -> impl Iterator<Item = (i64, i64, i64)> + '_ {
+    // @p2
+    let a = x.r16.iter().map(|&(lo, hi, s)| (i64::from(lo), i64::from(hi), i64::from(s)));
+    let b = x.r32.iter().map(|&(lo, hi, s)| (lo as i64, hi as i64, s as i64));
+    a.chain(b)
+}
+
+pub fn adder(n: i64) -> impl Fn(i64) -> i64 {
+    // @p3
+    move |x| x + n
+}
+
+pub fn token() -> impl Sized {
+    // @p4
+    7u8
+}
+
+fn need_send<T: Send>(_t: T) {}
+
+pub static T: Table = Table { r16: &[(1, 5, 1), (10, 20, 2)], r32: &[(0x10000, 0x10010, 1)] };
+
+pub fn run() -> i64 {
+    let mut n = 0;
+    for (lo, hi, s) in ranges(&T) {
+        n += (hi - lo) / s + 1;
+    }
+    need_send(adder(1));
+    need_send(token());
+    // @p5
+    n + adder(2)(3) + T.starts().sum::<i64>()
+}
+"""
+
 # Statements that check in any marked body (a `let` before the tail).
 PATCHSEQ_OK = ["let _v{n}: u32 = {n};", "let _v{n} = {n} as i64 + 1;", "if {n} > 3 {{ let _w{n} = {n}; }}",
                "let _s{n} = String::from(\"{n}\");", "let _m{n} = matches!({n} % 3, 0 | 1);",
@@ -1947,7 +1997,12 @@ PATCHSEQ_VALUES = [("consts.rs", "    4\n}", "    5\n}"), ("consts.rs", "    3\n
                    ("consts.rs", "    1\n}", "    5\n}"),
                    ("items.rs", "const K: i64 = 4;", "const K: i64 = 6;"), ("items.rs", "|| 7)", "|| 8)"),
                    ("items.rs", "vec![1, 2, 3]", "vec![1, 2]"), ("sigs.rs", "    v * 2\n", "    v * 3\n"),
-                   ("sigs.rs", "    a + b + c\n", "    a + b * c\n")]
+                   ("sigs.rs", "    a + b + c\n", "    a + b * c\n"),
+                   ("rpit.rs", "    a.chain(b)\n", "    b.chain(a)\n"), ("rpit.rs", "    7u8\n", "    7u16\n"),
+                   ("rpit.rs", "    7u8\n", "    std::rc::Rc::new(7u8)\n"),
+                   ("rpit.rs", "    move |x| x + n\n", "    let r = std::rc::Rc::new(n);\n    move |x| x + *r\n"),
+                   ("rpit.rs", "    move |x| x + n\n", "    move |x| x + n as i32\n"),
+                   ("rpit.rs", "t.0 as i64)", "t.1 as i64)"), ("rpit.rs", "t.0 as i64)", "t.0)")]
 
 
 def cmd_run_patchseq(a):
@@ -2012,7 +2067,7 @@ def cmd_run_patchseq(a):
         kv = dict(x.split("=", 1) for x in warm.split()[1:] if "=" in x)
         paths[kv.get("path", "?") + ("" if kv.get("why", "-") == "-" else ":" + kv["why"])] += 1
         if os.environ.get("PATCHSEQ_DEBUG"):
-            print(f"{tag:22s} rc={da[0]} {warm[13:110]}", flush=True)
+            print(f"{tag:22s} rc={da[0]} {warm[13:]}", flush=True)
         if not ok:
             failures += 1
             bad_ops[f"{tag} {why}"] += 1
