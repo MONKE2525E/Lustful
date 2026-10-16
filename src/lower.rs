@@ -2844,6 +2844,28 @@ impl<'p> Lower<'p> {
             }
         }
         match block.tail {
+            // A tail rustc coerces after the block (check `after_tail`):
+            // its value goes to a temporary of the enclosing scope, and
+            // the coercion reads it once the block's scopes are gone.
+            Some(tail) if self.ck.is_after_tail(tail) => {
+                let span = self.span(tail);
+                let (ty, outer) = (self.ty(tail), self.scopes.len().saturating_sub(2));
+                let t = self.new_local(ty, true, None);
+                self.scopes.push(Vec::new());
+                self.expr_into_raw(tail, Some(&Place::local(t)));
+                self.pop_scope(span);
+                self.pop_scope(block.span);
+                self.scopes[outer].push(t);
+                if dest.is_none() {
+                    // rustc reborrows the value even when it is unused
+                    // (`if c { &&G } else { &v[0] };`).
+                    self.push(StmtKind::FakeRead(t), span);
+                    return;
+                }
+                self.prelowered.push((tail, Place::local(t), self.spine_gen));
+                self.expr_into(tail, dest);
+                return;
+            }
             Some(tail) => {
                 // Edition 2024: temporaries in a block's tail drop before the block's locals.
                 let span = self.span(tail);

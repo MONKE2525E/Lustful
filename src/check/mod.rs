@@ -1617,6 +1617,11 @@ pub struct Checked<'g> {
     /// Comparisons between different sequence forms (slice, array,
     /// Vec) that lower as slice comparisons (check/slice.rs).
     pub seq_cmps: Vec<ExprId>,
+    /// `if` then-block tails whose coercion rustc's LUB applies to the
+    /// whole block (`lub_flip`), after the block's tail temporaries
+    /// drop: `if c { &&G } else { &v[0] }` reborrows through a dead
+    /// `&G` (E0716). Lowering coerces such a block's value (`block_into`).
+    pub after_tail: Vec<ExprId>,
     /// The `into_iter` method instance of each `Coerce::IntoIterCall`
     /// (an `extend` or `from_iter` argument), by coerced expression.
     pub into_iter_calls: Vec<(ExprId, LocalDefId)>,
@@ -1710,6 +1715,10 @@ impl Checked<'_> {
     /// The `into_iter` instance of a `Coerce::IntoIterCall` on `e`.
     pub fn into_iter_call(&self, e: ExprId) -> Option<LocalDefId> {
         self.into_iter_calls.iter().find(|(x, _)| *x == e).map(|(_, d)| *d)
+    }
+    /// True for a then-block tail coerced after its block (`after_tail`).
+    pub fn is_after_tail(&self, e: ExprId) -> bool {
+        self.after_tail.contains(&e)
     }
     pub fn coerce(&self, e: ExprId) -> Coerce {
         self.coerce[(e.0 - self.expr_base) as usize]
@@ -2336,6 +2345,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             drain_ranges: Vec::new(),
             index_ranges: Vec::new(),
             seq_cmps: Vec::new(),
+            after_tail: Vec::new(),
             into_iter_calls: Vec::new(),
             deref_coerce: Vec::new(),
             index_recv: Vec::new(),
@@ -8671,6 +8681,7 @@ impl<'p> Ctx<'p> {
                             && let Some(tail) = p.ast.block(*then).tail
                             && self.lub_flip(&[tail], t1, t2)
                         {
+                            self.out.after_tail.push(tail);
                             return t2;
                         }
                         {
@@ -8710,6 +8721,7 @@ impl<'p> Ctx<'p> {
                             && let Some(tail) = p.ast.block(*then).tail
                             && self.lub_flip(&[tail], t1, t2)
                         {
+                            self.out.after_tail.push(tail);
                             return t2;
                         }
                         {
