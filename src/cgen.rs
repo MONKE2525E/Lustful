@@ -5832,7 +5832,7 @@ impl FnGen<'_, '_> {
             // ipnsort over the element bytes.
             B::SliceSort | B::SliceSortUnstable | B::SliceSortBy | B::SliceSortUnstableBy | B::SliceSortByKey | B::SliceSortUnstableByKey => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
-                let size = c_size_align(self.p, &e).0;
+                let (size, align) = c_size_align(self.p, &e);
                 let clo = ops.get(1).map(|o| self.adapter_callee(o));
                 let adapter = self.sort_adapter(b, &e, clo);
                 let ctx = match (vals.get(1), tys.get(1)) {
@@ -5848,10 +5848,10 @@ impl FnGen<'_, '_> {
                 // (no Cell or RefCell inline).
                 let freeze = u8::from(is_freeze_c(self.p, &e, &mut HashSet::new()));
                 if matches!(b, B::SliceSort | B::SliceSortBy | B::SliceSortByKey) {
-                    let _ = writeln!(self.out, "    lust_sort_stable({ptr}, {len}, {size}, {freeze}, {cx}, {adapter});");
+                    let _ = writeln!(self.out, "    lust_sort_stable({ptr}, {len}, {size}, {align}, {freeze}, {cx}, {adapter});");
                 } else {
                     let copy = u8::from(is_copy_c(self.p, &e));
-                    let _ = writeln!(self.out, "    lust_sort_unstable({ptr}, {len}, {size}, {freeze}, {copy}, {cx}, {adapter});");
+                    let _ = writeln!(self.out, "    lust_sort_unstable({ptr}, {len}, {size}, {align}, {freeze}, {copy}, {cx}, {adapter});");
                 }
                 if let Some((c, t)) = ctx
                     && needs_drop_c(self.p, &t)

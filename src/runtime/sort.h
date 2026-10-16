@@ -10,7 +10,10 @@
    Cell/RefCell inside). Those three properties choose the small-sort
    variant in Rust, so the caller passes them. Scratch length follows
    Rust (a 4096-byte stack buffer when it fits, else a heap buffer of
-   the computed length); where the scratch lives is not observable.
+   the computed length). Every scratch buffer is aligned for the
+   element (`align`), because the comparator sees pointers into it:
+   an element aligned over 16 never uses a stack buffer, since tcc
+   does not realign stack frames (fx-overalign).
 
    Elements are moved as bytes (`size` per element), as Rust's ptr
    copies are. `less(ctx, a, b)` is the comparator adapter codegen
@@ -20,7 +23,7 @@
 typedef uint8_t (*lust_less_fn)(void *ctx, const void *a, const void *b);
 
 typedef struct {
-    uint64_t size;
+    uint64_t size, align;
     uint8_t freeze, copy;
     void *ctx;
     lust_less_fn less;
@@ -52,7 +55,7 @@ void lust_sort_reverse(lust_sort_cx *s, uint8_t *v, uint64_t len) LUST_BODY({
 /* A temporary element buffer: on the stack for small elements. */
 typedef struct { uint8_t *p; uint8_t local[64] __attribute__((aligned(16))); } lust_sort_tmp;
 uint8_t *lust_sort_tmp_get(lust_sort_cx *s, lust_sort_tmp *t) LUST_BODY({
-    t->p = s->size <= 64 ? t->local : (uint8_t *)malloc(s->size);
+    t->p = s->size <= 64 && s->align <= 16 ? t->local : (uint8_t *)lust_alloc(s->size, s->align);
     return t->p;
 })
 void lust_sort_tmp_free(lust_sort_tmp *t) LUST_BODY({
@@ -233,9 +236,11 @@ void lust_sort_small_network(lust_sort_cx *s, uint8_t *v, uint64_t len) LUST_BOD
         region = LS_AT(v, half);
         region_len = len - half;
     }
-    uint8_t stack[32 * 8] __attribute__((aligned(16)));
+    uint8_t stack_buf[32 * 8] __attribute__((aligned(16)));
+    uint8_t *stack = s->align <= 16 ? stack_buf : (uint8_t *)lust_alloc(sizeof stack_buf, s->align);
     lust_sort_bidir_merge(s, v, len, stack);
     memcpy(v, stack, len * s->size);
+    if (stack != stack_buf) free(stack);
 })
 
 /* shared/pivot.rs */
@@ -469,9 +474,9 @@ void lust_sort_drift(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *scratch
 })
 
 /* stable/mod.rs sort and driftsort_main */
-void lust_sort_stable(void *v, uint64_t len, uint64_t size, uint8_t freeze, void *ctx, lust_less_fn less) LUST_BODY({
+void lust_sort_stable(void *v, uint64_t len, uint64_t size, uint64_t align, uint8_t freeze, void *ctx, lust_less_fn less) LUST_BODY({
     if (size == 0 || len < 2) return;
-    lust_sort_cx cx = {size, freeze, 0, ctx, less};
+    lust_sort_cx cx = {size, align, freeze, 0, ctx, less};
     lust_sort_cx *s = &cx;
     if (len <= 20) {
         lust_sort_insertion_shift_left(s, (uint8_t *)v, len, 1);
@@ -483,7 +488,7 @@ void lust_sort_stable(void *v, uint64_t len, uint64_t size, uint8_t freeze, void
     if (alloc_len < 48) alloc_len = 48;
     uint64_t stack_len = 4096 / size;
     uint64_t scratch_len = stack_len >= alloc_len ? stack_len : alloc_len;
-    uint8_t *scratch = (uint8_t *)malloc(scratch_len * size);
+    uint8_t *scratch = align <= 16 ? (uint8_t *)malloc(scratch_len * size) : (uint8_t *)lust_alloc(scratch_len * size, align);
     if (!scratch) abort();
     uint8_t eager = len <= lust_sort_stable_threshold(s) * 2;
     lust_sort_drift(s, (uint8_t *)v, len, scratch, scratch_len, eager);
@@ -504,8 +509,10 @@ void lust_sort_unstable_small(lust_sort_cx *s, uint8_t *v, uint64_t len) LUST_BO
     if (s->freeze && lust_sort_network_ok(s)) {
         lust_sort_small_network(s, v, len);
     } else if (s->freeze && s->size * 48 <= 4096) {
-        uint8_t scratch[4096] __attribute__((aligned(16)));
+        uint8_t scratch_buf[4096] __attribute__((aligned(16)));
+        uint8_t *scratch = s->align <= 16 ? scratch_buf : (uint8_t *)lust_alloc(sizeof scratch_buf, s->align);
         lust_sort_small_general(s, v, len, scratch);
+        if (scratch != scratch_buf) free(scratch);
     } else if (len >= 2) {
         lust_sort_insertion_shift_left(s, v, len, 1);
     }
@@ -628,9 +635,9 @@ void lust_sort_unstable_quick(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t
 })
 
 /* unstable/mod.rs sort and ipnsort */
-void lust_sort_unstable(void *v, uint64_t len, uint64_t size, uint8_t freeze, uint8_t copy, void *ctx, lust_less_fn less) LUST_BODY({
+void lust_sort_unstable(void *v, uint64_t len, uint64_t size, uint64_t align, uint8_t freeze, uint8_t copy, void *ctx, lust_less_fn less) LUST_BODY({
     if (size == 0 || len < 2) return;
-    lust_sort_cx cx = {size, freeze, copy, ctx, less};
+    lust_sort_cx cx = {size, align, freeze, copy, ctx, less};
     lust_sort_cx *s = &cx;
     uint8_t *b = (uint8_t *)v;
     if (len <= 20) {
