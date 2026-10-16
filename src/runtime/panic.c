@@ -523,7 +523,11 @@ const uint32_t *lust_slot_file;
 
 #ifdef LUST_IMPL
 /* A message panic at a packed location; `kind` is the unwind payload's
-   type (LUST_EXC_STR or LUST_EXC_STRING), as Rust picks it per site. */
+   type (LUST_EXC_STR or LUST_EXC_STRING), as Rust picks it per site.
+   Under panic=unwind every lust_panic_* call returns with the exception
+   pending, and the caller's frame unwinds at its next check. A runtime
+   helper that panics must return at once, with no more writes: Rust
+   leaves memory and output as they were at the panic. */
 static void lust_panic_kind(uint32_t kind, const uint8_t *p, uint64_t n, lust_loc loc) {
     uint32_t slot = (uint32_t)(loc >> 40);
     const char *file;

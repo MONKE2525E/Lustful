@@ -2312,7 +2312,7 @@ static void lust_encode_panic(const char *what, uint64_t need, uint32_t c, uint6
    or core's panic when the buffer is short. */
 uint64_t lust_char_encode_utf8(uint32_t c, uint8_t *dst, uint64_t dst_len, lust_loc loc) LUST_BODY({
     uint64_t n = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
-    if (dst_len < n) lust_encode_panic("encode_utf8", n, c, dst_len, loc);
+    if (dst_len < n) { lust_encode_panic("encode_utf8", n, c, dst_len, loc); return 0; }
     if (n == 1) {
         dst[0] = (uint8_t)c;
     } else if (n == 2) {
@@ -2335,7 +2335,7 @@ uint64_t lust_char_encode_utf8(uint32_t c, uint8_t *dst, uint64_t dst_len, lust_
    or core's panic (which says "bytes") when the buffer is short. */
 uint64_t lust_char_encode_utf16(uint32_t c, uint16_t *dst, uint64_t dst_len, lust_loc loc) LUST_BODY({
     uint64_t n = c < 0x10000 ? 1 : 2;
-    if (dst_len < n) lust_encode_panic("encode_utf16", n, c, dst_len, loc);
+    if (dst_len < n) { lust_encode_panic("encode_utf16", n, c, dst_len, loc); return 0; }
     if (n == 1) {
         dst[0] = (uint16_t)c;
     } else {
