@@ -173,9 +173,22 @@ fn hoistable_path(
         end -= 1;
     }
     let init = &toks[open + 1..end];
+    // A path, also with generic args (`key::<Rc<T>>`, whose `>>` is one
+    // token; a comma only inside the angle brackets).
+    let mut depth = 0i32;
     let path_like = !init.is_empty()
-        && init.iter().all(|t| matches!(t.tok, Tok::Ident(_) | Tok::PathSep | Tok::Lt | Tok::Gt | Tok::As))
-        && matches!(init.last()?.tok, Tok::Ident(_));
+        && init.iter().all(|t| {
+            match t.tok {
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::Shr => depth -= 2,
+                Tok::Comma => return depth > 0,
+                _ => {}
+            }
+            depth >= 0 && matches!(t.tok, Tok::Ident(_) | Tok::PathSep | Tok::Lt | Tok::Gt | Tok::Shr | Tok::As | Tok::Comma)
+        })
+        && depth == 0
+        && matches!(init.last()?.tok, Tok::Ident(_) | Tok::Gt | Tok::Shr);
     if !path_like {
         return None;
     }
