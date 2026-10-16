@@ -1206,6 +1206,13 @@ fn slot_update(
     front.prev_adt_ids = adt_ids;
     front.prev_static_ids = static_ids;
     front.prev_order_fragile = fragile;
+    // Bodies and signatures modes keep cached C, which names Adts and
+    // statics by index. A fn or body edit can move those indices when a
+    // body holds a type item or a static (a removed fn or body item
+    // takes its types along, and the ranks after it move down), so such
+    // an edit takes the full path, as an item edit would.
+    front.ids_forced_full = had_env && !ids_stable && changed_names.is_some();
+    let changed_names = if front.ids_forced_full { None } else { changed_names };
     let nonfn_changed = had_env && nonfn_items_changed(&front.items, &item_scans);
     front.env_hash = Some(env);
     front.items = item_scans;
@@ -2853,6 +2860,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let body_hashes_all: Vec<u64> = (0..fn_count).map(|i| scan_of(front, i).0).collect();
     (map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, None)
     };
+    // A fn edit that moved Adt or static ids took the full path (`slot_update`).
+    let mode = if std::mem::take(&mut front.ids_forced_full) { "full" } else { mode };
     let scan_of = |front: &Front, i: usize| {
         let _ = front;
         (body_hashes_all[i], fn_lines_all[i])
@@ -4380,6 +4389,49 @@ fn main() { println!(\"{}\", f() + k() + S.m()); }
         sorted.dedup();
         assert_eq!(sorted.len(), ka.len(), "nested keys are unique");
         // `f` gained `h`: every key of `a` stays.
+        for (p, d) in &ka {
+            assert!(kb.iter().any(|(q, e)| q == p && e == d), "{p} moved");
+        }
+    }
+
+    /// A fn nested in a trait default method body takes the method's
+    /// path (trait path plus method name) as its parent, in the driver's
+    /// keys and in collect's def ids alike, and keeps it when another
+    /// body gains an item. It once had the body item index fallback and
+    /// no scanned slot (a DefPathHash collision with an instance slot).
+    #[test]
+    fn trait_default_nested_fn_keys_follow_the_method() {
+        let a = "\
+fn f0() -> i64 { fn z() -> i64 { 7 } z() }
+trait Tr {
+    fn t(&self) -> i64;
+    fn d(&self) -> i64 { fn h(x: &i64) -> bool { *x > 1 } fn m(x: i64) -> i64 { fn m(y: i64) -> i64 { y } m(x) * 10 } self.t() }
+}
+trait Tr2 { fn d(&self) -> i64 { fn h(_x: &i64) -> bool { true } 0 } }
+impl Tr for i64 { fn t(&self) -> i64 { *self } }
+fn main() { println!(\"{}\", f0() + 5i64.d()); }
+";
+        let b = a.replace("fn z() -> i64 { 7 }", "fn y() {} fn z() -> i64 { 7 }");
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let ids = CrateIds { local: def::LOCAL_CRATE, stable: def::synthetic_crate_hash("test.rs", false) };
+        let keys_of = |src: &str| {
+            let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let program = collect::collect(std::sync::Arc::new(ast.clone()), interner.clone(), known.clone(), ids).unwrap();
+            let keys = fn_keys(&ast, &fn_locations(&ast), &interner, ids.stable);
+            // The token scan counts every AST fn (instances come after them).
+            assert_eq!(crate::scan::scan(&lexed).fns.len(), keys.len());
+            for (i, k) in keys.iter().enumerate() {
+                assert_eq!(k.disk, program.disk_id(LocalDefId(i as u32)), "fn {i} ({})", k.path);
+            }
+            keys.into_iter().map(|k| (k.path, k.disk)).collect::<Vec<_>>()
+        };
+        let (ka, kb) = (keys_of(a), keys_of(&b));
+        let paths: Vec<&str> = ka.iter().map(|(p, _)| p.as_str()).collect();
+        for want in ["trait:Tr#0::method:d#0::fn:h#0", "trait:Tr#0::method:d#0::fn:m#0", "trait:Tr#0::method:d#0::fn:m#0::fn:m#0", "trait:Tr2#0::method:d#0::fn:h#0"] {
+            assert!(paths.contains(&want), "missing {want} in {paths:?}");
+        }
         for (p, d) in &ka {
             assert!(kb.iter().any(|(q, e)| q == p && e == d), "{p} moved");
         }

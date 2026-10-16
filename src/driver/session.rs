@@ -61,6 +61,10 @@ pub(crate) struct Front {
     /// program are session places that growth does not move; builds
     /// check them (`Caches::inst_ids`).
     pub(crate) prev_order_fragile: bool,
+    /// Set by the slot update when a bodies or signatures mode edit
+    /// moved Adt or static ids and it rebuilt in full instead; the
+    /// shared tail reads (and clears) it as full mode.
+    pub(crate) ids_forced_full: bool,
     /// The last collected program's static ids in index order
     /// (`Program::static_defs`): while a full resolve leaves them equal,
     /// nested statics kept their indexes and generic reuse holds.
@@ -385,6 +389,7 @@ impl Session {
                 prev_adt_ids: FxMap::default(),
                 prev_static_ids: FxMap::default(),
                 prev_order_fragile: false,
+                ids_forced_full: false,
                 prev_static_defs: None,
                 revalue_consts: false,
                 rpit_edit: false,
