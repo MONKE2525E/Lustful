@@ -32,23 +32,6 @@ impl CaseState {
         CaseState { chars, front: 0, back: (packed >> 64) as u8 }
     }
 
-    /// The chars left, as std's array `IntoIter` Debug prints them.
-    fn debug_into_iter(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("IntoIter([")?;
-        let mut i = self.front;
-        while i < self.back {
-            if i > self.front {
-                f.write_str(", ")?;
-            }
-            match char::from_u32(self.chars[i as usize]) {
-                Some(c) => write!(f, "{:?}", c)?,
-                None => f.write_str("'\\0'")?,
-            }
-            i += 1;
-        }
-        f.write_str("])")
-    }
-
     /// The chars left written out (the `Display` of both iterators).
     fn display(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let mut i = self.front;
@@ -136,19 +119,41 @@ impl DoubleEndedIterator for ToUppercase {
 impl ExactSizeIterator for ToLowercase {}
 impl ExactSizeIterator for ToUppercase {}
 
+/// Std's `CaseMappingIter(IntoIter([..]))`: the private iterator
+/// both case iterators wrap, over a `char` array `IntoIter`.
+impl core::fmt::Debug for CaseState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("CaseMappingIter").field(&CaseChars(self)).finish()
+    }
+}
+
+/// The chars left, as std's array `IntoIter` Debug prints them:
+/// `IntoIter([..])` of the remaining slice.
+struct CaseChars<'a>(&'a CaseState);
+
+impl core::fmt::Debug for CaseChars<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut chars = ['\0'; 3];
+        let mut i = 0;
+        while i < 3 {
+            if let Some(c) = char::from_u32(self.0.chars[i]) {
+                chars[i] = c;
+            }
+            i += 1;
+        }
+        f.debug_tuple("IntoIter").field(&&chars[self.0.front as usize..self.0.back as usize]).finish()
+    }
+}
+
 impl core::fmt::Debug for ToLowercase {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("ToLowercase(CaseMappingIter(")?;
-        self.state.debug_into_iter(f)?;
-        f.write_str("))")
+        f.debug_tuple("ToLowercase").field(&self.state).finish()
     }
 }
 
 impl core::fmt::Debug for ToUppercase {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("ToUppercase(CaseMappingIter(")?;
-        self.state.debug_into_iter(f)?;
-        f.write_str("))")
+        f.debug_tuple("ToUppercase").field(&self.state).finish()
     }
 }
 

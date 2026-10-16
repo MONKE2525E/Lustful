@@ -8406,7 +8406,8 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -
         TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_total_eq(p, tys, e, seen)),
         TyKind::Array(e, _) | TyKind::Slice(e) => glue_total_eq(p, tys, e, seen),
         _ => {
-            if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
+            // std's `ExitCode` is `PartialEq` but not `Eq`.
+            if tys.is_string_ty(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
                 return true;
             }
             // The sync types `sync_glue` calls `PartialEq` are

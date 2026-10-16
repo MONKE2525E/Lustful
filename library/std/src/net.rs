@@ -118,9 +118,19 @@ impl core::fmt::Display for AddrParseError {
     }
 }
 
+/// The derived Debug of std's private `AddrKind` variant (`Ip`).
+struct AddrKind(&'static str);
+
+impl core::fmt::Debug for AddrKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Std derives it over `AddrParseError(AddrKind)`.
 impl core::fmt::Debug for AddrParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "AddrParseError({})", self.kind_name())
+        f.debug_tuple("AddrParseError").field(&AddrKind(self.kind_name())).finish()
     }
 }
 
@@ -1771,9 +1781,10 @@ impl Iterator for Incoming<'_> {
     }
 }
 
+/// Std derives it: `Incoming { listener: TcpListener { .. } }`.
 impl core::fmt::Debug for Incoming<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Incoming { .. }")
+        f.debug_struct("Incoming").field("listener", self.listener).finish()
     }
 }
 

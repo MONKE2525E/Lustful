@@ -41,9 +41,11 @@ impl core::fmt::Debug for StringError {
     }
 }
 
+// Std forwards the formatter (`Display::fmt(&**self, f)`), so a width
+// pads the text: `f.pad` is `str`'s Display.
 impl core::fmt::Display for StringError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
+        f.pad(&self.0)
     }
 }
 

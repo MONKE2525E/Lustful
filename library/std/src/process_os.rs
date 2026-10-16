@@ -111,9 +111,19 @@ impl fmt::Display for ExitStatus {
     }
 }
 
+/// Std's unix inner status Debug: `unix_wait_status(N)`.
+struct WaitStatus(i32);
+
+impl fmt::Debug for WaitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("unix_wait_status").field(&self.0).finish()
+    }
+}
+
+/// Std derives it over the inner status: `ExitStatus(unix_wait_status(N))`.
 impl fmt::Debug for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ExitStatus(unix_wait_status({}))", self.raw)
+        f.debug_tuple("ExitStatus").field(&WaitStatus(self.raw)).finish()
     }
 }
 

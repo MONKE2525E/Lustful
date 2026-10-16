@@ -7555,10 +7555,11 @@ pub fn add_synthetic_impls(p: &mut Program) {
             &[lang.add_assign, lang.sub_assign, lang.mul_assign, lang.div_assign, lang.rem_assign],
         );
     }
-    // `process::ExitCode` (W-STD-A): Copy, Clone, Debug, PartialEq, Eq.
+    // `process::ExitCode` (W-STD-A): Copy, Clone, Debug, PartialEq.
+    // Std has no `Eq` for it; its `Default` is not in lust yet.
     {
         let t = p.tys.exit_code_ty();
-        for tr in [lang.copy, lang.clone, lang.debug, lang.eq] {
+        for tr in [lang.copy, lang.clone, lang.debug] {
             insert_synthetic(p, &mut ordinal, tr, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         insert_synthetic(p, &mut ordinal, lang.partial_eq, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
