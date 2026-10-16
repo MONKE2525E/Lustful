@@ -3651,6 +3651,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                         (ov.iter().skip(1).copied().collect(), dv.get(1).copied())
                     }
                     (false, false) => (ov.clone(), dv.first().copied()),
+                    // A reference to a raw dyn pointer (tf-fatptr): the raw
+                    // pointer holds no loan, so only the data's regions reach
+                    // the object lifetime.
+                    (true, false) if matches!(self.body.tys.kind(dt), TyKind::RawPtr(..)) => (ov.iter().skip(1).copied().collect(), dv.first().copied()),
                     _ => (Vec::new(), None),
                 };
                 let fits = dv.len() == usize::from(refs.1) + n_obj;

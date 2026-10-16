@@ -6460,6 +6460,11 @@ impl<'p> Ctx<'p> {
                     let (x, y) = (self.deep(x), self.deep(y));
                     match (self.kind(x), self.kind(y)) {
                         (TyKind::Array(..), TyKind::Slice(_)) => true,
+                        // An upcast (`*const dyn Sub` to `*const dyn Tr`).
+                        (TyKind::Dyn(..), TyKind::Dyn(..)) => match (object::principal_of(&self.tys, x), object::principal_of(&self.tys, y)) {
+                            (Some(a), Some(b)) => a.def != b.def,
+                            _ => false,
+                        },
                         (TyKind::Dyn(..), _) => false,
                         (TyKind::Infer(v), _) if !v.is_int() && !v.is_float() => false,
                         (_, TyKind::Dyn(..)) => true,
@@ -18376,8 +18381,12 @@ impl<'p> Ctx<'p> {
     fn check_deferred_raw(&mut self) {
         for (t, span, u) in std::mem::take(&mut self.deferred_raw) {
             let fat = self.fat_pointee(t);
-            let is_dyn = { let d = self.deep(t); matches!(self.kind(d), TyKind::Dyn(..)) };
+            let d = self.deep(t);
+            let is_dyn = matches!(self.kind(d), TyKind::Dyn(..));
+            // A `T: ?Sized` param may be `dyn Tr` at an instance.
+            let maybe_fat = matches!(self.kind(d), TyKind::Param(_)) && !self.sized_ok(d);
             let what = match (u, fat) {
+                (RawUse::Thin(w) | RawUse::NotDyn(w), None) if maybe_fat => w,
                 (_, None) => continue,
                 (_, Some(false)) => "a raw pointer to this unsized type",
                 (RawUse::Pointee, Some(true)) => continue,
@@ -18389,26 +18398,47 @@ impl<'p> Ctx<'p> {
         }
         for (from, to, span) in std::mem::take(&mut self.deferred_raw_casts) {
             let (from, to) = (self.deep(from), self.deep(to));
-            let pointee = |cx: &mut Self, t: Ty| match cx.kind(t) {
-                TyKind::RawPtr(_, e) => Some(cx.fat_pointee(e)),
+            // A pointee's class: thin (sized), fat (`str`, `[T]`, `dyn Tr`),
+            // or maybe fat (a `T: ?Sized` param, rustc's "may be wide").
+            #[derive(PartialEq)]
+            enum C {
+                Thin,
+                Fat,
+                MaybeFat,
+            }
+            let class = |cx: &mut Self, t: Ty| match cx.kind(t) {
+                TyKind::RawPtr(_, e) => Some(match cx.fat_pointee(e) {
+                    Some(_) => C::Fat,
+                    None => {
+                        let e = cx.deep(e);
+                        if matches!(cx.kind(e), TyKind::Param(_)) && !cx.sized_ok(e) { C::MaybeFat } else { C::Thin }
+                    }
+                }),
                 _ => None,
             };
-            let (a, b) = (pointee(self, from), pointee(self, to));
+            let (a, b) = (class(self, from), class(self, to));
             let err = match (a, b) {
-                // A fat pointer to an integer, or an integer to one
-                // (rustc E0606).
-                (Some(Some(_)), None) | (None, Some(Some(_))) => Some("L0116"),
-                // Thin to thin, and fat to thin (the address).
-                (Some(_), Some(None)) => None,
+                // To or from an integer: thin pointers only (rustc E0606).
+                (Some(C::Thin), None) | (None, Some(C::Thin)) => None,
+                (Some(_), None) | (None, Some(_)) => Some("L0116"),
+                // To a thin pointer: always (a fat one gives its address).
+                (Some(_), Some(C::Thin)) => None,
                 // Thin to fat is no cast (E0607); a coercion cast does not get here.
-                (Some(None), Some(Some(_))) => Some("L0116"),
-                // Fat to fat: the same pointee at another mutability.
-                (Some(Some(true)), Some(Some(true))) => {
-                    let (TyKind::RawPtr(_, x), TyKind::RawPtr(_, y)) = (self.kind(from), self.kind(to)) else { unreachable!() };
-                    if self.unify(x, y) { None } else { Some("L0602") }
+                (Some(C::Thin), Some(_)) => Some("L0116"),
+                // Fat to fat: the same pointee at another mutability. Other
+                // known fat pairs (`[u32]` to `[u8]`) are valid Rust lust
+                // does not build; a pair with a `?Sized` param is E0606.
+                (Some(x), Some(y)) => {
+                    let (TyKind::RawPtr(_, p), TyKind::RawPtr(_, q)) = (self.kind(from), self.kind(to)) else { unreachable!() };
+                    if self.unify(p, q) {
+                        None
+                    } else if x == C::Fat && y == C::Fat {
+                        Some("L0602")
+                    } else {
+                        Some("L0116")
+                    }
                 }
-                (Some(Some(_)), Some(Some(_))) => Some("L0602"),
-                _ => None,
+                (None, None) => None,
             };
             if let Some(code) = err {
                 let (a, b) = (self.tn(from), self.tn(to));
