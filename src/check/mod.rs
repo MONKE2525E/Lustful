@@ -7387,7 +7387,11 @@ impl<'p> Ctx<'p> {
         expected: Option<Ty>,
     ) -> Option<Ty> {
         let lang = self.p.gx.lang;
-        if self.deref_depth >= 4 || self.tys.local_adt(base).is_none() {
+        // The depth counts the steps of this call's own receiver chain
+        // (`W` to `X` to `Y`); a call nested in an argument starts its
+        // own chain at 0.
+        let depth = if self.user_deref_call == Some(e) { self.deref_depth } else { 0 };
+        if depth >= 4 || self.tys.local_adt(base).is_none() {
             return None;
         }
         // Core's blanket `Into`/`TryInto` may hold for any receiver, so
@@ -7397,13 +7401,12 @@ impl<'p> Ctx<'p> {
             return None;
         }
         let (f, target, impl_args) = self.user_deref_fn(lang.deref, base, "deref", name_span)?;
-        let depth = self.deref_depth;
         let tref = self.tys.mk_ref(false, target);
-        self.deref_depth += 1;
+        let saved = std::mem::replace(&mut self.deref_depth, depth + 1);
         let outer = self.user_deref_call.replace(e);
         let ret = self.method_call_with_rt(e, recv, tref, name, name_span, args, turbofish, expected);
         self.user_deref_call = outer;
-        self.deref_depth -= 1;
+        self.deref_depth = saved;
         let mutable = match self.out.expr_res[self.ei(e)] {
             // A pick on the `&Target` value itself (no deref of it) used
             // a step rustc does not have (it steps to the target place).
