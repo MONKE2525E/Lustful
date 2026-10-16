@@ -958,8 +958,12 @@ fn compute(
                 l.field_offsets.clear();
                 Ok(l)
             }
+            // rustc 1.99 lays `Vec` (and `String`) out as `{cap, ptr,
+            // len}`: the capacity niche is at offset 0, which decides
+            // where an enclosing enum's other variants fit. (cgen's C
+            // value is `{ptr, len, cap}`; only its size must agree.)
             Some(BuiltinTy::String) | Some(BuiltinTy::Vec) => struct_layout(
-                &[ptr_layout(), int_layout(IntTy::Usize), cap_layout()],
+                &[cap_layout(), ptr_layout(), int_layout(IntTy::Usize)],
                 Repr { kind: ReprKind::C, ..Repr::default() },
             ),
             Some(BuiltinTy::Option) => {
