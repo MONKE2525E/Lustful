@@ -1,8 +1,9 @@
-// expect: L0510
+// expect: L0509
 // `h0` gets `i2::X` through its private glob of `c` and then through
 // `pub use crate::h1::*`. rustc first records the wider visibility, but
 // `c`'s own binding changes later (it also globs `h1`), and the re-sent
-// binding replaces `h0`'s, so `h0::X` is a private import (E0603).
+// binding replaces `h0`'s, so `h0::X` is a private import (E0603). Which
+// binding wins depends on that order, so lust reports the order rule.
 mod i2 {
     pub struct X {}
 }

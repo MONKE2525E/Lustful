@@ -2248,9 +2248,11 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     }
     tables.pending_single.clear();
     crate::resolve::order::compute_order_dep(tables, imports, interner);
-    let order_spans = crate::resolve::order::report_order_imports(tables, imports, interner, &mut diags);
-    report_ambig_single(tables, interner, &mut diags, order_spans.clone());
-    finalize_singles(tables, interner, &mut diags, order_spans);
+    // The plain checks first: where they report (L0507, L0510), rustc
+    // does too; the order rule (L0509) takes the imports they pass.
+    let mut seen = report_ambig_single(tables, interner, &mut diags);
+    seen.extend(finalize_singles(tables, interner, &mut diags));
+    crate::resolve::order::report_order_imports(tables, imports, interner, &mut diags, &seen);
     for (i, imp) in &pending {
         if resolved[*i] {
             continue;
@@ -3128,8 +3130,9 @@ fn same_std_item(a: &[Sym], b: &[Sym]) -> bool {
 /// L0507 for each single import that read an ambiguous name
 /// (`ambig_single`) whose source is still ambiguous now, L0510 when the
 /// source settled to an item the import cannot see; once per import.
-/// `seen` holds the imports already reported (L0509).
-fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>, mut seen: Vec<Span>) {
+/// Returns the imports reported.
+fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>) -> Vec<Span> {
+    let mut seen: Vec<Span> = Vec::new();
     for (imp, ns, src, last) in std::mem::take(&mut tables.ambig_single) {
         let state = match (ns, &imp.kind) {
             (Namespace::Macro, ImportKind::Single { path, .. }) => tables.macro_import_lookup(&imp, src, path.len() == 1, last),
@@ -3152,6 +3155,7 @@ fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: 
         seen.push(imp.span);
         diags.push(diag);
     }
+    seen
 }
 
 /// True when `module` binds `name` at glob rank in some namespace (an
@@ -3210,8 +3214,9 @@ fn single_pending_for(tables: &ResolvedTables, src: ModuleId, name: Sym, from: M
 /// import replaces it (an import cycle the pending rule does not
 /// order). The final source binding decides: private is L0510,
 /// ambiguous is L0507, and another item is a reject, never a pick.
-/// `seen` holds the imports already reported (L0509).
-fn finalize_singles(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>, mut seen: Vec<Span>) {
+/// Returns the imports reported.
+fn finalize_singles(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>) -> Vec<Span> {
+    let mut seen: Vec<Span> = Vec::new();
     for (span, module, src, last, ns, target) in std::mem::take(&mut tables.single_binds) {
         if seen.contains(&span) {
             continue;
@@ -3235,6 +3240,7 @@ fn finalize_singles(tables: &mut ResolvedTables, interner: &Interner, diags: &mu
         seen.push(span);
         diags.push(diag);
     }
+    seen
 }
 
 /// Marks a name ambiguous in `module`: through a glob of a module

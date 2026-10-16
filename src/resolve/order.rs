@@ -634,11 +634,11 @@ fn grows_from(tables: &ResolvedTables, globs: &Globs, start: Key, skip: Option<M
 /// an order-dependent answer (`order_dependent`), or one whose widest and
 /// narrowest bindings give the import different visibilities
 /// (`order_import_mixed`). Every segment counts. One diagnostic per
-/// import; returns the spans reported.
-pub fn report_order_imports(tables: &ResolvedTables, imports: &[Import], interner: &Interner, diags: &mut Vec<Diag>) -> Vec<Span> {
-    let mut seen: Vec<Span> = Vec::new();
+/// import; imports in `done` are already reported.
+pub fn report_order_imports(tables: &ResolvedTables, imports: &[Import], interner: &Interner, diags: &mut Vec<Diag>, done: &[Span]) {
+    let mut seen: Vec<Span> = done.to_vec();
     if tables.order_dep.is_empty() {
-        return seen;
+        return;
     }
     // Only a path that names a stored name can read one.
     let names: FxMap<Sym, ()> = tables.order_dep.keys().map(|k| (k.2, ())).collect();
@@ -690,7 +690,6 @@ pub fn report_order_imports(tables: &ResolvedTables, imports: &[Import], interne
             diags.push(order_diag(&what, imp.span));
         }
     }
-    seen
 }
 
 /// The L0509 diagnostic for path `what`: it reads a name that glob
