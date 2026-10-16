@@ -1364,6 +1364,19 @@ pub const STD_IMPORTED_TYPES: &[(&[&str], &str, &str)] = &[
     (&["std"], "process", "ExitCode"),
     (&["std", "core"], "str", "Utf8Error"),
     (&["std", "alloc"], "string", "FromUtf8Error"),
+    (&["std", "core"], "num", "NonZero"),
+    (&["std", "core"], "num", "NonZeroU8"),
+    (&["std", "core"], "num", "NonZeroU16"),
+    (&["std", "core"], "num", "NonZeroU32"),
+    (&["std", "core"], "num", "NonZeroU64"),
+    (&["std", "core"], "num", "NonZeroU128"),
+    (&["std", "core"], "num", "NonZeroUsize"),
+    (&["std", "core"], "num", "NonZeroI8"),
+    (&["std", "core"], "num", "NonZeroI16"),
+    (&["std", "core"], "num", "NonZeroI32"),
+    (&["std", "core"], "num", "NonZeroI64"),
+    (&["std", "core"], "num", "NonZeroI128"),
+    (&["std", "core"], "num", "NonZeroIsize"),
 ];
 
 /// The std types under `std::sync::mpsc` lust knows by name besides the

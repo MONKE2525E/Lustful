@@ -2645,6 +2645,14 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 _ => match tables.resolve_module_path(imp.module, path, imp.leading_colon, interner) {
                     PathRes::Done(Target::Module(src)) => {
                         if src == imp.module {
+                            // `use self::*;` (or a longer path back to
+                            // this module): rustc E0432.
+                            diags.push(Diag::new(
+                                "L0506",
+                                imp.span,
+                                "cannot glob-import a module into itself",
+                                "Remove the import: the module's own items are already in scope.",
+                            ));
                             return TryOut::Done(false);
                         }
                         let changed = copy_glob(tables, imp, src, None, interner);
