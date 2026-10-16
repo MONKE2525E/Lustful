@@ -3803,6 +3803,8 @@ impl<'p> Ctx<'p> {
     /// Binds one inference variable, recording it on the probe
     /// trail so solver probes can roll back (see `SolveCx`).
     fn bind_var(&mut self, var: u32, t: Ty) {
+        // A late-bound region of `dyn Fn*` sugar stays in its object.
+        let t = crate::ty::unbind(&mut self.tys, t);
         self.trail.push(var);
         self.vars[var as usize].bound = Some(t);
     }
@@ -5480,12 +5482,26 @@ impl<'p> Ctx<'p> {
     fn unify_args(&mut self, a: ArgsId, b: ArgsId) -> bool {
         let n = self.tys.args(a).len();
         if n != self.tys.args(b).len() {
-            return false;
+            // An Adt in a dyn's `Fn*` sugar may carry its late-bound
+            // lifetimes (`Lifetime(DYN_LATE)`, R11); regions take no part.
+            let has_lt = |tys: &Tys, x: ArgsId| tys.args(x).iter().any(|g| matches!(g, GenericArg::Lifetime(_)));
+            if !has_lt(&self.tys, a) && !has_lt(&self.tys, b) {
+                return false;
+            }
+            let strip = |tys: &Tys, x: ArgsId| -> Vec<GenericArg> { tys.args(x).iter().copied().filter(|g| !matches!(g, GenericArg::Lifetime(_))).collect() };
+            let (xs, ys) = (strip(&self.tys, a), strip(&self.tys, b));
+            return xs.len() == ys.len()
+                && xs.into_iter().zip(ys).all(|(x, y)| match (x, y) {
+                    (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
+                    (GenericArg::Const(x), GenericArg::Const(y)) => self.unify_const(x, y),
+                    (x, y) => x == y,
+                });
         }
         for i in 0..n {
             let ok = match (self.tys.args(a)[i], self.tys.args(b)[i]) {
                 (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
                 (GenericArg::Const(x), GenericArg::Const(y)) => self.unify_const(x, y),
+                (GenericArg::Lifetime(_), GenericArg::Lifetime(_)) => true,
                 (x, y) => x == y,
             };
             if !ok {

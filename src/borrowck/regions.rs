@@ -15,8 +15,10 @@
 // region, then its pointee's slots; an Adt its region params (builtin `Chars` has
 // one), then its type args in order; tuples, arrays, slices, and raw pointers their
 // elements; a closure its upvar types; a fn pointer type that names a lifetime of
-// the enclosing item one, that free region (W-BORROW3, `fnptr`). Type params,
-// projections, other fn pointers, fn items, and scalars have none.
+// the enclosing item one, that free region (W-BORROW3, `fnptr`); a dyn type its
+// object lifetime, then the regions of its trait args (`dyn_arg_tys`, R11). Type
+// params, projections, other fn pointers, fn items, and scalars have none. A region
+// a dyn's `Fn*` sugar binds itself (`ty::DYN_LATE`, late-bound) has no slot.
 //
 // Signatures keep their regions in a side table (`RegionTables`) that collect fills
 // with the resolver's keep mode (check/generics.rs `RegionMode`): `Region::Static`
@@ -428,7 +430,14 @@ impl AdtTables {
             }
             // A dyn's object lifetime: covariant (`dyn Tr + 'long` is a
             // `dyn Tr + 'short`), drop-visible (an unknown destructor).
-            TyKind::Dyn(_, r) => note(r, v.then(Variance::Co), if m == DropMode::None { DropMode::None } else { DropMode::All }, var, drop),
+            // The regions of its trait args are invariant (R11).
+            TyKind::Dyn(_, r) => {
+                let dm = if m == DropMode::None { DropMode::None } else { DropMode::All };
+                note(r, v.then(Variance::Co), dm, var, drop);
+                for e in dyn_arg_tys(&p.tys, ty) {
+                    self.region_uses(p, e, v.then(Variance::Inv), dm, var, drop);
+                }
+            }
             _ => {
                 // A region inside anything else (fn pointers, closures)
                 // is held invariant and drop-visible: the safe answer.
@@ -655,9 +664,20 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
         None => {}
     }
     match tys.kind(t) {
-        TyKind::Adt(def, _) => adt_lifetimes.get(&def).map_or(0, |v| v.len() as u32),
+        // A lifetime of a dyn's `Fn*` sugar that the object binds itself
+        // (`Lifetime(DYN_LATE)`, R11) is no slot.
+        TyKind::Adt(def, args) => {
+            let late = tys.args(args).iter().filter(|g| matches!(g, GenericArg::Lifetime(r) if *r == crate::ty::DYN_LATE)).count() as u32;
+            adt_lifetimes.get(&def).map_or(0, |v| v.len() as u32).saturating_sub(late)
+        }
         _ => 0,
     }
+}
+
+/// Per lifetime arg of an Adt in check's types: a `DYN_LATE` mark (R11).
+/// Empty for an Adt with no lifetime args (every region a slot).
+fn adt_late_marks(tys: &impl TyIntern, args: ArgsId) -> Vec<bool> {
+    tys.args(args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r == crate::ty::DYN_LATE) } else { None }).collect()
 }
 
 /// The variance of a builtin type's region params: covariant, but for
@@ -703,6 +723,24 @@ fn owns_dyn(tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
+/// True for a late-bound region of a dyn type's `Fn*` sugar (R11): the
+/// object binds it itself, so it is no slot of any value.
+fn bound(r: Region) -> bool {
+    r == crate::ty::DYN_LATE
+}
+
+/// The types whose regions are a dyn type's slots after its object
+/// lifetime (R11): the principal's type args after Self, then its
+/// binding types (`Output`), in order. Those slots are invariant and
+/// drop-visible; `DYN_LATE` regions in them are the object's own.
+pub(crate) fn dyn_arg_tys(tys: &impl TyIntern, t: Ty) -> Vec<Ty> {
+    let TyKind::Dyn(b, _) = tys.kind(t) else { return Vec::new() };
+    let Some(pr) = tys.dyn_bounds(b).principal else { return Vec::new() };
+    let mut out: Vec<Ty> = tys.args(pr.value.args).iter().skip(1).filter_map(|g| g.as_ty()).collect();
+    out.extend(tys.bindings(pr.value.bindings).iter().filter_map(|(_, g)| g.as_ty()));
+    out
+}
+
 /// Type facts the region walks need, over one type store.
 pub(super) struct SlotCx<'t, 'p, T: TyIntern> {
     pub tys: &'t T,
@@ -721,7 +759,7 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
             return n;
         }
         let n = match self.tys.kind(t) {
-            TyKind::Ref(_, _, inner) => 1 + self.slots(inner),
+            TyKind::Ref(r, _, inner) => u32::from(!bound(r)) + self.slots(inner),
             TyKind::Adt(_, args) => {
                 let mut n = adt_regions(self.p, self.tys, t);
                 for g in self.tys.args(args).to_vec() {
@@ -734,8 +772,8 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
             TyKind::Tuple(ts) => self.tys.tys_of(ts).to_vec().into_iter().map(|e| self.slots(e)).sum(),
             TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.slots(e),
             TyKind::Closure(_, args) => closure_fields(self.tys, args).into_iter().map(|e| self.slots(e)).sum(),
-            // The object lifetime (`dyn Tr + 'o`).
-            TyKind::Dyn(..) => 1,
+            // The object lifetime (`dyn Tr + 'o`), then the trait args'.
+            TyKind::Dyn(_, r) => u32::from(!bound(r)) + dyn_arg_tys(self.tys, t).into_iter().map(|e| self.slots(e)).sum::<u32>(),
             // A fn pointer type's free region (W-BORROW3).
             TyKind::FnPtr(_) => u32::from(ptr_free(self.tys, t).is_some()),
             _ => 0,
@@ -749,7 +787,9 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
     pub fn slot_regions(&mut self, t: Ty, out: &mut Vec<Region>) {
         match self.tys.kind(t) {
             TyKind::Ref(r, _, inner) => {
-                out.push(r);
+                if !bound(r) {
+                    out.push(r);
+                }
                 self.slot_regions(inner, out);
             }
             TyKind::Adt(_, args) => {
@@ -775,7 +815,14 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
             }
             // A trait bounded by `'static` makes its object lifetime
             // `'static` whatever the default would be (rustc, ARCH 2.8).
-            TyKind::Dyn(_, r) => out.push(if crate::check::object::dyn_is_static(self.p, self.tys, t) { Region::Static } else { r }),
+            TyKind::Dyn(_, r) => {
+                if !bound(r) {
+                    out.push(if crate::check::object::dyn_is_static(self.p, self.tys, t) { Region::Static } else { r });
+                }
+                for e in dyn_arg_tys(self.tys, t) {
+                    self.slot_regions(e, out);
+                }
+            }
             TyKind::FnPtr(_) => out.extend(ptr_free(self.tys, t)),
             _ => {}
         }
@@ -786,10 +833,14 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
     /// next slot index.
     pub fn each_slot(&mut self, t: Ty, v: Variance, at: u32, f: &mut impl FnMut(u32, Variance)) -> u32 {
         match self.tys.kind(t) {
-            TyKind::Ref(_, m, inner) => {
-                f(at, v);
+            TyKind::Ref(r, m, inner) => {
+                let mut at = at;
+                if !bound(r) {
+                    f(at, v);
+                    at += 1;
+                }
                 let iv = if m.is_mut() { Variance::Inv } else { Variance::Co };
-                self.each_slot(inner, v.then(iv), at + 1, f)
+                self.each_slot(inner, v.then(iv), at, f)
             }
             TyKind::Adt(def, args) => {
                 let mut at = at;
@@ -822,9 +873,16 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
                 }
                 at
             }
-            TyKind::Dyn(..) => {
-                f(at, v.then(Variance::Co));
-                at + 1
+            TyKind::Dyn(_, r) => {
+                let mut at = at;
+                if !bound(r) {
+                    f(at, v.then(Variance::Co));
+                    at += 1;
+                }
+                for e in dyn_arg_tys(self.tys, t) {
+                    at = self.each_slot(e, v.then(Variance::Inv), at, f);
+                }
+                at
             }
             // Held invariant: the free region may sit in input and output
             // places alike (conservative).
@@ -843,9 +901,13 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
     pub fn drop_slots(&mut self, t: Ty, m: DropMode, at: u32, out: &mut Vec<bool>) -> u32 {
         let all = m == DropMode::All;
         match self.tys.kind(t) {
-            TyKind::Ref(_, _, inner) => {
-                out[at as usize] = all;
-                self.drop_slots(inner, if all { DropMode::All } else { DropMode::None }, at + 1, out)
+            TyKind::Ref(r, _, inner) => {
+                let mut at = at;
+                if !bound(r) {
+                    out[at as usize] = all;
+                    at += 1;
+                }
+                self.drop_slots(inner, if all { DropMode::All } else { DropMode::None }, at, out)
             }
             TyKind::RawPtr(_, inner) => self.drop_slots(inner, if all { DropMode::All } else { DropMode::None }, at, out),
             TyKind::Adt(def, args) => {
@@ -885,10 +947,14 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
                 }
                 at
             }
-            // An owned dyn's unknown destructor may use what it borrows.
+            // An owned dyn's unknown destructor may use what it borrows,
+            // its trait args' regions too.
             TyKind::Dyn(..) => {
-                out[at as usize] = m != DropMode::None;
-                at + 1
+                let n = self.slots(t);
+                for k in at..at + n {
+                    out[k as usize] = m != DropMode::None;
+                }
+                at + n
             }
             // A fn pointer has no destructor.
             TyKind::FnPtr(_) if ptr_free(self.tys, t).is_some() => at + 1,
@@ -1221,7 +1287,12 @@ fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region
     match (tys.kind(a), tys.kind(b)) {
         (TyKind::Param(_) | TyKind::Projection(..), _) | (_, TyKind::Param(_) | TyKind::Projection(..)) => true,
         (TyKind::Ref(ra, ma, ia), TyKind::Ref(rb, mb, ib)) if ma == mb => {
-            out.push((ra, rb));
+            if bound(ra) != bound(rb) {
+                return false;
+            }
+            if !bound(ra) {
+                out.push((ra, rb));
+            }
             region_pairs(tys, ia, ib, out)
         }
         (TyKind::Adt(da, xa), TyKind::Adt(db, xb)) if da == db => {
@@ -1229,8 +1300,10 @@ fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region
             xa.len() == xb.len()
                 && xa.into_iter().zip(xb).all(|(x, y)| match (x, y) {
                     (GenericArg::Lifetime(r), GenericArg::Lifetime(s)) => {
-                        out.push((r, s));
-                        true
+                        if !bound(r) && !bound(s) {
+                            out.push((r, s));
+                        }
+                        bound(r) == bound(s)
                     }
                     (GenericArg::Ty(x), GenericArg::Ty(y)) => region_pairs(tys, x, y, out),
                     (GenericArg::Const(_), GenericArg::Const(_)) => true,
@@ -1243,8 +1316,14 @@ fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region
         }
         (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => region_pairs(tys, x, y, out),
         (TyKind::Dyn(_, r), TyKind::Dyn(_, s)) => {
-            out.push((r, s));
-            true
+            if bound(r) != bound(s) {
+                return false;
+            }
+            if !bound(r) {
+                out.push((r, s));
+            }
+            let (x, y) = (dyn_arg_tys(tys, a), dyn_arg_tys(tys, b));
+            x.len() == y.len() && x.into_iter().zip(y).all(|(x, y)| region_pairs(tys, x, y, out))
         }
         (TyKind::FnPtr(_), TyKind::FnPtr(_)) => match (ptr_free(tys, a), ptr_free(tys, b)) {
             (Some(r), Some(s)) => {
@@ -1538,20 +1617,25 @@ impl OwnSig {
                 out.extend(us);
                 true
             }
-            (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
-                let mut fresh = || {
-                    self.n_univ += 1;
-                    self.n_univ
-                };
-                let u = univ_of(rr, &mut fresh);
-                while self.names.len() < self.n_univ as usize + 1 {
-                    self.names.push("an anonymous lifetime".into());
+            (TyKind::Ref(rr, rm, ri), TyKind::Ref(er, em, ei)) if rm == em => {
+                if bound(rr) != bound(er) {
+                    return false;
                 }
-                out.push(u);
+                if !bound(rr) {
+                    let mut fresh = || {
+                        self.n_univ += 1;
+                        self.n_univ
+                    };
+                    let u = univ_of(rr, &mut fresh);
+                    while self.names.len() < self.n_univ as usize + 1 {
+                        self.names.push("an anonymous lifetime".into());
+                    }
+                    out.push(u);
+                }
                 self.pair(sc, ri, ei, binds, out)
             }
             (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
-                let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g && *r != crate::ty::DYN_LATE { Some(*r) } else { None }).collect();
                 for k in 0..adt_regions(sc.p, tys, e) as usize {
                     let mut fresh = || {
                         self.n_univ += 1;
@@ -1579,18 +1663,26 @@ impl OwnSig {
             }
             // The object lifetime the signature names (or its default;
             // `'static` for a trait bounded by `'static`).
-            (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
-                let rr = if crate::check::object::dyn_is_static(sc.p, tys, e) { Region::Static } else { rr };
-                let mut fresh = || {
-                    self.n_univ += 1;
-                    self.n_univ
-                };
-                let u = univ_of(rr, &mut fresh);
-                while self.names.len() < self.n_univ as usize + 1 {
-                    self.names.push("an anonymous lifetime".into());
+            (TyKind::Dyn(_, rr), TyKind::Dyn(_, er)) => {
+                if bound(rr) != bound(er) {
+                    return false;
                 }
-                out.push(u);
-                true
+                if !bound(rr) {
+                    let rr = if crate::check::object::dyn_is_static(sc.p, tys, e) { Region::Static } else { rr };
+                    let mut fresh = || {
+                        self.n_univ += 1;
+                        self.n_univ
+                    };
+                    let u = univ_of(rr, &mut fresh);
+                    while self.names.len() < self.n_univ as usize + 1 {
+                        self.names.push("an anonymous lifetime".into());
+                    }
+                    out.push(u);
+                }
+                // The trait args' regions (R11): the written ones, or fresh
+                // universals of their own.
+                let (ra, ea) = (dyn_arg_tys(tys, r), dyn_arg_tys(tys, e));
+                ra.len() == ea.len() && ra.into_iter().zip(ea).all(|(x, y)| self.pair(sc, x, y, binds, out))
             }
             // A fn pointer's free region: the lifetime the signature names.
             (TyKind::FnPtr(_), TyKind::FnPtr(_)) if ptr_free(tys, e).is_some() => {
@@ -1968,7 +2060,7 @@ fn names_region(tys: &impl TyIntern, r: Ty) -> bool {
         }),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&t| names_region(tys, t)),
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => names_region(tys, e),
-        TyKind::Dyn(_, x) => named(x),
+        TyKind::Dyn(_, x) => named(x) || dyn_arg_tys(tys, r).into_iter().any(|e| names_region(tys, e)),
         TyKind::FnPtr(_) => ptr_free(tys, r).is_some_and(named),
         _ => false,
     }
@@ -1980,12 +2072,17 @@ fn names_region(tys: &impl TyIntern, r: Ty) -> bool {
 fn regioned_slots<T: TyIntern>(sc: &mut SlotCx<'_, '_, T>, r: Ty, e: Ty, out: &mut Vec<Region>) -> bool {
     let tys = sc.tys;
     match (tys.kind(r), tys.kind(e)) {
-        (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
-            out.push(rr);
+        (TyKind::Ref(rr, rm, ri), TyKind::Ref(er, em, ei)) if rm == em => {
+            if bound(rr) != bound(er) {
+                return false;
+            }
+            if !bound(er) {
+                out.push(rr);
+            }
             regioned_slots(sc, ri, ei, out)
         }
         (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
-            let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+            let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g && *x != crate::ty::DYN_LATE { Some(*x) } else { None }).collect();
             for k in 0..adt_regions(sc.p, tys, e) as usize {
                 out.push(lts.get(k).copied().unwrap_or(Region::Erased));
             }
@@ -2000,9 +2097,15 @@ fn regioned_slots<T: TyIntern>(sc: &mut SlotCx<'_, '_, T>, r: Ty, e: Ty, out: &m
         (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
             regioned_slots(sc, a, b, out)
         }
-        (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
-            out.push(rr);
-            true
+        (TyKind::Dyn(_, rr), TyKind::Dyn(_, er)) => {
+            if bound(rr) != bound(er) {
+                return false;
+            }
+            if !bound(er) {
+                out.push(rr);
+            }
+            let (ra, ea) = (dyn_arg_tys(tys, r), dyn_arg_tys(tys, e));
+            ra.len() == ea.len() && ra.into_iter().zip(ea).all(|(x, y)| regioned_slots(sc, x, y, out))
         }
         (TyKind::FnPtr(_), TyKind::FnPtr(_)) if ptr_free(tys, e).is_some() => {
             out.extend(ptr_free(tys, r).or(Some(Region::Erased)));
@@ -2067,6 +2170,7 @@ fn implied_walk<T: TyIntern>(
         }
     };
     match sc.tys.kind(t) {
+        TyKind::Ref(r, _, inner) if bound(r) => implied_walk(sc, inner, us, at, outer, facts),
         TyKind::Ref(_, _, inner) => {
             let Some(&u) = us.get(*at) else { return };
             each(u, facts, outer);
@@ -2120,11 +2224,17 @@ fn implied_walk<T: TyIntern>(
                 }
             }
         }
-        // `&'r (dyn Tr + 'o)` gives `'o: 'r`.
-        TyKind::Dyn(..) => {
-            let Some(&u) = us.get(*at) else { return };
-            each(u, facts, outer);
-            *at += 1;
+        // `&'r (dyn Tr + 'o)` gives `'o: 'r`; the trait args imply
+        // nothing (an object outlives by its object lifetime alone).
+        TyKind::Dyn(_, r) => {
+            if !bound(r) {
+                let Some(&u) = us.get(*at) else { return };
+                each(u, facts, outer);
+                *at += 1;
+            }
+            for e in dyn_arg_tys(sc.tys, t) {
+                *at += sc.slots(e) as usize;
+            }
         }
         // A fn pointer implies nothing of its free region (rustc's
         // implied bounds do not look into fn pointer types).
@@ -2214,6 +2324,14 @@ pub(super) struct Builder<'b, 'p> {
     /// While a call's signature is instantiated: the erased type each
     /// type param binds (`inst_walk`), for trait-selection checks.
     bind_tys: FxMap<u32, Ty>,
+    /// While a vtable call instantiates the trait method's signature: the
+    /// vars and types the trait's type params take from the object's trait
+    /// args (R11), by param index; empty otherwise.
+    seed_binds: Vec<(u32, Vec<u32>, Ty)>,
+    /// While `walk` pairs the trait args of two dyn types (R11): the
+    /// variance of the dyn types' own position, and the vars of the other
+    /// side that a late-bound (`DYN_LATE`) position met.
+    dyn_walk: Option<(Variance, Vec<u32>)>,
     /// The capture var of each local that may hold an `impl Trait` value
     /// (`Body::opaque_locals`): the regions the opaque type captures
     /// (edition 2024: every argument region of the defining call), which
@@ -2255,6 +2373,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             created: FxMap::default(),
             root_check: None,
             bind_tys: FxMap::default(),
+            dyn_walk: None,
+            seed_binds: Vec::new(),
             cap_var: FxMap::default(),
             borrowed_caps: Vec::new(),
         };
@@ -2536,11 +2656,13 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
             }
             TyKind::Ref(r, _, inner) => {
-                out.push(region(r));
+                if !bound(r) {
+                    out.push(region(r));
+                }
                 self.subst_vars(inner, ranges, vars, out);
             }
             TyKind::Adt(_, args) => {
-                let lts: Vec<Region> = tys.args(args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let lts: Vec<Region> = tys.args(args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g && *r != crate::ty::DYN_LATE { Some(*r) } else { None }).collect();
                 for k in 0..adt_regions(self.p, tys, f) as usize {
                     out.push(lts.get(k).map_or(0, |&r| region(r)));
                 }
@@ -2562,8 +2684,15 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
             }
             // A `dyn` type's object lifetime: an Adt lifetime param, else
-            // `'static` (`Box<dyn Tr>` in a field).
-            TyKind::Dyn(_, r) => out.push(region(r)),
+            // `'static` (`Box<dyn Tr>` in a field); then its trait args'.
+            TyKind::Dyn(_, r) => {
+                if !bound(r) {
+                    out.push(region(r));
+                }
+                for e in dyn_arg_tys(tys, f) {
+                    self.subst_vars(e, ranges, vars, out);
+                }
+            }
             _ => {}
         }
     }
@@ -2579,15 +2708,21 @@ impl<'b, 'p> Builder<'b, 'p> {
         // (`&'r mut (dyn Tr + 'a)` to `&'r mut (dyn Tr + 'b)`, `'a: 'b`),
         // which plain `&mut` invariance would equate.
         if v == Variance::Co
-            && let (TyKind::Ref(_, _, ai), TyKind::Ref(_, _, bi)) = (self.body.tys.kind(a), self.body.tys.kind(b))
+            && let (TyKind::Ref(ra, _, ai), TyKind::Ref(rb, _, bi)) = (self.body.tys.kind(a), self.body.tys.kind(b))
+            && !bound(ra)
+            && !bound(rb)
             && matches!(self.body.tys.kind(ai), TyKind::Dyn(..))
             && matches!(self.body.tys.kind(bi), TyKind::Dyn(..))
-            && av.len() == 2
-            && bv.len() == 2
+            && !av.is_empty()
+            && !bv.is_empty()
         {
             self.edge(av[0], bv[0]);
-            self.edge(av[1], bv[1]);
-            return true;
+            let (mut ia, mut ib) = (1usize, 1usize);
+            if self.walk(ai, av, &mut ia, bi, bv, &mut ib, Variance::Co) && ia == av.len() && ib == bv.len() {
+                return true;
+            }
+            self.equate_all(av, bv);
+            return false;
         }
         if a == b && a != ERROR && av.len() == bv.len() {
             let mut pairs: Vec<(u32, Variance)> = Vec::with_capacity(av.len());
@@ -2605,15 +2740,59 @@ impl<'b, 'p> Builder<'b, 'p> {
         false
     }
 
+    /// Pairs one region position of `walk` (a reference's region or an
+    /// object lifetime): two slots relate at `v`. Inside a dyn's trait
+    /// args (`dyn_walk`), a late-bound (`DYN_LATE`) position has no slot:
+    /// it may meet a free slot of the other side only on the subtype
+    /// side of a covariant pair (or the supertype side of a
+    /// contravariant one), and then ties that slot; any other mix is a
+    /// "not general enough" error. False when a slot is missing.
     #[allow(clippy::too_many_arguments)]
-    fn walk(&mut self, a: Ty, av: &[u32], ia: &mut usize, b: Ty, bv: &[u32], ib: &mut usize, v: Variance) -> bool {
-        let tys = &self.body.tys;
-        match (tys.kind(a), tys.kind(b)) {
-            (TyKind::Ref(_, am, ai), TyKind::Ref(_, bm, bi)) => {
+    fn late_pair(&mut self, ra: Region, av: &[u32], ia: &mut usize, rb: Region, bv: &[u32], ib: &mut usize, v: Variance) -> bool {
+        match (bound(ra), bound(rb)) {
+            (false, false) => {
                 let (Some(&x), Some(&y)) = (av.get(*ia), bv.get(*ib)) else { return false };
                 self.edge_v(x, y, v);
                 *ia += 1;
                 *ib += 1;
+            }
+            (true, true) => {}
+            (late_a, _) => {
+                let dyn_v = self.dyn_walk.as_ref().map_or(Variance::Inv, |w| w.0);
+                let ok = if late_a { dyn_v == Variance::Co } else { dyn_v == Variance::Contra };
+                let (vs, i) = if late_a { (bv, &mut *ib) } else { (av, &mut *ia) };
+                let Some(&y) = vs.get(*i) else { return false };
+                *i += 1;
+                if ok && let Some(w) = self.dyn_walk.as_mut() {
+                    w.1.push(y);
+                } else {
+                    self.dyn_not_general();
+                }
+            }
+        }
+        true
+    }
+
+    /// L0735: two dyn types whose trait args differ in which regions the
+    /// object binds itself (rustc E0308, "one type is more general than
+    /// the other").
+    fn dyn_not_general(&mut self) {
+        self.errs.push(Diag::new(
+            "L0735",
+            self.span,
+            "mismatched `dyn` types: one is more general than the other (a lifetime the object takes for any region meets a fixed one)",
+            "Make both types elide the same lifetimes, or both name them.",
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk(&mut self, a: Ty, av: &[u32], ia: &mut usize, b: Ty, bv: &[u32], ib: &mut usize, v: Variance) -> bool {
+        let tys = &self.body.tys;
+        match (tys.kind(a), tys.kind(b)) {
+            (TyKind::Ref(ra, am, ai), TyKind::Ref(rb, bm, bi)) => {
+                if !self.late_pair(ra, av, ia, rb, bv, ib, v) {
+                    return false;
+                }
                 let iv = if am.is_mut() && bm.is_mut() { Variance::Inv } else { Variance::Co };
                 self.walk(ai, av, ia, bi, bv, ib, v.then(iv))
             }
@@ -2622,12 +2801,16 @@ impl<'b, 'p> Builder<'b, 'p> {
                 self.walk(ai, av, ia, bi, bv, ib, v.then(if bm.is_mut() { Variance::Inv } else { Variance::Co }))
             }
             (TyKind::Adt(ad, aa), TyKind::Adt(bd, ba)) if ad == bd => {
-                for k in 0..adt_regions(self.p, tys, a) {
-                    let (Some(&x), Some(&y)) = (av.get(*ia), bv.get(*ib)) else { return false };
-                    let rv = if tys.builtin_of(a).is_some() { builtin_region_variance(tys, a) } else { self.p.regions.adts(self.p).region_modes(ad, k as usize).0 };
-                    self.edge_v(x, y, v.then(rv));
-                    *ia += 1;
-                    *ib += 1;
+                // A lifetime a dyn's sugar marks as its own (`DYN_LATE`,
+                // R11) has no slot; `late_pair` pairs the rest.
+                let (la, lb) = (adt_late_marks(tys, aa), adt_late_marks(tys, ba));
+                let n = adt_regions(self.p, tys, a) as usize + la.iter().filter(|&&x| x).count();
+                for k in 0..n {
+                    let rv = if tys.builtin_of(a).is_some() { builtin_region_variance(tys, a) } else { self.p.regions.adts(self.p).region_modes(ad, k).0 };
+                    let mark = |l: &[bool]| if l.get(k) == Some(&true) { crate::ty::DYN_LATE } else { Region::Erased };
+                    if !self.late_pair(mark(&la), av, ia, mark(&lb), bv, ib, v.then(rv)) {
+                        return false;
+                    }
                 }
                 let (xs, ys) = (tys.args(aa).to_vec(), tys.args(ba).to_vec());
                 if xs.len() != ys.len() {
@@ -2659,12 +2842,27 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let (xs, ys) = (closure_fields(tys, xa), closure_fields(tys, ya));
                 xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.walk(x, av, ia, y, bv, ib, Variance::Inv))
             }
-            (TyKind::Dyn(..), TyKind::Dyn(..)) => {
-                let (Some(&x), Some(&y)) = (av.get(*ia), bv.get(*ib)) else { return false };
-                self.edge_v(x, y, v.then(Variance::Co));
-                *ia += 1;
-                *ib += 1;
-                true
+            (TyKind::Dyn(_, ra), TyKind::Dyn(_, rb)) => {
+                if !self.late_pair(ra, av, ia, rb, bv, ib, v.then(Variance::Co)) {
+                    return false;
+                }
+                // The trait args (R11): invariant. A late-bound position
+                // of the subtype may meet a free one of the supertype
+                // (`dyn for<'r> Fn(&'r u8)` is a `dyn Fn(&'x u8)`); the
+                // free ones it meets are one region then (its output is
+                // its input's).
+                let (xs, ys) = (dyn_arg_tys(tys, a), dyn_arg_tys(tys, b));
+                if xs.len() != ys.len() {
+                    return false;
+                }
+                let outer = self.dyn_walk.replace((v, Vec::new()));
+                let ok = xs.into_iter().zip(ys).all(|(x, y)| self.walk(x, av, ia, y, bv, ib, Variance::Inv));
+                let (_, tied) = std::mem::replace(&mut self.dyn_walk, outer).unwrap_or((v, Vec::new()));
+                for w in tied.windows(2) {
+                    self.edge(w[0], w[1]);
+                    self.edge(w[1], w[0]);
+                }
+                ok
             }
             // Fn pointers with a free region (W-BORROW3): the coercion
             // proof; two without one are check's (`sig_static_mismatch`).
@@ -2684,6 +2882,14 @@ impl<'b, 'p> Builder<'b, 'p> {
     }
 }
 
+/// One region place of a `dyn Fn*` signature (`dyn_positions`): the
+/// object's own late-bound region, or a var (the object's slot, or 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pos {
+    Late,
+    Var(u32),
+}
+
 /// Callee signature shapes the call rules distinguish.
 enum Callee<'s> {
     /// A fn with a region signature: precise instantiation.
@@ -2701,12 +2907,17 @@ impl<'b, 'p> Builder<'b, 'p> {
     fn annotation_regions(&mut self, r: Ty, e: Ty, out: &mut Vec<Region>) -> bool {
         let et = &self.body.tys;
         match (et.kind(r), et.kind(e)) {
-            (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
-                out.push(rr);
+            (TyKind::Ref(rr, rm, ri), TyKind::Ref(er, em, ei)) if rm == em => {
+                if bound(rr) != bound(er) {
+                    return false;
+                }
+                if !bound(er) {
+                    out.push(rr);
+                }
                 self.annotation_regions(ri, ei, out)
             }
             (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
-                let lts: Vec<Region> = et.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+                let lts: Vec<Region> = et.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g && *x != crate::ty::DYN_LATE { Some(*x) } else { None }).collect();
                 for k in 0..adt_regions(self.p, et, e) as usize {
                     out.push(lts.get(k).copied().unwrap_or(Region::Erased));
                 }
@@ -2721,9 +2932,15 @@ impl<'b, 'p> Builder<'b, 'p> {
             (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
                 self.annotation_regions(a, b, out)
             }
-            (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
-                out.push(if crate::check::object::dyn_is_static(self.p, et, e) { Region::Static } else { rr });
-                true
+            (TyKind::Dyn(_, rr), TyKind::Dyn(_, er)) => {
+                if bound(rr) != bound(er) {
+                    return false;
+                }
+                if !bound(er) {
+                    out.push(if crate::check::object::dyn_is_static(self.p, et, e) { Region::Static } else { rr });
+                }
+                let (ra, ea) = (dyn_arg_tys(et, r), dyn_arg_tys(et, e));
+                ra.len() == ea.len() && ra.into_iter().zip(ea).all(|(x, y)| self.annotation_regions(x, y, out))
             }
             (TyKind::FnPtr(_), TyKind::FnPtr(_)) if ptr_free(et, e).is_some() => match ptr_free(et, r) {
                 Some(rr) => {
@@ -2772,6 +2989,17 @@ impl<'b, 'p> Builder<'b, 'p> {
         // `check::object`) is `'static`.
         let mut vars = Vec::new();
         let mut regs = Vec::new();
+        // A late-bound region of `dyn Fn*` sugar outside its object (R11)
+        // would read as no slot: check maps them back (`ty::unbind`), and
+        // one it missed is a cut, never a silent hole.
+        if self.body.locals.iter().any(|d| self.body.tys.flags(d.ty).contains_loose_bound()) {
+            self.errs.push(Diag::new(
+                "L0203",
+                self.span,
+                "a value whose type holds a late-bound lifetime of a `dyn Fn` type is not supported yet",
+                "Annotate the value's type with an owned type, or take it through a generic `F: Fn(..)` parameter.",
+            ));
+        }
         for l in 0..self.body.locals.len() {
             let t = self.body.locals[l].ty;
             if self.sc.slots(t) == 0 {
@@ -3034,11 +3262,20 @@ impl<'b, 'p> Builder<'b, 'p> {
                 // Tr`: `'p: 'q`), and every region of the data outlives the
                 // object lifetime (`S: 'o`, rustc's unsizing; an upcast
                 // gives `'o1: 'o2`). An owning pointer (`Box<dyn Tr + 'o>`)
-                // has only the object slot.
+                // has only the object's slots: its object lifetime, then its
+                // trait args' (R11), which the source's impl must fit
+                // (`dyn_fn_coercion`).
                 let mut ov = Vec::new();
                 let ot = self.operand(o, &mut ov);
                 let dt = self.place(dest, &mut dv, &mut d);
                 let refs = (matches!(self.body.tys.kind(ot), TyKind::Ref(..)), matches!(self.body.tys.kind(dt), TyKind::Ref(..)));
+                let n_obj = self.dyn_in(dt).map_or(1, |(t, _)| self.sc.slots(t) as usize);
+                if let Rvalue::DynUpcast { .. } = rv
+                    && (n_obj > 1 || self.dyn_in(ot).is_some_and(|(t, _)| self.sc.slots(t) > 1))
+                {
+                    self.dyn_upcast(ot, &ov, dt, &dv, refs);
+                    return;
+                }
                 let (data, obj): (Vec<u32>, Option<u32>) = match refs {
                     (true, true) => {
                         if let (Some(&x), Some(&y)) = (ov.first(), dv.first()) {
@@ -3049,8 +3286,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                     (false, false) => (ov.clone(), dv.first().copied()),
                     _ => (Vec::new(), None),
                 };
+                let fits = dv.len() == usize::from(refs.1) + n_obj;
                 match obj {
-                    Some(o) if dv.len() == if refs.1 { 2 } else { 1 } => {
+                    Some(o) if fits => {
                         for &x in &data {
                             self.edge(x, o);
                         }
@@ -3077,7 +3315,12 @@ impl<'b, 'p> Builder<'b, 'p> {
                             self.edge(x, 0);
                         }
                     }
-                    self.dyn_fn_coercion(*src, *dyn_ty, &data);
+                    let args: Vec<u32> = if fits { dv[usize::from(refs.1) + 1..].to_vec() } else { Vec::new() };
+                    if !fits && n_obj > 1 {
+                        self.dyn_args_cut();
+                    } else {
+                        self.dyn_fn_coercion(*src, *dyn_ty, &data, &args);
+                    }
                 }
             }
             // A `format_args!` value (R9): an `Arguments<'a>` holds a
@@ -3105,10 +3348,40 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
     }
 
+    /// The dyn type behind any references and smart pointers of `t`, and
+    /// the index of its first slot among `t`'s slots.
+    fn dyn_in(&mut self, t: Ty) -> Option<(Ty, usize)> {
+        let mut t = t;
+        let mut at = 0usize;
+        loop {
+            match self.body.tys.kind(t) {
+                TyKind::Dyn(..) => return Some((t, at)),
+                TyKind::Ref(r, _, inner) => {
+                    at += usize::from(!bound(r));
+                    t = inner;
+                }
+                _ => {
+                    let inner = self.body.tys.smart_elem(t)?;
+                    at += adt_regions(self.p, &self.body.tys, t) as usize;
+                    t = inner;
+                }
+            }
+        }
+    }
+
+    /// The slot vars of the trait args of the dyn type behind `t` (vars
+    /// `tv`), after its object lifetime (R11). None when they do not fit.
+    fn dyn_arg_vars(&mut self, t: Ty, tv: &[u32]) -> Option<Vec<u32>> {
+        let (d, at) = self.dyn_in(t)?;
+        let TyKind::Dyn(_, r) = self.body.tys.kind(d) else { return None };
+        let n = self.sc.slots(d) as usize;
+        tv.get(at + usize::from(!bound(r))..at + n).map(|s| s.to_vec())
+    }
+
     /// The inputs and output of a `dyn Fn*(I..) -> O` type, behind any
     /// references and smart pointers, in this body's types. None for any
-    /// other type. Every region in them is elided (check rejects written
-    /// ones, L0203), so late-bound: the `dyn Fn` rules below rely on it.
+    /// other type. Their regions are the object's own (`DYN_LATE`),
+    /// `'static`, or free: the object's slots (`dyn_positions`).
     fn dyn_fn_sig(&self, t: Ty) -> Option<(Vec<Ty>, Ty)> {
         let tys = &self.body.tys;
         let mut t = t;
@@ -3137,60 +3410,176 @@ impl<'b, 'p> Builder<'b, 'p> {
         Some((ins, out))
     }
 
-    /// A call through a `dyn Fn*` value (`call_late_bound`, the receiver
-    /// first). The receiver lends nothing to the result, and an argument
-    /// reaches nothing else: whatever is behind the object takes any
-    /// region there (`dyn_fn_coercion`).
-    fn call_dyn_fn(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
-        let Some((rt, _)) = avs.first() else { return false };
-        let Some((ins, out)) = self.dyn_fn_sig(*rt) else { return false };
-        self.call_late_bound(&ins, out, &avs[1..], dt, dv)
+    /// The region of each region place of a type inside `dyn Fn*` sugar,
+    /// in the slot order of the type a value there has (its own late-bound
+    /// places included, as `DYN_LATE`; a nested object's are its own).
+    fn sugar_regions(&mut self, t: Ty, out: &mut Vec<Region>) {
+        match self.body.tys.kind(t) {
+            TyKind::Ref(r, _, inner) => {
+                out.push(r);
+                self.sugar_regions(inner, out);
+            }
+            TyKind::Dyn(_, r) => {
+                out.push(if crate::check::object::dyn_is_static(self.p, &self.body.tys, t) { Region::Static } else { r });
+                for e in dyn_arg_tys(&self.body.tys, t) {
+                    self.sc.slot_regions(e, out);
+                }
+            }
+            TyKind::Adt(_, args) => {
+                let lts: Vec<Region> = self.body.tys.args(args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                if lts.is_empty() {
+                    for _ in 0..adt_regions(self.p, &self.body.tys, t) {
+                        out.push(Region::Erased);
+                    }
+                } else {
+                    out.extend(lts);
+                }
+                for g in self.body.tys.args(args).to_vec() {
+                    if let GenericArg::Ty(e) = g {
+                        self.sugar_regions(e, out);
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for e in self.body.tys.tys_of(ts).to_vec() {
+                    self.sugar_regions(e, out);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.sugar_regions(e, out),
+            _ => self.sc.slot_regions(t, out),
+        }
     }
 
-    /// The region of each slot of a type inside a fn pointer type or `dyn
-    /// Fn*` sugar: `'static` where written there (`Scope::static_refs`),
-    /// else elided (`Erased`), so late-bound.
+    /// The places of a `dyn Fn*(I..) -> O` signature (R11), inputs then
+    /// output, in slot order: the object's own late-bound regions, and
+    /// the rest, which take the object's trait-arg slot vars `args` in
+    /// order (`'static` ones var 0). None when `args` does not fit.
+    fn dyn_positions(&mut self, ins: &[Ty], out: Ty, args: &[u32]) -> Option<(Vec<Pos>, Vec<Pos>)> {
+        let mut next = args.iter().copied();
+        let mut statics: Vec<u32> = Vec::new();
+        let mut place = |r: Region, next: &mut dyn Iterator<Item = u32>| -> Option<Pos> {
+            if bound(r) {
+                return Some(Pos::Late);
+            }
+            let v = next.next()?;
+            if r == Region::Static {
+                statics.push(v);
+                return Some(Pos::Var(0));
+            }
+            Some(Pos::Var(v))
+        };
+        let mut pin = Vec::new();
+        for &it in ins {
+            let mut rs = Vec::new();
+            self.sugar_regions(it, &mut rs);
+            for r in rs {
+                pin.push(place(r, &mut next)?);
+            }
+        }
+        let mut rs = Vec::new();
+        self.sugar_regions(out, &mut rs);
+        let mut pout = Vec::new();
+        for r in rs {
+            pout.push(place(r, &mut next)?);
+        }
+        if next.next().is_some() {
+            return None;
+        }
+        // A written `'static` place is a slot that is `'static`.
+        for v in statics {
+            self.edge(v, 0);
+        }
+        Some((pin, pout))
+    }
+
+    /// A call through a `dyn Fn*` value (the receiver first): each
+    /// late-bound input place is a fresh region of this call that the
+    /// argument outlives, each other one the object's slot (R11); a
+    /// late-bound output place is the one late-bound input's. The
+    /// receiver lends nothing else to the result: whatever is behind the
+    /// object takes any region in its late-bound places
+    /// (`dyn_fn_coercion`).
+    fn call_dyn_fn(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((rt, rv)) = avs.first() else { return false };
+        let Some((ins, out)) = self.dyn_fn_sig(*rt) else { return false };
+        let Some(args) = self.dyn_arg_vars(*rt, rv) else { return false };
+        let Some((pin, pout)) = self.dyn_positions(&ins, out, &args) else { return false };
+        let avs = &avs[1..];
+        if ins.len() != avs.len() {
+            return false;
+        }
+        let mut late: Vec<u32> = Vec::new();
+        let mut k = 0usize;
+        for (i, &it) in ins.iter().enumerate() {
+            let (at, av) = &avs[i];
+            let mut rs = Vec::new();
+            self.sugar_regions(it, &mut rs);
+            let mut pv: Vec<u32> = Vec::with_capacity(rs.len());
+            for &p in &pin[k..k + rs.len()] {
+                pv.push(match p {
+                    Pos::Late => {
+                        let v = self.fresh();
+                        late.push(v);
+                        v
+                    }
+                    Pos::Var(v) => v,
+                });
+            }
+            k += rs.len();
+            if !av.is_empty() && !self.relate(*at, av, *at, &pv, Variance::Co) {
+                return false;
+            }
+        }
+        if dv.is_empty() {
+            return true;
+        }
+        let one = if let [one] = late[..] { Some(one) } else { None };
+        let rv = pout
+            .iter()
+            .map(|&p| match p {
+                Pos::Late => one,
+                Pos::Var(v) => Some(v),
+            })
+            .collect::<Option<Vec<u32>>>();
+        let Some(rv) = rv else { return false };
+        self.relate(dt, &rv, dt, dv, Variance::Co)
+    }
+
+    /// The region of each slot of a type inside a fn pointer type:
+    /// `'static` where written there (`Scope::static_refs`), else elided
+    /// (`Erased`), so late-bound.
     fn sig_slot_regions(&mut self, t: Ty) -> Vec<Region> {
         let mut rs = Vec::new();
         regioned_slots(&mut self.sc, t, t, &mut rs);
         rs
     }
 
-    /// A call of a signature whose regions are all elided, so late-bound,
-    /// or written `'static` (a `dyn Fn*` value, a fn pointer: check rejects
-    /// other written lifetimes there, L0203): each elided input slot is a
-    /// fresh region of this call that the argument outlives, a `'static`
-    /// one is `'static`, and each elided output slot is the one input
-    /// slot's (elision; L0202 otherwise). False when the shapes do not
-    /// pair or the output is not the one input's (the caller's rule then).
-    fn call_late_bound(&mut self, ins: &[Ty], out: Ty, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
-        self.call_late_bound_free(ins, out, None, avs, dt, dv)
-    }
-
-    /// `call_late_bound` through a fn pointer whose `free_slots` (`.0`) are
-    /// its free region, var `.1` (W-BORROW3): those slots take that var,
-    /// not a fresh region, in the inputs and the output.
+    /// A call of a fn pointer signature whose regions are all elided, so
+    /// late-bound, or written `'static` (check rejects other written
+    /// lifetimes there, L0203): each elided input slot is a fresh region
+    /// of this call that the argument outlives, a `'static` one is
+    /// `'static`, and each elided output slot is the one input slot's
+    /// (elision; L0202 otherwise). Slots in `free` (`.0`, W-BORROW3) are
+    /// the pointer's free region, var `.1`, in the inputs and the output.
+    /// False when the shapes do not pair or the output is not the one
+    /// input's (the caller's rule then).
     fn call_late_bound_free(&mut self, ins: &[Ty], out: Ty, free: Option<(u32, u32)>, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         if ins.len() != avs.len() {
             return false;
         }
         let mut j = 0u32;
-        let mut is_free = |j: &mut u32| {
+        let is_free = |j: &mut u32| {
             let f = free.filter(|&(m, _)| m >> *j & 1 == 1).map(|(_, v)| v);
             *j += 1;
             f
         };
         let mut slots: Vec<u32> = Vec::new();
-        let mut in_free = false;
         for (i, &it) in ins.iter().enumerate() {
             let (at, av) = &avs[i];
             let mut pv: Vec<u32> = Vec::new();
             for r in self.sig_slot_regions(it) {
                 pv.push(match is_free(&mut j) {
-                    Some(v) => {
-                        in_free = true;
-                        v
-                    }
+                    Some(v) => v,
                     None if r == Region::Static => 0,
                     None => self.fresh(),
                 });
@@ -3205,7 +3594,6 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let outs = self.sig_slot_regions(out);
         let one = if let [one] = slots[..] { Some(one) } else { None };
-        let _ = in_free;
         let rv = outs
             .iter()
             .map(|&r| match is_free(&mut j) {
@@ -3218,77 +3606,140 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.relate(out, &rv, dt, dv, Variance::Co)
     }
 
-    /// A coercion to `dyn Fn*(I..) -> O`, whose regions are all
-    /// late-bound (`dyn_fn_sig`): the source must take any region in each
-    /// input slot and return the one input's in each output slot, as
-    /// rustc proves `for<'r> Fn(&'r I) -> &'r O` of it. A closure with a
-    /// free argument slot (a `let` closure, a named annotation) is not
-    /// general enough (L0735), and what it returns from its captures
-    /// (`data`, the env's slots) must be `'static`; a type param or a fn
-    /// item is checked by its signature (`entail_dyn`).
-    fn dyn_fn_coercion(&mut self, src: Ty, dyn_ty: Ty, data: &[u32]) {
+    /// An upcast between dyn types whose trait args hold slots (R11): the
+    /// pointer's region carries over, and within one principal trait the
+    /// two objects pair like any two dyn types (object lifetime
+    /// covariant, trait args invariant); to another trait it is a cut.
+    fn dyn_upcast(&mut self, ot: Ty, ov: &[u32], dt: Ty, dv: &[u32], refs: (bool, bool)) {
+        let (Some((sd, sa)), Some((dd, da))) = (self.dyn_in(ot), self.dyn_in(dt)) else { return self.dyn_args_cut() };
+        let same = crate::check::object::principal_of(&self.body.tys, sd).map(|p| p.def) == crate::check::object::principal_of(&self.body.tys, dd).map(|p| p.def);
+        if !same || refs.0 != refs.1 {
+            return self.dyn_args_cut();
+        }
+        if refs.0
+            && let (Some(&x), Some(&y)) = (ov.first(), dv.first())
+        {
+            self.edge(x, y);
+        }
+        let (Some(sv), Some(tv)) = (ov.get(sa..), dv.get(da..)) else { return self.dyn_args_cut() };
+        let (mut i, mut j) = (0usize, 0usize);
+        if !self.walk(sd, sv, &mut i, dd, tv, &mut j, Variance::Co) || i != sv.len() || j != tv.len() {
+            self.equate_all(ov, dv);
+        }
+    }
+
+    /// L0203: an unsizing or upcast to a dyn type of a user trait whose
+    /// trait args hold regions (`dyn Tr<&'a T>`, R11): which regions the
+    /// impl puts there is not followed yet.
+    fn dyn_args_cut(&mut self) {
+        // A mono instance: its template's check covers every instance
+        // (there the trait args are type params, with no slots).
+        if self.p.gx.instances.contains_key(&self.body.fn_id) {
+            return;
+        }
+        self.errs.push(Diag::new(
+            "L0203",
+            self.span,
+            "a coercion to a `dyn` type whose trait arguments hold lifetimes is not supported yet for user traits",
+            "Use owned trait arguments, or a generic `T: Tr<..>` parameter.",
+        ));
+    }
+
+    /// A coercion to `dyn Fn*(I..) -> O` (`args`: the target's trait-arg
+    /// slot vars, R11). Each late-bound input place takes any region, as
+    /// rustc proves `for<'r> Fn(&'r I) -> &'r O` of the source; each other
+    /// place is the target's slot. A closure with a free argument slot (a
+    /// `let` closure, a named annotation) fits only a place of the
+    /// target's own (L0735 at a late-bound one), and what it returns from
+    /// its captures (`data`, the env's slots) or free arguments must
+    /// outlive the output place (`'static` for a late-bound one); a type
+    /// param or a fn item is checked by its signature (`entail_dyn`).
+    fn dyn_fn_coercion(&mut self, src: Ty, dyn_ty: Ty, data: &[u32], args: &[u32]) {
         let p = self.p;
-        let Some((ins, out)) = self.dyn_fn_sig(dyn_ty) else { return };
-        let n_out = self.sc.slots(out) as usize;
+        let Some((ins, out)) = self.dyn_fn_sig(dyn_ty) else {
+            if !args.is_empty() {
+                self.dyn_args_cut();
+            }
+            return;
+        };
+        let Some((pin, pout)) = self.dyn_positions(&ins, out, args) else { return self.dyn_args_cut() };
         match self.body.tys.kind(src) {
-            TyKind::Closure(def, args) => {
+            TyKind::Closure(def, cargs) => {
                 let Some(c) = p.gx.closures.get(&def) else { return };
-                // A free argument slot (a `let` closure, a named or
-                // `'static` annotation, or the target's own `&'static`)
-                // takes one region: only where the target writes `'static`
-                // does it serve, and it is `'static` then.
-                let mut targets: Vec<Region> = Vec::new();
-                for &it in &ins {
-                    targets.extend(self.sig_slot_regions(it));
-                }
+                let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
                 if let Ok(cs) = closure_arg_slots(&mut self.sc, c) {
-                    let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
                     for (i, (r, link)) in cs.iter().enumerate() {
                         if r.is_none() {
                             continue;
                         }
-                        if targets.get(i) != Some(&Region::Static) || cs.len() != targets.len() {
+                        let target = if cs.len() == pin.len() { pin.get(i).copied() } else { None };
+                        let Some(Pos::Var(y)) = target else {
                             self.not_general_enough();
                             return;
-                        }
-                        if link.is_none()
-                            && let Some(&v) = vars.get(i)
-                        {
-                            self.edge(v, 0);
-                            self.edge(0, v);
+                        };
+                        match *link {
+                            None => {
+                                if let Some(&v) = vars.get(i) {
+                                    self.edge(v, y);
+                                    self.edge(y, v);
+                                }
+                            }
+                            Some(_) if y == 0 => {}
+                            Some(Region::Static) => self.edge(y, 0),
+                            Some(Region::Param(k)) if !self.own.closure => {
+                                self.edge(y, k + 1);
+                                self.edge(k + 1, y);
+                            }
+                            Some(_) => {
+                                self.not_general_enough();
+                                return;
+                            }
                         }
                     }
                 }
-                if n_out == 0 {
+                if pout.is_empty() {
                     return;
                 }
+                let target = |k: usize| match pout.get(k) {
+                    Some(Pos::Var(v)) => Some(*v),
+                    Some(Pos::Late) => Some(0),
+                    None => None,
+                };
                 let mut roles = Vec::new();
-                closure_roles(&mut self.sc, args, &mut roles);
+                closure_roles(&mut self.sc, cargs, &mut roles);
                 match self.closure_reqs(def, &roles) {
                     Some(reqs) => {
                         for &(x, y) in reqs.iter() {
-                            if let (End::Cap(i), End::Out(_)) = (x, y)
-                                && let Some(&v) = data.get(i as usize)
-                            {
-                                self.edge(v, 0);
+                            let End::Out(k) = y else { continue };
+                            let Some(u) = target(k as usize) else { continue };
+                            let from = match x {
+                                End::Cap(i) => data.get(i as usize),
+                                End::Arg(j) => vars.get(j as usize),
+                                End::Static | End::Out(_) => None,
+                            };
+                            if let Some(&v) = from {
+                                self.edge(v, u);
                             }
                         }
                     }
                     None => {
+                        let us: Vec<u32> = (0..pout.len()).filter_map(target).collect();
                         for (i, &(src, _)) in roles.iter().enumerate() {
                             if src && let Some(&v) = data.get(i) {
-                                self.edge(v, 0);
+                                for &u in &us {
+                                    self.edge(v, u);
+                                }
                             }
                         }
                     }
                 }
             }
-            TyKind::Param(_) | TyKind::FnDef(..) => self.entail_dyn(src, &ins, out),
+            TyKind::Param(_) | TyKind::FnDef(..) => self.entail_dyn(src, &ins, &pin, &pout),
             // A fn pointer implements `Fn*` with its own signature: it must
             // match the target's once its binders are picked (W-BORROW3).
             TyKind::FnPtr(_) => {
                 let free = if ptr_free(&self.body.tys, src).is_some() { data.first().copied() } else { None };
-                let ok = match self.dyn_nodes(&ins, out) {
+                let ok = match self.dyn_nodes(&pin, &pout) {
                     Some(dst) => self.ptr_matches(src, free, &dst),
                     None => false,
                 };
@@ -3595,6 +4046,22 @@ impl<'b, 'p> Builder<'b, 'p> {
             && let Some(sig) = self.p.regions.trait_methods.get(&def)
             && let Some(t) = self.p.gx.trait_methods.get(&def)
         {
+            // The trait's type params are the object's trait args (R11):
+            // their regions are the object's slots.
+            self.seed_binds.clear();
+            if let Some((rt, rv)) = avs.first()
+                && let Some((d, _)) = self.dyn_in(*rt)
+                && let Some(args) = self.dyn_arg_vars(*rt, rv)
+            {
+                let mut at = 0usize;
+                for (j, e) in dyn_arg_tys(&self.body.tys, d).into_iter().enumerate() {
+                    let n = self.sc.slots(e) as usize;
+                    if let Some(vs) = args.get(at..at + n) {
+                        self.seed_binds.push((j as u32 + 1, vs.to_vec(), e));
+                    }
+                    at += n;
+                }
+            }
             if !self.call_sig_with(sig, &t.params, t.ret, &avs, dt, &dv, &[]) {
                 self.call_opaque(&avs, dt, &dv);
             }
@@ -5537,6 +6004,10 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
         self.bind_tys.clear();
+        for (j, vs, t) in std::mem::take(&mut self.seed_binds) {
+            binds.insert(j, vs);
+            self.bind_tys.insert(j, t);
+        }
         let mut ok = true;
         // A callee type that names type params (a template called in
         // check mode, a stub) has no slots where its params are: the
@@ -5901,7 +6372,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 self.match_impl_lifetimes(pi, ai, vars, at, out);
             }
             (TyKind::Adt(pd, pa), TyKind::Adt(ad, aa)) if pd == ad => {
-                let lts: Vec<Region> = tys.args(pa).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let lts: Vec<Region> = tys.args(pa).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g && *r != crate::ty::DYN_LATE { Some(*r) } else { None }).collect();
                 let n = adt_regions(self.p, tys, actual) as usize;
                 for (i, r) in lts.into_iter().enumerate().take(n) {
                     if let (Region::Param(k), Some(&v)) = (r, vars.get(*at + i)) {
@@ -6418,15 +6889,22 @@ impl<'b, 'p> Builder<'b, 'p> {
         })
     }
 
-    /// `entail_bound` for a coercion to `dyn Fn*(I..) -> O` (`dyn_fn_sig`):
-    /// every input slot there is its own binder, and every output slot
-    /// the one input slot's. A source whose signature does not pair takes
-    /// the conservative answer (L0733 when the target has regions).
-    fn entail_dyn(&mut self, src: Ty, ins: &[Ty], out: Ty) {
+    /// `entail_bound` for a coercion to `dyn Fn*(I..) -> O` (`dyn_fn_sig`)
+    /// with places `pin` and `pout` (`dyn_positions`): every late-bound
+    /// input place there is its own binder, every late-bound output place
+    /// the one input place's, and every other place the var it holds. A
+    /// source whose signature does not pair takes the conservative answer
+    /// (L0733 when the target has regions).
+    fn entail_dyn(&mut self, src: Ty, ins: &[Ty], pin: &[Pos], pout: &[Pos]) {
         let p = self.p;
         let Some(src) = self.source_fn_sig(src, ins.len()) else { return };
-        let n_slots: Vec<usize> = ins.iter().map(|&t| self.sc.slots(t) as usize).collect();
-        let n_out = self.sc.slots(out) as usize;
+        let mut n_slots: Vec<usize> = Vec::with_capacity(ins.len());
+        for &t in ins {
+            let mut rs = Vec::new();
+            self.sugar_regions(t, &mut rs);
+            n_slots.push(rs.len());
+        }
+        let n_out = pout.len();
         let unproved = |this: &mut Self| {
             if n_slots.iter().sum::<usize>() + n_out > 0 {
                 this.bound_mismatch();
@@ -6446,31 +6924,31 @@ impl<'b, 'p> Builder<'b, 'p> {
         if let Some(o) = f_out {
             regions_of(&p.tys, o, &mut f_out_regions);
         }
-        // The target's slots: a written `'static` is `'static`, each
-        // elided input its own binder, an elided output the one input's.
-        let mut t_in: Vec<Region> = Vec::new();
-        for &it in ins {
-            t_in.extend(self.sig_slot_regions(it));
-        }
-        let t_out = self.sig_slot_regions(out);
-        let tside = |i: usize, r: Region| if r == Region::Static { Side::Tie(0) } else { Side::Binder(i as u32) };
-        let t_outs: Option<Vec<Side>> = t_out
+        // The target's places: each late-bound input its own binder, a
+        // late-bound output the one late-bound input's, any other the var
+        // it holds (`'static` is var 0).
+        let tside = |i: usize, p: Pos| match p {
+            Pos::Var(v) => Side::Tie(v),
+            Pos::Late => Side::Binder(i as u32),
+        };
+        let lates: Vec<usize> = pin.iter().enumerate().filter(|(_, p)| **p == Pos::Late).map(|(i, _)| i).collect();
+        let t_outs: Option<Vec<Side>> = pout
             .iter()
-            .map(|&r| match (r, &t_in[..]) {
-                (Region::Static, _) => Some(Side::Tie(0)),
-                (_, [one]) => Some(tside(0, *one)),
+            .map(|&p| match (p, &lates[..]) {
+                (Pos::Var(v), _) => Some(Side::Tie(v)),
+                (Pos::Late, [one]) => Some(Side::Binder(*one as u32)),
                 _ => None,
             })
             .collect();
         let Some(t_outs) = t_outs else { return unproved(self) };
-        if f_out_regions.len() != n_out || t_in.len() != f_in_regions.len() {
+        if f_out_regions.len() != n_out || pin.len() != f_in_regions.len() {
             return unproved(self);
         }
         if item.is_none() && self.own.closure && f_in_regions.iter().chain(&f_out_regions).any(|r| matches!(r, Region::Param(_))) {
             return self.closure_param_bound_cut();
         }
         let mut sides = FnSides::new(item);
-        let ins: Vec<(Side, Side)> = t_in.iter().zip(&f_in_regions).enumerate().map(|(i, (&t, &r))| (tside(i, t), sides.side(self, r, false))).collect();
+        let ins: Vec<(Side, Side)> = pin.iter().zip(&f_in_regions).enumerate().map(|(i, (&t, &r))| (tside(i, t), sides.side(self, r, false))).collect();
         let outs: Vec<(Side, Side)> = t_outs.into_iter().zip(&f_out_regions).map(|(t, &r)| (t, sides.side(self, r, true))).collect();
         self.match_fn_sides(&ins, &outs);
     }
@@ -6599,12 +7077,14 @@ impl<'b, 'p> Builder<'b, 'p> {
         };
         match (p.tys.kind(tmpl), self.body.tys.kind(t)) {
             (TyKind::Param(_) | TyKind::Projection(..), _) => out.extend(std::iter::repeat_n(BoundSlot::Free, n)),
-            (TyKind::Ref(r, _, ti), TyKind::Ref(_, _, ei)) => {
-                out.push(kind(r));
+            (TyKind::Ref(r, _, ti), TyKind::Ref(er, _, ei)) => {
+                if !bound(er) {
+                    out.push(if bound(r) { BoundSlot::Hr } else { kind(r) });
+                }
                 self.bound_slots(ti, ei, univ, out);
             }
             (TyKind::Adt(_, ta), TyKind::Adt(_, ea)) => {
-                let lts: Vec<Region> = p.tys.args(ta).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let lts: Vec<Region> = p.tys.args(ta).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g && *r != crate::ty::DYN_LATE { Some(*r) } else { None }).collect();
                 let nr = adt_regions(p, &self.body.tys, t) as usize;
                 for i in 0..nr {
                     out.push(lts.get(i).map_or(BoundSlot::Hr, |&r| kind(r)));
@@ -6626,7 +7106,21 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
             }
             (TyKind::Array(a, _) | TyKind::Slice(a), TyKind::Array(b, _) | TyKind::Slice(b)) => self.bound_slots(a, b, univ, out),
-            (TyKind::Dyn(_, r), TyKind::Dyn(..)) => out.push(kind(r)),
+            (TyKind::Dyn(_, r), TyKind::Dyn(_, er)) => {
+                let start = out.len();
+                if !bound(er) {
+                    out.push(if bound(r) { BoundSlot::Hr } else { kind(r) });
+                }
+                let (ta, ea) = (dyn_arg_tys(&p.tys, tmpl), dyn_arg_tys(&self.body.tys, t));
+                if ta.len() == ea.len() {
+                    for (a, b) in ta.into_iter().zip(ea) {
+                        self.bound_slots(a, b, univ, out);
+                    }
+                }
+                let k = out.len() - start;
+                out.extend(std::iter::repeat_n(BoundSlot::Hr, n.saturating_sub(k)));
+                out.truncate(start + n);
+            }
             _ => out.extend(std::iter::repeat_n(BoundSlot::Hr, n)),
         }
     }
@@ -6738,6 +7232,16 @@ impl<'b, 'p> Builder<'b, 'p> {
         let tys = &self.p.tys;
         let et = &self.body.tys;
         match (tys.kind(r), et.kind(e)) {
+            // A late-bound place of a dyn's sugar (`T` against `&u8` in
+            // `dyn Fn(T)` from a `dyn Fn(&u8)`, R11) tells nothing of `T`:
+            // `T` binds at its other uses.
+            (TyKind::Param(_), _) if et.flags(e).contains_loose_bound() => {
+                for _ in 0..self.sc.slots(e) {
+                    let v = self.fresh();
+                    out.push(v);
+                }
+                true
+            }
             (TyKind::Param(j), _) => {
                 let n = self.sc.slots(e) as usize;
                 match binds.get(&j.0) {
@@ -6768,13 +7272,18 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 true
             }
-            (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
-                let v = self.inst_region(rr, univ);
-                out.push(v);
+            (TyKind::Ref(rr, rm, ri), TyKind::Ref(er, em, ei)) if rm == em => {
+                if bound(rr) != bound(er) {
+                    return false;
+                }
+                if !bound(er) {
+                    let v = self.inst_region(rr, univ);
+                    out.push(v);
+                }
                 self.inst_walk(ri, ei, univ, binds, out)
             }
             (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
-                let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g && *r != crate::ty::DYN_LATE { Some(*r) } else { None }).collect();
                 for k in 0..adt_regions(self.p, et, e) as usize {
                     let v = match lts.get(k) {
                         Some(&r) => self.inst_region(r, univ),
@@ -6793,11 +7302,17 @@ impl<'b, 'p> Builder<'b, 'p> {
             (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
                 self.inst_walk(a, b, univ, binds, out)
             }
-            (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
-                let rr = if crate::check::object::dyn_is_static(self.p, et, e) { Region::Static } else { rr };
-                let v = self.inst_region(rr, univ);
-                out.push(v);
-                true
+            (TyKind::Dyn(_, rr), TyKind::Dyn(_, er)) => {
+                if bound(rr) != bound(er) {
+                    return false;
+                }
+                if !bound(er) {
+                    let rr = if crate::check::object::dyn_is_static(self.p, et, e) { Region::Static } else { rr };
+                    let v = self.inst_region(rr, univ);
+                    out.push(v);
+                }
+                let (ra, ea) = (dyn_arg_tys(tys, r), dyn_arg_tys(et, e));
+                ra.len() == ea.len() && ra.into_iter().zip(ea).all(|(x, y)| self.inst_walk(x, y, univ, binds, out))
             }
             (TyKind::FnPtr(_), TyKind::FnPtr(_)) if ptr_free(et, e).is_some() => match ptr_free(tys, r) {
                 Some(rr) => {
@@ -6818,8 +7333,8 @@ impl<'b, 'p> Builder<'b, 'p> {
     fn static_bound_edges(&mut self, t: Ty, vars: &[u32], at: &mut usize) {
         let tys = &self.body.tys;
         match tys.kind(t) {
-            TyKind::Ref(_, _, inner) => {
-                *at += 1;
+            TyKind::Ref(r, _, inner) => {
+                *at += usize::from(!bound(r));
                 self.static_bound_edges(inner, vars, at);
             }
             TyKind::Adt(def, args) => {
@@ -6865,6 +7380,7 @@ impl<'b, 'p> Builder<'b, 'p> {
     fn implied_edges(&mut self, t: Ty, vars: &[u32], at: &mut usize, refs: &mut Vec<u32>) {
         let tys = &self.body.tys;
         match tys.kind(t) {
+            TyKind::Ref(r, _, inner) if bound(r) => self.implied_edges(inner, vars, at, refs),
             TyKind::Ref(_, _, inner) => {
                 let Some(&v) = vars.get(*at) else { return };
                 for &o in refs.iter() {
@@ -6910,13 +7426,20 @@ impl<'b, 'p> Builder<'b, 'p> {
                     self.implied_edges(e, vars, at, refs);
                 }
             }
-            TyKind::Dyn(..) => {
-                if let Some(&v) = vars.get(*at) {
-                    for &o in refs.iter() {
-                        self.edge(v, o);
+            // `&'r (dyn Tr + 'o)` needs `'o: 'r` only; the trait args are
+            // well formed on their own (R11).
+            TyKind::Dyn(_, r) => {
+                if !bound(r) {
+                    if let Some(&v) = vars.get(*at) {
+                        for &o in refs.iter() {
+                            self.edge(v, o);
+                        }
                     }
+                    *at += 1;
                 }
-                *at += 1;
+                for e in dyn_arg_tys(tys, t) {
+                    self.implied_edges(e, vars, at, &mut Vec::new());
+                }
             }
             TyKind::FnPtr(_) => *at += self.sc.slots(t) as usize,
             _ => {}
@@ -7471,7 +7994,8 @@ struct Contract<'p> {
     /// The impl-side region of each of the trait's own lifetime params.
     trait_lts: Vec<Region>,
     edges: Vec<(usize, usize)>,
-    /// Two fn pointer types whose free slots differ (W-BORROW3).
+    /// Two fn pointer types whose free slots differ (W-BORROW3), or two
+    /// dyn types whose late-bound regions differ (R11).
     mismatch: bool,
 }
 
@@ -7497,7 +8021,11 @@ impl Contract<'_> {
         let tys = &self.p.tys;
         match (tys.kind(a), tys.kind(b)) {
             (TyKind::Ref(ra, ma, ia), TyKind::Ref(rb, mb, ib)) if ma == mb => {
-                self.slot(ra, rb, v, a_trait);
+                if bound(ra) != bound(rb) {
+                    self.mismatch = true;
+                } else if !bound(ra) {
+                    self.slot(ra, rb, v, a_trait);
+                }
                 let iv = if ma.is_mut() { Variance::Inv } else { Variance::Co };
                 self.walk(ia, ib, v.then(iv), a_trait);
             }
@@ -7508,7 +8036,11 @@ impl Contract<'_> {
                     match (x, y) {
                         (GenericArg::Lifetime(rx), GenericArg::Lifetime(ry)) => {
                             let rv = self.p.regions.adts(self.p).region_modes(da, k).0;
-                            self.slot(rx, ry, v.then(rv), a_trait);
+                            if bound(rx) != bound(ry) {
+                                self.mismatch = true;
+                            } else if !bound(rx) {
+                                self.slot(rx, ry, v.then(rv), a_trait);
+                            }
                             k += 1;
                         }
                         (GenericArg::Ty(x), GenericArg::Ty(y)) => {
@@ -7526,7 +8058,20 @@ impl Contract<'_> {
                 }
             }
             (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => self.walk(x, y, v, a_trait),
-            (TyKind::Dyn(_, ra), TyKind::Dyn(_, rb)) => self.slot(ra, rb, v.then(Variance::Co), a_trait),
+            (TyKind::Dyn(_, ra), TyKind::Dyn(_, rb)) => {
+                if bound(ra) != bound(rb) {
+                    self.mismatch = true;
+                } else if !bound(ra) {
+                    self.slot(ra, rb, v.then(Variance::Co), a_trait);
+                }
+                let (xs, ys) = (dyn_arg_tys(tys, a), dyn_arg_tys(tys, b));
+                if xs.len() != ys.len() {
+                    self.mismatch = true;
+                }
+                for (x, y) in xs.into_iter().zip(ys) {
+                    self.walk(x, y, Variance::Inv, a_trait);
+                }
+            }
             (TyKind::FnPtr(sa), TyKind::FnPtr(sb)) => {
                 let (sa, sb) = (tys.sig(sa).value, tys.sig(sb).value);
                 if sa.free_slots != sb.free_slots {
@@ -7564,6 +8109,7 @@ fn implied_regioned(tys: &impl TyIntern, t: Ty, outer: &mut Vec<Region>, out: &m
         }
     };
     match tys.kind(t) {
+        TyKind::Ref(r, _, inner) if bound(r) => implied_regioned(tys, inner, outer, out),
         TyKind::Ref(r, _, inner) => {
             note(r, outer, out);
             outer.push(r);

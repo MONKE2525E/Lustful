@@ -53,13 +53,18 @@ pub(crate) fn paired_slot_regions(
     out: &mut Vec<Region>,
 ) -> bool {
     match (tys.kind(r), tys.kind(e)) {
-        (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
-            out.push(rr);
+        (TyKind::Ref(rr, rm, ri), TyKind::Ref(er, em, ei)) if rm == em => {
+            if bound(rr) != bound(er) {
+                return false;
+            }
+            if !bound(er) {
+                out.push(rr);
+            }
             paired_slot_regions(adt_lifetimes, tys, ri, ei, out)
         }
         (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
             let lts: Vec<Region> =
-                tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+                tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g && *x != crate::ty::DYN_LATE { Some(*x) } else { None }).collect();
             for k in 0..adt_region_count(adt_lifetimes, tys, e) as usize {
                 out.push(lts.get(k).copied().unwrap_or(Region::Erased));
             }
@@ -74,9 +79,15 @@ pub(crate) fn paired_slot_regions(
         (TyKind::Array(a, _), TyKind::Array(b, _))
         | (TyKind::Slice(a), TyKind::Slice(b))
         | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => paired_slot_regions(adt_lifetimes, tys, a, b, out),
-        (TyKind::Dyn(_, rr), TyKind::Dyn(..)) => {
-            out.push(rr);
-            true
+        (TyKind::Dyn(_, rr), TyKind::Dyn(_, er)) => {
+            if bound(rr) != bound(er) {
+                return false;
+            }
+            if !bound(er) {
+                out.push(rr);
+            }
+            let (ra, ea) = (dyn_arg_tys(tys, r), dyn_arg_tys(tys, e));
+            ra.len() == ea.len() && ra.into_iter().zip(ea).all(|(x, y)| paired_slot_regions(adt_lifetimes, tys, x, y, out))
         }
         (_, TyKind::FnPtr(_)) => {
             if let Some(f) = ptr_free(tys, e) {
@@ -468,19 +479,25 @@ impl Builder<'_, '_> {
         self.sub_sigs(&s, dst, &var, true).is_ok()
     }
 
-    /// The nodes of a `dyn Fn*(I..) -> O` target (`dyn_fn_sig`): each
-    /// elided input slot a placeholder, `'static` var 0, each elided output
-    /// slot the one input slot's.
-    pub(super) fn dyn_nodes(&mut self, ins: &[Ty], out: Ty) -> Option<(Vec<Node>, Vec<Node>)> {
-        let mut t_in = Vec::new();
-        for (j, r) in ins.iter().flat_map(|&it| self.sig_slot_regions(it)).enumerate() {
-            t_in.push(if r == Region::Static { Node::Var(0) } else { Node::Ph(j as u32) });
-        }
+    /// The nodes of a `dyn Fn*(I..) -> O` target with places `pin` and
+    /// `pout` (`dyn_positions`, R11): each late-bound input place a
+    /// placeholder, each other place its var, each late-bound output place
+    /// the one late-bound input's.
+    pub(super) fn dyn_nodes(&mut self, pin: &[Pos], pout: &[Pos]) -> Option<(Vec<Node>, Vec<Node>)> {
+        let t_in: Vec<Node> = pin
+            .iter()
+            .enumerate()
+            .map(|(j, p)| match *p {
+                Pos::Var(v) => Node::Var(v),
+                Pos::Late => Node::Ph(j as u32),
+            })
+            .collect();
+        let lates: Vec<Node> = t_in.iter().copied().filter(|n| matches!(n, Node::Ph(_))).collect();
         let mut t_out = Vec::new();
-        for r in self.sig_slot_regions(out) {
-            t_out.push(match (r, &t_in[..]) {
-                (Region::Static, _) => Node::Var(0),
-                (_, [one]) => *one,
+        for p in pout {
+            t_out.push(match (*p, &lates[..]) {
+                (Pos::Var(v), _) => Node::Var(v),
+                (Pos::Late, [one]) => *one,
                 _ => return None,
             });
         }

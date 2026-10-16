@@ -281,9 +281,10 @@ impl<'p> Ctx<'p> {
     }
 
     /// The parts of a `dyn Fn(A, B) -> R` type (any of the Fn family):
-    /// the trait, the input tuple `(A, B)`, and `R`. None for another
+    /// the trait, the input tuple `(A, B)`, and `R`, with the object's
+    /// late-bound regions made plain (`ty::unbind`). None for another
     /// type.
-    pub(super) fn dyn_fn_parts(&self, t: Ty) -> Option<(DefId, Ty, Ty)> {
+    pub(super) fn dyn_fn_parts(&mut self, t: Ty) -> Option<(DefId, Ty, Ty)> {
         let lang = self.p.gx.lang;
         let pr = crate::check::object::principal_of(&self.tys, self.resolve(t))?;
         if !lang.is_fn_family(pr.def) {
@@ -292,6 +293,7 @@ impl<'p> Ctx<'p> {
         let tuple = self.tys.args(pr.args).get(1).and_then(|g| g.as_ty())?;
         let out_def = lang.output_of(lang.fn_once)?;
         let out = self.tys.bindings(pr.bindings).iter().find(|(d, _)| *d == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
+        let (tuple, out) = (crate::ty::unbind(&mut self.tys, tuple), crate::ty::unbind(&mut self.tys, out));
         Some((pr.def, tuple, out))
     }
 

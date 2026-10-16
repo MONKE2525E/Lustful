@@ -574,6 +574,14 @@ impl TyKind {
     }
 }
 
+/// The late-bound region of a `dyn Fn*` type's sugar (R11): an elided
+/// lifetime of its inputs or output, which the object binds itself (`dyn
+/// Fn(&u8)` is `dyn for<'r> Fn(&'r u8)`). Check's types and region
+/// signatures mark it in the object's trait args; it is no region slot.
+/// A plain `Region::Bound` elsewhere (an `Fn*` bound's elided lifetime)
+/// keeps its own meaning.
+pub const DYN_LATE: Region = Region::Bound(u32::MAX);
+
 pub const ERROR: Ty = Ty(0);
 /// The Self slot of an existential dyn principal (see `DynBounds`). It is the
 /// error type, which no code reads as a real Self: callers that need a trait
@@ -776,6 +784,7 @@ impl TyFlags {
     const PROJECTION: u8 = 2;
     const INFER: u8 = 4;
     const STATIC_REGION: u8 = 8;
+    const LOOSE_BOUND: u8 = 16;
     /// True if some subterm is a generic `Param`.
     pub fn contains_param(self) -> bool {
         self.0 & Self::PARAM != 0
@@ -794,6 +803,12 @@ impl TyFlags {
     /// `check::object`): coercions skip the region checks without one.
     pub fn contains_static_region(self) -> bool {
         self.0 & Self::STATIC_REGION != 0
+    }
+    /// True if a `DYN_LATE` region sits outside every dyn type's trait
+    /// args (a late-bound region of `dyn Fn*` sugar that left its object;
+    /// see `unbind`).
+    pub fn contains_loose_bound(self) -> bool {
+        self.0 & Self::LOOSE_BOUND != 0
     }
     fn union(self, other: TyFlags) -> TyFlags {
         TyFlags(self.0 | other.0)
@@ -1081,6 +1096,68 @@ pub trait TyIntern {
 
 /// The containment bits of a kind about to be interned. Children are already
 /// interned, so their cached bits are read, never recomputed by walking terms.
+/// `t` with each loose `DYN_LATE` region (`TyFlags::contains_loose_bound`)
+/// made `Erased`. A type taken out of a `dyn Fn*` object (a call's
+/// argument or result type, an inference variable) holds a plain region
+/// where the object's sugar binds one. Trait args of a dyn type keep
+/// theirs.
+pub fn unbind(s: &mut impl TyIntern, t: Ty) -> Ty {
+    if !s.flags(t).contains_loose_bound() {
+        return t;
+    }
+    // An Adt's lifetime args in check's types are only `DYN_LATE` marks
+    // (and their companions): they go (`adt`).
+    fn args(s: &mut impl TyIntern, a: ArgsId, adt: bool) -> ArgsId {
+        let new: Vec<GenericArg> = s
+            .args(a)
+            .to_vec()
+            .into_iter()
+            .filter(|g| !(adt && matches!(g, GenericArg::Lifetime(_))))
+            .map(|g| if let GenericArg::Ty(e) = g { GenericArg::Ty(unbind(s, e)) } else { g })
+            .collect();
+        s.intern_args(&new)
+    }
+    match s.kind(t) {
+        TyKind::Ref(r, m, inner) => {
+            let i = unbind(s, inner);
+            let r = if r == DYN_LATE { Region::Erased } else { r };
+            s.intern(TyKind::Ref(r, m, i))
+        }
+        TyKind::Dyn(b, DYN_LATE) => s.intern(TyKind::Dyn(b, Region::Erased)),
+        TyKind::RawPtr(m, e) => {
+            let e = unbind(s, e);
+            s.intern(TyKind::RawPtr(m, e))
+        }
+        TyKind::Slice(e) => {
+            let e = unbind(s, e);
+            s.intern(TyKind::Slice(e))
+        }
+        TyKind::Array(e, n) => {
+            let e = unbind(s, e);
+            s.intern(TyKind::Array(e, n))
+        }
+        TyKind::Tuple(ts) => {
+            let v: Vec<Ty> = s.tys_of(ts).to_vec().into_iter().map(|e| unbind(s, e)).collect();
+            let ts = s.intern_tys(&v);
+            s.intern(TyKind::Tuple(ts))
+        }
+        TyKind::Adt(d, a) | TyKind::FnDef(d, a) | TyKind::Closure(d, a) | TyKind::Opaque(d, a) => {
+            let a = args(s, a, matches!(s.kind(t), TyKind::Adt(..)));
+            s.intern(match s.kind(t) {
+                TyKind::Adt(..) => TyKind::Adt(d, a),
+                TyKind::FnDef(..) => TyKind::FnDef(d, a),
+                TyKind::Closure(..) => TyKind::Closure(d, a),
+                _ => TyKind::Opaque(d, a),
+            })
+        }
+        TyKind::Projection(d, a) => {
+            let a = args(s, a, false);
+            s.intern(TyKind::Projection(d, a))
+        }
+        _ => t,
+    }
+}
+
 fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
     let of_ty = |t: Ty| s.flags(t);
     let of_const = |c: ConstId| match s.const_kind(c) {
@@ -1092,6 +1169,7 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
         s.args(a).iter().fold(TyFlags::default(), |f, g| match g {
             GenericArg::Ty(t) => f.union(of_ty(*t)),
             GenericArg::Const(c) => f.union(of_const(*c)),
+            GenericArg::Lifetime(DYN_LATE) => f.union(TyFlags(TyFlags::LOOSE_BOUND)),
             GenericArg::Lifetime(_) => f,
         })
     };
@@ -1107,6 +1185,7 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
         TyKind::Infer(_) => TyFlags(TyFlags::INFER),
         TyKind::Projection(_, a) => TyFlags(TyFlags::PROJECTION).union(of_args(a)),
         TyKind::Ref(Region::Static, _, t) => of_ty(t).union(TyFlags(TyFlags::STATIC_REGION)),
+        TyKind::Ref(DYN_LATE, _, t) => of_ty(t).union(TyFlags(TyFlags::LOOSE_BOUND)),
         TyKind::Ref(_, _, t) | TyKind::RawPtr(_, t) | TyKind::Slice(t) => of_ty(t),
         TyKind::Array(t, c) => of_ty(t).union(of_const(c)),
         TyKind::Tuple(ts) => s.tys_of(ts).iter().fold(TyFlags::default(), |f, &t| f.union(of_ty(t))),
@@ -1121,8 +1200,13 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
             for sup in &b.supertraits {
                 f = f.union(of_trait_ref(&sup.value));
             }
+            // The late-bound regions of the trait args are the object's own.
+            f = TyFlags(f.0 & !TyFlags::LOOSE_BOUND);
             if r == Region::Static {
                 f = f.union(TyFlags(TyFlags::STATIC_REGION));
+            }
+            if r == DYN_LATE {
+                f = f.union(TyFlags(TyFlags::LOOSE_BOUND));
             }
             f
         }

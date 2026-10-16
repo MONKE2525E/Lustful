@@ -1069,7 +1069,21 @@ impl<'g> PureCx<'g> {
     fn unify_args(&mut self, a: ArgsId, b: ArgsId) -> bool {
         let n = self.tys.args(a).len();
         if n != self.tys.args(b).len() {
-            return false;
+            // An Adt in a dyn's `Fn*` sugar may carry its late-bound
+            // lifetimes (`Lifetime(DYN_LATE)`, R11); regions take no part.
+            let strip = |x: ArgsId| -> Vec<GenericArg> {
+                self.tys.args(x).iter().copied().filter(|g| !matches!(g, GenericArg::Lifetime(_))).collect()
+            };
+            let (xs, ys) = (strip(a), strip(b));
+            if xs.len() == n && ys.len() == self.tys.args(b).len() {
+                return false;
+            }
+            return xs.len() == ys.len()
+                && xs.into_iter().zip(ys).all(|(x, y)| match (x, y) {
+                    (GenericArg::Ty(x), GenericArg::Ty(y)) => self.unify(x, y),
+                    (GenericArg::Const(x), GenericArg::Const(y)) => self.unify_const(x, y),
+                    (x, y) => x == y,
+                });
         }
         for i in 0..n {
             let ok = match (self.tys.args(a)[i], self.tys.args(b)[i]) {

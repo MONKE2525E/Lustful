@@ -1348,6 +1348,19 @@ pub struct Scope {
     /// a `dyn` type right under a reference (`&'a dyn Tr` is
     /// `&'a (dyn Tr + 'a)`); none means `'static` (`Box<dyn Tr>`).
     pub obj_default: Option<Region>,
+    /// Inside the trait args of a `dyn` type (R11): the default object
+    /// lifetime of a nested `dyn` is kept in every region mode (`'static`,
+    /// or the reference's right above it), since it is a region slot of
+    /// the outer object.
+    pub dyn_args: bool,
+    /// Inside `dyn Fn*(..) -> R` sugar (R11): an elided reference lifetime,
+    /// and the default object lifetime under it, is the object's own
+    /// late-bound region, `ty::DYN_LATE`. Nested fn pointer types
+    /// (`Scope::erased`) clear it: their elided lifetimes are their own.
+    pub late_elided: bool,
+    /// The region an elided lifetime in the output of that sugar takes
+    /// (its one input lifetime, `sugar_elision`); none in the inputs.
+    pub late_out: Option<Region>,
     /// W-BORROW: inside a lifetime alias's body (`type R<'a> = &'a str`),
     /// its lifetime params and the regions the use site gives them.
     pub alias_lifetimes: Vec<(Sym, Region)>,
@@ -1414,6 +1427,9 @@ impl Scope {
         let mut s = self.clone();
         s.regions = RegionMode::Erase;
         s.fn_ptr_free = false;
+        s.dyn_args = false;
+        s.late_elided = false;
+        s.late_out = None;
         s
     }
 
@@ -1565,6 +1581,16 @@ pub(crate) fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::L
     }
 }
 
+/// `scope_region` for a reference or object lifetime: inside `dyn Fn*`
+/// sugar (`Scope::late_elided`) an elided one is the object's own
+/// late-bound region.
+fn ref_region(interner: &Interner, scope: &Scope, lt: Option<ast::Lifetime>, span: Span) -> Result<Region, Diag> {
+    if scope.late_elided && lt.is_none_or(|lt| interner.get(lt.name) == "_") {
+        return Ok(scope.late_out.unwrap_or(crate::ty::DYN_LATE));
+    }
+    scope_region(interner, scope, lt, span)
+}
+
 /// True when a written type is a `dyn` type (through parens).
 fn points_to_dyn(ast: &Ast, id: ast::TyId) -> bool {
     match ast.ty(id) {
@@ -1587,7 +1613,7 @@ fn keep_object_lifetime(
     lifetime: Option<ast::Lifetime>,
     span: Span,
 ) -> Result<Ty, Diag> {
-    if !matches!(scope.regions, RegionMode::Keep { .. }) {
+    if !matches!(scope.regions, RegionMode::Keep { .. }) && !scope.dyn_args {
         return Ok(ty);
     }
     let TyKind::Dyn(b, r) = tys.kind(ty) else { return Ok(ty) };
@@ -1596,11 +1622,12 @@ fn keep_object_lifetime(
     }
     let written = lifetime.or_else(|| bounds.iter().find_map(|tb| if let TraitBound::Lifetime(lt) = tb { Some(*lt) } else { None }));
     // With no written bound: the enclosing reference's lifetime, else
-    // `'static` in a signature, and inferred in a body annotation (rustc
-    // infers the default object lifetime inside expressions).
+    // `'static` in a signature or another dyn's trait args, and inferred
+    // in a body annotation (rustc infers the default object lifetime
+    // inside expressions).
     let region = match written {
-        Some(lt) => scope_region(interner, scope, Some(lt), span)?,
-        None => scope.obj_default.unwrap_or(if scope.annotation { Region::Erased } else { Region::Static }),
+        Some(lt) => ref_region(interner, scope, Some(lt), span)?,
+        None => scope.obj_default.unwrap_or(if scope.annotation && !scope.dyn_args { Region::Erased } else { Region::Static }),
     };
     Ok(tys.intern(TyKind::Dyn(b, region)))
 }
@@ -2703,11 +2730,27 @@ fn resolve_trait_path_args(
             if !cx.lang.is_fn_family(trait_def) {
                 return Err(Diag::new("L0110", span, "parenthesized trait sugar is only for Fn traits", "Use angle arguments."));
             }
-            sugar_elision(ast, interner, known, cx, tys, scope, inputs, *output)?;
+            let one = sugar_elision(ast, interner, known, cx, tys, scope, inputs, *output)?;
             let mut parts = Vec::new();
             for t in inputs {
                 parts.push(resolve_scoped(ast, interner, known, cx, tys, *t, scope)?);
             }
+            // In a dyn's sugar (R11), an elided output lifetime is the one
+            // input lifetime: the object's late-bound one when that is
+            // elided, else the written one.
+            let out_scope;
+            let scope = if scope.late_elided {
+                let mut s = scope.clone();
+                s.late_out = Some(match one {
+                    Some(Region::Static) => Region::Static,
+                    Some(Region::Bound(_)) | None => crate::ty::DYN_LATE,
+                    Some(_) => Region::Erased,
+                });
+                out_scope = s;
+                &out_scope
+            } else {
+                scope
+            };
             let tuple = if parts.len() == 1 {
                 let ts = tys.intern_tys(&parts);
                 tys.intern(TyKind::Tuple(ts))
@@ -2905,8 +2948,8 @@ pub fn resolve_scoped(
             // borrow checker honors that kept region too. Every other
             // reference resolves under the scope's region mode.
             let pointee = *inner;
-            let dyn_pointee = matches!(scope.regions, RegionMode::Keep { .. }) && points_to_dyn(ast, pointee);
-            let early = if dyn_pointee { Some(scope_region(interner, scope, *lifetime, span)?) } else { None };
+            let dyn_pointee = (matches!(scope.regions, RegionMode::Keep { .. }) || scope.dyn_args) && points_to_dyn(ast, pointee);
+            let early = if dyn_pointee { Some(ref_region(interner, scope, *lifetime, span)?) } else { None };
             let mut inner = match early {
                 // W-BORROW: the pointee's default object lifetime is this
                 // reference's, in region signatures (`resolve_dyn`).
@@ -2927,7 +2970,7 @@ pub fn resolve_scoped(
             }
             let region = match early {
                 Some(r) => r,
-                None => scope_region(interner, scope, *lifetime, span)?,
+                None => ref_region(interner, scope, *lifetime, span)?,
             };
             let region = if scope.static_refs && lifetime.is_some_and(|lt| interner.get(lt.name) == "static") { Region::Static } else { region };
             Ok(if region == Region::Erased { tys.mk_ref(*mutable, inner) } else { tys.intern(TyKind::Ref(region, Mut::from_bool(*mutable), inner)) })
@@ -3235,7 +3278,20 @@ fn resolve_dyn(
                 }
                 let mut fs = scope.clone();
                 fs.static_refs = fn_family;
+                fs.dyn_args = true;
+                fs.late_elided = fn_family;
+                fs.late_out = None;
                 let tr = resolve_trait_path_args(ast, interner, known, cx, tys, &fs, trait_def, seg, DYN_SELF, span)?;
+                // An elided lifetime of an Adt in `Fn` sugar is late-bound,
+                // and erased Adts keep no lifetime args to mark that in.
+                if fn_family && sugar_has_adt_regions(cx, tys, tr) {
+                    return Err(Diag::new(
+                        "L0203",
+                        span,
+                        "a type with lifetime parameters in the arguments of a `dyn Fn` type is not supported yet",
+                        "Use a reference to an owned type, or a generic `F: Fn(..)` parameter.",
+                    ));
+                }
                 // The `Fn(..) -> R` sugar binds `Output`; other bindings
                 // are not supported yet.
                 if !fn_family && !tys.bindings(tr.bindings).is_empty() {
@@ -3253,6 +3309,24 @@ fn resolve_dyn(
     }
     let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto });
     Ok(tys.intern(TyKind::Dyn(bounds_id, region)))
+}
+
+/// True when a `dyn Fn*` principal's inputs or output hold an Adt with
+/// lifetime params (`Chars`, `V<'_>`), also inside nested `dyn` args.
+fn sugar_has_adt_regions(cx: &ResolveCx, tys: &impl TyIntern, tr: TraitRef) -> bool {
+    fn go(cx: &ResolveCx, tys: &impl TyIntern, t: Ty) -> bool {
+        match tys.kind(t) {
+            TyKind::Adt(_, a) => {
+                crate::borrowck::adt_region_count(cx.adt_lifetimes, tys, t) > 0 || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| go(cx, tys, e)))
+            }
+            TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => go(cx, tys, e),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(cx, tys, e)),
+            TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|p| sugar_has_adt_regions(cx, tys, p.value)),
+            _ => false,
+        }
+    }
+    tys.args(tr.args).iter().skip(1).any(|g| g.as_ty().is_some_and(|e| go(cx, tys, e)))
+        || tys.bindings(tr.bindings).iter().any(|(_, g)| g.as_ty().is_some_and(|e| go(cx, tys, e)))
 }
 
 /// True when a written type is a `dyn` type (through parentheses) with
@@ -3920,6 +3994,18 @@ pub(crate) fn resolve_path_ty(
             let mut all: Vec<GenericArg> = Vec::with_capacity(n_lts + gargs.len());
             for i in 0..n_lts {
                 all.push(GenericArg::Lifetime(scope_region(interner, scope, written.get(i).copied(), span)?));
+            }
+            all.extend(gargs);
+            return Ok(tys.mk_adt(def, &all));
+        }
+        // In a dyn's `Fn*` sugar (R11) an elided lifetime is the object's
+        // own, late-bound: the erased Adt keeps its lifetime args then,
+        // `DYN_LATE` there (a written one stays free, `Erased`).
+        if n_lts > 0 && scope.late_elided && (written.is_empty() || written.iter().any(|lt| interner.get(lt.name) == "_")) {
+            let mut all: Vec<GenericArg> = Vec::with_capacity(n_lts + gargs.len());
+            for i in 0..n_lts {
+                let named = written.get(i).is_some_and(|lt| interner.get(lt.name) != "_");
+                all.push(GenericArg::Lifetime(if named { Region::Erased } else { crate::ty::DYN_LATE }));
             }
             all.extend(gargs);
             return Ok(tys.mk_adt(def, &all));
@@ -5978,7 +6064,8 @@ fn opaque_elision(
 /// own elision scope: an elided lifetime in the output needs exactly one
 /// lifetime (written or elided) in the inputs (L0202). Resolves both with
 /// regions kept; the main resolution erases them and reports any other
-/// error.
+/// error. Returns that one input lifetime (`Region::Bound(0)` when it is
+/// elided), which an elided output lifetime is.
 #[allow(clippy::too_many_arguments)]
 fn sugar_elision(
     ast: &Ast,
@@ -5989,13 +6076,14 @@ fn sugar_elision(
     scope: &Scope,
     inputs: &[ast::TyId],
     output: Option<ast::TyId>,
-) -> Result<(), Diag> {
-    let Some(out) = output else { return Ok(()) };
+) -> Result<Option<Region>, Diag> {
+    let Some(out) = output else { return Ok(None) };
     let mut ks = scope.clone();
     ks.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    ks.late_elided = false;
     let mut lts: Vec<Region> = Vec::new();
     for &t in inputs {
-        let Ok(t) = resolve_scoped(ast, interner, known, cx, tys, t, &ks) else { return Ok(()) };
+        let Ok(t) = resolve_scoped(ast, interner, known, cx, tys, t, &ks) else { return Ok(None) };
         crate::borrowck::elision_regions(tys, t, &mut lts);
     }
     // Only lifetimes written in the inputs count, as rustc counts them:
@@ -6004,10 +6092,11 @@ fn sugar_elision(
     // elision candidates (W-STD-C: BTreeMap<_, &str>::iter). Elided
     // (`Bound(0)`) and named (`Param`) written ones stay.
     lts.retain(|r| *r != Region::Erased);
-    ks.regions = RegionMode::Keep { next: None, elided: if let [r] = lts[..] { Some(r) } else { None } };
+    let one = if let [r] = lts[..] { Some(r) } else { None };
+    ks.regions = RegionMode::Keep { next: None, elided: one };
     match resolve_scoped(ast, interner, known, cx, tys, out, &ks) {
         Err(d) if d.code == "L0202" => Err(d),
-        _ => Ok(()),
+        _ => Ok(one),
     }
 }
 
