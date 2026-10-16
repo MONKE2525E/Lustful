@@ -107,7 +107,8 @@ pub struct Parser<'a> {
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
-/// patterns, and operator or method chains). Real code stays far below this.
+/// patterns, operator or method chains, else-if chains, assignments, and closures).
+/// Real code stays far below this.
 const MAX_DEPTH: u32 = 2000;
 
 /// The deepest AST lust accepts, counting every node on the longest
@@ -3796,7 +3797,7 @@ impl<'a> Parser<'a> {
                 let mutable = self.eat(Tok::Mut);
                 let (name, _) = self.ident()?;
                 if self.eat(Tok::At) {
-                    let inner = self.pattern_one()?;
+                    let inner = self.nest(|p| p.pattern_one())?;
                     Pat::At { name, mutable, by_ref, inner }
                 } else {
                     Pat::Binding { name, mutable, by_ref }
@@ -3895,7 +3896,7 @@ impl<'a> Parser<'a> {
                         return Err(syntax(start, "expected a binding name before `@`"));
                     }
                     self.bump();
-                    let inner = self.pattern_one()?;
+                    let inner = self.nest(|p| p.pattern_one())?;
                     Pat::At { name: path[0].name, mutable: false, by_ref: false, inner }
                 } else {
                     match self.peek() {
@@ -3935,7 +3936,7 @@ impl<'a> Parser<'a> {
                                 let mutable = self.eat(Tok::Mut);
                                 let (fname, fspan) = self.ident()?;
                                 let p = if self.eat(Tok::At) {
-                                    let inner = self.pattern_one()?;
+                                    let inner = self.nest(|p| p.pattern_one())?;
                                     self.push_pat(Pat::At { name: fname, mutable, by_ref, inner }, fstart.to(self.prev_span()))
                                 } else if !by_ref && !mutable && self.eat(Tok::Colon) {
                                     self.pattern()?
@@ -4047,7 +4048,7 @@ impl<'a> Parser<'a> {
                 let double = self.bump().tok == Tok::AndAnd;
                 let mutable = self.eat(Tok::Mut);
                 let parenthesized = self.peek() == Tok::LParen;
-                let inner = self.pattern_one()?;
+                let inner = self.nest(|p| p.pattern_one())?;
                 // `&0..=9` is ambiguous in Rust: a range directly under
                 // `&` needs parentheses, `&(0..=9)`.
                 if !parenthesized && matches!(self.ast.pat(inner), Pat::Range { .. }) {
@@ -4207,7 +4208,7 @@ impl<'a> Parser<'a> {
         if ret.is_some() && self.peek() != Tok::LBrace {
             return Err(syntax(self.span(), "expected `{` after the closure return type"));
         }
-        let body = self.expr()?;
+        let body = self.nest(|p| p.expr())?;
         let span = start.to(self.prev_span());
         Ok(self.push_expr(Expr::Closure { is_move, is_async: false, params, ret, body }, span))
     }
@@ -4253,7 +4254,7 @@ impl<'a> Parser<'a> {
         for _ in 0..consume {
             self.bump();
         }
-        let rhs = self.expr_ctx(no_struct)?;
+        let rhs = self.nest(|p| p.expr_ctx(no_struct))?;
         let span = start.to(self.prev_span());
         Ok(match op {
             None => self.push_expr(Expr::Assign { lhs, rhs }, span),
@@ -4683,7 +4684,7 @@ impl<'a> Parser<'a> {
         let then = self.block()?;
         let els = if self.eat(Tok::Else) {
             if self.peek() == Tok::If {
-                Some(self.if_expr()?)
+                Some(self.nest(|p| p.if_expr())?)
             } else {
                 let s = self.span();
                 let b = self.block()?;
@@ -5479,5 +5480,23 @@ mod tests {
         assert!(parse_src(&m2000).is_ok(), "a 2000-link method chain parses");
         let m2001 = format!("fn main() {{ let _x = 5i64{}; }}", ".abs()".repeat(2001));
         assert_eq!(parse_src(&m2001).err().expect("2001 links reject").code, "L9001");
+    }
+
+    /// Right-recursive shapes (else-if chains, assignments, closures,
+    /// `&` and `@` patterns) count against `MAX_DEPTH` too: past it
+    /// the error is L9001, not a parser stack overflow (fx-parsehang).
+    #[test]
+    fn right_recursion_depth_cap() {
+        let n = 100_000;
+        let cases = [
+            format!("fn f(a: bool) {{ if a {{}}{} }}", " else if a {}".repeat(n)),
+            format!("fn f() {{ let mut a = 0; a{} = 0; }}", " = a".repeat(n)),
+            format!("fn f() {{ let _ = {}0; }}", "|| ".repeat(n)),
+            format!("fn f(y: i32) {{ let {}x = y; }}", "&".repeat(n)),
+            format!("fn f(y: i32) {{ let {}x = y; }}", "a @ ".repeat(n)),
+        ];
+        for src in &cases {
+            assert_eq!(parse_src(src).err().expect("deep shape rejects").code, "L9001", "{}", &src[..40]);
+        }
     }
 }
