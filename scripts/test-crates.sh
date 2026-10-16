@@ -37,6 +37,10 @@
 # Usage: scripts/test-crates.sh [filter]
 #   SANITIZE=1 also builds the lust-generated C with gcc
 #   -fsanitize=address,undefined and runs it, as difftest does.
+#   CASE_TIMEOUT seconds per lust compile (default 60). A timed-out lust
+#   compile retries once at RETRY_CASE_TIMEOUT (default 6x); a finished
+#   retry is reported as "slow", a second timeout is a HANG failure
+#   (scripts/timeout-lib.sh).
 # A missing tests/crates dir or an empty one fails the run; it never skips.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -66,6 +70,13 @@ filter=${1:-}
 pass=0
 fail=0
 seen=0
+case_timeout=${CASE_TIMEOUT:-60}
+# The one timeout rule for lust compiles (lust_cc). Serial here, so the
+# retry is alone. Cargo builds and program runs keep their plain timeouts.
+# shellcheck source=scripts/timeout-lib.sh
+source "$root/scripts/timeout-lib.sh"
+# slow_note <case> <step>: a lust_cc needed its retry and finished.
+slow_note() { [ "$lust_cc_slow" = 1 ] && echo "slow: $1 $2 timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"; return 0; }
 
 # A panic line names the OS thread id, which differs per run: mask it.
 mask_tid() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
@@ -159,7 +170,14 @@ for dir in "$fixtures"/*/; do
       report bad "$name" "cargo accepts it; add cargo=pass if lust rejects valid Rust on purpose"
       continue
     fi
-    if timeout 60 "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; then
+    lust_cc "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; st=$?
+    if is_timeout "$st"; then
+      # A timeout is never the expected reject.
+      report bad "$name" "HANG lust timed out alone at ${retry_timeout}s (first at ${case_timeout}s), want $expect"
+      continue
+    fi
+    slow_note "$name" "lust"
+    if [ "$st" -eq 0 ]; then
       report bad "$name" "lust accepted it, want $expect"
       continue
     fi
@@ -173,10 +191,17 @@ for dir in "$fixtures"/*/; do
   if [ -n "$lib" ]; then
     if [ $cargo_ok -eq 0 ]; then
       report bad "$name" "cargo check --lib failed: $(tail -3 "$case_dir/cargo.err")"
-    elif ! timeout 60 "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; then
-      report bad "$name" "lust check --lib failed: $(head -5 "$case_dir/lust.err")"
     else
-      report ok "$name"
+      lust_cc "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; st=$?
+      if is_timeout "$st"; then
+        report bad "$name" "HANG lust check --lib timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+      elif [ "$st" -ne 0 ]; then
+        slow_note "$name" "lust check --lib"
+        report bad "$name" "lust check --lib failed: $(head -5 "$case_dir/lust.err")"
+      else
+        slow_note "$name" "lust check --lib"
+        report ok "$name"
+      fi
     fi
     continue
   fi
@@ -188,7 +213,13 @@ for dir in "$fixtures"/*/; do
     report bad "$name" "cargo built, but no binary at $cargo_bin"
     continue
   fi
-  if ! timeout 60 "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; then
+  lust_cc "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; st=$?
+  if is_timeout "$st"; then
+    report bad "$name" "HANG lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    continue
+  fi
+  slow_note "$name" "lust build"
+  if [ "$st" -ne 0 ]; then
     report bad "$name" "lust build failed: $(head -5 "$case_dir/lust.err")"
     continue
   fi
@@ -213,7 +244,13 @@ for dir in "$fixtures"/*/; do
   if [ "${SANITIZE:-0}" = 1 ]; then
     emit=("${lust_args[@]}")
     emit[3]=$case_dir/lust.tmp.bin # the value after -o (lust_args[2])
-    if ! timeout 60 "$lust" "${emit[@]}" --emit-c "$case_dir/emit" >"$case_dir/emit.out" 2>"$case_dir/emit.err"; then
+    lust_cc "$lust" "${emit[@]}" --emit-c "$case_dir/emit" >"$case_dir/emit.out" 2>"$case_dir/emit.err"; st=$?
+    if is_timeout "$st"; then
+      report bad "$name" "HANG lust --emit-c build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+      continue
+    fi
+    slow_note "$name" "lust --emit-c build"
+    if [ "$st" -ne 0 ]; then
       report bad "$name" "lust --emit-c build failed: $(head -3 "$case_dir/emit.err")"
       continue
     fi

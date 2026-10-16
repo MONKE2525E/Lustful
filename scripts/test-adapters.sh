@@ -103,16 +103,31 @@ corpus_crate_one() {
   [ -n "${LUST:-}" ] || return
   local build=(build "$proj/src/bin/$name.rs" -o "$proj/$name.lust" --manifest-path "$proj/Cargo.toml" --bin "$name")
   if [ -n "$reject" ]; then
-    if CARGO_NET_OFFLINE=true timeout "$case_timeout" "$LUST" "${build[@]}" >/dev/null 2>"$proj/$name.lust.err"; then
+    lust_cc env CARGO_NET_OFFLINE=true "$LUST" "${build[@]}" >/dev/null 2>"$proj/$name.lust.err"
+    local st=$?
+    if is_timeout "$st"; then
+      # A timeout is never the expected reject.
+      corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    elif [ "$st" -eq 0 ]; then
+      corpus_slow_note "$name" "lust build"
       corpus_lust_note wrong "$name" "lust accepted a case it must reject with $reject"
     elif grep -q "$reject" "$proj/$name.lust.err"; then
+      corpus_slow_note "$name" "lust build"
       corpus_lust_note match "$name" ""
     else
+      corpus_slow_note "$name" "lust build"
       corpus_lust_note wrong "$name" "lust rejected without $reject: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
     fi
     return
   fi
-  if ! CARGO_NET_OFFLINE=true timeout "$case_timeout" "$LUST" "${build[@]}" 2>"$proj/$name.lust.err"; then
+  lust_cc env CARGO_NET_OFFLINE=true "$LUST" "${build[@]}" 2>"$proj/$name.lust.err"
+  local st=$?
+  if is_timeout "$st"; then
+    corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    return
+  fi
+  corpus_slow_note "$name" "lust build"
+  if [ "$st" -ne 0 ]; then
     corpus_lust_note unsupported "$name" "lust rejected a case the real crate builds: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
     return
   fi
@@ -123,7 +138,17 @@ corpus_crate_one() {
     return
   fi
   if [ "${SANITIZE:-0}" = 1 ]; then
-    CARGO_NET_OFFLINE=true timeout "$case_timeout" "$LUST" "${build[@]}" --emit-c "$proj/$name.san" >/dev/null 2>&1
+    lust_cc env CARGO_NET_OFFLINE=true "$LUST" "${build[@]}" --emit-c "$proj/$name.san" >/dev/null 2>&1
+    st=$?
+    if is_timeout "$st"; then
+      corpus_lust_note hang "$name" "lust build --emit-c timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+      return
+    fi
+    corpus_slow_note "$name" "lust build --emit-c"
+    if [ "$st" -ne 0 ]; then
+      corpus_lust_note wrong "$name" "lust build --emit-c failed on a case the plain build passed"
+      return
+    fi
     if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$proj/$name.sanbin" "$proj/$name.san".*.c 2>"$proj/$name.san.err"; then
       corpus_lust_note wrong "$name" "gcc could not build the generated C"
       return
@@ -138,11 +163,11 @@ corpus_crate_one() {
 }
 
 for d in "$corpus_root"/tests/adapters/crates/*/; do
-  m0=$lust_match u0=$lust_unsupported w0=$lust_wrong
+  m0=$lust_match u0=$lust_unsupported w0=$lust_wrong h0=$lust_hang
   corpus_crate_dir "tests/adapters/crates/$(basename "$d")"
   # One line per crate in lust mode: the W-DEPS exactness table (ARCH
   # 9.3). The last line stays the total that land.sh reads.
-  if [ -n "${LUST:-}" ] && [ $((lust_match + lust_unsupported + lust_wrong - m0 - u0 - w0)) -gt 0 ]; then
+  if [ -n "${LUST:-}" ] && [ $((lust_match + lust_unsupported + lust_wrong + lust_hang - m0 - u0 - w0 - h0)) -gt 0 ]; then
     echo "crate $(basename "$d"): $((lust_match - m0)) matched, $((lust_unsupported - u0)) unsupported, $((lust_wrong - w0)) wrong"
   fi
 done

@@ -16,7 +16,11 @@
 #   TIMEOUT   per-case seconds for each rustc, lust and run step (15).
 #   LUST=path also build and run pass cases with lust and check reject
 #             cases with `lust check`. Lust rejecting a user macro is
-#             reported as "unsupported" and does not fail the run.
+#             reported as "unsupported" and does not fail the run. A lust
+#             compile that times out is retried once at RETRY_CASE_TIMEOUT
+#             (default 6x; scripts/timeout-lib.sh): a finished retry is
+#             reported as "slow" and judged normally, a second timeout is
+#             a HANG and fails the run.
 #             A lust build whose output differs, or that accepts a
 #             both-reject case, is counted as WRONG (it breaks rule
 #             zero). WRONG counts do not fail the run until the
@@ -74,6 +78,10 @@ fi
 # test-corpus-lib.sh. TIMEOUT sets both.
 case_timeout=${CASE_TIMEOUT:-${TIMEOUT:-15}}
 run_timeout=${RUN_TIMEOUT:-${TIMEOUT:-15}}
+# The one timeout rule for lust compiles (lust_cc). This runner is serial, so
+# the retry is alone. Rustc steps keep plain run_cc.
+# shellcheck source=scripts/timeout-lib.sh
+source "$root/scripts/timeout-lib.sh"
 run_cc() { timeout "$case_timeout" "$@"; }
 run_to() { timeout "$run_timeout" "$@"; }
 rustc_flags=(--edition 2024 -C overflow-checks=on -A warnings)
@@ -83,6 +91,7 @@ fail=0
 lust_supported=0
 lust_wrong=0
 lust_unsupported=0
+lust_hang=0
 lust_rejected=0
 lust_expand_match=0
 lust_expand_differ=0
@@ -91,6 +100,12 @@ lust_expand_unsupported=0
 report() {
   if [ "$1" = ok ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $2: $3"; fi
 }
+
+# hang_note <case> <step>: a lust compile timed out twice. Counted apart here
+# and added to $fail at the end, so the summary lines keep their form.
+hang_note() { lust_hang=$((lust_hang + 1)); echo "HANG $1: $2 timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"; }
+# slow_note <case> <step>: a lust_cc needed its retry and finished.
+slow_note() { [ "$lust_cc_slow" = 1 ] && echo "slow: $1 $2 timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"; return 0; }
 
 # Probe once whether the lust binary offers an expand command.
 lust_expand_ok=0
@@ -103,7 +118,14 @@ if [ -n "${LUST:-}" ]; then
   export LUST_DAEMON_SOCKET="$work/no-daemon.sock"
   export LUST_CACHE_DIR="$work/cache"
   echo 'fn main() {}' >"$work/probe.rs"
-  if run_cc "$LUST" expand "$work/probe.rs" >"$work/probe.exp" 2>/dev/null && [ -s "$work/probe.exp" ]; then
+  lust_cc "$LUST" expand "$work/probe.rs" >"$work/probe.exp" 2>/dev/null
+  probe_st=$?
+  if is_timeout "$probe_st"; then
+    echo "FAIL probe: lust expand timed out alone at ${retry_timeout}s (hang)"
+    exit 1
+  fi
+  slow_note probe "lust expand"
+  if [ "$probe_st" -eq 0 ] && [ -s "$work/probe.exp" ]; then
     lust_expand_ok=1
   fi
 fi
@@ -111,7 +133,14 @@ fi
 lust_pass_case() {
   # $1 fixture, $2 expected .out, $3 expected .expanded, $4 name
   local f=$1 out=$2 expanded=$3 name=$4
-  if ! run_cc "$LUST" build "$f" -o "$work/$name.lust" 2>"$work/$name.lust.err"; then
+  lust_cc "$LUST" build "$f" -o "$work/$name.lust" 2>"$work/$name.lust.err"
+  local st=$?
+  if is_timeout "$st"; then
+    hang_note "$name" "lust build"
+    return 1
+  fi
+  slow_note "$name" "lust build"
+  if [ "$st" -ne 0 ]; then
     lust_unsupported=$((lust_unsupported + 1))
     return 0
   fi
@@ -133,7 +162,19 @@ lust_pass_case() {
   lust_supported=$((lust_supported + 1))
   if [ "${SANITIZE:-0}" = 1 ]; then
     # The daemon is off in this runner, so --emit-c writes every unit.
-    run_cc "$LUST" build "$f" -o "$work/$name.tmp" --emit-c "$work/$name.san" 2>/dev/null
+    lust_cc "$LUST" build "$f" -o "$work/$name.tmp" --emit-c "$work/$name.san" 2>/dev/null
+    st=$?
+    if is_timeout "$st"; then
+      hang_note "$name" "lust build --emit-c"
+      return 1
+    fi
+    slow_note "$name" "lust build --emit-c"
+    if [ "$st" -ne 0 ]; then
+      echo "WRONG $name: lust build --emit-c failed under SANITIZE=1 on a case the plain build passed"
+      lust_wrong=$((lust_wrong + 1))
+      if [ "${LUST_STRICT:-0}" = 1 ]; then report bad "$name" "lust wrong result in strict mode"; return 1; fi
+      return 0
+    fi
     if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$work/$name.sanbin" "$work/$name.san".*.c 2>"$work/$name.san.err"; then
       echo "WRONG $name: gcc could not build the generated C under SANITIZE=1: $(head -3 "$work/$name.san.err")"
       lust_wrong=$((lust_wrong + 1))
@@ -154,8 +195,12 @@ lust_pass_case() {
     # so its token compare counts as unsupported.
     if grep -q 'automatically_derived' "$expanded"; then
       lust_expand_unsupported=$((lust_expand_unsupported + 1))
-    elif run_cc "$LUST" expand "$f" 2>/dev/null | python3 tests/macros/normalize.py >"$work/$name.lust.expanded" \
+    elif lust_cc "$LUST" expand "$f" >"$work/$name.raw.exp" 2>/dev/null; st=$?; is_timeout "$st"; then
+      hang_note "$name" "lust expand"
+      return 1
+    elif [ "$st" -eq 0 ] && python3 tests/macros/normalize.py <"$work/$name.raw.exp" >"$work/$name.lust.expanded" \
       && [ -s "$work/$name.lust.expanded" ]; then
+      slow_note "$name" "lust expand"
       if diff -q "$expanded" "$work/$name.lust.expanded" >/dev/null; then
         lust_expand_match=$((lust_expand_match + 1))
       elif [ "${LUST_STRICT:-0}" = 1 ]; then
@@ -247,7 +292,15 @@ for f in tests/macros/reject/*.rs; do
     continue
   fi
   if [ -n "${LUST:-}" ]; then
-    if run_cc "$LUST" check "$f" >"$work/$name.lust.out" 2>&1; then
+    lust_cc "$LUST" check "$f" >"$work/$name.lust.out" 2>&1
+    st=$?
+    if is_timeout "$st"; then
+      # A timeout is never a reject, not even when rustc rejects the case too.
+      hang_note "$name" "lust check"
+      continue
+    fi
+    slow_note "$name" "lust check"
+    if [ "$st" -eq 0 ]; then
       echo "WRONG $name: lust accepted a program rustc rejects"
       lust_wrong=$((lust_wrong + 1))
       if [ "${LUST_STRICT:-0}" = 1 ]; then
@@ -279,6 +332,9 @@ if [ -z "$filter" ]; then
   [ "$missing" -ne 0 ] && fail=$((fail + missing))
 fi
 
+# A hang fails the run. The summary lines keep their form: the hang count
+# joins the failed count, and the HANG lines above name the cases.
+fail=$((fail + lust_hang))
 echo "test-macros: $pass passed, $fail failed"
 if [ -n "${LUST:-}" ]; then
   echo "lust: $lust_supported supported, $lust_unsupported unsupported, $lust_wrong wrong, $lust_rejected both-reject cases rejected"

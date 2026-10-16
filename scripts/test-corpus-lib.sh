@@ -11,10 +11,14 @@
 #            header (`// rustc-error: E####` or stable text).
 #   LUST=path: also try lust on every case and compare
 #            accept/reject and output. Gaps are reported as
-#            UNSUPPORTED (lust rejects a rustc-pass case, or
-#            times out) or WRONG (lust accepts a rustc-fail
-#            case, or its output differs). Gaps do not fail
-#            the run unless LUST_STRICT=1.
+#            UNSUPPORTED (lust rejects a rustc-pass case) or
+#            WRONG (lust accepts a rustc-fail case, or its
+#            output differs). Gaps do not fail the run unless
+#            LUST_STRICT=1. A lust compile that times out is
+#            retried once at RETRY_CASE_TIMEOUT (default 6x;
+#            scripts/timeout-lib.sh): a finished retry is
+#            reported as "slow" and judged normally, a second
+#            timeout is a HANG and fails the run.
 # Knobs: CASE_TIMEOUT (seconds per compile, default 30),
 # RUN_TIMEOUT (seconds per run, default 10), SANITIZE=1 (with
 # LUST: rebuild the generated C under ASan/UBSan, as difftest).
@@ -35,8 +39,13 @@ corpus_init() {
   lust_match=0
   lust_unsupported=0
   lust_wrong=0
+  lust_hang=0
   case_timeout=${CASE_TIMEOUT:-30}
   run_timeout=${RUN_TIMEOUT:-10}
+  # The one timeout rule (lust_cc, is_timeout, $retry_timeout). This runner is
+  # serial, so lust_cc's retry is alone.
+  # shellcheck source=scripts/timeout-lib.sh
+  source "${BASH_SOURCE[0]%/*}/timeout-lib.sh"
   # Compile cold, as difftest does: a warm daemon would make
   # accept/reject depend on session state, not on the corpus.
   # LUST_USE_DAEMON=1 opts into a private daemon instead: the
@@ -75,8 +84,8 @@ corpus_init() {
       # autostarts the daemon, the second is served by it, so
       # every real case below takes the daemon path.
       echo 'fn main() {}' >"$corpus_work/warmup.rs"
-      timeout "$case_timeout" "$LUST" check "$corpus_work/warmup.rs" >/dev/null 2>&1 || true
-      if ! timeout "$case_timeout" "$LUST" check "$corpus_work/warmup.rs" >/dev/null 2>"$corpus_work/warmup.err"; then
+      lust_cc "$LUST" check "$corpus_work/warmup.rs" >/dev/null 2>&1 || true
+      if ! lust_cc "$LUST" check "$corpus_work/warmup.rs" >/dev/null 2>"$corpus_work/warmup.err"; then
         echo "FAIL: daemon warm-up check failed: $(head -3 "$corpus_work/warmup.err")"
         exit 1
       fi
@@ -95,7 +104,8 @@ corpus_report() {
 }
 
 corpus_lust_note() {
-  # $1 = match|unsupported|wrong, $2 = case, $3 = detail
+  # $1 = match|unsupported|wrong|hang, $2 = case, $3 = detail. A hang is not a
+  # gap: corpus_finish adds every hang to the failed count.
   case "$1" in
     match) lust_match=$((lust_match + 1)) ;;
     unsupported)
@@ -106,7 +116,18 @@ corpus_lust_note() {
       lust_wrong=$((lust_wrong + 1))
       echo "WRONG $2: $3"
       ;;
+    hang)
+      lust_hang=$((lust_hang + 1))
+      echo "HANG $2: $3"
+      ;;
   esac
+}
+
+# corpus_slow_note <case> <step>: after a lust_cc that needed its retry and
+# finished, say so. The case is then judged on the retry's result as usual.
+corpus_slow_note() {
+  [ "$lust_cc_slow" = 1 ] && echo "slow: $1 $2 timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"
+  return 0
 }
 
 corpus_require_dir() {
@@ -168,7 +189,14 @@ corpus_pass_one() {
   corpus_report ok "$name"
   [ -n "${LUST:-}" ] || return
   # Lust path: build, run, and compare to the same oracle output.
-  if ! timeout "$case_timeout" "$LUST" build "$f" -o "$corpus_work/$name.lust" 2>"$corpus_work/$name.lust.err"; then
+  lust_cc "$LUST" build "$f" -o "$corpus_work/$name.lust" 2>"$corpus_work/$name.lust.err"
+  status=$?
+  if is_timeout "$status"; then
+    corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    return
+  fi
+  corpus_slow_note "$name" "lust build"
+  if [ "$status" -ne 0 ]; then
     corpus_lust_note unsupported "$name" "lust rejected a rustc-pass case: $(head -2 "$corpus_work/$name.lust.err" | tr '\n' ' ')"
     return
   fi
@@ -179,7 +207,17 @@ corpus_pass_one() {
     return
   fi
   if [ "${SANITIZE:-0}" = 1 ]; then
-    timeout "$case_timeout" "$LUST" build "$f" -o "$corpus_work/$name.tmp" --emit-c "$corpus_work/$name.san" 2>/dev/null
+    lust_cc "$LUST" build "$f" -o "$corpus_work/$name.tmp" --emit-c "$corpus_work/$name.san" 2>/dev/null
+    status=$?
+    if is_timeout "$status"; then
+      corpus_lust_note hang "$name" "lust build --emit-c timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+      return
+    fi
+    corpus_slow_note "$name" "lust build --emit-c"
+    if [ "$status" -ne 0 ]; then
+      corpus_lust_note wrong "$name" "lust build --emit-c failed on a case the plain build passed"
+      return
+    fi
     if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$corpus_work/$name.sanbin" "$corpus_work/$name.san".*.c 2>"$corpus_work/$name.san.err"; then
       corpus_lust_note wrong "$name" "gcc could not build the generated C"
       return
@@ -229,17 +267,27 @@ corpus_fail_one() {
   fi
   corpus_report ok "$name"
   [ -n "${LUST:-}" ] || return
-  timeout "$case_timeout" "$LUST" check --json "$f" >"$corpus_work/$name.lust.out" 2>&1
+  lust_cc "$LUST" check --json "$f" >"$corpus_work/$name.lust.out" 2>&1
   status=$?
-  if [ $status -eq 124 ]; then
-    corpus_lust_note unsupported "$name" "lust check timed out after ${case_timeout}s"
-  elif [ $status -eq 0 ]; then
+  if is_timeout "$status"; then
+    # A timeout is never a reject, not even when rustc rejects the case too.
+    corpus_lust_note hang "$name" "lust check timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    return
+  fi
+  corpus_slow_note "$name" "lust check"
+  if [ $status -eq 0 ]; then
     # A post-monomorphization error (a generic inline const assert,
     # ARCH 2.13) is a build error only, in rustc's check as in lust's:
     # the build must reject it then.
-    if timeout "$case_timeout" "$LUST" build "$f" -o "$corpus_work/$name.lust" >"$corpus_work/$name.lust.out" 2>&1; then
+    lust_cc "$LUST" build "$f" -o "$corpus_work/$name.lust" >"$corpus_work/$name.lust.out" 2>&1
+    status=$?
+    if is_timeout "$status"; then
+      corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    elif [ $status -eq 0 ]; then
+      corpus_slow_note "$name" "lust build"
       corpus_lust_note wrong "$name" "lust accepted a case rustc rejects ($want)"
     else
+      corpus_slow_note "$name" "lust build"
       corpus_lust_note match "$name" ""
     fi
   else
@@ -253,6 +301,10 @@ corpus_finish() {
     echo "FAIL: no cases matched filter '${corpus_filter}'"
     corpus_fail=1
   fi
+  # A hang fails the run (it is not an unsupported gap). The summary lines keep
+  # their form: the hang count joins the failed count of the first line, and
+  # the HANG lines above name the cases.
+  corpus_fail=$((corpus_fail + lust_hang))
   echo "$1: $corpus_pass passed, $corpus_fail failed (rustc oracle)"
   if [ -n "${LUST:-}" ]; then
     echo "$1 lust: $lust_match matched, $lust_unsupported unsupported, $lust_wrong wrong"

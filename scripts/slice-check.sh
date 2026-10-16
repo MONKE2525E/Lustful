@@ -20,6 +20,10 @@
 #
 # Env knobs: SLICE_CHECK_JOBS (parallel cold checks, default 4),
 # SLICE_CHECK_TIMEOUT (seconds per cold check, default 120),
+# SLICE_CHECK_RETRY_TIMEOUT (seconds for the solo rerun of a timed-out cold
+# check, default 6x; a finished rerun is reported as "slow" and judged
+# normally, a second timeout is a HANG failure even for an expected-fail
+# slice: a timeout is never a reject),
 # SLICE_CHECK_EXPECTED_FAIL (path override, for tests).
 # The last line is the gate summary: "slice-check: N passed, M failed".
 set -uo pipefail
@@ -28,6 +32,10 @@ lust=$root/target/release/lust
 expected_file=${SLICE_CHECK_EXPECTED_FAIL:-$root/scripts/slice-check.expected-fail}
 jobs=${SLICE_CHECK_JOBS:-4}
 timeout_secs=${SLICE_CHECK_TIMEOUT:-120}
+retry_secs=${SLICE_CHECK_RETRY_TIMEOUT:-$((timeout_secs * 6))}
+# is_timeout_rc <status>: a timeout (124) or a kill after one (137), as in
+# scripts/timeout-lib.sh.
+is_timeout_rc() { [ "$1" = 124 ] || [ "$1" = 137 ]; }
 passed=0
 failed=0
 wall_start=$(date +%s%N)
@@ -72,6 +80,21 @@ cold_check() {
   echo $? >"$w.rc"
   end=$(date +%s%N)
   echo $(( (end - start) / 1000000 )) >"$w.ms"
+}
+
+# cold_retry <name> <slice-dir> <root-file> <features>: rerun one timed-out
+# cold check alone at $retry_secs (the caller runs it serially, after the
+# parallel pool). Overwrites check-<name>.rc and .ms. Leaves
+# check-<name>.hang when the rerun timed out too, else prints a slow line.
+cold_retry() {
+  local name=$1
+  rm -rf "$work/check-$name" "$work/check-$name.hang"
+  (timeout_secs=$retry_secs cold_check "$@")
+  if is_timeout_rc "$(cat "$work/check-$name.rc")"; then
+    : >"$work/check-$name.hang"
+  else
+    echo "slow: check $name timed out at ${timeout_secs}s under load, finished alone at ${retry_secs}s"
+  fi
 }
 
 # run_step <name> <command...>: counts one test, prints its time.
@@ -126,7 +149,9 @@ PY
   fi
   export LUST_CACHE_DIR="$w/cold-cache"
   if run_step rustc-oracle bash -c 'p=$1 e=$2 o=$3; shift 3; rustc --edition 2024 -C panic=abort -C overflow-checks=on -A warnings "$@" -o "$p" "$e" && "$p" > "$o"' _ "$w/prog-rustc" "$entry" "$w/rustc.out" "${rustc_cfg[@]}"; then
-    if run_step lust-build-run bash -c 'l=$1 e=$2 p=$3 o=$4; shift 4; "$l" build "$e" "$@" -o "$p" && "$p" > "$o"' _ "$lust" "$entry" "$w/prog-lust" "$w/lust.out" "${lust_args[@]}"; then
+    # This step runs alone, so the lust build and the program run get the
+    # long solo limit directly; a timeout here is a hang and fails the step.
+    if run_step lust-build-run bash -c 't=$1 l=$2 e=$3 p=$4 o=$5; shift 5; timeout -k 5 "$t" "$l" build "$e" "$@" -o "$p" && timeout -k 5 "$t" "$p" > "$o"' _ "$retry_secs" "$lust" "$entry" "$w/prog-lust" "$w/lust.out" "${lust_args[@]}"; then
       if ! cmp -s "$w/rustc.out" "$w/lust.out"; then
         passed=$((passed - 1))
         failed=$((failed + 1))
@@ -149,7 +174,13 @@ if [ $# -ge 1 ]; then
   root_name=${root_name:-slice_main.rs}
   feats=${feats:--}
   cold_check "$name" "$dir" "$root_name" "$feats"
-  if [ "$(cat "$work/check-$name.rc")" = 0 ]; then
+  if is_timeout_rc "$(cat "$work/check-$name.rc")"; then
+    cold_retry "$name" "$dir" "$root_name" "$feats"
+  fi
+  if [ -f "$work/check-$name.hang" ]; then
+    echo "check $name: FAILED (hang: lust check timed out alone at ${retry_secs}s; first at ${timeout_secs}s)"
+    failed=$((failed + 1))
+  elif [ "$(cat "$work/check-$name.rc")" = 0 ]; then
     echo "check $name: ok ($(cat "$work/check-$name.ms") ms)"
     passed=$((passed + 1))
   else
@@ -217,10 +248,22 @@ done
 wait
 checks_end=$(date +%s%N)
 
+# Solo reruns of timed-out cold checks, before any verdict is read.
+for i in "${!names[@]}"; do
+  if is_timeout_rc "$(cat "$work/check-${names[$i]}.rc" 2>/dev/null || echo 1)"; then
+    cold_retry "${names[$i]}" "${dirs[$i]}" "${roots[$i]}" "${feats_list[$i]}"
+  fi
+done
+
 for name in "${names[@]}"; do
   rc=$(cat "$work/check-$name.rc" 2>/dev/null || echo 1)
   ms=$(cat "$work/check-$name.ms" 2>/dev/null || echo 0)
-  if [ "$rc" = 0 ]; then
+  if [ -f "$work/check-$name.hang" ]; then
+    # A hang fails even an expected-fail slice: the list records rejects,
+    # and a timeout is never a reject.
+    echo "check $name: FAILED (hang: lust check timed out alone at ${retry_secs}s; first at ${timeout_secs}s)"
+    failed=$((failed + 1))
+  elif [ "$rc" = 0 ]; then
     if [ -n "${expected[$name]+x}" ]; then
       echo "check $name: FAILED (passes but is in scripts/slice-check.expected-fail; remove it from the list) ($ms ms)"
       failed=$((failed + 1))

@@ -3,7 +3,9 @@
 # Mixes builds and runs of distinct small programs (a new session per file), checks and
 # builds of an edited crate (one session, many edits), and checks of a few fixed files.
 # Every 50 requests it samples the daemon's RSS, fds, threads, children, its temp dir size,
-# and the latency of a fixed probe check. Fails when a request hangs (60 s), when a run
+# and the latency of a fixed probe check. Fails when a request hangs (CASE_TIMEOUT,
+# default 60 s, retried once alone at RETRY_CASE_TIMEOUT, default 6x; a finished retry
+# is "slow", a second timeout is a hang and stops the soak), when a run
 # prints the wrong output, when the probe latency at the end is much above the start, or
 # when fds, threads, children, RSS, or temp dir size keep growing past fixed bounds.
 # Run after scripts/build.sh. N defaults to 1000. Samples: $out/samples.txt (out is printed).
@@ -12,6 +14,12 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
 [ -x "$lust" ] || { echo "error: $lust not built. Run scripts/build.sh first."; exit 2; }
 N=${1:-1000}
+case_timeout=${CASE_TIMEOUT:-60}
+# The one timeout rule for client requests (lust_cc). The soak is serial, so
+# the retry is alone.
+# shellcheck source=scripts/timeout-lib.sh
+source "$root/scripts/timeout-lib.sh"
+hang=0
 unset LUST_NO_DAEMON LUST_CACHE_DIR LUST_DAEMON_IDLE
 export LUST_NO_CACHE=1
 mkdir -p "${TMPDIR:-/tmp}"
@@ -65,14 +73,26 @@ mkdir -p progs fixed
 for f in 0 1 2 3; do prog $((100000 + f)) > fixed/f$f.rs; done
 probe=fixed/f0.rs
 # Start the daemon with the first build; wait for its lock file pid and socket.
-"$lust" build "$probe" -o fixed/bin0 >/dev/null 2>&1
+# The first build gets the same timeout rule as every later request (req).
+lust_cc "$lust" build "$probe" -o fixed/bin0 >/dev/null 2>&1
+if is_timeout $?; then echo "daemon-soak: first build timed out alone at ${retry_timeout}s (hang), 1 failed"; exit 1; fi
 for _ in $(seq 1 200); do [ -S "$LUST_DAEMON_SOCKET" ] && break; sleep 0.05; done
 dpid=$(cat "$LUST_DAEMON_SOCKET.lock" 2>/dev/null)
 [ -n "$dpid" ] && [ -d "/proc/$dpid" ] || { echo "daemon-soak: no daemon started, 1 failed"; exit 1; }
 echo "soak: daemon pid $dpid, $N requests, dir $out"
 
-# req <cmd...>: one client request with a hang limit. Prints nothing; sets rc.
-req() { timeout 60 "$lust" "$@" > "$out/last.out" 2> "$out/last.err"; rc=$?; [ $rc = 124 ] && bad "request hung: $*"; }
+# req <cmd...>: one client request under the timeout rule (lust_cc). Sets rc.
+# A second timeout is a hang: it fails here and sets $hang so the main loop
+# stops instead of queueing more requests behind a wedged daemon.
+req() {
+  lust_cc "$lust" "$@" >"$out/last.out" 2>"$out/last.err"; rc=$?
+  if is_timeout "$rc"; then
+    hang=1
+    bad "HANG request timed out alone at ${retry_timeout}s (first at ${case_timeout}s): $*"
+  elif [ "$lust_cc_slow" = 1 ]; then
+    echo "slow: request ($*) timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"
+  fi
+}
 ms() { date +%s%N | cut -c1-13; }
 probe_ms() { local t0; t0=$(ms); req check "$probe"; echo $(($(ms) - t0)); }
 sample() {
@@ -115,7 +135,9 @@ for ((i = 1; i <= N; i++)); do
       if [ $((i % 3)) = 0 ]; then req build "$f" -o fixed/bin; else req check "$f"; fi
       [ $rc = 0 ] || bad "fixed $f rc $rc" ;;
   esac
+  [ "$hang" = 1 ] && { echo "soak: stopping after a hang"; break; }
   [ $((i % 50)) = 0 ] && sample "$i"
+  [ "$hang" = 1 ] && { echo "soak: stopping after a hang"; break; }
   [ "$fail" -gt 20 ] && { echo "soak: too many failures, stopping"; break; }
 done
 echo "soak: $N requests in $(( ($(ms) - t_start) / 1000 )) s"

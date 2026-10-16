@@ -26,17 +26,17 @@ runtest_case() {
   local name=$1 f=$2 rs bs ms probe mode want_mode
   rustc_oracle run "$f" --edition 2024 -C panic=abort -C overflow-checks=on -A warnings
   [ "$(cat rustc.cc)" -eq 0 ] || { report bad "$name" "rustc rejected it"; return; }
-  run_cc "$lust" build "$f" -o "$name.lust" 2>"$name.build.err" || { report bad "$name" "lust build rejected it"; return; }
+  run_lust "$lust" build "$f" -o "$name.lust" 2>"$name.build.err" || { report bad "$name" "lust build rejected it"; return; }
   rs=$(cat rustc.rs)
   run_to_err "$name.lust.err" "./$name.lust" x y >"$name.lust.out"; bs=$?
-  run_cc "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
+  run_lust "$lust" run "$f" -- x y >"$name.mem.out" 2>"$name.mem.err"; ms=$?
   # Which run path did it take? A program with more than one function unit (glue_shared has
   # three; the glue_*_type_cross_unit tests force a split with filler fns; a program that
   # splices a std source module has hundreds of functions) must use the file. Units compiled
   # = main, glue, runtime, table, loc, plus the function units.
-  probe=$(run_cc "$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
+  probe=$(run_lust "$lust" run --timings "$f" -- x y 2>&1 >/dev/null)
   if grep -q "in memory" <<<"$probe"; then mode=mem; else mode=file; fi
-  units=$(run_cc "$lust" build --timings "$f" -o "$name.units" 2>&1 >/dev/null | grep -o '[0-9]* units compiled' | grep -o '^[0-9]*')
+  units=$(run_lust "$lust" build --timings "$f" -o "$name.units" 2>&1 >/dev/null | grep -o '[0-9]* units compiled' | grep -o '^[0-9]*')
   want_mode=mem; [ "${units:-0}" -gt 6 ] && want_mode=file
   # The glue_*_type_cross_unit tests force a unit split with filler fns.
   [[ "$name" == glue_shared || "$name" == glue_*_type_cross_unit ]] && want_mode=file

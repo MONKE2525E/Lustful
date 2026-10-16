@@ -23,7 +23,10 @@
 # [filter] keeps only entries whose name contains the text.
 # Knobs (ARCH 9.3 runner rules): CASE_TIMEOUT seconds per build
 # (default 300; a cold Cargo kernel build is slow), RUN_TIMEOUT
-# seconds per run (default 30), SANITIZE=1 in lust mode rebuilds
+# seconds per run (default 30), RETRY_CASE_TIMEOUT for the solo
+# retry of a timed-out lust build (default 6x; only a second
+# timeout is a HANG, which fails the script instead of counting
+# as unsupported), SANITIZE=1 in lust mode rebuilds
 # the generated C under ASan/UBSan and runs the cases on that
 # binary. Missing fixture dirs fail the run; they never skip.
 set -uo pipefail
@@ -37,6 +40,10 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 case_timeout=${CASE_TIMEOUT:-300}
 run_timeout=${RUN_TIMEOUT:-30}
+# The one timeout rule for lust builds (lust_cc). Serial here, so the retry
+# is alone. Cargo and rustc builds keep plain run_cc.
+# shellcheck source=scripts/timeout-lib.sh
+source "$root/scripts/timeout-lib.sh"
 run_cc() { timeout "$case_timeout" "$@"; }
 seen=0
 pass=0
@@ -123,18 +130,55 @@ fi
 # replaced by an ASan/UBSan build of the generated C, and a sanitizer
 # report at run time fails like any wrong run (run_case checks stderr
 # only via exit code, so the caller keeps the unsanitized compare too:
-# SANITIZE runs the cases twice, once per binary). Returns nonzero if
-# lust rejects the entry (unsupported in report mode).
+# SANITIZE runs the cases twice, once per binary). A clean reject is
+# unsupported in report mode; a timeout after the solo retry is a hang.
 lust_build() {
-  # $1 entry file, $2 out binary, $3 flat name
-  run_cc "$LUST" build "$1" -o "$2" 2>"$work/$3.err"
+  # $1 entry file, $2 out binary, $3 flat name. Returns lust_cc's status: 0,
+  # a clean reject status, or a timeout status (a hang; see is_timeout).
+  lust_cc "$LUST" build "$1" -o "$2" 2>"$work/$3.err"
+  local st=$?
+  [ "$lust_cc_slow" = 1 ] && ! is_timeout "$st" && echo "slow: $3 lust build timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"
+  return "$st"
 }
 
 lust_build_sanitized() {
   # $1 entry file, $2 out binary, $3 flat name. The entry is known to
   # build (lust_build just did), so a failure here is a real failure.
-  run_cc "$LUST" build "$1" -o "$work/$3.tmp" --emit-c "$work/$3.san" 2>/dev/null || return 1
+  lust_cc "$LUST" build "$1" -o "$work/$3.tmp" --emit-c "$work/$3.san" 2>/dev/null
+  local st=$?
+  is_timeout "$st" && return "$st"
+  [ "$lust_cc_slow" = 1 ] && echo "slow: $3 lust build --emit-c timed out at ${case_timeout}s, finished alone at ${retry_timeout}s"
+  [ "$st" -eq 0 ] || return 1
   gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$2" "$work/$3.san".*.c 2>"$work/$3.san.err"
+}
+
+# lust_build_or_note <label> <entry> <out> <flat>: lust_build with the
+# timeout rule's verdicts. Returns 0 only when the build passed. A second
+# timeout is a HANG and fails (bad); a clean reject is unsupported (unsup).
+lust_build_or_note() {
+  lust_build "$2" "$3" "$4"
+  local st=$?
+  if [ "$st" -eq 0 ]; then return 0; fi
+  seen=$((seen + 1))
+  if is_timeout "$st"; then
+    bad "$1" "HANG lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+  else
+    unsup "$1" "$(head -1 "$work/$4.err")"
+  fi
+  return 1
+}
+
+# san_or_note <label> <entry> <out> <flat>: lust_build_sanitized, 0 on pass.
+san_or_note() {
+  lust_build_sanitized "$2" "$3" "$4"
+  local st=$?
+  if [ "$st" -eq 0 ]; then return 0; fi
+  if is_timeout "$st"; then
+    bad "$1" "HANG lust build --emit-c timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+  else
+    bad "$1" "sanitized build failed: $(head -3 "$work/$4.san.err" 2>/dev/null)"
+  fi
+  return 1
 }
 
 if [ -n "${LUST:-}" ]; then
@@ -152,36 +196,22 @@ if [ -n "${LUST:-}" ]; then
     case "$k" in *-amalgam) parent=$root/tests/kernels/${k%-amalgam} ;; *) parent=$root/tests/kernels/$k ;; esac
     entry=$root/tests/kernels/$k/src/main.rs
     keep "$k" || continue
-    if lust_build "$entry" "$work/$k.lust" "$k"; then
+    if lust_build_or_note "$k" "$entry" "$work/$k.lust" "$k"; then
       kernel_cases "$k" "$work/$k.lust" "$parent"
       seen=$((seen + 1))
-      if [ "${SANITIZE:-0}" = 1 ]; then
-        if lust_build_sanitized "$entry" "$work/$k.sanbin" "$k"; then
-          kernel_cases "$k/san" "$work/$k.sanbin" "$parent"
-        else
-          bad "$k/san" "sanitized build failed: $(head -3 "$work/$k.san.err")"
-        fi
+      if [ "${SANITIZE:-0}" = 1 ] && san_or_note "$k/san" "$entry" "$work/$k.sanbin" "$k"; then
+        kernel_cases "$k/san" "$work/$k.sanbin" "$parent"
       fi
-    else
-      seen=$((seen + 1))
-      unsup "$k" "$(head -1 "$work/$k.err")"
     fi
   done
   for f in "$root"/tests/compat/*.rs; do
     name=$(basename "$f" .rs)
     keep "compat/$name" || continue
-    if lust_build "$f" "$work/$name.lust" "$name"; then
+    if lust_build_or_note "compat/$name" "$f" "$work/$name.lust" "$name"; then
       run_case "compat/$name" "$work/$name.lust" "$root/tests/compat/$name.expected"
-      if [ "${SANITIZE:-0}" = 1 ]; then
-        if lust_build_sanitized "$f" "$work/$name.sanbin" "$name"; then
-          run_case "compat/$name/san" "$work/$name.sanbin" "$root/tests/compat/$name.expected"
-        else
-          bad "compat/$name/san" "sanitized build failed: $(head -3 "$work/$name.san.err")"
-        fi
+      if [ "${SANITIZE:-0}" = 1 ] && san_or_note "compat/$name/san" "$f" "$work/$name.sanbin" "$name"; then
+        run_case "compat/$name/san" "$work/$name.sanbin" "$root/tests/compat/$name.expected"
       fi
-    else
-      seen=$((seen + 1))
-      unsup "compat/$name" "$(head -1 "$work/$name.err")"
     fi
   done
   echo "---"

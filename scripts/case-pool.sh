@@ -6,14 +6,32 @@
 #                        it off, as the landing gate does). Only rustc's side is cached, never
 #                        lust's.
 #   CASE_TIMEOUT seconds per compile (default 30), RUN_TIMEOUT per run (default 10).
+#   RETRY_CASE_TIMEOUT seconds for the solo rerun of a case whose lust compile timed
+#                        out (default 6x CASE_TIMEOUT; see run_lust and run_all).
 #   DIFFTEST_SHARD       <k>/<n>: run only the matching cases whose index i (0-based, in run_all
 #                        order) has i % n == k. The n shards together run every case once; the
 #                        landing gate runs them on separate machines. $matched counts the cases
 #                        the filter matched before the shard cut.
 case_timeout=${CASE_TIMEOUT:-30}
 run_timeout=${RUN_TIMEOUT:-10}
+retry_timeout=${RETRY_CASE_TIMEOUT:-$((case_timeout * 6))}
 run_cc() { timeout "$case_timeout" "$@"; }
 run_to() { timeout "$run_timeout" "$@"; }
+# is_timeout <status>: a timeout (124) or a kill after one (137), as in
+# scripts/timeout-lib.sh. Other signal deaths are crashes and fail at once.
+is_timeout() { [ "$1" = 124 ] || [ "$1" = 137 ]; }
+# run_lust <cmd...>: run_cc for lust compiles only. On a timeout it leaves a
+# `.lust-timeout` marker file in the case dir; run_all reruns a marked case once,
+# alone, at $retry_timeout after the pool drains (a timeout is never a reject:
+# the marker is how a parallel case asks for its solo retry). Rustc compiles
+# keep plain run_cc: a rustc timeout is the oracle's own result (and a
+# "// rustc-timeout: N" fail case needs it to stay one).
+run_lust() {
+  timeout "$case_timeout" "$@"
+  local st=$?
+  is_timeout "$st" && : >.lust-timeout
+  return "$st"
+}
 # run_to_err <errfile> <cmd...>: run_to with only the command's own stderr in <errfile>. A plain
 # `run_to cmd 2>file` also puts timeout's "dumped core" note and bash's "Aborted" job report
 # there when cmd dies by a signal (a panic=abort panic).
@@ -108,13 +126,16 @@ rustc_oracle() {
 
 # run_all <case fn> <file...>: runs `<case fn> <name> <file>` for each file whose name
 # matches $filter (and is in this DIFFTEST_SHARD), $jobs at a time. Case i runs in $work/c/i (its cwd, lust cache dir, and
-# daemon socket path), with its report in c/i/st and its output in c/i/log. Then prints
-# every log in case order, so the output does not depend on the job count, and adds to
-# pass, fail, unsupported, and seen.
+# daemon socket path), with its report in c/i/st and its output in c/i/log. A case whose
+# lust compile timed out (run_lust left a `.lust-timeout` marker) then reruns once, alone, at
+# $retry_timeout, and the rerun's result is the case's result: a finished rerun is
+# reported as "slow", a second timeout is a HANG and fails. Then prints every log in
+# case order, so the output does not depend on the job count, and adds to pass, fail,
+# unsupported, and seen.
 run_all() {
   local fn=$1; shift
   local f name i=0 m=0 running=0 st
-  local names=()
+  local names=() files=()
   rm -rf "$work/c"
   for f in "$@"; do
     name=$(basename "$f" .rs)
@@ -129,9 +150,28 @@ run_all() {
       export LUST_DAEMON_SOCKET=$PWD/no-daemon.sock LUST_CACHE_DIR=$PWD/cache
       "$fn" "$name" "$f"
     ) >"$work/c/$i/log" 2>&1 &
-    names+=("$name"); i=$((i + 1)); running=$((running + 1))
+    names+=("$name"); files+=("$f"); i=$((i + 1)); running=$((running + 1))
   done
   wait
+  # Solo reruns of timed-out cases, in case order, before any result is read.
+  for i in "${!names[@]}"; do
+    [ -f "$work/c/$i/.lust-timeout" ] || continue
+    rm -f "$work/c/$i/.lust-timeout" "$work/c/$i/st"
+    (
+      cd "$work/c/$i" || exit 1
+      export LUST_DAEMON_SOCKET=$PWD/no-daemon.sock LUST_CACHE_DIR=$PWD/cache
+      case_timeout=$retry_timeout
+      "$fn" "${names[$i]}" "${files[$i]}"
+    ) >"$work/c/$i/log.retry" 2>&1
+    if [ -f "$work/c/$i/.lust-timeout" ]; then
+      echo "FAIL ${names[$i]}: HANG lust timed out alone at ${retry_timeout}s (first at ${case_timeout}s under load)" >"$work/c/$i/log"
+      echo bad >"$work/c/$i/st"
+    else
+      { echo "slow: ${names[$i]} lust timed out at ${case_timeout}s under load, finished alone at ${retry_timeout}s"
+        cat "$work/c/$i/log.retry"; } >"$work/c/$i/log"
+    fi
+    rm -f "$work/c/$i/log.retry" "$work/c/$i/.lust-timeout"
+  done
   for i in "${!names[@]}"; do
     cat "$work/c/$i/log"
     st=$(cat "$work/c/$i/st" 2>/dev/null)

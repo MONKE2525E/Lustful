@@ -28,7 +28,9 @@
 #              tcc accepts silently) fails loudly here. A unit whose sanitized
 #              build passes SAN_CC_LIMIT seconds (default 20) is built at -O0.
 #   CASE_TIMEOUT seconds per compile (default 30), RUN_TIMEOUT per run
-#   (default 10). A missing or empty fixture dir fails the run, as does
+#   (default 10). A case whose lust compile times out reruns once, alone, at
+#   RETRY_CASE_TIMEOUT (default 6x); only a second timeout is a HANG failure
+#   (scripts/case-pool.sh). A missing or empty fixture dir fails the run, as does
 #   a filter that matches no case (ARCH 9.3: no silent skips).
 #   DIFFTEST_JOBS cases run at the same time (default nproc), each in its own dir.
 #   DIFFTEST_SHARD=<k>/<n> runs shard k of n (details in scripts/case-pool.sh). The run then
@@ -94,7 +96,7 @@ sanitize_case() {
   # lust build's, already checked against rustc). Returns 0 on match. Runs in the case dir.
   # A timeout or another exit status (a death without sanitizer text) is a failure.
   local f=$1 name=$2 expected=$3 want=$4 c o st objs=()
-  run_cc "$lust" build "${lust_flags[@]}" "$f" -o "$name.tmp" --emit-c "$name" 2>/dev/null || { echo "lust build --emit-c failed"; return 1; }
+  run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.tmp" --emit-c "$name" 2>/dev/null || { echo "lust build --emit-c failed"; return 1; }
   : >"$name.san.err"
   for c in "$name".*.c; do
     o=$san_obj/$(sha256sum <"$c" | cut -c1-40).o
@@ -170,7 +172,7 @@ if [ "${PANIC:-abort}" = unwind ]; then
       report bad "$name" "rustc (panic=unwind) rejected it: $(head -3 rustc.err)"; return
     fi
     rs=$(cat rustc.rs)
-    if ! run_cc "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" 2>"$name.lust.err"; then
+    if ! run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" 2>"$name.lust.err"; then
       if [[ "$f" == */unwind/* ]] || [ "${LUST_STRICT:-0}" = 1 ]; then
         report bad "$name" "lust rejected it: $(head -3 "$name.lust.err")"; return
       fi
@@ -218,7 +220,7 @@ pass_case() {
   if [ "$(cat rustc.cc)" -ne 0 ]; then
     report bad "$name" "rustc rejected it: $(head -3 rustc.err)"; return
   fi
-  if ! run_cc "$lust" build "$f" -o "$name.lust" 2>"$name.lust.err"; then
+  if ! run_lust "$lust" build "$f" -o "$name.lust" 2>"$name.lust.err"; then
     report bad "$name" "lust rejected it: $(head -5 "$name.lust.err")"; return
   fi
   panic_expect=$(sed -n 's|.*// panic: ||p' "$f" | head -1 | sed 's/[[:space:]]*$//')
@@ -263,12 +265,12 @@ neg_case() {
   if [[ "$f" == */reject/* && $rustc_ok -ne 0 ]]; then
     report bad "$name" "rustc rejected it, so it belongs in tests/fail"; return
   fi
-  out=$(run_cc "$lust" check --json "$f" 2>&1)
+  out=$(run_lust "$lust" check --json "$f" 2>&1)
   if [ $? -eq 0 ]; then
     report bad "$name" "lust accepted it (expected $expect)"
   elif ! grep -q "\"code\":\"$expect\"" <<<"$out"; then
     report bad "$name" "expected $expect, got: $(grep -o '"code":"L[0-9]*"' <<<"$out" | tr '\n' ' ')"
-  elif run_cc "$lust" build "$f" -o "$name.lust" >/dev/null 2>&1; then
+  elif run_lust "$lust" build "$f" -o "$name.lust" >/dev/null 2>&1; then
     # `build` checks bodies after mono, where a call can reach an
     # instance directly: it must reject what `check` rejects.
     report bad "$name" "lust check rejected it, but lust build accepted it"
