@@ -294,9 +294,10 @@ impl<T> Option<T> {
 
 // `as_deref` and `as_deref_mut`: core has one impl over `T: Deref`;
 // lust has no `Deref` impls for its builtin types yet, so these are
-// that impl at each std `Deref` type lust knows. Same results; a user
-// `Deref` type rejects (no method), and an `Option<_>` whose payload
-// is still open rejects as ambiguous (check's lang enum probe).
+// that impl at each std `Deref` type lust knows (`String`, `Vec`,
+// `Box`, `Rc`, `Arc`, references). Same results; a user `Deref` type
+// or `Cow` rejects (no method), and an `Option<_>` whose payload is
+// still open rejects as ambiguous (check's lang enum probe).
 impl Option<String> {
     pub fn as_deref(&self) -> Option<&str> {
         match *self {
@@ -345,7 +346,27 @@ impl<T: ?Sized> Option<Box<T>> {
     }
 }
 
-impl<T> Option<&T> {
+// `Rc` and `Arc` deref only shared (no `DerefMut`), so they have no
+// `as_deref_mut`.
+impl<T: ?Sized> Option<std::rc::Rc<T>> {
+    pub fn as_deref(&self) -> Option<&T> {
+        match *self {
+            Some(ref t) => Some(&**t),
+            None => None,
+        }
+    }
+}
+
+impl<T: ?Sized> Option<std::sync::Arc<T>> {
+    pub fn as_deref(&self) -> Option<&T> {
+        match *self {
+            Some(ref t) => Some(&**t),
+            None => None,
+        }
+    }
+}
+
+impl<T: ?Sized> Option<&T> {
     pub fn as_deref(&self) -> Option<&T> {
         match *self {
             Some(t) => Some(t),
@@ -354,7 +375,7 @@ impl<T> Option<&T> {
     }
 }
 
-impl<T> Option<&mut T> {
+impl<T: ?Sized> Option<&mut T> {
     pub fn as_deref(&self) -> Option<&T> {
         match *self {
             Some(ref t) => Some(&**t),
