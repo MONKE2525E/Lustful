@@ -21,6 +21,10 @@
 # --build: run scripts/tsrust_build.py instead (the census build: prune the fork with cfg(test) on,
 # then lust build and Cargo build of each lib's unit tests as one bin, and compare every test's
 # run; its options: --only a,b, --max-rounds N, --timeout SECS, -j N). Results: <out>/build.json.
+# --tsedit: run scripts/tsedit.py instead (warm one-fn edit kinds, lust daemon vs cargo check,
+# on the census clean fork; its options: --target a,b (default: the 3 libs and ts_wasm),
+# --clean TGZ (default: auto, the --rustc census first), --kinds, --probes, --quick, --no-cold).
+# Lust is a release build there (timing). Results: <out>/tsedit.json, <out>/tsedit-<target>.json.
 # --boat: run all of this on a boat sandbox (/tmp/lust-wt/boat-run.sh, BOAT_RUN overrides).
 # boat-run.sh does not pack submodule trees, so only this job uploads the fork (one tar of its
 # tracked and untracked files, no target/). Results come back to ./boat-out/tsrust-full/
@@ -32,12 +36,13 @@ set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 sub=third_party/ts-rust
-boat=0; deep=""; out=${TMPDIR:-/tmp}/tsrust-full; args=()
+boat=0; deep=""; tsedit=""; out=${TMPDIR:-/tmp}/tsrust-full; args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --boat) boat=1; shift;;
     --deep) deep=--deep; shift;;
     --build) deep=--build; shift;;
+    --tsedit) tsedit=--tsedit; shift;;
     --out) out=$2; shift 2;;
     *) args+=("$1"); shift;;
   esac
@@ -76,13 +81,16 @@ if [ $boat = 1 ]; then
   (cd "$sub" && git ls-files -co --exclude-standard -z) > "$W/files" || exit 2
   tar -czf "$W/ts-rust.tgz" -C "$sub" --null -T "$W/files" -C "$W" .fork-head || exit 2
   q=""; for x in "${args[@]}"; do q+=" $(printf %q "$x")"; done
-  name=${TSRUST_BOAT_NAME:-tsrust-full${deep:+-${deep#--}}}
+  name=${TSRUST_BOAT_NAME:-tsrust-full${deep:+-${deep#--}}${tsedit:+-tsedit}}
   [ "$deep" = --build ] && q+=" --clean"  # also the build census's bins and run dirs
+  # tsedit times lust: a release build (BRIEF "Building lust"); the others use the gate profile.
+  build="scripts/build.sh"
+  [ -n "$tsedit" ] && build="cargo build --release -q"
   # The fetch skips the cargo target dirs, the lust cache and the deep census's fork copy (several
   # GB on /tmp); it keeps results, logs and the lust-built bins.
   "${BOAT_RUN:-/tmp/lust-wt/boat-run.sh}" --hours "${TSRUST_BOAT_HOURS:-3}" --up "$W/ts-rust.tgz" --fetch "$name" -- \
-    "scripts/build.sh >/dev/null 2>&1 || { scripts/build.sh 2>&1 | tail -30; exit 8; }; scripts/tsrust-full.sh $deep --out ~/w/$name$q; rc=\$?;" \
-    "rm -rf ~/w/$name/cargo-target ~/w/$name/rustc-target ~/w/$name/lust-cargo-target ~/w/$name/lust-cache ~/w/$name/fork; exit \$rc"
+    "$build >/dev/null 2>&1 || { $build 2>&1 | tail -30; exit 8; }; scripts/tsrust-full.sh $deep $tsedit --out ~/w/$name$q; rc=\$?;" \
+    "rm -rf ~/w/$name/cargo-target ~/w/$name/rustc-target ~/w/$name/lust-cargo-target ~/w/$name/lust-cache ~/w/$name/fork ~/w/$name/census/{cargo-target,rustc-target,lust-cache,fork}; exit \$rc"
   rc=$?; rm -rf "$W"; exit $rc
 fi
 
@@ -93,4 +101,11 @@ export LUST_TCC_HOME=${LUST_TCC_HOME:-/home/theo/.t3/projects/lust-lang/third_pa
 mkdir -p "$out"
 [ "$deep" = --build ] && exec python3 "$root/scripts/tsrust_build.py" --fork "$root/$sub" --lust "$lust" --work "$out" "${args[@]}"
 [ -n "$deep" ] && exec python3 "$root/scripts/tsrust_deep.py" --fork "$root/$sub" --lust "$lust" --work "$out" "${args[@]}"
+if [ -n "$tsedit" ]; then
+  have_target=0; have_clean=0
+  for x in "${args[@]}"; do [ "$x" = --target ] && have_target=1; [ "$x" = --clean ] && have_clean=1; done
+  [ $have_target = 1 ] || args+=(--target goport_util,goport_lsproto,ts_goport,ts_wasm)
+  [ $have_clean = 1 ] || args+=(--clean auto --census-only goport_util,goport_lsproto,ts_goport,ts_wasm)
+  exec python3 "$root/scripts/tsedit.py" --fork "$root/$sub" --lust "$lust" --out "$out" --json "$out/tsedit.json" "${args[@]}"
+fi
 exec python3 "$root/scripts/tsrust_full.py" --fork "$root/$sub" --lust "$lust" --out "$out" "${args[@]}"

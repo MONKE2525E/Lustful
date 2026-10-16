@@ -311,6 +311,40 @@ lust phases, body edit check (median ms over all requests, absent = 0): body pat
 
 <!-- speed-table:end -->
 
+## Edit kinds on real ts-rust targets
+
+The slice rows above edit fn bodies only. `scripts/tsedit.py` measures eight
+kinds of one-fn edits on the largest real code that checks today: the census
+clean fork of each lib target (`scripts/tsrust_deep.py --rustc --save-clean`:
+items removed until both lust and `cargo check` accept the target), and the
+slices. Each probe edits one fn or item, then goes back to the base text.
+
+- `body`: a `let` in one fn body. `infer`: a `let` whose element type comes
+  from a later use, then a use that changes that type. `sig`: a real fn gets
+  `where u32: Copy`. `sigx`: a crate-root fn called from fns in other modules
+  changes its param and return types (callers still fit through `.into()`).
+  `oblig`: a body asks a trait of a real type that it derives. `derive`: one
+  trait goes out of a real `#[derive(..)]`. `generic`: a body edit in a
+  generic fn that other files name. `rpit`: a fn that returns `impl Trait`
+  gets a body edit, then a `+ Sized` bound.
+- Each kind also has reject states (`let x: u32 = "1"`, `where String: Copy`,
+  one more parameter, a trait the type lacks, `Option<T>::cloned`,
+  `+ Copy`, a return type callers cannot take). On every state the warm
+  daemon answer must match rustc's verdict and a cold one-shot lust check
+  (exit code, stdout, stderr). A timeout is a hang, never a reject.
+- Ratios use the states rustc accepts: `cargo check` of the same target in a
+  warm target dir with the same features as lust (`.lust.toml`), over the
+  warm daemon request. One boat sandbox per run, release lust.
+
+Reproduce: `scripts/tsrust-full.sh --boat --tsedit` (census, then every lib
+target), or `python3 scripts/tsedit.py --slice bench/slices/goport-util`.
+`python3 scripts/tsedit.py --render docs/speed.md a.json ...` rewrites the
+tables below. The gate's speed row runs one probe per kind on
+goport-util-small.
+
+<!-- tsedit-table:start -->
+<!-- tsedit-table:end -->
+
 ## Larger slices
 
 `tsrust-all` is all of ts_goport (671,746 lines with both part crates and

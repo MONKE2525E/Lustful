@@ -7,12 +7,12 @@
 //! `test <file> <fn line> <module path>::<name> <ignore 0|1> <returns a value 0|1>`, after it
 //! one `mod <file> <line> <private 0|1> <name>` per module on its path (the line of `mod`).
 //! slice-items --sites <file.rs>: edit sites for scripts/tsedit.py, one per line:
-//!   `fn ol oc cl cc sig_line paren_l paren_c ret_l ret_c where_l where_c n_inputs flags name tparams`
+//!   `fn ol oc cl cc sig_line paren_l paren_c ret_l ret_c where_l where_c n_inputs flags name tparams depth`
 //!   (body braces, the `)` that closes the inputs, the end of the return type, the `where`
 //!   keyword; 0 0 when absent; flags: g generic type params, m inherent impl method, t trait
 //!   impl method, d trait default body, s self receiver, r returns `impl Trait`, c const,
 //!   a async, u unsafe, n nested in a fn body, x under a cfg or test attribute, `-` for none;
-//!   tparams: the fn's own type params, comma separated, `-` for none)
+//!   tparams: the fn's own type params, comma separated, `-` for none; depth: inline mod depth)
 //!   `derive line depth kind name generic traits` (a one-line `#[derive(..)]` on a struct
 //!   or enum; depth = inline mod depth, generic 0/1, traits comma separated)
 //!
@@ -330,7 +330,7 @@ impl Sites {
         let flags = if flags.is_empty() { "-".into() } else { flags };
         let tp = if tparams.is_empty() { "-".into() } else { tparams.join(",") };
         self.out.push_str(&format!(
-            "fn {} {} {} {} {} {} {} {flags} {} {tp}\n",
+            "fn {} {} {} {} {} {} {} {flags} {} {tp} {}\n",
             lc(o),
             lc(c),
             sig.span().start().line,
@@ -338,7 +338,8 @@ impl Sites {
             ret,
             wh,
             sig.inputs.len(),
-            sig.ident
+            sig.ident,
+            self.mods
         ));
     }
 
