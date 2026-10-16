@@ -1835,6 +1835,13 @@ struct Ctx<'p> {
     /// operand does not bind the `_` at the cast. The pair is
     /// (operand type, target type); rechecked at finish.
     deferred_fn_casts: Vec<(Ty, Ty, Span)>,
+    /// Coercion casts (`&[1, 2] as &[u8]`, `Box::new(|| 1) as Box<dyn
+    /// Fn() -> u8>`) whose operand holds an inference var: rustc checks
+    /// casts at body end after literal fallback, so the cast must not
+    /// pick a literal's type, also one a later use gives a var (`&v as
+    /// &Vec<u8>` before `v.push(5)`). (operand type, target, span,
+    /// operand); rechecked at finish.
+    deferred_coerce_casts: Vec<(Ty, Ty, Span, ExprId)>,
     /// Types a `Result` method formats with Debug in its panic message.
     deferred_debug: Vec<(Ty, Span)>,
     /// Types a `take` builds with `Default::default()`.
@@ -2190,6 +2197,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_ord: Vec::new(),
         deferred_sort_ord: Vec::new(),
         deferred_fn_casts: Vec::new(),
+        deferred_coerce_casts: Vec::new(),
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_sized: Vec::new(),
@@ -8311,6 +8319,14 @@ impl<'p> Ctx<'p> {
                 // and `3000000000 as u64` needs no i32 fit first.
                 let exp = if crate::ty::consteval::is_unsuffixed_lit(&p.ast, *expr) { Some(target) } else { None };
                 let t = self.expr(*expr, exp);
+                let coerce_cast = matches!(
+                    (self.kind(t), self.kind(target)),
+                    (TyKind::Ref(..), TyKind::Ref(..)) | (TyKind::Ref(..), TyKind::RawPtr(..))
+                ) || self.owning_unsize_parts(t, target).is_some();
+                if coerce_cast && self.cast_operand_open(t) {
+                    self.deferred_coerce_casts.push((t, target, span, *expr));
+                    return target;
+                }
                 // A cast to a dyn reference is a coercion cast: rustc
                 // allows any coercion through `as` (ARCH 2.8).
                 if matches!(self.kind(target), TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..))) {
@@ -21290,6 +21306,50 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True when `t` holds an inference var at any depth, also in the
+    /// signature of a closure it holds (`Box<{closure}>` of `|| 1`): a
+    /// coercion cast of it waits for body end (`deferred_coerce_casts`).
+    fn cast_operand_open(&self, t: Ty) -> bool {
+        let args = |a: ArgsId| self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.cast_operand_open(e)));
+        match self.tys.kind(self.resolve(t)) {
+            TyKind::Infer(_) => true,
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => self.cast_operand_open(e),
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.cast_operand_open(e)),
+            TyKind::Closure(d, a) => {
+                args(a) || self.closures.iter().find(|c| c.def == d).is_some_and(|c| c.inputs.iter().chain([&c.output]).any(|&e| self.cast_operand_open(e)))
+            }
+            TyKind::Adt(_, a) | TyKind::Projection(_, a) | TyKind::FnDef(_, a) | TyKind::Opaque(_, a) => args(a),
+            TyKind::FnPtr(sig) => {
+                let b = self.tys.sig(sig);
+                self.tys.tys_of(b.value.inputs).iter().any(|&e| self.cast_operand_open(e)) || self.cast_operand_open(b.value.output)
+            }
+            _ => false,
+        }
+    }
+
+    /// `literal_fallback_ty`, also on the signatures of the closures `t`
+    /// holds (`cast_operand_open`).
+    fn literal_fallback_deep(&mut self, t: Ty) {
+        self.literal_fallback_ty(t);
+        let mut stack = vec![self.deep(t)];
+        while let Some(t) = stack.pop() {
+            match self.tys.kind(t) {
+                TyKind::Closure(d, _) => {
+                    if let Some(c) = self.closures.iter().find(|c| c.def == d) {
+                        let sig: Vec<Ty> = c.inputs.iter().copied().chain([c.output]).collect();
+                        for e in sig {
+                            self.literal_fallback_ty(e);
+                        }
+                    }
+                }
+                TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => stack.push(e),
+                TyKind::Tuple(ts) => stack.extend(self.tys.tys_of(ts).iter().copied()),
+                TyKind::Adt(_, a) => stack.extend(self.tys.args(a).iter().filter_map(|g| g.as_ty())),
+                _ => {}
+            }
+        }
+    }
+
     /// Binds every integer or float literal variable in `t` to
     /// its fallback type (`i32`, `f64`), at any depth. General
     /// variables stay free.
@@ -21469,6 +21529,22 @@ impl<'p> Ctx<'p> {
         // selects with i32 or f64, the types body end defaults to.
         self.run_obligations(false);
         self.literal_fallback_in_obligations();
+        // Coercion casts with an open operand, after literal fallback
+        // and before the last obligation run (rustc's `check_casts`).
+        for (src, dst, span, ex) in std::mem::take(&mut self.deferred_coerce_casts) {
+            self.literal_fallback_deep(src);
+            let snap = self.snapshot_vars();
+            let obl_len = self.obl_len();
+            let err_len = self.errs.len();
+            if !self.coerce_at(src, dst, span, Some(ex)) {
+                self.rollback_vars(snap);
+                self.obl_truncate(obl_len);
+                self.errs.truncate(err_len);
+                let (src_d, dst_d) = (self.deep(src), self.deep(dst));
+                let (a, b) = (self.tn(src_d), self.tn(dst_d));
+                self.err("L0116", span, format!("cannot cast `{a}` as `{b}`"), "Give the literal a type suffix (`1u8`), or annotate the value before the cast.");
+            }
+        }
         // A deferred `as_deref` pick can bind type variables other
         // sites wait on, so it runs before the uninferred check.
         method::finish_deferred_lang_methods(self);
