@@ -2223,7 +2223,8 @@ pub(crate) fn alias_holds_region(adt_lifetimes: &FxMap<DefId, Vec<Sym>>, tys: &i
 /// again with regions kept. Elsewhere in a body (a cast target, a
 /// turbofish) the checker would erase them and the borrow checker never
 /// see them, so an alias that holds a region is the same reject as a
-/// written `'static` there, and so is a block-local alias over an Adt
+/// written `'static` there (but inside a fn pointer type, where both keep
+/// `'static`), and so is a block-local alias over an Adt
 /// lifetime in an annotation.
 #[allow(clippy::too_many_arguments)]
 fn alias_at_use(
@@ -2252,6 +2253,9 @@ fn alias_at_use(
             AliasBody::Local => Err(not_here),
         },
         RegionMode::Keep { .. } => Ok(staticize(tys, alias_ty)),
+        // Inside a fn pointer or `dyn Fn` type a written `&'static` keeps
+        // its region (`Scope::static_refs`); so does an alias's.
+        RegionMode::Erase if scope.static_refs => Ok(staticize(tys, alias_ty)),
         RegionMode::Erase if scope.infer_cell.is_some() && !scope.annotation => {
             if alias_holds_region(cx.adt_lifetimes, tys, alias_ty, false) { Err(not_here) } else { Ok(alias_ty) }
         }
