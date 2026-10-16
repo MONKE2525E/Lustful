@@ -2668,8 +2668,8 @@ pub fn run() -> i64 {
             ("    2\n}\n\npub const fn tls_init", "    3\n}\n\npub const fn tls_init", "gen_state"),
             ("    9\n", "    let m: u32 = 4294967295;\n    m + 1\n", "gen_state"),
             // The failed reader stored no reads: it rechecks as any failed
-            // body does, and collect runs for its discovery.
-            ("    let m: u32 = 4294967295;\n    m + 1\n", "    10\n", "discovery"),
+            // body does, against the output its failed check made.
+            ("    let m: u32 = 4294967295;\n    m + 1\n", "    10\n", "reuse"),
             ("    let a = [0u8; local()];\n", "    let a = [0u8; local()];\n    let _b: [u8; 7] = [0u8; unread(3) as usize];\n", "reuse"),
             ("    x * 2 + 1\n", "    x * 2 + 2\n", "gen_state"),
             ("    x * 2 + 2\n", "    x * 2 + 1\n", "gen_state"),
@@ -3276,8 +3276,8 @@ pub fn run() -> i64 {
     /// A header edit of a free fn or an inherent method takes the item
     /// patch (path "item"): a where clause, a parameter type, a return
     /// type, each with an error state and the undo, all give the cold
-    /// answer; the request after a collect error resolves (R9 v1). An
-    /// outline edit (a new generic param) resolves.
+    /// answer; the request after a collect error patches too (the item
+    /// state stands, R9). An outline edit (a new generic param) resolves.
     #[test]
     fn item_edit_matches_cold() {
         let dir = std::env::temp_dir().join(format!("lust-item-{}", std::process::id()));
@@ -3288,8 +3288,8 @@ pub fn run() -> i64 {
         let steps: &[(&str, &str, &str)] = &[
             ("pub fn helper(x: i64) -> i64 {", "pub fn helper(x: i64) -> i64 where u32: Copy {", "item"),
             ("pub fn helper(x: i64) -> i64 where u32: Copy {", "pub fn helper(x: i64) -> i64 where String: Copy {", "item"),
-            // A collect error clears the item state (R9 v1): the fix resolves.
-            ("pub fn helper(x: i64) -> i64 where String: Copy {", "pub fn helper(x: i64) -> i64 {", "resolve"),
+            // A collect error keeps the item state (R9): the fix patches.
+            ("pub fn helper(x: i64) -> i64 where String: Copy {", "pub fn helper(x: i64) -> i64 {", "item"),
             ("pub fn helper(x: i64) -> i64 {", "pub fn helper(x: i32) -> i64 {", "item"),
             ("pub fn helper(x: i32) -> i64 {", "pub fn helper(x: i64) -> i64 {", "item"),
             ("    pub fn add(&mut self, x: i64) {", "    pub fn add(&mut self, x: i64) where u8: Copy {", "item"),
