@@ -374,7 +374,9 @@ def lust_build(lust, lib, work, env, out_bin, timeout):
             diags.append(f"{d.get('code')} {d.get('message')} @ {tsrust_full.rel(f or '?', copy)}:{sp.get('line', 0)}")
             if f and sp.get("line") and prune.located(f, sp) and Path(f).resolve().is_relative_to(copy) and not Path(f).name.startswith("lust_tests_"):
                 located.append((f, sp["line"], d.get("code", "?"), d.get("message", "")))
-    text = "; ".join(diags[:3]) if diags else tsrust_full.crash_reason({"stderr": r.stderr, "rc": r.returncode})
+    # The whole error line (crash_reason cuts at 200 chars; a layout error names a long type).
+    errs = [ln.strip() for ln in r.stderr.splitlines() if "error" in ln.lower() or "panicked" in ln]
+    text = "; ".join(diags[:3]) if diags else (errs[-1][:2000] if errs else tsrust_full.crash_reason({"stderr": r.stderr, "rc": r.returncode}))
     return False, f"exit {r.returncode}: {text}", located
 
 
@@ -431,8 +433,9 @@ def tree_digest(d):
     return sorted((str(p.relative_to(d)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in d.rglob("*") if p.is_file())
 
 
-# Rust 1.99 panic messages carry the OS thread id (`thread 'main' (4764) panicked`).
-TID = re.compile(rb"^(thread '[^']*') \(\d+\) panicked", re.M)
+# Rust 1.99 names the OS thread id in its thread messages (`thread 'main' (4764) panicked`,
+# `thread 'main' (4764) has overflowed its stack`).
+TID = re.compile(rb"^(thread '[^']*') \(\d+\)", re.M)
 
 
 def run_test(exe, i, cwd, env, tmp, timeout):
@@ -442,7 +445,7 @@ def run_test(exe, i, cwd, env, tmp, timeout):
     e = dict(env, TMPDIR=str(tmp))
     try:
         r = subprocess.run([str(exe)] + ["x"] * (i + 1), cwd=cwd, env=e, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        res = (r.returncode, r.stdout, TID.sub(rb"\1 (TID) panicked", r.stderr))
+        res = (r.returncode, r.stdout, TID.sub(rb"\1 (TID)", r.stderr))
     except subprocess.TimeoutExpired:
         res = ("hang", b"", b"")
     return res, tree_digest(tmp)

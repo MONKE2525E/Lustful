@@ -1071,6 +1071,11 @@ pub trait TyIntern {
     fn local_adt_instance(&self, _def: DefId, _args: ArgsId) -> Option<AdtId> {
         None
     }
+    /// The Adt whose C type `a` uses: `a` itself, or the instance that
+    /// differs from it only in lifetimes and was registered first.
+    fn c_adt(&self, a: AdtId) -> AdtId {
+        a
+    }
     /// The session-local index of a user Adt type. None for builtin Adts and
     /// non-Adt types; builtin checks must run first where both can appear.
     /// The builtin def list answers without a table lookup, which keeps
@@ -1282,6 +1287,12 @@ pub struct GlobalTys {
     /// to the instance's session-local index. Filled by mono during
     /// collection; body overlays read it through the global store.
     adt_instances: FxMap<(DefId, ArgsId), AdtId>,
+    /// Instances that differ only in lifetimes (`M<Rc<dyn Tr>>` next to
+    /// `M<Rc<dyn Tr + 'static>>`) share one C type: the first registered
+    /// instance under the region-free args (`region_free`), and each later
+    /// one to it (`c_adt`).
+    adt_c_keys: FxMap<(DefId, ArgsId), AdtId>,
+    adt_c_canon: FxMap<AdtId, AdtId>,
     /// The full applied type of each session-local Adt, in index
     /// order where registered: `Adt(def, args)` with the instance's
     /// args, not always `EMPTY_ARGS`.
@@ -1330,6 +1341,8 @@ impl GlobalTys {
             adt_locals: FxMap::default(),
             adt_defs: Vec::new(),
             adt_instances: FxMap::default(),
+            adt_c_keys: FxMap::default(),
+            adt_c_canon: FxMap::default(),
             adt_full_tys: Vec::new(),
             unsized_adts: FxMap::default(),
         };
@@ -1373,6 +1386,59 @@ impl GlobalTys {
         let t = self.intern(TyKind::Adt(def, EMPTY_ARGS));
         self.adt_full_tys[i] = Some(t);
     }
+    /// `t` with every kept region (`'static`, the only one left after
+    /// borrowck) erased, in references, dyn types and lifetime args: the
+    /// key that makes instances differing only in lifetimes one C type.
+    /// Fn pointers, closures and fn items keep theirs.
+    fn region_free(&mut self, t: Ty) -> Ty {
+        if !self.flags(t).contains_static_region() {
+            return t;
+        }
+        match self.kind(t) {
+            TyKind::Ref(_, m, i) => {
+                let i = self.region_free(i);
+                self.intern(TyKind::Ref(Region::Erased, m, i))
+            }
+            TyKind::Dyn(b, _) => self.intern(TyKind::Dyn(b, Region::Erased)),
+            TyKind::RawPtr(m, i) => {
+                let i = self.region_free(i);
+                self.intern(TyKind::RawPtr(m, i))
+            }
+            TyKind::Slice(e) => {
+                let e = self.region_free(e);
+                self.intern(TyKind::Slice(e))
+            }
+            TyKind::Array(e, n) => {
+                let e = self.region_free(e);
+                self.intern(TyKind::Array(e, n))
+            }
+            TyKind::Tuple(ts) => {
+                let elems: Vec<Ty> = self.tys_of(ts).to_vec();
+                let elems: Vec<Ty> = elems.into_iter().map(|e| self.region_free(e)).collect();
+                let ts = self.intern_tys(&elems);
+                self.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Adt(d, a) => {
+                let a = self.region_free_args(a);
+                self.intern(TyKind::Adt(d, a))
+            }
+            _ => t,
+        }
+    }
+
+    fn region_free_args(&mut self, args: ArgsId) -> ArgsId {
+        let old: Vec<GenericArg> = self.args(args).to_vec();
+        let new: Vec<GenericArg> = old
+            .iter()
+            .map(|&g| match g {
+                GenericArg::Ty(t) => GenericArg::Ty(self.region_free(t)),
+                GenericArg::Lifetime(_) => GenericArg::Lifetime(Region::Erased),
+                c => c,
+            })
+            .collect();
+        if new == old { args } else { self.intern_args(&new) }
+    }
+
     /// Records an unsized newtype (see `unsized_adts`): collect calls it
     /// once its single field type is known to be unsized.
     pub fn register_unsized_adt(&mut self, def: DefId, field: Ty) {
@@ -1385,6 +1451,11 @@ impl GlobalTys {
     pub fn register_adt_instance(&mut self, def: DefId, args: ArgsId, local: AdtId) -> Ty {
         let t = self.intern(TyKind::Adt(def, args));
         self.adt_instances.insert((def, args), local);
+        let key = self.region_free_args(args);
+        let canon = *self.adt_c_keys.entry((def, key)).or_insert(local);
+        if canon != local {
+            self.adt_c_canon.insert(local, canon);
+        }
         let i = local.0 as usize;
         if i >= self.adt_full_tys.len() {
             self.adt_full_tys.resize(i + 1, None);
@@ -1504,6 +1575,9 @@ impl TyIntern for GlobalTys {
     }
     fn local_adt_instance(&self, def: DefId, args: ArgsId) -> Option<AdtId> {
         self.adt_instances.get(&(def, args)).copied()
+    }
+    fn c_adt(&self, a: AdtId) -> AdtId {
+        self.adt_c_canon.get(&a).copied().unwrap_or(a)
     }
     fn full_adt_ty_of(&self, local: AdtId) -> Option<Ty> {
         self.full_adt_ty(local)
@@ -1693,6 +1767,9 @@ impl TyIntern for Tys<'_> {
     }
     fn local_adt_instance(&self, def: DefId, args: ArgsId) -> Option<AdtId> {
         self.global.local_adt_instance(def, args)
+    }
+    fn c_adt(&self, a: AdtId) -> AdtId {
+        self.global.c_adt(a)
     }
     fn full_adt_ty_of(&self, local: AdtId) -> Option<Ty> {
         self.global.full_adt_ty(local)

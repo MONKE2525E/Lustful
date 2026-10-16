@@ -297,7 +297,7 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
                 CTy::Hash(k, args)
             }
             None => match tys.local_adt(t) {
-                Some(a) => CTy::Adt(a),
+                Some(a) => CTy::Adt(tys.c_adt(a)),
                 None => CTy::Unit,
             },
         },
@@ -671,7 +671,11 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             ps.iter().for_each(|e| collect_types(e, out));
             collect_types(r, out);
         }
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) | CTy::Own(_, e) => collect_types(e, out),
+        // A raw pointer names its pointee (`A2480*` for `*const Mapper`): its
+        // forward typedef must be in the unit too.
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Ptr(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) | CTy::Own(_, e) => {
+            collect_types(e, out)
+        }
         CTy::ArrayIter(e, n) => {
             out.insert(t.clone());
             collect_types(&CTy::Array(e.clone(), *n), out);
@@ -3051,6 +3055,7 @@ impl FnGen<'_, '_> {
                 }
             }
             Rvalue::Aggregate(a, v, ops) => {
+                let a = &self.p.tys.c_adt(*a);
                 let adt = self.p.adt(*a);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
                 if adt.is_enum {
