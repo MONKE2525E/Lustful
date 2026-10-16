@@ -352,7 +352,8 @@ pub(super) struct Patched {
     /// `item_names` as the changed names.
     pub item_scans: Option<Vec<crate::scan::ItemScan>>,
     pub item_names: Vec<Sym>,
-    /// A derive list edit came with it: the slot update runs in full mode.
+    /// A derive list or trait impl method edit came with it: the slot
+    /// update runs in full mode.
     pub item_full: bool,
     /// Every edit is a derive list edit (no body or header edit): the
     /// compile tail may take the keyed dirty walk (sigedit P3.2).
@@ -416,6 +417,10 @@ struct NewItem {
     name: Sym,
     /// The old fn's expression range (`FnDef::exprs`).
     old_exprs: (u32, u32),
+    /// A trait impl's method: the tail runs in full mode, because
+    /// operators, `for` loops and generic callers reach it without
+    /// naming it (sigedit R10).
+    full: bool,
 }
 
 /// The fn body side of a `BodyEdit`.
@@ -963,7 +968,7 @@ fn find_derive_edit(front: &Front, text: &str, edit: Edit) -> Result<NewDerive, 
 }
 
 /// The item patch (sigedit P1.3): proves that `edit` sits strictly
-/// inside one free fn or inherent method, touches its header, and
+/// inside one free fn or method, touches its header, and
 /// leaves its outline (`item_outline::fn_outline`) as it was, then
 /// parses and rewrites the new fn whole against the frozen tables.
 /// `Err(None)` when no fn holds the edit; `Err(Some(why))` when one
@@ -971,7 +976,8 @@ fn find_derive_edit(front: &Front, text: &str, edit: Edit) -> Result<NewDerive, 
 /// Refused (R2, R5, and v1 limits): a header with a macro call, `$`,
 /// an attribute after `fn`, or an APIT; attributes the expander acts
 /// on; a body that needs the expander, or holds items; a const fn; a
-/// fn from a macro expansion; a trait impl's method.
+/// fn from a macro expansion. A trait impl's method takes the patch
+/// with `NewItem::full`.
 fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Option<&'static str>> {
     let base = front.patch.as_ref().ok_or(Some("no base"))?;
     let file = edit.file;
@@ -998,11 +1004,7 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     }
     let (fn_index, item, sub, lo, hi) = found.ok_or(None)?;
     let def = fn_def_at(ast, item, sub);
-    if let ItemKind::Impl(imp) = &ast.items[item].kind
-        && imp.trait_ref.is_some()
-    {
-        return Err(Some("item: trait impl"));
-    }
+    let full = matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.trait_ref.is_some());
     if def.qual.is_const {
         return Err(Some("item: const fn"));
     }
@@ -1130,7 +1132,7 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     }
     item_ast.items.push(new_item);
     let old_exprs = def.exprs;
-    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs })
+    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs, full })
 }
 
 /// Where the std splice starts in the new text: the new body or fn is
@@ -1588,9 +1590,11 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     // rescans whole (its scan may move: the tail runs in signatures mode).
     let mut item_names: Vec<Sym> = Vec::new();
     let mut item_fns: Vec<usize> = Vec::new();
+    let mut item_full = false;
     for e in edits.iter_mut() {
         let file = e.file;
         let Some(it) = e.item.as_mut() else { continue };
+        item_full |= it.full;
         let ast = &front.ast;
         let before = (ast.exprs.len(), ast.pats.len(), ast.tys.len(), ast.blocks.len(), ast.stmt_items.len());
         let ast = Arc::make_mut(&mut front.ast);
@@ -1757,7 +1761,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         const_edits,
         item_scans,
         item_names,
-        item_full: derive_edit,
+        item_full: derive_edit || item_full,
         derive_only: derive_edit && edited.is_empty(),
         files,
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
@@ -3341,6 +3345,37 @@ pub fn run() -> i64 {
             ("#[derive(Clone, Copy, Debug, PartialEq)]", "#[derive(Clone, Copy, Debug, PartialEq, Default)]", "item"),
             ("#[derive(Clone, Copy, Debug, PartialEq, Default)]", "#[derive(Clone, Copy, Debug, PartialEq)]", "item"),
             ("#[derive(Clone, Copy, Debug, PartialEq)]", "#[derive(Clone, Copy, Debug, PartialEq)]\n#[repr(C)]", "resolve"),
+        ];
+        for &(old, new, path) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trait impl method's header edit takes the item patch in full
+    /// mode: its callers (`+`, a `for` loop) never name it. Same types
+    /// spelled another way, a type change the trait rejects (a collect
+    /// error), its fix, then the revert.
+    #[test]
+    fn trait_impl_method_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-trait-item-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "pub struct V(i64);\n\nimpl std::ops::Add for V {\n    type Output = V;\n    fn add(self, o: V) -> V {\n        V(self.0 + o.0)\n    }\n}\n\n\
+                   pub struct C {\n    n: u32,\n}\n\nimpl Iterator for C {\n    type Item = u32;\n    fn next(&mut self) -> Option<u32> {\n        \
+                   self.n = self.n.checked_sub(1)?;\n        Some(self.n)\n    }\n}\n\n\
+                   pub fn run() -> i64 {\n    let mut t = (V(1) + V(2)).0;\n    for x in (C { n: 3 }) {\n        t += x as i64;\n    }\n    t\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str, &str)] = &[
+            ("    fn add(self, o: V) -> V {", "    fn add(self, o: V) -> Self {", "item"),
+            ("    fn next(&mut self) -> Option<u32> {", "    fn next(&mut self) -> Option<Self::Item> {", "item"),
+            ("    fn add(self, o: V) -> Self {", "    fn add(self, o: Self) -> Self {", "item"),
+            ("    fn next(&mut self) -> Option<Self::Item> {", "    fn next(&mut self) -> Option<u64> {", "item"),
+            ("    fn next(&mut self) -> Option<u64> {", "    fn next(&mut self) -> Option<u32> {", "item"),
+            ("    fn add(self, o: Self) -> Self {", "    fn add(self, o: V) -> V {", "item"),
         ];
         for &(old, new, path) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m0, old, new);

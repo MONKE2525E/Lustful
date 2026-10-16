@@ -1844,7 +1844,8 @@ fn resolved_setup(
             let fn_at: Vec<(usize, usize)> = (0..p.fn_count).map(|i| (0, i)).collect();
             let (hashes, lines) = (p.body_hashes.clone(), p.fn_lines.clone());
             let scan_of = |_: &Front, i: usize| (hashes[i], lines[i]);
-            // A derive list edit: full mode (any body may read the derives).
+            // A derive list edit (any body may read the derives) or a trait
+            // impl method edit (callers need not name it): full mode.
             let names = (!p.item_full).then_some(names);
             let mode = if p.item_full { "full" } else { "signatures" };
             caches.derive_only = p.derive_only;
