@@ -4448,8 +4448,19 @@ impl FnGen<'_, '_> {
                 }
             }
             B::ToString => {
-                let CTy::Ref(inner) = tys[0].clone() else { unreachable!() };
-                self.to_string_value(&inner, &vals[0], loc)
+                match tys[0].clone() {
+                    CTy::Ref(inner) => self.to_string_value(&inner, &vals[0], loc),
+                    // A dyn receiver arrives as the fat value itself
+                    // (`Box<dyn Error>::to_string`, F3): spill it so
+                    // the fmt shim reads it by address, as a format
+                    // argument does.
+                    t @ (CTy::Dyn | CTy::BoxDyn | CTy::RcDyn) => {
+                        let tmp = self.tmp();
+                        let _ = writeln!(self.out, "    {} {tmp} = {};", ctype(&t), vals[0]);
+                        self.to_string_value(&t, &format!("(&{tmp})"), loc)
+                    }
+                    _ => unreachable!(),
+                }
             }
             B::WrappingAdd | B::WrappingSub | B::WrappingMul => {
                 let it = int_of(&tys[0]);

@@ -156,16 +156,22 @@ impl<'p> Ctx<'p> {
         if n == "fmt" && args.len() == 1 && self.tys.local_adt(base).is_none() {
             return self.builtin_fmt_call(e, recv, base, derefs, name_span, args);
         }
-        if n == "to_string" && args.is_empty() && self.tys.local_adt(base).is_some() {
+        if n == "to_string" && args.is_empty() && (self.tys.local_adt(base).is_some() || matches!(self.tys.kind(base), TyKind::Dyn(..))) {
             // `impl<T: Display> ToString for T`, through the receiver's
             // Display impl (Self is bound as rustc's probe binds it).
+            // A dyn receiver (`Box<dyn Error>`, F3) is Display through
+            // its principal's supertrait and keeps the probe's derefs.
             // With no Display impl there is no `to_string`: other
             // dispatch runs and reports the missing method.
             let t = self.deep(rt);
             if !has_display(self.p, &self.tys, t) && !self.require_fmt(t, FmtKind::Display, name_span) {
                 return None;
             }
-            let derefs = u8::from(matches!(self.tys.kind(t), TyKind::Ref(..)));
+            let derefs = if matches!(self.tys.kind(base), TyKind::Dyn(..)) {
+                derefs
+            } else {
+                u8::from(matches!(self.tys.kind(t), TyKind::Ref(..)))
+            };
             self.check_packed_borrow(recv, name_span);
             self.set_res(e, Res::BuiltinMethod { b: Builtin::ToString, derefs, autoref: Autoref::Ref });
             return Some(STRING);

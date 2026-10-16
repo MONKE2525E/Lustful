@@ -42,6 +42,12 @@ fn main() {
     println!("io: {}", may_io().unwrap_err());
     println!("str: {}", may_str().unwrap_err());
     println!("boom: {}", may_boom().unwrap_err());
+    let from_fn: Box<dyn Error> = Box::from(Boom(11));
+    println!("from: {from_fn} {}", from_fn.to_string());
+    let from_str: Box<dyn Error + Send + Sync> = Box::from("from words");
+    println!("from str: {}", from_str.to_string());
+    let as_ref: &dyn Error = &Boom(12);
+    println!("ref: {}", as_ref.to_string());
     let boxed: Box<Boom> = Box::new(Boom(5));
     println!("box source: {:?}", boxed.source());
     let r = &Boom(6);

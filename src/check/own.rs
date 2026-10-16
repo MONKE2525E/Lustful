@@ -132,6 +132,20 @@ impl<'p> Ctx<'p> {
                 (vec![a], dst)
             }
             None => {
+                // A `dyn` pointee (`Box<dyn Error>` from an error
+                // value, F3) has no builtin build here: the call is
+                // the library `From` impl, selected at body end as
+                // `.into()` on the same value is.
+                if let Some((_, pt)) = own_parts(&self.tys, dst)
+                    && matches!(self.tys.kind(pt), TyKind::Dyn(..))
+                {
+                    let targs = self.tys.intern_args(&[GenericArg::Ty(dst), GenericArg::Ty(at)]);
+                    let trait_ref = TraitRef { def: self.p.gx.lang.from, args: targs, bindings: EMPTY_BINDINGS };
+                    self.obl.push_trait_at(trait_ref, span, 0);
+                    super::method::defer_path_call(self, e, trait_ref, self.p.interner.intern("from"), vec![]);
+                    self.record_pick(e, self.p.gx.lang.from, 0, ReceiverForm::Value);
+                    return (vec![at], dst);
+                }
                 let (dn, an) = (self.tn(dst), self.tn(at));
                 self.err(
                     "L0612",
