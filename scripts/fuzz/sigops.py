@@ -340,6 +340,14 @@ class External:
         b = self._base_ok(root, cold_env)
         if b == warm_ok:
             self.counts["known_" + ("fa" if warm_ok else "fr")] += 1
+            # SIGOPS_SAVE=<dir> keeps each known false accept's crate (a
+            # rule-zero bug the baseline has too: report it).
+            save = os.environ.get("SIGOPS_SAVE")
+            if warm_ok and save:
+                import shutil
+                src = os.path.dirname(root)
+                keep = lambda d, names: [n for n in names if not os.path.isdir(os.path.join(d, n)) and not n.endswith((".rs", ".toml"))]
+                shutil.copytree(src, os.path.join(save, f"known_fa-{self.counts['known_fa']}"), ignore=keep, dirs_exist_ok=True)
             return None
         if b is None and not warm_ok:
             # No baseline: a false reject may be a known gap.
