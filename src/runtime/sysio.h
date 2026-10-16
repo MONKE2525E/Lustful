@@ -38,6 +38,9 @@ int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out);
    errno of 0 is impossible, so -1 reads back as the NUL error only
    when the caller checked the path for NUL itself. Callers check. */
 int32_t lust_sys_fd_open(const uint8_t *p, uint64_t len, int32_t flags);
+/* lust_sys_fd_open plus std's custom flags (OR'd in) and creation mode,
+   retried on EINTR as std's open_c: the fd or -errno. */
+int32_t lust_sys_fd_open_ext(const uint8_t *p, uint64_t len, int32_t flags, int32_t custom, uint32_t mode);
 
 /* Stdin (fd 0) through one process-wide buffer, as std's stdin: bytes
    a lock buffered stay available to later reads. read appends up to
@@ -62,6 +65,14 @@ void lust_sys_stdin_consume(uint64_t n);
 int32_t lust_sys_proc_spawn(const uint8_t *prog, uint64_t proglen, const uint8_t *args, uint64_t argslen,
                             const uint8_t *env, uint64_t envlen, const uint8_t *cwd, uint64_t cwdlen, uint32_t stdio,
                             const uint8_t *fds, uint64_t fdslen, lust_Vec *out);
+/* std's `CommandExt::exec` in this process (no fork): with the same
+   packed inputs as lust_sys_proc_spawn, dup2 the configured stdio,
+   chdir, SIGPIPE back to its default, then execvp with `environ`
+   swapped for the packed environment when it changed (restored when
+   the exec fails). Returns only on failure: the errno. */
+int32_t lust_sys_proc_exec(const uint8_t *prog, uint64_t proglen, const uint8_t *args, uint64_t argslen,
+                           const uint8_t *env, uint64_t envlen, const uint8_t *cwd, uint64_t cwdlen, uint32_t stdio,
+                           const uint8_t *fds, uint64_t fdslen);
 /* waitpid(2) on `pid` (blocking when `block`): the raw wait status,
    -2 when a non-blocking wait finds the child still running, or
    -errno. */

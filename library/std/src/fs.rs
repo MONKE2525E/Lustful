@@ -55,15 +55,6 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
     status(core::intrinsics::sys_write_file(bytes_of(path.as_ref()), data))
 }
 
-/// The `mode: 0o000666` field of the `OpenOptions` Debug form.
-struct CreateMode;
-
-impl fmt::Debug for CreateMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("0o000666")
-    }
-}
-
 /// Options for opening a file: access, creation, and truncation, as
 /// std validates and applies them on Linux.
 #[derive(Clone)]
@@ -74,12 +65,16 @@ pub struct OpenOptions {
     truncate: bool,
     create: bool,
     create_new: bool,
+    /// `OpenOptionsExt::custom_flags` (os.rs): extra `open(2)` flags.
+    pub(crate) custom_flags: i32,
+    /// `OpenOptionsExt::mode` (os.rs): the mode of a created file.
+    pub(crate) mode: u32,
 }
 
 impl OpenOptions {
     /// A blank set of options, ready to configure.
     pub fn new() -> OpenOptions {
-        OpenOptions { read: false, write: false, append: false, truncate: false, create: false, create_new: false }
+        OpenOptions { read: false, write: false, append: false, truncate: false, create: false, create_new: false, custom_flags: 0, mode: 0o666 }
     }
 
     /// Read access.
@@ -160,7 +155,8 @@ impl OpenOptions {
         if self.create_new {
             flags |= 32;
         }
-        let fd = core::intrinsics::sys_fd_open(bytes, flags);
+        // std's open_c: `custom_flags` without the access mode bits.
+        let fd = core::intrinsics::sys_fd_open_ext(bytes, flags, self.custom_flags & !3, self.mode);
         if fd < 0 {
             Err(io::Error::from_raw_os_error(-fd))
         } else {
@@ -181,8 +177,8 @@ impl fmt::Debug for OpenOptionsInner<'_> {
             .field("truncate", &self.0.truncate)
             .field("create", &self.0.create)
             .field("create_new", &self.0.create_new)
-            .field("custom_flags", &0)
-            .field("mode", &CreateMode)
+            .field("custom_flags", &self.0.custom_flags)
+            .field("mode", &PermModeText(mode_text(self.0.mode as u64)))
             .finish()
     }
 }
@@ -619,41 +615,47 @@ impl fmt::Debug for Permissions {
     /// directory, block or char device, symlink, fifo, or regular file;
     /// the sticky bit shows (`t`, `T`) only on a directory.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let m = self.mode;
-        let kind = match m & S_IFMT {
-            S_IFDIR => Some('d'),
-            0o060000 => Some('b'),
-            0o020000 => Some('c'),
-            S_IFLNK => Some('l'),
-            0o010000 => Some('p'),
-            0o100000 => Some('-'),
-            _ => None,
-        };
-        let mut text = format!("{:#08o}", m);
-        if let Some(kind) = kind {
-            let bit = |b: u64, c: char| if m & b != 0 { c } else { '-' };
-            let exec = |x: u64, special: u64, set: char, unset: char| match (m & x != 0, m & special != 0) {
-                (true, true) => set,
-                (false, true) => unset,
-                (true, false) => 'x',
-                (false, false) => '-',
-            };
-            text.push_str(" (");
-            text.push(kind);
-            text.push(bit(0o400, 'r'));
-            text.push(bit(0o200, 'w'));
-            text.push(exec(0o100, 0o4000, 's', 'S'));
-            text.push(bit(0o040, 'r'));
-            text.push(bit(0o020, 'w'));
-            text.push(exec(0o010, 0o2000, 's', 'S'));
-            text.push(bit(0o004, 'r'));
-            text.push(bit(0o002, 'w'));
-            text.push(if kind == 'd' { exec(0o001, 0o1000, 't', 'T') } else { bit(0o001, 'x') });
-            text.push(')');
-        }
-        let mode = PermModeText(text);
+        let mode = PermModeText(mode_text(self.mode));
         f.debug_tuple("Permissions").field(&FilePerm { mode }).finish()
     }
+}
+
+/// std's `Mode` Debug text of a mode: the octal value, then the `ls` form
+/// only for a directory, block or char device, symlink, fifo, or regular
+/// file; the sticky bit shows (`t`, `T`) only on a directory.
+fn mode_text(m: u64) -> String {
+    let kind = match m & S_IFMT {
+        S_IFDIR => Some('d'),
+        0o060000 => Some('b'),
+        0o020000 => Some('c'),
+        S_IFLNK => Some('l'),
+        0o010000 => Some('p'),
+        0o100000 => Some('-'),
+        _ => None,
+    };
+    let mut text = format!("{:#08o}", m);
+    if let Some(kind) = kind {
+        let bit = |b: u64, c: char| if m & b != 0 { c } else { '-' };
+        let exec = |x: u64, special: u64, set: char, unset: char| match (m & x != 0, m & special != 0) {
+            (true, true) => set,
+            (false, true) => unset,
+            (true, false) => 'x',
+            (false, false) => '-',
+        };
+        text.push_str(" (");
+        text.push(kind);
+        text.push(bit(0o400, 'r'));
+        text.push(bit(0o200, 'w'));
+        text.push(exec(0o100, 0o4000, 's', 'S'));
+        text.push(bit(0o040, 'r'));
+        text.push(bit(0o020, 'w'));
+        text.push(exec(0o010, 0o2000, 's', 'S'));
+        text.push(bit(0o004, 'r'));
+        text.push(bit(0o002, 'w'));
+        text.push(if kind == 'd' { exec(0o001, 0o1000, 't', 'T') } else { bit(0o001, 'x') });
+        text.push(')');
+    }
+    text
 }
 
 /// Raw text that `Debug`-formats as itself (the mode value of

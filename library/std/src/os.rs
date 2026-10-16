@@ -408,6 +408,26 @@ pub mod unix {
             }
         }
 
+        /// Unix-specific extensions to `fs::OpenOptions`: the mode of a
+        /// created file and extra `open(2)` flags, as std's.
+        pub trait OpenOptionsExt {
+            /// Sets the mode bits a new file is created with.
+            fn mode(&mut self, mode: u32) -> &mut Self;
+            /// Passes custom flags to the `flags` argument of `open`.
+            fn custom_flags(&mut self, flags: i32) -> &mut Self;
+        }
+
+        impl OpenOptionsExt for crate::fs::OpenOptions {
+            fn mode(&mut self, mode: u32) -> &mut crate::fs::OpenOptions {
+                self.mode = mode;
+                self
+            }
+            fn custom_flags(&mut self, flags: i32) -> &mut crate::fs::OpenOptions {
+                self.custom_flags = flags;
+                self
+            }
+        }
+
         /// Creates a symbolic link pointing at `original`
         /// (`symlink(2)`), as std's `os::unix::fs::symlink` does.
         pub fn symlink<P: AsRef<crate::path::Path>, Q: AsRef<crate::path::Path>>(
@@ -417,6 +437,71 @@ pub mod unix {
             let a = original.as_ref().as_os_str().as_encoded_bytes();
             let b = link.as_ref().as_os_str().as_encoded_bytes();
             crate::fs::status(core::intrinsics::sys_symlink(a, b))
+        }
+    }
+
+    /// Unix-specific extensions to `std::process`: `exec`, and the raw
+    /// wait status of an `ExitStatus`. Both traits are sealed, as std's.
+    pub mod process {
+        use crate::io;
+        use crate::process::{Command, ExitStatus};
+
+        mod sealed {
+            pub trait Sealed {}
+            impl Sealed for crate::process::Command {}
+            impl Sealed for crate::process::ExitStatus {}
+        }
+
+        /// Unix-specific extensions to `process::Command` (only `exec`
+        /// here).
+        pub trait CommandExt: sealed::Sealed {
+            /// Replaces this process with the command's program, as
+            /// std's: returns only when the exec fails, with its error.
+            fn exec(&mut self) -> io::Error;
+        }
+
+        impl CommandExt for Command {
+            fn exec(&mut self) -> io::Error {
+                self.exec_here()
+            }
+        }
+
+        /// Unix-specific extensions to `process::ExitStatus`: the raw
+        /// wait status and its parts (glibc's `W*` macros).
+        pub trait ExitStatusExt: sealed::Sealed {
+            /// The status of a raw wait status.
+            fn from_raw(raw: i32) -> Self;
+            /// The signal that ended the process, if a signal did.
+            fn signal(&self) -> Option<i32>;
+            /// True when the process dumped core.
+            fn core_dumped(&self) -> bool;
+            /// The signal that stopped the process, if one did.
+            fn stopped_signal(&self) -> Option<i32>;
+            /// True when the process was continued from a stop.
+            fn continued(&self) -> bool;
+            /// The raw wait status.
+            fn into_raw(self) -> i32;
+        }
+
+        impl ExitStatusExt for ExitStatus {
+            fn from_raw(raw: i32) -> ExitStatus {
+                ExitStatus::from_wait_status(raw)
+            }
+            fn signal(&self) -> Option<i32> {
+                self.signal_raw()
+            }
+            fn core_dumped(&self) -> bool {
+                self.signal_raw().is_some() && self.raw() & 0x80 != 0
+            }
+            fn stopped_signal(&self) -> Option<i32> {
+                self.stopped_raw()
+            }
+            fn continued(&self) -> bool {
+                self.raw() == 0xffff
+            }
+            fn into_raw(self) -> i32 {
+                self.raw()
+            }
         }
     }
 }

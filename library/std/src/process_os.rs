@@ -73,7 +73,7 @@ pub struct ExitStatus {
 }
 
 impl ExitStatus {
-    pub(crate) fn from_raw(raw: i32) -> ExitStatus {
+    pub(crate) fn from_wait_status(raw: i32) -> ExitStatus {
         ExitStatus { raw }
     }
 
@@ -90,23 +90,43 @@ impl ExitStatus {
             None
         }
     }
+
+    /// The raw wait status (`ExitStatusExt::into_raw`).
+    pub(crate) fn raw(&self) -> i32 {
+        self.raw
+    }
+
+    /// glibc's `WIFSIGNALED` then `WTERMSIG`: the signal that ended
+    /// the process (`ExitStatusExt::signal`).
+    pub(crate) fn signal_raw(&self) -> Option<i32> {
+        if (((self.raw & 0x7f) + 1) as i8 >> 1) > 0 { Some(self.raw & 0x7f) } else { None }
+    }
+
+    /// glibc's `WIFSTOPPED` then `WSTOPSIG` (`ExitStatusExt::stopped_signal`).
+    pub(crate) fn stopped_raw(&self) -> Option<i32> {
+        if self.raw & 0xff == 0x7f { Some((self.raw >> 8) & 0xff) } else { None }
+    }
 }
 
 impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.code() {
-            Some(code) => write!(f, "exit status: {code}"),
-            None => {
-                let sig = self.raw & 0x7f;
-                match signal_name(sig) {
-                    Some(name) => write!(f, "signal: {sig} ({name})")?,
-                    None => write!(f, "signal: {sig}")?,
-                }
-                if self.raw & 0x80 != 0 {
-                    write!(f, " (core dumped)")?;
-                }
-                Ok(())
-            }
+        // std's unix Display: exited, signaled, stopped, continued, or
+        // an unrecognised raw status (`ExitStatusExt::from_raw`).
+        let name = |sig: i32| match signal_name(sig) {
+            Some(name) => format!(" ({name})"),
+            None => String::new(),
+        };
+        if let Some(code) = self.code() {
+            write!(f, "exit status: {code}")
+        } else if let Some(sig) = self.signal_raw() {
+            let core = if self.raw & 0x80 != 0 { " (core dumped)" } else { "" };
+            write!(f, "signal: {sig}{}{core}", name(sig))
+        } else if let Some(sig) = self.stopped_raw() {
+            write!(f, "stopped (not terminated) by signal: {sig}{}", name(sig))
+        } else if self.raw == 0xffff {
+            write!(f, "continued (WIFCONTINUED)")
+        } else {
+            write!(f, "unrecognised wait status: {} {:#x}", self.raw, self.raw)
         }
     }
 }
@@ -440,9 +460,29 @@ impl Command {
         packed
     }
 
-    /// Spawns the child with the given stdio configuration (the
-    /// entry points below supply std's defaults for their operation).
-    fn spawn_with(&self, specs: [StdioKind; 3]) -> io::Result<Child> {
+    /// `CommandExt::exec` (os.rs): replaces this process with the
+    /// program, unconfigured streams inherited, as std's `exec`. Returns
+    /// only the error of a failed exec (std's "nul byte" error first).
+    pub(crate) fn exec_here(&mut self) -> io::Error {
+        let (argv, cwd) = match self.checked_argv() {
+            Ok(parts) => parts,
+            Err(e) => return e,
+        };
+        let env = self.packed_env();
+        let specs = [
+            Command::kind_of(&self.stdin, StdioKind::Inherit),
+            Command::kind_of(&self.stdout, StdioKind::Inherit),
+            Command::kind_of(&self.stderr, StdioKind::Inherit),
+        ];
+        let (word, fds) = self.stdio_word(specs);
+        let code = core::intrinsics::sys_proc_exec(&self.program, &argv, &env, &cwd, word, &fds);
+        io::Error::from_raw_os_error(code)
+    }
+
+    /// The NUL-separated argv and the cwd bytes of a spawn or exec, or
+    /// std's error for a NUL byte in the program, an argument, an
+    /// environment change, or the working directory.
+    fn checked_argv(&self) -> io::Result<(Vec<u8>, Vec<u8>)> {
         if has_nul(&self.program) {
             return Err(nul_error());
         }
@@ -473,8 +513,12 @@ impl Command {
             }
             None => Vec::new(),
         };
-        let cwd_bytes: &[u8] = &cwd_owned;
-        let env = self.packed_env();
+        Ok((argv, cwd_owned))
+    }
+
+    /// The stdio spec word and packed fds of the spawn and exec
+    /// intrinsics (sysio.c has the format).
+    fn stdio_word(&self, specs: [StdioKind; 3]) -> (u32, Vec<u8>) {
         let mut fds: Vec<u8> = Vec::new();
         for i in 0..3 {
             let v = specs[i].fd() as i64 as u64;
@@ -483,6 +527,16 @@ impl Command {
             }
         }
         let word = specs[0].spec() | (specs[1].spec() << 2) | (specs[2].spec() << 4) | if self.cwd.is_some() { 64 } else { 0 };
+        (word, fds)
+    }
+
+    /// Spawns the child with the given stdio configuration (the
+    /// entry points below supply std's defaults for their operation).
+    fn spawn_with(&self, specs: [StdioKind; 3]) -> io::Result<Child> {
+        let (argv, cwd_owned) = self.checked_argv()?;
+        let cwd_bytes: &[u8] = &cwd_owned;
+        let env = self.packed_env();
+        let (word, fds) = self.stdio_word(specs);
         let mut out: Vec<u8> = Vec::new();
         let code = core::intrinsics::sys_proc_spawn(&self.program, &argv, &env, cwd_bytes, word, &fds, &mut out);
         if code != 0 {
@@ -574,7 +628,7 @@ impl Child {
         self.stdin = None;
         let v = core::intrinsics::sys_proc_wait(self.pid, true);
         if v >= 0 {
-            let st = ExitStatus::from_raw(v as i32);
+            let st = ExitStatus::from_wait_status(v as i32);
             self.status = Some(st);
             Ok(st)
         } else {
@@ -589,7 +643,7 @@ impl Child {
         }
         let v = core::intrinsics::sys_proc_wait(self.pid, false);
         if v >= 0 {
-            let st = ExitStatus::from_raw(v as i32);
+            let st = ExitStatus::from_wait_status(v as i32);
             self.status = Some(st);
             Ok(Some(st))
         } else if v == -2 {

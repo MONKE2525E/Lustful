@@ -105,6 +105,27 @@ int32_t lust_sys_fd_open(const uint8_t *p, uint64_t len, int32_t flags) {
     return fd < 0 ? -e : fd;
 }
 
+/* lust_sys_fd_open with std's OpenOptionsExt parts: `custom` flags
+   (the access mode bits already cleared) and the creation `mode`. */
+int32_t lust_sys_fd_open_ext(const uint8_t *p, uint64_t len, int32_t flags, int32_t custom, uint32_t mode) {
+    char *s = malloc(len + 1);
+    if (!s) lust_oom();
+    memcpy(s, p, len);
+    s[len] = 0;
+    int f = (flags & 3) | O_CLOEXEC | custom;
+    if (flags & 4) f |= O_CREAT;
+    if (flags & 8) f |= O_TRUNC;
+    if (flags & 16) f |= O_APPEND;
+    if (flags & 32) f |= O_EXCL;
+    int fd;
+    do {
+        fd = open(s, f, mode);
+    } while (fd < 0 && errno == EINTR);
+    int e = errno;
+    free(s);
+    return fd < 0 ? -e : fd;
+}
+
 /* Stdin: one process-wide buffer, as std's stdin. The buffer fills
    with a single read of up to 8192 bytes (std's stdin buffer size is
    also 8192 on Linux through BufReader::DEFAULT_BUF_SIZE, behind a
@@ -386,4 +407,85 @@ int32_t lust_sys_proc_spawn(const uint8_t *prog, uint64_t proglen, const uint8_t
     lust_sysio_push_u64(out, (uint64_t)pid);
     for (int i = 0; i < 3; i++) lust_sysio_push_u64(out, (uint64_t)(int64_t)(spec[i] == 2 ? pipes[i][i == 0 ? 1 : 0] : -1));
     return 0;
+}
+
+int32_t lust_sys_proc_exec(const uint8_t *prog, uint64_t proglen, const uint8_t *args, uint64_t argslen,
+                           const uint8_t *env, uint64_t envlen, const uint8_t *cwd, uint64_t cwdlen, uint32_t stdio,
+                           const uint8_t *fds, uint64_t fdslen) {
+    if (argslen == 0 || envlen == 0) return EINVAL;
+    int spec[3] = {(int)(stdio & 3), (int)((stdio >> 2) & 3), (int)((stdio >> 4) & 3)};
+    /* std's setup_io first: every stream's fd, then the dup2s. Our
+       ends of pipes and the /dev/null fds close when this returns. */
+    int theirs[3] = {-1, -1, -1}, ours[3] = {-1, -1, -1}, own[3] = {0, 0, 0};
+    int err = 0;
+    for (int i = 0; i < 3 && !err; i++) {
+        if (spec[i] == 1) {
+            theirs[i] = open("/dev/null", (i == 0 ? O_RDONLY : O_WRONLY) | O_CLOEXEC);
+            if (theirs[i] < 0) err = errno;
+            own[i] = 1;
+        } else if (spec[i] == 2) {
+            int pp[2];
+            if (pipe2(pp, O_CLOEXEC) != 0) {
+                err = errno;
+            } else {
+                theirs[i] = pp[i == 0 ? 0 : 1];
+                ours[i] = pp[i == 0 ? 1 : 0];
+                own[i] = 1;
+            }
+        } else if (spec[i] == 3) {
+            if (fdslen < (uint64_t)(i + 1) * 8) {
+                err = EINVAL;
+            } else {
+                uint64_t v = 0;
+                for (int k = 0; k < 8; k++) v |= (uint64_t)fds[i * 8 + k] << (8 * k);
+                theirs[i] = (int)(int64_t)v;
+            }
+        }
+    }
+    for (int i = 0; i < 3 && !err; i++) {
+        if (theirs[i] < 0) continue;
+        while (dup2(theirs[i], i) < 0) {
+            if (errno != EINTR) {
+                err = errno;
+                break;
+            }
+        }
+    }
+    char *prog_s = NULL, *cwd_s = NULL;
+    char **argv = NULL, **envp = NULL;
+    if (!err) {
+        int have_cwd = (stdio >> 6) & 1;
+        if (have_cwd) {
+            cwd_s = malloc(cwdlen + 1);
+            if (!cwd_s) lust_oom();
+            memcpy(cwd_s, cwd, cwdlen);
+            cwd_s[cwdlen] = 0;
+            if (chdir(cwd_s) != 0) err = errno;
+        }
+    }
+    if (!err) {
+        signal(SIGPIPE, SIG_DFL);
+        prog_s = malloc(proglen + 1);
+        if (!prog_s) lust_oom();
+        memcpy(prog_s, prog, proglen);
+        prog_s[proglen] = 0;
+        argv = lust_sysio_split(args, argslen);
+        char **saved = environ;
+        if (env[0] != 0) {
+            envp = lust_sysio_split(env + 1, envlen - 1);
+            environ = envp;
+        }
+        execvp(prog_s, argv);
+        err = errno;
+        environ = saved;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (own[i] && theirs[i] >= 0) close(theirs[i]);
+        if (ours[i] >= 0) close(ours[i]);
+    }
+    if (envp) lust_sysio_free_split(envp);
+    if (argv) lust_sysio_free_split(argv);
+    free(prog_s);
+    free(cwd_s);
+    return err;
 }

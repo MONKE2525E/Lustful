@@ -1052,6 +1052,16 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: ONLY_STD,
         implemented: true,
     },
+    // `OpenOptions::open` with std's custom flags and creation mode
+    // (OpenOptionsExt, sysio.c): the fd or -errno.
+    IntrinsicDef {
+        name: "sys_fd_open_ext",
+        c_symbol: "lust_sys_fd_open_ext",
+        params: &[S::Bytes, S::I32, S::I32, S::U32],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // Stdin through the process-wide buffer: up to `max` bytes into
     // the Vec, the count or -errno.
     IntrinsicDef {
@@ -1088,6 +1098,16 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         name: "sys_proc_spawn",
         c_symbol: "lust_sys_proc_spawn",
         params: &[S::Bytes, S::Bytes, S::Bytes, S::Bytes, S::U32, S::Bytes, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
+    // `CommandExt::exec`: the spawn inputs, run in this process
+    // (sysio.c); returns only the errno of a failed exec.
+    IntrinsicDef {
+        name: "sys_proc_exec",
+        c_symbol: "lust_sys_proc_exec",
+        params: &[S::Bytes, S::Bytes, S::Bytes, S::Bytes, S::U32, S::Bytes],
         ret: S::I32,
         allowed: ONLY_STD,
         implemented: true,

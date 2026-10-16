@@ -896,6 +896,24 @@ impl<R: Read + ?Sized> Read for &mut R {
     }
 }
 
+impl<R: Read + ?Sized> Read for Box<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (**self).read(buf)
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        (**self).read_exact(buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
+        (**self).read_to_end(buf)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        (**self).read_to_string(buf)
+    }
+}
+
 /// `BufRead::read_until`'s default over `fill_buf` and `consume`.
 fn read_until_default<B: BufRead + ?Sized>(r: &mut B, byte: u8, buf: &mut Vec<u8>) -> Result<usize> {
     let mut read = 0;
@@ -1006,6 +1024,24 @@ impl BufRead for &[u8] {
 }
 
 impl<B: BufRead + ?Sized> BufRead for &mut B {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        (**self).fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        (**self).consume(amt)
+    }
+
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize> {
+        (**self).read_until(byte, buf)
+    }
+
+    fn read_line(&mut self, buf: &mut String) -> Result<usize> {
+        (**self).read_line(buf)
+    }
+}
+
+impl<B: BufRead + ?Sized> BufRead for Box<B> {
     fn fill_buf(&mut self) -> Result<&[u8]> {
         (**self).fill_buf()
     }

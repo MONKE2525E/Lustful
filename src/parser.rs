@@ -4220,6 +4220,10 @@ impl<'a> Parser<'a> {
             ("Arc", "new") => 1,
             ("Rc" | "Arc", "clone" | "as_ptr" | "downgrade" | "strong_count" | "weak_count") => 1,
             ("Rc" | "Arc", "ptr_eq") => 2,
+            // As a closure, borrowck's `upgrade` rule applies inside it: the
+            // result shares `T` only, not the `&Weak` borrow
+            // (`.and_then(Weak::upgrade)` into an `Arc<dyn Tr>`).
+            ("Weak", "upgrade") => 1,
             ("char", "from_u32") => 1,
             ("MaybeUninit", "uninit" | "zeroed") => 0,
             // By-value predicates, so `trim_matches(char::is_whitespace)`
