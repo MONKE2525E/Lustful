@@ -56,9 +56,11 @@
 // rewrites that fn whole (`find_item_edit`), when its outline stands
 // (driver/item_outline.rs: everything name resolution reads from it). The
 // item rescans, and the compile tail runs the resolve path's slot update
-// in signatures mode with the fn's name as the changed name, then
-// collects in full (the kept programs go). A method is only ever called
-// by name, so a method's header edit also takes signatures mode (P1.5).
+// in signatures mode with the fn's name as the changed name. A kept
+// program stands when the signature delta redoes each edited header on it
+// (`reuse_kept`, driver/kept_delta.rs); else the tail collects in full. A
+// method is only ever called by name, so a method's header edit also
+// takes signatures mode (P1.5).
 use super::compile::{fn_def_at, fn_text_hash};
 use super::session::{Caches, Front};
 use super::span_shift::{self, Edit, FileRanges};
@@ -394,6 +396,8 @@ struct NewItem {
     item_ast: Ast,
     /// The written name of a method, for the changed-name list.
     name: Sym,
+    /// The old fn's expression range (`FnDef::exprs`).
+    old_exprs: (u32, u32),
 }
 
 /// The fn body side of a `BodyEdit`.
@@ -466,6 +470,9 @@ struct KeptEdit {
     old_exprs: (u32, u32),
     /// The fn returns `impl Trait` (`reuse_kept` compares hidden types).
     rpit: bool,
+    /// An item patch edit of the fn's header (`kept_delta::apply_headers`
+    /// redoes it on the program).
+    header: bool,
 }
 
 /// One edited fn's discovery output as the kept program was built with
@@ -491,12 +498,14 @@ pub(super) fn try_patch(
         .map(|e| KeptEdit {
             edit: e.edit,
             ctxts: FxMap::default(),
-            fn_index: e.body.as_ref().map(|b| b.fn_index),
-            plain: e.body.as_ref().is_none_or(|b| b.plain),
+            fn_index: e.body.as_ref().map(|b| b.fn_index).or(e.item.as_ref().map(|i| i.fn_index)),
+            // A header edit counts as not plain: the delta needs user generics.
+            plain: e.item.is_none() && e.body.as_ref().is_none_or(|b| b.plain),
             items: e.body.as_ref().map_or_else(Vec::new, |b| b.items.clone()),
             nested: e.body.as_ref().and_then(|b| b.nested),
-            old_exprs: e.body.as_ref().map_or((0, 0), |b| b.old_exprs),
+            old_exprs: e.body.as_ref().map(|b| b.old_exprs).or(e.item.as_ref().map(|i| i.old_exprs)).unwrap_or((0, 0)),
             rpit: e.body.as_ref().is_some_and(|b| b.rpit.is_some()),
+            header: e.item.is_some(),
         })
         .collect();
     // Everything above only read; from here the front state changes, and
@@ -521,17 +530,12 @@ pub(super) fn try_patch(
             }
         }
     }
-    // An item edit moves fn signatures: v1 drops the kept programs (the
-    // tail collects; sigedit P2 keeps them through `kept_delta.rs`).
-    let item_edit = edits.iter().any(|e| e.item.is_some());
+    // An item edit keeps the kept programs too: `reuse_kept` redoes its
+    // headers (`kept_delta::apply_headers`) or the tail collects.
     let mut ctxts: Vec<FxMap<u32, CtxtId>> = Vec::new();
     let out = apply(front, caches, edits, reads, &mut ctxts);
     if out.is_err() {
         front.patch = None;
-    } else if item_edit {
-        if caches.persistent && kept.iter().any(Option::is_some) {
-            let _ = crate::pool::thread("lust-drop").spawn(move || drop(kept));
-        }
     } else {
         for (slot, k) in kept.into_iter().enumerate() {
             if let Some(mut k) = k {
@@ -998,7 +1002,8 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
         *new_def = scratch;
     }
     item_ast.items.push(new_item);
-    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name })
+    let old_exprs = def.exprs;
+    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs })
 }
 
 /// The items (`stmt_items` indexes, in parse order) of the old fn body at
@@ -1749,6 +1754,18 @@ pub(super) fn reuse_kept(
         let (edit, ctxts) = (e.edit, &mut e.ctxts);
         spans += crate::check::prog_shift::shift_program(&mut p, &mut |s| edit.span(s, ctxts));
     }
+    // Item patch edits: the signature delta redoes each edited header
+    // (its own template check and reveal included).
+    let headers: Vec<super::kept_delta::HeaderEdit> = edits
+        .iter()
+        .filter(|e| e.header)
+        .filter_map(|e| Some(super::kept_delta::HeaderEdit { fn_index: e.fn_index?, old_exprs: e.old_exprs }))
+        .collect();
+    if !headers.is_empty() {
+        let front = &*front;
+        let reach = front.patch.as_ref().and_then(|b| b.reach.as_ref());
+        super::kept_delta::apply_headers(&mut p, front, caches, reach, &headers, walk_instances)?;
+    }
     // An edited fn that returns `impl Trait`: collect reveals its hidden
     // type from the new body, so the program stands only while that type
     // does (`Front::rpit_edit` sends the request on to collect otherwise).
@@ -1771,7 +1788,8 @@ pub(super) fn reuse_kept(
     let mut seen: Vec<usize> = Vec::new();
     for e in &edits {
         let Some(fn_index) = e.fn_index else { continue };
-        if p.gx.fn_class.get(fn_index) != Some(&FnClass::Template) || seen.contains(&fn_index) {
+        let header = edits.iter().any(|x| x.header && x.fn_index == Some(fn_index));
+        if header || p.gx.fn_class.get(fn_index) != Some(&FnClass::Template) || seen.contains(&fn_index) {
             continue;
         }
         seen.push(fn_index);
