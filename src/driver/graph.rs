@@ -928,6 +928,22 @@ fn hash_adt_regions(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut
     hash_def_pub(h, p, def);
     (p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len()) as u64).hash(h);
     p.regions.adt_facts.get(&def).hash(h);
+    // Its regioned trait bounds (tf-borrow r9): building a value replays them.
+    if let Some(bs) = p.regions.adt_bounds.get(&def) {
+        (bs.len() as u64).hash(h);
+        for b in bs {
+            if let Predicate::Trait(t) = b {
+                hash_def_pub(h, p, t.value.def);
+                for g in p.tys.args(t.value.args) {
+                    match *g {
+                        GenericArg::Ty(x) => hash_ty_refs(h, p, &p.tys, x, r),
+                        GenericArg::Lifetime(x) => hash_region(h, x),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
     let Some(variants) = p.regions.adt_fields.get(&def) else { return 0u8.hash(h) };
     (variants.len() as u64).hash(h);
     for fields in variants {

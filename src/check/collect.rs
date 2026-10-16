@@ -4290,6 +4290,14 @@ pub fn collect_reuse(
                 let def = p.defs.def_of_adt(id).expect("ADT defs are recorded in pass 1");
                 p.gx.param_defaults.insert(def, defaults);
             }
+            let bounds: Vec<Predicate> = {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                generics::regioned_bound_preds(ast, interner, known, &cx, &mut p.tys, &adt_scope, &g_ast, &w_ast, &[]).1
+            };
+            if bounds.iter().any(|pr| matches!(pr, Predicate::Trait(_))) {
+                let def = p.defs.def_of_adt(id).expect("ADT defs are recorded in pass 1");
+                p.regions.adt_bounds.insert(def, bounds);
+            }
             let env = generics::elaborate_env(&mut p.tys, &p.gx.index, &adt_generics.predicates);
             p.gx.adt_generics[id.0 as usize] = adt_generics;
             p.gx.adt_envs[id.0 as usize] = env;

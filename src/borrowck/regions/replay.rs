@@ -219,6 +219,34 @@ impl Builder<'_, '_> {
         self.replay_trait(pr.value.def, &acts, &binds, 0, &mut 0);
     }
 
+    /// A value of user Adt `dt` (slots `dv`) is built: its type is
+    /// well-formed, so the Adt's own bounds hold for its args.
+    pub(super) fn replay_adt(&mut self, dt: Ty, dv: &[u32]) {
+        let p = self.p;
+        let TyKind::Adt(def, _) = self.body.tys.kind(dt) else { return };
+        let Some(preds) = p.regions.adt_bounds.get(&def) else { return };
+        if self.sc.slots(dt) as usize != dv.len() {
+            return;
+        }
+        let View::Adt(_, lts, parts) = self.view(Act::Er(dt, dv.to_vec())) else { return };
+        let mut frame = Frame::default();
+        for (i, v) in lts.into_iter().enumerate() {
+            if let Some(v) = v {
+                frame.lts.insert(i as u32, v);
+            }
+        }
+        for (j, a) in parts.into_iter().enumerate() {
+            frame.tys.insert(j as u32, a);
+        }
+        let frame = Rc::new(frame);
+        let mut steps = 0;
+        for pred in preds {
+            if let Predicate::Trait(b) = *pred {
+                self.replay_pred(b, &frame, 0, &mut steps);
+            }
+        }
+    }
+
     /// A regioned trait bound (with its `Assoc = X` bindings) under `fr`.
     fn replay_pred(&mut self, b: Binder<TraitRef>, fr: &Rc<Frame>, depth: u32, steps: &mut u32) {
         let p = self.p;

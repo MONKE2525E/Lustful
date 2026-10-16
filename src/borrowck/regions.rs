@@ -223,6 +223,9 @@ pub struct RegionTables {
     pub impl_heads: FxMap<DefId, ImplHead>,
     /// Trait impls whose header or where-clauses may tie regions, by impl def.
     pub impl_regions: FxMap<DefId, ImplRegions>,
+    /// The trait bounds of user Adts (`struct W<Q: Tk<A>, A>`), regions
+    /// kept, by def: building a value replays them (`replay_adt`).
+    pub adt_bounds: FxMap<DefId, Vec<Predicate>>,
     /// Declared outlives facts between an Adt's lifetime params
     /// (`struct H<'a, 'b: 'a>`), by def: `(x, y)` is `'x: 'y` by param
     /// index, `y == STATIC_FACT` is `'static`. Every use of the type must
@@ -3669,6 +3672,8 @@ impl<'b, 'p> Builder<'b, 'p> {
                 for (i, o) in ops.iter().enumerate() {
                     self.into_place(o, dest, &[Proj::Downcast(*variant), Proj::Field(i as u32)]);
                 }
+                let dt = self.place(dest, &mut dv, &mut d);
+                self.replay_adt(dt, &dv);
             }
             Rvalue::Opt(_, Some(o)) => self.into_place(o, dest, &[Proj::Downcast(1), Proj::Field(0)]),
             Rvalue::Res(_, ok, o) => self.into_place(o, dest, &[Proj::Downcast(if *ok { 0 } else { 1 }), Proj::Field(0)]),
