@@ -74,6 +74,16 @@ pub(crate) struct Front {
     /// every passing body is a read-set candidate, so the users of the
     /// opaque type check again. Cleared by the request that collects.
     pub(crate) rpit_edit: bool,
+    /// Slots of read-set walk candidates that a failed collect left
+    /// unwalked: they kept their passing mark, but their stored reads may
+    /// be stale. The next request adds the ones still passing to its walk
+    /// (`compile`), so they recheck when a read moved. Full mode walks
+    /// every passing body anyway, so a compaction remap drops the list.
+    pub(crate) walk_pending: Vec<u32>,
+    /// Set by a failed collect of a request with a const fn edit: values
+    /// moved, and no body rechecked under them. The next request is a
+    /// const fn edit too (`compile`).
+    pub(crate) const_fn_pending: bool,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
     /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
@@ -375,6 +385,8 @@ impl Session {
                 prev_static_defs: None,
                 revalue_consts: false,
                 rpit_edit: false,
+                walk_pending: Vec::new(),
+                const_fn_pending: false,
                 items: Vec::new(),
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),

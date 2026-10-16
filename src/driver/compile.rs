@@ -1239,6 +1239,9 @@ fn slot_update(
             head: std::mem::take(&mut front.slot_head),
         };
         remap = Some((front.slot_of.clone(), old));
+        // Full mode walks every passing body, so the pending slots
+        // (old numbers) are covered.
+        front.walk_pending.clear();
         // Instance slots are not remapped: they get new numbers after
         // collect and recheck there (`slots_renumbered`).
         front.inst_slot.clear();
@@ -2242,6 +2245,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if front.resolved_crate && !wants_resolver {
         front.ast = Arc::default();
         front.env_hash = None;
+        front.walk_pending.clear();
+        front.const_fn_pending = false;
         front.prev_adt_ids.clear();
         front.prev_static_ids.clear();
         front.prev_order_fragile = false;
@@ -2896,6 +2901,39 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     });
     let nested_statics = visits.path != "patch" && front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
     let statics_may_move = nested_statics && front.prev_static_defs.is_none();
+    // What a failed collect left undone joins this request. A const fn
+    // edit (`Front::const_fn_pending`) makes this request one too, so every
+    // passing body is a candidate and generic reuse goes. Else the
+    // candidates it left unwalked (`Front::walk_pending`) join the walk
+    // while they still pass and no other rule listed them; a changed body
+    // lost its passing mark and rechecks.
+    // A slot past the passing marks is new here: it never passed.
+    let passed = |front: &Front, caches: &Caches, i: usize| front.fn_slot.get(i).is_some_and(|&s| caches.ok.get(s as usize) == Some(&true));
+    if std::mem::take(&mut front.const_fn_pending) {
+        const_fn_changed = true;
+        front.walk_pending.clear();
+        let mut listed = vec![false; fn_count];
+        changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
+        let cands: Vec<usize> = (0..fn_count).filter(|&i| passed(front, caches, i) && !listed[i]).collect();
+        mention_only.extend_from_slice(&cands);
+        changed.extend_from_slice(&cands);
+        changed.sort_unstable();
+    } else if !front.walk_pending.is_empty() {
+        let mut pending = vec![false; caches.ok.len()];
+        for s in std::mem::take(&mut front.walk_pending) {
+            if let Some(p) = pending.get_mut(s as usize) {
+                *p = true;
+            }
+        }
+        let mut listed = vec![false; fn_count];
+        changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
+        let cands: Vec<usize> = (0..fn_count)
+            .filter(|&i| front.fn_slot.get(i).is_some_and(|&s| pending.get(s as usize) == Some(&true)) && passed(front, caches, i) && !listed[i])
+            .collect();
+        mention_only.extend_from_slice(&cands);
+        changed.extend_from_slice(&cands);
+        changed.sort_unstable();
+    }
     // The trait-system half of this joins after collect (`gen_ok`).
     let mut gen_ok_here = caches.persistent && gen_env.is_some() && !const_fn_changed && !statics_may_move && !front.slots_renumbered;
     if !gen_ok_here {
@@ -3046,6 +3084,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // does a body patch's: its items are the last full resolve's,
             // and only a body moved (a const fn body that fails const
             // evaluation, say); the next request collects again.
+            // But this request's dirty state never reached the bodies:
+            // read-set walk candidates kept their passing mark for a walk
+            // that never ran (a body that calls a fn whose bound changed),
+            // a const fn edit moved values no body rechecked under, and
+            // collect may have seen a new trait system. The next request
+            // takes them over (`Front::walk_pending`,
+            // `Front::const_fn_pending`, `GenReuse::forget_failed_gate`).
+            front.walk_pending.extend(mention_only.iter().filter_map(|&i| front.fn_slot.get(i).copied()));
+            front.walk_pending.sort_unstable();
+            front.walk_pending.dedup();
+            front.const_fn_pending |= const_fn_changed;
+            caches.gen_reuse.forget_failed_gate();
             if caches.gen_reuse.template_errors != ds.len() && visits.path != "patch" {
                 front.env_hash = None;
             }

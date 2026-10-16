@@ -147,6 +147,8 @@ pub struct GenReuse {
     /// True unless this collect's trait-system key equals the last one;
     /// then every entry was dropped, and the driver rechecks every body.
     pub trait_changed: bool,
+    /// True once this collect reached `gate`.
+    gated: bool,
 }
 
 impl GenReuse {
@@ -173,6 +175,16 @@ impl GenReuse {
         }
         self.trait_key = Some(key.system);
         self.derive_key = Some(key.derives);
+        self.gated = true;
+    }
+
+    /// For a collect that failed after `gate` saw a new trait system: no
+    /// body rechecked under it, so the next collect must see the trait
+    /// system as changed again (drop every entry, recheck every body).
+    pub fn forget_failed_gate(&mut self) {
+        if self.gated && self.trait_changed {
+            self.trait_key = None;
+        }
     }
 
     /// For a build: true when derive lists moved since the last build
@@ -190,6 +202,7 @@ impl GenReuse {
     /// Resets the per-collect state before a collect runs.
     pub fn begin(&mut self) {
         self.trait_changed = true;
+        self.gated = false;
         self.memo.clear();
         self.tpl_out.clear();
         self.closure_out.clear();
@@ -205,6 +218,7 @@ impl GenReuse {
     /// template check, and the trait system stands.
     pub fn begin_kept(&mut self) {
         self.trait_changed = false;
+        self.gated = false;
         self.templates_checked = 0;
         self.templates_reused = 0;
         self.discovery_checked = 0;
