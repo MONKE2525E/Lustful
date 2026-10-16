@@ -104,6 +104,14 @@ speed and the parse thread counts chosen under
 `cfg!(feature = "jemalloc")` in `program.rs` differ in dev builds. That
 is accepted. The shipped binary is unchanged.
 
+## Example: ts-rust `backtrace`
+
+`crates/ts_goport` feature `backtrace` (default on) gates the
+`GOPORT_TRACE` debug output of tsgo's panic hook (`src/bin/tsgo.rs`).
+The fork's `.lust.toml` excludes it: a backtrace's text depends on the
+compiler's symbols and cannot match Cargo's byte for byte.
+`scripts/tsrust_parity.py` removes `GOPORT_TRACE` from its runs.
+
 ## Tools
 
 - `lust-port scan` reads the same config and evaluates
