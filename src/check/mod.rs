@@ -2010,7 +2010,10 @@ struct Ctx<'p> {
     /// `collect` calls whose target type a later use fixes
     /// (`let r = it.collect(); (r, n)` returned as `(Vec<String>, _)`):
     /// target, item, and span, checked at finish (`collect_target_ok`).
-    deferred_collect: Vec<(Ty, Ty, Span)>,
+    /// `collect` calls whose target only a later use fixes: target, item,
+    /// span, and the call (expr, receiver type, derefs) for the
+    /// `FromIterator` route (`Ctx::from_iter_route`).
+    deferred_collect: Vec<(Ty, Ty, Span, (ExprId, Ty, u8))>,
     /// `sum`/`product` calls whose item type was open: (target, item,
     /// is `sum`, span), checked at body end (`finish_deferred_sums`).
     deferred_sum: Vec<(Ty, Ty, bool, Span)>,
@@ -23799,8 +23802,14 @@ impl<'p> Ctx<'p> {
         // A deferred `as_deref` pick can bind type variables other
         // sites wait on, so it runs before the uninferred check.
         method::finish_deferred_lang_methods(self);
-        for (target, item, span) in std::mem::take(&mut self.deferred_collect) {
-            self.collect_target_ok(target, item, span);
+        for (target, item, span, (e, base, derefs)) in std::mem::take(&mut self.deferred_collect) {
+            // A source collection target (`BTreeMap`, `IndexMap`) takes the
+            // `FromIterator::from_iter` route, as at a call whose target is
+            // known; its deferred call is picked by `finish_deferred_methods`
+            // below.
+            if self.from_iter_route(e, target, item, span, base, derefs).is_none() {
+                self.collect_target_ok(target, item, span);
+            }
         }
         self.uninferred_site_args();
         // ARCH 2.4 run point: the obligation queue runs at body end to a fixpoint.

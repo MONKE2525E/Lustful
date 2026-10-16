@@ -1466,71 +1466,14 @@ impl<'p> Ctx<'p> {
                         self.rollback_vars(snap);
                     }
                 }
-                // A source collection (`BTreeMap`, `BTreeSet`, or a user
-                // type with a `FromIterator` impl, adapter crates
-                // included): the call is its
-                // `FromIterator::from_iter(self)`, as rustc's `collect`
-                // is (W-STD-C). The `Target: FromIterator<Item>`
-                // obligation proves the impl's bounds (`T: Ord`).
-                // Std ADTs take this route as before; a user ADT only
-                // when selection finds an impl for this item type, so
-                // a user type without one keeps the L0640 below.
-                // `VecDeque` is not here: its collect capacity is
-                // `Vec`'s, so it takes the builtin collect below and
-                // lowering wraps the `Vec` (W-STD-C phase 2).
-                let tr = self.resolve(target);
-                // A try target (`Result<C, E>` or `Option<C>`, F3):
-                // the source-collection question is about `C` and
-                // the item inside the `Result` or `Option`; the
-                // obligation and the deferred call stay on the whole
-                // target, as core's generic impl names it.
-                let (route_ty, route_item) = match self.try_collect_parts(tr) {
-                    Some((c, err)) => match self.try_collect_inner(item, err, span) {
-                        Some(inner) => (c, inner),
-                        None => return self.iter_bail(args),
-                    },
-                    None => (tr, item),
-                };
-                let from_iter_ref = |this: &mut Self| TraitRef {
-                    def: this.p.gx.lang.from_iterator,
-                    args: this.tys.intern_args(&[GenericArg::Ty(route_ty), GenericArg::Ty(route_item)]),
-                    bindings: EMPTY_BINDINGS,
-                };
-                if let Some(a) = self.tys.local_adt(route_ty).or_else(|| self.tys.adt_parts(route_ty).and_then(|(d, _)| self.tys.local_adt_of(d)))
-                    && !self.p.is_vec_deque_adt(a)
-                    && args.is_empty()
-                    && (self.p.is_std_adt(a)
-                        || {
-                            let r = from_iter_ref(self);
-                            matches!(self.select_obligation(r), Selection::Impl { .. })
-                        })
-                {
-                    // Each has one `FromIterator` impl, whose item is the
-                    // entry type: unify it now, so `collect::<BTreeMap<_,
-                    // _>>()` infers `K` and `V` from the items.
-                    let path = self.p.display_path(self.p.adt(a).name);
-                    let targs: Vec<Ty> = self.tys.adt_parts(route_ty).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
-                    let entry = match (path.rsplit("::").next(), targs.as_slice()) {
-                        (Some("BTreeMap"), [k, v]) => {
-                            let ts = self.tys.intern_tys(&[*k, *v]);
-                            Some(self.tys.intern(TyKind::Tuple(ts)))
-                        }
-                        (Some("BTreeSet"), [t]) => Some(*t),
-                        _ => None,
-                    };
-                    if let Some(entry) = entry
-                        && !self.unify(entry, route_item)
-                    {
-                        self.mismatch(span, entry, route_item);
-                        return self.iter_bail(args);
+                if args.is_empty() {
+                    match self.from_iter_route(e, target, item, span, actual_base, derefs) {
+                        Some(true) => return self.resolve(target),
+                        Some(false) => return self.iter_bail(args),
+                        None => {}
                     }
-                    let targs = self.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]);
-                    let trait_ref = TraitRef { def: self.p.gx.lang.from_iterator, args: targs, bindings: EMPTY_BINDINGS };
-                    self.obl.push_trait_at(trait_ref, span, 0);
-                    let name = self.p.interner.intern("from_iter");
-                    super::method::defer_trait_method(self, e, trait_ref, name, vec![GenericArg::Ty(actual_base)], derefs, Autoref::None);
-                    return tr;
                 }
+                let tr = self.resolve(target);
                 // A target only a later use fixes: checked at finish. A
                 // `FromIterator` ADT found then is still rejected there
                 // (its route above is picked here).
@@ -1539,7 +1482,7 @@ impl<'p> Ctx<'p> {
                 let open_pointee = matches!(self.tys.builtin_of(tr), Some(BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc)))
                     && self.tys.adt_first_ty_arg(tr).is_some_and(|e| matches!(self.kind(self.resolve(e)), TyKind::Infer(_)));
                 if (matches!(self.kind(tr), TyKind::Infer(_)) && !self.kind(tr).is_int_infer() && !self.kind(tr).is_float_infer()) || open_pointee {
-                    self.deferred_collect.push((target, item, span));
+                    self.deferred_collect.push((target, item, span, (e, actual_base, derefs)));
                 } else if !self.collect_target_ok(target, item, span) {
                     return self.iter_bail(args);
                 }
@@ -2003,6 +1946,81 @@ impl<'p> Ctx<'p> {
         Some(self.tys.intern(TyKind::Tuple(ts)))
     }
 
+    /// `collect` into a source collection (`BTreeMap`, `BTreeSet`, or a
+    /// user or adapter type with a `FromIterator` impl, `IndexMap`): the
+    /// call `e` becomes `FromIterator::from_iter(self)`, picked at body
+    /// end (W-STD-C). Used at the call when the target is known, and at
+    /// body end for a target only a later use fixed (`opt.map(|a|
+    /// a.iter().collect()).unwrap_or_default()` into a field). None when
+    /// the target is not such a type; Some(false) after a reported error.
+    pub(super) fn from_iter_route(&mut self, e: ExprId, target: Ty, item: Ty, span: Span, actual_base: Ty, derefs: u8) -> Option<bool> {
+        // A source collection (`BTreeMap`, `BTreeSet`, or a user
+        // type with a `FromIterator` impl, adapter crates
+        // included): the call is its
+        // `FromIterator::from_iter(self)`, as rustc's `collect`
+        // is (W-STD-C). The `Target: FromIterator<Item>`
+        // obligation proves the impl's bounds (`T: Ord`).
+        // Std ADTs take this route as before; a user ADT only
+        // when selection finds an impl for this item type, so
+        // a user type without one keeps the L0640 below.
+        // `VecDeque` is not here: its collect capacity is
+        // `Vec`'s, so it takes the builtin collect below and
+        // lowering wraps the `Vec` (W-STD-C phase 2).
+        let tr = self.resolve(target);
+        // A try target (`Result<C, E>` or `Option<C>`, F3):
+        // the source-collection question is about `C` and
+        // the item inside the `Result` or `Option`; the
+        // obligation and the deferred call stay on the whole
+        // target, as core's generic impl names it.
+        let (route_ty, route_item) = match self.try_collect_parts(tr) {
+            Some((c, err)) => match self.try_collect_inner(item, err, span) {
+                Some(inner) => (c, inner),
+                None => return Some(false),
+            },
+            None => (tr, item),
+        };
+        let from_iter_ref = |this: &mut Self| TraitRef {
+            def: this.p.gx.lang.from_iterator,
+            args: this.tys.intern_args(&[GenericArg::Ty(route_ty), GenericArg::Ty(route_item)]),
+            bindings: EMPTY_BINDINGS,
+        };
+        if let Some(a) = self.tys.local_adt(route_ty).or_else(|| self.tys.adt_parts(route_ty).and_then(|(d, _)| self.tys.local_adt_of(d)))
+            && !self.p.is_vec_deque_adt(a)
+            && (self.p.is_std_adt(a)
+                || {
+                    let r = from_iter_ref(self);
+                    matches!(self.select_obligation(r), Selection::Impl { .. })
+                })
+        {
+            // Each has one `FromIterator` impl, whose item is the
+            // entry type: unify it now, so `collect::<BTreeMap<_,
+            // _>>()` infers `K` and `V` from the items.
+            let path = self.p.display_path(self.p.adt(a).name);
+            let targs: Vec<Ty> = self.tys.adt_parts(route_ty).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+            let entry = match (path.rsplit("::").next(), targs.as_slice()) {
+                (Some("BTreeMap"), [k, v]) => {
+                    let ts = self.tys.intern_tys(&[*k, *v]);
+                    Some(self.tys.intern(TyKind::Tuple(ts)))
+                }
+                (Some("BTreeSet"), [t]) => Some(*t),
+                _ => None,
+            };
+            if let Some(entry) = entry
+                && !self.unify(entry, route_item)
+            {
+                self.mismatch(span, entry, route_item);
+                return Some(false);
+            }
+            let targs = self.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]);
+            let trait_ref = TraitRef { def: self.p.gx.lang.from_iterator, args: targs, bindings: EMPTY_BINDINGS };
+            self.obl.push_trait_at(trait_ref, span, 0);
+            let name = self.p.interner.intern("from_iter");
+            super::method::defer_trait_method(self, e, trait_ref, name, vec![GenericArg::Ty(actual_base)], derefs, Autoref::None);
+            return Some(true);
+        }
+        None
+    }
+
     /// The deferred collects whose target a later use made a `Vec`: that
     /// target has one `FromIterator` impl, so rustc's obligation pass
     /// before the next method call has already unified its element with
@@ -2010,13 +2028,13 @@ impl<'p> Ctx<'p> {
     /// True when one settled.
     fn settle_vec_collects(&mut self) -> bool {
         let mut settled = false;
-        for (target, item, span) in std::mem::take(&mut self.deferred_collect) {
+        for (target, item, span, call) in std::mem::take(&mut self.deferred_collect) {
             let t = self.resolve(target);
             if self.tys.vec_elem(t).is_some() {
                 self.collect_target_ok(t, item, span);
                 settled = true;
             } else {
-                self.deferred_collect.push((target, item, span));
+                self.deferred_collect.push((target, item, span, call));
             }
         }
         settled
