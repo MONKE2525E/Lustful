@@ -2662,8 +2662,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         });
         let mut mention_only = Vec::new();
         if const_fn_changed {
+            let mut listed = vec![false; fn_count];
+            changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
             for i in 0..fn_count {
-                if !changed.contains(&i) && caches.ok[front.fn_slot[i] as usize] {
+                if !listed[i] && caches.ok[front.fn_slot[i] as usize] {
                     mention_only.push(i);
                     changed.push(i);
                 }
@@ -3261,37 +3263,34 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut reads_invalidated = 0usize;
     if !mention_only.is_empty() {
         let slot_at = |i: usize| front.fn_slot[i] as usize;
-        // Clone the candidate read sets out of the caches so the walk can
-        // borrow the program while results land back in the caches.
-        let candidates: Vec<(usize, Option<crate::driver::graph::Reads>)> =
-            mention_only.iter().map(|&i| (i, caches.slot_reads.get(slot_at(i)).cloned().flatten())).collect();
-        let mut reused: Vec<usize> = Vec::new();
+        // First the dirty count of each candidate's stored reads (None:
+        // no stored reads), with the read sets borrowed in place; then
+        // the results land back in the caches.
         let mut memo = FxMap::default();
-        for (i, reads) in candidates {
-            match reads {
-                Some(r)
-                    if {
-                        let d = program.reads_dirty_memo(&r, &mut memo);
-                        reads_invalidated += d;
-                        d == 0
-                    } =>
-                {
-                    reused.push(i)
+        let dirty: Vec<Option<usize>> = mention_only
+            .iter()
+            .map(|&i| caches.slot_reads.get(slot_at(i)).and_then(Option::as_ref).map(|r| program.reads_dirty_memo(r, &mut memo)))
+            .collect();
+        // A mask, not a list: full mode makes every passing body a
+        // candidate, and `changed` holds them all.
+        let mut reused = vec![false; mention_only.iter().max().map_or(0, |&m| m + 1)];
+        for (&i, d) in mention_only.iter().zip(dirty) {
+            let s = slot_at(i);
+            match d {
+                Some(0) => {
+                    reused[i] = true;
+                    reads_reused += 1;
                 }
-                Some(_) => {
-                    let s = slot_at(i);
+                Some(d) => {
+                    reads_invalidated += d;
                     caches.has_out[s] = false;
                     caches.slot_reads[s] = None;
                 }
-                None => {
-                    let s = slot_at(i);
-                    caches.has_out[s] = false;
-                }
+                None => caches.has_out[s] = false,
             }
         }
-        if !reused.is_empty() {
-            reads_reused = reused.len();
-            changed.retain(|i| !reused.contains(i));
+        if reads_reused > 0 {
+            changed.retain(|&i| reused.get(i) != Some(&true));
         }
         t.lap("reads dirty walk");
     }
@@ -3305,10 +3304,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let slot = |i: usize| front.fn_slot[i] as usize;
     let mut reemit: Vec<(usize, ir::Body)> = Vec::new();
     let mut reemit_failed: Vec<usize> = Vec::new();
+    let mut in_changed = vec![false; program.fns.len()];
+    changed.iter().filter(|&&i| i < program.fns.len()).for_each(|&i| in_changed[i] = true);
     if req.cmd == Cmd::Build && !program.gx.has_generics {
         let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
         for i in 0..program.fns.len() {
-            if changed.contains(&i) {
+            if in_changed[i] {
                 continue;
             }
             let s = slot(i);
@@ -3345,7 +3346,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut work = changed.clone();
     work.extend(reemit_failed.iter().copied());
     if req.cmd == Cmd::Build {
-        work.extend((0..program.fns.len()).filter(|&i| !caches.has_out[slot(i)] && !changed.contains(&i)));
+        work.extend((0..program.fns.len()).filter(|&i| !caches.has_out[slot(i)] && !in_changed[i]));
     }
     // The instance Adt ids this build generates C under, and whether one
     // names another instance than in the C made since the last full
