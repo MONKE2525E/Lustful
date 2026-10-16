@@ -1732,12 +1732,6 @@ struct Ctx<'p> {
     /// (`finish_trait_fn_values`, `finish_trait_fn_calls`).
     deferred_trait_fn_values: Vec<(ExprId, TraitRef, Sym, Vec<GenericArg>, Span)>,
     deferred_trait_fn_calls: Vec<(ExprId, TraitRef, Sym, Vec<GenericArg>, Span)>,
-    /// `Some`, `Ok`, `Err`, `Box::new`, or `Rc::new` passed as a call
-    /// argument (`keep(Some, &x)` under `F: Fn(T) -> R`): borrowck does
-    /// not relate a fn item's signature at a generic Fn bound yet
-    /// (W-BORROW, ARCH 5.6), so at finish one whose input type may
-    /// borrow is a reject rather than a possible false accept.
-    deferred_item_args: Vec<(Ty, Span)>,
     /// Element types a builtin Vec method needs to be PartialEq
     /// (`contains`, `dedup`), re-tested at finish as above.
     deferred_eq: Vec<(Ty, Span)>,
@@ -2107,7 +2101,6 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_type_names: Vec::new(),
         deferred_trait_fn_values: Vec::new(),
         deferred_trait_fn_calls: Vec::new(),
-        deferred_item_args: Vec::new(),
         deferred_eq: Vec::new(),
         deferred_collect: Vec::new(),
         deferred_copy: Vec::new(),
@@ -13397,14 +13390,6 @@ impl<'p> Ctx<'p> {
                     }
                 }
                 self.reject_unsized_value(a);
-                let at = self.out.expr_ty[self.ei(a)];
-                if let TyKind::FnDef(def, _) = self.kind(self.resolve(at)) {
-                    let b = self.tys.builtins();
-                    if [b.option, b.result, b.boxed, b.rc].contains(&def) {
-                        let sp = self.span(a);
-                        self.deferred_item_args.push((at, sp));
-                    }
-                }
             }
         }
     }
@@ -21126,17 +21111,6 @@ impl<'p> Ctx<'p> {
             }
         }
         self.finish_unwind();
-        for (t, span) in std::mem::take(&mut self.deferred_item_args) {
-            let t = self.deep(t);
-            let TyKind::FnDef(_, args) = self.kind(t) else { continue };
-            if self.tys.args(args).iter().any(|g| g.as_ty().is_some_and(|e| object::may_borrow(self.p, &self.tys, e))) {
-                self.errs.push(not_yet(
-                    "L0702",
-                    span,
-                    "a builtin constructor or `Box::new`/`Rc::new` with a borrowing input as a call argument",
-                ));
-            }
-        }
         for (t, span) in std::mem::take(&mut self.deferred_string_from) {
             let t = self.deep(t);
             let tn = self.tn(t);

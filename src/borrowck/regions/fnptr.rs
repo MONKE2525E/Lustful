@@ -104,6 +104,30 @@ fn has_slot_kinds(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::Sym>>, tys: &i
     }
 }
 
+/// The vars `fn_nodes` gives one use of a fn's signature: one per
+/// early-bound lifetime, and the slot vars of each type param.
+struct SigNodes {
+    early: FxMap<u32, u32>,
+    tparams: FxMap<u32, Vec<u32>>,
+}
+
+/// True when regioned type `t` mentions a type param.
+fn contains_param(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Param(_) => true,
+        TyKind::Ref(_, _, x) | TyKind::Array(x, _) | TyKind::Slice(x) | TyKind::RawPtr(_, x) => contains_param(tys, x),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&x| contains_param(tys, x)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Projection(_, a) | TyKind::Opaque(_, a) => {
+            tys.args(a).iter().any(|g| g.as_ty().is_some_and(|x| contains_param(tys, x)))
+        }
+        TyKind::FnPtr(s) => {
+            let s = tys.sig(s).value;
+            tys.tys_of(s.inputs).iter().any(|&x| contains_param(tys, x)) || contains_param(tys, s.output)
+        }
+        _ => false,
+    }
+}
+
 /// Why a signature proof failed.
 pub(super) enum SubFail {
     /// A target binder would have to outlive another region.
@@ -158,33 +182,27 @@ impl Builder<'_, '_> {
     /// its params and of its return (paired with erased types `ins` and
     /// `out`): `'static` is var 0, an early-bound lifetime a fresh var of
     /// this use (one per lifetime; the fn's own `'a: 'b` facts become
-    /// edges), a late-bound one a source binder. None when the shapes do
-    /// not pair.
+    /// edges), a late-bound one a source binder, and the slots a type
+    /// param of the fn fills (`id::<&u8>`) vars of this use, one set per
+    /// param: a type param is fixed outside the pointer's binder, so it
+    /// cannot take a binder's region (rustc E0308, "one type is more
+    /// general than the other"). None when the shapes do not pair.
     pub(super) fn fn_nodes(&mut self, sig: &RegionSig, ins: &[Ty], out: Ty) -> Option<(Vec<Node>, Vec<Node>)> {
         if sig.params.len() != ins.len() {
             return None;
         }
-        let p = self.p;
-        let mut early: FxMap<u32, u32> = FxMap::default();
-        let mut node = |this: &mut Self, r: Region| match r {
-            Region::Static => Node::Var(0),
-            Region::Param(k) if sig.early.get(k as usize) == Some(&true) => Node::Var(*early.entry(k).or_insert_with(|| this.fresh())),
-            Region::Param(k) => Node::Late(k),
-            _ => Node::Late(10_000 + this.fresh()),
-        };
-        let mut side = |this: &mut Self, r: Ty, e: Ty| -> Option<Vec<Node>> {
-            let mut rs = Vec::new();
-            regions_of(&p.tys, r, &mut rs);
-            if rs.len() != this.sc.slots(e) as usize {
-                return None;
-            }
-            Some(rs.into_iter().map(|r| node(this, r)).collect())
-        };
+        let mut cx = SigNodes { early: FxMap::default(), tparams: FxMap::default() };
         let mut in_nodes = Vec::new();
         for (&r, &e) in sig.params.iter().zip(ins) {
-            in_nodes.extend(side(self, r, e)?);
+            if !self.sig_side_nodes(sig, &mut cx, r, e, &mut in_nodes) {
+                return None;
+            }
         }
-        let out_nodes = side(self, sig.ret, out)?;
+        let mut out_nodes = Vec::new();
+        if !self.sig_side_nodes(sig, &mut cx, sig.ret, out, &mut out_nodes) {
+            return None;
+        }
+        let early = cx.early;
         for &(a, b) in &sig.facts {
             if let (Region::Param(x), y) = (a, b) {
                 let (Some(&vx), vy) = (
@@ -203,6 +221,88 @@ impl Builder<'_, '_> {
             }
         }
         Some((in_nodes, out_nodes))
+    }
+
+    /// One param or the return of `fn_nodes`: regioned type `r` of the
+    /// fn's signature walked with erased type `e` of this use, pushing one
+    /// node per slot of `e`. False when the shapes do not pair.
+    fn sig_side_nodes(&mut self, sig: &RegionSig, cx: &mut SigNodes, r: Ty, e: Ty, out: &mut Vec<Node>) -> bool {
+        let p = self.p;
+        let (tys, et) = (&p.tys, &self.body.tys);
+        match (tys.kind(r), et.kind(e)) {
+            (TyKind::Param(j), _) => {
+                let n = self.sc.slots(e) as usize;
+                let vs = match cx.tparams.get(&j.0) {
+                    Some(vs) => vs.clone(),
+                    None => {
+                        let vs: Vec<u32> = (0..n).map(|_| self.fresh()).collect();
+                        cx.tparams.insert(j.0, vs.clone());
+                        vs
+                    }
+                };
+                out.extend(vs.iter().map(|&v| Node::Var(v)));
+                vs.len() == n
+            }
+            (TyKind::Ref(rr, rm, ri), TyKind::Ref(_, em, ei)) if rm == em => {
+                let n = self.sig_region_node(sig, cx, rr);
+                out.push(n);
+                self.sig_side_nodes(sig, cx, ri, ei, out)
+            }
+            (TyKind::Adt(..), _) if !contains_param(tys, r) => self.sig_side_flat(sig, cx, r, e, out),
+            (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
+                let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+                for k in 0..adt_regions(p, et, e) as usize {
+                    let n = match lts.get(k) {
+                        Some(&x) => self.sig_region_node(sig, cx, x),
+                        None => return false,
+                    };
+                    out.push(n);
+                }
+                let rargs: Vec<Ty> = tys.args(ra).iter().filter_map(|g| g.as_ty()).collect();
+                let eargs: Vec<Ty> = self.body.tys.args(ea).iter().filter_map(|g| g.as_ty()).collect();
+                rargs.len() == eargs.len() && rargs.into_iter().zip(eargs).all(|(x, y)| self.sig_side_nodes(sig, cx, x, y, out))
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                let (xs, ys) = (tys.tys_of(a).to_vec(), et.tys_of(b).to_vec());
+                xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.sig_side_nodes(sig, cx, x, y, out))
+            }
+            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
+                self.sig_side_nodes(sig, cx, a, b, out)
+            }
+            _ => self.sig_side_flat(sig, cx, r, e, out),
+        }
+    }
+
+    /// `sig_side_nodes` for a type without type params of the fn: its
+    /// written regions, one per slot of `e`.
+    fn sig_side_flat(&mut self, sig: &RegionSig, cx: &mut SigNodes, r: Ty, e: Ty, out: &mut Vec<Node>) -> bool {
+        let mut rs = Vec::new();
+        regions_of(&self.p.tys, r, &mut rs);
+        if rs.len() != self.sc.slots(e) as usize {
+            return false;
+        }
+        for r in rs {
+            let n = self.sig_region_node(sig, cx, r);
+            out.push(n);
+        }
+        true
+    }
+
+    /// The node of region `r` of a fn's signature (`fn_nodes`).
+    fn sig_region_node(&mut self, sig: &RegionSig, cx: &mut SigNodes, r: Region) -> Node {
+        match r {
+            Region::Static => Node::Var(0),
+            Region::Param(k) if sig.early.get(k as usize) == Some(&true) => match cx.early.get(&k) {
+                Some(&v) => Node::Var(v),
+                None => {
+                    let v = self.fresh();
+                    cx.early.insert(k, v);
+                    Node::Var(v)
+                }
+            },
+            Region::Param(k) => Node::Late(k),
+            _ => Node::Late(10_000 + self.fresh()),
+        }
     }
 
     /// The variance of each slot of the inputs (contravariant) and the

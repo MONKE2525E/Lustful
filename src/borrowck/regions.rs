@@ -6364,12 +6364,19 @@ impl<'b, 'p> Builder<'b, 'p> {
         let bv = self.fresh();
         self.bound_var = Some(bv);
         let mut ok = true;
+        // The source's own type params (`id::<T>`'s T) bind once for all
+        // inputs and the output, so `fn id<T>(x: T) -> T` carries its
+        // input's regions to its output. `inst` records their types in
+        // `bind_tys` under the source's param indices, which are not the
+        // callee's: those entries are undone after.
+        let saved = self.bind_tys.clone();
+        let mut own = FxMap::default();
         for (&st, &j) in s_ins.iter().zip(ins).chain(std::iter::once((&s_out, &out))) {
-            let (Some(&at), Some(bvs)) = (self.bind_tys.get(&j), binds.get(&j)) else {
+            let (Some(&at), Some(bvs)) = (saved.get(&j), binds.get(&j)) else {
                 ok = false;
                 break;
             };
-            let (mut pv, mut own) = (Vec::new(), FxMap::default());
+            let mut pv = Vec::new();
             if !self.inst(st, at, &univ, &mut own, &mut pv) || pv.len() != bvs.len() {
                 ok = false;
                 break;
@@ -6380,6 +6387,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
         }
         self.bound_var = None;
+        self.bind_tys = saved;
         ok
     }
 
