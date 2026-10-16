@@ -29,7 +29,8 @@ Steps, on a scratch copy of the fork (never a fork change):
 Usage: tsrust_build.py --fork DIR --lust PATH --work DIR [--only a,b] [--max-rounds N]
                        [--timeout SECS] [-j N] [--max-bugs N] [--reuse] [--clean]
 --reuse keeps <work>/fork from an earlier run (fast reruns after a lust fix); --clean removes the
-big dirs at the end (tsrust-full.sh --boat --build adds it).
+big dirs at the end and keeps the pruned sources as fork-src.tgz (tsrust-full.sh --boat --build
+adds it).
 Targets default to the three library crates in dependency order. Output: <work>/build.json,
 a table of bugs and diffs, and the last line
   tsrust-build: <b>/<libs> build, <same>/<ran> tests same, <k> build bugs, <d> diffs, <f> false accepts
@@ -637,6 +638,8 @@ def main():
     log(f"{nb}/{len(libs)} build, {same}/{len(report['runs'])} tests same, {len(report['build_bugs'])} build bugs, "
         f"{len(diffs)} diffs, {len(report['false_accepts'])} false accepts")
     if a.clean:
+        # The pruned sources stay, for repros (a few MB): fork-src.tgz.
+        subprocess.run(["tar", "-czf", str(work / "fork-src.tgz"), "--exclude=target", "--exclude=.lust-cache", "-C", str(work), "fork"])
         for d in ("fork", "cargo-target", "lust-cache", "run-tmp", "bin", "bisect-bin"):
             p = work / d
             shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)

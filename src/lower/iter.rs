@@ -5991,7 +5991,13 @@ impl Ex<'_, '_> {
 
     /// (size, align) of a type, as Rust lays it out.
     fn layout(&self, t: Ty) -> Result<(u64, u64), String> {
-        let l = crate::ty::layout::layout_of_ty(&self.body.tys, self.p, t).map_err(|_| "iterator expansion: element layout unknown".to_string())?;
+        let l = crate::ty::layout::layout_of_ty(&self.body.tys, self.p, t).map_err(|_| self.layout_unknown(t))?;
         Ok((l.size, l.align))
+    }
+
+    /// The error for an element type `layout_of_ty` has no layout for
+    /// (it names the type, so a build failure points at the gap).
+    fn layout_unknown(&self, t: Ty) -> String {
+        format!("iterator expansion: element layout unknown: `{}`", crate::check::collect::ty_name(self.p, &self.body.tys, t))
     }
 }
