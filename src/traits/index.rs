@@ -12,7 +12,7 @@ use crate::intern::{FxMap, Sym};
 use crate::ty::*;
 
 /// The index of one impl record in the `ImplIndex`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ImplId(pub u32);
 
 /// The head of a Self type: the bucket key of section 2.3. `&T` and
@@ -63,8 +63,9 @@ pub enum Synthetic {
     /// A written `impl` item.
     None,
     /// A `#[derive]` expansion (section 2.2). The payload is the
-    /// derive name (`Clone`, `Debug`, ...).
-    Derive(Sym),
+    /// derive name (`Clone`, `Debug`, ...) and its derive bit
+    /// (check/derive_delta.rs `bit`).
+    Derive(Sym, u16),
     /// A lang-trait fact for a builtin type (for example the
     /// `IntoIterator` blanket, `From<T> for T`, slice `Index`).
     /// These records exist so selection and coherence see one impl
@@ -248,6 +249,13 @@ pub struct ImplIndex {
     /// and a where clause they can satisfy is no disproof. A negative
     /// impl (`!Clone for &mut T`, flagged) only conflicts.
     shadows: Vec<(ImplRecord, bool)>,
+    /// The derived record of each (Adt template def, trait def), dead or
+    /// alive (`set_dead`).
+    derived: FxMap<(DefId, DefId), ImplId>,
+    /// Records a derive delta took out (check/derive_delta.rs): they keep
+    /// their ids and slots, but no bucket, trait list, def lookup, or
+    /// `all_impls` walk sees them, as if collect had never made them.
+    dead: Vec<bool>,
 }
 
 impl ImplIndex {
@@ -333,8 +341,57 @@ impl ImplIndex {
             self.blankets.entry(rec.trait_def).or_default().push(id);
         }
         self.by_trait.entry(rec.trait_def).or_default().push(id);
+        if let (Synthetic::Derive(..), SelfHead::Adt(adt)) = (rec.synthetic, rec.head) {
+            self.derived.insert((adt, rec.trait_def), id);
+        }
         self.impls.push(rec);
+        self.dead.push(false);
         id
+    }
+
+    /// The derived record of trait `trait_def` for the Adt template
+    /// `adt`, alive or dead (None: collect never made one).
+    pub fn derived_record(&self, adt: DefId, trait_def: DefId) -> Option<ImplId> {
+        self.derived.get(&(adt, trait_def)).copied()
+    }
+
+    /// The number of impl records, dead ones included (ids run below it).
+    pub fn record_count(&self) -> usize {
+        self.impls.len()
+    }
+
+    /// True when a derive delta took the record out (`set_dead`).
+    pub fn is_dead(&self, id: ImplId) -> bool {
+        self.dead[id.0 as usize]
+    }
+
+    /// Takes a derived record out of every lookup, or puts it back in its
+    /// old place (check/derive_delta.rs). Ids and insert order stand, so
+    /// the live records keep the order a collect without the dead ones
+    /// would give them. Only derived records (never blankets) toggle.
+    pub fn set_dead(&mut self, id: ImplId, dead: bool) {
+        let i = id.0 as usize;
+        if self.dead[i] == dead {
+            return;
+        }
+        self.dead[i] = dead;
+        let (def, key) = (self.impls[i].def, (self.impls[i].trait_def, self.impls[i].head));
+        debug_assert!(self.impls[i].blanket.is_none() && matches!(self.impls[i].synthetic, Synthetic::Derive(..)));
+        let lists = [self.buckets.entry(key).or_default(), self.by_trait.entry(key.0).or_default()];
+        for list in lists {
+            match (list.binary_search(&id), dead) {
+                (Ok(at), true) => {
+                    list.remove(at);
+                }
+                (Err(at), false) => list.insert(at, id),
+                _ => {}
+            }
+        }
+        if dead {
+            self.by_def.remove(&def);
+        } else {
+            self.by_def.insert(def, id);
+        }
     }
 
     /// Records one coherence-only std impl (see `shadows`).
@@ -343,11 +400,11 @@ impl ImplIndex {
     }
 
     /// One impl record by id. Handing out a derived record notes a read
-    /// of its Adt's derive list (check/derive_delta.rs).
+    /// of its trait in its Adt's derive list (check/derive_delta.rs).
     pub fn get(&self, id: ImplId) -> &ImplRecord {
         let rec = &self.impls[id.0 as usize];
-        if let (Synthetic::Derive(_), SelfHead::Adt(def)) = (rec.synthetic, rec.head) {
-            crate::check::derive_delta::note_def(def);
+        if let (Synthetic::Derive(_, bit), SelfHead::Adt(def)) = (rec.synthetic, rec.head) {
+            crate::check::derive_delta::note_def(def, bit);
         }
         rec
     }
@@ -359,7 +416,7 @@ impl ImplIndex {
 
     /// Every impl record, in insert order.
     pub fn all_impls(&self) -> impl Iterator<Item = (ImplId, &ImplRecord)> {
-        self.impls.iter().enumerate().map(|(i, r)| (ImplId(i as u32), r))
+        self.impls.iter().enumerate().filter(|&(i, _)| !self.dead[i]).map(|(i, r)| (ImplId(i as u32), r))
     }
 
     /// Every impl of one trait, in insert order.
@@ -932,12 +989,14 @@ impl ImplIndex {
     /// trait refs unify (Self, every input, and bindings) and no
     /// where clause of either is disprovable by the orphan test.
     /// The caller reports each pair as an overlapping-impls error at the later impl.
+    /// Only pairs with a side `only` takes are tested (a derive delta's scope).
     pub fn coherence_overlaps(
         &self,
         tys: &mut impl TyIntern,
         fundamental: &[DefId],
         by_construction: &[DefId],
         is_local: &dyn Fn(DefId) -> bool,
+        only: &dyn Fn(ImplId) -> bool,
     ) -> Vec<(ImplId, ImplId)> {
         // Pair generation by Self head, not all pairs per trait:
         // two non-blanket impls whose Self heads differ cannot unify
@@ -975,6 +1034,9 @@ impl ImplIndex {
         let mut out = Vec::new();
         for (a, b) in pairs {
             let (ra, rb) = (self.get(a), self.get(b));
+            if !only(a) && !only(b) {
+                continue;
+            }
             if self.pair_overlaps(tys, ra, rb, fundamental, by_construction, is_local) {
                 out.push((a, b));
             }
@@ -983,7 +1045,8 @@ impl ImplIndex {
     }
 
     /// The local impls that overlap a coherence-only std impl (see
-    /// `shadows`), each once, in index order.
+    /// `shadows`), each once, in index order. Only impls `only` takes
+    /// are tested (a derive delta's scope; collect takes all).
     pub fn shadow_overlaps(
         &self,
         tys: &mut impl TyIntern,
@@ -991,10 +1054,11 @@ impl ImplIndex {
         by_construction: &[DefId],
         is_local: &dyn Fn(DefId) -> bool,
         user_impl: &dyn Fn(ImplId) -> bool,
+        only: &dyn Fn(ImplId) -> bool,
     ) -> Vec<ImplId> {
         let mut out = Vec::new();
         for (id, rec) in self.all_impls() {
-            if !user_impl(id) {
+            if !user_impl(id) || !only(id) {
                 continue;
             }
             if self.shadows.iter().any(|(s, _)| s.trait_def == rec.trait_def && self.pair_overlaps(tys, s, rec, fundamental, by_construction, is_local)) {
@@ -1241,7 +1305,7 @@ mod tests {
         let pb = trait_pred(&mut g, b_tr, p0);
         let x = add_impl(&mut g, &mut index, 1000, tr, p0, &[], 1, vec![pa]);
         let y = add_impl(&mut g, &mut index, 1001, tr, p0, &[], 1, vec![pb]);
-        assert_eq!(index.coherence_overlaps(&mut g, &[], &[], &is_local), [(x, y)]);
+        assert_eq!(index.coherence_overlaps(&mut g, &[], &[], &is_local, &|_| true), [(x, y)]);
     }
 
     /// The orphan positive case: `impl<T: A> Tr for T` next to
@@ -1258,9 +1322,9 @@ mod tests {
         let pa = trait_pred(&mut g, a_tr, p0);
         add_impl(&mut g, &mut index, 1000, tr, p0, &[], 1, vec![pa]);
         add_impl(&mut g, &mut index, 1001, tr, my_ty, &[], 0, vec![]);
-        assert!(index.coherence_overlaps(&mut g, &[], &[], &is_local).is_empty());
+        assert!(index.coherence_overlaps(&mut g, &[], &[], &is_local, &|_| true).is_empty());
         add_impl(&mut g, &mut index, 1002, a_tr, my_ty, &[], 0, vec![]);
-        assert_eq!(index.coherence_overlaps(&mut g, &[], &[], &is_local).len(), 1);
+        assert_eq!(index.coherence_overlaps(&mut g, &[], &[], &is_local, &|_| true).len(), 1);
     }
 
     /// The same impl twice overlaps; the same Self with different
@@ -1274,9 +1338,9 @@ mod tests {
         let s_ty = g.mk_adt(s, &[]);
         add_impl(&mut g, &mut index, 1000, tr, s_ty, &[int(IntTy::U8)], 0, vec![]);
         add_impl(&mut g, &mut index, 1001, tr, s_ty, &[int(IntTy::U16)], 0, vec![]);
-        assert!(index.coherence_overlaps(&mut g, &[], &[], &is_local).is_empty());
+        assert!(index.coherence_overlaps(&mut g, &[], &[], &is_local, &|_| true).is_empty());
         add_impl(&mut g, &mut index, 1002, tr, s_ty, &[int(IntTy::U8)], 0, vec![]);
-        assert_eq!(index.coherence_overlaps(&mut g, &[], &[], &is_local).len(), 1);
+        assert_eq!(index.coherence_overlaps(&mut g, &[], &[], &is_local, &|_| true).len(), 1);
     }
 
     /// The blanket-plus-concrete `IntoIterator` shape: the
@@ -1294,7 +1358,7 @@ mod tests {
         add_impl(&mut g, &mut index, 1001, into_tr, range_ty, &[], 0, vec![]);
         let pi = trait_pred(&mut g, iter_tr, p0);
         add_impl(&mut g, &mut index, 1002, into_tr, p0, &[], 1, vec![pi]);
-        assert!(index.coherence_overlaps(&mut g, &[], &[], &is_local).is_empty());
+        assert!(index.coherence_overlaps(&mut g, &[], &[], &is_local, &|_| true).is_empty());
     }
 
     /// The orphan rule: foreign trait for a foreign type fails, a
@@ -1438,7 +1502,7 @@ mod tests {
             }
         }
         naive.sort_by_key(|(a, b)| (a.0, b.0));
-        let fast = index.coherence_overlaps(&mut g, &[], &[], &is_local);
+        let fast = index.coherence_overlaps(&mut g, &[], &[], &is_local, &|_| true);
         assert_eq!(fast, naive);
         // The duplicate, the generic-Adt pair, and the ref pair.
         assert_eq!(fast.len(), 3);

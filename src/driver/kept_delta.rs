@@ -210,7 +210,7 @@ fn untouched_refusals(
 /// (`reuse_kept` does the same for a body edit): its old picks and
 /// closure call kinds go, the check records new ones. Its closures must be
 /// the registered ones, and its own `impl Trait` must keep its hidden type.
-fn recheck_template(p: &mut Program, f: LocalDefId, old: &[(u32, u32)], caches: &mut Caches) -> Result<(), &'static str> {
+pub(super) fn recheck_template(p: &mut Program, f: LocalDefId, old: &[(u32, u32)], caches: &mut Caches) -> Result<(), &'static str> {
     if !generics::template_closures_stand(p, f) {
         return Err("closures");
     }
@@ -331,7 +331,7 @@ impl Touched {
                 names.contains(&b.name) || matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d))
             }
             ReadKey::Checked(_) => true,
-            ReadKey::ImplSet(_) | ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) => false,
+            ReadKey::ImplSet(_) | ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => false,
         })
     }
 }
@@ -450,15 +450,40 @@ fn replay_bodies(
             recheck_template(p, t, &[(lo, hi)], caches)?;
         }
         super::laps::mark("collect/delta replay templates");
+        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched)
+    })();
+    (p.record_reads, p.unwind) = (record_reads, unwind);
+    out
+}
+
+/// Mono's discovery checks of plain bodies after a kept-program delta (the
+/// header delta above, the derive delta in driver/kept_derive.rs), as a
+/// collect with generic reuse runs them. A body stands when the program
+/// holds its entry (none stored after `Program::reuse_stamp`) and the entry
+/// reads no node `touched` names, or when its stored output still holds.
+/// An entry stored after the program's stamp (and before `start`, when the
+/// delta began) checks against the output the program keeps for it
+/// (`bases`). Every other body checks again and must give the output
+/// collect built the program with (`GenReuse::out_copy`). A check still
+/// pending gives it too, as collect's last check of that body was; it is
+/// kept, not stored, as collect keeps it.
+pub(super) fn replay_discovery(
+    p: &mut Program,
+    caches: &mut Caches,
+    fn_count: usize,
+    walk_instances: bool,
+    start: u64,
+    bases: &Bases,
+    touched: &mut dyn FnMut(&Program, &ReadKey) -> bool,
+) -> Result<(), &'static str> {
+    let (record_reads, unwind) = (p.record_reads, p.unwind);
+    (p.record_reads, p.unwind) = (true, false);
+    let out = (|| {
         let reuse = &mut caches.gen_reuse;
         for g in (0..fn_count as u32).map(LocalDefId) {
             if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
                 continue;
             }
-            // A holding entry stands for this program's output only when
-            // this program stored or replayed it (`Program::reuse_stamp`);
-            // a newer one checks again against the output the program
-            // keeps for it (`own_bases`), if it keeps one.
             let own = bases.iter().find(|b| b.0 == g.0 as usize).map(|b| b.1.as_ref());
             let base = if reuse.newer(p, g, p.reuse_stamp, start) {
                 own.ok_or("sig mode")?.cloned()
@@ -467,17 +492,19 @@ fn replay_bodies(
             } else {
                 reuse.out_copy(p.def_id(g))
             };
-            let base = base.ok_or("discovery")?;
-            let (checked, discarded) = crate::check::check_fn(p, g);
-            if checked.closure_map_pending {
+            let Some(base) = base else {
+                crate::check::derive_delta::log(&|| format!("discovery {}: no output kept\n", p.display_name(p.fn_def(g).name)));
                 return Err("discovery");
-            }
+            };
+            let (checked, discarded) = crate::check::check_fn(p, g);
+            let pending = checked.closure_map_pending;
             let out = generics::discovery_out(p, &checked, &discarded);
             if !base.same(p, &out, walk_instances) {
+                crate::check::derive_delta::log(&|| format!("discovery {}: output differs (pending {pending})\n", p.display_name(p.fn_def(g).name)));
                 return Err("discovery");
             }
             let (adt_tys, reqs, closures, vts) = &out;
-            if discarded.is_empty() {
+            if discarded.is_empty() && !pending {
                 reuse.store_discovered(p, g, &checked.reads, adt_tys, reqs, closures, vts);
             } else {
                 reuse.note_unstored(p, g, adt_tys, reqs, closures, vts);

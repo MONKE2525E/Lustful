@@ -200,7 +200,7 @@ fn log(line: &str) {
 /// a panic with a `Failure` payload. Passing checks log
 /// `itempatch oracle: ok ...`, so a sweep can count them; every other
 /// line is a failure.
-fn fail(what: &str, path: &str, detail: &str) -> ! {
+pub(super) fn fail(what: &str, path: &str, detail: &str) -> ! {
     let line = format!("itempatch oracle: {what} (path={path}): {detail}");
     log(&line);
     eprintln!("{line}");

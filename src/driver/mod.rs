@@ -9,6 +9,7 @@ pub mod cache;
 mod compile;
 mod const_reach;
 pub(crate) mod kept_delta;
+mod kept_derive;
 pub(crate) mod laps;
 mod item_oracle;
 mod item_outline;

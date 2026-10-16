@@ -193,11 +193,16 @@ pub enum ReadKey {
     /// binding the body names. The fingerprint is the answer.
     TraitInScope(ModuleId, DefId),
     /// The derive list of one local Adt template (PLAN R12): every
-    /// `Program::derives_of` call inside a body check, and every trait
-    /// selection whose Self head is the Adt (a derived impl is a
+    /// `Program::derives_of` call inside a body check, and every selection
+    /// of a derivable trait whose Self head is the Adt (a derived impl is a
     /// synthetic record, which no `ImplSet` read covers). The
     /// fingerprint is the list itself (`derives_fingerprint`).
     Derives(DefId),
+    /// Some traits of the derive list of one local Adt template (sigedit
+    /// P3.2): a reader that asked only those (`Program::derive_has`, a
+    /// derivable trait's selection) records their bits
+    /// (check/derive_delta.rs `bit`). The fingerprint is those flags.
+    DeriveBits(DefId, u16),
 }
 
 /// One recorded read: the fingerprint the node had when it was read, and
@@ -220,6 +225,10 @@ pub struct Reads {
     /// exits after this compile): it records nothing and computes no
     /// fingerprints.
     off: bool,
+    /// The identity the read index (`ReadIndex`) gave this set's content,
+    /// or 0 when none: a new key resets it, so a changed set is indexed
+    /// again.
+    seal: u64,
 }
 
 impl Reads {
@@ -230,7 +239,7 @@ impl Reads {
 
     /// A sink that records nothing (see `off`).
     pub fn off() -> Reads {
-        Reads { map: FxMap::default(), off: true }
+        Reads { map: FxMap::default(), off: true, seal: 0 }
     }
 
     /// Records one read. The first record of a key wins.
@@ -238,7 +247,10 @@ impl Reads {
         if self.off {
             return;
         }
-        self.map.entry(key).or_insert(Read { fingerprint, failed });
+        if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
+            v.insert(Read { fingerprint, failed });
+            self.seal = 0;
+        }
     }
 
     /// Records one read, computing the fingerprint only if the key is new:
@@ -250,6 +262,7 @@ impl Reads {
         }
         if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
             v.insert(Read { fingerprint: fingerprint(), failed });
+            self.seal = 0;
         }
     }
 
@@ -795,8 +808,8 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(
     adt.repr.int.hash(h);
     adt.repr.align.hash(h);
     adt.repr.pack.hash(h);
-    let d = adt.derives_unlogged();
-    (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(h);
+    // The derive list is not part of the layout (PLAN R12, P3.3): every
+    // reader of it records its own `Derives` read (check/derive_delta.rs).
     // `#[non_exhaustive]` changes match exhaustiveness answers over
     // this type, which layout readers (a match's scrutinee type) see.
     adt.non_exhaustive.hash(h);
@@ -860,6 +873,23 @@ fn derives_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     if let Some(a) = p.adt_by_def(def) {
         let d = p.adt(a).derives_unlogged();
         (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(&mut h);
+    }
+    Fingerprint(h.finish())
+}
+
+/// The `DeriveBits(def, mask)` node's fingerprint: the derive flags of
+/// the Adt with that def that `mask` selects (and the `#[default]` variant
+/// with the `Default` bit), or a fixed value when there is no such Adt.
+fn derive_bits_fingerprint(p: &Program, def: DefId, mask: u16) -> Fingerprint {
+    let mut h = FxHasher::default();
+    "derive-bits-v1".hash(&mut h);
+    mask.hash(&mut h);
+    if let Some(a) = p.adt_by_def(def) {
+        let d = p.adt(a).derives_unlogged();
+        crate::check::derive_delta::masked(&d, mask).hash(&mut h);
+        if mask & crate::check::derive_delta::bit::DEFAULT != 0 {
+            d.default_variant.hash(&mut h);
+        }
     }
     Fingerprint(h.finish())
 }
@@ -1053,6 +1083,22 @@ fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerp
     (defs.len() as u64).hash(&mut h);
     for d in defs {
         d.hash(&mut h);
+    }
+    // A blanket impl bounded by a derivable trait (`impl<T: Debug> U for
+    // T`): whether a local Adt head selects it follows that Adt's derive
+    // list, so the derive flags its bounds name join (sigedit R13 v2).
+    if let Head::Adt(d) = key.head
+        && let Some(a) = p.adt_by_def(d)
+    {
+        let mask = set
+            .impls
+            .iter()
+            .filter_map(|&i| p.gx.index.by_def(i))
+            .filter(|(_, rec)| rec.blanket.is_some())
+            .fold(0u16, |m, (_, rec)| m | crate::check::derive_delta::bound_mask(p, &rec.generics.predicates));
+        if mask != 0 {
+            crate::check::derive_delta::masked(&p.adt(a).derives_unlogged(), mask).hash(&mut h);
+        }
     }
     Fingerprint(h.finish())
 }
@@ -1625,10 +1671,16 @@ impl<'a> Program {
         let set = self.impl_bucket(trait_, head);
         let key = ImplSetKey { trait_, head };
         reads.record_with(ReadKey::ImplSet(key), set.impls.is_empty(), || impl_set_fingerprint(self, &key, &set));
+        // Only a derivable trait's answer reads the derive list (its
+        // derived record, or the lack of one). Another trait's impls that
+        // a derive list decides (a blanket bounded by `Debug`) prove that
+        // bound as a goal of its own, which records its own read.
+        let bit = crate::check::derive_delta::trait_bit(self, trait_);
         if let Head::Adt(def) = head
+            && bit != 0
             && self.adt_by_def(def).is_some()
         {
-            self.record_derives(reads, def);
+            self.record_derive_bits(reads, def, bit);
         }
         set
     }
@@ -1647,6 +1699,12 @@ impl<'a> Program {
     /// check/derive_delta.rs calls it for each def a scope noted.
     pub(crate) fn record_derives(&self, reads: &mut Reads, def: DefId) {
         reads.record_with(ReadKey::Derives(def), self.adt_by_def(def).is_none(), || derives_fingerprint(self, def));
+    }
+
+    /// Records a `DeriveBits` read of the traits `mask` of the Adt template
+    /// `def` (check/derive_delta.rs `bit`).
+    pub(crate) fn record_derive_bits(&self, reads: &mut Reads, def: DefId, mask: u16) {
+        reads.record_with(ReadKey::DeriveBits(def, mask), self.adt_by_def(def).is_none(), || derive_bits_fingerprint(self, def, mask));
     }
 
     /// True for a trait whose impls fill `ImplSet` buckets, and so stay out
@@ -1798,6 +1856,9 @@ impl<'a> Program {
                 Read { fingerprint: trait_in_scope_fingerprint(ans), failed: !ans }
             }
             ReadKey::Derives(def) => Read { fingerprint: derives_fingerprint(self, *def), failed: self.adt_by_def(*def).is_none() },
+            ReadKey::DeriveBits(def, mask) => {
+                Read { fingerprint: derive_bits_fingerprint(self, *def, *mask), failed: self.adt_by_def(*def).is_none() }
+            }
         }
     }
 
@@ -1818,6 +1879,265 @@ impl<'a> Program {
     /// driver's walks use this form; tests use the plain one.
     pub fn reads_dirty_memo(&self, reads: &Reads, memo: &mut FxMap<ReadKey, Read>) -> usize {
         reads.iter().filter(|(k, stored)| *memo.entry(**k).or_insert_with(|| self.read_fingerprint(k)) != **stored).count()
+    }
+}
+
+// ---------- The read index and the keyed dirty walk (sigedit P3.2) ----------
+
+/// A reverse index over the per-slot read sets (`Caches::slot_reads`):
+/// each read key to the slots whose stored reads hold it. A derive delta
+/// knows which keys it can move (`Program::derive_key_moves`); the keyed
+/// walk compares only those keys' fingerprints, for only the slots that
+/// read them, in place of every passing body's whole read set.
+///
+/// Entries stay valid while the slot holds the same read set: `sync`
+/// gives each new set a seal (`Reads::seal`, reset by any new key), and an
+/// entry whose seal is not its slot's current one is stale and skipped.
+#[derive(Default)]
+pub(crate) struct ReadIndex {
+    by_key: FxMap<ReadKey, Vec<(u32, u64)>>,
+    /// The seal each slot was indexed under (0: none).
+    stamp: Vec<u64>,
+    next: u64,
+    /// Entries in `by_key`, stale ones included (a rebuild drops those).
+    entries: usize,
+    live: usize,
+}
+
+impl ReadIndex {
+    /// Indexes every slot whose read set changed since the last sync. The
+    /// compile tail calls it after each request once the index exists, so
+    /// a derive edit after a full recheck finds it current.
+    pub(crate) fn sync_if_built(&mut self, slot_reads: &mut [Option<Reads>]) {
+        if self.next != 0 {
+            self.sync(slot_reads);
+        }
+    }
+
+    /// Indexes every slot whose read set changed since the last sync.
+    fn sync(&mut self, slot_reads: &mut [Option<Reads>]) {
+        if self.entries > 2 * self.live + 100_000 {
+            *self = ReadIndex { next: self.next, ..ReadIndex::default() };
+        }
+        self.stamp.resize(slot_reads.len(), 0);
+        for (s, r) in slot_reads.iter_mut().enumerate() {
+            let cur = r.as_ref().map_or(0, |r| r.seal);
+            if cur != 0 && cur == self.stamp[s] {
+                continue;
+            }
+            match r {
+                Some(r) => {
+                    self.next += 1;
+                    r.seal = self.next;
+                    for k in r.map.keys() {
+                        self.by_key.entry(*k).or_default().push((s as u32, r.seal));
+                    }
+                    self.entries += r.map.len();
+                    self.stamp[s] = r.seal;
+                }
+                None => self.stamp[s] = 0,
+            }
+        }
+        self.live = slot_reads.iter().flatten().map(Reads::len).sum();
+    }
+
+    /// The slots whose stored reads hold a key that `moves` takes and whose
+    /// fingerprint differs from `p`'s now, and then, to a fixpoint, the
+    /// slots with a `Checked(d)` read of a body `d` whose slot is dirty
+    /// (`def_slot`; the oracle's rule: it checks again). Every other slot's
+    /// reads are clean, given that no key outside `moves` changed (the
+    /// caller's proof). Also returns, by slot, whether its reads hold any
+    /// `Checked` key. Syncs the index first.
+    pub(crate) fn dirty_slots(
+        &mut self,
+        p: &Program,
+        slot_reads: &mut [Option<Reads>],
+        moves: &mut dyn FnMut(&ReadKey) -> bool,
+        def_slot: &dyn Fn(DefId) -> Option<usize>,
+    ) -> (Vec<bool>, Vec<bool>) {
+        self.sync(slot_reads);
+        crate::driver::laps::mark("keyed/sync");
+        let mut dirty = vec![false; slot_reads.len()];
+        for (k, list) in &self.by_key {
+            if !moves(k) {
+                continue;
+            }
+            let now = p.read_fingerprint(k);
+            for &(s, seal) in list {
+                let s = s as usize;
+                if self.stamp.get(s) != Some(&seal) || dirty[s] {
+                    continue;
+                }
+                if slot_reads[s].as_ref().and_then(|r| r.get(k)).is_some_and(|stored| stored != now) {
+                    dirty[s] = true;
+                }
+            }
+        }
+        let live = |s: usize, seal: u64| self.stamp.get(s) == Some(&seal);
+        let mut has_checked = vec![false; slot_reads.len()];
+        let checked: Vec<(DefId, &Vec<(u32, u64)>)> =
+            self.by_key.iter().filter_map(|(k, list)| if let ReadKey::Checked(d) = k { Some((*d, list)) } else { None }).collect();
+        for (_, list) in &checked {
+            list.iter().filter(|&&(s, seal)| live(s as usize, seal)).for_each(|&(s, _)| has_checked[s as usize] = true);
+        }
+        loop {
+            let mut grew = false;
+            for (d, list) in &checked {
+                if !def_slot(*d).is_some_and(|s| dirty.get(s).copied().unwrap_or(false)) {
+                    continue;
+                }
+                for &(s, seal) in list.iter() {
+                    if live(s as usize, seal) && !dirty[s as usize] {
+                        dirty[s as usize] = true;
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        crate::driver::laps::mark("keyed/scan");
+        (dirty, has_checked)
+    }
+}
+
+/// What a derive delta can move, per read key (`Program::derive_key_moves`),
+/// with its answers per def memoized for one walk.
+pub(crate) struct DeriveMoves<'a> {
+    reach: &'a crate::check::derive_delta::Reach,
+    sig: FxMap<DefId, bool>,
+    /// Every key's answer, when asked for many read sets that share keys
+    /// (`memoized`; the read index asks each key once).
+    keys: Option<FxMap<ReadKey, bool>>,
+    /// The names of the fns whose signature moves (`MethodSet` keys key
+    /// on the method name).
+    names: Option<FxMap<Sym, ()>>,
+}
+
+impl<'a> DeriveMoves<'a> {
+    pub(crate) fn new(reach: &'a crate::check::derive_delta::Reach) -> DeriveMoves<'a> {
+        DeriveMoves { reach, sig: FxMap::default(), keys: None, names: None }
+    }
+
+    /// As `new`, with every key's answer memoized.
+    pub(crate) fn memoized(reach: &'a crate::check::derive_delta::Reach) -> DeriveMoves<'a> {
+        DeriveMoves { keys: Some(FxMap::default()), ..DeriveMoves::new(reach) }
+    }
+}
+
+impl Program {
+    /// True when a derive delta over `m.reach` may move the fingerprint of
+    /// `key` (sigedit P3.2, the keyed walk). It must hold for every key
+    /// whose fingerprint reads a derive list of the reach, directly or
+    /// through a deep hash: `Derives` and `Layout` of a reach Adt (a
+    /// layout folds the layouts of its field types, and the reach holds
+    /// every field user); `Sig` of a reach Adt, of a fn whose signature,
+    /// owner, hidden type, or bounds name one, and of a const, static, or
+    /// alias whose type names one; `Binding` through the `Sig` it folds;
+    /// `MethodSet` for a reach head or a moved method's name; `ImplSet`
+    /// for a reach head or a bucket with an impl that names one. `Checked`
+    /// and `TraitInScope` read no derive list.
+    pub(crate) fn derive_key_moves(&self, m: &mut DeriveMoves, key: &ReadKey) -> bool {
+        if let Some(&b) = m.keys.as_ref().and_then(|k| k.get(key)) {
+            return b;
+        }
+        let b = self.derive_key_moves_uncached(m, key);
+        if let Some(k) = &mut m.keys {
+            k.insert(*key, b);
+        }
+        b
+    }
+
+    /// `derive_key_moves` without the per-key memo.
+    fn derive_key_moves_uncached(&self, m: &mut DeriveMoves, key: &ReadKey) -> bool {
+        let reach = m.reach;
+        match key {
+            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) => self.adt_by_def(*d).is_none_or(|a| reach.row(self, a.0 as usize)) || self.hasher_reaches(m, *d),
+            ReadKey::Sig(def) => self.sig_moves(m, *def),
+            ReadKey::Binding(k) => match self.binding_res(k.module, k.ns, k.name) {
+                BindingRes::Def(def) => self.sig_moves(m, def),
+                _ => false,
+            },
+            ReadKey::MethodSet(k) => {
+                if let Head::Adt(d) = k.head
+                    && self.adt_by_def(d).is_some_and(|a| reach.row(self, a.0 as usize))
+                {
+                    return true;
+                }
+                if m.names.is_none() {
+                    let mut names = FxMap::default();
+                    for i in 0..self.fns.len() {
+                        let f = LocalDefId(i as u32);
+                        if self.sig_moves(m, self.def_id(f)) {
+                            names.insert(self.fn_info(f).name, ());
+                        }
+                    }
+                    m.names = Some(names);
+                }
+                m.names.as_ref().is_some_and(|n| n.contains_key(&k.name))
+            }
+            ReadKey::ImplSet(k) => {
+                if let Head::Adt(d) = k.head
+                    && self.adt_by_def(d).is_some_and(|a| reach.row(self, a.0 as usize))
+                {
+                    return true;
+                }
+                self.impl_bucket(k.trait_, k.head).impls.iter().any(|&d| {
+                    self.gx.index.by_def(d).is_none_or(|(_, rec)| reach.record(&self.tys, rec) || rec.items.iter().any(|&it| self.sig_moves(m, it)))
+                })
+            }
+            ReadKey::Checked(_) | ReadKey::TraitInScope(..) => false,
+        }
+    }
+
+    /// `derive_key_moves` for a `Sig` key (memoized in `m`).
+    pub(crate) fn sig_moves(&self, m: &mut DeriveMoves, def: DefId) -> bool {
+        if let Some(&b) = m.sig.get(&def) {
+            return b;
+        }
+        let reach = m.reach;
+        let tys = &self.tys;
+        let b = if let Some(local) = self.local_def(def.hash).filter(|l| self.def_id(*l) == def) {
+            let f = self.fn_info(local);
+            let od = crate::check::generics::opaque_def(def);
+            f.owner.is_some_and(|a| reach.row(self, a.0 as usize))
+                || f.params.iter().any(|&t| reach.ty(tys, t))
+                || reach.ty(tys, f.ret)
+                || self.gx.opaque_hidden.get(&od).is_some_and(|&t| reach.ty(tys, t))
+                || self.gx.opaques.get(&od).is_some_and(|o| o.bounds.iter().any(|q| reach.pred(tys, q)))
+                || self.gx.fn_templates.get(local.0 as usize).and_then(Option::as_ref).is_some_and(|t| t.generics.predicates.iter().any(|q| reach.pred(tys, q)))
+        } else if let Some(a) = self.adt_by_def(def) {
+            reach.row(self, a.0 as usize) || self.hasher_reaches(m, def)
+        } else if let Some(i) = self.const_by_def(def) {
+            reach.ty(tys, self.consts[i as usize].ty)
+        } else if let Some(i) = self.static_by_def(def) {
+            reach.ty(tys, self.statics[i as usize].ty)
+        } else if let Some(data) = self.defs.get(def) {
+            // `sig_fingerprint`: an alias folds its type; any other def
+            // only its name.
+            match (self.aliases.get(&data.name), self.gx.generic_aliases.get(&data.name)) {
+                (Some(&t), _) => reach.ty(tys, t),
+                (None, Some(la)) => reach.ty(tys, la.erased),
+                (None, None) => false,
+            }
+        } else {
+            false
+        };
+        m.sig.insert(def, b);
+        b
+    }
+
+    /// True when Adt `def`'s layout fingerprint folds a written `Hasher`
+    /// or `BuildHasher` impl's associated type that names a reach Adt
+    /// (`hash_adt_layout`).
+    fn hasher_reaches(&self, m: &DeriveMoves, def: DefId) -> bool {
+        [self.gx.lang.hasher, self.gx.lang.build_hasher].iter().any(|&tr| {
+            self.gx.index.impls_of_trait(tr).iter().any(|&id| {
+                let rec = self.gx.index.get(id);
+                rec.head == crate::traits::index::SelfHead::Adt(def) && rec.assoc_tys.iter().any(|&(_, t)| m.reach.ty(&self.tys, t))
+            })
+        })
     }
 }
 
@@ -2493,14 +2813,16 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
         let nested = src.replace("struct Inner { x: i64 }", "struct Inner { x: bool }");
         assert!(dirty_in(&interner, &known, &nested, &reads) >= 1, "nested field type edit dirties through make's Sig");
+        // Derive lists left the layout (P3.3): a body dirties on a derive
+        // edit only through its own Derives / DeriveBits reads.
         let derive = src.replace("struct Inner { x: i64 }", "#[derive(Clone)]\nstruct Inner { x: i64 }");
-        assert!(dirty_in(&interner, &known, &derive, &reads) >= 1, "derive edit dirties (clone-ness is layout content)");
+        assert_eq!(dirty_in(&interner, &known, &derive, &reads), 0, "a derive edit main never asks about stays clean");
         let unrelated = src.replace("struct Unused { n: i64 }", "struct Unused { n: bool }");
         assert_eq!(dirty_in(&interner, &known, &unrelated, &reads), 0, "unrelated type edit stays clean");
     }
 
-    /// The layout fingerprint is its own node: it moves on field and
-    /// derive edits, not on a method edit of the same type, and
+    /// The layout fingerprint is its own node: it moves on field edits,
+    /// not on a method or derive edit of the same type, and
     /// `layout_of` records it so the walk replays it.
     /// Deep fingerprints (`adt_deep`) over a type graph with a shared
     /// sub-type and a cycle: the same values with the program memo on or
@@ -2559,12 +2881,14 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         assert_eq!(layout_of_src(base), layout_of_src(&method_edit), "method body edit keeps the layout");
         let field_edit = base.replace("struct Foo { x: i64 }", "struct Foo { x: i64, y: i64 }");
         assert_ne!(layout_of_src(base), layout_of_src(&field_edit), "field edit moves the layout");
+        // Derive lists are their own reads (Derives, DeriveBits), not
+        // layout content (sigedit P3.3).
         let derive_edit = base.replace("struct Foo", "#[derive(Clone)]\nstruct Foo");
-        assert_ne!(layout_of_src(base), layout_of_src(&derive_edit), "derive edit moves the layout fingerprint");
+        assert_eq!(layout_of_src(base), layout_of_src(&derive_edit), "a derive edit keeps the layout fingerprint");
         let eq_base = base.replace("struct Foo", "#[derive(PartialEq, Eq, Hash)]\nstruct Foo");
         for (from, to) in [("Eq, Hash", "Hash"), ("Eq, Hash", "Eq")] {
             let edited = eq_base.replace(from, to);
-            assert_ne!(layout_of_src(&eq_base), layout_of_src(&edited), "an `Eq` or `Hash` derive edit moves the layout");
+            assert_eq!(layout_of_src(&eq_base), layout_of_src(&edited), "an `Eq` or `Hash` derive edit keeps the layout");
         }
         with_program(base, |interner, p| {
             let a = p.type_names[&interner.intern("Foo")];
@@ -2620,8 +2944,9 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
 
     /// A body that copies an Adt only inside a tuple and clones it only
     /// inside an Option names no signature that holds it, yet its answer
-    /// reads the Adt's derive list: it records a `Derives` read, which a
-    /// derive edit dirties and an unrelated derive edit does not (R12).
+    /// reads the Adt's derive list: it records a derive read of the trait
+    /// it asks, which an edit of that trait dirties and an unrelated
+    /// derive edit does not (R12).
     #[test]
     fn derive_answers_record_derives_reads() {
         let interner = std::sync::Arc::new(Interner::default());
@@ -2630,10 +2955,15 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
                    fn main() { let t = (A { x: 1 }, 2u8); let u = t; let o = Some(A { x: 3 }); let p = o.clone(); \
                    println!(\"{} {} {}\", t.0.x, u.0.x, p.unwrap().x); }\n";
         let reads = main_reads(&interner, &known, src);
-        assert!(reads.keys().any(|k| matches!(k, ReadKey::Derives(_))), "a Derives read is recorded");
+        assert!(reads.keys().any(|k| matches!(k, ReadKey::Derives(_) | ReadKey::DeriveBits(..))), "a derive read is recorded");
         assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
+        // Per trait (DeriveBits): the type check asks A only about Clone
+        // (`o.clone()`). The tuple copy is borrowck's question, which the
+        // driver's body scope records as its own read.
         let no_copy = src.replacen("#[derive(Clone, Copy)]", "#[derive(Clone)]", 1);
-        assert!(dirty_in(&interner, &known, &no_copy, &reads) >= 1, "-Copy on A dirties the tuple copy");
+        assert_eq!(dirty_in(&interner, &known, &no_copy, &reads), 0, "-Copy on A: the type check never asked about Copy");
+        let neither = src.replacen("#[derive(Clone, Copy)]\nstruct A", "struct A", 1);
+        assert!(dirty_in(&interner, &known, &neither, &reads) >= 1, "-Clone on A dirties o.clone()");
         let unrelated = src.replacen("#[derive(Clone)]\nstruct U;", "#[derive(Clone, Copy)]\nstruct U;", 1);
         assert_eq!(dirty_in(&interner, &known, &unrelated, &reads), 0, "+Copy on an Adt main never asks about stays clean");
     }

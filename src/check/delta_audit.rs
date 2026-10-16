@@ -87,6 +87,7 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
         fp_memo: _,      // the driver clears it
         impl_parents,    // same (impl headers stand)
         reuse_stamp: _,  // the driver sets it (`patch::keep`)
+        const_goals: _,  // same (const fns refuse)
     } = p;
     let fn_defs_data: Vec<_> = fn_defs.iter().map(|&d| defs.get(d)).collect();
     let mut out = vec![
@@ -184,6 +185,8 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         inst_order: _,            // the driver's order
         template_rows: _,         // rerun
         adt_created: _,           // rerun (materialize)
+        derive_marks: _,          // same
+        written_projections: _,   // replace (normalize_fn_sig)
         item_index: _,            // same
         param_defaults: _,        // same
         opaques,                  // replace

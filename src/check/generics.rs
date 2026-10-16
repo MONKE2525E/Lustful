@@ -5413,6 +5413,17 @@ pub struct GenTables {
     pub template_rows: Option<u32>,
     /// Adt instances in creation order (ids are not: see `InstOrder`).
     pub adt_created: Vec<AdtId>,
+    /// What collect's derive checks saw (a derive delta checks the same,
+    /// check/derive_delta.rs): the `adt_created` length at the derive
+    /// field checks and at `check_derive_bounds`, and the `fns` length at
+    /// `check_written_wf`. Instances made after those exist in a kept
+    /// program but not at that point of a collect.
+    pub derive_marks: [usize; 3],
+    /// The written types of each fn signature and Adt field list that held
+    /// a projection before `normalize_signatures`, by fn or Adt def. Well-
+    /// formedness ran on these; a derive delta refuses when one names its
+    /// reach (it neither normalizes nor checks them again).
+    pub written_projections: FxMap<DefId, Vec<Ty>>,
     /// The `Ast::items` index of each struct, enum, type alias, and trait
     /// by flat name (the first one when a name repeats). Param defaults
     /// and generic aliases read their written generics through it.
@@ -5504,6 +5515,8 @@ impl Default for GenTables {
             inst_order: Default::default(),
             template_rows: None,
             adt_created: Vec::new(),
+            derive_marks: [0; 3],
+            written_projections: FxMap::default(),
             item_index: FxMap::default(),
             param_defaults: FxMap::default(),
             opaques: FxMap::default(),
@@ -8190,7 +8203,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
             (derives.ord, lang.ord, names[7]),
             (derives.default, lang.default, names[8]),
         ];
-        for (on, trait_def, dname) in wanted {
+        for (k, (on, trait_def, dname)) in wanted.into_iter().enumerate() {
             if !on {
                 continue;
             }
@@ -8233,7 +8246,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 &rest,
                 generics,
                 Vec::new(),
-                Synthetic::Derive(dname),
+                Synthetic::Derive(dname, 1 << k),
                 true,
                 span,
             );
@@ -10164,6 +10177,10 @@ fn normalize_signatures(p: &mut Program) {
         if !has_projection {
             continue;
         }
+        if let Some(def) = p.defs.def_of_adt(AdtId(a as u32)) {
+            let written = p.adts[a].variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+            p.gx.written_projections.insert(def, written);
+        }
         let env = p.gx.adt_envs.get(a).cloned().unwrap_or_default();
         for v in 0..p.adts[a].variants.len() {
             for f in 0..p.adts[a].variants[v].fields.len() {
@@ -10182,6 +10199,7 @@ pub(crate) fn normalize_fn_sig(p: &mut Program, i: usize) {
     if !params.iter().chain([&ret]).any(|&t| p.tys.flags(t).contains_projection()) {
         return;
     }
+    p.gx.written_projections.insert(p.fn_defs[i], params.iter().copied().chain([ret]).collect());
     let env = p.gx.fn_scopes.get(i).map(|s| s.env.clone()).unwrap_or_default();
     let params: Vec<Ty> = params.into_iter().map(|t| normalize_global_in(p, &env, t)).collect();
     let ret = normalize_global_in(p, &env, ret);
@@ -12091,16 +12109,18 @@ fn prove_trait_ref(
                 } else if let Some(a) = cx.tys.local_adt(t) {
                     // A derived Adt: every field must hold, with
                     // this application's args substituted.
-                    let d = p.derives_of(a);
-                    let derived = if tr.def == lang.copy {
-                        d.copy
+                    // The one trait this goal asks (the others go unread).
+                    use crate::check::derive_delta::bit;
+                    let asked = if tr.def == lang.copy {
+                        bit::COPY
                     } else if tr.def == lang.clone {
-                        d.clone
+                        bit::CLONE
                     } else if tr.def == lang.debug {
-                        d.debug
+                        bit::DEBUG
                     } else {
-                        d.hash
+                        bit::HASH
                     };
+                    let derived = p.derive_has(a, asked);
                     if derived {
                         derived_adt = true;
                         let args: Vec<GenericArg> = cx.tys.adt_parts(t).map(|(_, a)| cx.tys.args(a).to_vec()).unwrap_or_default();
@@ -12302,10 +12322,15 @@ fn prove_goal(p: &Program, env: &[Predicate], tr: TraitRef) -> bool {
 /// impl's trait ref substituted in and its associated types
 /// rewritten to the impl's bindings. Runs at finish, when the
 /// whole impl set exists (rustc E0277's class).
-fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
+fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate::check::derive_delta::Reach>) {
     use crate::traits::index::{Synthetic, subst_predicate};
-    let records: Vec<crate::traits::index::ImplRecord> =
-        p.gx.index.all_impls().filter(|(_, r)| r.synthetic == Synthetic::None && r.local).map(|(_, r)| r.clone()).collect();
+    let records: Vec<crate::traits::index::ImplRecord> = p
+        .gx
+        .index
+        .all_impls()
+        .filter(|(_, r)| r.synthetic == Synthetic::None && r.local && reach.is_none_or(|x| x.record(&p.tys, r)))
+        .map(|(_, r)| r.clone())
+        .collect();
     for rec in records {
         let Some(trec) = p.gx.index.trait_record(rec.trait_def).cloned() else { continue };
         if trec.generics.predicates.is_empty() {
@@ -12435,7 +12460,7 @@ fn check_supertrait_cycles(p: &Program, errs: &mut Vec<Diag>) {
 
 /// A manual `Copy` impl needs every field to be `Copy` (rustc
 /// E0204), and no type may be both `Copy` and `Drop` (E0184).
-fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
+fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate::check::derive_delta::Reach>) {
     use crate::traits::index::Synthetic;
     let lang = p.gx.lang;
     let records: Vec<crate::traits::index::ImplRecord> = p.gx.index.all_impls().map(|(_, r)| r.clone()).collect();
@@ -12448,6 +12473,10 @@ fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>) {
         }
     }
     for rec in &records {
+        // A derive delta: only impls whose types reach the edited Adt.
+        if reach.is_some_and(|x| !x.record(&p.tys, rec)) {
+            continue;
+        }
         if rec.trait_def == lang.drop
             && rec.synthetic == Synthetic::None
             && let TyKind::Adt(d, _) = p.tys.kind(rec.self_ty(&p.tys))
@@ -12707,10 +12736,11 @@ fn dyn_keys(p: &mut Program, borrow: &FxMap<(AdtId, Ty), LocalDefId>) -> FxMap<A
 /// trait, as rustc writes it, so those bounds join the field env.
 /// Derived `Default` on an enum builds its unit `#[default]`
 /// variant and needs nothing of the fields.
-fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
+fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate::check::derive_delta::Reach>) {
     let lang = p.gx.lang;
     let n = p.gx.adt_info.len();
-    for idx in 0..n {
+    let rows: Vec<usize> = (0..n).filter(|&i| reach.is_none_or(|x| x.row(p, i) && x.cold_row(p, i, 1))).collect();
+    for idx in rows {
         let adt_id = AdtId(idx as u32);
         let (def, _) = p.gx.adt_info[idx];
         let (derives, span, is_enum, field_tys) = {
@@ -12865,6 +12895,37 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// The collect checks a derive list feeds, run again on a kept program
+/// after a derive delta toggled its synthetic records
+/// (check/derive_delta.rs): the glue method tables, then each item check
+/// over the items that reach the edited Adt (`Reach`; PLAN R13): field
+/// checks, derive bounds, and Copy impls over the Adt and its field
+/// users; impl obligations and written WF over the items whose types
+/// name one of them; the where clause overflow check (E0275) over every
+/// written impl; coherence over the impl pairs with such a side;
+/// main's Termination and the const fn goals. Only the error count
+/// matters to the caller (any error falls back).
+pub(crate) fn recheck_derive_items(p: &mut Program, reach: &crate::check::derive_delta::Reach, errs: &mut Vec<Diag>) {
+    compute_glue_methods(p);
+    compute_written_hash(p);
+    crate::driver::laps::mark("kept/derive glue");
+    check_impl_obligations(p, errs, Some(reach));
+    crate::check::where_overflow::check_impls(p, errs);
+    check_copy_impls(p, errs, Some(reach));
+    check_derive_bounds(p, errs, Some(reach));
+    let deferred = crate::check::collect::check_derive_fields(p, &|i| reach.row(p, i) && reach.cold_row(p, i, 0), errs);
+    p.gx.deferred_debug_fields = deferred;
+    check_deferred_debug_fields(p, errs);
+    crate::driver::laps::mark("kept/derive item checks");
+    check_written_wf(p, errs, Some(reach));
+    crate::driver::laps::mark("kept/derive wf");
+    check_overlaps(p, errs, Some(reach));
+    crate::driver::laps::mark("kept/derive overlap");
+    crate::check::collect::check_main_termination(p, errs);
+    let goals: Vec<(TraitRef, Span)> = p.const_goals.iter().filter(|(tr, _)| reach.trait_ref(&p.tys, tr)).cloned().collect();
+    crate::check::collect::prove_const_goals(p, goals, errs);
+}
+
 /// The `#[derive(Debug)]` field types collect deferred (see
 /// `deferred_debug_fields`): each must implement Debug, through the
 /// impl index now that every written impl is in it (W-STD-B).
@@ -13004,13 +13065,28 @@ fn own_trait_pred(p: &mut Program, method_def: DefId, generics: &Generics) -> Op
 /// same obligations in the checker. A where-clause predicate that
 /// mentions no parameter of its item is a plain fact and must
 /// hold as written.
-fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
+fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate::check::derive_delta::Reach>) {
     use crate::traits::index::Synthetic;
     // (types, value types, item predicates, span); the generics
     // also serve the param-free predicate rule.
     // Each written type carries its own span (a field type's, for an
     // Adt), so a failed bound points at the type that owes it.
-    let mut items: Vec<WfItem> = (0..p.fns.len()).filter_map(|i| wf_fn_item(p, i)).collect();
+    // A derive delta: the fns collect had here (no instance made later).
+    let n_fns = if reach.is_some() { p.gx.derive_marks[2].min(p.fns.len()) } else { p.fns.len() };
+    // Its types or bounds must name the reach (the retain below decides;
+    // this skips building the items that cannot).
+    let fn_reaches = |p: &Program, i: usize| {
+        reach.is_none_or(|x| {
+            let f = &p.fns[i];
+            let preds = |g: &Generics| g.predicates.iter().any(|q| x.pred(&p.tys, q));
+            f.params.iter().any(|&t| x.ty(&p.tys, t))
+                || x.ty(&p.tys, f.ret)
+                || p.gx.fn_templates.get(i).and_then(Option::as_ref).is_some_and(|t| preds(&t.generics))
+                || p.defs.get(p.fn_defs[i]).is_some_and(|d| preds(&d.generics))
+        })
+    };
+    let wanted: Vec<usize> = (0..n_fns).filter(|&i| fn_reaches(p, i)).collect();
+    let mut items: Vec<WfItem> = wanted.into_iter().filter_map(|i| wf_fn_item(p, i)).collect();
     let at = |tys: Vec<Ty>, span: Span| -> Vec<(Ty, Span)> { tys.into_iter().map(|t| (t, span)).collect() };
     let methods: Vec<(DefId, Vec<Ty>, bool, Generics, Span)> =
         p.gx.trait_methods
@@ -13074,6 +13150,10 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
         let args = p.tys.intern_args(&own);
         generics.predicates.push(Predicate::Trait(Binder::plain(TraitRef { def: rec.def, args, bindings: EMPTY_BINDINGS })));
         items.push((Vec::new(), Vec::new(), generics, rec.span));
+    }
+    // A derive delta: only items whose types or bounds reach the edited Adt.
+    if let Some(x) = reach {
+        items.retain(|(tys, _, generics, _)| tys.iter().any(|&(t, _)| x.ty(&p.tys, t)) || generics.predicates.iter().any(|q| x.pred(&p.tys, q)));
     }
     let adt_idx = adt_first_index(p);
     check_default_wf(p, &adt_idx, errs);
@@ -13344,35 +13424,11 @@ fn check_default_wf(p: &mut Program, adt_idx: &FxMap<DefId, usize>, errs: &mut V
     }
 }
 
-/// The last collect step before mono: synthetic impls, then
-/// coherence over the whole index (section 2.6).
-pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
-    append_trait_default_templates(p);
-    add_synthetic_impls(p);
-    compute_glue_methods(p);
-    compute_written_hash(p);
-    crate::driver::laps::mark("collect/finish impls+glue");
-    // Dyn compatibility needs the finished trait tables; the dyn
-    // type checks over signatures run before mono builds vtables.
-    p.gx.dyn_infos = crate::check::object::compute_dyn_infos(p);
-    crate::check::object::check_signatures(p, errs);
-    crate::check::caller::check_attrs(p, errs);
-    check_supertrait_cycles(p, errs);
-    check_impl_obligations(p, errs);
-    crate::check::where_overflow::check_impls(p, errs);
-    crate::check::ambig_assoc::check(p, errs);
-    check_copy_impls(p, errs);
-    check_derive_bounds(p, errs);
-    check_deferred_debug_fields(p, errs);
-    crate::driver::laps::mark("collect/finish item checks");
-    // Well-formedness reads the written projections (each owes its
-    // trait ref, where clauses included); normalization comes after.
-    check_written_wf(p, errs);
-    crate::check::outlives::check_all(p, errs);
-    crate::driver::laps::mark("collect/finish wf+outlives");
-    normalize_signatures(p);
-    crate::check::coherence_std::add_std_shadow_impls(p);
-    crate::driver::laps::mark("collect/finish normalize");
+/// Coherence (section 2.6): overlapping trait impls of the user crate
+/// (with each other and with std's shadow impls), and inherent methods
+/// and associated consts defined twice for one type. Collect runs it
+/// once; a derive delta runs it again (check/derive_delta.rs).
+pub(crate) fn check_overlaps(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate::check::derive_delta::Reach>) {
     // Local to the user crate: std source module items (`Duration`,
     // `std::error::Error`) and shipped crates are upstream, so an
     // upstream release may add impls for them (no negative reasoning).
@@ -13392,15 +13448,29 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     // supported type); the reference wrappers are structural. The
     // `Fn` traits are fundamental too (knowable for negative reasoning).
     let fundamental = [p.tys.builtins().boxed, lang.fn_, lang.fn_mut, lang.fn_once];
-    let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &fundamental, &by_construction, &is_local);
+    // A derive delta tests only the pairs with a side that reaches the
+    // edited Adt (no other pair's answer reads its derive list).
+    let reaching: Option<Vec<bool>> = reach.map(|x| {
+        let mut v = vec![false; p.gx.index.record_count()];
+        for (id, rec) in p.gx.index.all_impls() {
+            v[id.0 as usize] = x.record(&p.tys, rec);
+        }
+        v
+    });
+    let only = |id: crate::traits::ImplId| reaching.as_ref().is_none_or(|v| v[id.0 as usize]);
+    let pairs = p.gx.index.coherence_overlaps(&mut p.tys, &fundamental, &by_construction, &is_local, &only);
     // Pairs of two upstream impls (std source among itself) are std's own.
     let user_impl = |id| {
         let rec = p.gx.index.get(id);
         rec.local && !upstream_span(p, rec.span)
     };
     let mut overlapping: Vec<crate::traits::ImplId> = pairs.into_iter().filter(|&(a, b)| user_impl(a) || user_impl(b)).map(|(_, later)| later).collect();
-    let users: Vec<bool> = p.gx.index.all_impls().map(|(_, rec)| rec.local && !upstream_span(p, rec.span)).collect();
-    let with_std = p.gx.index.shadow_overlaps(&mut p.tys, &fundamental, &by_construction, &is_local, &|id| users[id.0 as usize]);
+    // By record id: a derive delta's dead records keep their ids.
+    let mut users: Vec<bool> = vec![false; p.gx.index.record_count()];
+    for (id, rec) in p.gx.index.all_impls() {
+        users[id.0 as usize] = rec.local && !upstream_span(p, rec.span);
+    }
+    let with_std = p.gx.index.shadow_overlaps(&mut p.tys, &fundamental, &by_construction, &is_local, &|id| users[id.0 as usize], &only);
     for id in with_std {
         if !overlapping.contains(&id) {
             overlapping.push(id);
@@ -13419,7 +13489,13 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     // Inherent overlap (rustc E0592): two inherent methods of one
     // Adt with one name whose Self patterns can both apply.
     let mut inherent_dups: Vec<LocalDefId> = Vec::new();
+    // A derive delta: only the groups with a Self pattern or bound that
+    // reaches the edited Adt.
+    let pat_reaches = |p: &Program, pat: Ty, g: &Generics| reach.is_none_or(|x| x.ty(&p.tys, pat) || g.predicates.iter().any(|q| x.pred(&p.tys, q)));
     for cands in p.gx.inherent_methods.clone().values() {
+        if !cands.iter().any(|c| p.gx.inherent_self_pats.get(c).is_some_and(|(pat, g)| pat_reaches(p, *pat, g))) {
+            continue;
+        }
         for (i, &a) in cands.iter().enumerate() {
             for &b in &cands[i + 1..] {
                 let (Some((pat_a, gen_a)), Some((pat_b, gen_b))) =
@@ -13451,6 +13527,10 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
         let adt_def = p.gx.adt_info.get(adt.0 as usize).map(|i| i.0);
         let methods: Vec<LocalDefId> =
             adt_def.and_then(|d| p.gx.inherent_methods.get(&(d, name))).cloned().unwrap_or_default();
+        let consts_reach = idxs.iter().any(|i| p.gx.inherent_const_self.get(i).is_some_and(|(pat, g, _)| pat_reaches(p, *pat, g)));
+        if !consts_reach && !methods.iter().any(|c| p.gx.inherent_self_pats.get(c).is_some_and(|(pat, g)| pat_reaches(p, *pat, g))) {
+            continue;
+        }
         for (n, &idx) in idxs.iter().enumerate() {
             let Some((pat, gens, _)) = p.gx.inherent_const_self.get(&idx).cloned() else { continue };
             let vs_const = idxs[..n].iter().any(|&other| {
@@ -13480,6 +13560,40 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
             "Rename one of the definitions, or narrow one impl's Self type so they cannot both apply.",
         ));
     }
+}
+
+/// The last collect step before mono: synthetic impls, then
+/// coherence over the whole index (section 2.6).
+pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
+    append_trait_default_templates(p);
+    add_synthetic_impls(p);
+    compute_glue_methods(p);
+    compute_written_hash(p);
+    crate::driver::laps::mark("collect/finish impls+glue");
+    // Dyn compatibility needs the finished trait tables; the dyn
+    // type checks over signatures run before mono builds vtables.
+    p.gx.dyn_infos = crate::check::object::compute_dyn_infos(p);
+    crate::check::object::check_signatures(p, errs);
+    crate::check::caller::check_attrs(p, errs);
+    check_supertrait_cycles(p, errs);
+    check_impl_obligations(p, errs, None);
+    crate::check::where_overflow::check_impls(p, errs);
+    crate::check::ambig_assoc::check(p, errs);
+    check_copy_impls(p, errs, None);
+    p.gx.derive_marks[1] = p.gx.adt_created.len();
+    check_derive_bounds(p, errs, None);
+    check_deferred_debug_fields(p, errs);
+    crate::driver::laps::mark("collect/finish item checks");
+    // Well-formedness reads the written projections (each owes its
+    // trait ref, where clauses included); normalization comes after.
+    p.gx.derive_marks[2] = p.fns.len();
+    check_written_wf(p, errs, None);
+    crate::check::outlives::check_all(p, errs);
+    crate::driver::laps::mark("collect/finish wf+outlives");
+    normalize_signatures(p);
+    crate::check::coherence_std::add_std_shadow_impls(p);
+    crate::driver::laps::mark("collect/finish normalize");
+    check_overlaps(p, errs, None);
     // Mono runs last: it checks bodies against the finished
     // tables and appends every reachable instance. Plain fns that
     // return `impl Trait` get their hidden types first.

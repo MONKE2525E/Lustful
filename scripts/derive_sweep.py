@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-# Derive edit differential (PLAN P3.1): "-Copy, -Clone through Option<A>
-# and tuples". Each generated program defines one Adt A with a derive list
+# Derive edit differential (PLAN P3.1, extended for P3.2): "-Copy, -Clone
+# through Option<A> and tuples". Odd seeds take the round 3 programs: all
+# nine derivable traits, generic Adts, fields through Box/Vec/Option,
+# wrappers of wrappers, consts and const fn bounds, WF bounds, supertraits,
+# a user blanket impl, and `main` returning `Result<(), A>`. Each generated program defines one Adt A with a derive list
 # and uses A only through compound types (tuples, Option, arrays, Vec,
 # generic bounds, closures, a wrapper that derives over a field of A). A
 # sequence of versions then drops and adds Copy and Clone (and sometimes
@@ -68,32 +71,136 @@ SHAPES = {
         "impl A {\n    fn twice(self) -> (A, A) {\n        (self, self)\n    }\n}\n",
         "let (x, _y) = mk().twice();\n    println!(\"{}\", show(&x));",
     ),
+    # Round 3 (P3.2): every derivable trait, fields through Box/Vec/Option,
+    # wrappers of wrappers, consts and const fn bounds, WF, supertraits,
+    # a user blanket impl, and Hash/Eq/Ord users.
+    "hash_map": ("", "let mut m = std::collections::HashMap::new();\n    m.insert(mk(), 1u8);\n    println!(\"{}\", m.len());"),
+    "btree_set": ("", "let mut s = std::collections::BTreeSet::new();\n    s.insert(mk());\n    s.insert(mk());\n    println!(\"{}\", s.len());"),
+    "sort_vec": ("", "let mut v = vec![mk(), mk()];\n    v.sort();\n    println!(\"{}\", show(&v[1]));"),
+    "cmp_lt": ("", "println!(\"{} {:?}\", mk() < mk(), mk().partial_cmp(&mk()));"),
+    "ne_eq": ("", "println!(\"{} {}\", mk() != mk(), Some(mk()) == None);"),
+    "box_vec_wrapper": (
+        "#[derive(Clone, Debug, PartialEq)]\nstruct BW {\n    b: Box<A>,\n    v: Vec<A>,\n    o: Option<A>,\n}\n",
+        "let w = BW { b: Box::new(mk()), v: vec![mk()], o: None };\n    let c = w.clone();\n    println!(\"{} {:?}\", c == w, c.o.is_none());",
+    ),
+    "wrapper_of_wrapper": (
+        "#[derive(Clone, Copy)]\nstruct W1 {\n    a: A,\n}\n#[derive(Clone, Copy)]\nstruct W2 {\n    w: W1,\n    n: u8,\n}\n",
+        "let w = W2 { w: W1 { a: mk() }, n: 2 };\n    let v = w;\n    println!(\"{} {}\", show(&w.w.a), v.n);",
+    ),
+    "hash_wrapper": (
+        "#[derive(PartialEq, Eq, Hash)]\nstruct HK {\n    k: (A, u8),\n}\n",
+        "let mut m = std::collections::HashSet::new();\n    m.insert(HK { k: (mk(), 1) });\n    println!(\"{}\", m.len());",
+    ),
+    "ord_wrapper": (
+        "#[derive(PartialEq, Eq, PartialOrd, Ord)]\nstruct OK {\n    k: Option<A>,\n}\n",
+        "println!(\"{:?}\", OK { k: Some(mk()) }.cmp(&OK { k: None }));",
+    ),
+    "default_wrapper": (
+        "#[derive(Default)]\nstruct DW {\n    a: Option<A>,\n    v: Vec<A>,\n}\n",
+        "let d = DW::default();\n    println!(\"{} {}\", d.a.is_none(), d.v.len());",
+    ),
+    "supertrait_impl": (
+        "trait Dup: Clone {\n    fn dup2(&self) -> (Self, Self) {\n        (self.clone(), self.clone())\n    }\n}\nimpl Dup for A {}\n",
+        "let (x, _) = mk().dup2();\n    println!(\"{}\", show(&x));",
+    ),
+    "wf_bound": (
+        "struct NeedCopy<T: Copy>(T);\nfn wrap_nc(a: A) -> NeedCopy<A> {\n    NeedCopy(a)\n}\n",
+        "let n = wrap_nc(mk());\n    println!(\"{}\", show(&n.0));",
+    ),
+    "blanket_debug": (
+        "trait Show2 {\n    fn s2(&self) -> String;\n}\nimpl<T: std::fmt::Debug> Show2 for T {\n    fn s2(&self) -> String {\n        format!(\"<{:?}>\", self)\n    }\n}\n",
+        "println!(\"{}\", mk().s2());",
+    ),
+    "generic_default": (
+        "fn make_d<T: Default>() -> T {\n    T::default()\n}\n",
+        "let d: A = make_d();\n    println!(\"{}\", show(&d));",
+    ),
+    "const_item": (
+        "const CA: A = MK_CONST;\nconst ARR: [A; 2] = [CA; 2];\n",
+        "let a = CA;\n    let b = ARR;\n    println!(\"{} {}\", show(&a), show(&b[1]));",
+    ),
+    "const_fn_bound": (
+        "const fn ident_c<T: Copy>(t: T) -> T {\n    t\n}\nconst CB: A = ident_c(MK_CONST);\n",
+        "println!(\"{}\", show(&CB));",
+    ),
+    "const_pattern": (
+        "const CP: A = MK_CONST;\n",
+        "let m = match mk() {\n        CP => 1,\n        _ => 2,\n    };\n    println!(\"{}\", m);",
+    ),
+    "assoc_bound": (
+        "trait HasOut {\n    type Out: Clone;\n    fn out(&self) -> Self::Out;\n}\nimpl HasOut for u8 {\n    type Out = A;\n    fn out(&self) -> A {\n        mk()\n    }\n}\n",
+        "let o = 3u8.out();\n    println!(\"{}\", show(&o));",
+    ),
+    "where_trivial": ("fn needs_where() -> u8\nwhere\n    A: Copy,\n{\n    1\n}\n", "println!(\"{}\", needs_where());"),
+    "impl_on_vec": (
+        "trait Tr2: Clone {\n    fn n2(&self) -> usize;\n}\nimpl Tr2 for Vec<A> {\n    fn n2(&self) -> usize {\n        self.len()\n    }\n}\n",
+        "let v: Vec<A> = vec![mk()];\n    println!(\"{}\", v.n2());",
+    ),
+    "assoc_impl_bound": (
+        "trait Pick {\n    type Out;\n}\nstruct Holder<T>(T);\nimpl<T: Clone> Pick for Holder<T> {\n    type Out = T;\n}\nfn pick_out(h: Holder<A>) -> <Holder<A> as Pick>::Out {\n    h.0\n}\n",
+        "let o = pick_out(Holder(mk()));\n    println!(\"{}\", show(&o));",
+    ),
+    # R13 v2: A under user blanket impls bounded by a toggled trait.
+    "blanket_overlap": (
+        "trait Show3 {\n    fn s3(&self) -> u8 {\n        1\n    }\n}\nimpl<T: std::fmt::Debug> Show3 for T {}\nimpl Show3 for A {}\n",
+        "println!(\"{}\", mk().s3());",
+    ),
+    "blanket_super": (
+        "trait Base: std::fmt::Debug {}\nimpl<T: std::fmt::Debug> Base for T {}\ntrait Up {\n    fn up(&self) -> u8 {\n        2\n    }\n}\nimpl<T: Base> Up for T {}\n",
+        "println!(\"{}\", mk().up());",
+    ),
+    "blanket_eq": (
+        "trait Same {\n    fn same(&self, o: &Self) -> bool;\n}\nimpl<T: PartialEq> Same for T {\n    fn same(&self, o: &Self) -> bool {\n        self == o\n    }\n}\n",
+        "println!(\"{}\", mk().same(&mk()));",
+    ),
+    "blanket_dyn": (
+        "trait Show4 {\n    fn s4(&self) -> String;\n}\nimpl<T: std::fmt::Debug> Show4 for T {\n    fn s4(&self) -> String {\n        format!(\"{:?}\", self)\n    }\n}\n",
+        "let b: Box<dyn Show4> = Box::new(mk());\n    println!(\"{}\", b.s4());",
+    ),
 }
 
-# Adt forms: (definition after the derive line, mk body, show body).
+ROUND1_SHAPES = sorted(list(SHAPES)[: list(SHAPES).index("hash_map")])
+
+# Shapes that need a trait an Adt form cannot derive: Default (enum forms).
+NEEDS_DEFAULT = {"generic_default"}
+# Shapes a generic Adt form leaves out: lust rejects `#[derive(Copy)]` over a
+# field of a generic Adt instance (`AG<u8>`) in both modes (a false reject).
+NOT_GENERIC = {"wrapper_derive", "wrapper_of_wrapper"}
+
+# Adt forms: (definition after the derive line, mk body, show body, alias
+# line or "", derives Default). A generic form derives on `AG<T>` and the
+# programs name the instance through `type A = AG<..>;`.
 ADTS = [
-    ("struct A {\n    x: u8,\n    y: i64,\n}\n", "A { x: 1, y: -2 }", "format!(\"{}\", a.x as i64 + a.y)"),
-    ("struct A(u32, char);\n", "A(7, 'q')", "format!(\"{}{}\", a.0, a.1)"),
-    ("enum A {\n    P,\n    Q(i8),\n}\n", "A::Q(3)", "match a {\n        A::P => String::from(\"p\"),\n        A::Q(n) => format!(\"q{}\", n),\n    }"),
-    ("struct A {\n    r: &'static str,\n    o: Option<u8>,\n}\n", "A { r: \"z\", o: Some(5) }", "format!(\"{}{:?}\", a.r, a.o)"),
+    ("struct A {\n    x: u8,\n    y: i64,\n}\n", "A { x: 1, y: -2 }", "format!(\"{}\", a.x as i64 + a.y)", "", True),
+    ("struct A(u32, char);\n", "A(7, 'q')", "format!(\"{}{}\", a.0, a.1)", "", True),
+    ("enum A {\n    P,\n    Q(i8),\n}\n", "A::Q(3)", "match a {\n        A::P => String::from(\"p\"),\n        A::Q(n) => format!(\"q{}\", n),\n    }", "", False),
+    ("struct A {\n    r: &'static str,\n    o: Option<u8>,\n}\n", "A { r: \"z\", o: Some(5) }", "format!(\"{}{:?}\", a.r, a.o)", "", True),
+    ("struct AG<T> {\n    x: T,\n    y: i64,\n}\n", "AG { x: 1, y: -2 }", "format!(\"{}\", a.x as i64 + a.y)", "type A = AG<u8>;\n", True),
+    ("enum AG<T> {\n    P,\n    Q(T),\n}\n", "AG::Q(3)", "match a {\n        AG::P => String::from(\"p\"),\n        AG::Q(n) => format!(\"q{}\", n),\n    }", "type A = AG<i8>;\n", False),
+    ("struct AG<T>(Option<T>, u8);\n", "AG(Some(4), 9)", "format!(\"{:?}{}\", a.0, a.1)", "type A = AG<u16>;\n", True),
 ]
 
 FULL = ["Clone", "Copy", "Debug", "PartialEq"]
+# The round 3 list: every derivable trait (Default only on forms that take it).
+FULL3 = ["Clone", "Copy", "Debug", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord"]
 
 
-def program(adt, derives, shapes, resolver=False):
-    defn, mk, show = adt
+def program(adt, derives, shapes, resolver=False, main_result=False):
+    defn, mk, show, alias, _ = adt
     out = ["const _ROUTE: u8 = 0;\n"] if resolver else []
     if derives:
         out.append(f"#[derive({', '.join(derives)})]\n")
     out.append(defn)
+    out.append(alias)
     out.append(f"fn mk() -> A {{\n    {mk}\n}}\n")
     out.append(f"fn show(a: &A) -> String {{\n    {show}\n}}\n")
-    for s in shapes:
-        out.append(SHAPES[s][0])
-    out.append("fn main() {\n")
-    for s in shapes:
-        out.append("    {\n    " + SHAPES[s][1] + "\n    }\n")
+    for sh in shapes:
+        out.append(SHAPES[sh][0].replace("MK_CONST", mk))
+    out.append("fn main() -> Result<(), A> {\n" if main_result else "fn main() {\n")
+    for sh in shapes:
+        out.append("    {\n    " + SHAPES[sh][1] + "\n    }\n")
+    if main_result:
+        out.append("    if false {\n        return Err(mk());\n    }\n    Ok(())\n")
     out.append("}\n")
     return "".join(out)
 
@@ -119,11 +226,40 @@ def versions(rng):
     return seq
 
 
+def versions3(rng, full):
+    """Round 3: from the full list, drop one to three traits (any), often
+    go back to full, and sometimes add a trait back one at a time."""
+    seq = [full]
+    cur = list(full)
+    for _ in range(rng.randint(3, 6)):
+        r = rng.random()
+        if r < 0.35:
+            cur = list(full)
+        elif r < 0.55 and len(cur) < len(full):
+            missing = [t for t in full if t not in cur]
+            cur = [t for t in full if t in cur or t == rng.choice(missing)]
+        else:
+            drop = rng.sample(cur, min(len(cur), rng.randint(1, 3)))
+            cur = [t for t in cur if t not in drop]
+        seq.append(cur)
+    if seq[-1] != full:
+        seq.append(full)
+    return seq
+
+
 def gen(seed, resolver=False):
     rng = random.Random(seed)
+    if seed % 2 == 0:
+        # The round 1 programs: the first four Adt forms, the first shapes.
+        adt = rng.choice(ADTS[:4])
+        shapes = rng.sample(ROUND1_SHAPES, rng.randint(2, 5))
+        return [program(adt, d, shapes, resolver) for d in versions(rng)]
     adt = rng.choice(ADTS)
-    shapes = rng.sample(sorted(SHAPES), rng.randint(2, 5))
-    return [program(adt, d, shapes, resolver) for d in versions(rng)]
+    full = FULL3 + (["Default"] if adt[4] else [])
+    pool = [sh for sh in sorted(SHAPES) if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
+    shapes = rng.sample(pool, rng.randint(2, 6))
+    main_result = rng.random() < 0.2
+    return [program(adt, d, shapes, resolver, main_result) for d in versions3(rng, full)]
 
 
 def first_code(stderr):

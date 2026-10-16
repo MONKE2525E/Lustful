@@ -63,8 +63,8 @@
 // takes signatures mode (P1.5). An edit of only the names in a struct's
 // or enum's `#[derive(..)]` lists (P1.4, `find_derive_edit`) patches the
 // item's attributes and derives the same way, in full mode: any body may
-// read the derives (`ReadKey::Derives`), and the kept program does not
-// stand.
+// read the derives (`ReadKey::Derives`). In a check the kept program
+// stands when the derive delta takes the edit (driver/kept_derive.rs).
 use super::compile::{fn_def_at, fn_text_hash};
 use super::session::{Caches, Front};
 use super::span_shift::{self, Edit, FileRanges};
@@ -354,6 +354,9 @@ pub(super) struct Patched {
     pub item_names: Vec<Sym>,
     /// A derive list edit came with it: the slot update runs in full mode.
     pub item_full: bool,
+    /// Every edit is a derive list edit (no body or header edit): the
+    /// compile tail may take the keyed dirty walk (sigedit P3.2).
+    pub derive_only: bool,
     /// Files whose text changed, Ast nodes the patch built, bodies
     /// re-parsed, and spans moved.
     pub files: usize,
@@ -499,8 +502,9 @@ struct KeptEdit {
     /// An item patch edit of the fn's header (`kept_delta::apply_headers`
     /// redoes it on the program).
     header: bool,
-    /// A derive list edit: the kept program does not stand (no delta yet).
-    derive: bool,
+    /// A derive list edit of this struct or enum (its `ast.items` index):
+    /// the derive delta applies it (driver/kept_derive.rs).
+    derive: Option<usize>,
     /// The program's spans already moved for it (`reuse_kept` kept the
     /// program after a refused header delta).
     shifted: bool,
@@ -537,7 +541,7 @@ pub(super) fn try_patch(
             old_exprs: e.body.as_ref().map(|b| b.old_exprs).or(e.item.as_ref().map(|i| i.old_exprs)).unwrap_or((0, 0)),
             rpit: e.body.as_ref().is_some_and(|b| b.rpit.is_some()),
             header: e.item.is_some(),
-            derive: e.derive.is_some(),
+            derive: e.derive.as_ref().map(|d| d.item),
             shifted: false,
         })
         .collect();
@@ -1754,6 +1758,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         item_scans,
         item_names,
         item_full: derive_edit,
+        derive_only: derive_edit && edited.is_empty(),
         files,
         nodes: super::compile::ast_nodes(&front.ast) - nodes_before,
         bodies: edits_len,
@@ -1873,8 +1878,9 @@ pub(super) fn reuse_kept(
         None if Arc::ptr_eq(&k.program.ast, &front.ast) => Vec::new(),
         None => return Err("ast"),
     };
-    if edits.iter().any(|e| e.derive) {
-        return Err("derive");
+    // A build's instances and glue would keep the old derive lists.
+    if walk_instances && edits.iter().any(|e| e.derive.is_some()) {
+        return Err("derive build");
     }
     let mut p = k.program;
     // The edits below change what fingerprints read.
@@ -1889,8 +1895,9 @@ pub(super) fn reuse_kept(
             return Err("body scan");
         }
         // A body that now calls a fn handing out a `Cow` turns the
-        // generic flags on in collect (`uses_cow`).
-        if !p.gx.user_generics && calls_cow_fn(&p, e.fn_index) {
+        // generic flags on in collect (`uses_cow`). A derive list edit
+        // has no body, and no flag scan reads derive lists.
+        if !p.gx.user_generics && e.derive.is_none() && calls_cow_fn(&p, e.fn_index) {
             return Err("body scan");
         }
         // Body items keep their indexes, text, and blocks (`same_items`),
@@ -1945,6 +1952,14 @@ pub(super) fn reuse_kept(
             }
             return Err(why);
         }
+    }
+    // Derive list edits: the derive delta toggles the synthetic records
+    // and runs the checks derive lists feed again.
+    let mut derives: Vec<usize> = edits.iter().filter_map(|e| e.derive).collect();
+    derives.sort_unstable();
+    derives.dedup();
+    if !derives.is_empty() {
+        super::kept_derive::apply_derives(&mut p, front, caches, &derives, walk_instances)?;
     }
     // An edited fn that returns `impl Trait`: collect reveals its hidden
     // type from the new body, so the program stands only while that type

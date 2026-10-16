@@ -1175,7 +1175,13 @@ fn slot_update(
 ) -> Result<(Vec<usize>, Vec<usize>, bool), String> {
     let fn_count = fn_at.len();
     front.fn_loc = fn_locations(&front.ast);
-    let had_env = std::mem::take(&mut front.walk_after_reject) || front.env_hash.is_some();
+    let after_reject = std::mem::take(&mut front.walk_after_reject);
+    // The derive delta's keyed shortcuts hold only when derive keys are all
+    // that moved since the last walk: not after a rejected collect.
+    if after_reject {
+        caches.derive_only = false;
+    }
+    let had_env = after_reject || front.env_hash.is_some();
     // Cached output stays reusable in full mode when every Adt and
     // static of the last parse keeps its session-local index in
     // this parse (pure additions append at the end of the session
@@ -1848,6 +1854,7 @@ fn resolved_setup(
             // A derive list edit: full mode (any body may read the derives).
             let names = (!p.item_full).then_some(names);
             let mode = if p.item_full { "full" } else { "signatures" };
+            caches.derive_only = p.derive_only;
             let slots = slot_update(front, caches, scans, env, names, &fn_at, crate_ids, &scan_of, t);
             let (changed, mention_only, const_fn) = match slots {
                 Ok(c) => c,
@@ -2912,6 +2919,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // lost its passing mark and rechecks.
     // A slot past the passing marks is new here: it never passed.
     let passed = |front: &Front, caches: &Caches, i: usize| front.fn_slot.get(i).is_some_and(|&s| caches.ok.get(s as usize) == Some(&true));
+    // The derive delta's keyed shortcuts (its replays, the keyed dirty walk
+    // below) hold only when a derive delta is all that moved since the
+    // last walk: not with a failed collect's leftovers.
+    if front.const_fn_pending || !front.walk_pending.is_empty() {
+        caches.derive_only = false;
+    }
     if std::mem::take(&mut front.const_fn_pending) {
         const_fn_changed = true;
         front.walk_pending.clear();
@@ -2983,6 +2996,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     } else {
         Err("gen state")
     };
+    // What a derive delta on the kept program can move, when every edit of
+    // this request is a derive list edit (the keyed dirty walk below).
+    let derive_dirty = caches.derive_dirty.take().filter(|_| std::mem::take(&mut caches.derive_only) && kept.is_ok());
     // A const fn edit that only const and static values read: the kept
     // program stands when they all evaluate as before. Else (or with no
     // kept program) the request goes on as a const fn edit that changed
@@ -3325,6 +3341,23 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // set and lose their stored C, exactly as before this walk existed.
     let mut reads_reused = 0usize;
     let mut reads_invalidated = 0usize;
+    // The keyed dirty walk (sigedit P3.2): after a derive delta only the
+    // read keys it can move (`Program::derive_key_moves`) may have moved;
+    // the delta found the slots that read one with a new fingerprint
+    // (driver/kept_derive.rs). The other candidates reuse their results
+    // here; the dirty ones go on to the walk below.
+    if let Some(is_dirty) = derive_dirty.as_ref().filter(|_| mode == "full" && !mention_only.is_empty()) {
+        let mut reused = vec![false; mention_only.iter().max().map_or(0, |&m| m + 1)];
+        mention_only.retain(|&i| {
+            let s = front.fn_slot[i] as usize;
+            let clean = caches.slot_reads.get(s).is_some_and(Option::is_some) && !is_dirty.get(s).copied().unwrap_or(true);
+            reused[i] = clean;
+            !clean
+        });
+        reads_reused = reused.iter().filter(|&&r| r).count();
+        changed.retain(|&i| reused.get(i) != Some(&true));
+        t.lap("reads keyed walk");
+    }
     if !mention_only.is_empty() {
         let slot_at = |i: usize| front.fn_slot[i] as usize;
         // First the dirty count of each candidate's stored reads (None:
@@ -3478,9 +3511,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 // it replays from its template or parent), then, if it
                 // was checked under another item-level environment, its
                 // reads (see gen_reuse.rs).
+                // After a derive delta the keyed walk knows the dirty slots
+                // (the oracle proves each clean one).
+                let clean = |r: &crate::driver::graph::Reads| match &derive_dirty {
+                    Some(d) => {
+                        let clean = !d.get(s).copied().unwrap_or(true);
+                        if clean && super::item_oracle::on() && program.reads_dirty_memo(r, &mut memo) != 0 {
+                            super::item_oracle::fail("clean instance body has dirty reads", visits.path, &i.to_string());
+                        }
+                        clean
+                    }
+                    None => program.reads_dirty_memo(r, &mut memo) == 0,
+                };
                 recheck = reuse.src_of(&program, LocalDefId(i as u32)) != Some(front.slot_hash[s])
-                    || (front.slot_env[s] != env
-                        && !caches.slot_reads[s].as_ref().is_some_and(|r| program.reads_dirty_memo(r, &mut memo) == 0));
+                    || (front.slot_env[s] != env && !caches.slot_reads[s].as_ref().is_some_and(clean));
                 if !recheck {
                     front.slot_env[s] = env;
                 }
@@ -3562,6 +3606,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             caches.slot_reads[slot(i)] = Some(stored);
         }
         diags.extend(results[k].1.iter().cloned());
+    }
+    // The read index of the keyed dirty walk follows the new read sets
+    // here, where their bodies were just checked (sigedit P3.2).
+    if !work.is_empty() {
+        caches.read_index.sync_if_built(&mut caches.slot_reads);
     }
     // rustc stops before monomorphization once a pre-mono check fails, so an
     // instance checked over an erroneous caller (an error-typed closure argument)

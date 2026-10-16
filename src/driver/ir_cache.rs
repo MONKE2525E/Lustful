@@ -1296,7 +1296,12 @@ fn main() {
         let base = fp_of(SRC);
         assert_eq!(base, fp_of(&format!("\n\n{SRC}")), "whole-fn moves keep fingerprints");
         assert_ne!(base, fp_of(&SRC.replace("a * 2", "a * 3")), "body edit moves the fingerprint");
-        assert_ne!(base, fp_of(&SRC.replace("struct Foo { x: i64 }", "#[derive(Clone)]\nstruct Foo { x: i64 }")), "layout edit moves fingerprints");
+        let field = SRC.replace("struct Foo { x: i64 }", "struct Foo { x: i64, y: u8 }").replace("Foo { x: helper(20) }", "Foo { x: helper(20), y: 0 }");
+        assert_ne!(base, fp_of(&field), "layout edit moves fingerprints");
+        // Derive lists left the layout (sigedit P3.3): a body whose lowering
+        // reads one (Copy moves, glue calls) changes its MIR, and a build
+        // after a derive edit regenerates every body (`build_derives_moved`).
+        assert_eq!(base, fp_of(&SRC.replace("struct Foo { x: i64 }", "#[derive(Clone)]\nstruct Foo { x: i64 }")), "an unused derive keeps fingerprints");
     }
 
     /// `#[track_caller]` changes the fn's C signature and its panic

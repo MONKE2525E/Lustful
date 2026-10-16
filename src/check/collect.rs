@@ -96,6 +96,12 @@ impl AdtDef {
     pub(crate) fn derives_unlogged(&self) -> Derives {
         self.derives
     }
+
+    /// Sets the derive list (a derive delta on a kept program,
+    /// check/derive_delta.rs).
+    pub(crate) fn set_derives(&mut self, d: Derives) {
+        self.derives = d;
+    }
 }
 
 /// One evaluated `const` item.
@@ -380,6 +386,9 @@ pub struct Program {
     /// Deep Adt fingerprints, kept while the driver holds the program
     /// unchanged (driver/graph.rs `FpMemo`). Off after collect.
     pub fp_memo: crate::driver::graph::FpMemo,
+    /// The trait goals of bounded const fn calls in const and static
+    /// initializers (`prove_const_goals`), kept for a derive delta.
+    pub const_goals: Vec<(TraitRef, Span)>,
     /// Each impl's generics and scope as its methods' signatures saw
     /// them, by `ast.items` index (`fn_record` rebuilds a method with it).
     pub(crate) impl_parents: HashMap<u32, ParentGen>,
@@ -421,8 +430,15 @@ impl Program {
     /// notes a `Derives` read of the Adt (check/derive_delta.rs), so a
     /// derive edit rechecks the bodies whose answers it can move.
     pub fn derives_of(&self, id: AdtId) -> Derives {
-        crate::check::derive_delta::note(self, id);
+        crate::check::derive_delta::note(self, id, crate::check::derive_delta::bit::ALL);
         self.adts[id.0 as usize].derives
+    }
+    /// Whether Adt `id` derives the trait of `bit` (check/derive_delta.rs
+    /// `bit`): as `derives_of`, but a body check notes that trait only, so a
+    /// toggle of another trait leaves the body alone.
+    pub fn derive_has(&self, id: AdtId, bit: u16) -> bool {
+        crate::check::derive_delta::note(self, id, bit);
+        crate::check::derive_delta::masked(&self.adts[id.0 as usize].derives, bit) != 0
     }
     pub fn fn_info(&self, id: LocalDefId) -> &FnInfo {
         &self.fns[id.0 as usize]
@@ -3328,6 +3344,7 @@ pub fn collect_reuse(
         unwind: false,
         regions: Default::default(),
         fp_memo: Default::default(),
+        const_goals: Vec::new(),
         impl_parents: HashMap::default(),
         reuse_stamp: 0,
     };
@@ -4707,58 +4724,8 @@ pub fn collect_reuse(
     }
 
     // Derived traits need every field type to have the trait too.
-    let mut deferred_debug: Vec<(Ty, Span)> = Vec::new();
-    for i in 0..p.adts.len() {
-        let adt = &p.adts[i];
-        let d = p.derives_of(AdtId(i as u32));
-        for v in &adt.variants {
-            for f in &v.fields {
-                if p.tys.flags(f.ty).contains_param() {
-                    // A generic field: the synthetic derive impl
-                    // carries the bound (section 2.2), checked per
-                    // instance, not against the abstract field type.
-                    continue;
-                }
-                // Each query runs only for a derive the type asks for: the queries
-                // are pure, so skipping the others changes no result.
-                let mut checks: [(bool, &str); 4] = [(true, ""); 4];
-                let mut n_checks = 0;
-                // `Clone` fields are checked in finish_collect
-                // (`check_derive_bounds`): a field type with a written
-                // `Clone` impl needs the impl index first.
-                // A field of a local type may be `Copy` through a written
-                // impl, which needs the impl index: `check_derive_bounds`
-                // proves it.
-                if d.copy && !crate::check::fmt::mentions_local_adt(&p.tys, f.ty) {
-                    checks[n_checks] = (is_copy(&p, &p.tys, f.ty), "Copy");
-                    n_checks += 1;
-                }
-                // `PartialEq` fields are checked in finish_collect too.
-                if d.debug {
-                    // A field of a type with a written `impl Debug` waits
-                    // for the impl index: finish_collect proves it (W-STD-B).
-                    let ok = has_debug(&p, &p.tys, f.ty);
-                    if !ok && crate::check::fmt::mentions_local_adt(&p.tys, f.ty) {
-                        deferred_debug.push((f.ty, adt.span));
-                    } else {
-                        checks[n_checks] = (ok, "Debug");
-                        n_checks += 1;
-                    }
-                }
-                for &(ok, name) in &checks[..n_checks] {
-                    if !ok {
-                        errs.push(Diag::new(
-                            "L0112",
-                            adt.span,
-                            format!("cannot derive {name}: field type `{}` does not implement {name}", ty_name(&p, &p.tys, f.ty)),
-                            format!("Derive {name} on the field type too, or remove {name} from the derive list."),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
+    p.gx.derive_marks[0] = p.gx.adt_created.len();
+    let deferred_debug = check_derive_fields(&p, &|_| true, &mut errs);
     p.gx.deferred_debug_fields.extend(deferred_debug);
 
     // Unsized newtypes (W-SHIM): a non-generic struct whose only field
@@ -5406,31 +5373,97 @@ pub fn collect_reuse(
     }
     crate::driver::laps::mark("collect/trait key");
     generics::finish_collect(&mut p, &mut errs);
+    p.const_goals = const_goals.clone();
     prove_const_goals(&mut p, const_goals, &mut errs);
     crate::driver::laps::mark("collect/const goals");
     if errs.is_empty() {
         crate::check::delta_audit::self_test_if_asked(&mut p);
+        crate::check::derive_delta::census_if_asked(&p);
     }
-    if let Some(main) = p.main {
-        let f = p.fn_info(main);
-        // Rust's Termination for main: (), ExitCode, or Result<T, E>
-        // with T one of those and E: Debug.
-        let term = |t: Ty| t == UNIT || p.tys.is_exit_code(t);
-        let ret_ok = term(f.ret) || matches!(p.tys.result_args(f.ret), Some((ok, e)) if term(ok) && has_debug(&p, &p.tys, e));
-        if !f.params.is_empty() || !ret_ok {
-            errs.push(Diag::new(
-                "L0110",
-                f.def(&p.ast).name_span,
-                "`main` must take no parameters and return (), ExitCode, or Result<T, E> with T one of those and E: Debug",
-                "Write `fn main() { ... }` or `fn main() -> Result<(), E> { ... }`.",
-            ));
-        }
-    }
+    check_main_termination(&p, &mut errs);
 
     crate::check::delta_audit::dump_if_asked(&p, errs.len());
     *reuse = std::mem::take(&mut p.gx.reuse);
     def_order.instances = std::mem::take(&mut p.gx.inst_order);
     if errs.is_empty() { Ok(p) } else { Err(errs) }
+}
+
+/// Rust's Termination for main: (), ExitCode, or Result<T, E> with T one
+/// of those and E: Debug (collect's last check; a derive delta runs it
+/// again).
+pub(crate) fn check_main_termination(p: &Program, errs: &mut Vec<Diag>) {
+    let Some(main) = p.main else { return };
+    let f = p.fn_info(main);
+    let term = |t: Ty| t == UNIT || p.tys.is_exit_code(t);
+    let ret_ok = term(f.ret) || matches!(p.tys.result_args(f.ret), Some((ok, e)) if term(ok) && has_debug(p, &p.tys, e));
+    if !f.params.is_empty() || !ret_ok {
+        errs.push(Diag::new(
+            "L0110",
+            f.def(&p.ast).name_span,
+            "`main` must take no parameters and return (), ExitCode, or Result<T, E> with T one of those and E: Debug",
+            "Write `fn main() { ... }` or `fn main() -> Result<(), E> { ... }`.",
+        ));
+    }
+}
+
+/// Collect's field checks of the derived `Copy` and `Debug` impls, for
+/// the Adt rows `rows` takes (collect: all of them; a derive delta: the
+/// edited Adt and the rows whose fields reach it). Errors go to `errs`;
+/// returns the `Debug` fields that wait for the impl index
+/// (`deferred_debug_fields`).
+pub(crate) fn check_derive_fields(p: &Program, rows: &dyn Fn(usize) -> bool, errs: &mut Vec<Diag>) -> Vec<(Ty, Span)> {
+    let mut deferred_debug: Vec<(Ty, Span)> = Vec::new();
+    for i in (0..p.adts.len()).filter(|&i| rows(i)) {
+        let adt = &p.adts[i];
+        let d = p.derives_of(AdtId(i as u32));
+        for v in &adt.variants {
+            for f in &v.fields {
+                if p.tys.flags(f.ty).contains_param() {
+                    // A generic field: the synthetic derive impl
+                    // carries the bound (section 2.2), checked per
+                    // instance, not against the abstract field type.
+                    continue;
+                }
+                // Each query runs only for a derive the type asks for: the queries
+                // are pure, so skipping the others changes no result.
+                let mut checks: [(bool, &str); 4] = [(true, ""); 4];
+                let mut n_checks = 0;
+                // `Clone` fields are checked in finish_collect
+                // (`check_derive_bounds`): a field type with a written
+                // `Clone` impl needs the impl index first.
+                // A field of a local type may be `Copy` through a written
+                // impl, which needs the impl index: `check_derive_bounds`
+                // proves it.
+                if d.copy && !crate::check::fmt::mentions_local_adt(&p.tys, f.ty) {
+                    checks[n_checks] = (is_copy(p, &p.tys, f.ty), "Copy");
+                    n_checks += 1;
+                }
+                // `PartialEq` fields are checked in finish_collect too.
+                if d.debug {
+                    // A field of a type with a written `impl Debug` waits
+                    // for the impl index: finish_collect proves it (W-STD-B).
+                    let ok = has_debug(p, &p.tys, f.ty);
+                    if !ok && crate::check::fmt::mentions_local_adt(&p.tys, f.ty) {
+                        deferred_debug.push((f.ty, adt.span));
+                    } else {
+                        checks[n_checks] = (ok, "Debug");
+                        n_checks += 1;
+                    }
+                }
+                for &(ok, name) in &checks[..n_checks] {
+                    if !ok {
+                        errs.push(Diag::new(
+                            "L0112",
+                            adt.span,
+                            format!("cannot derive {name}: field type `{}` does not implement {name}", ty_name(p, &p.tys, f.ty)),
+                            format!("Derive {name} on the field type too, or remove {name} from the derive list."),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    deferred_debug
 }
 
 /// The enclosing item's part of a fn signature: the impl's generics and
@@ -8198,7 +8231,7 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         && (p.is_phantom_adt(a) || tys.args(args).iter().filter_map(|g| g.as_ty()).all(|x| is_copy(p, tys, x)))
                 }
                 Some(a) => {
-                    p.derives_of(a).copy
+                    p.derive_has(a, crate::check::derive_delta::bit::COPY)
                         && (p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
                             && p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
                             || {
@@ -8569,7 +8602,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             if p.gx.glue_methods.contains_key(&(a, p.gx.lang.clone)) {
                 return true;
             }
-            (p.derives_of(a).clone && adt_instance_fields_all(p, a, t, GlueKey::Clone, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
+            (p.derive_has(a, crate::check::derive_delta::bit::CLONE) && adt_instance_fields_all(p, a, t, GlueKey::Clone, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
                 || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen)
         }
         None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen),
@@ -8747,14 +8780,13 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                 Some(_) if pcmp && !total && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, Some("partial_cmp"), &["lt"], seen) => true,
                 Some(a)
                     if no_ord
-                        && !p.derives_of(a).ord
+                        && !p.derive_has(a, crate::check::derive_delta::bit::ORD)
                         && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, Some("partial_cmp"), &["lt", "le", "gt", "ge"], seen) =>
                 {
                     true
                 }
                 Some(a) => {
-                    let d = p.derives_of(a);
-                    if !(if total { d.ord } else { d.partial_ord }) {
+                    if !p.derive_has(a, if total { crate::check::derive_delta::bit::ORD } else { crate::check::derive_delta::bit::PARTIAL_ORD }) {
                         return false;
                     }
                     // rustc's derived `partial_cmp` on a non-generic
@@ -8762,7 +8794,7 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                     // other))`: its fields must then order by `Ord`.
                     let generic = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some())
                         || p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty());
-                    let fields_total = total || (d.ord && !generic);
+                    let fields_total = total || (!generic && p.derive_has(a, crate::check::derive_delta::bit::ORD));
                     adt_fields_all(p, a, t, GlueKey::Cmp(fields_total, pcmp && !fields_total), seen, &mut |f, seen| {
                         glue_cmp_mode(p, tys, f, fields_total, seen, pcmp && !fields_total)
                     })
@@ -9112,7 +9144,7 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bo
             match tys.local_adt(t) {
                 // A written impl the glue calls (`gx.written_hash`).
                 Some(a) if p.gx.written_hash.contains_key(&a) => true,
-                Some(a) if p.derives_of(a).hash => adt_fields_all(p, a, t, GlueKey::Hash, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
+                Some(a) if p.derive_has(a, crate::check::derive_delta::bit::HASH) => adt_fields_all(p, a, t, GlueKey::Hash, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
                 // A written generic impl (`impl<T: Hash> Hash for
                 // VecDeque<T>`): the glue calls its instance
                 // (`gx.generic_hash`) when its bounds hold by glue.
@@ -9215,7 +9247,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) ->
                         return true;
                     }
                     let adt = p.adt(a);
-                    if !p.derives_of(a).default {
+                    if !p.derive_has(a, crate::check::derive_delta::bit::DEFAULT) {
                         return false;
                     }
                     // An enum's default is its unit `#[default]` variant.
@@ -9289,7 +9321,7 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.derives_of(a).eq && adt_instance_fields_all(p, a, t, GlueKey::TotalEq, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
+                    (p.derive_has(a, crate::check::derive_delta::bit::EQ) && adt_instance_fields_all(p, a, t, GlueKey::TotalEq, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen),
@@ -9352,7 +9384,7 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool
                 // A written non-generic impl: the glue calls its `eq`.
                 Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,
                 Some(a) => {
-                    (p.derives_of(a).partial_eq && adt_instance_fields_all(p, a, t, GlueKey::Eq, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
+                    (p.derive_has(a, crate::check::derive_delta::bit::PARTIAL_EQ) && adt_instance_fields_all(p, a, t, GlueKey::Eq, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen),
@@ -9441,7 +9473,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.derives_of(a).debug && adt_instance_fields_all(p, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
+                    (p.derive_has(a, crate::check::derive_delta::bit::DEBUG) && adt_instance_fields_all(p, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
                         || crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.debug)
                         // A conditional written impl (`impl<K: Debug>
                         // Debug for W<K>`) whose bounds the glue walks

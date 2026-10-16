@@ -66,7 +66,9 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         fp_memo: _,
         impl_parents,
         reuse_stamp: _,
+        const_goals,
     } = p;
+    const_goals.iter_mut().for_each(|(_, s)| sp(s));
     defs.for_each_span(&mut |s| sp(s));
     adts.iter_mut().for_each(|a| {
         sp(&mut a.span);
@@ -157,6 +159,8 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         inst_order: _,
         template_rows: _,
         adt_created: _,
+        derive_marks: _,
+        written_projections: _,
         item_index: _,
         param_defaults: _,
         opaques: _,

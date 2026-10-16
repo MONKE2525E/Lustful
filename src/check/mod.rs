@@ -19436,7 +19436,7 @@ impl<'p> Ctx<'p> {
             }
             (_, CV::Aggregate(_) | CV::Variant(..)) if self.tys.local_adt(t).is_some() => {
                 let a = self.tys.local_adt(t).unwrap_or(AdtId(0));
-                if !p.derives_of(a).partial_eq {
+                if !p.derive_has(a, crate::check::derive_delta::bit::PARTIAL_EQ) {
                     self.non_structural_const(t, span);
                     return None;
                 }

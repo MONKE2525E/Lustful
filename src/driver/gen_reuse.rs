@@ -435,6 +435,18 @@ impl GenReuse {
         Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads))
     }
 
+    /// `template_holds` when only the read keys `moves` takes can have
+    /// moved since the stored check (a derive-only request, sigedit P3.2):
+    /// the other reads are not compared.
+    pub fn template_holds_moved(&mut self, p: &Program, t: LocalDefId, moves: &mut dyn FnMut(&ReadKey) -> bool) -> Option<bool> {
+        let src = self.src_of(p, t)?;
+        let (lo, hi) = p.fn_def(t).exprs;
+        let e = self.templates.get(&p.def_id(t))?;
+        let memo = &mut self.memo;
+        let clean = e.reads.iter().all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored);
+        Some(self.on && e.src == src && e.n_exprs == hi - lo && clean)
+    }
+
     /// True when a template check or discovery output of fn `f` was
     /// stored after stamp `lo` and no later than `hi`. The check and build
     /// programs share these entries: one stored after a program's

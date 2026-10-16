@@ -1,0 +1,181 @@
+// The derive delta's driver half (sigedit PLAN P3.2, R13): derive list
+// edits applied to the daemon's kept program in place of a full collect.
+// The item patch (driver/patch.rs `find_derive_edit`) has already put the
+// new derive lists in the Ast and moved the program's spans; `reuse_kept`
+// then calls `apply_derives` with the edited struct and enum items.
+//
+// For each item, check/derive_delta.rs `apply` sets the new list, toggles
+// the synthetic derive records, and runs the collect checks a derive list
+// feeds again, over the items that reach the Adt. Then:
+//
+// - the keyed dirty walk (graph.rs `ReadIndex`): only the read keys the
+//   delta can move (`Program::derive_key_moves`) are compared, for the
+//   slots that read them; the compile tail rechecks the dirty slots and
+//   reuses the rest without walking their reads;
+// - mono's checks that read derive lists replay, as a collect with generic
+//   reuse runs them: a template whose stored check no longer holds checks
+//   again, and so does one with no stored check (it has closures) whose
+//   body names the reach; plain bodies go through the header delta's
+//   discovery replay (`kept_delta::replay_discovery`): a body whose entry
+//   reads no key the delta can move stands, the others must give the same
+//   discovery output. Entries stored after the program's `reuse_stamp`
+//   (the other mode's program) check again.
+//
+// Refused (the caller collects in full): a build (its instances and glue
+// would keep the old lists), an item the kept program has no Adt for, and
+// whatever `derive_delta::apply` refuses. Any diagnostic falls back too:
+// the full path gives the answer. The keyed shortcuts apply only when the
+// request's edits are all derive list edits (`Caches::derive_only`).
+use super::session::{Caches, Front};
+use crate::ast::ItemKind;
+use crate::check::collect::Program;
+use crate::check::generics::{self, FnClass};
+use crate::def::LocalDefId;
+
+/// Applies the derive list edits of the struct and enum items `items`
+/// (`ast.items` indexes) to the kept program `p`. Err names the first
+/// condition that failed (the `kept=` of `lust-visits:`); `p` is then half
+/// edited and must be dropped.
+pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches, items: &[usize], walk_instances: bool) -> Result<(), &'static str> {
+    if walk_instances {
+        return Err("derive build");
+    }
+    // The node answers of the last collect read the old lists.
+    caches.gen_reuse.forget_answers();
+    // Entries stored from here on are this delta's own (`replay_discovery`).
+    let start = crate::driver::gen_reuse::stamp_now();
+    let mut moved: Option<crate::check::derive_delta::Reach> = None;
+    for &item in items {
+        let (name, names, is_enum) = match &p.ast.items.get(item).ok_or("derive adt")?.kind {
+            ItemKind::Struct(s) => (s.name, s.derives.iter().map(|d| d.0).collect::<Vec<_>>(), false),
+            ItemKind::Enum(e) => (e.name, e.derives.iter().map(|d| d.0).collect::<Vec<_>>(), true),
+            _ => return Err("derive adt"),
+        };
+        let a = *p.type_names.get(&name).ok_or("derive adt")?;
+        if p.adt(a).name != name || p.adt(a).is_enum != is_enum {
+            return Err("derive adt");
+        }
+        let new = crate::check::derive_delta::derives_from_names(p, p.adt(a).derives_unlogged(), is_enum, &names)?;
+        let reach = crate::check::derive_delta::apply(p, a, new)?;
+        moved = Some(match moved.take() {
+            Some(m) => m.union(reach),
+            None => reach,
+        });
+    }
+    crate::driver::laps::mark("kept/derive delta");
+    let Some(reach) = moved else { return Ok(()) };
+    // The keyed dirty walk: only the read keys the delta can move
+    // (graph.rs `Program::derive_key_moves`) are compared, for the slots
+    // that read them. The compile tail rechecks the dirty slots.
+    let (is_dirty, _) = {
+        let prog: &Program = p;
+        let mut moves = crate::driver::graph::DeriveMoves::new(&reach);
+        let def_slot = |d: crate::def::DefId| prog.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
+        caches.read_index.dirty_slots(prog, &mut caches.slot_reads, &mut |k| prog.derive_key_moves(&mut moves, k), &def_slot)
+    };
+    // The shortcuts below hold only when the derive delta is the request's
+    // only change (no header or body edit moved other keys).
+    let keyed = caches.derive_only;
+    // Without user generics collect runs no template check or discovery
+    // (the lang enum methods' generics alone need neither in a check).
+    if p.gx.user_generics {
+        replay_templates(p, front, caches, &reach, keyed, start)?;
+        crate::driver::laps::mark("kept/derive templates");
+        // A body whose entry reads no key the delta can move stands
+        // (`GenReuse::untouched`, as in the header delta); with other
+        // edits in the request every key counts as moved.
+        let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
+        let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
+        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched)?;
+        crate::driver::laps::mark("kept/derive discovery");
+    }
+    caches.derive_dirty = Some(is_dirty);
+    Ok(())
+}
+
+/// The source names a body must mention to read a derive list of the
+/// reach: the reach Adts and their variants, and the fns, consts, and
+/// statics whose types name one (a value of a reach type comes from one
+/// of them, or from a type the body writes).
+fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count: usize) -> crate::intern::FxMap<crate::intern::Sym, ()> {
+    let mut out = crate::intern::FxMap::default();
+    let mut add = |s: crate::intern::Sym| {
+        let text = crate::intern::source_name(p.interner.get(s)).to_string();
+        out.insert(p.interner.intern(&text), ());
+    };
+    for (i, adt) in p.adts.iter().enumerate() {
+        if p.gx.adt_instance_of.get(i).copied().flatten().is_none() && reach.row(p, i) {
+            add(adt.name);
+            adt.variants.iter().for_each(|v| add(v.name));
+        }
+    }
+    let mut moves = crate::driver::graph::DeriveMoves::new(reach);
+    // The AST fns (instances and closures share their names or have none).
+    for i in 0..fn_count.min(p.fns.len()) {
+        let f = LocalDefId(i as u32);
+        if p.sig_moves(&mut moves, p.def_id(f)) {
+            add(p.fn_def(f).name);
+        }
+    }
+    p.consts.iter().filter(|c| reach.ty(&p.tys, c.ty)).for_each(|c| add(c.name));
+    p.statics.iter().filter(|s| reach.ty(&p.tys, s.ty)).for_each(|s| add(s.name));
+    out
+}
+
+/// Mono's template checks after a derive delta: a template whose stored
+/// check no longer holds checks again as collect's template check does,
+/// and must pass with the same hidden type (`kept_delta::recheck_template`).
+/// A template with no stored check (one with closures) checks again when
+/// its body mentions a name of `reach_names`, or its own signature moves.
+/// With `keyed` (a derive-only request) a stored check compares only the
+/// read keys the delta can move. A check stored after the program's
+/// `reuse_stamp` (by the other mode's program) checks again: this program
+/// may hold another.
+fn replay_templates(
+    p: &mut Program,
+    front: &Front,
+    caches: &mut Caches,
+    reach: &crate::check::derive_delta::Reach,
+    keyed: bool,
+    start: u64,
+) -> Result<(), &'static str> {
+    let fn_count = front.fn_loc.len();
+    let names = reach_names(p, reach, fn_count);
+    let mut moves = crate::driver::graph::DeriveMoves::memoized(reach);
+    let idents = &front.chunks[0].scan.body_idents;
+    let (record_reads, unwind) = (p.record_reads, p.unwind);
+    (p.record_reads, p.unwind) = (true, false);
+    let out = (|| {
+        for t in (0..fn_count as u32).map(LocalDefId) {
+            if p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Template) || p.is_lang_method(t) {
+                continue;
+            }
+            if p.check_skips(t) && !p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(t))) {
+                continue;
+            }
+            let holds = if caches.gen_reuse.newer(p, t, p.reuse_stamp, start) {
+                Some(false)
+            } else if keyed {
+                let prog: &Program = p;
+                caches.gen_reuse.template_holds_moved(prog, t, &mut |k| prog.derive_key_moves(&mut moves, k))
+            } else {
+                caches.gen_reuse.template_holds(p, t)
+            };
+            match holds {
+                Some(true) => continue,
+                Some(false) => {}
+                None => {
+                    let named = idents.get(t.0 as usize).is_none_or(|ids| ids.iter().any(|s| names.contains_key(s)));
+                    if !named && !p.sig_moves(&mut moves, p.def_id(t)) {
+                        continue;
+                    }
+                }
+            }
+            let body = p.fn_def(t).exprs;
+            super::kept_delta::recheck_template(p, t, &[body], caches)?;
+        }
+        Ok(())
+    })();
+    (p.record_reads, p.unwind) = (record_reads, unwind);
+    out
+}

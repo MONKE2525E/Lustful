@@ -246,6 +246,14 @@ pub(crate) struct Caches {
     /// without a recheck. Session-local only (`Sym` and `DefId` keys are
     /// stable inside one session, never written to disk in this form).
     pub(crate) slot_reads: Vec<Option<crate::driver::graph::Reads>>,
+    /// The reverse index over `slot_reads` the keyed dirty walk reads
+    /// (driver/graph.rs `ReadIndex`; sigedit P3.2).
+    pub(crate) read_index: crate::driver::graph::ReadIndex,
+    /// This request's derive delta's keyed dirty walk (driver/kept_derive.rs):
+    /// by slot, whether a stored read moved. Taken by the compile tail.
+    pub(crate) derive_dirty: Option<Vec<bool>>,
+    /// This request's edits are all derive list edits (`Patched::derive_only`).
+    pub(crate) derive_only: bool,
     /// Slots each slot's generated C references (itself plus its `Fn` call
     /// targets), collected from the IR at codegen. A unit's used-slots
     /// hash (section 4.2) is computed over the union for its slots.
@@ -430,6 +438,9 @@ impl Session {
                 out: Vec::new(),
                 has_out: Vec::new(),
                 slot_reads: Vec::new(),
+                read_index: Default::default(),
+                derive_dirty: None,
+                derive_only: false,
                 slot_used: Vec::new(),
                 slot_fp: Vec::new(),
                 slot_ir: Vec::new(),
