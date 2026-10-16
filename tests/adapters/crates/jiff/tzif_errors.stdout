@@ -1,0 +1,162 @@
+empty: invalid 32-bit TZif header: too short
+invalid 32-bit TZif header: too short
+Error {
+    kind: JcoreTzifParse(
+        ParseError {
+            kind: Header32(
+                TooShort,
+            ),
+        },
+    ),
+    cause: None,
+}
+short: invalid 32-bit TZif header: too short
+invalid 32-bit TZif header: too short
+Error {
+    kind: JcoreTzifParse(
+        ParseError {
+            kind: Header32(
+                TooShort,
+            ),
+        },
+    ),
+    cause: None,
+}
+magic: invalid 32-bit TZif header: magic bytes mismatch
+invalid 32-bit TZif header: magic bytes mismatch
+Error {
+    kind: JcoreTzifParse(
+        ParseError {
+            kind: Header32(
+                MismatchMagic,
+            ),
+        },
+    ),
+    cause: None,
+}
+valid: ok
+no footer: invalid TZif footer: expected to find `\n` at the beginning of the TZif file footer, but found unexpected end of data
+invalid TZif footer: expected to find `\n` at the beginning of the TZif file footer, but found unexpected end of data
+Error {
+    kind: JcoreTzifParse(
+        ParseError {
+            kind: Footer(
+                UnexpectedEnd,
+            ),
+        },
+    ),
+    cause: None,
+}
+bad footer: invalid TZif footer: invalid POSIX time zone transition rulefailed to parse start of DST transition rule: parsed month, but it's not in supported range of `1..=12`
+invalid TZif footer: invalid POSIX time zone transition rulefailed to parse start of DST transition rule: parsed month, but it's not in supported range of `1..=12`
+Error {
+    kind: JcoreTzifParse(
+        ParseError {
+            kind: Footer(
+                InvalidPosixTz(
+                    ParseError {
+                        kind: Rule(
+                            DateTimeStart(
+                                Date(
+                                    WeekdayOfMonth(
+                                        Month(
+                                            Range,
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    },
+                ),
+            ),
+        },
+    ),
+    cause: None,
+}
+footer mismatch: ok
+type offset: ok
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+Error {
+    kind: JcoreRange(
+        RangeError {
+            kind: Bounds(
+                BoundsError {
+                    kind: UnixEpochSeconds(
+                        RawBoundsError {
+                            what: "Unix timestamp seconds",
+                            min: -377705023201,
+                            max: 253402207200,
+                        },
+                    ),
+                },
+            ),
+        },
+    ),
+    cause: None,
+}
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+Error {
+    kind: JcoreRange(
+        RangeError {
+            kind: Bounds(
+                BoundsError {
+                    kind: UnixEpochSeconds(
+                        RawBoundsError {
+                            what: "Unix timestamp seconds",
+                            min: -377705023201,
+                            max: 253402207200,
+                        },
+                    ),
+                },
+            ),
+        },
+    ),
+    cause: None,
+}
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+failed to get duration between `std::time::SystemTime` values: parameter 'signed duration seconds' is not in the required range of -9223372036854775808..=9223372036854775807
+failed to get duration between `std::time::SystemTime` values: parameter 'signed duration seconds' is not in the required range of -9223372036854775808..=9223372036854775807
+Error {
+    kind: SignedDuration(
+        ConvertSystemTime,
+    ),
+    cause: Some(
+        Error {
+            kind: Bounds(
+                SignedDurationSeconds(
+                    RawBoundsError {
+                        what: "signed duration seconds",
+                        min: -9223372036854775808,
+                        max: 9223372036854775807,
+                    },
+                ),
+            ),
+            cause: None,
+        },
+    ),
+}
+failed to get duration between `std::time::SystemTime` values: parameter 'signed duration seconds' is not in the required range of -9223372036854775808..=9223372036854775807
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200
+Error {
+    kind: JcoreRange(
+        RangeError {
+            kind: Bounds(
+                BoundsError {
+                    kind: UnixEpochSeconds(
+                        RawBoundsError {
+                            what: "Unix timestamp seconds",
+                            min: -377705023201,
+                            max: 253402207200,
+                        },
+                    ),
+                },
+            ),
+        },
+    ),
+    cause: None,
+}
+parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200

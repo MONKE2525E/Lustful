@@ -1,0 +1,9 @@
+[package]
+name = "jiff"
+version = "0.2.37"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+features = ["alloc", "std"]

@@ -55,6 +55,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "flate2",
     "same-file",
     "name-to-handle-at",
+    "jiff",
 ];
 
 /// One adapter crate, read from its manifest.
