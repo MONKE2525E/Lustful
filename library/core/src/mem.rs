@@ -25,8 +25,11 @@ impl<T> core::fmt::Debug for core::mem::MaybeUninit<T> {
 // (`drop`, `take`) are not here: lust has no `unsafe`. No
 // `T: ?Sized` yet.
 
-/// A wrapper that stops the compiler from dropping its value.
-#[derive(Copy, Clone, Debug, Default)]
+/// A wrapper that stops the compiler from dropping its value. Core writes
+/// `PartialEq`, `Eq`, `PartialOrd`, `Ord`, and `Hash` by hand over the one
+/// field (and `StructuralPartialEq`); derives over the one field are the
+/// same impls, and lust's sort, map keys, and const patterns take them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct ManuallyDrop<T> {
     value: MaybeDangling<T>,
@@ -35,7 +38,7 @@ pub struct ManuallyDrop<T> {
 /// Core's (unstable) field type of `ManuallyDrop`. Private here, so
 /// user code cannot name it; it shows in `ManuallyDrop`'s Debug text
 /// as in core (`ManuallyDrop { value: MaybeDangling(5) }`).
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 struct MaybeDangling<T>(T);
 
@@ -61,31 +64,5 @@ impl<T> core::ops::Deref for ManuallyDrop<T> {
 impl<T> core::ops::DerefMut for ManuallyDrop<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.value.0
-    }
-}
-
-impl<T: Eq> Eq for ManuallyDrop<T> {}
-
-impl<T: PartialEq> PartialEq for ManuallyDrop<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.value.0 == other.value.0
-    }
-}
-
-impl<T: Ord> Ord for ManuallyDrop<T> {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.value.0.cmp(&other.value.0)
-    }
-}
-
-impl<T: PartialOrd> PartialOrd for ManuallyDrop<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        self.value.0.partial_cmp(&other.value.0)
-    }
-}
-
-impl<T: core::hash::Hash> core::hash::Hash for ManuallyDrop<T> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.value.0.hash(state);
     }
 }
