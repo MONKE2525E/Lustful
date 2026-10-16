@@ -4789,6 +4789,20 @@ impl<'p> Ctx<'p> {
                         }
                     }
                     obligations::Obligation::DynStatic { .. } | obligations::Obligation::TypeStatic { .. } => pending.push(ob),
+                    // Error recovery: once the body has an error, an obligation
+                    // over an error type proves nothing more (the compile fails
+                    // anyway). Selecting it tried every impl of the trait and
+                    // reported each (`fs::canonicalize(&unknown)`: 20,000 L0613
+                    // in 113 s).
+                    obligations::Obligation::Trait { trait_ref, .. }
+                        if !self.errs.is_empty()
+                            && self.tys.args(trait_ref.args).to_vec().into_iter().any(|g| g.as_ty().is_some_and(|t| {
+                                let t = self.resolve(t);
+                                self.has_error_kind(t)
+                            })) =>
+                    {
+                        progress = true;
+                    }
                     obligations::Obligation::Trait { trait_ref, span, depth } => match self.select_obligation_at(trait_ref, span, depth) {
                         Selection::Impl { id, args, unbound, .. } => {
                             if !unbound.is_empty() && self.still_unbound(&unbound, trait_ref) {
