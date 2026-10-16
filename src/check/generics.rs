@@ -11285,10 +11285,16 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 // body's requests) checks again next round; its requests
                 // that name them would make instances over template
                 // closures, which have no code.
+                // A body still pending after its recheck (in `lust check`,
+                // which makes no instances, or when the definer's instance
+                // came from an earlier collect and was not walked again)
+                // is not stored: its requests miss the ones that name
+                // the definer's closures, and a replay in a later build
+                // would never make those instances (daemon warm builds).
                 if checked.closure_map_pending && !rechecked.contains(&fid) {
                     rechecked.push(fid);
                     recheck.push(fid);
-                } else if discarded.is_empty() {
+                } else if discarded.is_empty() && !checked.closure_map_pending {
                     reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
                 } else {
                     reuse.note_unstored(p, fid);
