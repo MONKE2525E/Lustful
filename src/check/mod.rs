@@ -20906,6 +20906,17 @@ impl<'p> Ctx<'p> {
                 _ => {}
             }
         }
+        // A user `Deref` step's target can hold a literal's type var
+        // (`L { v: vec![1, 2] }[0]`); lowering types the step's temporary
+        // with it.
+        for i in 0..self.out.deref_recv.len() {
+            let t = self.out.deref_recv[i].1.target_ref;
+            self.out.deref_recv[i].1.target_ref = self.zonk(t);
+        }
+        for i in 0..self.out.deref_coerce.len() {
+            let t = self.out.deref_coerce[i].1.target_ref;
+            self.out.deref_coerce[i].1.target_ref = self.zonk(t);
+        }
         // A body with errors already (a missing impl, an error type) has
         // its vtable misses explained by them.
         let clean = !self.errs.iter().any(|d| d.severity == "error");
