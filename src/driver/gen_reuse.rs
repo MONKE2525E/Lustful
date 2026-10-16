@@ -137,6 +137,10 @@ pub struct GenReuse {
     /// see `src_of`).
     tpl_out: FxMap<LocalDefId, u64>,
     closure_out: FxMap<DefId, u64>,
+    /// `tpl_out` and `closure_out` as the last collect began: a collect
+    /// that fails gives them back (`forget_failed_gate`), since the kept
+    /// program the next request takes is the one they describe.
+    prev_outs: Option<(FxMap<LocalDefId, u64>, FxMap<DefId, u64>)>,
     /// This collect's work, for the stats line: checks run and reused.
     pub templates_checked: usize,
     pub templates_reused: usize,
@@ -228,9 +232,14 @@ impl GenReuse {
     /// For a collect that failed after `gate` saw a new trait system: no
     /// body rechecked under it, so the next collect must see the trait
     /// system as changed again (drop every entry, recheck every body).
+    /// The output fingerprints the failed collect cleared come back: a
+    /// kept program that later requests take holds those outputs.
     pub fn forget_failed_gate(&mut self) {
         if self.gated && self.trait_changed {
             self.trait_key = None;
+        }
+        if let Some((t, c)) = self.prev_outs.take() {
+            (self.tpl_out, self.closure_out) = (t, c);
         }
     }
 
@@ -251,8 +260,7 @@ impl GenReuse {
         self.trait_changed = true;
         self.gated = false;
         self.memo.clear();
-        self.tpl_out.clear();
-        self.closure_out.clear();
+        self.prev_outs = Some((std::mem::take(&mut self.tpl_out), std::mem::take(&mut self.closure_out)));
         self.templates_checked = 0;
         self.templates_reused = 0;
         self.discovery_checked = 0;
@@ -264,6 +272,7 @@ impl GenReuse {
     /// stands in for collect (driver/patch.rs): no collect ran, so no
     /// template check, and the trait system stands.
     pub fn begin_kept(&mut self) {
+        self.prev_outs = None;
         self.trait_changed = false;
         self.gated = false;
         self.templates_checked = 0;
