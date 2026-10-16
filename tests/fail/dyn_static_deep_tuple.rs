@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // rustc: lifetime may not live long enough. The `'static` object lifetime
 // sits 32 tuples deep; the walk must reach it, not stop and accept.
 trait T {}

@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // ARCH 2.8, rustc E0521: `self` in `impl dyn Shape + '_` is not `'static`.
 trait Shape { fn area(&self) -> u32; }
 impl dyn Shape { fn double(&self) -> u32 { self.area() * 2 } }

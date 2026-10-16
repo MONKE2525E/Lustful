@@ -2939,7 +2939,7 @@ impl<'p> Ctx<'p> {
             && self.p.gx.static_dyn_fns.contains(&f)
         {
             let span = self.span(e);
-            self.obl.push(obligations::Obligation::DynStatic { span });
+            self.obl.push(obligations::Obligation::DynStatic { span, bck: true });
         }
         let i = self.ei(e);
         self.out.expr_res[i] = r;
@@ -4858,7 +4858,7 @@ impl<'p> Ctx<'p> {
         if let Selection::Impl { id, .. } = &sel
             && p.gx.static_dyn_impls.contains(&p.gx.index.get(*id).def)
         {
-            self.obl.push(obligations::Obligation::DynStatic { span });
+            self.obl.push(obligations::Obligation::DynStatic { span, bck: false });
         }
         if let Selection::Impl { nested, .. } = &sel {
             if depth >= 64 {
@@ -5140,7 +5140,9 @@ impl<'p> Ctx<'p> {
                             pending.push(ob);
                         }
                     }
-                    obligations::Obligation::DynStatic { .. } | obligations::Obligation::TypeStatic { .. } => pending.push(ob),
+                    obligations::Obligation::DynStatic { .. } | obligations::Obligation::TypeStatic { .. } | obligations::Obligation::StaticSource { .. } => {
+                        pending.push(ob)
+                    }
                     // Error recovery: once the body has an error, an obligation
                     // over an error type proves nothing more (the compile fails
                     // anyway). Selecting it tried every impl of the trait and
@@ -5210,12 +5212,14 @@ impl<'p> Ctx<'p> {
             }
         }
         if hard && !self.obl.is_empty() {
-            let mut dyn_static: Vec<Span> = Vec::new();
+            let mut dyn_static: Vec<(Span, bool)> = Vec::new();
             let mut type_static: Vec<(Ty, Span)> = Vec::new();
+            let mut static_src: Vec<(Ty, Span)> = Vec::new();
             for ob in self.obl.take() {
                 match ob {
-                    obligations::Obligation::DynStatic { span } => dyn_static.push(span),
+                    obligations::Obligation::DynStatic { span, bck } => dyn_static.push((span, bck)),
                     obligations::Obligation::TypeStatic { ty, span } => type_static.push((ty, span)),
+                    obligations::Obligation::StaticSource { ty, span } => static_src.push((ty, span)),
                     obligations::Obligation::Trait { trait_ref, span, .. } => {
                         // One last try now that literal fallbacks and
                         // late bindings have run: an impl with a
@@ -5268,6 +5272,12 @@ impl<'p> Ctx<'p> {
             }
             self.check_dyn_static(dyn_static);
             self.check_type_static(type_static);
+            for (ty, span) in static_src {
+                let ty = self.deep(ty);
+                if object::may_borrow_in(self.p, &self.tys, self.env(), ty) {
+                    self.static_source_err(ty, span);
+                }
+            }
         }
     }
 
@@ -5376,7 +5386,7 @@ impl<'p> Ctx<'p> {
                     eq.trait_args
                 }
                 obligations::Obligation::DynStatic { .. } => continue,
-                obligations::Obligation::TypeStatic { ty, .. } => {
+                obligations::Obligation::TypeStatic { ty, .. } | obligations::Obligation::StaticSource { ty, .. } => {
                     self.default_literal_vars(*ty);
                     continue;
                 }
@@ -5420,15 +5430,44 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True when the source `x` of an unsizing coercion to a `'static`
+    /// dyn type still has inference variables: whether it may hold a
+    /// borrow is decided at body end, once they are bound (a value made
+    /// in a closure whose type args come from the closure's return), and
+    /// the coercion goes on.
+    fn defer_static_source(&mut self, x: Ty, span: Span) -> bool {
+        let x = self.deep(x);
+        if !self.tys.flags(x).contains_infer() {
+            return false;
+        }
+        self.obl.push(obligations::Obligation::StaticSource { ty: x, span });
+        true
+    }
+
+    /// L0705 for the source of an unsizing coercion to a `'static` dyn
+    /// type that may hold a borrow.
+    fn static_source_err(&mut self, x: Ty, span: Span) {
+        let tn = self.tn(x);
+        self.err(
+            "L0705",
+            span,
+            format!("lust cannot prove that `{tn}` lives for `'static`, which this `dyn` type requires"),
+            "Use a type without references here, or drop the `'static` bound from the `dyn` type or its trait.",
+        );
+    }
+
     /// Reports the uses that need a `'static` dyn object lifetime when
     /// this body cannot give them one (see `dyn_static_clean`). Concrete
     /// instances skip it: their caller proved the bound that picked the
     /// impl, and their params are the caller's types.
-    fn check_dyn_static(&mut self, mut spans: Vec<Span>) {
-        if spans.is_empty() || matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
+    fn check_dyn_static(&mut self, items: Vec<(Span, bool)>) {
+        if items.is_empty() || matches!(self.p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance)) {
             return;
         }
-        if self.dyn_static_clean() {
+        let bck_ok = !items.iter().any(|&(_, bck)| bck) || self.dyn_static_bck_clean();
+        let clean = items.iter().all(|&(_, bck)| bck) || self.dyn_static_clean();
+        let mut spans: Vec<Span> = items.into_iter().filter(|&(_, bck)| if bck { !bck_ok } else { !clean }).map(|(s, _)| s).collect();
+        if spans.is_empty() {
             return;
         }
         // A probe re-selection records no span; the call site does.
@@ -5446,6 +5485,47 @@ impl<'p> Ctx<'p> {
                 "Make the `dyn` value `'static` (`&'static dyn Tr` or `dyn Tr + 'static`), or write `impl dyn Tr + '_` for an impl that takes any lifetime.",
             );
         }
+    }
+
+    /// The part of `dyn_static_clean` the borrow checker does not replace,
+    /// for the `'static` uses it proves (`Obligation::DynStatic::bck`): no
+    /// dyn type with a caller's object lifetime sits in an invariant
+    /// position (under `&mut`, a user Adt, a fn pointer) of a parameter,
+    /// the return type, a callee's return type, or a closure's signature,
+    /// and no parameter or return type reaches a user Adt field that holds
+    /// one (`object::reaches_erased_dyn_field`).
+    /// The borrow checker lets any value flowing into a place shorten the
+    /// object lifetime of an outer `&mut dyn` (rustc does so only at a
+    /// coercion site with a known target type), so a `'static` object it
+    /// proved could still reach such a place (`let o = Some(d); o`).
+    fn dyn_static_bck_clean(&mut self) -> bool {
+        let p = self.p;
+        if self.f.params.iter().chain([&self.f.ret]).any(|&t| object::has_erased_dyn_invariant(p, &p.tys, t) || object::reaches_erased_dyn_field(p, &p.tys, t)) {
+            return false;
+        }
+        for i in 0..self.closures.len() {
+            let sig: Vec<Ty> = self.closures[i].inputs.iter().copied().chain([self.closures[i].output]).collect();
+            for t in sig {
+                let t = self.deep(t);
+                if object::has_erased_dyn_invariant(p, &self.tys, t) {
+                    return false;
+                }
+            }
+        }
+        for i in 0..self.out.expr_res.len() {
+            let invariant = match self.out.expr_res[i] {
+                Res::Fn(f) | Res::Method { f, .. } | Res::TraitBin { f, .. } => object::has_erased_dyn_invariant(p, &p.tys, p.fn_info(f).ret),
+                Res::DynMethod { .. } | Res::Indirect => {
+                    let t = self.deep(self.out.expr_ty[i]);
+                    object::has_erased_dyn_invariant(p, &self.tys, t)
+                }
+                _ => continue,
+            };
+            if invariant {
+                return false;
+            }
+        }
+        true
     }
 
     /// True when every dyn value in this body may have a `'static` object
@@ -6505,7 +6585,10 @@ impl<'p> Ctx<'p> {
                 why,
                 "Use the same object lifetime on both sides, or drop the `'static` bound from the `dyn` type.",
             ),
-            None if need_static => self.obl.push(obligations::Obligation::DynStatic { span }),
+            None if need_static => {
+                let bck = !object::user_adt_over_dyn(&self.tys, e);
+                self.obl.push(obligations::Obligation::DynStatic { span, bck });
+            }
             None => {}
         }
     }
@@ -6888,7 +6971,7 @@ impl<'p> Ctx<'p> {
                 return None;
             }
             if object::dyn_is_static(p, &self.tys, y) && !object::dyn_is_static(p, &self.tys, x) {
-                self.obl.push(obligations::Obligation::DynStatic { span });
+                self.obl.push(obligations::Obligation::DynStatic { span, bck: true });
             }
             return Some(Coerce::Unsize(expected));
         }
@@ -6916,14 +6999,8 @@ impl<'p> Ctx<'p> {
             self.dyn_borrow_src = true;
         }
         let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
-        if to_static && borrows && !instance {
-            let tn = self.tn(x);
-            self.err(
-                "L0705",
-                span,
-                format!("lust cannot prove that `{tn}` lives for `'static`, which this `dyn` type requires"),
-                "Use a type without references here, or write a shorter object lifetime.",
-            );
+        if to_static && borrows && !instance && !self.defer_static_source(x, span) {
+            self.static_source_err(x, span);
             return None;
         }
         let want = match self.tys.kind(y) {
@@ -7060,7 +7137,7 @@ impl<'p> Ctx<'p> {
                 return None;
             }
             if to_static && !object::dyn_is_static(p, &self.tys, x) {
-                self.obl.push(obligations::Obligation::DynStatic { span });
+                self.obl.push(obligations::Obligation::DynStatic { span, bck: true });
             }
             return Some(Coerce::Unsize(expected));
         }
@@ -7083,14 +7160,8 @@ impl<'p> Ctx<'p> {
         // An instance replays its template, which proved this under the
         // env's `'static` bounds (a `T: 'static` arg may be `&'static str`).
         let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
-        if to_static && borrows && !instance {
-            let tn = self.tn(x);
-            self.err(
-                "L0705",
-                span,
-                format!("lust cannot prove that `{tn}` lives for `'static`, which this `dyn` type requires"),
-                "Use a type without references here, or drop the `'static` bound from the `dyn` type or its trait.",
-            );
+        if to_static && borrows && !instance && !self.defer_static_source(x, span) {
+            self.static_source_err(x, span);
             return None;
         }
         let lang = p.gx.lang;
@@ -13310,7 +13381,7 @@ impl<'p> Ctx<'p> {
         let cand = u8::try_from(ci).expect("at most 256 object candidates");
         self.set_res(e, Res::DynMethod { owner: c.owner.def, cand, slot, derefs: 0, autoref: Autoref::None });
         if c.needs_static && !object::dyn_is_static(p, &self.tys, base) {
-            self.obl.push(obligations::Obligation::DynStatic { span });
+            self.obl.push(obligations::Obligation::DynStatic { span, bck: false });
         }
         self.check_args(&params, args, span);
         Some(self.normalize_here(ret))
@@ -22888,7 +22959,9 @@ impl<'p> Ctx<'p> {
                     self.args_mention(eq.trait_args, &reported) || reported.iter().any(|&v| self.occurs(v, eq.ty))
                 }
                 obligations::Obligation::DynStatic { .. } => false,
-                obligations::Obligation::TypeStatic { ty, .. } => reported.iter().any(|&v| self.occurs(v, ty)),
+                obligations::Obligation::TypeStatic { ty, .. } | obligations::Obligation::StaticSource { ty, .. } => {
+                    reported.iter().any(|&v| self.occurs(v, ty))
+                }
             };
             if !mentions {
                 self.obl.push(ob);

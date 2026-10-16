@@ -23,11 +23,19 @@ pub enum Obligation {
     Trait { trait_ref: TraitRef, span: Span, depth: u16 },
     AssocEq { eq: AssocEqData, span: Span },
     /// A use that needs a dyn value's object lifetime to be `'static`
-    /// (`check::object`); decided once at body end.
-    DynStatic { span: Span },
+    /// (`check::object`); decided once at body end. `bck`: the borrow
+    /// checker proves it from the types' object lifetime slots (a
+    /// coercion or subtyping into a `'static` object), so the body-level
+    /// rule (`Ctx::dyn_static_clean`) skips it.
+    DynStatic { span: Span, bck: bool },
     /// A `'static` bound (`X: 'static`) on an instantiated type;
     /// decided once at body end (`Ctx::static_bound_err`).
     TypeStatic { ty: Ty, span: Span },
+    /// The source of an unsizing coercion to a `'static` dyn type whose
+    /// type still had inference variables there (`Ctx::coerce_unsize`):
+    /// it must hold no borrow (`object::may_borrow_in`) once they are
+    /// bound; decided once at body end.
+    StaticSource { ty: Ty, span: Span },
 }
 
 /// The per-body work queue. Runs happen in `check/mod.rs`; see

@@ -1,6 +1,5 @@
-// expect: L0705
-// ARCH 2.8: rustc infers a `'static` object lifetime for `d`; lust sees the
-// `&dyn Shape` param `p` in the same body and cannot tell the values apart.
+// ARCH 2.8: rustc infers a `'static` object lifetime for `d`, next to the
+// `&dyn Shape` param `p` in the same body; the borrow checker tells them apart.
 trait Shape { fn area(&self) -> u32; }
 impl dyn Shape { fn double(&self) -> u32 { self.area() * 2 } }
 struct Sq(u32);

@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0306
 // ARCH 2.8, rustc E0597: a dyn made from `&Sq` lives only as long as `s`.
 trait Shape { fn area(&self) -> u32; }
 impl dyn Shape { fn double(&self) -> u32 { self.area() * 2 } }

@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // rustc E0521: `impl dyn Tr` is for `dyn Tr + 'static`, and `a` has a shorter object lifetime.
 trait Tr {
     fn id(&self) -> u8;

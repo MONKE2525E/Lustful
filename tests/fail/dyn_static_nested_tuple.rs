@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // rustc: lifetime may not live long enough (object lifetime inside a tuple).
 trait T { fn read(&self) -> u32; }
 struct S { n: u32 }

@@ -239,6 +239,60 @@ impl<'p> Ctx<'p> {
         kind
     }
 
+    /// `t` (an annotated closure parameter's type) with each inferred dyn
+    /// object lifetime that is `'static` in `x` (the expected signature's
+    /// input) made `'static`: rustc equates the annotation with the
+    /// expected input, so `|p: Rc<dyn Tr>|` passed as `dyn FnMut(Rc<dyn
+    /// Tr>)` takes the sugar's `'static` default. Other regions stay.
+    fn static_objects_from(&mut self, t: Ty, x: Ty, depth: u32) -> Ty {
+        let x = self.deep(x);
+        if depth > crate::check::object::LIFETIME_WALK_LIMIT {
+            return t;
+        }
+        match (self.kind(t), self.kind(x)) {
+            (TyKind::Dyn(b, Region::Erased), TyKind::Dyn(_, Region::Static)) => self.tys.intern(TyKind::Dyn(b, Region::Static)),
+            (TyKind::Ref(r, m, e), TyKind::Ref(_, _, xe)) => {
+                let e2 = self.static_objects_from(e, xe, depth + 1);
+                if e2 == e { t } else { self.tys.intern(TyKind::Ref(r, m, e2)) }
+            }
+            (TyKind::Tuple(ts), TyKind::Tuple(xs)) => {
+                let (ts, xs) = (self.tys.tys_of(ts).to_vec(), self.tys.tys_of(xs).to_vec());
+                if ts.len() != xs.len() {
+                    return t;
+                }
+                let new: Vec<Ty> = ts.iter().zip(&xs).map(|(&a, &b)| self.static_objects_from(a, b, depth + 1)).collect();
+                if new == ts { t } else {
+                    let l = self.tys.intern_tys(&new);
+                    self.tys.intern(TyKind::Tuple(l))
+                }
+            }
+            (TyKind::Adt(d, a), TyKind::Adt(xd, xa)) if d == xd => {
+                let (ga, gx) = (self.tys.args(a).to_vec(), self.tys.args(xa).to_vec());
+                if ga.len() != gx.len() {
+                    return t;
+                }
+                let mut changed = false;
+                let mut new = Vec::with_capacity(ga.len());
+                for (g, h) in ga.into_iter().zip(gx) {
+                    match (g, h) {
+                        (GenericArg::Ty(a), GenericArg::Ty(b)) => {
+                            let n = self.static_objects_from(a, b, depth + 1);
+                            changed |= n != a;
+                            new.push(GenericArg::Ty(n));
+                        }
+                        (g, _) => new.push(g),
+                    }
+                }
+                if !changed {
+                    return t;
+                }
+                let a = self.tys.intern_args(&new);
+                self.tys.intern(TyKind::Adt(d, a))
+            }
+            _ => t,
+        }
+    }
+
     /// True when `t` has a `'static` reference region (kept only inside fn
     /// pointer types and `dyn Fn*` sugar, `Scope::static_refs`).
     fn has_static_region(&mut self, t: Ty) -> bool {
@@ -759,7 +813,10 @@ impl<'p> Ctx<'p> {
                     {
                         self.mismatch(prm.span, x, t);
                     }
-                    t
+                    match exp {
+                        Some(x) => self.static_objects_from(t, x, 0),
+                        None => t,
+                    }
                 }
                 (None, Some(x)) => x,
                 (None, None) => self.new_var(false),

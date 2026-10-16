@@ -1666,7 +1666,7 @@ pub(super) fn dyn_probe(
     let cand = u8::try_from(ci).expect("at most 256 object candidates");
     cx.set_res(e, Res::DynMethod { owner: c.owner.def, cand, slot, derefs, autoref: probe.autoref });
     if c.needs_static && !object::dyn_is_static(p, &cx.tys, step) {
-        cx.obl.push(crate::check::obligations::Obligation::DynStatic { span: name_span });
+        cx.obl.push(crate::check::obligations::Obligation::DynStatic { span: name_span, bck: false });
     }
     cx.check_args(&params[1.min(params.len())..], args, name_span);
     Probe::Hit(cx.normalize_here(ret))

@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0306
 // ARCH 2.8, rustc E0597: `get` returns a `&dyn` that lives only as long as `g`.
 trait Shape { fn area(&self) -> u32; }
 impl dyn Shape { fn double(&self) -> u32 { self.area() * 2 } }
