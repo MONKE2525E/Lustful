@@ -4216,7 +4216,6 @@ pub fn collect_reuse(
         let (variants_src, derives_src): (Vec<VariantSrc>, &Vec<(Sym, Span)>) = match &item.kind {
             ItemKind::Struct(s) => {
                 let (shape, fields) = variant_fields_src(interner, &s.fields);
-                let shape = if shape == VariantShape::Unit { VariantShape::Named } else { shape };
                 (vec![(s.name, s.name_span, shape, fields, None, false)], &s.derives)
             }
             ItemKind::Enum(e) => {
@@ -4315,7 +4314,6 @@ pub fn collect_reuse(
         let mut keep_scope = p.gx.adt_scopes[id.0 as usize].clone();
         keep_scope.regions = generics::RegionMode::Keep { next: None, elided: None };
         for (vname, vspan, shape, field_srcs, disc_src, variant_ne) in variants_src {
-            let shape = if !is_enum && field_srcs.is_empty() { VariantShape::Unit } else { shape };
             let mut fields = Vec::new();
             for (fname, fty, fspan) in field_srcs {
                 if shape == VariantShape::Named && fields.iter().any(|f: &Field| f.name == fname) {

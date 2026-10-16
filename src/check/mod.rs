@@ -3216,7 +3216,8 @@ impl<'p> Ctx<'p> {
     /// What a lone identifier in a pattern resolves to through the
     /// module bindings (imports included): a const item, a static, or
     /// a unit variant or struct constructor. Anything else stays a
-    /// fresh binding. The binding query records the read, so a body
+    /// fresh binding, the name of a struct with named fields (`struct Z
+    /// {}` too, which has no value) included. The binding query records the read, so a body
     /// rechecks when the name's target changes.
     fn pat_ident(&mut self, name: Sym) -> PatIdent {
         use crate::resolve::imports::{BindState, Target};
@@ -3254,6 +3255,9 @@ impl<'p> Ctx<'p> {
                     }
                     return PatIdent::Other;
                 }
+                if p.adt(a).variants[0].shape == VariantShape::Named {
+                    return PatIdent::Other;
+                }
                 return PatIdent::Variant(a, 0);
             }
         }
@@ -3270,6 +3274,7 @@ impl<'p> Ctx<'p> {
         }
         if let Some(&a) = p.type_names.get(&name)
             && !p.adt(a).is_enum
+            && p.adt(a).variants[0].shape != VariantShape::Named
         {
             return PatIdent::Variant(a, 0);
         }
