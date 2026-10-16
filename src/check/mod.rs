@@ -12685,12 +12685,23 @@ impl<'p> Ctx<'p> {
                         let obl_len = self.obl_len();
                         let sites_len = self.generic_sites.len();
                         let err_len = self.errs.len();
+                        // The place steps the trial records (`&**w`
+                        // through a user `Deref`, a user `Index`) are
+                        // recorded again by the recheck; kept, a step
+                        // would run twice (one `deref` call on the
+                        // other's result).
+                        let place_lens =
+                            (self.out.deref_recv.len(), self.out.deref_coerce.len(), self.out.index_recv.len(), self.deref_sites.len());
                         let at = self.expr(args[0], None);
                         let at = self.deep(at);
                         self.rollback_vars(snap);
                         self.obl_truncate(obl_len);
                         self.generic_sites.truncate(sites_len);
                         self.errs.truncate(err_len);
+                        self.out.deref_recv.truncate(place_lens.0);
+                        self.out.deref_coerce.truncate(place_lens.1);
+                        self.out.index_recv.truncate(place_lens.2);
+                        self.deref_sites.truncate(place_lens.3);
                         let mut bases = vec![at];
                         if let TyKind::Ref(_, _, inner) = self.tys.kind(at) {
                             bases.insert(0, self.deep(inner));
