@@ -648,6 +648,10 @@ impl<'p> Ctx<'p> {
             return ERROR;
         }
         let item = crate::ty::iter::item_ty(&mut self.tys, it).unwrap_or(ERROR);
+        let item_d = self.deep(item);
+        if self.extend_item_open(item_d, *a) {
+            return ERROR;
+        }
         let (k, s) = (targs[0], *targs.last().unwrap_or(&UNIT));
         let want = if kind == HashTy::HashMap {
             let ts = self.tys.intern_tys(&[targs[0], targs[1]]);

@@ -1825,6 +1825,9 @@ struct Ctx<'p> {
     /// (`let r = it.collect(); (r, n)` returned as `(Vec<String>, _)`):
     /// target, item, and span, checked at finish (`collect_target_ok`).
     deferred_collect: Vec<(Ty, Ty, Span)>,
+    /// `sum`/`product` calls whose item type was open: (target, item,
+    /// is `sum`, span), checked at body end (`finish_deferred_sums`).
+    deferred_sum: Vec<(Ty, Ty, bool, Span)>,
     /// Item types an iterator method needs to be Copy (`copied`),
     /// re-tested at finish as above (W-STD-A).
     deferred_copy: Vec<(Ty, Span)>,
@@ -1942,6 +1945,11 @@ struct Ctx<'p> {
     /// Lowering emits the builtin operator, so the types must turn out
     /// scalar by body end (see `finish`).
     open_binops: Vec<(ExprId, BinOp, Ty)>,
+    /// Operators whose trait selection rustc leaves pending on an open
+    /// operand (`binop_waits`): (expr, op, lhs type, rhs type, rhs
+    /// expr, span, result type unless an `Output` projection carries
+    /// it), checked at body end.
+    wait_binops: Vec<(ExprId, BinOp, Ty, Ty, ExprId, Span, Option<Ty>)>,
     /// Unsizing coercion sites, (concrete pointee, dyn type, span)
     /// before zonking; `finish` turns them into vtable requests.
     vtable_sites: Vec<(Ty, Ty, Span)>,
@@ -2218,6 +2226,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_trait_fn_calls: Vec::new(),
         deferred_eq: Vec::new(),
         deferred_collect: Vec::new(),
+        deferred_sum: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_exact_range: Vec::new(),
         stmt_expr: None,
@@ -2254,6 +2263,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         closure_bound_inputs: std::collections::HashMap::new(),
         closure_call_outs: std::collections::HashSet::new(),
         open_binops: Vec::new(),
+        wait_binops: Vec::new(),
         vtable_sites: Vec::new(),
         unwind_checks: Vec::new(),
         dyn_borrow_src: false,
@@ -14802,6 +14812,11 @@ impl<'p> Ctx<'p> {
             }
             return ERROR;
         }
+        // `extend` on a std source collection with an open item type
+        // (check/extend.rs): rustc E0283, before the impl probe picks one.
+        if self.name(name) == "extend" && self.std_extend_item_open(base, args) {
+            return ERROR;
+        }
         // User methods, through the method-set probes of section 2.10: every
         // form is probed in order and recorded, hit or miss, before the
         // builtin compat dispatch below runs.
@@ -16847,12 +16862,144 @@ impl<'p> Ctx<'p> {
     /// left-leaning operator chain (`a + b + c + ...`) in a loop
     /// instead of recursing down its left spine.
     fn binary_with_lt(&mut self, e: ExprId, op: BinOp, lt: Ty, rhs: ExprId, span: Span) -> Ty {
-        use BinOp::*;
-        debug_assert!(!matches!(op, And | Or));
-        let rt = self.expr(rhs, Some(lt));
+        debug_assert!(!matches!(op, BinOp::And | BinOp::Or));
+        // An open left operand gives the right one no expected type: rustc
+        // checks the right operand on its own.
+        let expect = (!self.unbound_general(lt)).then_some(lt);
+        let rt = self.expr(rhs, expect);
         // ARCH 2.12 run point: an operator on a non-scalar must know the left
         // operand type. The scalar path above and below needs no trait search.
         self.run_obligations(false);
+        if self.binop_waits(op, lt, rt) {
+            return self.wait_binop(e, op, lt, rt, rhs, span);
+        }
+        self.binary_types(e, op, lt, rt, rhs, span)
+    }
+
+    /// True when rustc leaves this operator's trait selection pending:
+    /// the left operand (under matching references) is a type variable,
+    /// which an operator never binds (`?T: Add<u8>` waits for `?T`), or
+    /// the right one is and the left side is a number, whose arithmetic
+    /// has `Rhs = T` and `Rhs = &T` (a scalar comparison has only `Rhs =
+    /// Self`, and a single written impl selects too: both bind it). Such
+    /// an operator is checked at body end (`wait_binops`), and a variable
+    /// still open there is rustc's E0282.
+    fn binop_waits(&self, op: BinOp, lt: Ty, rt: Ty) -> bool {
+        let (l, r) = self.binop_operands(op, lt, rt);
+        // Both operands open (`|a, b| a + b`): the `open_binops` path.
+        if self.unbound_general(l) && self.unbound_general(r) && self.unbound_general(lt) && self.unbound_general(rt) {
+            return false;
+        }
+        if self.unbound_general(l) {
+            return true;
+        }
+        // A mono instance's template already proved the operator through
+        // its bounds (`X: Add<Output = X>` fixes `Rhs = X`): an open right
+        // operand next to a now concrete left one is the template's.
+        if self.p.gx.fn_class.get(self.fid.0 as usize) == Some(&generics::FnClass::Instance) {
+            return false;
+        }
+        let k = self.kind(l);
+        let scalar = matches!(k, TyKind::Int(_) | TyKind::Float(_)) || k.is_int_infer() || k.is_float_infer();
+        self.unbound_general(r) && !op.is_cmp() && scalar
+    }
+
+    /// The operand types an operator's impls select on: under matching
+    /// references for a comparison (`&A: PartialEq<&B>` is `A: PartialEq<B>`),
+    /// under one reference each for arithmetic (`&u8: Add<u8>`).
+    fn binop_operands(&self, op: BinOp, lt: Ty, rt: Ty) -> (Ty, Ty) {
+        let (mut l, mut r) = (self.resolve(lt), self.resolve(rt));
+        if op.is_cmp() {
+            while let (TyKind::Ref(_, _, a), TyKind::Ref(_, _, b)) = (self.kind(l), self.kind(r)) {
+                (l, r) = (self.resolve(a), self.resolve(b));
+            }
+            (l, r)
+        } else {
+            (self.resolve(self.peel_one_ref(l).1), self.resolve(self.peel_one_ref(r).1))
+        }
+    }
+
+    /// An operator `binop_waits` holds until body end: a comparison is
+    /// `bool`; arithmetic gives a variable for its result. With the left
+    /// operand open, `<L as Op<R>>::Output` fixes it as soon as a later
+    /// use fixes `L` (`|x| x * 2` called with a `u64`, then `y.pow(2)`);
+    /// with a literal left operand and an open right one (`|x| 1 + x`),
+    /// literal fallback decides it.
+    /// With the left side a known number and the right one open, the
+    /// projection would pick one of the `Rhs = T` and `Rhs = &T` impls,
+    /// so only the body-end check (`finish_wait_binops`) binds it; also
+    /// for a reference operand, whose scalar impls (`u32: Add<&u32>`,
+    /// `&i32: Add<i32>`) the solver does not have.
+    fn wait_binop(&mut self, e: ExprId, op: BinOp, lt: Ty, rt: Ty, rhs: ExprId, span: Span) -> Ty {
+        self.set_res(e, Res::Bin { ld: 0, rd: 0 });
+        let out = if op.is_cmp() { BOOL } else { self.new_var(false) };
+        let (l, r) = self.binop_operands(op, lt, rt);
+        let lk = self.kind(l);
+        let literal_left = lk.is_int_infer() || lk.is_float_infer();
+        let mut projected = false;
+        if let Some(assoc) = self.binop_output_assoc(op)
+            && ((self.unbound_general(l) && !self.unbound_general(r)) || (literal_left && self.unbound_general(r)))
+            && !matches!(self.kind(self.resolve(rt)), TyKind::Ref(..))
+            && !matches!(self.kind(self.resolve(lt)), TyKind::Ref(..))
+        {
+            let trait_args = self.tys.intern_args(&[GenericArg::Ty(lt), GenericArg::Ty(rt)]);
+            self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc, trait_args, ty: out }, span });
+            projected = true;
+        }
+        // A projected result is the projection's alone: literal fallback
+        // decides it (`|x| x + 1` called with a literal is i32 + i32, and
+        // a `u64` use is rustc's E0271), so body end does not bind it.
+        let out_slot = if projected { None } else { Some(out) };
+        self.wait_binops.push((e, op, lt, rt, rhs, span, out_slot));
+        out
+    }
+
+    /// The `Output` item of an arithmetic or bit operator's trait.
+    fn binop_output_assoc(&self, op: BinOp) -> Option<DefId> {
+        use BinOp::*;
+        let lang = &self.p.gx.lang;
+        let tr = match op {
+            Add => lang.add,
+            Sub => lang.sub,
+            Mul => lang.mul,
+            Div => lang.div,
+            Rem => lang.rem,
+            BitAnd => lang.bit_and,
+            BitOr => lang.bit_or,
+            BitXor => lang.bit_xor,
+            Shl => lang.shl,
+            Shr => lang.shr,
+            _ => return None,
+        };
+        lang.output_of(tr)
+    }
+
+    /// Body end: each operator `wait_binop` held is checked now that
+    /// its operand types are known, or is an annotation error.
+    fn finish_wait_binops(&mut self) {
+        for (e, op, lt, rt, rhs, span, out) in std::mem::take(&mut self.wait_binops) {
+            if self.binop_waits(op, lt, rt) {
+                self.err(
+                    "L0610",
+                    span,
+                    "type annotations needed: the operand types of this operator must be known here",
+                    "Annotate the type of the operand, such as `let v: Vec<i32> = Vec::new();`.",
+                );
+                continue;
+            }
+            let t = self.binary_types(e, op, lt, rt, rhs, span);
+            if let Some(out) = out
+                && t != ERROR
+                && !self.unify(out, t)
+            {
+                self.mismatch(span, out, t);
+            }
+        }
+    }
+
+    /// `binary_with_lt` once both operand types are checked.
+    fn binary_types(&mut self, e: ExprId, op: BinOp, lt: Ty, rt: Ty, rhs: ExprId, span: Span) -> Ty {
+        use BinOp::*;
         self.replay_pick_operands(e, &[lt, rt]);
         let (lk, rk) = (self.kind(lt), self.kind(rt));
         if lk == TyKind::Error || rk == TyKind::Error {
@@ -21846,6 +21993,12 @@ impl<'p> Ctx<'p> {
         // the hard one: an obligation that is only ambiguous over a
         // literal's type (`{float}: Tr` with impls for f32 and f64)
         // selects with i32 or f64, the types body end defaults to.
+        self.run_obligations(false);
+        // Operators and sums that waited on an open operand or item, now
+        // that later uses fixed it: before literal fallback, as rustc
+        // selects them as soon as the variable is known.
+        self.finish_wait_binops();
+        self.finish_deferred_sums();
         self.run_obligations(false);
         self.literal_fallback_in_obligations();
         // Coercion casts with an open operand, after literal fallback

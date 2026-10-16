@@ -453,6 +453,65 @@ pub(super) fn trait_method_probe(
     trait_probe_for(cx, e, None, probes, derefs, name, name_span, args, explicit, expected)
 }
 
+/// The checker state a trial check of call arguments adds to, so the
+/// trial can be undone in full (`trait_probe_for`'s input trial,
+/// `std_extend_item_open`). Closures checked in a trial are checked
+/// again for real: their records and parameter locals go too.
+pub(super) struct ArgTrial {
+    vars: usize,
+    obl: usize,
+    errs: usize,
+    sites: usize,
+    picks: usize,
+    dmeth: usize,
+    closures: usize,
+    calls: usize,
+    locals: usize,
+    binops: usize,
+    open: usize,
+    wait: usize,
+    sum: usize,
+    fmt: usize,
+}
+
+impl ArgTrial {
+    pub(super) fn mark(cx: &mut Ctx) -> Self {
+        ArgTrial {
+            vars: cx.snapshot_vars(),
+            obl: cx.obl_len(),
+            errs: cx.errs.len(),
+            sites: cx.generic_sites.len(),
+            picks: cx.out.trait_picks.len(),
+            dmeth: cx.deferred_methods.len(),
+            closures: cx.closures.len(),
+            calls: cx.out.closure_calls.len(),
+            locals: cx.out.locals.len(),
+            binops: cx.deferred_binops.len(),
+            open: cx.open_binops.len(),
+            wait: cx.wait_binops.len(),
+            sum: cx.deferred_sum.len(),
+            fmt: cx.deferred_fmt.len(),
+        }
+    }
+
+    pub(super) fn rollback(self, cx: &mut Ctx) {
+        cx.rollback_vars(self.vars);
+        cx.obl_truncate(self.obl);
+        cx.errs.truncate(self.errs);
+        cx.generic_sites.truncate(self.sites);
+        cx.out.trait_picks.truncate(self.picks);
+        cx.deferred_methods.truncate(self.dmeth);
+        cx.closures.truncate(self.closures);
+        cx.out.closure_calls.truncate(self.calls);
+        cx.out.locals.truncate(self.locals);
+        cx.deferred_binops.truncate(self.binops);
+        cx.open_binops.truncate(self.open);
+        cx.wait_binops.truncate(self.wait);
+        cx.deferred_sum.truncate(self.sum);
+        cx.deferred_fmt.truncate(self.fmt);
+    }
+}
+
 /// `trait_method_probe` over every trait in scope, or over `only`
 /// when a template pick or a where clause already fixed the trait
 /// (scope was decided there). A confirmed hit is recorded as a
@@ -770,20 +829,7 @@ pub(super) fn trait_probe_for(
             // signature (rolled back in full), then select again
             // with the inferred inputs.
             if ambiguous && let Some(t) = &tmpl {
-                let snap = cx.snapshot_vars();
-                let obl_len = cx.obl_len();
-                let err_len = cx.errs.len();
-                let sites_len = cx.generic_sites.len();
-                let picks_len = cx.out.trait_picks.len();
-                let dmeth_len = cx.deferred_methods.len();
-                // Closures checked in the trial are checked again for
-                // real below: drop their records and parameter locals.
-                let closures_len = cx.closures.len();
-                let calls_len = cx.out.closure_calls.len();
-                let locals_len = cx.out.locals.len();
-                let binops_len = cx.deferred_binops.len();
-                let open_len = cx.open_binops.len();
-                let fmt_len = cx.deferred_fmt.len();
+                let trial = ArgTrial::mark(cx);
                 let mut input_vars: Vec<Ty> = Vec::new();
                 let mut full: Vec<GenericArg> = vec![GenericArg::Ty(step)];
                 for _ in 0..n_inputs {
@@ -826,18 +872,7 @@ pub(super) fn trait_probe_for(
                 } else {
                     None
                 };
-                cx.rollback_vars(snap);
-                cx.obl_truncate(obl_len);
-                cx.errs.truncate(err_len);
-                cx.generic_sites.truncate(sites_len);
-                cx.out.trait_picks.truncate(picks_len);
-                cx.deferred_methods.truncate(dmeth_len);
-                cx.closures.truncate(closures_len);
-                cx.out.closure_calls.truncate(calls_len);
-                cx.out.locals.truncate(locals_len);
-                cx.deferred_binops.truncate(binops_len);
-                cx.open_binops.truncate(open_len);
-                cx.deferred_fmt.truncate(fmt_len);
+                trial.rollback(cx);
                 if let Some(inputs) = zonked {
                     let snap = cx.snapshot_vars();
                     let obl_len = cx.obl_len();
