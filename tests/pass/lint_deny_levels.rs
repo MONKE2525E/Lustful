@@ -6,9 +6,12 @@
 use std::mem::ManuallyDrop;
 use std::sync::{Mutex, RwLock};
 
+// Not Copy and owns no heap memory, so a forgotten value leaks nothing.
+struct Nc(u8);
+
 #[allow(undropped_manually_drops)]
 fn fn_level() {
-    drop(ManuallyDrop::new(String::from("a")));
+    drop(ManuallyDrop::new(Nc(1)));
 }
 
 #[macro_export(local_inner_macros)]
@@ -35,8 +38,8 @@ fn main() {
     let m = ManuallyDrop::new(5);
     drop(m);
     #[allow(undropped_manually_drops)]
-    drop(ManuallyDrop::new(vec![1]));
-    drop(&ManuallyDrop::new(String::from("b")));
+    drop(ManuallyDrop::new(Nc(2)));
+    drop(&ManuallyDrop::new(Nc(3)));
     drop(vec![ManuallyDrop::new(6)]);
     let lock = Mutex::new(1);
     let _g = lock.lock();
