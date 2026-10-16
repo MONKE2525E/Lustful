@@ -1,29 +1,30 @@
 // `&&Vec<T>` coerces to `&[T]` through both derefs (ts-rust core.rs
 // `impl Deref for Declarations`: a match arm binds `list: &&'static
-// Vec<Node>` and returns it as `&[Node]`), also in returns that name
-// the inner or outer lifetime, and in closures.
+// Vec<Node>` and returns it as `&[Node]`; here the list is borrowed
+// for `'a`), also in returns that name the inner or outer lifetime, and
+// in closures.
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 struct Node(u32);
 
-enum List {
+enum List<'a> {
     Empty,
     One(Node),
     Many(Arc<Vec<Node>>),
-    Static(&'static Vec<Node>),
+    Borrowed(&'a Vec<Node>),
 }
 
-struct Decls(List);
+struct Decls<'a>(List<'a>);
 
-impl std::ops::Deref for Decls {
+impl std::ops::Deref for Decls<'_> {
     type Target = [Node];
     fn deref(&self) -> &[Node] {
         match &self.0 {
             List::Empty => &[],
             List::One(node) => std::slice::from_ref(node),
             List::Many(list) => list,
-            List::Static(list) => list,
+            List::Borrowed(list) => list,
         }
     }
 }
@@ -37,8 +38,8 @@ fn outer<'a, 'b: 'a>(x: &'a &'b mut Vec<u8>) -> &'a [u8] {
 }
 
 fn main() {
-    let v: &'static Vec<Node> = Box::leak(Box::new(vec![Node(1), Node(2)]));
-    let d = Decls(List::Static(v));
+    let v = vec![Node(1), Node(2)];
+    let d = Decls(List::Borrowed(&v));
     let e = Decls(List::Many(Arc::new(vec![Node(3)])));
     let f = Decls(List::One(Node(4)));
     let g = Decls(List::Empty);
