@@ -198,10 +198,12 @@ static EPOCH: AtomicU64 = AtomicU64::new(1);
 /// The `epoch` key: many statistics are cached and refresh when
 /// the epoch advances. Here it only counts, as a fresh real
 /// process observes it (first read 1, each advance adds one).
-pub mod epoch {
-    use super::{EPOCH, Result};
-    use std::sync::atomic::Ordering;
+#[allow(non_camel_case_types)]
+pub struct epoch;
 
+/// Upstream's `epoch` is a unit struct whose key fns are associated
+/// fns (so `use epoch::advance` rejects, as upstream).
+impl epoch {
     /// Reads the epoch.
     pub fn read() -> Result<u64> {
         Ok(EPOCH.load(Ordering::SeqCst))
@@ -221,7 +223,7 @@ pub mod epoch {
 
     /// Advances the epoch returning its latest value.
     pub fn advance() -> Result<u64> {
-        update(1)
+        epoch::update(1)
     }
 }
 
@@ -229,10 +231,12 @@ pub mod epoch {
 /// its trailing null, as `version` reads it upstream.
 const VERSION: &str = "5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8\0";
 
-/// The `version` key: the jemalloc version string.
-pub mod version {
-    use super::{Result, VERSION};
+/// The `version` key: the jemalloc version string (a unit struct
+/// with an associated `read`, as upstream).
+#[allow(non_camel_case_types)]
+pub struct version;
 
+impl version {
     /// Reads the version string (with its trailing null, as
     /// upstream returns it).
     pub fn read() -> Result<&'static str> {

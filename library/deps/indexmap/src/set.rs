@@ -3,13 +3,23 @@
 
 use crate::map::{self, IndexMap};
 use core::hash::{BuildHasher, Hash};
+#[cfg(feature = "std")]
 use std::collections::hash_map::RandomState;
 
-/// A hash set that keeps insertion order.
+/// A hash set that keeps insertion order (`S` defaults to `RandomState`
+/// only with `std`, as upstream).
+#[cfg(feature = "std")]
 pub struct IndexSet<T, S = RandomState> {
     pub(crate) map: IndexMap<T, (), S>,
 }
 
+/// A hash set that keeps insertion order (no `std`: no default hasher).
+#[cfg(not(feature = "std"))]
+pub struct IndexSet<T, S> {
+    pub(crate) map: IndexMap<T, (), S>,
+}
+
+#[cfg(feature = "std")]
 impl<T> IndexSet<T> {
     pub fn new() -> Self {
         IndexSet { map: IndexMap::new() }

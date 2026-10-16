@@ -13,6 +13,12 @@
 // the bytes decoded before it first, as upstream's streaming
 // decoder does at read_to_end.
 
+// Upstream builds only with a backend; of the features this adapter
+// takes, `miniz_oxide` (also implied by `rust_backend` and `default`)
+// is the one that gives it one.
+#[cfg(not(feature = "miniz_oxide"))]
+compile_error!("flate2 needs a backend feature (`rust_backend` or `miniz_oxide`)");
+
 pub mod read;
 
 mod inflate;
@@ -52,8 +58,8 @@ impl Compression {
         Compression(9)
     }
 
-    /// The level number.
-    pub const fn level(self) -> u32 {
+    /// The level number (not a const fn upstream).
+    pub fn level(&self) -> u32 {
         self.0
     }
 }

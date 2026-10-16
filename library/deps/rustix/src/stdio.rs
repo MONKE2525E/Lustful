@@ -3,18 +3,21 @@
 use crate::fd::{AsFd, AsRawFd, BorrowedFd};
 use crate::io::{Errno, Result};
 
+#[cfg(feature = "std")]
 /// `STDIN_FILENO` as a borrowed fd.
-pub fn stdin() -> BorrowedFd<'static> {
+pub const fn stdin() -> BorrowedFd<'static> {
     BorrowedFd::borrow_raw(0)
 }
 
+#[cfg(feature = "std")]
 /// `STDOUT_FILENO` as a borrowed fd.
-pub fn stdout() -> BorrowedFd<'static> {
+pub const fn stdout() -> BorrowedFd<'static> {
     BorrowedFd::borrow_raw(1)
 }
 
+#[cfg(feature = "std")]
 /// `STDERR_FILENO` as a borrowed fd.
-pub fn stderr() -> BorrowedFd<'static> {
+pub const fn stderr() -> BorrowedFd<'static> {
     BorrowedFd::borrow_raw(2)
 }
 

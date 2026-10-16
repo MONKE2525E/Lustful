@@ -5,14 +5,25 @@
 
 use crate::inner::{Bucket, Core};
 use core::hash::{BuildHasher, Hash};
+#[cfg(feature = "std")]
 use std::collections::hash_map::RandomState;
 
-/// A hash map that keeps insertion order.
+/// A hash map that keeps insertion order. `S` defaults to `RandomState`
+/// only with upstream's `std` feature, as upstream.
+#[cfg(feature = "std")]
 pub struct IndexMap<K, V, S = RandomState> {
     pub(crate) core: Core<K, V>,
     hash_builder: S,
 }
 
+/// A hash map that keeps insertion order (no `std`: no default hasher).
+#[cfg(not(feature = "std"))]
+pub struct IndexMap<K, V, S> {
+    pub(crate) core: Core<K, V>,
+    hash_builder: S,
+}
+
+#[cfg(feature = "std")]
 impl<K, V> IndexMap<K, V> {
     pub fn new() -> Self {
         IndexMap { core: Core::new(), hash_builder: RandomState::new() }

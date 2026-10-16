@@ -6563,6 +6563,7 @@ pub fn finish_trait_impl(
         }
     }
     check_impl_rules(p, imp, &impl_generics, self_pat, tr, errs);
+    errs.extend(crate::check::platform::user_impl_of_hidden(p, imp.span, tr.def, method_ids));
     crate::check::fmt::check_fmt_impl(p, imp, tr, self_pat, method_ids, errs);
     // Method validation against the trait's templates.
     let impl_parent_n = impl_generics.params.len();

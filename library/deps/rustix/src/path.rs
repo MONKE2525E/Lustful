@@ -7,56 +7,65 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-/// A path argument.
+/// A path argument. Upstream's methods (`as_str`, `into_with_c_str`,
+/// ...) are not here; the one hook is a `__lust_` name user code cannot
+/// call or define (check/platform.rs), so a user impl of `Arg` rejects.
 pub trait Arg {
     /// The path bytes (no terminator; the shim adds it).
-    fn as_path_bytes(&self) -> Vec<u8>;
+    fn __lust_path_bytes(&self) -> Vec<u8>;
 }
 
 impl Arg for &str {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Arg for String {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Arg for &String {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
 }
 
+#[cfg(feature = "std")]
 impl Arg for &OsStr {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_encoded_bytes().to_vec()
     }
 }
 
+#[cfg(feature = "std")]
 impl Arg for &OsString {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_encoded_bytes().to_vec()
     }
 }
 
+#[cfg(feature = "std")]
 impl Arg for &Path {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_os_str().as_encoded_bytes().to_vec()
     }
 }
 
+#[cfg(feature = "std")]
 impl Arg for &PathBuf {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_os_str().as_encoded_bytes().to_vec()
     }
 }
 
+#[cfg(feature = "std")]
 impl Arg for PathBuf {
-    fn as_path_bytes(&self) -> Vec<u8> {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_os_str().as_encoded_bytes().to_vec()
     }
 }

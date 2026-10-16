@@ -21,13 +21,13 @@ impl PipeFlags {
     pub const fn empty() -> PipeFlags {
         PipeFlags(0)
     }
-    pub const fn bits(self) -> u32 {
+    pub const fn bits(&self) -> u32 {
         self.0
     }
     pub const fn from_bits_retain(bits: u32) -> PipeFlags {
         PipeFlags(bits)
     }
-    pub const fn contains(self, other: PipeFlags) -> bool {
+    pub const fn contains(&self, other: PipeFlags) -> bool {
         self.0 & other.0 == other.0
     }
 }

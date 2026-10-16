@@ -332,7 +332,7 @@ impl<A: Array> SmallVec<A> {
         self.truncate(w);
     }
 
-    pub fn dedup_by_key<K: PartialEq, F: FnMut(&mut A::Item) -> K>(&mut self, mut key: F) {
+    pub fn dedup_by_key<F: FnMut(&mut A::Item) -> K, K: PartialEq>(&mut self, mut key: F) {
         self.dedup_by(|a, b| key(a) == key(b));
     }
 }

@@ -14,6 +14,8 @@ MultiGzDecoder). Gate: `scripts/test-adapters.sh flate2`.
   Error kinds and messages match upstream for bad headers,
   corrupt deflate streams, bad checksums, and truncation.
 - `Compression` (the level type alone; no encoder takes it).
+- A unit without a backend feature (`rust_backend` or
+  `miniz_oxide`) fails to build, as upstream does.
 - A decode error returns the bytes decoded before it first,
   as upstream's streaming decoder does at `read_to_end`.
 

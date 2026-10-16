@@ -21523,6 +21523,7 @@ impl<'p> Ctx<'p> {
             self.out.generic_site_args.push((ei, template, zargs.clone()));
             self.out.inst_requests.push((template, zargs));
         }
+        self.hidden_fn_uses();
         // A generic Adt constructor names the template Adt; the
         // value's type names the instance mono made. Point the
         // resolution at the instance so lowering lays it out.

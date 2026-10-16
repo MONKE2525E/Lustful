@@ -70,7 +70,90 @@ fn user_writer_diag(p: &Program, tys: &impl TyIntern, writer: Ty, fallback: Span
     ))
 }
 
+/// Fns that are `unsafe fn` in rustc's std but safe fns in lust's std
+/// source (lust source cannot spell `unsafe fn`): `FromRawFd::from_raw_fd`
+/// (the trait method and every impl of it) and `BorrowedFd::borrow_raw`.
+/// Shipped crates call them; user code that names one rejects, as rustc
+/// rejects the call outside an `unsafe` block (E0133).
+const UPSTREAM_UNSAFE_FNS: &[&str] = &["from_raw_fd", "borrow_raw"];
+
+/// The name prefix of adapter helper fns that upstream lacks (the hooks
+/// of an adapter's sealed traits, rustix `Arg` and `Buffer`). User code
+/// cannot name them, and cannot define one in an impl of a shipped trait.
+const HIDDEN_PREFIX: &str = "__lust_";
+
+/// True when `span` is in shipped source: spliced std, the platform
+/// crate, or an adapter crate's files.
+fn shipped_span(p: &Program, span: Span) -> bool {
+    p.shipped_crate_at(span).is_some() || p.adapter_at(span).is_some() || p.std_source_span(span)
+}
+
+/// The impl-level half of the rules above, for a user impl of trait
+/// `trait_def` with methods `methods`: implementing std's `FromRawFd`
+/// needs an `unsafe fn` (L0404), and a `__lust_` method in an impl of a
+/// shipped trait names a member upstream's trait does not have.
+pub fn user_impl_of_hidden(p: &Program, impl_span: Span, trait_def: crate::def::DefId, methods: &[LocalDefId]) -> Option<Diag> {
+    if shipped_span(p, impl_span) {
+        return None;
+    }
+    let tdata = p.defs.get(trait_def)?;
+    if !shipped_span(p, tdata.span) {
+        return None;
+    }
+    if p.display_path(tdata.name) == "std::os::fd::FromRawFd" {
+        return Some(Diag::new(
+            "L0404",
+            impl_span,
+            "implementing `FromRawFd` needs an `unsafe fn from_raw_fd`, and `unsafe` is not supported",
+            "Build the value from an owned fd with a safe constructor instead.",
+        ));
+    }
+    let hidden = methods.iter().find(|&&m| p.name(p.fn_info(m).name).starts_with(HIDDEN_PREFIX))?;
+    let f = p.fn_def(*hidden);
+    Some(Diag::new(
+        "L0110",
+        f.name_span,
+        format!("method `{}` is not a member of the trait", p.name(p.fn_info(*hidden).name)),
+        "Remove the method.",
+    ))
+}
+
 impl Ctx<'_> {
+    /// Body end: user code that names a fn of a shipped crate that is
+    /// `unsafe` upstream (L0404) or a hidden `__lust_` helper (L0104).
+    pub(super) fn hidden_fn_uses(&mut self) {
+        let p = self.p;
+        for i in 0..self.out.expr_res.len() {
+            let f = match self.out.expr_res[i] {
+                super::Res::Fn(f) | super::Res::Method { f, .. } => f,
+                _ => continue,
+            };
+            // Hidden: an adapter's `__lust_` hook (std's own internal
+            // `__lust_` fns sit behind public std paths and stay usable).
+            let def_span = p.fn_def(f).name_span;
+            let name = p.name(p.fn_info(f).name);
+            let hidden = name.starts_with(HIDDEN_PREFIX) && p.adapter_at(def_span).is_some();
+            if !hidden && !UPSTREAM_UNSAFE_FNS.contains(&name) {
+                continue;
+            }
+            let e = crate::ast::ExprId(self.out.expr_base + i as u32);
+            let span = p.ast.expr_span(e);
+            if shipped_span(p, span) || !shipped_span(p, p.fn_def(f).name_span) {
+                continue;
+            }
+            if hidden {
+                self.err("L0104", span, format!("no function or method `{name}`"), "Use the crate's public API.");
+            } else {
+                self.err(
+                    "L0404",
+                    span,
+                    format!("`{name}` is an `unsafe fn` in std; calling it needs `unsafe`, which is not supported"),
+                    "Use a safe std API instead.",
+                );
+            }
+        }
+    }
+
     /// True, after an L0104 error, when user code names a hidden variant
     /// of an enum a shipped crate defines: std's unstable `io::ErrorKind`
     /// kinds carry a `__` prefix in lust's source, and rustc has no such

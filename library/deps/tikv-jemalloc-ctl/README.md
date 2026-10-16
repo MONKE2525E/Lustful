@@ -25,7 +25,8 @@ so a program that uses it rejects at compile time.
   `version` reads do not fail in either build), so there is no
   error output to match. Upstream derives `Copy`, `Clone`,
   and `PartialEq` (no `Eq`); so does this adapter.
-- `epoch` (`read`, `write`, `update`, `advance`): a fresh real
+- `epoch` (a unit struct, as upstream, with associated `read`,
+  `write`, `update`, `advance`): a fresh real
   process reads 1 first, each advance adds exactly one, and
   `update` returns the new value. That held across repeated
   runs and with `_RJEM_MALLOC_CONF` set. Nothing else in this
@@ -56,7 +57,7 @@ different allocator can return them exactly. Removed:
   by-name form cannot reject one key at compile time and keep
   another, so all by-name key reads and writes reject,
   including `epoch` and `version` by name. Use the typed
-  `epoch` and `version` modules above.
+  `epoch` and `version` unit structs above.
 - With them go `thread.arena`, `opt.narenas`,
   `thread.tcache.enabled`, the string keys
   (`config.malloc_conf` reads the build's conf string), and

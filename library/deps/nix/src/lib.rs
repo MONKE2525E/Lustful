@@ -8,9 +8,11 @@
 pub mod errno;
 pub mod sys;
 
-pub use errno::Errno;
+// Upstream imports `Errno` privately at the root (`nix::errno::Errno`
+// and the `nix::Error` alias are the public names).
+use errno::Errno;
 
-use std::ffi::{CStr, OsStr, OsString};
+use std::ffi::{CStr, OsStr};
 use std::path::{Path, PathBuf};
 
 /// The nix error type (an alias of `Errno`, as upstream).
@@ -71,18 +73,6 @@ impl NixPath for str {
 }
 
 impl NixPath for OsStr {
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn len(&self) -> usize {
-        self.len()
-    }
-    fn with_nix_path<T, F: FnOnce(&CStr) -> T>(&self, f: F) -> Result<T> {
-        bytes_with_nix_path(self.as_encoded_bytes(), f)
-    }
-}
-
-impl NixPath for OsString {
     fn is_empty(&self) -> bool {
         self.is_empty()
     }

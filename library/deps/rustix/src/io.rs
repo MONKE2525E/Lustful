@@ -2,6 +2,8 @@
 // calls. Errno's Debug and Display are std's io::Error forms, as
 // upstream delegates to them.
 
+use crate::buffer::Buffer;
+use crate::buffer::private::Sealed as _;
 use crate::fd::{AsFd, AsRawFd};
 use core::fmt;
 
@@ -49,7 +51,7 @@ impl Errno {
     /// `ENOMEM`
     pub const NOMEM: Errno = Errno(12);
     /// `EACCES`
-    pub const ACCES: Errno = Errno(13);
+    pub const ACCESS: Errno = Errno(13);
     /// `EFAULT`
     pub const FAULT: Errno = Errno(14);
     /// `EBUSY`
@@ -104,20 +106,22 @@ impl Errno {
     pub const CONNREFUSED: Errno = Errno(111);
 
     /// The error from a raw OS error number.
-    pub fn from_raw_os_error(code: i32) -> Errno {
+    pub const fn from_raw_os_error(code: i32) -> Errno {
         Errno(code)
     }
 
     /// The raw OS error number.
-    pub fn raw_os_error(self) -> i32 {
+    pub const fn raw_os_error(self) -> i32 {
         self.0
     }
 
+    #[cfg(feature = "std")]
     /// The `Errno` of an `io::Error`, when it holds a raw OS error.
     pub fn from_io_error(err: &std::io::Error) -> Option<Errno> {
         err.raw_os_error().map(Errno)
     }
 
+    #[cfg(feature = "std")]
     /// Shorthand for `std::io::Error::from(self).kind()`.
     pub fn kind(self) -> std::io::ErrorKind {
         std::io::Error::from(self).kind()
@@ -142,6 +146,7 @@ impl fmt::Debug for Errno {
 // (README); the io::Error conversion below is the form ts-rust
 // uses.
 
+#[cfg(feature = "std")]
 impl From<Errno> for std::io::Error {
     fn from(err: Errno) -> std::io::Error {
         std::io::Error::from_raw_os_error(err.0)
@@ -150,7 +155,12 @@ impl From<Errno> for std::io::Error {
 
 /// One `read` of up to `buf.len()` bytes (sys_fd_read fills a Vec,
 /// copied here; the count and the bytes are the syscall's).
-pub fn read<Fd: AsFd>(fd: Fd, buf: &mut [u8]) -> Result<usize> {
+pub fn read<Fd: AsFd, Buf: Buffer<u8>>(fd: Fd, mut buf: Buf) -> Result<usize> {
+    read_into(fd, buf.__lust_slice())
+}
+
+/// The fill of `read` over a plain slice.
+fn read_into<Fd: AsFd>(fd: Fd, buf: &mut [u8]) -> Result<usize> {
     if buf.is_empty() {
         return Ok(0);
     }

@@ -5,15 +5,20 @@ signal registry. Gate: `scripts/test-adapters.sh signal-hook`.
 
 ## Implemented, same results as upstream
 
-- `consts` (and `consts::signal`): the Linux signal numbers
-  and `FORBIDDEN`. Registering a forbidden signal panics with
+- `consts` (and `consts::signal`): the signal numbers upstream
+  re-exports from libc on Linux, `FORBIDDEN`, and
+  `TERM_SIGNALS`. Registering a forbidden signal panics with
   upstream's message.
 - `flag::register`, `register_usize`,
   `register_conditional_shutdown`, and
   `register_conditional_default`, returning a `SigId`.
-- `iterator::Signals` with `new`, `add_signal`, `pending`,
-  `wait`, `forever`, `handle`, and `is_closed`; `Handle` with
-  `close` and `is_closed`. Pending batches are sorted by
+- `iterator::Signals` (feature `iterator`) with `new`,
+  `add_signal`, `pending`, `wait`, `forever`, `handle`, and
+  `is_closed`; `Pending<E>` and `Forever<'a, E>` over the sealed
+  `iterator::exfiltrator::Exfiltrator` with `SignalOnly` (the one
+  exfiltrator here; the Iterator impls are for it alone);
+  `Handle` with `close` and `is_closed`. Auto traits as
+  upstream (Send and Sync, not UnwindSafe). Pending batches are sorted by
   signal number with duplicates removed, as upstream's slot
   exfiltrator yields them.
 - `low_level::raise`, `exit` (a bare `_exit`), `abort`,
@@ -39,7 +44,8 @@ signal registry. Gate: `scripts/test-adapters.sh signal-hook`.
 
 ## Rejected (lust error, never a different answer)
 
-- The generic exfiltrator forms (`SignalsInfo<E>`,
-  `WithOrigin`, `WithSend`), `low_level::channel` and `pipe`
-  helpers, `iterator::exfiltrator` types, and layout queries
-  on the adapter types.
+- `SignalsInfo<E>`, `WithRawSiginfo`, `WithOrigin`, generic
+  code over `E: Exfiltrator`, the sealed trait's storage
+  hooks, `low_level::channel` and `pipe` helpers, `SigId`'s
+  Debug, Hash, and Ord, and layout queries on the adapter
+  types.

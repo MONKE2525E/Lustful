@@ -23,6 +23,7 @@ impl Pid {
         if raw == 0 { None } else { Some(Pid(raw)) }
     }
 
+    #[cfg(feature = "std")]
     /// The pid of a child process.
     pub fn from_child(child: &std::process::Child) -> Pid {
         Pid(child.id() as i32)
@@ -231,6 +232,7 @@ pub fn set_parent_process_death_signal(signal: Option<Signal>) -> Result<()> {
 /// A resource limit kind (`RLIMIT_*`, Linux numbers).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum Resource {
     Cpu = 0,
     Fsize = 1,

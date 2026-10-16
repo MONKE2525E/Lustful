@@ -42,7 +42,11 @@ corpus_fail_dir tests/consts/later/fail
 # lust, which swaps the adapter in, and compares stdout and exit status.
 # A case headed `// lust-reject: L####` is valid Rust that lust must
 # reject with that code (an API or layout the adapter does not
-# implement); Cargo must still build it.
+# implement); Cargo must still build it. A case in the dir's `fail/`
+# headed `// expect: L####` is invalid Rust against the real crate (an
+# adapter shape upstream lacks): Cargo must fail to compile it and lust
+# must reject it with that code. A dir may pin other features of the
+# same package (deps.toml), e.g. `crates/signal-hook-nodefault/`.
 corpus_crate_dir() {
   # $1 = dir relative to the repo root
   corpus_require_dir "$1" || return 0
@@ -66,16 +70,67 @@ corpus_crate_dir() {
     cp "$f" "$proj/src/bin/$name.rs"
     cases+=("$name")
   done
-  [ ${#cases[@]} -eq 0 ] && return 0
-  # One Cargo build for every case, so the dependency compiles once.
-  if ! (cd "$proj" && CARGO_NET_OFFLINE=true timeout 600 cargo build -q --bins --target-dir "$proj/target") >"$proj/cargo.out" 2>&1; then
-    corpus_report bad "$1" "cargo build against the real crate failed: $(grep -m3 -E '^error' "$proj/cargo.out" | tr '\n' ' ')"
+  if [ ${#cases[@]} -gt 0 ]; then
+    # One Cargo build for every case, so the dependency compiles once.
+    if ! (cd "$proj" && CARGO_NET_OFFLINE=true timeout 600 cargo build -q --bins --target-dir "$proj/target") >"$proj/cargo.out" 2>&1; then
+      corpus_report bad "$1" "cargo build against the real crate failed: $(grep -m3 -E '^error' "$proj/cargo.out" | tr '\n' ' ')"
+      return
+    fi
+    for name in "${cases[@]}"; do
+      corpus_cases=$((corpus_cases + 1))
+      corpus_crate_one "$dir" "$proj" "$name"
+    done
+  fi
+  for f in "$dir"/fail/*.rs; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .rs)
+    [[ -n "$corpus_filter" && "$name" != *"$corpus_filter"* && "$pkg" != *"$corpus_filter"* ]] && continue
+    corpus_cases=$((corpus_cases + 1))
+    corpus_crate_fail_one "$f" "$proj" "$pkg" "$name"
+  done
+}
+
+# One `fail/` case: Cargo must reject it in the case's own crate (not
+# in the dependency), and lust must reject it with the expected code.
+corpus_crate_fail_one() {
+  local f=$1 proj=$2 pkg=$3 name=$4 code
+  code=$(grep -m1 '// expect:' "$f" | sed 's|.*expect: *||; s/[[:space:]]*$//')
+  if [ -z "$code" ]; then
+    corpus_report bad "$name" "fail case has no // expect: L#### line"
     return
   fi
-  for name in "${cases[@]}"; do
-    corpus_cases=$((corpus_cases + 1))
-    corpus_crate_one "$dir" "$proj" "$name"
-  done
+  cp "$f" "$proj/src/bin/$name.rs"
+  (cd "$proj" && CARGO_NET_OFFLINE=true timeout 600 cargo build -q --bin "$name" --target-dir "$proj/target") >"$proj/$name.cargo.out" 2>&1
+  local cst=$?
+  if [ $cst -eq 0 ]; then
+    rm -f "$proj/src/bin/$name.rs"
+    corpus_report bad "$name" "the real crate builds this fail case"
+    return
+  fi
+  if ! grep -q "could not compile \`adapter-$pkg\`" "$proj/$name.cargo.out"; then
+    rm -f "$proj/src/bin/$name.rs"
+    corpus_report bad "$name" "cargo failed outside the case: $(grep -m2 -E '^error' "$proj/$name.cargo.out" | tr '\n' ' ')"
+    return
+  fi
+  corpus_report ok "$name"
+  if [ -n "${LUST:-}" ]; then
+    lust_cc env CARGO_NET_OFFLINE=true "$LUST" build "$proj/src/bin/$name.rs" -o "$proj/$name.lust" --manifest-path "$proj/Cargo.toml" \
+      --bin "$name" >/dev/null 2>"$proj/$name.lust.err"
+    local st=$?
+    if is_timeout "$st"; then
+      corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    elif [ "$st" -eq 0 ]; then
+      corpus_slow_note "$name" "lust build"
+      corpus_lust_note wrong "$name" "lust accepted a case the real crate rejects (want $code)"
+    elif grep -q "$code" "$proj/$name.lust.err"; then
+      corpus_slow_note "$name" "lust build"
+      corpus_lust_note match "$name" ""
+    else
+      corpus_slow_note "$name" "lust build"
+      corpus_lust_note wrong "$name" "lust rejected without $code: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
+    fi
+  fi
+  rm -f "$proj/src/bin/$name.rs"
 }
 
 corpus_crate_one() {

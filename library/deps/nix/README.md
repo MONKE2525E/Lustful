@@ -15,19 +15,16 @@ fswatch/unix.rs uses. Gate: `scripts/test-adapters.sh nix`.
   `AsRawFd`, `FromRawFd`, and `From<Fanotify> for OwnedFd`
   impls. Events are read by callers as raw bytes on the fd,
   as ts-rust does.
-- `NixPath` for `[u8]`, `str`, `OsStr`, `OsString`, `CStr`,
-  `Path`, and `PathBuf` (interior NUL is EINVAL, as upstream).
-- `Errno` (also `nix::Error`): upstream's Linux
+- `NixPath` for `[u8]`, `str`, `OsStr`, `CStr`, `Path`, and
+  `PathBuf` (interior NUL is EINVAL, as upstream).
+- `sys::prctl` needs feature `process` and `sys::fanotify`
+  feature `fanotify`, as upstream.
+- `errno::Errno` (also `nix::Error`): upstream's Linux
   `#[repr(i32)]` enum with every variant, so `err as i32`
   works; variant-name Debug, `EPERM: Operation not permitted`
   Display from nix's `desc` table, `from_raw` (unknown codes
   are `UnknownErrno`, as upstream), and the `io::Error`
   conversions.
-
-## Known differences
-
-- The flag types' Debug forms are the derived tuple forms,
-  not upstream's flag-name lists (as in the rustix adapter).
 
 ## Rejected (lust error, never a different answer)
 

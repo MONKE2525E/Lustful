@@ -12,7 +12,7 @@ pub const CWD: BorrowedFd<'static> = BorrowedFd::borrow_raw(-100);
 
 /// The path bytes of `path`, or EINVAL for an interior NUL.
 fn path_bytes<P: Arg>(path: &P) -> Result<Vec<u8>> {
-    let bytes = path.as_path_bytes();
+    let bytes = path.__lust_path_bytes();
     if bytes.contains(&0) {
         return Err(Errno::INVAL);
     }
@@ -46,13 +46,13 @@ impl OFlags {
     /// No flags.
     pub const fn empty() -> OFlags { OFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> OFlags { OFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: OFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: OFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for OFlags {
@@ -76,32 +76,32 @@ impl core::ops::BitAnd for OFlags {
 pub struct Mode(u32);
 
 impl Mode {
-    pub const IRWXU: Mode = Mode(0o700);
-    pub const IRUSR: Mode = Mode(0o400);
-    pub const IWUSR: Mode = Mode(0o200);
-    pub const IXUSR: Mode = Mode(0o100);
-    pub const IRWXG: Mode = Mode(0o070);
-    pub const IRGRP: Mode = Mode(0o040);
-    pub const IWGRP: Mode = Mode(0o020);
-    pub const IXGRP: Mode = Mode(0o010);
-    pub const IRWXO: Mode = Mode(0o007);
-    pub const IROTH: Mode = Mode(0o004);
-    pub const IWOTH: Mode = Mode(0o002);
-    pub const IXOTH: Mode = Mode(0o001);
-    pub const ISUID: Mode = Mode(0o4000);
-    pub const ISGID: Mode = Mode(0o2000);
-    pub const ISVTX: Mode = Mode(0o1000);
+    pub const RWXU: Mode = Mode(0o700);
+    pub const RUSR: Mode = Mode(0o400);
+    pub const WUSR: Mode = Mode(0o200);
+    pub const XUSR: Mode = Mode(0o100);
+    pub const RWXG: Mode = Mode(0o070);
+    pub const RGRP: Mode = Mode(0o040);
+    pub const WGRP: Mode = Mode(0o020);
+    pub const XGRP: Mode = Mode(0o010);
+    pub const RWXO: Mode = Mode(0o007);
+    pub const ROTH: Mode = Mode(0o004);
+    pub const WOTH: Mode = Mode(0o002);
+    pub const XOTH: Mode = Mode(0o001);
+    pub const SUID: Mode = Mode(0o4000);
+    pub const SGID: Mode = Mode(0o2000);
+    pub const SVTX: Mode = Mode(0o1000);
 
     /// No flags.
     pub const fn empty() -> Mode { Mode(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> Mode { Mode(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: Mode) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: Mode) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for Mode {
@@ -122,7 +122,7 @@ impl core::ops::BitAnd for Mode {
 // No Debug (upstream prints the bitflags form, which this adapter lacks)
 // and no Default (upstream has none).
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub struct AtFlags(i32);
+pub struct AtFlags(u32);
 
 impl AtFlags {
     pub const SYMLINK_NOFOLLOW: AtFlags = AtFlags(0x100);
@@ -138,13 +138,13 @@ impl AtFlags {
     /// No flags.
     pub const fn empty() -> AtFlags { AtFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> i32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
-    pub const fn from_bits_retain(bits: i32) -> AtFlags { AtFlags(bits) }
+    pub const fn from_bits_retain(bits: u32) -> AtFlags { AtFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: AtFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: AtFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for AtFlags {
@@ -176,13 +176,13 @@ impl Access {
     /// No flags.
     pub const fn empty() -> Access { Access(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> Access { Access(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: Access) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: Access) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for Access {
@@ -226,13 +226,13 @@ impl StatxFlags {
     /// No flags.
     pub const fn empty() -> StatxFlags { StatxFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> StatxFlags { StatxFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: StatxFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: StatxFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for StatxFlags {
@@ -332,11 +332,11 @@ pub struct Stat {
     pub st_blksize: i64,
     pub st_blocks: i64,
     pub st_atime: i64,
-    pub st_atime_nsec: i64,
+    pub st_atime_nsec: u64,
     pub st_mtime: i64,
-    pub st_mtime_nsec: i64,
+    pub st_mtime_nsec: u64,
     pub st_ctime: i64,
-    pub st_ctime_nsec: i64,
+    pub st_ctime_nsec: u64,
 }
 
 /// Decodes one sysx stat record.
@@ -353,11 +353,11 @@ fn stat_of(rec: &[u8]) -> Stat {
         st_blksize: rec_i64(rec, 8),
         st_blocks: rec_i64(rec, 9),
         st_atime: rec_i64(rec, 10),
-        st_atime_nsec: rec_i64(rec, 11),
+        st_atime_nsec: rec_u64(rec, 11),
         st_mtime: rec_i64(rec, 12),
-        st_mtime_nsec: rec_i64(rec, 13),
+        st_mtime_nsec: rec_u64(rec, 13),
         st_ctime: rec_i64(rec, 14),
-        st_ctime_nsec: rec_i64(rec, 15),
+        st_ctime_nsec: rec_u64(rec, 15),
     }
 }
 
@@ -379,7 +379,6 @@ pub struct StatxTimestamp {
 pub struct Statx {
     pub stx_mask: u32,
     pub stx_blksize: u32,
-    pub stx_attributes: u64,
     pub stx_nlink: u32,
     pub stx_uid: u32,
     pub stx_gid: u32,
@@ -387,7 +386,6 @@ pub struct Statx {
     pub stx_ino: u64,
     pub stx_size: u64,
     pub stx_blocks: u64,
-    pub stx_attributes_mask: u64,
     pub stx_atime: StatxTimestamp,
     pub stx_mtime: StatxTimestamp,
     pub stx_ctime: StatxTimestamp,
@@ -404,7 +402,6 @@ fn statx_of(rec: &[u8]) -> Statx {
     Statx {
         stx_mask: rec_u64(rec, 0) as u32,
         stx_blksize: rec_u64(rec, 1) as u32,
-        stx_attributes: rec_u64(rec, 2),
         stx_nlink: rec_u64(rec, 3) as u32,
         stx_uid: rec_u64(rec, 4) as u32,
         stx_gid: rec_u64(rec, 5) as u32,
@@ -412,7 +409,6 @@ fn statx_of(rec: &[u8]) -> Statx {
         stx_ino: rec_u64(rec, 7),
         stx_size: rec_u64(rec, 8),
         stx_blocks: rec_u64(rec, 9),
-        stx_attributes_mask: rec_u64(rec, 10),
         stx_atime: ts(11, 12),
         stx_mtime: ts(13, 14),
         stx_ctime: ts(15, 16),
@@ -424,12 +420,7 @@ fn statx_of(rec: &[u8]) -> Statx {
     }
 }
 
-/// A time for `utimensat`: seconds and nanoseconds since the epoch.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct Timespec {
-    pub tv_sec: i64,
-    pub tv_nsec: i64,
-}
+pub use crate::timespec::{Nsecs, Secs, Timespec};
 
 /// `UTIME_NOW` for a `Timespec` nanosecond field.
 pub const UTIME_NOW: i64 = (1 << 30) - 1;
@@ -450,7 +441,7 @@ pub fn open<P: Arg>(path: P, flags: OFlags, mode: Mode) -> Result<OwnedFd> {
 }
 
 /// `openat(dirfd, path, oflags, mode)`.
-pub fn openat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, flags: OFlags, mode: Mode) -> Result<OwnedFd> {
+pub fn openat<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, flags: OFlags, mode: Mode) -> Result<OwnedFd> {
     let bytes = path_bytes(&path)?;
     let fd = core::intrinsics::sys_x_openat(dirfd.as_fd().as_raw_fd(), &bytes, flags.bits() as i32, mode.as_raw_mode());
     if fd < 0 {
@@ -471,10 +462,10 @@ pub fn fstat<Fd: AsFd>(fd: Fd) -> Result<Stat> {
 }
 
 /// `fstatat(dirfd, path, flags)`.
-pub fn statat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, flags: AtFlags) -> Result<Stat> {
+pub fn statat<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, flags: AtFlags) -> Result<Stat> {
     let bytes = path_bytes(&path)?;
     let mut rec: Vec<u8> = Vec::new();
-    let e = core::intrinsics::sys_x_statat(dirfd.as_fd().as_raw_fd(), &bytes, flags.bits(), &mut rec);
+    let e = core::intrinsics::sys_x_statat(dirfd.as_fd().as_raw_fd(), &bytes, flags.bits() as i32, &mut rec);
     if e != 0 {
         return Err(Errno::from_raw_os_error(e));
     }
@@ -482,10 +473,10 @@ pub fn statat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, flags: AtFlags) -> Result<St
 }
 
 /// `statx(dirfd, path, flags, mask)`.
-pub fn statx<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, flags: AtFlags, mask: StatxFlags) -> Result<Statx> {
+pub fn statx<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, flags: AtFlags, mask: StatxFlags) -> Result<Statx> {
     let bytes = path_bytes(&path)?;
     let mut rec: Vec<u8> = Vec::new();
-    let e = core::intrinsics::sys_x_statx(dirfd.as_fd().as_raw_fd(), &bytes, flags.bits(), mask.bits(), &mut rec);
+    let e = core::intrinsics::sys_x_statx(dirfd.as_fd().as_raw_fd(), &bytes, flags.bits() as i32, mask.bits(), &mut rec);
     if e != 0 {
         return Err(Errno::from_raw_os_error(e));
     }
@@ -493,9 +484,9 @@ pub fn statx<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, flags: AtFlags, mask: StatxFl
 }
 
 /// `faccessat(dirfd, path, access, flags)`.
-pub fn accessat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, access: Access, flags: AtFlags) -> Result<()> {
+pub fn accessat<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, access: Access, flags: AtFlags) -> Result<()> {
     let bytes = path_bytes(&path)?;
-    let e = core::intrinsics::sys_x_accessat(dirfd.as_fd().as_raw_fd(), &bytes, access.bits() as i32, flags.bits());
+    let e = core::intrinsics::sys_x_accessat(dirfd.as_fd().as_raw_fd(), &bytes, access.bits() as i32, flags.bits() as i32);
     if e != 0 {
         return Err(Errno::from_raw_os_error(e));
     }
@@ -503,7 +494,7 @@ pub fn accessat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, access: Access, flags: AtF
 }
 
 /// `utimensat(dirfd, path, times, flags)`.
-pub fn utimensat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, times: &Timestamps, flags: AtFlags) -> Result<()> {
+pub fn utimensat<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, times: &Timestamps, flags: AtFlags) -> Result<()> {
     let bytes = path_bytes(&path)?;
     let e = core::intrinsics::sys_x_utimensat(
         dirfd.as_fd().as_raw_fd(),
@@ -512,7 +503,7 @@ pub fn utimensat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, times: &Timestamps, flags
         times.last_access.tv_nsec,
         times.last_modification.tv_sec,
         times.last_modification.tv_nsec,
-        flags.bits(),
+        flags.bits() as i32,
     );
     if e != 0 {
         return Err(Errno::from_raw_os_error(e));
@@ -521,7 +512,7 @@ pub fn utimensat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, times: &Timestamps, flags
 }
 
 /// `mknodat(dirfd, path, kind, mode, dev)`.
-pub fn mknodat<Fd: AsFd, P: Arg>(dirfd: Fd, path: P, kind: FileType, mode: Mode, dev: u64) -> Result<()> {
+pub fn mknodat<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, kind: FileType, mode: Mode, dev: u64) -> Result<()> {
     let bytes = path_bytes(&path)?;
     let e = core::intrinsics::sys_x_mknodat(dirfd.as_fd().as_raw_fd(), &bytes, kind.as_raw_mode() | mode.as_raw_mode(), dev);
     if e != 0 {
@@ -578,13 +569,13 @@ impl StatVfsMountFlags {
     /// No flags.
     pub const fn empty() -> StatVfsMountFlags { StatVfsMountFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u64 { self.0 }
+    pub const fn bits(&self) -> u64 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u64) -> StatVfsMountFlags { StatVfsMountFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: StatVfsMountFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: StatVfsMountFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for StatVfsMountFlags {
@@ -680,13 +671,13 @@ impl CreateFlags {
     /// No flags.
     pub const fn empty() -> CreateFlags { CreateFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> CreateFlags { CreateFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: CreateFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: CreateFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for CreateFlags {
@@ -755,13 +746,13 @@ impl WatchFlags {
     /// No flags.
     pub const fn empty() -> WatchFlags { WatchFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> WatchFlags { WatchFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: WatchFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: WatchFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for WatchFlags {
@@ -820,13 +811,13 @@ impl ReadFlags {
     /// No flags.
     pub const fn empty() -> ReadFlags { ReadFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> ReadFlags { ReadFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: ReadFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: ReadFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for ReadFlags {
@@ -854,7 +845,7 @@ impl core::ops::BitAnd for ReadFlags {
     }
 
     /// `inotify_add_watch(fd, path, flags)`: the watch descriptor.
-    pub fn add_watch<Fd: AsFd, P: Arg>(fd: Fd, path: P, flags: WatchFlags) -> Result<i32> {
+    pub fn add_watch<P: Arg, Fd: AsFd>(fd: Fd, path: P, flags: WatchFlags) -> Result<i32> {
         let bytes = path_bytes(&path)?;
         let wd = core::intrinsics::sys_x_inotify_add_watch(fd.as_fd().as_raw_fd(), &bytes, flags.bits());
         if wd < 0 {

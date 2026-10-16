@@ -38,25 +38,25 @@ impl Decoded {
 }
 
 /// A decoder over a reader, decoded lazily by `make` on the
-/// first read.
-pub struct Decoder<R> {
+/// first read. Private: upstream has no such public type.
+struct Decoder<R> {
     inner: R,
     make: fn(&[u8]) -> Decoded,
     state: Option<Decoded>,
 }
 
-impl<R: Read> Decoder<R> {
+impl<R> Decoder<R> {
     fn new(inner: R, make: fn(&[u8]) -> Decoded) -> Decoder<R> {
         Decoder { inner, make, state: None }
     }
 
     /// The inner reader.
-    pub fn get_ref(&self) -> &R {
+    fn get_ref(&self) -> &R {
         &self.inner
     }
 
     /// The inner reader, mutably.
-    pub fn get_mut(&mut self) -> &mut R {
+    fn get_mut(&mut self) -> &mut R {
         &mut self.inner
     }
 }
@@ -221,7 +221,10 @@ impl<R: Read> GzDecoder<R> {
     pub fn new(inner: R) -> GzDecoder<R> {
         GzDecoder(Decoder::new(inner, decode_gzip_one))
     }
+}
 
+// The accessors need no `Read` bound, as upstream.
+impl<R> GzDecoder<R> {
     /// The inner reader.
     pub fn get_ref(&self) -> &R {
         self.0.get_ref()
@@ -247,7 +250,10 @@ impl<R: Read> MultiGzDecoder<R> {
     pub fn new(inner: R) -> MultiGzDecoder<R> {
         MultiGzDecoder(Decoder::new(inner, decode_gzip_multi))
     }
+}
 
+// The accessors need no `Read` bound, as upstream.
+impl<R> MultiGzDecoder<R> {
     /// The inner reader.
     pub fn get_ref(&self) -> &R {
         self.0.get_ref()
@@ -273,7 +279,10 @@ impl<R: Read> ZlibDecoder<R> {
     pub fn new(inner: R) -> ZlibDecoder<R> {
         ZlibDecoder(Decoder::new(inner, decode_zlib))
     }
+}
 
+// The accessors need no `Read` bound, as upstream.
+impl<R> ZlibDecoder<R> {
     /// The inner reader.
     pub fn get_ref(&self) -> &R {
         self.0.get_ref()
@@ -299,7 +308,10 @@ impl<R: Read> DeflateDecoder<R> {
     pub fn new(inner: R) -> DeflateDecoder<R> {
         DeflateDecoder(Decoder::new(inner, decode_deflate))
     }
+}
 
+// The accessors need no `Read` bound, as upstream.
+impl<R> DeflateDecoder<R> {
     /// The inner reader.
     pub fn get_ref(&self) -> &R {
         self.0.get_ref()

@@ -69,13 +69,13 @@ impl MaskFlags {
     /// No flags.
     pub const fn empty() -> MaskFlags { MaskFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u64 { self.0 }
+    pub const fn bits(&self) -> u64 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u64) -> MaskFlags { MaskFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: MaskFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: MaskFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for MaskFlags {
@@ -121,13 +121,13 @@ impl InitFlags {
     /// No flags.
     pub const fn empty() -> InitFlags { InitFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> InitFlags { InitFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: InitFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: InitFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for InitFlags {
@@ -175,13 +175,13 @@ impl EventFFlags {
     /// No flags.
     pub const fn empty() -> EventFFlags { EventFFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> EventFFlags { EventFFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: EventFFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: EventFFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for EventFFlags {
@@ -235,13 +235,13 @@ impl MarkFlags {
     /// No flags.
     pub const fn empty() -> MarkFlags { MarkFlags(0) }
     /// The raw bits.
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(&self) -> u32 { self.0 }
     /// Flags from raw bits, keeping unknown bits.
     pub const fn from_bits_retain(bits: u32) -> MarkFlags { MarkFlags(bits) }
     /// True when every bit of `other` is set in `self`.
-    pub const fn contains(self, other: MarkFlags) -> bool { self.0 & other.0 == other.0 }
+    pub const fn contains(&self, other: MarkFlags) -> bool { self.0 & other.0 == other.0 }
     /// True when no bit is set.
-    pub const fn is_empty(self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
 impl core::ops::BitOr for MarkFlags {

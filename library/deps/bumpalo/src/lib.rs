@@ -41,6 +41,9 @@ pub struct Bump {
     /// The total chunk sizes so far, without footers.
     allocated: Cell<usize>,
     allocation_limit: Cell<Option<usize>>,
+    /// Upstream's `Bump` holds a `NonNull` chunk pointer, so it is not
+    /// `UnwindSafe`; `&mut ()` gives the same auto traits (Send stays).
+    _unwind: core::marker::PhantomData<&'static mut ()>,
 }
 
 fn round_up(n: usize, align: usize) -> Option<usize> {
@@ -91,7 +94,7 @@ impl Bump {
     }
 
     pub fn with_capacity(capacity: usize) -> Bump {
-        let b = Bump { chunk_size: Cell::new(0), ptr: Cell::new(0), allocated: Cell::new(0), allocation_limit: Cell::new(None) };
+        let b = Bump { chunk_size: Cell::new(0), ptr: Cell::new(0), allocated: Cell::new(0), allocation_limit: Cell::new(None), _unwind: core::marker::PhantomData };
         if capacity > 0 {
             match new_chunk_size(None, capacity, 1) {
                 Some(n) => b.start_chunk(n),
@@ -201,7 +204,7 @@ impl Bump {
         self.try_alloc_with(|| val)
     }
 
-    pub fn alloc_with<T, F: FnOnce() -> T>(&self, f: F) -> &mut T {
+    pub fn alloc_with<F: FnOnce() -> T, T>(&self, f: F) -> &mut T {
         if self.try_alloc_layout(core::mem::size_of::<T>(), core::mem::align_of::<T>()).is_err() {
             oom();
         }
@@ -209,7 +212,7 @@ impl Bump {
     }
 
     /// Room first, then `f`: a failed allocation never calls `f`.
-    pub fn try_alloc_with<T, F: FnOnce() -> T>(&self, f: F) -> Result<&mut T, AllocErr> {
+    pub fn try_alloc_with<F: FnOnce() -> T, T>(&self, f: F) -> Result<&mut T, AllocErr> {
         self.try_alloc_layout(core::mem::size_of::<T>(), core::mem::align_of::<T>())?;
         Ok(Box::leak(Box::new(f())))
     }

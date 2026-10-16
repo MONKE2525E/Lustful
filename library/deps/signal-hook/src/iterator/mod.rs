@@ -4,14 +4,24 @@
 // slot exfiltrator yields them.
 
 use crate::{check_forbidden, reg_status};
+use std::borrow::Borrow;
 use std::io;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The shared pipe pair of one Signals instance.
+pub mod exfiltrator;
+
+use exfiltrator::{Exfiltrator, SignalOnly};
+
+/// The shared pipe pair of one Signals instance. The marker gives
+/// `Signals`, `Handle`, and `Forever` upstream's auto traits (Send and
+/// Sync, but not UnwindSafe or RefUnwindSafe: upstream holds `dyn`
+/// trait objects there).
 struct Inner {
     read_fd: i32,
     write_fd: i32,
+    _unwind: PhantomData<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Drop for Inner {
@@ -54,8 +64,12 @@ pub struct Signals {
 
 impl Signals {
     /// Registers handlers for the given signals and starts the
-    /// collection.
-    pub fn new<I: IntoIterator<Item = i32>>(signals: I) -> io::Result<Signals> {
+    /// collection. Upstream's generics: any `Borrow<c_int>` items.
+    pub fn new<I, S>(signals: I) -> io::Result<Signals>
+    where
+        I: IntoIterator<Item = S>,
+        S: Borrow<i32>,
+    {
         let mut raw: Vec<u8> = Vec::new();
         let read_fd = core::intrinsics::sys_sig_pipe(&mut raw);
         if read_fd < 0 {
@@ -69,19 +83,19 @@ impl Signals {
             v as i32
         };
         let mut this = Signals {
-            inner: Arc::new(Inner { read_fd, write_fd }),
+            inner: Arc::new(Inner { read_fd, write_fd, _unwind: PhantomData }),
             closed: Arc::new(AtomicBool::new(false)),
             queue: Vec::new(),
             head: 0,
         };
         for signal in signals {
-            this.add_signal(signal)?;
+            this.add_signal(*signal.borrow())?;
         }
         Ok(this)
     }
 
     /// Adds one signal to the collection.
-    pub fn add_signal(&mut self, signal: i32) -> io::Result<()> {
+    pub fn add_signal(&self, signal: i32) -> io::Result<()> {
         check_forbidden(signal);
         reg_status(core::intrinsics::sys_sig_register_pipe(signal, self.inner.write_fd))
     }
@@ -134,7 +148,7 @@ impl Signals {
     }
 
     /// Already-received signals, without blocking.
-    pub fn pending(&mut self) -> Pending {
+    pub fn pending(&mut self) -> Pending<SignalOnly> {
         self.fill(false);
         let mut out: Vec<i32> = Vec::new();
         for i in self.head..self.queue.len() {
@@ -142,12 +156,12 @@ impl Signals {
         }
         self.queue = Vec::new();
         self.head = 0;
-        Pending { items: out, at: 0 }
+        Pending { items: out, at: 0, _e: PhantomData }
     }
 
     /// Blocks until at least one signal arrives, then returns
     /// what is pending.
-    pub fn wait(&mut self) -> Pending {
+    pub fn wait(&mut self) -> Pending<SignalOnly> {
         while self.head >= self.queue.len() && !self.is_closed() {
             self.fill(true);
         }
@@ -155,18 +169,21 @@ impl Signals {
     }
 
     /// A blocking iterator over arriving signals.
-    pub fn forever(&mut self) -> Forever<'_> {
-        Forever { signals: self }
+    pub fn forever(&mut self) -> Forever<'_, SignalOnly> {
+        Forever { signals: self, _e: PhantomData }
     }
 }
 
-/// The signals of one pending or wait batch.
-pub struct Pending {
+/// The signals of one pending or wait batch. `E` is upstream's
+/// exfiltrator parameter; only `SignalOnly` exists here, so the
+/// Iterator impl is for it alone (generic uses reject).
+pub struct Pending<E: Exfiltrator> {
     items: Vec<i32>,
     at: usize,
+    _e: PhantomData<E>,
 }
 
-impl Iterator for Pending {
+impl Iterator for Pending<SignalOnly> {
     type Item = i32;
     fn next(&mut self) -> Option<i32> {
         if self.at >= self.items.len() {
@@ -178,12 +195,13 @@ impl Iterator for Pending {
     }
 }
 
-/// The blocking iterator of `forever`.
-pub struct Forever<'a> {
+/// The blocking iterator of `forever` (see `Pending` for `E`).
+pub struct Forever<'a, E: Exfiltrator> {
     signals: &'a mut Signals,
+    _e: PhantomData<E>,
 }
 
-impl Iterator for Forever<'_> {
+impl Iterator for Forever<'_, SignalOnly> {
     type Item = i32;
     fn next(&mut self) -> Option<i32> {
         loop {

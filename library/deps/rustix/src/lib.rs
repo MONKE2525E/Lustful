@@ -19,15 +19,43 @@
 //
 // Linux x86_64 values throughout, as the lust target is.
 
+// Gated by upstream's features, so a unit with fewer features sees
+// upstream's surface.
+#[cfg(feature = "event")]
 pub mod event;
+pub mod buffer;
 pub mod fd;
+#[cfg(feature = "fs")]
 pub mod fs;
 pub mod io;
+#[cfg(feature = "fs")]
 pub mod path;
+#[cfg(feature = "pipe")]
 pub mod pipe;
+#[cfg(feature = "process")]
 pub mod process;
+#[cfg(feature = "stdio")]
 pub mod stdio;
+#[cfg(feature = "termios")]
 pub mod termios;
+
+/// `struct timespec`, re-exported by `fs` and `event` as upstream.
+#[allow(dead_code)]
+mod timespec {
+    /// Seconds.
+    pub type Secs = i64;
+    /// Nanoseconds.
+    pub type Nsecs = i64;
+
+    /// A quantity of time in seconds plus nanoseconds.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Timespec {
+        /// Seconds.
+        pub tv_sec: Secs,
+        /// Nanoseconds.
+        pub tv_nsec: Nsecs,
+    }
+}
 
 /// Little-endian u64 field `i` of a sysx record.
 fn rec_u64(rec: &[u8], i: usize) -> u64 {

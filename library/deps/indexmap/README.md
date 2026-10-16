@@ -5,7 +5,8 @@ Lust adapter crate (docs/ARCH.md section 3.6). Gate:
 
 ## Implemented, same results as upstream
 
-- `IndexMap<K, V, S = RandomState>`: `new`, `with_capacity`,
+- `IndexMap<K, V, S = RandomState>` (the default hasher, `new`, and
+  `with_capacity` need feature `std`, as upstream): `new`, `with_capacity`,
   `with_hasher`, `with_capacity_and_hasher`, `capacity`, `hasher`,
   `len`, `is_empty`, `iter`, `keys`, `values`, `clear`, `truncate`,
   `split_off`, `reserve`, `reserve_exact`, `shrink_to_fit`, `shrink_to`,

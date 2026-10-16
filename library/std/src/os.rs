@@ -12,8 +12,9 @@
 /// `std::os::fd`: raw and owned Unix file descriptors, as std
 /// defines them on Linux. `borrow_raw` and `from_raw_fd` are
 /// `unsafe` in std; lust source cannot spell `unsafe fn`, so they
-/// are safe fns here (a false accept with the same result for
-/// every valid program, as the rustix adapter already does).
+/// are safe fns here that only shipped crates may call: user code
+/// that names one, or implements `FromRawFd`, rejects with L0404
+/// (`UPSTREAM_UNSAFE_FNS` in src/check/platform.rs).
 pub mod fd {
     use crate::fs::File;
     use crate::io;

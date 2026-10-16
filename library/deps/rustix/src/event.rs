@@ -5,7 +5,7 @@
 // print). README lists this.
 
 use crate::fd::{AsFd, AsRawFd, BorrowedFd};
-pub use crate::fs::Timespec;
+pub use crate::timespec::{Nsecs, Secs, Timespec};
 use crate::io::{Errno, Result};
 
 /// Poll event flags (`POLL*`, Linux values).
@@ -41,16 +41,16 @@ impl PollFlags {
     pub const fn empty() -> PollFlags {
         PollFlags(0)
     }
-    pub const fn bits(self) -> u16 {
+    pub const fn bits(&self) -> u16 {
         self.0
     }
     pub const fn from_bits_retain(bits: u16) -> PollFlags {
         PollFlags(bits)
     }
-    pub const fn contains(self, other: PollFlags) -> bool {
+    pub const fn contains(&self, other: PollFlags) -> bool {
         self.0 & other.0 == other.0
     }
-    pub const fn is_empty(self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0 == 0
     }
 }
@@ -87,16 +87,6 @@ impl<'fd> PollFd<'fd> {
     /// A poll entry from a borrowed fd.
     pub fn from_borrowed_fd(fd: BorrowedFd<'fd>, events: PollFlags) -> PollFd<'fd> {
         PollFd { fd, events, revents: PollFlags::empty() }
-    }
-
-    /// The events to wait for.
-    pub fn events(&self) -> PollFlags {
-        self.events
-    }
-
-    /// Sets the events to wait for.
-    pub fn set_events(&mut self, events: PollFlags) {
-        self.events = events;
     }
 
     /// The events `poll` returned for this fd.

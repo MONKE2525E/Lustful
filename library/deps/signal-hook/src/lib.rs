@@ -7,7 +7,8 @@
 // registration (the registry installs its own; README).
 
 pub mod consts {
-    /// The signal numbers.
+    /// The signal numbers upstream re-exports from libc on Linux
+    /// (not SIGPWR, SIGSTKFLT, or the aliases).
     pub mod signal {
         pub const SIGHUP: i32 = 1;
         pub const SIGINT: i32 = 2;
@@ -24,7 +25,6 @@ pub mod consts {
         pub const SIGPIPE: i32 = 13;
         pub const SIGALRM: i32 = 14;
         pub const SIGTERM: i32 = 15;
-        pub const SIGSTKFLT: i32 = 16;
         pub const SIGCHLD: i32 = 17;
         pub const SIGCONT: i32 = 18;
         pub const SIGSTOP: i32 = 19;
@@ -38,18 +38,13 @@ pub mod consts {
         pub const SIGPROF: i32 = 27;
         pub const SIGWINCH: i32 = 28;
         pub const SIGIO: i32 = 29;
-        pub const SIGPWR: i32 = 30;
         pub const SIGSYS: i32 = 31;
-        pub const SIGIOT: i32 = 6;
-        pub const SIGLOST: i32 = 29;
-        pub const SIGUNUSED: i32 = 31;
     }
 
-    pub use signal::{
-        SIGABRT, SIGALRM, SIGBUS, SIGCHLD, SIGCONT, SIGFPE, SIGHUP, SIGILL, SIGINT, SIGIO, SIGIOT, SIGKILL, SIGLOST, SIGPIPE,
-        SIGPROF, SIGPWR, SIGQUIT, SIGSEGV, SIGSTKFLT, SIGSTOP, SIGSYS, SIGTERM, SIGTRAP, SIGTSTP, SIGTTIN, SIGTTOU, SIGUNUSED,
-        SIGURG, SIGUSR1, SIGUSR2, SIGVTALRM, SIGWINCH, SIGXCPU, SIGXFSZ,
-    };
+    pub use self::signal::*;
+
+    /// Signals commonly requesting shutdown.
+    pub const TERM_SIGNALS: &[i32] = &[SIGTERM, SIGQUIT, SIGINT];
 
     /// Signals a handler may not be registered for (registering
     /// one panics, as upstream).
@@ -57,6 +52,7 @@ pub mod consts {
 }
 
 pub mod flag;
+#[cfg(feature = "iterator")]
 pub mod iterator;
 pub mod low_level;
 

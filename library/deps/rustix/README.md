@@ -6,8 +6,10 @@ Gate: `scripts/test-adapters.sh rustix`.
 
 ## Implemented, same results as upstream
 
-- `io`: `Errno` (Linux numbers; Debug and Display are std's
-  `io::Error` forms, as upstream), `Result`, `read`, `write`.
+- `io`: `Errno` (Linux numbers and upstream's names, e.g.
+  `ACCESS`; Debug and Display are std's `io::Error` forms, as
+  upstream), `Result`, `read` (over `buffer::Buffer`: `&mut [u8]`,
+  `&mut [u8; N]`, `&mut Vec<u8>`), `write`.
 - `fd`: std's `BorrowedFd`, `OwnedFd`, `AsFd`, `AsRawFd`,
   `IntoRawFd`, `FromRawFd`, `RawFd`, re-exported as upstream
   does with the `std` feature (lust std has `std::os::fd`).
@@ -25,6 +27,10 @@ Gate: `scripts/test-adapters.sh rustix`.
   `getppid`, `kill_process`, `test_kill_process`,
   `set_parent_process_death_signal`, `Resource`, `Rlimit`,
   `getrlimit`, `setrlimit`.
+- Modules and std-only items follow upstream's feature gates
+  (`fs`, `path`, `event`, `pipe`, `process`, `stdio`,
+  `termios`; `std` for the `io::Error` forms, `stdio::stdin`
+  and kin, `Pid::from_child`, and the std path `Arg` forms).
 - `pipe`: `PipeFlags`, `pipe`, `pipe_with`. `event`: `PollFd`,
   `PollFlags`, `poll`. `stdio`: `stdin`, `stdout`, `stderr`,
   `dup2_stdin`, `dup2_stdout`, `dup2_stderr`. `termios`:
@@ -38,16 +44,9 @@ Gate: `scripts/test-adapters.sh rustix`.
 
 - `Pid` and `Signal` store a plain `i32`, not a `NonZeroI32`
   (no `as_raw_nonzero`).
-- `BorrowedFd::borrow_raw` and `FromRawFd::from_raw_fd` are
-  safe fns in lust std (it cannot spell `unsafe fn`);
-  upstream's are `unsafe`. Calling them in safe code is a
-  false accept with the same result.
 - `poll` runs through poll(2) with the timeout rounded up to
   whole milliseconds; upstream uses ppoll. A timed-out wait
   can run up to a millisecond long.
-- The flag types' Debug forms are the derived tuple forms,
-  not upstream's flag-name lists. A program that prints an
-  `OFlags` with `{:?}` prints a different text.
 - No `impl std::error::Error for Errno` (the core::error
   overlay is spliced only when user code names it). The
   `From<Errno> for io::Error` conversion ts-rust uses is here.
@@ -63,3 +62,8 @@ Gate: `scripts/test-adapters.sh rustix`.
   the `fs` and `process` items
   beyond the lists above (wait and exec forms included), and
   layout queries on every adapter type.
+- Debug of the flag types (upstream prints flag-name lists),
+  upstream's `Arg` methods (`as_str`, `into_with_c_str`, ...;
+  a user `Arg` impl rejects), `Statx::stx_attributes` (its
+  `StatxAttributes` type is not here), and the `MaybeUninit`
+  and `SpareCapacity` buffer forms.
