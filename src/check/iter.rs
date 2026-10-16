@@ -1381,7 +1381,7 @@ impl<'p> Ctx<'p> {
                 let open = {
                     let (i, t) = (self.resolve(item), self.resolve(target));
                     let tk = self.kind(t);
-                    self.unbound_general(i) || self.unbound_general(t) || tk.is_int_infer() || tk.is_float_infer()
+                    self.sum_item_open(t, i) || self.unbound_general(t) || tk.is_int_infer() || tk.is_float_infer()
                 };
                 if open {
                     self.deferred_sum.push((target, item, n == "sum", span));
@@ -1440,8 +1440,9 @@ impl<'p> Ctx<'p> {
     /// (cgen `adapter_callee`). A `dyn Fn` one meets the bound but has
     /// no adapter yet: an error here, never a codegen failure. The
     /// callable is the last argument. `once`: the builtin calls it as
-    /// `FnOnce` (`bool::then`), where a boxed closure would be moved out
-    /// of its box, which the adapter does not do.
+    /// `FnOnce` (`bool::then`, and the Entry closure forms that
+    /// lower/iter.rs expands), where a boxed closure would be moved out
+    /// of its box, which neither does.
     pub(crate) fn adapter_callable_gap(&mut self, args: &[ExprId], params: &[Ty], once: bool) -> bool {
         let (Some(&a), Some(&pt)) = (args.last(), params.last()) else { return false };
         let mut t = self.deep(pt);
@@ -1459,7 +1460,7 @@ impl<'p> Ctx<'p> {
         let what = if matches!(self.kind(t), TyKind::Dyn(..)) {
             "a `dyn Fn` value as this method's callable"
         } else if once && boxed {
-            "a boxed callable as `bool::then`'s fn"
+            "a boxed callable as this method's fn"
         } else {
             return false;
         };
@@ -2060,7 +2061,8 @@ impl<'p> Ctx<'p> {
     pub(super) fn finish_deferred_sums(&mut self) {
         for (target, item, sum, span) in std::mem::take(&mut self.deferred_sum) {
             let n = if sum { "sum" } else { "product" };
-            if self.unbound_general(self.resolve(item)) {
+            let t = self.resolve(target);
+            if self.sum_item_open(t, self.resolve(item)) {
                 self.err(
                     "L0610",
                     span,
@@ -2092,6 +2094,24 @@ impl<'p> Ctx<'p> {
                 self.sum_target_ok(target, item, n, span);
             }
         }
+    }
+
+    /// True when a `sum`'s item type picks no impl yet: it is open, or
+    /// it is the `Option`/`Result` of an open type for a try target
+    /// (`S: Sum<?U>` has two impls, `Sum<S>` and `Sum<&S>`, so rustc
+    /// does not infer `U` from `S`: E0284).
+    fn sum_item_open(&mut self, target: Ty, item: Ty) -> bool {
+        if self.unbound_general(item) {
+            return true;
+        }
+        if self.tys.option_elem(target).is_none() && self.tys.result_args(target).is_none() {
+            return false;
+        }
+        let payload = self.tys.option_elem(item).or_else(|| self.tys.result_args(item).map(|(u, _)| u));
+        payload.is_some_and(|u| {
+            let u = self.resolve(u);
+            self.unbound_general(u)
+        })
     }
 
     /// `sum` and `product` into an integer or float type `S`, from

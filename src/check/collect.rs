@@ -8542,6 +8542,7 @@ fn iter_item_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match k {
         K::SliceIter | K::Windows | K::Chunks | K::ChunksExact | K::SliceSplit | K::CharIndices | K::StrSplit | K::StrMatches | K::EncodeUtf16 => true,
         K::OptionIter | K::ResultIter | K::Range | K::RangeInclusive => true,
+        K::MapIter | K::MapKeys | K::MapValues | K::SetIter => true,
         K::Map | K::FilterMap => is_copy(p, tys, arg(2)),
         K::Copied | K::Cloned => is_copy(p, tys, arg(1)),
         K::OptionIntoIter | K::ResultIntoIter | K::RepeatN => is_copy(p, tys, arg(0)),

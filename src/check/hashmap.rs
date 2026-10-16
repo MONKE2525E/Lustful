@@ -544,13 +544,8 @@ impl<'p> Ctx<'p> {
         if matches!(b, B::MapRetain | B::SetRetain) && self.adapter_callable_gap(args, &params, false) {
             return Some(ERROR);
         }
-        // The expansion calls a closure body directly (lower/iter.rs).
-        if matches!(b, B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify)
-            && let Some(&f) = params.first()
-            && let f = self.deep(f)
-            && !matches!(self.kind(f), TyKind::Closure(..) | TyKind::Error)
-        {
-            self.err("L0640", name_span, format!("`Entry::{n}` with a fn item or fn pointer is not implemented yet"), "Pass a closure: `|| Vec::new()`.");
+        if matches!(b, B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify) && self.adapter_callable_gap(args, &params, true) {
+            return Some(ERROR);
         }
         if let Some(q) = q {
             let q = self.deep(q);

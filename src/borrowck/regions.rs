@@ -6245,6 +6245,8 @@ impl<'b, 'p> Builder<'b, 'p> {
                 None => return false,
             },
             (Some(BuiltinTy::Option | BuiltinTy::Vec), &[t]) => vec![t],
+            // A `sum` into `Result<S, E>` holds the items' error.
+            (Some(BuiltinTy::Result), &[s, e]) if matches!(b, crate::check::Builtin::IterSum | crate::check::Builtin::IterProduct) => vec![s, e],
             (Some(BuiltinTy::Hash(HashTy::HashMap)), &[k, v, _]) if collect => vec![k, v],
             (Some(BuiltinTy::Hash(HashTy::HashSet)), &[t, _]) if collect => vec![t],
             _ => return false,
@@ -8383,7 +8385,8 @@ fn fmt_builder_builtin(b: crate::check::Builtin) -> bool {
 }
 
 /// The builtin iterator calls whose result is an item (or a collection
-/// of items): their regions come from the iterator's sources.
+/// of items, or a `sum` into `Option` or `Result`): their regions come
+/// from the iterator's sources.
 fn item_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
     matches!(
@@ -8400,6 +8403,8 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
             | B::IterMaxByKey
             | B::IterCollect
             | B::FromIter
+            | B::IterSum
+            | B::IterProduct
     )
 }
 
