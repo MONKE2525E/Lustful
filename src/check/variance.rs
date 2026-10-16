@@ -28,12 +28,15 @@ pub fn check_unused_params(p: &Program, adts: &[(AdtId, usize)], errs: &mut Vec<
     let fields: Vec<Vec<Ty>> = adts.iter().map(|&(id, _)| field_tys(p, id)).collect();
     let mut used: Vec<Used> = adts
         .iter()
-        .map(|&(id, _)| {
+        .zip(&fields)
+        .map(|(&(id, _), fs)| {
             let def = p.gx.adt_info[id.0 as usize].0;
             let n_lts = p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len());
-            // `PhantomData<T>` uses its `T` by definition (std source).
-            let phantom = p.is_phantom_adt(id);
-            Used { tys: vec![phantom; p.gx.adt_generics[id.0 as usize].params.len()], lts: vec![false; n_lts] }
+            // `PhantomData<T>` uses its `T` by definition (std source). An Adt with a field
+            // type that did not resolve has its own error; it counts as using every
+            // parameter, so its users get no follow-on "never used" error.
+            let all = p.is_phantom_adt(id) || fs.contains(&ERROR);
+            Used { tys: vec![all; p.gx.adt_generics[id.0 as usize].params.len()], lts: vec![fs.contains(&ERROR); n_lts] }
         })
         .collect();
     let slot: crate::intern::FxMap<AdtId, usize> = adts.iter().enumerate().map(|(i, &(id, _))| (id, i)).collect();
