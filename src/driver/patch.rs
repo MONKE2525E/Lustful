@@ -173,9 +173,10 @@ pub(crate) struct PatchBase {
     /// patch's: any other edit since may have moved what their contexts
     /// name (a macro definition in another file).
     kept_bodies: Vec<KeptBody>,
-    /// Some patch applied an edit since the full resolve: its stored
-    /// expansions may name contexts the patches moved since.
-    edited: bool,
+    /// The files patches edited since the full resolve: a stored
+    /// expansion whose tokens or contexts name one may hold spans the
+    /// patches moved since (`kept_body`).
+    edited: Vec<FileId>,
 }
 
 /// One cfg-disabled node the last full resolve dropped (`Dep::Dropped`).
@@ -341,7 +342,7 @@ impl PatchBase {
             oracle_input: None,
             expansions: front.resolve_cache.expansions(),
             kept_bodies: Vec::new(),
-            edited: false,
+            edited: Vec::new(),
         }
     }
 
@@ -1494,9 +1495,9 @@ fn expand_pure(
 /// (`edit`) of fn `fn_index` whose body the patch cannot expand alone
 /// (a user macro). They come from the last request's item patch of the
 /// same body at the same place (`PatchBase::kept_bodies`), or from the
-/// full resolve's stored expansion of the file when no patch came since
-/// (`ResolveCache::expansion_of`): what a cold expansion of the same body
-/// text gives. Only while that expansion is this Ast's own
+/// full resolve's stored expansion of the file when no patch since edited
+/// a file its tokens or contexts name (`ResolveCache::expansion_of`,
+/// `PatchBase::edited`): what a cold expansion of the same body text gives. Only while that expansion is this Ast's own
 /// (`PatchBase::expansions`), and as the request's only edit (another
 /// edit may move a macro definition its contexts name); `find_edits`
 /// refuses an expansion that read a token position. Contexts move as the Ast's do (`Edit::span`, with a
@@ -1511,14 +1512,31 @@ fn kept_body(front: &Front, base: &PatchBase, fn_index: usize, edit: Edit, body:
             let old = front.map.text(file).ok_or("no text")?;
             let own = if file == FileId(0) { base.root_unspliced.as_str() } else { old };
             let stored = match cache.expansion_of(file, own).or_else(|| cache.expansion_of(file, old)) {
-                Some(l) if cache.expansions() == base.expansions && !base.edited => l,
+                Some(l) if cache.expansions() == base.expansions => l,
                 _ => return Err("item: body macro"),
             };
             // The expander gives both delimiters of a group the group's span.
             let at = |t: &lexer::Token, tok: Tok| t.tok == tok && t.span == crate::diag::Span { file, lo: body.0, hi: body.1, ctxt: CtxtId::ROOT };
             let i0 = stored.tokens.iter().position(|t| at(t, Tok::LBrace)).ok_or("item: body macro")?;
             let n = stored.tokens[i0..].iter().position(|t| at(t, Tok::RBrace)).ok_or("item: body macro")?;
-            (&stored.tokens[i0..=i0 + n], &stored.strings[..])
+            let toks = &stored.tokens[i0..=i0 + n];
+            // Its spans and contexts stand when no patch edited a file they
+            // name (a macro definition's file, or this one and back).
+            let mut named: Vec<FileId> = Vec::new();
+            let mut ctxts: Vec<CtxtId> = Vec::new();
+            for t in toks {
+                if !named.contains(&t.span.file) {
+                    named.push(t.span.file);
+                }
+                if t.span.ctxt != CtxtId::ROOT && !ctxts.contains(&t.span.ctxt) {
+                    ctxts.push(t.span.ctxt);
+                    crate::diag::ctxt_files(t.span.ctxt, &mut named);
+                }
+            }
+            if named.iter().any(|f| base.edited.contains(f)) {
+                return Err("item: body macro");
+            }
+            (toks, &stored.strings[..])
         }
     };
     let mut memo = FxMap::default();
@@ -1836,7 +1854,11 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     // A request with no edit keeps the last patch's bodies.
     if !edits.is_empty() {
         base.kept_bodies = edits.iter_mut().filter_map(|e| e.item.as_mut().and_then(|it| it.kept.take())).collect();
-        base.edited = true;
+        for e in &edits {
+            if !base.edited.contains(&e.file) {
+                base.edited.push(e.file);
+            }
+        }
     }
     // Derive edits: the item's attributes and derive lists, then its scan
     // (the tail runs in full mode: any body may read the derives).
@@ -3584,13 +3606,14 @@ pub fn run() -> i64 {
     /// and rewrites with the new header (a param rename, an error and its
     /// fix, a hygienic local in the macro). A body edit in the macro's
     /// input, a macro definition edit, a header and body edit together,
-    /// or another such fn's header edit after a patch resolve; the header
+    /// or another such fn's header edit after a patch of its file resolve
+    /// (a patch of another file does not); the header
     /// edit after the definition edit patches with the new expansion.
     /// Each state is the cold answer.
     #[test]
     fn user_macro_body_item_edit_matches_cold() {
         let dir = std::env::temp_dir().join(format!("lust-umacro-item-{}", std::process::id()));
-        let root = write_crate(&dir, 1);
+        let root = write_crate(&dir, 2);
         let m0 = dir.join("m0.rs");
         let src = "macro_rules! args {\n    ($($x:expr),* $(,)?) => { vec![$($x.to_string()),*] };\n}\n\n\
                    macro_rules! tw {\n    ($e:expr) => {{ let t = $e; t + t }};\n}\n\n\
@@ -3611,6 +3634,10 @@ pub fn run() -> i64 {
         let def_2 = "{ [$(format!(\"{}\", $x)),*].to_vec() }";
         let tw = "pub fn twice(t: i64) -> i64 {";
         let tw_w = "pub fn twice(t: i64) -> i64 where i64: Copy {";
+        // A patch in another file names nothing the body's expansion does.
+        let m1 = dir.join("m1.rs");
+        let v = warm_equals_cold(&mut warm, &root, &m1, "pub fn helper(x: i64) -> i64 {", "pub fn helper(x: i64) -> i64 where u32: Copy {");
+        assert_eq!(field(&v, "path"), "item", "{v}");
         let steps: &[(&str, &str, &str, i32)] = &[
             (ch, ch_w, "item", 0),
             (ch_w, ch_bad, "item", 1),
@@ -3619,8 +3646,9 @@ pub fn run() -> i64 {
             (ch_k, ch, "item", 0),
             (ch, ch_e, "item", 1),
             (ch_e, ch, "item", 0),
-            // Another fn's body after a patch: the stored expansion may
-            // name moved contexts, so it resolves; the undo patches.
+            // Another fn's body after a patch of its own file: the stored
+            // expansion may name moved spans, so it resolves; the undo
+            // patches.
             (tw, tw_w, "resolve", 0),
             (tw_w, tw, "item", 0),
             (call, call_3, "resolve", 0),
