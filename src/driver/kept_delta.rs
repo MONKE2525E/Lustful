@@ -12,7 +12,9 @@
 // - mono's body checks that read the signature: every plain body whose
 //   stored discovery no longer holds checks again and must make the same
 //   instances, closures, and vtables. A template whose stored check no
-//   longer holds, or that stores none and names an edited fn, refuses.
+//   longer holds, or that stores none and names an edited fn, checks
+//   again in a check (no diagnostic, same hidden type) and refuses in a
+//   build.
 //   The check and build programs share the stored checks; one stored
 //   after the kept program's `reuse_stamp` (by the other mode's request)
 //   refuses, since this program may not hold that output.
@@ -263,7 +265,6 @@ fn rpit_namers(
 /// result that no longer holds checks again, and a plain body must give
 /// the discovery output collect built the program with.
 fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usize], walk_instances: bool) -> Result<(), &'static str> {
-    let reuse = &mut caches.gen_reuse;
     let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
     let idents = &front.chunks[0].scan.body_idents;
     let fn_count = front.fn_loc.len();
@@ -288,6 +289,8 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
     let out = (|| {
+        let reuse = &mut caches.gen_reuse;
+        let mut again = Vec::new();
         for t in (0..fn_count as u32).map(LocalDefId) {
             if p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Template) || p.is_lang_method(t) || fns.contains(&(t.0 as usize)) {
                 continue;
@@ -308,10 +311,21 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             // while its body does not name an edited fn.
             let named = idents.get(t.0 as usize).is_none_or(|ids| ids.iter().any(|s| names.contains(s)));
             if !reuse.template_holds(p, t).unwrap_or(!named) {
-                return Err("sig template");
+                again.push(t);
             }
         }
+        // A template whose check no longer holds checks again, as collect
+        // does, in a check only: a build's instances of it would keep
+        // their old checks.
+        if !again.is_empty() && walk_instances {
+            return Err("sig template");
+        }
+        for t in again {
+            let (lo, hi) = p.fn_def(t).exprs;
+            recheck_template(p, t, &[(lo, hi)], caches)?;
+        }
         super::laps::mark("collect/delta replay templates");
+        let reuse = &mut caches.gen_reuse;
         for g in (0..fn_count as u32).map(LocalDefId) {
             if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
                 continue;
