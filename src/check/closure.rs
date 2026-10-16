@@ -248,13 +248,20 @@ impl<'p> Ctx<'p> {
         rs.contains(&Region::Static)
     }
 
-    /// `t` with every region but a written `'static` `Region::Bound(0)`,
+    /// `t` with each late-bound region (`DYN_LATE`) `Region::Bound(0)`,
     /// Adt lifetime args included: the written output of a `dyn Fn`
-    /// signature (`dyn_fn_written_out`), whose other regions are all the
-    /// one input region's (`ClosureInfo::bound_output`). An Adt without
-    /// lifetime args (erased) gets `Bound(0)` for each.
+    /// signature (`dyn_fn_written_out`), whose elided regions are the one
+    /// input region's (`ClosureInfo::bound_output`). A written `'static`
+    /// stays; a named lifetime (erased) is `Bound(1)`: the body may return
+    /// an argument there as before, but it is no higher-ranked slot
+    /// (`bound_hr_out_slots`). An Adt without lifetime args (erased)
+    /// gets `Bound(0)` for each.
     fn rebind_bound(&mut self, t: Ty) -> Ty {
-        let b = |r: Region| if r == Region::Static { r } else { Region::Bound(0) };
+        let b = |r: Region| match r {
+            crate::ty::DYN_LATE => Region::Bound(0),
+            Region::Static => r,
+            _ => Region::Bound(1),
+        };
         match self.kind(t) {
             TyKind::Ref(r, m, e) => {
                 let e = self.rebind_bound(e);
@@ -277,7 +284,7 @@ impl<'p> Ctx<'p> {
                 let n = self.p.gx.adt_lifetimes.get(&d).map_or(0, |v| v.len());
                 let old = self.tys.args(args).to_vec();
                 let lts: Vec<Region> = old.iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
-                let mut new: Vec<GenericArg> = (0..n).map(|i| GenericArg::Lifetime(b(lts.get(i).copied().unwrap_or(Region::Erased)))).collect();
+                let mut new: Vec<GenericArg> = (0..n).map(|i| GenericArg::Lifetime(b(lts.get(i).copied().unwrap_or(crate::ty::DYN_LATE)))).collect();
                 for g in old {
                     match g {
                         GenericArg::Ty(e) => new.push(GenericArg::Ty(self.rebind_bound(e))),

@@ -5187,14 +5187,15 @@ impl<'b, 'p> Builder<'b, 'p> {
     }
 
     /// The output slots of closure `def` that its bound output makes the
-    /// one higher-ranked input's (`ClosureEntry::bound_output`).
+    /// one higher-ranked input's (`ClosureEntry::bound_output`, `Bound(0)`;
+    /// a dyn's named lifetime is `Bound(1)`, `rebind_bound`).
     fn bound_hr_out_slots(&mut self, def: DefId) -> Vec<u32> {
         let Some((bo, out_t)) = self.p.gx.closures.get(&def).and_then(|c| c.bound_output.map(|b| (b, c.output))) else { return Vec::new() };
         let mut named: Vec<Region> = Vec::new();
         if !regioned_slots(&mut self.sc, bo, out_t, &mut named) {
             return Vec::new();
         }
-        named.iter().enumerate().filter(|(_, r)| matches!(r, Region::Bound(_))).map(|(k, _)| k as u32).collect()
+        named.iter().enumerate().filter(|(_, r)| matches!(r, Region::Bound(0))).map(|(k, _)| k as u32).collect()
     }
 
     /// The argument slot vars of closure `def` (`closure_created` at its
