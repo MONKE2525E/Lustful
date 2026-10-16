@@ -297,7 +297,16 @@ impl<'p> Lower<'p> {
                 };
                 op_ok && !by_ref(self, lhs) && !by_ref(self, rhs) && self.promotable(lhs) && self.promotable(rhs)
             }
-            Expr::Cast { expr, .. } => matches!(self.p.ast.expr(*expr), Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_)),
+            // A numeric cast or a fn item to fn pointer (check types the
+            // item as the pointer already) of a promotable operand. A pointer to integer cast is never promoted in rustc.
+            Expr::Cast { expr, .. } => {
+                let inner = *expr;
+                let st = self.ty(inner);
+                let scalar = |k: TyKind| matches!(k, TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char);
+                let ok = (scalar(self.kind(st)) && scalar(self.kind(ty)))
+                    || (matches!(self.kind(st), TyKind::FnDef(..) | TyKind::FnPtr(_)) && matches!(self.kind(ty), TyKind::FnPtr(_)));
+                ok && self.promotable(inner)
+            }
             Expr::Tuple(es) | Expr::Array(es) => es.clone().iter().all(|&x| self.promotable(x)),
             Expr::ArrayRepeat { value, .. } => self.promotable(*value),
             // A tuple struct, tuple variant, `Some`, `Ok` or `Err` constructor call.
@@ -306,7 +315,7 @@ impl<'p> Lower<'p> {
             }
             Expr::Path(_) => {
                 self.ck.const_value(e).is_some()
-                    || matches!(self.ck.res(e), Res::OptNone)
+                    || matches!(self.ck.res(e), Res::OptNone | Res::Fn(_))
                     || (matches!(self.ck.res(e), Res::Variant(..)) && !matches!(self.kind(ty), TyKind::FnDef(..)))
             }
             Expr::StructLit { fields, update: None, .. } => fields.clone().iter().all(|f| self.promotable(f.2)),
@@ -321,7 +330,7 @@ impl<'p> Lower<'p> {
     }
 
     /// True when a value of type `t` may be promoted by its shape:
-    /// scalars, raw and fn pointers, `&str`, shared refs to such, and tuples,
+    /// scalars, raw and fn pointers, fn items, `&str`, shared refs to such, and tuples,
     /// arrays, `Option`, `Result`, this crate's Adts built of them, and
     /// std Adts. Drops and interior mutability are the value's
     /// question (`value_qualif`).
@@ -331,7 +340,7 @@ impl<'p> Lower<'p> {
         }
         match self.kind(t) {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Never => true,
-            TyKind::RawPtr(..) | TyKind::FnPtr(_) => true,
+            TyKind::RawPtr(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) => true,
             TyKind::Tuple(ts) => self.body.tys.tys_of(ts).to_vec().into_iter().all(|x| self.promotable_ty(x, depth + 1)),
             TyKind::Array(el, _) | TyKind::Slice(el) => self.promotable_ty(el, depth + 1),
             TyKind::Ref(_, Mut::Shared, inner) => self.promotable_ty(inner, depth + 1),
@@ -368,7 +377,7 @@ impl<'p> Lower<'p> {
     /// (`ty::constqual`, recorded by check), anything else by its type.
     fn value_qualif(&mut self, e: ExprId) -> Qualif {
         let ty = self.ty(e);
-        let by_ty = Qualif { drop: self.needs_drop_ty(ty), cell: crate::check::collect::interior_mut(self.p, &self.body.tys, ty) };
+        let by_ty = Qualif { drop: self.needs_drop_ty(ty), cell: self.mut_interior_ty(ty, 0) };
         if !by_ty.any() {
             return Qualif::NONE;
         }
@@ -396,6 +405,54 @@ impl<'p> Lower<'p> {
             _ => Qualif::ALL,
         };
         q.and(by_ty)
+    }
+
+    /// True when a value of type `t` may hold an `UnsafeCell` (not
+    /// `Freeze`), read through this body's types: `collect::interior_mut`
+    /// with Adt fields substituted here. Unknown shapes answer true.
+    fn mut_interior_ty(&mut self, t: Ty, depth: u32) -> bool {
+        if depth > 16 {
+            return true;
+        }
+        match self.kind(t) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Never | TyKind::Unit => return false,
+            TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) => return false,
+            TyKind::Tuple(ts) => return self.body.tys.tys_of(ts).to_vec().into_iter().any(|x| self.mut_interior_ty(x, depth + 1)),
+            TyKind::Array(el, _) | TyKind::Slice(el) => return self.mut_interior_ty(el, depth + 1),
+            TyKind::Adt(..) => {}
+            _ => return true,
+        }
+        let tys = &self.body.tys;
+        if tys.cell_elem(t).is_some()
+            || tys.refcell_elem(t).is_some()
+            || tys.lock_elem(t).is_some()
+            || crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::OnceLock)
+            || crate::ty::sync::atomic_of(tys, t).is_some()
+        {
+            return true;
+        }
+        if let Some(e) = self.body.tys.option_elem(t) {
+            return self.mut_interior_ty(e, depth + 1);
+        }
+        if let Some((a, b)) = self.body.tys.result_args(t) {
+            return self.mut_interior_ty(a, depth + 1) || self.mut_interior_ty(b, depth + 1);
+        }
+        let Some(a) = self.body.tys.local_adt(t) else { return false };
+        if matches!(
+            crate::intern::source_name(self.p.interner.get(self.p.adt(a).name)),
+            "UnsafeCell" | "Once" | "OnceLock" | "OnceCell" | "LazyLock" | "LazyCell"
+        ) {
+            return true;
+        }
+        let args: Vec<GenericArg> = match self.kind(t) {
+            TyKind::Adt(_, a) => self.body.tys.args(a).to_vec(),
+            _ => Vec::new(),
+        };
+        let fields: Vec<Ty> = self.p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+        fields.into_iter().any(|f| {
+            let f = subst(&mut self.body.tys, f, &args);
+            self.mut_interior_ty(f, depth + 1)
+        })
     }
 
     /// Whether a value of type `ty` needs a drop (cached per body type).
