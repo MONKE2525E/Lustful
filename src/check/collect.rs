@@ -3618,8 +3618,10 @@ pub fn collect_reuse(
             // `BorrowError` and `BorrowMutError` (10, 11) are std's
             // synthetic `#[non_exhaustive]` types here.
             let synthetic_ne = matches!(usize::MAX - item_idx, 4 | 10 | 11);
-            p.adts[id.0 as usize] =
-                AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
+            // `cmp::Ordering` (index 0) is `#[repr(i8)]` in core: its
+            // derived `Hash` writes an `i8` discriminant.
+            let repr = crate::ty::layout::Repr { int: (item_idx == usize::MAX).then_some((8, true)), ..Default::default() };
+            p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr, non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
             if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 || usize::MAX - item_idx == 26 {
                 // `Bound<T>` and `NonZero<T>`: the generic synthetic

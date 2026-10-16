@@ -479,12 +479,32 @@ const S_IFREG: u64 = 0o100000;
 const S_IFLNK: u64 = 0o120000;
 
 /// The type of a file: directory, regular file, symlink, or other.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Eq)]
 pub struct FileType {
     mode: u64,
 }
 
+/// Std compares the type bits only (`mode & S_IFMT`), not the
+/// permission bits.
+impl PartialEq for FileType {
+    fn eq(&self, other: &FileType) -> bool {
+        self.masked() == other.masked()
+    }
+}
+
+/// Std hashes the type bits as a `mode_t` (`u32` on Linux).
+impl core::hash::Hash for FileType {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.masked().hash(state);
+    }
+}
+
 impl FileType {
+    /// The type bits of the mode, as std's `masked` (a `mode_t`).
+    fn masked(&self) -> u32 {
+        (self.mode & S_IFMT) as u32
+    }
+
     /// True for a directory.
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR

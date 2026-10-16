@@ -685,15 +685,22 @@ impl FnGen<'_, '_> {
         match b {
             // `x.hash(state)`: (&T, &mut H), through the value glue.
             B::HashInto => {
-                let (Some(CTy::Ref(x)), Some(CTy::Ref(hc))) = (tys.first(), tys.get(1)) else { return Some("((lust_Unit){})".into()) };
+                let Some(CTy::Ref(hc)) = tys.get(1) else { panic!("internal: `hash` without a `&mut H` argument") };
                 // A `&str` or `&[T]` receiver is a fat value, not a
-                // pointer: hash the reference itself (core hashes it as
-                // its pointee) from a temporary.
-                let (xt, xp) = if matches!(**x, CTy::Str | CTy::Slice(_)) {
-                    let _ = writeln!(self.out, "    {} {t}_x = {};", ctype(&tys[0]), vals[0]);
-                    (tys[0].clone(), format!("(&{t}_x)"))
-                } else {
-                    ((**x).clone(), vals[0].clone())
+                // pointer (the autoref'd `[T]` arrives as `CTy::Slice`
+                // itself): hash it from a temporary, as core hashes the
+                // reference as its pointee.
+                let (xt, xp) = match &tys[0] {
+                    CTy::Ref(x) if matches!(**x, CTy::Str | CTy::Slice(_)) => {
+                        let _ = writeln!(self.out, "    {} {t}_x = {};", ctype(&tys[0]), vals[0]);
+                        (tys[0].clone(), format!("(&{t}_x)"))
+                    }
+                    CTy::Ref(x) => ((**x).clone(), vals[0].clone()),
+                    CTy::Slice(_) | CTy::Str => {
+                        let _ = writeln!(self.out, "    {} {t}_x = {};", ctype(&tys[0]), vals[0]);
+                        (tys[0].clone(), format!("(&{t}_x)"))
+                    }
+                    other => panic!("internal: `hash` receiver of C type {other:?}"),
                 };
                 let key = hv_key(&xt, hc);
                 self.want(Glue::HashValue, &key);

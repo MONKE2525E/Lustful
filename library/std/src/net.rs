@@ -31,15 +31,43 @@ fn push_hex(out: &mut String, v: u16) {
 }
 
 /// An IPv4 address.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ipv4Addr {
     octets: [u8; 4],
 }
 
 /// An IPv6 address.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ipv6Addr {
     octets: [u8; 16],
+}
+
+/// Std's hash: the octets as one native-endian `u32`
+/// (`u32::from_ne_bytes`; lust's targets are little-endian), not a byte
+/// slice.
+impl core::hash::Hash for Ipv4Addr {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        let mut v = 0u32;
+        let mut i = 4;
+        while i > 0 {
+            i -= 1;
+            v = (v << 8) | self.octets[i] as u32;
+        }
+        v.hash(state);
+    }
+}
+
+/// Std's hash: the octets as one native-endian `u128`.
+impl core::hash::Hash for Ipv6Addr {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        let mut v = 0u128;
+        let mut i = 16;
+        while i > 0 {
+            i -= 1;
+            v = (v << 8) | self.octets[i] as u128;
+        }
+        v.hash(state);
+    }
 }
 
 /// An IP address, either IPv4 or IPv6.

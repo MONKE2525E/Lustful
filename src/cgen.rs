@@ -735,6 +735,10 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     }
 }
 
+/// True when a value of `t` copies bitwise (Rust `Copy`). An Adt
+/// instance copies only when its derive does and its own fields do: a
+/// derived `Copy` on `Bound<T>` is `T: Copy` (`Bound<String>` clones
+/// its string).
 fn is_copy_c(p: &Program, t: &CTy) -> bool {
     match t {
         CTy::Unit
@@ -759,7 +763,12 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
         CTy::Array(e, _) => is_copy_c(p, e),
         CTy::ArrayIter(e, _) => is_copy_c(p, e),
-        CTy::Adt(a) => p.adt(*a).derives.copy,
+        CTy::Adt(a) => {
+            let adt = p.adt(*a);
+            // A non-generic Adt's derive was checked against its fields.
+            let instance = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some());
+            adt.derives.copy && (!instance || adt.variants.iter().all(|v| v.fields.iter().all(|f| is_copy_c(p, &cty(&p.tys, f.ty)))))
+        }
         _ => false,
     }
 }
