@@ -733,10 +733,11 @@ fn keyed_dirty(
     caches: &mut Caches,
     touched: &mut crate::driver::kept_delta::Touched,
     base: u64,
+    answers: &mut FxMap<crate::driver::graph::ReadKey, crate::driver::graph::Read>,
 ) -> Vec<Option<bool>> {
     let mode = usize::from(p.gx.walk_instances);
     let def_slot = |d: def::DefId| p.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
-    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &mut |k| touched.hit(p, k), &def_slot);
+    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &mut |k| touched.hit(p, k), &def_slot, answers);
     caches.slot_reads.iter().zip(dirty).map(|(r, d)| r.as_ref().filter(|r| r.verified[mode] == base).map(|_| d)).collect()
 }
 
@@ -3559,10 +3560,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // below with such a set take its answer; the others (a set of another
     // program, after a failed collect, say) go on to the full walks. The
     // oracle proves each keyed clean set with the full walk.
+    // This request's node answers for the program, shared by the keyed
+    // walk and the oracle's proofs below.
+    let mut answers = FxMap::default();
     let keyed: Option<Vec<Option<bool>>> = match header_moves.as_mut() {
         Some(touched) if keyed_base != 0 && (!mention_only.is_empty() || program.gx.has_generics) => {
             super::laps::start();
-            let k = keyed_dirty(&program, front, caches, touched, keyed_base);
+            let k = keyed_dirty(&program, front, caches, touched, keyed_base, &mut answers);
             t.lap("reads keyed index");
             t.note_parts(super::laps::take());
             Some(k)
@@ -3577,10 +3581,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         clean
     };
     if keyed.is_some() && !mention_only.is_empty() {
-        let mut memo = FxMap::default();
+        let memo = &mut answers;
         let mut reused = vec![false; mention_only.iter().max().map_or(0, |&m| m + 1)];
         mention_only.retain(|&i| {
-            let clean = keyed_clean(caches, front.fn_slot[i] as usize, &mut memo, i);
+            let clean = keyed_clean(caches, front.fn_slot[i] as usize, memo, i);
             reused[i] = clean;
             !clean
         });
@@ -3716,7 +3720,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
         let reuse = &caches.gen_reuse;
         let env = gen_env.unwrap_or(0);
-        let mut memo = FxMap::default();
+        let memo = &mut answers;
         // Slots some fn of this program holds. A body whose stored C
         // names any other slot rebuilds it: that callee's identity moved
         // to a new slot (a nested fn's body item index, when its parent
@@ -3748,7 +3752,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 // (the oracle proves each clean one).
                 let mut clean = |r: &crate::driver::graph::Reads, d: &Vec<bool>| {
                     let clean = !d.get(s).copied().unwrap_or(true);
-                    if clean && super::item_oracle::on() && program.reads_dirty_memo(r, &mut memo) != 0 {
+                    if clean && super::item_oracle::on() && program.reads_dirty_memo(r, memo) != 0 {
                         super::item_oracle::fail("clean instance body has dirty reads", visits.path, &i.to_string());
                     }
                     clean
@@ -3759,7 +3763,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         (None, _) => recheck = true,
                         (Some(r), Some(d)) => recheck = !clean(r, d),
                         (Some(_), None) if keyed.as_ref().is_some_and(|k| matches!(k.get(s), Some(Some(_)))) => {
-                            recheck = !keyed_clean(caches, s, &mut memo, i);
+                            recheck = !keyed_clean(caches, s, memo, i);
                             visits.keyed += 1;
                         }
                         (Some(_), None) => {
@@ -3877,10 +3881,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         diags.extend(results[k].1.iter().cloned());
     }
-    // The read index of the keyed dirty walk follows the new read sets
-    // here, where their bodies were just checked (sigedit P3.2).
-    if !work.is_empty() {
-        caches.read_index.sync_if_built(&mut caches.slot_reads);
+    // The read index of the keyed walks follows the new read sets here,
+    // where their bodies were just checked (sigedit P3.2): the first
+    // request of a daemon builds it, so no edit request pays for that.
+    if caches.persistent && !work.is_empty() {
+        caches.read_index.sync(&mut caches.slot_reads);
     }
     // rustc stops before monomorphization once a pre-mono check fails, so an
     // instance checked over an erroneous caller (an error-typed closure argument)

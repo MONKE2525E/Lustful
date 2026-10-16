@@ -129,8 +129,9 @@ pub struct GenReuse {
     /// keeps that check's output, stamped (`next_stamp`): never replayed,
     /// only compared (`out_copy`).
     unstored: FxMap<DefId, (u64, OutCopy)>,
-    /// Node answers of this collect's program, for read replays.
-    memo: FxMap<ReadKey, Read>,
+    /// Node answers of this collect's program, for read replays (and the
+    /// derive delta's keyed walk, graph.rs `ReadIndex::dirty_slots`).
+    pub(crate) memo: FxMap<ReadKey, Read>,
     /// This collect's template check outputs that instances replay, by
     /// template, and its closure records, by closure def (fingerprints;
     /// see `src_of`).

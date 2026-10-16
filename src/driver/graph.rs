@@ -1919,16 +1919,9 @@ pub(crate) struct ReadIndex {
 
 impl ReadIndex {
     /// Indexes every slot whose read set changed since the last sync. The
-    /// compile tail calls it after each request once the index exists, so
-    /// a derive edit after a full recheck finds it current.
-    pub(crate) fn sync_if_built(&mut self, slot_reads: &mut [Option<Reads>]) {
-        if self.next != 0 {
-            self.sync(slot_reads);
-        }
-    }
-
-    /// Indexes every slot whose read set changed since the last sync.
-    fn sync(&mut self, slot_reads: &mut [Option<Reads>]) {
+    /// compile tail of a daemon calls it after each request, so a keyed
+    /// walk finds it current (the first request builds it).
+    pub(crate) fn sync(&mut self, slot_reads: &mut [Option<Reads>]) {
         if self.entries > 2 * self.live + 100_000 {
             *self = ReadIndex { next: self.next, ..ReadIndex::default() };
         }
@@ -1960,22 +1953,29 @@ impl ReadIndex {
     /// (`def_slot`; the oracle's rule: it checks again). Every other slot's
     /// reads are clean, given that no key outside `moves` changed (the
     /// caller's proof). Also returns, by slot, whether its reads hold any
-    /// `Checked` key. Syncs the index first.
+    /// `Checked` key. Syncs the index first. The moved keys' fingerprints
+    /// come from `answers`, the request's node answers for `p`, and the
+    /// missing ones are computed in parallel and join it (the template and
+    /// discovery replays read the same map, `GenReuse::memo`).
     pub(crate) fn dirty_slots(
         &mut self,
         p: &Program,
         slot_reads: &mut [Option<Reads>],
         moves: &mut dyn FnMut(&ReadKey) -> bool,
         def_slot: &dyn Fn(DefId) -> Option<usize>,
+        answers: &mut FxMap<ReadKey, Read>,
     ) -> (Vec<bool>, Vec<bool>) {
         self.sync(slot_reads);
         crate::driver::laps::mark("keyed/sync");
         let moved: Vec<(&ReadKey, &Vec<(u32, u64)>)> = self.by_key.iter().filter(|(k, _)| moves(k)).collect();
         crate::driver::laps::mark("keyed/classify");
-        let now: Vec<Read> = moved.iter().map(|(k, _)| p.read_fingerprint(k)).collect();
+        let missing: Vec<ReadKey> = moved.iter().map(|(k, _)| **k).filter(|k| !answers.contains_key(k)).collect();
+        let fresh = crate::driver::compile::par_map(&missing, |k| p.read_fingerprint(k));
+        answers.extend(missing.into_iter().zip(fresh));
         crate::driver::laps::mark("keyed/fingerprint");
         let mut dirty = vec![false; slot_reads.len()];
-        for ((k, list), now) in moved.into_iter().zip(now) {
+        for (k, list) in moved {
+            let now = answers[k];
             for &(s, seal) in list {
                 let s = s as usize;
                 if self.stamp.get(s) != Some(&seal) || dirty[s] {

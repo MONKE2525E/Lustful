@@ -67,12 +67,17 @@ pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches,
     // The keyed dirty walk: only the read keys the delta can move
     // (graph.rs `Program::derive_key_moves`) are compared, for the slots
     // that read them. The compile tail rechecks the dirty slots.
+    // Deep Adt fingerprints are kept across the moved keys (the derive
+    // lists are final here; the memo goes before any other write).
+    p.fp_memo.on(p.adts.len());
     let (is_dirty, has_checked) = {
         let prog: &Program = p;
         let mut moves = crate::driver::graph::DeriveMoves::new(&reach);
         let def_slot = |d: crate::def::DefId| prog.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
-        caches.read_index.dirty_slots(prog, &mut caches.slot_reads, &mut |k| prog.derive_key_moves(&mut moves, k), &def_slot)
+        let answers = &mut caches.gen_reuse.memo;
+        caches.read_index.dirty_slots(prog, &mut caches.slot_reads, &mut |k| prog.derive_key_moves(&mut moves, k), &def_slot, answers)
     };
+    p.fp_memo.off();
     // The shortcuts below hold only when the derive delta is the request's
     // only change (no header or body edit moved other keys).
     let keyed = caches.derive_only;
