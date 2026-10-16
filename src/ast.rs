@@ -156,6 +156,18 @@ impl Ast {
     pub fn expr_span(&self, id: ExprId) -> Span {
         self.expr_spans[id.0 as usize]
     }
+    /// True for a closure the parser made from a std fn used as a value
+    /// (`parser::eta_closure`): it, its call body, and the callee share
+    /// the path's span, which no written closure can (`|` comes first).
+    pub fn is_eta_closure(&self, id: ExprId) -> bool {
+        let span = self.expr_span(id);
+        match self.expr(id) {
+            Expr::Closure { body, .. } => {
+                self.expr_span(*body) == span && matches!(self.expr(*body), Expr::Call { callee, .. } if self.expr_span(*callee) == span)
+            }
+            _ => false,
+        }
+    }
     pub fn pat(&self, id: PatId) -> &Pat {
         &self.pats[id.0 as usize]
     }

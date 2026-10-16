@@ -1391,6 +1391,11 @@ zero-sized, implements the `Fn` traits its signature
 matches, coerces to the fn ptr `FnPtr(sig)`. Early-bound
 lifetime params are part of the `FnDef` args; late-bound
 ones become the binder of the `FnPtr` it coerces to (5.5).
+A std fn with no item value in lust (`Vec::new`, `Arc::new`,
+`Ord::cmp`; the list is `parser::eta_arity`) used as a value
+is parsed as the closure `|a, ..| path(a, ..)`: it behaves as
+the fn item does, but each use has its own type, so a
+`TypeId` of one is a reject (L0702).
 
 Typed receivers. The receiver type grammar is recursive:
 

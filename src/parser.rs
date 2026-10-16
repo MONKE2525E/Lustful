@@ -4129,6 +4129,55 @@ impl<'a> Parser<'a> {
     /// single patterns (no top-level `|` alternation, as in Rust);
     /// attributes on parameters are not parsed yet and fall out
     /// as a syntax error. The body is a full expression.
+    /// The arity of a std fn that a path names when lust has no value form
+    /// for it, so a value use eta-expands (`eta_closure`): `Vec::new`,
+    /// `Arc::new`, `Rc::downgrade`, `Ord::cmp`, `HashMap::default`. Only
+    /// the last two segments count. None for every other path. Each fn
+    /// here is safe and not `#[track_caller]`, so the closure behaves as
+    /// the fn item does (its panics, drops, and output are the same).
+    fn eta_arity(&self, path: &[PathSeg]) -> Option<usize> {
+        let [.., ty, item] = path else { return None };
+        if !matches!(item.args, GenericArgs::None) {
+            return None;
+        }
+        let (t, i) = (self.interner.get(ty.name), self.interner.get(item.name));
+        Some(match (t, i) {
+            ("Default" | "Self", _) => return None,
+            (_, "default") => 0,
+            ("Vec" | "String" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "VecDeque" | "BinaryHeap" | "Weak", "new") => 0,
+            ("Arc", "new") => 1,
+            ("Rc" | "Arc", "clone" | "as_ptr" | "downgrade" | "strong_count" | "weak_count") => 1,
+            ("Rc" | "Arc", "ptr_eq") => 2,
+            ("char", "from_u32") => 1,
+            ("thread", "sleep" | "spawn") => 1,
+            ("mem", "drop" | "take") => 1,
+            ("mem", "swap" | "replace") => 2,
+            ("Ord" | "PartialOrd", "cmp" | "partial_cmp" | "lt" | "le" | "gt" | "ge" | "max" | "min") => 2,
+            ("PartialEq", "eq" | "ne") => 2,
+            ("Duration", "from_secs" | "from_millis" | "from_micros" | "from_nanos") => 1,
+            _ => return None,
+        })
+    }
+
+    /// `path` used as a value, for a fn `eta_arity` lists: the closure
+    /// `|a0, .., an| path(a0, .., an)`, every node at the path's span.
+    /// rustc gives the fn item type instead; the two differ only in type
+    /// identity, so a `TypeId` of such a closure is a reject
+    /// (check/any.rs, `ast::is_eta_closure`).
+    fn eta_closure(&mut self, path: Vec<PathSeg>, n: usize, span: Span) -> ExprId {
+        let mut params = Vec::with_capacity(n);
+        let mut args = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = self.interner.intern(&format!("__lust_eta{i}"));
+            let pat = self.push_pat(Pat::Binding { name, mutable: false, by_ref: false }, span);
+            params.push(ClosureParam { pat, ty: None, attrs: Vec::new(), span });
+            args.push(self.push_expr(Expr::Path(vec![PathSeg::plain(name)]), span));
+        }
+        let callee = self.push_expr(Expr::Path(path), span);
+        let body = self.push_expr(Expr::Call { callee, args }, span);
+        self.push_expr(Expr::Closure { is_move: false, is_async: false, params, ret: None, body }, span)
+    }
+
     fn closure_expr(&mut self, start: Span) -> PResult<ExprId> {
         let is_move = self.eat(Tok::Move);
         let mut params: Vec<ClosureParam> = Vec::new();
@@ -4890,6 +4939,12 @@ impl<'a> Parser<'a> {
                 let path = self.path(false)?;
                 if self.peek() == Tok::LBrace && !no_struct {
                     return self.struct_lit(path, start);
+                }
+                if self.peek() != Tok::LParen
+                    && let Some(n) = self.eta_arity(&path)
+                {
+                    let span = start.to(self.prev_span());
+                    return Ok(self.eta_closure(path, n, span));
                 }
                 Expr::Path(path)
             }

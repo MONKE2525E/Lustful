@@ -504,6 +504,15 @@ impl<'p> Ctx<'p> {
         if matches!(self.kind(t), TyKind::Error) {
             return false;
         }
+        if self.contains_eta_closure(t) {
+            self.err(
+                "L0702",
+                span,
+                "the type id of a std fn used as a value is not supported yet",
+                "Pass a fn of your own instead, such as `fn new_vec() -> Vec<u8> { Vec::new() }`.",
+            );
+            return false;
+        }
         if contains_opaque(&self.tys, t) {
             self.errs.push(generics::dyn_not_yet(span, "the type id of an `impl Trait` type"));
             return false;
@@ -533,6 +542,38 @@ impl<'p> Ctx<'p> {
             return false;
         }
         true
+    }
+}
+
+impl<'p> Ctx<'p> {
+    /// True when `t` holds the type of a closure the parser made from a
+    /// std fn value (`Ast::is_eta_closure`): rustc gives the fn item's
+    /// type there, one type per fn, but each such closure has its own.
+    fn contains_eta_closure(&self, t: Ty) -> bool {
+        match self.tys.kind(t) {
+            TyKind::Closure(def, a) => {
+                self.closure_def_is_eta(def) || self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.contains_eta_closure(e)))
+            }
+            TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.contains_eta_closure(e),
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).iter().any(|&e| self.contains_eta_closure(e)),
+            TyKind::Adt(_, a) | TyKind::FnDef(_, a) => self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.contains_eta_closure(e))),
+            _ => false,
+        }
+    }
+
+    /// True when closure def `def` is an eta closure: its parent fn (the
+    /// registered one, else this body) has an eta closure at the ordinal
+    /// the def hashes (`closure::closure_def`).
+    fn closure_def_is_eta(&self, def: DefId) -> bool {
+        let p = self.p;
+        let parent = p.gx.closures.get(&def).map_or(self.fid, |c| c.parent);
+        let (lo, hi) = p.fn_info(parent).loc.def(&p.ast).exprs;
+        let mut order: Vec<ExprId> = (lo..hi).map(ExprId).filter(|&x| matches!(p.ast.expr(x), Expr::Closure { .. })).collect();
+        order.sort_by_key(|&x| (p.ast.expr_span(x).lo, x.0));
+        let ph = p.def_id(parent).hash;
+        order.iter().enumerate().any(|(i, &x)| {
+            p.ast.is_eta_closure(x) && crate::def::child_hash(ph, crate::def::DefKind::Closure, "{closure}", i as u32) == def.hash
+        })
     }
 }
 
