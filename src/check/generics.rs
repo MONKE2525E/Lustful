@@ -10076,7 +10076,14 @@ fn ensure_drop_method(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) 
     else {
         return;
     };
-    let drop_fn = if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
+    // An Adt whose args still hold a type param (a field type of a generic
+    // Adt's template, `W<T>` in `struct G<T: Write> { w: W<T> }`) records
+    // the template fn: cgen never sees it, `needs_drop` only asks whether
+    // it has one, and an instance would check the body with no bounds on
+    // the param (a false L0612).
+    let drop_fn = if p.tys.flags(self_ty).contains_param() {
+        local
+    } else if p.gx.fn_templates.get(local.0 as usize).is_some_and(|t| t.is_some()) {
         let raw: Vec<GenericArg> = impl_args;
         let before = p.fns.len();
         let inst = fn_instance(p, local, &raw);
