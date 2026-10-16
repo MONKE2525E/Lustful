@@ -1317,8 +1317,9 @@ impl ResolvedTables {
                 h.write_u64(ns as u64);
                 h.write_u64(name.0 as u64);
                 h.write_u64(set.absent as u64);
-                h.write_u64(set.entries.len() as u64);
-                for (v, dm, item) in &set.entries {
+                h.write_u64(set.fixed as u64);
+                h.write_u64(set.ends.len() as u64);
+                for (v, dm, item) in set.ends.iter().chain(&set.all) {
                     vis(h, v);
                     h.write_u64(dm.0 as u64);
                     match item {
