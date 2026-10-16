@@ -8133,6 +8133,20 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                 return is_copy(p, tys, a) && is_copy(p, tys, b);
             }
             match tys.local_adt(t) {
+                // A generic Adt whose instance does not exist yet (a
+                // closure capture checked before collect made `W<u8>`):
+                // the template's fields name its params, so ask the
+                // derive's own bounds (`impl<T: Copy> Copy for W<T>`) on
+                // the type's args, as the instance answer would.
+                Some(a)
+                    if p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty())
+                        && p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
+                        && tys.adt_parts(t).is_some_and(|(_, args)| args != crate::ty::EMPTY_ARGS) =>
+                {
+                    let (_, args) = tys.adt_parts(t).expect("checked above");
+                    p.derives_of(a).copy
+                        && (p.is_phantom_adt(a) || tys.args(args).iter().filter_map(|g| g.as_ty()).all(|x| is_copy(p, tys, x)))
+                }
                 Some(a) => {
                     p.derives_of(a).copy
                         && (p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
