@@ -203,3 +203,17 @@ pub fn current_exe() -> io::Result<PathBuf> {
         code => Err(io::Error::from_raw_os_error(code)),
     }
 }
+
+/// Constants of the target (`std::env::consts`). Only the values lust
+/// builds for are defined: another target leaves a name out, so a use
+/// rejects instead of printing a wrong value.
+pub mod consts {
+    #[cfg(target_os = "linux")]
+    pub const OS: &str = "linux";
+    #[cfg(target_os = "linux")]
+    pub const FAMILY: &str = "unix";
+    #[cfg(target_arch = "x86_64")]
+    pub const ARCH: &str = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    pub const ARCH: &str = "aarch64";
+}
