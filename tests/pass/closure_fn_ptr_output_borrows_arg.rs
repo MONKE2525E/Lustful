@@ -46,5 +46,16 @@ fn main() {
     println!("{:?}", (p.f)(&[4, 9, 2]));
     let pair: fn(&(u8, String)) -> (&u8, &str) = |t| (&t.0, t.1.as_str());
     let t = (7, String::from("seven"));
-    println!("{:?}", pair(&t));
+    println!("{:?} {}", pair(&t), alias_use());
+}
+
+// An elided pointer type through an alias, as a struct field.
+type Sel = fn(&(u8, String)) -> &str;
+struct HasSel {
+    f: Sel,
+}
+#[allow(dead_code)]
+fn alias_use() -> usize {
+    let h = HasSel { f: |t| t.1.as_str() };
+    (h.f)(&(1, String::from("ab"))).len()
 }

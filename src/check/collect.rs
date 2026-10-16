@@ -1451,6 +1451,12 @@ pub fn resolve_ty(
                 Some(r) => resolve_ty(ast, interner, known, type_names, aliases, tys, *r, self_ty)?,
                 None => UNIT,
             };
+            // A pointer whose input borrows may need `FnSig::own_out`, which
+            // only the scoped resolver can tell (an alias in its output may be
+            // `'static`).
+            if ins.iter().any(|&t| crate::check::closure::may_hold_region(tys, t)) {
+                return Err(not_yet("L0602", span, "a fn pointer type with a borrowed input here (it needs the scoped resolver)"));
+            }
             let inputs = tys.intern_tys(&ins);
             let sig = tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig::plain(inputs, out)));
             Ok(tys.intern(TyKind::FnPtr(sig)))

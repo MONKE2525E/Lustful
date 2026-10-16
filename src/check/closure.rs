@@ -2358,7 +2358,7 @@ fn truncate_for_optimization(mut pl: CPlace, mut mode: CaptureMode, tys: &impl T
 /// unresolved type (not a numeric literal's), or an Adt with a lifetime
 /// argument, at any depth.
 /// A type param holds none in a template.
-fn may_hold_region(tys: &impl TyIntern, t: Ty) -> bool {
+pub(crate) fn may_hold_region(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Infer(v) => !v.is_int() && !v.is_float(),
         TyKind::Ref(..) | TyKind::Dyn(..) | TyKind::Opaque(..) => true,
