@@ -1401,6 +1401,12 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
             // `fn`, `static`, `const`, and `use` items are compared after
             // the parse (`same_items`).
             Tok::Struct | Tok::Enum | Tok::Impl | Tok::Trait | Tok::Mod | Tok::Extern | Tok::Type => return Err("body item"),
+            // A glob `use` in a body: a full resolve reads block globs
+            // through what it records for them, which the body rewrite
+            // against the frozen tables does not rebuild (the patch
+            // oracle found `use core::ops::Bound::*;` rewriting another
+            // way on tsrust-all4).
+            Tok::Use if toks[i..n].iter().take_while(|t| t.tok != Tok::Semi).any(|t| t.tok == Tok::Star) => return Err("body glob"),
             // Attributes go through the expander (cfg stripping).
             Tok::Pound | Tok::DocStr(_) => pure = true,
             Tok::Dollar => return Err("body attr"),
