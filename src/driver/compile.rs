@@ -3032,8 +3032,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
     // Every body of a generic program rechecks when the trait system
-    // moved too (collect dropped the cache then).
-    let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed;
+    // moved too (collect dropped the cache then), and in a build when
+    // derive lists moved since the last build: codegen reads them with
+    // no recorded read (gen_reuse.rs `build_derives_moved`).
+    let derives_moved = req.cmd == Cmd::Build && caches.gen_reuse.build_derives_moved();
+    if derives_moved {
+        caches.glue_stale = true;
+    }
+    let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed && !derives_moved;
     // Persist the def order when collect grew it, like the slot
     // manifest above: the next daemon must number defs as this
     // one did or the disk objects' indices move under it.

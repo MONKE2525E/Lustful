@@ -9,11 +9,14 @@
 // A stored result depends on three things, and holds while all three do:
 // - the trait system: trait items, impl items of lang and foreign
 //   traits, inherent impls with an associated const or a `dyn` Self,
-//   type alias and const items, and derive lists (`trait_key`).
-//   Collect drops every entry when their fingerprint changes
-//   (`GenReuse::gate`), and the driver also drops them on a const fn
-//   body edit, a nested static, or a slot renumber (`compile.rs`,
-//   "generic reuse"). Impls of user traits are not in the key:
+//   and type alias and const items (`trait_key`). Collect drops every
+//   entry when their fingerprint changes (`GenReuse::gate`), and the
+//   driver also drops them on a const fn body edit, a nested static, or
+//   a slot renumber (`compile.rs`, "generic reuse"). Derive lists are
+//   not in the key (PLAN R12): every answer that reads one records a
+//   `Derives` read (check/derive_delta.rs), so a derive edit rechecks
+//   only the bodies that asked. A build still falls back on a derive
+//   edit (`build_derives_moved`). Impls of user traits are not in the key:
 //   selection records an `ImplSet` read of the bucket it searched
 //   (driver/graph.rs), so an added, removed, or edited user trait impl
 //   rechecks only the bodies that read its bucket. Other inherent impls
@@ -136,6 +139,11 @@ pub struct GenReuse {
     /// The trait-system key of the last collect that reached its body
     /// checks (`gate`).
     trait_key: Option<u64>,
+    /// The derive-list key of that collect (`TraitKey::derives`).
+    derive_key: Option<u64>,
+    /// The derive-list key the last build made its C under
+    /// (`build_derives_moved`).
+    build_derive_key: Option<u64>,
     /// True unless this collect's trait-system key equals the last one;
     /// then every entry was dropped, and the driver rechecks every body.
     pub trait_changed: bool,
@@ -156,13 +164,27 @@ impl GenReuse {
 
     /// Drops every entry when the trait-system key moved since the last
     /// collect. Collect calls it once the impl index is built, before any
-    /// template check or discovery runs.
-    pub fn gate(&mut self, key: u64) {
-        self.trait_changed = self.trait_key != Some(key);
+    /// template check or discovery runs. A derive-list change alone keeps
+    /// the entries: their `Derives` reads decide.
+    pub fn gate(&mut self, key: TraitKey) {
+        self.trait_changed = self.trait_key != Some(key.system);
         if self.trait_changed {
             self.clear();
         }
-        self.trait_key = Some(key);
+        self.trait_key = Some(key.system);
+        self.derive_key = Some(key.derives);
+    }
+
+    /// For a build: true when derive lists moved since the last build
+    /// made C, and records this build's key. Codegen reads derive lists
+    /// with no recorded read (derived glue, Copy layouts, comparison
+    /// forms), so such a build regenerates every body and the glue, as a
+    /// trait-system change does. The first build of a session has no C
+    /// to keep.
+    pub fn build_derives_moved(&mut self) -> bool {
+        let moved = self.build_derive_key.is_some() && self.build_derive_key != self.derive_key;
+        self.build_derive_key = self.derive_key;
+        moved
     }
 
     /// Resets the per-collect state before a collect runs.
@@ -454,25 +476,36 @@ impl GenReuse {
     }
 }
 
+/// The two keys `GenReuse::gate` compares across collects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraitKey {
+    /// The trait-system key (see `trait_key`).
+    pub system: u64,
+    /// The derive list of each Adt that has one.
+    pub derives: u64,
+}
+
 /// The trait-system key (see the module docs): trait items (default
 /// bodies included), impl items (headers, method heads, associated
-/// items), type alias and const items (an impl header or a bound can
-/// reach a type through them), and the derive list of each Adt that has
-/// one. An impl of a trait whose impls `ImplSet` reads cover
+/// items), and type alias and const items (an impl header or a bound
+/// can reach a type through them); and, apart, the derive-list key. An
+/// impl of a trait whose impls `ImplSet` reads cover
 /// (`Program::impls_read_covered`; `impl_traits` gives each trait impl's
 /// trait by item index) is left out, and so is an inherent impl with no
 /// associated const or type and no `dyn` Self: method probes and every
 /// direct inherent table lookup record `MethodSet` reads
 /// (`Program::inherent_reads`), whose fingerprints cover each method's
 /// signature.
-pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> u64 {
+pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> TraitKey {
     use crate::ast::{ItemKind, TyExpr};
     let user_trait = |d: &DefId| p.impls_read_covered(*d);
     let plain_inherent = |imp: &crate::ast::ImplDef| {
         imp.trait_ref.is_none() && imp.consts.is_empty() && imp.types.is_empty() && !matches!(p.ast.ty(imp.self_ty), TyExpr::Dyn { .. })
     };
     let mut h = FxHasher::default();
-    "trait-system-v2".hash(&mut h);
+    "trait-system-v3".hash(&mut h);
+    let mut dh = FxHasher::default();
+    "derives-v1".hash(&mut dh);
     for (i, item) in p.ast.items.iter().enumerate() {
         let derives = match &item.kind {
             ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(user_trait) => continue,
@@ -490,14 +523,13 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> u64 {
         if derives.1.is_empty() {
             continue;
         }
-        1u8.hash(&mut h);
-        p.interner.get(derives.0).hash(&mut h);
-        (derives.1.len() as u64).hash(&mut h);
+        p.interner.get(derives.0).hash(&mut dh);
+        (derives.1.len() as u64).hash(&mut dh);
         for (d, _) in derives.1 {
-            p.interner.get(*d).hash(&mut h);
+            p.interner.get(*d).hash(&mut dh);
         }
     }
-    h.finish()
+    TraitKey { system: h.finish(), derives: dh.finish() }
 }
 
 /// A check's read set plus a `Sig` read of the checked fn itself: a body
