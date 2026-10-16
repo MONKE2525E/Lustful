@@ -43,6 +43,14 @@ with tempfile.TemporaryDirectory() as d:
     tb.manifests_with_dev_deps(Path(d))
     eq("dev deps", m.read_text(), '[package]\nname = "p"\n\n[dependencies]\ny = "2"\nx = "1"\n\n')
 
+# The census helpers tsrust_build.py calls (tsrust_deep.py and prune.py change under other packages).
+import inspect  # noqa: E402
+
+for mod, name, nargs in [(tb.tsrust_deep, "errors", 4), (tb.tsrust_deep, "in_item", 2), (tb.tsrust_deep, "names_in", 1),
+                         (tb.tsrust_deep, "remove_users", 5), (tb.prune, "prune_round", 6), (tb.prune, "located", 2)]:
+    f = getattr(mod, name, None)
+    eq(f"{mod.__name__}.{name}", f is not None and len(inspect.signature(f).parameters), nargs)
+
 if failures:
     print("\n".join(failures))
     sys.exit(1)
