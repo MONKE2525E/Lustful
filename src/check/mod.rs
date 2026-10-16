@@ -1803,6 +1803,9 @@ struct Ctx<'p> {
     /// elided input lifetime (`F: Fn(&T) -> &U`), with that output's
     /// regioned type (`ClosureInfo::bound_output`).
     closure_bound_outputs: std::collections::HashMap<u32, Ty>,
+    /// The regioned inputs of the `Fn` bound a closure var is passed to
+    /// (`ClosureInfo::bound_inputs`).
+    closure_bound_inputs: std::collections::HashMap<u32, Vec<Ty>>,
     /// Scalar operators checked while both operand types were still
     /// open (a closure's `|a, b| a + b`): (expr, op, operand type).
     /// Lowering emits the builtin operator, so the types must turn out
@@ -2101,6 +2104,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         iter_closure_args: std::collections::HashMap::new(),
         scope_closure_vars: Vec::new(),
         closure_bound_outputs: std::collections::HashMap::new(),
+        closure_bound_inputs: std::collections::HashMap::new(),
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
         unwind_checks: Vec::new(),
@@ -4377,6 +4381,9 @@ impl<'p> Ctx<'p> {
             let n_in = p.tys.tys_of(ts).len();
             let bound = fn_bounds.iter().find(|b| b.param == j.0 && b.inputs.len() == n_in);
             let regioned = bound.map(|b| b.inputs.as_slice());
+            if let Some(b) = bound {
+                self.closure_bound_inputs.insert(v.0, b.inputs.clone());
+            }
             if let Some(b) = bound
                 && let Some(out) = b.output
             {

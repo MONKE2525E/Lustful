@@ -4465,6 +4465,8 @@ pub struct ClosureEntry {
     pub output_region: Option<Ty>,
     /// `ClosureInfo::bound_output` (W-BORROW).
     pub bound_output: Option<Ty>,
+    /// `ClosureInfo::bound_inputs` (W-BORROW).
+    pub bound_inputs: Vec<Ty>,
 }
 
 /// One return-position `impl Trait` (ARCH 2.11): the fn that defines it
@@ -9150,6 +9152,7 @@ pub(crate) struct OwnedClosure {
     pub(crate) input_regions: Vec<Option<OwnedTy>>,
     pub(crate) output_region: Option<OwnedTy>,
     pub(crate) bound_output: Option<OwnedTy>,
+    pub(crate) bound_inputs: Vec<OwnedTy>,
 }
 
 /// Snapshots the closures of one checked body. None when a closure
@@ -9168,6 +9171,7 @@ fn snapshot_closures(c: &crate::check::Checked) -> Option<Vec<OwnedClosure>> {
             input_regions: cl.input_regions.iter().map(|o| o.and_then(|t| snapshot_ty(&c.tys, t))).collect(),
             output_region: cl.output_region.and_then(|t| snapshot_ty(&c.tys, t)),
             bound_output: cl.bound_output.and_then(|t| snapshot_ty(&c.tys, t)),
+            bound_inputs: cl.bound_inputs.iter().map(|&t| snapshot_ty(&c.tys, t)).collect::<Option<Vec<_>>>().unwrap_or_default(),
         });
     }
     Some(out)
@@ -9275,6 +9279,7 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
         let input_regions: Vec<Option<Ty>> = oc.input_regions.iter().map(|o| o.as_ref().map(|t| build_owned_ty(p, t))).collect();
         let output_region: Option<Ty> = oc.output_region.as_ref().map(|t| build_owned_ty(p, t));
         let bound_output: Option<Ty> = oc.bound_output.as_ref().map(|t| build_owned_ty(p, t));
+        let bound_inputs: Vec<Ty> = oc.bound_inputs.iter().map(|t| build_owned_ty(p, t)).collect();
         let env_param = match oc.kind {
             ClosureKind::Fn => p.tys.mk_ref(false, env),
             ClosureKind::FnMut => p.tys.mk_ref(true, env),
@@ -9309,7 +9314,7 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
         let scope = p.gx.fn_scopes.get(parent.0 as usize).cloned().unwrap_or_default();
         p.gx.fn_scopes.push(scope);
         p.gx.fn_class.push(class);
-        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone(), scope_body: oc.scope_body, input_regions, output_region, bound_output });
+        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone(), scope_body: oc.scope_body, input_regions, output_region, bound_output, bound_inputs });
         p.gx.closure_fns.insert(id, oc.def);
         out.push(id);
     }
@@ -9351,6 +9356,7 @@ pub(crate) fn template_closures_stand(p: &mut Program, t: LocalDefId) -> bool {
         let input_regions: Vec<Option<Ty>> = oc.input_regions.iter().map(|o| o.as_ref().map(|x| build_owned_ty(p, x))).collect();
         let output_region = oc.output_region.as_ref().map(|x| build_owned_ty(p, x));
         let bound_output = oc.bound_output.as_ref().map(|x| build_owned_ty(p, x));
+        let bound_inputs: Vec<Ty> = oc.bound_inputs.iter().map(|x| build_owned_ty(p, x)).collect();
         let f = p.fn_info(e.body_fn);
         let same = e.parent == t
             && e.kind == oc.kind
@@ -9361,6 +9367,7 @@ pub(crate) fn template_closures_stand(p: &mut Program, t: LocalDefId) -> bool {
             && e.input_regions == input_regions
             && e.output_region == output_region
             && e.bound_output == bound_output
+            && e.bound_inputs == bound_inputs
             && f.params.first() == Some(&env)
             && f.params[1..] == inputs[..]
             && f.ret == output;

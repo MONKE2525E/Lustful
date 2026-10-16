@@ -1681,12 +1681,22 @@ impl OwnSig {
             } else {
                 // A slot the argument's type keeps as `'static` (`&Rc<dyn Tr>`
                 // from a `'static` type) is `'static`, unless the body can
-                // store into it (a sink: the contract would assume it).
+                // store into it (a sink: the contract would assume it). A
+                // slot the `Fn` bound's own input type makes `'static`
+                // (`Box<dyn Fn()>` in `impl FnOnce(&RefCell<Vec<Box<dyn
+                // Fn()>>>)`) is `'static` in rustc's closure signature too,
+                // sink or not (`ClosureEntry::bound_inputs`).
                 let mut kept: Vec<Region> = Vec::new();
                 sc.slot_regions(t, &mut kept);
+                let mut fixed: Vec<Region> = Vec::new();
+                if let Some(&bt) = entry.and_then(|c| c.bound_inputs.get(l - 2)) {
+                    sc.slot_regions(bt, &mut fixed);
+                }
                 for k in 0..n {
                     let snk = arg_roles.get(arg_at + k).copied().flatten().is_some_and(|(_, snk)| snk);
-                    if kept.get(k) == Some(&Region::Static) && !snk && kept.len() == n {
+                    if fixed.len() == n && fixed[k] == Region::Static {
+                        out.push(0);
+                    } else if kept.get(k) == Some(&Region::Static) && !snk && kept.len() == n {
                         out.push(0);
                     } else {
                         out.push(fresh(self, "a closure argument's lifetime"));
@@ -7157,8 +7167,14 @@ impl Builder<'_, '_> {
             let mut reported: Vec<(usize, usize)> = Vec::new();
             for u in 1..nu {
                 let c = scc[u] as usize;
+                // A captured or free argument region the body needs to be
+                // `'static` is the creator's requirement (`'static` outlives
+                // every region, so the others it reaches follow from it).
+                let creator_static = matches!(self.own.ends.get(u), Some(Some(End::Cap(_) | End::Arg(_))))
+                    && matches!(self.own.ends.first(), Some(Some(End::Static)))
+                    && bit_iter(&univ[c * wu..(c + 1) * wu]).any(|v| v == 0);
                 for v in bit_iter(&univ[c * wu..(c + 1) * wu]) {
-                    if v == u || v >= nu || known[u * nu + v] || reported.contains(&(u, v)) {
+                    if v == u || v >= nu || known[u * nu + v] || reported.contains(&(u, v)) || creator_static {
                         continue;
                     }
                     // A closure's creator proves relations between its

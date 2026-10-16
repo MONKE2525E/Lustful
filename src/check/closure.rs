@@ -87,6 +87,11 @@ pub struct ClosureInfo {
     /// input lifetime (`F: Fn(&T) -> &U`; rustc gives the closure `for<'r>
     /// fn(&'r T) -> &'r U`): the body may return borrows of that argument.
     pub bound_output: Option<Ty>,
+    /// W-BORROW: the regioned inputs of the `Fn` bound this closure is
+    /// passed to (empty when there is none): a slot the bound makes
+    /// `'static` (`impl FnOnce(&RefCell<Vec<Box<dyn Fn()>>>)`) is
+    /// `'static` in the body, not higher-ranked.
+    pub bound_inputs: Vec<Ty>,
 }
 
 /// The env field type of one capture.
@@ -323,6 +328,12 @@ impl<'p> Ctx<'p> {
         });
         // W-BORROW: every region of a `dyn Fn` signature is elided, so an
         // output region is the one input region's (Fn sugar elision).
+        let bound_inputs = expected
+            .and_then(|t| match self.kind(self.resolve(t)) {
+                TyKind::Infer(v) => self.closure_bound_inputs.get(&v.0).cloned(),
+                _ => None,
+            })
+            .unwrap_or_default();
         let bound_output = bound_output.or_else(|| {
             let o = self.deep(dyn_out?);
             Some(self.rebind_bound(o))
@@ -480,7 +491,7 @@ impl<'p> Ctx<'p> {
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
         let captures_any = !captures.is_empty();
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs });
         if let Some((fp, _, _)) = to_fn_ptr {
             if captures_any {
                 self.err(
