@@ -117,7 +117,9 @@ impl<'p> Ctx<'p> {
     }
 
     /// The trait of the impl this body's fn is a method of, walking out
-    /// of closures and from an instance to its template.
+    /// of closures and nested fns and from an instance to its template.
+    /// The nearest impl decides: an inherent impl nested in a trait
+    /// method has no trait (rustc resets its current trait ref there).
     fn enclosing_impl_trait(&self) -> Option<DefId> {
         let p = self.p;
         let mut f = self.fid;
@@ -131,6 +133,9 @@ impl<'p> Ctx<'p> {
             let d = def?;
             if let Some((_, rec)) = p.gx.index.by_def(d) {
                 return Some(rec.trait_def);
+            }
+            if matches!(p.defs.kind_of(d), Some(crate::ty::defs::DefKind::Impl)) {
+                return None;
             }
             def = p.defs.parent_of(d);
         }

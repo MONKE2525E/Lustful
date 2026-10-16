@@ -117,6 +117,12 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
     if cx.trait_scopes.iter().any(|layer| layer.contains(&trait_def)) {
         return true;
     }
+    // Inside a trait impl (its methods, their closures and nested fns)
+    // the impl's own trait is in scope for every receiver, as rustc's
+    // current trait ref: `self.write_all(..)` in `impl io::Write for S`.
+    if cx.enclosing_impl_trait_pub() == Some(trait_def) {
+        return true;
+    }
     let p = cx.p;
     // A user trait defined in or imported into this module under any
     // name (including `as _`). The query records a `TraitInScope` read:
