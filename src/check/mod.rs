@@ -14681,7 +14681,12 @@ impl<'p> Ctx<'p> {
                         if ok {
                             self.record_glue_reads(self.p.gx.lang.default, t);
                         }
-                        if !ok {
+                        // A type a later use fixes (`.and_then(Arc::get_mut)`)
+                        // waits for body end, as rustc's `T: Default`
+                        // obligation does; an error type is a follow-on.
+                        if !ok && matches!(k, TyKind::Infer(_)) {
+                            self.deferred_default.push((t, span));
+                        } else if !ok && k != TyKind::Error {
                             self.errs.push(unsupported(span, "`mem::take` on this type"));
                         }
                     }
@@ -23160,6 +23165,9 @@ impl<'p> Ctx<'p> {
             if !has_default(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` does not implement Default, or lust cannot build its default yet"), "Use `replace` with a value.");
+            } else {
+                // The default glue reads the type's layout.
+                self.record_glue_reads(self.p.gx.lang.default, t);
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_downgrade) {
