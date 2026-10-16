@@ -10932,7 +10932,12 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     }
     // Std platform bodies are no roots in `lust check` (`check_skips`).
     queue.retain(|&f| !p.check_skips(f));
+    let eager_from = queue.len();
     crate::mono::vtable::eager_vtables(p, &mut queue);
+    // Method instances only the eager vtables made: no body has called
+    // them or coerced their self type to `dyn` yet (`live_writers`).
+    let mut eager_only: Vec<LocalDefId> = queue[eager_from..].to_vec();
+    let mut live_writers: Vec<Ty> = Vec::new();
     // Eager vtable method instances of std impls (every `Error` impl
     // once std source names `dyn Error`, F3) are std bodies too: no
     // discovery roots in `lust check`, as above.
@@ -10999,6 +11004,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 let src = normalize_global(p, src);
                 let dyn_ty = build_owned_ty(p, dyn_ty);
                 let Some(principal) = crate::check::object::vtable_key(p, &p.tys, dyn_ty) else { continue };
+                if !live_writers.contains(&src) {
+                    live_writers.push(src);
+                }
                 let mut made: Vec<LocalDefId> = Vec::new();
                 crate::mono::vtable::ensure_vtable(p, src, principal, &mut made);
                 for inst in made {
@@ -11044,7 +11052,8 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 }
                 let template_def = p.def_id(template);
                 let args_id = p.tys.intern_args(&lifted);
-                if p.gx.instance_by_key.contains_key(&(template_def, args_id)) {
+                if let Some(&had) = p.gx.instance_by_key.get(&(template_def, args_id)) {
+                    eager_only.retain(|&f| f != had);
                     continue;
                 }
                 // A lang enum method checks as a template before its
@@ -11086,10 +11095,18 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     }
     p.gx.reuse = reuse;
     p.gx.mono_done = true;
-    // W-SHIM: instances whose behavior lust cannot make exact.
+    // W-SHIM: instances whose behavior lust cannot make exact. A
+    // `write_fmt` slot of an eager vtable runs only through a `dyn`
+    // made from its writer, so it counts only when some body coerces
+    // that writer (a `Box<dyn Write>` of stdout next to a user writer
+    // that is never `dyn` is fine).
     for i in first_instance..p.fns.len() {
-        errs.extend(crate::check::platform::user_write_fmt_instance(p, LocalDefId(i as u32)));
-        errs.extend(crate::check::platform::io_copy_instance(p, LocalDefId(i as u32)));
+        let f = LocalDefId(i as u32);
+        if eager_only.contains(&f) && !crate::check::platform::writer_of(p, f).is_some_and(|w| live_writers.contains(&w)) {
+            continue;
+        }
+        errs.extend(crate::check::platform::user_write_fmt_instance(p, f));
+        errs.extend(crate::check::platform::io_copy_instance(p, f));
     }
     errs
 }

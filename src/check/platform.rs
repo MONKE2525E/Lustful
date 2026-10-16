@@ -22,15 +22,22 @@ use crate::ty::{AdtId, Mut, Ty, TyIntern, TyKind};
 /// The `&mut W` forwarding impl is not the default: its inner writer
 /// gets its own instance, which this check sees.
 pub fn user_write_fmt_instance(p: &Program, inst: LocalDefId) -> Option<Diag> {
-    let f = p.fn_info(inst);
     if !is_platform_write_fmt(p, inst) {
         return None;
     }
-    let TyKind::Ref(_, _, writer) = p.tys.kind(*f.params.first()?) else { return None };
+    let writer = writer_of(p, inst)?;
     if matches!(p.tys.kind(writer), TyKind::Ref(..)) {
         return None;
     }
-    user_writer_diag(p, &p.tys, writer, f.def(&p.ast).name_span)
+    user_writer_diag(p, &p.tys, writer, p.fn_info(inst).def(&p.ast).name_span)
+}
+
+/// The type behind a method instance's `&self` or `&mut self` param.
+pub fn writer_of(p: &Program, inst: LocalDefId) -> Option<Ty> {
+    match p.tys.kind(*p.fn_info(inst).params.first()?) {
+        TyKind::Ref(_, _, t) => Some(t),
+        _ => None,
+    }
 }
 
 /// The same rule at a `write!` call `lust check` sees, for a receiver
