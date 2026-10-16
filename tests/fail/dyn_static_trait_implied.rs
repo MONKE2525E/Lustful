@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0306
 // rustc E0597: `trait T: 'static` makes `&dyn T` a `'static` object, so
 // the borrow of `n` inside `W` must live for `'static`.
 trait T: 'static {

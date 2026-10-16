@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0306
 // rustc E0597: a `dyn T + '_` parameter of a `'static` trait still needs a
 // `'static` source; `W<&u32>` borrows a local.
 trait T: 'static {

@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // rustc E0521: borrowed data escapes. The coercion's source type holds an inference variable
 // that a later store binds to `&u8`, so the `'static` dyn value would hold a borrow.
 use std::any::Any;

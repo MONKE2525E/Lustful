@@ -1,7 +1,5 @@
-// expect: L0705
-// ARCH 2.8: `dyn Tr + 'static` over a type that holds a reference. The
-// reference is 'static here, so rustc accepts; lust erases lifetimes in
-// types and cannot prove it, so it rejects instead of guessing.
+// ARCH 2.8: `dyn Tr + 'static` over a type that holds a reference. The reference is 'static
+// here, so rustc accepts; the borrow checker proves it at the unsizing (R02).
 trait Tr {
     fn get(&self) -> u8;
 }

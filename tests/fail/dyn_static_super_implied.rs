@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0306
 // rustc E0597: the `'static` bound comes from the supertrait `Root`.
 trait Root: 'static {}
 trait Read: Root {

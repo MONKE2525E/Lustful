@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0306
 // rustc E0597: the `'static` bound sits 70 supertraits down; the search for it
 // must not stop early and answer "not 'static".
 trait S0: 'static {}
