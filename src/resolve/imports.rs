@@ -390,18 +390,6 @@ impl ResolvedTables {
         })
     }
 
-    /// True when `module` has a glob import of a std module or enum
-    /// (`std_mod_only`: of a module, not an enum's variants). Lust does
-    /// not know every name such a glob brings (`Rewrite::std_glob_check`).
-    pub fn has_std_glob(&self, module: ModuleId, std_mod_only: bool, interner: &Interner) -> bool {
-        self.std_globs.iter().any(|(m, path)| {
-            *m == module && (!std_mod_only || {
-                let p: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
-                crate::ty::lang::std_enum_variants(&p).is_empty()
-            })
-        })
-    }
-
     /// An empty table set with only the first crate's root module (id
     /// 0, the selected crate; dependency crates join with
     /// `add_crate_root`).
@@ -1670,6 +1658,38 @@ impl ResolvedTables {
         Some((m, items))
     }
 
+    /// The shipped platform crate's module for the std module `path`
+    /// (`std::io`, `std::os::unix::fs`; W-SHIM) and the items a glob of
+    /// it brings: the ones std 1.99 also has at that path. None when the
+    /// platform crate is not loaded or has no such module.
+    pub fn std_platform_glob_items(&self, path: &[Sym], from: ModuleId, interner: &Interner) -> Option<(ModuleId, Vec<(Namespace, Sym)>)> {
+        let (root, _) = self.std_platform?;
+        let [std, first, ..] = path else { return None };
+        if interner.get(*std) != "std" || !STD_PLATFORM_MODULES.contains(&interner.get(*first)) {
+            return None;
+        }
+        let mut m = root;
+        for &seg in &path[1..] {
+            match self.segment_in(m, seg, Namespace::Type, from, interner) {
+                PathRes::Done(Target::Module(next)) => m = next,
+                _ => return None,
+            }
+        }
+        let mut full: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+        let mut items = Vec::new();
+        for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+            for &name in self.maps[m.0 as usize][ns_index(ns)].keys() {
+                full.push(interner.get(name));
+                if crate::resolve::stdpaths::std_has(&full).is_some() {
+                    items.push((ns, name));
+                }
+                full.pop();
+            }
+        }
+        items.sort_by(|a, b| (ns_index(a.0), interner.get(a.1)).cmp(&(ns_index(b.0), interner.get(b.1))));
+        Some((m, items))
+    }
+
     /// The std items lust knows by path that a glob of the std module
     /// `path` brings, with the namespaces an explicit import of each binds
     /// (`use std::mem::*;` brings `swap`, `use std::collections::*;`
@@ -2673,10 +2693,6 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         let mut changed = false;
                         if tables.externs[i as usize].is_std_lib {
                             let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
-                            if std_glob_shadows_prelude(&strs) {
-                                diags.push(std_glob_diag(imp.span));
-                                return TryOut::Done(false);
-                            }
                             // A glob binds nothing here, so a module or
                             // enum lust does not know (or a missing path)
                             // would import silently.
@@ -2691,11 +2707,13 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 changed |= tables.insert_glob_std_alias(imp.module, Namespace::Value, name, imp.vis.clone(), imp.module, full);
                             }
                             // `use std::panic::*;`: the items of the std
-                            // source overlay module (AssertUnwindSafe), then
-                            // the std items lust knows by path (catch_unwind,
-                            // mem::swap, HashSet) bind at glob rank, as their
-                            // explicit imports would.
-                            let overlay = tables.std_overlay_items(i, path, interner);
+                            // source overlay module (AssertUnwindSafe) or of
+                            // the platform crate's module (`std::io::*`
+                            // brings io's own `Result`), then the std items
+                            // lust knows by path (catch_unwind, mem::swap,
+                            // HashSet) bind at glob rank, as their explicit
+                            // imports would.
+                            let overlay = tables.std_overlay_items(i, path, interner).or_else(|| tables.std_platform_glob_items(path, imp.module, interner));
                             if let Some((m, items)) = &overlay {
                                 let mut only: Vec<Sym> = items.iter().map(|&(_, n)| n).collect();
                                 only.sort();
@@ -3337,23 +3355,6 @@ fn reexport_diag(name: &str, span: Span) -> Diag {
 }
 
 /// The L0507 diagnostic for a use of a glob-ambiguous name.
-/// True for a glob of a std module that brings its own `Result`
-/// (`std::io`, `std::fmt`, `std::thread`): it shadows the prelude's
-/// `Result`, which lust would still use.
-pub fn std_glob_shadows_prelude(path: &[&str]) -> bool {
-    path.len() == 2 && matches!(path[0], "std" | "core") && matches!(path[1], "io" | "fmt" | "thread")
-}
-
-/// L0505 for a glob import of `std::io`, `std::fmt`, or `std::thread`.
-pub fn std_glob_diag(span: Span) -> Diag {
-    Diag::new(
-        "L0505",
-        span,
-        "a glob import of a std module with its own `Result` is not supported yet",
-        "Import the std items you use by name, such as `use std::io::{self, Write};`.",
-    )
-}
-
 /// L0505 for a name a std glob import may bring or shadow: lust does
 /// not know every name a std module exports.
 pub fn std_glob_name_diag(name: &str, span: Span) -> Diag {

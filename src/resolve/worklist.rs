@@ -6675,10 +6675,6 @@ impl Rewrite<'_> {
                                 && let Some(frame) = scopes.last_mut()
                             {
                                 let p: Vec<&str> = path.iter().map(|s| self.interner.get(*s)).collect();
-                                if crate::resolve::imports::std_glob_shadows_prelude(&p) {
-                                    self.diags.push(crate::resolve::imports::std_glob_diag(span));
-                                    continue;
-                                }
                                 if let Some(d) = crate::resolve::imports::std_unbound_diag(&path, true, span, self.interner) {
                                     self.diags.push(d);
                                     continue;
@@ -6688,7 +6684,7 @@ impl Rewrite<'_> {
                                 // The std source overlay's items (`use
                                 // std::panic::*;` brings AssertUnwindSafe)
                                 // and the std items lust knows by path.
-                                let overlay = self.tables.std_overlay_items(i, &path, self.interner);
+                                let overlay = self.tables.std_overlay_items(i, &path, self.interner).or_else(|| self.tables.std_platform_glob_items(&path, module, self.interner));
                                 for &(ns, name) in overlay.iter().flat_map(|(_, items)| items) {
                                     let mut full = path.clone();
                                     full.push(name);
@@ -7102,9 +7098,15 @@ impl Rewrite<'_> {
             }
         }
         // A glob copy of a std overlay item (`use std::cell::*;` binds
-        // OnceCell) is the std glob's own name; two std globs that bring
+        // OnceCell) or of a platform crate item (`use std::io::*;` binds
+        // stdout) is the std glob's own name; two std globs that bring
         // different items are `std_glob_ambiguous`.
-        let from_std = |key| self.tables.glob_src.get(&key).is_some_and(|src| self.tables.std_modules.iter().any(|&(_, m)| m == *src));
+        let platform = self.tables.std_platform.map(|(root, _)| root);
+        let from_std = |key| {
+            self.tables.glob_src.get(&key).is_some_and(|src| {
+                self.tables.std_modules.iter().any(|&(_, m)| m == *src) || platform.is_some_and(|root| self.tables.root_of(*src) == root)
+            })
+        };
         matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank <= 1)
             && !from_std((module, ns_index(asked) as u8, first))
             && self.std_globs_bring(self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p), first)
@@ -7172,13 +7174,19 @@ impl Rewrite<'_> {
     }
 
     /// True when an uppercase binding name sits under a glob of a std
-    /// module (in a block or the module): the glob may bring a const of
-    /// that name (`use std::f64::consts::*; let PI = 3.0;` is rustc
-    /// E0005), so lust rejects the binding.
+    /// module (in a block or the module) that brings an item of that name
+    /// (std 1.99's path table): it may be a const (`use std::f64::consts::*;
+    /// let PI = 3.0;` is rustc E0005), so lust rejects the binding. Globs
+    /// of std enums' variants are left to the variant rewrite.
     fn binding_under_std_glob(&self, name: Sym, module: ModuleId, scopes: &[Frame]) -> bool {
+        let module_glob = |p: &&Vec<Sym>| {
+            let strs: Vec<&str> = p.iter().map(|s| self.interner.get(*s)).collect();
+            crate::ty::lang::std_enum_variants(&strs).is_empty()
+        };
         self.interner.get(name).starts_with(|c: char| c.is_ascii_uppercase())
             && !Self::frames_bind(scopes, name)
-            && (scopes.iter().any(|f| f.std_mod_glob) || self.tables.has_std_glob(module, true, self.interner))
+            && (scopes.iter().any(|f| f.std_mod_glob && self.std_globs_bring(f.std_glob_paths.iter().filter(module_glob), name))
+                || self.std_globs_bring(self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p).filter(module_glob), name))
     }
 
     /// rustc E0530 for a binding over a static or const that a block's
