@@ -100,6 +100,23 @@ static int lust_pad_sink_write(lust_sink *k, const uint8_t *p, uint64_t n) {
     return 0;
 }
 
+int lust_args_write(const lust_Arguments *a, lust_sink *k) {
+    if (a->fmt) return a->fmt(a->env, k);
+    return a->len ? k->write(k, (const uint8_t *)a->text, a->len) : 0;
+}
+
+int lust_f_args(lust_Formatter *f, const lust_Arguments *a) {
+    return lust_args_write(a, f->buf);
+}
+
+lust_String lust_args_to_string(const lust_Arguments *a) {
+    lust_String s = lust_string_with_capacity(a->cap);
+    lust_sink k;
+    lust_sink_string(&k, &s);
+    if (lust_args_write(a, &k)) lust_fmt_failed(0, 0);
+    return s;
+}
+
 void lust_f_init(lust_Formatter *f, lust_sink *buf) {
     f->buf = buf;
     f->fill = ' ';

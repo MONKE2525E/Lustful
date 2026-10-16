@@ -1362,7 +1362,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("references in struct and enum fields without a lifetime (E0106)", "L0201"),
     ("lifetimes in body type annotations, fn pointer types, dyn trait args, trait params, and `T: 'a` bounds", "L0203"),
     ("explicit lifetime turbofish args", "L0731"),
-    ("macro calls with no expanded form yet, such as format_args!", "L0401"),
+    ("format macros (format_args! and kin) outside expression position", "L0401"),
     ("attributes lust does not know by name (named in the message)", "L0402"),
     ("known attributes such as non_exhaustive (named in the message)", "L0522"),
     ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, Hash (named in the message)", "L0403"),

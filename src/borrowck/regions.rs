@@ -645,8 +645,9 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
         // The borrowing hash iterators hold `&'a` (or `&'a mut`) of their table (W-STD-B).
         Some(BuiltinTy::Iter(k)) if k.is_hash() && !k.is_hash_owning() => return 1,
         // A Debug builder holds `&mut Formatter`, a map Entry `&mut` its
-        // map (W-STD-B).
-        Some(BuiltinTy::Fmt(k)) if k.is_builder() => return 1,
+        // map (W-STD-B). An `Arguments<'a>` borrows its format
+        // arguments, so it holds one region too (R9).
+        Some(BuiltinTy::Fmt(k)) if k.is_builder() || k == crate::ty::fmt::FmtTy::Arguments => return 1,
         // The lock guards borrow their lock (W-THREADS).
         Some(BuiltinTy::Sync(k)) if k.regions() > 0 => return k.regions(),
         Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry)) => return 1,
@@ -3078,6 +3079,17 @@ impl<'b, 'p> Builder<'b, 'p> {
                     }
                     self.dyn_fn_coercion(*src, *dyn_ty, &data);
                 }
+            }
+            // A `format_args!` value (R9): an `Arguments<'a>` holds a
+            // borrow of its arguments temporary, which holds the
+            // argument references; all their regions flow into the
+            // value's one region slot. A literal-only value relates
+            // nothing (it is `'static`).
+            Rvalue::FormatArgs(Some(env), _) => {
+                self.place(dest, &mut dv, &mut d);
+                let mut ov = Vec::new();
+                self.operand(env, &mut ov);
+                self.flow_all(&ov, &dv);
             }
             // A downcast (W-CHECK-G3): `&'p dyn Any` to `&'q T` needs
             // `'p: 'q`. T is `'static`; an owning pointer relates nothing.

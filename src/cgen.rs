@@ -539,7 +539,8 @@ pub fn ctype(t: &CTy) -> String {
 fn fmt_size_align(k: crate::ty::fmt::FmtTy) -> (u64, u64) {
     use crate::ty::fmt::FmtTy as F;
     match k {
-        F::Formatter | F::Arguments | F::DebugTuple => (24, 8),
+        F::Formatter | F::DebugTuple => (24, 8),
+        F::Arguments => (40, 8),
         F::DebugStruct | F::DebugList | F::DebugSet | F::DebugMap => (16, 8),
     }
 }
@@ -549,9 +550,9 @@ fn fmt_ctype(k: crate::ty::fmt::FmtTy) -> &'static str {
     use crate::ty::fmt::FmtTy as F;
     match k {
         F::Formatter => "lust_Formatter",
-        // A `format_args!` value is formatted when it is made (W-SHIM:
-        // `io::Write::write_fmt`); it holds the text.
-        F::Arguments => "lust_String",
+        // A `format_args!` value: its site's formatter fn and arguments
+        // (cgen/fmt.rs `format_args_value`).
+        F::Arguments => "lust_Arguments",
         F::DebugStruct => "lust_DebugStruct",
         F::DebugTuple => "lust_DebugTuple",
         F::DebugList | F::DebugSet => "lust_DebugList",
@@ -3148,6 +3149,7 @@ impl FnGen<'_, '_> {
             }
             Rvalue::Format(parts) => self.format(parts, loc, post, 0),
             Rvalue::WriteFmt(dst, parts, stream) => self.write_fmt(dst, parts, *stream, loc, post),
+            Rvalue::FormatArgs(env, parts) => self.format_args_value(env.as_ref(), parts, loc, post),
             Rvalue::Discriminant(pl) => {
                 let (e, t) = self.place(pl, loc);
                 disc_call(self.p, &t, &format!("(&{e})"))
@@ -9414,12 +9416,12 @@ fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: 
                 op(o);
             }
         }
-        Rvalue::Format(parts) => parts.iter().for_each(|p| {
+        Rvalue::Format(parts) | Rvalue::FormatArgs(None, parts) => parts.iter().for_each(|p| {
             if let FmtPart::Arg { value, .. } = p {
                 op(value);
             }
         }),
-        Rvalue::WriteFmt(dst, parts, _) => {
+        Rvalue::WriteFmt(dst, parts, _) | Rvalue::FormatArgs(Some(dst), parts) => {
             op(dst);
             parts.iter().for_each(|p| {
                 if let FmtPart::Arg { value, .. } = p {

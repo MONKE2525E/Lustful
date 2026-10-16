@@ -97,8 +97,22 @@ typedef struct {
     uint8_t state;
 } lust_DebugMap;
 
+/* fmt::Arguments (cgen format_args_value): `fmt` formats the parts of
+   one format_args! site into a sink through a fresh Formatter, reading
+   the argument references from `env`, and returns 0 (Ok) or 1 (Err).
+   It is NULL for literal-only text (`text`, `len`). `cap` is the
+   site's `estimated_capacity`, for `to_string`. */
+typedef struct {
+    int (*fmt)(const void *env, lust_sink *k);
+    const void *env;
+    const char *text;
+    uint64_t len;
+    uint64_t cap;
+} lust_Arguments;
+
 /* Sizes the compiler's layout tables assume (cgen fmt_size_align). */
 _Static_assert(sizeof(lust_Formatter) == 24 && sizeof(lust_DebugTuple) == 24, "fmt layout");
+_Static_assert(sizeof(lust_Arguments) == 40, "fmt layout");
 _Static_assert(sizeof(lust_DebugStruct) == 16 && sizeof(lust_DebugList) == 16 && sizeof(lust_DebugMap) == 16, "fmt layout");
 
 /* A sink over a String, and a Formatter with default options over a
@@ -121,6 +135,12 @@ typedef struct {
 } lust_io_sink;
 void lust_io_begin(lust_io_sink *k, int to_stderr);
 void lust_f_init(lust_Formatter *f, lust_sink *buf);
+/* fmt::Arguments: `fmt::write(k, a)`; Display and Debug of `a` into
+   `f` (core writes to `f`'s sink and ignores `f`'s options); and
+   `a.to_string()` (alloc's `fmt::format`). */
+int lust_args_write(const lust_Arguments *a, lust_sink *k);
+int lust_f_args(lust_Formatter *f, const lust_Arguments *a);
+lust_String lust_args_to_string(const lust_Arguments *a);
 /* Sets the options of one placeholder. `width` and `prec` count only
    when their flag bit is set. */
 void lust_f_set(lust_Formatter *f, uint32_t fill, uint32_t align, uint32_t flags, uint32_t width, uint32_t prec);

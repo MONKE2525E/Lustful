@@ -17,9 +17,10 @@
 int64_t lust_sys_write_std(int32_t fd, const uint8_t *p, uint64_t len);
 int32_t lust_sys_flush_std(int32_t fd);
 
-/* A `fmt::Arguments` value is its formatted text (a lust_String, see
-   cgen's fmt_ctype); its bytes as a Vec<u8> take over the buffer. */
-lust_Vec lust_sys_fmt_arguments_bytes(lust_String args);
+/* The text of a `fmt::Arguments` value (fmt.h), formatted now, as a
+   Vec<u8> (std's `io::Write::write_fmt`). A fmt impl error panics as
+   std's does. */
+lust_Vec lust_sys_fmt_arguments_bytes(lust_Arguments args);
 
 /* Byte views of text (OsStr, Path): a `&[u8]` return comes back as a
    lust_str (cgen rebuilds the slice value from its ptr and len). */

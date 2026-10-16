@@ -392,9 +392,9 @@ pub trait Write {
     }
 
     /// Writes a formatted string into this writer (`write!` and
-    /// `writeln!`). In lust a `fmt::Arguments` value already holds its
-    /// text, so this is one `write_all`; for std's writers that is the
-    /// same output as std's piece-by-piece writes. The compiler
+    /// `writeln!`). lust formats the `fmt::Arguments` into one buffer
+    /// and writes it with one `write_all`; for std's writers that is
+    /// the same output as std's piece-by-piece writes. The compiler
     /// streams `write!` on `Stdout`, `Stderr`, and their locks piece
     /// by piece instead of calling this default, so a print inside a
     /// fmt impl stays in order there. A user type that relies on this

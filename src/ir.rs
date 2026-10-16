@@ -179,6 +179,14 @@ pub enum Rvalue {
     /// `io::Result`'s `Err`, and a fmt impl error panics as
     /// `io::Write::write_fmt` does in std.
     WriteFmt(Operand, Vec<FmtPart>, Option<bool>),
+    /// A `format_args!` value (R9): an `fmt::Arguments` that formats
+    /// `parts` each time it is formatted, as core's does. `env` is a
+    /// `&` of the arguments temporary (a tuple of the argument
+    /// references, whose scope is the one rustc gives its args
+    /// array); each argument operand of `parts` reads a field of that
+    /// temporary. None when no argument is left after rustc's literal
+    /// inlining: the value is then `'static` text.
+    FormatArgs(Option<Operand>, Vec<FmtPart>),
 }
 
 #[derive(Clone, Debug)]

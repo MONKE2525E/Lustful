@@ -1686,9 +1686,6 @@ struct Ctx<'p> {
     /// inference variable (call, pointee, align, span): answered at the
     /// body end (W-STD-C).
     deferred_layout: Vec<(ExprId, Ty, bool, Span)>,
-    /// `format_args!` expressions checked as the argument of a
-    /// `write_fmt` call (check/fmt.rs); any other is a reject.
-    format_args_ok: Vec<ExprId>,
     /// Element types a builtin Vec or slice method needs to be
     /// Clone (`extend_from_slice`, `resize`, `to_vec`), re-tested
     /// at finish like the format traits: the element type can
@@ -2080,7 +2077,6 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_fmt: Vec::new(),
         deferred_layout: Vec::new(),
         turbofish_ty: None,
-        format_args_ok: Vec::new(),
         deferred_clone: Vec::new(),
         deferred_string_from: Vec::new(),
         deferred_prim_from: Vec::new(),
@@ -13717,15 +13713,6 @@ impl<'p> Ctx<'p> {
         for (_, _, n, _, a, g) in &spine {
             let seg = ast::PathSeg { name: *n, args: ast::GenericArgs::Angle(g.to_vec()) };
             self.lifetime_turbofish(std::slice::from_ref(&seg));
-            // `write!` into an `io::Write` value (W-SHIM): the
-            // `format_args!` argument is an `Arguments` value.
-            if let [arg] = a
-                && p.interner.get(*n) == "write_fmt"
-                && matches!(p.ast.expr(*arg), Expr::Macro { kind: MacroKind::FormatArgs, .. })
-                && p.resolved.as_ref().is_some_and(|r| r.std_platform.is_some())
-            {
-                self.format_args_ok.push(*arg);
-            }
         }
         let writes: Vec<(ExprId, ExprId, Span)> =
             spine.iter().filter(|s| p.interner.get(s.2) == "write_fmt").map(|s| (s.0, s.1, s.3)).collect();
@@ -16646,17 +16633,7 @@ impl<'p> Ctx<'p> {
             }
             MacroKind::Println | MacroKind::Print | MacroKind::Eprintln | MacroKind::Eprint => UNIT,
             MacroKind::Format => STRING,
-            MacroKind::FormatArgs => {
-                if !self.format_args_ok.contains(&e) {
-                    self.err(
-                        "L0401",
-                        span,
-                        "this macro call has no expanded form yet: `format_args!` outside `write!` and `write_fmt`",
-                        "Use `format!` for a String, or pass the arguments to `write!`.",
-                    );
-                }
-                crate::ty::fmt::fmt_ty(&mut self.tys, crate::ty::fmt::FmtTy::Arguments)
-            }
+            MacroKind::FormatArgs => crate::ty::fmt::fmt_ty(&mut self.tys, crate::ty::fmt::FmtTy::Arguments),
             MacroKind::Panic | MacroKind::Todo | MacroKind::Unreachable => NEVER,
         };
         for piece in fmt {

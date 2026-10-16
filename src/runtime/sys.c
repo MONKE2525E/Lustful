@@ -48,11 +48,15 @@ void lust_sys_os_error_text(int32_t code, lust_String *out) {
     lust_string_push_cstr(out, strerror(code));
 }
 
-lust_Vec lust_sys_fmt_arguments_bytes(lust_String args) {
+lust_Vec lust_sys_fmt_arguments_bytes(lust_Arguments args) {
+    lust_String s = lust_string_with_capacity(0);
+    lust_sink k;
+    lust_sink_string(&k, &s);
+    if (lust_args_write(&args, &k)) lust_fmt_failed(2, 0);
     lust_Vec v;
-    v.ptr = args.ptr;
-    v.len = args.len;
-    v.cap = args.cap;
+    v.ptr = s.ptr;
+    v.len = s.len;
+    v.cap = s.cap;
     return v;
 }
 

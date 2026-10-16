@@ -34,6 +34,10 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         CTy::Str => str_expr(debug, f, &format!("(*{v})")),
         CTy::Ref(inner) if **inner == CTy::Str => str_expr(debug, f, &format!("(*{v})")),
         CTy::String => str_expr(debug, f, &format!("lust_string_as_str({v})")),
+        // `fmt::Arguments`: core's Display and Debug both format the
+        // parts through a fresh Formatter over `f`'s sink (`fmt::write`),
+        // so `f`'s width, fill, and precision do not apply.
+        CTy::Fmt(crate::ty::fmt::FmtTy::Arguments) => format!("lust_f_args({f}, {v})"),
         CTy::Unit => format!("lust_f_unit({f})"),
         CTy::FnPtr(..) => format!("lust_f_fnptr({f}, (const void*)(*{v}))"),
         // A raw pointer's Debug is its address (w-cinterop).
@@ -496,6 +500,8 @@ fn may_fail(t: &CTy) -> bool {
         CTy::Unsized(..) => true,
         CTy::Result(a, b) => may_fail(a) || may_fail(b),
         CTy::Tuple(es) => es.iter().any(may_fail),
+        // A `format_args!` value formats its own arguments.
+        CTy::Fmt(crate::ty::fmt::FmtTy::Arguments) => true,
         _ => false,
     }
 }
@@ -562,6 +568,7 @@ impl FnGen<'_, '_> {
         spec: &FmtSpec,
         width: &Option<Operand>,
         prec: &Option<Operand>,
+        env: Option<Local>,
         loc: &str,
         post: &mut Vec<String>,
     ) -> (u32, u32, u32, String, String) {
@@ -569,7 +576,7 @@ impl FnGen<'_, '_> {
         let mut count = |this: &mut Self, c: &Option<Operand>, lit: u32, flag: u32| match c {
             Some(c) => {
                 flags |= flag;
-                let (v, _) = this.operand(c, loc, post);
+                let (v, _) = this.fmt_operand(c, env, loc, post);
                 format!("lust_f_count(*{v}, {loc})")
             }
             None => lit.to_string(),
@@ -599,10 +606,74 @@ impl FnGen<'_, '_> {
             return s;
         }
         let _ = writeln!(self.out, "    lust_sink {s}k; lust_sink_string(&{s}k, &{s}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); int {s}e = 0;");
-        if self.format_parts(parts, &s, loc, post) && what != 4 {
+        if self.format_parts(parts, &s, None, loc, post) && what != 4 {
             let _ = writeln!(self.out, "    if ({s}e) lust_fmt_failed({what}, {loc});");
         }
         s
+    }
+
+    /// `Rvalue::FormatArgs`: the C value of an `fmt::Arguments`
+    /// (`lust_Arguments`, src/runtime/fmt.h). With arguments it is this
+    /// site's formatter fn, emitted ahead of the function, and the
+    /// pointer to the arguments temporary that `env` borrows. The fn
+    /// writes the parts through a fresh Formatter over the sink it is
+    /// given (core's `fmt::write`), reading each argument reference
+    /// from the temporary, so the arguments format at each use, as in
+    /// rustc. With no argument it is the literal text. The value also
+    /// keeps `estimated_capacity`, for `to_string`.
+    pub(super) fn format_args_value(&mut self, env: Option<&Operand>, parts: &[FmtPart], loc: &str, post: &mut Vec<String>) -> String {
+        let cap = estimated_capacity(parts);
+        let Some(env) = env else {
+            let text: String = parts.iter().map(|p| if let FmtPart::Lit(s) = p { s.as_str() } else { "" }).collect();
+            return format!("((lust_Arguments){{ NULL, NULL, {}, {}, {cap} }})", c_string_lit(text.as_bytes()), text.len());
+        };
+        let (e, et) = self.operand(env, loc, post);
+        let CTy::Ref(env_ct) = et else { unreachable!("a format_args! env is a reference") };
+        let Some(env_local) = parts.iter().find_map(|p| match p {
+            FmtPart::Arg { value: Operand::Copy(pl), .. } => Some(pl.local),
+            _ => None,
+        }) else {
+            unreachable!("a format_args! value with an env has an argument")
+        };
+        // rustc converts each width and precision argument when the
+        // value is made (`Argument::from_usize`): an out-of-range count
+        // panics here, at the `format_args!` site, and never in the
+        // formatter fn (which has no caller location to report).
+        for part in parts {
+            if let FmtPart::Arg { width, prec, .. } = part {
+                for c in width.iter().chain(prec) {
+                    let Operand::Copy(pl) = c else { unreachable!("a count reads the env") };
+                    let [Proj::Field(i)] = pl.proj[..] else { unreachable!("a count reads the env") };
+                    let _ = writeln!(self.out, "    lust_f_count(*({e})->f{i}, {loc});");
+                }
+            }
+        }
+        let name = format!("lust_fa_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
+        self.adapters += 1;
+        let outer = std::mem::take(&mut self.out);
+        let _ = writeln!(self.out, "    const {} *env = (const {0} *)envp;", ctype(&env_ct));
+        let _ = writeln!(self.out, "    lust_Formatter xf; lust_f_init(&xf, k); int xe = 0;");
+        let mut inner_post = Vec::new();
+        self.format_parts(parts, "x", Some(env_local), "0u", &mut inner_post);
+        debug_assert!(inner_post.is_empty(), "argument reads leave no cleanup");
+        let body = std::mem::replace(&mut self.out, outer);
+        let _ = writeln!(self.prelude, "static int {name}(const void *envp, lust_sink *k) {{\n{body}    return xe;\n}}");
+        format!("((lust_Arguments){{ {name}, (const void *){e}, NULL, 0, {cap} }})")
+    }
+
+    /// An argument operand of format parts. Inside a `format_args!`
+    /// formatter fn (`env` is the arguments temporary's local) a read
+    /// of the temporary's field `i` is `env->f<i>` through the fn's
+    /// `env` pointer; every other operand is the function's own.
+    fn fmt_operand(&mut self, o: &Operand, env: Option<Local>, loc: &str, post: &mut Vec<String>) -> (String, CTy) {
+        if let (Some(l), Operand::Copy(pl)) = (env, o)
+            && pl.local == l
+            && let [Proj::Field(i)] = pl.proj[..]
+        {
+            let CTy::Tuple(es) = &self.local_cty[l as usize] else { unreachable!("a format_args! env is a tuple") };
+            return (format!("(env->f{i})"), es[i as usize].clone());
+        }
+        self.operand(o, loc, post)
     }
 
     /// Emits `print!` (`eprint!` with `stderr`; `newline` for the `ln`
@@ -613,7 +684,7 @@ impl FnGen<'_, '_> {
         let s = self.tmp();
         let fd = u8::from(stderr);
         let _ = writeln!(self.out, "    lust_sink {s}k; lust_print_begin(&{s}k, {fd}); lust_Formatter {s}f; lust_f_init(&{s}f, &{s}k); int {s}e = 0;");
-        let fallible = self.format_parts(parts, &s, loc, post);
+        let fallible = self.format_parts(parts, &s, None, loc, post);
         let guard = if fallible { format!("if (!{s}e) ") } else { String::new() };
         if newline {
             let _ = writeln!(self.out, "    {guard}lust_f_write(&{s}f, \"\\n\", 1);");
@@ -634,8 +705,8 @@ impl FnGen<'_, '_> {
     /// Emits the writes of `parts` through the Formatter `{s}f` the
     /// caller set up, with its error flag `{s}e`: after a fmt impl
     /// error nothing more is written, as `fmt::write` stops. Returns
-    /// whether any argument's impl can fail.
-    fn format_parts(&mut self, parts: &[FmtPart], s: &str, loc: &str, post: &mut Vec<String>) -> bool {
+    /// whether any argument's impl can fail. `env`: see `fmt_operand`.
+    fn format_parts(&mut self, parts: &[FmtPart], s: &str, env: Option<Local>, loc: &str, post: &mut Vec<String>) -> bool {
         let mut fallible = false;
         for part in parts {
             match part {
@@ -646,7 +717,7 @@ impl FnGen<'_, '_> {
                     }
                 }
                 FmtPart::Arg { value, ty, spec, width, prec, .. } => {
-                    let (v, vt) = self.operand(value, loc, post);
+                    let (v, vt) = self.fmt_operand(value, env, loc, post);
                     let t = cty(&self.body.tys, *ty);
                     // An unsized `str` or `[T]` argument arrives as its
                     // fat value; the formatters take a pointer to it.
@@ -662,7 +733,7 @@ impl FnGen<'_, '_> {
                     for (g, t) in want {
                         self.want(g, &t);
                     }
-                    let (fill, align, flags, width, prec) = self.spec_words_dyn(spec, width, prec, loc, post);
+                    let (fill, align, flags, width, prec) = self.spec_words_dyn(spec, width, prec, env, loc, post);
                     let guard = if fallible { format!("if (!{s}e) ") } else { String::new() };
                     let _ = writeln!(self.out, "    {guard}{{ lust_f_set(&{s}f, {fill}, {align}, {flags}, {width}, {prec}); {s}e = {e}; }}");
                     fallible |= may_fail(&t);
@@ -702,6 +773,13 @@ impl FnGen<'_, '_> {
         match t {
             CTy::String => {
                 let _ = writeln!(self.out, "    lust_String {s} = lust_string_from(lust_string_as_str({v}));");
+                return s;
+            }
+            // `fmt::Arguments::to_string` in alloc (`fmt::format`): a
+            // String of `estimated_capacity` that the parts format into,
+            // or `as_str()` copied for literal-only text.
+            CTy::Fmt(crate::ty::fmt::FmtTy::Arguments) => {
+                let _ = writeln!(self.out, "    lust_String {s} = lust_args_to_string({v});");
                 return s;
             }
             CTy::Str => {
@@ -1086,7 +1164,7 @@ impl FnGen<'_, '_> {
                     for (g, t) in want {
                         self.want(g, &t);
                     }
-                    let (fill, align, flags, width, prec) = self.spec_words_dyn(spec, width, prec, loc, post);
+                    let (fill, align, flags, width, prec) = self.spec_words_dyn(spec, width, prec, None, loc, post);
                     let _ = writeln!(self.out, "    if (!{s}e) {{ lust_f_set(&{s}f, {fill}, {align}, {flags}, {width}, {prec}); {s}e = {e}; }}");
                     // As in `print`: a fmt impl that panicked under
                     // unwind stops the formatting; the parts before it

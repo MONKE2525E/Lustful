@@ -3274,7 +3274,7 @@ pub(crate) fn resolve_path_ty(
             // `core::fmt` types are known by their full path only:
             // `Error` and `Result` must never match a bare name.
             if path.len() == 3 && path[1] == "fmt" {
-                return resolve_fmt_path(tys, path[2], segs.last().unwrap(), span);
+                return resolve_fmt_path(interner, tys, scope, path[2], segs.last().unwrap(), span);
             }
             // `Location<'a>`: lust erases its one lifetime.
             if path[1..] == ["panic", "Location"]
@@ -3910,7 +3910,14 @@ fn resolve_hash_path(
 /// A `core::fmt` type by its last path segment (W-STD-B): the
 /// Formatter family (lifetime arguments only), `fmt::Result`, and
 /// `fmt::Error`.
-fn resolve_fmt_path(tys: &mut impl TyIntern, name: &str, seg: &ast::PathSeg, span: Span) -> Result<Ty, Diag> {
+fn resolve_fmt_path(
+    interner: &Interner,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    name: &str,
+    seg: &ast::PathSeg,
+    span: Span,
+) -> Result<Ty, Diag> {
     let only_lifetimes = match &seg.args {
         GenericArgs::None => true,
         GenericArgs::Angle(a) => a.iter().all(|g| matches!(g, ast::GenericArg::Lifetime(_))),
@@ -3925,7 +3932,28 @@ fn resolve_fmt_path(tys: &mut impl TyIntern, name: &str, seg: &ast::PathSeg, spa
         "Error" if seg.has_args() => Err(Diag::new("L0110", span, "`fmt::Error` takes no generic arguments", "Remove the `<...>` part.")),
         "Error" => Ok(fmt_error_ty(tys)),
         _ => match crate::ty::fmt::FmtTy::by_name(name) {
-            Some(k) => Ok(crate::ty::fmt::fmt_ty(tys, k)),
+            Some(k) => {
+                // In region signatures the written lifetimes stay as
+                // lifetime args (like the sync guards above), so a
+                // field `Arguments<'a>` uses `'a` and borrowck can
+                // relate the field's slot. Erased types keep no args.
+                if matches!(scope.regions, RegionMode::Keep { .. }) {
+                    let written: Vec<ast::Lifetime> = match &seg.args {
+                        GenericArgs::Angle(a) => {
+                            a.iter().filter_map(|g| if let ast::GenericArg::Lifetime(lt) = g { Some(*lt) } else { None }).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let n_lts = if k.is_builder() { 2 } else { 1 };
+                    let mut all = Vec::new();
+                    for i in 0..n_lts {
+                        all.push(GenericArg::Lifetime(scope_region(interner, scope, written.get(i).copied(), span)?));
+                    }
+                    let def = tys.builtins().fmt_tys[k as usize];
+                    return Ok(tys.mk_adt(def, &all));
+                }
+                Ok(crate::ty::fmt::fmt_ty(tys, k))
+            }
             None => Err(Diag::new("L0102", span, format!("unknown type `{name}`"), "Check the spelling, or define the type.")),
         },
     }
@@ -7545,6 +7573,15 @@ pub fn add_synthetic_impls(p: &mut Program) {
             insert_synthetic(p, &mut ordinal, tr, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
         insert_synthetic(p, &mut ordinal, lang.partial_eq, t, &[t], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    // `fmt::Arguments` (R9): Copy, Clone, Debug, and Display, as in
+    // core. Both fmt impls format the parts with a fresh Formatter,
+    // the outer specs ignored; cgen/fmt.rs has the rendering.
+    {
+        let t = crate::ty::fmt::fmt_ty(&mut p.tys, crate::ty::fmt::FmtTy::Arguments);
+        for tr in [lang.copy, lang.clone, lang.debug, lang.display] {
+            insert_synthetic(p, &mut ordinal, tr, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
     }
     let p0 = p.tys.intern(TyKind::Param(ParamId(0)));
     let p1 = p.tys.intern(TyKind::Param(ParamId(1)));

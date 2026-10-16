@@ -5,9 +5,8 @@
 use super::*;
 use std::hash::Hash as _;
 
-/// Macros the parser owns as `Expr::Macro` forms, plus `format_args!`,
-/// which stays unexpanded (its `Arguments` type lands with source std)
-/// so the parser rejects it with its own code today.
+/// Macros the parser owns as `Expr::Macro` forms (`format_args!` is
+/// one: its value is an `fmt::Arguments`) and `offset_of!`.
 pub fn is_passthrough(name: &str) -> bool {
     matches!(
         name,

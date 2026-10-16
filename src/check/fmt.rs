@@ -7,8 +7,9 @@
 // impl's `fmt` instance is what cgen's glue calls (`gx.fmt_methods`).
 //
 // Rule zero: methods Rust declares on these types that lust has no
-// port of reject with L0640; `format_args!` outside `write_fmt`
-// rejects with L0401 (no expanded form yet).
+// port of reject with L0640. A `format_args!` value is an
+// `fmt::Arguments` in every position; it formats its arguments at
+// each use, as in rustc (cgen/fmt.rs `format_args_value`).
 use super::*;
 use crate::ty::fmt::{FmtTy, fmt_kind, fmt_ty};
 
@@ -141,7 +142,12 @@ impl<'p> Ctx<'p> {
         args: &[ExprId],
     ) -> Option<Ty> {
         let n = self.p.interner.get(name);
-        if let Some(k) = fmt_kind(&self.tys, base) {
+        // `fmt::Arguments` has no inherent methods lust ports; its
+        // `to_string` and trait `fmt` run through the generic arms
+        // below, like a local Adt with a Display impl.
+        if let Some(k) = fmt_kind(&self.tys, base)
+            && !(k == FmtTy::Arguments && matches!(n, "to_string" | "fmt"))
+        {
             return Some(self.fmt_type_method(e, recv, k, derefs, n, name_span, args));
         }
         // `<String as fmt::Write>`: write_str and write_char append and
@@ -156,7 +162,12 @@ impl<'p> Ctx<'p> {
         if n == "fmt" && args.len() == 1 && self.tys.local_adt(base).is_none() {
             return self.builtin_fmt_call(e, recv, base, derefs, name_span, args);
         }
-        if n == "to_string" && args.is_empty() && (self.tys.local_adt(base).is_some() || matches!(self.tys.kind(base), TyKind::Dyn(..))) {
+        if n == "to_string"
+            && args.is_empty()
+            && (self.tys.local_adt(base).is_some()
+                || matches!(self.tys.kind(base), TyKind::Dyn(..))
+                || fmt_kind(&self.tys, base) == Some(FmtTy::Arguments))
+        {
             // `impl<T: Display> ToString for T`, through the receiver's
             // Display impl (Self is bound as rustc's probe binds it).
             // A dyn receiver (`Box<dyn Error>`, F3) is Display through
@@ -453,7 +464,6 @@ impl<'p> Ctx<'p> {
         }
         self.check_packed_borrow(recv, name_span);
         self.set_res(e, Res::BuiltinMethod { b: Builtin::FmtWriteFmt, derefs, autoref: Autoref::RefMut });
-        self.format_args_ok.push(*arg);
         let fa = fmt_ty(&mut self.tys, FmtTy::Arguments);
         self.check_args(&[fa], args, name_span);
         Some(self.fmt_result_ty())

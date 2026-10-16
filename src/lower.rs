@@ -2820,6 +2820,22 @@ impl<'p> Lower<'p> {
                     self.mark_extending(a, depth);
                 }
             }
+            // rustc's `format_args!` is a `super let` of its args array,
+            // each argument under an extending `&`: the array (keyed by
+            // the macro expression, see `format_args_into`) and each
+            // argument's temporaries, also those of a nested
+            // `format_args!`, live to the end of the block (R9).
+            Expr::Macro { kind: MacroKind::FormatArgs, args, fmt, .. } => {
+                self.extended.push((e, depth));
+                for piece in fmt {
+                    if let FmtPiece::Arg { index, spec, .. } = piece {
+                        for i in [Some(*index as u32), spec.width_arg, spec.precision_arg].into_iter().flatten() {
+                            self.mark_extending(args[i as usize], depth);
+                            self.mark_extended(args[i as usize], depth);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -6355,7 +6371,71 @@ impl<'p> Lower<'p> {
     /// the format string (`inline_literal`) becomes literal text, merged
     /// with its neighbours, so `format!` capacity and the panic payload
     /// kind match rustc's (W-STD-B).
+    /// rustc's `flatten_format_args`: a `format_args!` argument (under
+    /// any `&`) that one Display or Debug placeholder uses, and no other
+    /// placeholder, is spliced into the outer format. Its pieces replace
+    /// the placeholder and its arguments take the outer argument's
+    /// place, so the evaluation order stays. An `Arguments` writes the
+    /// same text either way; the flattened form changes
+    /// `estimated_capacity`, which literals inline, and whether a
+    /// `format_args!` value is `'static`, as in rustc. None when
+    /// nothing flattens.
+    fn flatten_fmt(&self, args: &[ExprId], fmt: &[FmtPiece]) -> Option<(Vec<ExprId>, Vec<FmtPiece>)> {
+        let (mut args, mut fmt) = (args.to_vec(), fmt.to_vec());
+        let mut changed = false;
+        let mut i = 0;
+        while i < fmt.len() {
+            let FmtPiece::Arg { index, spec, .. } = &fmt[i] else {
+                i += 1;
+                continue;
+            };
+            let (index, kind) = (*index, spec.kind);
+            let mut a = args[index];
+            while let Expr::Ref { raw: false, expr, .. } = self.p.ast.expr(a) {
+                a = *expr;
+            }
+            let once = fmt.iter().enumerate().all(|(j, p)| j == i || !matches!(p, FmtPiece::Arg { index: k, .. } if *k == index));
+            let Expr::Macro { kind: MacroKind::FormatArgs, args: inner_args, fmt: inner_fmt, .. } = self.p.ast.expr(a) else {
+                i += 1;
+                continue;
+            };
+            if !once || !matches!(kind, FmtKind::Display | FmtKind::Debug) {
+                i += 1;
+                continue;
+            }
+            // Outer argument `index` becomes the inner arguments: later
+            // outer indices move by their count less one.
+            let n = inner_args.len();
+            let outer = |k: u32| if k as usize > index { (k as usize + n - 1) as u32 } else { k };
+            for p in fmt.iter_mut() {
+                if let FmtPiece::Arg { index: k, spec, .. } = p {
+                    *k = outer(*k as u32) as usize;
+                    spec.width_arg = spec.width_arg.map(outer);
+                    spec.precision_arg = spec.precision_arg.map(outer);
+                }
+            }
+            let inner: Vec<FmtPiece> = inner_fmt
+                .iter()
+                .cloned()
+                .map(|mut p| {
+                    if let FmtPiece::Arg { index: k, spec, .. } = &mut p {
+                        *k += index;
+                        spec.width_arg = spec.width_arg.map(|c| c + index as u32);
+                        spec.precision_arg = spec.precision_arg.map(|c| c + index as u32);
+                    }
+                    p
+                })
+                .collect();
+            args.splice(index..index + 1, inner_args.iter().copied());
+            fmt.splice(i..i + 1, inner);
+            changed = true;
+        }
+        changed.then_some((args, fmt))
+    }
+
     fn fmt_parts(&mut self, args: &[ExprId], fmt: &[FmtPiece]) -> Vec<FmtPart> {
+        let flat = self.flatten_fmt(args, fmt);
+        let (args, fmt) = flat.as_ref().map_or((args, fmt), |(a, f)| (&a[..], &f[..]));
         let mut parts: Vec<FmtPart> = Vec::with_capacity(fmt.len());
         let push_lit = |parts: &mut Vec<FmtPart>, text: &str| match parts.last_mut() {
             Some(FmtPart::Lit(prev)) => prev.push_str(text),
@@ -6490,6 +6570,64 @@ impl<'p> Lower<'p> {
         }
     }
 
+    /// `format_args!` as an `fmt::Arguments` value (R9). The arguments
+    /// are evaluated and borrowed here, as in rustc; their references
+    /// go into one tuple temporary, rustc's args array, in the scope
+    /// rustc gives that array: the innermost one, or the enclosing
+    /// block's when a `let` extends the expression (`mark_extending`).
+    /// The value borrows the temporary, so borrowck keeps it inside
+    /// that scope, and its parts read the references from the
+    /// temporary's fields. cgen formats the parts each time the value
+    /// is formatted. With no argument left after literal inlining the
+    /// value is `'static` text and borrows nothing.
+    fn format_args_into(&mut self, e: ExprId, args: &[ExprId], fmt: &[FmtPiece], dest: Option<&Place>, ty: Ty, span: Span) {
+        let mut parts = self.fmt_parts(args, fmt);
+        // Each distinct argument reference (`fmt_parts` borrows each
+        // used argument once, into a local) is one field.
+        let mut refs: Vec<Local> = Vec::new();
+        let mut field = |o: &mut Operand| {
+            let (Operand::Copy(pl) | Operand::Move(pl)) = o else { unreachable!("fmt_parts borrows each argument into a local") };
+            let i = refs.iter().position(|&l| l == pl.local).unwrap_or_else(|| {
+                refs.push(pl.local);
+                refs.len() - 1
+            });
+            i as u32
+        };
+        let mut fields: Vec<u32> = Vec::new();
+        for part in &mut parts {
+            if let FmtPart::Arg { value, width, prec, .. } = part {
+                fields.push(field(value));
+                fields.extend(width.iter_mut().chain(prec.iter_mut()).map(&mut field));
+            }
+        }
+        if refs.is_empty() {
+            self.set_or_temp(dest, Rvalue::FormatArgs(None, parts), ty, span);
+            return;
+        }
+        let ref_tys: Vec<Ty> = refs.iter().map(|&l| self.body.locals[l as usize].ty).collect();
+        let env_ty = {
+            let ts = self.body.tys.intern_tys(&ref_tys);
+            self.body.tys.intern(TyKind::Tuple(ts))
+        };
+        let refs = refs.into_iter().map(|l| Operand::Copy(Place::local(l))).collect();
+        let env = self.new_local(env_ty, true, None);
+        self.assign(Place::local(env), Rvalue::TupleAgg(env_ty, refs), span);
+        let depth = self.extended.iter().rev().find(|&&(x, _)| x == e).map_or(self.scopes.len() - 1, |&(_, d)| d);
+        self.scopes[depth].push(env);
+        let rt = self.ref_ty(false, env_ty);
+        let r = self.temp(rt);
+        self.assign(Place::local(r), Rvalue::Ref(false, Place::local(env)), span);
+        let mut fields = fields.into_iter();
+        let mut read = |o: &mut Operand| *o = Operand::Copy(Place { local: env, proj: vec![Proj::Field(fields.next().unwrap())] });
+        for part in &mut parts {
+            if let FmtPart::Arg { value, width, prec, .. } = part {
+                read(value);
+                width.iter_mut().chain(prec.iter_mut()).for_each(&mut read);
+            }
+        }
+        self.set_or_temp(dest, Rvalue::FormatArgs(Some(Operand::Copy(Place::local(r))), parts), ty, span);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn macro_into(
         &mut self,
@@ -6525,14 +6663,10 @@ impl<'p> Lower<'p> {
                 let parts = self.prefixed_parts("not yet implemented", args, fmt);
                 self.terminate(Terminator::Panic(parts), span)
             }
-            // As a `write_fmt` argument on a Formatter or String it lowers
-            // in `write_fmt_into`. Any other `write_fmt` argument (the
-            // `io::Write` method, W-SHIM) is an `Arguments` value: its
-            // text, formatted here.
-            MacroKind::FormatArgs => {
-                let parts = self.fmt_parts(args, fmt);
-                self.set_or_temp(dest, Rvalue::Format(parts), ty, span);
-            }
+            // As a `write_fmt` argument on a Formatter, a String, or a
+            // std stream it lowers in `write_fmt_into`; anywhere else it
+            // is an `Arguments` value.
+            MacroKind::FormatArgs => self.format_args_into(e, args, fmt, dest, ty, span),
             MacroKind::Unreachable => {
                 let parts = self.prefixed_parts("internal error: entered unreachable code", args, fmt);
                 self.terminate(Terminator::Panic(parts), span)

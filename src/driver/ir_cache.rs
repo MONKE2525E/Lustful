@@ -300,6 +300,13 @@ fn hash_rvalue(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, r: &Rvalue, s
             hash_operand(h, p, tys, dst, seen);
             hash_fmt(h, p, tys, parts, seen);
         }
+        Rvalue::FormatArgs(env, parts) => {
+            (42u8, env.is_some()).hash(h);
+            if let Some(env) = env {
+                hash_operand(h, p, tys, env, seen);
+            }
+            hash_fmt(h, p, tys, parts, seen);
+        }
     }
 }
 
@@ -608,6 +615,7 @@ enum CachedRvalue {
     DynMeta(CachedOperand, u32),
     DynData(CachedOperand, u32),
     WriteFmt(CachedOperand, Vec<CachedFmt>, Option<bool>),
+    FormatArgs(Option<CachedOperand>, Vec<CachedFmt>),
 }
 
 #[derive(Clone, Debug)]
@@ -933,6 +941,7 @@ fn cache_rvalue(b: &mut TreeBuilder, p: &Program, r: &Rvalue) -> CachedRvalue {
         Rvalue::DynMeta { ptr, word } => CachedRvalue::DynMeta(cache_operand(b, p, ptr), *word),
         Rvalue::DynData { ptr, ty } => CachedRvalue::DynData(cache_operand(b, p, ptr), b.ty(*ty)),
         Rvalue::WriteFmt(dst, parts, stream) => CachedRvalue::WriteFmt(cache_operand(b, p, dst), cache_fmt(b, p, parts), *stream),
+        Rvalue::FormatArgs(env, parts) => CachedRvalue::FormatArgs(env.as_ref().map(|e| cache_operand(b, p, e)), cache_fmt(b, p, parts)),
     }
 }
 
@@ -1124,6 +1133,13 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             CachedRvalue::DynMeta(o, word) => Rvalue::DynMeta { ptr: operand(intern, tys, strings, o)?, word: *word },
             CachedRvalue::DynData(o, t) => Rvalue::DynData { ptr: operand(intern, tys, strings, o)?, ty: intern.ty(tys, *t)? },
             CachedRvalue::WriteFmt(o, parts, stream) => Rvalue::WriteFmt(operand(intern, tys, strings, o)?, fmt(intern, tys, strings, parts)?, *stream),
+            CachedRvalue::FormatArgs(o, parts) => Rvalue::FormatArgs(
+                match o {
+                    Some(o) => Some(operand(intern, tys, strings, o)?),
+                    None => None,
+                },
+                fmt(intern, tys, strings, parts)?,
+            ),
         })
     }
     let mut blocks = Vec::with_capacity(cached.blocks.len());

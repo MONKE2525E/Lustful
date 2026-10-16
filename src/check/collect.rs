@@ -7472,7 +7472,13 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Closure(_, a) => closure_fields(tys, a).iter().all(|&e| is_copy(p, tys, e)),
         TyKind::Array(e, _) => is_copy(p, tys, e),
         _ => {
-            if tys.is_exit_code(t) || tys.builtin_of(t) == Some(BuiltinTy::AccessError) {
+            if tys.is_exit_code(t)
+                || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
+                // `fmt::Arguments` is Copy in core (R9); its lust value
+                // (`lust_Arguments`: a fn and borrowed pointers) has no
+                // drop call, so a copy is a plain struct copy.
+                || crate::ty::fmt::fmt_kind(tys, t) == Some(crate::ty::fmt::FmtTy::Arguments)
+            {
                 return true;
             }
             if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Copy) {
@@ -8544,6 +8550,8 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             // no such rendering, so it is not Debug here (a reject).
             if tys.is_string_ty(t) || tys.is_exit_code(t) || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some()
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
+                // `fmt::Arguments` Debug is its Display (R9).
+                || crate::ty::fmt::fmt_kind(tys, t) == Some(crate::ty::fmt::FmtTy::Arguments)
             {
                 return true;
             }
@@ -8641,6 +8649,8 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::try_send_error_def()
                 })
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
+                // `fmt::Arguments` Display formats its parts (R9).
+                || crate::ty::fmt::fmt_kind(tys, t) == Some(crate::ty::fmt::FmtTy::Arguments)
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))
         }
     }

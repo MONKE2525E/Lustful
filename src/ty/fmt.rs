@@ -11,7 +11,8 @@ use super::*;
 pub enum FmtTy {
     /// `fmt::Formatter<'a>`, only ever behind `&mut` in user code.
     Formatter,
-    /// `fmt::Arguments<'a>`: only the argument of `write_fmt`.
+    /// `fmt::Arguments<'a>`: a `format_args!` value. Display and
+    /// Debug format its arguments at each use, as in core.
     Arguments,
     DebugStruct,
     DebugTuple,
@@ -44,7 +45,8 @@ impl FmtTy {
     }
 
     /// True for the Debug builders, which hold `&mut Formatter` (one
-    /// region slot in the borrow checker).
+    /// region slot in the borrow checker; `Arguments` holds one for
+    /// its borrowed format arguments).
     pub fn is_builder(self) -> bool {
         !matches!(self, FmtTy::Formatter | FmtTy::Arguments)
     }

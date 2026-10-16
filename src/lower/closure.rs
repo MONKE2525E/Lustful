@@ -398,7 +398,8 @@ fn rewrite_rvalue(up: &Upvars, rv: &mut Rvalue) -> bool {
             ops.iter_mut().fold(true, |acc, o| acc & rewrite_operand(up, o))
         }
         Rvalue::Format(parts) => rewrite_parts(up, parts),
-        Rvalue::WriteFmt(dst, parts, _) => rewrite_operand(up, dst) & rewrite_parts(up, parts),
+        Rvalue::WriteFmt(dst, parts, _) | Rvalue::FormatArgs(Some(dst), parts) => rewrite_operand(up, dst) & rewrite_parts(up, parts),
+        Rvalue::FormatArgs(None, parts) => rewrite_parts(up, parts),
         Rvalue::Ref(_, pl) | Rvalue::Discriminant(pl) | Rvalue::SliceOf(pl) | Rvalue::LenOf(pl) => rewrite_place(up, pl, false),
         Rvalue::Subslice { base, lo, hi, .. } => {
             rewrite_place(up, base, false) & rewrite_operand(up, lo) & hi.as_mut().is_none_or(|h| rewrite_operand(up, h))
