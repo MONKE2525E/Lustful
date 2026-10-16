@@ -637,6 +637,40 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     crate::pool::par_map(items, f)
 }
 
+/// The dirty count of each stored read set in `sets` against `p` (None
+/// for a slot with no stored reads), the answers
+/// `Program::reads_dirty_memo` gives one set at a time (sigedit P4.4).
+/// Many reads (a full-mode walk, every instance after an item-level
+/// edit) go in parallel: the distinct keys split into one shard per
+/// thread by key hash, each shard computes its keys' fingerprints once,
+/// then each set compares against them. Few stay on this thread.
+fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::Reads>]) -> Vec<Option<usize>> {
+    use crate::driver::graph::{Read, ReadKey};
+    use std::hash::{Hash, Hasher};
+    let total: usize = sets.iter().flatten().map(|r| r.len()).sum();
+    let n = crate::pool::threads();
+    if total < 4096 || n < 2 {
+        let mut memo = FxMap::default();
+        return sets.iter().map(|r| r.map(|r| p.reads_dirty_memo(r, &mut memo))).collect();
+    }
+    let shard_of = |k: &ReadKey| {
+        let mut h = crate::intern::FxHasher::default();
+        k.hash(&mut h);
+        (h.finish() >> 32) as usize % n
+    };
+    let ids: Vec<usize> = (0..n).collect();
+    let shards: Vec<FxMap<ReadKey, Read>> = par_map(&ids, |&t| {
+        let mut now = FxMap::default();
+        for r in sets.iter().flatten() {
+            for (k, _) in r.iter().filter(|(k, _)| shard_of(k) == t) {
+                now.entry(*k).or_insert_with(|| p.read_fingerprint(k));
+            }
+        }
+        now
+    });
+    par_map(sets, |r| r.map(|r| r.iter().filter(|(k, stored)| shards[shard_of(k)].get(*k) != Some(*stored)).count()))
+}
+
 /// The file's inner `allow` attributes, for seeding later chunks so a
 /// chunk parse builds the same item attributes as a whole parse. Empty
 /// when there is only one chunk (it reads them itself).
@@ -1214,6 +1248,7 @@ fn slot_update(
     front.ids_forced_full = had_env && !ids_stable && changed_names.is_some();
     let changed_names = if front.ids_forced_full { None } else { changed_names };
     let nonfn_changed = had_env && nonfn_items_changed(&front.items, &item_scans);
+    t.lap("slots: def ids");
     front.env_hash = Some(env);
     front.items = item_scans;
     let compact = front.slot_of.len() > fn_count * 2 + 64;
@@ -1314,6 +1349,7 @@ fn slot_update(
     // text is a hash collision: stop with an internal error (section 1.7). The
     // same path twice is a duplicate definition, which `collect` reports.
     let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
+    t.lap("slots: fn keys");
     let mut live = vec![false; front.slot_of.len()];
     let mut fn_slot = Vec::with_capacity(keys.len());
     for k in &keys {
@@ -1384,6 +1420,7 @@ fn slot_update(
     })
     .into_iter()
     .unzip();
+    t.lap("slots: assign+heads");
     // Instance slots are not AST fns: the generic block in `compile`
     // decides after collect which are live.
     for slot in (0..n_slots).filter(|&s| !live[s] && !front.inst_slot[s]) {
@@ -3360,11 +3397,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // First the dirty count of each candidate's stored reads (None:
         // no stored reads), with the read sets borrowed in place; then
         // the results land back in the caches.
-        let mut memo = FxMap::default();
-        let dirty: Vec<Option<usize>> = mention_only
-            .iter()
-            .map(|&i| caches.slot_reads.get(slot_at(i)).and_then(Option::as_ref).map(|r| program.reads_dirty_memo(r, &mut memo)))
-            .collect();
+        let sets: Vec<_> = mention_only.iter().map(|&i| caches.slot_reads.get(slot_at(i)).and_then(Option::as_ref)).collect();
+        let dirty = reads_dirty_par(&program, &sets);
         // A mask, not a list: full mode makes every passing body a
         // candidate, and `changed` holds them all.
         let mut reused = vec![false; mention_only.iter().max().map_or(0, |&m| m + 1)];
@@ -3496,7 +3530,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 *h = true;
             }
         }
-        work = Vec::new();
+        // Each concrete fn's verdict; an instance or closure body fn whose
+        // stored reads decide waits for one parallel walk over all of them
+        // (`reads_dirty_par`).
+        let mut recheck_of = vec![false; program.fns.len()];
+        let mut by_reads: Vec<usize> = Vec::new();
         for i in (0..program.fns.len()).filter(|&i| concrete(i)) {
             let s = front.fn_slot[i] as usize;
             let calls_dead = build && caches.out[s].used.iter().any(|&u| !held.get(u as usize).copied().unwrap_or(false));
@@ -3510,26 +3548,38 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 // reads (see gen_reuse.rs).
                 // After a derive delta the keyed walk knows the dirty slots
                 // (the oracle proves each clean one).
-                let clean = |r: &crate::driver::graph::Reads| match &derive_dirty {
-                    Some(d) => {
-                        let clean = !d.get(s).copied().unwrap_or(true);
-                        if clean && super::item_oracle::on() && program.reads_dirty_memo(r, &mut memo) != 0 {
-                            super::item_oracle::fail("clean instance body has dirty reads", visits.path, &i.to_string());
-                        }
-                        clean
+                let mut clean = |r: &crate::driver::graph::Reads, d: &Vec<bool>| {
+                    let clean = !d.get(s).copied().unwrap_or(true);
+                    if clean && super::item_oracle::on() && program.reads_dirty_memo(r, &mut memo) != 0 {
+                        super::item_oracle::fail("clean instance body has dirty reads", visits.path, &i.to_string());
                     }
-                    None => program.reads_dirty_memo(r, &mut memo) == 0,
+                    clean
                 };
-                recheck = reuse.src_of(&program, LocalDefId(i as u32)) != Some(front.slot_hash[s])
-                    || (front.slot_env[s] != env && !caches.slot_reads[s].as_ref().is_some_and(clean));
+                recheck = reuse.src_of(&program, LocalDefId(i as u32)) != Some(front.slot_hash[s]);
+                if !recheck && front.slot_env[s] != env {
+                    match (&caches.slot_reads[s], &derive_dirty) {
+                        (None, _) => recheck = true,
+                        (Some(r), Some(d)) => recheck = !clean(r, d),
+                        (Some(_), None) => {
+                            by_reads.push(i);
+                            continue;
+                        }
+                    }
+                }
                 if !recheck {
                     front.slot_env[s] = env;
                 }
             }
-            if recheck {
-                work.push(i);
+            recheck_of[i] = recheck;
+        }
+        let sets: Vec<_> = by_reads.iter().map(|&i| caches.slot_reads[front.fn_slot[i] as usize].as_ref()).collect();
+        for (&i, d) in by_reads.iter().zip(reads_dirty_par(&program, &sets)) {
+            recheck_of[i] = d != Some(0);
+            if !recheck_of[i] {
+                front.slot_env[front.fn_slot[i] as usize] = env;
             }
         }
+        work = (0..program.fns.len()).filter(|&i| recheck_of[i]).collect();
         // A recheck leaves the slot's C stale until codegen replaces
         // it; a check request, or a build that stops on errors, never
         // gets there.
@@ -3537,6 +3587,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             caches.has_out[front.fn_slot[i] as usize] = false;
         }
     }
+    t.lap("generic reuse walk");
     // A one-shot check needs no IR after borrowck: dropping each body on
     // its worker lets the allocator reuse the memory for the next body,
     // instead of touching fresh pages for every function.
@@ -3549,6 +3600,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let (build, tables) = (req.cmd == Cmd::Build, resolved_tables.as_ref());
         let (lines, hashes) = (&fn_lines_all, &body_hashes_all);
         super::item_oracle::check(front, caches, Ok(&program), &work, fn_count, hashes, lines, visits.path, crate_ids, build, tables);
+        t.lap("item oracle");
     }
     let results = par_map(&work, |&i| {
         let f = LocalDefId(i as u32);
