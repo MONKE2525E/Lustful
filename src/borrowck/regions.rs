@@ -2550,6 +2550,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                     self.subst_vars(e, ranges, vars, out);
                 }
             }
+            // A `dyn` type's object lifetime: an Adt lifetime param, else
+            // `'static` (`Box<dyn Tr>` in a field).
+            TyKind::Dyn(_, r) => out.push(region(r)),
             _ => {}
         }
     }
