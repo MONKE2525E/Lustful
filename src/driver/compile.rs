@@ -3185,7 +3185,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // next: this request may be check-only, and the build request
     // after it sees an unchanged file in bodies mode. The build that
     // refreshes the glue clears the flag (see the glue step below).
-    if mode == "full" || const_fn_changed {
+    // A type item inside a fn body (R18) never edits in bodies mode
+    // (its item scan folds it in, `ast_hash::item_scan`), but a
+    // signatures-mode edit can move its fields, which its glue reads.
+    if mode == "full" || const_fn_changed || (mode == "signatures" && def::has_body_type_items(&front.ast)) {
         caches.glue_stale = true;
     }
 

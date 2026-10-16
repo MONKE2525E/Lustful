@@ -45,6 +45,28 @@ fn item_scan(ast: &Ast, item: &Item, body_hashes: &[u64], inner: Option<&mut Vec
     let mut w = Walker { ast, idents: None, inner };
     let mut h = FxHasher::default();
     w.item(&mut h, item, false);
+    // The type items in the item's bodies (structs, enums, traits,
+    // aliases, impls) are program state, not body state: collect
+    // records them like module items, and a warm request keeps that
+    // record while the item scan stands. So they fold in here, and an
+    // edit to one is an item edit (tf-bodyitems). Without the body
+    // walk's list (`scan_item_reuse`), the spans inside the item find
+    // them; per-item hashes fold sorted, so the order does not count.
+    let types: Vec<u32> = match w.inner.as_deref() {
+        Some(list) => list.to_vec(),
+        None => (0..ast.stmt_items.len() as u32).filter(|&i| span_holds(item.span, ast.stmt_items[i as usize].span)).collect(),
+    };
+    let mut type_hashes: Vec<u64> = types
+        .into_iter()
+        .map(|i| &ast.stmt_items[i as usize])
+        .filter(|it| is_body_type_item(&it.kind))
+        .map(|it| item_hash(ast, it))
+        .collect();
+    if !type_hashes.is_empty() {
+        type_hashes.sort_unstable();
+        "body-type-items".hash(&mut h);
+        type_hashes.hash(&mut h);
+    }
     let rpit = |f: &FnDef| f.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. }));
     let fn_name = match &item.kind {
         ItemKind::Fn(f) if !rpit(f) => Some(f.name),
@@ -56,6 +78,17 @@ fn item_scan(ast: &Ast, item: &Item, body_hashes: &[u64], inner: Option<&mut Vec
         }
     }
     scan::ItemScan { hash: h.finish(), fn_name }
+}
+
+/// True for an item kind inside a fn body that collect records as
+/// program state (`item_scan`).
+fn is_body_type_item(kind: &ItemKind) -> bool {
+    matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_) | ItemKind::Trait(_) | ItemKind::Type(_) | ItemKind::Impl(_))
+}
+
+/// True when span `inner` lies inside span `outer` (same file).
+fn span_holds(outer: crate::diag::Span, inner: crate::diag::Span) -> bool {
+    outer.file == inner.file && outer.lo <= inner.lo && inner.hi <= outer.hi
 }
 
 /// One item's scan and its fns' body scans (see `ItemScans`).

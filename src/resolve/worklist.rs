@@ -4758,10 +4758,21 @@ fn collect_assoc_vis(ast: &Ast, items: &[Item], module: ModuleId, interner: &Int
 #[derive(Default, Clone)]
 struct Frame {
     locals: Vec<Sym>,
-    /// Value names of the block's own items (`fn`, `const`, `static`).
-    /// A path that names one stays written: check resolves it through
-    /// its block item scopes, and it hides module items of the name.
+    /// Value names of the block's own items (`fn`, `const`, `static`,
+    /// and the constructor of a unit or tuple struct). A path that
+    /// names one stays written: check resolves it through its block
+    /// item scopes, and it hides module items of the name.
     items: Vec<Sym>,
+    /// Type names of the block's own type items (struct, enum, union,
+    /// trait, type alias) with their `Ast::stmt_items` index. A path
+    /// through one stays written, as for `items`: check resolves it
+    /// through its block type overlay (R18).
+    types: Vec<(Sym, u32)>,
+    /// Function-local imports of block items (`use E::V;`, `use E::*;`,
+    /// `use S as T;` for a block-local `E` or `S`): (name, namespace
+    /// index) to the written path the name stands for. A use site
+    /// rewrites the name to that path (`local_use_path`).
+    local_uses: FxMap<(Sym, usize), LocalUse>,
     /// Function-local imports: (name, namespace index) to target.
     imports: FxMap<(Sym, usize), LocalBind>,
     /// Function-local `use std::... [as Name]` imports, in the
@@ -4786,6 +4797,20 @@ enum LocalBind {
     Ambiguous,
 }
 
+/// One function-local import of a block item (`Frame::local_uses`).
+/// `path` is the written path the imported name stands for (`[E, V]`
+/// for `use E::V;`); `item` is the `Ast::stmt_items` index of the block
+/// item its first segment names, so a use site can tell whether an
+/// inner block shadows that name. `glob` marks a binding from
+/// `use E::*;`; `ambiguous` two globs that bring different items.
+#[derive(Clone)]
+struct LocalUse {
+    path: Vec<Sym>,
+    item: u32,
+    glob: bool,
+    ambiguous: bool,
+}
+
 /// What the innermost frame that knows a path's first segment says
 /// (`Rewrite::frame_hit`).
 enum FrameHit {
@@ -4795,6 +4820,8 @@ enum FrameHit {
     Import(LocalBind),
     /// A function-local `use std::...`: the canonical std path.
     Std(Vec<Sym>),
+    /// A function-local import of a block item (`Frame::local_uses`).
+    LocalUse(LocalUse),
 }
 
 struct Rewrite<'a> {
@@ -5109,7 +5136,7 @@ impl Rewrite<'_> {
     /// True when `name` is a local or a block item in any open frame:
     /// check resolves a written path of that name to it first.
     fn frames_bind(scopes: &[Frame], name: Sym) -> bool {
-        scopes.iter().rev().any(|f| f.locals.contains(&name) || f.items.contains(&name))
+        scopes.iter().rev().any(|f| f.locals.contains(&name) || f.items.contains(&name) || f.types.iter().any(|t| t.0 == name))
     }
 
     /// The innermost frame binding of a path's first segment, as
@@ -5127,6 +5154,12 @@ impl Rewrite<'_> {
             if asked != Namespace::Type && (frame.locals.contains(&first) || frame.items.contains(&first)) {
                 return Some(FrameHit::Local);
             }
+            if asked == Namespace::Type && frame.types.iter().any(|t| t.0 == first) {
+                return Some(FrameHit::Local);
+            }
+            if let Some(u) = frame.local_uses.get(&key) {
+                return Some(FrameHit::LocalUse(u.clone()));
+            }
             if let Some(b) = frame.imports.get(&key) {
                 return Some(FrameHit::Import(*b));
             }
@@ -5143,7 +5176,7 @@ impl Rewrite<'_> {
     /// is Absent too (not local): `expand_std_alias` rewrites it.
     fn resolve(&self, segs: &[Sym], ns: Namespace, module: ModuleId, scopes: &[Frame]) -> (PathRes, bool) {
         match self.frame_hit(segs, ns, scopes) {
-            Some(FrameHit::Local) => (PathRes::Absent, true),
+            Some(FrameHit::Local | FrameHit::LocalUse(_)) => (PathRes::Absent, true),
             Some(FrameHit::Std(_)) => (PathRes::Absent, false),
             Some(FrameHit::Import(LocalBind::Ambiguous)) => (PathRes::Ambiguous, false),
             Some(FrameHit::Import(LocalBind::Target(t))) => {
@@ -5167,7 +5200,10 @@ impl Rewrite<'_> {
     /// locals do not count here.
     fn frame_seg(frame: &Frame, name: Sym, ns: Namespace) -> Option<SegInfo> {
         let key = (name, ns_index(ns));
-        if ns == Namespace::Value && frame.items.contains(&name) {
+        if (ns == Namespace::Value && frame.items.contains(&name))
+            || (ns == Namespace::Type && frame.types.iter().any(|t| t.0 == name))
+            || frame.local_uses.contains_key(&key)
+        {
             // A block item hides any import of the name in its
             // frame, as in `frame_hit`. Its target is not a
             // `Target` the tables know; a path through it stays
@@ -5361,6 +5397,12 @@ impl Rewrite<'_> {
     /// local `f`, would land on the nearer binding.
     fn misread(&self, flat: Sym, def: DefId, ns: Namespace, single: bool, module: ModuleId, scopes: &[Frame]) -> bool {
         if single && ns == Namespace::Value && Self::frames_bind(scopes, flat) {
+            return true;
+        }
+        // The checker reads a written type name as a block type item
+        // first (its R18 overlay), so a type path or a path prefix
+        // under a block type item of the flat name would land on it.
+        if (ns == Namespace::Type || !single) && scopes.iter().any(|f| f.types.iter().any(|t| t.0 == flat)) {
             return true;
         }
         // A crate-root item's flat name is its plain name, so a generic
@@ -5714,6 +5756,20 @@ impl Rewrite<'_> {
             }
             return;
         }
+        // A name a block `use` of a block item binds reads as the
+        // written path it stands for (`V` as `E::V`); check resolves
+        // that through its block overlay.
+        if let Some(FrameHit::LocalUse(u)) = self.frame_hit(&names, ns, scopes) {
+            if let Some(path) = self.local_use_path(&u, names[0], span, scopes) {
+                let mut out: Vec<PathSeg> = path.iter().map(|s| PathSeg::plain(*s)).collect();
+                if let Some(last) = out.last_mut() {
+                    last.args = segs[0].args.clone();
+                }
+                out.extend(segs[1..].iter().cloned());
+                *segs = out;
+            }
+            return;
+        }
         let (res, local) = self.resolve(&names, ns, module, scopes);
         if self.std_glob_ambiguous(&names, ns, module, scopes) {
             self.diags.push(crate::resolve::imports::ambiguous_diag(self.interner.get(names[0]), span));
@@ -5939,7 +5995,11 @@ impl Rewrite<'_> {
         scopes.push(Frame::default());
         let stmts = std::mem::take(&mut ast.blocks[id.0 as usize].stmts);
         let items: Vec<u32> = stmts.iter().filter_map(|s| if let Stmt::Item(i) = s { Some(*i) } else { None }).collect();
-        for &idx in &items {
+        // Items bind before `use`s: a `use` may name a block item
+        // declared after it (`use E::A; enum E { A }`).
+        let (uses, others): (Vec<u32>, Vec<u32>) =
+            items.iter().partition(|&&i| matches!(ast.stmt_items.get(i as usize).map(|it| &it.kind), Some(ItemKind::Use(_))));
+        for &idx in others.iter().chain(&uses) {
             self.stmt_item(ast, idx, module, scopes);
         }
         // With the block's bindings complete, every `use` of the
@@ -6089,6 +6149,39 @@ impl Rewrite<'_> {
                 }
                 frame.items.push(name);
             }
+            // A type item binds the type namespace, and a unit or tuple
+            // struct its constructor in the value namespace too (R18).
+            // Two of one name in one block are rustc E0428.
+            let type_item = match &item.kind {
+                ItemKind::Struct(s) => Some((s.name, s.name_span, !matches!(s.fields, crate::ast::VariantFields::Struct(_)))),
+                ItemKind::Enum(e) => Some((e.name, e.name_span, false)),
+                ItemKind::Union(u) => Some((u.name, u.name_span, false)),
+                ItemKind::Trait(t) => Some((t.name, t.name_span, false)),
+                ItemKind::Type(a) => Some((a.name, a.name_span, false)),
+                _ => None,
+            };
+            if let Some((name, span, ctor)) = type_item
+                && let Some(frame) = scopes.last_mut()
+            {
+                let mut keys = vec![(name, ns_index(Namespace::Type))];
+                if ctor {
+                    keys.push((name, ns_index(Namespace::Value)));
+                }
+                if keys.iter().any(|k| frame.explicit.contains(k)) {
+                    self.diags.push(Diag::new(
+                        "L0106",
+                        span,
+                        format!("`{}` is defined more than once", self.interner.get(name)),
+                        "Rename one of the definitions.",
+                    ));
+                } else {
+                    frame.explicit.extend(keys);
+                }
+                frame.types.push((name, idx));
+                if ctor {
+                    frame.items.push(name);
+                }
+            }
         }
         let ItemKind::Use(u) = &item.kind else { return };
         let tree = u.tree.clone();
@@ -6143,6 +6236,26 @@ impl Rewrite<'_> {
                         }
                     }
                 }
+            }
+            // A path through a block type item (`use E::V;` for an
+            // enum of this or an enclosing block) binds a local use.
+            if !imp.leading_colon
+                && let ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } = &imp.kind
+                && let Some(&first) = path.first()
+                && let Some((item, base)) = self.frame_type_item(first, scopes)
+            {
+                if base == [first] && self.macro_item_ambiguous(ast, first, module, scopes) {
+                    let n = self.interner.get(first);
+                    self.diags.push(Diag::new(
+                        "L0507",
+                        span,
+                        format!("`{n}` is ambiguous: a block item made by a macro (a derive) and an outer item have this name"),
+                        "Rename the block item, or import through a path that names one of them.",
+                    ));
+                    continue;
+                }
+                self.local_item_use(ast, &imp.kind, item, base, span, scopes);
+                continue;
             }
             match imp.kind {
                 ImportKind::BadLeading { .. } => {
@@ -6265,6 +6378,24 @@ impl Rewrite<'_> {
                                 }
                             }
                             None => self.push_unresolved_use(span, &path),
+                        }
+                        continue;
+                    }
+                    // `use a::E::V [as X];` imports one variant of a crate
+                    // enum, as at module level, through a frame binding
+                    // of the path's first segment when there is one.
+                    let vres = match self.frame_use_target(&path, imp.leading_colon, module, scopes) {
+                        Some(r) => r,
+                        None => self.tables.resolve_path(module, &path, Namespace::Type, PathMode::Use, imp.leading_colon, self.interner),
+                    };
+                    if let PathRes::Partial(Target::Def(adt), rest) = vres
+                        && rest + 1 == path.len()
+                        && self.tables.variants.get(&adt).is_some_and(|vs| vs.contains(&path[rest]))
+                    {
+                        let target = Target::Variant(adt, path[rest]);
+                        let bn = crate::resolve::imports::import_bind_name(name, target, self.interner);
+                        if insert_local(scopes, bn, Namespace::Value, LocalBind::Target(target), 2) && self.interner.get(name) != "_" {
+                            self.push_local_dup(span, name);
                         }
                         continue;
                     }
@@ -6546,6 +6677,146 @@ impl Rewrite<'_> {
         }
     }
 
+    /// The block type item a path's first segment names through the
+    /// block frames, innermost binding first: its `Ast::stmt_items`
+    /// index and the written path that names it (`[E]`, or `[E]` for
+    /// an `F` that `use E as F;` binds). None when the innermost frame
+    /// binding of the name in the type namespace is something else (an
+    /// import of a module item, a std import), or no frame binds it.
+    fn frame_type_item(&self, first: Sym, scopes: &[Frame]) -> Option<(u32, Vec<Sym>)> {
+        let key = (first, ns_index(Namespace::Type));
+        for frame in scopes.iter().rev() {
+            if let Some(&(_, idx)) = frame.types.iter().rev().find(|t| t.0 == first) {
+                return Some((idx, vec![first]));
+            }
+            if let Some(u) = frame.local_uses.get(&key) {
+                return (u.path.len() == 1 && !u.ambiguous).then(|| (u.item, u.path.clone()));
+            }
+            if frame.imports.contains_key(&key) || frame.std_imports.contains_key(&key) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// rustc E0659 for a `use` path whose first segment is a block type
+    /// item that a macro made (a `#[derive]` on it, or an item from a
+    /// macro call): import resolution treats it as macro-expanded, and
+    /// any binding of the name outside its block (an outer block, the
+    /// module, the std prelude, the extern prelude) is then ambiguous
+    /// with it. Plain paths outside `use` are not affected.
+    fn macro_item_ambiguous(&self, ast: &Ast, first: Sym, module: ModuleId, scopes: &[Frame]) -> bool {
+        let Some(fi) = scopes.iter().rposition(|f| f.types.iter().any(|t| t.0 == first)) else { return false };
+        let Some(&(_, idx)) = scopes[fi].types.iter().rev().find(|t| t.0 == first) else { return false };
+        let Some(item) = ast.stmt_items.get(idx as usize) else { return false };
+        let derived = match &item.kind {
+            ItemKind::Struct(s) => !s.derives.is_empty(),
+            ItemKind::Enum(e) => !e.derives.is_empty(),
+            ItemKind::Union(u) => !u.derives.is_empty(),
+            _ => false,
+        };
+        if !derived && item.span.ctxt == crate::diag::CtxtId::ROOT {
+            return false;
+        }
+        !matches!(self.import_seg(first, Namespace::Type, module, &scopes[..fi]).0.bind, SegBind::None)
+    }
+
+    /// Binds one function-local `use` whose path starts at a block
+    /// type item (`frame_type_item` gave `item` and the written `base`
+    /// path to it): `use E::V [as X];` and `use E::*;` for a block
+    /// enum's variants, `use S as T;` for the item itself. Other forms
+    /// (an associated item, a deeper path) are unresolved imports, as
+    /// in rustc. The bound names stay written paths (`local_use_path`).
+    fn local_item_use(&mut self, ast: &Ast, kind: &ImportKind, item: u32, base: Vec<Sym>, span: Span, scopes: &mut [Frame]) {
+        let self_sym = self.interner.intern("self");
+        let Some(it) = ast.stmt_items.get(item as usize) else { return };
+        let variant_of = |v: Sym| match &it.kind {
+            ItemKind::Enum(e) => e.variants.iter().find(|x| x.name == v).map(|_| ()),
+            _ => None,
+        };
+        let ctor = matches!(&it.kind, ItemKind::Struct(s) if !matches!(s.fields, crate::ast::VariantFields::Struct(_)));
+        let bind = |this: &mut Self, scopes: &mut [Frame], name: Sym, nss: &[Namespace], path: Vec<Sym>, glob: bool| {
+            if this.interner.get(name) == "_" {
+                return;
+            }
+            let mut dup = false;
+            for &ns in nss {
+                let u = LocalUse { path: path.clone(), item, glob, ambiguous: false };
+                dup |= insert_local_use(scopes, name, ns, u);
+            }
+            if dup {
+                this.push_local_dup(span, name);
+            }
+        };
+        match kind {
+            ImportKind::Single { path, name } => {
+                let mut rest = &path[1..];
+                let mut name = *name;
+                // `use E::{self};` binds the item itself.
+                if rest == [self_sym] {
+                    rest = &[];
+                    if name == self_sym {
+                        name = path[0];
+                    }
+                }
+                match rest {
+                    // `use S;` names an item already in scope: in its own
+                    // block that is a second definition (rustc E0255),
+                    // so only a rename (`use S as T;`) binds.
+                    [] if name == path[0] => {
+                        self.diags.push(crate::diag::not_yet("L0820", span, "a `use` of a block item without a rename"));
+                    }
+                    [] => {
+                        let nss: &[Namespace] = if ctor { &[Namespace::Type, Namespace::Value] } else { &[Namespace::Type] };
+                        bind(self, scopes, name, nss, base, false);
+                    }
+                    [v] if variant_of(*v).is_some() => {
+                        let mut p = base;
+                        p.push(*v);
+                        bind(self, scopes, name, &[Namespace::Type, Namespace::Value], p, false);
+                    }
+                    _ => self.push_unresolved_use(span, path),
+                }
+            }
+            ImportKind::Glob { path } => match (&it.kind, path.len()) {
+                (ItemKind::Enum(e), 1) => {
+                    let vs: Vec<Sym> = e.variants.iter().map(|v| v.name).collect();
+                    for v in vs {
+                        let mut p = base.clone();
+                        p.push(v);
+                        bind(self, scopes, v, &[Namespace::Type, Namespace::Value], p, true);
+                    }
+                }
+                _ => self.push_unresolved_use(span, path),
+            },
+            ImportKind::CheckPath { path } => {
+                if !(path.len() == 1 || (path.len() == 2 && variant_of(path[1]).is_some())) {
+                    self.push_unresolved_use(span, path);
+                }
+            }
+            ImportKind::BadLeading { .. } => {}
+        }
+    }
+
+    /// The written path a use site of a function-local import of a
+    /// block item reads as (`Frame::local_uses`): the import's path,
+    /// when the first segment of that path still names the same block
+    /// item at the use site. An inner block that shadows it would make
+    /// the written path name a different item, so that case is a
+    /// not-yet reject instead (L0820), and two globs that bring
+    /// different items are ambiguous (L0507, rustc E0659).
+    fn local_use_path(&mut self, u: &LocalUse, name: Sym, span: Span, scopes: &[Frame]) -> Option<Vec<Sym>> {
+        if u.ambiguous {
+            self.diags.push(ambiguous_diag(self.interner.get(name), span));
+            return None;
+        }
+        if self.frame_type_item(u.path[0], scopes).is_none_or(|(item, base)| item != u.item || base != [u.path[0]]) {
+            self.diags.push(crate::diag::not_yet("L0820", span, "an imported block item whose path an inner block shadows"));
+            return None;
+        }
+        Some(u.path.clone())
+    }
+
     /// The L0506 diagnostic for a function-local `use` that does not
     /// resolve, matching the module-level fixpoint message.
     fn push_unresolved_use(&mut self, span: Span, path: &[Sym]) {
@@ -6634,6 +6905,12 @@ impl Rewrite<'_> {
     /// a fresh binding; one that resolves to a static is an error
     /// (L0633). Returns the replacement path pattern when it applies.
     fn binding_pat(&mut self, name: Sym, span: Span, module: ModuleId, scopes: &[Frame]) -> Option<Pat> {
+        // An imported block enum variant or unit struct is a path
+        // pattern through its written path.
+        if let Some(FrameHit::LocalUse(u)) = self.frame_hit(&[name], Namespace::Value, scopes) {
+            let path = self.local_use_path(&u, name, span, scopes)?;
+            return Some(Pat::Path(path.iter().map(|s| PathSeg::plain(*s)).collect()));
+        }
         let (res, local) = self.resolve(&[name], Namespace::Value, module, scopes);
         if local {
             return None;
@@ -6697,6 +6974,8 @@ impl Rewrite<'_> {
         let key = (first, ns_index(asked));
         let binds = |f: &Frame| {
             (asked != Namespace::Type && (f.locals.contains(&first) || f.items.contains(&first)))
+                || (asked == Namespace::Type && f.types.iter().any(|t| t.0 == first))
+                || f.local_uses.contains_key(&key)
                 || f.imports.contains_key(&key)
                 || f.std_imports.contains_key(&key)
         };
@@ -7137,6 +7416,7 @@ fn insert_local_std(scopes: &mut [Frame], name: Sym, ns: Namespace, path: Vec<Sy
     frame.explicit.push(key);
     // It beats an earlier glob binding of the name.
     frame.imports.remove(&key);
+    frame.local_uses.remove(&key);
     frame.std_imports.insert(key, path);
     false
 }
@@ -7149,6 +7429,10 @@ fn insert_glob_local_std(scopes: &mut [Frame], name: Sym, ns: usize, path: Vec<S
     let Some(frame) = scopes.last_mut() else { return };
     let key = (name, ns);
     if frame.explicit.contains(&key) || matches!(frame.imports.get(&key), Some(LocalBind::Ambiguous)) {
+        return;
+    }
+    if let Some(u) = frame.local_uses.get_mut(&key) {
+        u.ambiguous = true;
         return;
     }
     let same = |old: &[Sym]| old == path.as_slice() || (old.len() > 1 && old.len() == path.len() && old[1..] == path[1..]);
@@ -7166,6 +7450,19 @@ fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind,
     let dup = rank >= 2 && frame.explicit.contains(&key);
     if rank >= 2 && !dup {
         frame.explicit.push(key);
+    }
+    // A glob local use of a block item (`use E::*;` for a block enum)
+    // beside this binding: an explicit one replaces it, a glob one of
+    // a different item makes the name ambiguous.
+    if let Some(u) = frame.local_uses.get_mut(&key) {
+        if rank >= 2 {
+            frame.local_uses.remove(&key);
+        } else {
+            if !frame.explicit.contains(&key) {
+                u.ambiguous = true;
+            }
+            return false;
+        }
     }
     // An explicit binding of the frame (an import, a std import, or a
     // block item) beats a glob.
@@ -7187,6 +7484,37 @@ fn insert_local(scopes: &mut [Frame], name: Sym, ns: Namespace, bind: LocalBind,
         }
     }
     dup
+}
+
+/// Binds a function-local import of a block item in the innermost
+/// frame (`Frame::local_uses`), with `insert_local`'s ranks: an
+/// explicit binding beats a glob, and two globs that bring different
+/// items make the name ambiguous. Returns true for a second explicit
+/// binding of the name in the frame (a duplicate).
+fn insert_local_use(scopes: &mut [Frame], name: Sym, ns: Namespace, u: LocalUse) -> bool {
+    let Some(frame) = scopes.last_mut() else { return false };
+    let key = (name, ns_index(ns));
+    if !u.glob {
+        let dup = frame.explicit.contains(&key);
+        if !dup {
+            frame.explicit.push(key);
+        }
+        frame.imports.remove(&key);
+        frame.std_imports.remove(&key);
+        frame.local_uses.insert(key, u);
+        return dup;
+    }
+    if frame.explicit.contains(&key) {
+        return false;
+    }
+    let other = frame.imports.contains_key(&key) || frame.std_imports.contains_key(&key);
+    match frame.local_uses.get_mut(&key) {
+        Some(old) => old.ambiguous |= other || old.path != u.path,
+        None => {
+            frame.local_uses.insert(key, LocalUse { ambiguous: other, ..u });
+        }
+    }
+    false
 }
 
 /// A throwaway FnDef for `mem::replace` during the item walk.

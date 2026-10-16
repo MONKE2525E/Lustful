@@ -2839,6 +2839,36 @@ impl<'p> Ctx<'p> {
     /// first. Items are not hygienic in `macro_rules!` expansions (only
     /// locals are), so the name alone matches: a macro body's `V` sees a
     /// `const V` of the block it expands in, as in rustc.
+    /// The unit or tuple struct whose constructor a value name denotes
+    /// through the type items of the enclosing blocks (R18): block by
+    /// block from the innermost, as rustc's ribs, where a block value
+    /// item (fn, const, static) of the name stops the search (the two
+    /// in one block are E0428). Then the blocks around a nested fn
+    /// (`overlay_base`). None for a module-level name.
+    fn local_ctor_of(&self, name: Sym) -> Option<AdtId> {
+        let p = self.p;
+        let ctor = |a: AdtId| !p.adt(a).is_enum && p.adt(a).variants.first().is_some_and(|v| v.shape != VariantShape::Named);
+        let of_item = |idx: u32| -> Option<AdtId> {
+            let crate::check::collect::BodyTypeItem::Adt(a) = *p.body_type_items.get(&idx)? else { return None };
+            match &p.ast.stmt_items[idx as usize].kind {
+                ItemKind::Struct(s) if s.name == name && ctor(a) => Some(a),
+                _ => None,
+            }
+        };
+        for d in (0..self.type_layers.len()).rev() {
+            if self.item_scopes.get(d).is_some_and(|l| l.iter().any(|((n, _), _)| *n == name)) {
+                return None;
+            }
+            if let Some(a) = self.type_layers[d].iter().rev().find_map(|&i| of_item(i)) {
+                return Some(a);
+            }
+        }
+        if self.item_scopes.iter().any(|l| l.iter().any(|((n, _), _)| *n == name)) {
+            return None;
+        }
+        self.overlay_base.0.iter().rev().find(|(n, a, _)| *n == name && ctor(*a)).map(|e| e.1)
+    }
+
     fn body_item_of(&self, name: Sym) -> Option<crate::check::collect::BodyItem> {
         for layer in self.item_scopes.iter().rev() {
             for &((n, _), idx) in layer.iter().rev() {
@@ -3313,6 +3343,9 @@ impl<'p> Ctx<'p> {
         // impl's, see `self_path_args`).
         if name == self.p.known.self_type {
             return self.self_adt().filter(|&a| !self.p.adt(a).is_enum && self.p.adt(a).variants[0].shape == VariantShape::Tuple);
+        }
+        if let Some(a) = self.local_ctor_of(name) {
+            return (self.p.adt(a).variants[0].shape == VariantShape::Tuple).then_some(a);
         }
         match self.binding(Namespace::Value, name) {
             BindingRes::Def(def) => match self.p.adt_by_def(def) {
@@ -10557,6 +10590,14 @@ impl<'p> Ctx<'p> {
                 self.set_res(e, Res::Local(l));
                 return self.out.locals[l as usize].ty;
             }
+            // A unit or tuple struct of an enclosing block (R18).
+            if let Some(a) = self.local_ctor_of(name) {
+                self.set_res(e, Res::Variant(a, 0));
+                return match p.adt(a).variants[0].shape {
+                    VariantShape::Unit => self.unit_value_ty(e, a, span),
+                    _ => self.ctor_value_ty(e, a, 0, span),
+                };
+            }
             match self.body_item_of(name) {
                 Some(crate::check::collect::BodyItem::Fn(f)) => {
                     // A nested fn used as a value is a fn item like a
@@ -11243,6 +11284,14 @@ impl<'p> Ctx<'p> {
             }
             (names[names.len() - 2], names[names.len() - 1])
         };
+        // A type item of an enclosing block shadows every builtin and
+        // module type of its name (R18).
+        if segs.len() == 2
+            && ty_name != k.self_type
+            && let Some(a) = self.local_adt_of(ty_name)
+        {
+            return self.adt_assoc(a, ty_name, item, segs, span, false);
+        }
         // The hashed collections and hashers by their std path (an
         // import expands to it; a bare name reaching here was not
         // imported, which rustc rejects).
@@ -11521,6 +11570,14 @@ impl<'p> Ctx<'p> {
             );
             return None;
         };
+        self.adt_assoc(a, ty_name, item, segs, span, std_ty)
+    }
+
+    /// `resolve_assoc` for a path whose type segment names the user
+    /// Adt `a` (a module item, `Self`, an alias, or a type item of an
+    /// enclosing block): its variant, inherent fn, or trait fn `item`.
+    fn adt_assoc(&mut self, a: AdtId, ty_name: Sym, item: Sym, segs: &[ast::PathSeg], span: Span, std_ty: bool) -> Option<Res> {
+        let p = self.p;
         // A std path names std's type, never a user type of the same
         // name (std's `Ordering` is the one std Adt here).
         if std_ty && !generics::is_std_adt(&p.tys, a) {
@@ -11877,6 +11934,8 @@ impl<'p> Ctx<'p> {
         }
         let a = if ty_name == p.known.self_type {
             self.self_adt()?
+        } else if let Some(a) = self.local_adt_of(ty_name) {
+            a
         } else {
             match self.binding(Namespace::Type, ty_name) {
                 BindingRes::Def(def) => p.adt_by_def(def).or_else(|| self.alias_adt_seg(&segs[0], span).map(|(a, ..)| a))?,
@@ -12898,6 +12957,7 @@ impl<'p> Ctx<'p> {
             Expr::Path(segs) if segs.len() == 1 => {
                 let name = segs[0].name;
                 match self.body_item_of(name) {
+                    _ if let Some(a) = self.local_ctor_of(name) && p.adt(a).variants[0].shape == VariantShape::Tuple => Res::Variant(a, 0),
                     Some(crate::check::collect::BodyItem::Fn(f)) => Res::Fn(f),
                     _ => match self.binding_fn(name) {
                         Some(f) => Res::Fn(f),

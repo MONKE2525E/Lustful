@@ -5021,6 +5021,7 @@ pub fn collect_reuse(
             }
         }
     }
+    block_item_dups(ast, interner, &mut errs);
     // Sibling visibility for nested fns: the items of the block that
     // directly contains each nested fn, and of the blocks around it.
     // The same scope (by stmt_items index) also governs what a nested
@@ -5995,6 +5996,46 @@ pub(crate) fn top_fn_hashes(ast: &Ast, interner: &Interner, stable: crate::def::
 /// The stmt item indexes visible at `at`: the items of every block
 /// whose span holds `at`, outermost block first (so a later entry
 /// shadows an earlier one of the same name).
+/// Two items of one name in one namespace in one block are rustc
+/// E0428 (L0106): a type item binds the type namespace, a fn, const,
+/// or static the value namespace, and a unit or tuple struct both.
+/// The resolver reports these too, but a single-file program that
+/// skips it (`needs_resolve`) is checked only here. One report per
+/// duplicate item, at its name.
+fn block_item_dups(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>) {
+    for block in &ast.blocks {
+        let mut seen: Vec<(bool, Sym)> = Vec::new();
+        for s in &block.stmts {
+            let ast::Stmt::Item(i) = s else { continue };
+            let item = &ast.stmt_items[*i as usize];
+            let (name, span, ty, val) = match &item.kind {
+                ItemKind::Struct(st) => (st.name, st.name_span, true, !matches!(st.fields, ast::VariantFields::Struct(_))),
+                ItemKind::Enum(e) => (e.name, e.name_span, true, false),
+                ItemKind::Union(u) => (u.name, u.name_span, true, false),
+                ItemKind::Trait(t) => (t.name, t.name_span, true, false),
+                ItemKind::Type(a) => (a.name, a.name_span, true, false),
+                ItemKind::Fn(f) => (f.name, f.name_span, false, true),
+                ItemKind::Const(c) => match c.name {
+                    Some(n) => (n, c.name_span, false, true),
+                    None => continue,
+                },
+                ItemKind::Static(st) => (st.name, st.name_span, false, true),
+                _ => continue,
+            };
+            let keys: Vec<(bool, Sym)> = [(true, ty), (false, val)].iter().filter(|k| k.1).map(|k| (k.0, name)).collect();
+            if keys.iter().any(|k| seen.contains(k)) {
+                errs.push(Diag::new(
+                    "L0106",
+                    span,
+                    format!("`{}` is defined more than once", interner.get(name)),
+                    "Rename one of the definitions.",
+                ));
+            }
+            seen.extend(keys);
+        }
+    }
+}
+
 fn visible_stmt_items(item_blocks: &[(Span, Vec<u32>)], at: Span) -> Vec<u32> {
     let mut blocks: Vec<&(Span, Vec<u32>)> = item_blocks
         .iter()
