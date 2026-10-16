@@ -11611,9 +11611,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 // is not stored: its requests miss the ones that name
                 // the definer's closures, and a replay in a later build
                 // would never make those instances (daemon warm builds).
-                let n = rechecked.entry(fid).or_insert(0);
-                if checked.closure_map_pending && *n < recheck_limit {
-                    *n += 1;
+                let n = rechecked.get(&fid).copied().unwrap_or(0);
+                if checked.closure_map_pending && n < recheck_limit {
+                    rechecked.insert(fid, n + 1);
                     recheck.push(fid);
                 } else if discarded.is_empty() && !checked.closure_map_pending {
                     reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
