@@ -533,13 +533,7 @@ impl<'p> Ctx<'p> {
         }
         // The target is a later use's to fix: as the scalar form,
         // with the slice as the obligation's Self (the pair the
-        // selection answers). Only in a template, where the
-        // instance re-checks with the target known: in a concrete
-        // body the deferred projection does not normalize into
-        // the IR types (the scalar form has the same limit).
-        if !self.generic_mode() {
-            return None;
-        }
+        // selection answers) and the error as its projection.
         if !args.is_empty() {
             self.check_args(&[], args, name_span);
         }
@@ -547,7 +541,13 @@ impl<'p> Ctx<'p> {
         let proj_args = self.tys.intern_args(&[GenericArg::Ty(src), GenericArg::Ty(dst)]);
         let err = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_try_into_error), proj_args));
         let args_id = self.tys.intern_args(&[GenericArg::Ty(src), GenericArg::Ty(dst)]);
-        let tr = TraitRef { def: lang.try_into, args: args_id, bindings: EMPTY_BINDINGS };
+        // The obligation carries the slice error binding: a
+        // target that settles through another impl (a Vec through
+        // the blanket) then fails selection cleanly instead of
+        // lowering this cast against a stale result type.
+        let slice_err = self.try_err_ty(TryErr::Slice);
+        let bindings = self.tys.intern_bindings(&[(lang.assoc_try_into_error, GenericArg::Ty(slice_err))]);
+        let tr = TraitRef { def: lang.try_into, args: args_id, bindings };
         self.obl.push_trait_at(tr, name_span, 0);
         method::defer_trait_method(self, e, tr, name, Vec::new(), derefs, Autoref::None);
         self.set_res(e, Res::PrimOp { kind: PrimOpKind::TryIntoCast, derefs });
