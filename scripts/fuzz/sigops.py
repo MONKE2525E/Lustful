@@ -35,6 +35,12 @@
 #   sig_tdefault   trait default bodies (templates after the AST fns) that
 #                  call a fn and use a derived type: header edits of the fn,
 #                  and a derive drop of a trait a default body uses
+#   sig_dyn        a fn with a `dyn` type in its header: header edits that
+#                  keep the traits `dyn` types name (the header delta takes
+#                  them) and ones that add or drop one (eager vtables move)
+#   sig_samename   inherent methods of the same name on two Adts, a free fn
+#                  and a trait method of that name: header edits of one of
+#                  them (the header delta's readers key by Adt and def)
 # `External` adds verdicts from rustc 1.99 and a pinned baseline lust for
 # the op states (`--rustc`, `--baseline`): a state where the warm answer
 # disagrees with rustc fails unless the baseline gives the same answer
@@ -44,7 +50,7 @@ import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
        "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl",
-       "sig_apit", "sig_umacro", "sig_tdefault"]
+       "sig_apit", "sig_umacro", "sig_tdefault", "sig_dyn", "sig_samename"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -430,6 +436,63 @@ def sig_tdefault(rng, fs):
              f"const fn zd{k}_f(x: u32) -> u32 {{"]
     drops = [(derive, derive.replace(t, "")) for t in ("Copy, ", "Debug, ", ", Default", "Clone, Copy, ")]
     return _header_walk(rng, fs, items, head, edits, drops)
+
+
+def sig_dyn(rng, fs):
+    """Two traits, one only some edits name in a `dyn`; a fn with a `dyn`
+    param, a const coerced to `dyn` in a body (eager vtables), and their
+    callers; header edits of the `dyn` fn."""
+    k = rng.randrange(10**6)
+    items = (f"\ntrait Zd{k} {{\n    fn zd{k}(&self) -> u32;\n}}\n#[allow(dead_code)]\ntrait Ze{k} {{\n    fn ze{k}(&self) -> u32;\n}}\n"
+             f"struct Zds{k}(u32);\nimpl Zd{k} for Zds{k} {{\n    fn zd{k}(&self) -> u32 {{\n        self.0\n    }}\n}}\n"
+             f"impl Ze{k} for Zds{k} {{\n    fn ze{k}(&self) -> u32 {{\n        self.0 + 1\n    }}\n}}\n"
+             f"const ZDC{k}: Zds{k} = Zds{k}(5);\n"
+             f"#[allow(dead_code)]\nfn zd{k}_visit(f: &mut dyn FnMut(u32) -> u32, x: u32) -> u32 {{\n    f(x)\n}}\n"
+             f"#[allow(dead_code)]\nfn zd{k}_show(t: &dyn Zd{k}) -> u32 {{\n    t.zd{k}()\n}}\n"
+             f"#[allow(dead_code)]\nfn zd{k}_wrap<T: Copy>(t: T) -> T {{ t }}\n"
+             f"#[allow(dead_code)]\nfn zd{k}_use() -> u32 {{\n    let c: &dyn Zd{k} = &ZDC{k};\n    let mut n = 0;\n"
+             f"    zd{k}_visit(&mut |x| {{ n += x; x }}, 2) + zd{k}_show(&Zds{k}(3)) + c.zd{k}() + zd{k}_wrap(n)\n}}\n")
+    if rng.random() < 0.5:
+        c = f"fn zd{k}_visit"
+        head = f"{c}(f: &mut dyn FnMut(u32) -> u32, x: u32) -> u32 {{"
+        edits = [f"{c}(f: &mut dyn FnMut(u32) -> u32, x: u32) -> u32 where u32: Copy {{",
+                 f"{c}(f: &mut (dyn FnMut(u32) -> u32 + Send), x: u32) -> u32 {{",
+                 f"{c}(f: &mut dyn FnMut(u32) -> u32, x: u32) -> u64 {{",
+                 f"{c}(f: &mut dyn Fn(u32) -> u32, x: u32) -> u32 {{",
+                 f"{c}(f: &mut dyn FnMut(u32) -> u32, x: u32, _e: Option<&dyn Ze{k}>) -> u32 {{",
+                 f"{c}(f: &mut dyn FnMut(u32) -> u32, x: u32) -> u32 where String: Copy {{"]
+    else:
+        c = f"fn zd{k}_show"
+        head = f"{c}(t: &dyn Zd{k}) -> u32 {{"
+        edits = [f"{c}(t: &dyn Zd{k}) -> u32 where u32: Copy {{", f"{c}(t: &(dyn Zd{k} + 'static)) -> u32 {{",
+                 f"{c}(t: &dyn Ze{k}) -> u32 {{", f"{c}(t: &Zds{k}) -> u32 {{", f"{c}(t: &dyn Zd{k}) -> u64 {{",
+                 f"{c}(t: &dyn Zd{k}, _e: Option<Box<dyn Ze{k}>>) -> u32 {{"]
+    return _header_walk(rng, fs, items, head, edits)
+
+
+def sig_samename(rng, fs):
+    """Two Adts with an inherent method of one name, a free fn and a trait
+    method of that name; callers by method, UFCS, autoderef and generics;
+    header edits of one of the methods or of the free fn."""
+    k = rng.randrange(10**6)
+    g = f"zg{k}"
+    items = (f"\nmod zgm{k} {{\n    pub fn {g}(x: u32) -> u32 {{\n        x + 1\n    }}\n}}\n"
+             f"#[derive(Clone, Copy)]\nstruct Zga{k}(u32);\nstruct Zgb{k}<T>(T);\ntrait Zgt{k} {{\n    fn {g}(&self) -> u32;\n}}\n"
+             f"impl Zga{k} {{\n    fn {g}(&self) -> u32 {{\n        self.0\n    }}\n}}\n"
+             f"impl<T: Copy + Into<u32>> Zgb{k}<T> {{\n    fn {g}(&self) -> u32 {{\n        self.0.into()\n    }}\n}}\n"
+             f"impl Zgt{k} for u8 {{\n    fn {g}(&self) -> u32 {{\n        7\n    }}\n}}\n"
+             f"#[allow(dead_code)]\nfn {g}_use(a: &Zga{k}, b: Box<Zga{k}>) -> u32 {{\n"
+             f"    a.{g}() + Zga{k}::{g}(a) + b.{g}() + Zgb{k}(3u8).{g}() + Zgb{k}::<u8>::{g}(&Zgb{k}(1)) + 5u8.{g}() + zgm{k}::{g}(1)\n}}\n")
+    heads = {f"    fn {g}(&self) -> u32 {{\n        self.0\n": [
+                f"    fn {g}(&self) -> u32 where u32: Copy {{\n        self.0\n", f"    fn {g}(&self) -> u64 {{\n        self.0 as u64\n",
+                f"    fn {g}(self) -> u32 {{\n        self.0\n", f"    fn {g}(&self, _k: u8) -> u32 {{\n        self.0\n"],
+             f"    fn {g}(&self) -> u32 {{\n        self.0.into()\n": [
+                f"    fn {g}(&self) -> u32 where T: Copy {{\n        self.0.into()\n", f"    fn {g}(&self) -> u64 {{\n        let x: u32 = self.0.into();\n        x as u64\n"],
+             f"    pub fn {g}(x: u32) -> u32 {{\n": [
+                f"    pub fn {g}(x: u32) -> u32 where u32: Copy {{\n", f"    pub fn {g}(x: u64) -> u32 {{\n        let x = x as u32;\n",
+                f"    pub fn {g}(x: String) -> u32 {{\n        let x = x.len() as u32;\n"]}
+    head = rng.choice(sorted(heads))
+    return _header_walk(rng, fs, items, head, heads[head])
 
 
 def sig_states(rng, fs):
