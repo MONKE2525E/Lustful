@@ -7093,7 +7093,7 @@ impl Rewrite<'_> {
             }
             // A block std glob that does not have the name (std 1.99's
             // path table) leaves it to the outer scopes.
-            if frame.std_mod_glob && self.std_globs_bring(&frame.std_glob_paths, first) {
+            if frame.std_mod_glob && self.std_globs_bring(&frame.std_glob_paths, first, asked) {
                 return scopes[..i].iter().any(binds) || self.tables.lookup(module, asked, first).is_some();
             }
         }
@@ -7109,16 +7109,20 @@ impl Rewrite<'_> {
         };
         matches!(self.tables.lookup(module, asked, first), Some(BindState::One(b)) if b.rank <= 1)
             && !from_std((module, ns_index(asked) as u8, first))
-            && self.std_globs_bring(self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p), first)
+            && self.std_globs_bring(self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p), first, asked)
     }
 
     /// True when one of the std globs `paths` brings `name` (std 1.99's
-    /// path table), in any namespace.
-    fn std_globs_bring<'p>(&self, paths: impl IntoIterator<Item = &'p Vec<Sym>>, name: Sym) -> bool {
+    /// path table) in namespace `ns`: `use std::rc::*;` brings `Weak`
+    /// as a type only, so a value `Weak` comes from outside the glob.
+    fn std_globs_bring<'p>(&self, paths: impl IntoIterator<Item = &'p Vec<Sym>>, name: Sym, ns: Namespace) -> bool {
         paths.into_iter().any(|p| {
             let mut full: Vec<&str> = p.iter().map(|s| self.interner.get(*s)).collect();
             full.push(self.interner.get(name));
-            crate::resolve::stdpaths::std_has(&full).is_some()
+            match ns {
+                Namespace::Value => crate::resolve::stdpaths::std_has_value(&full),
+                _ => crate::resolve::stdpaths::std_has(&full).is_some(),
+            }
         })
     }
 
@@ -7144,7 +7148,13 @@ impl Rewrite<'_> {
             for p in paths {
                 let mut full: Vec<&str> = p.iter().map(|s| self.interner.get(*s)).collect();
                 full.push(name);
-                if crate::resolve::stdpaths::std_has(&full).is_none() {
+                // Ambiguity is per namespace: `use std::io::*; use
+                // std::fmt::*;` and a value `Error` is fmt's unit struct.
+                let has = match asked {
+                    Namespace::Value => crate::resolve::stdpaths::std_has_value(&full),
+                    _ => crate::resolve::stdpaths::std_has(&full).is_some(),
+                };
+                if !has {
                     continue;
                 }
                 match &seen {
@@ -7185,8 +7195,8 @@ impl Rewrite<'_> {
         };
         self.interner.get(name).starts_with(|c: char| c.is_ascii_uppercase())
             && !Self::frames_bind(scopes, name)
-            && (scopes.iter().any(|f| f.std_mod_glob && self.std_globs_bring(f.std_glob_paths.iter().filter(module_glob), name))
-                || self.std_globs_bring(self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p).filter(module_glob), name))
+            && (scopes.iter().any(|f| f.std_mod_glob && self.std_globs_bring(f.std_glob_paths.iter().filter(module_glob), name, Namespace::Value))
+                || self.std_globs_bring(self.tables.std_globs.iter().filter(|(m, _)| *m == module).map(|(_, p)| p).filter(module_glob), name, Namespace::Value))
     }
 
     /// rustc E0530 for a binding over a static or const that a block's

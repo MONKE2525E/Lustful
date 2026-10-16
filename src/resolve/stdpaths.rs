@@ -69,9 +69,42 @@ pub fn std_has(path: &[&str]) -> Option<StdHas> {
     }
 }
 
+/// The std items named in UpperCamelCase that also live in the value
+/// namespace: unit and tuple structs with a public constructor, as
+/// (parent module, name). rustc 1.99 is the oracle: `use <path> as Zq;
+/// let _ = Zq;` for every such non-enum, non-trait name in
+/// std_paths.txt (421 paths). Every other UpperCamel item is a type
+/// only (a struct with private fields, a type alias, a union).
+const VALUE_STRUCTS: &[(&str, &str)] = &[
+    ("alloc", "System"),
+    ("cmp", "Reverse"),
+    ("fmt", "Error"),
+    ("marker", "PhantomData"),
+    ("marker", "PhantomPinned"),
+    ("mpsc", "RecvError"),
+    ("mpsc", "SendError"),
+    ("num", "Saturating"),
+    ("num", "Wrapping"),
+    ("ops", "RangeFull"),
+    ("panic", "AssertUnwindSafe"),
+    ("range", "RangeFull"),
+];
+
+/// True when std 1.99 may have a value-namespace item at `path`: a fn,
+/// const, static, or macro (any name not in UpperCamelCase), or one of
+/// `VALUE_STRUCTS`. Modules, enums, and traits are types only.
+pub fn std_has_value(path: &[&str]) -> bool {
+    let [.., parent, last] = path else { return false };
+    let upper_camel = last.starts_with(|c: char| c.is_ascii_uppercase()) && last.chars().any(|c| c.is_ascii_lowercase());
+    match std_has(path) {
+        Some(StdHas::Item) => !upper_camel || VALUE_STRUCTS.contains(&(*parent, *last)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StdHas, std_has};
+    use super::{StdHas, std_has, std_has_value};
 
     fn has(p: &str) -> Option<StdHas> {
         std_has(&p.split("::").collect::<Vec<_>>())
@@ -92,6 +125,20 @@ mod tests {
         assert_eq!(has("std::os::unix::fs::OpenOptionsExt"), Some(StdHas::Trait));
         assert_eq!(has("std::arch::x86_64::_mm_add_ps"), Some(StdHas::Item));
         assert_eq!(has("std::arch::x86_64::Lines"), None);
+    }
+
+    #[test]
+    fn value_namespace() {
+        let v = |p: &str| std_has_value(&p.split("::").collect::<Vec<_>>());
+        assert!(!v("std::rc::Weak"));
+        assert!(v("std::fmt::Error"));
+        assert!(!v("std::io::Error"));
+        assert!(v("core::num::Wrapping"));
+        assert!(v("std::f64::consts::PI"));
+        assert!(v("std::mem::swap"));
+        assert!(!v("std::cmp::Ordering"));
+        assert!(!v("std::collections::hash_map"));
+        assert!(!v("std::rc::Nope"));
     }
 
     #[test]
