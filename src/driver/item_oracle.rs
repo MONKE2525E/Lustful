@@ -449,14 +449,15 @@ pub(crate) fn forget(session: &mut Session) {
 /// the same facts (`Snap`) when both requests reached collect. The fresh
 /// session starts from this session's def numbering, as a restarted
 /// daemon does from its disk cache: fingerprints hold Adt and static
-/// indices. One-shot sessions are cold already and skip it, and so do
-/// `--timings` requests (their lines differ by design).
+/// indices. One-shot sessions are cold already and skip it. A
+/// `--timings` request compares with an untimed cold compile, up to its
+/// timing report (`lust check <file>: ok (...` and the laps after it).
 pub(crate) fn compare_response(req: &Request, session: &mut Session, warm: &Response) {
     let (snap, patched) = {
         let mut st = session.front.oracle.lock().unwrap_or_else(|e| e.into_inner());
         (st.snap.take(), std::mem::take(&mut st.patched))
     };
-    if !session.caches.persistent || req.cmd != Cmd::Check || req.timings {
+    if !session.caches.persistent || req.cmd != Cmd::Check {
         return;
     }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -467,7 +468,8 @@ pub(crate) fn compare_response(req: &Request, session: &mut Session, warm: &Resp
     cold.cache_tried = true;
     let o = &session.front.def_order;
     cold.front.def_order = crate::check::collect::DefOrder { adts: o.adts.clone(), statics: o.statics.clone(), instances: o.instances.clone() };
-    let resp = super::compile::compile(req, &mut cold);
+    let untimed = Request { timings: false, ..req.clone() };
+    let resp = super::compile::compile(&untimed, &mut cold);
     let cold_snap = cold.front.oracle.lock().unwrap_or_else(|e| e.into_inner()).snap.take();
     drop(cold);
     let _ = std::fs::remove_dir_all(&dir);
@@ -475,7 +477,10 @@ pub(crate) fn compare_response(req: &Request, session: &mut Session, warm: &Resp
     // `LUST_STATS` lines count work, which differs by design. A failed
     // `cargo metadata` quotes Cargo's own text, which holds lock waits
     // ("Blocking waiting for file lock") by timing: only the code counts.
-    let answer = |s: &str| s.lines().filter(|l| !l.starts_with("lust-stats: ") && !l.starts_with("lust-visits: ")).collect::<Vec<_>>().join("\n");
+    let answer = |s: &str| {
+        let lines = s.lines().take_while(|l| !(req.timings && l.starts_with("lust check ") && l.contains(": ok (")));
+        lines.filter(|l| !l.starts_with("lust-stats: ") && !l.starts_with("lust-visits: ")).collect::<Vec<_>>().join("\n")
+    };
     let cargo_failed = |s: &str| s.contains("`cargo metadata` failed");
     let same_text = answer(&resp.stderr) == answer(&warm.stderr) || cargo_failed(&resp.stderr) && cargo_failed(&warm.stderr);
     if resp.code != warm.code || resp.stdout != warm.stdout || !same_text {
