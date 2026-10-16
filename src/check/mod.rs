@@ -1760,6 +1760,12 @@ pub struct Checked<'g> {
     /// template's closures. Mono checks the body again once the instance
     /// exists (`opaque::build_closure_map`).
     pub closure_map_pending: bool,
+    /// A revealed call of a closure from another body (a non-generic
+    /// definer's `impl Trait` hidden type) that no check registered yet:
+    /// its kind and signature are unknown, so this check's closures and
+    /// requests are provisional. Mono drops them and checks the body
+    /// again after the definer (`closure::closure_facts`).
+    pub closure_kind_pending: bool,
 }
 
 impl Checked<'_> {
@@ -2462,6 +2468,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             expr_moves: Vec::new(),
             local_moves: Vec::new(),
             closure_map_pending: false,
+            closure_kind_pending: false,
         },
         scopes: Vec::new(),
         item_scopes: Vec::new(),

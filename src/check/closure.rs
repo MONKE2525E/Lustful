@@ -2195,7 +2195,14 @@ impl<'p> Ctx<'p> {
         if let Some(c) = self.closures.iter().find(|c| c.def == def) {
             return Some((c.kind, c.inputs.clone(), c.output));
         }
-        let g = self.p.gx.closures.get(&def)?;
+        // Another body's closure (an `impl Trait` hidden type revealed
+        // here) that no check registered yet, when the discovery walk
+        // checks this body before its definer: check this body again
+        // after it, as for a generic definer's closures.
+        let Some(g) = self.p.gx.closures.get(&def) else {
+            self.out.closure_kind_pending = true;
+            return None;
+        };
         let (kind, inputs, output) = (g.kind, g.inputs.clone(), g.output);
         // A generic definer's hidden closure, revealed at a call: its
         // signature names the definer's params, which the call's args

@@ -11873,15 +11873,27 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 // the definer's closures, and a replay in a later build
                 // would never make those instances (daemon warm builds).
                 let n = rechecked.get(&fid).copied().unwrap_or(0);
-                if checked.closure_map_pending && n < recheck_limit {
+                let pending = checked.closure_map_pending || checked.closure_kind_pending;
+                if pending && n < recheck_limit {
                     rechecked.insert(fid, n + 1);
                     recheck.push(fid);
-                } else if discarded.is_empty() && !checked.closure_map_pending {
-                    reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
+                    // A call of a closure no check registered yet gave this
+                    // body's closures provisional kinds and types: none of
+                    // them (or the requests and types that name them) stand;
+                    // the recheck after the definer makes them.
+                    if checked.closure_kind_pending {
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    } else {
+                        (adt_tys, reqs, closures_owned, vts)
+                    }
                 } else {
-                    reuse.note_unstored(p, fid, &adt_tys, &reqs, &closures_owned, &vts);
+                    if discarded.is_empty() && !pending {
+                        reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
+                    } else {
+                        reuse.note_unstored(p, fid, &adt_tys, &reqs, &closures_owned, &vts);
+                    }
+                    (adt_tys, reqs, closures_owned, vts)
                 }
-                (adt_tys, reqs, closures_owned, vts)
             };
             reuse.note_closures(&closures_owned);
             register_closures(p, fid, closures_owned, FnClass::Closure);
