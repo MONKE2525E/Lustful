@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Which body edits miss the warm body patch, and why, on a slice.
 
-Usage: bench/slices/patch_miss.py <slice dir> [--sample N] [--seed S] [--cold-every K] [--json out.json] [--lust BIN]
+Usage: bench/slices/patch_miss.py <slice dir> [--sample N] [--seed S] [--cold-every K] [--json out.json] [--lust BIN] [--only-rpit]
 
 For a sample of fn bodies across the slice (every fn whose open brace ends
 its line, const fns included), a warm daemon checks after one edit that
@@ -13,6 +13,7 @@ misses, and a few example fns per reason. Every K-th edit also compares
 the warm answer with a cold one-shot check (stdout, stderr, exit code).
 A check that fails (every edit keeps the slice valid) counts as
 path=fail, and the run goes on. --lust measures another lust binary.
+--only-rpit samples only fns whose signature returns `impl Trait`.
 """
 import json
 import random
@@ -37,17 +38,20 @@ def all_bodies(b):
             ol, oc, cl, cc, start = map(int, row.split())
             if cl - ol < 2 or lines[ol - 1][oc:].strip():
                 continue
-            out.append((p, ol, "const fn" in lines[start - 1]))
+            sig = " ".join(lines[start - 1:ol])
+            out.append((p, ol, "const fn" in lines[start - 1], "-> impl " in sig))
     return out
 
 
 def main():
     args = sys.argv[1:]
-    opt = {"--sample": 300, "--seed": 1, "--cold-every": 0, "--json": None, "--lust": None}
+    opt = {"--sample": 300, "--seed": 1, "--cold-every": 0, "--json": None, "--lust": None, "--only-rpit": False}
     slice_dir = None
     while args:
         a = args.pop(0)
-        if a in opt:
+        if a == "--only-rpit":
+            opt[a] = True
+        elif a in opt:
             opt[a] = args.pop(0) if a in ("--json", "--lust") else int(args.pop(0))
         else:
             slice_dir = a
@@ -63,7 +67,7 @@ def main():
         _, r = b.lust("check")
         if r.returncode != 0:
             b.fail(f"slice does not check\n{r.stderr[-1500:]}")
-    bodies = all_bodies(b)
+    bodies = [x[:3] for x in all_bodies(b) if x[3] or not opt["--only-rpit"]]
     random.Random(opt["--seed"]).shuffle(bodies)
     bodies = bodies[: opt["--sample"]]
     rows = []
