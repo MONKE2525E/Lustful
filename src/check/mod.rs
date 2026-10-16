@@ -1138,6 +1138,17 @@ pub enum CmpVia {
     Partial(ast::BinOp),
 }
 
+/// What rustc knows of a comparison call's `Rhs` (`Ctx::cmp_rhs_shape`).
+#[derive(Clone)]
+enum CmpShape {
+    /// Not known yet: any type fits.
+    Any,
+    /// A reference of this kind to a type of the inner shape.
+    Ref(Mut, Box<CmpShape>),
+    /// This type.
+    Exact(Ty),
+}
+
 /// Which `Ordering` method a `Res::OrderingOp` call computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderingOpKind {
@@ -13593,7 +13604,9 @@ impl<'p> Ctx<'p> {
         }
         self.check_packed_borrow(recv, name_span);
         let other_ty = self.tys.mk_ref(false, base);
-        self.check_args(&[other_ty], args, name_span);
+        if !self.cmp_arg(recv, base, trait_def, args, name) {
+            self.check_args(&[other_ty], args, name_span);
+        }
         self.set_res(e, Res::PrimCmp { kind, derefs });
         Some(match kind {
             PrimCmpKind::Partial(_) => {
@@ -13603,6 +13616,159 @@ impl<'p> Ctx<'p> {
             PrimCmpKind::Total(_) => generics::ordering_ty(&mut self.tys),
             PrimCmpKind::Op(_) => BOOL,
         })
+    }
+
+    /// The argument of a comparison method call (`eq`, `partial_cmp`,
+    /// `cmp`, ...) as rustc types it (`cmp_arg_rule`), then coerced on to
+    /// `&base`, which lowering compares; false when the plain check (a
+    /// coercion to `&base`) is rustc's: `Self` is `base` with one impl.
+    /// `s.eq(&&s)` on a `String` is E0277 (several impls: no deref
+    /// coercion); `Box::new(5).eq(&5)` is E0308 (`Rhs` is the Box).
+    fn cmp_arg(&mut self, recv: ExprId, base: Ty, trait_def: DefId, args: &[ExprId], name: Sym) -> bool {
+        let [a] = args else { return false };
+        let rt = self.out.expr_ty[self.ei(recv)];
+        let rt = self.deep(rt);
+        let self_ty = self.cmp_self_ty(rt);
+        let open = trait_def != self.p.gx.lang.ord && self.cmp_rhs_open(self_ty, trait_def);
+        if !open && self_ty == base {
+            return false;
+        }
+        let want = self.tys.mk_ref(false, self_ty);
+        let at = self.expr(*a, Some(want));
+        if self.cmp_arg_rule(rt, at, trait_def, *a, name) {
+            let to = self.tys.mk_ref(false, base);
+            self.coerce_expr(*a, at, to);
+        }
+        true
+    }
+
+    /// Rustc's `Self` of a comparison method call on a receiver of type
+    /// `rt`: one shared reference peeled (`x: &T` matches `&self` by
+    /// value at the first step), else the receiver itself (an autoref).
+    fn cmp_self_ty(&mut self, rt: Ty) -> Ty {
+        match self.kind(rt) {
+            TyKind::Ref(_, Mut::Shared, inner) => self.resolve(inner),
+            _ => rt,
+        }
+    }
+
+    /// Checks the argument type `at` (before coercion) of a comparison
+    /// call on a receiver of type `rt` by rustc's rule, reporting L0612
+    /// at `a` when it fails. Rustc knows of `Rhs` what `Self`'s impls fix
+    /// (`cmp_rhs_shape`): an unknown `Rhs` takes the argument's pointee
+    /// as is; a known shape takes the first deref of it that fits (deref
+    /// coercion). Lust compares `Rhs = Self` only. Also run after the
+    /// method search picks a written impl of a std type (check/method.rs
+    /// `cmp_needs_rustc_rhs`), whose argument it coerced as a plain call.
+    pub(super) fn cmp_arg_rule(&mut self, rt: Ty, at: Ty, trait_def: DefId, a: ExprId, name: Sym) -> bool {
+        let rt = self.deep(rt);
+        let at = self.deep(at);
+        let self_ty = self.cmp_self_ty(rt);
+        let shape = self.cmp_rhs_shape(self_ty, trait_def);
+        let mut u = match self.kind(at) {
+            TyKind::Ref(_, _, u) => Some(self.resolve(u)),
+            _ => None,
+        };
+        let ok = match &shape {
+            None => u.is_some_and(|u| self.unify(u, self_ty)),
+            Some(shape) => {
+                let mut hit = false;
+                for _ in 0..16 {
+                    let Some(t) = u else { break };
+                    if self.cmp_shape_fits(t, shape) {
+                        hit = self.unify(t, self_ty);
+                        break;
+                    }
+                    u = match self.kind(t) {
+                        TyKind::Ref(_, _, i) => Some(self.resolve(i)),
+                        _ => self.tys.smart_elem(t).map(|i| self.resolve(i)),
+                    };
+                }
+                hit
+            }
+        };
+        if !ok && self.kind(at) != TyKind::Error && self.kind(self_ty) != TyKind::Error {
+            let (sn, an, n) = (self.tn(self_ty), self.tn(at), self.name(name).to_string());
+            let why = if shape.is_none() { "`Self` has several impls, so the argument's type picks one" } else { "the argument must deref to `&Self`" };
+            self.err(
+                "L0612",
+                self.span(a),
+                format!("`{sn}::{n}` takes `&{sn}` here, not `{an}` ({why})"),
+                "Pass a reference to a value of the receiver's type, such as `x.eq(&y)`.",
+            );
+        }
+        ok
+    }
+
+    /// What rustc knows of `Rhs` for `Self = t` before it types the
+    /// argument: None when several impls leave it open (`cmp_rhs_open`;
+    /// a reference's `PartialEq` has two blanket impls), else its shape:
+    /// `t` itself, or for a reference's one `PartialOrd` blanket impl a
+    /// reference of the same kind to its pointee's shape.
+    fn cmp_rhs_shape(&mut self, t: Ty, trait_def: DefId) -> Option<CmpShape> {
+        let lang = self.p.gx.lang;
+        if trait_def == lang.ord {
+            return Some(CmpShape::Exact(t));
+        }
+        match self.kind(t) {
+            TyKind::Ref(_, m, inner) => {
+                if trait_def == lang.partial_eq {
+                    return None;
+                }
+                let inner = self.resolve(inner);
+                let p = self.cmp_rhs_shape(inner, trait_def).unwrap_or(CmpShape::Any);
+                Some(CmpShape::Ref(m, Box::new(p)))
+            }
+            _ if self.cmp_rhs_open(t, trait_def) => None,
+            _ => Some(CmpShape::Exact(t)),
+        }
+    }
+
+    /// True when type `t` fits `shape` (an `Exact` part unifies).
+    fn cmp_shape_fits(&mut self, t: Ty, shape: &CmpShape) -> bool {
+        match shape {
+            CmpShape::Any => true,
+            CmpShape::Ref(m, p) => match self.kind(t) {
+                TyKind::Ref(_, m2, inner) if m2 == *m => {
+                    let inner = self.resolve(inner);
+                    self.cmp_shape_fits(inner, p)
+                }
+                _ => false,
+            },
+            CmpShape::Exact(x) => self.unify(t, *x),
+        }
+    }
+
+    /// True when `t` has more than one `trait_def` (`PartialEq` or
+    /// `PartialOrd`) impl in std 1.99, so a method call leaves `Rhs` to
+    /// the argument. A reference has two `PartialEq` blanket impls (`&A`
+    /// with `&B` and with `&mut B`) and one `PartialOrd` (its pointee's
+    /// answer). Literal variables have one impl per type.
+    pub(super) fn cmp_rhs_open(&mut self, t: Ty, trait_def: DefId) -> bool {
+        let eq = trait_def == self.p.gx.lang.partial_eq;
+        match self.kind(t) {
+            TyKind::Ref(_, _, inner) => eq || self.cmp_rhs_open(inner, trait_def),
+            TyKind::Infer(v) => v.is_int() || v.is_float(),
+            TyKind::Str | TyKind::Array(..) | TyKind::Slice(_) => eq,
+            _ if self.tys.is_string_ty(t) || self.tys.vec_elem(t).is_some() => eq,
+            _ if crate::check::collect::cow_arg(&self.tys, t).is_some() => true,
+            _ => {
+                let Some(a) = self.tys.local_adt(t) else { return false };
+                if method::std_display_path(self.p, a) {
+                    let path = self.p.display_path(self.p.adt(a).name);
+                    let seg = path.rsplit("::").next().unwrap_or("");
+                    return match seg {
+                        "OsStr" | "OsString" | "Ipv4Addr" | "Ipv6Addr" | "IpAddr" | "Path" | "PathBuf" => true,
+                        "VecDeque" | "CString" => eq,
+                        _ => false,
+                    };
+                }
+                // A user type: its own impls of the trait, any `Rhs`.
+                let Some((def, _)) = self.tys.adt_parts(t) else { return false };
+                use crate::traits::index::SelfHead;
+                self.p.gx.index.impls_of_trait(trait_def).iter().filter(|&&id| self.p.gx.index.get(id).head == SelfHead::Adt(def)).count() > 1
+            }
+        }
     }
 
     /// `x.into()` where the target is a scalar type core has a

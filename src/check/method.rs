@@ -1585,6 +1585,44 @@ pub(super) fn dyn_probe(
 /// rustc's receiver-type probe order. Returns Hit/Miss/Failed
 /// like a single probe.
 #[allow(clippy::too_many_arguments)]
+/// The comparison trait of a method call (`eq`, `partial_cmp`, `cmp`,
+/// ...) whose argument rustc types differently from a plain coercion to
+/// the written impl's `&Self`: on a `&mut` receiver of an Adt (rustc's
+/// `Self` is the `&mut A` itself, through core's blanket impls) or on a
+/// std type with several `PartialEq`/`PartialOrd` impls in std that
+/// lust's source does not all have (`cmp_rhs_open`). The search still
+/// picks the impl; `cmp_arg_rule` then checks the argument's own type.
+fn cmp_needs_rustc_rhs(cx: &mut Ctx, recv_ty: Ty, name: Sym) -> Option<DefId> {
+    let lang = cx.p.gx.lang;
+    let trait_def = match cx.p.interner.get(name) {
+        "eq" | "ne" => lang.partial_eq,
+        "lt" | "le" | "gt" | "ge" | "partial_cmp" => lang.partial_ord,
+        "cmp" => lang.ord,
+        _ => return None,
+    };
+    let rt = cx.resolve(recv_ty);
+    // The Adt under every reference decides; `Self` keeps the outer
+    // references but one shared one (`&&OsStr` compares as `&OsStr`).
+    let mut adt_ty = rt;
+    while let TyKind::Ref(_, _, inner) = cx.tys.kind(adt_ty) {
+        adt_ty = cx.resolve(inner);
+    }
+    let a = cx.tys.local_adt(adt_ty)?;
+    let self_ty = match cx.tys.kind(rt) {
+        TyKind::Ref(_, Mut::Mut, _) => return Some(trait_def),
+        TyKind::Ref(_, _, inner) => cx.resolve(inner),
+        _ => rt,
+    };
+    (std_display_path(cx.p, a) && trait_def != lang.ord && cx.cmp_rhs_open(self_ty, trait_def)).then_some(trait_def)
+}
+
+/// True when Adt `a` is a std type (spliced source or lust's std
+/// platform crate): its display path is under `std`, `core`, or `alloc`.
+pub(super) fn std_display_path(p: &Program, a: AdtId) -> bool {
+    let path = p.display_path(p.adt(a).name);
+    ["std::", "core::", "alloc::"].iter().any(|r| path.starts_with(r))
+}
+
 /// `Iterator` methods lust has no port of that other std traits also
 /// name (`PartialEq::eq`, `PartialOrd::partial_cmp`, `Ord::max`, ...).
 const ITER_SHADOWED: &[&str] = &["eq", "ne", "lt", "le", "gt", "ge", "partial_cmp", "cmp", "max", "min"];
@@ -1637,6 +1675,27 @@ fn iterator_shadow_reject(cx: &mut Ctx, step: Ty, name: Sym, name_span: Span, ar
 }
 
 pub(super) fn generic_method_search(
+    cx: &mut Ctx,
+    e: ExprId,
+    recv_ty: Ty,
+    name: Sym,
+    name_span: Span,
+    args: &[ExprId],
+    explicit: &[Option<GenericArg>],
+    expected: Option<Ty>,
+) -> Probe {
+    let cmp_trait = cmp_needs_rustc_rhs(cx, recv_ty, name);
+    let hit = method_search_steps(cx, e, recv_ty, name, name_span, args, explicit, expected);
+    if let (Some(tr), Probe::Hit(_), [a]) = (cmp_trait, &hit, args) {
+        let at = cx.out.expr_ty[cx.ei(*a)];
+        cx.cmp_arg_rule(recv_ty, at, tr, *a, name);
+    }
+    hit
+}
+
+/// The step+form search of `generic_method_search`.
+#[allow(clippy::too_many_arguments)]
+fn method_search_steps(
     cx: &mut Ctx,
     e: ExprId,
     recv_ty: Ty,
