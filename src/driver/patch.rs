@@ -244,8 +244,11 @@ impl PatchBase {
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
         let mut fns_by_file: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // Nested fns too (`(usize::MAX, Some(stmt item))`): an edit above
+        // one in its file moves its line as well.
         for (i, &(item, sub)) in front.fn_loc.iter().enumerate() {
-            if item == usize::MAX || item >= front.ast.items.len() {
+            let known = if item == usize::MAX { sub.is_some_and(|k| k < front.ast.stmt_items.len()) } else { item < front.ast.items.len() };
+            if !known {
                 continue;
             }
             let file = fn_def_at(&front.ast, item, sub).name_span.file;
