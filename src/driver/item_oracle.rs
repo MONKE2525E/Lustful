@@ -146,8 +146,9 @@ impl Digest {
 fn log(line: &str) {
     if let Some(log) = std::env::var_os("LUST_ITEMPATCH_LOG") {
         use std::io::Write;
+        // One write per line: parallel writers append whole lines.
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-            let _ = writeln!(f, "{line}");
+            let _ = f.write_all(format!("{line}\n").as_bytes());
         }
     }
 }
