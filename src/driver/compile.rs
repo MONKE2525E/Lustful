@@ -637,6 +637,47 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     crate::pool::par_map(items, f)
 }
 
+/// True when no macro but the builtin can take a builtin macro's name in
+/// the local crate of a crate with dependencies
+/// (`macro_scope::dep_macros_shut`), over its files. Each file belongs to
+/// the crate of the module the resolver gave it (a file two crates share
+/// has one id per crate); one with no recorded module counts for every
+/// crate. A dependency is clean when it compiles from source here and its
+/// own files pass the scan, with its own dependencies judged the same way.
+/// `root_text` is the root file without the std splice.
+fn dep_macros_shut(front: &Front, tables: &crate::resolve::imports::ResolvedTables, root_text: &str) -> bool {
+    use crate::resolve::imports::ResolvedTables;
+    use crate::ty::defs::ModuleId;
+    let mut texts: FxMap<Option<ModuleId>, Vec<&str>> = FxMap::default();
+    for k in 0..front.map.file_count() {
+        let f = FileId(k as u32);
+        let Some(text) = (if k == 0 { Some(root_text) } else { front.map.text(f) }) else { return false };
+        texts.entry(tables.macro_scopes.get(&f).map(|(m, _)| tables.root_of(*m))).or_default().push(text);
+    }
+    /// The scan of crate `root`, its dependencies judged recursively
+    /// (memoized by crate root; the crate graph has no cycle).
+    fn shut(
+        root: ModuleId,
+        front: &Front,
+        tables: &ResolvedTables,
+        texts: &FxMap<Option<ModuleId>, Vec<&str>>,
+        memo: &std::cell::RefCell<FxMap<ModuleId, bool>>,
+    ) -> bool {
+        if let Some(&ok) = memo.borrow().get(&root) {
+            return ok;
+        }
+        let deps: Vec<(Sym, Option<ModuleId>)> =
+            tables.externs.iter().filter(|e| e.owner == root && !e.is_std_lib).map(|e| (front.interner.intern(&e.name), e.root_module)).collect();
+        let names: Vec<Sym> = deps.iter().map(|d| d.0).collect();
+        let crate_texts: Vec<&str> = texts.get(&Some(root)).into_iter().chain(texts.get(&None)).flatten().copied().collect();
+        let clean = |d: Sym| deps.iter().any(|&(n, r)| n == d && r.is_some_and(|r| r != root && shut(r, front, tables, texts, memo)));
+        let ok = super::macro_scope::dep_macros_shut(&crate_texts, &front.interner, &names, &clean);
+        memo.borrow_mut().insert(root, ok);
+        ok
+    }
+    shut(ModuleId(0), front, tables, &texts, &Default::default())
+}
+
 /// The dirty count of each stored read set in `sets` against `p` (None
 /// for a slot with no stored reads), the answers
 /// `Program::reads_dirty_memo` gives one set at a time (sigedit P4.4).
@@ -1841,9 +1882,11 @@ fn resolved_setup(
         &front.client.shown_root,
         key.krate.test,
     ));
-    // What a later patch needs to expand a body alone (no dependency
-    // crate can export a macro).
-    let patch_expand = externs.is_empty().then(|| (env.clone(), crate_name.clone()));
+    // What a later patch needs to expand a body alone. With dependencies,
+    // only when none of their macros can take a builtin's name (the
+    // PatchBase below asks `macro_scope::dep_macros_shut`).
+    let patch_expand = Some((env.clone(), crate_name.clone()));
+    let has_deps = !externs.is_empty();
     let patched =
         if ast_bloated(front) { Err("ast compaction") } else { super::patch::try_patch(front, caches, inputs, &root_text, request_start) };
     match patched {
@@ -2149,6 +2192,17 @@ fn resolved_setup(
         ..Default::default()
     };
     if caches.persistent {
+        // With no dependency, any user macro named like a builtin (or a
+        // rename to one) in any file refuses (patch.rs `shadows_builtin`).
+        let shut = || match has_deps {
+            true => dep_macros_shut(front, &tables, &unspliced_root),
+            false => {
+                let texts = (1..front.map.file_count()).filter_map(|k| front.map.text(FileId(k as u32)));
+                let texts: Vec<&str> = std::iter::once(unspliced_root.as_str()).chain(texts).collect();
+                !texts.iter().any(|t| t.contains("macro_rules")) || !texts.iter().any(|t| super::patch::shadows_builtin(t))
+            }
+        };
+        let patch_expand = patch_expand.filter(|_| shut());
         front.patch = Some(super::patch::PatchBase::new(
             front,
             inputs,

@@ -25,6 +25,8 @@ Edit kinds (each probe edits one fn or item, then goes back to the base text):
   derive   one trait removed from a real `#[derive(..)]` (users of that trait break)
   generic  a body edit in a generic fn named in other files; reject: `Option<T>::cloned`
   rpit     a fn that returns `impl Trait`: body edit, `+ Sized` bound; reject: `+ Copy`
+  macbody  `body` in fns whose bodies call a pure builtin macro (`matches!`, `write!`,
+           `writeln!`, `debug_assert*!`): the expander runs on the patch path (not default)
 
 Manifest kinds (stale Cargo view probes; not in the default list, `--kinds manifest` runs them all).
 Each state edits what Cargo reads besides the sources, and often a cfg-gated bad `let` in one body:
@@ -90,7 +92,9 @@ import oracle_log  # noqa: E402  (scripts/oracle_log.py)
 
 KINDS = ["body", "infer", "sig", "sigx", "oblig", "derive", "generic", "rpit"]
 MANIFEST_KINDS = ["mfeat", "medition", "mlints", "mprofile", "mdeps", "mtarget"]
-ALL_KINDS = KINDS + MANIFEST_KINDS
+# Kinds outside the default list.
+EXTRA_KINDS = ["macbody"]
+ALL_KINDS = KINDS + EXTRA_KINDS + MANIFEST_KINDS
 # Traits the oblig kind can ask for, with the path its helper names.
 NEED = {"Clone": "::std::clone::Clone", "Copy": "::std::marker::Copy", "Debug": "::std::fmt::Debug",
         "Default": "::std::default::Default", "Hash": "::std::hash::Hash", "PartialEq": "::std::cmp::PartialEq",
@@ -399,6 +403,17 @@ class Bench:
         for kind in self.a.kinds:
             if kind == "body":
                 for f in self.spread([f for f in fns if self.body_ok(f)], n):
+                    t = self.base[f["file"]]
+                    i = next(k)
+                    out.append((kind, lbl(f), [("accept", f["file"], in_body(t, f, f"let _lust_e: u32 = {i};")),
+                                               ("reject", f["file"], in_body(t, f, f'let _lust_e: u32 = "{i}";'))]))
+            elif kind == "macbody":
+                pure = ("matches!(", "write!(", "writeln!(", "debug_assert")
+
+                def calls_pure(f):
+                    lines = self.base[f["file"]].splitlines()[f["ol"] - 1:f["cl"]]
+                    return any(m in ln for ln in lines for m in pure)
+                for f in self.spread([f for f in fns if self.body_ok(f) and calls_pure(f)], n):
                     t = self.base[f["file"]]
                     i = next(k)
                     out.append((kind, lbl(f), [("accept", f["file"], in_body(t, f, f"let _lust_e: u32 = {i};")),

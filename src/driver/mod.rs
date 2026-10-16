@@ -12,6 +12,7 @@ pub(crate) mod kept_delta;
 mod kept_derive;
 pub(crate) mod laps;
 mod item_oracle;
+mod macro_scope;
 mod item_outline;
 pub(crate) mod gen_reuse;
 pub mod graph;

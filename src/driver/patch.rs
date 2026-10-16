@@ -108,9 +108,10 @@ pub(crate) struct PatchBase {
     /// user's macro, which the expander owns.
     shadowed: bool,
     tables: Arc<ResolvedTables>,
-    /// The crate's cfg environment and name, for expanding a body alone,
-    /// when no user or dependency macro can take a builtin's name (no
-    /// dependency crate, and no file `shadows_builtin`).
+    /// The local crate's cfg environment and name, for expanding a body
+    /// alone, when no user or dependency macro can take a builtin's name
+    /// (the caller decides: with no dependency crate, no file
+    /// `shadows_builtin`; else driver/macro_scope.rs).
     expand: Option<(crate::resolve::cfg::CfgEnv, String)>,
     /// `ResolvedTables::local_named_set`, for the patch's path rewrites.
     local_names: Option<FxMap<Sym, u8>>,
@@ -185,7 +186,7 @@ fn shadows_parser_macro(text: &str) -> bool {
 /// `shadows_parser_macro` for every builtin macro (parser and expander
 /// owned), and for a macro whose name a macro supplies
 /// (`macro_rules! $name`, read as an empty name).
-fn shadows_builtin(text: &str) -> bool {
+pub(super) fn shadows_builtin(text: &str) -> bool {
     use crate::expand::builtin::{is_passthrough, is_token_builtin};
     shadows(text, &|name| name.is_empty() || is_passthrough(name) || is_token_builtin(name))
 }
@@ -254,7 +255,6 @@ impl PatchBase {
             .collect();
         let user_macros = texts.iter().any(|(_, t)| t.contains("macro_rules"));
         let shadowed = user_macros && texts.iter().any(|(_, t)| shadows_parser_macro(t));
-        let expand = expand.filter(|_| !user_macros || !texts.iter().any(|(_, t)| shadows_builtin(t)));
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
         let mut fns_by_file: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -1382,6 +1382,11 @@ fn expand_pure(
     raw: lexer::Lexed,
 ) -> Result<lexer::Lexed, &'static str> {
     let Some((env, crate_name)) = &base.expand else { return Err("macro in body") };
+    // The cfg and crate name are the local crate's: a dependency's fn
+    // (a path dependency shares the session) resolves in full.
+    if base.tables.root_of(module) != crate::ty::defs::ModuleId(0) {
+        return Err("body macro");
+    }
     let path = front.map.path(file);
     let shown = front.display_root.as_deref().and_then(|r| std::path::Path::new(path).strip_prefix(r).ok());
     let ctx = crate::expand::ExpandCtx {
