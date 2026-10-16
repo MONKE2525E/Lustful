@@ -17077,6 +17077,15 @@ impl<'p> Ctx<'p> {
             self.err("L0110", span, "cannot use NaN in patterns", "Use a guard to test for NaN.");
             return None;
         }
+        if matches!(val, CV::StrBytes(_)) {
+            self.err(
+                "L0630",
+                span,
+                "a const string made by `split_at` in a pattern is not supported yet",
+                "Match on a string literal, or compare in a guard.",
+            );
+            return None;
+        }
         let scalar = matches!(val, CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Float(..) | CV::Str(_));
         if !scalar {
             let ct = self.deep(ct);
@@ -21667,6 +21676,13 @@ fn needs_drop_answer(p: &Program, tys: &mut impl TyIntern, drop_defs: &[DefId], 
 
 impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
     type Tys = Tys<'p>;
+
+    fn alias_primitive(&self, name: Sym) -> Option<&'static str> {
+        crate::check::collect::alias_primitive_of(self.cx.p, name)
+    }
+    fn alias_hash(&self, name: Sym) -> Option<crate::ty::hash::HashTy> {
+        crate::check::collect::alias_hash_of(self.cx.p, name)
+    }
 
     fn enter_const_fn(&mut self, owner: Option<Sym>) {
         let cx = &mut *self.cx;

@@ -69,7 +69,7 @@ pub(super) fn key_cty(t: &CTy) -> CTy {
 }
 
 /// The `S` (BuildHasher) type of a table.
-fn builder_cty(t: &CTy) -> CTy {
+pub(super) fn builder_cty(t: &CTy) -> CTy {
     match t {
         CTy::Hash(_, a) => a.last().cloned().unwrap_or(CTy::Unit),
         _ => CTy::Unit,
@@ -569,6 +569,22 @@ pub(super) fn clone_body(p: &Program, t: &CTy, need: &mut dyn FnMut(Glue, &CTy))
     format!(
         "  {ct} r; r.s = {sc}; lust_hash_init(&r.t, sizeof({e}), _Alignof({e}));\n  lust_hash_clone_into(&r.t, &p->t, hcl_{}, 0);\n  return r;\n",
         mangle(t)
+    )
+}
+
+/// The static initializer of an empty table around a const hasher
+/// value (`HashMap::with_hasher(S)` in a static): the empty singleton,
+/// as `lust_hash_init` leaves it. The control bytes point at a 16-byte
+/// all-EMPTY array of this unit (emitted once into `pre`), a copy of
+/// the runtime's static empty group; the table never writes through it.
+pub(super) fn const_empty_table(t: &CTy, s_init: &str, pre: &mut String) -> String {
+    if !pre.contains("lust_hash_cempty[16]") {
+        pre.push_str("#ifndef LUST_HASH_CEMPTY\n#define LUST_HASH_CEMPTY\nstatic const uint8_t lust_hash_cempty[16] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};\n#endif\n");
+    }
+    let e = ctype(&elem_cty(t));
+    format!(
+        "(({}){{ .s = {s_init}, .t = {{ .ctrl = (uint8_t*)lust_hash_cempty, .elem_size = sizeof({e}), .elem_align = _Alignof({e}) }} }})",
+        ctype(t)
     )
 }
 

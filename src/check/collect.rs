@@ -6712,6 +6712,28 @@ fn coerce_const_value(
     ))
 }
 
+/// The primitive a non-generic type alias names, for `Alias::MAX` in
+/// const position (`ConstCx::alias_primitive`).
+pub fn alias_primitive_of(p: &Program, name: Sym) -> Option<&'static str> {
+    match p.tys.kind(*p.aliases.get(&name)?) {
+        TyKind::Int(it) => Some(it.name()),
+        TyKind::Char => Some("char"),
+        TyKind::Float(crate::ty::FloatTy::F32) => Some("f32"),
+        TyKind::Float(crate::ty::FloatTy::F64) => Some("f64"),
+        _ => None,
+    }
+}
+
+/// The hashed collection a plain or generic type alias names
+/// (`ConstCx::alias_hash`).
+pub fn alias_hash_of(p: &Program, name: Sym) -> Option<crate::ty::hash::HashTy> {
+    let t = match p.aliases.get(&name) {
+        Some(&t) => t,
+        None => p.gx.generic_aliases.get(&name)?.erased,
+    };
+    crate::ty::hash::hash_parts(&p.tys, t).map(|(k, _)| k)
+}
+
 /// How a const fn's generics meet a call in const position
 /// (`ConstFnBody::generic`): from its template's predicates, with std's
 /// `LazyLock::new` and `LazyCell::new` named by their std paths.
@@ -7221,6 +7243,12 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
     fn adt_instance(&mut self, adt: AdtId, binds: &[Option<Ty>]) -> Option<Ty> {
         let (def, args) = const_adt_args(self.p, adt, binds)?;
         Some(self.p.tys.mk_adt(def, &args))
+    }
+    fn alias_primitive(&self, name: Sym) -> Option<&'static str> {
+        alias_primitive_of(self.p, name)
+    }
+    fn alias_hash(&self, name: Sym) -> Option<crate::ty::hash::HashTy> {
+        alias_hash_of(self.p, name)
     }
     fn names_type(&mut self, name: Sym) -> bool {
         let p = &*self.p;

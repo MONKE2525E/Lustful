@@ -7549,6 +7549,12 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         // An atomic's constant is its value (cgen/sync.rs).
         // `Vec::new()` and `String::new()`: an empty buffer, its pointer
         // dangling at the element's alignment (W-THREADS).
+        // `HashMap::with_hasher(s)` / `HashSet::with_hasher(s)`: an
+        // empty table around the hasher.
+        (CV::Aggregate(vals), CTy::Hash(k, _)) if hash::is_table(*k) && vals.len() == 1 => {
+            let s = const_init(p, &vals[0], &hash::builder_cty(t), pre, counter, slots, None);
+            hash::const_empty_table(t, &s, pre)
+        }
         (CV::Aggregate(vals), CTy::Vec(e)) if vals.is_empty() => format!("{{(void*)(uintptr_t){}, 0, 0}}", c_size_align(p, e).1.max(1)),
         (CV::Aggregate(vals), CTy::String) if vals.is_empty() => "{(uint8_t*)(uintptr_t)1, 0, 0}".into(),
         // A const lock: unlocked and unpoisoned around its value.
@@ -7569,6 +7575,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let s = &p.ast.strings[*i as usize];
             format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len())
         }
+        (CV::StrBytes(b), _) => format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(b.as_slice()), b.len()),
         (CV::StaticRef(idx), CTy::Slice(_)) => {
             let st = &p.statics[*idx as usize];
             let sct = cty(&p.tys, st.ty);

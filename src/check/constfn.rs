@@ -99,6 +99,9 @@ fn builtin_is_const(b: Builtin) -> bool {
         // still a drop type, so destroying it here rejects elsewhere.
         StringNew
             | VecNew
+            // `HashMap::with_hasher` and `HashSet::with_hasher` (const
+            // since Rust 1.85); `new` and `default` are not.
+            | HashWithHasher
             // `AtomicX::new` and `into_inner` are `const fn` (W-THREADS).
             | Sync(crate::check::sync::SyncOp::AtomicNew(_) | crate::check::sync::SyncOp::AtomicIntoInner | crate::check::sync::SyncOp::LockNew(_) | crate::check::sync::SyncOp::SyncNew(_))
             // Length and view queries on str, String, Vec, and slices.

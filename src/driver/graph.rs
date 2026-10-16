@@ -1185,6 +1185,11 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
             3u8.hash(h);
             p.ast.strings.get(*i as usize).map_or("", String::as_str).hash(h);
         }
+        // Hashed as the text, like a literal of the same text.
+        ConstValue::StrBytes(b) => {
+            3u8.hash(h);
+            std::str::from_utf8(b.as_slice()).unwrap_or("").hash(h);
+        }
         ConstValue::Unit => 4u8.hash(h),
         ConstValue::Aggregate(vals) => {
             5u8.hash(h);

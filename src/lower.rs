@@ -6762,6 +6762,7 @@ impl<'p> Lower<'p> {
             CV::Bool(b) => Operand::Const(Const::Bool(*b)),
             CV::Char(c) => Operand::Const(Const::Char(*c)),
             CV::Str(i) => Operand::Const(Const::Str(*i)),
+            CV::StrBytes(b) => Operand::Const(Const::StrBytes(b.clone())),
             CV::Bytes(b) if matches!(self.kind(ty), TyKind::Array(..)) => Operand::Const(Const::Bytes(b.clone())),
             CV::Unit => Operand::Const(Const::Unit),
             _ => {

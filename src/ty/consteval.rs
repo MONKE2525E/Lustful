@@ -42,6 +42,9 @@ pub enum ConstValue {
     Char(char),
     /// A string literal: an index into the AST string table. Its type is `&str`.
     Str(u32),
+    /// A `&str` made by evaluation, in no AST string table (a half of
+    /// `str::split_at`), as one shared UTF-8 buffer.
+    StrBytes(ast::ByteBlob),
     Unit,
     Aggregate(Vec<ConstValue>),
     Variant(u32, Vec<ConstValue>),
@@ -253,6 +256,16 @@ pub trait ConstCx<'a> {
     /// type, alias, trait, or primitive here: the path's error is then
     /// the unknown type (rustc E0433). Contexts that cannot tell say
     /// true.
+    /// The primitive a non-generic type alias names (`type IdCell =
+    /// u32;` gives "u32"), so `IdCell::MAX` reads `u32::MAX`.
+    fn alias_primitive(&self, _name: Sym) -> Option<&'static str> {
+        None
+    }
+    /// The hashed collection a type alias names (`FxHashMap<K, V>` is a
+    /// `HashMap`), for `Alias::with_hasher(s)` in const position.
+    fn alias_hash(&self, _name: Sym) -> Option<super::hash::HashTy> {
+        None
+    }
     fn names_type(&mut self, _name: Sym) -> bool {
         true
     }
@@ -1257,6 +1270,23 @@ impl Evaluator {
                     None => Err(outside(span, "this path")),
                 };
             }
+            // `<u64>::MAX`: an inherent const of a primitive by its
+            // qualified form.
+            Expr::QPath { self_ty, trait_path, segs } if segs.len() == 1 && trait_path.is_empty() => {
+                let t = cx.resolve_ty(*self_ty);
+                let item = segs[0].name;
+                let v = match cx.tys_ref().kind(t) {
+                    TyKind::Int(it) => self.int_assoc_const(cx, it.name(), cx.sym_text(item)),
+                    TyKind::Char => self.char_assoc_const(cx, item),
+                    TyKind::Float(f) => match primitive_float_assoc(f, cx.sym_text(item)) {
+                        Some((bits, None)) => Some((ConstValue::Float(bits, f), t)),
+                        Some((v, Some(it))) => Some((ConstValue::Int(v as i128), super::int(it))),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                return v.map(Flow::Val).ok_or_else(|| outside(span, "this path"));
+            }
             Expr::Block(b) => return self.block(cx, env, *b, expected),
             Expr::ConstBlock(b) => {
                 // An inline const is an item of its own: its tail
@@ -1502,7 +1532,7 @@ impl Evaluator {
                 if !extended && !self.is_place(cx, env, *expr) && cx.needs_drop(t) {
                     return Err(drop_diag(cx, t, span));
                 }
-                let (v, rt) = if let ConstValue::Str(_) = v {
+                let (v, rt) = if let ConstValue::Str(_) | ConstValue::StrBytes(_) = v {
                     return Ok(Flow::Val((v, t)));
                 } else if let Some(et) = expected
                     && let TyKind::Ref(_, _, s) = cx.tys_ref().kind(et)
@@ -1544,6 +1574,7 @@ impl Evaluator {
                         got => got,
                     },
                     ConstValue::Str(i) => (ConstValue::Str(i), t),
+                    ConstValue::StrBytes(b) => (ConstValue::StrBytes(b), t),
                     _ => return Err(outside(span, "this dereference")),
                 }
             }
@@ -2460,11 +2491,33 @@ impl Evaluator {
         }
         // Associated consts of integer types: `i64::MAX`, `usize::MAX`, `u8::MIN`, ...
         if segs.len() == 2 {
-            if let Some(v) = self.int_assoc_const(cx, segs) {
+            if let Some(v) = self.int_assoc_const(cx, cx.sym_text(segs[0].name), cx.sym_text(segs[1].name)) {
                 return Ok(v);
             }
-            if let Some(v) = self.char_assoc_const(cx, segs) {
+            if cx.sym_text(segs[0].name) == "char"
+                && let Some(v) = self.char_assoc_const(cx, segs[1].name)
+            {
                 return Ok(v);
+            }
+            // Through a type alias of a primitive (`IdCell::MAX`).
+            if !segs[0].has_args()
+                && let Some(prim) = cx.alias_primitive(segs[0].name)
+            {
+                let v = match prim {
+                    "char" => self.char_assoc_const(cx, segs[1].name),
+                    "f32" | "f64" => {
+                        let f = if prim == "f32" { FloatTy::F32 } else { FloatTy::F64 };
+                        match primitive_float_assoc(f, cx.sym_text(segs[1].name)) {
+                            Some((bits, None)) => Some((ConstValue::Float(bits, f), cx.tys().float_ty(f))),
+                            Some((v, Some(it))) => Some((ConstValue::Int(v as i128), super::int(it))),
+                            None => None,
+                        }
+                    }
+                    _ => self.int_assoc_const(cx, prim, cx.sym_text(segs[1].name)),
+                };
+                if let Some(v) = v {
+                    return Ok(v);
+                }
             }
         }
         // Inherent associated consts of user types: `Type::CONST`.
@@ -2515,12 +2568,10 @@ impl Evaluator {
     }
 
     /// `char::MAX`, `char::REPLACEMENT_CHARACTER`, and
-    /// `char::UNICODE_VERSION`, resolved by written names.
-    fn char_assoc_const<'a, C: ConstCx<'a>>(&self, cx: &mut C, segs: &[ast::PathSeg]) -> Option<TypedValue> {
-        if cx.sym_text(segs[0].name) != "char" {
-            return None;
-        }
-        match cx.sym_text(segs[1].name) {
+    /// `char::UNICODE_VERSION` by the item's written name (the caller
+    /// checks that the type is `char`).
+    fn char_assoc_const<'a, C: ConstCx<'a>>(&self, cx: &mut C, item: Sym) -> Option<TypedValue> {
+        match cx.sym_text(item) {
             "MAX" => Some((ConstValue::Char(char::MAX), CHAR)),
             "MIN" => Some((ConstValue::Char(char::MIN), CHAR)),
             "REPLACEMENT_CHARACTER" => Some((ConstValue::Char(char::REPLACEMENT_CHARACTER), CHAR)),
@@ -2537,10 +2588,8 @@ impl Evaluator {
     }
 
     /// `i32::MAX` and friends, resolved by written names.
-    fn int_assoc_const<'a, C: ConstCx<'a>>(&self, cx: &C, segs: &[ast::PathSeg]) -> Option<TypedValue> {
-        let ty_name = cx.sym_text(segs[0].name);
+    fn int_assoc_const<'a, C: ConstCx<'a>>(&self, _cx: &C, ty_name: &str, item: &str) -> Option<TypedValue> {
         let it = IntTy::ALL.iter().find(|i| i.name() == ty_name).copied()?;
-        let item = cx.sym_text(segs[1].name);
         let bits = it.bits();
         let v = match item {
             "MAX" => {
@@ -2911,6 +2960,40 @@ impl Evaluator {
                 let t = super::sync::sync_ty(cx.tys(), k, &[vt]);
                 return Ok((ConstValue::Aggregate(vec![v]), t));
             }
+        }
+        // `HashMap::with_hasher(s)` and `HashSet::with_hasher(s)` are
+        // const fns (Rust 1.85): an empty table around the hasher value.
+        // The table type is the expected one (a static, a field, a lock's
+        // payload), and the written type must name that kind (directly or
+        // through an alias such as rustc-hash's `FxHashMap`).
+        if let Expr::Path(segs) = cx.ast().expr(callee)
+            && let [.., ty_seg, f] = segs.as_slice()
+            && args.len() == 1
+            && cx.sym_text(f.name) == "with_hasher"
+            && f.type_args().is_empty()
+            && let Some(want) = expected
+            && let Some((k @ (super::hash::HashTy::HashMap | super::hash::HashTy::HashSet), targs)) = super::hash::hash_parts(cx.tys_ref(), want)
+            && (super::hash::HashTy::by_name(cx.sym_text(ty_seg.name)) == Some(k) || cx.alias_hash(ty_seg.name) == Some(k))
+        {
+            let s = *targs.last().unwrap_or(&ERROR);
+            let (hv, ht) = self.value_moved(cx, env, args[0], Some(s))?;
+            if !const_ty_compatible(cx.tys_ref(), ht, s) {
+                return Err(const_ty_mismatch(span, "this hasher"));
+            }
+            return Ok((ConstValue::Aggregate(vec![hv]), want));
+        }
+        // `BuildHasherDefault::new()` is a const fn (Rust 1.85): the unit
+        // builder, at the expected `BuildHasherDefault<H>`.
+        if let Expr::Path(segs) = cx.ast().expr(callee)
+            && let [.., ty_seg, f] = segs.as_slice()
+            && args.is_empty()
+            && cx.sym_text(f.name) == "new"
+            && f.type_args().is_empty()
+            && cx.sym_text(ty_seg.name) == "BuildHasherDefault"
+            && let Some(want) = expected
+            && matches!(super::hash::hash_parts(cx.tys_ref(), want), Some((super::hash::HashTy::BuildHasherDefault, _)))
+        {
+            return Ok((ConstValue::Unit, want));
         }
         // A call through a local (a fn pointer value): rustc rejects
         // fn pointer calls in const contexts. Never resolve the name
@@ -3642,10 +3725,28 @@ impl Evaluator {
         }
         let no_args = |args: &[ExprId]| args.is_empty();
         match &rv {
-            ConstValue::Str(i) => {
-                let text = cx.ast().strings[*i as usize].clone();
+            ConstValue::Str(_) | ConstValue::StrBytes(_) => {
+                let text = match &rv {
+                    ConstValue::Str(i) => cx.ast().strings[*i as usize].clone(),
+                    ConstValue::StrBytes(b) => String::from_utf8(b.as_slice().to_vec()).map_err(|_| outside_err())?,
+                    _ => unreachable!(),
+                };
                 let bytes = text.as_bytes();
                 match name.as_str() {
+                    // `str::split_at` is a const fn; off a char
+                    // boundary or past the end it panics, which is a
+                    // const evaluation error (rustc E0080).
+                    "split_at" if args.len() == 1 => {
+                        let mid = self.int_arg(cx, env, args[0], USIZE, span)?;
+                        let Some(mid) = usize::try_from(mid).ok().filter(|&m| text.is_char_boundary(m)) else {
+                            return Err(outside(span, "this `split_at` (the index is not a char boundary of the string)"));
+                        };
+                        let (a, b) = text.split_at(mid);
+                        let part = |x: &str| ConstValue::StrBytes(ast::ByteBlob::new(x.as_bytes().to_vec()));
+                        let ts = cx.tys().intern_tys(&[REF_STR, REF_STR]);
+                        let t = cx.tys().intern(TyKind::Tuple(ts));
+                        Ok((ConstValue::Aggregate(vec![part(a), part(b)]), t))
+                    }
                     "len" if no_args(args) => Ok((ConstValue::Int(bytes.len() as i128), USIZE)),
                     "is_empty" if no_args(args) => Ok((ConstValue::Bool(bytes.is_empty()), BOOL)),
                     "is_ascii" if no_args(args) => Ok((ConstValue::Bool(bytes.iter().all(|b| b.is_ascii())), BOOL)),
@@ -4766,14 +4867,19 @@ impl Evaluator {
                     let inner_v = (**inner_v).clone();
                     self.match_pat(cx, env, *inner, &inner_v, it, _in_match, binds)
                 }
-                ConstValue::Str(i) => {
-                    let s = ConstValue::Str(*i);
+                ConstValue::Str(_) | ConstValue::StrBytes(_) => {
+                    let s = v.clone();
                     self.match_pat(cx, env, *inner, &s, t, _in_match, binds)
                 }
                 _ => Ok(false),
             },
             Pat::Lit(l) => {
                 let (lv, _) = self.value(cx, env, *l, Some(t))?;
+                // Strings compare by text: a literal and an evaluated
+                // string (`StrBytes`) live in different tables.
+                if let (Some(a), Some(b)) = (str_bytes(cx, v), str_bytes(cx, &lv)) {
+                    return Ok(a == b);
+                }
                 Ok(values_eq(v, &lv))
             }
             Pat::Range { lo, hi, inclusive } => {
@@ -5128,6 +5234,10 @@ impl Evaluator {
     fn place_ty<'a, C: ConstCx<'a>>(&self, cx: &C, env: &Env, e: ExprId) -> Option<Ty> {
         match cx.ast().expr(e) {
             Expr::Path(segs) if segs.len() == 1 => env.iter().rev().find(|(n, _, _, _)| *n == segs[0].name).map(|(_, v, _, _)| v.1),
+            Expr::SelfValue => {
+                let s = self.self_sym?;
+                env.iter().rev().find(|(n, _, _, _)| *n == s).map(|(_, v, _, _)| v.1)
+            }
             Expr::Field { base, name } => {
                 let bt = self.place_ty(cx, env, *base)?;
                 let bt = match cx.tys_ref().kind(bt) {
@@ -5210,14 +5320,20 @@ impl Evaluator {
         // (E0493). A whole local that was moved out holds nothing,
         // so it alone may be assigned over.
         if !matches!(cx.ast().expr(e), Expr::Path(segs) if segs.len() == 1)
+            && !matches!(cx.ast().expr(e), Expr::SelfValue)
             && let Some(pt) = self.place_ty(cx, env, e)
             && cx.needs_drop(pt)
         {
             return Err(drop_diag(cx, pt, span));
         }
+        let whole = match cx.ast().expr(e) {
+            Expr::Path(segs) if segs.len() == 1 => Some(segs[0].name),
+            // A `mut self` receiver, bound as a local named `self`.
+            Expr::SelfValue => Some(self.self_sym.ok_or_else(|| outside(span, "`self` here"))?),
+            _ => None,
+        };
         match cx.ast().expr(e) {
-            Expr::Path(segs) if segs.len() == 1 => {
-                let name = segs[0].name;
+            _ if let Some(name) = whole => {
                 match env.iter_mut().rev().find(|(n, _, _, _)| *n == name) {
                     Some(slot) => {
                         if !slot.2 {
@@ -5330,6 +5446,29 @@ impl Evaluator {
                 let name = segs[0].name;
                 env.iter_mut().rev().find(|(n, _, _, _)| *n == name).map(|slot| &mut slot.1.0).ok_or_else(|| outside(span, "this assignment"))
             }
+            Expr::SelfValue => {
+                let name = self.self_sym.ok_or_else(|| outside(span, "`self` here"))?;
+                env.iter_mut().rev().find(|(n, _, _, _)| *n == name).map(|slot| &mut slot.1.0).ok_or_else(|| outside(span, "this assignment"))
+            }
+            // A named field of a struct place (`k.a[i] = v`).
+            Expr::Field { base, name } => {
+                let bt = self.place_ty(cx, env, *base).ok_or_else(|| outside(span, "this assignment"))?;
+                let bt = match cx.tys_ref().kind(bt) {
+                    TyKind::Ref(_, _, inner) => inner,
+                    _ => bt,
+                };
+                let adt = cx.tys_ref().local_adt(bt).ok_or_else(|| outside(span, "this assignment"))?;
+                let i = cx.variant_fields(adt, 0).iter().position(|(n, _)| n == name).ok_or_else(|| outside(span, "this assignment"))?;
+                let slot = self.place_slot(cx, env, *base, span)?;
+                match slot {
+                    ConstValue::Aggregate(vals) => vals.get_mut(i).ok_or_else(|| outside(span, "this assignment")),
+                    ConstValue::Ref(cell) => match &mut **cell {
+                        ConstValue::Aggregate(vals) => vals.get_mut(i).ok_or_else(|| outside(span, "this assignment")),
+                        _ => Err(outside(span, "this assignment")),
+                    },
+                    _ => Err(outside(span, "this assignment")),
+                }
+            }
             Expr::TupleField { base, index } => {
                 let slot = self.place_slot(cx, env, *base, span)?;
                 match slot {
@@ -5374,6 +5513,15 @@ fn map_rest(elems: &[PatId], n: usize, ast: &Ast) -> Option<Vec<(usize, PatId)>>
             }
             Some(out)
         }
+    }
+}
+
+/// The UTF-8 bytes of a string value (a literal or an evaluated one).
+fn str_bytes<'a, C: ConstCx<'a>>(cx: &C, v: &ConstValue) -> Option<Vec<u8>> {
+    match v {
+        ConstValue::Str(i) => Some(cx.ast().strings[*i as usize].as_bytes().to_vec()),
+        ConstValue::StrBytes(b) => Some(b.as_slice().to_vec()),
+        _ => None,
     }
 }
 
