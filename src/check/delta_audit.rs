@@ -266,11 +266,24 @@ pub(crate) fn redo_sig(p: &mut Program, f: LocalDefId, rpit: bool, errs: &mut Ve
         return Err("sig diag");
     }
     collect::install_fn(p, rec, Install::Replace(f));
+    // A trait impl method: `finish_trait_impl` compares it with the trait
+    // method before the signature checks run.
+    if loc_is_trait_impl(p, loc) && !generics::redo_impl_method(p, f, errs) {
+        return Err("sig loc");
+    }
+    if !errs.is_empty() {
+        return Err("sig diag");
+    }
     crate::check::object::check_fn_signature(p, f, errs);
     generics::check_fn_wf(p, f, errs);
     crate::check::outlives::check_queued(p, errs);
     generics::normalize_fn_sig(p, f.0 as usize);
     Ok(())
+}
+
+/// True for a method of a trait impl.
+fn loc_is_trait_impl(p: &Program, loc: FnLoc) -> bool {
+    matches!(loc, FnLoc::Impl(item, _) if matches!(&p.ast.items[item as usize].kind, crate::ast::ItemKind::Impl(imp) if imp.trait_ref.is_some()))
 }
 
 /// The record of one fn as `redo_sig` finds it: `undo` writes it back,

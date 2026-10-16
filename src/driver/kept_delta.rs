@@ -23,8 +23,9 @@
 // template keeps its parameter kinds), and a template in a build or in a
 // program with generic associated consts (its instances would keep their
 // old signatures); const fns and any fn const evaluation may reach
-// through const fn bodies (`ConstReach`, transitive); trait methods and
-// trait impl methods; lang and shipped std fns;
+// through const fn bodies (`ConstReach`, transitive); trait methods; trait
+// impl methods in a build, or of a trait whose impls no `ImplSet` read
+// covers (`generics::delta_impl_trait`); lang and shipped std fns;
 // main and #[test] fns; an `impl Trait` return that comes or goes; a fn
 // that a body revealing an opaque type names, unless that body reveals
 // again with the same hidden type (a plain fn's, or a template's check in
@@ -337,9 +338,20 @@ fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'sta
     let def = info.def(&p.ast);
     match info.loc {
         FnLoc::Item(_) => {}
-        // An inherent method of a local Adt (`inherent_self_pats`); trait
-        // impl methods answer to their trait's signature.
+        // An inherent method of a local Adt (`inherent_self_pats`).
         FnLoc::Impl(item, _) if p.gx.inherent_self_pats.contains_key(&f) && p.impl_parents.contains_key(&item) => {}
+        // A method of an impl of a user trait (`generics::delta_impl_trait`),
+        // in a check: `redo_sig` compares it with the trait method again,
+        // and every body that reads the trait's impl buckets checks again
+        // (`Touched`). A build's instances call it with their old checks;
+        // an `impl Trait` return in a trait impl refuses.
+        FnLoc::Impl(item, _) if p.impl_parents.contains_key(&item) && is_trait_impl(p, item) => {
+            if walk_instances || generics::delta_impl_trait(p, f).is_none() || p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f))) {
+                return Err("sig trait impl");
+            }
+        }
+        FnLoc::Trait(..) => return Err("sig trait"),
+        FnLoc::Nested(_) => return Err("sig nested"),
         _ => return Err("sig loc"),
     }
     if p.is_lang_method(f) || p.fn_shipped_crate(f).is_some() || p.std_source_span(def.name_span) {
@@ -374,15 +386,17 @@ fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'sta
 }
 
 /// The nodes a header delta of `fns` can move: the edited fns'
-/// signatures, and the bindings and method sets whose answers hash them
-/// (graph.rs `binding_fingerprint`, `method_set_fingerprint`). No other
-/// node reads an edited fn's record (every other fn keeps its signature
-/// and hidden type). A `Checked` read never holds by fingerprint.
+/// signatures, and the bindings, method sets and (for a trait impl
+/// method) impl buckets of its trait whose answers hash them (graph.rs
+/// `binding_fingerprint`, `method_set_fingerprint`, `impl_content`). No
+/// other node reads an edited fn's record (every other fn keeps its
+/// signature and hidden type). A `Checked` read never holds by fingerprint.
 /// A successful delta leaves its set in `Caches::header_moves` (the
 /// compile tail's keyed walk, read only).
 pub(crate) struct Touched {
     defs: Vec<crate::def::DefId>,
     names: Vec<crate::intern::Sym>,
+    traits: Vec<crate::def::DefId>,
     seen: crate::intern::FxMap<ReadKey, bool>,
 }
 
@@ -390,12 +404,12 @@ impl Touched {
     fn new(p: &Program, fns: &[usize]) -> Touched {
         let defs = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
         let names = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
-        Touched { defs, names, seen: Default::default() }
+        Touched { defs, names, traits: impl_traits(p, fns), seen: Default::default() }
     }
 
     /// True when the delta may move the fingerprint of `k`.
     pub(crate) fn hit(&mut self, p: &Program, k: &ReadKey) -> bool {
-        let (defs, names) = (&self.defs, &self.names);
+        let (defs, names, traits) = (&self.defs, &self.names, &self.traits);
         *self.seen.entry(*k).or_insert_with(|| match k {
             ReadKey::Sig(d) => defs.contains(d),
             ReadKey::MethodSet(m) => names.contains(&m.name),
@@ -403,9 +417,23 @@ impl Touched {
                 names.contains(&b.name) || matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d))
             }
             ReadKey::Checked(_) => true,
-            ReadKey::ImplSet(_) | ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => false,
+            ReadKey::ImplSet(s) => traits.contains(&s.trait_),
+            ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => false,
         })
     }
+}
+
+/// The traits of the trait impls that hold the edited fns `fns`.
+fn impl_traits(p: &Program, fns: &[usize]) -> Vec<crate::def::DefId> {
+    let mut out: Vec<crate::def::DefId> = fns.iter().filter_map(|&i| generics::delta_impl_trait(p, LocalDefId(i as u32))).collect();
+    out.sort_unstable_by_key(|d| (d.krate, d.hash.0));
+    out.dedup();
+    out
+}
+
+/// True when item `item` is a trait impl.
+fn is_trait_impl(p: &Program, item: u32) -> bool {
+    matches!(&p.ast.items[item as usize].kind, crate::ast::ItemKind::Impl(imp) if imp.trait_ref.is_some())
 }
 
 /// Discovery bases one kept program holds: (AST fn index, its output as
@@ -436,7 +464,7 @@ fn own_bases(p: &Program, front: &Front, caches: &Caches, fns: &[usize]) -> Base
 fn readers(p: &Program, reuse: &crate::driver::gen_reuse::GenReuse, fns: &[usize]) -> crate::intern::FxMap<crate::def::DefId, ()> {
     let defs: Vec<crate::def::DefId> = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
     let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
-    reuse.readers(&defs, &names)
+    reuse.readers(&defs, &names, &impl_traits(p, fns))
 }
 
 /// The fns whose bodies reveal an opaque type and name one of the edited

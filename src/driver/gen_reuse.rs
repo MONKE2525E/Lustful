@@ -174,6 +174,8 @@ enum ReaderKey {
     Name(crate::intern::Sym),
     Def(DefId),
     Checked,
+    /// An `ImplSet` read of a bucket of this trait (any head).
+    Trait(DefId),
 }
 
 impl GenReuse {
@@ -541,9 +543,11 @@ impl GenReuse {
     /// The defs whose stored entry may read a node a header delta of the
     /// fns `defs` (named `names`) moves: their signatures, the bindings
     /// that resolve to them or share a name, the method sets of a name,
+    /// the impl buckets of `traits` (an edited trait impl method's trait),
     /// and every `Checked` read (`untouched_by` takes the set).
-    pub(crate) fn readers(&self, defs: &[DefId], names: &[crate::intern::Sym]) -> FxMap<DefId, ()> {
+    pub(crate) fn readers(&self, defs: &[DefId], names: &[crate::intern::Sym], traits: &[DefId]) -> FxMap<DefId, ()> {
         let keys = defs.iter().flat_map(|&d| [ReaderKey::Sig(d), ReaderKey::Def(d)]).chain(names.iter().map(|&n| ReaderKey::Name(n)));
+        let keys = keys.chain(traits.iter().map(|&t| ReaderKey::Trait(t)));
         keys.chain([ReaderKey::Checked]).filter_map(|k| self.readers_index.get(&k)).flatten().map(|&d| (d, ())).collect()
     }
 
@@ -570,7 +574,8 @@ impl GenReuse {
                         }
                     }
                     ReadKey::Checked(_) => add(ReaderKey::Checked),
-                    ReadKey::ImplSet(_) | ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => {}
+                    ReadKey::ImplSet(k) => add(ReaderKey::Trait(k.trait_)),
+                    ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => {}
                 }
             }
             n

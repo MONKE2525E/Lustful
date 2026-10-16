@@ -7413,6 +7413,40 @@ pub fn finish_trait_impl(
     }
 }
 
+/// The trait of the trait impl that holds method `f`, when the header
+/// delta can take an edit of `f` (driver/kept_delta.rs): a local user
+/// trait outside std whose impls `ImplSet` reads cover
+/// (`Program::impls_read_covered`), with a written template for the
+/// method. Operators and `for` loops reach only lang traits, which name
+/// no read; these callers all read the trait's impl buckets.
+pub(crate) fn delta_impl_trait(p: &Program, f: LocalDefId) -> Option<DefId> {
+    let impl_def = p.defs.get(p.def_id(f)).and_then(|d| d.parent)?;
+    let (_, rec) = p.gx.index.by_def(impl_def)?;
+    let tr = p.gx.index.trait_record(rec.trait_def)?;
+    let user = tr.local && !p.std_source_span(tr.span) && p.shipped_crate_at(tr.span).is_none() && p.impls_read_covered(tr.def);
+    let method = tr.method_by_name(p.fn_info(f).name)?;
+    (user && matches!(rec.synthetic, crate::traits::index::Synthetic::None) && p.gx.trait_methods.contains_key(&method)).then_some(tr.def)
+}
+
+/// `finish_trait_impl`'s work for one method `f` of a trait impl, after a
+/// header delta wrote its new record (`delta_audit::redo_sig`): the compare
+/// against the trait method, then the rewrite of the impl's own
+/// associated types in its signature. False when `f` is not such a method.
+pub(crate) fn redo_impl_method(p: &mut Program, f: LocalDefId, errs: &mut Vec<Diag>) -> bool {
+    let Some(impl_def) = p.defs.get(p.def_id(f)).and_then(|d| d.parent) else { return false };
+    let Some((_, rec)) = p.gx.index.by_def(impl_def) else { return false };
+    let (tr, generics, assoc_tys, span) = (rec.trait_ref, rec.generics.clone(), rec.assoc_tys.clone(), rec.span);
+    let Some(method) = p.gx.index.trait_record(tr.def).and_then(|r| r.method_by_name(p.fn_info(f).name)) else { return false };
+    let Some(tmpl) = p.gx.trait_methods.get(&method).cloned() else { return false };
+    validate_method_sig(p, &tmpl, f, tr, generics.params.len(), &generics.predicates, &assoc_tys, span, errs);
+    let (params, ret) = (p.fn_info(f).params.clone(), p.fn_info(f).ret);
+    let params: Vec<Ty> = params.into_iter().map(|t| rewrite_own_projections(p, t, tr.args, &assoc_tys)).collect();
+    let ret = rewrite_own_projections(p, ret, tr.args, &assoc_tys);
+    let info = &mut p.fns[f.0 as usize];
+    (info.params, info.ret) = (params, ret);
+    true
+}
+
 /// True when const parameter `idx` occurs in a type (in an
 /// array length or a const argument).
 pub fn ty_uses_const_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
