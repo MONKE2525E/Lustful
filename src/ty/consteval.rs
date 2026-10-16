@@ -4129,13 +4129,8 @@ impl Evaluator {
                     };
                     Ok(self.opt_value(cx, rt, r.map(ConstValue::Int)))
                 }
-                "saturating_neg" => {
-                    if signed {
-                        int_v(if xs == lo { hi_s } else { -xs })
-                    } else {
-                        int_v(0)
-                    }
-                }
+                // Signed only in std (rustc E0599 on unsigned types).
+                "saturating_neg" if signed => int_v(if xs == lo { hi_s } else { -xs }),
                 "wrapping_neg" => bits_v(0u128.wrapping_sub(xb)),
                 "strict_neg" => {
                     if (signed && xs == lo) || (!signed && xb != 0) {
@@ -4260,9 +4255,12 @@ impl Evaluator {
         // runs in i128 (exact below 128-bit widths, where the
         // checker keeps these). The overflowing forms stay out,
         // with the plain overflowing family above.
+        // std has the `_unsigned` forms on signed types only and the
+        // `_signed` forms on unsigned types only (rustc E0599 otherwise).
+        let suffix_ok = if signed { name.ends_with("_unsigned") } else { name.ends_with("_signed") && name != "checked_signed_diff" };
         let mixed_kind = ["checked_", "wrapping_", "saturating_", "strict_"]
             .iter()
-            .find(|p| name.starts_with(**p) && (name.ends_with("_unsigned") || name.ends_with("_signed") && name != "checked_signed_diff"));
+            .find(|p| suffix_ok && (name.starts_with(&format!("{p}add_")) || name.starts_with(&format!("{p}sub_"))));
         if let Some(kind) = mixed_kind {
             if width >= 128 {
                 return Err(outside_err());
