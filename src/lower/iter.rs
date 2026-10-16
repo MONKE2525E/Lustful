@@ -5855,15 +5855,18 @@ impl Ex<'_, '_> {
             self.goto(join);
         } else {
             // First item, then `max(MIN_NON_ZERO_CAP, lower + 1)`, then
-            // `extend_desugared`: reserve `lower + 1` whenever full.
+            // `extend_desugared`: reserve `lower + 1` whenever full. The
+            // amortized reserve of an empty Vec is that capacity (the
+            // runtime knows the element size, which the Rust layout of a
+            // std source type such as `Cell<T>` does not give here).
             let (_, n, first, _) = self.pull(&itp, ty)?;
             let (lo, _) = self.hint(itp.clone(), ty)?;
             let l1 = self.local(USIZE);
             self.call_builtin(Builtin::SaturatingAdd, vec![Operand::Copy(Place::local(lo)), Self::usize_c(1)], Place::local(l1));
-            let cap = self.local(USIZE);
-            let min_cap = self.min_non_zero_cap(elem)?;
-            self.call_builtin(Builtin::Max, vec![Self::usize_c(min_cap), Operand::Copy(Place::local(l1))], Place::local(cap));
-            with_capacity(self, Operand::Copy(Place::local(cap)));
+            self.assign(Place::local(v), Rvalue::VecLit(elem, Vec::new()));
+            let rvm = self.ref_to(true, Place::local(v), vec_ty);
+            let u = self.local(UNIT);
+            self.call_builtin(Builtin::VecReserve, vec![Operand::Move(Place::local(rvm)), Operand::Copy(Place::local(l1))], Place::local(u));
             push(self, first);
             let lp = self.block();
             self.goto(lp);
@@ -5990,18 +5993,5 @@ impl Ex<'_, '_> {
     fn layout(&self, t: Ty) -> Result<(u64, u64), String> {
         let l = crate::ty::layout::layout_of_ty(&self.body.tys, self.p, t).map_err(|_| "iterator expansion: element layout unknown".to_string())?;
         Ok((l.size, l.align))
-    }
-
-    /// `RawVec::MIN_NON_ZERO_CAP` for an element type: 8 for 1-byte
-    /// elements, 4 up to 1024 bytes, else 1.
-    fn min_non_zero_cap(&self, elem: Ty) -> Result<u64, String> {
-        let l = crate::ty::layout::layout_of_ty(&self.body.tys, self.p, elem).map_err(|_| "iterator expansion: element layout unknown".to_string())?;
-        Ok(if l.size == 1 {
-            8
-        } else if l.size <= 1024 {
-            4
-        } else {
-            1
-        })
     }
 }
