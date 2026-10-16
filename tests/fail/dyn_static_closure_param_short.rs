@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // rustc: lifetime may not live long enough. The annotation `Rc<dyn P>` equals the expected
 // input `Rc<dyn P + 'a>`, which is not `'static`.
 use std::rc::Rc;

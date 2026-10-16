@@ -3558,9 +3558,8 @@ fn dyn_lifetime_unwritten(ast: &Ast, t: ast::TyId) -> bool {
 }
 
 /// A region signature's type arg `elem` of a std type whose param has a
-/// lifetime bound (`MutexGuard<'a, T: ?Sized + 'a>`, the `RwLock` guards,
-/// `Cow<'a, B: ?Sized + 'a>`; not the `RefCell` guards, whose arm says
-/// why): a `dyn` written there
+/// lifetime bound (`MutexGuard<'a, T: ?Sized + 'a>`, the `RwLock` and
+/// `RefCell` guards, `Cow<'a, B: ?Sized + 'a>`): a `dyn` written there
 /// with no lifetime bound has that lifetime `r` as its object lifetime
 /// (rustc's default from the containing type's bound), not `'static`.
 fn bounded_arg_default(ast: &Ast, tys: &mut impl TyIntern, seg: &ast::PathSeg, elem: Ty, r: Region) -> Ty {
@@ -4009,14 +4008,14 @@ pub(crate) fn resolve_path_ty(
         // `RefCell<dyn Tr>` behind a pointer is check/own.rs's, and
         // `Weak<dyn Tr>` is cgen/own.rs's; their object lifetime
         // defaults as for `Box<dyn Tr>`.
-        // A guard over `dyn Tr` (`RefMut<'_, dyn Tr>`) takes the same
-        // default here and in region signatures. rustc's is the guard's
-        // lifetime (`T: ?Sized + 'b`); lust keeps `'static` because the
-        // guards' unsizing coercion (`RefMut<'b, dyn Tr + 'static>` to
-        // `RefMut<'b, dyn Tr + 'b>`) is not modeled. Known gap (R26,
-        // tf-dynlife-2 report): a guard's object is taken as `'static`.
+        // A guard over `dyn Tr` (`RefMut<'_, dyn Tr>`) takes the guard's
+        // lifetime (`T: ?Sized + 'b`, RFC 599): erased here (a caller's
+        // lifetime), the guard's region in region signatures. A guard
+        // over a `'static` object coerces to it (`Ctx::guard_unsize`).
         let dyn_cell = matches!(n, "RefCell" | "Weak" | "Ref" | "RefMut") && matches!(tys.kind(elem), TyKind::Dyn(..));
+        let guard = matches!(n, "Ref" | "RefMut");
         if dyn_cell
+            && !guard
             && scope.infer_cell.is_none()
             && matches!(scope.regions, RegionMode::Erase)
             && let TyKind::Dyn(b, Region::Erased) = tys.kind(elem)
@@ -4026,7 +4025,6 @@ pub(crate) fn resolve_path_ty(
         {
             elem = tys.intern(TyKind::Dyn(b, Region::Static));
         }
-        let guard = matches!(n, "Ref" | "RefMut");
         // `rc::Weak<str>` and `rc::Weak<[T]>` hold the Rc's fat value (cgen/own.rs).
         let weak_fat = n == "Weak" && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str);
         if !dyn_cell && !guard && !weak_fat && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
@@ -4048,6 +4046,7 @@ pub(crate) fn resolve_path_ty(
                 _ => None,
             };
             let r = scope_region(interner, scope, written, span)?;
+            let elem = bounded_arg_default(ast, tys, seg, elem, r);
             let def = which(tys.builtins());
             return Ok(tys.mk_adt(def, &[GenericArg::Lifetime(r), GenericArg::Ty(elem)]));
         }

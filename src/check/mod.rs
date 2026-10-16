@@ -6677,7 +6677,8 @@ impl<'p> Ctx<'p> {
                     self.mismatch(span, expected, found);
                     return false;
                 }
-                self.dyn_regions(found, expected, false, span);
+                let (f, x) = self.guard_unsize(found, expected).unwrap_or((found, expected));
+                self.dyn_regions(f, x, false, span);
                 Coerce::None
             }
         };
@@ -6721,6 +6722,21 @@ impl<'p> Ctx<'p> {
             }
             None => {}
         }
+    }
+
+    /// The object types of a `RefCell` guard coercion (`RefMut<'b, dyn Tr +
+    /// 'static>` to `RefMut<'b, dyn Tr + 'b>`, std's `CoerceUnsized` for
+    /// `Ref` and `RefMut`): at a coercion site, the guard's object
+    /// lifetime may shorten, as for `&mut dyn Tr`. None for other types.
+    fn guard_unsize(&mut self, found: Ty, expected: Ty) -> Option<(Ty, Ty)> {
+        let (f, e) = (self.deep(found), self.deep(expected));
+        let b = self.tys.builtin_of(f);
+        if !matches!(b, Some(BuiltinTy::RefGuard | BuiltinTy::RefMutGuard)) || b != self.tys.builtin_of(e) {
+            return None;
+        }
+        let (TyKind::Adt(_, af), TyKind::Adt(_, ae)) = (self.tys.kind(f), self.tys.kind(e)) else { return None };
+        let (xf, xe) = (self.tys.args(af).iter().find_map(|g| g.as_ty())?, self.tys.args(ae).iter().find_map(|g| g.as_ty())?);
+        matches!((self.tys.kind(xf), self.tys.kind(xe)), (TyKind::Dyn(..), TyKind::Dyn(..))).then_some((xf, xe))
     }
 
     /// `dyn_regions` over two unified types, in parallel. Sets
@@ -6773,9 +6789,14 @@ impl<'p> Ctx<'p> {
                 let (a, b) = (self.tys.tys_of(a).to_vec(), self.tys.tys_of(b).to_vec());
                 a.into_iter().zip(b).find_map(|(x, y)| self.region_walk(x, y, invariant, need_static, depth + 1))
             }
-            // `Option`, `Result`, and `Vec` are covariant.
+            // `Option`, `Result`, `Vec`, `Box`, `Rc`, `Arc`, and the
+            // shared guards `Ref` and `RwLockReadGuard` are covariant.
             (TyKind::Adt(df, af), TyKind::Adt(de, ae)) if df == de => {
-                let covariant = matches!(self.tys.builtin_of(f), Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec));
+                let covariant = matches!(
+                    self.tys.builtin_of(f),
+                    Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::RefGuard)
+                        | Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::RwLockReadGuard))
+                );
                 self.args_walk(af, ae, invariant || !covariant, need_static, depth)
             }
             (TyKind::FnPtr(sf), TyKind::FnPtr(se)) => {

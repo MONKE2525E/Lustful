@@ -686,6 +686,22 @@ fn adt_late_marks(tys: &impl TyIntern, args: ArgsId) -> Vec<bool> {
     tys.args(args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r == crate::ty::DYN_LATE) } else { None }).collect()
 }
 
+/// The pointees of two pointers whose object lifetime a coercion may
+/// shorten (`Builder::relate`): `&`/`&mut dyn Tr` with free regions, or,
+/// with `guards`, the same `RefCell` guard (`Ref`, `RefMut`) over `dyn Tr`.
+fn outer_dyn_pointees(tys: &impl TyIntern, a: Ty, b: Ty, guards: bool) -> Option<(Ty, Ty)> {
+    let (ai, bi) = match (tys.kind(a), tys.kind(b)) {
+        (TyKind::Ref(ra, _, ai), TyKind::Ref(rb, _, bi)) if !bound(ra) && !bound(rb) => (ai, bi),
+        (TyKind::Adt(da, xa), TyKind::Adt(db, xb))
+            if guards && da == db && matches!(tys.builtin_of(a), Some(BuiltinTy::RefGuard | BuiltinTy::RefMutGuard)) =>
+        {
+            (tys.args(xa).iter().find_map(|g| g.as_ty())?, tys.args(xb).iter().find_map(|g| g.as_ty())?)
+        }
+        _ => return None,
+    };
+    matches!((tys.kind(ai), tys.kind(bi)), (TyKind::Dyn(..), TyKind::Dyn(..))).then_some((ai, bi))
+}
+
 /// The variance of a builtin type's region params: covariant, but for
 /// `thread::Scope<'scope, 'env>`, invariant in both (std's
 /// `PhantomData<&'scope mut &'scope ()>`), which pins a scoped spawn's
@@ -2492,6 +2508,13 @@ pub(super) struct Builder<'b, 'p> {
     /// variance of the dyn types' own position, and the vars of the other
     /// side that a late-bound (`DYN_LATE`) position met.
     dyn_walk: Option<(Variance, Vec<u32>)>,
+    /// True while a value flows into a coercion site whose target type is
+    /// written: the return place `_0`, or a call argument whose declared
+    /// param type is a `RefCell` guard over `dyn Tr` (not a type param).
+    /// There a guard's object lifetime may shorten (`relate`,
+    /// `call_cell`). Elsewhere a guard stays invariant: lust cannot tell a
+    /// coercion site from a move into an inferred place (`let o = Some(g)`).
+    guard_coerce: bool,
     /// The capture var of each local that may hold an `impl Trait` value
     /// (`Body::opaque_locals`): the regions the opaque type captures
     /// (edition 2024: every argument region of the defining call), which
@@ -2535,6 +2558,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             root_check: None,
             bind_tys: FxMap::default(),
             dyn_walk: None,
+            guard_coerce: false,
             inst_inv: (false, None),
             inst_ret: false,
             seed_binds: Vec::new(),
@@ -2869,13 +2893,12 @@ impl<'b, 'p> Builder<'b, 'p> {
         // A value flowing into a place is a coercion site: rustc may
         // shorten the object lifetime of the outermost `&`/`&mut dyn`
         // (`&'r mut (dyn Tr + 'a)` to `&'r mut (dyn Tr + 'b)`, `'a: 'b`),
-        // which plain `&mut` invariance would equate.
+        // which plain `&mut` invariance would equate. The `RefCell` guards
+        // coerce the same way (`RefMut<'r, dyn Tr + 'a>`, std's
+        // `CoerceUnsized`), here only at a written target (`guard_coerce`);
+        // their one region slot comes first too.
         if v == Variance::Co
-            && let (TyKind::Ref(ra, _, ai), TyKind::Ref(rb, _, bi)) = (self.body.tys.kind(a), self.body.tys.kind(b))
-            && !bound(ra)
-            && !bound(rb)
-            && matches!(self.body.tys.kind(ai), TyKind::Dyn(..))
-            && matches!(self.body.tys.kind(bi), TyKind::Dyn(..))
+            && let Some((ai, bi)) = outer_dyn_pointees(&self.body.tys, a, b, self.guard_coerce)
             && !av.is_empty()
             && !bv.is_empty()
         {
@@ -3404,7 +3427,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                     return;
                 }
                 let dt = self.place(dest, &mut dv, &mut d);
+                self.guard_coerce = dest.local == 0 && dest.proj.is_empty();
                 self.relate(ot, &ov, dt, &dv, Variance::Co);
+                self.guard_coerce = false;
             }
             // A fn item coerced to a fn pointer (W-BORROW3, `fnptr`).
             Rvalue::FnValue(f, ty) if matches!(self.body.tys.kind(*ty), TyKind::FnPtr(_)) => {
@@ -4702,7 +4727,12 @@ impl<'b, 'p> Builder<'b, 'p> {
                 && !av.is_empty()
                 && self.relate(el, &av[1..], rl, &dv, Variance::Co) => {}
             _ if let CallTarget::Builtin(b) = target
-                && self.call_cell(b, &avs, dt, &dv) => {}
+                && {
+                    self.guard_coerce = dest.local == 0 && dest.proj.is_empty();
+                    let done = self.call_cell(b, &avs, dt, &dv);
+                    self.guard_coerce = false;
+                    done
+                } => {}
             _ if let CallTarget::Builtin(b) = target
                 && self.call_poison(b, &avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(b) = target
@@ -5173,7 +5203,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             B::RefCellBorrow | B::RefCellBorrowMut | B::RefCellTryBorrow | B::RefCellTryBorrowMut => {
                 let Some(&g) = dv.first() else { return true };
                 self.edge(rv[0], g);
-                let v = if matches!(b, B::RefCellBorrowMut | B::RefCellTryBorrowMut) { Variance::Inv } else { Variance::Co };
+                // A `RefMut` over `dyn Tr` returned at once coerces into the
+                // return place (`guard_coerce`): its object lifetime may
+                // shorten there.
+                let to_dyn = self.guard_coerce && b == B::RefCellBorrowMut && matches!(self.body.tys.kind(elem), TyKind::Dyn(..));
+                let v = if matches!(b, B::RefCellBorrowMut | B::RefCellTryBorrowMut) && !to_dyn { Variance::Inv } else { Variance::Co };
                 if !self.relate(elem, &tv, elem, &dv[1..], v) {
                     self.equate_all(&tv, &dv[1..]);
                 }
@@ -6777,7 +6811,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             let mut pv = Vec::new();
             ok &= self.inst(sig.params[i], et, &univ, &mut binds, &mut pv);
             if !av.is_empty() {
+                self.guard_coerce = !has_param(params[i]) && outer_dyn_pointees(&self.p.tys, params[i], params[i], true).is_some();
                 ok &= self.relate(*at, av, et, &pv, Variance::Co);
+                self.guard_coerce = false;
             }
         }
         let er = if has_param(ret) { dt } else { ret };

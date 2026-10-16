@@ -884,8 +884,8 @@ pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 
 /// True when a dyn type with an erased object lifetime sits in an
 /// invariant position of the return type `t`: under `&mut` or `*mut`
-/// (other than a dyn pointee of the outer reference, which a return
-/// coerces), a user Adt (lust computes no variance), a fn pointer, or
+/// (other than a dyn pointee of the outer reference or `RefMut`, which a
+/// return coerces), a user Adt (lust computes no variance), a fn pointer, or
 /// trait args. A body value that flows there gets the caller's object
 /// lifetime, so it cannot also be `'static` (`Ctx::dyn_static_clean`).
 pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
@@ -901,7 +901,11 @@ pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool
             TyKind::Slice(e) | TyKind::Array(e, _) => go(p, tys, e, inv, depth + 1),
             TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(p, tys, e, inv, depth + 1)),
             TyKind::Adt(_, a) => {
-                let covariant = matches!(tys.builtin_of(t), Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec));
+                let covariant = matches!(
+                    tys.builtin_of(t),
+                    Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::RefGuard)
+                        | Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::RwLockReadGuard))
+                );
                 args_go(a, inv || !covariant)
             }
             TyKind::FnPtr(sig) => {
@@ -914,6 +918,14 @@ pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool
     }
     match tys.kind(t) {
         TyKind::Ref(_, _, e) if matches!(tys.kind(e), TyKind::Dyn(..)) => go(p, tys, e, false, 1),
+        // A `RefMut` over `dyn Tr` coerces as `&mut dyn Tr` does.
+        TyKind::Adt(_, a)
+            if tys.builtin_of(t) == Some(BuiltinTy::RefMutGuard)
+                && let Some(e) = tys.args(a).iter().find_map(|g| g.as_ty())
+                && matches!(tys.kind(e), TyKind::Dyn(..)) =>
+        {
+            go(p, tys, e, false, 1)
+        }
         _ => go(p, tys, t, false, 0),
     }
 }

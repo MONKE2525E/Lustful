@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0733
 // rustc: lifetime may not live long enough. `x`'s object lifetime is `'a`, and `need` takes
 // `&Rc<dyn P>` (`'static`); the body also makes a dyn value from a borrow.
 use std::rc::Rc;
