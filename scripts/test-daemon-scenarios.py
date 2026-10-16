@@ -90,18 +90,19 @@ def cargo_scenario(srcdir, name, work, env, daemon):
         crc, cout, cerr = run([LUST, "run", root, *flags, "-o", os.path.join(work, "c.bin")], work, cenv)
         if (wrc, wout, first_code(werr)) != (crc, cout, first_code(cerr)):
             problems.append(f"{tag}: warm != cold: warm=({wrc},{wout!r},{werr[:200]!r}) cold=({crc},{cout!r},{cerr[:200]!r})")
+        # A compile reject, not a run that failed (a panic exits 101 after a build that passed).
+        rejects = lambda rc, err: rc != 0 and (first_code(err) is not None or err.lstrip().startswith("error"))  # noqa: E731
         sel = [f for f in cmd[1:] if f != "--offline"]
         genv = dict(wenv, CARGO_TARGET_DIR=work + "-cargo-target")
         brc, _, berr = run(["cargo", "build", "-q", "--offline", *sel], work, genv, timeout=300)
         if brc != 0:
-            for mode, rc, out in (("warm", wrc, wout), ("cold", crc, cout)):
-                if rc == 0:
+            for mode, rc, out, err in (("warm", wrc, wout, werr), ("cold", crc, cout, cerr)):
+                if not rejects(rc, err):
                     problems.append(f"{tag}: {mode} accepts but cargo rejects; {mode} out={out!r} cargo={berr[-300:]!r}")
             continue
         grc, gout, _ = run(["cargo", "run", "-q", "--offline", *sel], work, genv, timeout=300)
         grc = 128 - grc if grc < 0 else grc  # killed by a signal: the shell's code, as lust's client gives it
-        # A compile reject (not a run that failed) in both modes: lust is a subset.
-        rejects = lambda rc, err: rc != 0 and (first_code(err) is not None or err.lstrip().startswith("error"))  # noqa: E731
+        # A compile reject in both modes: lust is a subset.
         if rejects(wrc, werr) and rejects(crc, cerr):
             notes.append(f"{tag}: lust rejects what cargo accepts: {werr[:160]!r}")
             continue
