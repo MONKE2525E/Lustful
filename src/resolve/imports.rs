@@ -85,6 +85,16 @@ pub struct Bind {
     pub def_module: ModuleId,
 }
 
+/// One pending single import (`ResolvedTables::pending_single`).
+#[derive(Clone, Debug)]
+pub struct PendingSingle {
+    pub span: Span,
+    pub vis: VisKind,
+    pub mod_path: Vec<Sym>,
+    pub leading_colon: bool,
+    pub last: Sym,
+}
+
 /// One name in one namespace of one module.
 #[derive(Clone, Debug)]
 pub enum BindState {
@@ -229,14 +239,20 @@ pub struct ResolvedTables {
     /// Fixpoint state only; the final answer stays in `maps`.
     pub glob_src: FxMap<(ModuleId, u8, Sym), ModuleId>,
     /// The single imports (`use a::b::n;`) each module still waits on,
-    /// by bound name, with each import's span and visibility. rustc
+    /// by bound name, with each import's span, visibility, module path,
+    /// leading `::`, and the name it reads. rustc
     /// hides a module's glob binding of a name while a single import of
     /// that name there is pending (`NameResolution::binding`): a glob of
     /// that module does not copy it yet, and a single import elsewhere
     /// that can see the pending one waits, so no importer reads a
     /// binding the single import later replaces. Fixpoint state of
     /// `run_imports` only.
-    pub pending_single: FxMap<(ModuleId, Sym), Vec<(Span, VisKind)>>,
+    pub pending_single: FxMap<(ModuleId, Sym), Vec<PendingSingle>>,
+    /// False once the fixpoint stalls with imports still waiting: the
+    /// wait rule of `single_pending_for` then stops, so an import cycle
+    /// the rule cannot order still resolves (`finalize_singles` checks
+    /// the result).
+    pub pending_wait: bool,
     /// The bindings single imports made: (import span, importing
     /// module, source module, name read, namespace, target). rustc
     /// checks each import again against the final tables
@@ -390,6 +406,7 @@ impl ResolvedTables {
             std_glob_aliases: FxMap::default(),
             glob_src: FxMap::default(),
             pending_single: FxMap::default(),
+            pending_wait: true,
             single_binds: Vec::new(),
             ambig_vis: FxMap::default(),
             ambig_single: Vec::new(),
@@ -1927,9 +1944,13 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     tables.pending_single.clear();
     tables.ambig_single.clear();
     tables.single_binds.clear();
+    tables.pending_wait = true;
     for imp in imports {
-        if let ImportKind::Single { name, .. } = &imp.kind {
-            tables.pending_single.entry((imp.module, *name)).or_default().push((imp.span, imp.vis.clone()));
+        if let ImportKind::Single { name, path } = &imp.kind
+            && let Some((&last, mod_path)) = path.split_last()
+        {
+            let p = PendingSingle { span: imp.span, vis: imp.vis.clone(), mod_path: mod_path.to_vec(), leading_colon: imp.leading_colon, last };
+            tables.pending_single.entry((imp.module, *name)).or_default().push(p);
         }
     }
     let cap = tables.modules.len() + 2;
@@ -1962,6 +1983,10 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
             }
         }
         pending = still;
+        if !pending.is_empty() && !changed && tables.pending_wait {
+            tables.pending_wait = false;
+            continue;
+        }
         if pending.is_empty() || !changed {
             break;
         }
@@ -2799,7 +2824,7 @@ fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: 
 /// settled (`pending_single`).
 fn settle_single(tables: &mut ResolvedTables, module: ModuleId, name: Sym, span: Span) {
     if let Some(list) = tables.pending_single.get_mut(&(module, name)) {
-        list.retain(|(s, _)| *s != span);
+        list.retain(|p| p.span != span);
         if list.is_empty() {
             tables.pending_single.remove(&(module, name));
         }
@@ -2807,14 +2832,32 @@ fn settle_single(tables: &mut ResolvedTables, module: ModuleId, name: Sym, span:
 }
 
 /// True when module `src` has a pending single import of `name` that
-/// code in `from` can see: a glob binding of the name in `src` may
-/// still be replaced, so a single import from `from` waits (rustc's
-/// `single_imports` check in `resolve_ident_in_module`).
+/// code in `from` can see and that could still bind the name: a glob
+/// binding of the name in `src` may yet be replaced, so a single import
+/// from `from` waits (rustc's `single_imports` check in
+/// `resolve_ident_in_module`). The pending import could bind it when
+/// its module path is not resolved yet, or when its source module has
+/// a binding of the name the pending import's module can see.
 fn single_pending_for(tables: &ResolvedTables, src: ModuleId, name: Sym, from: ModuleId, interner: &Interner) -> bool {
-    tables
-        .pending_single
-        .get(&(src, name))
-        .is_some_and(|list| list.iter().any(|(_, vis)| tables.visible(vis, src, from, interner)))
+    if !tables.pending_wait {
+        return false;
+    }
+    let Some(list) = tables.pending_single.get(&(src, name)) else { return false };
+    list.iter().any(|p| {
+        tables.visible(&p.vis, src, from, interner)
+            && !p.mod_path.is_empty()
+            && match tables.resolve_module_path(src, &p.mod_path, p.leading_colon, interner) {
+                PathRes::Done(Target::Module(m)) => [Namespace::Type, Namespace::Value, Namespace::Macro].iter().any(|&ns| {
+                    match tables.lookup(m, ns, p.last) {
+                        Some(BindState::One(b)) => tables.visible(&b.vis, b.def_module, src, interner),
+                        Some(BindState::Ambiguous) => tables.ambiguous_visible(m, ns, p.last, src, interner),
+                        None => false,
+                    }
+                }),
+                PathRes::Done(_) => false,
+                _ => true,
+            }
+    })
 }
 
 /// Checks each single import binding again against the final tables,
