@@ -513,6 +513,45 @@ lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, 
     return d;
 })
 
+/* `slice::range(r, ..len)` for the callers outside this file
+   (`Vec::extend_from_within`): drain's four range words checked at
+   core's index.rs sites (`lust_range_bounds_check`). */
+void lust_range_check(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t *out_s, uint64_t *out_e) LUST_BODY({
+    lust_range_bounds_check(len, s_tag, s_val, e_tag, e_val, out_s, out_e);
+})
+
+/* `[u8]::eq_ignore_ascii_case`: equal lengths and every byte pair equal
+   after ASCII lowercasing. */
+uint8_t lust_bytes_eq_ignore_ascii_case(const uint8_t *a, uint64_t an, const uint8_t *b, uint64_t bn) LUST_BODY({
+    if (an != bn) return 0;
+    for (uint64_t i = 0; i < an; i++) {
+        uint8_t x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y) return 0;
+    }
+    return 1;
+})
+
+/* `[T]::rotate_left(mid)` over `len` elements of `elem` bytes, after the
+   caller's assert: three reversals, elements moved as bytes. */
+void lust_slice_rotate_left(void *ptr, uint64_t len, uint64_t elem, uint64_t mid) LUST_BODY({
+    uint8_t *p = (uint8_t *)ptr;
+    uint64_t spans[3][2] = {{0, mid}, {mid, len}, {0, len}};
+    for (int k = 0; k < 3; k++) {
+        uint64_t lo = spans[k][0], hi = spans[k][1];
+        while (lo + 1 < hi) {
+            hi--;
+            for (uint64_t b = 0; b < elem; b++) {
+                uint8_t t = p[lo * elem + b];
+                p[lo * elem + b] = p[hi * elem + b];
+                p[hi * elem + b] = t;
+            }
+            lo++;
+        }
+    }
+})
+
 /* `[T]::copy_within` over a byte buffer of `len` elements of `elem`
    bytes: core checks the range as for drain (`lust_range_bounds_check`,
    core's own panic sites), then the destination against the space

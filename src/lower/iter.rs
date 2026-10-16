@@ -54,6 +54,7 @@ fn expands(b: Builtin) -> bool {
             | B::BoundCloned
             | B::RangeIsEmpty
             | B::RangeContains
+            | B::VecResizeWith
             | B::RangeInclStart
             | B::RangeInclEnd
             | B::IterMap
@@ -1094,6 +1095,55 @@ impl Ex<'_, '_> {
                     (Place::local(l), ty)
                 };
                 self.bound_map_like(b, itp, ty, None, dest, dest_ty)?;
+            }
+            // `Vec::resize_with(n, f)` (tf-small-a, R4): alloc's
+            // `extend_trusted(repeat_with(f).take(n - len))` (one
+            // `reserve`, then `f()` per element) or `truncate(n)`; `f`
+            // drops last. Any callable: closure, fn item, fn pointer.
+            B::VecResizeWith => {
+                use crate::ast::BinOp::{Gt, Lt, Sub};
+                let (v, n, f) = (arg()?, arg()?, arg()?);
+                let vt = self.op_ty(&v)?;
+                let elem = match self.body.tys.kind(vt) {
+                    TyKind::Ref(_, _, vv) => self.body.tys.vec_elem(vv),
+                    _ => None,
+                }
+                .ok_or("resize_with expansion: receiver is not a Vec reference")?;
+                let vl = self.copy_local(v, vt);
+                let nl = self.copy_local(n, USIZE);
+                let fty = self.op_ty(&f)?;
+                let fl = self.copy_local(f, fty);
+                let rv = || Operand::Copy(Place::local(vl));
+                let len = self.local(USIZE);
+                self.call_builtin(Builtin::VecLen, vec![rv()], Place::local(len));
+                let grow = self.cmp(Gt, Operand::Copy(Place::local(nl)), Operand::Copy(Place::local(len)));
+                let (g, shrink) = self.branch(grow);
+                let join = self.block();
+                self.cur = shrink;
+                let u = self.local(UNIT);
+                self.call_builtin(Builtin::VecTruncate, vec![rv(), Operand::Copy(Place::local(nl))], Place::local(u));
+                self.goto(join);
+                self.cur = g;
+                let add = self.local(USIZE);
+                self.assign(Place::local(add), Rvalue::Bin(Sub, Operand::Copy(Place::local(nl)), Operand::Copy(Place::local(len))));
+                self.call_builtin(Builtin::VecReserve, vec![rv(), Operand::Copy(Place::local(add))], Place::local(u));
+                let lp = self.block();
+                self.goto(lp);
+                self.cur = lp;
+                let now = self.local(USIZE);
+                self.call_builtin(Builtin::VecLen, vec![rv()], Place::local(now));
+                let more = self.cmp(Lt, Operand::Copy(Place::local(now)), Operand::Copy(Place::local(nl)));
+                let (body, done) = self.branch(more);
+                self.cur = done;
+                self.goto(join);
+                self.cur = body;
+                let x = self.local(elem);
+                self.call_fn(fty, Place::local(fl), Vec::new(), Place::local(x))?;
+                self.call_builtin(Builtin::VecPush, vec![rv(), Operand::Move(Place::local(x))], Place::local(u));
+                self.goto(lp);
+                self.cur = join;
+                self.drop_local(fl);
+                self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
             }
             B::RangeIsEmpty | B::RangeInclStart | B::RangeInclEnd => {
                 let r = arg()?;

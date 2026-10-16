@@ -323,6 +323,25 @@ pub enum Builtin {
     /// `[T]::copy_within` (`T: Copy`): the range bounds travel as
     /// drain's four words (check/slice.rs, lower.rs).
     SliceCopyWithin,
+    /// `[u8]::eq_ignore_ascii_case` and `[u8]::is_ascii` (tf-small-a, R4).
+    SliceEqIgnoreAsciiCase,
+    SliceIsAscii,
+    /// `[T]::rotate_left` and `rotate_right`: core's assert at its own
+    /// site (core/src/slice/mod.rs), then bitwise moves.
+    SliceRotateLeft,
+    SliceRotateRight,
+    /// `[T]::partition_point(pred)`: `binary_search_by` over `Less`
+    /// or `Greater`, as core writes it.
+    SlicePartitionPoint,
+    /// `Vec::extend_from_within(range)` (`T: Clone`): the range travels
+    /// as drain's four words; clones push front to back.
+    VecExtendFromWithin,
+    /// `Vec::resize_with(n, f)`: `f()` per new element, else truncate.
+    VecResizeWith,
+    /// `Vec::dedup_by(f)` and `dedup_by_key(f)`: `VecDedup` with the
+    /// closure as the test, called as (current, previous kept).
+    VecDedupBy,
+    VecDedupByKey,
     /// `[T]::get` and `get_mut` with a range index: the bounds
     /// travel as drain's four words; out-of-range is `None`
     /// (check/slice.rs, runtime `lust_range_bounds_get`).

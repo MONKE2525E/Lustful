@@ -20,6 +20,7 @@ mod split;
 mod bytes;
 mod unwind;
 mod own;
+mod slices;
 use unwind::Unw;
 
 /// A body-independent type, so glue can be shared across functions.
@@ -444,7 +445,8 @@ fn is128(i: IntTy) -> bool {
 /// alloc/src/vec/spec_from_iter_nested.rs, 7
 /// core/src/iter/traits/accum.rs, 8 core/src/iter/range.rs, 9
 /// core/src/cell.rs, 10 std/src/thread/local.rs, 11 core/src/ops/arith.rs, 12
-/// core/src/slice/index.rs, 13 core/src/iter/traits/exact_size.rs),
+/// core/src/slice/index.rs, 13 core/src/iter/traits/exact_size.rs, 14
+/// core/src/slice/mod.rs),
 /// plus 0x40 for `pow`. Lowering names one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFF_FF00u64 + file) << 40) | (line << 20) | col)
@@ -3877,6 +3879,10 @@ impl FnGen<'_, '_> {
         if let B::Sync(op) = b {
             return self.sync_builtin(op, &vals, &tys, loc);
         }
+        // The R4 slice and Vec methods (cgen/slices.rs).
+        if let Some(v) = self.slices_builtin(b, ops, &vals, &tys) {
+            return v;
+        }
         let slice_like = |t: &CTy, val: &str| -> (CTy, String, String) {
             match t {
                 CTy::Ref(inner) => match &**inner {
@@ -5295,6 +5301,15 @@ impl FnGen<'_, '_> {
                 );
                 "((lust_Unit){})".into()
             }
+            B::SliceEqIgnoreAsciiCase
+            | B::SliceIsAscii
+            | B::SliceRotateLeft
+            | B::SliceRotateRight
+            | B::SlicePartitionPoint
+            | B::VecExtendFromWithin
+            | B::VecDedupBy
+            | B::VecDedupByKey => unreachable!("emitted by cgen/slices.rs"),
+            B::VecResizeWith => unreachable!("expanded in lower/iter.rs"),
             B::SliceCopyWithin => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let et = ctype(&e);

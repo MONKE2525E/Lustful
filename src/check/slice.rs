@@ -51,8 +51,31 @@ impl<'p> Ctx<'p> {
             "get_mut" => "get_mut",
             "join" => "join",
             "concat" => "concat",
+            "eq_ignore_ascii_case" => "eq_ignore_ascii_case",
+            "is_ascii" => "is_ascii",
+            "rotate_left" => "rotate_left",
+            "rotate_right" => "rotate_right",
+            "partition_point" => "partition_point",
+            "extend_from_within" => "extend_from_within",
+            "resize_with" => "resize_with",
+            "dedup_by" => "dedup_by",
+            "dedup_by_key" => "dedup_by_key",
             _ => return None,
         };
+        if matches!(
+            n,
+            "eq_ignore_ascii_case"
+                | "is_ascii"
+                | "rotate_left"
+                | "rotate_right"
+                | "partition_point"
+                | "extend_from_within"
+                | "resize_with"
+                | "dedup_by"
+                | "dedup_by_key"
+        ) {
+            return self.slice_method_r4(e, recv, base, elem, derefs, n, name_span, args, turbofish);
+        }
         if n == "join" || n == "concat" {
             return self.slice_join_concat(e, recv, elem, derefs, name_span, args, n == "join");
         }
@@ -454,6 +477,97 @@ impl<'p> Ctx<'p> {
 
     /// Checks the arguments with no expectations and answers the
     /// error type: the bail-out of a slice method already reported.
+    /// The R4 slice and Vec methods (tf-small-a): `[u8]::eq_ignore_ascii_case`
+    /// and `is_ascii`, `[T]::rotate_left`/`rotate_right` and
+    /// `partition_point`, and on `Vec<T>` only `extend_from_within`,
+    /// `resize_with`, `dedup_by`, and `dedup_by_key`. None for a name
+    /// outside the list or a receiver the method does not take (a byte
+    /// method on a non-`u8` element, a Vec method on a slice), so the
+    /// normal dispatch rejects it.
+    #[allow(clippy::too_many_arguments)]
+    fn slice_method_r4(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        elem: Ty,
+        derefs: u8,
+        n: &str,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+    ) -> Option<Ty> {
+        use Builtin as B;
+        let bytes = self.resolve(elem) == int(IntTy::U8);
+        let is_vec = self.tys.vec_elem(base).is_some();
+        let (b, autoref, params, ret): (B, Autoref, Vec<Ty>, Ty) = match n {
+            "eq_ignore_ascii_case" if bytes => {
+                let sl = self.tys.intern(TyKind::Slice(elem));
+                let r = self.tys.mk_ref(false, sl);
+                (B::SliceEqIgnoreAsciiCase, Autoref::Ref, vec![r], BOOL)
+            }
+            "is_ascii" if bytes => (B::SliceIsAscii, Autoref::Ref, vec![], BOOL),
+            "rotate_left" => (B::SliceRotateLeft, Autoref::RefMut, vec![USIZE], UNIT),
+            "rotate_right" => (B::SliceRotateRight, Autoref::RefMut, vec![USIZE], UNIT),
+            "partition_point" => {
+                // `P: FnMut(&T) -> bool`, the reference higher-ranked.
+                let r = self.tys.mk_ref(false, elem);
+                let f = self.fn_mut_param_ref(&[r], BOOL, name_span);
+                (B::SlicePartitionPoint, Autoref::Ref, vec![f], USIZE)
+            }
+            "extend_from_within" if is_vec => {
+                if !turbofish.is_empty() {
+                    self.errs.push(not_yet("L0721", name_span, "turbofish on `extend_from_within`"));
+                    return Some(self.slice_bail(args));
+                }
+                if args.len() != 1 {
+                    self.err("L0105", name_span, "`extend_from_within` takes 1 argument", "Pass the source range.");
+                    return Some(self.slice_bail(args));
+                }
+                self.deferred_clone.push((elem, name_span));
+                let Some(form) = self.drain_range_form(e, args[0], name_span) else { return Some(ERROR) };
+                self.check_packed_borrow(recv, name_span);
+                self.out.drain_ranges.push((e, form));
+                self.set_res(e, Res::BuiltinMethod { b: B::VecExtendFromWithin, derefs, autoref: Autoref::RefMut });
+                return Some(UNIT);
+            }
+            "resize_with" if is_vec => {
+                let f = self.fn_mut_param(&[], elem, name_span);
+                (B::VecResizeWith, Autoref::RefMut, vec![USIZE, f], UNIT)
+            }
+            "dedup_by" if is_vec => {
+                // `F: FnMut(&mut T, &mut T) -> bool`, both higher-ranked.
+                let r = self.tys.mk_ref(true, elem);
+                let f = self.fn_mut_param_ref(&[r, r], BOOL, name_span);
+                (B::VecDedupBy, Autoref::RefMut, vec![f], UNIT)
+            }
+            "dedup_by_key" if is_vec => {
+                // `F: FnMut(&mut T) -> K`, `K: PartialEq`.
+                let key = self.new_var(false);
+                let r = self.tys.mk_ref(true, elem);
+                let f = self.fn_mut_param_ref(&[r], key, name_span);
+                self.deferred_eq.push((key, name_span));
+                (B::VecDedupByKey, Autoref::RefMut, vec![f], UNIT)
+            }
+            _ => return None,
+        };
+        if !turbofish.is_empty() {
+            self.errs.push(not_yet("L0721", name_span, "turbofish on this slice method"));
+            return Some(self.slice_bail(args));
+        }
+        self.check_packed_borrow(recv, name_span);
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+        self.check_args(&params, args, name_span);
+        // Codegen calls these callables as closures (cgen/slices.rs).
+        if matches!(b, B::SlicePartitionPoint | B::VecDedupBy | B::VecDedupByKey)
+            && let Some(&f) = args.first()
+            && !matches!(self.kind(self.resolve(self.out.expr_ty[self.ei(f)])), TyKind::Closure(..) | TyKind::Error)
+        {
+            self.errs.push(not_yet("L0641", self.span(f), "a callable that is not a closure here"));
+        }
+        Some(ret)
+    }
+
     fn slice_bail(&mut self, args: &[ExprId]) -> Ty {
         for &a in args {
             self.expr(a, None);

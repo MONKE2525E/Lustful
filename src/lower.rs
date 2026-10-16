@@ -3331,29 +3331,39 @@ impl<'p> Lower<'p> {
         );
         let mt = self.ref_ty(true, recv_ty);
         let t = self.temp(mt);
+        // `Vec::extend_from_within` is a Vec method: its autoref is a
+        // two-phase borrow, like a slice method on a slice place.
+        let within = b == Builtin::VecExtendFromWithin;
         let two_phase = root.is_none()
-            && matches!(self.kind(recv_ty), TyKind::Slice(_))
+            && (matches!(self.kind(recv_ty), TyKind::Slice(_)) || within)
             && !pl.proj.iter().any(|x| matches!(x, Proj::Index(_)));
+        let mut dest_arg = |this: &mut Self| {
+            (!within).then(|| {
+                let d = this.temp(USIZE);
+                this.expr_into(args[1], Some(&Place::local(d)));
+                Operand::Copy(Place::local(d))
+            })
+        };
         let (bounds, dest_op) = if two_phase {
             let st = self.ref_ty(false, recv_ty);
             let reserve = self.temp(st);
             self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
             let bounds = self.drain_bounds(e, args[0], form, span);
-            let d = self.temp(USIZE);
-            self.expr_into(args[1], Some(&Place::local(d)));
+            let d = dest_arg(self);
             self.push(StmtKind::FakeRead(reserve), span);
             self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
-            (bounds, Operand::Copy(Place::local(d)))
+            (bounds, d)
         } else {
             self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
             let bounds = self.drain_bounds(e, args[0], form, span);
-            let d = self.temp(USIZE);
-            self.expr_into(args[1], Some(&Place::local(d)));
-            (bounds, Operand::Copy(Place::local(d)))
+            let d = dest_arg(self);
+            (bounds, d)
         };
         let (stag, sval, etag, eval) = bounds;
         let d = self.call_dest(dest, self.ty(e));
-        self.call_into(CallTarget::Builtin(b), vec![Operand::Move(Place::local(t)), stag, sval, etag, eval, dest_op], d, span);
+        let mut call_args = vec![Operand::Move(Place::local(t)), stag, sval, etag, eval];
+        call_args.extend(dest_op);
+        self.call_into(CallTarget::Builtin(b), call_args, d, span);
     }
 
     /// `[T]::get` and `get_mut` with a range index: the receiver
@@ -4153,7 +4163,7 @@ impl<'p> Lower<'p> {
             self.drain_into(e, recv, args, derefs, dest, span);
             return;
         }
-        if let Res::BuiltinMethod { b: Builtin::SliceCopyWithin, derefs, .. } = self.ck.res(e) {
+        if let Res::BuiltinMethod { b: Builtin::SliceCopyWithin | Builtin::VecExtendFromWithin, derefs, .. } = self.ck.res(e) {
             self.copy_within_into(e, recv, args, derefs, dest, span);
             return;
         }
@@ -4441,7 +4451,16 @@ impl<'p> Lower<'p> {
         use Builtin as B;
         matches!(
             b,
-            B::VecSwap | B::VecReverse | B::VecFirstMut | B::VecLastMut | B::VecGetMut | B::IterIterMut | B::SliceFill | B::SliceCopyFromSlice
+            B::VecSwap
+                | B::VecReverse
+                | B::VecFirstMut
+                | B::VecLastMut
+                | B::VecGetMut
+                | B::IterIterMut
+                | B::SliceFill
+                | B::SliceCopyFromSlice
+                | B::SliceRotateLeft
+                | B::SliceRotateRight
         )
             && (self.body.tys.vec_elem(recv_ty).is_some() || matches!(self.kind(recv_ty), TyKind::Array(..)))
     }
