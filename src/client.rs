@@ -65,7 +65,7 @@ fn daemon_alloc_env() -> Vec<(&'static str, &'static str)> {
 /// autostart is off or another client or daemon already claims this socket. The current
 /// command is still answered cold by the caller; the next one finds the daemon warm.
 fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
-    if env_on("LUST_NO_DAEMON") {
+    if env_on("LUST_NO_DAEMON") || protocol::source_override().is_some() {
         return;
     }
     let Some(lock) = claim_start(&protocol::daemon_lock_path(sock)) else { return };
@@ -127,7 +127,10 @@ fn main() {
             let sock = protocol::socket_path();
             // LUST_NO_DAEMON means "do not use a daemon at all": neither
             // start one nor send work to a live one.
+            // A std or adapter source override is never served warm (see
+            // `protocol::source_override`).
             if !env_on("LUST_NO_DAEMON")
+                && protocol::source_override().is_none()
                 && let Some(resp) = protocol::request(&sock, &req)
             {
                 protocol::finish(resp, run, &req.out, &run_args);

@@ -732,6 +732,16 @@ fn get_field(r: &mut impl BufRead) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The source override set in this process's env, if any (`LUST_STD_SRC`,
+/// `LUST_LIBRARY`; ARCH 3.8): std or adapter source read from a tree the
+/// user edits. A daemon session loads std once and the disk cache keys on
+/// the compiler build, so neither can see those edits: under an override
+/// the client never uses a daemon, a daemon does not start, and the disk
+/// cache is off. Every compile is then cold, so it reads the tree as it is.
+pub fn source_override() -> Option<&'static str> {
+    ["LUST_STD_SRC", "LUST_LIBRARY"].into_iter().find(|v| std::env::var_os(v).is_some_and(|d| !d.is_empty()))
+}
+
 /// This build's identity on the daemon wire: the build hash (compiler and
 /// shipped library sources, tcc; see build.rs) and the file identity of the
 /// `lust-core` binary (device, inode, size, mtime), so a rebuild or a binary

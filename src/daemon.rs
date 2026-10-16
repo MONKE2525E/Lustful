@@ -792,6 +792,12 @@ fn log_stats(served: u64, sessions: usize) {
 
 /// Serves requests until idle. Each crate selection (`SessionKey`) has its own session.
 pub fn serve(sock: &Path) -> ! {
+    // Sessions load std once; a std or adapter source override must be
+    // read fresh by every compile (see `protocol::source_override`).
+    if let Some(var) = protocol::source_override() {
+        eprintln!("error: lust daemon does not run with {var} set: compiles under a source override are always cold");
+        std::process::exit(2);
+    }
     // Clean up temp dirs of daemons and cold compiles that died without
     // a cleanup (SIGKILL, crash). Pid and owner checks protect anything
     // live, including a daemon already serving this socket.

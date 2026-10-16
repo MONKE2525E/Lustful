@@ -199,7 +199,8 @@ fn src_reads_outside(src: &[u8]) -> bool {
 impl Cache {
     /// Opens the cache for `src_file`. None when turned off or the dir cannot be made.
     pub fn open(src_file: &Path) -> Option<Cache> {
-        if env_on("LUST_NO_CACHE") {
+        // A std or adapter source override: the compiler id does not cover that tree.
+        if env_on("LUST_NO_CACHE") || crate::protocol::source_override().is_some() {
             return None;
         }
         let dir = cache_dir(src_file);

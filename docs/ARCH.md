@@ -2237,10 +2237,13 @@ versioned with the compiler; a mismatch rebuilds.
 Std is immutable inside a daemon session. Editing
 `library/` source requires a new lust version string
 in dev (use the git hash of the lust repo) or an
-explicit `LUST_STD_SRC` override that keys the cache
-by the std source tree hash. That override exists for
-the agents who build std (package W-STD, section 9)
-so they get normal incremental behavior on std code.
+explicit `LUST_STD_SRC` (or `LUST_LIBRARY`) override.
+That override exists for the agents who build std
+(package W-STD, section 9). Under it every compile is
+cold and uncached: the client uses no daemon, a daemon
+refuses to start, and the disk cache is off
+(`protocol::source_override`), because neither a
+session nor the cache key can see edits to that tree.
 
 ## 4. Monomorphization and codegen
 
