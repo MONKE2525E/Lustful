@@ -540,6 +540,12 @@ pub enum Builtin {
     /// core's `[T]::split_first` (false) and `split_last` (true), and
     /// their `_mut` forms.
     SliceSplitEnd(bool),
+    /// core's `[T]::strip_prefix` (false) and `strip_suffix` (true),
+    /// with a `[T]` or `[T; N]` pattern (check/slice.rs).
+    SliceStrip(bool),
+    /// core's `[u8]::trim_ascii_start` (0), `trim_ascii_end` (1), and
+    /// `trim_ascii` (2).
+    SliceTrimAscii(u8),
     /// The `core::mem` byte-move family and `core::cmp::max`/`min`
     /// free fns (ARCH 4.4). `MemTake` only survives to lowering,
     /// which fills the freed slot with a synthesized default and
@@ -571,6 +577,10 @@ pub enum Builtin {
     IterSkipWhile,
     IterPeekable,
     IterPeek,
+    /// `Peekable::next_if(func)` and `next_if_eq(&expected)` (R22): one
+    /// `next`, kept when the test passes, else put back in the slot.
+    IterNextIf,
+    IterNextIfEq,
     IterInspect,
     IterCount,
     /// `Iterator::eq` and `ne` (core's `iter_eq`, lower/iter.rs).

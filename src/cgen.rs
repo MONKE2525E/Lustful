@@ -4421,7 +4421,9 @@ impl FnGen<'_, '_> {
             // `by_ref`: the `&mut Self` receiver is the result.
             B::IterByRef => vals[0].clone(),
             B::OwnFrom(_) | B::OwnIntoString | B::OwnSliceAlloc(_) | B::OwnSlicePush => unreachable!("owning pointer builtins emit in cgen/own.rs"),
-            B::SliceSplitAt(_) | B::SliceSplitEnd(_) | B::StrSplitAt(_) => unreachable!("dest-typed: cgen/slices.rs slice_split_builtin"),
+            B::SliceSplitAt(_) | B::SliceSplitEnd(_) | B::StrSplitAt(_) | B::SliceStrip(_) | B::SliceTrimAscii(_) => {
+                unreachable!("dest-typed: cgen/slices.rs slice_split_builtin")
+            }
             B::IntToLeBytes | B::IntToBeBytes | B::IntToNeBytes | B::IntFromLeBytes | B::IntFromBeBytes | B::IntFromNeBytes => {
                 unreachable!("byte conversions emit in cgen/bytes.rs")
             }
@@ -5753,6 +5755,8 @@ impl FnGen<'_, '_> {
             | B::IterSkipWhile
             | B::IterPeekable
             | B::IterPeek
+            | B::IterNextIf
+            | B::IterNextIfEq
             | B::IterInspect
             | B::IterCount
             | B::IterEq

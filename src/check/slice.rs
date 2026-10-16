@@ -62,8 +62,37 @@ impl<'p> Ctx<'p> {
             "dedup_by" => "dedup_by",
             "dedup_by_key" => "dedup_by_key",
             "splice" => "splice",
+            "strip_prefix" => "strip_prefix",
+            "strip_suffix" => "strip_suffix",
+            "trim_ascii_start" => "trim_ascii_start",
+            "trim_ascii_end" => "trim_ascii_end",
+            "trim_ascii" => "trim_ascii",
             _ => return None,
         };
+        if n == "strip_prefix" || n == "strip_suffix" {
+            return Some(self.slice_strip_method(e, recv, elem, derefs, name_span, args, turbofish, n == "strip_suffix"));
+        }
+        if n.starts_with("trim_ascii") {
+            // `[u8]` only; other element types fall through to the
+            // normal dispatch and reject there.
+            if self.resolve(elem) != int(IntTy::U8) {
+                return None;
+            }
+            if !turbofish.is_empty() {
+                self.errs.push(not_yet("L0721", name_span, "turbofish on this slice method"));
+                return Some(self.slice_bail(args));
+            }
+            let which = match n {
+                "trim_ascii_start" => 0,
+                "trim_ascii_end" => 1,
+                _ => 2,
+            };
+            self.check_packed_borrow(recv, name_span);
+            self.set_res(e, Res::BuiltinMethod { b: B::SliceTrimAscii(which), derefs, autoref: Autoref::Ref });
+            self.check_args(&[], args, name_span);
+            let sl = self.tys.intern(TyKind::Slice(elem));
+            return Some(self.tys.mk_ref(false, sl));
+        }
         if matches!(
             n,
             "eq_ignore_ascii_case"
@@ -152,6 +181,68 @@ impl<'p> Ctx<'p> {
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
         self.check_args(&params, args, name_span);
         Some(ret)
+    }
+
+    /// `[T]::strip_prefix` and `strip_suffix` (R13): `prefix: &P` with
+    /// `P: SlicePattern<Item = T>`, which core implements for `[T]`
+    /// and `[T; N]` only. `P` is generic, so the argument takes no
+    /// unsizing or deref coercion: `&Vec<T>` and `&&[T]` reject, as
+    /// rustc's E0277 does. `&mut` reborrows as `&`.
+    #[allow(clippy::too_many_arguments)]
+    fn slice_strip_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        elem: Ty,
+        derefs: u8,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        suffix: bool,
+    ) -> Ty {
+        let n = if suffix { "strip_suffix" } else { "strip_prefix" };
+        if !turbofish.is_empty() {
+            self.errs.push(not_yet("L0721", name_span, "turbofish on this slice method"));
+            return self.slice_bail(args);
+        }
+        let [a] = args else {
+            self.err("L0105", name_span, format!("`{n}` takes 1 argument"), "Pass the pattern slice.");
+            return self.slice_bail(args);
+        };
+        let at = self.expr(*a, None);
+        let at = self.deep(at);
+        if at == ERROR {
+            return ERROR;
+        }
+        let pat = match self.kind(at) {
+            TyKind::Ref(_, _, inner) => match self.kind(inner) {
+                TyKind::Slice(x) | TyKind::Array(x, _) => Some((inner, x)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((inner, pe)) = pat else {
+            let tn = self.tn(at);
+            self.err(
+                "L0612",
+                self.span(*a),
+                format!("the trait bound `SlicePattern` is not satisfied by the pattern `{tn}` of `{n}`"),
+                "Pass a `&[T]` or a `&[T; N]`, such as `&v[..]`.",
+            );
+            return ERROR;
+        };
+        if !self.unify(pe, elem) {
+            self.mismatch(self.span(*a), elem, pe);
+            return ERROR;
+        }
+        let want = self.tys.mk_ref(false, inner);
+        self.coerce_expr(*a, at, want);
+        self.deferred_eq.push((elem, name_span));
+        self.check_packed_borrow(recv, name_span);
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::SliceStrip(suffix), derefs, autoref: Autoref::Ref });
+        let sl = self.tys.intern(TyKind::Slice(elem));
+        let r = self.tys.mk_ref(false, sl);
+        self.tys.mk_option(r)
     }
 
     /// `[T]::copy_within(src, dest)`: `src` is any

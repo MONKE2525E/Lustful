@@ -34,12 +34,13 @@ fn slice_parts(t: &CTy, val: &str) -> (CTy, String, String) {
 
 impl FnGen<'_, '_> {
     /// `SliceSplitAt` and `SliceSplitEnd` (core's `split_at` family) into
-    /// their tuple or `Option` of a tuple; None for any other call.
+    /// their tuple or `Option` of a tuple, and the `SliceStrip` and
+    /// `SliceTrimAscii` subslices; None for any other call.
     pub(super) fn slice_split_builtin(&mut self, b: Builtin, ops: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> Option<String> {
         if let Builtin::StrSplitAt(checked) = b {
             return Some(self.str_split_at(checked, ops, dest, loc, post));
         }
-        if !matches!(b, Builtin::SliceSplitAt(_) | Builtin::SliceSplitEnd(_)) {
+        if !matches!(b, Builtin::SliceSplitAt(_) | Builtin::SliceSplitEnd(_) | Builtin::SliceStrip(_) | Builtin::SliceTrimAscii(_)) {
             return None;
         }
         let (v, vt) = self.operand(&ops[0], loc, post);
@@ -75,6 +76,35 @@ impl FnGen<'_, '_> {
                 };
                 let (some, none) = (self.make_variant(dest, 1, &[pair]), self.make_variant(dest, 0, &[]));
                 let _ = writeln!(self.out, "    {dc} {t} = {n} > 0 ? {some} : {none};");
+            }
+            // core: `head == prefix` on `split_at(n)` (or `tail == suffix`
+            // on `split_at(len - n)`): the receiver's element on the left,
+            // front to back, stopping at the first unequal pair.
+            Builtin::SliceStrip(suffix) => {
+                let (pv, pt) = self.operand(&ops[1], loc, post);
+                let (_, pptr, plen) = slice_parts(&pt, &pv);
+                let (pp, pn, off, i, ok) = (self.tmp(), self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let et = ctype(&e);
+                let eq = self.eq_expr(&e, &format!("(&{p}[{off} + {i}])"), &format!("(&{pp}[{i}])"));
+                let off_expr = if suffix { format!("{n} - {pn}") } else { "0".to_string() };
+                let rest = if suffix { format!("(({st}){{ {p}, {n} - {pn} }})") } else { format!("(({st}){{ {p} + {pn}, {n} - {pn} }})") };
+                let _ = writeln!(
+                    self.out,
+                    "    {et} *{pp} = {pptr}; uint64_t {pn} = {plen};\n    uint8_t {ok} = {pn} <= {n}; uint64_t {off} = {ok} ? {off_expr} : 0;\n    for (uint64_t {i} = 0; {ok} && {i} < {pn}; {i}++) if (!({eq})) {{ {ok} = 0; break; }}"
+                );
+                let (some, none) = (self.make_variant(dest, 1, &[rest]), self.make_variant(dest, 0, &[]));
+                let _ = writeln!(self.out, "    {dc} {t} = {ok} ? {some} : {none};");
+            }
+            // `u8::is_ascii_whitespace`: `\t`, `\n`, `\x0C`, `\r`, and space.
+            Builtin::SliceTrimAscii(which) => {
+                let ws = |x: &str| format!("({x} == 9 || {x} == 10 || {x} == 12 || {x} == 13 || {x} == 32)");
+                if which != 1 {
+                    let _ = writeln!(self.out, "    while ({n} > 0 && {}) {{ {p}++; {n}--; }}", ws(&format!("{p}[0]")));
+                }
+                if which != 0 {
+                    let _ = writeln!(self.out, "    while ({n} > 0 && {}) {n}--;", ws(&format!("{p}[{n} - 1]")));
+                }
+                let _ = writeln!(self.out, "    {dc} {t} = (({st}){{ {p}, {n} }});");
             }
             _ => unreachable!(),
         }

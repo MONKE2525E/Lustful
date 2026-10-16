@@ -9029,6 +9029,8 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::SliceSplitAt(_)
             | B::StrSplitAt(_)
             | B::SliceSplitEnd(_)
+            | B::SliceStrip(_)
+            | B::SliceTrimAscii(_)
             | B::VecFirst
             | B::VecLast
             | B::VecGetMut
@@ -9087,7 +9089,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
 /// `fn_mut_param_ref`): its outer reference is higher-ranked.
 fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
     use crate::check::Builtin as B;
-    matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey | B::VecRetain | B::VecRetainMut | B::MapRetain | B::SetRetain))
+    matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterNextIf | B::IterFind | B::IterMinByKey | B::IterMaxByKey | B::VecRetain | B::VecRetainMut | B::MapRetain | B::SetRetain))
         || b.is_some_and(sort_by_builtin)
 }
 
@@ -9169,6 +9171,8 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
         b,
         B::IterNext
             | B::IterNextBack
+            | B::IterNextIf
+            | B::IterNextIfEq
             | B::IterNth
             | B::IterFind
             | B::IterFindMap

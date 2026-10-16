@@ -973,7 +973,7 @@ impl<'p> Ctx<'p> {
         let item = self.iter_item(base);
         let by_value = !matches!(
             n,
-            "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "try_fold" | "position" | "rposition" | "peek" | "size_hint" | "len"
+            "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "try_fold" | "position" | "rposition" | "peek" | "next_if" | "next_if_eq" | "size_hint" | "len"
                 | "as_slice" | "as_mut_slice" | "as_str" | "remainder" | "by_ref"
         );
         // A by-value method through `&mut I` uses core's `impl Iterator
@@ -1217,6 +1217,34 @@ impl<'p> Ctx<'p> {
                 let ri = r(self, item);
                 let o = self.tys.mk_option(ri);
                 (B::IterPeek, vec![], o)
+            }
+            // `next_if(func: impl FnOnce(&Item) -> bool)` is taken as
+            // `FnMut`, a stronger bound: a closure that is only `FnOnce`
+            // rejects. `next_if_eq(&T)` with `Item: PartialEq<T>`
+            // compares items of one type (`T = Item`).
+            "next_if" | "next_if_eq" => {
+                let Some((K::Peekable, _)) = it::iter_parts(&self.tys, base) else { return self.iter_unknown(n, span, base, args) };
+                let o = self.tys.mk_option(item);
+                if n == "next_if" {
+                    let ri = r(self, item);
+                    let f = self.fn_mut_param_ref(&[ri], BOOL, span);
+                    (B::IterNextIf, vec![f], o)
+                } else {
+                    let [a] = args else {
+                        self.err("L0105", span, "`next_if_eq` takes 1 argument", "Pass a reference to the expected item.");
+                        return self.iter_bail(args);
+                    };
+                    let at = self.expr(*a, None);
+                    let at = self.deep(at);
+                    let want = r(self, item);
+                    if !self.coerce_expr(*a, at, want) {
+                        return ERROR;
+                    }
+                    self.deferred_eq.push((item, span));
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: B::IterNextIfEq, derefs, autoref: Autoref::RefMut });
+                    return o;
+                }
             }
             "inspect" => {
                 let ri = r(self, item);
@@ -2907,7 +2935,7 @@ const STD_ITER_TRAIT_METHODS: &[&str] = &[
 
 /// The methods `iter_call` answers that belong to an iterator type
 /// itself, not to an iterator trait (`Peekable::peek`, `Chars::as_str`).
-const ITER_VIEW_METHODS: &[&str] = &["peek", "as_slice", "as_mut_slice", "as_str", "remainder", "into_remainder"];
+const ITER_VIEW_METHODS: &[&str] = &["peek", "next_if", "next_if_eq", "as_slice", "as_mut_slice", "as_str", "remainder", "into_remainder"];
 
 /// The adapter and consumer methods `iter_call` answers, by name: the
 /// calls that wrap a `ByNext` iterator.

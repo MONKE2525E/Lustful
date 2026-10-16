@@ -76,6 +76,8 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::IterSkipWhile
             | B::IterPeekable
             | B::IterPeek
+            | B::IterNextIf
+            | B::IterNextIfEq
             | B::IterInspect
             | B::IterCount
             | B::IterEq
@@ -1253,6 +1255,11 @@ impl Ex<'_, '_> {
                 let r = arg()?;
                 let (itp, ty) = self.deref_arg(r)?;
                 self.peek(itp, ty, dest, dest_ty)?;
+            }
+            B::IterNextIf | B::IterNextIfEq => {
+                let (r, f) = (arg()?, arg()?);
+                let (itp, ty) = self.deref_arg(r)?;
+                self.next_if(b == B::IterNextIfEq, itp, ty, f, dest, dest_ty)?;
             }
             B::IterNth => {
                 let (r, n) = (arg()?, arg()?);
@@ -3156,6 +3163,50 @@ impl Ex<'_, '_> {
         self.none(&dest, dest_ty);
         self.goto(join);
         self.cur = join;
+        Ok(())
+    }
+
+    /// `Peekable::next_if` (and `next_if_eq`, whose test is
+    /// `next == expected`): core's `match self.next() { Some(matched) if
+    /// func(&matched) => Some(matched), other => { self.peeked =
+    /// Some(other); None } }`. `func` runs at most once and drops before
+    /// the call returns.
+    fn next_if(&mut self, eq: bool, itp: Place, ty: Ty, f: Operand, dest: Place, dest_ty: Ty) -> R {
+        let item = self.item(ty)?;
+        let fty = self.op_ty(&f)?;
+        let fl = self.local(fty);
+        self.assign(Place::local(fl), Rvalue::Use(f));
+        let t = self.local(dest_ty);
+        self.next(itp.clone(), ty, Place::local(t), false)?;
+        let slot = itp.project(Proj::Field(1));
+        let pty = self.place_ty(&slot)?;
+        let (join, back) = (self.block(), self.block());
+        let (s, n) = self.switch_opt(&Place::local(t));
+        self.cur = s;
+        let rx = self.ref_to(false, Self::payload(&Place::local(t)), item);
+        let b = self.local(BOOL);
+        if eq {
+            // `&Item == &T` with `T = Item` (check took one type).
+            let rt = self.body.tys.mk_ref(false, item);
+            self.item_eq(rx, rt, fl, b);
+        } else {
+            self.call_fn(fty, Place::local(fl), vec![Operand::Move(Place::local(rx))], Place::local(b))?;
+        }
+        let (yes, no) = self.branch(Operand::Copy(Place::local(b)));
+        self.cur = yes;
+        self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(t))));
+        self.goto(join);
+        self.cur = no;
+        self.goto(back);
+        self.cur = n;
+        self.goto(back);
+        // `next` emptied the slot: no old value to drop.
+        self.cur = back;
+        self.some(&slot, pty, Operand::Move(Place::local(t)));
+        self.none(&dest, dest_ty);
+        self.goto(join);
+        self.cur = join;
+        self.drop_local(fl);
         Ok(())
     }
 
