@@ -471,6 +471,8 @@ pub(super) struct ArgTrial {
     binops: usize,
     open: usize,
     wait: usize,
+    wait_asserts: usize,
+    wait_assign_ops: usize,
     sum: usize,
     fmt: usize,
 }
@@ -491,6 +493,8 @@ impl ArgTrial {
             binops: cx.deferred_binops.len(),
             open: cx.open_binops.len(),
             wait: cx.wait_binops.len(),
+            wait_asserts: cx.wait_asserts.len(),
+            wait_assign_ops: cx.wait_assign_ops.len(),
             sum: cx.deferred_sum.len(),
             fmt: cx.deferred_fmt.len(),
         }
@@ -510,6 +514,8 @@ impl ArgTrial {
         cx.deferred_binops.truncate(self.binops);
         cx.open_binops.truncate(self.open);
         cx.wait_binops.truncate(self.wait);
+        cx.wait_asserts.truncate(self.wait_asserts);
+        cx.wait_assign_ops.truncate(self.wait_assign_ops);
         cx.deferred_sum.truncate(self.sum);
         cx.deferred_fmt.truncate(self.fmt);
     }

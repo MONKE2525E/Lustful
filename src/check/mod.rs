@@ -1998,6 +1998,13 @@ struct Ctx<'p> {
     /// expr, span, result type unless an `Output` projection carries
     /// it), checked at body end.
     wait_binops: Vec<(ExprId, BinOp, Ty, Ty, ExprId, Span, Option<Ty>)>,
+    /// `assert_eq!`/`assert_ne!` whose left type was open: (expr, left
+    /// type, right type, macro span, right span), checked at body end.
+    wait_asserts: Vec<(ExprId, Ty, Ty, Span, Span)>,
+    /// Compound assignments with a known number on the left and an open
+    /// right operand: (expr, op, lhs type, rhs type, rhs expr, span),
+    /// checked at body end.
+    wait_assign_ops: Vec<(ExprId, BinOp, Ty, Ty, ExprId, Span)>,
     /// Unsizing coercion sites, (concrete pointee, dyn type, span)
     /// before zonking; `finish` turns them into vtable requests.
     vtable_sites: Vec<(Ty, Ty, Span)>,
@@ -2348,6 +2355,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         closure_call_outs: std::collections::HashSet::new(),
         open_binops: Vec::new(),
         wait_binops: Vec::new(),
+        wait_asserts: Vec::new(),
+        wait_assign_ops: Vec::new(),
         vtable_sites: Vec::new(),
         unwind_checks: Vec::new(),
         dyn_borrow_src: false,
@@ -9099,54 +9108,19 @@ impl<'p> Ctx<'p> {
             Expr::AssignOp { op, lhs, rhs } => {
                 let lt = self.expr(*lhs, None);
                 self.place_check(*lhs, false);
-                let rt = self.expr(*rhs, Some(lt));
-                let lk = self.kind(lt);
-                if self.tys.is_string_ty(self.resolve(lt)) && *op == BinOp::Add {
-                    self.coerce_expr(*rhs, rt, REF_STR);
+                // A known number on the left gives the right side no type:
+                // `u8: AddAssign<u8>` and `AddAssign<&u8>` both exist (shifts
+                // take any integer), so rustc's `Rhs` stays open (E0283)
+                // unless the right side fixes it; such an operator waits
+                // for body end (`wait_assign_ops`).
+                let known_number = matches!(self.kind(self.resolve(lt)), TyKind::Int(_) | TyKind::Float(_));
+                let rt = self.expr(*rhs, if known_number { None } else { Some(lt) });
+                if known_number && self.unbound_general(self.resolve(self.peel_one_ref(rt).1)) {
                     self.set_res(e, Res::Bin { ld: 0, rd: 0 });
+                    self.wait_assign_ops.push((e, *op, lt, rt, *rhs, span));
                     return UNIT;
                 }
-                if crate::check::collect::cow_arg(&self.tys, self.resolve(lt)) == Some(STR) && *op == BinOp::Add {
-                    let rt_deep = self.deep(rt);
-                    if crate::check::collect::cow_arg(&self.tys, rt_deep) != Some(STR) {
-                        self.coerce_expr(*rhs, rt, REF_STR);
-                    }
-                    self.set_res(e, Res::Bin { ld: 0, rd: 0 });
-                    return UNIT;
-                }
-                let (rd, rinner) = self.peel_one_ref(rt);
-                // `x += &y` is fine, but Rust has no compound assignment with a `&mut` operand.
-                let rmut = matches!(self.kind(rt), TyKind::Ref(_, Mut::Mut, _));
-                let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
-                let ok = !rmut
-                    && match (*op, lk) {
-                        (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, TyKind::Float(_)) => self.unify(lt, rinner),
-                        (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, k) if k.is_float_infer() => self.unify(lt, rinner),
-                        (_, TyKind::Error) => true,
-                        (BinOp::Shl | BinOp::Shr, k) if int_like(k) => int_like(self.kind(rinner)),
-                        (_, k) if int_like(k) => self.unify(lt, rinner),
-                        (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, TyKind::Bool) => self.unify(lt, rinner),
-                        _ => false,
-                    };
-                if !ok {
-                    // Through the assignment trait, like the binary
-                    // operators: a bound proves it in a template, the
-                    // unique impl answers in an instance.
-                    // The right side as written (no peeled reference):
-                    // `a += &b` needs `impl AddAssign<&B> for A`.
-                    if !rmut && self.trait_assign_op(e, *op, lt, rt, 0, span) {
-                        return UNIT;
-                    }
-                    let (a, b) = (self.tn(lt), self.tn(rt));
-                    self.err(
-                        "L0113",
-                        span,
-                        format!("cannot apply `{}=` to `{a}` and `{b}`", op.symbol()),
-                        "Both sides must be the same integer type.",
-                    );
-                }
-                self.set_res(e, Res::Bin { ld: 0, rd });
-                UNIT
+                self.assign_op_types(e, *op, lt, rt, *rhs, span)
             }
             Expr::StructLit { path, fields, update } => self.struct_lit(e, path, fields, *update, span, expected),
             Expr::Range { lo, hi, inclusive } => self.range_value(e, *lo, *hi, *inclusive, span),
@@ -17473,8 +17447,15 @@ impl<'p> Ctx<'p> {
     fn binary_with_lt(&mut self, e: ExprId, op: BinOp, lt: Ty, rhs: ExprId, span: Span) -> Ty {
         debug_assert!(!matches!(op, BinOp::And | BinOp::Or));
         // An open left operand gives the right one no expected type: rustc
-        // checks the right operand on its own.
-        let expect = (!self.unbound_general(lt)).then_some(lt);
+        // checks the right operand on its own. So does a number (or a
+        // number literal) on the left of arithmetic, bit, or shift
+        // operators: their impls take `Rhs = T` and `Rhs = &T` (shifts any
+        // integer), so rustc's `Rhs` stays a variable (`1u8 +
+        // Default::default()` and `3 + it.sum()` are E0283/E0284) unless the
+        // right operand fixes it (a literal, a typed value).
+        let lk = self.kind(self.resolve(lt));
+        let number = matches!(lk, TyKind::Int(_) | TyKind::Float(_)) || lk.is_int_infer() || lk.is_float_infer();
+        let expect = (!self.unbound_general(lt) && !(number && !op.is_cmp())).then_some(lt);
         let rt = self.expr(rhs, expect);
         // ARCH 2.12 run point: an operator on a non-scalar must know the left
         // operand type. The scalar path above and below needs no trait search.
@@ -17583,9 +17564,108 @@ impl<'p> Ctx<'p> {
         lang.output_of(tr)
     }
 
+    /// A compound assignment `lhs op= rhs` once both operand types are
+    /// checked (`Expr::AssignOp`, or body end for `wait_assign_ops`).
+    fn assign_op_types(&mut self, e: ExprId, op: BinOp, lt: Ty, rt: Ty, rhs: ExprId, span: Span) -> Ty {
+        let lk = self.kind(lt);
+        if self.tys.is_string_ty(self.resolve(lt)) && op == BinOp::Add {
+            self.coerce_expr(rhs, rt, REF_STR);
+            self.set_res(e, Res::Bin { ld: 0, rd: 0 });
+            return UNIT;
+        }
+        if crate::check::collect::cow_arg(&self.tys, self.resolve(lt)) == Some(STR) && op == BinOp::Add {
+            let rt_deep = self.deep(rt);
+            if crate::check::collect::cow_arg(&self.tys, rt_deep) != Some(STR) {
+                self.coerce_expr(rhs, rt, REF_STR);
+            }
+            self.set_res(e, Res::Bin { ld: 0, rd: 0 });
+            return UNIT;
+        }
+        let (rd, rinner) = self.peel_one_ref(rt);
+        // `x += &y` is fine, but Rust has no compound assignment with a `&mut` operand.
+        let rmut = matches!(self.kind(rt), TyKind::Ref(_, Mut::Mut, _));
+        let int_like = |k: TyKind| matches!(k, TyKind::Int(_)) || k.is_int_infer();
+        let ok = !rmut
+            && match (op, lk) {
+                (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, TyKind::Float(_)) => self.unify(lt, rinner),
+                (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, k) if k.is_float_infer() => self.unify(lt, rinner),
+                (_, TyKind::Error) => true,
+                (BinOp::Shl | BinOp::Shr, k) if int_like(k) => int_like(self.kind(rinner)),
+                (_, k) if int_like(k) => self.unify(lt, rinner),
+                (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, TyKind::Bool) => self.unify(lt, rinner),
+                _ => false,
+            };
+        if !ok {
+            // Through the assignment trait, like the binary
+            // operators: a bound proves it in a template, the
+            // unique impl answers in an instance.
+            // The right side as written (no peeled reference):
+            // `a += &b` needs `impl AddAssign<&B> for A`.
+            if !rmut && self.trait_assign_op(e, op, lt, rt, 0, span) {
+                return UNIT;
+            }
+            let (a, b) = (self.tn(lt), self.tn(rt));
+            self.err(
+                "L0113",
+                span,
+                format!("cannot apply `{}=` to `{a}` and `{b}`", op.symbol()),
+                "Both sides must be the same integer type.",
+            );
+        }
+        self.set_res(e, Res::Bin { ld: 0, rd });
+        UNIT
+    }
+
+    /// `assert_eq!`/`assert_ne!` operand types `a` and `b`: one type with
+    /// PartialEq and Debug, or a String against a `&str`.
+    fn assert_eq_types(&mut self, e: ExprId, a: Ty, b: Ty, span: Span, s: Span) {
+        if let Some((ld, rd)) = self.mixed_string_eq(a, b) {
+            // String against &str: compared as strings, as Rust's PartialEq impls do.
+            self.set_res(e, Res::Bin { ld, rd });
+        } else if self.unify(a, b) {
+            let a = self.deep(a);
+            if !has_eq(self.p, &self.tys, a) || !has_debug(self.p, &self.tys, a) {
+                let tn = self.tn(a);
+                self.err(
+                    "L0112",
+                    span,
+                    format!("assert_eq! needs PartialEq and Debug, but `{tn}` lacks one"),
+                    "Derive PartialEq and Debug on the type.",
+                );
+            }
+        } else {
+            self.mismatch(s, a, b);
+        }
+    }
+
     /// Body end: each operator `wait_binop` held is checked now that
-    /// its operand types are known, or is an annotation error.
+    /// its operand types are known, or is an annotation error; so is
+    /// each `assert_eq!` whose left type was open (`wait_asserts`).
     fn finish_wait_binops(&mut self) {
+        for (e, op, lt, rt, rhs, span) in std::mem::take(&mut self.wait_assign_ops) {
+            if self.unbound_general(self.resolve(self.peel_one_ref(rt).1)) {
+                self.err(
+                    "L0610",
+                    span,
+                    "type annotations needed: the right operand type of this operator must be known here",
+                    "Annotate the type of the right operand, such as `let r: u8 = make();`.",
+                );
+                continue;
+            }
+            self.assign_op_types(e, op, lt, rt, rhs, span);
+        }
+        for (e, a, b, span, s) in std::mem::take(&mut self.wait_asserts) {
+            if self.unbound_general(self.resolve(a)) {
+                self.err(
+                    "L0610",
+                    span,
+                    "type annotations needed: the type of the left value must be known here",
+                    "Annotate the type of the value, such as `let x: i32 = make();`.",
+                );
+                continue;
+            }
+            self.assert_eq_types(e, a, b, span, s);
+        }
         for (e, op, lt, rt, rhs, span, out) in std::mem::take(&mut self.wait_binops) {
             if self.binop_waits(op, lt, rt) {
                 self.err(
@@ -18402,24 +18482,17 @@ impl<'p> Ctx<'p> {
                     self.err("L0105", span, "this macro takes 2 arguments", "Pass both values to compare.");
                 } else {
                     let a = self.expr(args[0], None);
-                    let b = self.expr(args[1], Some(a));
+                    // `*left_val == *right_val` with the left type still a
+                    // variable: rustc's `?T: PartialEq<R>` waits and never
+                    // binds `?T` from the right side (E0283 unless a later
+                    // use fixes it), so the check waits for body end.
+                    let open = self.unbound_general(self.resolve(a));
+                    let b = self.expr(args[1], if open { None } else { Some(a) });
                     let s = self.span(args[1]);
-                    if let Some((ld, rd)) = self.mixed_string_eq(a, b) {
-                        // String against &str: compared as strings, as Rust's PartialEq impls do.
-                        self.set_res(e, Res::Bin { ld, rd });
-                    } else if self.unify(a, b) {
-                        let a = self.deep(a);
-                        if !has_eq(self.p, &self.tys, a) || !has_debug(self.p, &self.tys, a) {
-                            let tn = self.tn(a);
-                            self.err(
-                                "L0112",
-                                span,
-                                format!("assert_eq! needs PartialEq and Debug, but `{tn}` lacks one"),
-                                "Derive PartialEq and Debug on the type.",
-                            );
-                        }
+                    if open {
+                        self.wait_asserts.push((e, a, b, span, s));
                     } else {
-                        self.mismatch(s, a, b);
+                        self.assert_eq_types(e, a, b, span, s);
                     }
                 }
                 UNIT
