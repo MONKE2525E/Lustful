@@ -56,6 +56,7 @@ for s in "${suites[@]}"; do
   fail=$(grep -vc '^itempatch oracle: ok' "$LUST_ITEMPATCH_LOG" 2>/dev/null || true)
   [ "$rc" = 0 ] && [ "${fail:-0}" = 0 ] || bad=1
   tail -3 "$log"
+  grep -h '^sigops:\|^paths:' "$log" | head -6
   [ "${fail:-0}" = 0 ] || grep -v '^itempatch oracle: ok' "$LUST_ITEMPATCH_LOG" | sort | uniq -c | sort -rn | head -5
   echo "sweep: $s rc=$rc oracle_ok=${ok:-0} oracle_fail=${fail:-0}"
 done
