@@ -4509,6 +4509,16 @@ impl FnGen<'_, '_> {
                 let s = str_of(&vals[0], &tys[0]);
                 format!("lust_bytes_is_ascii({s}.ptr, {s}.len)")
             }
+            B::StrMakeAsciiUppercase | B::StrMakeAsciiLowercase => {
+                let (s, i) = (self.tmp(), self.tmp());
+                let (lo, hi, d) = if b == B::StrMakeAsciiUppercase { ('a', 'z', "-= 32") } else { ('A', 'Z', "+= 32") };
+                let _ = writeln!(
+                    self.out,
+                    "    lust_str {s} = {};\n    for (uint64_t {i} = 0; {i} < {s}.len; {i}++) if ({s}.ptr[{i}] >= '{lo}' && {s}.ptr[{i}] <= '{hi}') {s}.ptr[{i}] {d};",
+                    str_of(&vals[0], &tys[0])
+                );
+                "((lust_Unit){})".into()
+            }
             B::StrEqIgnoreAsciiCase => {
                 let s = str_of(&vals[0], &tys[0]);
                 format!("lust_bytes_eq_ignore_ascii_case({s}.ptr, {s}.len, {}.ptr, {}.len)", vals[1], vals[1])

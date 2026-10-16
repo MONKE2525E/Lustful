@@ -444,6 +444,9 @@ pub enum Builtin {
     /// `str::is_ascii` and `str::eq_ignore_ascii_case` (R3).
     StrIsAscii,
     StrEqIgnoreAsciiCase,
+    /// `str::make_ascii_uppercase` and `make_ascii_lowercase` (R3).
+    StrMakeAsciiUppercase,
+    StrMakeAsciiLowercase,
     StrRepeat,
     StrIsCharBoundary,
     StrGetRange,
@@ -15932,6 +15935,8 @@ impl<'p> Ctx<'p> {
             "replacen" => return Some((B::StrReplacen, Autoref::Ref, vec![REF_STR, REF_STR, USIZE], STRING)),
             "is_ascii" => return Some((B::StrIsAscii, Autoref::Ref, vec![], BOOL)),
             "eq_ignore_ascii_case" => return Some((B::StrEqIgnoreAsciiCase, Autoref::Ref, vec![REF_STR], BOOL)),
+            "make_ascii_uppercase" => return Some((B::StrMakeAsciiUppercase, Autoref::RefMut, vec![], UNIT)),
+            "make_ascii_lowercase" => return Some((B::StrMakeAsciiLowercase, Autoref::RefMut, vec![], UNIT)),
             _ => {}
         }
         let table = [
