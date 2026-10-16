@@ -323,6 +323,20 @@ const KNOWN_ATTRS: &[&str] = &[
 /// Parses one function body (`tokens` runs from its `{` to its `}`) and appends it to `ast`.
 /// Returns the body block and the new expression and pattern ranges for the function.
 pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner: &Interner, known: &Known) -> PResult<ParsedBody> {
+    parse_body_seeded(tokens, strings, ast, interner, known, &[])
+}
+
+/// `parse_body` under the enclosing scopes' `allow` attributes
+/// (`scope_allows`), which a whole parse seeds into each nested fn's
+/// attributes: the body patch re-parses a body whose fn sits under them.
+pub fn parse_body_seeded(
+    tokens: &[Token],
+    strings: &[String],
+    ast: &mut Ast,
+    interner: &Interner,
+    known: &Known,
+    seed_allows: &[Attr],
+) -> PResult<ParsedBody> {
     let mut toks = tokens.to_vec();
     let end = tokens.last().map_or(Span::default(), |t| t.span);
     toks.push(Token { tok: Tok::Eof, span: Span { lo: end.hi, ..end } });
@@ -340,7 +354,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
         depth: 0,
         deferred: None,
         let_ok: false,
-        scope_allows: Vec::new(),
+        scope_allows: seed_allows.to_vec(),
         block_inner_ok: false,
         depths: Depths::default(),
         cfg_syntax: false,

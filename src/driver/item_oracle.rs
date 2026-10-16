@@ -222,7 +222,17 @@ pub(super) fn check(
         let h = super::compile::fn_text_hash(&cold.ast, &cold.map, def, line, b.0);
         if body_hashes.get(i) != Some(&h) || fn_lines.get(i) != Some(&line) {
             let warm = (body_hashes.get(i).copied().unwrap_or(0), fn_lines.get(i).copied().unwrap_or(0));
-            let detail = format!("fn {} (#{i}): warm {:x} line {}, cold {h:x} line {line}", front.interner.get(def.name), warm.0, warm.1);
+            let wloc = front.fn_loc.get(i).copied().unwrap_or((usize::MAX, None));
+            let wdef = super::compile::fn_def_at(&front.ast, wloc.0, wloc.1);
+            let wraw = super::ast_hash::body_scan(&front.ast, wdef, None).0;
+            let craw = super::ast_hash::body_scan(&cold.ast, def, None).0;
+            let detail = format!(
+                "fn {} (#{i}): warm {:x} line {}, cold {h:x} line {line}; raw body hash warm {wraw:x} cold {craw:x} (cold scan {:x})",
+                front.interner.get(def.name),
+                warm.0,
+                warm.1,
+                b.0
+            );
             fail("fn body hash or line differs", path, &detail);
         }
     }

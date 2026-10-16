@@ -690,8 +690,21 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         _ => crate::expand::lazy::hoist_static_closures(raw, &front.interner),
     };
     let toks = &hoisted.tokens[..hoisted.tokens.len() - 1];
+    // A whole parse seeds each nested fn's attributes with the enclosing
+    // scopes' `allow`s: for a top-level fn, its attributes after its
+    // item's own. A method's own attributes are not kept apart, so a
+    // method with attributes and a nested fn resolves in full.
+    let seed: &[crate::ast::Attr] = match sub {
+        None => def.attrs.get(ast.items[item].attrs.len()..).unwrap_or(&[]),
+        Some(_) => &[],
+    };
+    let nested_fn = |t: &[lexer::Token]| t.windows(2).any(|w| w[0].tok == Tok::Fn && matches!(w[1].tok, Tok::Ident(_)));
+    if sub.is_some() && !def.attrs.is_empty() && (nested_fn(&old_body.tokens) || nested_fn(&new_body.tokens)) {
+        return Err("body items");
+    }
     let (body, mut exprs, mut pats) =
-        crate::parser::parse_body(toks, &hoisted.strings, &mut body_ast, &front.interner, &front.known).map_err(|_| "body parse")?;
+        crate::parser::parse_body_seeded(toks, &hoisted.strings, &mut body_ast, &front.interner, &front.known, seed)
+            .map_err(|_| "body parse")?;
     let (items, nested) = same_items(ast, old, text, span, &body_ast, (&old_body.tokens, &new_body.tokens), edit)?;
     let nested = match nested {
         Some(i) => Some(front.fn_loc.iter().position(|&l| l == (usize::MAX, Some(i as usize))).ok_or("body items")?),
@@ -2685,6 +2698,31 @@ pub fn run() -> i64 {
         let mut cold = Session::new(dir.join("obj-cold-b"), false, SessionKey::synthetic(&root, false));
         assert_eq!(run(&mut cold, &root, Cmd::Build).0, 0);
         assert_eq!(out, run_bin(&bin), "warm and cold builds print the same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body edit around a nested fn in a file with an inner `allow`: the
+    /// re-parsed nested fn gets the scope's allows, as a whole parse seeds
+    /// them, so its body hashes are a full resolve's (the patch oracle
+    /// found the missing seed).
+    #[test]
+    fn nested_fn_under_file_allows_hashes_as_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-allow-seed-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        std::fs::write(&m0, format!("#![allow(dead_code)]\n{ITEMS}")).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let v = warm_equals_cold(&mut warm, &root, &m0, "    inner(2)\n", "    inner(3)\n");
+        assert_eq!(field(&v, "path"), "patch", "{v}");
+        // Body hashes hash `Sym` ids: compare with a full resolve of the
+        // same text in the same session.
+        let hashes = |s: &Session| s.front.chunks[0].scan.fns.iter().map(|f| f.body_hash).collect::<Vec<_>>();
+        let patched = hashes(&warm);
+        warm.front.patch = None;
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert_eq!(field(&warm.front.last_visits, "path"), "resolve");
+        assert_eq!(patched, hashes(&warm), "patched and resolved body hashes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
