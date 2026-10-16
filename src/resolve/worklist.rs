@@ -2124,6 +2124,13 @@ fn parse_use_trees(
         leading = true;
         i = 1;
     }
+    // A group with no path before it: `use {a, b};` or `use ::{a, b};`.
+    if let Some(TokenTree::Delim(Delim::Brace, inner, _)) = trees.get(i) {
+        for chunk in comma_chunks(inner) {
+            parse_use_trees(&chunk, &segs, leading, module, vis, lo, interner, out);
+        }
+        return;
+    }
     let mut alias: Option<Sym> = None;
     let mut underscore = false;
     loop {
