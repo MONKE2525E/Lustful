@@ -2326,7 +2326,20 @@ pub fn attr_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<AttrInfo> 
 /// `invalid_macro_export_arguments` unless `leveled`.
 fn check_macro_export_input(trees: &[Tt], attr: &AttrInfo, leveled: bool, interner: &Interner) -> Result<(), Diag> {
     let Some(Tt::Delim(Delim::Bracket, body, _)) = attr.end.checked_sub(1).and_then(|k| trees.get(k)) else { return Ok(()) };
-    let rest = body.get(1..).unwrap_or(&[]);
+    let is_name = |t: &Tt, name: &str| matches!(t, Tt::Tok(x) if seg_text(x.tok, interner).as_deref() == Some(name));
+    // `#[macro_export ..]`, or `#[cfg_attr(cond, macro_export ..)]`: the
+    // input is what follows the name, up to the next top-level comma.
+    let rest: &[Tt] = if body.first().is_some_and(|t| is_name(t, "macro_export")) {
+        &body[1..]
+    } else if body.first().is_some_and(|t| is_name(t, "cfg_attr"))
+        && let Some(Tt::Delim(Delim::Paren, group, _)) = body.get(1)
+        && let Some(at) = group.iter().position(|t| is_name(t, "macro_export"))
+    {
+        let tail = &group[at + 1..];
+        &tail[..tail.iter().position(|t| t.is_tok(Tok::Comma)).unwrap_or(tail.len())]
+    } else {
+        return Ok(());
+    };
     let ok = match rest {
         [] => true,
         [Tt::Delim(Delim::Paren, group, _)] => {
