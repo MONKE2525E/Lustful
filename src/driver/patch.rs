@@ -770,35 +770,9 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     // resolver's token passes do.
     let module = *base.tables.fn_module.get(fn_index).ok_or("state")?;
     let raw = lexer::Lexed { tokens: new_body.tokens.clone(), strings: new_body.strings.clone() };
-    let hoisted = match &base.expand {
-        Some((env, crate_name)) if new_pure => {
-            let path = front.map.path(file);
-            let shown = front.display_root.as_deref().and_then(|r| std::path::Path::new(path).strip_prefix(r).ok());
-            let ctx = crate::expand::ExpandCtx {
-                interner: &front.interner,
-                known: &front.known,
-                file_path: shown.map_or_else(|| path.to_string(), |rel| rel.to_string_lossy().to_string()),
-                real_path: std::path::PathBuf::from(path),
-                // No Cargo env on the patch path: a body that reads
-                // one (`env!`, an include) records a non-`Dropped`
-                // dep below and the patch gives up to a full resolve.
-                cargo_env: Vec::new(),
-                src: text,
-                cfg: crate::resolve::worklist::expand_cfg(env),
-                module_path: base.tables.modules[module.0 as usize].path.clone(),
-                crate_name: Some(crate_name.clone()),
-                client: &front.client,
-            };
-            // Unknown cfg names reject before expansion, as in the resolver.
-            if crate::resolve::worklist::check_cfg_names(&raw, env, &front.interner).is_err() {
-                return Err("body macro");
-            }
-            match crate::expand::expand_lexed_seeded_with_deps(raw, &ctx, &[]) {
-                Ok((out, deps)) if deps.iter().all(|d| matches!(d, crate::expand::Dep::Dropped { .. })) => out,
-                _ => return Err("body macro"),
-            }
-        }
-        _ => crate::expand::lazy::hoist_static_closures(raw, &front.interner),
+    let hoisted = match new_pure {
+        true => expand_pure(front, base, file, text, module, raw)?,
+        false => crate::expand::lazy::hoist_static_closures(raw, &front.interner),
     };
     let toks = &hoisted.tokens[..hoisted.tokens.len() - 1];
     // A whole parse seeds each nested fn's attributes with the enclosing
@@ -976,8 +950,8 @@ fn find_derive_edit(front: &Front, text: &str, edit: Edit) -> Result<NewDerive, 
 /// does but the patch cannot prove the edit (the caller resolves).
 /// Refused (R2, R5, and v1 limits): a header with a macro call, `$`,
 /// an attribute after `fn`, or an APIT; attributes the expander acts
-/// on; a body that needs the expander, or holds items; a fn from a
-/// macro expansion. A trait impl's method and a const fn take the patch
+/// on; a body that needs more than pure builtin macros, or holds items;
+/// a fn from a macro expansion. A trait impl's method and a const fn take the patch
 /// with `NewItem::full`.
 fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Option<&'static str>> {
     let base = front.patch.as_ref().ok_or(Some("no base"))?;
@@ -1058,7 +1032,9 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     let (ob, nb) = (body_lx(&old_lx, oo), body_lx(&new_lx, no));
     let (oc, op) = body_tokens_ok(&ob, ot[oo].span.lo as usize, hi as usize, &front.interner).map_err(Some)?;
     let (nc, np) = body_tokens_ok(&nb, nt[no].span.lo as usize, new_hi as usize, &front.interner).map_err(Some)?;
-    if op || np || (oc || nc) && base.shadowed || nb.tokens.iter().any(|t| t.tok == Tok::Static) {
+    // A body with pure builtin macros or attributes expands as the body
+    // patch's does (`expand_pure`); a `static` would hoist into an item.
+    if (oc || nc) && base.shadowed || (op || np) && base.expand.is_none() || nb.tokens.iter().any(|t| t.tok == Tok::Static) {
         return Err(Some("item: body macro"));
     }
     // Parse: a free fn as an item, a method inside a placeholder impl.
@@ -1070,12 +1046,23 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
             toks.push(lexer::Token { tok, span: edge });
         }
     }
-    toks.extend_from_slice(nt);
+    // The expander keeps the input's string table and appends to it, so
+    // the header's tokens index the expanded strings as before.
+    let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
+    let (body, strings) = match np {
+        true => {
+            let out = expand_pure(front, base, file, text, module, nb).map_err(Some)?;
+            (out.tokens[..out.tokens.len() - 1].to_vec(), out.strings)
+        }
+        false => (nt[no..].to_vec(), new_lx.strings.clone()),
+    };
+    toks.extend_from_slice(&nt[..no]);
+    toks.extend(body);
     if sub.is_some() {
         toks.push(lexer::Token { tok: Tok::RBrace, span: crate::diag::Span { lo: new_hi, hi: new_hi, ..edge } });
     }
     toks.push(lexer::Token { tok: Tok::Eof, span: crate::diag::Span { lo: new_hi, hi: new_hi, ..edge } });
-    let lexed = lexer::Lexed { tokens: toks, strings: new_lx.strings.clone() };
+    let lexed = lexer::Lexed { tokens: toks, strings };
     let mut item_ast =
         crate::parser::parse_items(&lexed, 0..lexed.tokens.len(), &front.interner, &front.known).map_err(|_| Some("item parse"))?;
     if item_ast.items.len() != 1 || !item_ast.stmt_items.is_empty() || !item_ast.inner_attrs.is_empty() {
@@ -1105,7 +1092,6 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
         new_def.attrs.truncate(own);
         new_def.attrs.extend_from_slice(&def.attrs[own..]);
         new_def.name = def.name;
-        let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
         let outer = match &ast.items[item].kind {
             ItemKind::Impl(imp) => Some(&imp.generics),
             _ => None,
@@ -1379,6 +1365,47 @@ fn plain_body(lexed: &lexer::Lexed, interner: &crate::intern::Interner) -> bool 
         Tok::Ident(s) => !crate::check::generics::flag_scan_name(interner.get(s)),
         _ => true,
     })
+}
+
+/// Expands the pure builtin macros and attributes of `raw` (a body, or
+/// a whole fn item whose header needs no expander) as the resolver's
+/// token pass does, in `module` of `file` (new text `text`). Gives up
+/// on a crate with no expander state, an unknown cfg name, or an
+/// expansion that reads a file or env value (a dep other than a
+/// cfg-dropped node): the request then resolves in full.
+fn expand_pure(
+    front: &Front,
+    base: &PatchBase,
+    file: FileId,
+    text: &str,
+    module: crate::ty::defs::ModuleId,
+    raw: lexer::Lexed,
+) -> Result<lexer::Lexed, &'static str> {
+    let Some((env, crate_name)) = &base.expand else { return Err("macro in body") };
+    let path = front.map.path(file);
+    let shown = front.display_root.as_deref().and_then(|r| std::path::Path::new(path).strip_prefix(r).ok());
+    let ctx = crate::expand::ExpandCtx {
+        interner: &front.interner,
+        known: &front.known,
+        file_path: shown.map_or_else(|| path.to_string(), |rel| rel.to_string_lossy().to_string()),
+        real_path: std::path::PathBuf::from(path),
+        // No Cargo env on the patch path: a body that reads one (`env!`,
+        // an include) records a non-`Dropped` dep and the patch gives up.
+        cargo_env: Vec::new(),
+        src: text,
+        cfg: crate::resolve::worklist::expand_cfg(env),
+        module_path: base.tables.modules[module.0 as usize].path.clone(),
+        crate_name: Some(crate_name.clone()),
+        client: &front.client,
+    };
+    // Unknown cfg names reject before expansion, as in the resolver.
+    if crate::resolve::worklist::check_cfg_names(&raw, env, &front.interner).is_err() {
+        return Err("body macro");
+    }
+    match crate::expand::expand_lexed_seeded_with_deps(raw, &ctx, &[]) {
+        Ok((out, deps)) if deps.iter().all(|d| matches!(d, crate::expand::Dep::Dropped { .. })) => Ok(out),
+        _ => Err("body macro"),
+    }
 }
 
 /// Checks one lexed body (`{` at `lo` through `}` ending at `hi`, then
@@ -3376,6 +3403,34 @@ pub fn run() -> i64 {
         for &(old, new, path) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
             assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A header edit of a fn whose body holds pure builtin macros or a
+    /// statement attribute takes the item patch: the body expands as the
+    /// body patch's does. A body error (the caller's, then the fn's own)
+    /// is the cold answer and keeps the item state.
+    #[test]
+    fn expander_body_item_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-pure-item-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "fn pick(x: i64) -> bool {\n    matches!(x, 1 | 2)\n}\n\nfn mk(n: usize) -> Vec<i64> {\n    #[allow(unused_variables)]\n    let unused = 1;\n    vec![0; n]\n}\n\n\
+                   pub fn run() -> i64 {\n    let v = mk(2);\n    if pick(v.len() as i64) { 1 } else { 0 }\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str, &str, i32)] = &[
+            ("fn mk(n: usize) -> Vec<i64> {", "fn mk(n: usize) -> Vec<i64> where i64: Copy {", "item", 0),
+            ("fn pick(x: i64) -> bool {", "fn pick(x: i32) -> bool {", "item", 1),
+            ("fn pick(x: i32) -> bool {", "fn pick(x: i64) -> bool {", "item", 0),
+            ("fn mk(n: usize) -> Vec<i64> where i64: Copy {", "fn mk(n: u8) -> Vec<i64> {", "item", 1),
+        ];
+        for &(old, new, path, code) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+            assert_eq!(check(&mut warm, &root).0, code, "{new:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
