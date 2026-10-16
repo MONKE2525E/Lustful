@@ -9758,7 +9758,7 @@ impl<'p> Ctx<'p> {
     fn branch_hint(&self, expected: Option<Ty>, prev: Option<Ty>) -> Option<Ty> {
         // A diverging earlier branch (`!`) says nothing about the
         // others: `if a { return x; } else if b { 1 } else { 2 }`.
-        expected.or(prev.filter(|&t| !matches!(self.kind(t), TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::Never)))
+        expected.or(prev.filter(|&t| !matches!(self.kind(self.resolve(t)), TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::Never | TyKind::Error)))
     }
 
     /// The expected type when it is a fn pointer (see `LoopCtx::want`).
