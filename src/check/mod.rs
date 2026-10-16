@@ -1972,7 +1972,9 @@ struct Ctx<'p> {
     /// borrow checker's to prove: its spawn rule makes every region of
     /// the function `'static` (borrowck/regions.rs).
     spawn_static: Vec<Span>,
-    /// Set while `static_bound_err` checks a `spawn_static` obligation.
+    /// Set while `static_bound_err` may pass a `dyn` with an inferred
+    /// object lifetime: a `spawn_static` obligation, or the retry of
+    /// `check_type_static` that hands the bound to the borrow checker.
     static_dyn_inferred_ok: bool,
     /// The expression of the expression statement being checked (`e;`):
     /// `Vec::splice` is taken only there, where its `Splice` drops at once.
@@ -5441,14 +5443,18 @@ impl<'p> Ctx<'p> {
                     }
                 }
             }
-            self.check_dyn_static(dyn_static);
-            self.check_type_static(type_static);
             for (ty, span) in static_src {
                 let ty = self.deep(ty);
                 if object::may_borrow_in(self.p, &self.tys, self.env(), ty) {
-                    self.static_source_err(ty, span);
+                    if object::may_borrow_untracked_in(self.p, &self.tys, self.env(), ty) {
+                        self.static_source_err(ty, span);
+                    } else {
+                        dyn_static.push((span, true));
+                    }
                 }
             }
+            self.check_dyn_static(dyn_static);
+            self.check_type_static(type_static);
         }
     }
 
@@ -5461,19 +5467,33 @@ impl<'p> Ctx<'p> {
             return;
         }
         let mut seen: Vec<Span> = Vec::new();
+        let mut bck: Vec<(Span, bool)> = Vec::new();
         for (ty, span) in items {
             let ty = self.deep(ty);
             if seen.contains(&span) {
                 continue;
             }
-            self.static_dyn_inferred_ok = self.spawn_static.contains(&span);
-            let err = self.static_bound_err(ty, 0);
+            let spawn = self.spawn_static.contains(&span);
+            self.static_dyn_inferred_ok = spawn;
+            let mut err = self.static_bound_err(ty, 0);
+            // Failing only on inferred object lifetimes: the borrow
+            // checker proves the bound where it is used (a call's `F:
+            // 'static`, an impl's where-clause, an opaque's bound), under
+            // the guard of `dyn_static_bck_clean`.
+            if err.is_some() && !spawn {
+                self.static_dyn_inferred_ok = true;
+                if self.static_bound_err(ty, 0).is_none() {
+                    bck.push((span, true));
+                    err = None;
+                }
+            }
             self.static_dyn_inferred_ok = false;
             if let Some((code, msg)) = err {
                 seen.push(span);
                 self.err(code, span, msg, "Use a type that lives for `'static` here, or add a `'static` bound to the type parameter.");
             }
         }
+        self.check_dyn_static(bck);
     }
 
     /// Why `t` may fail a `'static` bound, as far as lust can tell. A
@@ -7195,7 +7215,7 @@ impl<'p> Ctx<'p> {
             self.dyn_borrow_src = true;
         }
         let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
-        if to_static && borrows && !instance && !self.defer_static_source(x, span) {
+        if to_static && borrows && !instance && !self.defer_static_source(x, span) && !self.bck_static_source(x, span) {
             self.static_source_err(x, span);
             return None;
         }
@@ -7356,7 +7376,7 @@ impl<'p> Ctx<'p> {
         // An instance replays its template, which proved this under the
         // env's `'static` bounds (a `T: 'static` arg may be `&'static str`).
         let instance = matches!(p.gx.fn_class.get(self.fid.0 as usize), Some(generics::FnClass::Instance));
-        if to_static && borrows && !instance && !self.defer_static_source(x, span) {
+        if to_static && borrows && !instance && !self.defer_static_source(x, span) && !self.bck_static_source(x, span) {
             self.static_source_err(x, span);
             return None;
         }

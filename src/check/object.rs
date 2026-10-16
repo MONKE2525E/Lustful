@@ -889,6 +889,7 @@ pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// trait args. A body value that flows there gets the caller's object
 /// lifetime, so it cannot also be `'static` (`Ctx::dyn_static_clean`).
 pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    use crate::ty::sync::SyncTy;
     fn go(p: &Program, tys: &impl TyIntern, t: Ty, inv: bool, depth: u32) -> bool {
         let args_go = |a: crate::ty::ArgsId, inv: bool| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| go(p, tys, e, inv, depth + 1)));
         // Too deep to tell: count it as erased, so the body is not clean.
@@ -903,8 +904,16 @@ pub fn has_erased_dyn_invariant(p: &Program, tys: &impl TyIntern, t: Ty) -> bool
             TyKind::Adt(_, a) => {
                 let covariant = matches!(
                     tys.builtin_of(t),
-                    Some(BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::RefGuard)
-                        | Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::RwLockReadGuard))
+                    Some(
+                        BuiltinTy::Option
+                            | BuiltinTy::Result
+                            | BuiltinTy::Vec
+                            | BuiltinTy::Boxed
+                            | BuiltinTy::Rc
+                            | BuiltinTy::Weak
+                            | BuiltinTy::RefGuard
+                            | BuiltinTy::Sync(SyncTy::Arc | SyncTy::ArcWeak | SyncTy::RwLockReadGuard)
+                    )
                 );
                 args_go(a, inv || !covariant)
             }
@@ -1008,6 +1017,34 @@ pub fn may_borrow_in(p: &Program, tys: &impl TyIntern, env: &[Predicate], t: Ty)
     }
 }
 
+/// `may_borrow_in` without the borrows the borrow checker sees in its
+/// region slots: references and dyn object lifetimes. A source that only
+/// borrows through those (`&'static str` in a body annotation, a `Box<dyn
+/// Tr>` let whose object lifetime rustc infers) may still become a
+/// `'static` dyn value: borrowck makes each of their regions outlive
+/// `'static` at the coercion (`Rvalue::MakeDyn`) or the call whose bound
+/// needs it. A type param, projection, opaque, inference variable, or
+/// borrowing std iterator stays check's to reject.
+pub fn may_borrow_untracked_in(p: &Program, tys: &impl TyIntern, env: &[Predicate], t: Ty) -> bool {
+    fn go(p: &Program, tys: &impl TyIntern, env: &[Predicate], t: Ty, depth: u32) -> bool {
+        let args_go = |a: ArgsId| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| go(p, tys, env, e, depth + 1)));
+        if depth > LIFETIME_WALK_LIMIT {
+            return true;
+        }
+        match tys.kind(t) {
+            TyKind::Param(_) | TyKind::Projection(..) => may_borrow_in(p, tys, env, t),
+            TyKind::Opaque(..) | TyKind::Infer(_) => true,
+            TyKind::Dyn(..) => principal_of(tys, t).is_some_and(|pr| args_go(pr.args)),
+            TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => go(p, tys, env, e, depth + 1),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(p, tys, env, e, depth + 1)),
+            TyKind::Closure(_, a) => args_go(a),
+            TyKind::Adt(_, a) | TyKind::FnDef(_, a) => tys.is_chars_ty(t) || args_go(a),
+            _ => false,
+        }
+    }
+    go(p, tys, env, t, 0)
+}
+
 /// True when `t` holds a reference typed `&'static` (lust keeps that
 /// region only on references to dyn types).
 pub fn has_static_ref(tys: &impl TyIntern, t: Ty) -> bool {
@@ -1089,3 +1126,18 @@ pub fn with_self(tys: &mut impl TyIntern, tr: TraitRef, self_ty: Ty) -> TraitRef
     TraitRef { args, ..tr }
 }
 
+
+impl super::Ctx<'_> {
+    /// The source `x` of an unsizing coercion to a `'static` dyn type
+    /// that may borrow only through regions the borrow checker tracks
+    /// (`may_borrow_untracked_in`): the borrow checker proves the bound,
+    /// under the guard of `Ctx::dyn_static_bck_clean`. False when check
+    /// must decide it.
+    pub(super) fn bck_static_source(&mut self, x: Ty, span: Span) -> bool {
+        if may_borrow_untracked_in(self.p, &self.tys, self.env(), x) {
+            return false;
+        }
+        self.obl.push(super::obligations::Obligation::DynStatic { span, bck: true });
+        true
+    }
+}
