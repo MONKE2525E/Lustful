@@ -436,15 +436,17 @@ impl GenReuse {
     }
 
     /// True when a template check or discovery output of fn `f` was
-    /// stored after `stamp`. The check and build programs share these
-    /// entries: one stored after a program's `Program::reuse_stamp` may
+    /// stored after stamp `lo` and no later than `hi`. The check and build
+    /// programs share these entries: one stored after a program's
+    /// `Program::reuse_stamp` (and before the work that asks, `hi`) may
     /// hold an output that program does not have (the kept program delta
     /// refuses then, driver/kept_delta.rs).
-    pub(crate) fn newer(&self, p: &Program, f: LocalDefId, stamp: u64) -> bool {
+    pub(crate) fn newer(&self, p: &Program, f: LocalDefId, lo: u64, hi: u64) -> bool {
         let def = p.def_id(f);
-        self.templates.get(&def).is_some_and(|e| e.stamp > stamp)
-            || self.discovery.get(&def).is_some_and(|e| e.stamp > stamp)
-            || self.unstored.get(&def).is_some_and(|e| e.0 > stamp)
+        let after = |s: u64| s > lo && s <= hi;
+        self.templates.get(&def).is_some_and(|e| after(e.stamp))
+            || self.discovery.get(&def).is_some_and(|e| after(e.stamp))
+            || self.unstored.get(&def).is_some_and(|e| after(e.0))
     }
 
     /// True when fn `f`'s stored template check or discovery output was

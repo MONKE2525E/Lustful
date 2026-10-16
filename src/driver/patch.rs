@@ -459,12 +459,23 @@ pub(crate) struct KeptProgram {
     /// None while the program shares the front's Ast.
     edits: Option<Vec<KeptEdit>>,
     bases: Vec<KeptBase>,
+    /// Put back by `reuse_kept` after a header edit that made a body error
+    /// (`hidden diag`): this request's collect may succeed and still give
+    /// an error answer, and its program (with no hidden type for that
+    /// fn) would refuse the fix, so `keep` leaves this one in place.
+    prefer: bool,
 }
 
 /// Keeps `program` for later requests, in its mode's slot.
-pub(crate) fn keep(front: &mut Front, program: crate::check::collect::Program) {
+pub(crate) fn keep(front: &mut Front, mut program: crate::check::collect::Program) {
     let slot = usize::from(program.gx.walk_instances);
-    front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new() });
+    // The request is done: every entry stored so far agrees with the
+    // program (its collect stored or replayed it, `kept_delta`).
+    program.reuse_stamp = crate::driver::gen_reuse::stamp_now();
+    if front.kept[slot].as_ref().is_some_and(|k| k.prefer) {
+        return;
+    }
+    front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new(), prefer: false });
 }
 
 /// One patch edit under a detached kept program.
@@ -1856,7 +1867,7 @@ pub(super) fn reuse_kept(
     use crate::def::LocalDefId;
     // A build's program holds the generic instances a check's lacks.
     let k = front.kept[usize::from(walk_instances)].take().ok_or(if front.kept.iter().any(Option::is_some) { "mode" } else { "none" })?;
-    let bases = k.bases;
+    let mut bases = k.bases;
     let mut edits = match k.edits {
         Some(e) => e,
         None if Arc::ptr_eq(&k.program.ast, &front.ast) => Vec::new(),
@@ -1924,12 +1935,13 @@ pub(super) fn reuse_kept(
         .collect();
     if !headers.is_empty() {
         let reach = front.patch.as_ref().and_then(|b| b.reach.as_ref());
-        if let Err((why, intact)) = super::kept_delta::apply_headers(&mut p, front, caches, reach, &headers, walk_instances) {
+        if let Err((why, intact)) = super::kept_delta::apply_headers(&mut p, front, caches, reach, &headers, walk_instances, &mut bases) {
             // The program is as it was, with its spans moved: it stays
             // for the next request, which redoes these headers with its
             // own (sigedit R9: a rejected header edit, then its fix).
             if intact {
-                front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases });
+                let prefer = why == "hidden diag";
+                front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer });
             }
             return Err(why);
         }
@@ -2022,8 +2034,6 @@ pub(super) fn reuse_kept(
         }
     }
     super::laps::mark("collect/kept bodies");
-    // Every stored entry now agrees with the program (`kept_delta`).
-    p.reuse_stamp = crate::driver::gen_reuse::stamp_now();
     Ok((p, spans, template_errs))
 }
 

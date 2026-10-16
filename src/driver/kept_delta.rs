@@ -27,9 +27,10 @@
 // trait impl methods; methods of inherent impls with associated items
 // (the trait-system key hashes their heads); lang and shipped std fns;
 // main and #[test] fns; an `impl Trait` return that comes or goes; a fn
-// that a template body revealing an opaque type names (a plain one reveals
-// again, and its hidden type must stand: then the auto traits callers read
-// through it, and any opaque type that names it, stand too); a header with a `dyn` or macro type (eager vtables scan the Ast
+// that a body revealing an opaque type names, unless that body reveals
+// again with the same hidden type (a plain fn's, or a template's check in
+// a check only): then the auto traits callers read through it, and any
+// opaque type that names it, stand too; a header with a `dyn` or macro type (eager vtables scan the Ast
 // for `dyn`); programs without user generics (collect's whole-Ast flag
 // scans may turn them on); and any diagnostic. The full path answers
 // then. A refusal before any write, or a diagnostic of a new signature
@@ -57,8 +58,9 @@ pub(crate) struct HeaderEdit {
 /// Applies header edits to the kept program `p`. `reach` is the patch
 /// base's const reach, if it has one. Err names the first condition that
 /// failed (the `kept=` of `lust-visits:`), and says whether `p` is as it
-/// was (a refusal before any write, or a diagnostic of a new signature,
-/// whose records go back: the caller may keep it for the next request,
+/// was (a refusal before any write, a diagnostic of a new signature, or
+/// a hidden type that moved before any template checked again: the old
+/// records go back, and the caller may keep it for the next request,
 /// sigedit R9) or half edited (it must be dropped).
 #[allow(dead_code)] // The item patch (sigedit P1.3) calls it from `reuse_kept`.
 pub(crate) fn apply_headers(
@@ -68,10 +70,40 @@ pub(crate) fn apply_headers(
     reach: Option<&ConstReach>,
     edits: &[HeaderEdit],
     walk_instances: bool,
+    bases: &mut Bases,
 ) -> Result<(), (&'static str, bool)> {
+    let out = apply(p, front, caches, reach, edits, walk_instances, bases);
+    // A program kept after a diagnostic keeps the outputs its callers'
+    // bodies have now (`own_bases`).
+    if let Err((why @ ("sig diag" | "hidden diag"), true)) = out {
+        let mut fns: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
+        fns.sort_unstable();
+        fns.dedup();
+        for b in own_bases(p, front, caches, &fns) {
+            if !bases.iter().any(|x| x.0 == b.0) {
+                bases.push(b);
+            }
+        }
+        return Err((why, true));
+    }
+    out
+}
+
+/// `apply_headers` without the bases of a refused program.
+fn apply(
+    p: &mut Program,
+    front: &Front,
+    caches: &mut Caches,
+    reach: Option<&ConstReach>,
+    edits: &[HeaderEdit],
+    walk_instances: bool,
+    bases: &Bases,
+) -> Result<(), (&'static str, bool)> {
+    // Entries this delta stores come after this stamp (`replay_bodies`).
+    let start = crate::driver::gen_reuse::stamp_now();
     let fns = untouched_refusals(p, front, reach, edits, walk_instances).map_err(|e| (e, true))?;
     let opaque_idents = opaque_body_idents(p);
-    let namers = rpit_namers(p, &opaque_idents, &fns).map_err(|e| (e, true))?;
+    let (namers, template_namers) = rpit_namers(p, &opaque_idents, &fns, walk_instances).map_err(|e| (e, true))?;
     super::laps::mark("collect/delta refusals");
     // The node answers of the last collect describe the old signatures.
     caches.gen_reuse.forget_answers();
@@ -92,13 +124,24 @@ pub(crate) fn apply_headers(
     }
     let half = |e: &'static str| (e, false);
     super::laps::mark("collect/delta redo");
+    // Until a template checks again, a failed reveal writes nothing the
+    // records do not hold: the old ones go back and `p` stands.
+    let mut undos = Some(undos);
+    let fail = |p: &mut Program, undos: &mut Option<Vec<crate::check::delta_audit::SigUndo>>, why: &'static str| match undos.take() {
+        Some(us) => {
+            us.into_iter().rev().for_each(|u| crate::check::delta_audit::undo(p, u));
+            (why, true)
+        }
+        None => (why, false),
+    };
     for (&i, &(rpit, old_ret)) in fns.iter().zip(&old_rets) {
         let f = LocalDefId(i as u32);
         if p.gx.fn_class[i] == FnClass::Template {
             let ranges: Vec<(u32, u32)> = edits.iter().filter(|e| e.fn_index == i).map(|e| e.old_exprs).collect();
+            undos = None;
             recheck_template(p, f, &ranges, caches).map_err(half)?;
-        } else if rpit {
-            crate::check::delta_audit::reveal_again(p, f, old_ret).map_err(half)?;
+        } else if rpit && let Err(why) = crate::check::delta_audit::reveal_again(p, f, old_ret) {
+            return Err(fail(p, &mut undos, why));
         }
     }
     // A plain fn that reveals an opaque type and names an edited fn: its
@@ -108,14 +151,22 @@ pub(crate) fn apply_headers(
     for g in namers {
         let (record_reads, unwind) = (p.record_reads, p.unwind);
         (p.record_reads, p.unwind) = (true, false);
-        let stands = crate::check::opaque::hidden_stands(p, g);
+        let again = crate::check::opaque::hidden_again(p, g);
         (p.record_reads, p.unwind) = (record_reads, unwind);
-        if !stands {
-            return Err(half("hidden type"));
+        match again {
+            crate::check::opaque::HiddenAgain::Stands => {}
+            crate::check::opaque::HiddenAgain::Errors => return Err(fail(p, &mut undos, "hidden diag")),
+            crate::check::opaque::HiddenAgain::Moved => return Err(fail(p, &mut undos, "hidden type")),
         }
     }
+    // A template that does: its check runs again (the hidden type must
+    // stand), as for a template that calls an edited fn.
+    for t in template_namers {
+        let (lo, hi) = p.fn_def(t).exprs;
+        recheck_template(p, t, &[(lo, hi)], caches).map_err(half)?;
+    }
     super::laps::mark("collect/delta reveal");
-    let out = replay_bodies(p, front, caches, &fns, walk_instances).map_err(half);
+    let out = replay_bodies(p, front, caches, &fns, walk_instances, start, bases).map_err(half);
     super::laps::mark("collect/delta replay");
     out
 }
@@ -253,51 +304,27 @@ fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'sta
     Ok(())
 }
 
-/// The plain fns whose bodies reveal an opaque type and name one of the
-/// edited fns `fns` (by identifier, as `body_scan` sees the rewritten
-/// body), not counting the edited fns themselves: `apply_headers` reveals
-/// each again. Refuses when such a body is a template's (its hidden type
-/// comes from the template check) or when an opaque owner has no local
-/// body to scan.
-fn rpit_namers(
-    p: &Program,
-    opaque_idents: &[(crate::def::DefId, Vec<crate::intern::Sym>)],
-    fns: &[usize],
-) -> Result<Vec<LocalDefId>, &'static str> {
-    let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
-    let mut out = Vec::new();
-    for (owner, ids) in opaque_idents {
-        let Some(g) = p.local_def(owner.hash) else { return Err("sig rpit") };
-        if fns.contains(&(g.0 as usize)) || !ids.iter().any(|s| names.contains(s)) {
-            continue;
-        }
-        if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || !p.gx.opaque_ret_of.contains_key(&g) {
-            return Err("sig rpit");
-        }
-        out.push(g);
-    }
-    out.sort_unstable_by_key(|g| g.0);
-    out.dedup();
-    Ok(out)
+/// The nodes a header delta of `fns` can move: the edited fns'
+/// signatures, and the bindings and method sets whose answers hash them
+/// (graph.rs `binding_fingerprint`, `method_set_fingerprint`). No other
+/// node reads an edited fn's record (every other fn keeps its signature
+/// and hidden type). A `Checked` read never holds by fingerprint.
+struct Touched {
+    defs: Vec<crate::def::DefId>,
+    names: Vec<crate::intern::Sym>,
+    seen: crate::intern::FxMap<ReadKey, bool>,
 }
 
-/// Mono's body checks that read the edited signatures, as a collect with
-/// generic reuse runs them (`materialize`, `template_check`): a stored
-/// result that no longer holds checks again, and a plain body must give
-/// the discovery output collect built the program with.
-fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usize], walk_instances: bool) -> Result<(), &'static str> {
-    let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
-    let idents = &front.chunks[0].scan.body_idents;
-    let fn_count = front.fn_loc.len();
-    // The nodes the delta can move: the edited fns' signatures, and the
-    // bindings and method sets whose answers hash them (graph.rs
-    // `binding_fingerprint`, `method_set_fingerprint`). No other node
-    // reads an edited fn's record (every other fn keeps its signature and
-    // hidden type). A `Checked` read never holds by fingerprint.
-    let defs: Vec<crate::def::DefId> = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
-    let mut seen: crate::intern::FxMap<ReadKey, bool> = Default::default();
-    let mut touched = |p: &Program, k: &ReadKey| -> bool {
-        *seen.entry(*k).or_insert_with(|| match k {
+impl Touched {
+    fn new(p: &Program, fns: &[usize]) -> Touched {
+        let defs = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
+        let names = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
+        Touched { defs, names, seen: Default::default() }
+    }
+
+    fn hit(&mut self, p: &Program, k: &ReadKey) -> bool {
+        let (defs, names) = (&self.defs, &self.names);
+        *self.seen.entry(*k).or_insert_with(|| match k {
             ReadKey::Sig(d) => defs.contains(d),
             ReadKey::MethodSet(m) => names.contains(&m.name),
             ReadKey::Binding(b) => {
@@ -306,7 +333,82 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             ReadKey::Checked(_) => true,
             ReadKey::ImplSet(_) | ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) => false,
         })
-    };
+    }
+}
+
+/// Discovery bases one kept program holds: (AST fn index, its output as
+/// the program has it), the `KeptProgram::bases` of driver/patch.rs.
+pub(crate) type Bases = Vec<(usize, Option<crate::driver::gen_reuse::OutCopy>)>;
+
+/// The discovery outputs `p` holds for the plain bodies a header delta of
+/// `fns` would check again (their stored reads name a touched node), as
+/// the stored entries no newer than `p` give them. A program kept after a
+/// diagnostic takes them: the collect that answers the request may store
+/// new entries for those bodies, and the next delta compares with these.
+fn own_bases(p: &Program, front: &Front, caches: &Caches, fns: &[usize]) -> Bases {
+    let reuse = &caches.gen_reuse;
+    let mut touched = Touched::new(p, fns);
+    let now = crate::driver::gen_reuse::stamp_now();
+    (0..front.fn_loc.len() as u32)
+        .map(LocalDefId)
+        .filter(|&g| p.gx.fn_class.get(g.0 as usize) == Some(&FnClass::Plain) && !p.check_skips(g))
+        .filter(|&g| !reuse.newer(p, g, p.reuse_stamp, now) && !reuse.untouched(p, g, &mut |k| touched.hit(p, k)))
+        .map(|g| (g.0 as usize, reuse.out_copy(p.def_id(g))))
+        .collect()
+}
+
+/// The fns whose bodies reveal an opaque type and name one of the edited
+/// fns `fns` (by identifier, as `body_scan` sees the rewritten body), not
+/// counting the edited fns themselves: plain fns (`apply_headers` reveals
+/// each again) and templates (their check runs again: in a check only,
+/// and not a lang method). Refuses any other such fn, and an opaque owner
+/// with no local body to scan.
+#[allow(clippy::type_complexity)]
+fn rpit_namers(
+    p: &Program,
+    opaque_idents: &[(crate::def::DefId, Vec<crate::intern::Sym>)],
+    fns: &[usize],
+    walk_instances: bool,
+) -> Result<(Vec<LocalDefId>, Vec<LocalDefId>), &'static str> {
+    let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
+    let (mut plain, mut tmpl) = (Vec::new(), Vec::new());
+    for (owner, ids) in opaque_idents {
+        let Some(g) = p.local_def(owner.hash) else { return Err("sig rpit") };
+        if fns.contains(&(g.0 as usize)) || !ids.iter().any(|s| names.contains(s)) {
+            continue;
+        }
+        match p.gx.fn_class.get(g.0 as usize) {
+            Some(FnClass::Plain) if p.gx.opaque_ret_of.contains_key(&g) => plain.push(g),
+            Some(FnClass::Template) if !walk_instances && p.gx.assoc_const_tmpls.is_empty() && !p.is_lang_method(g) => tmpl.push(g),
+            _ => return Err("sig rpit"),
+        }
+    }
+    for v in [&mut plain, &mut tmpl] {
+        v.sort_unstable_by_key(|g| g.0);
+        v.dedup();
+    }
+    Ok((plain, tmpl))
+}
+
+/// Mono's body checks that read the edited signatures, as a collect with
+/// generic reuse runs them (`materialize`, `template_check`): a stored
+/// result that no longer holds checks again, and a plain body must give
+/// the discovery output collect built the program with. `start` is the
+/// store stamp when the delta began: entries after it are its own.
+fn replay_bodies(
+    p: &mut Program,
+    front: &Front,
+    caches: &mut Caches,
+    fns: &[usize],
+    walk_instances: bool,
+    start: u64,
+    bases: &Bases,
+) -> Result<(), &'static str> {
+    let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
+    let idents = &front.chunks[0].scan.body_idents;
+    let fn_count = front.fn_loc.len();
+    let mut touched = Touched::new(p, fns);
+    let mut touched = |p: &Program, k: &ReadKey| touched.hit(p, k);
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
     let out = (|| {
@@ -319,10 +421,12 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             if p.check_skips(t) && !p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(t))) {
                 continue;
             }
-            // The other mode's program stored this check: this one may
-            // hold another.
-            if reuse.newer(p, t, p.reuse_stamp) {
-                return Err("sig mode");
+            // Another program stored this check (the other mode's, or the
+            // collect of a request this program sat out): this one may
+            // hold another, so it checks again (in a check, below).
+            if reuse.newer(p, t, p.reuse_stamp, start) {
+                again.push(t);
+                continue;
             }
             // Every entry no newer than the program held for it.
             if reuse.untouched(p, t, &mut |k| touched(p, k)) {
@@ -352,14 +456,18 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
                 continue;
             }
             // A holding entry stands for this program's output only when
-            // this program stored or replayed it (`Program::reuse_stamp`).
-            if reuse.newer(p, g, p.reuse_stamp) {
-                return Err("sig mode");
-            }
-            if reuse.untouched(p, g, &mut |k| touched(p, k)) || reuse.discovery_holds(p, g) {
+            // this program stored or replayed it (`Program::reuse_stamp`);
+            // a newer one checks again against the output the program
+            // keeps for it (`own_bases`), if it keeps one.
+            let own = bases.iter().find(|b| b.0 == g.0 as usize).map(|b| b.1.as_ref());
+            let base = if reuse.newer(p, g, p.reuse_stamp, start) {
+                own.ok_or("sig mode")?.cloned()
+            } else if reuse.untouched(p, g, &mut |k| touched(p, k)) || reuse.discovery_holds(p, g) {
                 continue;
-            }
-            let base = reuse.out_copy(p.def_id(g)).ok_or("discovery")?;
+            } else {
+                reuse.out_copy(p.def_id(g))
+            };
+            let base = base.ok_or("discovery")?;
             let (checked, discarded) = crate::check::check_fn(p, g);
             if checked.closure_map_pending {
                 return Err("discovery");
@@ -404,7 +512,7 @@ pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
         {
             continue;
         }
-        let why = refusal(p, f, false).and_then(|()| rpit_namers(p, &opaque_idents, &[i]).map(drop)).err().unwrap_or("ok");
+        let why = refusal(p, f, false).and_then(|()| rpit_namers(p, &opaque_idents, &[i], false).map(drop)).err().unwrap_or("ok");
         match out.iter_mut().find(|e| e.0 == why) {
             Some(e) => e.1 += 1,
             None => out.push((why, 1)),

@@ -385,7 +385,7 @@ pub struct Program {
     pub(crate) impl_parents: HashMap<u32, ParentGen>,
     /// Every stored template check and discovery output up to this
     /// `gen_reuse` stamp agrees with this program (`gen_reuse::stamp_now`
-    /// at the end of its collect or of a kept program reuse).
+    /// when the driver keeps it, `patch::keep`); 0 before.
     pub(crate) reuse_stamp: u64,
 }
 
@@ -5415,7 +5415,6 @@ pub fn collect_reuse(
 
     crate::check::delta_audit::dump_if_asked(&p, errs.len());
     *reuse = std::mem::take(&mut p.gx.reuse);
-    p.reuse_stamp = crate::driver::gen_reuse::stamp_now();
     def_order.instances = std::mem::take(&mut p.gx.inst_order);
     if errs.is_empty() { Ok(p) } else { Err(errs) }
 }

@@ -1133,10 +1133,27 @@ pub fn reveal_plain(p: &mut Program) {
 /// capture types; their signatures and kinds are the discovery output
 /// `reuse_kept` compares.
 pub(crate) fn hidden_stands(p: &mut Program, f: LocalDefId) -> bool {
+    hidden_again(p, f) == HiddenAgain::Stands
+}
+
+/// What revealing plain fn `f`'s own `impl Trait` again gives
+/// (`hidden_stands`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HiddenAgain {
+    /// The program's hidden type, or none before and after.
+    Stands,
+    /// Another hidden type, or one where the program has none.
+    Moved,
+    /// No hidden type: the body has errors now (it had none before).
+    Errors,
+}
+
+/// `hidden_stands` with the reason it fails.
+pub(crate) fn hidden_again(p: &mut Program, f: LocalDefId) -> HiddenAgain {
     let opaque = p.gx.opaque_ret_of.get(&f).copied().unwrap_or(p.fn_info(f).ret);
-    let TyKind::Opaque(od, _) = p.tys.kind(opaque) else { return false };
+    let TyKind::Opaque(od, _) = p.tys.kind(opaque) else { return HiddenAgain::Moved };
     if p.gx.opaques.get(&od).is_none_or(|o| o.owner != p.def_id(f)) {
-        return false;
+        return HiddenAgain::Moved;
     }
     let old = p.gx.opaque_ret_of.contains_key(&f).then(|| p.gx.opaque_hidden.get(&od).copied());
     // As `reveal_plain` runs in collect: before mono.
@@ -1148,7 +1165,11 @@ pub(crate) fn hidden_stands(p: &mut Program, f: LocalDefId) -> bool {
     };
     (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
     let new = owned.map(|o| Some(crate::check::generics::build_owned_ty(p, &o)));
-    new == old
+    match (new == old, new) {
+        (true, _) => HiddenAgain::Stands,
+        (false, None) => HiddenAgain::Errors,
+        (false, Some(_)) => HiddenAgain::Moved,
+    }
 }
 
 /// Reveals the opaque types left in revealed plain fns' `FnInfo::ret` (a

@@ -86,7 +86,7 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
         regions,         // replace (`fns`, `opaque_sigs`); rerun (outlives)
         fp_memo: _,      // the driver clears it
         impl_parents,    // same (impl headers stand)
-        reuse_stamp: _,  // the driver sets it (`reuse_kept`)
+        reuse_stamp: _,  // the driver sets it (`patch::keep`)
     } = p;
     let fn_defs_data: Vec<_> = fn_defs.iter().map(|&d| defs.get(d)).collect();
     let mut out = vec![
@@ -283,6 +283,8 @@ pub(crate) struct SigUndo {
     class: FnClass,
     regions: (Option<crate::borrowck::RegionSig>, Option<crate::borrowck::RegionSig>),
     opaque: (crate::def::DefId, Option<generics::OpaqueInfo>),
+    /// The opaque return a revealed fn keeps (`reveal_again` writes it).
+    opaque_ret: Option<crate::ty::Ty>,
 }
 
 /// Takes fn `f`'s record before `redo_sig` (see `SigUndo`).
@@ -298,6 +300,7 @@ pub(crate) fn sig_undo(p: &Program, f: LocalDefId) -> SigUndo {
         class: p.gx.fn_class[i],
         regions: (p.regions.fns.get(&f).cloned(), p.regions.opaque_sigs.get(&f).cloned()),
         opaque: (od, p.gx.opaques.get(&od).cloned()),
+        opaque_ret: p.gx.opaque_ret_of.get(&f).copied(),
     }
 }
 
@@ -320,6 +323,10 @@ pub(crate) fn undo(p: &mut Program, u: SigUndo) {
         Some(o) => p.gx.opaques.insert(u.opaque.0, o),
         None => p.gx.opaques.remove(&u.opaque.0),
     };
+    match u.opaque_ret {
+        Some(t) => p.gx.opaque_ret_of.insert(u.f, t),
+        None => p.gx.opaque_ret_of.remove(&u.f),
+    };
     p.regions.outlives_items.clear();
 }
 
@@ -331,10 +338,13 @@ pub(crate) fn undo(p: &mut Program, u: SigUndo) {
 pub(crate) fn reveal_again(p: &mut Program, f: LocalDefId, old_ret: crate::ty::Ty) -> Result<(), &'static str> {
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
-    let stands = crate::check::opaque::hidden_stands(p, f);
+    let again = crate::check::opaque::hidden_again(p, f);
     (p.record_reads, p.unwind) = (record_reads, unwind);
-    if !stands {
-        return Err("hidden type");
+    match again {
+        crate::check::opaque::HiddenAgain::Stands => {}
+        // The body has errors now: the request answers with them.
+        crate::check::opaque::HiddenAgain::Errors => return Err("hidden diag"),
+        crate::check::opaque::HiddenAgain::Moved => return Err("hidden type"),
     }
     if p.gx.opaque_ret_of.contains_key(&f) {
         let opaque = p.fns[f.0 as usize].ret;
