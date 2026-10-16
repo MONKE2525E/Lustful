@@ -3931,7 +3931,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             None => Vec::new(),
         };
         let mut at = 0usize;
-        self.receiver_walk(dt, dv, &mut at, own, comp, &comp_vars);
+        self.receiver_walk(dt, dv, &mut at, own, comp, &comp_vars, Variance::Co);
         true
     }
 
