@@ -99,7 +99,8 @@ pub struct ClosureInfo {
     /// (`closure_requirements`), not an error in the body.
     pub call_out: bool,
     /// W-BORROW: checked with no expected signature (a `let` closure), or
-    /// for a bound whose output is a callee type param (`call_out`): each
+    /// for a bound whose output is a callee type param (`call_out`) and
+    /// not its input's (`bound_output` None): each
     /// region of its output is one free inferred region, never an
     /// argument's, so it cannot meet `F: Fn(&T) -> &U` or `dyn Fn(&T) ->
     /// &U`, whose output is the input's (rustc E0308).
@@ -938,7 +939,7 @@ impl<'p> Ctx<'p> {
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
         let captures_any = !captures.is_empty();
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs, call_out, free_sig: no_sig || call_out });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs, call_out, free_sig: no_sig || call_out && bound_output.is_none() });
         if let Some((fp, _, _)) = to_fn_ptr {
             if captures_any {
                 self.err(

@@ -7432,7 +7432,8 @@ impl<'b, 'p> Builder<'b, 'p> {
         let (Some(self_t), Some(tuple)) = (targs.first().and_then(|g| g.as_ty()), targs.get(1).and_then(|g| g.as_ty())) else { return };
         let (TyKind::Param(jf), TyKind::Tuple(ts)) = (p.tys.kind(self_t), p.tys.kind(tuple)) else { return };
         let n_in = p.tys.tys_of(ts).len();
-        let Some(out_t) = sig.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).and_then(|b| b.output) else { return };
+        let Some(g) = sig.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned() else { return };
+        let Some(out_t) = g.output else { return };
         let Some(&(mut ft)) = self.bind_tys.get(&jf.0) else { return };
         while let TyKind::Ref(_, _, inner) = self.body.tys.kind(ft) {
             ft = inner;
@@ -7451,7 +7452,17 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         // The other way: an output slot the closure's own bound made its
         // input's (`tie(|a: &u8| &G)`) meets a fixed one (`'static`, a
-        // named lifetime, a type param's), which no binder can be.
+        // named lifetime, a type param's) where the bound's input is
+        // higher-ranked, which no binder can be (`Fn(T) -> R` instead
+        // takes the binder at the call's `T`).
+        let Some(c_in) = p.gx.closures.get(&def).map(|c| c.inputs.clone()) else { return };
+        let mut ins: Vec<BoundSlot> = Vec::new();
+        for (&t, &ci) in g.inputs.iter().zip(&c_in) {
+            self.bound_slots(t, ci, univ, &mut ins);
+        }
+        if !ins.contains(&BoundSlot::Hr) {
+            return;
+        }
         let hr = self.bound_hr_out_slots(def);
         if hr.iter().any(|&k| outs.get(k as usize).is_some_and(|&o| o != BoundSlot::Hr)) {
             self.free_output_not_general();
