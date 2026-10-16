@@ -479,6 +479,13 @@ pub enum Builtin {
     StrGetRange,
     BoxNew,
     BoxLeak,
+    /// `Box::new_uninit` and `Box::new_zeroed`: a fresh allocation
+    /// of `MaybeUninit<T>` (cgen; zero bytes for both).
+    BoxNewUninit,
+    BoxNewZeroed,
+    /// `Box::write(boxed, value)`: store into the `MaybeUninit<T>`
+    /// slot and give the same allocation back as `Box<T>`.
+    BoxWrite,
     RcNew,
     RcStrongCount,
     RcWeakCount,
@@ -11622,6 +11629,14 @@ impl<'p> Ctx<'p> {
             if item == k.leak {
                 return Some(Res::Builtin(Builtin::BoxLeak));
             }
+            // alloc's safe uninit surface (`assume_init` is unsafe and
+            // stays out).
+            match self.name(item) {
+                "new_uninit" => return Some(Res::Builtin(Builtin::BoxNewUninit)),
+                "new_zeroed" => return Some(Res::Builtin(Builtin::BoxNewZeroed)),
+                "write" => return Some(Res::Builtin(Builtin::BoxWrite)),
+                _ => {}
+            }
             if item == k.from {
                 return Some(Res::Builtin(Builtin::OwnFrom(own::Owner::Box)));
             }
@@ -11629,7 +11644,7 @@ impl<'p> Ctx<'p> {
                 "L0104",
                 span,
                 format!("no function `Box::{}`", self.name(item)),
-                "Lust supports Box::new and Box::leak.",
+                "Lust supports Box::new, Box::leak, Box::new_uninit, Box::new_zeroed, and Box::write.",
             );
             return None;
         }
@@ -13982,6 +13997,34 @@ impl<'p> Ctx<'p> {
                         let bx = self.tys.mk_boxed(elem);
                         let r = self.tys.mk_ref(true, elem);
                         (vec![bx], r)
+                    }
+                    // The written Self is `Box<T>` for these two but the
+                    // result is `Box<MaybeUninit<T>>`, so the written T
+                    // is the element here, not a unify of the result.
+                    Builtin::BoxNewUninit | Builtin::BoxNewZeroed => {
+                        let elem = self.new_var(false);
+                        if let Some(want) = written_self.take() {
+                            let bx = self.tys.mk_boxed(elem);
+                            if !self.unify(bx, want) {
+                                self.mismatch(span, want, bx);
+                            }
+                        }
+                        let mu = generics::maybe_uninit_ty(&mut self.tys, elem);
+                        (vec![], self.tys.mk_boxed(mu))
+                    }
+                    // `impl<T> Box<MaybeUninit<T>>`: the written Self is
+                    // the first param's type, not the result's.
+                    Builtin::BoxWrite => {
+                        let elem = self.new_var(false);
+                        let mu = generics::maybe_uninit_ty(&mut self.tys, elem);
+                        let bx = self.tys.mk_boxed(mu);
+                        if let Some(want) = written_self.take()
+                            && !self.unify(bx, want)
+                        {
+                            let tn = self.tn(want);
+                            self.err("L0104", span, format!("no associated function `write` for `{tn}`"), "`Box::write` takes a `Box<MaybeUninit<T>>`.");
+                        }
+                        (vec![bx, elem], self.tys.mk_boxed(elem))
                     }
                     Builtin::RcNew => {
                         let elem = self.new_var(false);

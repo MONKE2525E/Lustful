@@ -822,6 +822,8 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::Array(e, _) => needs_drop_c(p, e),
         CTy::ArrayIter(e, _) => needs_drop_c(p, e),
         CTy::Adt(a) if p.is_manually_drop_adt(*a) => false,
+        // `MaybeUninit<T>` never drops its bytes (a union in core).
+        CTy::Adt(a) if p.def_of_adt(*a) == crate::ty::maybe_uninit_def() => false,
         CTy::Adt(a) => {
             p.gx.drop_methods.contains_key(a) || p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty)))
         }
@@ -2853,6 +2855,24 @@ impl FnGen<'_, '_> {
             // over every process argument.
             CallTarget::Builtin(Builtin::EnvArgs) => format!("(({}){{ 0, (uint64_t)lust_argc }})", ctype(dest_cty)),
             CallTarget::Builtin(Builtin::MaybeUninitUninit | Builtin::MaybeUninitZeroed) => format!("(({}){{0}})", ctype(dest_cty)),
+            // `Box::new_uninit` and `new_zeroed`: a heap slot of the
+            // `MaybeUninit<T>` the destination box points to. The bytes
+            // are zero for both (any bytes are valid for uninit).
+            CallTarget::Builtin(Builtin::BoxNewUninit | Builtin::BoxNewZeroed) => {
+                let CTy::Boxed(mu) = dest_cty else { unreachable!("Box::new_uninit makes a Box") };
+                let mt = ctype(mu);
+                format!("(({mt}*)lust_alloc_zeroed(sizeof({mt}), _Alignof({mt})))")
+            }
+            // `Box::write`: the slot's field 0 is the `T` at offset 0,
+            // so the same pointer, cast, is the `Box<T>` to store into.
+            CallTarget::Builtin(Builtin::BoxWrite) => {
+                let (b, _) = self.operand(&args[0], loc, post);
+                let (v, _) = self.operand(&args[1], loc, post);
+                let t = self.tmp();
+                let bt = ctype(dest_cty);
+                let _ = writeln!(self.out, "    {bt} {t} = ({bt})({b}); *{t} = {v};");
+                t
+            }
             CallTarget::Builtin(Builtin::MaybeUninitNew) => {
                 let (v, _) = self.operand(&args[0], loc, post);
                 format!("(({}){{ {v} }})", ctype(dest_cty))
@@ -4299,7 +4319,7 @@ impl FnGen<'_, '_> {
             B::WaitTimedOut => format!("((*{0}).f0)", vals[0]),
             B::MaybeUninitWrite => format!("(((*{0}).f0 = {1}), &(*{0}).f0)", vals[0], vals[1]),
             B::MaybeUninitAsPtr | B::MaybeUninitAsMutPtr => format!("(&(*{0}).f0)", vals[0]),
-            B::MaybeUninitUninit | B::MaybeUninitZeroed | B::MaybeUninitNew | B::VecSpareCapacityMut => {
+            B::MaybeUninitUninit | B::MaybeUninitZeroed | B::MaybeUninitNew | B::VecSpareCapacityMut | B::BoxNewUninit | B::BoxNewZeroed | B::BoxWrite => {
                 unreachable!("dest-typed compound literals in the call dispatch")
             }
             B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => unreachable!("expanded with its closure (lower/iter.rs)"),
