@@ -64,6 +64,7 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         unwind: _,
         regions: _,
         fp_memo: _,
+        impl_parents,
     } = p;
     defs.for_each_span(&mut |s| sp(s));
     adts.iter_mut().for_each(|a| {
@@ -77,6 +78,7 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         sp(&mut s);
         (*lo, *hi) = (s.lo, s.hi);
     }
+    impl_parents.values_mut().for_each(|g| shift_generics(&mut g.generics, &mut sp));
     shift_gen_tables(gx, &mut sp);
     n
 }

@@ -16,6 +16,7 @@ pub mod convert;
 pub mod cow;
 pub mod extend;
 pub mod defaults;
+pub mod delta_audit;
 pub mod fmt;
 pub mod generics;
 pub mod into;

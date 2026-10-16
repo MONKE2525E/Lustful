@@ -211,6 +211,7 @@ impl FnLoc {
     }
 }
 
+#[derive(Debug)]
 pub struct FnInfo {
     pub name: Sym,
     /// Where the def sits: `def` reads it.
@@ -356,6 +357,9 @@ pub struct Program {
     /// Deep Adt fingerprints, kept while the driver holds the program
     /// unchanged (driver/graph.rs `FpMemo`). Off after collect.
     pub fp_memo: crate::driver::graph::FpMemo,
+    /// Each impl's generics and scope as its methods' signatures saw
+    /// them, by `ast.items` index (`fn_record` rebuilds a method with it).
+    pub(crate) impl_parents: HashMap<u32, ParentGen>,
 }
 
 impl Program {
@@ -3125,6 +3129,7 @@ pub fn collect_reuse(
         unwind: false,
         regions: Default::default(),
         fp_memo: Default::default(),
+        impl_parents: HashMap::default(),
     };
     let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;
@@ -4522,164 +4527,10 @@ pub fn collect_reuse(
     // its FnInfo holds the signature over `Param` tys, and mono appends a
     // concrete FnInfo per instance after this pass. Plain fns are their
     // own only instance, exactly as before generics.
-    struct ParentGen<'g> {
-        generics: Generics,
-        scope: generics::Scope,
-        /// The impl's written generics and where clause: their `F: Fn*`
-        /// bounds join each method's region signature (W-BORROW).
-        ast_generics: Option<(&'g ast::Generics, &'g ast::WhereClause)>,
-    }
-    let plain_parent = || ParentGen { generics: Generics::default(), scope: generics::Scope::default(), ast_generics: None };
-    let add_fn = |p: &mut Program,
-                  def: &ast::FnDef,
-                  loc: FnLoc,
-                  owner: Option<AdtId>,
-                  self_ty: Option<Ty>,
-                  parent: Option<DefId>,
-                  parent_gen: &ParentGen,
-                  hash: DefPathHash,
-                  errs: &mut Vec<Diag>|
-     -> LocalDefId {
-        let shift = parent_gen.generics.params.len() as u32;
-        let std = p.in_lang_methods(def.name_span);
-        // `T: 'a` bounds: free fns and inherent methods (`ParentGen::scope`
-        // of an inherent impl allows them; see `Scope::type_outlives`).
-        let mut seed = parent_gen.scope.clone();
-        seed.type_outlives |= matches!(loc, FnLoc::Item(_) | FnLoc::Nested(_));
-        let (own_generics, own_scope) = {
-            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
-            generics::build_generics_shifted(
-                ast,
-                interner,
-                known,
-                &cx,
-                &mut p.tys,
-                &def.generics,
-                &def.where_clause,
-                shift,
-                &seed,
-                errs,
-            )
-        };
-        let mut generics = parent_gen.generics.clone();
-        generics.params.extend(own_generics.params.iter().cloned());
-        generics.predicates.extend(own_generics.predicates.iter().copied());
-        generics.parent = parent;
-        // A parameter may not reuse a name from the enclosing impl or
-        // trait (rustc E0403). Duplicates inside one list are reported by
-        // `build_generics_shifted`.
-        for param in &own_generics.params {
-            if parent_gen.generics.params.iter().any(|q| q.name == param.name) {
-                errs.push(Diag::new(
-                    "L0106",
-                    param.span,
-                    format!("the parameter `{}` is already used for a parameter of an enclosing item", interner.get(param.name)),
-                    "Rename one of the parameters.",
-                ));
-            }
-        }
-        let mut scope = parent_gen.scope.clone();
-        // `impl Tr + 'a` arguments take `T: 'a` like written params do.
-        scope.type_outlives |= matches!(loc, FnLoc::Item(_) | FnLoc::Nested(_));
-        scope.lifetimes.extend(own_scope.lifetimes.iter().copied());
-        scope.region_facts.extend(own_scope.region_facts.iter().copied());
-        scope.type_params.extend(own_scope.type_params.iter().copied());
-        scope.const_params.extend(own_scope.const_params.iter().copied());
-        scope.param_tys.extend(own_scope.param_tys.iter().copied());
-        scope.assoc_srcs.extend(own_scope.assoc_srcs.iter().cloned());
-        // Associated sources from every bound in the combined env,
-        // so `T::Assoc` resolves in this signature.
-        {
-            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
-            let mut srcs = generics::assoc_srcs_of(&cx, &p.tys, &generics.predicates);
-            scope.assoc_srcs.append(&mut srcs);
-        }
-        let (params, ret, ret_borrows_from, generics, scope, region_sig, opaque) = {
-            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
-            let owner = DefId { krate: p.krate, hash };
-            generics::resolve_fn_sig(ast, interner, known, &mut p.tys, &cx, def, generics, &scope, self_ty, Some(owner), errs)
-        };
-        if let Some((od, info)) = opaque {
-            p.gx.opaques.insert(od, info);
-        }
-        {
-            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
-            let skip = usize::from(def.self_param.is_some());
-            let extra = generics::apit_bounds(ast, def, &params[skip.min(params.len())..], &scope);
-            let required = generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, &def.generics, &def.where_clause, &extra);
-            if !required.is_empty() {
-                let implied = generics::implied_sig_tys(ast, interner, known, &cx, &mut p.tys, &scope, def, &params);
-                let item = crate::check::outlives::Item {
-                    implied,
-                    required,
-                    facts: scope.region_facts.clone(),
-                    preds: generics.predicates.clone(),
-                    span: def.name_span,
-                };
-                if crate::check::outlives::wanted(p, &item) {
-                    p.regions.outlives_items.push(item);
-                }
-            }
-        }
-        if def.self_param.is_some() && self_ty.is_none() {
-            errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
-        }
-        let env = generics::body_env(&mut p.tys, &p.gx.index, &generics.predicates);
-        let is_template = !generics.params.is_empty();
-        if is_template {
-            p.mark_generic(def.name_span);
-        }
-        let id = LocalDefId(p.fns.len() as u32);
-        if let Some(mut rs) = region_sig {
-            // The impl's lifetimes are params of the impl: early-bound for
-            // its methods (a method does not coerce to a fn pointer that
-            // is generic over them).
-            for e in rs.early.iter_mut().take(parent_gen.scope.lifetimes.len()) {
-                *e = true;
-            }
-            if let Some((g, w)) = parent_gen.ast_generics {
-                let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
-                rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
-                rs.trait_bounds.extend(generics::trait_lts_of(ast, interner, known, &cx, &scope, g, w));
-            }
-            if rs.opaque_caps.is_some() {
-                p.regions.opaque_sigs.insert(id, rs);
-            } else {
-                p.regions.fns.insert(id, rs);
-            }
-        }
-        let def_id = DefId { krate: p.krate, hash };
-        p.fn_defs.push(def_id);
-        p.def_by_hash.entry(hash).or_insert(id);
-        // The def table record mirrors `FnInfo` for identity, kind, and generics;
-        // body checking still reads `FnInfo` through the compat path.
-        let mut data =
-            DefData::skeleton(if owner.is_some() { DefsKind::Method } else { DefsKind::Fn }, parent, def.name, Vis::Priv, def.name_span);
-        data.generics = generics.clone();
-        data.sig = SigData::Fn { params: params.clone(), ret };
-        p.defs.insert(def_id, data);
-        p.fns.push(FnInfo {
-            name: def.name,
-            loc,
-            owner,
-            self_kind: def.self_param.as_ref().map(|s| s.kind),
-            params,
-            ret,
-            ret_borrows_from,
-            is_const: def.qual.is_const,
-        });
-        p.gx.fn_templates.push(if is_template { Some(generics::FnTemplate { generics, env: env.clone() }) } else { None });
-        // The body scope of a template keeps its parameters (the
-        // abstract-instance check substitutes them); of a plain
-        // fn it is empty but for Self and assoc sources.
-        let mut body_scope = scope;
-        if !is_template {
-            body_scope.type_params.clear();
-            body_scope.const_params.clear();
-        }
-        p.gx.fn_scopes.push(generics::FnScope { env, scope: body_scope });
-        p.gx.fn_class.push(if is_template { generics::FnClass::Template } else { generics::FnClass::Plain });
-        id
+    let plain_parent = ParentGen::default;
+    let add_fn = |p: &mut Program, site: FnSite, parent_gen: &ParentGen, errs: &mut Vec<Diag>| -> LocalDefId {
+        let rec = fn_record(p, ast, interner, known, site, parent_gen, errs);
+        install_fn(p, rec)
     };
     // W-BORROW: each lifetime alias's body, checked once like rustc does
     // (an unused alias with an unknown type is still an error), and its
@@ -4730,7 +4581,8 @@ pub fn collect_reuse(
                 if let Some(b) = def.body {
                     top_hashes.insert(b, hash);
                 }
-                let id = add_fn(&mut p, def, FnLoc::Item(item_idx as u32), None, None, None, &plain_parent(), hash, &mut errs);
+                let site = FnSite { loc: FnLoc::Item(item_idx as u32), owner: None, self_ty: None, parent: None, hash };
+                let id = add_fn(&mut p, site, &plain_parent(), &mut errs);
                 // The first value of a name owns it. A unit or tuple struct
                 // constructor is a value of the struct's name too, so a fn
                 // of that name is a duplicate; a braced struct is not.
@@ -5001,8 +4853,7 @@ pub fn collect_reuse(
                 }
                 let mut impl_scope = impl_scope;
                 impl_scope.type_outlives = trait_ref.is_none();
-                let parent_gen =
-                    ParentGen { generics: impl_generics.clone(), scope: impl_scope, ast_generics: Some((&imp.generics, &imp.where_clause)) };
+                let parent_gen = ParentGen { generics: impl_generics.clone(), scope: impl_scope, impl_item: Some(item_idx as u32) };
                 let mut method_ids: Vec<LocalDefId> = Vec::new();
                 for (k, def) in imp.fns.iter().enumerate() {
                     // Functions in trait impls cannot be declared const
@@ -5016,17 +4867,8 @@ pub fn collect_reuse(
                         ));
                     }
                     let hash = crate::def::method_hash(parent, interner.get(def.name));
-                    let id = add_fn(
-                        &mut p,
-                        def,
-                        FnLoc::Impl(item_idx as u32, k as u32),
-                        owner,
-                        Some(self_pat),
-                        Some(impl_def),
-                        &parent_gen,
-                        hash,
-                        &mut errs,
-                    );
+                    let site = FnSite { loc: FnLoc::Impl(item_idx as u32, k as u32), owner, self_ty: Some(self_pat), parent: Some(impl_def), hash };
+                    let id = add_fn(&mut p, site, &parent_gen, &mut errs);
                     method_ids.push(id);
                     if static_dyn {
                         p.gx.static_dyn_fns.push(id);
@@ -5068,6 +4910,7 @@ pub fn collect_reuse(
                         &mut errs,
                     );
                 }
+                p.impl_parents.insert(item_idx as u32, parent_gen);
                 // Associated consts are evaluated with the const
                 // items below (W-RESOLVE phase 2).
             }
@@ -5090,14 +4933,15 @@ pub fn collect_reuse(
     );
     for (idx, item) in ast.stmt_items.iter().enumerate() {
         match &item.kind {
-            ItemKind::Fn(def) => {
+            ItemKind::Fn(_) => {
                 let hash = nested_hashes[idx].expect("every nested fn has an identity");
                 // The nested fn's signature resolves against the
                 // type items of its enclosing blocks, and may not
                 // use the outer functions' parameters (R18).
                 let mut parent = plain_parent();
                 apply_stmt_overlay(&p, &mut parent.scope, item.span);
-                let id = add_fn(&mut p, def, FnLoc::Nested(idx as u32), None, None, None, &parent, hash, &mut errs);
+                let site = FnSite { loc: FnLoc::Nested(idx as u32), owner: None, self_ty: None, parent: None, hash };
+                let id = add_fn(&mut p, site, &parent, &mut errs);
                 p.body_items.insert(idx as u32, BodyItem::Fn(id));
                 // The def parent chain names the enclosing fn, so
                 // paths print through it (`crate::f::inner::Local`);
@@ -5258,9 +5102,238 @@ pub fn collect_reuse(
         }
     }
 
+    crate::check::delta_audit::dump_if_asked(&p, errs.len());
     *reuse = std::mem::take(&mut p.gx.reuse);
     def_order.instances = std::mem::take(&mut p.gx.inst_order);
     if errs.is_empty() { Ok(p) } else { Err(errs) }
+}
+
+/// The enclosing item's part of a fn signature: the impl's generics and
+/// scope (empty for a free fn), and the impl item whose written `F: Fn*`
+/// bounds join each method's region signature (W-BORROW). Collect keeps
+/// each impl's in `Program::impl_parents`, so a signature delta rebuilds
+/// one method the way collect built it.
+#[derive(Clone, Default)]
+pub(crate) struct ParentGen {
+    pub(crate) generics: Generics,
+    pub(crate) scope: generics::Scope,
+    /// The impl's `ast.items` index, for its written generics.
+    pub(crate) impl_item: Option<u32>,
+}
+
+/// Where one fn sits and what owns it: `fn_record`'s identity input.
+#[derive(Clone, Copy)]
+pub(crate) struct FnSite {
+    pub(crate) loc: FnLoc,
+    pub(crate) owner: Option<AdtId>,
+    pub(crate) self_ty: Option<Ty>,
+    pub(crate) parent: Option<DefId>,
+    pub(crate) hash: DefPathHash,
+}
+
+/// What collect learns from one fn's signature, before any table but
+/// the type store changes. `install_fn` writes it into the program.
+pub(crate) struct FnRecord {
+    site: FnSite,
+    name: Sym,
+    name_span: Span,
+    self_kind: Option<SelfKind>,
+    is_const: bool,
+    params: Vec<Ty>,
+    ret: Ty,
+    ret_borrows_from: Option<usize>,
+    /// The combined generics (the impl's params, then the fn's own).
+    generics: Generics,
+    env: Vec<Predicate>,
+    body_scope: generics::Scope,
+    region_sig: Option<crate::borrowck::RegionSig>,
+    opaque: Option<(DefId, generics::OpaqueInfo)>,
+    outlives: Option<crate::check::outlives::Item>,
+}
+
+/// Resolves the signature of the fn at `site.loc` under its parent's
+/// generics. A fn with generic parameters (its own, or its impl's) is a
+/// template: its record holds the signature over `Param` tys, and mono
+/// appends a concrete FnInfo per instance after collect. Plain fns are
+/// their own only instance. Only `p.tys` changes.
+pub(crate) fn fn_record(
+    p: &mut Program,
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    site: FnSite,
+    parent_gen: &ParentGen,
+    errs: &mut Vec<Diag>,
+) -> FnRecord {
+    let FnSite { loc, self_ty, hash, .. } = site;
+    let def = loc.def(ast);
+    let shift = parent_gen.generics.params.len() as u32;
+    let std = p.in_lang_methods(def.name_span);
+    // `T: 'a` bounds: free fns and inherent methods (`ParentGen::scope`
+    // of an inherent impl allows them; see `Scope::type_outlives`).
+    let mut seed = parent_gen.scope.clone();
+    seed.type_outlives |= matches!(loc, FnLoc::Item(_) | FnLoc::Nested(_));
+    let (own_generics, own_scope) = {
+        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+        generics::build_generics_shifted(ast, interner, known, &cx, &mut p.tys, &def.generics, &def.where_clause, shift, &seed, errs)
+    };
+    let mut generics = parent_gen.generics.clone();
+    generics.params.extend(own_generics.params.iter().cloned());
+    generics.predicates.extend(own_generics.predicates.iter().copied());
+    generics.parent = site.parent;
+    // A parameter may not reuse a name from the enclosing impl or
+    // trait (rustc E0403). Duplicates inside one list are reported by
+    // `build_generics_shifted`.
+    for param in &own_generics.params {
+        if parent_gen.generics.params.iter().any(|q| q.name == param.name) {
+            errs.push(Diag::new(
+                "L0106",
+                param.span,
+                format!("the parameter `{}` is already used for a parameter of an enclosing item", interner.get(param.name)),
+                "Rename one of the parameters.",
+            ));
+        }
+    }
+    let mut scope = parent_gen.scope.clone();
+    // `impl Tr + 'a` arguments take `T: 'a` like written params do.
+    scope.type_outlives |= matches!(loc, FnLoc::Item(_) | FnLoc::Nested(_));
+    scope.lifetimes.extend(own_scope.lifetimes.iter().copied());
+    scope.region_facts.extend(own_scope.region_facts.iter().copied());
+    scope.type_params.extend(own_scope.type_params.iter().copied());
+    scope.const_params.extend(own_scope.const_params.iter().copied());
+    scope.param_tys.extend(own_scope.param_tys.iter().copied());
+    scope.assoc_srcs.extend(own_scope.assoc_srcs.iter().cloned());
+    // Associated sources from every bound in the combined env,
+    // so `T::Assoc` resolves in this signature.
+    {
+        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+        let mut srcs = generics::assoc_srcs_of(&cx, &p.tys, &generics.predicates);
+        scope.assoc_srcs.append(&mut srcs);
+    }
+    let (params, ret, ret_borrows_from, generics, scope, region_sig, opaque) = {
+        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+        let owner = DefId { krate: p.krate, hash };
+        generics::resolve_fn_sig(ast, interner, known, &mut p.tys, &cx, def, generics, &scope, self_ty, Some(owner), errs)
+    };
+    let mut outlives = None;
+    {
+        let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+        let skip = usize::from(def.self_param.is_some());
+        let extra = generics::apit_bounds(ast, def, &params[skip.min(params.len())..], &scope);
+        let required = generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, &def.generics, &def.where_clause, &extra);
+        if !required.is_empty() {
+            let implied = generics::implied_sig_tys(ast, interner, known, &cx, &mut p.tys, &scope, def, &params);
+            let item = crate::check::outlives::Item {
+                implied,
+                required,
+                facts: scope.region_facts.clone(),
+                preds: generics.predicates.clone(),
+                span: def.name_span,
+            };
+            if crate::check::outlives::wanted(p, &item) {
+                outlives = Some(item);
+            }
+        }
+    }
+    if def.self_param.is_some() && self_ty.is_none() {
+        errs.push(Diag::new("L0001", def.name_span, "`self` parameter outside an impl", "Move this function into an impl block."));
+    }
+    let env = generics::body_env(&mut p.tys, &p.gx.index, &generics.predicates);
+    let region_sig = region_sig.map(|mut rs| {
+        // The impl's lifetimes are params of the impl: early-bound for
+        // its methods (a method does not coerce to a fn pointer that
+        // is generic over them).
+        for e in rs.early.iter_mut().take(parent_gen.scope.lifetimes.len()) {
+            *e = true;
+        }
+        if let Some(i) = parent_gen.impl_item
+            && let ItemKind::Impl(imp) = &ast.items[i as usize].kind
+        {
+            let (g, w) = (&imp.generics, &imp.where_clause);
+            let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
+            rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
+            rs.trait_bounds.extend(generics::trait_lts_of(ast, interner, known, &cx, &scope, g, w));
+        }
+        rs
+    });
+    // The body scope of a template keeps its parameters (the
+    // abstract-instance check substitutes them); of a plain
+    // fn it is empty but for Self and assoc sources.
+    let mut body_scope = scope;
+    if generics.params.is_empty() {
+        body_scope.type_params.clear();
+        body_scope.const_params.clear();
+    }
+    FnRecord {
+        site,
+        name: def.name,
+        name_span: def.name_span,
+        self_kind: def.self_param.as_ref().map(|s| s.kind),
+        is_const: def.qual.is_const,
+        params,
+        ret,
+        ret_borrows_from,
+        generics,
+        env,
+        body_scope,
+        region_sig,
+        opaque,
+        outlives,
+    }
+}
+
+/// Appends one fn's record to the program's fn tables, as the next
+/// `LocalDefId`, and returns that id.
+pub(crate) fn install_fn(p: &mut Program, rec: FnRecord) -> LocalDefId {
+    let FnRecord {
+        site,
+        name,
+        name_span,
+        self_kind,
+        is_const,
+        params,
+        ret,
+        ret_borrows_from,
+        generics,
+        env,
+        body_scope,
+        region_sig,
+        opaque,
+        outlives,
+    } = rec;
+    if let Some((od, info)) = opaque {
+        p.gx.opaques.insert(od, info);
+    }
+    if let Some(item) = outlives {
+        p.regions.outlives_items.push(item);
+    }
+    let is_template = !generics.params.is_empty();
+    if is_template {
+        p.mark_generic(name_span);
+    }
+    let id = LocalDefId(p.fns.len() as u32);
+    if let Some(rs) = region_sig {
+        if rs.opaque_caps.is_some() {
+            p.regions.opaque_sigs.insert(id, rs);
+        } else {
+            p.regions.fns.insert(id, rs);
+        }
+    }
+    let def_id = DefId { krate: p.krate, hash: site.hash };
+    p.fn_defs.push(def_id);
+    p.def_by_hash.entry(site.hash).or_insert(id);
+    // The def table record mirrors `FnInfo` for identity, kind, and generics;
+    // body checking still reads `FnInfo` through the compat path.
+    let kind = if site.owner.is_some() { DefsKind::Method } else { DefsKind::Fn };
+    let mut data = DefData::skeleton(kind, site.parent, name, Vis::Priv, name_span);
+    data.generics = generics.clone();
+    data.sig = SigData::Fn { params: params.clone(), ret };
+    p.defs.insert(def_id, data);
+    p.fns.push(FnInfo { name, loc: site.loc, owner: site.owner, self_kind, params, ret, ret_borrows_from, is_const });
+    p.gx.fn_templates.push(if is_template { Some(generics::FnTemplate { generics, env: env.clone() }) } else { None });
+    p.gx.fn_scopes.push(generics::FnScope { env, scope: body_scope });
+    p.gx.fn_class.push(if is_template { generics::FnClass::Template } else { generics::FnClass::Plain });
+    id
 }
 
 /// Where an associated const's evaluated value lands.
