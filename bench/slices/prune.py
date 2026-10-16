@@ -349,8 +349,8 @@ def prune_round(errs, tool, removed, src_root, unlocated, relocate):
         if not f.startswith(str(src_root)):
             sys.exit(f"error outside the slice ({f}:{line}): {code} {msg}")
         it = innermost(f, line)
-        if it and it[3] == "use" and drop_use_leaf(f, it, code, msg):
-            removed.append({"file": os.path.relpath(f, src_root), "kind": "use-leaf", "name": msg.split("`")[1].split("::")[-1],
+        if it and it[3] == "use" and (bound := drop_use_leaf(f, it, code, msg)):
+            removed.append({"file": os.path.relpath(f, src_root), "kind": "use-leaf", "name": bound,
                             "lines": 0, "by": tool, "code": code, "message": msg[:160]})
             n_leaf += 1
             continue
@@ -392,19 +392,23 @@ def prune_round(errs, tool, removed, src_root, unlocated, relocate):
             outer.append(s)
         for s in sorted(outer, reverse=True):
             it, code, msg = spans[s]
+            # A whole `use` names no item, but its renames (`a as b`) are names users refer to.
+            binds = re.findall(r"\bas\s+([A-Za-z]\w*)", "\n".join(lines[s[0] - 1:s[1]])) if it[3] == "use" else []
             del lines[s[0] - 1:s[1]]
             removed.append({"file": os.path.relpath(f, src_root), "kind": it[3], "name": it[4],
-                            "lines": s[1] - s[0] + 1, "by": tool, "code": code, "message": msg[:160]})
+                            "lines": s[1] - s[0] + 1, "by": tool, "code": code, "message": msg[:160]}
+                           | ({"binds": binds} if binds else {}))
             n += 1
         Path(f).write_text("\n".join(lines))
     return n + n_leaf
 
 
 def drop_use_leaf(f, it, code, msg):
-    """For an unresolved import inside a `use a::{b, c}` group, delete only the failing
-    name, in place (line count unchanged), so the other names stay imported. Returns
-    False (remove the whole item) for a plain `use a::b;` or an ambiguous match."""
-    if code not in ("L0506", "E0432") or msg.count("`") < 2:
+    """For an unresolved or private import inside a `use a::{b, c}` group, delete only the
+    failing name, in place (line count unchanged), so the other names stay imported. Returns
+    the name the leaf bound (its rename for `b as x`), or False (remove the whole item) for a
+    plain `use a::b;` or an ambiguous match."""
+    if code not in ("L0506", "E0432", "L0510", "E0603") or msg.count("`") < 2:
         return False
     leaf = msg.split("`")[1].split("::")[-1]
     lines = Path(f).read_text().split("\n")
@@ -418,7 +422,8 @@ def drop_use_leaf(f, it, code, msg):
     i, m = hits[0]
     lines[i] = lines[i][:m.start()] + lines[i][m.end():]
     Path(f).write_text("\n".join(lines))
-    return True
+    alias = m.group(1).split()[-1] if m.group(1) else "_"
+    return leaf if alias == "_" else alias
 
 
 def bisect(lust, root, env, src_root, code, msg, verb="check"):

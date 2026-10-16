@@ -43,6 +43,15 @@ with tempfile.TemporaryDirectory() as d:
     tb.manifests_with_dev_deps(Path(d))
     eq("dev deps", m.read_text(), '[package]\nname = "p"\n\n[dependencies]\ny = "2"\nx = "1"\n\n')
 
+# Deep census: a private leaf in a use group goes alone and reports its rename (the census
+# removed the whole group for "`new_program` is private", and `IncrementalProgram` went with it).
+with tempfile.TemporaryDirectory() as d:
+    f = Path(d) / "a.rs"
+    f.write_text("use a::program::{\n    Program as IncrementalProgram, build_info_program,\n    new_program as new_incremental_program,\n};\n")
+    eq("private leaf", tb.prune.drop_use_leaf(str(f), (1, 4, 0, "use", "-"), "L0510", "`new_program` is private"), "new_incremental_program")
+    eq("private leaf text", f.read_text(), "use a::program::{\n    Program as IncrementalProgram, build_info_program,\n    \n};\n")
+    eq("other code", tb.prune.drop_use_leaf(str(f), (1, 3, 0, "use", "-"), "L0102", "`build_info_program` x"), False)
+
 # The census helpers tsrust_build.py calls (tsrust_deep.py and prune.py change under other packages).
 import inspect  # noqa: E402
 
