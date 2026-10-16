@@ -812,6 +812,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
         CTy::Array(e, _) => needs_drop_c(p, e),
         CTy::ArrayIter(e, _) => needs_drop_c(p, e),
+        CTy::Adt(a) if p.is_manually_drop_adt(*a) => false,
         CTy::Adt(a) => {
             p.gx.drop_methods.contains_key(a) || p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| needs_drop(p, &p.tys, f.ty)))
         }

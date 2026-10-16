@@ -22192,6 +22192,9 @@ fn needs_drop_answer(p: &Program, tys: &mut impl TyIntern, drop_defs: &[DefId], 
             } else {
                 // The template's field types with this instance's args.
                 let a = tys.local_adt_of(def)?;
+                if p.is_manually_drop_adt(a) {
+                    return Some(false);
+                }
                 let args: Vec<GenericArg> = tys.args(args).to_vec();
                 let fields: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
                 fields.into_iter().map(|f| crate::ty::subst(tys, f, &args)).collect()

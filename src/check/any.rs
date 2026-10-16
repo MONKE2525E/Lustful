@@ -976,7 +976,7 @@ fn tn_std_source_path(display: &str) -> Option<&'static str> {
         "std::collections::BTreeSet" | "alloc::collections::BTreeSet" => "alloc::collections::btree::set::BTreeSet",
         "std::collections::BinaryHeap" | "alloc::collections::BinaryHeap" => "alloc::collections::binary_heap::BinaryHeap",
         "std::num::Wrapping" => "core::num::wrapping::Wrapping",
-        "std::mem::ManuallyDrop" => "core::mem::manually_drop::ManuallyDrop",
+        "std::mem::ManuallyDrop" | "core::mem::ManuallyDrop" => "core::mem::manually_drop::ManuallyDrop",
         "std::mem::MaybeUninit" => "core::mem::maybe_uninit::MaybeUninit",
         "std::pin::Pin" => "core::pin::Pin",
         "std::error::Error" => "core::error::Error",

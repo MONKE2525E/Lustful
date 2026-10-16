@@ -584,6 +584,13 @@ impl Program {
     pub fn is_phantom_adt(&self, a: AdtId) -> bool {
         self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::marker::PhantomData"
     }
+    /// True when Adt `a` (a template or an instance) is std's
+    /// `core::mem::ManuallyDrop` (std source, R2): it has no drop glue,
+    /// so the value inside is never dropped (`needs_drop_sub`,
+    /// cgen's `needs_drop_c`), and layout queries see it.
+    pub fn is_manually_drop_adt(&self, a: AdtId) -> bool {
+        self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::mem::ManuallyDrop"
+    }
     /// True when Adt `a` is std's `core::ops::ControlFlow` (std source,
     /// W-STD-C): `?` on it returns its `Break` from the enclosing fn
     /// (`try_expr` in check, `try_into` in lower).
@@ -9037,6 +9044,9 @@ fn needs_drop_sub(p: &Program, tys: &impl TyIntern, t: Ty, args: &[GenericArg], 
     }
     match tys.local_adt(t) {
         Some(a) => {
+            if p.is_manually_drop_adt(a) {
+                return false;
+            }
             if p.gx.drop_methods.contains_key(&a) || (exact && p.drop_adts.contains(&a)) {
                 return true;
             }
@@ -9154,11 +9164,15 @@ impl crate::ty::layout::AdtShapes for UserLayout<'_> {
         // `OnceCell<T>` is std's `UnsafeCell<Option<T>>`: its source
         // fields (the `Option<T>` and a `PhantomData`) with the niche
         // hidden.
+        // `ManuallyDrop<T>` is core's repr(transparent) wrapper over its
+        // `MaybeDangling<T>`, itself repr(transparent) over `T`: the
+        // source form is exact, and `T`'s niche stays visible.
         if p.std_source_span(adt.span) && !p.is_phantom_adt(id) && !p.is_known_allocator_adt(id) {
-            if p.display_path(adt.name) == "core::cell::OnceCell" {
-                return p.adt_shape(id).map(|s| crate::ty::layout::AdtShape { hide_niche: true, ..s });
+            match p.display_path(adt.name).as_str() {
+                "core::cell::OnceCell" => return p.adt_shape(id).map(|s| crate::ty::layout::AdtShape { hide_niche: true, ..s }),
+                "core::mem::ManuallyDrop" | "core::mem::MaybeDangling" => return p.adt_shape(id),
+                _ => return None,
             }
-            return None;
         }
         if let Some(a) = p.adapter_at(adt.span) {
             let path = p.display_path(adt.name);
