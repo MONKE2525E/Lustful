@@ -135,6 +135,11 @@ impl<'p> Ctx<'p> {
                 "strong_count" => (B::WeakStrongCount, Autoref::Ref, vec![], USIZE),
                 "weak_count" => (B::WeakWeakCount, Autoref::Ref, vec![], USIZE),
                 "ptr_eq" => (B::WeakPtrEq, Autoref::Ref, vec![w_ref], BOOL),
+                // A Weak of `str`, `[T]` or `dyn` is a fat value with no
+                // `as_ptr` here yet.
+                "as_ptr" if { let d = self.deep(el); !matches!(self.kind(d), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) } => {
+                    (B::WeakAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, el)))
+                }
                 _ => return None,
             }
         } else if let Some(el) = self.tys.refcell_elem(base) {

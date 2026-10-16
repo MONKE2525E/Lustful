@@ -344,6 +344,8 @@ pub enum Builtin {
     /// `[T]::copy_from_slice` (`T: Copy`): an exact-length copy; a
     /// length mismatch panics with core's text at the call.
     SliceCopyFromSlice,
+    /// `[T]::clone_from_slice` for a non-Copy `T`: core's element-wise `clone_from`.
+    SliceCloneFromSlice,
     /// `[T]::copy_within` (`T: Copy`): the range bounds travel as
     /// drain's four words (check/slice.rs, lower.rs).
     SliceCopyWithin,
@@ -737,6 +739,8 @@ pub enum Builtin {
     RcPtrEq,
     WeakNew,
     WeakUpgrade,
+    /// `rc::Weak::as_ptr` of a sized `T`: `*const T` at the value (or the dangling address).
+    WeakAsPtr,
     WeakStrongCount,
     WeakWeakCount,
     WeakPtrEq,
@@ -1028,6 +1032,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::WrappingDiv, Builtin::WrappingMul, Builtin::WrappingNeg, Builtin::WrappingPow, Builtin::WrappingRem, Builtin::WrappingShl,
     Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet, Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetRef), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetMut), Builtin::Sync(crate::check::sync::SyncOp::ArcWeakUpgrade),
     Builtin::RefCellBorrow, Builtin::RefCellBorrowMut,
+    Builtin::VecAsSlice, Builtin::VecAsMutSlice, Builtin::VecLen, Builtin::VecIsEmpty,
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
@@ -3870,6 +3875,20 @@ impl<'p> Ctx<'p> {
                     self.str_method(name)?
                 }
             }
+            // `Vec::as_slice` and kin as values (`opt.map(Vec::as_slice)`).
+            _ if let Some(e) = self.tys.vec_elem(self_ty) => match self.name(name) {
+                "as_slice" => {
+                    let sl = self.tys.intern(TyKind::Slice(e));
+                    (B::VecAsSlice, Autoref::Ref, vec![], self.tys.mk_ref(false, sl))
+                }
+                "as_mut_slice" => {
+                    let sl = self.tys.intern(TyKind::Slice(e));
+                    (B::VecAsMutSlice, Autoref::RefMut, vec![], self.tys.mk_ref(true, sl))
+                }
+                "len" => (B::VecLen, Autoref::Ref, vec![], USIZE),
+                "is_empty" => (B::VecIsEmpty, Autoref::Ref, vec![], BOOL),
+                _ => return None,
+            },
             _ if self_ty == STRING => {
                 if name == k.as_str {
                     (B::StringAsStr, Autoref::Ref, vec![], REF_STR)
@@ -11883,6 +11902,11 @@ impl<'p> Ctx<'p> {
                 Builtin::VecFrom
             } else if item == k.clone {
                 Builtin::Clone
+            } else if let Some(vt) = Some(self.new_var(false)).map(|e| self.tys.mk_vec(e))
+                && let Some((b, _, _, _)) = self.prim_assoc_sig(vt, item, &[])
+            {
+                // `Vec::as_slice` and kin as values (`prim_assoc_sig`).
+                return Some(Res::PrimAssoc { b, self_ty: vt, name: item });
             } else {
                 self.err(
                     "L0104",
@@ -11903,6 +11927,11 @@ impl<'p> Ctx<'p> {
             }
             if item == k.leak {
                 return Some(Res::Builtin(Builtin::BoxLeak));
+            }
+            // `Box::default()`: the default glue of `Box<T>` (`box_default_sig`;
+            // `Box::<T>::default()` keeps its own path).
+            if self.name(item) == "default" && segs.len() >= 2 && segs[segs.len() - 2].type_args().is_empty() {
+                return Some(Res::Builtin(Builtin::DefaultGlue));
             }
             // alloc's safe uninit surface (`assume_init` is unsafe and
             // stays out).
@@ -14373,7 +14402,7 @@ impl<'p> Ctx<'p> {
                     Builtin::RcDowngrade | Builtin::RcNewCyclic | Builtin::RcPtrEq | Builtin::SmartAsPtr | Builtin::WeakNew | Builtin::WeakPtrEq | Builtin::RefCellNew | Builtin::CellNew => {
                         self.cell_call_sig(b, callee)
                     }
-                    Builtin::DefaultGlue => match self.cow_default_sig(callee, span) {
+                    Builtin::DefaultGlue => match self.cow_default_sig(callee, span).or_else(|| self.box_default_sig(callee, span)) {
                         Some(sig) => sig,
                         None => self.cell_default_sig(callee, span),
                     },

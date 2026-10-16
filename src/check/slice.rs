@@ -46,6 +46,7 @@ impl<'p> Ctx<'p> {
             "ends_with" => "ends_with",
             "fill" => "fill",
             "copy_from_slice" => "copy_from_slice",
+            "clone_from_slice" => "clone_from_slice",
             "copy_within" => "copy_within",
             "get" => "get",
             "get_mut" => "get_mut",
@@ -112,6 +113,30 @@ impl<'p> Ctx<'p> {
                 }
                 self.deferred_clone.push((elem, name_span));
                 (B::SliceFill, Autoref::RefMut, vec![elem], UNIT)
+            }
+            // core specializes `clone_from_slice` on `TrivialClone` (a Copy
+            // type whose Clone is core's or derived): that runs
+            // `copy_from_slice`, panic message included. Any other
+            // `T: Clone` runs `clone_from` per element after its own
+            // length assert. A Copy type with a written Clone stays out
+            // (the glue does not call such impls, see `glue_methods`).
+            "clone_from_slice" => {
+                let el = self.deep(elem);
+                let r = needle(self);
+                if crate::check::collect::is_copy(self.p, &self.tys, el) {
+                    if !trivial_clone(self.p, &self.tys, el) {
+                        self.errs.push(not_yet("L0640", name_span, "`clone_from_slice` on a Copy type with a written `Clone` impl"));
+                        return Some(self.slice_bail(args));
+                    }
+                    (B::SliceCopyFromSlice, Autoref::RefMut, vec![r], UNIT)
+                } else {
+                    if crate::check::collect::mentions_hash_table(self.p, &self.tys, el) {
+                        self.errs.push(not_yet("L0640", name_span, "`clone_from_slice` on a slice of a type holding a hash table"));
+                        return Some(self.slice_bail(args));
+                    }
+                    self.deferred_clone.push((elem, name_span));
+                    (B::SliceCloneFromSlice, Autoref::RefMut, vec![r], UNIT)
+                }
             }
             _ => {
                 self.deferred_copy.push((elem, name_span));
@@ -649,4 +674,43 @@ impl<'p> Ctx<'p> {
         }
         ERROR
     }
+}
+
+/// True when `t` is a Copy type whose `Clone` is core's or derived all the
+/// way down (core's `TrivialClone`): primitives, references, raw and fn
+/// pointers, tuples, arrays and `Option` of such, and local Adts that
+/// derive both `Clone` and `Copy` with such fields. A written `Clone` impl
+/// anywhere makes it false; so does any type this walk does not know.
+fn trivial_clone(p: &crate::check::collect::Program, tys: &impl TyIntern, t: Ty) -> bool {
+    fn go(p: &crate::check::collect::Program, tys: &impl TyIntern, t: Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match tys.kind(t) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Never => true,
+            TyKind::Ref(_, m, _) => !m.is_mut(),
+            TyKind::RawPtr(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) => true,
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| go(p, tys, e, depth + 1)),
+            TyKind::Array(e, _) => go(p, tys, e, depth + 1),
+            _ => {
+                if let Some(e) = tys.option_elem(t) {
+                    return go(p, tys, e, depth + 1);
+                }
+                let Some(a) = tys.local_adt(t) else { return false };
+                let d = p.derives_of(a);
+                if !(d.clone && d.copy) {
+                    return false;
+                }
+                let args: Vec<GenericArg> = match tys.kind(t) {
+                    TyKind::Adt(_, a) => tys.args(a).to_vec(),
+                    _ => Vec::new(),
+                };
+                if !args.is_empty() {
+                    return false;
+                }
+                p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| go(p, tys, f.ty, depth + 1)))
+            }
+        }
+    }
+    go(p, tys, t, 0)
 }

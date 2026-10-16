@@ -1074,9 +1074,10 @@ impl<'p> Ctx<'p> {
                 self.set_res(e, Res::BuiltinMethod { b: B::IterFlatMap, derefs, autoref: Autoref::None });
                 self.check_args(&[f], args, span);
                 self.run_obligations(false);
-                // The expansion calls a closure body directly.
-                let fd = self.deep(f);
-                if !matches!(self.kind(fd), TyKind::Closure(..) | TyKind::Error) {
+                // The expansion is `Flatten<Map<I, F>>`, whose map calls a
+                // closure, fn item or fn pointer (lower/iter.rs `call_fn`).
+                let fd = self.peel_callable_refs(f);
+                if !matches!(self.kind(fd), TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(_) | TyKind::Error) {
                     self.err("L0640", span, "`flat_map` with a fn item or fn pointer is not implemented yet", "Pass a closure: `|x| f(x)`.");
                     return ERROR;
                 }

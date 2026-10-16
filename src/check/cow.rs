@@ -66,6 +66,20 @@ impl<'p> Ctx<'p> {
         Some((vec![], cow))
     }
 
+    /// `Box::default()` with no written type args (`Box::leak(Box::default())`):
+    /// `Box<T>` for an inferred `T: Default`. None for other paths.
+    pub(super) fn box_default_sig(&mut self, callee: ExprId, span: Span) -> Option<(Vec<Ty>, Ty)> {
+        let Expr::Path(segs) = self.p.ast.expr(callee) else { return None };
+        let [.., ty_seg, _] = segs.as_slice() else { return None };
+        if self.name(ty_seg.name) != "Box" || !ty_seg.type_args().is_empty() {
+            return None;
+        }
+        let elem = self.new_var(false);
+        let b = self.tys.mk_boxed(elem);
+        self.deferred_default.push((b, span));
+        Some((vec![], b))
+    }
+
     /// A method on a `Cow<B>` receiver, or None for other receivers and
     /// names (the other dispatch then runs).
     #[allow(clippy::too_many_arguments)]

@@ -4638,6 +4638,7 @@ impl<'p> Lower<'p> {
                 | B::IterIterMut
                 | B::SliceFill
                 | B::SliceCopyFromSlice
+                | B::SliceCloneFromSlice
                 | B::SliceRotateLeft
                 | B::SliceRotateRight
         )

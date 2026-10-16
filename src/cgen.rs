@@ -5358,6 +5358,12 @@ impl FnGen<'_, '_> {
             B::RcPtrEq if matches!(&tys[0], CTy::Ref(r) if **r == CTy::RcDyn) => format!("((*{}).data == (*{}).data)", vals[0], vals[1]),
             B::RcPtrEq | B::WeakPtrEq => format!("(*{} == *{})", vals[0], vals[1]),
             B::WeakNew => "((void*)~(uint64_t)0)".into(),
+            // std: the value's address, or the dangling sentinel itself.
+            B::WeakAsPtr => {
+                let w = self.tmp();
+                let _ = writeln!(self.out, "    {} {w} = *{};", ctype(&deref_cty(&tys[0])), vals[0]);
+                format!("({w} == (void*)~(uint64_t)0 ? (void*)~(uint64_t)0 : (void*)&{w}->v)")
+            }
             B::WeakUpgrade => {
                 let w = deref_cty(&tys[0]);
                 let CTy::Weak(e) = &w else { unreachable!("Weak::upgrade on a Weak") };
@@ -5743,6 +5749,20 @@ impl FnGen<'_, '_> {
                         let _ = writeln!(self.out, "    if ({len} > 0) {ptr}[{len} - 1] = {tv};");
                     }
                 }
+                "((lust_Unit){})".into()
+            }
+            // core's non-`TrivialClone` `clone_from_slice`: the length
+            // assert, then `self[i].clone_from(&src[i])` in order.
+            B::SliceCloneFromSlice => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (_, sptr, slen) = slice_like(&tys[1], &vals[1]);
+                self.want(Glue::CloneFrom, &e);
+                let i = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    if ({slen} != {len}) lust_panic_cstr(\"destination and source slices have different lengths\", {loc});\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) clonefrom_{}(&{ptr}[{i}], &{sptr}[{i}]);",
+                    mangle(&e)
+                );
                 "((lust_Unit){})".into()
             }
             B::SliceCopyFromSlice => {
