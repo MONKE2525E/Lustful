@@ -240,7 +240,12 @@ impl FnGen<'_, '_> {
             TyKind::Array(_, c) => format!("((lust_pat){{ .kind = LUST_PAT_SET, .set = ({ptr})->v, .n = {} }})", n_of(self, c)),
             TyKind::Closure(def, _) => {
                 let f = self.p.gx.closures[&def].body_fn;
-                let a = self.split_adapter(f);
+                let a = self.split_adapter(f, true);
+                format!("((lust_pat){{ .kind = LUST_PAT_PRED, .pred = {a}, .env = (void*){ptr} }})")
+            }
+            // A plain fn item (check/split.rs `is_pattern_fn_item`): no env.
+            TyKind::FnDef(def, _) if let Some(f) = self.p.local_def(def.hash) => {
+                let a = self.split_adapter(f, false);
                 format!("((lust_pat){{ .kind = LUST_PAT_PRED, .pred = {a}, .env = (void*){ptr} }})")
             }
             TyKind::Ref(_, _, inner) => match self.body.tys.kind(inner) {
@@ -255,12 +260,17 @@ impl FnGen<'_, '_> {
     }
 
     /// The `uint8_t f(void *env, uint32_t c)` adapter that calls a
-    /// predicate closure's body (its env is the stored closure).
-    fn split_adapter(&mut self, f: LocalDefId) -> String {
+    /// predicate closure's body (its env is the stored closure), or,
+    /// without `env`, a plain fn item that takes the char alone.
+    fn split_adapter(&mut self, f: LocalDefId, env: bool) -> String {
         let name = format!("lust_splitp_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
         self.adapters += 1;
         let mut body = String::new();
-        let (r, _) = self.closure_call_c(&mut body, f, "env", &["c".to_string()]);
+        let (r, _) = if env {
+            self.closure_call_c(&mut body, f, "env", &["c".to_string()])
+        } else {
+            self.fn_call_c(&mut body, f, &["c".to_string()])
+        };
         let _ = writeln!(self.prelude, "static uint8_t {name}(void *env, uint32_t c) {{\n{body}  return {r};\n}}");
         name
     }

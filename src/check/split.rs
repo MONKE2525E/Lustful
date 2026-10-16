@@ -86,16 +86,14 @@ impl<'p> Ctx<'p> {
                     self.expr(a, None)
                 };
                 let t = self.deep(t);
-                if let TyKind::Closure(..) = self.kind(t)
-                    && !closure_expr
-                {
+                if (matches!(self.kind(t), TyKind::Closure(..)) || self.is_pattern_fn_item(t)) && !closure_expr {
                     let f = self.fn_mut_param(&[CHAR], BOOL, name_span);
                     if !self.unify(f, t) {
                         self.mismatch(self.span(a), f, t);
                         return Some(ERROR);
                     }
                 }
-                if !pattern_ok(&self.tys, t) {
+                if !pattern_ok(&self.tys, t) && !self.is_pattern_fn_item(t) {
                     if self.kind(t) != TyKind::Error {
                         let tn = self.tn(t);
                         self.err(
@@ -185,6 +183,18 @@ impl<'p> Ctx<'p> {
         Some(self.tys.mk_result(t, err))
     }
 
+    /// True for a plain non-generic fn item used as a str pattern
+    /// (`trim_start_matches(is_white_space_like)`): codegen calls it
+    /// through an adapter (cgen/split.rs `split_pat`), as a closure body.
+    fn is_pattern_fn_item(&self, t: Ty) -> bool {
+        match self.kind(t) {
+            TyKind::FnDef(def, args) => {
+                self.p.is_fn_item_def(def) && self.tys.args(args).is_empty() && self.p.local_def(def.hash).is_some() && def != crate::ty::prim_fn_def()
+            }
+            _ => false,
+        }
+    }
+
     /// One checked pattern argument (the split family's rules): a
     /// closure literal is checked against `FnMut(char) -> bool`, a
     /// closure value must have that signature, and the type must be
@@ -199,16 +209,14 @@ impl<'p> Ctx<'p> {
             self.expr(a, None)
         };
         let t = self.deep(t);
-        if let TyKind::Closure(..) = self.kind(t)
-            && !closure_expr
-        {
+        if (matches!(self.kind(t), TyKind::Closure(..)) || self.is_pattern_fn_item(t)) && !closure_expr {
             let f = self.fn_mut_param(&[CHAR], BOOL, name_span);
             if !self.unify(f, t) {
                 self.mismatch(self.span(a), f, t);
                 return None;
             }
         }
-        if !pattern_ok(&self.tys, t) {
+        if !pattern_ok(&self.tys, t) && !self.is_pattern_fn_item(t) {
             if self.kind(t) != TyKind::Error {
                 let tn = self.tn(t);
                 self.err(

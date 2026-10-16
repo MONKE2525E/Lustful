@@ -3663,6 +3663,16 @@ impl FnGen<'_, '_> {
     /// argument expressions, into a fresh variable of its return type
     /// (written to `out`): the large-return form takes `&var` first.
     fn closure_call_c(&mut self, out: &mut String, f: LocalDefId, env: &str, args: &[String]) -> (String, CTy) {
+        let mut all: Vec<String> = vec![env.to_string()];
+        all.extend(args.iter().cloned());
+        self.fn_call_c(out, f, &all)
+    }
+
+    /// C statements (into `out`) calling fn `f` through its slot with
+    /// C argument values `args` (all of its params, in order); returns
+    /// the result temp and its C type. `closure_call_c` passes a closure
+    /// body's env first.
+    fn fn_call_c(&mut self, out: &mut String, f: LocalDefId, args: &[String]) -> (String, CTy) {
         let rt = cty(&self.p.tys, self.p.fn_info(f).ret);
         collect_types(&rt, &mut self.sig_types);
         for &t in &self.p.fn_info(f).params {
@@ -3672,10 +3682,8 @@ impl FnGen<'_, '_> {
         let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, f), self.slots[f.0 as usize]);
         // A dropped parameter (a zero-sized env taken by value, or a
         // zero-sized argument) is not in the C signature, so it is
-        // not passed here either (see `param_dropped`); the env is
-        // the body fn's first parameter.
-        let mut all: Vec<String> = vec![env.to_string()];
-        all.extend(args.iter().cloned());
+        // not passed here either (see `param_dropped`).
+        let mut all: Vec<String> = args.to_vec();
         let dropped: Vec<bool> = self.p.fn_info(f).params.iter().map(|&t| param_dropped(self.p, &cty(&self.p.tys, t))).collect();
         let mut i = 0;
         all.retain(|_| {

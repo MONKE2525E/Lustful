@@ -4149,6 +4149,9 @@ impl<'a> Parser<'a> {
             ("Rc" | "Arc", "clone" | "as_ptr" | "downgrade" | "strong_count" | "weak_count") => 1,
             ("Rc" | "Arc", "ptr_eq") => 2,
             ("char", "from_u32") => 1,
+            // By-value predicates, so `trim_matches(char::is_whitespace)`
+            // takes them as the closure patterns lust has.
+            ("char", "is_whitespace" | "is_alphabetic" | "is_alphanumeric" | "is_numeric" | "is_control" | "is_lowercase" | "is_uppercase") => 1,
             ("thread", "sleep" | "spawn") => 1,
             ("mem", "drop" | "take") => 1,
             ("mem", "swap" | "replace") => 2,
