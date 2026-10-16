@@ -2067,6 +2067,22 @@ const STD_FN_PATHS: &[&str] = &[
     "std/any/type_name",
     "alloc/fmt/format",
     "std/fmt/format",
+    "core/slice/from_ref",
+    "std/slice/from_ref",
+    "core/slice/from_mut",
+    "std/slice/from_mut",
+    "core/ptr/from_ref",
+    "std/ptr/from_ref",
+    "core/ptr/from_mut",
+    "std/ptr/from_mut",
+    "core/ptr/null",
+    "std/ptr/null",
+    "core/ptr/null_mut",
+    "std/ptr/null_mut",
+    "core/ptr/eq",
+    "std/ptr/eq",
+    "core/ptr/addr_eq",
+    "std/ptr/addr_eq",
 ];
 
 const STD_MACRO_PATHS: &[&str] = &[
