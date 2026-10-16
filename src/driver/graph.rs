@@ -1026,7 +1026,7 @@ fn hash_vis_facts(h: &mut FxHasher, p: &Program, def: DefId) {
     }
 }
 
-/// Folds one evaluated const value into `h`. `StaticRef` indices are
+/// Folds one evaluated const value into `h`. `StaticRef` (`StaticPlace`) indices are
 /// collect-order positions, not stable content, so they fold the
 /// referenced static's name and (depth-capped) value instead.
 fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::ConstValue, depth: u32) {
@@ -1070,6 +1070,10 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
         ConstValue::Bytes(b) => {
             12u8.hash(h);
             b.as_slice().hash(h);
+        }
+        ConstValue::StaticPlace(i, path) => {
+            (13u8, path).hash(h);
+            hash_const_value(h, p, &ConstValue::StaticRef(*i), depth);
         }
         ConstValue::StaticRef(i) => {
             9u8.hash(h);

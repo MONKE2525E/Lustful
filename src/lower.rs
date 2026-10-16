@@ -6420,11 +6420,6 @@ impl<'p> Lower<'p> {
             CV::Str(i) => Operand::Const(Const::Str(*i)),
             CV::Bytes(b) if matches!(self.kind(ty), TyKind::Array(..)) => Operand::Const(Const::Bytes(b.clone())),
             CV::Unit => Operand::Const(Const::Unit),
-            CV::StaticRef(idx) => {
-                let t = self.temp(ty);
-                self.assign(Place::local(t), Rvalue::StaticRef(*idx), span);
-                Operand::Copy(Place::local(t))
-            }
             _ => {
                 let t = self.temp(ty);
                 self.const_into(v, ty, &Place::local(t), span);
@@ -6434,6 +6429,54 @@ impl<'p> Lower<'p> {
     }
 
     /// Stores a const value into a place, building it from its parts.
+    /// Stores into `dest` (of reference type `ty`) the address of the
+    /// place at `path` inside static `idx` (a `StaticRef` or `StaticPlace`
+    /// const value), reached from the static's address at run time. A
+    /// slice reference type takes the fat value of the array place.
+    fn static_place_into(&mut self, idx: u32, path: &[crate::ty::consteval::StaticStep], ty: Ty, dest: &Place, span: Span) {
+        use crate::ty::consteval::StaticStep;
+        let mut cur = self.p.statics[idx as usize].ty;
+        let wants_slice = matches!(self.kind(ty), TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Slice(_)));
+        if path.is_empty() && !(wants_slice && matches!(self.kind(cur), TyKind::Array(..))) {
+            self.assign(dest.clone(), Rvalue::StaticRef(idx), span);
+            return;
+        }
+        let rt = self.ref_ty(false, cur);
+        let t = self.temp(rt);
+        self.assign(Place::local(t), Rvalue::StaticRef(idx), span);
+        let mut place = Place::local(t).deref();
+        for step in path {
+            cur = match (step, self.kind(cur)) {
+                (StaticStep::Field(i), TyKind::Tuple(ts)) => {
+                    place = place.project(Proj::Field(*i));
+                    self.body.tys.tys_of(ts)[*i as usize]
+                }
+                (StaticStep::Field(i), _) => {
+                    let a = self.body.tys.local_adt(cur).expect("internal: a static place field of a non-struct");
+                    place = place.project(Proj::Field(*i));
+                    self.p.adt(a).variants[0].fields[*i as usize].ty
+                }
+                (StaticStep::Elem(i), TyKind::Array(el, _) | TyKind::Slice(el)) => {
+                    let il = self.temp(USIZE);
+                    self.assign(Place::local(il), Rvalue::Use(Operand::Const(Const::Int(u128::from(*i), IntTy::Usize))), span);
+                    self.mark_index_loc(il, span);
+                    place = place.project(Proj::Index(il));
+                    el
+                }
+                (StaticStep::Deref, TyKind::Ref(_, _, inner)) => {
+                    place = place.deref();
+                    inner
+                }
+                _ => panic!("internal: a static place step {step:?} on a type without it"),
+            };
+        }
+        if wants_slice && matches!(self.kind(cur), TyKind::Array(..) | TyKind::Slice(_)) {
+            self.assign(dest.clone(), Rvalue::SliceOf(place), span);
+        } else {
+            self.assign(dest.clone(), Rvalue::Ref(false, place), span);
+        }
+    }
+
     fn const_into(&mut self, v: &crate::ty::consteval::ConstValue, ty: Ty, dest: &Place, span: Span) {
         use crate::ty::consteval::ConstValue as CV;
         // `ExitCode::SUCCESS` and `FAILURE` build through `ExitCode::from`.
@@ -6533,7 +6576,8 @@ impl<'p> Lower<'p> {
                 let mutable = matches!(self.kind(ty), TyKind::Ref(_, Mut::Mut, _));
                 self.assign(dest.clone(), Rvalue::Ref(mutable, Place::local(t)), span);
             }
-            CV::StaticRef(idx) => self.assign(dest.clone(), Rvalue::StaticRef(*idx), span),
+            CV::StaticRef(idx) => self.static_place_into(*idx, &[], ty, dest, span),
+            CV::StaticPlace(idx, path) => self.static_place_into(*idx, path, ty, dest, span),
             // A fn pointer in a const value (W-STD-C): the slot trampoline.
             CV::FnPtr(f) => self.assign(dest.clone(), Rvalue::FnValue(LocalDefId(*f), ty), span),
             _ => {

@@ -58,10 +58,78 @@ pub enum ConstValue {
     Ref(Box<ConstValue>),
     /// A reference to a static item, by index into the program's statics.
     StaticRef(u32),
+    /// A reference into a static item (`&STATIC.f`, `&TABLE[i]`): the
+    /// static's index and a non-empty path from its root. It keeps the
+    /// static's storage, as in rustc. A `Deref` step only goes through
+    /// a promoted reference inside the root's value (`static T: &[M] =
+    /// &[..]`): a step through a reference to another static re-roots
+    /// the path there (`static_place`).
+    StaticPlace(u32, Box<[StaticStep]>),
     /// A fn item coerced to a fn pointer, by its `LocalDefId` index
     /// (W-STD-C: `static LazyLock` init fns). It can be stored and moved,
     /// never called or compared here, as in rustc.
     FnPtr(u32),
+}
+
+/// One step of a `ConstValue::StaticPlace` path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StaticStep {
+    /// A struct or tuple field, by index.
+    Field(u32),
+    /// An array or slice element, by index.
+    Elem(u32),
+    /// Into the promoted value a reference points to.
+    Deref,
+}
+
+/// The value at `path` inside `v`, a static's value; None when the path
+/// leaves the value (a step through a reference to another static, or
+/// one the value's shape does not have).
+pub fn value_at<'v>(mut v: &'v ConstValue, path: &[StaticStep]) -> Option<&'v ConstValue> {
+    for step in path {
+        v = match (step, v) {
+            (StaticStep::Field(i) | StaticStep::Elem(i), ConstValue::Aggregate(vals)) => vals.get(*i as usize)?,
+            (StaticStep::Elem(i), ConstValue::Repeat(x, n)) if u64::from(*i) < *n => x,
+            (StaticStep::Deref, ConstValue::Ref(inner)) => inner,
+            // A slice reference's value is its backing aggregate.
+            (StaticStep::Deref, ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Bytes(_)) => v,
+            _ => return None,
+        };
+    }
+    Some(v)
+}
+
+/// Follows the reference at `path` inside static `idx`: into its
+/// promoted value (a `Deref` step), or to the static it points into
+/// (the path re-roots there). False when the value there is no
+/// reference the path can follow.
+fn static_deref<'a, C: ConstCx<'a>>(cx: &mut C, idx: &mut u32, path: &mut Vec<StaticStep>) -> bool {
+    let Some(v) = cx.static_value(*idx).and_then(|v| value_at(v, path)) else { return false };
+    match v {
+        ConstValue::StaticRef(j) => {
+            *idx = *j;
+            path.clear();
+        }
+        ConstValue::StaticPlace(j, p) => {
+            *idx = *j;
+            *path = p.to_vec();
+        }
+        ConstValue::Ref(_) | ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Bytes(_) => path.push(StaticStep::Deref),
+        _ => return false,
+    }
+    true
+}
+
+/// A copy of the value at `path` inside static `idx`, for a read
+/// through a reference into it; a byte blob element reads as its int.
+fn read_static<'a, C: ConstCx<'a>>(cx: &mut C, idx: u32, path: &[StaticStep]) -> Option<ConstValue> {
+    let root = cx.static_value(idx)?;
+    if let [init @ .., StaticStep::Elem(i)] = path
+        && let Some(ConstValue::Bytes(b)) = value_at(root, init)
+    {
+        return b.as_slice().get(*i as usize).map(|&x| ConstValue::Int(x as i128));
+    }
+    value_at(root, path).cloned()
 }
 
 /// A value with its type, as the evaluator produces it.
@@ -184,6 +252,12 @@ pub trait ConstCx<'a> {
     fn unit_variant(&mut self, segs: &[ast::PathSeg], expected: Option<Ty>) -> Option<(AdtId, u32, Ty)>;
     /// A static item by name at a use site: its index and type.
     fn static_item(&mut self, name: Sym, at: Span) -> Option<(u32, Ty)>;
+    /// The evaluated value of the static at index `idx`, for a read
+    /// through a reference into it (`StaticRef`, `StaticPlace`). None
+    /// when the context cannot read it.
+    fn static_value(&mut self, _idx: u32) -> Option<&ConstValue> {
+        None
+    }
     /// A safe, non-generic free fn named by a path, as a fn pointer
     /// value with its `fn(..) -> R` type.
     fn fn_item(&mut self, _segs: &[ast::PathSeg], _at: Span) -> Option<TypedValue> {
@@ -1406,8 +1480,8 @@ impl Evaluator {
                 if !extended && !self.is_place(cx, env, *expr) && cx.needs_drop(t) {
                     return Err(drop_diag(cx, t, span));
                 }
-                if let ConstValue::Str(_) = v {
-                    (v, t)
+                let (v, rt) = if let ConstValue::Str(_) = v {
+                    return Ok(Flow::Val((v, t)));
                 } else if let Some(et) = expected
                     && matches!(cx.tys_ref().kind(et), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_)))
                     && matches!(v, ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Bytes(_))
@@ -1418,18 +1492,25 @@ impl Evaluator {
                 } else {
                     let rt = cx.tys().mk_ref(*mutable, t);
                     (ConstValue::Ref(Box::new(v)), rt)
+                };
+                // A borrow of a place inside a static points into that
+                // static's storage (`&TABLE[i]`, `&S.f`), not at a copy.
+                if !*mutable
+                    && let Some((idx, path, _)) = self.static_place(cx, env, *expr)?
+                {
+                    let v = if path.is_empty() { ConstValue::StaticRef(idx) } else { ConstValue::StaticPlace(idx, path.into()) };
+                    return Ok(Flow::Val((v, rt)));
                 }
+                (v, rt)
             }
             Expr::Deref(inner) => {
                 let (v, t) = self.value_place(cx, env, *inner, None)?;
                 match v {
-                    ConstValue::Ref(inner_v) => {
-                        let inner_ty = match cx.tys_ref().kind(t) {
-                            TyKind::Ref(_, _, it) => it,
-                            _ => ERROR,
-                        };
-                        (*inner_v, inner_ty)
-                    }
+                    ConstValue::Ref(_) | ConstValue::StaticRef(_) | ConstValue::StaticPlace(..) => match self.deref_value(cx, v, t) {
+                        // Unchanged: a static the context cannot read.
+                        (_, dt) if dt == t => return Err(outside(span, "this dereference")),
+                        got => got,
+                    },
                     ConstValue::Str(i) => (ConstValue::Str(i), t),
                     _ => return Err(outside(span, "this dereference")),
                 }
@@ -1437,7 +1518,7 @@ impl Evaluator {
             Expr::Field { base, name } => {
                 let (v, t) = self.value_place(cx, env, *base, None)?;
                 self.check_temp_drop(cx, env, *base, t, span)?;
-                let (v, t) = self.deref_value(cx, v, t);
+                let (v, t) = self.auto_deref(cx, v, t);
                 let Some(adt) = cx.tys_ref().local_adt(t) else { return Err(outside(span, "this field access")) };
                 self.check_named_field(cx, adt, *name, span)?;
                 let fields = cx.variant_fields(adt, 0);
@@ -1452,7 +1533,7 @@ impl Evaluator {
             Expr::TupleField { base, index } => {
                 let (v, t) = self.value_place(cx, env, *base, None)?;
                 self.check_temp_drop(cx, env, *base, t, span)?;
-                let (v, t) = self.deref_value(cx, v, t);
+                let (v, t) = self.auto_deref(cx, v, t);
                 if !matches!(cx.tys_ref().kind(t), TyKind::Tuple(_))
                     && let Some(adt) = cx.tys_ref().local_adt(t)
                 {
@@ -1482,7 +1563,7 @@ impl Evaluator {
                 }
                 let (v, t) = self.value_place(cx, env, *base, None)?;
                 self.check_temp_drop(cx, env, *base, t, span)?;
-                let (v, t) = self.deref_value(cx, v, t);
+                let (v, t) = self.auto_deref(cx, v, t);
                 let (iv, _) = self.value(cx, env, *index, Some(USIZE))?;
                 let ConstValue::Int(i) = iv else { return Err(outside(span, "this index")) };
                 let i = usize::try_from(i).map_err(|_| outside(span, "this index"))?;
@@ -2069,12 +2150,129 @@ impl Evaluator {
         }
     }
 
-    /// Peels one promoted reference layer for field and index access.
-    fn deref_value<'a, C: ConstCx<'a>>(&self, cx: &C, v: ConstValue, t: Ty) -> (ConstValue, Ty) {
-        match (v, cx.tys_ref().kind(t)) {
-            (ConstValue::Ref(inner), TyKind::Ref(_, _, it)) => (*inner, it),
-            (v, _) => (v, t),
+    /// Peels one reference layer for field and index access: a promoted
+    /// value, or the place a reference into a static names (read from
+    /// the static's value).
+    fn deref_value<'a, C: ConstCx<'a>>(&self, cx: &mut C, v: ConstValue, t: Ty) -> (ConstValue, Ty) {
+        let it = match cx.tys_ref().kind(t) {
+            TyKind::Ref(_, _, it) => it,
+            _ => return (v, t),
+        };
+        let got = match &v {
+            ConstValue::StaticRef(idx) => read_static(cx, *idx, &[]),
+            ConstValue::StaticPlace(idx, path) => read_static(cx, *idx, path),
+            _ => None,
+        };
+        if let ConstValue::Ref(inner) = v {
+            return (*inner, it);
         }
+        match got {
+            Some(g) => (g, it),
+            None => (v, t),
+        }
+    }
+
+    /// Peels every reference layer, for field and index access (auto-deref).
+    fn auto_deref<'a, C: ConstCx<'a>>(&self, cx: &mut C, mut v: ConstValue, mut t: Ty) -> (ConstValue, Ty) {
+        while matches!(cx.tys_ref().kind(t), TyKind::Ref(..)) {
+            let (v2, t2) = self.deref_value(cx, v, t);
+            let done = t2 == t;
+            (v, t) = (v2, t2);
+            if done {
+                break;
+            }
+        }
+        (v, t)
+    }
+
+    /// The static place a reference-typed `e` that is no static place
+    /// itself points to: a const, local, or field holding a `StaticRef` or
+    /// `StaticPlace` (`const R: &[M] = &ARR;` then `&R[1]`). Only cheap
+    /// place shapes are evaluated again.
+    fn static_target<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId) -> Result<Option<(u32, Vec<StaticStep>, Ty)>, Diag> {
+        if !matches!(cx.ast().expr(e), Expr::Path(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. }) {
+            return Ok(None);
+        }
+        let (v, t) = self.value_place(cx, env, e, None)?;
+        let TyKind::Ref(_, _, it) = cx.tys_ref().kind(t) else { return Ok(None) };
+        Ok(match v {
+            ConstValue::StaticRef(idx) => Some((idx, Vec::new(), it)),
+            ConstValue::StaticPlace(idx, path) => Some((idx, path.into_vec(), it)),
+            _ => None,
+        })
+    }
+
+    /// The static place `e` names (`S`, `S.f`, `S.0[i]`, `(*S)[i]`, auto-deref
+    /// included) as a static index, a path from its root, and the place's
+    /// type. A deref of a reference to another static re-roots the path
+    /// there, so the result is the storage rustc's value points to. None
+    /// when `e` is no such place, or a step cannot be followed.
+    fn static_place<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId) -> Result<Option<(u32, Vec<StaticStep>, Ty)>, Diag> {
+        let ast = cx.ast();
+        // The base place of a projection, with every reference layer peeled.
+        macro_rules! base {
+            ($b:expr) => {{
+                let got = match self.static_place(cx, env, $b)? {
+                    Some(got) => Some(got),
+                    None => self.static_target(cx, env, $b)?,
+                };
+                let Some((mut idx, mut path, mut t)) = got else { return Ok(None) };
+                while let TyKind::Ref(_, _, it) = cx.tys_ref().kind(t) {
+                    if !static_deref(cx, &mut idx, &mut path) {
+                        return Ok(None);
+                    }
+                    t = it;
+                }
+                (idx, path, t)
+            }};
+        }
+        let got = match ast.expr(e) {
+            Expr::Path(segs) => {
+                let [seg] = segs.as_slice() else { return Ok(None) };
+                if env.iter().any(|(n, _, _, _)| *n == seg.name) {
+                    return Ok(None);
+                }
+                cx.static_item(seg.name, ast.expr_span(e)).map(|(idx, t)| (idx, Vec::new(), t))
+            }
+            Expr::Deref(inner) => match self.static_place(cx, env, *inner)? {
+                Some((mut idx, mut path, t)) => {
+                    let TyKind::Ref(_, _, it) = cx.tys_ref().kind(t) else { return Ok(None) };
+                    static_deref(cx, &mut idx, &mut path).then_some((idx, path, it))
+                }
+                None => self.static_target(cx, env, *inner)?,
+            },
+            Expr::Field { base, name } => {
+                let (idx, mut path, t) = base!(*base);
+                let Some(adt) = cx.tys_ref().local_adt(t).filter(|&a| !cx.is_enum(a)) else { return Ok(None) };
+                let fields = cx.variant_fields(adt, 0);
+                fields.iter().position(|(n, _)| n == name).map(|i| {
+                    path.push(StaticStep::Field(i as u32));
+                    (idx, path, fields[i].1)
+                })
+            }
+            Expr::TupleField { base, index } => {
+                let (idx, mut path, t) = base!(*base);
+                let ft = match cx.tys_ref().kind(t) {
+                    TyKind::Tuple(ts) => cx.tys_ref().tys_of(ts).get(*index as usize).copied(),
+                    _ => cx.tys_ref().local_adt(t).filter(|&a| !cx.is_enum(a)).and_then(|a| cx.variant_fields(a, 0).get(*index as usize).map(|f| f.1)),
+                };
+                ft.map(|ft| {
+                    path.push(StaticStep::Field(*index));
+                    (idx, path, ft)
+                })
+            }
+            Expr::Index { base, index } => {
+                let (idx, mut path, t) = base!(*base);
+                let (TyKind::Array(el, _) | TyKind::Slice(el)) = cx.tys_ref().kind(t) else { return Ok(None) };
+                let (ConstValue::Int(i), _) = self.value(cx, env, *index, Some(USIZE))? else { return Ok(None) };
+                u32::try_from(i).ok().map(|i| {
+                    path.push(StaticStep::Elem(i));
+                    (idx, path, el)
+                })
+            }
+            _ => None,
+        };
+        Ok(got)
     }
 
     fn block<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, b: ast::BlockId, expected: Option<Ty>) -> Result<Flow, Diag> {

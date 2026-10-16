@@ -21117,6 +21117,15 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
         }
         Some((i, ty))
     }
+    fn static_value(&mut self, idx: u32) -> Option<&crate::ty::consteval::ConstValue> {
+        // The value is consumed: record the static's `Sig` read, as
+        // `static_item` does.
+        let p = self.cx.p;
+        if let Some(&def) = p.static_defs.get(idx as usize) {
+            let _ = p.sig_of(&mut self.cx.out.reads, def);
+        }
+        p.statics.get(idx as usize).map(|s| &s.value)
+    }
     fn call_target(&mut self, callee: ExprId) -> crate::ty::consteval::CallTarget {
         use crate::ty::consteval::CallTarget;
         let p = self.cx.p;

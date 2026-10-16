@@ -365,6 +365,9 @@ impl<'a, T: TyIntern> ConstCx<'a> for InstCx<'a, T> {
     fn static_item(&mut self, name: Sym, _at: Span) -> Option<(u32, Ty)> {
         self.p.static_names.get(&name).map(|&i| (i, self.p.statics[i as usize].ty))
     }
+    fn static_value(&mut self, idx: u32) -> Option<&crate::ty::consteval::ConstValue> {
+        self.p.statics.get(idx as usize).map(|s| &s.value)
+    }
     fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
         let (adt, variant) = self.variant_of(path)?;
         Some((adt, variant, self.tys.adt_ty(adt)))

@@ -6628,6 +6628,18 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
         }
         self.p.static_names.get(&name).map(|&i| (i, self.p.statics[i as usize].ty))
     }
+    fn static_value(&mut self, idx: u32) -> Option<&crate::ty::consteval::ConstValue> {
+        let Some(i) = self.pending.iter().position(|(it, _)| it.is_static.is_some() && it.static_idx == idx) else {
+            return self.p.statics.get(idx as usize).map(|s| &s.value);
+        };
+        if matches!(self.pending[i].1, PendingState::Todo) {
+            self.eval_pending(i)?;
+        }
+        match &self.pending[i].1 {
+            PendingState::Done(v) => Some(v),
+            _ => None,
+        }
+    }
     fn fn_item(&mut self, segs: &[ast::PathSeg], at: Span) -> Option<crate::ty::consteval::TypedValue> {
         // A plain safe Rust-ABI free fn with no generics. With params,
         // its return type may not hold a reference or lifetime: the

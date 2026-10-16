@@ -7395,7 +7395,7 @@ fn variant_lit(p: &Program, t: &CTy, variant: usize, vals: &[String]) -> String 
 
 /// The C initializer for one const value at the given C type. Referenced
 /// aggregates are promoted to file-scope constants first, written to `pre`.
-fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32, slots: &[u32]) -> String {
+fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32, slots: &[u32], pos: Option<&str>) -> String {
     if let (CV::Float(bits, f), CTy::Float(_)) = (v, t) {
         return match f {
             FloatTy::F64 => format!("(((union {{ uint64_t b; double d; }}){{ .b = {}ull }}).d)", bits),
@@ -7422,15 +7422,15 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         // A const lock: unlocked and unpoisoned around its value.
         (CV::Aggregate(vals), CTy::Sync(k, e)) if k.is_cell_struct() && vals.len() == 1 => {
             let words = vec!["0"; sync::cell_words(*k).len()].join(", ");
-            format!("{{{words}, {}}}", const_init(p, &vals[0], e, pre, counter, slots))
+            format!("{{{words}, {}}}", const_init(p, &vals[0], e, pre, counter, slots, None))
         }
         // An empty `OnceLock`, a `Condvar`, a `Barrier::new(n)` (W-THREADS).
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::OnceLock, _)) if vals.is_empty() => "{0}".into(),
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Condvar, _)) if vals.is_empty() => "0".into(),
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Barrier, _)) if vals.len() == 1 => {
-            format!("{{0, 0, 0, 0, {}}}", const_init(p, &vals[0], &CTy::Int(IntTy::Usize), pre, counter, slots))
+            format!("{{0, 0, 0, 0, {}}}", const_init(p, &vals[0], &CTy::Int(IntTy::Usize), pre, counter, slots, None))
         }
-        (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter, slots),
+        (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter, slots, None),
         (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
         (CV::Unit, _) => "((lust_Unit){})".into(),
         (CV::Str(i), _) => {
@@ -7446,6 +7446,15 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             }
         }
         (CV::StaticRef(idx), _) => format!("(&{})", static_sym(p, *idx)),
+        (CV::StaticPlace(idx, path), _) => match static_place_c(p, *idx, path) {
+            Some((e, CTy::Array(_, n))) if matches!(t, CTy::Slice(_)) => format!("(({}){{ {e}.v, {n} }})", ctype(t)),
+            Some((e, _)) => format!("(&{e})"),
+            // A place cgen cannot name: a promoted copy of its value.
+            None => match crate::ty::consteval::value_at(&p.statics[*idx as usize].value, path) {
+                Some(x) => const_init(p, &CV::Ref(Box::new(x.clone())), t, pre, counter, slots, None),
+                None => panic!("internal: a static place {path:?} outside its static's value"),
+            },
+        },
         (CV::FnPtr(f), CTy::FnPtr(..)) => {
             // Runtime fn pointer values are `lust_tramps[slot]`, not a
             // constant; this unit gets its own copy of the slot's
@@ -7463,17 +7472,15 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             match &**inner {
                 CV::Aggregate(vals) => {
                     let at = CTy::Array(el.clone(), vals.len() as u64);
-                    let init = const_init(p, inner, &at, pre, counter, slots);
-                    *counter += 1;
-                    let name = format!("lust_promoted_{counter}");
+                    let name = promoted_name(counter, pos);
+                    let init = const_init(p, inner, &at, pre, counter, slots, pos.map(|_| name.as_str()));
                     let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
                     format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
                 }
                 CV::Bytes(b) => {
                     let at = CTy::Array(el.clone(), b.len() as u64);
-                    let init = const_init(p, inner, &at, pre, counter, slots);
-                    *counter += 1;
-                    let name = format!("lust_promoted_{counter}");
+                    let init = const_init(p, inner, &at, pre, counter, slots, None);
+                    let name = promoted_name(counter, pos);
                     let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
                     format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
                 }
@@ -7481,9 +7488,8 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             }
         }
         (CV::Ref(inner), CTy::Ref(inner_ct)) => {
-            let init = const_init(p, inner, inner_ct, pre, counter, slots);
-            *counter += 1;
-            let name = format!("lust_promoted_{counter}");
+            let name = promoted_name(counter, pos);
+            let init = const_init(p, inner, inner_ct, pre, counter, slots, pos.map(|_| name.as_str()));
             let _ = writeln!(pre, "static const {} {name} = {init};", ctype(inner_ct));
             format!("(&{name})")
         }
@@ -7492,7 +7498,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 zero_lit(p, t)
             } else {
                 let parts: Vec<String> =
-                    vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, counter, slots))).collect();
+                    vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, counter, slots, sub(pos, i).as_deref()))).collect();
                 format!("(({}){{ {} }})", ctype(t), parts.join(", "))
             }
         }
@@ -7500,7 +7506,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             if vals.is_empty() {
                 zero_lit(p, t)
             } else {
-                let parts: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots)).collect();
+                let parts: Vec<String> = vals.iter().enumerate().map(|(i, x)| const_init(p, x, e, pre, counter, slots, sub(pos, i).as_deref())).collect();
                 format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
             }
         }
@@ -7508,7 +7514,9 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             if *n == 0 {
                 zero_lit(p, t)
             } else {
-                let one = const_init(p, x, e, pre, counter, slots);
+                // Every element is the one value: a promoted reference in it is one
+                // allocation, named by element 0.
+                let one = const_init(p, x, e, pre, counter, slots, sub(pos, 0).as_deref());
                 let parts: Vec<String> = (0..*n).map(|_| one.clone()).collect();
                 format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
             }
@@ -7521,7 +7529,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 let parts: Vec<String> = vals
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, counter, slots)))
+                    .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, counter, slots, sub(pos, i).as_deref())))
                     .collect();
                 format!("((A{}){{ {} }})", a.0, parts.join(", "))
             }
@@ -7531,24 +7539,23 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let inits: Vec<String> = vals
                 .iter()
                 .enumerate()
-                .map(|(i, x)| const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter, slots))
+                .map(|(i, x)| const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter, slots, None))
                 .collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Variant(variant, vals), CTy::Option(e)) => {
-            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots)).collect();
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots, None)).collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Variant(variant, vals), CTy::Result(a, b)) => {
             let e = if *variant == 0 { a } else { b };
-            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots)).collect();
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots, None)).collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Aggregate(vals), CTy::Slice(e)) => {
             let at = CTy::Array(e.clone(), vals.len() as u64);
-            let init = const_init(p, v, &at, pre, counter, slots);
-            *counter += 1;
-            let name = format!("lust_promoted_{counter}");
+            let name = promoted_name(counter, pos);
+            let init = const_init(p, v, &at, pre, counter, slots, pos.map(|_| name.as_str()));
             let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
             format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
         }
@@ -7558,14 +7565,80 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         (CV::Bytes(b), CTy::Array(..)) => bytes_array_lit(p, t, b.as_slice()),
         (CV::Bytes(b), CTy::Slice(e)) => {
             let at = CTy::Array(e.clone(), b.len() as u64);
-            let init = const_init(p, v, &at, pre, counter, slots);
-            *counter += 1;
-            let name = format!("lust_promoted_{counter}");
+            let init = const_init(p, v, &at, pre, counter, slots, None);
+            let name = promoted_name(counter, pos);
             let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
             format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
         }
         _ => zero_lit(p, t),
     }
+}
+
+/// The C name of a promoted value in static data. Inside a static's
+/// value (`pos` is the position's name, see `static_pos`) it is named by
+/// its path, so a `StaticPlace` in another static can name it
+/// (`static_place_c`); elsewhere it gets a counter name.
+fn promoted_name(counter: &mut u32, pos: Option<&str>) -> String {
+    match pos {
+        Some(at) => format!("{at}_d"),
+        None => {
+            *counter += 1;
+            format!("lust_promoted_{counter}")
+        }
+    }
+}
+
+/// The position name of field or element `i` below position `pos`.
+fn sub(pos: Option<&str>, i: usize) -> Option<String> {
+    pos.map(|at| format!("{at}_{i}"))
+}
+
+/// The position name of static `idx`'s root value: the prefix of the
+/// names of the promoted values inside it (`promoted_name`).
+fn static_pos(p: &Program, idx: u32) -> String {
+    format!("lust_sp{}", &static_sym(p, idx)["lust_static".len()..])
+}
+
+/// The C place of a `ConstValue::StaticPlace` and its C type: field and
+/// element projections of the static's symbol, and a `Deref` step to the
+/// promoted value the static holds there, by its path name. None for a
+/// step this shape does not have.
+fn static_place_c(p: &Program, idx: u32, path: &[crate::ty::consteval::StaticStep]) -> Option<(String, CTy)> {
+    use crate::ty::consteval::{ConstValue as CV, StaticStep, value_at};
+    let st = p.statics.get(idx as usize)?;
+    // `v` follows the value along (None past a byte blob's element).
+    let (mut e, mut pos, mut ct, mut v) = (static_sym(p, idx), static_pos(p, idx), cty(&p.tys, st.ty), Some(&st.value));
+    for step in path {
+        // A repeat's elements share element 0's promoted values.
+        let at = match (step, v) {
+            (StaticStep::Field(_) | StaticStep::Elem(_), Some(CV::Repeat(..))) => format!("{pos}_0"),
+            (StaticStep::Field(i) | StaticStep::Elem(i), _) => format!("{pos}_{i}"),
+            (StaticStep::Deref, _) => format!("{pos}_d"),
+        };
+        (e, ct) = match (step, ct) {
+            (StaticStep::Field(i), CTy::Adt(a)) => (format!("{e}.f{i}"), cty(&p.tys, p.adt(a).variants.first()?.fields.get(*i as usize)?.ty)),
+            (StaticStep::Field(i), CTy::Tuple(es)) => (format!("{e}.f{i}"), es.get(*i as usize)?.clone()),
+            (StaticStep::Elem(i), CTy::Array(el, _)) => (format!("{e}.v[{i}]"), *el),
+            (StaticStep::Deref, CTy::Ref(inner)) => (at.clone(), *inner),
+            (StaticStep::Deref, CTy::Slice(el)) => {
+                let n = match v? {
+                    CV::Ref(inner) => match &**inner {
+                        CV::Aggregate(vals) => vals.len() as u64,
+                        CV::Bytes(b) => b.len() as u64,
+                        _ => return None,
+                    },
+                    CV::Aggregate(vals) => vals.len() as u64,
+                    CV::Bytes(b) => b.len() as u64,
+                    _ => return None,
+                };
+                (at.clone(), CTy::Array(el, n))
+            }
+            _ => return None,
+        };
+        pos = at;
+        v = v.and_then(|v| value_at(v, std::slice::from_ref(step)));
+    }
+    Some((e, ct))
 }
 
 /// The C symbol of one static. Named by the static's stable def hash,
@@ -7654,10 +7727,21 @@ fn static_defs(p: &Program, slots: &[u32]) -> String {
     let mut counter = 0u32;
     for (i, st) in p.statics.iter().enumerate() {
         let ct = cty(&p.tys, st.ty);
-        let init = const_init(p, &st.value, &ct, &mut pre, &mut counter, slots);
+        let init = const_init(p, &st.value, &ct, &mut pre, &mut counter, slots, Some(&static_pos(p, i as u32)));
         let _ = writeln!(out, "{} {} = {init};", ctype(&ct), static_sym(p, i as u32));
     }
-    format!("{pre}{out}")
+    // Tentative definitions of the path-named promoted values first: one
+    // static's data can point into another's (`static_place_c`), in any order.
+    let mut fwd = String::new();
+    for line in pre.lines() {
+        if let Some(rest) = line.strip_prefix("static const ")
+            && let Some((decl, _)) = rest.split_once(" = ")
+            && decl.contains(" lust_sp_")
+        {
+            let _ = writeln!(fwd, "static const {decl};");
+        }
+    }
+    format!("{fwd}{pre}{out}")
 }
 
 /// Extern declarations of the statics, for function units.
