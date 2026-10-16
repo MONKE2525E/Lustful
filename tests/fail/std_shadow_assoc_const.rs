@@ -1,8 +1,8 @@
-// expect: L0104
+// expect: L0110
 #![allow(non_upper_case_globals)]
 // rustc E0308: `Vec::<u8>::len` is Vec's inherent method (a fn item), which
-// wins over the user trait's associated const of that name. lust does not
-// take the trait const on a builtin type path (std_shadow_path guards it).
+// wins over the user trait's associated const of that name; lust resolves it
+// to the method too, so the `&str` annotation is the same mismatch.
 trait Named {
     const len: &'static str;
 }
