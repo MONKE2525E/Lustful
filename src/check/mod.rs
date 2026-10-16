@@ -1321,7 +1321,9 @@ enum PatIdent {
 /// `Ctx::check_const_value`).
 #[derive(Clone, Copy)]
 enum ConstPat {
-    Scalar,
+    /// Compare with the const's value: a scalar, or field by field
+    /// for a structural value (lowering's `test_const_value`).
+    Value,
     Variant(AdtId, u32),
     OptNone,
 }
@@ -16528,15 +16530,13 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// Checks one const pattern value against the scrutinee type:
-    /// structural-match (a constant whose Adt type has no derived
-    /// `PartialEq` is L0633, as in Rust; a structural value lust
-    /// cannot compare yet is the non-scalar unsupported error), then
-    /// type equality and refutability outside `match`. Returns true
-    /// when the pattern may use the value.
-    /// Checks a const pattern's value against the scrutinee type.
-    /// Returns how the pattern resolves: a scalar comparison, a
-    /// unit variant, or `None` (the error is already reported).
+    /// Checks a const pattern's value against the scrutinee type, as
+    /// rustc's const-to-pattern does: no NaN anywhere, the const's type
+    /// implements `PartialEq`, and every Adt the value reaches derives
+    /// it (structural match; L0633 otherwise). Then type equality and
+    /// refutability outside `match`. Returns how the pattern resolves:
+    /// a comparison with the value (scalar or structural), a unit
+    /// variant, or `None` (the error is already reported).
     fn check_const_value(
         &mut self,
         cty: Ty,
@@ -16553,26 +16553,23 @@ impl<'p> Ctx<'p> {
             self.err("L0110", span, "cannot use NaN in patterns", "Use a guard to test for NaN.");
             return None;
         }
+        let scalar = matches!(val, CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Float(..) | CV::Str(_));
+        if !scalar {
+            let ct = self.deep(ct);
+            self.record_glue_reads(self.p.gx.lang.partial_eq, ct);
+            if !has_eq(self.p, &self.tys, ct) {
+                self.non_structural_const(ct, span);
+                return None;
+            }
+            self.const_structural(ct, val, span, 0)?;
+        }
         let out = match val {
-            CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Float(..) | CV::Str(_) => ConstPat::Scalar,
-            CV::Variant(v, fields) if fields.is_empty() => {
-                let nonstructural = matches!(self.tys.local_adt(ct), Some(a) if !self.p.adt(a).derives.partial_eq);
-                if nonstructural {
-                    let tn = self.tn(ct);
-                    self.err(
-                        "L0633",
-                        span,
-                        format!("constant of non-structural type `{tn}` cannot be used in a pattern"),
-                        "Derive `PartialEq` on the type, match a field, or compare in a guard instead.",
-                    );
-                    return None;
-                }
-                if self.tys.option_elem(ct).is_some() && *v == 0 {
-                    ConstPat::OptNone
-                } else if let Some(a) = self.tys.local_adt(ct).filter(|&a| {
-                    self.p.adt(a).is_enum
-                        && self.p.adt(a).variants.get(*v as usize).is_some_and(|var| var.shape == VariantShape::Unit)
-                }) {
+            _ if scalar => ConstPat::Value,
+            CV::Variant(0, fields) if fields.is_empty() && self.tys.option_elem(ct).is_some() => ConstPat::OptNone,
+            CV::Variant(v, fields) if fields.is_empty() => match self.tys.local_adt(ct).filter(|&a| {
+                self.p.adt(a).is_enum && self.p.adt(a).variants.get(*v as usize).is_some_and(|var| var.shape == VariantShape::Unit)
+            }) {
+                Some(a) => {
                     // A generic enum instance scrutinee names its own
                     // Adt; the const's type may name the template.
                     let dt = self.deep(t);
@@ -16581,36 +16578,151 @@ impl<'p> Ctx<'p> {
                         _ => a,
                     };
                     ConstPat::Variant(a, *v)
-                } else {
-                    self.errs.push(unsupported(span, "non-scalar const patterns"));
-                    return None;
                 }
-            }
-            _ => {
-                let nonstructural = matches!(self.tys.local_adt(ct), Some(a) if !self.p.adt(a).derives.partial_eq);
-                if nonstructural {
-                    let tn = self.tn(ct);
-                    self.err(
-                        "L0633",
-                        span,
-                        format!("constant of non-structural type `{tn}` cannot be used in a pattern"),
-                        "Derive `PartialEq` on the type, match a field, or compare in a guard instead.",
-                    );
-                } else {
-                    self.errs.push(unsupported(span, "non-scalar const patterns"));
-                }
-                return None;
-            }
+                None => ConstPat::Value,
+            },
+            _ => ConstPat::Value,
         };
-        let eff = if matches!(val, CV::Str(_)) && self.kind(t) == TyKind::Str { t } else { ct };
-        if !self.unify(eff, t) {
-            self.mismatch(span, t, eff);
+        if !self.unify(ct, t) {
+            self.mismatch(span, t, ct);
             return None;
         }
         if !in_match {
             self.errs.push(unsupported(span, "refutable patterns here"));
         }
         Some(out)
+    }
+
+    /// Undoes the match-ergonomics peeling `pattern_mode` did for a
+    /// pattern that turned out to be a const: a const pattern matches
+    /// the scrutinee type as it is.
+    fn unpeel_const_pat(&mut self, pi: usize, scrut_t: Ty) {
+        self.out.pat_derefs[pi] = 0;
+        self.out.pat_ty[pi] = scrut_t;
+    }
+
+    /// L0633: a const pattern value of type `t`, which is not
+    /// structural-match (no derived `PartialEq`).
+    fn non_structural_const(&mut self, t: Ty, span: Span) {
+        let tn = self.tn(t);
+        self.err(
+            "L0633",
+            span,
+            format!("constant of non-structural type `{tn}` cannot be used in a pattern"),
+            "Derive `PartialEq` on the type, match a field, or compare in a guard instead.",
+        );
+    }
+
+    /// Walks a const pattern value at type `t` as rustc's
+    /// const-to-pattern does: each Adt the value reaches must derive
+    /// `PartialEq` (an Adt in a variant the value does not take is not
+    /// checked), and fn pointers are rejected. Values lowering cannot
+    /// compare field by field (statics, builtin aggregates) are the
+    /// non-scalar unsupported error. `None` when an error was reported.
+    fn const_structural(&mut self, t: Ty, val: &crate::ty::consteval::ConstValue, span: Span, depth: u32) -> Option<()> {
+        use crate::ty::consteval::ConstValue as CV;
+        let t = self.deep(t);
+        let p = self.p;
+        let fail = |this: &mut Self| {
+            this.errs.push(unsupported(span, "non-scalar const patterns"));
+            None
+        };
+        if depth > 64 {
+            return fail(self);
+        }
+        let kind = self.kind(t);
+        match (kind, val) {
+            (TyKind::Int(_), CV::Int(_))
+            | (TyKind::Bool, CV::Bool(_))
+            | (TyKind::Char, CV::Char(_))
+            | (TyKind::Float(_), CV::Float(..))
+            | (TyKind::Tuple(_), CV::Unit) => Some(()),
+            (TyKind::Ref(_, Mut::Shared, inner), CV::Str(_)) if self.kind(inner) == TyKind::Str => Some(()),
+            (TyKind::Tuple(ts), CV::Aggregate(vals)) => {
+                let ts = self.tys.tys_of(ts).to_vec();
+                if ts.len() != vals.len() {
+                    return fail(self);
+                }
+                for (ft, v) in ts.into_iter().zip(vals) {
+                    self.const_structural(ft, v, span, depth + 1)?;
+                }
+                Some(())
+            }
+            (TyKind::Array(el, _) | TyKind::Slice(el), CV::Aggregate(vals)) => {
+                for v in vals {
+                    self.const_structural(el, v, span, depth + 1)?;
+                }
+                Some(())
+            }
+            (TyKind::Array(el, _) | TyKind::Slice(el), CV::Repeat(v, _)) => self.const_structural(el, v, span, depth + 1),
+            (TyKind::Array(el, _) | TyKind::Slice(el), CV::Bytes(_)) if self.kind(el) == TyKind::Int(IntTy::U8) => Some(()),
+            (TyKind::Ref(_, Mut::Shared, inner), CV::Ref(v)) => self.const_structural(inner, v, span, depth + 1),
+            // A slice reference holds its backing array in place.
+            (TyKind::Ref(_, Mut::Shared, inner), CV::Aggregate(_) | CV::Repeat(..) | CV::Bytes(_))
+                if matches!(self.kind(inner), TyKind::Slice(_)) =>
+            {
+                self.const_structural(inner, val, span, depth + 1)
+            }
+            (TyKind::FnPtr(..), _) => {
+                self.err(
+                    "L0633",
+                    span,
+                    "function pointers in patterns behave unpredictably and cannot be used",
+                    "Compare the pointers in a guard instead.",
+                );
+                None
+            }
+            (_, CV::Variant(v, vals)) if self.tys.option_elem(t).is_some() => match (v, vals.as_slice()) {
+                (0, []) => Some(()),
+                (1, [x]) => {
+                    let el = self.tys.option_elem(t).unwrap_or(ERROR);
+                    self.const_structural(el, x, span, depth + 1)
+                }
+                _ => fail(self),
+            },
+            (_, CV::Variant(v, vals)) if self.tys.result_args(t).is_some() => {
+                let (ok, err) = self.tys.result_args(t).unwrap_or((ERROR, ERROR));
+                match (v, vals.as_slice()) {
+                    (0, [x]) => self.const_structural(ok, x, span, depth + 1),
+                    (1, [x]) => self.const_structural(err, x, span, depth + 1),
+                    _ => fail(self),
+                }
+            }
+            (_, CV::Aggregate(_) | CV::Variant(..)) if self.tys.local_adt(t).is_some() => {
+                let a = self.tys.local_adt(t).unwrap_or(AdtId(0));
+                if !p.adt(a).derives.partial_eq {
+                    self.non_structural_const(t, span);
+                    return None;
+                }
+                let (v, vals) = match val {
+                    CV::Aggregate(vals) if !p.adt(a).is_enum => (0, vals),
+                    CV::Variant(v, vals) if p.adt(a).is_enum => (*v, vals),
+                    _ => return fail(self),
+                };
+                let Some(variant) = p.adt(a).variants.get(v as usize) else { return fail(self) };
+                if variant.fields.len() != vals.len() {
+                    return fail(self);
+                }
+                // A template Adt's field types take the type's args.
+                let args: Vec<GenericArg> = match self.tys.adt_parts(t) {
+                    Some((d, aa)) if d == p.def_of_adt(a) => self.tys.args(aa).to_vec(),
+                    _ => Vec::new(),
+                };
+                for (f, x) in variant.fields.iter().zip(vals) {
+                    let ft = if args.is_empty() { f.ty } else { self.subst_norm(f.ty, &args, span) };
+                    self.const_structural(ft, x, span, depth + 1)?;
+                }
+                Some(())
+            }
+            _ if kind == TyKind::Error => None,
+            _ if self.tys.builtin_of(t).is_some() => {
+                // `Vec`, `String`, `Box`, the locks: their `PartialEq`
+                // is written by hand, as in std.
+                self.non_structural_const(t, span);
+                None
+            }
+            _ => fail(self),
+        }
     }
 
     /// A free const item used as a pattern, by const index.
@@ -16624,7 +16736,7 @@ impl<'p> Ctx<'p> {
         let c = &self.p.consts[idx as usize];
         let (ct, val) = (c.ty, c.value.clone());
         match self.check_const_value(ct, &val, t, span, in_match) {
-            Some(ConstPat::Scalar) => self.out.pat_res[pi] = PatRes::ConstItem(idx),
+            Some(ConstPat::Value) => self.out.pat_res[pi] = PatRes::ConstItem(idx),
             Some(ConstPat::Variant(a, v)) => self.out.pat_res[pi] = PatRes::Variant(a, v),
             Some(ConstPat::OptNone) => self.out.pat_res[pi] = PatRes::Opt(false),
             None => {}
@@ -17532,7 +17644,7 @@ impl<'p> Ctx<'p> {
             let c = &p.body_consts[ci as usize];
             let (ct, val) = (c.ty, c.value.clone());
             match self.check_const_value(ct, &val, t, span, in_match) {
-                Some(ConstPat::Scalar) => self.out.pat_res[pi] = PatRes::BodyConst(ci),
+                Some(ConstPat::Value) => self.out.pat_res[pi] = PatRes::BodyConst(ci),
                 Some(ConstPat::Variant(a, v)) => self.out.pat_res[pi] = PatRes::Variant(a, v),
                 Some(ConstPat::OptNone) => self.out.pat_res[pi] = PatRes::Opt(false),
                 None => {}
@@ -17583,21 +17695,11 @@ impl<'p> Ctx<'p> {
         // is not a variant: it compares against the const's value.
         if let Pat::Path(segs) = p.ast.pat(pat) {
             let segs = segs.clone();
-            if self.try_const_path_pat(pi, &segs, t, span, in_match) {
-                // A const path pattern does not auto-deref (unlike a
-                // literal or a variant): if peeling references above
-                // was needed to reach the const's type, the pattern
-                // does not match the scrutinee (rustc E0308). A const
-                // whose own type is a reference (a `&str` const) needs
-                // no peeling: its type already is the scrutinee type.
-                let const_is_ref = match self.out.pat_res[pi] {
-                    PatRes::ConstItem(idx) => matches!(self.kind(self.p.consts[idx as usize].ty), TyKind::Ref(..)),
-                    PatRes::BodyConst(ci) => matches!(self.kind(self.p.body_consts[ci as usize].ty), TyKind::Ref(..)),
-                    _ => false,
-                };
-                if self.out.pat_derefs[pi] > 0 && !const_is_ref {
-                    self.mismatch(span, scrut_t, t);
-                }
+            if self.try_const_path_pat(pi, &segs, scrut_t, span, in_match) {
+                // A const path pattern never auto-derefs (rustc's
+                // `AdjustMode::Pass`): it matches the scrutinee type
+                // itself, so peeling above is undone.
+                self.unpeel_const_pat(pi, scrut_t);
                 return;
             }
         }
@@ -17798,14 +17900,10 @@ impl<'p> Ctx<'p> {
                     if segs.len() == 1 {
                         match self.pat_ident(segs[0].name) {
                             PatIdent::Const(idx) => {
-                                // As above: a const pattern does not
-                                // auto-deref, unless its own type is a
-                                // reference.
-                                if self.out.pat_derefs[pi] > 0 && !matches!(self.kind(p.consts[idx as usize].ty), TyKind::Ref(..)) {
-                                    self.mismatch(span, scrut_t, t);
-                                    return;
-                                }
-                                self.const_item_pat(pi, idx, t, span, in_match);
+                                // As above: a const pattern never
+                                // auto-derefs.
+                                self.const_item_pat(pi, idx, scrut_t, span, in_match);
+                                self.unpeel_const_pat(pi, scrut_t);
                                 return;
                             }
                             PatIdent::Static => {

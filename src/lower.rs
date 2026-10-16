@@ -5704,8 +5704,111 @@ impl<'p> Lower<'p> {
         }
     }
 
+    /// Emits the tests of a structural const pattern (a value the
+    /// checker's `const_structural` accepted) against `place` of type
+    /// `ty`, field by field as rustc's const-to-pattern does: scalars
+    /// by `==` (so `-0.0` matches `0.0`), `&str` by content, variants
+    /// by discriminant, references through their pointee, and slices
+    /// by length first. Falls through on a match; jumps to `fail`.
+    fn test_const_value(&mut self, cv: &crate::ty::consteval::ConstValue, ty: Ty, place: Place, fail: Bb, span: Span) {
+        use crate::ty::consteval::ConstValue as CV;
+        let branch = |this: &mut Self, cond: Rvalue| {
+            let c = this.temp(BOOL);
+            this.assign(Place::local(c), cond, span);
+            let ok = this.new_block();
+            let b = &mut this.body.blocks[this.cur.0 as usize];
+            b.term = Terminator::If(Operand::Copy(Place::local(c)), ok, fail);
+            this.cur = ok;
+        };
+        let switch = |this: &mut Self, place: &Place, v: u32| {
+            let d = this.temp(int(IntTy::U32));
+            this.assign(Place::local(d), Rvalue::Discriminant(place.clone()), span);
+            let ok = this.new_block();
+            let b = &mut this.body.blocks[this.cur.0 as usize];
+            b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(v, ok)], fail);
+            this.cur = ok;
+        };
+        match (self.kind(ty), cv) {
+            (_, CV::Unit) => {}
+            (_, CV::Int(_) | CV::Float(..) | CV::Bool(_) | CV::Char(_)) => {
+                let op = self.const_operand(cv, ty, span);
+                branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(place), op));
+            }
+            (_, CV::Str(i)) => branch(self, Rvalue::StrCmp(BinOp::Eq, Operand::Copy(place), Operand::Const(Const::Str(*i)))),
+            (TyKind::Ref(_, _, inner), CV::Ref(v)) => self.test_const_value(v, inner, place.deref(), fail, span),
+            // A slice reference holds its backing array in place.
+            (TyKind::Ref(_, _, inner), _) => self.test_const_value(cv, inner, place.deref(), fail, span),
+            (TyKind::Tuple(ts), CV::Aggregate(vals)) => {
+                let ts = self.body.tys.tys_of(ts).to_vec();
+                for (i, (v, ft)) in vals.iter().zip(ts).enumerate() {
+                    self.test_const_value(v, ft, place.project(Proj::Field(i as u32)), fail, span);
+                }
+            }
+            (TyKind::Array(el, _) | TyKind::Slice(el), CV::Aggregate(_) | CV::Repeat(..) | CV::Bytes(_)) => {
+                let n = match cv {
+                    CV::Aggregate(vals) => vals.len(),
+                    CV::Repeat(_, n) => *n as usize,
+                    CV::Bytes(b) => b.len(),
+                    _ => 0,
+                };
+                if matches!(self.kind(ty), TyKind::Slice(_)) {
+                    let len = self.temp(USIZE);
+                    self.assign(Place::local(len), Rvalue::LenOf(place.clone()), span);
+                    branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(Place::local(len)), Operand::Const(Const::Int(n as u128, IntTy::Usize))));
+                }
+                for i in 0..n {
+                    let idx = self.const_usize(i as u64, span);
+                    let at = place.project(Proj::Index(idx));
+                    match cv {
+                        CV::Aggregate(vals) => self.test_const_value(&vals[i], el, at, fail, span),
+                        CV::Repeat(v, _) => self.test_const_value(v, el, at, fail, span),
+                        CV::Bytes(b) => branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(at), Operand::Const(Const::Int(b.as_slice()[i] as u128, IntTy::U8)))),
+                        _ => {}
+                    }
+                }
+            }
+            (_, CV::Variant(v, vals)) if self.body.tys.option_elem(ty).is_some() => {
+                let elem = self.body.tys.option_elem(ty).unwrap_or(ERROR);
+                switch(self, &place, *v);
+                if let [x] = vals.as_slice() {
+                    self.test_const_value(x, elem, place.project(Proj::Downcast(1)).project(Proj::Field(0)), fail, span);
+                }
+            }
+            (_, CV::Variant(v, vals)) if self.body.tys.result_args(ty).is_some() => {
+                let (ok_t, err_t) = self.body.tys.result_args(ty).unwrap_or((ERROR, ERROR));
+                switch(self, &place, *v);
+                if let [x] = vals.as_slice() {
+                    let ft = if *v == 0 { ok_t } else { err_t };
+                    self.test_const_value(x, ft, place.project(Proj::Downcast(*v)).project(Proj::Field(0)), fail, span);
+                }
+            }
+            (_, CV::Aggregate(vals) | CV::Variant(_, vals)) => {
+                let Some(a) = self.body.tys.local_adt(ty) else { return };
+                let v = match cv {
+                    CV::Variant(v, _) if self.p.adt(a).is_enum => {
+                        switch(self, &place, *v);
+                        *v
+                    }
+                    _ => 0,
+                };
+                let base = if self.p.adt(a).is_enum { place.project(Proj::Downcast(v)) } else { place };
+                let args: Vec<GenericArg> = match self.kind(ty) {
+                    TyKind::Adt(_, aa) => self.body.tys.args(aa).to_vec(),
+                    _ => Vec::new(),
+                };
+                let fields: Vec<Ty> = self.p.adt(a).variants[v as usize].fields.iter().map(|f| f.ty).collect();
+                for (i, (x, ft)) in vals.iter().zip(fields).enumerate() {
+                    let ft = subst(&mut self.body.tys, ft, &args);
+                    self.test_const_value(x, ft, base.project(Proj::Field(i as u32)), fail, span);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Emits tests for `pat` against `place`. Falls through on a match; jumps to `fail` otherwise.
     fn test_pat(&mut self, pat: PatId, place: Place, fail: Bb) {
+        use crate::ty::consteval::ConstValue as CV;
         let p = self.p;
         let place = Self::derefs(place, self.ck.pat_derefs(pat));
         let ty = self.ck.pat_ty(pat);
@@ -5741,6 +5844,10 @@ impl<'p> Lower<'p> {
             _ => None,
         };
         if let Some(cv) = const_pat {
+            if !matches!(cv, CV::Int(_) | CV::Float(..) | CV::Bool(_) | CV::Char(_) | CV::Str(_)) {
+                self.test_const_value(&cv, ty, place, fail, span);
+                return;
+            }
             let op = self.const_operand(&cv, ty, span);
             let c = self.temp(BOOL);
             let cond = if matches!(cv, crate::ty::consteval::ConstValue::Str(_)) {
