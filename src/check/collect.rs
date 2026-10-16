@@ -1229,7 +1229,8 @@ pub fn resolve_ty(
             } else if segs.len() == 1 {
                 &segs[0]
             } else {
-                return Err(not_yet("L0505", span, "module paths in types"));
+                let names: Vec<&str> = segs.iter().map(|s| interner.get(s.name)).collect();
+                return Err(crate::diag::module_path_not_yet(&names, span));
             };
             let name = seg.name;
             let no_generics = |tys: Ty| -> Result<Ty, Diag> {

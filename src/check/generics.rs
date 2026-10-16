@@ -2603,7 +2603,8 @@ pub(crate) fn trait_def_of_path(
 ) -> Result<DefId, Diag> {
     let last = segs.last().ok_or_else(|| Diag::new("L0102", span, "expected a trait name", "Write a trait name."))?;
     if segs.len() > 1 && segs[0].name != known.std && interner.get(segs[0].name) != "core" && interner.get(segs[0].name) != "alloc" {
-        return Err(not_yet("L0505", span, "module paths in trait references"));
+        let names: Vec<&str> = segs.iter().map(|s| interner.get(s.name)).collect();
+        return Err(crate::diag::module_path_not_yet(&names, span));
     }
     // A full std path must name the trait really living at that
     // path (`std::mem::Display` is not `Display`): only exact
@@ -3851,6 +3852,16 @@ pub(crate) fn resolve_path_ty(
     }
     if let Some(k) = crate::ty::hash::HashTy::by_name(n) {
         return Err(crate::ty::hash::not_imported(k, span));
+    }
+    // A user trait in a type position (rustc E0782): name the trait by
+    // its source path, not its flat name.
+    if cx.trait_names.contains_key(&name) {
+        return Err(Diag::new(
+            "L0102",
+            span,
+            format!("expected a type, found trait `{}`", crate::intern::source_path(n)),
+            "Write `dyn Trait` for a trait object, or name a type.",
+        ));
     }
     Err(Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type."))
 }

@@ -48,7 +48,7 @@ pub mod variance;
 use crate::ast::{self, BinOp, Expr, ExprId, FmtKind, FmtPiece, FmtSpec, ItemKind, MacroKind, Pat, PatId, Stmt, UnOp};
 use crate::check::collect::*;
 use crate::check::generics::Scope;
-use crate::diag::{CtxtId, Diag, Span, not_yet, unsupported};
+use crate::diag::{CtxtId, Diag, Span, module_path_not_yet, not_yet, unsupported};
 use crate::driver::graph::{BindingRes, Fingerprint, Head, Namespace, Reads, ReceiverForm, SigOf};
 use crate::intern::{Interner, Sym};
 use crate::traits::solve::{Selection, SolveCx, Solver};
@@ -10597,7 +10597,7 @@ impl<'p> Ctx<'p> {
         } else {
             let path: Vec<&str> = names[..names.len() - 1].iter().map(|n| self.name(*n)).collect();
             if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Type) {
-                self.errs.push(not_yet("L0505", span, "module paths"));
+                self.errs.push(module_path_not_yet(&names.iter().map(|n| self.name(*n)).collect::<Vec<_>>(), span));
                 return None;
             }
             (names[names.len() - 2], names[names.len() - 1])

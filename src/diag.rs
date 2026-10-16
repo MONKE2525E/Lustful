@@ -140,6 +140,19 @@ pub fn not_yet(code: &'static str, span: Span, what: &str) -> Diag {
     Diag::new(code, span, format!("{what} is not supported yet"), "Rewrite this part with the supported subset (see README).")
 }
 
+/// L0505 for a module path lust cannot resolve after every table: in
+/// practice a std or core item lust does not have yet. The message names
+/// the path, so a census can group its sites by item.
+pub fn module_path_not_yet<S: AsRef<str>>(segs: &[S], span: Span) -> Diag {
+    let path: Vec<&str> = segs.iter().map(|s| s.as_ref()).collect();
+    Diag::new(
+        "L0505",
+        span,
+        format!("the module path `{}` is not supported yet", path.join("::")),
+        "Use a std item lust implements today (`lust capabilities`), or import the item with `use` from a module of this crate.",
+    )
+}
+
 /// Error for a Rust feature that lust will support later but this prototype does not.
 pub fn unsupported(span: Span, what: &str) -> Diag {
     Diag::new(
