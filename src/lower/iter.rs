@@ -156,7 +156,7 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         opaque_nodrop: Vec::new(),
         stmt_unwind: body.stmt_unwind.clone(),
     };
-    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), fold: false, unw: None };
+    let mut ex = Ex { p, body: copy, cur: Bb(0), span: Span::default(), fold: false, unw: None, shim_line: 166 };
     let n = ex.body.blocks.len();
     for b in 0..n {
         let Terminator::Call { target: CallTarget::Builtin(x), .. } = ex.body.blocks[b].term else { continue };
@@ -188,6 +188,10 @@ struct Ex<'b, 'g> {
     /// The expanded call's cleanup successor: every call and statement
     /// of its expansion that can unwind continues there (panic=unwind).
     unw: Option<Bb>,
+    /// The core/src/ops/function.rs line of the Fn trait method a
+    /// primitive method item's shim runs in (`call_fn`): `call_mut`
+    /// (166) for an adapter's `FnMut` bound, `call` (79) behind a `&`.
+    shim_line: u32,
 }
 
 impl Ex<'_, '_> {
@@ -397,6 +401,16 @@ impl Ex<'_, '_> {
     /// `f_ty`), called through `FnMut`: the env goes by `&` for an
     /// `Fn` closure and by `&mut` for an `FnMut` one.
     fn call_fn(&mut self, f_ty: Ty, f_place: Place, args: Vec<Operand>, dest: Place) -> R {
+        // A reference to a callable (`fold(0, &u32::div_euclid)`, `&c`):
+        // core's `impl FnMut for &F` calls `F::call`, and `&mut F`
+        // calls `F::call_mut`.
+        if let TyKind::Ref(_, m, inner) = self.body.tys.kind(f_ty) {
+            let line = if m.is_mut() { 166 } else { 79 };
+            let saved = std::mem::replace(&mut self.shim_line, line);
+            let r = self.call_fn(inner, f_place.deref(), args, dest);
+            self.shim_line = saved;
+            return r;
+        }
         // A fn pointer, fn item, or tuple constructor (W-CHECK-G): a plain
         // call, as `Ctx::callable_res` resolves a call of the value.
         match self.body.tys.kind(f_ty) {
@@ -454,11 +468,12 @@ impl Ex<'_, '_> {
                             self.assign(dest, Rvalue::Cast(op, ty));
                             return Ok(());
                         }
-                        // The adapters call it as `FnMut::call_mut`: a
+                        // The adapters call it as `FnMut::call_mut` (or
+                        // `call` behind a `&`, `shim_line`): a
                         // `#[track_caller]` panic reports that shim's
                         // line in core/src/ops/function.rs, as rustc's
                         // fn item shim does.
-                        let saved = std::mem::replace(&mut self.span, Span::std_site(15, 166, 5));
+                        let saved = std::mem::replace(&mut self.span, Span::std_site(15, self.shim_line, 5));
                         self.call(CallTarget::Builtin(bf), args, dest);
                         self.span = saved;
                         return Ok(());
@@ -2699,9 +2714,11 @@ impl Ex<'_, '_> {
                     return Err("iterator expansion: Zip is forward-only here".into());
                 }
                 let (ia, ib) = (self.item(a[0])?, self.item(a[1])?);
-                if self.tra(a[0]) && self.tra(a[1]) {
+                if self.tra_coerce(a[0]) && self.tra_coerce(a[1]) {
                     // Both sides random access (Rust's `Zip` over two
-                    // `TrustedRandomAccess` sides): the length fixed at
+                    // `TrustedRandomAccess` sides; with only the
+                    // `NoCoerce` form, `next` is the general one and
+                    // `fold` reads by index, see `fold_differs`): the length fixed at
                     // `zip` creation bounds the pulls, so each side is
                     // pulled exactly `len` times. Pulling with `next`
                     // gives the same items and side effects as std's
@@ -3976,9 +3993,11 @@ impl Ex<'_, '_> {
         use IterKind as K;
         let Some((k, a)) = self.kind_args(ty) else { return false };
         match k {
-            // `array::IntoIter` is random access in Rust 1.99 (a zip with
-            // it pulls only `min` items from a mapped side).
-            K::SliceIter | K::SliceIterMut | K::ArrayIntoIter | K::Windows => true,
+            // `array::IntoIter` is random access in Rust 1.99 for `Copy`
+            // items (a zip with it pulls only `min` items from a mapped
+            // side), in the `NoCoerce` form only.
+            K::ArrayIntoIter => is_copy(self.p, &self.body.tys, a[0]),
+            K::SliceIter | K::SliceIterMut | K::Windows => true,
             K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => true,
             K::Range => matches!(
                 self.body.tys.kind(a[0]),
@@ -3987,6 +4006,20 @@ impl Ex<'_, '_> {
             K::Map | K::Enumerate | K::Copied | K::Cloned | K::Skip => self.tra(a[0]),
             K::Zip => self.tra(a[0]) && self.tra(a[1]),
             _ => false,
+        }
+    }
+
+    /// True when Rust 1.99 implements the full `TrustedRandomAccess`
+    /// (not only `TrustedRandomAccessNoCoerce`): `Skip` and `StepBy`
+    /// are `TrustedLen` only over it. `array::IntoIter` has only the
+    /// `NoCoerce` form.
+    fn tra_coerce(&self, ty: Ty) -> bool {
+        use IterKind as K;
+        match self.kind_args(ty) {
+            Some((K::ArrayIntoIter, _)) => false,
+            Some((K::Map | K::Enumerate | K::Copied | K::Cloned | K::Skip, a)) => self.tra_coerce(a[0]),
+            Some((K::Zip, a)) => self.tra_coerce(a[0]) && self.tra_coerce(a[1]),
+            _ => self.tra(ty),
         }
     }
 
@@ -4025,8 +4058,15 @@ impl Ex<'_, '_> {
                 let inner = self.size(f(0), a[0])?;
                 self.call_builtin(Builtin::SaturatingSub, vec![inner, Operand::Copy(f(1))], Place::local(out));
             }
-            K::Zip => {
+            K::Zip if self.tra_coerce(a[0]) && self.tra_coerce(a[1]) => {
                 self.assign(Place::local(out), Rvalue::Bin(Sub, Operand::Copy(f(3)), Operand::Copy(f(2))));
+            }
+            // The `NoCoerce` form pulls its sides with `next`: the
+            // general `size_hint`, exact over random-access sides.
+            K::Zip => {
+                let x = self.size(f(0), a[0])?;
+                let y = self.size(f(1), a[1])?;
+                self.call_builtin(Builtin::Min, vec![x, y], Place::local(out));
             }
             K::ArrayIntoIter => {
                 self.assign(Place::local(out), Rvalue::Bin(Sub, Operand::Copy(f(2)), Operand::Copy(f(1))));
@@ -4435,6 +4475,13 @@ impl Ex<'_, '_> {
                         self.goto(j2);
                         self.cur = j2;
                     }
+                    // std's `OneShot` specialization: an inner iterator of
+                    // at most one item never stays in front or back, so
+                    // the hint is (0, the outer's upper).
+                    None if self.one_shot(a[1]) => {
+                        self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                        self.assign(Place::local(hi), Rvalue::Use(Operand::Move(Place::local(ihi))));
+                    }
                     None => {
                         // (lo, fhi + bhi) only when the outer is exactly empty.
                         self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(sum))));
@@ -4693,7 +4740,7 @@ impl Ex<'_, '_> {
             K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => true,
             K::Map | K::Enumerate | K::Rev | K::Take | K::Copied | K::Cloned | K::Peekable => self.trusted_len(a[0]),
             K::Chain | K::Zip => self.trusted_len(a[0]) && self.trusted_len(a[1]),
-            K::Skip | K::StepBy => self.tra(a[0]),
+            K::Skip | K::StepBy => self.tra_coerce(a[0]),
             K::Filter | K::FilterMap | K::TakeWhile | K::SkipWhile | K::Inspect => false,
             K::RecvIter | K::RecvTryIter | K::RecvIntoIter => false,
             // Not `TrustedLen` in Rust 1.99 (`collect` of two keys
@@ -4710,8 +4757,10 @@ impl Ex<'_, '_> {
             | K::SetIntoIter => false,
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator may implement the unstable TrustedLen only
-            // in std itself.
-            K::ByNext | K::CharIndices | K::StrSplit | K::StrMatches | K::EncodeUtf16 => false,
+            // in std itself: of the std source iterators, core's `Once`
+            // and `OnceWith` do (library/core/src/iter.rs).
+            K::ByNext => self.std_trusted_len(a[0]),
+            K::CharIndices | K::StrSplit | K::StrMatches | K::EncodeUtf16 => false,
             K::Windows | K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
                 true
             }
@@ -4727,6 +4776,30 @@ impl Ex<'_, '_> {
             // `env::Args` and the slice splits are not `TrustedLen` in std.
             K::Args | K::SliceSplit | K::SliceSplitMut => false,
         }
+    }
+
+    /// True for the inner iterators Rust 1.99 marks `OneShot` (at most
+    /// one item; core/src/iter/adapters/flatten.rs): `Once`, `OnceWith`,
+    /// the Option and Result iterators, `array::IntoIter<T, 0 or 1>`,
+    /// and `Map`, `Filter`, `FilterMap`, `Copied`, `Cloned` over one.
+    fn one_shot(&self, ty: Ty) -> bool {
+        use IterKind as K;
+        let Some((k, a)) = self.kind_args(ty) else { return false };
+        match k {
+            K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIntoIter | K::ResultIter | K::ResultIterMut => true,
+            K::ArrayIntoIter => self.const_size(a[1]).is_some_and(|n| n <= 1),
+            K::ByNext => self.std_trusted_len(a[0]),
+            K::Map | K::Filter | K::FilterMap | K::Copied | K::Cloned => self.one_shot(a[0]),
+            _ => false,
+        }
+    }
+
+    /// True for the std source iterator types that Rust 1.99 marks
+    /// `TrustedLen` (`unsafe impl` in core/src/iter/sources/once.rs and
+    /// once_with.rs). `FromFn` and `Successors` are not.
+    fn std_trusted_len(&self, t: Ty) -> bool {
+        let Some(a) = self.body.tys.local_adt(t) else { return false };
+        self.p.is_std_adt(a) && matches!(self.p.display_path(self.p.adt(a).name).as_str(), "core::iter::Once" | "core::iter::OnceWith")
     }
 
     /// `dest = itp.start_bound()` (or `end_bound`), a `Bound<&T>`
@@ -5215,7 +5288,13 @@ impl Ex<'_, '_> {
         use IterKind as K;
         let Some((k, a)) = self.kind_args(ty) else { return false };
         match k {
-            K::Zip => self.trusted_len(a[0]) && self.trusted_len(a[1]) && !(self.tra(a[0]) && self.tra(a[1])),
+            // Two `TrustedLen` sides (`SpecFold`), or random-access sides
+            // in the `NoCoerce` form only (an indexed `fold` over the
+            // `min` length); both fold exactly the hint's upper pairs.
+            K::Zip => {
+                (self.trusted_len(a[0]) && self.trusted_len(a[1]) || self.tra(a[0]) && self.tra(a[1]))
+                    && !(self.tra_coerce(a[0]) && self.tra_coerce(a[1]))
+            }
             K::Map | K::Filter | K::FilterMap | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Peekable | K::SkipWhile | K::Skip => {
                 self.fold_differs(a[0])
             }
