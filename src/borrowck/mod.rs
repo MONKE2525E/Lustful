@@ -1450,6 +1450,47 @@ impl<'b, 'p> Ck<'b, 'p> {
         false
     }
 
+    /// True when `p` is reached through a deref of a shared reference or
+    /// a raw pointer: a loan of such a place conflicts with nothing
+    /// (rustc `ignore_borrow`; the reference is `Copy`, its referent
+    /// cannot change, and region constraints keep the referent alive).
+    /// An unknown type on the way counts as no such deref.
+    fn through_shared_ref(&self, p: &Place) -> bool {
+        let tys = &self.body.tys;
+        let mut t = self.body.locals[p.local as usize].ty;
+        let mut variant = 0;
+        for pr in &p.proj {
+            t = match *pr {
+                Proj::Deref => match tys.kind(t) {
+                    TyKind::Ref(_, Mut::Shared, _) | TyKind::RawPtr(..) => return true,
+                    TyKind::Ref(_, Mut::Mut, inner) => inner,
+                    _ => tys.adt_first_ty_arg(t).unwrap_or(ERROR),
+                },
+                Proj::Field(i) => {
+                    let f = match (tys.option_elem(t), tys.result_args(t)) {
+                        (Some(e), _) => e,
+                        (_, Some((a, b))) => if variant == 0 { a } else { b },
+                        _ => self.step_field_ty(t, variant, i),
+                    };
+                    variant = 0;
+                    f
+                }
+                Proj::Downcast(v) => {
+                    variant = v;
+                    t
+                }
+                Proj::Index(_) => match tys.kind(t) {
+                    TyKind::Array(e, _) | TyKind::Slice(e) => e,
+                    _ => tys.vec_elem(t).unwrap_or(ERROR),
+                },
+            };
+            if t == ERROR {
+                return false;
+            }
+        }
+        false
+    }
+
     /// True when a type has region slots (unknown types count).
     fn has_regions(&self, t: Ty) -> bool {
         let tys = &self.body.tys;
@@ -2335,6 +2376,9 @@ impl<'b, 'p> Ck<'b, 'p> {
         }
         for li in live_loans.iter() {
             let loan = &self.loans[li];
+            if self.through_shared_ref(&loan.place) {
+                continue;
+            }
             // A write to a whole local is shallow: writing a reference local itself does
             // not touch the value behind it, so a loan on `*a` does not block `a = ...`.
             if kind == Access::Write && p.proj.is_empty() && loan.place.proj.first() == Some(&Proj::Deref) && self.through_ref(&loan.place) {
