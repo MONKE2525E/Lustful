@@ -1776,8 +1776,9 @@ fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId) -> Result<Opt
 /// input region sets its bit (an elided output slot is that region). A
 /// `'static` slot, and an erased one of an alias argument, does not. A
 /// type parameter adds no slot (`fn(&D, usize) -> &T` is mask 1 of 1
-/// slot). (0, 0) when the inputs have no or several regions, the output
-/// holds a projection or an infer var, or it has more than 32 slots.
+/// slot), and so does a `_`. (0, `u8::MAX`) when the inputs have no or
+/// several regions, the output holds a projection, or it has more than
+/// 32 slots; (0, 0) with no output.
 #[allow(clippy::too_many_arguments)]
 fn fn_ptr_own_output(
     ast: &Ast,
@@ -1792,25 +1793,27 @@ fn fn_ptr_own_output(
 ) -> (u32, u8) {
     let Some(r) = ret else { return (0, 0) };
     let f = tys.flags(out);
-    if f.contains_projection() || f.contains_infer() {
-        return (0, 0);
+    // A `_` adds no slot, as a type param does: what it resolves to is
+    // fixed outside the pointer's binder.
+    if f.contains_projection() {
+        return (0, u8::MAX);
     }
     let mut ts = scope.clone();
     ts.fn_ptr_free = false;
     ts.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
     let mut lts: Vec<Region> = Vec::new();
     for &t in in_tys {
-        let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, t, &ts) else { return (0, 0) };
+        let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, t, &ts) else { return (0, u8::MAX) };
         crate::borrowck::elision_regions(tys, twin, &mut lts);
     }
     lts.retain(|r| !matches!(r, Region::Erased | Region::Static));
     lts.dedup();
-    let [own] = lts[..] else { return (0, 0) };
+    let [own] = lts[..] else { return (0, u8::MAX) };
     ts.regions = RegionMode::Keep { next: None, elided: Some(own) };
-    let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, r, &ts) else { return (0, 0) };
+    let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, r, &ts) else { return (0, u8::MAX) };
     let mut slots: Vec<Region> = Vec::new();
     if !crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, twin, out, &mut slots) || slots.len() > 32 {
-        return (0, 0);
+        return (0, u8::MAX);
     }
     let mask = slots.iter().enumerate().filter(|(_, r)| **r == own).fold(0u32, |m, (k, _)| m | 1 << k);
     (mask, slots.len() as u8)
@@ -3097,7 +3100,7 @@ pub fn resolve_scoped(
                 Some((lt, r)) => (fn_ptr_free_mask(ast, interner, known, cx, tys, outer, &in_tys, *ret, lt, &ins, out)?, r),
                 None => (0, Region::Erased),
             };
-            let (own_out, out_slots) = if free_slots == 0 { fn_ptr_own_output(ast, interner, known, cx, tys, outer, &in_tys, *ret, out) } else { (0, 0) };
+            let (own_out, out_slots) = if free_slots == 0 { fn_ptr_own_output(ast, interner, known, cx, tys, outer, &in_tys, *ret, out) } else { (0, u8::MAX) };
             let inputs = tys.intern_tys(&ins);
             let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, out_slots, ..FnSig::plain(inputs, out) }));
             Ok(tys.intern(TyKind::FnPtr(sig)))

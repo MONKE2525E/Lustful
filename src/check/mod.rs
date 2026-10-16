@@ -6516,6 +6516,9 @@ impl<'p> Ctx<'p> {
                     return Some(why);
                 }
             }
+            if self.ptr_out_tied_lost(f, e, invariant) {
+                return Some(format!("`{}` is not as general as `{}`: their lifetimes differ", self.tn(f), self.tn(e)));
+            }
             return self.sig_pos_mismatch(fo, eo, false, invariant, f, e);
         }
         match (self.tys.kind(f), self.tys.kind(e)) {
@@ -6536,6 +6539,42 @@ impl<'p> Ctx<'p> {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// True when fn pointer `f` is not as general as fn pointer `e` in a
+    /// way `sig_pos_mismatch` does not see (rustc E0308): `f` returns its
+    /// one input's borrow in an output slot where `e`'s slot was filled by
+    /// a type argument (`FnSig::out_substituted`: `fn(&u8) -> &u8` passed
+    /// for `fn(&u8) -> T` with `T = &u8`), or the other way round when
+    /// `invariant`; or an input slot of `f` is a free region where `e`'s
+    /// is higher-ranked. Slots line up: the two types unified.
+    fn ptr_out_tied_lost(&mut self, f: Ty, e: Ty, invariant: bool) -> bool {
+        let (TyKind::FnPtr(sf), TyKind::FnPtr(se)) = (self.tys.kind(f), self.tys.kind(e)) else { return false };
+        let (sf, se) = (self.tys.sig(sf).value, self.tys.sig(se).value);
+        let al = &self.p.gx.adt_lifetimes;
+        // A source input slot that is the enclosing item's lifetime
+        // (`fn(&'x u8) -> &'x u8`, `FnSig::free_slots`) cannot take every
+        // region a higher-ranked target input slot may be.
+        if sf.free_slots != 0 && se.free_slots == 0 {
+            let mut ins = Vec::new();
+            for &t in self.tys.tys_of(se.inputs) {
+                crate::borrowck::paired_slot_regions(al, &self.tys, t, t, &mut ins);
+            }
+            if ins.iter().enumerate().any(|(j, r)| j < 32 && sf.free_slots >> j & 1 == 1 && *r != Region::Static) {
+                return true;
+            }
+        }
+        let mut slots = Vec::new();
+        crate::borrowck::paired_slot_regions(al, &self.tys, sf.output, sf.output, &mut slots);
+        let n = slots.len();
+        // A substituted side's slots are no binder's; an exact one's are
+        // its `own_out` bits.
+        let tied = |s: &crate::ty::FnSig| if s.out_substituted(n) || s.out_slots == u8::MAX { None } else { Some(s.own_out) };
+        match (tied(&sf), tied(&se)) {
+            (Some(a), None) if se.out_substituted(n) => a != 0,
+            (None, Some(b)) if invariant && sf.out_substituted(n) => b != 0,
+            _ => false,
         }
     }
 

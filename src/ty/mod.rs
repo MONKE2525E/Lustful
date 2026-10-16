@@ -420,14 +420,25 @@ pub struct FnSig {
     /// The number of region slots of the written output (`own_out`'s
     /// width). A type parameter there has none; when a substitution gives
     /// the output more slots, they came from a type argument and the mask
-    /// no longer lines up, so `own_out` does not apply.
+    /// no longer lines up, so `own_out` does not apply. `u8::MAX` when
+    /// unknown (a pointer type lust builds, a free region, several input
+    /// regions): every elided output slot is the one input's then.
     pub out_slots: u8,
 }
 
 impl FnSig {
     /// A signature with no free region (`free_slots` 0).
     pub fn plain(inputs: TysId, output: Ty) -> FnSig {
-        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased, own_out: 0, out_slots: 0 }
+        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased, own_out: 0, out_slots: u8::MAX }
+    }
+
+    /// True when the output has `actual` region slots and the written one
+    /// had another count (`out_slots`): a type argument filled them
+    /// (`fn(&u8) -> T` with `T = &'x u8`), so they are no binder's
+    /// (rustc E0308 "one type is more general than the other" when a fn
+    /// that returns its argument's borrow meets that type).
+    pub fn out_substituted(&self, actual: usize) -> bool {
+        self.free_slots == 0 && self.out_slots != u8::MAX && actual != self.out_slots as usize
     }
 }
 

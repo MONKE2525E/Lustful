@@ -150,8 +150,9 @@ impl Builder<'_, '_> {
     /// slot of the inputs and of the output: its free slots are `free`
     /// (a var), written `'static` is var 0, each other input slot a
     /// binder of its own (`Ph` for a target, `Late` for a source; ids
-    /// from `base`), and each other output slot the one input slot's.
-    /// None when an output slot has no one input to take.
+    /// from `base`), and each other output slot the one input slot's,
+    /// except slots a type argument filled (`FnSig::out_substituted`):
+    /// a var each. None when an output slot has no one input to take.
     pub(super) fn ptr_nodes(&mut self, t: Ty, free: Option<u32>, target: bool, base: u32) -> Option<(Vec<Node>, Vec<Node>)> {
         let TyKind::FnPtr(s) = self.body.tys.kind(t) else { return None };
         let s = self.body.tys.sig(s).value;
@@ -174,11 +175,15 @@ impl Builder<'_, '_> {
             }
         }
         let mut outs = Vec::new();
-        for r in self.sig_slot_regions(s.output) {
+        let out_rs = self.sig_slot_regions(s.output);
+        let substituted = s.out_substituted(out_rs.len());
+        for r in out_rs {
             outs.push(if s.free_slots >> j & 1 == 1 {
                 free_node(self)
             } else if r == Region::Static {
                 Node::Var(0)
+            } else if substituted {
+                Node::Var(self.fresh())
             } else if let [one] = ins[..] {
                 one
             } else {
@@ -537,6 +542,12 @@ impl Builder<'_, '_> {
         let mut rs = Vec::new();
         if let Some(o) = g.output {
             regions_of(&p.tys, o, &mut rs);
+            // An output type param (`F: Fn(&u8) -> T`): the call fixes its
+            // slots outside the bound's binder, a var each.
+            if matches!(p.tys.kind(o), TyKind::Param(_)) {
+                let n = self.sc.slots(out);
+                return Some((t_in, (0..n).map(|_| Node::Var(self.fresh())).collect()));
+            }
         }
         if rs.len() != self.sc.slots(out) as usize {
             return None;

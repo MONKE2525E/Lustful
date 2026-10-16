@@ -1319,6 +1319,31 @@ fn type_params_in(tys: &impl TyIntern, t: Ty, out: &mut Vec<u32>) {
 /// callee's bound and the argument's signature, `entail_bound`); a type
 /// param or projection on either side (an instantiation) pairs nothing.
 /// False when the shapes differ.
+/// The regions of `b` in the places where `a` (the same shape, as for
+/// `region_pairs`) has a type param or a projection.
+fn param_covered_regions(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<Region>) {
+    match (tys.kind(a), tys.kind(b)) {
+        (TyKind::Param(_) | TyKind::Projection(..), _) => regions_of(tys, b, out),
+        (TyKind::Ref(_, _, x), TyKind::Ref(_, _, y))
+        | (TyKind::Array(x, _), TyKind::Array(y, _))
+        | (TyKind::Slice(x), TyKind::Slice(y))
+        | (TyKind::RawPtr(_, x), TyKind::RawPtr(_, y)) => param_covered_regions(tys, x, y, out),
+        (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+            for (x, y) in tys.tys_of(x).to_vec().into_iter().zip(tys.tys_of(y).to_vec()) {
+                param_covered_regions(tys, x, y, out);
+            }
+        }
+        (TyKind::Adt(da, xa), TyKind::Adt(db, xb)) if da == db => {
+            for (x, y) in tys.args(xa).to_vec().into_iter().zip(tys.args(xb).to_vec()) {
+                if let (GenericArg::Ty(x), GenericArg::Ty(y)) = (x, y) {
+                    param_covered_regions(tys, x, y, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region)>) -> bool {
     match (tys.kind(a), tys.kind(b)) {
         (TyKind::Param(_) | TyKind::Projection(..), _) | (_, TyKind::Param(_) | TyKind::Projection(..)) => true,
@@ -7173,7 +7198,16 @@ impl<'b, 'p> Builder<'b, 'p> {
         let mut gn = 0u32;
         let ins: Vec<(Side, Side)> = ins.iter().map(|&(a, b)| (gside(a, &mut gn, false), sides.side(self, b, false))).collect();
         let outs: Vec<(Side, Side)> = outs.iter().map(|&(a, b)| (gside(a, &mut gn, true), sides.side(self, b, true))).collect();
-        self.match_fn_sides(&ins, &outs);
+        // The argument's output regions in the places of `G`'s output type
+        // params (`F: Fn(&u8) -> T`): the call fixes `T` outside `G`'s
+        // binder, so none may be a binder `G`'s input takes (rustc:
+        // "implementation of `FnOnce` is not general enough").
+        let mut covered = Vec::new();
+        if let (Some(a), Some(b)) = (g.output, output) {
+            param_covered_regions(&p.tys, a, b, &mut covered);
+        }
+        let covered: Vec<Side> = covered.into_iter().map(|b| sides.side(self, b, true)).collect();
+        self.match_fn_sides(&ins, &outs, &covered);
     }
 
     /// A fn pointer passed for the callee's `G: Fn*` bound (W-BORROW3):
@@ -7405,7 +7439,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let mut sides = FnSides::new(item);
         let ins: Vec<(Side, Side)> = pin.iter().zip(&f_in_regions).enumerate().map(|(i, (&t, &r))| (tside(i, t), sides.side(self, r, false))).collect();
         let outs: Vec<(Side, Side)> = t_outs.into_iter().zip(&f_out_regions).map(|(t, &r)| (t, sides.side(self, r, true))).collect();
-        self.match_fn_sides(&ins, &outs);
+        self.match_fn_sides(&ins, &outs, &[]);
     }
 
     /// L0203: inside a closure, a type param whose `Fn` bound names a
@@ -7426,7 +7460,7 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// target is higher-ranked, or the one lifetime the target writes there
     /// (trait args are invariant); a target binder needs a source binder
     /// (L0735); outputs agree the same way (L0733).
-    fn match_fn_sides(&mut self, ins: &[(Side, Side)], outs: &[(Side, Side)]) {
+    fn match_fn_sides(&mut self, ins: &[(Side, Side)], outs: &[(Side, Side)], covered: &[Side]) {
         let mut takes: FxMap<u32, u32> = FxMap::default();
         let mut inst: FxMap<u32, u32> = FxMap::default();
         for &(ga, fb) in ins {
@@ -7458,6 +7492,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 _ => {}
             }
+        }
+        if covered.iter().any(|c| matches!(c, Side::Binder(k) if takes.contains_key(k))) {
+            return self.bound_mismatch();
         }
         for &(ga, fb) in outs {
             match (ga, fb) {
