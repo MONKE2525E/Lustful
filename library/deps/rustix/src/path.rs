@@ -4,7 +4,7 @@
 // fs calls reject a path with an interior NUL with EINVAL
 // before the syscall, as upstream's C string conversion does.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// A path argument. Upstream's methods (`as_str`, `into_with_c_str`,
@@ -67,5 +67,13 @@ impl Arg for &PathBuf {
 impl Arg for PathBuf {
     fn __lust_path_bytes(&self) -> Vec<u8> {
         self.as_os_str().as_encoded_bytes().to_vec()
+    }
+}
+
+/// A C string path (upstream passes it to the syscall as it is; its
+/// bytes have no interior NUL, so the EINVAL check never fires).
+impl Arg for &CStr {
+    fn __lust_path_bytes(&self) -> Vec<u8> {
+        self.to_bytes().to_vec()
     }
 }

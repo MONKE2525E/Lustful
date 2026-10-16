@@ -5,6 +5,7 @@ true
 ["a.txt", "b.txt", "sub"]
 true
 true
+[("a.txt", 2), ("b.txt", 1)]
 1
 Event { wd: 1, events: ReadFlags(CREATE), cookie: 0, file_name: Some("new.txt") }
 ReadFlags(

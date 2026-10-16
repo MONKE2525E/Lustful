@@ -41,7 +41,7 @@ Gate: `scripts/test-adapters.sh rustix`.
   `dup2_stdin`, `dup2_stdout`, `dup2_stderr`. `termios`:
   `Winsize`, `tcgetwinsize`. `path`: the `Arg` forms for
   `&str`, `String`, `&OsStr`, `&OsString`, `&Path`, `&PathBuf`,
-  and `PathBuf`.
+  `PathBuf`, and `&CStr`.
 - Features `default`, `std`, `alloc`, `fs`, `process`,
   `termios`, `pipe`, `event`, `stdio`: the set ts-rust enables.
 

@@ -44,6 +44,22 @@ fn main() {
     let first = raw2.next().unwrap().unwrap();
     println!("{}", first.ino() > 0);
 
+    // An entry name as a path argument (`Arg for &CStr`), as ts-rust's
+    // osvfs lstat of an entry of unknown type does.
+    let fd3 = openat(CWD, &dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+    let mut buf3 = vec![MaybeUninit::<u8>::uninit(); 4096];
+    let mut raw3 = RawDir::new(&fd3, &mut buf3);
+    let mut sizes: Vec<(String, i64)> = Vec::new();
+    while let Some(ent) = raw3.next() {
+        let ent = ent.unwrap();
+        let st = rustix::fs::statat(&fd3, ent.file_name(), rustix::fs::AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile {
+            sizes.push((ent.file_name().to_string_lossy().into_owned(), st.st_size));
+        }
+    }
+    sizes.sort();
+    println!("{:?}", sizes);
+
     // inotify Reader over a stack buffer.
     let ino = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
     let wd = inotify::add_watch(&ino, &dir, WatchFlags::CREATE | WatchFlags::DELETE).unwrap();
