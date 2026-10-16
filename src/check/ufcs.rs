@@ -263,15 +263,32 @@ impl<'p> Ctx<'p> {
     /// `Rc::default()` and `Arc::default()`: `() -> Rc<T>` with `T:
     /// Default` (std's `impl<T: Default> Default for Rc<T>`), the element
     /// inferred or written (`Rc::<u8>::default()`, `unify_builtin_self`);
-    /// the default glue builds the value. None for other paths.
+    /// the default glue builds the value. An alias of an `Rc`, `Arc`, or
+    /// `Box` names its target (`type D = Arc<Mutex<P>>; .then(D::default)`).
+    /// None for other paths.
     pub(super) fn smart_default_sig(&mut self, callee: ExprId, span: Span) -> Option<(Vec<Ty>, Ty)> {
         let Expr::Path(segs) = self.p.ast.expr(callee) else { return None };
         let [.., ty_seg, _] = segs.as_slice() else { return None };
+        use crate::check::own::Owner;
+        let owner = match self.builtin_alias_ty(segs, span, false) {
+            Some(t) => match self.tys.builtin_of(t) {
+                Some(BuiltinTy::Rc) => Owner::Rc,
+                Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc)) => Owner::Arc,
+                Some(BuiltinTy::Boxed) => Owner::Box,
+                _ => return None,
+            },
+            // `Box::default()` is `box_default_sig`'s.
+            None => match self.name(ty_seg.name) {
+                "Rc" => Owner::Rc,
+                "Arc" => Owner::Arc,
+                _ => return None,
+            },
+        };
         let elem = self.new_var(false);
-        let t = match self.name(ty_seg.name) {
-            "Rc" => self.tys.mk_rc(elem),
-            "Arc" => crate::ty::sync::sync_ty(&mut self.tys, crate::ty::sync::SyncTy::Arc, &[elem]),
-            _ => return None,
+        let t = match owner {
+            Owner::Rc => self.tys.mk_rc(elem),
+            Owner::Arc => crate::ty::sync::sync_ty(&mut self.tys, crate::ty::sync::SyncTy::Arc, &[elem]),
+            Owner::Box => self.tys.mk_boxed(elem),
         };
         self.deferred_default.push((t, span));
         Some((vec![], t))
