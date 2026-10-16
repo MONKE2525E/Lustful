@@ -401,7 +401,10 @@ fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
 
 /// What a closure body needs between its captured and free argument
 /// regions and `'static`, and what its output slots may hold (rustc's
-/// closure requirements; `regions::End`), for its creator. None when the
+/// closure requirements; `regions::End`), for its creator. A `call_out`
+/// closure also gives what its output slots must outlive (`(Out(k),
+/// x)`), which only `flow_closure_output` proves; every other creator
+/// path skips those pairs, and `Builder::out_reqs_unproved` reports them. None when the
 /// body has lowering errors or an `impl Trait` value.
 fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, regions::End)>> {
     if !body.lower_errs.is_empty() || body.locals.iter().any(|l| mentions_opaque(&body.tys, l.ty)) {
@@ -414,6 +417,7 @@ fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, r
         return None;
     }
     let ends = own.ends.clone();
+    let call_out = own.call_out;
     let mut b = regions::Builder::new(p, body, own, ck.loans.len(), &ck.loan_at, &ck.stmt_base);
     b.build();
     let sol = b.solve();
@@ -422,7 +426,7 @@ fn closure_requirements(p: &Program, body: &Body) -> Option<Vec<(regions::End, r
         sol.reqs
             .iter()
             .filter_map(|&(a, b)| Some((end(a)?, end(b)?)))
-            .filter(|(a, _)| !matches!(a, regions::End::Out(_)))
+            .filter(|(a, b)| !matches!(a, regions::End::Out(_)) || call_out && !matches!(b, regions::End::Out(_)))
             .collect(),
     )
 }

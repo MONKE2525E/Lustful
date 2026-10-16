@@ -4850,6 +4850,8 @@ pub struct ClosureEntry {
     pub bound_output: Option<Ty>,
     /// `ClosureInfo::bound_inputs` (W-BORROW).
     pub bound_inputs: Vec<Ty>,
+    /// `ClosureInfo::call_out` (W-BORROW).
+    pub call_out: bool,
 }
 
 /// One return-position `impl Trait` (ARCH 2.11): the fn that defines it
@@ -9616,6 +9618,7 @@ pub(crate) struct OwnedClosure {
     pub(crate) output_region: Option<OwnedTy>,
     pub(crate) bound_output: Option<OwnedTy>,
     pub(crate) bound_inputs: Vec<OwnedTy>,
+    pub(crate) call_out: bool,
 }
 
 /// Snapshots the closures of one checked body. None when a closure
@@ -9635,6 +9638,7 @@ fn snapshot_closures(c: &crate::check::Checked) -> Option<Vec<OwnedClosure>> {
             output_region: cl.output_region.and_then(|t| snapshot_ty(&c.tys, t)),
             bound_output: cl.bound_output.and_then(|t| snapshot_ty(&c.tys, t)),
             bound_inputs: cl.bound_inputs.iter().map(|&t| snapshot_ty(&c.tys, t)).collect::<Option<Vec<_>>>().unwrap_or_default(),
+            call_out: cl.call_out,
         });
     }
     Some(out)
@@ -9777,7 +9781,7 @@ fn register_closures(p: &mut Program, parent: LocalDefId, owned: Vec<OwnedClosur
         let scope = p.gx.fn_scopes.get(parent.0 as usize).cloned().unwrap_or_default();
         p.gx.fn_scopes.push(scope);
         p.gx.fn_class.push(class);
-        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone(), scope_body: oc.scope_body, input_regions, output_region, bound_output, bound_inputs });
+        p.gx.closures.insert(oc.def, ClosureEntry { parent, body_fn: id, kind: oc.kind, inputs, output, free_args: oc.free_args.clone(), scope_body: oc.scope_body, input_regions, output_region, bound_output, bound_inputs, call_out: oc.call_out });
         p.gx.closure_fns.insert(id, oc.def);
         out.push(id);
     }
@@ -9831,6 +9835,7 @@ pub(crate) fn template_closures_stand(p: &mut Program, t: LocalDefId) -> bool {
             && e.output_region == output_region
             && e.bound_output == bound_output
             && e.bound_inputs == bound_inputs
+            && e.call_out == oc.call_out
             && f.params.first() == Some(&env)
             && f.params[1..] == inputs[..]
             && f.ret == output;

@@ -1181,6 +1181,10 @@ pub(super) struct OwnSig {
     /// (`closure_requirements`), not errors here; the env reference and
     /// higher-ranked argument slots are None.
     pub ends: Vec<Option<End>>,
+    /// A closure body passed for a bound whose output holds a callee type
+    /// param (`ClosureEntry::call_out`): what it needs of its output slots
+    /// is also its creator's to prove (`flow_closure_output`).
+    pub call_out: bool,
     /// An `impl Trait` return: the universal the returned value's
     /// capture var equals (`Builder::cap_var` of local 0), for the
     /// captures its hidden type has no slot for. The ret slots' rule
@@ -1465,10 +1469,12 @@ impl OwnSig {
             check,
             closure,
             ends: Vec::new(),
+            call_out: false,
             ret_cap: None,
             param_univ: Vec::new(),
         };
         if closure {
+            own.call_out = p.gx.closure_fns.get(&body.fn_id).and_then(|d| p.gx.closures.get(d)).is_some_and(|c| c.call_out);
             own.closure_sig(p, body, &mut sc);
             own.closure_param_univs(p, body);
             return own;
@@ -2343,6 +2349,9 @@ pub(super) struct Builder<'b, 'p> {
     closure_reqs: FxMap<DefId, Option<std::rc::Rc<Vec<(End, End)>>>>,
     /// The closures a call's `F: Fn*(..)` bounds linked (`link_bound_closure`).
     bound_linked: Vec<DefId>,
+    /// The `call_out` closures whose output requirements a call proved
+    /// (`flow_closure_output`; `out_reqs_unproved` reports the others).
+    out_proved: Vec<DefId>,
     /// While a call of a trait method instantiates its signature: the vars
     /// its first universals (the trait's lifetime params) take
     /// (`trait_lifetime_seeds`); empty otherwise.
@@ -2408,6 +2417,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             closure_args: FxMap::default(),
             closure_reqs: FxMap::default(),
             bound_linked: Vec::new(),
+            out_proved: Vec::new(),
             seed_univ: Vec::new(),
             created: FxMap::default(),
             root_check: None,
@@ -3122,6 +3132,45 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.span = b.term_span;
             if let Terminator::Call { target, args, dest, .. } = &b.term {
                 self.call(*target, args, dest);
+            }
+        }
+        self.out_reqs_unproved();
+    }
+
+    /// A `call_out` closure created in this body whose body needs
+    /// something of its output slots (`(Out(k), x)` in `closure_reqs`, or
+    /// requirements lust could not compute) that no call proved
+    /// (`out_proved`): the body did not report it, so it is an error here.
+    fn out_reqs_unproved(&mut self) {
+        if !self.own.check {
+            return;
+        }
+        let p = self.p;
+        let mut seen: Vec<DefId> = Vec::new();
+        for l in 0..self.body.locals.len() {
+            let mut t = self.body.locals[l].ty;
+            while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+                t = inner;
+            }
+            let TyKind::Closure(def, args) = self.body.tys.kind(t) else { continue };
+            let Some(c) = p.gx.closures.get(&def) else { continue };
+            if !c.call_out || c.parent != self.body.fn_id || seen.contains(&def) || self.out_proved.contains(&def) {
+                continue;
+            }
+            seen.push(def);
+            let mut roles = Vec::new();
+            closure_roles(&mut self.sc, args, &mut roles);
+            let needs = match self.closure_reqs(def, &roles) {
+                Some(reqs) => reqs.iter().any(|(x, _)| matches!(x, End::Out(_))),
+                None => true,
+            };
+            if needs {
+                self.errs.push(Diag::new(
+                    "L0733",
+                    p.fn_def(c.body_fn).name_span,
+                    "lifetime may not live long enough: lust cannot prove what this closure's return value needs of the call's types",
+                    "Return a value whose regions come from the closure's arguments or captures only, or annotate the closure's return type.",
+                ));
             }
         }
     }
@@ -3845,8 +3894,11 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// `Fn*` bounds whose output has no type param: what the closure
     /// returns has the bound's regions (`tie_bound_output`), which the
     /// signature relates to the result, as rustc checks a call by its
-    /// signature alone.
-    fn output_tied(&self, f: LocalDefId, avs: &[(Ty, Vec<u32>)]) -> Vec<usize> {
+    /// signature alone. Also those whose bound output holds type params
+    /// the signature binds (`-> U`, `-> Option<U>`), when the closure's
+    /// body solves: its returns reach `U`'s slots one by one
+    /// (`flow_closure_output`).
+    fn output_tied(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)]) -> Vec<usize> {
         let p = self.p;
         if p.gx.fn_class.get(f.0 as usize) == Some(&crate::check::generics::FnClass::Stub) {
             return Vec::new();
@@ -3866,8 +3918,33 @@ impl<'b, 'p> Builder<'b, 'p> {
                 pt = inner;
             }
             let TyKind::Param(j) = p.tys.kind(pt) else { continue };
-            let mut bounds = sig.fn_bounds.iter().filter(|b| b.param == j.0).peekable();
-            if bounds.peek().is_some() && bounds.all(|b| b.output.is_none_or(|o| !p.tys.flags(o).contains_param())) {
+            let bounds: Vec<Option<Ty>> = sig.fn_bounds.iter().filter(|b| b.param == j.0).map(|b| b.output).collect();
+            // The params of `sig`'s inputs and return: `flow_closure_output`
+            // finds their slots bound at the call.
+            let mut bound_ps = Vec::new();
+            for &t in sig.params.iter().chain([&sig.ret]) {
+                params_in(&p.tys, t, &mut bound_ps);
+            }
+            let mut param_out = false;
+            let ok = !bounds.is_empty()
+                && bounds.iter().all(|o| match o {
+                    Some(o) if p.tys.flags(*o).contains_param() => {
+                        let mut ps = Vec::new();
+                        params_in(&p.tys, *o, &mut ps);
+                        param_out = true;
+                        ps.iter().all(|q| bound_ps.contains(q))
+                    }
+                    _ => true,
+                });
+            if ok && param_out {
+                let TyKind::Closure(def, args) = self.body.tys.kind(t) else { continue };
+                let mut roles = Vec::new();
+                closure_roles(&mut self.sc, args, &mut roles);
+                if self.closure_reqs(def, &roles).is_none() {
+                    continue;
+                }
+            }
+            if ok {
                 out.push(i);
             }
         }
@@ -4882,7 +4959,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let c = self.p.gx.closures.get(&def)?;
         let free = matches!(closure_arg_slots(&mut self.sc, c), Ok(v) if v.iter().any(|(r, _)| r.is_some()));
-        let r = if free || !roles.is_empty() {
+        let r = if free || !roles.is_empty() || c.call_out {
             // `check_fn` of a closure is its enclosing fn's check.
             let cf = c.body_fn;
             let mut root = c.parent;
@@ -6187,6 +6264,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             {
                 self.link_bound_closure(b.value.args, &binds, sig, &univ);
                 self.tie_bound_output(b.value.args, &binds, sig, &univ);
+                self.flow_closure_output(b.value.args, &binds, sig, &univ, dv);
                 self.entail_bound(b.value.args, sig, &univ);
                 self.entail_bound_ptr(b.value.args, &binds, sig, &univ);
                 self.flow_bound_inputs(b.value.args, &binds, sig, &univ);
@@ -6743,6 +6821,71 @@ impl<'b, 'p> Builder<'b, 'p> {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// A closure passed for `F: Fn*(..) -> O` where `O` holds a callee
+    /// type param (`Option::map`'s `FnOnce(T) -> U`): per slot of the
+    /// closure's output, what its body returns of its captured and free
+    /// argument slots (`closure_reqs`) flows into `O`'s instantiation at
+    /// the call, so `U`'s slots in the result get only that (`Some(s).map(
+    /// |st| (st, "x"))` keeps the `'static` slot free of `s`), and
+    /// `output_tied` skips the call's every-source rule for it. When the
+    /// output does not pair, or the body does not solve, every source of
+    /// the closure flows into the result `dv`.
+    fn flow_closure_output(&mut self, trait_args: ArgsId, binds: &FxMap<u32, Vec<u32>>, sig: &RegionSig, univ: &[u32], dv: &[u32]) {
+        let p = self.p;
+        let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
+        let (Some(self_t), Some(tuple)) = (targs.first().and_then(|g| g.as_ty()), targs.get(1).and_then(|g| g.as_ty())) else { return };
+        let (TyKind::Param(jf), TyKind::Tuple(ts)) = (p.tys.kind(self_t), p.tys.kind(tuple)) else { return };
+        let n_in = p.tys.tys_of(ts).len();
+        let Some(out_t) = sig.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).and_then(|b| b.output) else { return };
+        if !p.tys.flags(out_t).contains_param() {
+            return;
+        }
+        let Some(&ft) = self.bind_tys.get(&jf.0) else { return };
+        let TyKind::Closure(def, args) = self.body.tys.kind(ft) else { return };
+        let Some(c_out) = p.gx.closures.get(&def).map(|c| c.output) else { return };
+        let caps = binds.get(&jf.0).cloned().unwrap_or_default();
+        let mut roles = Vec::new();
+        closure_roles(&mut self.sc, args, &mut roles);
+        let mut ps = Vec::new();
+        params_in(&p.tys, out_t, &mut ps);
+        let mut ob = binds.clone();
+        let mut rv = Vec::new();
+        let paired = ps.iter().all(|j| binds.contains_key(j))
+            && self.inst(out_t, c_out, univ, &mut ob, &mut rv)
+            && rv.len() == self.sc.slots(c_out) as usize;
+        match self.closure_reqs(def, &roles) {
+            Some(reqs) if paired => {
+                let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
+                let end = |e: End| match e {
+                    End::Static => Some(0),
+                    End::Cap(i) => caps.get(i as usize).copied(),
+                    End::Arg(j) => vars.get(j as usize).copied(),
+                    End::Out(k) => rv.get(k as usize).copied(),
+                };
+                // `(x, Out(k))`: what slot `k` may hold; `(Out(k), x)`
+                // (a `call_out` body): what slot `k` must outlive.
+                let mut all = true;
+                for &(x, y) in reqs.iter() {
+                    if !matches!((x, y), (_, End::Out(_)) | (End::Out(_), _)) {
+                        continue;
+                    }
+                    match (end(x), end(y)) {
+                        (Some(a), Some(b)) => self.edge(a, b),
+                        _ => all &= !matches!(x, End::Out(_)),
+                    }
+                }
+                if all {
+                    self.out_proved.push(def);
+                }
+            }
+            _ => {
+                let mut srcs = Vec::new();
+                self.closure_sources(ft, &caps, &mut 0, &mut srcs);
+                self.flow_all(&srcs, dv);
             }
         }
     }
@@ -7913,6 +8056,14 @@ impl Builder<'_, '_> {
                     // A closure's creator proves relations between its
                     // captured and free argument regions (`closure_reqs`).
                     if matches!(self.own.ends.get(u), Some(Some(End::Cap(_) | End::Arg(_))))
+                        && matches!(self.own.ends.get(v), Some(Some(End::Static | End::Cap(_) | End::Arg(_))))
+                    {
+                        continue;
+                    }
+                    // So does a `call_out` closure's creator for its output
+                    // slots: the call picks their regions.
+                    if self.own.call_out
+                        && matches!(self.own.ends.get(u), Some(Some(End::Out(_))))
                         && matches!(self.own.ends.get(v), Some(Some(End::Static | End::Cap(_) | End::Arg(_))))
                     {
                         continue;

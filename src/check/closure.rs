@@ -92,6 +92,12 @@ pub struct ClosureInfo {
     /// `'static` (`impl FnOnce(&RefCell<Vec<Box<dyn Fn()>>>)`) is
     /// `'static` in the body, not higher-ranked.
     pub bound_inputs: Vec<Ty>,
+    /// W-BORROW: passed for a callee's `F: Fn*(..) -> O` bound whose `O`
+    /// holds a callee type param (`Option::map`'s `-> U`): the output's
+    /// regions are the call's to pick, so what the body needs of them
+    /// (`'static`, an argument's region) is the creator's to prove
+    /// (`closure_requirements`), not an error in the body.
+    pub call_out: bool,
 }
 
 /// The env field type of one capture.
@@ -428,6 +434,7 @@ impl<'p> Ctx<'p> {
                 _ => None,
             })
             .unwrap_or_default();
+        let call_out = expected.is_some_and(|t| matches!(self.kind(self.resolve(t)), TyKind::Infer(v) if self.closure_call_outs.contains(&v.0)));
         let bound_output = bound_output.or_else(|| {
             let o = self.deep(dyn_out?);
             Some(self.rebind_bound(o))
@@ -586,7 +593,7 @@ impl<'p> Ctx<'p> {
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
         let captures_any = !captures.is_empty();
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs, call_out });
         if let Some((fp, _, _)) = to_fn_ptr {
             if captures_any {
                 self.err(

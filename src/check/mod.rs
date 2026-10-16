@@ -1923,6 +1923,9 @@ struct Ctx<'p> {
     /// The regioned inputs of the `Fn` bound a closure var is passed to
     /// (`ClosureInfo::bound_inputs`).
     closure_bound_inputs: std::collections::HashMap<u32, Vec<Ty>>,
+    /// Inference vars of closure arguments for a bound whose output holds
+    /// a callee type param (`ClosureInfo::call_out`).
+    closure_call_outs: std::collections::HashSet<u32>,
     /// Scalar operators checked while both operand types were still
     /// open (a closure's `|a, b| a + b`): (expr, op, operand type).
     /// Lowering emits the builtin operator, so the types must turn out
@@ -2225,6 +2228,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         scope_closure_vars: Vec::new(),
         closure_bound_outputs: std::collections::HashMap::new(),
         closure_bound_inputs: std::collections::HashMap::new(),
+        closure_call_outs: std::collections::HashSet::new(),
         open_binops: Vec::new(),
         vtable_sites: Vec::new(),
         unwind_checks: Vec::new(),
@@ -4623,6 +4627,9 @@ impl<'p> Ctx<'p> {
             let regioned = bound.map(|b| b.inputs.as_slice());
             if let Some(b) = bound {
                 self.closure_bound_inputs.insert(v.0, b.inputs.clone());
+                if b.output.is_some_and(|o| p.tys.flags(o).contains_param()) {
+                    self.closure_call_outs.insert(v.0);
+                }
             }
             if let Some(b) = bound
                 && let Some(out) = b.output
