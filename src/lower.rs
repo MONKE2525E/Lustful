@@ -4821,20 +4821,32 @@ impl<'p> Lower<'p> {
 
     /// A `&str` view of a String or str value reached through `n` references.
     fn str_view(&mut self, e: ExprId, n: u8) -> Operand {
-        let span = self.span(e);
-        let base = self.peel(self.ty(e), n);
+        let (span, t) = (self.span(e), self.ty(e));
+        let p = self.place(e);
+        self.str_view_at(p, t, n, span)
+    }
+
+    /// `str_view` of a value already evaluated into place `p` (of type
+    /// `t`): `assert_eq!` borrows its operands first and must not
+    /// evaluate them again.
+    fn str_view_at(&mut self, p: Place, t: Ty, n: u8, span: Span) -> Operand {
+        let base = self.peel(t, n);
+        let borrow = |this: &mut Self, p: Place, t: Ty| {
+            let rt = this.ref_ty(false, t);
+            let tmp = this.temp(rt);
+            this.assign(Place::local(tmp), Rvalue::Ref(false, p), span);
+            Operand::Copy(Place::local(tmp))
+        };
         if self.kind(base) == TyKind::Str {
             if n == 0 {
-                // The expression itself is a `str` place (`*t` for `t: &str`): borrow it back.
-                let (r, _) = self.borrow_of(e, 0);
-                return r;
+                // The place itself is a `str` place (`*t` for `t: &str`): borrow it back.
+                return borrow(self, p, base);
             }
-            let p = self.place(e);
             return Operand::Copy(Self::derefs(p, n - 1));
         }
         // A String's `as_str`, or a `Cow<str>`'s view (W-STD-B).
         let b = if crate::check::collect::cow_arg(&self.body.tys, base).is_some() { Builtin::CowDeref } else { Builtin::StringAsStr };
-        let (r, _) = self.borrow_of(e, n);
+        let r = borrow(self, Self::derefs(p, n), base);
         let t = self.temp(REF_STR);
         self.call_into(CallTarget::Builtin(b), vec![r], Place::local(t), span);
         Operand::Copy(Place::local(t))
@@ -6722,7 +6734,14 @@ impl<'p> Lower<'p> {
                 let c = self.temp(BOOL);
                 let cmp = match self.ck.res(e) {
                     Res::Bin { ld, rd } => {
-                        let (x, y) = (self.str_view(args[0], ld), self.str_view(args[1], rd));
+                        // The operands are already borrowed (`a`, `b`): view
+                        // them in place, so each is evaluated once.
+                        let place_of = |o: &Operand| match o {
+                            Operand::Copy(p) | Operand::Move(p) => p.clone().deref(),
+                            _ => unreachable!("borrow_of gives a place operand"),
+                        };
+                        let (pa, pb) = (place_of(&a), place_of(&b));
+                        let (x, y) = (self.str_view_at(pa, t, ld, span), self.str_view_at(pb, tb, rd, span));
                         Rvalue::StrCmp(if ne { BinOp::Ne } else { BinOp::Eq }, x, y)
                     }
                     _ => Rvalue::Eq { a: a.clone(), b: b.clone(), ty: t, ne },
