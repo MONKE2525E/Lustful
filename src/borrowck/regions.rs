@@ -741,6 +741,28 @@ pub(crate) fn dyn_arg_tys(tys: &impl TyIntern, t: Ty) -> Vec<Ty> {
     out
 }
 
+/// True when a local of `body` holds a dyn type with a late-bound place
+/// (`DYN_LATE`, R11) or a loose one: the region pass must pair them.
+pub(super) fn has_dyn_late(body: &Body) -> bool {
+    fn go(tys: &impl TyIntern, t: Ty, depth: u32) -> bool {
+        if depth > 32 || tys.flags(t).contains_loose_bound() {
+            return depth <= 32;
+        }
+        match tys.kind(t) {
+            TyKind::Dyn(_, r) => bound(r) || dyn_arg_tys(tys, t).into_iter().any(|e| go(tys, e, depth + 1)),
+            TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => go(tys, e, depth + 1),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| go(tys, e, depth + 1)),
+            TyKind::Adt(_, a) | TyKind::Closure(_, a) => tys.args(a).iter().any(|g| match g {
+                GenericArg::Ty(e) => go(tys, *e, depth + 1),
+                GenericArg::Lifetime(r) => bound(*r),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+    body.locals.iter().any(|l| go(&body.tys, l.ty, 0))
+}
+
 /// Type facts the region walks need, over one type store.
 pub(super) struct SlotCx<'t, 'p, T: TyIntern> {
     pub tys: &'t T,
@@ -2337,6 +2359,14 @@ pub(super) struct Builder<'b, 'p> {
     /// vars and types the trait's type params take from the object's trait
     /// args (R11), by param index; empty otherwise.
     seed_binds: Vec<(u32, Vec<u32>, Ty)>,
+    /// While `inst_walk` instantiates a signature type: whether the place
+    /// is invariant, and whether the dyn type whose trait args hold it
+    /// sits in an invariant place (R11; `None` outside dyn args).
+    inst_inv: (bool, Option<bool>),
+    /// While `call_sig_with` instantiates the return type: the callee's
+    /// type flows out, so a late-bound place of the destination's dyn
+    /// may not meet the callee's `T` (R11).
+    inst_ret: bool,
     /// While `walk` pairs the trait args of two dyn types (R11): the
     /// variance of the dyn types' own position, and the vars of the other
     /// side that a late-bound (`DYN_LATE`) position met.
@@ -2383,6 +2413,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             root_check: None,
             bind_tys: FxMap::default(),
             dyn_walk: None,
+            inst_inv: (false, None),
+            inst_ret: false,
             seed_binds: Vec::new(),
             cap_var: FxMap::default(),
             borrowed_caps: Vec::new(),
@@ -3709,6 +3741,14 @@ impl<'b, 'p> Builder<'b, 'p> {
                 if pout.is_empty() {
                     return;
                 }
+                // The closure took its signature from the unbound sugar,
+                // where a fixed output place looks elided from the input:
+                // with a late-bound input, a fixed (not `'static`) output
+                // place is a cut.
+                if pin.contains(&Pos::Late) && pout.iter().any(|p| matches!(p, Pos::Var(v) if *v != 0)) {
+                    self.not_general_enough();
+                    return;
+                }
                 let target = |k: usize| match pout.get(k) {
                     Some(Pos::Var(v)) => Some(*v),
                     Some(Pos::Late) => Some(0),
@@ -3721,6 +3761,19 @@ impl<'b, 'p> Builder<'b, 'p> {
                         for &(x, y) in reqs.iter() {
                             let End::Out(k) = y else { continue };
                             let Some(u) = target(k as usize) else { continue };
+                            // An argument place returned: a late-bound one
+                            // only into a late-bound output (elision), a
+                            // fixed one outlives the output place.
+                            if let End::Arg(j) = x {
+                                match (pin.get(j as usize), pout.get(k as usize)) {
+                                    (Some(Pos::Late), Some(Pos::Var(_))) => {
+                                        self.not_general_enough();
+                                        return;
+                                    }
+                                    (Some(&Pos::Var(a)), _) => self.edge(a, u),
+                                    _ => {}
+                                }
+                            }
                             let from = match x {
                                 End::Cap(i) => data.get(i as usize),
                                 End::Arg(j) => vars.get(j as usize),
@@ -3732,7 +3785,21 @@ impl<'b, 'p> Builder<'b, 'p> {
                         }
                     }
                     None => {
+                        // Unknown flows: a late-bound input may reach a fixed
+                        // output place (not general enough), a fixed one any.
+                        // A `'static` output is the closure's own return type
+                        // (its body proves it).
+                        if pin.contains(&Pos::Late) && pout.iter().any(|p| matches!(p, Pos::Var(v) if *v != 0)) {
+                            self.not_general_enough();
+                            return;
+                        }
                         let us: Vec<u32> = (0..pout.len()).filter_map(target).collect();
+                        let ins: Vec<u32> = pin.iter().filter_map(|p| if let Pos::Var(a) = *p { Some(a) } else { None }).collect();
+                        for &a in &ins {
+                            for &u in &us {
+                                self.edge(a, u);
+                            }
+                        }
                         for (i, &(src, _)) in roles.iter().enumerate() {
                             if src && let Some(&v) = data.get(i) {
                                 for &u in &us {
@@ -6033,7 +6100,9 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let er = if has_param(ret) { dt } else { ret };
         let mut rv = Vec::new();
+        self.inst_ret = true;
         ok &= self.inst(sig.ret, er, &univ, &mut binds, &mut rv);
+        self.inst_ret = false;
         if !dv.is_empty() {
             ok &= self.relate(er, &rv, dt, dv, Variance::Co);
         }
@@ -7221,7 +7290,9 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// `r` (every region inside a reference outlives it) as constraints.
     fn inst(&mut self, r: Ty, e: Ty, univ: &[u32], binds: &mut FxMap<u32, Vec<u32>>, out: &mut Vec<u32>) -> bool {
         let start = out.len();
+        let saved = std::mem::replace(&mut self.inst_inv, (false, None));
         let ok = self.inst_walk(r, e, univ, binds, out);
+        self.inst_inv = saved;
         if !ok {
             out.truncate(start);
             let n = self.sc.slots(e);
@@ -7243,8 +7314,12 @@ impl<'b, 'p> Builder<'b, 'p> {
         match (tys.kind(r), et.kind(e)) {
             // A late-bound place of a dyn's sugar (`T` against `&u8` in
             // `dyn Fn(T)` from a `dyn Fn(&u8)`, R11) tells nothing of `T`:
-            // `T` binds at its other uses.
+            // `T` binds at its other uses. That is a subtyping, so the dyn
+            // must sit in a covariant place (rustc E0308 under `&mut`).
             (TyKind::Param(_), _) if et.flags(e).contains_loose_bound() => {
+                if self.inst_inv.1 != Some(false) || self.inst_ret {
+                    self.dyn_not_general();
+                }
                 for _ in 0..self.sc.slots(e) {
                     let v = self.fresh();
                     out.push(v);
@@ -7289,7 +7364,11 @@ impl<'b, 'p> Builder<'b, 'p> {
                     let v = self.inst_region(rr, univ);
                     out.push(v);
                 }
-                self.inst_walk(ri, ei, univ, binds, out)
+                let saved = self.inst_inv;
+                self.inst_inv.0 |= rm.is_mut();
+                let ok = self.inst_walk(ri, ei, univ, binds, out);
+                self.inst_inv = saved;
+                ok
             }
             (TyKind::Adt(rd, ra), TyKind::Adt(ed, ea)) if rd == ed => {
                 let lts: Vec<Region> = tys.args(ra).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g && *r != crate::ty::DYN_LATE { Some(*r) } else { None }).collect();
@@ -7301,16 +7380,28 @@ impl<'b, 'p> Builder<'b, 'p> {
                     out.push(v);
                 }
                 let rargs: Vec<Ty> = tys.args(ra).iter().filter_map(|g| g.as_ty()).collect();
-                let eargs: Vec<Ty> = et.args(ea).iter().filter_map(|g| g.as_ty()).collect();
-                rargs.len() == eargs.len() && rargs.into_iter().zip(eargs).all(|(x, y)| self.inst_walk(x, y, univ, binds, out))
+                let ej: Vec<(usize, Ty)> = et.args(ea).iter().enumerate().filter_map(|(j, g)| g.as_ty().map(|t| (j, t))).collect();
+                rargs.len() == ej.len()
+                    && rargs.into_iter().zip(ej).all(|(x, (j, y))| {
+                        let saved = self.inst_inv;
+                        self.inst_inv.0 |= self.p.regions.adts(self.p).arg_modes(self.p, ed, j).0 != Variance::Co;
+                        let ok = self.inst_walk(x, y, univ, binds, out);
+                        self.inst_inv = saved;
+                        ok
+                    })
             }
             (TyKind::Tuple(a), TyKind::Tuple(b)) => {
                 let (xs, ys) = (tys.tys_of(a).to_vec(), et.tys_of(b).to_vec());
                 xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.inst_walk(x, y, univ, binds, out))
             }
-            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
-                self.inst_walk(a, b, univ, binds, out)
+            (TyKind::RawPtr(m, a), TyKind::RawPtr(_, b)) => {
+                let saved = self.inst_inv;
+                self.inst_inv.0 |= m.is_mut();
+                let ok = self.inst_walk(a, b, univ, binds, out);
+                self.inst_inv = saved;
+                ok
             }
+            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) => self.inst_walk(a, b, univ, binds, out),
             (TyKind::Dyn(_, rr), TyKind::Dyn(_, er)) => {
                 if bound(rr) != bound(er) {
                     return false;
@@ -7321,7 +7412,12 @@ impl<'b, 'p> Builder<'b, 'p> {
                     out.push(v);
                 }
                 let (ra, ea) = (dyn_arg_tys(tys, r), dyn_arg_tys(et, e));
-                ra.len() == ea.len() && ra.into_iter().zip(ea).all(|(x, y)| self.inst_walk(x, y, univ, binds, out))
+                let saved = self.inst_inv;
+                // A dyn nested in another's args is in an invariant place.
+                self.inst_inv = (true, Some(saved.0 || saved.1.is_some()));
+                let ok = ra.len() == ea.len() && ra.into_iter().zip(ea).all(|(x, y)| self.inst_walk(x, y, univ, binds, out));
+                self.inst_inv = saved;
+                ok
             }
             (TyKind::FnPtr(_), TyKind::FnPtr(_)) if ptr_free(et, e).is_some() => match ptr_free(tys, r) {
                 Some(rr) => {

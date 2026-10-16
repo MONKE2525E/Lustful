@@ -512,7 +512,9 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     {
         ck.errs.push(d);
     }
-    let needs_regions = !ck.loans.is_empty() || own.n_univ > 0 || regions::may_entail_bounds(p, body);
+    // A dyn type with late-bound places (R11) may meet one with fixed
+    // places, a type error only the region pass sees.
+    let needs_regions = !ck.loans.is_empty() || own.n_univ > 0 || regions::may_entail_bounds(p, body) || regions::has_dyn_late(body);
     if needs_regions {
         let mut b = regions::Builder::new(p, body, own, ck.loans.len(), &ck.loan_at, &ck.stmt_base);
         b.build();
