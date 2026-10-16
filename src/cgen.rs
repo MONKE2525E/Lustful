@@ -9118,15 +9118,21 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 by_value_deps(r, &mut deps);
                 deps.retain(|d| matches!(d, CTy::FnPtr(..)));
             }
-            CTy::Hash(_, args) => {
-                // A table holds its builder by value; an Entry its key.
+            // A table holds its builder by value, an Entry its key; an
+            // iterator holds neither (see `hash::struct_fields`). The
+            // elements live behind the table pointer. Counting the key
+            // and the `(K, V)` tuple made a false cycle for a recursive
+            // `enum Any { Obj(HashMap<String, Any>) }` that left `Any`
+            // incomplete inside the tuple.
+            CTy::Hash(k, args) if hash::is_table(*k) => {
                 if let Some(s) = args.last() {
                     by_value_deps(s, &mut deps);
                 }
+            }
+            CTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry, args) => {
                 if let Some(k) = args.first() {
                     by_value_deps(k, &mut deps);
                 }
-                by_value_deps(&hash::elem_cty(t), &mut deps);
             }
             _ => {}
         }
