@@ -319,14 +319,16 @@ impl<'p> Lower<'p> {
     }
 
     /// True when a value of type `t` may be promoted: no drop, no
-    /// interior mutability (scalars, `&str`, shared refs to such, and
-    /// tuples, arrays, `Option`, `Result`, and this crate's Adts built of them).
+    /// interior mutability (scalars, raw and fn pointers, `&str`, shared
+    /// refs to such, and tuples, arrays, `Option`, `Result`, and this
+    /// crate's Adts built of them).
     fn promotable_ty(&mut self, t: Ty, depth: u32) -> bool {
         if depth > 8 || self.needs_drop_ty(t) {
             return false;
         }
         match self.kind(t) {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Never => true,
+            TyKind::RawPtr(..) | TyKind::FnPtr(_) => true,
             TyKind::Tuple(ts) => self.body.tys.tys_of(ts).to_vec().into_iter().all(|x| self.promotable_ty(x, depth + 1)),
             TyKind::Array(el, _) | TyKind::Slice(el) => self.promotable_ty(el, depth + 1),
             TyKind::Ref(_, Mut::Shared, inner) => self.promotable_ty(inner, depth + 1),

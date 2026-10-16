@@ -27,6 +27,58 @@ pub struct Niche {
     pub start: u128,
 }
 
+impl Niche {
+    /// The bit mask of the niche scalar.
+    fn mask(&self) -> u128 {
+        if self.scalar_size * 8 >= 128 { u128::MAX } else { (1u128 << (self.scalar_size * 8)) - 1 }
+    }
+
+    /// rustc 1.99's `Niche::reserve`: takes `count` free values next to
+    /// one end of the valid range and returns the first value taken (the
+    /// tag of the first niche variant; the rest count up from it) and
+    /// the niche that is left. The valid range runs from `start + free`
+    /// up to `start - 1`, wrapping. One value (an `Option`) goes to the
+    /// side nearer zero in signed terms, a tie to the low side, except
+    /// for the valid range 0..=1 (`bool`), which keeps the older rule
+    /// below like a count above one.
+    fn reserve(&self, count: u128) -> Option<(u128, Option<Niche>)> {
+        if count == 0 || count > self.free {
+            return None;
+        }
+        let mask = self.mask();
+        let bits = (self.scalar_size * 8) as u32;
+        let (vs, ve) = (self.start.wrapping_add(self.free) & mask, self.start.wrapping_sub(1) & mask);
+        let left = |start| if self.free == count { None } else { Some(Niche { start, free: self.free - count, ..*self }) };
+        // `move_start`: the values just below the valid range.
+        let low = || Some((vs.wrapping_sub(count) & mask, left(self.start)));
+        // `move_end`: the values just above it.
+        let high = || Some((self.start, left(self.start.wrapping_add(count) & mask)));
+        let sext_abs = |v: u128| {
+            let sh = 128 - bits;
+            (((v << sh) as i128) >> sh).unsigned_abs()
+        };
+        if count == 1 && (vs, ve) != (0, 1) {
+            let next_up = sext_abs(ve.wrapping_add(1) & mask);
+            let next_down = sext_abs(vs.wrapping_sub(1) & mask);
+            if next_down <= next_up { low() } else { high() }
+        } else if vs > ve {
+            high()
+        } else if vs <= mask - ve {
+            if count <= vs { low() } else { high() }
+        } else {
+            let end = ve.wrapping_add(count) & mask;
+            if (1..=ve).contains(&end) { low() } else { high() }
+        }
+    }
+}
+
+/// The niche scalar bit pattern that stands for variant `vi` of a
+/// niche-filled enum (rustc's `TagEncoding::Niche`): `start` plus the
+/// distance of `vi` from `first`, wrapping at the top of the scalar.
+pub fn niche_tag_value(niche: Niche, first: usize, start: u128, vi: usize) -> u128 {
+    start.wrapping_add((vi - first) as u128) & niche.mask()
+}
+
 /// How an enum stores its discriminant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnumTag {
@@ -34,9 +86,11 @@ pub enum EnumTag {
     None(usize),
     /// A tag scalar at offset 0 with this width in bytes.
     Explicit { size: u64, signed: bool },
-    /// The discriminant lives in the niche of the named variant; the other
-    /// variants take successive niche values from `niche.start`, in order.
-    NicheFilled { variant: usize, niche: Niche },
+    /// The discriminant lives in the niche of the named variant (`niche`
+    /// is that variant's niche before the reserve). Variants `first..=last`
+    /// map to niche values from `start` by variant index (`niche_tag_value`),
+    /// so a dataful or absent variant inside the span still uses a value.
+    NicheFilled { variant: usize, niche: Niche, first: usize, last: usize, start: u128 },
 }
 
 /// The layout of one sized type.
@@ -50,9 +104,9 @@ pub struct Layout {
     pub variant_offsets: Vec<Vec<u64>>,
     pub niche: Option<Niche>,
     pub enum_tag: Option<EnumTag>,
-    /// Uninhabited in rustc's layout sense: no value exists, and the
-    /// type is zero-sized (a non-ZST uninhabited type like
-    /// `(u8, Never)` does not count, so enums keep its variant).
+    /// Uninhabited in rustc's layout sense: no value exists (a field is
+    /// uninhabited, or every enum variant is). Such a type can still have
+    /// a size (`(u8, Never)`); an enum drops only absent variants.
     pub uninhabited: bool,
 }
 
@@ -285,7 +339,7 @@ fn univariant_biased(fields: &[Layout], repr: Repr, kind: UnivKind, bias: NicheB
     }
     let mut out = Layout::simple(align_up(end_off, align), align, best);
     out.field_offsets = offsets;
-    out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
+    out.uninhabited = fields.iter().any(|f| f.uninhabited);
     finish(out, repr)
 }
 
@@ -349,7 +403,7 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
                 }
             }
             out.field_offsets = vec![0; fields.len()];
-            out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
+            out.uninhabited = fields.iter().any(|f| f.uninhabited);
             return finish(out, repr);
         }
         ReprKind::C => {
@@ -359,7 +413,7 @@ pub fn struct_layout(fields: &[Layout], repr: Repr) -> Result<Layout, ()> {
             let niche = best_niche(fields, &offsets, &order);
             let mut out = Layout::simple(align_up(end, align), align, niche);
             out.field_offsets = offsets;
-            out.uninhabited = out.size == 0 && fields.iter().any(|f| f.uninhabited);
+            out.uninhabited = fields.iter().any(|f| f.uninhabited);
             return finish(out, repr);
         }
         ReprKind::Default => {}
@@ -404,43 +458,39 @@ fn tag_width(discs: &[i128]) -> Result<(u64, bool), ()> {
 }
 
 /// Free values and first free value of an explicit tag scalar, under rustc's
-/// wrapping valid-range model: the valid values form the smallest wrapping
-/// arc of bit patterns that covers every discriminant, and the niche is the
-/// rest of the circle (the largest gap between consecutive discriminants in
-/// bit order). Negative discriminants therefore keep their niche: the signed
-/// range, read as bit patterns, is one wrapping arc. Niche values run
-/// upward from `start`, wrapping at the top of the scalar range.
+/// wrapping valid-range model (`WrappingRange::smallest_range_containing`):
+/// the valid values form the smallest wrapping arc of bit patterns that
+/// covers every discriminant (the plain `min..=max` arc wins a tie, then the
+/// lowest wrapping one), and the niche is the rest of the circle. Negative
+/// discriminants therefore keep their niche: the signed range, read as bit
+/// patterns, is one wrapping arc. No discriminant at all (every variant
+/// uninhabited) is the arc `0..=0`.
 fn tag_niche(width: u64, discs: &[i128]) -> Option<Niche> {
-    if discs.is_empty() {
-        return None;
-    }
     let bits = width * 8;
     let mask: u128 = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
     let mut pats: Vec<u128> = discs.iter().map(|&d| (d as u128) & mask).collect();
+    if pats.is_empty() {
+        pats.push(0);
+    }
     pats.sort_unstable();
     pats.dedup();
-    // The largest gap between consecutive patterns, in circular bit order.
-    let mut best_start: u128 = 0;
-    let mut best_free: u128 = 0;
-    for (i, &cur) in pats.iter().enumerate() {
-        let next = pats[(i + 1) % pats.len()];
-        let gap = next.wrapping_sub(cur).wrapping_sub(1) & mask;
-        if i + 1 == pats.len() && pats.len() > 1 && bits < 128 {
-            // The wrap pair: distance runs through the top of the range.
-            let gap = (mask - cur) + next;
-            if gap > best_free {
-                best_free = gap;
-                best_start = cur.wrapping_add(1) & mask;
+    let (min, max) = (pats[0], pats[pats.len() - 1]);
+    // An arc as (start, end), and its value count less one.
+    let span = |(s, e): (u128, u128)| e.wrapping_sub(s) & mask;
+    let mut best = (min, max);
+    if max - min > 1u128 << (bits - 1) {
+        for w in pats.windows(2) {
+            let cand = (w[1], w[0]);
+            if span(cand) < span(best) {
+                best = cand;
             }
-        } else if gap > best_free {
-            best_free = gap;
-            best_start = cur.wrapping_add(1) & mask;
         }
     }
-    if best_free == 0 {
+    let free = mask - span(best);
+    if free == 0 {
         return None;
     }
-    Some(Niche { offset: 0, scalar_size: width, free: best_free, start: best_start })
+    Some(Niche { offset: 0, scalar_size: width, free, start: best.1.wrapping_add(1) & mask })
 }
 
 /// One variant laid out as a struct that starts with a tag of `tag_w` bytes:
@@ -508,15 +558,13 @@ pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Resu
         l.enum_tag = Some(EnumTag::None(0));
         return finish(l, repr);
     }
-    // A variant whose payload is uninhabited (in the layout sense:
-    // zero-sized with an uninhabited field) takes no part in the
+    // An absent variant (uninhabited, only 1-ZST fields) takes no part in the
     // layout under the default repr. With one inhabited variant
     // left, the enum is that variant with no tag; with none, it is
     // itself uninhabited. With two or more left, the candidates
     // below run over every variant as before.
     if !repr.fixes_tag() && variants.len() > 1 {
-        let dropped = |v: &Vec<Layout>| v.iter().any(|f| f.uninhabited) && v.iter().all(|f| f.size == 0);
-        let kept: Vec<usize> = (0..variants.len()).filter(|&i| !dropped(&variants[i])).collect();
+        let kept: Vec<usize> = (0..variants.len()).filter(|&i| !absent(&variants[i])).collect();
         if kept.len() < variants.len() {
             if kept.is_empty() {
                 let mut l = zst_layout(1);
@@ -552,6 +600,19 @@ pub fn enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Resu
 
 /// The tagged candidate layout (and the only candidate when the repr fixes the tag).
 fn tagged_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Result<Layout, ()> {
+    let l = tagged_enum_layout_inner(variants, discs, repr)?;
+    // The tag's valid range covers only the discriminants of inhabited
+    // variants (all of them under repr(C)); that decides the enum's niche.
+    let tag_discs: Vec<i128> = (0..variants.len())
+        .filter(|&i| repr.kind == ReprKind::C || !variants[i].iter().any(|f| f.uninhabited))
+        .map(|i| discs[i])
+        .collect();
+    let Some(EnumTag::Explicit { size, .. }) = l.enum_tag else { return Ok(l) };
+    let uninhabited = variants.iter().all(|v| v.iter().any(|f| f.uninhabited));
+    Ok(Layout { niche: tag_niche(size, &tag_discs), uninhabited, ..l })
+}
+
+fn tagged_enum_layout_inner(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Result<Layout, ()> {
     let (mut tag_w, signed) = if let Some((bits, signed)) = repr.int {
         ((bits / 8) as u64, signed)
     } else if repr.kind == ReprKind::C {
@@ -640,28 +701,23 @@ fn tagged_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> R
     };
     let (size, align, mut variant_offsets) = layout_with(tag_w);
     if repr.int.is_none() && repr.kind == ReprKind::Default {
-        // Widen the tag into the padding every variant leaves after it. The
-        // size does not change; the enum's own niche grows.
-        let mut min_gap: Option<u64> = None;
+        // rustc widens the tag to the smallest alignment among the
+        // variants' first fields (by offset) that are not 1-ZSTs, when
+        // that alignment is an integer size above the tag's. Every other
+        // field is at least as aligned, so no field moves and the size
+        // does not change; the enum's own niche grows.
+        let mut start_align: Option<u64> = None;
         for (v, offs) in variants.iter().zip(&variant_offsets) {
-            if v.is_empty() {
-                continue;
-            }
-            let first = offs.iter().copied().min().unwrap_or(tag_w);
-            min_gap = Some(min_gap.map_or(first, |g: u64| g.min(first)));
-        }
-        if let Some(gap) = min_gap {
-            for w in [16u64, 8, 4, 2, 1] {
-                if w > tag_w && w <= gap {
-                    let (s2, _, _) = layout_with(w);
-                    if s2 == size {
-                        tag_w = w;
-                    }
-                    break;
-                }
+            let first = (0..v.len()).filter(|&i| !(v[i].size == 0 && v[i].align == 1)).min_by_key(|&i| (offs[i], v[i].align, i));
+            if let Some(i) = first {
+                start_align = Some(start_align.map_or(v[i].align, |a: u64| a.min(v[i].align)));
             }
         }
-        if tag_w > 0 {
+        if let Some(a) = start_align
+            && a > tag_w
+            && a <= 16
+        {
+            tag_w = a;
             let (_, _, offs) = layout_with(tag_w);
             variant_offsets = offs;
         }
@@ -677,7 +733,8 @@ fn tagged_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> R
 /// the largest variant by size (the last on a tie) donates its niche,
 /// and every other variant's whole layout must fit either before the
 /// niche scalar or shifted to just after it. Niche values are reserved
-/// for the whole index span from the first to the last other variant.
+/// (`Niche::reserve`) for the whole index span from the first to the
+/// last variant that needs a tag (not the donor, not absent).
 fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Option<Layout> {
     let _ = discs;
     if variants.len() < 2 {
@@ -695,13 +752,11 @@ fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Op
         }
     }
     let base = layouts[vi].clone();
+    let needs_tag = |i: usize| i != vi && !absent(&variants[i]);
+    let first = (0..variants.len()).find(|&i| needs_tag(i))?;
+    let last = (0..variants.len()).rev().find(|&i| needs_tag(i))?;
     let niche = base.niche?;
-    let first = (0..variants.len()).find(|&i| i != vi)?;
-    let last = (0..variants.len()).rev().find(|&i| i != vi)?;
-    let count = (last - first + 1) as u128;
-    if niche.free < count {
-        return None;
-    }
+    let (start, left) = niche.reserve((last - first + 1) as u128)?;
     // Another variant may need a larger alignment than the niche variant
     // (a u128 payload next to an align-8 niche variant): the enum then
     // takes that alignment, and its size is rounded up to it.
@@ -719,20 +774,17 @@ fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Op
             variant_offsets.push(l.field_offsets.iter().map(|&o| o + shift).collect());
         }
     }
-    let remaining = niche.free - count;
-    let niche_mask: u128 = if niche.scalar_size * 8 >= 128 { u128::MAX } else { (1u128 << (niche.scalar_size * 8)) - 1 };
-    let mut l = Layout::simple(
-        eff_size,
-        eff_align,
-        if remaining > 0 {
-            Some(Niche { free: remaining, start: niche.start.wrapping_add(count) & niche_mask, ..niche })
-        } else {
-            None
-        },
-    );
+    let mut l = Layout::simple(eff_size, eff_align, left);
     l.variant_offsets = variant_offsets;
-    l.enum_tag = Some(EnumTag::NicheFilled { variant: vi, niche });
+    l.enum_tag = Some(EnumTag::NicheFilled { variant: vi, niche, first, last, start });
+    l.uninhabited = layouts.iter().all(|v| v.uninhabited);
     finish(l, repr).ok()
+}
+
+/// rustc's absent variant: uninhabited with only 1-ZST fields. It needs
+/// no tag value and, under the default repr, no space.
+fn absent(fields: &[Layout]) -> bool {
+    fields.iter().any(|f| f.uninhabited) && fields.iter().all(|f| f.size == 0 && f.align == 1)
 }
 
 /// `l` behind an `UnsafeCell`: the same size, alignment and
@@ -1199,6 +1251,32 @@ mod tests {
     }
 
     #[test]
+    fn rustc_niche_values() {
+        // The tag value of variant `vi` of a niche-filled layout.
+        let tag = |l: &Layout, vi: usize| match l.enum_tag {
+            Some(EnumTag::NicheFilled { niche, first, start, .. }) => niche_tag_value(niche, first, start, vi),
+            ref t => panic!("not niche-filled: {t:?}"),
+        };
+        let opt = |l: &Layout| enum_layout(&[vec![], vec![l.clone()]], &[0, 1], Repr::default()).unwrap();
+        // Values as rustc 1.99 stores them (checked with transmute).
+        let oc = opt(&char_layout());
+        assert_eq!(tag(&oc, 0), 0xFFFF_FFFF);
+        assert_eq!(tag(&opt(&oc), 0), 0xFFFF_FFFE);
+        let ob = opt(&bool_layout());
+        assert_eq!(tag(&ob, 0), 2);
+        assert_eq!(tag(&opt(&ob), 0), 255);
+        assert_eq!(tag(&opt(&ptr_layout()), 0), 0);
+        assert_eq!(tag(&opt(&cap_layout()), 0), u64::MAX as u128);
+        // enum Y { A, B(char), C, D }: numbered by variant index from A.
+        let y = enum_layout(&[vec![], vec![char_layout()], vec![], vec![]], &[0, 1, 2, 3], Repr::default()).unwrap();
+        assert_eq!([tag(&y, 0), tag(&y, 2), tag(&y, 3)], [0x110000, 0x110002, 0x110003]);
+        // A tag range 5..=7 with two values to take: below it (3, 4).
+        let e = enum_layout(&[vec![], vec![], vec![]], &[5, 6, 7], Repr::default()).unwrap();
+        let t = enum_layout(&[vec![], vec![], vec![e]], &[0, 1, 2], Repr::default()).unwrap();
+        assert_eq!([tag(&t, 0), tag(&t, 1)], [3, 4]);
+    }
+
+    #[test]
     fn vec_capacity_niche() {
         // A Vec/String-shaped (ptr, len, cap) value reports the
         // capacity niche, so two nested Options stay 24 bytes.
@@ -1223,9 +1301,13 @@ mod tests {
         assert_eq!(sz(&l), (1, 1));
         assert_eq!(l.enum_tag, Some(EnumTag::None(1)));
         let pair = tuple_layout(&[int_layout(IntTy::U8), never_layout()]).unwrap();
-        assert!(!pair.uninhabited);
+        assert!(pair.uninhabited);
         let l = enum_layout(&[vec![pair], ints(&[IntTy::U8])], &[0, 1], Repr::default()).unwrap();
         assert_eq!(l.size, 2);
+        // The kept uninhabited variant needs no tag value: the tag's valid
+        // range is 1..=1, so Option of it takes 0 (rustc 1.99).
+        let o = enum_layout(&[vec![], vec![l]], &[0, 1], Repr::default()).unwrap();
+        assert!(matches!(o.enum_tag, Some(EnumTag::NicheFilled { start: 0, .. })));
         // Every variant uninhabited: the enum itself is.
         let l = enum_layout(&[vec![never_layout()], vec![never_layout()]], &[0, 1], Repr::default()).unwrap();
         assert_eq!(l.size, 0);

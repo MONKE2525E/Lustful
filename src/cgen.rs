@@ -6,7 +6,7 @@ use crate::check::collect::*;
 use crate::diag::{SourceMap, Span};
 use crate::ir::*;
 use crate::ty::lang::{self, SigTy};
-use crate::ty::layout::{self, EnumTag, Layout, Niche, ReprKind};
+use crate::ty::layout::{self, EnumTag, Layout, Niche, ReprKind, niche_tag_value};
 use crate::ty::iter::IterKind;
 use crate::ty::*;
 use std::collections::{HashMap, HashSet};
@@ -1004,20 +1004,15 @@ fn enum_is_exact(l: &Layout, variants: usize) -> bool {
         Some(EnumTag::Explicit { size, .. }) => size <= 16,
         Some(EnumTag::NicheFilled { niche, .. }) => matches!(niche.scalar_size, 1 | 2 | 4 | 8 | 16),
         Some(EnumTag::None(_)) => true,
-        None => false,
+        // An uninhabited enum (no variants, or only absent ones) is
+        // zero-sized, as in Rust, so a type holding it keeps its size.
+        None => l.uninhabited && l.size == 0,
     }
 }
 
 /// The bit mask of a tag or niche scalar of `size` bytes.
 fn scalar_mask(size: u64) -> u128 {
     if size * 8 >= 128 { u128::MAX } else { (1u128 << (size * 8)) - 1 }
-}
-
-/// The niche scalar bit pattern that stands for the `k`-th non-niche
-/// variant (in the order of `NicheFilled`): successive values from
-/// `niche.start`, wrapping at the top of the scalar range.
-fn niche_val(niche: Niche, k: u128) -> u128 {
-    niche.start.wrapping_add(k) & scalar_mask(niche.scalar_size)
 }
 
 /// A C literal for the raw bit pattern `bits` of a tag or niche scalar.
@@ -1197,7 +1192,17 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                     for f in &adt.variants[0].fields {
                         fields.push(go(p, &cty(&p.tys, f.ty), seen)?);
                     }
-                    layout::struct_layout(&fields, adt.repr).ok()
+                    // `NonZero<T>` has zero as its niche and `MaybeUninit<T>`
+                    // none (a union), as ty/layout.rs gives them.
+                    let def = p.def_of_adt(*a);
+                    layout::struct_layout(&fields, adt.repr).ok().map(|mut l| {
+                        if def == crate::ty::nonzero_def() {
+                            l.niche = Some(Niche { offset: 0, scalar_size: l.size, free: 1, start: 0 });
+                        } else if def == crate::ty::maybe_uninit_def() {
+                            l.niche = None;
+                        }
+                        l
+                    })
                 };
                 seen.on.remove(a);
                 if let Some(l) = &r {
@@ -1311,12 +1316,11 @@ fn disc_set(p: &Program, t: &CTy, e: &str, vi: usize) -> String {
     let Some(l) = c_layout(p, t) else { return format!("{e}.tag = {vi};") };
     match l.enum_tag {
         Some(EnumTag::Explicit { size, signed }) => format!("{e}.u._tag = {};", disc_lit(adt_discs(p, t)[vi], size, signed)),
-        Some(EnumTag::NicheFilled { variant, niche }) => {
+        Some(EnumTag::NicheFilled { variant, niche, first, start, .. }) => {
             if vi == variant {
                 String::new()
             } else {
-                let k = (0..vi).filter(|&i| i != variant).count() as u128;
-                format!("{e}.u._n._s = {};", scalar_lit(niche_val(niche, k), niche.scalar_size, false))
+                format!("{e}.u._n._s = {};", scalar_lit(niche_tag_value(niche, first, start, vi), niche.scalar_size, false))
             }
         }
         _ => String::new(),
@@ -8181,11 +8185,10 @@ fn variant_lit(p: &Program, t: &CTy, variant: usize, vals: &[String]) -> String 
                 }
                 format!("(({ct}){{ .u = {{ .v{variant} = {{ {init} }} }} }})")
             }
-            Some(EnumTag::NicheFilled { variant: niche_variant, niche }) if variant != niche_variant => {
+            Some(EnumTag::NicheFilled { variant: niche_variant, niche, first, start, .. }) if variant != niche_variant => {
                 // The variant struct carries the niche scalar as its
                 // own `_s` member, so one literal sets tag and fields.
-                let k = (0..variant).filter(|&i| i != niche_variant).count() as u128;
-                let mut init = format!("._s = {}", scalar_lit(niche_val(niche, k), niche.scalar_size, false));
+                let mut init = format!("._s = {}", scalar_lit(niche_tag_value(niche, first, start, variant), niche.scalar_size, false));
                 if !fields.is_empty() {
                     init.push_str(", ");
                     init.push_str(&fields.join(", "));
@@ -8820,7 +8823,7 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
     // variant struct (whose fields avoid its bytes by construction),
     // for the same single-designator reason.
     let niche = match l.enum_tag {
-        Some(EnumTag::NicheFilled { variant, niche }) => Some((variant, niche)),
+        Some(EnumTag::NicheFilled { variant, niche, .. }) => Some((variant, niche)),
         _ => None,
     };
     for (vi, v) in variants.iter().enumerate() {
@@ -8882,12 +8885,14 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
                 let _ = writeln!(out, " default: return 0; }} }}");
             }
         }
-        Some(EnumTag::NicheFilled { variant, niche }) => {
-            let others: Vec<usize> = (0..variants.len()).filter(|&i| i != variant).collect();
+        Some(EnumTag::NicheFilled { variant, niche, first, last, start }) => {
+            // Niche value `start + d` is variant `first + d` for `d` up to
+            // `last - first`; any other value is the dataful variant.
+            let span = last - first + 1;
             if niche.scalar_size >= 16 {
                 let _ = write!(out, "static inline uint32_t disc_{m}(const {ct} *p) {{");
-                for (k, &vi) in others.iter().enumerate() {
-                    let bits = niche_val(niche, k as u128);
+                for vi in (first..=last).filter(|&i| i != variant) {
+                    let bits = niche_tag_value(niche, first, start, vi);
                     let _ = write!(
                         out,
                         " if (p->u._n._s.lo == {}ULL && p->u._n._s.hi == {}ULL) return {vi};",
@@ -8900,18 +8905,11 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
                 // Wrapping distance from the first niche value: values
                 // that wrap past the top of the scalar range read back
                 // as small distances.
-                let start = niche.start as u64;
                 let mask: u64 = if niche.scalar_size >= 8 { u64::MAX } else { (1u64 << (niche.scalar_size * 8)) - 1 };
-                let ret = if others.len() == 1 {
-                    format!("return {};", others[0])
-                } else {
-                    let map: Vec<String> = others.iter().map(|i| i.to_string()).collect();
-                    format!("static const uint32_t map[{}] = {{{}}}; return map[d];", others.len(), map.join(","))
-                };
                 let _ = writeln!(
                     out,
-                    "static inline uint32_t disc_{m}(const {ct} *p) {{ uint64_t s = p->u._n._s; uint64_t d = (s - {start}ULL) & {mask}ULL; if (d < {}ULL) {{ {ret} }} return {variant}; }}",
-                    others.len()
+                    "static inline uint32_t disc_{m}(const {ct} *p) {{ uint64_t s = p->u._n._s; uint64_t d = (s - {}ULL) & {mask}ULL; if (d < {span}ULL) return {first} + (uint32_t)d; return {variant}; }}",
+                    start as u64
                 );
             }
         }

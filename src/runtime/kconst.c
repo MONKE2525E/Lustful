@@ -21,10 +21,14 @@
                         zero-sized address, a static, a fn)
      3 off count stride sublen sub[sublen]       an array
      4 off size nvar disc[nvar] {sublen sub}*nvar
-                        an enum with a tag of `size` bytes at off
-     5 off noff nsize start dataful nvar {sublen sub}*nvar
-                        an enum whose tag is the niche scalar at off+noff
-                        (lust's encoding, cgen `niche_val`)
+                        an enum with a tag of `size` bytes at off (a
+                        16-byte tag takes two words per disc, low first)
+     5 off noff nsize start first span dataful nvar {sublen sub}*nvar
+                        (a 16-byte niche takes two words for start)
+                        an enum whose tag is the niche scalar at off+noff:
+                        value start+d is variant first+d for d < span,
+                        any other value the dataful variant (layout.rs
+                        `niche_tag_value`)
    Offsets in a sub-descriptor count from the element or enum start.
    A null descriptor means every byte is init. */
 
@@ -110,22 +114,27 @@ static void lust_kwalk(const uint8_t *v, uint8_t *cls, const uint64_t *d, uint64
             /* An enum: find the variant, mark its tag bytes, walk its fields. */
             uint64_t nvar, j, var = 0;
             if (op == 4) {
-                uint64_t size = d[i + 2], tag = lust_kread(v + off, size);
+                /* A 16-byte tag compares two words per discriminant. */
+                uint64_t size = d[i + 2], w = size == 16 ? 2 : 1;
+                uint64_t lo = lust_kread(v + off, size >= 8 ? 8 : size), hi = w == 2 ? lust_kread(v + off + 8, 8) : 0;
                 uint64_t mask = size >= 8 ? ~0ull : (1ull << (8 * size)) - 1;
                 nvar = d[i + 3];
                 for (uint64_t k = 0; k < nvar; k++)
-                    if ((d[i + 4 + k] & mask) == tag) var = k;
+                    if ((d[i + 4 + w * k] & mask) == lo && (w == 1 || d[i + 5 + w * k] == hi)) var = k;
                 memset(cls + off, 1, size);
-                j = i + 4 + nvar;
+                j = i + 4 + w * nvar;
             } else {
-                uint64_t noff = d[i + 2], nsize = d[i + 3], start = d[i + 4], dataful = d[i + 5];
+                /* A 16-byte niche: `start` is two words, the distance is
+                   taken over 128 bits. */
+                uint64_t noff = d[i + 2], nsize = d[i + 3], w = nsize == 16 ? 2 : 1;
+                uint64_t first = d[i + 4 + w], span = d[i + 5 + w], dataful = d[i + 6 + w];
                 uint64_t mask = nsize >= 8 ? ~0ull : (1ull << (8 * nsize)) - 1;
-                uint64_t rel = (lust_kread(v + off + noff, nsize) - start) & mask;
-                nvar = d[i + 6];
-                var = dataful;
-                if (rel < nvar - 1) var = rel < dataful ? rel : rel + 1;
+                uint64_t lo = lust_kread(v + off + noff, nsize >= 8 ? 8 : nsize), rel = (lo - d[i + 4]) & mask, rhi = 0;
+                if (w == 2) rhi = lust_kread(v + off + noff + 8, 8) - d[i + 5] - (lo < d[i + 4]);
+                nvar = d[i + 7 + w];
+                var = rhi == 0 && rel < span ? first + rel : dataful;
                 if (var != dataful) memset(cls + off + noff, 1, nsize);
-                j = i + 7;
+                j = i + 8 + w;
             }
             for (uint64_t k = 0; k < nvar; k++) {
                 uint64_t sl = d[j];

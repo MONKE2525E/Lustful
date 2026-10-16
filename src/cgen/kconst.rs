@@ -44,10 +44,11 @@ enum Op {
     /// An array: offset, element count, stride, the element's ops.
     Arr(u64, u64, u64, Vec<Op>),
     /// A tagged enum: offset, tag size, each variant's discriminant and ops.
-    Tag(u64, u64, Vec<u64>, Vec<Vec<Op>>),
+    Tag(u64, u64, Vec<u128>, Vec<Vec<Op>>),
     /// A niche enum: offset, niche offset, niche size, niche start, the
-    /// dataful variant, each variant's ops.
-    Niche(u64, u64, u64, u64, u64, Vec<Vec<Op>>),
+    /// first niche variant, the span of niche variants, the dataful
+    /// variant, each variant's ops.
+    Niche(u64, u64, u64, u128, u64, u64, u64, Vec<Vec<Op>>),
 }
 
 /// The words of `ops`.
@@ -68,13 +69,22 @@ fn emit(ops: &[Op], w: &mut Vec<u64>) {
             }
             Op::Tag(off, size, discs, vars) => {
                 w.extend([4, *off, *size, vars.len() as u64]);
-                w.extend(discs);
+                for &d in discs {
+                    w.push(d as u64);
+                    if *size == 16 {
+                        w.push((d >> 64) as u64);
+                    }
+                }
                 for v in vars {
                     sub(v, w);
                 }
             }
-            Op::Niche(off, noff, nsize, start, dataful, vars) => {
-                w.extend([5, *off, *noff, *nsize, *start, *dataful, vars.len() as u64]);
+            Op::Niche(off, noff, nsize, start, first, span, dataful, vars) => {
+                w.extend([5, *off, *noff, *nsize, *start as u64]);
+                if *nsize == 16 {
+                    w.push((*start >> 64) as u64);
+                }
+                w.extend([*first, *span, *dataful, vars.len() as u64]);
                 for v in vars {
                     sub(v, w);
                 }
@@ -182,11 +192,13 @@ fn enum_ops(p: &Program, t: &CTy, off: u64, size: u64, out: &mut Vec<Op>) {
     };
     match l.enum_tag {
         Some(EnumTag::None(v)) => fields_at(v, off, out),
-        Some(EnumTag::Explicit { size: ts, .. }) if ts <= 8 => {
-            out.push(Op::Tag(off, ts, adt_discs(p, t).iter().map(|&d| d as u64).collect(), subs()));
+        Some(EnumTag::Explicit { size: ts, .. }) if matches!(ts, 1 | 2 | 4 | 8 | 16) => {
+            let mask = scalar_mask(ts);
+            out.push(Op::Tag(off, ts, adt_discs(p, t).iter().map(|&d| d as u128 & mask).collect(), subs()));
         }
-        Some(EnumTag::NicheFilled { variant, niche }) if niche.scalar_size <= 8 => {
-            out.push(Op::Niche(off, niche.offset, niche.scalar_size, niche.start as u64, variant as u64, subs()));
+        Some(EnumTag::NicheFilled { variant, niche, first, last, start }) if matches!(niche.scalar_size, 1 | 2 | 4 | 8 | 16) => {
+            let span = (last - first + 1) as u64;
+            out.push(Op::Niche(off, niche.offset, niche.scalar_size, start, first as u64, span, variant as u64, subs()));
         }
         _ => init_bytes(out, off, size),
     }
@@ -416,10 +428,9 @@ fn put(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, off: usize, b
             match l.enum_tag? {
                 EnumTag::None(_) => {}
                 EnumTag::Explicit { size: ts, .. } => bytes(off, adt_discs(p, t)[vi] as u128, ts as usize, b, cls),
-                EnumTag::NicheFilled { variant, niche } => {
+                EnumTag::NicheFilled { variant, niche, first, start, .. } => {
                     if vi != variant {
-                        let k = (0..vi).filter(|&i| i != variant).count() as u128;
-                        bytes(off + niche.offset as usize, niche_val(niche, k), niche.scalar_size as usize, b, cls);
+                        bytes(off + niche.offset as usize, niche_tag_value(niche, first, start, vi), niche.scalar_size as usize, b, cls);
                     }
                 }
             }
