@@ -219,6 +219,9 @@ def main():
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--only", default="", help="comma list of target names (package or package:bin)")
     ap.add_argument("-j", type=int, default=4)
+    # A lust build of a ts_goport bin peaks at about 10.6 GB (fx-buildbins 16:44); 3 at once on a
+    # 32 GB boat box get killed by the OOM killer.
+    ap.add_argument("--build-j", type=int, default=2)
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--parity", action="store_true", help="after the builds, run tsrust_parity.py (needs the cargo step)")
     a = ap.parse_args()
@@ -245,7 +248,7 @@ def main():
     if not a.skip_build:
         # lust builds bin targets only (a lib has no main and lust has no rlib).
         ok_ts = [t for t, r in zip(ts, checks) if r["status"] == "ok" and t["kind"] == "bin"]
-        with ThreadPoolExecutor(a.j) as pool:
+        with ThreadPoolExecutor(a.build_j) as pool:
             builds = list(pool.map(lambda t: run_lust(a.lust, "build", t, out, a.timeout), ok_ts))
         for r in builds:
             print(f"tsrust-full: build {r['target']}: {r['status']} ({len(r['diags'])} errors, {r['secs']}s)", flush=True)
