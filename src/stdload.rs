@@ -69,6 +69,7 @@ fn builtin_text(rel: &str) -> Option<&'static str> {
         "core/src/ops.rs" => include_str!("../library/core/src/ops.rs"),
         "core/src/cell.rs" => include_str!("../library/core/src/cell.rs"),
         "core/src/char.rs" => include_str!("../library/core/src/char.rs"),
+        "core/src/mem.rs" => include_str!("../library/core/src/mem.rs"),
         "std/src/sync.rs" => include_str!("../library/std/src/sync.rs"),
         "std/src/panic.rs" => include_str!("../library/std/src/panic.rs"),
         "alloc/src/collections.rs" => include_str!("../library/alloc/src/collections.rs"),

@@ -74,6 +74,14 @@ pub const STD_MODULES: &[StdModule] = &[
         triggers: &["OnceCell", "LazyCell"],
     },
     StdModule {
+        name: "__lust_core_mem",
+        rel: "core/src/mem.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "mem"), ("std", "mem")],
+        full: false,
+        triggers: &["MaybeUninit"],
+    },
+    StdModule {
         name: "__lust_core_char",
         rel: "core/src/char.rs",
         krate: ShippedCrate::Core,

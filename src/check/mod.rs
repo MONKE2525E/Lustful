@@ -845,6 +845,17 @@ pub enum Builtin {
     NonZeroGet,
     /// `WaitTimeoutResult::timed_out`: its flag (field 0).
     WaitTimedOut,
+    /// `MaybeUninit::uninit` and `zeroed`: lowered as aggregates
+    /// in lower.rs (uninit bytes read as zero is exact here).
+    MaybeUninitUninit,
+    MaybeUninitZeroed,
+    /// `MaybeUninit::new(v)`: lowered as an aggregate in lower.rs.
+    MaybeUninitNew,
+    /// `MaybeUninit::write`: store through &mut self, return &mut T.
+    MaybeUninitWrite,
+    /// `MaybeUninit::as_ptr` / `as_mut_ptr`: the field address.
+    MaybeUninitAsPtr,
+    MaybeUninitAsMutPtr,
     /// `Range::is_empty` and the range kinds' `contains`, plus
     /// `RangeInclusive::start` and `end`: expanded in lower/iter.rs.
     RangeIsEmpty,
@@ -10620,6 +10631,26 @@ impl<'p> Ctx<'p> {
                 return r;
             }
         }
+        // `MaybeUninit::uninit`, `new`, and `zeroed` by path
+        // (TRIAGE T5).
+        if self.name(ty_name) == "MaybeUninit" {
+            let b = match self.name(item) {
+                "uninit" => Some(Builtin::MaybeUninitUninit),
+                "zeroed" => Some(Builtin::MaybeUninitZeroed),
+                "new" => Some(Builtin::MaybeUninitNew),
+                _ => None,
+            };
+            if let Some(b) = b {
+                return Some(Res::Builtin(b));
+            }
+            self.err(
+                "L0104",
+                span,
+                format!("no variant or associated function `{}` on `MaybeUninit`", self.name(item)),
+                "Check the name.",
+            );
+            return None;
+        }
         // `NonZero::new`, `NonZeroU64::new`, and `NonZero::get` by
         // path (TRIAGE T5/T12): `new` is the constructor builtin,
         // `get` rides the primitive assoc machinery as a value.
@@ -12851,6 +12882,23 @@ impl<'p> Ctx<'p> {
                     Builtin::F64FromBits => (vec![int(IntTy::U64)], self.tys.float_ty(FloatTy::F64)),
                     Builtin::F32FromBits => (vec![int(IntTy::U32)], self.tys.float_ty(FloatTy::F32)),
                     Builtin::CharFromU32 => (vec![int(IntTy::U32)], self.tys.mk_option(CHAR)),
+                    Builtin::MaybeUninitUninit | Builtin::MaybeUninitZeroed | Builtin::MaybeUninitNew => {
+                        // `MaybeUninit::uninit()` and kin (TRIAGE
+                        // T5): the element from the written type.
+                        let inner = match p.ast.expr(callee) {
+                            Expr::Path(segs) => match self.builtin_ctor_args(segs, 1, span) {
+                                Some(a) => a[0],
+                                None => self.new_var(false),
+                            },
+                            _ => self.new_var(false),
+                        };
+                        let mu = generics::maybe_uninit_ty(&mut self.tys, inner);
+                        if b == Builtin::MaybeUninitNew {
+                            (vec![inner], mu)
+                        } else {
+                            (vec![], mu)
+                        }
+                    }
                     Builtin::NonZeroNew => {
                         // `NonZero::new(x)` and `NonZeroU64::new(x)`
                         // (TRIAGE T5): the integer from the alias
@@ -14090,6 +14138,10 @@ impl<'p> Ctx<'p> {
         }
         // The inherent methods of `core::num::NonZero<T>` (same).
         if let Some(ret) = self.nonzero_adt_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
+        // The inherent methods of `core::mem::MaybeUninit<T>` (same).
+        if let Some(ret) = self.maybe_uninit_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         // `WaitTimeoutResult::timed_out` (same).

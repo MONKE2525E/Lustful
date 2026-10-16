@@ -931,6 +931,14 @@ fn compute(
             Some(_) => Err(()),
             // `core::num::NonZero<T>` (TRIAGE T5): the integer
             // itself, with zero as the niche.
+            // `core::mem::MaybeUninit<T>` (TRIAGE T5): T's layout
+            // with no niche (it is a union).
+            None if tys.adt_parts(t).is_some_and(|(def, _)| def == super::maybe_uninit_def()) => {
+                let e = tys.adt_first_ty_arg(t).ok_or(())?;
+                let mut l = go(tys, shapes, e, env, frames, memo, active)?;
+                l.niche = None;
+                Ok(l)
+            }
             None if tys.adt_parts(t).is_some_and(|(def, _)| def == super::nonzero_def()) => {
                 match tys.adt_first_ty_arg(t).map(|a| tys.kind(a)) {
                     Some(TyKind::Int(i)) => Ok(nonzero_layout(i)),

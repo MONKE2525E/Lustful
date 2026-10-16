@@ -626,6 +626,13 @@ pub fn nonzero_def() -> DefId {
     builtin_def(&["core", "num"], "NonZero")
 }
 
+/// The def of `core::mem::MaybeUninit<T>` (TRIAGE T5): a
+/// synthetic std Adt like `NonZero`, named here so layout can
+/// drop the field's niche (a union has none).
+pub fn maybe_uninit_def() -> DefId {
+    builtin_def(&["core", "mem"], "MaybeUninit")
+}
+
 /// The defs of the types that were closed `TyKind` cases before S3a. They become real
 /// std-crate defs when source std lands (ARCH 3.1); until then the builtin code paths
 /// in check, lower, and cgen recognize them through the `TyIntern` compat helpers.

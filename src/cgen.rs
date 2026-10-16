@@ -2746,6 +2746,14 @@ impl FnGen<'_, '_> {
                 t
             }
             CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::ChanTrySend)) => self.chan_try_send(args, dest_cty, loc, post),
+            // `MaybeUninit::uninit` and `zeroed` (TRIAGE T5): a
+            // zero compound literal of the destination type (an
+            // uninitialized value may hold any bytes; zero is one).
+            CallTarget::Builtin(Builtin::MaybeUninitUninit | Builtin::MaybeUninitZeroed) => format!("(({}){{0}})", ctype(dest_cty)),
+            CallTarget::Builtin(Builtin::MaybeUninitNew) => {
+                let (v, _) = self.operand(&args[0], loc, post);
+                format!("(({}){{ {v} }})", ctype(dest_cty))
+            }
             CallTarget::Builtin(b) => match self.hash_builtin(b, args, dest_cty, loc, post) {
                 Some(v) => v,
                 None => match self.split_builtin(b, args, dest_cty, loc, post) {
@@ -3958,6 +3966,9 @@ impl FnGen<'_, '_> {
             B::NonZeroNew => unreachable!("lowered as an aggregate (lower.rs)"),
             B::NonZeroGet => format!("(({0}).f0)", vals[0]),
             B::WaitTimedOut => format!("((*{0}).f0)", vals[0]),
+            B::MaybeUninitWrite => format!("(((*{0}).f0 = {1}), &(*{0}).f0)", vals[0], vals[1]),
+            B::MaybeUninitAsPtr | B::MaybeUninitAsMutPtr => format!("(&(*{0}).f0)", vals[0]),
+            B::MaybeUninitUninit | B::MaybeUninitZeroed | B::MaybeUninitNew => unreachable!("dest-typed compound literals in the call dispatch"),
             B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => unreachable!("expanded with its closure (lower/iter.rs)"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own
@@ -8925,6 +8936,11 @@ fn glue_def_value(
                     let c = clone_of(e, &format!("(({et}*)p->ptr)[i]"), &mut need);
                     let _ =
                         writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) (({et}*)r.ptr)[i] = {c};\n  r.len = p->len;\n  return r;");
+                }
+                // `MaybeUninit::clone` is a byte copy in core
+                // (no clone of the possibly-uninit value).
+                CTy::Adt(a) if p.def_of_adt(*a) == crate::ty::maybe_uninit_def() => {
+                    body.push_str("  return *p;\n");
                 }
                 CTy::Adt(a) => {
                     let adt = p.adt(*a);

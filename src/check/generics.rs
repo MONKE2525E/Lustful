@@ -886,6 +886,24 @@ pub fn wait_timeout_result_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(wait_timeout_result_def(), EMPTY_ARGS))
 }
 
+/// The def of `core::mem::MaybeUninit<T>` (TRIAGE T5): a
+/// synthetic generic struct Adt over its bytes. The def itself
+/// lives in `ty` so layout can name it.
+pub fn maybe_uninit_def() -> DefId {
+    crate::ty::maybe_uninit_def()
+}
+
+/// The `core::mem::MaybeUninit<T>` type.
+pub fn maybe_uninit_ty(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    tys.mk_adt(maybe_uninit_def(), &[GenericArg::Ty(t)])
+}
+
+/// The value type inside a `MaybeUninit<T>` type, when `t` is one.
+pub fn maybe_uninit_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    let (def, _) = tys.adt_parts(t)?;
+    (def == maybe_uninit_def()).then(|| tys.adt_first_ty_arg(t)).flatten()
+}
+
 /// The def of `core::ops::Bound<T>`, a synthetic generic enum Adt:
 /// `Included(T)`, `Excluded(T)`, `Unbounded`, in std's order.
 pub fn bound_def() -> DefId {
@@ -909,14 +927,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 28] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 29] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 28] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 28]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 29] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 29]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -948,6 +966,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 28] {
             (25, "NonZero", adt(&["core", "num"], "NonZero"), false),
             (26, "TrySendError", adt(&["std", "sync", "mpsc"], "TrySendError"), true),
             (27, "WaitTimeoutResult", adt(&["std", "sync"], "WaitTimeoutResult"), false),
+            (28, "MaybeUninit", adt(&["core", "mem"], "MaybeUninit"), false),
         ]
     })
 }
@@ -956,7 +975,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 28] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -993,6 +1012,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("num", "NonZero", nonzero_def()),
         ("mpsc", "TrySendError", try_send_error_def()),
         ("sync", "WaitTimeoutResult", wait_timeout_result_def()),
+        ("mem", "MaybeUninit", maybe_uninit_def()),
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
         ("cell", "BorrowMutError", borrow_mut_error_def()),
@@ -3305,6 +3325,19 @@ pub(crate) fn resolve_path_ty(
                     return Err(Diag::new("L0110", span, "`Bound` takes one type argument", "Write `Bound<&T>`, for example."));
                 }
                 return Ok(tys.mk_adt(bound_def(), &args));
+            }
+            // `core::mem::MaybeUninit<T>` (TRIAGE T5).
+            if path.len() == 3 && path[1] == "mem" && path[2] == "MaybeUninit" {
+                let seg = segs.last().unwrap();
+                let GenericArgs::Angle(a) = &seg.args else {
+                    return Err(Diag::new("L0110", span, "`MaybeUninit` takes one type argument", "Write `MaybeUninit<T>`."));
+                };
+                let args: Vec<GenericArg> =
+                    resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, "MaybeUninit")?.into_iter().filter(|g| g.as_ty().is_some()).collect();
+                if args.len() != 1 {
+                    return Err(Diag::new("L0110", span, "`MaybeUninit` takes one type argument", "Write `MaybeUninit<T>`."));
+                }
+                return Ok(tys.mk_adt(maybe_uninit_def(), &args));
             }
             // `std::sync::mpsc::TrySendError<T>` (TRIAGE T5).
             if path.len() == 4 && path[1] == "sync" && path[2] == "mpsc" && path[3] == "TrySendError" {
@@ -10217,6 +10250,25 @@ pub fn ast_uses_try_send_error(ast: &Ast, interner: &Interner) -> bool {
     };
     ast.exprs.iter().any(|e| match e {
         ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "try_send"),
+        ast::Expr::Path(segs) => named(segs),
+        ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.tys.iter().any(|t| match t {
+        TyExpr::Path(segs) => named(segs),
+        TyExpr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.pats.iter().any(|p| match p {
+        ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } => named(segs),
+        _ => false,
+    })
+}
+
+pub fn ast_uses_maybe_uninit(ast: &Ast, interner: &Interner) -> bool {
+    let named = |segs: &[ast::PathSeg]| {
+        segs.iter().any(|s| matches!(interner.get(s.name), "MaybeUninit"))
+    };
+    ast.exprs.iter().any(|e| match e {
+        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "uninit" | "write"),
         ast::Expr::Path(segs) => named(segs),
         ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
         _ => false,

@@ -499,6 +499,37 @@ impl<'p> Ctx<'p> {
         Some(BOOL)
     }
 
+    /// The inherent methods of `core::mem::MaybeUninit<T>` lust
+    /// takes (TRIAGE T5): `write`, `as_ptr`, and `as_mut_ptr` (the
+    /// safe surface the fork uses as a buffer). The unsafe
+    /// readers stay out: lust has no unsafe.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn maybe_uninit_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+    ) -> Option<Ty> {
+        let _ = recv;
+        let inner = generics::maybe_uninit_elem(&self.tys, self.resolve(base))?;
+        let (b, autoref, params, ret): (Builtin, Autoref, Vec<Ty>, Ty) = match self.name(name) {
+            "write" => (Builtin::MaybeUninitWrite, Autoref::RefMut, vec![inner], self.tys.mk_ref(true, inner)),
+            "as_ptr" => (Builtin::MaybeUninitAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, inner))),
+            "as_mut_ptr" => (Builtin::MaybeUninitAsMutPtr, Autoref::RefMut, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, inner))),
+            _ => return None,
+        };
+        if autoref != Autoref::None {
+            self.check_packed_borrow(recv, name_span);
+        }
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+        self.check_args(&params, args, name_span);
+        Some(ret)
+    }
+
     /// The inherent methods of `core::num::NonZero<T>` lust takes:
     /// `get` (the wrapped integer). `new` is an associated fn
     /// (check's `resolve_assoc`); the rest of std's arithmetic

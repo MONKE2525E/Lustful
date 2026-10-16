@@ -1676,6 +1676,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/hash/DefaultHasher",
     "std/hash/BuildHasherDefault",
     "core/hash/BuildHasherDefault",
+    "core/mem/MaybeUninit",
+    "std/mem/MaybeUninit",
     "core/num/NonZero",
     "std/num/NonZero",
     "core/num/NonZeroU8",

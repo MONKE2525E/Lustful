@@ -3590,6 +3590,19 @@ pub fn collect_reuse(
                     vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", BOOL)], disc: 0, non_exhaustive: false }],
                     Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, ..Derives::default() },
                 ),
+                // core: `union MaybeUninit<T>` (TRIAGE T5) as a
+                // one-field struct: layout drops the niche and
+                // drop is suppressed (layout.rs, needs_drop).
+                // Clone is unconditional in core, so it is a
+                // synthetic impl (generics.rs), not a derive.
+                28 => {
+                    let t = p.tys.intern(TyKind::Param(ParamId(0)));
+                    (
+                        generics::maybe_uninit_def(),
+                        vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", t)], disc: 0, non_exhaustive: false }],
+                        Derives { clone: true, copy: true, ..Derives::default() },
+                    )
+                }
                 // core: `struct NonZero<T>(T)` (TRIAGE T5). Debug
                 // and Display forward to the integer (synthetic
                 // impls in generics.rs, glue in cgen/fmt.rs), so
@@ -3623,7 +3636,7 @@ pub fn collect_reuse(
             let repr = crate::ty::layout::Repr { int: (item_idx == usize::MAX).then_some((8, true)), ..Default::default() };
             p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr, non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 || usize::MAX - item_idx == 26 {
+            if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 || usize::MAX - item_idx == 26 || usize::MAX - item_idx == 28 {
                 // `Bound<T>` and `NonZero<T>`: the generic synthetic
                 // std Adts. Give each its param and field table, as
                 // the field pass does for a user generic type.
@@ -3633,7 +3646,7 @@ pub fn collect_reuse(
                 // fast path; the perf gate measures those). Both
                 // flags, like `Cow`: mono's lang-enum fast path
                 // (user_generics false) makes no Adt instances.
-                if generics::ast_uses_bound(ast, interner) || generics::ast_uses_nonzero(ast, interner) || generics::ast_uses_try_send_error(ast, interner) {
+                if generics::ast_uses_bound(ast, interner) || generics::ast_uses_nonzero(ast, interner) || generics::ast_uses_try_send_error(ast, interner) || generics::ast_uses_maybe_uninit(ast, interner) {
                     p.gx.has_generics = true;
                     p.gx.user_generics = true;
                 }
@@ -7474,6 +7487,10 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Closure(_, a) => closure_fields(tys, a).iter().all(|&e| is_copy(p, tys, e)),
         TyKind::Array(e, _) => is_copy(p, tys, e),
         _ => {
+            // `MaybeUninit<T>` is Copy for every T (TRIAGE T5).
+            if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::maybe_uninit_def()) {
+                return true;
+            }
             if tys.is_exit_code(t)
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
                 // `fmt::Arguments` is Copy in core (R9); its lust value
@@ -8711,6 +8728,10 @@ fn needs_drop_sub(p: &Program, tys: &impl TyIntern, t: Ty, args: &[GenericArg], 
         TyKind::Closure(_, a) => return closure_fields(tys, a).iter().any(|&e| needs_drop_sub(p, tys, e, args, exact)),
         TyKind::Array(e, _) => return needs_drop_sub(p, tys, e, args, exact),
         _ => {}
+    }
+    // `MaybeUninit<T>` never drops its bytes (TRIAGE T5).
+    if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::maybe_uninit_def()) {
+        return false;
     }
     if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.smart_elem(t).is_some() || tys.weak_elem(t).is_some() || tys.arc_weak_elem(t).is_some() {
         return true;
