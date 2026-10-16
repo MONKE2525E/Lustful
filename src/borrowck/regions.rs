@@ -4673,11 +4673,13 @@ impl<'b, 'p> Builder<'b, 'p> {
                     // at their variance in the iterator's type (an invariant
                     // `T` stays equal; the `&mut` the call takes is only the
                     // borrow `next` needs); the sources reach the other slots.
+                    // The sources (`from`, no closure captures) reach the
+                    // other slots, at each slot's variance.
                     let mut filled = vec![false; dv.len()];
                     for (t, v) in &avs {
                         let f = match self.body.tys.kind(*t) {
-                            TyKind::Ref(_, _, inner) if !v.is_empty() => self.store_into(inner, &v[1..], dt, &dv),
-                            _ => self.store_into(*t, v, dt, &dv),
+                            TyKind::Ref(_, _, inner) if !v.is_empty() => self.store_parts(inner, &v[1..], dt, &dv, false),
+                            _ => self.store_parts(*t, v, dt, &dv, false),
                         };
                         for (x, y) in filled.iter_mut().zip(f) {
                             *x |= y;
@@ -4685,6 +4687,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     }
                     let rest: Vec<u32> = dv.iter().zip(&filled).filter(|(_, f)| !**f).map(|(&x, _)| x).collect();
                     self.flow_all(&from, &rest);
+                    self.store_flat_in(&from, dt, &dv, &filled);
                 }
                 // An item that can write through shared memory (`&RefCell`)
                 // is its source's own regions, both ways.

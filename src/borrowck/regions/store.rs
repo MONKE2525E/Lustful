@@ -78,6 +78,12 @@ impl Builder<'_, '_> {
     /// own one-way flows (into the other slots, for the adapter and item
     /// rules); this only adds edges.
     pub(super) fn store_into(&mut self, at: Ty, av: &[u32], pt: Ty, pv: &[u32]) -> Vec<bool> {
+        self.store_parts(at, av, pt, pv, true)
+    }
+
+    /// `store_into`; with `flat` false only the matched parts relate (the
+    /// caller relates the other slots itself) and the filled slots return.
+    pub(super) fn store_parts(&mut self, at: Ty, av: &[u32], pt: Ty, pv: &[u32], flat: bool) -> Vec<bool> {
         let tys = &self.body.tys;
         let mut filled = vec![false; pv.len()];
         if (pv.is_empty() || av.is_empty()) && !(has_fn_ptr(tys, at) && has_fn_ptr(tys, pt)) {
@@ -139,8 +145,10 @@ impl Builder<'_, '_> {
         }
         // The rest reaches only the slots no stored part fills (an
         // iterator's own borrow is not the `&'static str` its items hold).
-        let rest: Vec<u32> = av.iter().zip(&covered).filter(|(_, c)| !**c).map(|(&x, _)| x).collect();
-        self.store_flat_in(&rest, pt, pv, &filled);
+        if flat {
+            let rest: Vec<u32> = av.iter().zip(&covered).filter(|(_, c)| !**c).map(|(&x, _)| x).collect();
+            self.store_flat_in(&rest, pt, pv, &filled);
+        }
         filled
     }
 
@@ -169,7 +177,7 @@ impl Builder<'_, '_> {
     }
 
     /// `store_flat` over the slots of `pv` that `skip` does not mark.
-    fn store_flat_in(&mut self, srcs: &[u32], pt: Ty, pv: &[u32], skip: &[bool]) {
+    pub(super) fn store_flat_in(&mut self, srcs: &[u32], pt: Ty, pv: &[u32], skip: &[bool]) {
         if srcs.is_empty() || pv.is_empty() {
             return;
         }
@@ -181,6 +189,14 @@ impl Builder<'_, '_> {
         for (k, &f) in skip.iter().enumerate() {
             if f && k < var.len() {
                 var[k] = Variance::Bi;
+            }
+        }
+        // A closure's captures are no place a call stores into.
+        let mut pp = Vec::new();
+        self.sc.parts(pt, Variance::Co, 0, &mut pp);
+        for q in pp.iter().filter(|q| matches!(self.body.tys.kind(q.ty), TyKind::Closure(..))) {
+            for w in var.iter_mut().skip(q.at as usize).take(q.n as usize) {
+                *w = Variance::Bi;
             }
         }
         // `x: h: y` for covariant and invariant slots, `y: g: x` for
