@@ -4461,6 +4461,8 @@ impl<'b, 'p> Builder<'b, 'p> {
                 && self.call_map_value(b, &avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(crate::check::Builtin::MapGet | crate::check::Builtin::MapGetMut) = target
                 && self.call_map_get(&avs, dt, &dv) => {}
+            _ if let CallTarget::Builtin(crate::check::Builtin::SetGet) = target
+                && self.call_set_get(&avs, dt, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
                 self.call_opaque(&avs[..1], dt, &dv)
             }
@@ -5277,6 +5279,25 @@ impl<'b, 'p> Builder<'b, 'p> {
         let vv = v0[1 + nk..1 + nk + nv].to_vec();
         let mut at = 0usize;
         self.receiver_walk(dt, dv, &mut at, v0[0], Some(v), &vv, Variance::Co);
+        true
+    }
+
+    /// `set.get(&q)` (rustc `-> Option<&'r T>`): the reference is the
+    /// receiver's loan, and `T` is the set's own `T` (a subtype behind the
+    /// `&`), as `call_map_get` does for a map's V. A `HashSet<&'static
+    /// str>` element stays `'static`. False when the types do not pair.
+    fn call_set_get(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, set) = self.body.tys.kind(*t0) else { return false };
+        let Some((crate::ty::hash::HashTy::HashSet, sargs)) = crate::ty::hash::hash_parts(&self.body.tys, set) else { return false };
+        let Some(&t) = sargs.first() else { return false };
+        let nt = self.sc.slots(t) as usize;
+        if v0.len() < 1 + nt || dv.len() != nt + 1 {
+            return false;
+        }
+        let tv = v0[1..1 + nt].to_vec();
+        let mut at = 0usize;
+        self.receiver_walk(dt, dv, &mut at, v0[0], Some(t), &tv, Variance::Co);
         true
     }
 
