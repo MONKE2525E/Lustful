@@ -1,0 +1,1 @@
+cmd src/main.rs --bin scen --features a

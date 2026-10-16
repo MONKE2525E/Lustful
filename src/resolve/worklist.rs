@@ -822,9 +822,12 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
         n.hash(&mut h);
     }
     input.env.allow_lust_dev.hash(&mut h);
-    // Cargo env values and per-dependency build script cfg outputs:
-    // files that read env are never cached, but a `rustc-cfg` change
-    // re-expands a dependency's files, so the fingerprint must move.
+    // Cargo env values, per-dependency build script cfg outputs, and
+    // each dependency's own selection (features, edition, lib root):
+    // files that read env are never cached, but a `rustc-cfg` or
+    // feature change re-expands a dependency's files, so the
+    // fingerprint must move (a path dependency's `default` feature
+    // edit kept its old `cfg!(feature)` answers, w-daemon-sound).
     for (k, v) in &input.cargo_env {
         k.hash(&mut h);
         v.hash(&mut h);
@@ -833,6 +836,7 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
         use std::hash::Hash;
         for d in deps {
             d.package_id.hash(h);
+            (&d.extern_name, &d.lib_name, &d.lib_src, &d.edition, &d.features).hash(h);
             for (k, v) in &d.cargo_env {
                 k.hash(h);
                 v.hash(h);

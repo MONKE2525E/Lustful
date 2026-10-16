@@ -1720,6 +1720,7 @@ fn resolved_setup(
             all_features: key.all_features,
             target_triple: key.target_triple.clone(),
             cargo_net: key.cargo_net,
+            env: req.client.env.as_deref().map(cargo::cargo_env_of),
         };
         let graph = cargo::load_graph(&greq).map_err(code2)?;
         t.lap("cargo graph");

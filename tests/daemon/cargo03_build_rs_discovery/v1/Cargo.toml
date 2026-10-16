@@ -1,0 +1,8 @@
+[package]
+name = "scen"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

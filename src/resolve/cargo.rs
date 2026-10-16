@@ -9,11 +9,16 @@
 // for the same request, whose compiler-artifact messages carry the exact
 // feature set of each selected unit.
 //
-// The graph key is the full resolver input: every workspace `Cargo.toml`
+// The graph key is the full resolver input: every ancestor `Cargo.toml`
 // plus `Cargo.lock`, the requested package and target, the requested
-// features with the default-feature policy, the target triple, and the
-// `.cargo/config.toml` chain that applies. Two feature selections or two
-// targets therefore key two sessions in one daemon (section 1.8).
+// features with the default-feature policy, the target triple, the
+// `.cargo/config.toml` chain that applies, and the env vars that steer
+// Cargo. Two feature selections or two targets therefore key two
+// sessions in one daemon (section 1.8). A cached graph also carries a
+// stamp of what the key cannot see before metadata runs: the manifest
+// and target discovery inputs of every path package (`watch_stamp`).
+// A daemon checks the stamp on each request, so an added `src/bin/x.rs`
+// or a sibling member's manifest edit reloads the graph.
 use crate::diag::{Diag, Span};
 use crate::intern::FxHasher;
 use crate::resolve::cfg::CfgEnv;
@@ -298,7 +303,14 @@ pub struct DepUnit {
 /// The full graph for one request.
 #[derive(Clone, Debug)]
 pub struct CrateGraph {
+    /// The graph key mixed with the watch stamp: it names this exact
+    /// graph (the features probe caches by it).
     pub key: u64,
+    /// The path package dirs whose manifests and target discovery
+    /// inputs the graph read (`watch_stamp`), and their stamp before
+    /// metadata ran.
+    pub watch: Vec<PathBuf>,
+    pub stamp: u64,
     pub workspace_root: PathBuf,
     pub packages: Vec<PackageInfo>,
     pub workspace_members: Vec<String>,
@@ -314,6 +326,48 @@ pub struct GraphRequest {
     pub all_features: bool,
     pub target_triple: String,
     pub cargo_net: crate::protocol::CargoNet,
+    /// The env vars that steer Cargo (`steers_cargo`) as the client sees
+    /// them, sorted. None: this process's env (a cold run, unit tests).
+    /// A daemon passes its client's: the daemon's own env is the env of
+    /// the client that started it.
+    pub env: Option<Vec<(String, String)>>,
+}
+
+/// True for an env var that changes what Cargo reads or runs: its
+/// config and registry (`CARGO*`, `HOME`), the toolchain (`RUSTUP_*`,
+/// `RUSTC`, `PATH`), and flags (`RUSTFLAGS`).
+fn steers_cargo(name: &str) -> bool {
+    name.starts_with("CARGO") || name.starts_with("RUSTUP_") || matches!(name, "RUSTC" | "RUSTFLAGS" | "HOME" | "PATH")
+}
+
+/// The Cargo-steering vars of a client env, sorted (`GraphRequest::env`).
+pub fn cargo_env_of(client: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = client.iter().filter(|(k, _)| steers_cargo(k)).cloned().collect();
+    env.sort();
+    env
+}
+
+impl GraphRequest {
+    /// One env var as Cargo sees it for this request.
+    fn var(&self, name: &str) -> Option<String> {
+        match &self.env {
+            Some(env) => env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
+            None => std::env::var(name).ok(),
+        }
+    }
+
+    /// Gives `cmd` the request's Cargo env: this process's steering vars
+    /// are replaced by the client's (vars a command sets itself, such
+    /// as the probe's `RUSTC_WRAPPER`, do not steer and stay).
+    fn apply_env(&self, cmd: &mut Command) {
+        let Some(env) = &self.env else { return };
+        for (k, _) in std::env::vars_os() {
+            if k.to_str().is_some_and(steers_cargo) {
+                cmd.env_remove(k);
+            }
+        }
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
+    }
 }
 
 fn hash_bytes(h: &mut FxHasher, path: &Path) {
@@ -342,14 +396,20 @@ pub fn graph_key(req: &GraphRequest) -> u64 {
             hash_bytes(&mut h, &m);
             hash_bytes(&mut h, &d.join("Cargo.lock"));
         }
-        // The config chain: `.cargo/config.toml` in every ancestor.
+        // The config chain: `.cargo/config.toml` (and the legacy
+        // `.cargo/config`) in every ancestor.
         hash_bytes(&mut h, &d.join(".cargo/config.toml"));
+        hash_bytes(&mut h, &d.join(".cargo/config"));
         dir = d.parent();
     }
-    if let Ok(home) = std::env::var("CARGO_HOME") {
-        hash_bytes(&mut h, &Path::new(&home).join("config.toml"));
-    } else if let Ok(home) = std::env::var("HOME") {
-        hash_bytes(&mut h, &Path::new(&home).join(".cargo/config.toml"));
+    let home = req.var("CARGO_HOME").map(PathBuf::from).or_else(|| req.var("HOME").map(|h| Path::new(&h).join(".cargo")));
+    if let Some(home) = home {
+        hash_bytes(&mut h, &home.join("config.toml"));
+        hash_bytes(&mut h, &home.join("config"));
+    }
+    match &req.env {
+        Some(env) => env.hash(&mut h),
+        None => cargo_env_of(&std::env::vars().collect::<Vec<_>>()).hash(&mut h),
     }
     req.package.hash(&mut h);
     let mut feats = req.features.clone();
@@ -363,8 +423,56 @@ pub fn graph_key(req: &GraphRequest) -> u64 {
     h.finish()
 }
 
+/// Hashes the inputs of Cargo's view of one path package dir that the
+/// graph key does not cover: the manifest text, whether `build.rs`,
+/// `src/main.rs`, and `src/lib.rs` exist (target discovery reads their
+/// presence, not their text), and the entries of `src/bin`, `examples`,
+/// `tests`, and `benches` (a file or a dir with a `main.rs` is a target).
+fn hash_package_dir(h: &mut FxHasher, dir: &Path) {
+    hash_bytes(h, &dir.join("Cargo.toml"));
+    for f in ["build.rs", "src/main.rs", "src/lib.rs"] {
+        dir.join(f).exists().hash(h);
+    }
+    for sub in ["src/bin", "examples", "tests", "benches"] {
+        let mut names: Vec<(std::ffi::OsString, bool)> = std::fs::read_dir(dir.join(sub))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| (e.file_name(), e.path().join("main.rs").exists()))
+            .collect();
+        names.sort();
+        names.hash(h);
+    }
+}
+
+/// The watch stamp of a set of path package dirs (`hash_package_dir`).
+fn watch_stamp(dirs: &[PathBuf]) -> u64 {
+    let mut h = FxHasher::default();
+    "lust-watch-v1".hash(&mut h);
+    for d in dirs {
+        d.hash(&mut h);
+        hash_package_dir(&mut h, d);
+    }
+    h.finish()
+}
+
+/// The dirs a graph's watch stamp covers: the named manifest's dir and
+/// every path package (workspace members and path dependencies).
+fn watch_dirs(req: &GraphRequest, packages: &[PackageInfo]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = req.manifest_path.parent().map(Path::to_path_buf).into_iter().collect();
+    for p in packages.iter().filter(|p| p.source.is_none()) {
+        if let Some(d) = p.manifest_path.parent() {
+            dirs.push(d.to_path_buf());
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 /// In-process cache of loaded graphs, by graph key. A daemon serves many
-/// requests per graph; metadata runs once per key while inputs hold.
+/// requests per graph; metadata runs once per key while inputs hold
+/// (the key, and the graph's watch stamp).
 fn graph_cache() -> &'static Mutex<std::collections::HashMap<u64, std::sync::Arc<CrateGraph>>> {
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, std::sync::Arc<CrateGraph>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -375,9 +483,39 @@ fn graph_cache() -> &'static Mutex<std::collections::HashMap<u64, std::sync::Arc
 /// Cargo itself rejects has no crate to attach a span diagnostic to.
 pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, String> {
     let key = graph_key(req);
-    if let Some(g) = graph_cache().lock().unwrap().get(&key) {
+    let cached = graph_cache().lock().unwrap().get(&key).cloned();
+    if let Some(g) = &cached
+        && watch_stamp(&g.watch) == g.stamp
+    {
         return Ok(g.clone());
     }
+    // The stamp is taken before metadata runs, over the dirs the last
+    // graph watched (else the named manifest's dir), so an edit made
+    // while Cargo runs moves the stamp. When metadata names a path
+    // package outside that set, the run repeats with it in the set.
+    let mut watch = cached.map_or_else(|| watch_dirs(req, &[]), |g| g.watch.clone());
+    for _ in 0..4 {
+        let stamp = watch_stamp(&watch);
+        let mut graph = run_metadata(req, key)?;
+        let dirs = watch_dirs(req, &graph.packages);
+        if dirs.iter().all(|d| watch.contains(d)) {
+            let mut h = FxHasher::default();
+            (key, stamp).hash(&mut h);
+            (graph.key, graph.watch, graph.stamp) = (h.finish(), watch, stamp);
+            let graph = std::sync::Arc::new(graph);
+            graph_cache().lock().unwrap().insert(key, graph.clone());
+            return Ok(graph);
+        }
+        watch.extend(dirs);
+        watch.sort();
+        watch.dedup();
+    }
+    Err("the Cargo package set kept changing while `cargo metadata` ran".into())
+}
+
+/// One `cargo metadata` run for `req`, read into a graph (key, watch,
+/// and stamp are filled by `load_graph`).
+fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     let mut cmd = Command::new("cargo");
     // Run in the manifest's directory: Cargo discovers `.cargo/config.toml`
     // from the working directory, and the project's config (source
@@ -403,6 +541,7 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
         cmd.args(["--filter-platform", filter]);
     }
     cmd.args(req.cargo_net.args());
+    req.apply_env(&mut cmd);
     let out = cmd.output().map_err(|e| format!("cannot run `cargo metadata`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -514,9 +653,7 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
                 .unwrap_or_default(),
         });
     }
-    let graph = std::sync::Arc::new(CrateGraph { key, workspace_root, packages, workspace_members: members });
-    graph_cache().lock().unwrap().insert(key, graph.clone());
-    Ok(graph)
+    Ok(CrateGraph { key, watch: Vec::new(), stamp: 0, workspace_root, packages, workspace_members: members })
 }
 
 /// The stable package identity of section 1.7 step 1.
@@ -590,20 +727,20 @@ pub fn build_dir(manifest: &Path) -> Option<PathBuf> {
 /// The per-unit feature sets from one `cargo check --message-format=json`
 /// run for the same request (section 1.1), keyed by (package id repr,
 /// target name). The run is the cheap probe of `resolve::probe`: rustc
-/// runs only for build scripts and proc macros. Cached per graph key in
-/// this process, and on disk (see `features_disk_path`): its answer does
+/// runs only for build scripts and proc macros. Cached per `graph.key`
+/// (graph key plus watch stamp) in this process, and on disk (see `features_disk_path`): its answer does
 /// not depend on the sources. Returns None when the run fails; the caller then falls back
 /// to resolve-node features and the session still works for single-package
 /// graphs.
 fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
-    let key = graph_key(req);
+    let key = graph.key;
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, std::collections::HashMap<(String, String), Vec<String>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(v) = cache.lock().unwrap().get(&key) {
         return Some(v.clone());
     }
-    let disk = features_disk_path(req, graph);
+    let disk = features_disk_path(graph);
     if let Some(map) = disk.as_deref().and_then(read_features_file) {
         cache.lock().unwrap().insert(key, map.clone());
         return Some(map);
@@ -622,6 +759,7 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         cmd.arg("--all-features");
     }
     cmd.args(req.cargo_net.args());
+    req.apply_env(&mut cmd);
     let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut map = std::collections::HashMap::new();
@@ -647,19 +785,17 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
 
 /// The disk cache file of `unit_features_via_check`:
 /// `$LUST_CACHE_DIR` (else `<workspace root>/.lust-cache`)`/features-<key>.txt`.
-/// The key is the graph key plus every workspace member manifest (a sibling
-/// member is not an ancestor of the named manifest, so the graph key alone
-/// misses it). None under `LUST_NO_CACHE`.
-fn features_disk_path(req: &GraphRequest, graph: &CrateGraph) -> Option<PathBuf> {
+/// The key is `graph.key`: the graph key plus the watch stamp, which
+/// covers every path package manifest (a sibling member is not an
+/// ancestor of the named manifest, so the graph key alone misses it).
+/// None under `LUST_NO_CACHE`.
+fn features_disk_path(graph: &CrateGraph) -> Option<PathBuf> {
     if matches!(std::env::var("LUST_NO_CACHE"), Ok(v) if !v.is_empty() && v != "0") {
         return None;
     }
     let mut h = FxHasher::default();
-    "lust-features-v1".hash(&mut h);
-    graph_key(req).hash(&mut h);
-    for p in graph.packages.iter().filter(|p| graph.workspace_members.contains(&p.id_repr)) {
-        hash_bytes(&mut h, &p.manifest_path);
-    }
+    "lust-features-v2".hash(&mut h);
+    graph.key.hash(&mut h);
     let dir = match std::env::var_os("LUST_CACHE_DIR") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
         _ => graph.workspace_root.join(".lust-cache"),
@@ -988,6 +1124,7 @@ mod tests {
             all_features: false,
             target_triple: String::new(),
             cargo_net: Default::default(),
+            env: None,
         };
         let graph = load_graph(&req).expect("cargo metadata on the hello fixture");
         let interner = crate::intern::Interner::default();
@@ -999,5 +1136,35 @@ mod tests {
         assert!(unit.package_id.contains("hello 0.1.0"), "{}", unit.package_id);
         check_edition(&unit).unwrap();
         check_lints(&graph, &unit).unwrap();
+    }
+
+    #[test]
+    fn graph_reloads_when_discovery_or_a_path_manifest_moves() {
+        // A daemon keeps graphs; an added bin or a path dependency's
+        // manifest edit moves none of the graph key's files.
+        let dir = std::env::temp_dir().join(format!("lust-cargo-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::create_dir_all(dir.join("util/src")).unwrap();
+        let pkg = "[package]\nname = \"w\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        std::fs::write(dir.join("Cargo.toml"), format!("{pkg}\n[dependencies]\nutil = {{ path = \"util\" }}\n\n[workspace]\n")).unwrap();
+        std::fs::write(dir.join("util/Cargo.toml"), "[package]\nname = \"util\"\nversion = \"0.1.0\"\nedition = \"2024\"\n").unwrap();
+        std::fs::write(dir.join("util/src/lib.rs"), "").unwrap();
+        std::fs::write(dir.join("src/bin/a.rs"), "fn main() {}").unwrap();
+        let req = GraphRequest { manifest_path: dir.join("Cargo.toml"), default_features: true, ..Default::default() };
+        let bins = |g: &CrateGraph| g.packages.iter().find(|p| p.name == "w").unwrap().targets.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        // The first run writes Cargo.lock, which the graph key covers.
+        load_graph(&req).expect("metadata");
+        let first = load_graph(&req).unwrap();
+        assert_eq!(bins(&first), ["a"]);
+        assert!(std::sync::Arc::ptr_eq(&first, &load_graph(&req).unwrap()), "inputs hold: the cached graph");
+        std::fs::write(dir.join("src/bin/b.rs"), "fn main() {}").unwrap();
+        let second = load_graph(&req).unwrap();
+        assert_eq!(bins(&second), ["a", "b"]);
+        std::fs::write(dir.join("util/Cargo.toml"), "[package]\nname = \"util\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let third = load_graph(&req).unwrap();
+        assert_eq!(third.packages.iter().find(|p| p.name == "util").unwrap().edition, "2021");
+        assert_ne!(second.key, third.key, "the features probe caches by the graph key");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,1 @@
+cmd app/src/bin/two.rs --bin two

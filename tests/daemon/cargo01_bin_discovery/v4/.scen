@@ -1,0 +1,2 @@
+rm src/bin/d.rs
+cmd src/bin/c.rs --bin c

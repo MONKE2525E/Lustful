@@ -28,6 +28,88 @@ def first_code(stderr):
     return m.group(1) if m else None
 
 
+def apply_overlay(vpath, work, mtime):
+    """Cargo mode: copies the files under `vpath` into `work` (same
+    relative paths, mtime `mtime`) and reads its `.scen` directives:
+    `rm <path>` deletes a file or dir, `cmd <root> <flags...>` sets this
+    version's lust command (kept for later versions), and `env K=V` sets
+    a client env var for this version only."""
+    directives = []
+    for dirpath, _, files in os.walk(vpath):
+        for f in files:
+            src = os.path.join(dirpath, f)
+            rel = os.path.relpath(src, vpath)
+            if rel == ".scen":
+                directives = open(src).read().splitlines()
+                continue
+            dst = os.path.join(work, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+            os.utime(dst, (mtime, mtime))
+    cmd, env = None, {}
+    for line in directives:
+        verb, _, rest = line.strip().partition(" ")
+        if verb == "rm":
+            path = os.path.join(work, rest.strip())
+            shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+            # Bump the dir mtime past the last version's, as an editor would.
+            os.utime(os.path.dirname(path), (mtime, mtime))
+        elif verb == "cmd":
+            cmd = rest.split()
+        elif verb == "env":
+            k, _, v = rest.partition("=")
+            env[k.strip()] = v.strip()
+    return cmd, env
+
+
+def cargo_scenario(srcdir, name, work, env, daemon):
+    """Cargo mode (a `cargo` file in the scenario dir): each `vN/` is an
+    overlay on one package tree in `work`, and the command is
+    `lust check|run <root> --manifest-path Cargo.toml <flags>` from the
+    `cargo` file or a `cmd` directive. The oracle is `cargo run` (dev
+    profile, offline) of the same bin. Warm must equal cold; an accepted
+    program must give cargo's exit code and stdout."""
+    problems, notes = [], []
+    cmd = open(os.path.join(srcdir, "cargo")).read().split()
+    versions = sorted(f for f in os.listdir(srcdir) if f.startswith("v") and os.path.isdir(os.path.join(srcdir, f)))
+    mtime = int(time.time())
+    for v in versions:
+        mtime += 2
+        vcmd, venv = apply_overlay(os.path.join(srcdir, v), work, mtime)
+        cmd = vcmd or cmd
+        root, flags = cmd[0], ["--manifest-path", "Cargo.toml"] + cmd[1:]
+        wenv = dict(env, **venv)
+        cenv = dict(wenv, LUST_NO_DAEMON="1")
+        tag = f"{name} {v}"
+        wkc, _, wkerr = run([LUST, "check", root, *flags], work, wenv)
+        ckc, _, ckerr = run([LUST, "check", root, *flags], work, cenv)
+        if (wkc == 0) != (ckc == 0) or first_code(wkerr) != first_code(ckerr):
+            problems.append(f"{tag}: warm check != cold check: warm rc={wkc} {wkerr[:200]!r}, cold rc={ckc} {ckerr[:200]!r}")
+        wrc, wout, werr = run([LUST, "run", root, *flags, "-o", os.path.join(work, "w.bin")], work, wenv)
+        crc, cout, cerr = run([LUST, "run", root, *flags, "-o", os.path.join(work, "c.bin")], work, cenv)
+        if (wrc, wout, first_code(werr)) != (crc, cout, first_code(cerr)):
+            problems.append(f"{tag}: warm != cold: warm=({wrc},{wout!r},{werr[:200]!r}) cold=({crc},{cout!r},{cerr[:200]!r})")
+        sel = [f for f in cmd[1:] if f != "--offline"]
+        genv = dict(wenv, CARGO_TARGET_DIR=work + "-cargo-target")
+        brc, _, berr = run(["cargo", "build", "-q", "--offline", *sel], work, genv, timeout=300)
+        if brc != 0:
+            for mode, rc, out in (("warm", wrc, wout), ("cold", crc, cout)):
+                if rc == 0:
+                    problems.append(f"{tag}: {mode} accepts but cargo rejects; {mode} out={out!r} cargo={berr[-300:]!r}")
+            continue
+        grc, gout, _ = run(["cargo", "run", "-q", "--offline", *sel], work, genv, timeout=300)
+        grc = 128 - grc if grc < 0 else grc  # killed by a signal: the shell's code, as lust's client gives it
+        # A compile reject (not a run that failed) in both modes: lust is a subset.
+        rejects = lambda rc, err: rc != 0 and (first_code(err) is not None or err.lstrip().startswith("error"))  # noqa: E731
+        if rejects(wrc, werr) and rejects(crc, cerr):
+            notes.append(f"{tag}: lust rejects what cargo accepts: {werr[:160]!r}")
+            continue
+        for mode, rc, out in (("warm", wrc, wout), ("cold", crc, cout)):
+            if (rc, out) != (grc, gout):
+                problems.append(f"{tag}: {mode} wrong: {mode}=({rc},{out!r},{(werr if mode == 'warm' else cerr)[:200]!r}) cargo=({grc},{gout!r})")
+    return problems, notes
+
+
 def scenario(srcdir):
     """Returns (name, problems, notes). One temp dir and one daemon per
     scenario; versions are applied in order with strictly rising mtimes."""
@@ -47,6 +129,9 @@ def scenario(srcdir):
             if time.time() - t0 > 10 or daemon.poll() is not None:
                 return name, [f"{name}: daemon start failed"], notes
             time.sleep(0.005)
+        if os.path.exists(os.path.join(srcdir, "cargo")):
+            problems, notes = cargo_scenario(srcdir, name, work, env, daemon)
+            return name, problems, notes
         versions = sorted(
             f for f in os.listdir(srcdir)
             if f.startswith("v") and (f.endswith(".rs") or os.path.isdir(os.path.join(srcdir, f))))
@@ -107,6 +192,7 @@ def scenario(srcdir):
             daemon.terminate()
         log.close()
         shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(work + "-cargo-target", ignore_errors=True)
     return name, problems, notes
 
 

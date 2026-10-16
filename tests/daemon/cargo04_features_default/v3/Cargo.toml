@@ -1,0 +1,11 @@
+[package]
+name = "scen"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = ["a", "b"]
+a = []
+b = []
