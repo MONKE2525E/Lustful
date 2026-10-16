@@ -67,12 +67,8 @@ fn main() {
     let mut by_str: HashMap<&str, Vec<u8>> = HashMap::default();
     by_str.insert("a", vec![1]);
     by_str.insert("b", vec![]);
-    let mut n = 0;
-    by_str.retain(|k, v| {
-        n += k.len();
-        !v.is_empty()
-    });
-    println!("{:?} {}", by_str, n);
+    by_str.retain(|k, v| k.len() == 1 && !v.is_empty());
+    println!("{:?}", by_str);
     let mut owned: HashMap<String, u32> = HashMap::default();
     owned.insert("x".to_string(), 1);
     println!("{:?} {:?}", owned.remove_entry("x"), owned.remove_entry("x"));

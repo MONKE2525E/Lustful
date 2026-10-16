@@ -4563,14 +4563,12 @@ impl<'b, 'p> Builder<'b, 'p> {
             // and `link_closure_args` gave its args the elements.
             _ if matches!(target, CallTarget::Builtin(b) if sort_by_builtin(b)) => {}
             // So does `retain`'s predicate, which takes `&T`: its captures
-            // reach neither the Vec nor the unit result (`retain_mut` hands
-            // out `&mut T` and keeps the conservative rule). A map's
-            // predicate takes `&mut V`: what it stores there is
-            // `link_closure_args`' edges to the map's slots.
-            _ if matches!(
-                target,
-                CallTarget::Builtin(crate::check::Builtin::VecRetain | crate::check::Builtin::SetRetain | crate::check::Builtin::MapRetain)
-            ) => {}
+            // reach neither the Vec (or set) nor the unit result
+            // (`retain_mut` and a map's `retain` hand out `&mut T` and
+            // `&mut V`, and keep the conservative rule; so does an
+            // element with a `Cell` inside, which `&T` can write).
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::VecRetain | crate::check::Builtin::SetRetain))
+                && avs.first().is_some_and(|(t0, _)| plain_shared(&self.body.tys, *t0)) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if let CallTarget::Builtin(
@@ -8406,6 +8404,26 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
             | B::IterSum
             | B::IterProduct
     )
+}
+
+/// True when nothing in a value of type `t` can be written through a
+/// shared reference to it, at any depth: built only from primitives,
+/// `str`, references, `String`, `Vec`, `Box`, `Option`, tuples,
+/// arrays, slices, and the hash tables of such parts. Any other type
+/// (a `Cell` anywhere, a user Adt, `dyn`, a parameter) answers false.
+fn plain_shared(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Unit => true,
+        TyKind::Ref(_, _, i) | TyKind::Array(i, _) | TyKind::Slice(i) => plain_shared(tys, i),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| plain_shared(tys, e)),
+        TyKind::Adt(_, a) => {
+            matches!(
+                tys.builtin_of(t),
+                Some(BuiltinTy::String | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Option | BuiltinTy::Hash(_))
+            ) && tys.args(a).iter().all(|g| g.as_ty().is_none_or(|e| plain_shared(tys, e)))
+        }
+        _ => false,
+    }
 }
 
 /// True when a type holds a `&mut` reference somewhere.
