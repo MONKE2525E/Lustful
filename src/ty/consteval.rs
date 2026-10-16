@@ -1548,7 +1548,13 @@ impl Evaluator {
                 if !extended && !self.is_place(cx, env, *expr) && cx.needs_drop(t) {
                     return Err(drop_diag(cx, t, span));
                 }
-                let (v, rt) = if let ConstValue::Str(_) | ConstValue::StrBytes(_) = v {
+                // A str value stands for a `str` place behind `*s` or
+                // `s[..]`, whose borrow is the `&str` itself; a borrow of
+                // any other `&str` value (`&"ab"`) is a `&&str`.
+                let str_place = matches!(cx.ast().expr(*expr), Expr::Deref(_) | Expr::Index { .. });
+                let (v, rt) = if let ConstValue::Str(_) | ConstValue::StrBytes(_) = v
+                    && str_place
+                {
                     return Ok(Flow::Val((v, t)));
                 } else if let Some(et) = expected
                     && let TyKind::Ref(_, _, s) = cx.tys_ref().kind(et)

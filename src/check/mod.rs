@@ -14619,13 +14619,33 @@ impl<'p> Ctx<'p> {
                         };
                         (vec![], self.tys.intern(TyKind::RawPtr(Mut::from_bool(m), t)))
                     }
-                    // `ptr::eq` and `addr_eq` (w-cinterop): two raw
-                    // pointers of one pointee; references coerce.
+                    // `ptr::eq` (w-cinterop): two raw pointers of one
+                    // pointee; references coerce. `addr_eq::<T, U>`
+                    // compares the addresses of two pointee types.
                     Builtin::PtrEqFn => {
-                        let t = self.callee_turbo_ty(callee, span);
-                        self.deferred_sized.push((t, span));
-                        let rp = self.tys.intern(TyKind::RawPtr(Mut::Shared, t));
-                        (vec![rp, rp], BOOL)
+                        let seg = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs.last(),
+                            _ => None,
+                        };
+                        let written = seg.map(|s| s.type_args()).unwrap_or_default();
+                        let pointees = if seg.is_some_and(|s| self.name(s.name) == "addr_eq") {
+                            if !matches!(written.len(), 0 | 2) {
+                                self.err("L0105", span, "this function takes two type arguments", "Write two types in the `::<...>`.");
+                            }
+                            let mut one = |i: usize| match written.get(i) {
+                                Some(&w) => self.resolve_written(w),
+                                None => self.new_var(false),
+                            };
+                            [one(0), one(1)]
+                        } else {
+                            let t = self.callee_turbo_ty(callee, span);
+                            [t, t]
+                        };
+                        let ps = pointees.map(|t| {
+                            self.deferred_sized.push((t, span));
+                            self.tys.intern(TyKind::RawPtr(Mut::Shared, t))
+                        });
+                        (ps.to_vec(), BOOL)
                     }
                     // `Option::iter(&o)`, `Result::into_iter(r)`, and
                     // kin (fx-option-rest): a method in path form, so

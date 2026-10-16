@@ -264,7 +264,7 @@ impl<'p> Lower<'p> {
     /// True when `&e` is promoted to `'static` (rustc's promotion rules,
     /// a conservative subset): a literal, a negated or cast literal, a
     /// const path check folded, arithmetic over those (never a fn call), a
-    /// unit variant or unit struct,
+    /// unit variant or unit struct, a shared borrow of a promotable value,
     /// or a tuple, array, array repeat, struct literal, or constructor
     /// call of those, whose type needs
     /// no drop and has no interior mutability (`promotable_ty`).
@@ -287,14 +287,20 @@ impl<'p> Lower<'p> {
                     B::Div | B::Rem => matches!(self.p.ast.expr(rhs), Expr::Int(v, _) if *v != 0),
                     _ => true,
                 };
-                op_ok && self.promotable(lhs) && self.promotable(rhs)
+                // On a reference operand (`&1 + 2`) the operator is a trait
+                // call, which is never promoted.
+                let by_ref = |s: &mut Self, x: ExprId| {
+                    let t = s.ty(x);
+                    matches!(s.kind(t), TyKind::Ref(..))
+                };
+                op_ok && !by_ref(self, lhs) && !by_ref(self, rhs) && self.promotable(lhs) && self.promotable(rhs)
             }
             Expr::Cast { expr, .. } => matches!(self.p.ast.expr(*expr), Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_)),
             Expr::Tuple(es) | Expr::Array(es) => es.clone().iter().all(|&x| self.promotable(x)),
             Expr::ArrayRepeat { value, .. } => self.promotable(*value),
-            // A tuple struct, tuple variant, or `Some` constructor call.
+            // A tuple struct, tuple variant, `Some`, `Ok` or `Err` constructor call.
             Expr::Call { args, .. } => {
-                matches!(self.ck.res(e), Res::Variant(..) | Res::OptSome) && args.clone().iter().all(|&x| self.promotable(x))
+                matches!(self.ck.res(e), Res::Variant(..) | Res::OptSome | Res::ResOk | Res::ResErr) && args.clone().iter().all(|&x| self.promotable(x))
             }
             Expr::Path(_) => {
                 self.ck.const_value(e).is_some()
@@ -302,13 +308,15 @@ impl<'p> Lower<'p> {
                     || (matches!(self.ck.res(e), Res::Variant(..)) && !matches!(self.kind(ty), TyKind::FnDef(..)))
             }
             Expr::StructLit { fields, update: None, .. } => fields.clone().iter().all(|f| self.promotable(f.2)),
+            // `&&1`: a shared borrow of a promotable value is a constant too.
+            Expr::Ref { mutable: false, raw: false, expr } => self.promotable(*expr),
             _ => false,
         }
     }
 
     /// True when a value of type `t` may be promoted: no drop, no
     /// interior mutability (scalars, `&str`, shared refs to such, and
-    /// tuples, arrays, `Option`, and this crate's Adts built of them).
+    /// tuples, arrays, `Option`, `Result`, and this crate's Adts built of them).
     fn promotable_ty(&mut self, t: Ty, depth: u32) -> bool {
         if depth > 8 || self.needs_drop_ty(t) {
             return false;
@@ -322,6 +330,9 @@ impl<'p> Lower<'p> {
             _ => {
                 if let Some(inner) = self.body.tys.option_elem(t) {
                     return self.promotable_ty(inner, depth + 1);
+                }
+                if let Some((ok, err)) = self.body.tys.result_args(t) {
+                    return self.promotable_ty(ok, depth + 1) && self.promotable_ty(err, depth + 1);
                 }
                 let Some(a) = self.body.tys.local_adt(t) else { return false };
                 if self.p.is_std_adt(a) {
