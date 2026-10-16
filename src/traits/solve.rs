@@ -1075,6 +1075,9 @@ impl<'g> SolveCx for PureCx<'g> {
         };
         let src = self.deep_resolve(src);
         let dst = self.deep_resolve(dst);
+        if crate::check::tryfrom::slice_try_shape(&self.tys, src, dst) {
+            return Some(g::try_from_slice_error_ty(&mut self.tys));
+        }
         let (sk, dk) = (self.tys.kind(src), self.tys.kind(dst));
         let sort = crate::check::tryfrom::scalar_try_from(sk, dk)?;
         Some(match sort {
@@ -1082,6 +1085,7 @@ impl<'g> SolveCx for PureCx<'g> {
             crate::check::tryfrom::TryErr::Int => g::try_from_int_error_ty(&mut self.tys),
             crate::check::tryfrom::TryErr::CharFrom => g::char_try_from_error_ty(&mut self.tys),
             crate::check::tryfrom::TryErr::FromChar => g::try_from_char_error_ty(&mut self.tys),
+            crate::check::tryfrom::TryErr::Slice => g::try_from_slice_error_ty(&mut self.tys),
         })
     }
 

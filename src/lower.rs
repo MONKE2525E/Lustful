@@ -3686,6 +3686,30 @@ impl<'p> Lower<'p> {
         self.assign(Place::local(s), Rvalue::Use(op), span);
         let copy_s = Operand::Copy(Place::local(s));
         let err_def = self.body.tys.adt_parts(err_ty).map(|(x, _)| x);
+        // In a template the error is still the `TryInto::Error`
+        // projection; the destination shape tells the slice form.
+        let dst_arrayish = match self.kind(dst_ty) {
+            TyKind::Array(..) => true,
+            TyKind::Ref(_, _, i) => matches!(self.kind(i), TyKind::Array(..)),
+            _ => false,
+        };
+        if err_def == Some(gdef::try_from_slice_error_def()) || (dst_arrayish && matches!(self.kind(src_ty), TyKind::Slice(_) | TyKind::Array(..) | TyKind::Ref(..))) {
+            // A slice-to-array conversion (tf-slice): an array
+            // source first becomes its slice; the destination type
+            // tells cgen the length and form.
+            let s_op = match self.kind(src_ty) {
+                TyKind::Array(el, _) => {
+                    let sl = self.body.tys.intern(TyKind::Slice(el));
+                    let rt = self.ref_ty(false, sl);
+                    let t = self.temp(rt);
+                    self.assign(Place::local(t), Rvalue::SliceOf(Place::local(s)), span);
+                    Operand::Move(Place::local(t))
+                }
+                _ => Operand::Move(Place::local(s)),
+            };
+            self.call_into(CallTarget::Builtin(Builtin::SliceTryInto), vec![s_op], d, span);
+            return;
+        }
         if err_def == Some(gdef::infallible_def()) {
             let c = self.temp(dst_ty);
             self.assign(Place::local(c), Rvalue::Cast(copy_s, dst_ty), span);
@@ -3866,9 +3890,22 @@ impl<'p> Lower<'p> {
                 self.set_or_temp(dest, Rvalue::Cast(a, self.ty(e)), self.ty(e), span);
             }
             K::TryIntoCast => {
-                let a = self.operand_derefs(recv, derefs);
-                let src_ty = self.peel(self.ty(recv), derefs);
-                self.try_cast_into(a, src_ty, self.ty(e), dest, span);
+                // A slice-to-array cast (tf-slice) reads the
+                // receiver value itself (the fat slice, Copy for
+                // `&[T]`), not a move out of its deref.
+                let result_ty = self.ty(e);
+                let is_slice_try = self.body.tys.result_args(result_ty).is_some_and(|(_, err)| {
+                    self.body.tys.adt_parts(err).map(|(d, _)| d) == Some(crate::check::generics::try_from_slice_error_def())
+                }) || matches!(self.kind(self.peel(self.ty(recv), derefs)), TyKind::Slice(_));
+                if is_slice_try {
+                    let a = self.operand(recv);
+                    let src_ty = self.ty(recv);
+                    self.try_cast_into(a, src_ty, result_ty, dest, span);
+                } else {
+                    let a = self.operand_derefs(recv, derefs);
+                    let src_ty = self.peel(self.ty(recv), derefs);
+                    self.try_cast_into(a, src_ty, result_ty, dest, span);
+                }
             }
             // core's blanket `IntoIterator for I: Iterator`: the receiver moves through.
             K::IntoIterSelf => {

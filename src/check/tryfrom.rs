@@ -28,6 +28,9 @@ pub enum TryErr {
     /// `core::char::TryFromCharError`: `u8`, `u16`, or `usize`
     /// from `char`.
     FromChar,
+    /// `core::array::TryFromSliceError`: a slice to an array or
+    /// array reference (tf-slice).
+    Slice,
 }
 
 /// The error sort of core's `TryFrom<src> for dst` between scalar
@@ -49,6 +52,19 @@ pub fn scalar_try_from(src: TyKind, dst: TyKind) -> Option<TryErr> {
     })
 }
 
+/// The shape of a slice-to-array pair (no `Copy` check, no
+/// unification): the solver's `Error` normalization reads it on
+/// types it cannot unify (traits/solve.rs).
+pub fn slice_try_shape(tys: &impl crate::ty::TyIntern, src: Ty, dst: Ty) -> bool {
+    let TyKind::Ref(_, sm, si) = tys.kind(src) else { return false };
+    let TyKind::Slice(el) = tys.kind(si) else { return false };
+    match tys.kind(dst) {
+        TyKind::Array(el2, _) => el == el2,
+        TyKind::Ref(_, dm, di) => (dm != Mut::Mut || sm == Mut::Mut) && matches!(tys.kind(di), TyKind::Array(el2, _) if el2 == el),
+        _ => false,
+    }
+}
+
 /// True for the concrete scalar kinds the pair table covers.
 fn scalar_kind(k: TyKind) -> bool {
     matches!(k, TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
@@ -62,7 +78,36 @@ impl<'p> Ctx<'p> {
             TryErr::Int => generics::try_from_int_error_ty(&mut self.tys),
             TryErr::CharFrom => generics::char_try_from_error_ty(&mut self.tys),
             TryErr::FromChar => generics::try_from_char_error_ty(&mut self.tys),
+            TryErr::Slice => generics::try_from_slice_error_ty(&mut self.tys),
         }
+    }
+
+    /// Core's slice-to-array `TryFrom` pairs: `&[T]` and
+    /// `&mut [T]` to `[T; N]` (`T: Copy`), `&[T]` to `&[T; N]`, and
+    /// `&mut [T]` to `&mut [T; N]`. Some(Slice) for exactly those,
+    /// with the elements unified; None otherwise.
+    pub(super) fn slice_try_from(&mut self, src: Ty, dst: Ty) -> Option<TryErr> {
+        let TyKind::Ref(_, sm, si) = self.kind(src) else { return None };
+        let TyKind::Slice(el) = self.kind(si) else { return None };
+        match self.kind(dst) {
+            TyKind::Array(el2, _) => {
+                let el = self.deep(el);
+                if !self.unify(el, el2) || !crate::check::collect::is_copy(self.p, &self.tys, el) {
+                    return None;
+                }
+            }
+            TyKind::Ref(_, dm, di) => {
+                let TyKind::Array(el2, _) = self.kind(di) else { return None };
+                if dm == Mut::Mut && sm != Mut::Mut {
+                    return None;
+                }
+                if !self.unify(el, el2) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        Some(TryErr::Slice)
     }
 
     /// Selection for a `TryFrom` or `TryInto` obligation between
@@ -83,6 +128,18 @@ impl<'p> Ctx<'p> {
         // (`U: TryInto<u8>` in a template), never this table's.
         if matches!(sk, TyKind::Param(_) | TyKind::Projection(..)) || matches!(dk, TyKind::Param(_) | TyKind::Projection(..)) {
             return None;
+        }
+        // The slice-to-array pairs, ahead of the scalar table
+        // (tf-slice): a checked length test with no impl record.
+        if let Some(sort) = self.slice_try_from(src, dst) {
+            let err_ty = self.try_err_ty(sort);
+            let assoc = if tr.def == lang.try_from { lang.assoc_try_from_error } else { lang.assoc_try_into_error };
+            for (a, ga) in self.tys.bindings(tr.bindings).to_vec() {
+                if a == assoc && ga.as_ty().is_some_and(|want| !self.unify(err_ty, want)) {
+                    return Some(Selection::NoImpl);
+                }
+            }
+            return Some(Selection::ParamEvidence(usize::MAX));
         }
         // A non-scalar side (`Even: TryFrom<{integer}>`) is the impl
         // index's: user impls and the blankets.
@@ -121,6 +178,9 @@ impl<'p> Ctx<'p> {
         } else {
             return None;
         };
+        if let Some(sort) = self.slice_try_from(src, dst) {
+            return Some(self.try_err_ty(sort));
+        }
         let (sk, dk) = (self.kind(src), self.kind(dst));
         let sort = scalar_try_from(sk, dk)?;
         Some(self.try_err_ty(sort))
@@ -161,6 +221,14 @@ impl<'p> Ctx<'p> {
         };
         let src = self.deep(src);
         let (sk, dk) = (self.kind(src), self.kind(base));
+        // The slice-to-array forms (tf-slice): the same checked
+        // cast res, lowered by the destination type.
+        if hint_ok && let Some(sort) = self.slice_try_from(src, base) {
+            self.set_res(callee, Res::TryFromCast);
+            self.set_res(e, Res::TryFromCast);
+            let err = self.try_err_ty(sort);
+            return Some(self.tys.mk_result(base, err));
+        }
         if hint_ok && scalar_kind(dk) {
             // An unsuffixed literal argument takes its fallback
             // type when that pair converts, as in rustc.
@@ -283,6 +351,17 @@ impl<'p> Ctx<'p> {
         let hint = hint.filter(|h| h.def == lang.try_into)?;
         let dst = self.deep(self.tys.args(hint.args).get(1).and_then(|g| g.as_ty())?);
         let (sk, dk) = (self.kind(base), self.kind(dst));
+        if let Some(sort) = self.slice_try_from(base, dst) {
+            let src = self.expr(args[0], Some(base));
+            if !self.unify(src, base) {
+                self.mismatch(span, base, src);
+                return Some(ERROR);
+            }
+            self.set_res(callee, Res::TryFromCast);
+            self.set_res(e, Res::TryFromCast);
+            let err = self.try_err_ty(sort);
+            return Some(self.tys.mk_result(dst, err));
+        }
         if !scalar_kind(sk) || !scalar_kind(dk) {
             return None;
         }
@@ -374,6 +453,103 @@ impl<'p> Ctx<'p> {
         let proj_args = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(dst)]);
         let err = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_try_into_error), proj_args));
         let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(dst)]);
+        let tr = TraitRef { def: lang.try_into, args: args_id, bindings: EMPTY_BINDINGS };
+        self.obl.push_trait_at(tr, name_span, 0);
+        method::defer_trait_method(self, e, tr, name, Vec::new(), derefs, Autoref::None);
+        self.set_res(e, Res::PrimOp { kind: PrimOpKind::TryIntoCast, derefs });
+        Some(self.tys.mk_result(dst, err))
+    }
+
+    /// `slice.try_into()` to an array or array-reference target
+    /// (tf-slice): the same checked cast res as the scalar form,
+    /// lowered by the destination type. The receiver is a slice
+    /// place, a slice reference, or an array (through its slice);
+    /// a `&mut [T; N]` target needs a written `&mut [T]` receiver
+    /// (a mutable place form is not taken yet). None when the
+    /// receiver is none of these, so the trait search runs.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn slice_try_into_method(
+        &mut self,
+        e: ExprId,
+        rt: Ty,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+        builtin_only: bool,
+    ) -> Option<Ty> {
+        let p = self.p;
+        let lang = &p.gx.lang;
+        if self.name(name) != "try_into" {
+            return None;
+        }
+        // The src type the `TryFrom` pair is read on: a written
+        // slice reference as itself; a slice place or array as a
+        // shared slice of itself.
+        let src = match self.kind(rt) {
+            TyKind::Ref(_, _, i) if matches!(self.kind(i), TyKind::Slice(_)) => rt,
+            _ => match self.kind(base) {
+                TyKind::Slice(el) => {
+                    let sl = self.tys.intern(TyKind::Slice(el));
+                    self.tys.mk_ref(false, sl)
+                }
+                TyKind::Array(el, _) => {
+                    let sl = self.tys.intern(TyKind::Slice(el));
+                    self.tys.mk_ref(false, sl)
+                }
+                _ => return None,
+            },
+        };
+        let from_turbofish = match turbofish.first() {
+            Some(ast::GenericArg::Type(t)) => Some(self.resolve_written(*t)),
+            _ => None,
+        };
+        if turbofish.len() > 1 {
+            self.err("L0105", name_span, "this method takes 1 type argument", "Write one target type.");
+            return Some(ERROR);
+        }
+        let replayed = self
+            .replayed_trait_ref(e, lang.try_into)
+            .and_then(|r| self.tys.args(r.args).get(1).and_then(|g| g.as_ty()))
+            .map(|t| self.deep(t));
+        let exp_pair = expected.map(|t| self.deep(t)).and_then(|t| self.tys.result_args(t));
+        let known = from_turbofish.or(replayed).or_else(|| exp_pair.map(|(ok, _)| self.deep(ok)));
+        if let Some(dst) = known {
+            // A target that is no array form is another conversion's.
+            let arrayish = match self.kind(dst) {
+                TyKind::Array(..) => true,
+                TyKind::Ref(_, _, i) => matches!(self.kind(i), TyKind::Array(..)),
+                _ => false,
+            };
+            if !arrayish {
+                return None;
+            }
+            let Some(sort) = self.slice_try_from(src, dst) else {
+                let (sn, dn) = (self.tn(src), self.tn(dst));
+                self.err("L0612", name_span, format!("no impl of `TryFrom<{sn}>` for `{dn}`"), "Change the target type.");
+                return Some(ERROR);
+            };
+            if !builtin_only && self.prim_lang_guard(name, name_span, args, lang.try_into, base) {
+                return Some(ERROR);
+            }
+            self.check_args(&[], args, name_span);
+            self.set_res(e, Res::PrimOp { kind: PrimOpKind::TryIntoCast, derefs });
+            let err = self.try_err_ty(sort);
+            return Some(self.tys.mk_result(dst, err));
+        }
+        // The target is a later use's to fix: as the scalar form,
+        // with the slice as the obligation's Self (the pair the
+        // selection answers).
+        if !args.is_empty() {
+            self.check_args(&[], args, name_span);
+        }
+        let dst = self.new_var(false);
+        let proj_args = self.tys.intern_args(&[GenericArg::Ty(src), GenericArg::Ty(dst)]);
+        let err = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_try_into_error), proj_args));
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(src), GenericArg::Ty(dst)]);
         let tr = TraitRef { def: lang.try_into, args: args_id, bindings: EMPTY_BINDINGS };
         self.obl.push_trait_at(tr, name_span, 0);
         method::defer_trait_method(self, e, tr, name, Vec::new(), derefs, Autoref::None);

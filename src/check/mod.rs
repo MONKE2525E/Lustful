@@ -517,6 +517,10 @@ pub enum Builtin {
     /// `core::slice::from_ref(&T) -> &[T]` and `from_mut`
     /// (fx-option-rest): a one-element slice of the argument.
     SliceFromRef,
+    /// The slice-to-array `TryFrom` conversions (tf-slice): the
+    /// destination `Result` type tells the array length and form;
+    /// emitted at the call terminator in cgen, like `DefaultGlue`.
+    SliceTryInto,
     /// The safe raw pointer surface (w-cinterop): `core::ptr::from_ref`
     /// and `from_mut` (the reference value as a raw pointer).
     PtrFromRef,
@@ -13890,6 +13894,10 @@ impl<'p> Ctx<'p> {
         // `try_into()` to a scalar target: the checked cast
         // (check/tryfrom.rs).
         if let Some(ret) = self.prim_try_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
+            return ret;
+        }
+        // `try_into()` from a slice to an array target (check/tryfrom.rs).
+        if let Some(ret) = self.slice_try_into_method(e, rt, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
             return ret;
         }
         // `into_iter()` on a value that is its own iterator.

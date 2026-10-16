@@ -342,6 +342,9 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut 
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::try_from_char_error_def()) == Some(*a) => {
             format!("  (void)p; return lust_f_pad(f, {});\n", lit("unicode code point out of range"))
         }
+        CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::try_from_slice_error_def()) == Some(*a) => {
+            format!("  (void)p; return lust_f_pad(f, {});\n", lit("could not convert slice to array"))
+        }
         // core's parse errors (tf-str): str Display of core's texts,
         // by the kind field's discriminant.
         CTy::Adt(a) if p.tys.local_adt_of(crate::check::generics::parse_int_error_def()) == Some(*a) => {

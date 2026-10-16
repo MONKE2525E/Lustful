@@ -829,6 +829,18 @@ pub fn char_error_kind_def() -> DefId {
     std_adt_table()[23].2
 }
 
+/// The def of `core::array::TryFromSliceError` (tf-slice), a tuple
+/// struct over `()`. Only `array::` paths reach it (no flat name,
+/// like `TryFromIntError`).
+pub fn try_from_slice_error_def() -> DefId {
+    std_adt_table()[24].2
+}
+
+/// The `core::array::TryFromSliceError` type.
+pub fn try_from_slice_error_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(try_from_slice_error_def(), EMPTY_ARGS))
+}
+
 /// The `core::sync::atomic::Ordering` type.
 pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
@@ -857,14 +869,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 24] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 25] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 24] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 24]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 25] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 25]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -892,6 +904,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 24] {
             (21, "ParseBoolError", adt(&["core", "str"], "ParseBoolError"), false),
             (22, "ParseCharError", adt(&["core", "char"], "ParseCharError"), false),
             (23, "CharErrorKind", adt(&["core", "char"], "CharErrorKind"), true),
+            (24, "TryFromSliceError", adt(&["core", "array"], "TryFromSliceError"), false),
         ]
     })
 }
@@ -900,7 +913,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 24] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -946,6 +959,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("num", "ParseFloatError", parse_float_error_def()),
         ("str", "ParseBoolError", parse_bool_error_def()),
         ("char", "ParseCharError", parse_char_error_def()),
+        ("array", "TryFromSliceError", try_from_slice_error_def()),
     ]
         .into_iter()
         .find(|(m, n, _)| m == module && n == name)
@@ -7616,7 +7630,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
         // core's `Display` for its conversion errors (the text is
         // `display_glue_body`'s): a record, so the source `Error`
         // impls in library/core/src/error.rs meet their supertrait.
-        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def()] {
+        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def(), try_from_slice_error_def()] {
             let t = p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
             insert_synthetic(p, &mut ordinal, lang.display, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }

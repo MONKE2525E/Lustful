@@ -1692,6 +1692,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/str/ParseBoolError",
     "core/char/ParseCharError",
     "std/char/ParseCharError",
+    "core/array/TryFromSliceError",
+    "std/array/TryFromSliceError",
 ];
 
 const STD_TRAIT_PATHS: &[&str] = &[

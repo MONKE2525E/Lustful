@@ -2682,6 +2682,40 @@ impl FnGen<'_, '_> {
                 self.want(Glue::Default, dest_cty);
                 format!("default_{}()", mangle(dest_cty))
             }
+            // A slice-to-array `TryFrom` (tf-slice): the destination
+            // `Result` type tells the array length and whether the
+            // Ok form is the array or a reference to it.
+            CallTarget::Builtin(Builtin::SliceTryInto) => {
+                let (sv, sct) = self.operand(&args[0], loc, post);
+                let CTy::Result(ok, err) = dest_cty.clone() else { unreachable!() };
+                let (arr, by_ref) = match &*ok {
+                    CTy::Array(..) => ((*ok).clone(), false),
+                    CTy::Ref(a) => ((**a).clone(), true),
+                    _ => unreachable!(),
+                };
+                let CTy::Array(_, n) = &arr else { unreachable!() };
+                let n = *n;
+                let (ptr, len) = match &sct {
+                    CTy::Slice(_) => (format!("{sv}.ptr"), format!("{sv}.len")),
+                    CTy::Ref(inner) if matches!(&**inner, CTy::Slice(_)) => (format!("{sv}->ptr"), format!("{sv}->len")),
+                    _ => unreachable!(),
+                };
+                let (ok_ct, err_ct) = (ctype(&ok), ctype(&err));
+                let res = CTy::Result(ok, err);
+                collect_types(&res, &mut self.sig_types);
+                let (t, i) = (self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
+                let ok_assign = if by_ref {
+                    format!("{ok_f} = ({ok_ct}){ptr};")
+                } else {
+                    format!("for (uint64_t {i} = 0; {i} < {n}; {i}++) {ok_f}.v[{i}] = {ptr}[{i}];")
+                };
+                let te = self.tmp();
+                let _ = writeln!(self.out, "    {} {t}; {err_ct} {te}; {te}.f0 = ((lust_Unit){{}});", ctype(&res));
+                let _ = writeln!(self.out, "    if ({len} == {n}) {{ {ok_assign} {ok_d} }} else {{ {err_f} = {te}; {err_d} }}");
+                t
+            }
             CallTarget::Builtin(b) => match self.hash_builtin(b, args, dest_cty, loc, post) {
                 Some(v) => v,
                 None => match self.split_builtin(b, args, dest_cty, loc, post) {
@@ -4212,6 +4246,7 @@ impl FnGen<'_, '_> {
                 format!("&(*{v})->v")
             }
             B::DefaultGlue => unreachable!("the default glue call is emitted at its call terminator"),
+            B::SliceTryInto => unreachable!("the slice-to-array call is emitted at its call terminator"),
             B::TlsWith
             | B::TlsTryWith
             | B::TlsWithBorrow

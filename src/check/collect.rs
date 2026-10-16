@@ -3422,6 +3422,13 @@ pub fn collect_reuse(
                     vec![unit("EmptyString", 0), unit("TooManyChars", 1)],
                     Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                 ),
+                // core: `#[derive(Debug, Copy, Clone)] pub struct
+                // TryFromSliceError(())` (tf-slice; no PartialEq).
+                24 => (
+                    generics::try_from_slice_error_def(),
+                    vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", UNIT)], disc: 0, non_exhaustive: false }],
+                    Derives { debug: true, clone: true, copy: true, ..Derives::default() },
+                ),
                 17 => (
                     generics::infallible_def(),
                     Vec::new(),
@@ -8139,6 +8146,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::borrow_error_def()
                         || d == generics::borrow_mut_error_def()
                         || d == generics::try_from_int_error_def()
+                        || d == generics::try_from_slice_error_def()
                         || d == generics::char_try_from_error_def()
                         || d == generics::try_from_char_error_def()
                         || d == generics::parse_int_error_def()
