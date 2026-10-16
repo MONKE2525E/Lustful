@@ -1693,7 +1693,7 @@ fn resolved_setup(
     std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
     user_src: &str,
     root_lexed: Option<lexer::Lexed>,
-    route_std_mods: Option<u16>,
+    route_std_mods: Option<u32>,
     crate_ids_default: CrateIds,
     std_ranges: &mut Vec<(u32, u32, crate::ty::lang::ShippedCrate)>,
     std_routes: &mut Vec<&'static crate::ty::lang::StdFnDef>,

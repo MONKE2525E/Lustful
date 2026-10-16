@@ -153,10 +153,18 @@ pub const STD_MODULES: &[StdModule] = &[
         full: false,
         triggers: &["BTreeMap", "BTreeSet", "VecDeque", "btree_map", "btree_set", "vec_deque"],
     },
+    StdModule {
+        name: "__lust_core_iter",
+        rel: "core/src/iter.rs",
+        krate: ShippedCrate::Core,
+        paths: &[("core", "iter"), ("std", "iter")],
+        full: false,
+        triggers: &["once", "Once"],
+    },
 ];
 
 // `needs` gives one bit per row.
-const _: () = assert!(STD_MODULES.len() <= 16);
+const _: () = assert!(STD_MODULES.len() <= 32);
 
 /// The std source modules `src` can mention, one bit per
 /// `STD_MODULES` row: a row's trigger (its module segment, or for an
@@ -164,8 +172,8 @@ const _: () = assert!(STD_MODULES.len() <= 16);
 /// runs on every compile, so each trigger is first a `contains` test (a
 /// vectorized scan), and only a hit looks for a whole-word match. A hit
 /// only costs the splice, and a real use always names a trigger.
-pub fn needs(src: &str) -> u16 {
-    let mut mask = 0u16;
+pub fn needs(src: &str) -> u32 {
+    let mut mask = 0u32;
     for (k, m) in STD_MODULES.iter().enumerate() {
         // Rows with the same triggers (the two time modules) share one scan.
         let hit = match STD_MODULES[..k].iter().position(|e| e.triggers == m.triggers) {

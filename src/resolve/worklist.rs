@@ -162,14 +162,14 @@ pub fn route_root(root_text: &str, interner: &Interner) -> (bool, Option<lexer::
 /// (else false), found in the same parallel pass: each piece ends right
 /// after a newline, so no word crosses a cut and the file's answer is
 /// any piece's answer.
-pub fn route_root_std(root_text: &str, interner: &Interner, std: bool) -> (bool, u16, Option<lexer::Lexed>) {
+pub fn route_root_std(root_text: &str, interner: &Interner, std: bool) -> (bool, u32, Option<lexer::Lexed>) {
     if let Some(pieces) = route_pieces(root_text) {
         let answers = par_map(&pieces, |&(a, b)| {
             let lexed = lexer::lex(&root_text[a..b], FileId(0), a as u32, interner).ok()?;
             let std_mods = if std { crate::stdmods::needs(&root_text[a..b]) } else { 0 };
             piece_cut_ok(&lexed, b, root_text.len()).then(|| (route_keywords(&lexed, interner), std_mods, lexed))
         });
-        if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, u16, lexer::Lexed)>>>() {
+        if let Some(answers) = answers.into_iter().collect::<Option<Vec<(bool, u32, lexer::Lexed)>>>() {
             let std_mods = answers.iter().fold(0, |m, a| m | a.1);
             // The brace scan needs the whole file in order: each piece but
             // the last ends in an end-of-input token that `join_lexed` drops.
