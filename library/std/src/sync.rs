@@ -35,7 +35,7 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     pub fn force(this: &LazyLock<T, F>) -> &T {
         this.once.get_or_init(|| match core::intrinsics::once_take(&this.init) {
             Some(f) => f(),
-            None => panic!("LazyLock instance has previously been poisoned"),
+            None => panic!("LazyLock instance has previously been poisoned"), //@ std/src/sync/lazy_lock.rs:415:5
         })
     }
 
@@ -43,7 +43,7 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
         LazyLock::force(this);
         match this.once.get_mut() {
             Some(v) => v,
-            None => unreachable!(),
+            None => unreachable!(), //@ never
         }
     }
 
@@ -97,10 +97,18 @@ impl Once {
         Once { done: std::sync::OnceLock::new(), poisoned: std::sync::atomic::AtomicBool::new(false) }
     }
 
+    /// `#[track_caller]` as std's: a poisoned `Once` panics at the
+    /// caller. The check inside the closure only runs when another thread
+    /// poisons the `Once` while this call waits; that panic reports lust's
+    /// line (a known gap: the closure cannot take the caller's location).
+    #[track_caller]
     pub fn call_once<F: FnOnce()>(&self, f: F) {
+        if self.done.get().is_none() && self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            panic!("Once instance has previously been poisoned");
+        }
         self.done.get_or_init(|| {
             if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
-                panic!("Once instance has previously been poisoned");
+                panic!("Once instance has previously been poisoned"); //@ gap
             }
             self.poisoned.store(true, std::sync::atomic::Ordering::Release);
             f();

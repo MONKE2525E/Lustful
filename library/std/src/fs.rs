@@ -124,7 +124,7 @@ impl OpenOptions {
         let bytes = bytes_of(path);
         if bytes.contains(&0) {
             return match status(-1) {
-                Ok(()) => unreachable!(),
+                Ok(()) => unreachable!(), //@ never
                 Err(e) => Err(e),
             };
         }

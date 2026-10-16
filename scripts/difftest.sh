@@ -136,21 +136,9 @@ sanitize_case() {
 }
 
 # lust_stderr <case file> <lust stderr>: lust's stderr as difftest compares it to rustc's
-# (mask_stderr, the case path as @CASE@). Known gap (source std, W-STD): lust's std
-# source is spliced after the case's own text, so a panic raised inside it names a case
-# line past the file's end, where rustc names its library/ line (or, for a track_caller
-# std method, the caller). Only that location takes rustc's text; the rest stays exact.
-lust_stderr() {
-  local n at
-  n=$(wc -l <"$1")
-  at=$(mask_stderr rustc.stderr | sed -nE "s/^thread '[^']*' \(TID\) panicked at (.*):$/\1/p" | head -1)
-  mask_stderr "$2" | sed "s|$1|@CASE@|g" | awk -v n="$n" -v at="$at" '
-    at != "" && /^thread .* panicked at @CASE@:[0-9]+:[0-9]+:$/ {
-      k = split($0, w, ":")
-      if (w[k - 2] + 0 > n + 1) { sub(/@CASE@:[0-9]+:[0-9]+:$/, at ":") }
-    }
-    { print }'
-}
+# (mask_stderr, the case path as @CASE@). A panic inside lust's shipped std source reports
+# std's own library/ path and line (src/stdloc.rs), so the whole text compares exactly.
+lust_stderr() { mask_stderr "$2" | sed "s|$1|@CASE@|g"; }
 
 if [ "${PANIC:-abort}" = unwind ]; then
   lust_flags=(-C panic=unwind)

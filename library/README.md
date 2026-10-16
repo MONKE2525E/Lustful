@@ -157,7 +157,11 @@ defined there are std types: user inherent impls and orphan impls on
 them reject (L0616), and layout queries on them reject (L0652), because
 std's niche fields (`Nanoseconds`) are plain integers here. Rules for
 these files: stable items only, `const fn` exactly where std has it,
-std's panic messages, and `Self::` in associated const values.
+std's panic messages, `#[track_caller]` exactly where std has it, a
+`//@ <std path>:L:C` marker (rustc's location) or `//@ never` on each
+panic site outside a `#[track_caller]` fn (src/stdloc.rs; the std
+platform crate follows the same rule), and `Self::` in associated const
+values.
 
 | Std paths | File | Items | Notes |
 |---|---|---|---|

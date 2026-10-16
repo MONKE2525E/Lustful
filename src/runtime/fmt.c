@@ -647,6 +647,11 @@ int lust_f_fnptr(lust_Formatter *f, const void *p) {
 
 static int lust_f_alt(const lust_Formatter *f) { return (f->flags & LUST_FLAG_ALT) != 0; }
 
+/* panic=unwind: a field or entry fmt impl that panicked returns with its
+   panic pending. Rust's unwinding leaves the builder there, so the
+   builder fails: it writes nothing more (no `, `, `]`, or `}`). */
+static int lust_f_unwinding(void) { return lust_unw_pending && lust_unw_mine(); }
+
 void lust_dstruct_new(lust_DebugStruct *d, lust_Formatter *f, lust_str name) {
     d->fmt = f;
     d->err = (uint8_t)lust_f_write_str(f, name);
@@ -676,7 +681,7 @@ fail:
 }
 
 void lust_dstruct_field_end(lust_DebugStruct *d, lust_fmt_slot *s, int err) {
-    if (err || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) d->err = 1;
+    if (err || lust_f_unwinding() || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) d->err = 1;
     d->has_fields = 1;
 }
 
@@ -730,7 +735,7 @@ fail:
 }
 
 void lust_dtuple_field_end(lust_DebugTuple *d, lust_fmt_slot *s, int err) {
-    if (err || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) d->err = 1;
+    if (err || lust_f_unwinding() || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) d->err = 1;
     d->fields++;
 }
 
@@ -791,7 +796,7 @@ fail:
 }
 
 void lust_dlist_entry_end(lust_DebugList *d, lust_fmt_slot *s, int err) {
-    if (err || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) d->err = 1;
+    if (err || lust_f_unwinding() || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) d->err = 1;
     d->has_fields = 1;
 }
 
@@ -850,7 +855,7 @@ fail:
 
 void lust_dmap_key_end(lust_DebugMap *d, lust_fmt_slot *s, int err) {
     lust_Formatter *w = lust_f_alt(d->fmt) ? &s->f : d->fmt;
-    if (err || lust_f_write_str(w, lust_cstr(": "))) {
+    if (err || lust_f_unwinding() || lust_f_write_str(w, lust_cstr(": "))) {
         d->err = 1;
         return;
     }
@@ -870,7 +875,7 @@ lust_Formatter *lust_dmap_value(lust_DebugMap *d, lust_fmt_slot *s, lust_loc loc
 }
 
 void lust_dmap_value_end(lust_DebugMap *d, lust_fmt_slot *s, int err) {
-    if (err || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) {
+    if (err || lust_f_unwinding() || (lust_f_alt(d->fmt) && lust_f_write_str(&s->f, lust_cstr(",\n")))) {
         d->err = 1;
     } else {
         d->has_key = 0;

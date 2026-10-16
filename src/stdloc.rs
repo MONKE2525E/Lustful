@@ -13,7 +13,8 @@
 // line of a fn without `#[track_caller]` (a `#[track_caller]` fn reports its
 // caller's location, as rustc does). `//@ never` marks a site that cannot
 // panic, and `//@ gap` a known gap whose panic reports lust's line (say why
-// next to it).
+// next to it). The lint test below wants a marker on each explicit panic
+// site outside a `#[track_caller]` fn.
 //
 // The marker path indexes `STD_FILES`, which must equal `lust_std_files` in
 // src/runtime/panic.c (a test checks it): the packed location carries the
@@ -67,7 +68,7 @@ pub enum Marker {
 }
 
 /// The marker of the `//@` comment on `line`, if any. A malformed marker or
-/// an unknown path is a std authoring bug.
+/// an unknown path is a std authoring bug; the test below rejects both.
 pub fn parse_marker(line: &str) -> Option<Result<Marker, String>> {
     let at = line.find("//@ ")?;
     let text = line[at + 4..].trim();
@@ -169,6 +170,63 @@ mod tests {
         let paths: Vec<&str> = body.lines().filter_map(|l| l.trim().strip_prefix("LUST_STD_SRC \"")?.strip_suffix("\",")).collect();
         assert_eq!(paths, STD_FILES);
         assert!(STD_FILES.len() <= 0x40, "index 0x40 is the pow bit");
+    }
+
+    /// Every marker in the shipped std source parses, and every explicit
+    /// panic site (`panic!`, `assert!`, `unreachable!`, `expect`, `unwrap`)
+    /// outside a `#[track_caller]` fn has a marker on its line: without
+    /// one, its panic would name a line of lust's text under the user's
+    /// file name.
+    #[test]
+    fn std_panic_sites_have_markers() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("library");
+        let mut bad = Vec::new();
+        for dir in ["core/src", "alloc/src", "std/src"] {
+            let mut files: Vec<_> = std::fs::read_dir(root.join(dir)).unwrap().map(|e| e.unwrap().path()).collect();
+            files.sort();
+            for path in files.into_iter().filter(|p| p.extension().is_some_and(|e| e == "rs")) {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let rel = path.strip_prefix(&root).unwrap().display().to_string();
+                // The lang enum methods splice as one block, not a hidden
+                // module, so `site` reads no marker there: every panic in
+                // them is in a `#[track_caller]` fn or unreachable.
+                if rel == "core/src/option.rs" || rel == "core/src/result.rs" {
+                    continue;
+                }
+                bad.extend(unmarked_sites(&text).into_iter().map(|(n, l)| format!("library/{rel}:{n}: {l}")));
+            }
+        }
+        assert!(bad.is_empty(), "std panic sites without a `//@` marker (see src/stdloc.rs):\n{}", bad.join("\n"));
+    }
+
+    /// The explicit panic sites of `text` outside `#[track_caller]` fns
+    /// whose line has no valid marker, as (line, text). A lexical scan: a
+    /// fn's attribute is the `#[track_caller]` line right above it.
+    fn unmarked_sites(text: &str) -> Vec<(usize, String)> {
+        const SITES: &[&str] = &["panic!(", "assert!(", "assert_eq!(", "assert_ne!(", "unreachable!(", ".expect(", ".unwrap()"];
+        let mut out = Vec::new();
+        let (mut tc, mut pending) = (false, false);
+        for (i, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if code.starts_with("#[track_caller]") {
+                pending = true;
+            } else if !code.starts_with("#[") && (code.contains("fn ") && (code.starts_with("fn ") || code.contains(" fn "))) {
+                tc = pending;
+                pending = false;
+            }
+            let code = code.split("//").next().unwrap_or("");
+            if tc || !SITES.iter().any(|s| code.contains(s)) {
+                continue;
+            }
+            match parse_marker(line) {
+                Some(Ok(_)) => {}
+                _ => out.push((i + 1, line.trim().to_string())),
+            }
+        }
+        out
     }
 
     #[test]

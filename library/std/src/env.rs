@@ -111,20 +111,16 @@ impl Iterator for Vars {
 
     fn next(&mut self) -> Option<(String, String)> {
         match self.inner.next() {
-            Some((k, v)) => Some((unicode(k), unicode(v))),
+            Some((k, v)) => {
+                let k = k.into_string().unwrap(); //@ std/src/env.rs:168:57
+                let v = v.into_string().unwrap(); //@ std/src/env.rs:168:83
+                Some((k, v))
+            }
             None => None,
         }
     }
 }
 
-/// The text of an environment name or value; panics as std's
-/// `into_string().unwrap()` does when it is not valid Unicode.
-fn unicode(s: OsString) -> String {
-    match s.into_string() {
-        Ok(text) => text,
-        Err(e) => panic!("called `Result::unwrap()` on an `Err` value: {:?}", e),
-    }
-}
 
 /// The environment when called, as `OsString` pairs.
 pub fn vars_os() -> VarsOs {

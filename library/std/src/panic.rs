@@ -81,7 +81,7 @@ type Hook = Option<Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>>;
 /// Installs `hook`, dropping the one before it.
 pub fn set_hook(hook: Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>) {
     if std::thread::panicking() {
-        panic!("cannot modify the panic hook from a panicking thread");
+        panic!("cannot modify the panic hook from a panicking thread"); //@ std/src/panicking.rs:144:9
     }
     let old: Hook = core::intrinsics::panic_hook_swap(Some(hook));
     core::intrinsics::panic_hook_custom(true);
@@ -92,7 +92,7 @@ pub fn set_hook(hook: Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>) {
 /// none was installed).
 pub fn take_hook() -> Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static> {
     if std::thread::panicking() {
-        panic!("cannot modify the panic hook from a panicking thread");
+        panic!("cannot modify the panic hook from a panicking thread"); //@ std/src/panicking.rs:184:9
     }
     let old: Hook = core::intrinsics::panic_hook_swap(None);
     core::intrinsics::panic_hook_custom(false);

@@ -67,13 +67,13 @@ impl<T> OnceCell<T> {
         if self.inner.is_none() {
             let value = f();
             if self.inner.is_some() {
-                panic!("reentrant init");
+                panic!("reentrant init"); //@ core/src/cell/once.rs:325:66
             }
             core::intrinsics::once_init(&self.inner, value);
         }
         match &self.inner {
             Some(v) => v,
-            None => unreachable!(),
+            None => unreachable!(), //@ never
         }
     }
 
@@ -151,12 +151,12 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
                     let value = f();
                     core::intrinsics::once_init(&this.cell.inner, value);
                 }
-                None => panic!("LazyCell instance has previously been poisoned"),
+                None => panic!("LazyCell instance has previously been poisoned"), //@ core/src/cell/lazy.rs:383:5
             }
         }
         match &this.cell.inner {
             Some(v) => v,
-            None => unreachable!(),
+            None => unreachable!(), //@ never
         }
     }
 
@@ -167,12 +167,12 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
                     let value = f();
                     core::intrinsics::once_init(&this.cell.inner, value);
                 }
-                None => panic!("LazyCell instance has previously been poisoned"),
+                None => panic!("LazyCell instance has previously been poisoned"), //@ core/src/cell/lazy.rs:383:5
             }
         }
         match &mut this.cell.inner {
             Some(v) => v,
-            None => unreachable!(),
+            None => unreachable!(), //@ never
         }
     }
 

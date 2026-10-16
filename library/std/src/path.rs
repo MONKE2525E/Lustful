@@ -885,7 +885,7 @@ impl PathBuf {
         let extension = extension.as_ref();
         for &b in extension.as_encoded_bytes() {
             if b == b'/' {
-                panic!("extension cannot contain path separators: {:?}", extension);
+                panic!("extension cannot contain path separators: {:?}", extension); //@ std/src/path.rs:385:13
             }
         }
         let end = match self.file_stem_end() {

@@ -411,7 +411,7 @@ pub trait Write {
         while !rest.is_empty() {
             match self.write(rest) {
                 Ok(0) => return Err(Error::simple_message(ErrorKind::WriteZero, "failed to write whole buffer")),
-                Ok(n) => rest = &rest[n..],
+                Ok(n) => rest = &rest[n..], //@ core/src/io/write.rs:220:36
                 Err(e) => {
                     if !e.is_interrupted() {
                         return Err(e);
@@ -697,7 +697,7 @@ pub(crate) fn read_to_end_default<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>
                     Ok(0) => return Ok(buf.len() - start),
                     Ok(n) => {
                         let cap_before = buf.capacity();
-                        buf.extend_from_slice(&probe[..n]);
+                        buf.extend_from_slice(&probe[..n]); //@ alloc/src/io/read.rs:878:57
                         if buf.capacity() != cap_before {
                             probe_ok = false;
                         }
@@ -716,7 +716,13 @@ pub(crate) fn read_to_end_default<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>
         let mut chunk: Vec<u8> = vec![0u8; spare];
         match r.read(&mut chunk) {
             Ok(0) => return Ok(buf.len() - start),
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                // std reads into the spare capacity through a cursor,
+                // whose `advance_checked` asserts the count.
+                let init_unfilled = chunk.len();
+                assert!(n <= init_unfilled); //@ core/src/io/borrowed_buf.rs:287:9
+                buf.extend_from_slice(&chunk[..n]);
+            }
             Err(e) => {
                 if !e.is_interrupted() {
                     return Err(e);
@@ -739,7 +745,7 @@ pub trait Read {
                 Ok(0) => return Err(Error::simple_message(ErrorKind::UnexpectedEof, "failed to fill whole buffer")),
                 Ok(n) => {
                     let rest = buf;
-                    buf = &mut rest[n..];
+                    buf = &mut rest[n..]; //@ alloc/src/io/read.rs:1031:31
                 }
                 Err(e) => {
                     if !e.is_interrupted() {
@@ -988,7 +994,7 @@ impl BufRead for &[u8] {
 
     fn consume(&mut self, amt: usize) {
         let cur: &[u8] = *self;
-        *self = &cur[amt..];
+        *self = &cur[amt..]; //@ alloc/src/io/impls.rs:389:22
     }
 }
 
@@ -1199,7 +1205,12 @@ impl<R: Read> Read for BufReader<R> {
 impl<R: Read> BufRead for BufReader<R> {
     fn fill_buf(&mut self) -> Result<&[u8]> {
         if self.pos >= self.filled {
-            self.filled = self.inner.read(&mut self.buf)?;
+            let n = self.inner.read(&mut self.buf)?;
+            // std reads through a cursor, whose `advance_checked` asserts
+            // the count.
+            let init_unfilled = self.buf.len();
+            assert!(n <= init_unfilled); //@ core/src/io/borrowed_buf.rs:287:9
+            self.filled = n;
             self.pos = 0;
         }
         Ok(&self.buf[self.pos..self.filled])
@@ -1259,12 +1270,17 @@ impl<W: Write> BufWriter<W> {
         self.buf.capacity()
     }
 
-    /// Drops the first `n` buffered bytes (they were written).
+    /// Drops the first `n` buffered bytes (they were written). A writer
+    /// that reported more bytes than it was given panics here, as std's
+    /// `BufGuard` drop does in its `copy_within(written.., 0)`.
     fn drop_prefix(&mut self, n: usize) {
         if n == 0 {
             return;
         }
         let len = self.buf.len();
+        if n > len {
+            panic!("range start index {} out of range for slice of length {}", n, len); //@ core/src/slice/index.rs:1020:55
+        }
         for i in n..len {
             self.buf[i - n] = self.buf[i];
         }
@@ -1291,7 +1307,7 @@ impl<W: Write> BufWriter<W> {
                 }
             }
         }
-        self.buf.clear();
+        self.drop_prefix(written);
         Ok(())
     }
 }
