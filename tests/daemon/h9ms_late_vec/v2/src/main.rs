@@ -1,0 +1,2 @@
+use util::*;
+fn main() { let v = vec![1,2]; println!("{} {}", v.len(), helper()); }

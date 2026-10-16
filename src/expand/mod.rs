@@ -907,13 +907,26 @@ pub fn cache_len() -> usize {
 
 /// True when a flat token list can contain work for the expander: a
 /// `macro_rules` definition, a call to a macro the parser does not own,
-/// a cfg attribute, or a `recursion_limit` the expander reads. A
-/// macro-free file pays one token scan and runs the unchanged pipeline.
+/// a `use` that binds a parser macro's name (`use dep::vec;`: calls of
+/// it are then the imported macro), a cfg attribute, or a
+/// `recursion_limit` the expander reads. A macro-free file pays one
+/// token scan and runs the unchanged pipeline.
 pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
     let macro_rules = interner.intern("macro_rules");
     for (i, t) in tokens.iter().enumerate() {
         match t.tok {
             Tok::Ident(s) if s == macro_rules => return true,
+            // A name a use tree binds: a leaf before `;`, `,` or `}`, or
+            // the name after `as`.
+            Tok::Ident(s)
+                if builtin::is_passthrough(interner.get(s))
+                    && i > 0
+                    && (tokens[i - 1].tok == Tok::As
+                        || (tokens.get(i + 1).is_some_and(|n| matches!(n.tok, Tok::Semi | Tok::Comma | Tok::RBrace))
+                            && in_use_tree(tokens, i))) =>
+            {
+                return true;
+            }
             Tok::Bang => {
                 // `name!`: the token before the bang names the macro.
                 // A path-qualified parser macro (`std::println!`) also
@@ -942,6 +955,39 @@ pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
         }
     }
     false
+}
+
+/// True when `tokens[i]` is inside a `use` item: a `use` comes before it
+/// with only use-tree tokens between (`use<..>` precise capturing is not).
+fn in_use_tree(tokens: &[Token], i: usize) -> bool {
+    for j in (0..i).rev() {
+        match tokens[j].tok {
+            Tok::Use => return tokens.get(j + 1).is_none_or(|t| t.tok != Tok::Lt),
+            Tok::Ident(_) | Tok::PathSep | Tok::Comma | Tok::LBrace | Tok::RBrace | Tok::As | Tok::Star | Tok::Crate | Tok::Super => {}
+            Tok::SelfLower | Tok::Underscore => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The name a worklist seed defines (`macro_rules! name`), if it reads.
+fn seed_name(seed: &MacroSeed, interner: &Interner) -> Option<Sym> {
+    let at = seed.tokens.iter().position(|t| matches!(t.tok, Tok::Ident(s) if interner.get(s) == "macro_rules"))?;
+    match (seed.tokens.get(at + 1).map(|t| t.tok), seed.tokens.get(at + 2).map(|t| t.tok)) {
+        (Some(Tok::Bang), Some(Tok::Ident(s))) => Some(s),
+        _ => None,
+    }
+}
+
+/// True when the expander must run for this file although
+/// `needs_expansion` finds no work in its tokens: a glob `use` may bring
+/// a macro named like a parser macro (a seed defines one), or a
+/// worklist glob seed for this file does.
+fn seeds_bind_parser_name(tokens: &[Token], seeds: &[MacroSeed], interner: &Interner) -> bool {
+    let parser = |s: &MacroSeed| seed_name(s, interner).is_none_or(|n| builtin::is_passthrough(interner.get(n)));
+    let glob_use = || tokens.iter().enumerate().any(|(i, t)| t.tok == Tok::Star && in_use_tree(tokens, i));
+    seeds.iter().any(|s| s.import_into.is_some() && (s.ambiguous || parser(s))) || (seeds.iter().any(parser) && glob_use())
 }
 
 /// Per-file expander state. One `expand_lexed` run builds one of these.
@@ -1484,7 +1530,7 @@ pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[Mac
 
 /// Macro expansion proper, for `expand_lexed_seeded_with_deps`.
 fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
-    if !needs_expansion(&lexed.tokens, ctx.interner) {
+    if !needs_expansion(&lexed.tokens, ctx.interner) && !seeds_bind_parser_name(&lexed.tokens, seeds, ctx.interner) {
         return Ok((lexed, Vec::new()));
     }
     let (trees, balanced) = build_trees(&lexed.tokens);
@@ -5020,6 +5066,20 @@ mod tests {
         std::fs::write(&data, "two").unwrap();
         assert!(deps_stale(&deps, &ClientView::PROCESS), "a changed included file is stale");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `use` that binds a parser macro's name needs the expander, so
+    /// calls of it reach the imported macro; other uses do not.
+    #[test]
+    fn parser_macro_imports_need_expansion() {
+        let interner = Interner::default();
+        let needs = |src: &str| needs_expansion(&crate::lexer::lex(src, crate::diag::FileId(0), 0, &interner).unwrap().tokens, &interner);
+        assert!(needs("use util::vec; fn main() { let _v = vec![1]; }"));
+        assert!(needs("use util::{helper, panic}; fn main() {}"));
+        assert!(needs("use util::mine as format; fn main() {}"));
+        assert!(needs("fn main() { use util::assert; assert!(true); }"));
+        assert!(!needs("use std::fmt::Write; use std::vec::Vec; fn main() { let v = vec![1]; println!(\"{v:?}\"); }"));
+        assert!(!needs("fn main() { let vec = 1; let _ = vec; }"));
     }
 
     /// stringify! keeps the source's own spacing between tokens.
