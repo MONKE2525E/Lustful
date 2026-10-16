@@ -4435,38 +4435,64 @@ impl<'p> Lower<'p> {
     }
 
     /// The operands of call arguments `args` (after any receiver or
-    /// closure env) in the `ordered_operands` order, where the first
-    /// `&mut` place that argument coercion reborrows and a later argument
-    /// follows (`f(nodes, nodes.len())`, `cb(1, self, id(&self.syms))`)
-    /// is two-phase, as rustc's argument coercion reborrow is: lowered as
-    /// a method receiver's (a shared reservation while the later
-    /// arguments run, `FakeRead`, then the `&mut`; `two_phase_receiver`
-    /// in borrowck). A place through an index (`v[0]` is an `IndexMut`
-    /// borrow in rustc, not two-phase) takes its `&mut` at once.
+    /// closure env) in the `ordered_operands` order, where each `&mut`
+    /// place that argument coercion reborrows and a later argument follows
+    /// (`f(nodes, nodes.len())`, `cb(1, self, id(&self.syms))`, `g(a, b,
+    /// a.len() + b.len())`) is two-phase, as rustc's argument coercion
+    /// reborrow is: lowered as a method receiver's (a shared reservation
+    /// while the later arguments run, `FakeRead`, then the `&mut`;
+    /// `two_phase_loans` in borrowck). A place through an index (`v[0]` is
+    /// an `IndexMut` borrow in rustc, not two-phase) takes its `&mut` at
+    /// once.
     pub(super) fn call_arg_operands(&mut self, args: &[ExprId], span: Span) -> Vec<Operand> {
-        let two_phase = (0..args.len().saturating_sub(1)).find(|&i| self.ck.coerce(args[i]) == Coerce::Reborrow && self.is_place_expr(args[i]));
-        let Some(j) = two_phase else { return self.ordered_operands(args) };
-        let mut ops: Vec<Operand> = (0..j).map(|i| self.ordered_operand(args, i)).collect();
-        let pl = self.place(args[j]).deref();
-        let inner = self.peel(self.ty(args[j]), 1);
-        let mt = self.ref_ty(true, inner);
-        if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+        let (mut ops, pending) = self.call_arg_reserved(args, span);
+        self.activate_two_phase(&mut ops, pending, span);
+        ops
+    }
+
+    /// `call_arg_operands` without the activations: the operands, with a
+    /// placeholder at each two-phase argument, and per such argument its
+    /// operand index, reservation local and place (`activate_two_phase`
+    /// makes the `&mut`s, after a two-phase receiver's own).
+    fn call_arg_reserved(&mut self, args: &[ExprId], span: Span) -> (Vec<Operand>, Vec<(usize, Local, Place)>) {
+        let mut ops = Vec::with_capacity(args.len());
+        let mut pending = Vec::new();
+        for i in 0..args.len() {
+            if i + 1 == args.len() || self.ck.coerce(args[i]) != Coerce::Reborrow || !self.is_place_expr(args[i]) {
+                let o = self.ordered_operand(args, i);
+                ops.push(o);
+                continue;
+            }
+            let pl = self.place(args[i]).deref();
+            let inner = self.peel(self.ty(args[i]), 1);
+            if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+                let mt = self.ref_ty(true, inner);
+                let t = self.temp(mt);
+                self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+                ops.push(Operand::Move(Place::local(t)));
+                continue;
+            }
+            let st = self.ref_ty(false, inner);
+            let reserve = self.temp(st);
+            self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+            pending.push((ops.len(), reserve, pl));
+            ops.push(Operand::Copy(Place::local(reserve)));
+        }
+        (ops, pending)
+    }
+
+    /// The activations of `call_arg_reserved`'s two-phase arguments, in
+    /// order: `FakeRead` of the reservation, then the `&mut`, which
+    /// replaces the placeholder operand.
+    fn activate_two_phase(&mut self, ops: &mut [Operand], pending: Vec<(usize, Local, Place)>, span: Span) {
+        for (at, reserve, pl) in pending {
+            let inner = self.peel(self.body.locals[reserve as usize].ty, 1);
+            let mt = self.ref_ty(true, inner);
+            self.push(StmtKind::FakeRead(reserve), span);
             let t = self.temp(mt);
             self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
-            ops.push(Operand::Move(Place::local(t)));
-            ops.extend((j + 1..args.len()).map(|i| self.ordered_operand(args, i)));
-            return ops;
+            ops[at] = Operand::Move(Place::local(t));
         }
-        let st = self.ref_ty(false, inner);
-        let reserve = self.temp(st);
-        self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
-        let rest_ops: Vec<Operand> = (j + 1..args.len()).map(|i| self.ordered_operand(args, i)).collect();
-        self.push(StmtKind::FakeRead(reserve), span);
-        let t = self.temp(mt);
-        self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
-        ops.push(Operand::Move(Place::local(t)));
-        ops.extend(rest_ops);
-        ops
     }
 
     /// The autoref of a range-indexed receiver (`v[1..].iter()`,
@@ -4820,14 +4846,13 @@ impl<'p> Lower<'p> {
                     let st = self.ref_ty(false, recv_ty);
                     let reserve = self.temp(st);
                     self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
-                    let mut arg_ops = Vec::new();
-                    for (ai, &a) in args.iter().enumerate() {
-                        let o = self.ordered_operand(args, ai);
-                        arg_ops.push(o);
-                    }
+                    // Reborrowed `&mut` arguments are two-phase too; all
+                    // activate after the arguments run, the receiver first.
+                    let (mut arg_ops, pending) = self.call_arg_reserved(args, span);
                     self.push(StmtKind::FakeRead(reserve), span);
                     let t = self.temp(mt);
                     self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+                    self.activate_two_phase(&mut arg_ops, pending, span);
                     ops.push(Operand::Move(Place::local(t)));
                     ops.extend(arg_ops);
                 }

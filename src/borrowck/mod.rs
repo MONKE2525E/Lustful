@@ -343,9 +343,10 @@ struct Ck<'b, 'p> {
     /// Reused operand list of the statement being checked, so a statement
     /// visit does not allocate.
     ops_buf: Vec<&'b Operand>,
-    /// The two-phase receiver loan of the call being checked, while its
-    /// arguments are: until the call activates it, it is a shared borrow.
-    reserved: Option<usize>,
+    /// The two-phase receiver and argument loans of the call being
+    /// checked, while its arguments are: until the call activates them,
+    /// they are shared borrows.
+    reserved: Vec<usize>,
     /// Per local: it holds only one byte string literal's bytes
     /// (`ir::byte_blob_locals`), so its storage ending drops
     /// nothing a borrow of it reads. Codegen gives such a local
@@ -483,7 +484,7 @@ impl<'b, 'p> Ck<'b, 'p> {
             mpaths: Vec::new(),
             mpath_at: Vec::new(),
             ops_buf: Vec::new(),
-            reserved: None,
+            reserved: Vec::new(),
             promoted: crate::ir::byte_blob_locals(body).iter().map(|b| b.is_some()).collect(),
         }
     }
@@ -1749,47 +1750,53 @@ impl<'b, 'p> Ck<'b, 'p> {
             ops.insert(0, &callee_op);
         }
         let carriers = if self.report { self.carriers(&ops, Some(dest)) } else { Vec::new() };
-        // A two-phase receiver (lowered as reservation, arguments, `FakeRead`,
-        // then `&mut`) is activated by the call itself: the other arguments
-        // are read before it in Rust, so its own loan acts as a shared borrow
-        // for them. Loans it reborrows through (`r.push(v[0])` with
-        // `r = &mut v`) stay as they are.
-        if self.two_phase_receiver(b, args) {
-            let last = self.stmt_base[b as usize] + self.body.blocks[b as usize].stmts.len() - 1;
-            self.reserved = Some(self.loan_at[last] as usize).filter(|&li| li < self.loans.len());
-        }
+        // Two-phase receivers and arguments (each lowered as reservation,
+        // arguments, `FakeRead`, then `&mut`) are activated by the call
+        // itself: the other arguments are read before them in Rust, so
+        // their own loans act as shared borrows for them. Loans they
+        // reborrow through (`r.push(v[0])` with `r = &mut v`) stay as they
+        // are.
+        let base = self.stmt_base[b as usize];
+        self.reserved = self.two_phase_loans(b, args).into_iter().map(|k| self.loan_at[base + k] as usize).filter(|&li| li < self.loans.len()).collect();
         for (j, o) in ops.iter().enumerate() {
             let live = self.live_for(q, Some(j), &carriers);
             self.operand(o, span, st, &live);
         }
-        self.reserved = None;
+        self.reserved.clear();
         let live = self.live_for(q, None, &[]);
         self.write_dest(dest, span, &live, st);
     }
 
-    /// True when the call ending block `b` takes a two-phase `&mut`
-    /// receiver or argument (lower.rs `call_arg_operands`): one of its
-    /// arguments moves the temporary that the block's last statement
-    /// borrows mutably, right after a `FakeRead` of the reservation, an
-    /// unnamed shared borrow of the same place (a `let` binding's
-    /// `FakeRead` is not one).
-    fn two_phase_receiver(&self, b: u32, args: &[Operand]) -> bool {
+    /// The statement indexes (in block `b`) of the two-phase `&mut`
+    /// receiver and arguments of the call ending `b` (lower.rs
+    /// `call_arg_operands`): the block ends with pairs of a `FakeRead` of
+    /// the reservation, an unnamed shared borrow of the same place made
+    /// earlier (a `let` binding's `FakeRead` is not one), and the `&mut`
+    /// of a temporary that an argument moves.
+    fn two_phase_loans(&self, b: u32, args: &[Operand]) -> Vec<usize> {
         let stmts = &self.body.blocks[b as usize].stmts;
-        let [.., before, last] = stmts.as_slice() else { return false };
-        let (StmtKind::FakeRead(r), StmtKind::Assign(t, Rvalue::Ref(true, place))) = (&before.kind, &last.kind) else {
-            return false;
-        };
-        let moved = args.iter().any(|a| matches!(a, Operand::Move(a) if a.proj.is_empty() && a.local == t.local));
-        if !t.proj.is_empty() || !moved || self.body.locals[*r as usize].name.is_some() {
-            return false;
+        let mut out = Vec::new();
+        let mut k = stmts.len();
+        while k >= 2 {
+            let (StmtKind::FakeRead(r), StmtKind::Assign(t, Rvalue::Ref(true, place))) = (&stmts[k - 2].kind, &stmts[k - 1].kind) else { break };
+            let moved = args.iter().any(|a| matches!(a, Operand::Move(a) if a.proj.is_empty() && a.local == t.local));
+            if !t.proj.is_empty() || !moved || self.body.locals[*r as usize].name.is_some() {
+                break;
+            }
+            // The reservation is made before the arguments run, so it is in
+            // this block or (after an argument's call) an earlier one.
+            let reserved = (0..=b as usize).rev().any(|bi| {
+                self.body.blocks[bi].stmts.iter().rev().any(|s| {
+                    matches!(&s.kind, StmtKind::Assign(d, Rvalue::Ref(false, p)) if d.proj.is_empty() && d.local == *r && p == place)
+                })
+            });
+            if !reserved {
+                break;
+            }
+            out.push(k - 1);
+            k -= 2;
         }
-        // The reservation is made before the arguments run, so it is in
-        // this block or (after an argument's call) an earlier one.
-        (0..=b as usize).rev().any(|bi| {
-            self.body.blocks[bi].stmts.iter().rev().any(|s| {
-                matches!(&s.kind, StmtKind::Assign(d, Rvalue::Ref(false, p)) if d.proj.is_empty() && d.local == *r && p == place)
-            })
-        })
+        out
     }
 
     /// True when a slice-making assignment's destination is a `&mut [T]` local.
@@ -2390,7 +2397,7 @@ impl<'b, 'p> Ck<'b, 'p> {
             if kind == Access::Dead && self.promoted.get(loan.place.local as usize).copied().unwrap_or(false) {
                 continue;
             }
-            let mutable = loan.mutable && self.reserved != Some(li);
+            let mutable = loan.mutable && !self.reserved.contains(&li);
             let conflict = match kind {
                 Access::Read | Access::BorrowShared => mutable && self.overlaps(p, p_range, loan),
                 Access::Write | Access::Move | Access::BorrowMut => self.overlaps(p, p_range, loan),
