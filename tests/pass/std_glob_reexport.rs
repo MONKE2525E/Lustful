@@ -1,5 +1,4 @@
-// expect: L0102
-// lust does not follow a std glob through a `pub use` glob yet.
+// A std glob followed through a `pub use` glob of a crate module.
 mod a {
     pub use std::cell::*;
 }
