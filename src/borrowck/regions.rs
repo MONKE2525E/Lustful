@@ -9464,6 +9464,8 @@ fn plain_shared(tys: &impl TyIntern, t: Ty) -> bool {
             !tys.args(pr.value.args).iter().any(|g| matches!(g, GenericArg::Lifetime(_)))
                 && dyn_arg_tys(tys, t).into_iter().all(|e| plain_shared(tys, e))
         }),
+        // `Rc<T>` and `Arc<T>` hand out `&T` only.
+        TyKind::Adt(..) if let Some(e) = tys.rc_elem(t) => plain_shared(tys, e),
         TyKind::Adt(_, a) => {
             matches!(
                 tys.builtin_of(t),
