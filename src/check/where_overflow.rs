@@ -13,12 +13,26 @@ use crate::ty::*;
 /// expand rejects a malformed value and one below 128.
 pub fn recursion_limit(p: &Program) -> usize {
     for a in &p.ast.inner_attrs {
-        if a.path.len() == 1
-            && p.interner.get(a.path[0].name) == "recursion_limit"
-            && let crate::ast::AttrInput::Eq(e) = &a.input
-            && let crate::ast::Expr::Str(i) = p.ast.expr(*e)
-            && let Some(n) = p.ast.strings.get(*i as usize).and_then(|s| s.parse::<usize>().ok())
-        {
+        if a.path.len() != 1 || p.interner.get(a.path[0].name) != "recursion_limit" {
+            continue;
+        }
+        // `= "N"` arrives as an expression or, after expansion, as the
+        // raw tokens.
+        let text = match &a.input {
+            crate::ast::AttrInput::Eq(e) => match p.ast.expr(*e) {
+                crate::ast::Expr::Str(i) => p.ast.strings.get(*i as usize),
+                _ => None,
+            },
+            crate::ast::AttrInput::List(_, trees) => trees.iter().find_map(|t| match t {
+                crate::lexer::TokenTree::Token(tok) => match tok.tok {
+                    crate::lexer::Tok::Str(i, _) => p.ast.strings.get(i as usize),
+                    _ => None,
+                },
+                _ => None,
+            }),
+            crate::ast::AttrInput::None => None,
+        };
+        if let Some(n) = text.and_then(|s| s.parse::<usize>().ok()) {
             return n;
         }
     }

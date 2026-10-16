@@ -1,0 +1,8 @@
+// expect: L0611
+// rustc E0275: `count` on 128 chained `map` adapters overflows the
+// `Iterator` obligations.
+fn main() {
+    let v = vec![1u8, 2, 3];
+    let it = v.iter().map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x).map(|x| x);
+    println!("{}", it.count());
+}

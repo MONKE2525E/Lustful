@@ -1815,6 +1815,9 @@ impl<'a> Parser<'a> {
                 // collect records it on the Adt; the checker enforces
                 // it across crate borders.
                 _ if name_text == "non_exhaustive" => {}
+                // `#![recursion_limit = "N"]`: the expander checked the value;
+                // the checker reads the crate's from `Ast::inner_attrs`.
+                _ if inner && name_text == "recursion_limit" => {}
                 // `#[global_allocator]` on a static: collect checks
                 // the type is a known allocator and that there is
                 // only one; the lust runtime keeps its allocator

@@ -36,12 +36,8 @@ pub fn check(p: &Program, errs: &mut Vec<Diag>) {
             continue;
         }
         let Some(trec) = p.gx.index.trait_record(rec.trait_def) else { continue };
-        let names: Vec<Sym> = def
-            .variants
-            .iter()
-            .map(|v| v.name)
-            .filter(|n| trec.assoc_items.iter().any(|&(_, a, is_type)| is_type && a == *n))
-            .collect();
+        let names: Vec<Sym> =
+            def.variants.iter().map(|v| v.name).filter(|n| trec.assoc_items.iter().any(|&(_, a, is_type)| is_type && a == *n)).collect();
         if !names.is_empty() {
             enum_impls.insert((rec.span.file.0, rec.span.lo), names);
         }
@@ -74,7 +70,10 @@ pub fn check(p: &Program, errs: &mut Vec<Diag>) {
         errs.push(Diag::new(
             "L0622",
             span,
-            format!("ambiguous associated item: `Self::{}` is both a variant of the enum and an associated type", p.interner.get(segs[1].name)),
+            format!(
+                "ambiguous associated item: `Self::{}` is both a variant of the enum and an associated type",
+                p.interner.get(segs[1].name)
+            ),
             format!("Write `<Self as Trait>::{}` for the associated type.", p.interner.get(segs[1].name)),
         ));
         return;

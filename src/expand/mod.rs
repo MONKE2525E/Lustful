@@ -3056,12 +3056,11 @@ impl<'a> Expander<'a> {
         item_list: bool,
         depth: u32,
     ) -> Result<usize, Diag> {
-        // The expander reads `#![recursion_limit]` itself and the
-        // parser has no form for it, so it is consumed here, once its
-        // value is checked.
+        // The expander reads `#![recursion_limit]` itself; once its value
+        // is checked it passes on to the parser, so the checker reads the
+        // same limit for trait and type depth (check/where_overflow.rs).
         if first.inner_attr && first.path == "recursion_limit" {
             recursion_limit_value(&first.inner, &self.strings, first.span)?;
-            return Ok(first.end);
         }
         // An inner attribute applies to the enclosing item or crate:
         // nothing for the expander to do with it here.

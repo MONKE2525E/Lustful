@@ -30,10 +30,6 @@ use crate::ty::iter::IterKind;
 use crate::ty::sync::SyncTy;
 use crate::ty::{AdtId, BuiltinTy, GenericArg, IntTy, Ty, TyIntern, TyKind, Tys};
 
-/// rustc's default recursion limit. lust rejects a smaller
-/// `#![recursion_limit]` (expand), and a larger one only moves where a
-/// finite nesting overflows; an unbounded one overflows at any limit.
-const LIMIT: usize = 128;
 
 /// One worklist entry: a type, or a std-internal type a builtin's
 /// layout names and lust has no def for (rustc dedups them by type,
@@ -68,6 +64,8 @@ struct Constraint {
 /// template Adt in its own params (rustc's `adt_dtorck_constraint`).
 struct Dropck<'a, 'g> {
     p: &'a Program,
+    /// The crate's recursion limit (128 unless `#![recursion_limit]`).
+    limit: usize,
     tys: &'a mut Tys<'g>,
     adts: FxMap<AdtId, Constraint>,
 }
@@ -76,6 +74,39 @@ struct Dropck<'a, 'g> {
 /// template, or a closure's parent; mono instances are skipped by the
 /// caller. Returns the first overflow as rustc's E0320.
 pub fn check_body(p: &Program, fid: LocalDefId, ck: &mut Checked) -> Option<Diag> {
+    let found = body_types(p, fid, ck);
+    let mut seen: FxSet<Ty> = FxSet::default();
+    let mut cx = Dropck { p, limit: crate::check::where_overflow::recursion_limit(p), tys: &mut ck.tys, adts: FxMap::default() };
+    for (t, span, boring) in found {
+        if !seen.insert(t) || trivial(&*cx.tys, p, t) {
+            continue;
+        }
+        // A body local whose type names a region is checked only where
+        // it may be dropped (rustc's drop-live locals); a type with no
+        // drop glue is never dropped.
+        if !boring && has_region(&*cx.tys, t) && !may_drop(p, cx.tys, t, 0) {
+            continue;
+        }
+        if let Some(over) = cx.overflows(t) {
+            let ty = short_name(p, &*cx.tys, t);
+            let on = cx.item_name(over);
+            return Some(Diag::new(
+                "L0730",
+                span,
+                format!("overflow while adding drop-check rules for `{ty}` (overflowed on `{on}`)"),
+                "The type's drop check never ends: a field names the type again with larger type arguments \
+                 (polymorphic recursion). Give the recursive field a fixed type argument.",
+            ));
+        }
+    }
+    None
+}
+
+/// The types rustc gives one body's MIR locals: the return place and the
+/// parameters (`true`: rustc checks these always), then the bindings and
+/// the value-expression temporaries. Place expressions name storage and
+/// make no local.
+pub(crate) fn body_types(p: &Program, fid: LocalDefId, ck: &Checked) -> Vec<(Ty, Span, bool)> {
     let mut found: Vec<(Ty, Span, bool)> = Vec::new();
     let f = p.fn_info(fid);
     let def = f.def(&p.ast);
@@ -100,31 +131,7 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &mut Checked) -> Option<Diag
         }
         found.push((t, p.ast.expr_spans[i as usize], false));
     }
-    let mut seen: FxSet<Ty> = FxSet::default();
-    let mut cx = Dropck { p, tys: &mut ck.tys, adts: FxMap::default() };
-    for (t, span, boring) in found {
-        if !seen.insert(t) || trivial(&*cx.tys, p, t) {
-            continue;
-        }
-        // A body local whose type names a region is checked only where
-        // it may be dropped (rustc's drop-live locals); a type with no
-        // drop glue is never dropped.
-        if !boring && has_region(&*cx.tys, t) && !may_drop(p, cx.tys, t, 0) {
-            continue;
-        }
-        if let Some(over) = cx.overflows(t) {
-            let ty = short_name(p, &*cx.tys, t);
-            let on = cx.item_name(over);
-            return Some(Diag::new(
-                "L0730",
-                span,
-                format!("overflow while adding drop-check rules for `{ty}` (overflowed on `{on}`)"),
-                "The type's drop check never ends: a field names the type again with larger type arguments \
-                 (polymorphic recursion). Give the recursive field a fixed type argument.",
-            ));
-        }
-    }
-    None
+    found
 }
 
 /// rustc's place expressions: they name storage and make no temporary.
@@ -263,7 +270,7 @@ impl Dropck<'_, '_> {
     /// level deeper in the same step; an Adt adds its field
     /// constraint's types, which the worklist then takes.
     fn inner(&mut self, item: Item, depth: usize, c: &mut Constraint) {
-        if depth > LIMIT {
+        if depth > self.limit {
             c.overflow.get_or_insert(item);
             return;
         }
@@ -281,7 +288,7 @@ impl Dropck<'_, '_> {
             }
             Item::OwnedLeaf => {
                 // `Owned` and `LeafOrInternal` are field-less enums.
-                if depth + 1 > LIMIT {
+                if depth + 1 > self.limit {
                     c.overflow.get_or_insert(item);
                 }
                 return;
@@ -293,7 +300,7 @@ impl Dropck<'_, '_> {
             }
             Item::SetPair(e) => {
                 self.inner(Item::Ty(e), depth + 1, c);
-                if depth + 1 > LIMIT {
+                if depth + 1 > self.limit {
                     c.overflow.get_or_insert(item);
                 }
                 return;
@@ -441,9 +448,13 @@ impl Dropck<'_, '_> {
                 SyncTy::Arc => tys.first().map(|&t| vec![Item::CountedInner(t, true), Item::Global]).unwrap_or_default(),
                 SyncTy::ArcWeak => vec![Item::Global],
                 // `Mutex { inner: futex Mutex (AtomicU32), poison: Flag
-                // (AtomicBool), data: UnsafeCell<T> }`; `RwLock` alike.
+                // (AtomicBool), data: UnsafeCell<T> }`; `RwLock` alike. The
+                // futex is one Adt level deeper than a `u32` (`Cell<u32>`
+                // stands for it): `Option` nested 127 deep around a `Mutex`
+                // overflows (fx-traitdepth calibration); the worklist dedups
+                // it, so a chain of `Mutex`es counts it once.
                 SyncTy::Mutex | SyncTy::RwLock => [
-                    Some(Item::Ty(crate::ty::int(IntTy::U32))),
+                    Some(Item::Ty(self.tys.mk_builtin1(|b| b.cell, crate::ty::int(IntTy::U32)))),
                     Some(Item::Ty(crate::ty::BOOL)),
                     at(0),
                 ]

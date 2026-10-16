@@ -4408,7 +4408,21 @@ pub fn collect_reuse(
             variants.push(Variant { name: vname, shape, fields, disc, non_exhaustive: variant_ne });
         }
         let mut d = Derives::default();
+        let mut seen_derives: Vec<Sym> = Vec::new();
         for &(name, span) in derives_src {
+            // A trait derived twice (in one list, across `#[derive]`
+            // attributes, or through `cfg_attr`) is two impls (rustc E0119).
+            if seen_derives.contains(&name) {
+                let tname = interner.get(name);
+                errs.push(Diag::new(
+                    "L0615",
+                    span,
+                    format!("conflicting implementations of trait `{tname}`: it is derived twice"),
+                    "Derive each trait once.",
+                ));
+                continue;
+            }
+            seen_derives.push(name);
             match interner.get(name) {
                 "Debug" => d.debug = true,
                 "Clone" => d.clone = true,
@@ -8187,8 +8201,17 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                     p.derives_of(a).copy
                         && (p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
                             && p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
-                            || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| is_copy(p, tys, f.ty)))
-                                && derive_args_all(p, a, &mut GlueSeen::default(), &mut |x, _| is_copy(p, tys, x)))
+                            || {
+                                // The derive's bounds on the args first; a field
+                                // whose type is a proven arg is not asked again
+                                // (`G<G<..>>` asked each level twice: 2^n).
+                                let mut proven: Vec<Ty> = Vec::new();
+                                derive_args_all(p, a, &mut GlueSeen::default(), &mut |x, _| {
+                                    let ok = is_copy(p, tys, x);
+                                    proven.push(x);
+                                    ok
+                                }) && p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| proven.contains(&f.ty) || is_copy(p, tys, f.ty)))
+                            })
                 }
                 None => false,
             }

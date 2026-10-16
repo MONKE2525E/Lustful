@@ -274,6 +274,9 @@ fn confirm_method(
         cx.check_turbofish_min(&generics, offset, supplied, name_span);
     }
     let (mut params, ret, _) = cx.instantiate_template(e, template, generics, &full_explicit, name_span);
+    if !prefix.is_empty() {
+        cx.obl.deepen_from(obl_len, 1);
+    }
     let want_recv = *params.first()?;
     if !cx.unify(want_recv, probe.recv_ty) {
         cx.rollback_vars(snap_vars);

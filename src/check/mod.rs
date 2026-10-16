@@ -31,6 +31,7 @@ pub mod obligations;
 pub mod outlives;
 pub mod dropck;
 pub mod deny_lints;
+pub mod depth;
 pub mod opaque;
 pub mod own;
 pub mod picks;
@@ -1771,6 +1772,8 @@ struct Ctx<'p> {
     /// The crate's recursion limit (128 unless `#![recursion_limit]`):
     /// nested trait obligations overflow at this depth, as in rustc.
     recursion_limit: usize,
+    /// `depth::struct_depth` answers for this body's types.
+    depth_memo: crate::intern::FxMap<(depth::Family, Ty), usize>,
     /// The module this fn is defined in (root without the resolver),
     /// for field visibility checks (ARCH 1.5).
     module: crate::ty::defs::ModuleId,
@@ -2253,7 +2256,18 @@ pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>)
         && matches!(class, generics::FnClass::Plain | generics::FnClass::Template)
         && !p.in_lang_methods(p.fn_def(fid).name_span)
         && p.fn_shipped_crate(fid).is_none()
-        && let Some(d) = deny_lints::check_body(p, fid, &ck).or_else(|| dropck::check_body(p, fid, &mut ck))
+        && let Some(d) = deny_lints::check_body(p, fid, &ck)
+            .or_else(|| depth::check_uses(p, fid, &ck, where_overflow::recursion_limit(p)))
+            .or_else(|| dropck::check_body(p, fid, &mut ck))
+            .or_else(|| {
+                // Build-only: `cargo check` asks no `Copy` or layout query of locals.
+                let types: Vec<(Ty, Span)> = if p.gx.walk_instances {
+                    dropck::body_types(p, fid, &ck).into_iter().map(|(t, s, _)| (t, s)).collect()
+                } else {
+                    Vec::new()
+                };
+                depth::check_locals(p, &types, &ck.tys, where_overflow::recursion_limit(p))
+            })
     {
         errs.push(d);
     }
@@ -2296,6 +2310,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         p,
         f,
         recursion_limit: where_overflow::recursion_limit(p),
+        depth_memo: crate::intern::FxMap::default(),
         module: defining_module(p, fid),
         tys: Tys::new(&p.tys),
         vars: Vec::new(),
@@ -4760,6 +4775,33 @@ impl<'p> Ctx<'p> {
     /// step 7) instead of looping. Synchronous callers pass the
     /// span to blame and depth 0.
     fn select_obligation_at(&mut self, tr: TraitRef, span: Span, depth: u16) -> Selection {
+        // rustc's evaluation depth: the root obligation is depth 0 and its
+        // stack entry counts once more, so a nested obligation at depth
+        // `limit` overflows (an `Option` nested 128 deep asks `u8: Copy`
+        // at depth 128 and fails; 127 deep compiles).
+        if depth as usize >= self.recursion_limit {
+            return Selection::Overflow;
+        }
+        let sel = self.select_obligation_here(tr, span, depth);
+        // A structural answer (the derive family and the auto traits on std
+        // and structural types) queues no nested goals, so the depth rustc
+        // reaches below it comes from the type (`depth::struct_depth`).
+        let queued = matches!(&sel, Selection::Impl { nested, .. } if nested.iter().any(|q| matches!(q, Predicate::Trait(b) if b.count == 0)));
+        if !queued
+            && matches!(sel, Selection::Impl { .. } | Selection::ParamEvidence(_) | Selection::Builtin)
+            && let Some(fam) = depth::family(self.p, tr.def)
+            && let Some(t) = self.tys.args(tr.args).first().and_then(|g| g.as_ty())
+        {
+            let t = self.deep(t);
+            if depth as usize + depth::struct_depth(self.p, &self.tys, fam, t, &mut self.depth_memo) >= self.recursion_limit {
+                return Selection::Overflow;
+            }
+        }
+        sel
+    }
+
+    /// `select_obligation_at` without the depth checks.
+    fn select_obligation_here(&mut self, tr: TraitRef, span: Span, depth: u16) -> Selection {
         let p = self.p;
         let lang = &p.gx.lang;
         // Projections in the trait ref normalize first: an
@@ -4932,13 +4974,6 @@ impl<'p> Ctx<'p> {
             self.obl.push(obligations::Obligation::DynStatic { span, bck: false });
         }
         if let Selection::Impl { nested, .. } = &sel {
-            // rustc's evaluation depth: the root obligation is depth 0 and
-            // its stack entry counts once more, so a nested obligation at
-            // depth `limit` overflows (an `Option` nested 128 deep asks
-            // `u8: Copy` at depth 128 and fails; 127 deep compiles).
-            if depth as usize + 1 >= self.recursion_limit {
-                return Selection::Overflow;
-            }
             for pred in nested.clone() {
                 match pred {
                     Predicate::Trait(b) if b.count == 0 => self.obl.push_trait_at(b.value, span, depth + 1),
@@ -12436,6 +12471,10 @@ impl<'p> Ctx<'p> {
         if self.is_template_check() && self.tys.flags(t).contains_param() {
             return Res::ConstBool(false);
         }
+        if depth::query_overflows(p, &self.tys, t, true, self.recursion_limit) {
+            self.err("L0611", span, "overflow evaluating whether this type is `Copy`: it nests deeper than the recursion limit", "Nest the type less deeply, or raise `#![recursion_limit]`.");
+            return Res::ConstBool(false);
+        }
         // The question is about a written, concrete type: ask the
         // global store (a body-local inference leftover answers None).
         let drop = p.gx.lang.drop;
@@ -12466,6 +12505,10 @@ impl<'p> Ctx<'p> {
         let t = self.resolve_written(args[0]);
         let p: &Program = self.p;
         let t = self.deep(t);
+        if depth::query_overflows(p, &self.tys, t, false, self.recursion_limit) {
+            self.err("L0611", span, "queries overflow the depth limit computing this type's layout", "Nest the type less deeply, or raise `#![recursion_limit]`.");
+            return Res::ConstUsize(0);
+        }
         // The answer is baked into this body as a constant. Record a
         // layout read for every Adt in the type: the written-type
         // binding read only names an outermost path, so a compound

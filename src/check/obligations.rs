@@ -68,6 +68,18 @@ impl Obligations {
         self.queue.push(Obligation::Trait { trait_ref, span, depth });
     }
 
+    /// Raises the trait obligations queued since `from` to at least
+    /// `depth`: the impl predicates a method pick queues are nested goals
+    /// of the trait obligation the pick stands for (rustc counts them one
+    /// level down for its recursion limit).
+    pub fn deepen_from(&mut self, from: usize, depth: u16) {
+        for ob in self.queue.iter_mut().skip(from) {
+            if let Obligation::Trait { depth: d, .. } = ob {
+                *d = (*d).max(depth);
+            }
+        }
+    }
+
     /// True while nothing waits.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
