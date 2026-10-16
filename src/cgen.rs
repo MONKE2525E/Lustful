@@ -2888,7 +2888,13 @@ impl FnGen<'_, '_> {
             // `env::args()`: the `IterKind::Args` state (front, back)
             // over every process argument.
             CallTarget::Builtin(Builtin::EnvArgs) => format!("(({}){{ 0, (uint64_t)lust_argc }})", ctype(dest_cty)),
-            CallTarget::Builtin(Builtin::MaybeUninitUninit | Builtin::MaybeUninitZeroed) => format!("(({}){{0}})", ctype(dest_cty)),
+            // A zeroed temporary, not `(T){0}`: a zero-sized `T` is an
+            // empty C struct, which takes no initializer.
+            CallTarget::Builtin(Builtin::MaybeUninitUninit | Builtin::MaybeUninitZeroed) => {
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t}; memset(&{t}, 0, sizeof({t}));", ctype(dest_cty));
+                t
+            }
             // `Box::new_uninit` and `new_zeroed`: a heap slot of the
             // `MaybeUninit<T>` the destination box points to. The bytes
             // are zero for both (any bytes are valid for uninit).
@@ -2896,6 +2902,22 @@ impl FnGen<'_, '_> {
                 let CTy::Boxed(mu) = dest_cty else { unreachable!("Box::new_uninit makes a Box") };
                 let mt = ctype(mu);
                 format!("(({mt}*)lust_alloc_zeroed(sizeof({mt}), _Alignof({mt})))")
+            }
+            // `Box::new_uninit_slice(n)`: RawVec's allocation for `n`
+            // slots (its capacity overflow panic), zeroed, as a boxed
+            // slice of exactly `n`. Under panic=unwind the overflow
+            // returns with cap 0 (an empty box, never written).
+            CallTarget::Builtin(Builtin::BoxNewUninitSlice) => {
+                let CTy::BoxSlice(mu) = dest_cty else { unreachable!("Box::new_uninit_slice makes a Box<[T]>") };
+                let mt = ctype(mu);
+                let (n, _) = self.operand(&args[0], loc, post);
+                let (k, v, t) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {k} = {n}; lust_Vec {v} = lust_vec_with_capacity({k}, sizeof({mt}), _Alignof({mt})); if ({v}.cap) memset({v}.ptr, 0, {k} * sizeof({mt})); {} {t}; {t}.ptr = ({mt}*){v}.ptr; {t}.len = {v}.cap ? {k} : 0;",
+                    ctype(dest_cty)
+                );
+                t
             }
             // `Box::write`: the slot's field 0 is the `T` at offset 0,
             // so the same pointer, cast, is the `Box<T>` to store into.
@@ -4355,9 +4377,10 @@ impl FnGen<'_, '_> {
             B::WaitTimedOut => format!("((*{0}).f0)", vals[0]),
             B::MaybeUninitWrite => format!("(((*{0}).f0 = {1}), &(*{0}).f0)", vals[0], vals[1]),
             B::MaybeUninitAsPtr | B::MaybeUninitAsMutPtr => format!("(&(*{0}).f0)", vals[0]),
-            B::MaybeUninitUninit | B::MaybeUninitZeroed | B::MaybeUninitNew | B::VecSpareCapacityMut | B::BoxNewUninit | B::BoxNewZeroed | B::BoxWrite => {
+            B::MaybeUninitUninit | B::MaybeUninitZeroed | B::MaybeUninitNew | B::VecSpareCapacityMut | B::BoxNewUninit | B::BoxNewZeroed | B::BoxWrite | B::BoxNewUninitSlice => {
                 unreachable!("dest-typed compound literals in the call dispatch")
             }
+            B::RcNewUninit | B::ArcNewUninit => unreachable!("lowered as two calls (lower.rs)"),
             B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => unreachable!("expanded with its closure (lower/iter.rs)"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own

@@ -483,6 +483,14 @@ pub enum Builtin {
     /// of `MaybeUninit<T>` (cgen; zero bytes for both).
     BoxNewUninit,
     BoxNewZeroed,
+    /// `Box::new_uninit_slice(n)` and `new_zeroed_slice(n)`: `n`
+    /// zeroed `MaybeUninit<T>` slots (RawVec's capacity rules).
+    BoxNewUninitSlice,
+    /// `Rc::new_uninit`/`new_zeroed` and the `Arc` forms: lowered as
+    /// `Rc::new(MaybeUninit::uninit())` (lower.rs). Their `_slice`
+    /// forms stay out: std panics at its own `Layout::array` sites.
+    RcNewUninit,
+    ArcNewUninit,
     /// `Box::write(boxed, value)`: store into the `MaybeUninit<T>`
     /// slot and give the same allocation back as `Box<T>`.
     BoxWrite,
@@ -11682,6 +11690,7 @@ impl<'p> Ctx<'p> {
             match self.name(item) {
                 "new_uninit" => return Some(Res::Builtin(Builtin::BoxNewUninit)),
                 "new_zeroed" => return Some(Res::Builtin(Builtin::BoxNewZeroed)),
+                "new_uninit_slice" | "new_zeroed_slice" => return Some(Res::Builtin(Builtin::BoxNewUninitSlice)),
                 "write" => return Some(Res::Builtin(Builtin::BoxWrite)),
                 _ => {}
             }
@@ -11692,13 +11701,22 @@ impl<'p> Ctx<'p> {
                 "L0104",
                 span,
                 format!("no function `Box::{}`", self.name(item)),
-                "Lust supports Box::new, Box::leak, Box::new_uninit, Box::new_zeroed, and Box::write.",
+                "Lust supports Box::new, Box::leak, Box::new_uninit, Box::new_zeroed, their _slice forms, and Box::write.",
             );
             return None;
         }
         // `AtomicUsize::new`, `Arc::new`, `sync::Weak::new`, and the other
         // sync types by their full path (check/sync.rs), ahead of the
         // `rc::Weak` names below.
+        // alloc's safe `Arc` uninit constructors (the `Arc` path test is
+        // `sync_assoc`'s; `assume_init` is unsafe and stays out).
+        if std_ty
+            && let Some((&item, ty_path)) = names.split_last()
+            && matches!(self.name(item), "new_uninit" | "new_zeroed")
+            && crate::ty::sync::SyncTy::by_path(&ty_path.iter().map(|n| self.name(*n)).collect::<Vec<_>>()) == Some(crate::ty::sync::SyncTy::Arc)
+        {
+            return Some(Res::Builtin(Builtin::ArcNewUninit));
+        }
         if let Some(r) = self.sync_assoc(&names, std_ty, span) {
             return r;
         }
@@ -11712,6 +11730,9 @@ impl<'p> Ctx<'p> {
         // A user type named `Rc` shadows std's (which needs a `use`),
         // but never on a std path.
         if ty_name == k.Rc && (std_ty || !self.p.type_names.contains_key(&ty_name)) {
+            if matches!(self.name(item), "new_uninit" | "new_zeroed") {
+                return Some(Res::Builtin(Builtin::RcNewUninit));
+            }
             let b = if item == k.new {
                 Builtin::RcNew
             } else if item == k.clone {
@@ -14051,6 +14072,7 @@ impl<'p> Ctx<'p> {
                     // is the element here, not a unify of the result.
                     Builtin::BoxNewUninit | Builtin::BoxNewZeroed => {
                         let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
                         if let Some(want) = written_self.take() {
                             let bx = self.tys.mk_boxed(elem);
                             if !self.unify(bx, want) {
@@ -14060,10 +14082,38 @@ impl<'p> Ctx<'p> {
                         let mu = generics::maybe_uninit_ty(&mut self.tys, elem);
                         (vec![], self.tys.mk_boxed(mu))
                     }
+                    // The same for the `Rc`/`Arc` ones. The slice form
+                    // is on `impl<T> Box<[T]>`: the written Self is
+                    // `Box<[T]>` (`Box::<u8>::new_uninit_slice` is E0599).
+                    Builtin::BoxNewUninitSlice
+                    | Builtin::RcNewUninit
+                    | Builtin::ArcNewUninit => {
+                        let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
+                        let owner = |this: &mut Self, t: Ty| match b {
+                            Builtin::BoxNewUninitSlice => this.tys.mk_boxed(t),
+                            Builtin::RcNewUninit => this.tys.mk_rc(t),
+                            _ => crate::ty::sync::sync_ty(&mut this.tys, crate::ty::sync::SyncTy::Arc, &[t]),
+                        };
+                        let slice = b == Builtin::BoxNewUninitSlice;
+                        if let Some(want) = written_self.take() {
+                            let written = if slice { self.tys.intern(TyKind::Slice(elem)) } else { elem };
+                            let o = owner(self, written);
+                            if !self.unify(o, want) {
+                                let tn = self.tn(want);
+                                let item = if slice { "new_uninit_slice" } else { "new_uninit" };
+                                self.err("L0104", span, format!("no associated function `{item}` for `{tn}`"), "Check the type's arguments.");
+                            }
+                        }
+                        let mu = generics::maybe_uninit_ty(&mut self.tys, elem);
+                        let pointee = if slice { self.tys.intern(TyKind::Slice(mu)) } else { mu };
+                        (if slice { vec![USIZE] } else { vec![] }, owner(self, pointee))
+                    }
                     // `impl<T> Box<MaybeUninit<T>>`: the written Self is
                     // the first param's type, not the result's.
                     Builtin::BoxWrite => {
                         let elem = self.new_var(false);
+                        self.deferred_sized.push((elem, span));
                         let mu = generics::maybe_uninit_ty(&mut self.tys, elem);
                         let bx = self.tys.mk_boxed(mu);
                         if let Some(want) = written_self.take()
@@ -23765,3 +23815,4 @@ fn bound_type_has_regions(p: &Program, t: Ty) -> bool {
         _ => false,
     }
 }
+

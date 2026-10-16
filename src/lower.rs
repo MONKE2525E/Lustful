@@ -1969,6 +1969,17 @@ impl<'p> Lower<'p> {
                         self.call_into(CallTarget::Intrinsic(id), ops, d, span);
                     }
                     Res::Builtin(Builtin::VecNew) => self.set_or_temp(dest, Rvalue::VecLit(self.peel_vec(ty), Vec::new()), ty, span),
+                    // `Rc::new_uninit()` is `Rc::new(MaybeUninit::uninit())`
+                    // (the same for `Arc`): the shared header comes from
+                    // the plain form.
+                    Res::Builtin(b @ (Builtin::RcNewUninit | Builtin::ArcNewUninit)) => {
+                        let mu = self.body.tys.rc_elem(ty).expect("an Rc or Arc result");
+                        let new = if b == Builtin::RcNewUninit { Builtin::RcNew } else { Builtin::Sync(crate::check::sync::SyncOp::ArcNew) };
+                        let t = self.temp(mu);
+                        self.call_into(CallTarget::Builtin(Builtin::MaybeUninitUninit), ops, Place::local(t), span);
+                        let d = self.call_dest(dest, ty);
+                        self.call_into(CallTarget::Builtin(new), vec![Operand::Move(Place::local(t))], d, span);
+                    }
                     Res::Builtin(Builtin::VecWithCapacity) => {
                         // An empty Vec in a temporary, an exact
                         // reserve on it, then a move to the dest:

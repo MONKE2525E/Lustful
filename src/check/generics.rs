@@ -10800,13 +10800,17 @@ fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
 
 /// Path segment names that mark a use of a generic synthetic std Adt:
 /// `Bound` (its variants and `RangeBounds`), `NonZero` (and its
-/// aliases), `TrySendError` (and `try_send`), and `MaybeUninit`. A synthetic std Adt
+/// aliases), `TrySendError` (and `try_send`), and `MaybeUninit` (and alloc's
+/// uninit constructors). A synthetic std Adt
 /// that needs the generic flags adds its names here, not a new scan.
 const GENERIC_STD_NAMES: &[&str] = &[
     "Bound", "Included", "Excluded", "Unbounded", "RangeBounds",
     "NonZero", "NonZeroU8", "NonZeroU16", "NonZeroU32", "NonZeroU64", "NonZeroU128", "NonZeroUsize",
     "NonZeroI8", "NonZeroI16", "NonZeroI32", "NonZeroI64", "NonZeroI128", "NonZeroIsize",
     "TrySendError", "try_send", "MaybeUninit",
+    // alloc's uninit constructors make a `MaybeUninit<T>` with no
+    // `MaybeUninit` in the text (`Box::write(Box::new_uninit(), v)`).
+    "new_uninit", "new_zeroed", "new_uninit_slice", "new_zeroed_slice",
 ];
 
 /// Method names that mark the same uses: the `RangeBounds` bound
