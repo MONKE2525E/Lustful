@@ -6041,9 +6041,10 @@ impl<'b, 'p> Builder<'b, 'p> {
 
     /// `v.extend(iter)` with a builtin iterator: the items' regions
     /// outlive the elements' (`Extend<&T>` copies, so an item's leading
-    /// borrow does not flow); the iterator's own loans and a closure's
-    /// captures reach the Vec only through the items. False (nothing
-    /// added) for another argument or unknown item slots.
+    /// borrow does not flow), at the element's variance (`store_slots`;
+    /// fn pointer items through `store_into`); the iterator's own loans
+    /// and a closure's captures reach the Vec only through the items.
+    /// False (nothing added) for another argument or unknown item slots.
     fn call_vec_extend(&mut self, avs: &[(Ty, Vec<u32>)]) -> bool {
         let [(t0, v0), (it, iv)] = avs else { return false };
         let TyKind::Ref(_, Mut::Mut, vt) = self.body.tys.kind(*t0) else { return false };
@@ -6060,7 +6061,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             k if k == n + 1 => item_vars[1..].to_vec(),
             _ => return false,
         };
+        if store::has_fn_ptr(&self.body.tys, vt) {
+            self.store_into(*it, iv, vt, &v0[1..]);
+        }
         self.flow_all(&item_vars, &ev);
+        self.store_slots(&item_vars, vt, &ev);
         true
     }
 
