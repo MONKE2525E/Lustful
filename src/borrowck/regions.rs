@@ -8457,6 +8457,20 @@ impl Builder<'_, '_> {
                     {
                         continue;
                     }
+                    // `u: v` follows from `u: w` and a known `w: v` (an implied
+                    // bound: a capture's region outlives the closure env's
+                    // lifetime) when `u: w` itself is known or is the
+                    // creator's to prove (not skipped by this rule in turn).
+                    let to_creator = |w: usize| {
+                        let end = |x: usize| self.own.ends.get(x).copied().flatten();
+                        matches!(end(w), Some(End::Static | End::Cap(_) | End::Arg(_)))
+                            && (matches!(end(u), Some(End::Cap(_) | End::Arg(_))) || self.own.call_out && matches!(end(u), Some(End::Out(_))))
+                    };
+                    if bit_iter(&univ[c * wu..(c + 1) * wu])
+                        .any(|w| w != u && w != v && w < nu && known[w * nu + v] && (known[u * nu + w] || to_creator(w)))
+                    {
+                        continue;
+                    }
                     reported.push((u, v));
                     let span = self.path_span(u as u32, v as u32, &start, &adj);
                     let (a, b) = (&self.own.names[u], &self.own.names[v]);
