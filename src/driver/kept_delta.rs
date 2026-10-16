@@ -25,9 +25,9 @@
 // trait impl methods; methods of inherent impls with associated items
 // (the trait-system key hashes their heads); lang and shipped std fns;
 // main and #[test] fns; an `impl Trait` return that comes or goes; a fn
-// that another body revealing an opaque type names (that hidden type, and
-// the auto traits callers read through it, may move: no transitive rule
-// yet); a header with a `dyn` or macro type (eager vtables scan the Ast
+// that a template body revealing an opaque type names (a plain one reveals
+// again, and its hidden type must stand: then the auto traits callers read
+// through it, and any opaque type that names it, stand too); a header with a `dyn` or macro type (eager vtables scan the Ast
 // for `dyn`); programs without user generics (collect's whole-Ast flag
 // scans may turn them on); and any diagnostic: v1 drops the kept program
 // then and answers through the full path.
@@ -39,6 +39,7 @@ use crate::check::collect::{FnLoc, Program};
 use crate::check::generics::{self, FnClass};
 use crate::def::LocalDefId;
 use crate::diag::Diag;
+use crate::driver::graph::{BindingRes, ReadKey};
 
 /// One header edit: the edited AST fn (its `LocalDefId` index) and its
 /// old body's expression range (a template's picks key on it).
@@ -81,11 +82,13 @@ pub(crate) fn apply_headers(
         if i >= front.fn_loc.len() {
             return Err("sig class");
         }
-        refusal(p, &opaque_idents, LocalDefId(i as u32), walk_instances)?;
+        refusal(p, LocalDefId(i as u32), walk_instances)?;
         if reach.reaches(front, i) {
             return Err("sig const");
         }
     }
+    let namers = rpit_namers(p, &opaque_idents, &fns)?;
+    super::laps::mark("collect/delta refusals");
     // The node answers of the last collect describe the old signatures.
     caches.gen_reuse.forget_answers();
     // Every new signature first: a body checked below may call any of them.
@@ -100,6 +103,7 @@ pub(crate) fn apply_headers(
             return Err("sig diag");
         }
     }
+    super::laps::mark("collect/delta redo");
     for (&i, &(rpit, old_ret)) in fns.iter().zip(&old_rets) {
         let f = LocalDefId(i as u32);
         if p.gx.fn_class[i] == FnClass::Template {
@@ -109,7 +113,23 @@ pub(crate) fn apply_headers(
             crate::check::delta_audit::reveal_again(p, f, old_ret)?;
         }
     }
-    replay_bodies(p, front, caches, &fns, walk_instances)
+    // A plain fn that reveals an opaque type and names an edited fn: its
+    // hidden type (and so the auto traits callers read through it) must
+    // stand under the new signatures. Then the opaque types that name it
+    // see no change either.
+    for g in namers {
+        let (record_reads, unwind) = (p.record_reads, p.unwind);
+        (p.record_reads, p.unwind) = (true, false);
+        let stands = crate::check::opaque::hidden_stands(p, g);
+        (p.record_reads, p.unwind) = (record_reads, unwind);
+        if !stands {
+            return Err("hidden type");
+        }
+    }
+    super::laps::mark("collect/delta reveal");
+    let out = replay_bodies(p, front, caches, &fns, walk_instances);
+    super::laps::mark("collect/delta replay");
+    out
 }
 
 /// An edited template checks again as collect's template check does
@@ -151,15 +171,9 @@ fn opaque_body_idents(p: &Program) -> Vec<(crate::def::DefId, Vec<crate::intern:
 }
 
 /// Why fn `f` cannot take a header delta, if anything (see the module
-/// docs; `apply_headers` adds the const reach). Reads the new Ast and the
-/// old program. An owner in `opaque_idents` with no body names nothing,
-/// so a missing owner refuses below.
-fn refusal(
-    p: &Program,
-    opaque_idents: &[(crate::def::DefId, Vec<crate::intern::Sym>)],
-    f: LocalDefId,
-    walk_instances: bool,
-) -> Result<(), &'static str> {
+/// docs; `apply_headers` adds the const reach and `rpit_namers`). Reads
+/// the new Ast and the old program.
+fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'static str> {
     let i = f.0 as usize;
     // A template's instances keep their old signatures: only a check that
     // walks none (no build, no generic associated consts) takes it.
@@ -199,15 +213,8 @@ fn refusal(
     }
     // An `impl Trait` return of the fn itself reveals again from its body
     // (`delta_audit::reveal_again`, or the template check); the new header
-    // must keep one (`redo_sig`).
-    let fdef = p.def_id(f);
-    // Another body that reveals an opaque type and names this fn: its
-    // hidden type (and the auto traits callers read through it) may move.
-    for (owner, ids) in opaque_idents {
-        if *owner != fdef && (p.local_def(owner.hash).is_none() || ids.contains(&def.name)) {
-            return Err("sig rpit");
-        }
-    }
+    // must keep one (`redo_sig`). Other bodies that reveal one and name
+    // the fn: `rpit_namers`.
     // Collect's eager vtables scan every written `dyn` type.
     if let Some(body) = def.body {
         let (lo, hi, file) = (def.name_span.lo, p.ast.blocks[body.0 as usize].span.lo, def.name_span.file);
@@ -223,6 +230,34 @@ fn refusal(
     Ok(())
 }
 
+/// The plain fns whose bodies reveal an opaque type and name one of the
+/// edited fns `fns` (by identifier, as `body_scan` sees the rewritten
+/// body), not counting the edited fns themselves: `apply_headers` reveals
+/// each again. Refuses when such a body is a template's (its hidden type
+/// comes from the template check) or when an opaque owner has no local
+/// body to scan.
+fn rpit_namers(
+    p: &Program,
+    opaque_idents: &[(crate::def::DefId, Vec<crate::intern::Sym>)],
+    fns: &[usize],
+) -> Result<Vec<LocalDefId>, &'static str> {
+    let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
+    let mut out = Vec::new();
+    for (owner, ids) in opaque_idents {
+        let Some(g) = p.local_def(owner.hash) else { return Err("sig rpit") };
+        if fns.contains(&(g.0 as usize)) || !ids.iter().any(|s| names.contains(s)) {
+            continue;
+        }
+        if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || !p.gx.opaque_ret_of.contains_key(&g) {
+            return Err("sig rpit");
+        }
+        out.push(g);
+    }
+    out.sort_unstable_by_key(|g| g.0);
+    out.dedup();
+    Ok(out)
+}
+
 /// Mono's body checks that read the edited signatures, as a collect with
 /// generic reuse runs them (`materialize`, `template_check`): a stored
 /// result that no longer holds checks again, and a plain body must give
@@ -232,6 +267,24 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
     let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
     let idents = &front.chunks[0].scan.body_idents;
     let fn_count = front.fn_loc.len();
+    // The nodes the delta can move: the edited fns' signatures, and the
+    // bindings and method sets whose answers hash them (graph.rs
+    // `binding_fingerprint`, `method_set_fingerprint`). No other node
+    // reads an edited fn's record (every other fn keeps its signature and
+    // hidden type). A `Checked` read never holds by fingerprint.
+    let defs: Vec<crate::def::DefId> = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
+    let mut seen: crate::intern::FxMap<ReadKey, bool> = Default::default();
+    let mut touched = |p: &Program, k: &ReadKey| -> bool {
+        *seen.entry(*k).or_insert_with(|| match k {
+            ReadKey::Sig(d) => defs.contains(d),
+            ReadKey::MethodSet(m) => names.contains(&m.name),
+            ReadKey::Binding(b) => {
+                names.contains(&b.name) || matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d))
+            }
+            ReadKey::Checked(_) => true,
+            ReadKey::ImplSet(_) | ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) => false,
+        })
+    };
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
     let out = (|| {
@@ -247,6 +300,10 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             if reuse.newer(p, t, p.reuse_stamp) {
                 return Err("sig mode");
             }
+            // Every entry no newer than the program held for it.
+            if reuse.untouched(p, t, &mut |k| touched(p, k)) {
+                continue;
+            }
             // A template with no stored check (one with closures) stands
             // while its body does not name an edited fn.
             let named = idents.get(t.0 as usize).is_none_or(|ids| ids.iter().any(|s| names.contains(s)));
@@ -254,6 +311,7 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
                 return Err("sig template");
             }
         }
+        super::laps::mark("collect/delta replay templates");
         for g in (0..fn_count as u32).map(LocalDefId) {
             if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
                 continue;
@@ -263,7 +321,7 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             if reuse.newer(p, g, p.reuse_stamp) {
                 return Err("sig mode");
             }
-            if reuse.discovery_holds(p, g) {
+            if reuse.untouched(p, g, &mut |k| touched(p, k)) || reuse.discovery_holds(p, g) {
                 continue;
             }
             let base = reuse.out_copy(p.def_id(g)).ok_or("discovery")?;
@@ -311,7 +369,7 @@ pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
         {
             continue;
         }
-        let why = refusal(p, &opaque_idents, f, false).err().unwrap_or("ok");
+        let why = refusal(p, f, false).and_then(|()| rpit_namers(p, &opaque_idents, &[i]).map(drop)).err().unwrap_or("ok");
         match out.iter_mut().find(|e| e.0 == why) {
             Some(e) => e.1 += 1,
             None => out.push((why, 1)),
