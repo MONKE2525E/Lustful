@@ -1969,6 +1969,22 @@ impl FnGen<'_, '_> {
         (format!(" drop_{}(&{d});", mangle(dt)), String::new())
     }
 
+    /// panic=unwind: C text that drops `v` (of type `t`), which a
+    /// builtin owns, when this thread has a pending exception: the
+    /// exception is held while the drop runs as cleanup, a second panic
+    /// aborts (`lust_unw_dstep`), then it is pending again. The drop
+    /// call is in expression form, so `wrap_calls` leaves it alone.
+    pub(super) fn unw_cleanup_drop(&mut self, v: &str, t: &CTy) -> String {
+        if !needs_drop_c(self.p, t) {
+            return String::new();
+        }
+        self.want(Glue::Drop, t);
+        format!(
+            " if (lust_unw_pending && lust_unw_mine()) {{ lust_exc e_; int32_t u_ = 0; lust_unw_dstep(&e_, &u_); (void)(drop_{}(&{v}), 0); lust_unw_dstep(&e_, &u_); lust_unw_resume(&e_); }}",
+            mangle(t)
+        )
+    }
+
     // ---------- Drop elaboration ----------
 
     /// The move path of a place: its projections as `Step`s, or None
@@ -2393,9 +2409,10 @@ impl FnGen<'_, '_> {
 
     /// An indexed element place under panic=unwind: a GNU statement
     /// expression whose failed bounds check panics and leaves for the
-    /// cleanup at block `b` before any element is read.
+    /// cleanup at block `b` before any element is read. The `(void)`
+    /// keeps `wrap_calls` from adding its own check in front of `b`.
     fn index_unw(&self, len: &str, base: &str, l: Local, loc: &str, b: u32) -> String {
-        format!("(*({{ if (l{l} >= {len}) {{ lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))")
+        format!("(*({{ if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))")
     }
 
     fn operand(&mut self, o: &Operand, loc: &str, post: &mut Vec<String>) -> (String, CTy) {
@@ -2497,6 +2514,23 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    {p}");
             }
             let _ = writeln!(self.out, "    {}", u.check());
+            if drop
+                && let Unw::Goto(cb) = u
+                && dest.proj.iter().any(|p| matches!(p, Proj::Index(_)))
+            {
+                // An index out of bounds panics before the value moves
+                // into the place (rustc checks bounds first), so the
+                // value drops as cleanup: the place's bounds checks run
+                // once here with a local cleanup label that drops it.
+                self.tmp += 1;
+                let lab = 1_000_000_000 + self.tmp;
+                self.unw = Some(Unw::Goto(lab));
+                let (pd, _) = self.place(dest, loc);
+                self.unw = Some(u);
+                self.want(Glue::Drop, &dt);
+                let _ = writeln!(self.out, "    (void)&{pd};");
+                let _ = writeln!(self.out, "    if (0) {{ bb{lab}:; (void)(drop_{}(&{t}), 0); LUST_UNW_ABORT(); goto bb{cb}; }}", mangle(&dt));
+            }
             if drop {
                 let (drop_old, refill) = self.drop_old_value(dest, &d, &dt);
                 // A drop that panics leaves the local unowned, so its
@@ -5812,10 +5846,17 @@ impl FnGen<'_, '_> {
                 let (vv, i, x) = (&vals[0], &vals[1], &vals[2]);
                 // Read the index and the value before the shift: both can
                 // read the Vec itself, as in `v.insert(0, v[1])`.
-                let _ = writeln!(
-                    self.out,
-                    "    uint64_t {ti} = {i}; {et} {tx} = {x};\n    lust_vec_insert_at({vv}, {ti}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{ti}] = {tx};"
-                );
+                let _ = writeln!(self.out, "    uint64_t {ti} = {i}; {et} {tx} = {x};");
+                if self.p.unwind {
+                    // A bad index panics with the value still owned by
+                    // `insert`, which drops it as it unwinds.
+                    let drop_x = self.unw_cleanup_drop(&tx, e);
+                    let _ = writeln!(self.out, "    if ({ti} > {vv}->len) {{ (void)(lust_vec_insert_at({vv}, {ti}, sizeof({et}), _Alignof({et}), {loc}), 0);{drop_x} }} else {{");
+                }
+                let _ = writeln!(self.out, "    lust_vec_insert_at({vv}, {ti}, sizeof({et}), _Alignof({et}), {loc});\n    (({et}*){vv}->ptr)[{ti}] = {tx};");
+                if self.p.unwind {
+                    let _ = writeln!(self.out, "    }}");
+                }
                 "((lust_Unit){})".into()
             }
             B::VecRemove => {
@@ -5972,15 +6013,24 @@ impl FnGen<'_, '_> {
                 let (w, r, c) = (self.tmp(), self.tmp(), self.tmp());
                 let mut body = String::new();
                 let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
-                let _ = writeln!(body, "    uint64_t {w} = 0;");
-                let _ = writeln!(body, "    for (uint64_t {r} = 0; {r} < {vv}->len; {r}++) {{");
+                let _ = writeln!(body, "    uint64_t {w} = 0, {r} = 0;");
+                let _ = writeln!(body, "    for (; {r} < {vv}->len; {r}++) {{");
                 let elem_r = format!("(&(({et}*){vv}->ptr)[{r}])");
                 let (keep, _) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[elem_r]);
+                // panic=unwind: a panic in the predicate keeps the element
+                // it saw; one in a rejected element's drop counts that one
+                // removed. Either way the rest moves down behind the kept
+                // ones (std's `BackshiftOnDrop`), so nothing is lost.
+                let mine = "lust_unw_pending && lust_unw_mine()";
+                if self.p.unwind {
+                    let _ = writeln!(body, "      if ({mine}) break;");
+                }
                 // A removed element drops as soon as it is rejected,
                 // before the predicate sees the next one, as in Rust.
                 let drop_rej = if needs_drop_c(self.p, e) {
                     self.want(Glue::Drop, e);
-                    format!("drop_{}(&(({et}*){vv}->ptr)[{r}]); ", mangle(e))
+                    let after = if self.p.unwind { format!(" if ({mine}) {{ {r}++; break; }}") } else { String::new() };
+                    format!("(void)(drop_{}(&(({et}*){vv}->ptr)[{r}]), 0);{after} ", mangle(e))
                 } else {
                     String::new()
                 };
@@ -5989,10 +6039,21 @@ impl FnGen<'_, '_> {
                     "      if ({keep}) {{ if ({w} != {r}) (({et}*){vv}->ptr)[{w}] = (({et}*){vv}->ptr)[{r}]; {w}++; }} else {{ {drop_rej}}}"
                 );
                 let _ = writeln!(body, "    }}");
-                let _ = writeln!(body, "    {vv}->len = {w};");
+                if self.p.unwind {
+                    let n = self.tmp();
+                    let _ = writeln!(body, "    uint64_t {n} = {vv}->len - {r}; {vv}->len = {w} + {n};");
+                    let _ = writeln!(body, "    if ({n} && {w} != {r}) lust_memmove((({et}*){vv}->ptr) + {w}, (({et}*){vv}->ptr) + {r}, {n} * sizeof({et}));");
+                } else {
+                    let _ = writeln!(body, "    {vv}->len = {w};");
+                }
                 if needs_drop_c(self.p, &tys[1]) {
                     self.want(Glue::Drop, &tys[1]);
-                    let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
+                    if self.p.unwind {
+                        let drop_c = self.unw_cleanup_drop(&c, &tys[1]);
+                        let _ = writeln!(body, "    if ({mine}) {{{drop_c} }} else drop_{}(&{c});", mangle(&tys[1]));
+                    } else {
+                        let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
+                    }
                 }
                 let _ = write!(self.out, "{body}");
                 "((lust_Unit){})".into()

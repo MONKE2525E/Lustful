@@ -391,17 +391,20 @@ static void lust_str_boundary_fail(const char *which, const uint8_t *ptr, uint64
 }
 #endif
 
-/* The end of a str slice range, checked in Rust 1.99's order: start and
-   end against the length, start against end, then both on UTF-8 char
-   boundaries (the end of the string or a byte that is not a
-   continuation byte). */
+/* The end of a str slice range, checked in Rust 1.99's order
+   (`slice_error_fail_rt`): start and end against the length, start
+   against end, then both on UTF-8 char boundaries (the end of the string
+   or a byte that is not a continuation byte). An inclusive end at the
+   length stays as written, so its boundary checks come first and its
+   own out-of-bounds message last, as in core. */
 uint64_t lust_str_range(const uint8_t *ptr, uint64_t lo, uint64_t hi, int inclusive, uint64_t len, lust_loc loc) LUST_BODY({
     if (lo > len) { lust_panic_nn("start byte index ", lo, " is out of bounds for string of length ", len, "", loc); return lo; }
-    if (inclusive ? hi >= len : hi > len) { lust_panic_nn("end byte index ", hi, " is out of bounds for string of length ", len, "", loc); return lo; }
-    uint64_t end = inclusive ? hi + 1 : hi;
+    if (hi > len) { lust_panic_nn("end byte index ", hi, " is out of bounds for string of length ", len, "", loc); return lo; }
+    uint64_t end = inclusive && hi < len ? hi + 1 : hi;
     if (lo > end) { lust_panic_nn("byte range starts at ", lo, " but ends at ", end, "", loc); return lo; }
     if (lo < len && (ptr[lo] & 0xC0) == 0x80) { lust_str_boundary_fail("start byte index ", ptr, lo, loc); return lo; }
     if (end < len && (ptr[end] & 0xC0) == 0x80) { lust_str_boundary_fail("end byte index ", ptr, end, loc); return lo; }
+    if (inclusive && hi == len) { lust_panic_nn("end byte index ", hi, " is out of bounds for string of length ", len, "", loc); return lo; }
     return end;
 })
 
@@ -488,6 +491,11 @@ lust_VecDrain lust_vec_drain(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64
     (void)loc; /* range panics report core's slice/index.rs sites */
     uint64_t start, end;
     lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, &start, &end);
+    if (lust_unwind_mode && lust_unw_mine()) {
+        /* The range panicked: the Vec stays as it is (an empty Drain at its end). */
+        lust_VecDrain e = {v, v->len, v->len, v->len, v->len, 0};
+        return e;
+    }
     lust_VecDrain d = {v, start, start, end, end, v->len - end};
     v->len = start;
     return d;
@@ -499,15 +507,19 @@ lust_VecDrain lust_vec_drain(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64
 lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
     uint64_t start, end;
     lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, &start, &end);
+    lust_VecDrain e = {v, v->len, v->len, v->len, v->len, 0}; /* after a panic: an empty Drain at the end */
+    if (lust_unwind_mode && lust_unw_mine()) return e;
     if (!(start == v->len || (v->ptr[start] & 0xC0) != 0x80)) {
         lust_String s = lust_string_new();
         lust_string_push_cstr(&s, "assertion failed: self.is_char_boundary(start)");
         lust_panic(&s, loc);
+        return e;
     }
     if (!(end == v->len || (v->ptr[end] & 0xC0) != 0x80)) {
         lust_String s = lust_string_new();
         lust_string_push_cstr(&s, "assertion failed: self.is_char_boundary(end)");
         lust_panic(&s, loc);
+        return e;
     }
     lust_VecDrain d = {v, start, start, end, end, v->len - end};
     return d;
@@ -640,6 +652,7 @@ int lust_range_bounds_get(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t
 void lust_slice_copy_within(void *ptr, uint64_t len, uint64_t elem, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t dest, lust_loc loc) LUST_BODY({
     uint64_t start, end;
     lust_range_bounds_check(len, s_tag, s_val, e_tag, e_val, &start, &end);
+    if (lust_unwind_mode && lust_unw_mine()) return;
     if (dest > len - (end - start)) {
         lust_panic_cstr("dest is out of bounds", loc);
         return;
