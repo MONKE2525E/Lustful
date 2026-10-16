@@ -8352,6 +8352,31 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let pairr = p.tys.intern(TyKind::Tuple(pairr_ts));
         insert_synthetic(p, &mut ordinal, lang.range_bounds, pairr, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
+    // The six range kinds derive PartialEq, Eq, and Hash over their
+    // fields in core (`RangeFull` with no bound; its Hash is left out
+    // here); the glue compares and hashes their C tuples
+    // (`collect::range_elem`).
+    {
+        use crate::ty::iter::{IterKind as K, mk_iter};
+        for k in [K::Range, K::RangeInclusive, K::RangeFrom, K::RangeTo, K::RangeToInclusive, K::RangeFull] {
+            let full = k == K::RangeFull;
+            let self_pat = if full { mk_iter(&mut p.tys, k, &[]) } else { mk_iter(&mut p.tys, k, &[p0]) };
+            for tr in [lang.partial_eq, lang.eq, lang.hash] {
+                // `RangeFull` hashes no glue (`collect::range_elem`).
+                if full && tr == lang.hash {
+                    continue;
+                }
+                let g = if full {
+                    g0.clone()
+                } else {
+                    let mut g1 = one.clone();
+                    g1.predicates = pred_on_p0(p, tr);
+                    g1
+                };
+                insert_synthetic(p, &mut ordinal, tr, self_pat, &rhs_of(tr, self_pat), g, Vec::new(), Synthetic::Lang, false, span);
+            }
+        }
+    }
     // IntoIterator for the builtin collections, as alloc and core
     // declare it: Vec<T> by value (vec::IntoIter<T>), &Vec<T> and &[T]
     // (slice::Iter), &mut Vec<T> and &mut [T] (slice::IterMut). Their

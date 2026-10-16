@@ -262,6 +262,11 @@ impl<'p> Ctx<'p> {
         if self.tys.is_chars_ty(base) && (n == "next" || n == "count") {
             return None;
         }
+        // A range's derived `Hash::hash` is no iterator method: the
+        // hasher hook takes it (check/hashmap.rs).
+        if n == "hash" && it::iter_parts(&self.tys, base).is_some_and(|(k, _)| k.is_range()) {
+            return None;
+        }
         Some(self.iter_call(e, recv, base, base, derefs, &n, name_span, args, turbofish, expected))
     }
 

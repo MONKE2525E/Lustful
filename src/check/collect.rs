@@ -8323,6 +8323,21 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
 /// containers of such types, and Adts that derive `Hash` with
 /// fields of such types. (Lust has no `Hasher` yet: this answers
 /// bounds, no hashing code exists.)
+/// For the six `core::ops` range types (builtin iterator kinds over an
+/// integer, ty/iter.rs): `Some(None)` for `RangeFull`, else
+/// `Some(Some(elem))`. Std derives `PartialEq`, `Eq`, and `Hash` on each
+/// over its fields (`start`, `end`, and `RangeInclusive`'s `exhausted`
+/// flag); their C form is the tuple of those fields, so the tuple glue
+/// gives std's answers. `RangeFull`'s C form is one dummy flag: equal
+/// always, but it hashes no glue (std writes nothing).
+fn range_elem(tys: &impl TyIntern, t: Ty) -> Option<Option<Ty>> {
+    let (k, a) = crate::ty::iter::iter_parts(tys, t)?;
+    if !k.is_range() {
+        return None;
+    }
+    Some(if k == crate::ty::iter::IterKind::RangeFull { None } else { a.first().copied() })
+}
+
 pub fn has_hash(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     glue_hash(p, tys, t, &mut GlueSeen::default())
 }
@@ -8342,6 +8357,10 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bo
         _ => {
             if tys.is_string_ty(t) {
                 return true;
+            }
+            // `RangeFull`'s C form holds a dummy flag: no Hash glue.
+            if let Some(e) = range_elem(tys, t) {
+                return e.is_some_and(|e| glue_hash(p, tys, e, seen));
             }
             if tys.guard_elem(t).is_some() {
                 return false;
@@ -8498,6 +8517,9 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -
             if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::PartialEq) {
                 return b;
             }
+            if let Some(e) = range_elem(tys, t) {
+                return e.is_none_or(|e| glue_total_eq(p, tys, e, seen));
+            }
             if tys.guard_elem(t).is_some() {
                 return false;
             }
@@ -8557,6 +8579,9 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool
             }
             if let Some(Ok(b)) = crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::PartialEq) {
                 return b;
+            }
+            if let Some(e) = range_elem(tys, t) {
+                return e.is_none_or(|e| glue_eq(p, tys, e, seen));
             }
             if tys.guard_elem(t).is_some() {
                 return false;

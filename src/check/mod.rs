@@ -13773,6 +13773,14 @@ impl<'p> Ctx<'p> {
         let intlike = matches!(bk, TyKind::Int(_)) || bk.is_int_infer();
         let floatlike = matches!(bk, TyKind::Float(_)) || bk.is_float_infer();
         if !intlike && !floatlike && !matches!(bk, TyKind::Bool | TyKind::Char) {
+            // The iterator range kinds (`Range`, `RangeInclusive`,
+            // `RangeFrom`) by value, or through `&mut` or `Box`: rustc's
+            // by-value probe finds `Iterator::eq` and kin first (as
+            // method.rs `iterator_shadows` has it for user iterators), so
+            // the iterator path answers, not `PartialEq`.
+            if !builtin_only && self.range_iter_receiver(recv) {
+                return None;
+            }
             // Other types compare by structure when every part does
             // (strings, tuples, containers, derived impls): lowering
             // uses the `eq` and `cmp` glue for them.
@@ -13818,6 +13826,22 @@ impl<'p> Ctx<'p> {
             PrimCmpKind::Total(_) => generics::ordering_ty(&mut self.tys),
             PrimCmpKind::Op(_) => BOOL,
         })
+    }
+
+    /// True when the receiver `recv` is, by value or through `&mut` or
+    /// `Box`, one of the range kinds std makes iterators (`Range`,
+    /// `RangeInclusive`, `RangeFrom`): `prim_cmp_method` leaves its
+    /// comparison method names to the iterator path.
+    fn range_iter_receiver(&mut self, recv: ExprId) -> bool {
+        use crate::ty::iter::IterKind as K;
+        let rt = self.out.expr_ty[self.ei(recv)];
+        let rt = self.deep(rt);
+        let t = match self.kind(rt) {
+            TyKind::Ref(_, Mut::Mut, inner) => self.resolve(inner),
+            TyKind::Ref(..) => return false,
+            _ => self.tys.boxed_elem(rt).map_or(rt, |e| self.resolve(e)),
+        };
+        crate::ty::iter::iter_parts(&self.tys, t).is_some_and(|(k, _)| matches!(k, K::Range | K::RangeInclusive | K::RangeFrom))
     }
 
     /// The argument of a comparison method call (`eq`, `partial_cmp`,
