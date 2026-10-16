@@ -921,7 +921,13 @@ pub fn serve(sock: &Path) -> ! {
             file: file.clone(),
         };
         let entry = entry_for(&mut sessions, &base, &req.session, &mut made);
-        let _ = compile_guarded(entry, &req, &mut jobs);
+        // No client reads this answer, and the file can change while it
+        // compiles (the client may write the next version), so it runs as a
+        // background check does: no oracle response compare, which would
+        // read other bytes. A panic leaves no session to trust.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile_background(&req, &mut entry.session))).is_err() {
+            sessions.remove(&req.session);
+        }
         last = std::time::Instant::now();
     }
     loop {
