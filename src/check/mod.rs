@@ -20878,11 +20878,22 @@ impl<'p> Ctx<'p> {
             self.layout_val_res(e, t, align, span);
         }
         // Deferred format tests, with types as bound by now.
+        // A test whose type holds an Adt with a written impl queues its
+        // goal (`require_fmt`), so the queue runs once more: the last
+        // run above is over, and a goal left in it is never proved. A
+        // literal in the goal (`Wrap(5)`) takes its fallback type first,
+        // and so does one in the tested type: an Adt over a literal's
+        // variable (`H<Range<{integer}>>`) is no instance yet, and the
+        // derive walk would read it as a template.
         for (t, spec, span) in std::mem::take(&mut self.deferred_fmt) {
+            self.default_literal_vars(t);
             let t = self.deep(t);
             self.require_sized(t, span);
             self.check_fmt_arg(t, spec, span);
         }
+        self.run_obligations(false);
+        self.literal_fallback_in_obligations();
+        self.run_obligations(true);
         // Deferred Clone and PartialEq needs of builtin Vec and
         // slice methods, with types as bound by now.
         self.finish_make_mut();

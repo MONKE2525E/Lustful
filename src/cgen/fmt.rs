@@ -295,6 +295,10 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
                 let _ = writeln!(body, "  {call}");
             } else {
                 let adt = p.adt(*a);
+                // The field print is the derive's. An Adt with no derive
+                // and no written impl here is a checker gap: print
+                // nothing rather than a guess (rule zero).
+                assert!(adt.derives.debug, "internal: Debug glue for `{}`, which has no derive and no selected impl", p.display_name(adt.name));
                 let variant = |v: &Variant, access: &dyn Fn(usize) -> String, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                     // The struct's pseudo-variant carries the flat name;
                     // rustc prints the source name.
