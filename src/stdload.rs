@@ -79,6 +79,7 @@ fn builtin_text(rel: &str) -> Option<&'static str> {
         "std/src/net.rs" => include_str!("../library/std/src/net.rs"),
         "std/src/alloc.rs" => include_str!("../library/std/src/alloc.rs"),
         "std/src/unix_net.rs" => include_str!("../library/std/src/unix_net.rs"),
+        "std/src/fs_time.rs" => include_str!("../library/std/src/fs_time.rs"),
         _ => return None,
     })
 }

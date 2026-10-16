@@ -95,6 +95,13 @@ impl Error {
         Error { repr: Repr::CustomFmt(kind, display, debug) }
     }
 
+    /// std's `const_error!(kind, message)` for std source outside this
+    /// crate (the std splice): an error with a static message.
+    #[doc(hidden)]
+    pub fn __lust_adapter_simple_message(kind: ErrorKind, message: &'static str) -> Error {
+        Error::simple_message(kind, message)
+    }
+
     /// Creates an error from an OS error code.
     pub fn from_raw_os_error(code: i32) -> Error {
         Error { repr: Repr::Os(code) }

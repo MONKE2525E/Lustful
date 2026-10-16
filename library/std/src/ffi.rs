@@ -294,9 +294,11 @@ impl From<String> for OsString {
     }
 }
 
-impl From<&str> for OsString {
-    fn from(s: &str) -> OsString {
-        OsString { inner: core::intrinsics::sys_str_as_bytes(s).to_vec() }
+impl<T: ?Sized + AsRef<OsStr>> From<&T> for OsString {
+    /// Copies any value implementing `AsRef<OsStr>` into a newly allocated
+    /// `OsString`.
+    fn from(s: &T) -> OsString {
+        s.as_ref().to_os_string()
     }
 }
 

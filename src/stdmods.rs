@@ -169,6 +169,14 @@ pub const STD_MODULES: &[StdModule] = &[
         full: false,
         triggers: &["once", "once_with", "from_fn", "successors", "Once", "OnceWith", "FromFn", "Successors"],
     },
+    StdModule {
+        name: "__lust_std_fs_time",
+        rel: "std/src/fs_time.rs",
+        krate: ShippedCrate::Std,
+        paths: &[("std", "fs")],
+        full: false,
+        triggers: &["modified", "accessed"],
+    },
 ];
 
 // `needs` gives one bit per row.

@@ -595,6 +595,13 @@ pub(super) fn trait_probe_for(
         // An instance replays the template's param-env pick with its
         // trait inputs (`U: Add2<u8>` gives `u16: Add2<u8>`).
         let replayed = if only.is_some() { cx.replayed_trait_ref(e, trait_def) } else { None };
+        // Core's blanket `Into`/`TryInto` may hold for any receiver, so
+        // rustc's probe stops at the first step and never autoderefs to
+        // them: `Box<String>` into an `OsString` is E0277, not `String`'s
+        // impl through the deref.
+        if (trait_def == p.gx.lang.into || trait_def == p.gx.lang.try_into) && derefs > 0 {
+            continue;
+        }
         for &probe in probes {
             // rustc picks `into`/`try_into` at the by-value step for any
             // sized receiver (core's blanket `Into` for every `T` may
