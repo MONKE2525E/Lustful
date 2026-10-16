@@ -1,7 +1,7 @@
-// expect: L0643
+// expect: L0112
 // rustc E0277: `v.spare_capacity_mut()` is Vec's inherent method, which
-// wins over the user trait's method of that name. lust does not model it,
-// so it must not pick the trait instead.
+// wins over the user trait's method of that name; its `&mut
+// [MaybeUninit<u8>]` is not Display. lust must not pick the trait.
 trait T {
     fn spare_capacity_mut(&mut self) -> u8;
 }
