@@ -182,13 +182,16 @@ impl<'p> Ctx<'p> {
         matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_))
     }
 
-    /// The std hash trait `name` is usable here: imported by its std
-    /// path, the trait of the impl this body is in, or a bound in the
-    /// env (as rustc needs the trait in scope).
-    fn hash_trait_in_scope(&self, trait_def: DefId, name: &str) -> bool {
+    /// The std hash trait `name` is in scope here for any receiver: imported
+    /// by its std path or a glob of `std::hash`, or the trait of the impl
+    /// this body is in (as rustc needs the trait in scope). A bound brings
+    /// it in only for its own param (`method::trait_in_scope_at`); an
+    /// instance still counts its template's bounds.
+    pub(super) fn hash_trait_in_scope(&mut self, trait_def: DefId, name: &str) -> bool {
         self.std_trait_imported("hash", name)
+            || self.std_glob("hash")
             || self.enclosing_impl_trait_pub() == Some(trait_def)
-            || self.env().iter().any(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == trait_def))
+            || method::in_template_env(self, trait_def)
     }
 
     /// The written `BuildHasher` method `name` (`build_hasher`, or a
@@ -311,7 +314,7 @@ impl<'p> Ctx<'p> {
         let n = self.p.interner.get(name);
         let base = self.deep(base);
         match n {
-            "hash" if args.len() == 1 && self.hash_trait_in_scope(lang.hash, "Hash") => {
+            "hash" if args.len() == 1 && method::trait_in_scope_at(self, lang.hash, base) => {
                 // The receiver must be Hash; the argument `&mut H`, H a hasher.
                 if !self.tys.flags(base).contains_param() && !self.implements(lang.hash, base) {
                     return None;
@@ -330,7 +333,7 @@ impl<'p> Ctx<'p> {
                 self.set_res(e, Res::BuiltinMethod { b: B::HashInto, derefs, autoref: Autoref::Ref });
                 Some(UNIT)
             }
-            "hash_one" if args.len() == 1 && self.hash_trait_in_scope(lang.build_hasher, "BuildHasher") => {
+            "hash_one" if args.len() == 1 && method::trait_in_scope_at(self, lang.build_hasher, base) => {
                 // A written `hash_one` runs as written; the glue is
                 // only the provided body (fx-fromiter).
                 if let Some((f, params, ret)) = self.written_builder_method(e, base, "hash_one", name_span) {
@@ -351,7 +354,7 @@ impl<'p> Ctx<'p> {
             // trait here); std's builders are the glue: RandomState
             // builds a DefaultHasher, BuildHasherDefault<H> an
             // `H::default()`.
-            "build_hasher" if args.is_empty() && self.hash_trait_in_scope(lang.build_hasher, "BuildHasher") => {
+            "build_hasher" if args.is_empty() && method::trait_in_scope_at(self, lang.build_hasher, base) => {
                 if let Some((f, params, ret)) = self.written_builder_method(e, base, "build_hasher", name_span) {
                     self.set_res(e, Res::Method { f, derefs, autoref: Autoref::Ref });
                     self.check_args(&params[1.min(params.len())..], args, name_span);
@@ -365,7 +368,7 @@ impl<'p> Ctx<'p> {
                 self.set_res(e, Res::BuiltinMethod { b: B::BuildHasher, derefs, autoref: Autoref::Ref });
                 Some(h)
             }
-            m if HASHER_METHODS.contains(&m) && self.hash_trait_in_scope(lang.hasher, "Hasher") => {
+            m if HASHER_METHODS.contains(&m) && method::trait_in_scope_at(self, lang.hasher, base) => {
                 // A concrete hasher only: a bound's methods are its stubs.
                 if self.tys.flags(base).contains_param() || !self.implements(lang.hasher, base) {
                     return None;

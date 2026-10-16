@@ -159,13 +159,18 @@ impl Ctx<'_> {
     /// The traits of the where clauses on one type parameter (or
     /// projection) that declare a method `name` with a template, from
     /// this body's env. The env is elaborated, so supertraits count.
-    pub(super) fn bound_traits_with(&self, self_ty: Ty, name: Sym) -> Vec<DefId> {
+    /// Only a param's bounds bring a trait in scope (rustc's inherent
+    /// candidates); a projection or opaque type keeps the bound traits
+    /// that are in scope anyway.
+    pub(super) fn bound_traits_with(&mut self, self_ty: Ty, name: Sym) -> Vec<DefId> {
         let p = self.p;
         let Some(traits) = p.gx.traits_by_method.get(&name) else { return Vec::new() };
         let self_ty = self.resolve(self_ty);
-        if !matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..)) {
-            return Vec::new();
-        }
+        let param = match self.tys.kind(self_ty) {
+            TyKind::Param(_) => true,
+            TyKind::Projection(..) | TyKind::Opaque(..) => false,
+            _ => return Vec::new(),
+        };
         let env = self.solve_env();
         let is_bound = |t: DefId| {
             env.iter().any(|pred| {
@@ -179,6 +184,9 @@ impl Ctx<'_> {
             if templated && !out.contains(&t) && is_bound(t) {
                 out.push(t);
             }
+        }
+        if !param {
+            out.retain(|&t| method::trait_in_scope_pub(self, t));
         }
         out
     }

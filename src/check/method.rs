@@ -78,14 +78,35 @@ impl RcvProbe {
     }
 }
 
-/// True when a trait is in scope for method calls here: a std
-/// prelude trait, a trait defined in or imported into the
-/// current fn's module (per the resolver tables), or a trait
-/// named by a bound in the current param env. Without resolver
-/// tables (collect-only test paths) every local trait counts
-/// as in scope, as before.
+/// True when a trait is in scope for method calls on any receiver
+/// here: a std prelude trait, or a trait defined in or imported into
+/// the current fn's module (per the resolver tables). A bound brings a
+/// trait in only for its own type parameter: use `trait_in_scope_at`
+/// where the Self type is known. Without resolver tables
+/// (collect-only test paths) every local trait counts as in scope,
+/// as before.
 pub(super) fn trait_in_scope_pub(cx: &mut Ctx, trait_def: DefId) -> bool {
     trait_in_scope(cx, trait_def)
+}
+
+/// `trait_in_scope`, or a bound of this body's env names the trait
+/// with `self_ty` as its Self and `self_ty` is a type parameter
+/// (rustc's inherent candidates from the param env). So `T: Add`
+/// gives `x.add(y)` and `T::add` for `x: T`, but not `1i32.add(2)`;
+/// a bound on a projection or an opaque type brings nothing in.
+pub(super) fn trait_in_scope_at(cx: &mut Ctx, trait_def: DefId, self_ty: Ty) -> bool {
+    trait_in_scope(cx, trait_def) || param_bound_names(cx, trait_def, self_ty)
+}
+
+/// True when `self_ty` is a type parameter that a bound of this
+/// body's env (elaborated, so supertraits count) gives `trait_def`.
+pub(super) fn param_bound_names(cx: &mut Ctx, trait_def: DefId, self_ty: Ty) -> bool {
+    let t = cx.resolve(self_ty);
+    if !matches!(cx.tys.kind(t), TyKind::Param(_)) {
+        return false;
+    }
+    let env = cx.env();
+    env.iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def && cx.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(t)))
 }
 
 fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
@@ -113,10 +134,10 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         || (trait_def == lang.borrow_mut && cx.std_trait_imported("borrow", "BorrowMut"))
         || (trait_def == lang.any && cx.std_trait_imported("any", "Any"))
         || (trait_def == lang.range_bounds && cx.std_trait_imported("ops", "RangeBounds"))
-        || (trait_def == lang.hasher
-            && (cx.std_trait_imported("hash", "Hasher") || cx.enclosing_impl_trait_pub() == Some(trait_def)))
-        || (trait_def == lang.build_hasher
-            && (cx.std_trait_imported("hash", "BuildHasher") || cx.enclosing_impl_trait_pub() == Some(trait_def)))
+        // Only the `Hash` derive macro is in the prelude, not the trait.
+        || (trait_def == lang.hash && cx.hash_trait_in_scope(trait_def, "Hash"))
+        || (trait_def == lang.hasher && cx.hash_trait_in_scope(trait_def, "Hasher"))
+        || (trait_def == lang.build_hasher && cx.hash_trait_in_scope(trait_def, "BuildHasher"))
     {
         return true;
     }
@@ -127,7 +148,6 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.eq,
         lang.partial_ord,
         lang.ord,
-        lang.hash,
         lang.default,
         lang.drop,
         lang.iterator,
@@ -155,15 +175,12 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
     }
     // The operator traits, `Deref`, and `Index` are not in the prelude: a
     // method call by name (`1i32.add(2)`, `s.deref()`) needs the trait
-    // imported, by name or by a glob of `std::ops`. Operator syntax and
-    // bounds do not ask.
-    if let Some(name) = ops_trait_name(lang, trait_def) {
-        return cx.std_trait_imported("ops", name) || cx.std_ops_glob() || in_env_or_template(cx, trait_def);
-    }
-    if in_env_or_template(cx, trait_def) {
+    // imported, by name or by a glob of `std::ops`. Operator syntax does
+    // not ask; a bound counts for its own param (`trait_in_scope_at`).
+    if let Some(name) = ops_trait_name(lang, trait_def) && (cx.std_trait_imported("ops", name) || cx.std_glob("ops")) {
         return true;
     }
-    false
+    in_template_env(cx, trait_def)
 }
 
 /// The `core::ops` name of lang trait `d` when it is one of the operator,
@@ -200,23 +217,18 @@ fn ops_trait_name(lang: &crate::check::generics::LangTraits, d: DefId) -> Option
     table.iter().find(|&&(t, _)| t == d).map(|&(_, n)| n)
 }
 
-/// True when a bound in this body's env (or its template's, for an
-/// instance) names trait `trait_def`, which brings it in scope.
-fn in_env_or_template(cx: &mut Ctx, trait_def: DefId) -> bool {
+/// True in an instance body when a bound of its template names trait
+/// `trait_def`. An instance re-checks its template with concrete types
+/// and an empty env; the template check already held the call to the
+/// bound's own param (`trait_in_scope_at`), so the bound still speaks
+/// for scope here.
+pub(super) fn in_template_env(cx: &mut Ctx, trait_def: DefId) -> bool {
     let p = cx.p;
-    let in_env = |preds: &[Predicate]| preds.iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def));
-    // An opaque type's bounds count like a where clause (check/opaque.rs).
-    if in_env(&cx.solve_env()) {
-        return true;
-    }
-    // An instance body re-checks its template with concrete
-    // types and an empty env; the template's bounds are what
-    // made the call legal, so they still speak for scope here.
     if let Some(info) = p.gx.instances.get(&cx.fid)
         && let Some(tl) = info.template_local
         && let Some(fs) = p.gx.fn_scopes.get(tl.0 as usize)
     {
-        return in_env(&fs.env);
+        return fs.env.iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def));
     }
     false
 }
@@ -586,7 +598,10 @@ pub(super) fn trait_probe_for(
     // builtin dispatch or the no-method error answers).
     let mut lang_hits: Vec<DefId> = Vec::new();
     for trait_def in traits {
-        if only.is_none() && !trait_in_scope(cx, trait_def) {
+        // A trait out of scope here may still come in through a bound,
+        // but only at a probe whose Self is that bound's param.
+        let in_scope = only.is_some() || trait_in_scope(cx, trait_def);
+        if !in_scope && !probes.iter().any(|pr| param_bound_names(cx, trait_def, pr.self_ty)) {
             continue;
         }
         // rustc picks a std inherent item first here (check/std_inherent.rs).
@@ -641,6 +656,9 @@ pub(super) fn trait_probe_for(
                     && probe.autoref == Autoref::Ref
                     && matches!(cx.kind(probe.self_ty), TyKind::Ref(_, _, s) if cx.into_self(s).1 != Autoref::None))
             {
+                continue;
+            }
+            if !in_scope && !param_bound_names(cx, trait_def, probe.self_ty) {
                 continue;
             }
             let step = probe.self_ty;

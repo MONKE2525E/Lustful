@@ -335,7 +335,23 @@ impl<'p> Ctx<'p> {
         let in_scope = method::trait_in_scope_pub(self, p.gx.lang.any);
         let mut cur = self.resolve(rt);
         let mut hit: Option<(Ty, u8, bool)> = None;
+        // An instance takes the template's step: a param's bound counts
+        // only at that param, which its concrete type no longer shows
+        // (`Box<T>` with `T: Any` and no `use` is `T`'s id, not the Box's).
+        if let Some(pick) = self.replay_pick(e).filter(|pk| pk.trait_def == p.gx.lang.any) {
+            for _ in 0..pick.derefs {
+                cur = match self.tys.kind(cur) {
+                    TyKind::Ref(_, _, inner) => self.resolve(inner),
+                    _ => self.resolve(self.tys.smart_elem(cur)?),
+                };
+            }
+            let dynamic = matches!(self.kind(cur), TyKind::Dyn(..)) && dyn_reaches_any(p, &mut self.tys, cur);
+            hit = Some((cur, pick.derefs, dynamic));
+        }
         for derefs in 0..32u8 {
+            if hit.is_some() {
+                break;
+            }
             let mut cands: Vec<(Ty, u8)> = Vec::new();
             if let TyKind::Ref(_, Mut::Shared, inner) = self.tys.kind(cur) {
                 cands.push((self.resolve(inner), derefs + 1));
@@ -346,7 +362,8 @@ impl<'p> Ctx<'p> {
                     hit = Some((self_ty, d, true));
                     break;
                 }
-                if in_scope {
+                // A bound on a param Self brings `Any` in for that param only.
+                if in_scope || method::param_bound_names(self, p.gx.lang.any, self_ty) {
                     hit = Some((self_ty, d, false));
                     break;
                 }
@@ -363,6 +380,9 @@ impl<'p> Ctx<'p> {
             };
         }
         let (self_ty, derefs, dynamic) = hit?;
+        if !dynamic {
+            self.record_pick(e, p.gx.lang.any, derefs, ReceiverForm::Ref);
+        }
         self.check_args(&[], args, name_span);
         let id_ty = generics::type_id_ty(&mut self.tys);
         if dynamic {

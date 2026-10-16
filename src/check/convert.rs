@@ -283,10 +283,10 @@ impl<'p> Ctx<'p> {
         let conv = match n {
             "as_ref" => Conv::AsRef,
             "as_mut" => Conv::AsMut,
-            // A trait named in the fn's bounds is in scope in its body
-            // (rustc's rule, method.rs `trait_in_scope`): an instance
-            // of a `K: Borrow<Q>` body calling `k.borrow()` on a
-            // builtin key lands here, with no `use` in the module.
+            // An instance of a `K: Borrow<Q>` body calling `k.borrow()`
+            // on a builtin key lands here with no `use` in the module:
+            // the template's bound speaks for scope (method.rs
+            // `in_template_env`).
             "borrow"
                 if (super::method::trait_in_scope_pub(self, lang.borrow) || self.enclosing_impl_trait_pub() == Some(lang.borrow))
                     && plain(self, self_ty) =>
@@ -435,9 +435,9 @@ impl<'p> Ctx<'p> {
         let lang = self.p.gx.lang;
         let tr = if mutable { lang.deref_mut } else { lang.deref };
         let replayed = self.replay_pick(e).filter(|pk| pk.trait_def == tr);
-        let in_scope = super::method::trait_in_scope_pub(self, tr)
-            || self.enclosing_impl_trait_pub() == Some(tr)
-            || self.env().iter().any(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == tr));
+        // A bound brings `Deref` in only for its own param, which is not a
+        // builtin Self (an instance counts its template's bounds).
+        let in_scope = super::method::trait_in_scope_pub(self, tr) || self.enclosing_impl_trait_pub() == Some(tr);
         if replayed.is_none() && !in_scope {
             return None;
         }

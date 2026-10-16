@@ -100,13 +100,14 @@ impl<'p> Ctx<'p> {
         })
     }
 
-    /// True when a glob of `std::ops` (or core's) is imported into this
-    /// body's module: it brings every operator trait in scope.
-    pub(super) fn std_ops_glob(&self) -> bool {
+    /// True when a glob of std module `module` (or core's: `std::ops::*`,
+    /// `std::hash::*`) is imported into this body's module: it brings
+    /// every trait of that module in scope.
+    pub(super) fn std_glob(&self, module: &str) -> bool {
         let p = self.p;
         let Some(res) = &p.resolved else { return false };
         res.std_globs.iter().any(|(m, path)| {
-            *m == self.module && path.len() == 2 && matches!(p.interner.get(path[0]), "std" | "core") && p.interner.get(path[1]) == "ops"
+            *m == self.module && path.len() == 2 && matches!(p.interner.get(path[0]), "std" | "core") && p.interner.get(path[1]) == module
         })
     }
 

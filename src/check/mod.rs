@@ -12285,7 +12285,7 @@ impl<'p> Ctx<'p> {
         let p = self.p;
         let traits: Vec<DefId> = match hint {
             Some(tr) => vec![tr.def],
-            None => p.gx.traits_by_method.get(&name).cloned().unwrap_or_default().into_iter().filter(|&d| method::trait_in_scope_pub(self, d)).collect(),
+            None => p.gx.traits_by_method.get(&name).cloned().unwrap_or_default().into_iter().filter(|&d| method::trait_in_scope_at(self, d, base)).collect(),
         };
         // First pass, rolled back: which traits answer.
         let mut hits: Vec<TraitRef> = Vec::new();
@@ -12980,7 +12980,7 @@ impl<'p> Ctx<'p> {
                     .cloned()
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|&d| method::trait_in_scope_pub(self, d))
+                    .filter(|&d| method::trait_in_scope_at(self, d, base))
                     .collect()
             }
         };
@@ -14961,7 +14961,7 @@ impl<'p> Ctx<'p> {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|&d| d != trait_def && method::trait_in_scope_pub(self, d))
+            .filter(|&d| d != trait_def && method::trait_in_scope_at(self, d, base))
             .collect();
         for other in others {
             let Some(rec) = p.gx.index.trait_record(other) else { continue };
@@ -19641,11 +19641,18 @@ impl<'p> Ctx<'p> {
         } else {
             Vec::new()
         };
+        // A projection's bounds do not bring their traits in scope (only a
+        // param's do, as rustc's inherent candidates).
+        let bound: Vec<DefId> = if matches!(self.tys.kind(base_r), TyKind::Projection(..)) {
+            bound.into_iter().filter(|&t| method::trait_in_scope_pub(self, t)).collect()
+        } else {
+            bound
+        };
         let traits: Vec<DefId> = match (hint, pick_e.and_then(|e| self.replay_pick(e))) {
             (Some(tr), _) => vec![tr.def],
             (None, Some(pick)) => vec![pick.trait_def],
             (None, None) if !bound.is_empty() => bound,
-            (None, None) => by_name.into_iter().filter(|&d| method::trait_in_scope_pub(self, d)).collect(),
+            (None, None) => by_name.into_iter().filter(|&d| method::trait_in_scope_at(self, d, base)).collect(),
         };
         let mut hits: Vec<(Option<(u32, crate::ty::consteval::ConstValue)>, Ty)> = Vec::new();
         let mut hit_traits: Vec<DefId> = Vec::new();
@@ -19770,7 +19777,7 @@ impl<'p> Ctx<'p> {
         // The one found trait's selection was ambiguous.
         let mut open = false;
         for trait_def in traits {
-            if !method::trait_in_scope_pub(self, trait_def) {
+            if !method::trait_in_scope_at(self, trait_def, base) {
                 continue;
             }
             let n_inputs = p.gx.index.trait_record(trait_def)?.generics.params.len().saturating_sub(1);
@@ -19837,7 +19844,7 @@ impl<'p> Ctx<'p> {
                 }
                 continue;
             }
-            if trait_def.is_none() && !method::trait_in_scope_pub(self, rec.trait_def) {
+            if trait_def.is_none() && !method::trait_in_scope_at(self, rec.trait_def, self_ty) {
                 continue;
             }
             let idx = p.impl_assoc_consts.get(&(rec.def, assoc)).or_else(|| p.trait_assoc_const_values.get(&assoc)).copied()?;
