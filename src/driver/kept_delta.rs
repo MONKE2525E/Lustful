@@ -110,9 +110,11 @@ fn apply(
     // Entries this delta stores come after this stamp (`replay_bodies`).
     let start = crate::driver::gen_reuse::stamp_now();
     let fns = untouched_refusals(p, front, reach, edits, walk_instances).map_err(|e| (e, true))?;
-    let opaque_idents = opaque_body_idents(p);
-    let (namers, template_namers) = rpit_namers(p, &opaque_idents, &fns, walk_instances).map_err(|e| (e, true))?;
     super::laps::mark("collect/delta refusals");
+    let opaque_idents = opaque_body_idents(p);
+    super::laps::mark("collect/delta opaque idents");
+    let (namers, template_namers) = rpit_namers(p, &opaque_idents, &fns, walk_instances).map_err(|e| (e, true))?;
+    super::laps::mark("collect/delta rpit namers");
     // The node answers of the last collect describe the old signatures.
     caches.gen_reuse.forget_answers();
     // Every new signature first: a body checked below may call any of them.
@@ -266,6 +268,7 @@ fn untouched_refusals(
         Some(r) => r,
         None => {
             built = ConstReach::build(front);
+            super::laps::mark("collect/delta const reach");
             &built
         }
     };
