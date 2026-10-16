@@ -21,6 +21,8 @@ use crate::ir::*;
 use crate::ty::iter::{self as it, IterKind};
 use crate::ty::*;
 
+mod char_range;
+
 type R = Result<(), String>;
 
 /// How many references wrap `t` (`&&T` is 2).
@@ -1709,6 +1711,12 @@ impl Ex<'_, '_> {
         let item = self.item(ty)?;
         let opt = self.body.tys.mk_option(item);
         let join = self.block();
+        if self.is_char_range(ty) {
+            self.char_range_next(itp, ty, dest, back)?;
+            self.goto(join);
+            self.cur = join;
+            return Ok(());
+        }
         if self.body.tys.is_chars_ty(ty) {
             let r = self.ref_to(true, itp, ty);
             let b = if back { Builtin::CharsNextBack } else { Builtin::CharsNext };
@@ -2249,21 +2257,24 @@ impl Ex<'_, '_> {
                 self.some(&dest, opt, Operand::Copy(Place::local(v)));
                 self.goto(join);
                 self.cur = last;
-                self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
                 self.some(&dest, opt, Operand::Copy(if back { f(1) } else { f(0) }));
-                // The cursor moves past the end it came from,
-                // wrapping, as std's fields do (observable through
-                // `start()`, `end()`, and `contains`).
-                if back {
-                    let t = self.local(a[0]);
-                    let one = Self::one(a[0], &self.body.tys)?;
-                    self.call_builtin(Builtin::WrappingSub, vec![Operand::Copy(f(1)), one], Place::local(t));
-                    self.assign(f(1), Rvalue::Use(Operand::Copy(Place::local(t))));
+                if self.fold {
+                    // core's `spec_try_fold` (`try_rfold`): the last
+                    // item sets `exhausted` and leaves the cursor.
+                    self.assign(f(2), Rvalue::Use(Operand::Const(Const::Bool(true))));
                 } else {
+                    // `next`: the cursor steps past the end it came
+                    // from, wrapping, and `exhausted` is the overflow
+                    // (`Step::forward_overflowing`), as std's fields do
+                    // (observable through `start()`, `end()`,
+                    // `end_bound`, and `contains`).
+                    let (cur, b, wrapped) = if back { (f(1), Builtin::WrappingSub, Gt) } else { (f(0), Builtin::WrappingAdd, Lt) };
                     let t = self.local(a[0]);
                     let one = Self::one(a[0], &self.body.tys)?;
-                    self.call_builtin(Builtin::WrappingAdd, vec![Operand::Copy(f(0)), one], Place::local(t));
-                    self.assign(f(0), Rvalue::Use(Operand::Copy(Place::local(t))));
+                    self.call_builtin(b, vec![Operand::Copy(cur.clone()), one], Place::local(t));
+                    let o = self.cmp(wrapped, Operand::Copy(Place::local(t)), Operand::Copy(cur.clone()));
+                    self.assign(f(2), Rvalue::Use(o));
+                    self.assign(cur, Rvalue::Use(Operand::Copy(Place::local(t))));
                 }
                 self.goto(join);
                 self.cur = none_b;
@@ -2846,6 +2857,9 @@ impl Ex<'_, '_> {
     fn nth_in(&mut self, itp: Place, ty: Ty, n: Local, dest: Place) -> R {
         use crate::ast::BinOp::*;
         use IterKind as K;
+        if self.is_char_range(ty) {
+            return self.char_range_nth(itp, ty, n, dest, false);
+        }
         let item = self.item(ty)?;
         let opt = self.body.tys.mk_option(item);
         let Some((k, a)) = self.kind_args(ty) else {
@@ -3232,6 +3246,9 @@ impl Ex<'_, '_> {
     fn nth_back(&mut self, itp: Place, ty: Ty, n: Local, dest: Place) -> R {
         use crate::ast::BinOp::*;
         use IterKind as K;
+        if self.is_char_range(ty) {
+            return self.char_range_nth(itp, ty, n, dest, true);
+        }
         let item = self.item(ty)?;
         let opt = self.body.tys.mk_option(item);
         let Some((k, a)) = self.kind_args(ty) else {
@@ -3438,6 +3455,9 @@ impl Ex<'_, '_> {
     fn advance(&mut self, itp: Place, ty: Ty, n: Local) -> Result<Local, String> {
         use crate::ast::BinOp::*;
         use IterKind as K;
+        if self.is_char_range(ty) {
+            return self.char_range_advance(itp, ty, n, false);
+        }
         let Some((k, a)) = self.kind_args(ty) else {
             return self.advance_loop(itp, ty, n, false);
         };
@@ -3583,6 +3603,9 @@ impl Ex<'_, '_> {
     fn advance_back(&mut self, itp: Place, ty: Ty, n: Local) -> Result<Local, String> {
         use crate::ast::BinOp::*;
         use IterKind as K;
+        if self.is_char_range(ty) {
+            return self.char_range_advance(itp, ty, n, true);
+        }
         let Some((k, a)) = self.kind_args(ty) else {
             return self.advance_loop(itp, ty, n, true);
         };
@@ -3687,6 +3710,9 @@ impl Ex<'_, '_> {
     fn size(&mut self, itp: Place, ty: Ty) -> Result<Operand, String> {
         use crate::ast::BinOp::*;
         use IterKind as K;
+        if self.is_char_range(ty) {
+            return self.char_range_size(itp, ty);
+        }
         let (k, a) = self.kind_args(ty).ok_or("iterator expansion: size of a non-iterator")?;
         let f = |i: u32| itp.project(Proj::Field(i));
         let out = self.local(USIZE);
@@ -3818,6 +3844,9 @@ impl Ex<'_, '_> {
     fn hint(&mut self, itp: Place, ty: Ty) -> Result<(Local, Local), String> {
         use crate::ast::BinOp::*;
         use IterKind as K;
+        if self.is_char_range(ty) {
+            return self.char_range_hint(itp, ty);
+        }
         let ou = self.body.tys.mk_option(USIZE);
         let (lo, hi) = (self.local(USIZE), self.local(ou));
         let set_exact = |this: &mut Self, n: Operand| {
@@ -4400,7 +4429,18 @@ impl Ex<'_, '_> {
             match (k, start) {
                 (K::Range, true) | (K::RangeInclusive, true) | (K::RangeFrom, true) => incl(self, f(0), 0),
                 (K::Range, false) => incl(self, f(1), 1),
-                (K::RangeInclusive, false) => incl(self, f(1), 0),
+                // core: `Excluded(&start)` once exhausted (empty).
+                (K::RangeInclusive, false) => {
+                    let (ex, live) = self.branch(Operand::Copy(f(2)));
+                    let join = self.block();
+                    self.cur = ex;
+                    incl(self, f(0), 1);
+                    self.goto(join);
+                    self.cur = live;
+                    incl(self, f(1), 0);
+                    self.goto(join);
+                    self.cur = join;
+                }
                 (K::RangeTo, false) => incl(self, f(0), 1),
                 (K::RangeToInclusive, false) => incl(self, f(0), 0),
                 _ => self.assign(dest, Rvalue::Aggregate(bound, 2, Vec::new())),
@@ -4525,10 +4565,14 @@ impl Ex<'_, '_> {
                     let b2 = self.cmp(Lt, xo, cp(f(1)));
                     both(self, a, b2)
                 }
+                // An exhausted range contains nothing: core's
+                // `end_bound` is then `Excluded(&start)`.
                 K::RangeInclusive => {
                     let a = self.cmp(Le, cp(f(0)), xo.clone());
                     let b2 = self.cmp(Le, xo, cp(f(1)));
-                    both(self, a, b2)
+                    let live = self.cmp(crate::ast::BinOp::Eq, cp(f(2)), Operand::Const(Const::Bool(false)));
+                    let ab = both(self, a, b2);
+                    both(self, ab, live)
                 }
                 K::RangeFrom => self.cmp(Le, cp(f(0)), xo),
                 K::RangeTo => self.cmp(Lt, xo, cp(f(0))),
@@ -4862,6 +4906,9 @@ impl Ex<'_, '_> {
     fn count(&mut self, itp: Place, ty: Ty, dest: Place) -> R {
         use crate::ast::BinOp::*;
         use IterKind as K;
+        if self.is_char_range(ty) {
+            return self.char_range_count(itp, ty, dest);
+        }
         let Some((k, a)) = self.kind_args(ty) else {
             return self.count_loop(itp, ty, dest);
         };

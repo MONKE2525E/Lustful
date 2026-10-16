@@ -16502,6 +16502,16 @@ impl<'p> Ctx<'p> {
             };
             let lt = self.expr(lo, None);
             let ht = self.expr(hi, Some(lt));
+            // A `char` range loops through its iterator (core's
+            // `Step for char` skips the surrogates), not the integer
+            // counting loop lowering keeps for a syntactic range.
+            if matches!(self.kind(self.resolve(lt)), TyKind::Char) && self.unify(lt, ht) {
+                let Expr::Range { inclusive, .. } = p.ast.expr(iter) else { unreachable!() };
+                let k = if *inclusive { crate::ty::iter::IterKind::RangeInclusive } else { crate::ty::iter::IterKind::Range };
+                let rt = crate::ty::iter::mk_iter(&mut self.tys, k, &[CHAR]);
+                self.set(iter, rt);
+                return CHAR;
+            }
             let ok = (matches!(self.kind(lt), TyKind::Int(_)) || self.kind(lt).is_int_infer()) && self.unify(lt, ht);
             if !ok {
                 let s = self.span(iter);

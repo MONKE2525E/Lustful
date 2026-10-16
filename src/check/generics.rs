@@ -8266,8 +8266,20 @@ pub fn add_synthetic_impls(p: &mut Program) {
         use crate::ty::iter::{IterKind as K, mk_iter};
         for k in [K::SliceIter, K::SliceIterMut, K::VecIntoIter, K::VecDrain, K::Range] {
             let self_pat = mk_iter(&mut p.tys, k, &[p0]);
-            insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+            if k != K::Range {
+                insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+            }
             insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        // `Range` is exact size over core's `range_exact_iter_impl!`
+        // list only (not 64-bit, 128-bit, or `char` ranges).
+        {
+            use crate::ty::IntTy as I;
+            for i in [I::Usize, I::U8, I::U16, I::U32, I::Isize, I::I8, I::I16, I::I32] {
+                let t = p.tys.intern(TyKind::Int(i));
+                let self_pat = mk_iter(&mut p.tys, K::Range, &[t]);
+                insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+            }
         }
         // `RangeInclusive` is double-ended but not exact size in
         // std (its length can overflow `usize`).

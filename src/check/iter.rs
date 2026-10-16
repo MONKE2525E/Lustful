@@ -1816,10 +1816,15 @@ impl<'p> Ctx<'p> {
             return ok;
         };
         match k {
+            // core's `range_exact_iter_impl!` list: not the 64-bit,
+            // 128-bit, or `char` ranges.
+            K::Range => matches!(
+                self.kind(self.resolve(a[0])),
+                TyKind::Int(IntTy::Usize | IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::Isize | IntTy::I8 | IntTy::I16 | IntTy::I32)
+            ),
             K::SliceIter
             | K::SliceIterMut
             | K::VecIntoIter
-            | K::Range
             | K::VecDrain
             | K::ArrayIntoIter
             | K::RepeatN
@@ -2434,15 +2439,17 @@ impl<'p> Ctx<'p> {
     }
 
     /// A range expression used as a value: one of the six
-    /// `std::ops` range types over an integer type (`for` loops and
-    /// slicing keep their own syntactic paths). The open-ended
-    /// forms are `RangeBounds` values here, not iterators.
+    /// `std::ops` range types over an integer type or `char` (`for`
+    /// loops over integers and slicing keep their own syntactic
+    /// paths). The open-ended forms are `RangeBounds` values here,
+    /// not iterators. A `char` range steps over the surrogate gap
+    /// (lower/iter/char_range.rs).
     pub(super) fn range_value(&mut self, e: ExprId, lo: Option<ExprId>, hi: Option<ExprId>, inclusive: bool, span: Span) -> Ty {
         let _ = e;
         let bound_ty = |this: &mut Self, b: ExprId, want: Option<Ty>| -> Option<Ty> {
             let t = this.expr(b, want);
             let t = this.resolve(t);
-            if matches!(this.kind(t), TyKind::Int(_)) || this.kind(t).is_int_infer() || matches!(this.kind(t), TyKind::Error) {
+            if matches!(this.kind(t), TyKind::Int(_) | TyKind::Char | TyKind::Error) || this.kind(t).is_int_infer() {
                 Some(t)
             } else {
                 let tn = this.tn(t);

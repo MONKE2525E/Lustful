@@ -4893,7 +4893,10 @@ impl<'p> Lower<'p> {
             let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
             let op = self.operand_from(c, item_ty);
             self.assign(Place::local(item), Rvalue::Use(op), span);
-        } else if let Expr::Range { lo, hi, inclusive } = p.ast.expr(iter) {
+        } else if let Expr::Range { lo, hi, inclusive } = p.ast.expr(iter)
+            // A `char` range (typed by check) takes the iterator arm.
+            && !crate::ty::iter::is_iter(&self.body.tys, self.ty(iter))
+        {
             let (lo, hi) = (lo.unwrap(), hi.unwrap());
             let cur = self.temp(item_ty);
             self.expr_into(lo, Some(&Place::local(cur)));

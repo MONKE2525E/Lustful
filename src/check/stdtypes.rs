@@ -334,9 +334,9 @@ pub fn resolve_iter_path(
             }
             if k.is_range()
                 && k != K::RangeFull
-                && !erased_args.first().is_some_and(|&t| matches!(tys.kind(t), TyKind::Int(_)))
+                && !erased_args.first().is_some_and(|&t| matches!(tys.kind(t), TyKind::Int(_) | TyKind::Char))
             {
-                return Err(unsupported("over a type that is not an integer"));
+                return Err(unsupported("over a type that is not an integer or `char`"));
             }
             let mut extra: Vec<Ty> = Vec::new();
             match k {
