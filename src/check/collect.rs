@@ -5092,6 +5092,7 @@ pub fn collect_reuse(
         }
     }
     block_item_dups(ast, interner, &mut errs);
+    block_item_builtin_names(ast, interner, &mut errs);
     // Sibling visibility for nested fns: the items of the block that
     // directly contains each nested fn, and of the blocks around it.
     // The same scope (by stmt_items index) also governs what a nested
@@ -6102,6 +6103,34 @@ fn block_item_dups(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>) {
                 ));
             }
             seen.extend(keys);
+        }
+    }
+}
+
+/// A block type item named like a primitive type, a std prelude type
+/// or trait, or a std type lust knows by name is not supported yet
+/// (L0820): check reads those names by their text in many value paths
+/// (`u8::default()`, `String::new()`, `Rc::new(..)`) before any block
+/// overlay, so the block item would lose to the builtin (a wrong
+/// output: rustc calls the block item).
+fn block_item_builtin_names(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>) {
+    const PRIMS: &[&str] =
+        &["u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "f32", "f64", "bool", "char", "str"];
+    for item in &ast.stmt_items {
+        let (name, span) = match &item.kind {
+            ItemKind::Struct(s) => (s.name, s.name_span),
+            ItemKind::Enum(e) => (e.name, e.name_span),
+            ItemKind::Union(u) => (u.name, u.name_span),
+            ItemKind::Trait(t) => (t.name, t.name_span),
+            ItemKind::Type(a) => (a.name, a.name_span),
+            _ => continue,
+        };
+        let n = interner.get(name);
+        if PRIMS.contains(&n)
+            || crate::resolve::imports::in_std_prelude(n, crate::driver::graph::Namespace::Type)
+            || crate::ty::lang::needs_std_use(n)
+        {
+            errs.push(not_yet("L0820", span, "a block type item named like a builtin or std type"));
         }
     }
 }

@@ -112,8 +112,8 @@ pub fn aliases() {
         type Count = i8;
         let d: Count = -1;
         #[derive(Debug)]
-        struct String(i32);
-        println!("{} {:?}", d, String(4));
+        struct Thing(i32);
+        println!("{} {:?}", d, Thing(4));
     }
     println!("{:?} {} {:?} {}", v, c, Holder::default(), std::mem::size_of::<Count>());
 }
