@@ -2900,7 +2900,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         std::hash::Hash::hash(&(env, fn_count), &mut h);
         std::hash::Hasher::finish(&h)
     });
-    let nested_statics = visits.path != "patch" && front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
+    // The item patch moves no static either: it refuses a fn with body
+    // items (driver/patch.rs), so every other body keeps its items.
+    let nested_statics = !matches!(visits.path, "patch" | "item") && front.ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Static(_)));
     let statics_may_move = nested_statics && front.prev_static_defs.is_none();
     // What a failed collect left undone joins this request. A const fn
     // edit (`Front::const_fn_pending`) makes this request one too, so every
