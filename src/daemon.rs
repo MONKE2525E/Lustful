@@ -485,9 +485,12 @@ fn crate_inputs(req: &Request) -> Vec<PathBuf> {
 /// included. A missing file counts by its nearest existing directory, whose
 /// ctime a delete moves. The proof is as fine as the filesystem's clock: an
 /// edit in the first clock tick of the warm compile can read as older, which
-/// at worst shows as a mismatch; it never hides one.
+/// at worst shows as a mismatch; it never hides one. Linux stamps file times
+/// from a coarse clock (a few ms behind `SystemTime::now()`), so a ctime up to
+/// `CTIME_SLACK` before `start` also counts as changed (stale, no compare).
 fn changed_input(paths: &[PathBuf], start: std::time::SystemTime) -> Option<PathBuf> {
-    let start = start.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    const CTIME_SLACK: std::time::Duration = std::time::Duration::from_millis(50);
+    let start = start.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().saturating_sub(CTIME_SLACK);
     let start = (start.as_secs() as i64, start.subsec_nanos() as i64);
     let newer = |md: &std::fs::Metadata| (md.ctime(), md.ctime_nsec()) > start;
     paths
@@ -563,7 +566,10 @@ impl GuardJobs {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile_background(&req, &mut fresh))) {
                     Ok(resp) => {
                         guard_hold();
+                        // req.file even when it did not parse (then no
+                        // session lists it).
                         let mut all = inputs;
+                        all.push(req.file.clone());
                         all.extend(session_inputs(&fresh, &req));
                         all.extend(crate_inputs(&req));
                         all.sort();
@@ -1072,7 +1078,7 @@ mod tests {
     /// Writes `text` to `path` after the clock has moved past every earlier
     /// timestamp (file times tick in a coarse clock).
     fn write_later(path: &Path, text: &str) {
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(80));
         std::fs::write(path, text).unwrap();
     }
 
@@ -1094,7 +1100,7 @@ mod tests {
         for p in [&a, &b, &c] {
             std::fs::write(p, "fn f() {}\n").unwrap();
         }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(80));
         let start = std::time::SystemTime::now();
         let all = vec![a.clone(), b.clone(), c.clone()];
         assert_eq!(changed_input(&all, start), None, "nothing changed");
@@ -1121,7 +1127,7 @@ mod tests {
         let store = base.join("store.rs");
         std::fs::write(&root, "mod store;\nfn main() {\n    store::put(1);\n}\n").unwrap();
         std::fs::write(&store, "pub fn put(x: u8) -> u8 {\n    x + true\n}\n").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(80));
         let req = check_req(&root);
         let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
         let entry = entry_for(&mut sessions, &base.join("s"), &req.session, &mut 0);
@@ -1154,7 +1160,7 @@ mod tests {
         // An edit and a revert of the root (A -> B -> A, fx-cgen-rec 11:16):
         // the bytes match again, the check is still stale.
         let text = std::fs::read_to_string(&root).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(80));
         let start = std::time::SystemTime::now();
         write_later(&root, "fn main() {}\n");
         std::fs::write(&root, &text).unwrap();
