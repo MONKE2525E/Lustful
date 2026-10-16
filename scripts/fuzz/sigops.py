@@ -18,6 +18,10 @@
 #   const_closure  Sol's case: `static P: fn() -> u32 = make();` with
 #                  `const fn make() -> fn() -> u32 { f }`, then a `where`
 #                  clause on f
+#   sig_generic    the header delta's own op (driver/kept_delta.rs takes
+#                  only programs with user generics): a generic fn first,
+#                  sometimes an RPIT user or a const closure of a fresh fn,
+#                  then two header edits in a row, back, and the files
 # `External` adds verdicts from rustc 1.99 and a pinned baseline lust for
 # the op states (`--rustc`, `--baseline`): a state where the warm answer
 # disagrees with rustc fails unless the baseline gives the same answer
@@ -26,7 +30,7 @@
 import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
-       "alias_rename", "reexport_glob", "rpit_chain", "const_closure"]
+       "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -237,6 +241,46 @@ def const_closure(rng, fs):
     b = dict(fs)
     b[root] = fs[root] + rng.choice([items(" where u32: Copy", ""), items("", " where u32: Copy")])
     return [a, b, a, fs]
+
+
+def sig_generic(rng, fs):
+    """A: the files with a generic fn (and maybe a fresh fn `f` that an
+    unchanged `-> impl Debug` body or a const fn names) at the end of the
+    root file; then one header edit on A, a second on top of it, back to
+    A, and the files. The edits pick `f` half the time when it exists."""
+    k = rng.randrange(10**6)
+    extra = rng.choice(["", "rpit", "const"])
+    items = f"\n#[allow(dead_code)]\nfn zg{k}_id<T: Clone>(t: T) -> T {{ t.clone() }}\n"
+    if extra == "rpit":
+        auto = rng.choice(["Send", "Sync"])
+        items += (f"fn zg{k}_f(x: u32) -> u32 {{\n    x\n}}\n"
+                  f"fn zg{k}_g() -> impl std::fmt::Debug {{ zg{k}_f(1) }}\n"
+                  f"fn zg{k}_need<T: {auto}>(t: T) -> T {{ t }}\n"
+                  f"#[allow(dead_code)]\nfn zg{k}_use() {{ let _ = zg{k}_need(zg{k}_g()); }}\n")
+    elif extra == "const":
+        items += (f"fn zg{k}_f(x: u32) -> u32 {{\n    x\n}}\n"
+                  f"const fn zg{k}_make() -> fn(u32) -> u32 {{ zg{k}_f }}\n"
+                  f"static ZG{k}_P: fn(u32) -> u32 = zg{k}_make();\n"
+                  f"#[allow(dead_code)]\nfn zg{k}_use() -> u32 {{ let p = ZG{k}_P; p(2) }}\n")
+    root = _root(fs)
+    a = dict(fs)
+    a[root] = fs[root] + items
+
+    def edit(cur):
+        heads = _heads(cur)
+        own = [(rel, m) for rel, m in heads if m.group("name") == f"zg{k}_f"]
+        if own and rng.random() < 0.5:
+            rel, m = own[0]
+            new = rng.choice([_header(m, where=" where u32: Copy"), _header(m, where=" where String: Copy"),
+                              _header(m, params="x: u64"), _header(m, ret="u64"), _header(m, params="x: u32, _y: u8")])
+            return _swap(cur, rel, m.start(), m.end(), new)
+        op = rng.choice([sig_where, sig_param, sig_ret])
+        states = op(rng, cur)
+        return states[0] if states else cur
+
+    s1 = edit(a)
+    s2 = edit(s1)
+    return [a, s1, s2, a, fs]
 
 
 def sig_states(rng, fs):
