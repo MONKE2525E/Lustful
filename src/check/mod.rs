@@ -4909,6 +4909,15 @@ impl<'p> Ctx<'p> {
                 if self.env().iter().any(|pred| matches!(pred, Predicate::TypeOutlives(x, Region::Static) if *x == t)) {
                     return None;
                 }
+                // A `T: 'static` the signature implies: a param, the
+                // return, or the impl header names a type whose Adt
+                // needs it (`impl<T> S<T>` with `struct S<T: 'static>`).
+                if let TyKind::Param(ParamId(i)) = self.tys.kind(t)
+                    && let Some(sig) = p.regions.body_sig(p, self.fid)
+                    && crate::check::outlives::param_bounds(p, Some(sig), &[]).contains(&(i, Region::Static))
+                {
+                    return None;
+                }
                 let name = match self.tys.kind(t) {
                     TyKind::Param(ParamId(i)) => p
                         .gx
