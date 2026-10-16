@@ -184,6 +184,8 @@ pub(crate) struct Front {
     /// request's first guess (`StdPlan`). Only a guess: the driver
     /// checks it against the files each pass sees.
     pub(crate) std_plan: Option<crate::stdload::StdPlan>,
+    /// The patch oracle's state (`item_oracle.rs`; unused when it is off).
+    pub(crate) oracle: std::sync::Mutex<super::item_oracle::State>,
 }
 
 pub(crate) struct Chunk {
@@ -401,6 +403,7 @@ impl Session {
                 last_visits: String::new(),
                 last_check: None,
                 std_plan: None,
+                oracle: Default::default(),
             },
             caches: Caches {
                 ok: Vec::new(),

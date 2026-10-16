@@ -153,13 +153,8 @@ pub(crate) struct PatchBase {
     /// What const evaluation may reach (`const_reach.rs`), built on the
     /// first const fn body edit and kept up to date by later patches.
     reach: Option<super::const_reach::ConstReach>,
-    /// Under the patch oracle (`item_oracle.rs`): the cold resolve input,
-    /// the last request's program digest, and whether this request took
-    /// a patch path (its response then compares with a one-shot compile).
+    /// Under the patch oracle (`item_oracle.rs`): the cold resolve input.
     pub(super) oracle_input: Option<super::item_oracle::ColdInput>,
-    /// (Interior mutability: the compile tail holds the front shared.)
-    pub(super) oracle_prev: std::sync::Mutex<Option<super::item_oracle::Digest>>,
-    pub(super) oracle_due: std::sync::atomic::AtomicBool,
 }
 
 /// One cfg-disabled node the last full resolve dropped (`Dep::Dropped`).
@@ -320,8 +315,6 @@ impl PatchBase {
             dropped,
             reach: None,
             oracle_input: None,
-            oracle_prev: Default::default(),
-            oracle_due: Default::default(),
         }
     }
 

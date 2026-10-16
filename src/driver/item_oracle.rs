@@ -1,20 +1,24 @@
 // The patch oracle (`LUST_CHECK_ITEMPATCH=1`; sigedit PLAN, P1.1). After
-// each request on a patch path (`path=patch`, the body patch, and later
+// each request on a patch path (`path=patch`, the body patch, and
 // `path=item`, the item patch), a cold resolve and collect of the same
 // text, in the same interner, must agree with the warm state:
 // - resolve: the rewrite epoch, the item scans, and every fn's body hash
 //   and line;
 // - collect: the same errors, or a program with the same `Digest` (Sig
-//   and Layout per def, ImplSet buckets, fn classes, hidden types);
+//   and Layout per def, ImplSet buckets, fn classes, hidden types).
+// On every path (the single-file chunk path and full resolves too):
 // - the dirty set: an AST fn the warm request does not check again must
 //   have stored reads that are clean against the cold program, or, with
 //   no stored reads, the cold digest must equal the last request's;
-// - the response: a one-shot compile of the same check request gives the
-//   same bytes (`compare_response`).
-// Any difference appends one line to the file `LUST_ITEMPATCH_LOG` names
-// and panics. A daemon answers a panicked request again from a fresh
-// session, so the sweeps fail on a non-empty log, not on the answers.
-// Requests on other paths only store the warm digest for the next one.
+// - the response: every daemon check request compiles again in a fresh
+//   session (`compare_response`), which must answer the same bytes and
+//   reach the same fn lines, collect errors and `Digest`.
+// Any difference appends one line to the file `LUST_ITEMPATCH_LOG` names,
+// prints it, and panics with a `Failure` payload. The daemon answers that
+// request as an internal error (code 3) and never retries it in a fresh
+// session, so the failure shows in the answer too. Passing checks log
+// `itempatch oracle: ok ...`; a sweep fails on any other line and on a log
+// with no `ok` line (a suite the oracle never saw).
 use super::session::{Caches, Front, Session};
 use crate::ast::ItemKind;
 use crate::check::collect::Program;
@@ -47,6 +51,44 @@ struct DefFacts {
     sig: Fingerprint,
     layout: Option<Fingerprint>,
     class: Option<FnClass>,
+}
+
+/// The payload of an oracle failure panic (`fail`). The daemon answers
+/// it as an internal error and never retries it in a fresh session,
+/// which would hide the failure behind a correct answer.
+pub(crate) struct Failure(pub(crate) String);
+
+/// The oracle failure line in a panic payload, if it is one.
+pub(crate) fn failure(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload.downcast_ref::<Failure>().map(|f| f.0.as_str())
+}
+
+/// The oracle's per-session state, on `Front` (interior mutability: the
+/// compile tail holds the front shared).
+#[derive(Default)]
+pub(crate) struct State {
+    /// The last request's program digest, for the no-reads rule.
+    prev: Option<Digest>,
+    /// This request's facts, for `compare_response`.
+    snap: Option<Snap>,
+    /// This request took a patch path.
+    patched: bool,
+}
+
+/// What one request reached: its path, fn lines, and its collect errors
+/// or program digest. `compare_response` compares the warm request's
+/// with a fresh session's.
+struct Snap {
+    path: String,
+    lines: Vec<u32>,
+    collected: Result<Digest, Vec<ErrKey>>,
+}
+
+/// A collect error as the oracle compares it: code, text, file, span.
+type ErrKey = (&'static str, String, crate::diag::FileId, u32, u32);
+
+fn err_keys(ds: &[Diag]) -> Vec<ErrKey> {
+    ds.iter().map(|d| (d.code, d.message.clone(), d.span.file, d.span.lo, d.span.hi)).collect()
 }
 
 /// The program facts the oracle compares, keyed by stable ids.
@@ -154,18 +196,22 @@ fn log(line: &str) {
     }
 }
 
-/// Reports one oracle failure: a log line, then a panic. Passing checks
-/// log `itempatch oracle: ok ...`, so a sweep can count them; every
-/// other line is a failure.
+/// Reports one oracle failure: a log line, the same line on stderr, then
+/// a panic with a `Failure` payload. Passing checks log
+/// `itempatch oracle: ok ...`, so a sweep can count them; every other
+/// line is a failure.
 fn fail(what: &str, path: &str, detail: &str) -> ! {
     let line = format!("itempatch oracle: {what} (path={path}): {detail}");
     log(&line);
-    panic!("{line}");
+    eprintln!("{line}");
+    std::panic::panic_any(Failure(line));
 }
 
 /// The oracle check of one request (see the module docs), called by the
 /// compile tail with the warm collect result and the fns it will check
-/// (`work`). On a path that is not a patch it only stores the digest.
+/// (`work`). On a path that is not a patch the warm program is a full
+/// collect: it checks the dirty set against it and stores the facts for
+/// `compare_response`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check(
     front: &Front,
@@ -182,19 +228,31 @@ pub(super) fn check(
 ) {
     let warm_digest = warm.ok().map(|p| Digest::of(p, fn_count));
     let patched = matches!(path, "patch" | "item");
-    let Some(base) = front.patch.as_ref() else { return };
-    let prev = std::mem::replace(&mut *base.oracle_prev.lock().unwrap_or_else(|e| e.into_inner()), warm_digest.clone());
+    let prev = {
+        let mut st = front.oracle.lock().unwrap_or_else(|e| e.into_inner());
+        let collected = warm_digest.clone().ok_or_else(|| warm.err().map(err_keys).unwrap_or_default());
+        st.snap = Some(Snap { path: path.to_string(), lines: fn_lines.to_vec(), collected });
+        st.patched = patched;
+        std::mem::replace(&mut st.prev, warm_digest.clone())
+    };
     if !patched {
         // A full collect: the warm program is the cold one, so only the
-        // dirty set needs a check (signatures mode reuses bodies).
+        // dirty set needs a check (signatures mode reuses bodies). A
+        // one-shot session reuses nothing and logs nothing, so a sweep's
+        // cold side cannot count as oracle coverage.
+        if !caches.persistent {
+            return;
+        }
         if let (Ok(p), Some(d)) = (warm, warm_digest.as_ref()) {
             dirty_check(front, caches, p, p, work, fn_count, body_hashes, prev.as_ref(), d, path);
             log(&format!("itempatch oracle: ok dirty path={path}"));
         }
         return;
     }
-    base.oracle_due.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (Some(cold_in), Some(tables)) = (base.oracle_input.as_ref(), tables) else { return };
+    let Some(base) = front.patch.as_ref() else { fail("patch path with no patch base", path, "") };
+    let (Some(cold_in), Some(tables)) = (base.oracle_input.as_ref(), tables) else {
+        fail("patch path with no cold resolve input", path, "")
+    };
     let mut input = cold_in.input.clone();
     input.root_text.clone_from(&front.src);
     input.client = front.client.clone();
@@ -282,8 +340,7 @@ pub(super) fn check(
     );
     let mut cold_p = match (warm, collected) {
         (Err(w), Err(c)) => {
-            let key = |d: &Diag| (d.code, d.message.clone(), d.span.file, d.span.lo, d.span.hi);
-            let (wk, ck): (Vec<_>, Vec<_>) = (w.iter().map(key).collect(), c.iter().map(key).collect());
+            let (wk, ck) = (err_keys(w), err_keys(&c));
             if wk != ck {
                 fail("collect errors differ", path, &format!("warm {:?}, cold {:?}", wk.first(), ck.first()));
             }
@@ -350,7 +407,7 @@ fn dirty_check(
                         ReadKey::Binding(b) if cold_p.read_fingerprint(k) != **stored => !pattern_read(cold_p, front, i, b),
                         _ => cold_p.read_fingerprint(k) != **stored,
                     })
-                    .map(|(k, _)| format!("{k:?}"))
+                    .map(|(k, stored)| format!("{k:?} stored {:?} now {:?}", stored, cold_p.read_fingerprint(k)))
                     .take(3)
                     .collect();
                 if !dirty.is_empty() {
@@ -381,27 +438,78 @@ fn pattern_read(p: &Program, front: &Front, i: usize, b: &crate::driver::graph::
     front.chunks.first().and_then(|c| c.scan.body_idents.get(i)).is_some_and(|ids| !ids.contains(&flat))
 }
 
-/// The response half of the oracle: a patched check request compiles
-/// again in a one-shot session, which must answer the same bytes.
+/// Drops this request's facts unchecked (`driver::compile_background`).
+pub(crate) fn forget(session: &mut Session) {
+    let mut st = session.front.oracle.lock().unwrap_or_else(|e| e.into_inner());
+    (st.snap, st.patched) = (None, false);
+}
+
+/// The response half of the oracle: every daemon check request compiles
+/// again in a fresh session, which must answer the same bytes and reach
+/// the same facts (`Snap`) when both requests reached collect. The fresh
+/// session starts from this session's def numbering, as a restarted
+/// daemon does from its disk cache: fingerprints hold Adt and static
+/// indices. One-shot sessions are cold already and skip it, and so do
+/// `--timings` requests (their lines differ by design).
 pub(crate) fn compare_response(req: &Request, session: &mut Session, warm: &Response) {
-    let due = session.front.patch.as_ref().is_some_and(|b| b.oracle_due.swap(false, std::sync::atomic::Ordering::Relaxed));
-    if !due || req.cmd != Cmd::Check || req.timings || std::env::var_os("LUST_STATS").is_some() {
+    let (snap, patched) = {
+        let mut st = session.front.oracle.lock().unwrap_or_else(|e| e.into_inner());
+        (st.snap.take(), std::mem::take(&mut st.patched))
+    };
+    if !session.caches.persistent || req.cmd != Cmd::Check || req.timings {
         return;
     }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("lust-itempatch-{}-{n}", std::process::id()));
     let mut cold = Session::new(dir.clone(), false, req.session.clone());
+    // No disk cache: it would read and write the daemon's stored state.
+    cold.cache_tried = true;
+    let o = &session.front.def_order;
+    cold.front.def_order = crate::check::collect::DefOrder { adts: o.adts.clone(), statics: o.statics.clone(), instances: o.instances.clone() };
     let resp = super::compile::compile(req, &mut cold);
+    let cold_snap = cold.front.oracle.lock().unwrap_or_else(|e| e.into_inner()).snap.take();
     drop(cold);
     let _ = std::fs::remove_dir_all(&dir);
-    if resp.code != warm.code || resp.stdout != warm.stdout || resp.stderr != warm.stderr {
+    let path = snap.as_ref().map_or("none", |s| s.path.as_str());
+    // `LUST_STATS` lines count work, which differs by design. A failed
+    // `cargo metadata` quotes Cargo's own text, which holds lock waits
+    // ("Blocking waiting for file lock") by timing: only the code counts.
+    let answer = |s: &str| s.lines().filter(|l| !l.starts_with("lust-stats: ") && !l.starts_with("lust-visits: ")).collect::<Vec<_>>().join("\n");
+    let cargo_failed = |s: &str| s.contains("`cargo metadata` failed");
+    let same_text = answer(&resp.stderr) == answer(&warm.stderr) || cargo_failed(&resp.stderr) && cargo_failed(&warm.stderr);
+    if resp.code != warm.code || resp.stdout != warm.stdout || !same_text {
         let first = |s: &str| s.lines().next().unwrap_or("").chars().take(160).collect::<String>();
         fail(
-            "response differs from a one-shot compile",
-            "patch",
-            &format!("warm {} `{}`, cold {} `{}`", warm.code, first(&warm.stderr), resp.code, first(&resp.stderr)),
+            "response differs from a cold compile",
+            path,
+            &format!("warm {} `{}`, cold {} `{}`", warm.code, first(&answer(&warm.stderr)), resp.code, first(&answer(&resp.stderr))),
         );
     }
-    log("itempatch oracle: ok response");
+    if let (Some(w), Some(c)) = (&snap, &cold_snap) {
+        // Body hashes fold session interner ids, so only lines compare
+        // across sessions (the patch half compares hashes in one).
+        if w.lines != c.lines {
+            let detail = match (0..w.lines.len().min(c.lines.len())).find(|&i| w.lines[i] != c.lines[i]) {
+                Some(i) => format!("fn #{i}: warm line {}, cold line {}", w.lines[i], c.lines[i]),
+                None => format!("fn count: warm {}, cold {}", w.lines.len(), c.lines.len()),
+            };
+            fail("fn lines differ from a cold compile", path, &detail);
+        }
+        match (&w.collected, &c.collected) {
+            (Ok(wd), Ok(cd)) => {
+                let diff = wd.diff(cd);
+                if !diff.is_empty() {
+                    fail("program digest differs from a cold compile", path, &diff.join("; "));
+                }
+            }
+            (Err(we), Err(ce)) if we == ce => {}
+            (we, ce) => {
+                let first = |r: &Result<Digest, Vec<ErrKey>>| r.as_ref().err().and_then(|e| e.first().cloned());
+                fail("collect errors differ from a cold compile", path, &format!("warm {:?}, cold {:?}", first(we), first(ce)));
+            }
+        }
+    }
+    let facts = if snap.is_some() && cold_snap.is_some() { "facts" } else { "bytes" };
+    log(&format!("itempatch oracle: ok response path={path} patched={patched} compared={facts}"));
 }
