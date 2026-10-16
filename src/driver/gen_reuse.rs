@@ -52,6 +52,8 @@ struct TemplateEntry {
     src: u64,
     /// The item-level environment the entry last held under.
     env: u64,
+    /// When it was stored (`next_stamp`).
+    stamp: u64,
     reads: Reads,
     n_exprs: u32,
     picks: Vec<(u32, TraitPick)>,
@@ -64,6 +66,8 @@ struct TemplateEntry {
 struct DiscoveryEntry {
     src: u64,
     env: u64,
+    /// When it was stored (`next_stamp`).
+    stamp: u64,
     reads: Reads,
     adt_tys: Vec<OwnedTy>,
     requests: Vec<(DefId, Vec<OwnedArg>)>,
@@ -399,7 +403,7 @@ impl GenReuse {
         }
         let picks = picks.iter().map(|&(e, pick)| (e.0 - lo, pick)).collect();
         let calls = calls.iter().map(|&(e, k)| (e.0 - lo, k)).collect();
-        let entry = TemplateEntry { src, env: self.env, reads: with_own_sig(p, t, reads), n_exprs: hi - lo, picks, calls };
+        let entry = TemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads), n_exprs: hi - lo, picks, calls };
         self.templates.insert(p.def_id(t), entry);
     }
 
@@ -416,6 +420,16 @@ impl GenReuse {
         let (lo, hi) = p.fn_def(t).exprs;
         let e = self.templates.get(&p.def_id(t))?;
         Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads))
+    }
+
+    /// True when a template check or discovery output of fn `f` was
+    /// stored after `stamp`. The check and build programs share these
+    /// entries: one stored after a program's `Program::reuse_stamp` may
+    /// hold an output that program does not have (the kept program delta
+    /// refuses then, driver/kept_delta.rs).
+    pub(crate) fn newer(&self, p: &Program, f: LocalDefId, stamp: u64) -> bool {
+        let def = p.def_id(f);
+        self.templates.get(&def).is_some_and(|e| e.stamp > stamp) || self.discovery.get(&def).is_some_and(|e| e.stamp > stamp)
     }
 
     /// True when fn `f`'s stored discovery output still holds
@@ -487,6 +501,7 @@ impl GenReuse {
         let entry = DiscoveryEntry {
             src,
             env: self.env,
+            stamp: next_stamp(),
             reads,
             adt_tys: adt_tys.to_vec(),
             requests,
@@ -497,6 +512,21 @@ impl GenReuse {
         self.discovery.insert(p.def_id(f), entry);
     }
 }
+
+/// The stamp of the next stored entry. One counter for the whole
+/// process, so stamps only rise, also across a fresh `GenReuse`.
+fn next_stamp() -> u64 {
+    STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// The stamp of the last stored entry: a program whose template checks
+/// and discovery outputs agree with every entry stored so far takes it
+/// as its `Program::reuse_stamp`.
+pub(crate) fn stamp_now() -> u64 {
+    STAMP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The two keys `GenReuse::gate` compares across collects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

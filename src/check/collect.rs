@@ -383,6 +383,10 @@ pub struct Program {
     /// Each impl's generics and scope as its methods' signatures saw
     /// them, by `ast.items` index (`fn_record` rebuilds a method with it).
     pub(crate) impl_parents: HashMap<u32, ParentGen>,
+    /// Every stored template check and discovery output up to this
+    /// `gen_reuse` stamp agrees with this program (`gen_reuse::stamp_now`
+    /// at the end of its collect or of a kept program reuse).
+    pub(crate) reuse_stamp: u64,
 }
 
 impl Program {
@@ -3325,6 +3329,7 @@ pub fn collect_reuse(
         regions: Default::default(),
         fp_memo: Default::default(),
         impl_parents: HashMap::default(),
+        reuse_stamp: 0,
     };
     let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;
@@ -5410,6 +5415,7 @@ pub fn collect_reuse(
 
     crate::check::delta_audit::dump_if_asked(&p, errs.len());
     *reuse = std::mem::take(&mut p.gx.reuse);
+    p.reuse_stamp = crate::driver::gen_reuse::stamp_now();
     def_order.instances = std::mem::take(&mut p.gx.inst_order);
     if errs.is_empty() { Ok(p) } else { Err(errs) }
 }

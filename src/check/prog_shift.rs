@@ -65,6 +65,7 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         regions: _,
         fp_memo: _,
         impl_parents,
+        reuse_stamp: _,
     } = p;
     defs.for_each_span(&mut |s| sp(s));
     adts.iter_mut().for_each(|a| {

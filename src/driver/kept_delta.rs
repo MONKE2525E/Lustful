@@ -13,6 +13,9 @@
 //   stored discovery no longer holds checks again and must make the same
 //   instances, closures, and vtables. A template whose stored check no
 //   longer holds, or that stores none and names an edited fn, refuses.
+//   The check and build programs share the stored checks; one stored
+//   after the kept program's `reuse_stamp` (by the other mode's request)
+//   refuses, since this program may not hold that output.
 //
 // Also refused (the caller collects in full): a fn whose class moves (a
 // template keeps its parameter kinds), and a template in a build or in a
@@ -239,6 +242,11 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             if p.check_skips(t) && !p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(t))) {
                 continue;
             }
+            // The other mode's program stored this check: this one may
+            // hold another.
+            if reuse.newer(p, t, p.reuse_stamp) {
+                return Err("sig mode");
+            }
             // A template with no stored check (one with closures) stands
             // while its body does not name an edited fn.
             let named = idents.get(t.0 as usize).is_none_or(|ids| ids.iter().any(|s| names.contains(s)));
@@ -247,7 +255,15 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             }
         }
         for g in (0..fn_count as u32).map(LocalDefId) {
-            if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) || reuse.discovery_holds(p, g) {
+            if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
+                continue;
+            }
+            // A holding entry stands for this program's output only when
+            // this program stored or replayed it (`Program::reuse_stamp`).
+            if reuse.newer(p, g, p.reuse_stamp) {
+                return Err("sig mode");
+            }
+            if reuse.discovery_holds(p, g) {
                 continue;
             }
             let base = reuse.out_copy(p.def_id(g)).ok_or("discovery")?;

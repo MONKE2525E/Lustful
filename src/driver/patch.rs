@@ -2008,6 +2008,8 @@ pub(super) fn reuse_kept(
             (p.record_reads, p.unwind) = (record_reads, unwind);
         }
     }
+    // Every stored entry now agrees with the program (`kept_delta`).
+    p.reuse_stamp = crate::driver::gen_reuse::stamp_now();
     Ok((p, spans, template_errs))
 }
 

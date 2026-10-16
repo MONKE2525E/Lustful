@@ -86,6 +86,7 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
         regions,         // replace (`fns`, `opaque_sigs`); rerun (outlives)
         fp_memo: _,      // the driver clears it
         impl_parents,    // same (impl headers stand)
+        reuse_stamp: _,  // the driver sets it (`reuse_kept`)
     } = p;
     let fn_defs_data: Vec<_> = fn_defs.iter().map(|&d| defs.get(d)).collect();
     let mut out = vec![
