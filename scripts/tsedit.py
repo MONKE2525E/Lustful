@@ -200,7 +200,9 @@ class Bench:
     def lust_cold(self):
         self.cold_n += 1
         cache = self.work / f"cold-{self.cold_n}"
-        env = dict(self.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(cache))
+        # Its own Cargo target dir: a cold run's build script refresh must not touch the
+        # daemon's, or the next warm request re-validates them (a bench artefact).
+        env = dict(self.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(cache), CARGO_TARGET_DIR=str(self.work / "cold-cargo-target"))
         ms, r = self.run(self.lust_cmd(), env, COLD_TIMEOUT)
         shutil.rmtree(cache, ignore_errors=True)
         return ms, r

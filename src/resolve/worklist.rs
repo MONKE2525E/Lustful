@@ -1851,6 +1851,7 @@ fn bind_outline_macros(
             let root = job.root_module;
             if tables.macro_textual_binds.remove(&(root, m.name)).is_some() {
                 tables.maps[root.0 as usize][ns_index(Namespace::Macro)].remove(&m.name);
+                tables.touch(root, m.name);
             }
             tables.insert(root, Namespace::Macro, m.name, Bind { target: Target::Def(def), vis: VisKind::Pub, rank: 2, def_module: root });
         }
