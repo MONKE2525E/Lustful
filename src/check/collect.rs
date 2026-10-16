@@ -9106,6 +9106,11 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) ->
             if tys.guard_elem(t).is_some() {
                 return false;
             }
+            // alloc's `impl<T> Default for Weak<T>` (rc and sync): `Weak::new()`
+            // for every sized `T` (cgen's Default glue of both).
+            if let Some(e) = tys.weak_elem(t).or_else(|| tys.arc_weak_elem(t)) {
+                return is_sized_ty(tys, e);
+            }
             // alloc's `impl<T> Default for Box<[T]>` is the empty
             // boxed slice: no bound on `T` (the `smart_elem` step
             // below would ask `[T]: Default`, which never holds).

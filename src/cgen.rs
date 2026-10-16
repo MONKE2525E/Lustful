@@ -9954,6 +9954,8 @@ fn glue_def_value(
                 CTy::Cell(e) => {
                     let _ = writeln!(body, "  return {};", def_of(e, &mut need));
                 }
+                // alloc's `Weak::default()` is `Weak::new()`: the dangling pointer.
+                CTy::Weak(_) => body.push_str("  return (void*)~(uint64_t)0;\n"),
                 CTy::Rc(e) => {
                     // The header as `Rc::new` builds it: one implicit weak ref.
                     let it = format!("RcI_{}", mangle(e));
