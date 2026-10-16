@@ -403,6 +403,10 @@ typedef struct lust_ThreadInfo {
     uint64_t name_len;
     /* A Builder name's owned copy (0 for a static name). */
     uint8_t *name_buf;
+    /* A spawned thread's stack overflow window and alternate signal
+       stack (panic.c `lust_thread_guard_init`); 0 for the main thread. */
+    uintptr_t guard_lo, guard_hi;
+    void *alt;
 } lust_ThreadInfo;
 
 /* A `thread::Scope`: the count of its live packets. The scope's end
@@ -465,6 +469,22 @@ static void lust_cur_thread_name(const uint8_t **p, uint64_t *n) {
     else { *p = (const uint8_t *)"<unnamed>"; *n = 9; }
 }
 
+#ifdef __linux__
+/* The stack overflow handler's view of the calling thread (panic.c): a
+   spawned thread's guard window and its name, "<unknown>" when it has
+   none, as std's handler prints it. The main thread keeps the defaults. */
+static void lust_cur_thread_guard(uintptr_t *lo, uintptr_t *hi, const uint8_t **name, uint64_t *n) {
+    int ready;
+    __atomic_load(&lust_cur_ready, &ready, 2);
+    lust_ThreadInfo *t = ready ? (lust_ThreadInfo *)pthread_getspecific(lust_cur_key) : 0;
+    if (!t || t == &lust_main_info || !t->guard_hi) return;
+    *lo = t->guard_lo;
+    *hi = t->guard_hi;
+    if (t->name) { *name = t->name; *n = t->name_len; }
+    else { *name = (const uint8_t *)"<unknown>"; *n = 9; }
+}
+#endif
+
 /* Drops a packet's result: the value, or the payload of a panic. */
 static void lust_packet_drop_result(lust_JoinHdr *h) {
     if (!h->panicked) { h->drop_ret(h); return; }
@@ -485,8 +505,11 @@ static void lust_packet_free(lust_JoinHdr *h) {
 
 static void *lust_thread_entry(void *p) {
     lust_JoinHdr *h = (lust_JoinHdr *)p;
+    lust_ThreadInfo *self = h->th;
+    lust_thread_guard_init(&self->guard_lo, &self->guard_hi, &self->alt);
     pthread_setspecific(lust_cur_key, h->th);
     h->run(h);
+    void *alt = self->alt;
     /* A panic that reached the thread's root ends the thread; its payload
        is the join's Err (std's spawn wrapper catches it). */
     lust_exc ex;
@@ -500,6 +523,7 @@ static void *lust_thread_entry(void *p) {
         lust_packet_drop_result(h);
         lust_packet_free(h);
     }
+    lust_thread_guard_fini(alt);
     return 0;
 }
 #endif
@@ -508,7 +532,7 @@ static void *lust_thread_entry(void *p) {
 void lust_thread_spawn(lust_JoinHdr *h, lust_loc loc) LUST_BODY({
     if (h->scope) __atomic_add_fetch(&h->scope->live, 1, 5);
     pthread_once(&lust_cur_once, lust_cur_key_init);
-    lust_ThreadInfo *t = (lust_ThreadInfo *)malloc(sizeof(lust_ThreadInfo));
+    lust_ThreadInfo *t = (lust_ThreadInfo *)calloc(1, sizeof(lust_ThreadInfo));
     if (!t) lust_oom();
     t->rc = 2; /* the handle's (h->th) and the running thread's (its key) */
     t->id = __atomic_fetch_add(&lust_next_tid, 1, 0);
@@ -547,7 +571,7 @@ int pthread_setname_np(unsigned long t, const char *name);
 int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST_BODY({
     if (h->scope) __atomic_add_fetch(&h->scope->live, 1, 5);
     pthread_once(&lust_cur_once, lust_cur_key_init);
-    lust_ThreadInfo *t = (lust_ThreadInfo *)malloc(sizeof(lust_ThreadInfo));
+    lust_ThreadInfo *t = (lust_ThreadInfo *)calloc(1, sizeof(lust_ThreadInfo));
     if (!t) lust_oom();
     t->rc = 2;
     t->id = __atomic_fetch_add(&lust_next_tid, 1, 0);

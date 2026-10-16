@@ -735,10 +735,11 @@ fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Op
     finish(l, repr).ok()
 }
 
-/// `l` behind an `UnsafeCell`: the same size and alignment, with no
-/// niche for an enclosing enum to use.
+/// `l` behind an `UnsafeCell`: the same size, alignment and
+/// inhabitedness (`Cell<!>` has no value), with no niche for an
+/// enclosing enum to use.
 fn no_niche(l: Layout) -> Layout {
-    Layout::simple(l.size, l.align, None)
+    Layout { uninhabited: l.uninhabited, ..Layout::simple(l.size, l.align, None) }
 }
 
 /// Applies `repr(align(n))` and the final size round-up.
@@ -990,7 +991,8 @@ fn compute(
             // `OnceLock<T>`: `{ once: Once (an AtomicU32 futex), value:
             // UnsafeCell<MaybeUninit<T>> }`.
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::OnceLock)) => {
-                let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
+                // The value is a `MaybeUninit<T>`: inhabited for any `T`.
+                let v = Layout { uninhabited: false, ..no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?) };
                 struct_layout(&[Layout::simple(4, 4, None), v], Repr::default())
             }
             Some(BuiltinTy::Sync(k @ (crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::RwLock))) => {
@@ -1056,6 +1058,8 @@ fn compute(
                 let e = tys.adt_first_ty_arg(t).ok_or(())?;
                 let mut l = go(tys, shapes, e, env, frames, memo, active)?;
                 l.niche = None;
+                // A union: `MaybeUninit<!>` still has a value (uninit).
+                l.uninhabited = false;
                 Ok(l)
             }
             None if tys.adt_parts(t).is_some_and(|(def, _)| def == super::nonzero_def()) => {

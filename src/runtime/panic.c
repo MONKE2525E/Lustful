@@ -797,19 +797,28 @@ int pthread_attr_getstack(const void *, void **, size_t *);
 int pthread_attr_destroy(void *);
 static uintptr_t lust_guard_lo, lust_guard_hi;
 static char lust_alt_stack[65536];
+/* A spawned thread's guard window and name (sync.c): leaves the main
+   thread's values when the caller is the main thread. */
+static void lust_cur_thread_guard(uintptr_t *lo, uintptr_t *hi, const uint8_t **name, uint64_t *n);
 
 static void lust_segv(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     uintptr_t a = (uintptr_t)info->si_addr;
-    if (a >= lust_guard_lo && a < lust_guard_hi) {
+    uintptr_t lo = lust_guard_lo, hi = lust_guard_hi;
+    const uint8_t *name = (const uint8_t *)"main";
+    uint64_t name_len = 4;
+    lust_cur_thread_guard(&lo, &hi, &name, &name_len);
+    if (a >= lo && a < hi) {
         char tid[24];
         int n = 0;
         unsigned long long t = lust_os_tid();
         do { tid[n++] = (char)('0' + t % 10); t /= 10; } while (t);
-        char msg[160];
+        char msg[160 + 64];
         int m = 0;
-        const char *head = "\nthread 'main' (", *tail = ") has overflowed its stack\nfatal runtime error: stack overflow, aborting\n";
+        const char *head = "\nthread '", *mid = "' (", *tail = ") has overflowed its stack\nfatal runtime error: stack overflow, aborting\n";
         while (*head) msg[m++] = *head++;
+        for (uint64_t i = 0; i < name_len && i < 64; i++) msg[m++] = (char)name[i];
+        while (*mid) msg[m++] = *mid++;
         while (n) msg[m++] = tid[--n];
         while (*tail) msg[m++] = *tail++;
         if (write(2, msg, (size_t)m) < 0) {}
@@ -819,17 +828,47 @@ static void lust_segv(int sig, siginfo_t *info, void *ctx) {
     signal(sig, SIG_DFL);
 }
 
-static void lust_stack_guard_init(void) {
+/* The calling thread's guard window: one page above the stack's low end
+   down to 16 MiB below it (see above). False when the bounds are unknown. */
+static int lust_guard_window(uintptr_t *lo, uintptr_t *hi) {
     lust_pthread_attr at;
     void *addr;
     size_t size;
-    if (pthread_getattr_np(pthread_self(), &at) != 0) return;
+    if (pthread_getattr_np(pthread_self(), &at) != 0) return 0;
     int ok = pthread_attr_getstack(&at, &addr, &size) == 0;
     pthread_attr_destroy(&at);
-    if (!ok) return;
+    if (!ok) return 0;
     long page = sysconf(_SC_PAGESIZE);
-    lust_guard_hi = (uintptr_t)addr + (uintptr_t)(page > 0 ? page : 4096);
-    lust_guard_lo = (uintptr_t)addr > (16u << 20) ? (uintptr_t)addr - (16u << 20) : 0;
+    *hi = (uintptr_t)addr + (uintptr_t)(page > 0 ? page : 4096);
+    *lo = (uintptr_t)addr > (16u << 20) ? (uintptr_t)addr - (16u << 20) : 0;
+    return 1;
+}
+
+/* A spawned thread's start (sync.c): its own guard window and alternate
+   signal stack, as std's thread start sets them up, so an overflow there
+   reports with the thread's name. `*alt` is freed by lust_thread_guard_fini. */
+static void lust_thread_guard_init(uintptr_t *lo, uintptr_t *hi, void **alt) {
+    if (!lust_guard_window(lo, hi)) return;
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp = malloc(65536);
+    if (!ss.ss_sp) return;
+    ss.ss_size = 65536;
+    if (sigaltstack(&ss, NULL) != 0) { free(ss.ss_sp); return; }
+    *alt = ss.ss_sp;
+}
+
+static void lust_thread_guard_fini(void *alt) {
+    if (!alt) return;
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_flags = SS_DISABLE;
+    sigaltstack(&ss, NULL);
+    free(alt);
+}
+
+static void lust_stack_guard_init(void) {
+    if (!lust_guard_window(&lust_guard_lo, &lust_guard_hi)) return;
     stack_t ss;
     memset(&ss, 0, sizeof ss);
     ss.ss_sp = lust_alt_stack;
@@ -845,6 +884,8 @@ static void lust_stack_guard_init(void) {
 }
 #elif defined(LUST_IMPL)
 static void lust_stack_guard_init(void) {}
+static void lust_thread_guard_init(uintptr_t *lo, uintptr_t *hi, void **alt) { (void)lo; (void)hi; (void)alt; }
+static void lust_thread_guard_fini(void *alt) { (void)alt; }
 #endif
 
 /* Runtime setup before main: Rust ignores SIGPIPE and reports a stack
