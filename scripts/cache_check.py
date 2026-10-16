@@ -151,7 +151,7 @@ class Prog:
             body.insert(self.rng.randint(0, len(body)), stmt(self.rng, self.tag(), len(self.fill), callees))
         elif op == "del_stmt" and len(body) > 1:
             body.pop(self.rng.randrange(len(body)))
-        elif op == "swap_stmt":
+        elif op == "swap_stmt" and body:
             body[self.rng.randrange(len(body))] = stmt(self.rng, self.tag(), len(self.fill), callees)
         elif op == "add_worker":
             self.add_worker()
