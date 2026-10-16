@@ -19778,8 +19778,15 @@ impl<'p> Ctx<'p> {
             return Some(t);
         }
         let a = match self.binding(Namespace::Type, head) {
-            BindingRes::Def(def) => p.adt_by_def(def)?,
-            _ => return None,
+            BindingRes::Def(def) => p.adt_by_def(def),
+            _ => None,
+        };
+        // Through a type alias of a user Adt: the alias's type, with its
+        // own args (`type R = M; R::NONE`).
+        let Some(a) = a else {
+            let (t, _) = self.alias_seg_ty(&segs[0], span.unwrap_or_default(), span.is_some())?;
+            self.tys.adt_parts(t).and_then(|(d, _)| p.adt_by_def(d))?;
+            return Some(t);
         };
         let generics = p.gx.adt_generics.get(a.0 as usize).cloned().unwrap_or_default();
         // `S::<3>::D` on a type with fewer type or const parameters
@@ -19879,7 +19886,12 @@ impl<'p> Ctx<'p> {
                 BindingRes::Def(def) => p.adt_by_def(def),
                 _ => None,
             }
-        }?;
+        };
+        // Through a type alias of a user Adt (`type R = M; R::NONE`).
+        let adt = adt.or_else(|| {
+            let (t, _) = self.alias_seg_ty(&segs[0], Span::default(), false)?;
+            p.adt_by_def(self.tys.adt_parts(t)?.0)
+        })?;
         Some((adt, item))
     }
 
