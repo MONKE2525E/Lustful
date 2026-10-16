@@ -38,7 +38,7 @@ fn ref_depth(tys: &Tys, mut t: Ty) -> usize {
 
 /// True for the builtins this pass rewrites. `IterVecIntoIter` and
 /// the `vec::IntoIter` element moves stay calls: codegen emits them.
-fn expands(b: Builtin) -> bool {
+pub(crate) fn expands(b: Builtin) -> bool {
     use Builtin as B;
     matches!(
         b,

@@ -9,6 +9,10 @@
 //     static NAME: TY = PATH(__lust_lazy$NAME);
 //     fn __lust_lazy$NAME() -> T { BODY }
 //
+// `LazyLock::new(INIT)` and `LazyCell::new(INIT)` with a plain path `INIT`
+// (`Default::default`, `HashMap::new`) hoist the same way, with the body
+// `let f: fn() -> T = INIT; f()` (see `hoistable_path`).
+//
 // `T` is the closure's written return type, else the first type argument
 // of the last `LazyLock<..>` / `LazyCell<..>` in `TY`; other statics are
 // left alone (and reject in the const evaluator as before). It runs after
@@ -25,10 +29,12 @@ use crate::intern::Interner;
 use crate::lexer::{Lexed, Tok, Token};
 
 /// Rewrites every hoistable static init closure in `lexed`. A file with
-/// no `static` followed by `||` comes back unchanged.
+/// no `static`, or with no `||` and no `LazyLock` / `LazyCell`, comes
+/// back unchanged.
 pub fn hoist_static_closures(lexed: Lexed, interner: &Interner) -> Lexed {
     let toks = &lexed.tokens;
-    if !toks.iter().any(|t| t.tok == Tok::Static) || !toks.iter().any(|t| t.tok == Tok::OrOr) {
+    let lazy_name = |t: &Token| matches!(t.tok, Tok::Ident(s) if matches!(interner.get(s), "LazyLock" | "LazyCell"));
+    if !toks.iter().any(|t| t.tok == Tok::Static) || !toks.iter().any(|t| t.tok == Tok::OrOr || lazy_name(t)) {
         return lexed;
     }
     let mut out: Vec<Token> = Vec::with_capacity(toks.len() + 16);
@@ -49,7 +55,7 @@ pub fn hoist_static_closures(lexed: Lexed, interner: &Interner) -> Lexed {
             out.push(Token { tok: Tok::Arrow, span: sp });
             out.extend(h.ret);
             out.push(Token { tok: Tok::LBrace, span: sp });
-            out.extend_from_slice(&toks[h.body.clone()]);
+            out.extend(h.body);
             out.push(Token { tok: Tok::RBrace, span: sp });
             i = h.semi + 1;
             continue;
@@ -70,8 +76,8 @@ struct Hoist {
     open: usize,
     close: usize,
     semi: usize,
-    /// The closure body tokens.
-    body: std::ops::Range<usize>,
+    /// The hidden fn's body tokens.
+    body: Vec<Token>,
     /// The hidden fn's return type tokens.
     ret: Vec<Token>,
 }
@@ -99,6 +105,9 @@ fn hoistable(toks: &[Token], at: usize, interner: &Interner) -> Option<Hoist> {
     let close = semi - 1;
     if toks[close].tok != Tok::RParen || matching_close(toks, open)? != close {
         return None;
+    }
+    if let Some(h) = hoistable_path(toks, name, ty_start..eq, open, close, semi, interner) {
+        return Some(h);
     }
     let mut k = open + 1;
     if toks[k].tok == Tok::Move {
@@ -132,7 +141,67 @@ fn hoistable(toks: &[Token], at: usize, interner: &Interner) -> Option<Hoist> {
         return None;
     }
     let hidden = interner.intern(&format!("__lust_lazy${}", interner.get(name)));
-    Some(Hoist { name: hidden, span, open, close, semi, body, ret: static_lifetimes(ret, span, interner) })
+    Some(Hoist { name: hidden, span, open, close, semi, body: toks[body].to_vec(), ret: static_lifetimes(ret, span, interner) })
+}
+
+/// The hoist for `static NAME: TY = LazyLock::new(INIT);` (or
+/// `LazyCell::new`) whose `INIT` is a plain or qualified path
+/// (`Default::default`, `HashMap::new`, a user fn, `<S as Default>::default`):
+/// the hidden fn is
+/// `{ let f: fn() -> T = INIT; f() }`. The written fn pointer type keeps
+/// rustc's coercion of `INIT` to `F = fn() -> T` exact (a `fn() -> !` or
+/// a `fn() -> &[u8; 2]` for `T = &[u8]` rejects, as there), and gives
+/// a std fn with no item value its eta closure's place.
+fn hoistable_path(
+    toks: &[Token],
+    name: crate::intern::Sym,
+    ty: std::ops::Range<usize>,
+    open: usize,
+    close: usize,
+    semi: usize,
+    interner: &Interner,
+) -> Option<Hoist> {
+    let ctor = open >= ty.end + 4
+        && matches!(toks[open - 1].tok, Tok::Ident(s) if interner.get(s) == "new")
+        && toks[open - 2].tok == Tok::PathSep
+        && matches!(toks[open - 3].tok, Tok::Ident(s) if matches!(interner.get(s), "LazyLock" | "LazyCell"));
+    if !ctor {
+        return None;
+    }
+    let mut end = close;
+    if toks[end - 1].tok == Tok::Comma {
+        end -= 1;
+    }
+    let init = &toks[open + 1..end];
+    let path_like = !init.is_empty()
+        && init.iter().all(|t| matches!(t.tok, Tok::Ident(_) | Tok::PathSep | Tok::Lt | Tok::Gt | Tok::As))
+        && matches!(init.last()?.tok, Tok::Ident(_));
+    if !path_like {
+        return None;
+    }
+    let span = init[0].span;
+    let ret = static_lifetimes(lazy_value_ty(&toks[ty], interner)?, span, interner);
+    let f = interner.intern("__lust_lazy$f");
+    let mut body = vec![
+        Token { tok: Tok::Let, span },
+        Token { tok: Tok::Ident(f), span },
+        Token { tok: Tok::Colon, span },
+        Token { tok: Tok::Fn, span },
+        Token { tok: Tok::LParen, span },
+        Token { tok: Tok::RParen, span },
+        Token { tok: Tok::Arrow, span },
+    ];
+    body.extend(ret.iter().cloned());
+    body.push(Token { tok: Tok::Eq, span });
+    body.extend_from_slice(init);
+    body.extend([
+        Token { tok: Tok::Semi, span },
+        Token { tok: Tok::Ident(f), span },
+        Token { tok: Tok::LParen, span },
+        Token { tok: Tok::RParen, span },
+    ]);
+    let hidden = interner.intern(&format!("__lust_lazy${}", interner.get(name)));
+    Some(Hoist { name: hidden, span, open, close, semi, body, ret })
 }
 
 /// The first index at or after `from` whose token satisfies `want`, at

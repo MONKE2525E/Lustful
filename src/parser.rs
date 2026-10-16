@@ -4144,7 +4144,7 @@ impl<'a> Parser<'a> {
         }
         let (t, i) = (self.interner.get(ty.name), self.interner.get(item.name));
         Some(match (t, i) {
-            ("Default" | "Self", _) => return None,
+            ("Self", _) => return None,
             (_, "default") => 0,
             ("Vec" | "String" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "VecDeque" | "BinaryHeap" | "Weak", "new") => 0,
             ("Arc", "new") => 1,
@@ -4155,10 +4155,23 @@ impl<'a> Parser<'a> {
             // takes them as the closure patterns lust has.
             ("char", "is_whitespace" | "is_alphabetic" | "is_alphanumeric" | "is_numeric" | "is_control" | "is_lowercase" | "is_uppercase") => 1,
             ("thread", "sleep" | "spawn") => 1,
+            // Builtin methods by path as values (check/ufcs.rs types the
+            // call): `map_or(0, Vec::len)`, `start(f, Builder::spawn)`.
+            ("Builder", "spawn") => 2,
+            ("Vec" | "String" | "VecDeque", "len" | "is_empty" | "capacity") => 1,
             ("mem", "drop" | "take") => 1,
             ("mem", "swap" | "replace") => 2,
             ("Ord" | "PartialOrd", "cmp" | "partial_cmp" | "lt" | "le" | "gt" | "ge" | "max" | "min") => 2,
             ("PartialEq", "eq" | "ne") => 2,
+            // A primitive's comparison and clone trait methods: their
+            // marker values have no fn for a builtin's C adapter to call
+            // (`sort_by(i32::cmp)`), a closure does.
+            (
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" | "bool",
+                "cmp" | "partial_cmp" | "eq" | "ne" | "lt" | "le" | "gt" | "ge",
+            ) => 2,
+            ("i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" | "bool", "max" | "min") => 2,
+            ("i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" | "bool" | "String", "clone") => 1,
             ("Duration", "from_secs" | "from_millis" | "from_micros" | "from_nanos") => 1,
             _ => return None,
         })

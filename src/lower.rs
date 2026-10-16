@@ -1683,6 +1683,7 @@ impl<'p> Lower<'p> {
                 Res::OptSome | Res::ResOk | Res::ResErr | Res::Builtin(_) | Res::PrimAssoc { .. } if matches!(self.kind(ty), TyKind::FnDef(..)) => {
                     self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span)
                 }
+                _ if self.is_trait_marker_value(ty) => self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span),
                 _ => {}
             },
             Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } | Expr::Deref(_) => {
@@ -1813,6 +1814,14 @@ impl<'p> Lower<'p> {
                 // (A qualified path call through a dyn receiver,
                 // `Tr::m(d)`, passes its receiver as an argument.)
                 let dyn_fn_call = matches!(res, Res::DynMethod { owner, .. } if self.p.gx.lang.is_fn_family(owner));
+                // A builtin method by path (`Vec::len(&v)`, check/ufcs.rs):
+                // the method form with the first argument as the receiver.
+                // Its callee is a type path with no resolution of its own.
+                let by_path = matches!(self.p.ast.expr(*callee), Expr::Path(segs) if segs.len() >= 2) && self.ck.res(*callee) == Res::None;
+                if let (Res::BuiltinMethod { .. } | Res::Method { .. }, true, [recv, rest @ ..]) = (res, by_path, args.as_slice()) {
+                    self.method_into(e, *recv, rest, dest, span);
+                    return;
+                }
                 if matches!(res, Res::Method { .. }) || dyn_fn_call {
                     self.method_into(e, *callee, args, dest, span);
                     return;
@@ -2555,6 +2564,10 @@ impl<'p> Lower<'p> {
                         _ => ty,
                     };
                     self.set_or_temp(dest, Rvalue::FnValue(f, want), ty, span)
+                } else if matches!(self.ck.res(e), Res::Builtin(_)) && matches!(self.kind(ty), TyKind::FnDef(..)) || self.is_trait_marker_value(ty) {
+                    // A builtin-marker trait fn value (`<i32 as
+                    // Clone>::clone`): zero-sized, as on a plain path.
+                    self.set_or_temp(dest, Rvalue::Use(Operand::Const(Const::Unit)), ty, span)
                 }
             }
             Expr::Float(_)
@@ -7123,6 +7136,13 @@ impl<'p> Lower<'p> {
                 self.assign(dest.clone(), Rvalue::Use(Operand::Const(Const::Unit)), span);
             }
         }
+    }
+
+    /// True for the type of a trait fn value check left as a marker
+    /// (check/traitpath.rs `finish_marker_value`): the trait method's
+    /// own `FnDef`, zero-sized; calls through it select by the trait.
+    fn is_trait_marker_value(&self, ty: Ty) -> bool {
+        matches!(self.kind(ty), TyKind::FnDef(d, _) if self.p.gx.index.trait_of_method(d).is_some() || d == crate::check::generics::to_string_defs().1)
     }
 
     fn set_or_temp(&mut self, dest: Option<&Place>, rv: Rvalue, ty: Ty, span: Span) {

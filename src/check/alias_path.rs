@@ -387,7 +387,7 @@ impl<'p> Ctx<'p> {
 /// The canonical std path of a builtin Adt type's head (`Vec<u8>` is
 /// `std::vec::Vec`). None for other types and for the builtins with no
 /// associated items to name (iterators, fmt structs, guards).
-fn builtin_std_path(tys: &impl TyIntern, t: Ty) -> Option<Vec<&'static str>> {
+pub(super) fn builtin_std_path(tys: &impl TyIntern, t: Ty) -> Option<Vec<&'static str>> {
     let mut path = vec!["std"];
     match tys.builtin_of(t)? {
         BuiltinTy::String => path.extend(["string", "String"]),

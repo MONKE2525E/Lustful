@@ -150,13 +150,41 @@ impl<'p> Ctx<'p> {
     /// the trait method's signature, with the call deferred to body end
     /// like `trait_path_call`'s (a std builtin or the impl's fn).
     pub(super) fn trait_ref_call(&mut self, e: ExprId, tr: TraitRef, name: Sym, args: &[ExprId], span: Span) -> Option<Ty> {
+        let (method_def, full) = self.trait_ref_full(tr, name)?;
+        let (mut params, ret) = self.trait_method_sig(method_def, &full)?;
+        self.trait_ref_obligations(e, tr, method_def, &full, span);
+        self.normalize_params(&mut params, span);
+        let n_trait = self.tys.args(tr.args).len();
+        self.deferred_trait_fn_calls.push((e, tr, name, full[n_trait..].to_vec(), span));
+        self.check_args(&params, args, span);
+        Some(self.normalize_use(ret, span))
+    }
+
+    /// `<Self as Trait>::method` as a value with the whole trait ref
+    /// known (`T::area` or `<T as Sh>::mk` on a type parameter, its
+    /// instance at a concrete `T`, `<i32 as Clone>::clone`): the trait
+    /// method's `FnDef`, pointed at the impl fn, the param-env stub, or
+    /// a builtin at body end, like `trait_path_fn_value`'s.
+    pub(super) fn trait_ref_fn_value(&mut self, e: ExprId, tr: TraitRef, name: Sym, span: Span) -> Option<Ty> {
+        let (method_def, full) = self.trait_ref_full(tr, name)?;
+        self.trait_method_sig(method_def, &full)?;
+        self.trait_ref_obligations(e, tr, method_def, &full, span);
+        let n_trait = self.tys.args(tr.args).len();
+        self.deferred_trait_fn_values.push((e, tr, name, full[n_trait..].to_vec(), span));
+        let args = self.tys.intern_args(&full);
+        Some(self.tys.intern(TyKind::FnDef(method_def, args)))
+    }
+
+    /// The method def of `name` in `tr`'s trait and its full generic
+    /// arguments: `tr`'s, then fresh ones for the method's own params.
+    fn trait_ref_full(&mut self, tr: TraitRef, name: Sym) -> Option<(DefId, Vec<GenericArg>)> {
         let p = self.p;
         let method_def = p.gx.index.trait_record(tr.def)?.method_by_name(name)?;
         let n_trait = self.tys.args(tr.args).len();
         let mut full: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
-        let (own_kinds, preds): (Vec<ParamKind>, Vec<Predicate>) = match p.gx.trait_methods.get(&method_def) {
-            Some(t) => (t.generics.params.iter().skip(n_trait).map(|x| x.kind).collect(), t.generics.predicates.clone()),
-            None => (Vec::new(), Vec::new()),
+        let own_kinds: Vec<ParamKind> = match p.gx.trait_methods.get(&method_def) {
+            Some(t) => t.generics.params.iter().skip(n_trait).map(|x| x.kind).collect(),
+            None => Vec::new(),
         };
         for kind in own_kinds {
             full.push(match kind {
@@ -165,14 +193,16 @@ impl<'p> Ctx<'p> {
                 ParamKind::Const(_) => GenericArg::Const(self.fresh_const_var()),
             });
         }
-        let (mut params, ret) = self.trait_method_sig(method_def, &full)?;
-        self.push_predicates(&preds, &full, span);
+        Some((method_def, full))
+    }
+
+    /// Queues what a trait-ref call or value needs: the method's own
+    /// predicates, the trait obligation, and the pick.
+    fn trait_ref_obligations(&mut self, e: ExprId, tr: TraitRef, method_def: DefId, full: &[GenericArg], span: Span) {
+        let preds: Vec<Predicate> = self.p.gx.trait_methods.get(&method_def).map(|t| t.generics.predicates.clone()).unwrap_or_default();
+        self.push_predicates(&preds, full, span);
         self.obl.push_trait_at(tr, span, 0);
         self.record_pick(e, tr.def, 0, ReceiverForm::Value);
-        self.normalize_params(&mut params, span);
-        self.deferred_trait_fn_calls.push((e, tr, name, full[n_trait..].to_vec(), span));
-        self.check_args(&params, args, span);
-        Some(self.normalize_use(ret, span))
     }
 
     /// The trait ref and full generic arguments (trait, then the
@@ -470,8 +500,6 @@ impl<'p> Ctx<'p> {
                         let mut from: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
                         from.extend(own.iter().copied());
                         if method != self.p.def_id(f) {
-                            for (i, t) in self.out.expr_ty.clone().iter().enumerate() {
-                            }
                             self.rewrite_fn_def(method, &from, to);
                         }
                         self.out.expr_ty[ei] = to;
@@ -486,7 +514,85 @@ impl<'p> Ctx<'p> {
                 TraitFnRes::Default => {
                     self.finish_marker_value(e, Res::Builtin(Builtin::DefaultGlue), tr, name, span);
                 }
-                TraitFnRes::PrimCmp(_) | TraitFnRes::OrdPick(_) | TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, true),
+                // A builtin comparison: the value stays the trait
+                // method's `FnDef` with no resolution (zero-sized, as a
+                // marker); a call through it selects again by the trait
+                // (`value_call`), here `PrimCmp` or `OrdPick`.
+                TraitFnRes::PrimCmp(_) | TraitFnRes::OrdPick(_) => self.finish_marker_value(e, Res::None, tr, name, span),
+                TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, true),
+            }
+        }
+    }
+
+    /// Rejects a callable a builtin cannot call through its C adapter: a
+    /// boxed `dyn` thread function, and a trait fn value left as a marker (`i32::cmp`,
+    /// `Clone::clone` at a builtin impl) where a builtin calls it
+    /// through a C adapter (`sort_by`, `retain`, `thread::spawn`): the
+    /// marker has no fn to call there. The iterator builtins expand
+    /// the conversion, clone, default, and `to_string` markers
+    /// (lower/iter.rs `call_fn`); every other use calls through the
+    /// value, which selects again by the trait (`value_call`).
+    pub(super) fn reject_marker_callables(&mut self) {
+        if self.is_template_check() {
+            return;
+        }
+        let p = self.p;
+        let base = self.out.expr_base;
+        for i in 0..self.out.expr_res.len() {
+            let e = ExprId(base + i as u32);
+            let (b, args) = match (&self.out.expr_res[i], p.ast.expr(e)) {
+                // (A builtin method by path, `Vec::len(&v)`, is a call.)
+                (Res::BuiltinMethod { b, .. }, ast::Expr::MethodCall { args, .. } | ast::Expr::Call { args, .. }) => (*b, args),
+                (Res::Builtin(b), ast::Expr::Call { args, .. }) => (*b, args),
+                _ => continue,
+            };
+            // A thread's main as a `dyn FnOnce` value (`Box<dyn FnOnce()
+            // -> T + Send>`, gopanic.rs): the thread start calls closures,
+            // fn items, and fn pointers only (cgen/sync.rs `callee_of_ty`).
+            let spawn = matches!(
+                b,
+                Builtin::Sync(crate::check::sync::SyncOp::ThreadSpawn | crate::check::sync::SyncOp::BuilderSpawn | crate::check::sync::SyncOp::ScopeSpawn)
+            );
+            for &a in args {
+                let t0 = self.deep(self.out.expr_ty[self.ei(a)]);
+                if spawn && (matches!(self.kind(t0), TyKind::Dyn(..) | TyKind::Ref(..)) || self.tys.boxed_elem(t0).is_some()) {
+                    let span = self.span(a);
+                    self.errs.push(generics::dyn_not_yet(span, "a `dyn FnOnce` value or a reference to a callable as a thread's function"));
+                    continue;
+                }
+                let mut t = t0;
+                loop {
+                    t = match self.kind(t) {
+                        TyKind::Ref(_, _, inner) => inner,
+                        _ if let Some(inner) = self.tys.boxed_elem(t) => inner,
+                        _ => break,
+                    };
+                }
+                let TyKind::FnDef(def, _) = self.kind(t) else { continue };
+                let tdef = if def == generics::to_string_defs().1 {
+                    generics::to_string_defs().0
+                } else {
+                    match p.gx.index.trait_of_method(def) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                };
+                let lang = &p.gx.lang;
+                let expanded = crate::lower::iter::expands(b)
+                    && ([lang.from, lang.into, lang.clone, lang.default, generics::to_string_defs().0].contains(&tdef)
+                        || p.gx.index.trait_record(tdef).is_some_and(|r| p.interner.get(r.name) == "ToString"));
+                if !expanded {
+                    let tn = self.trait_name(tdef);
+                    let name = p.gx.index.trait_record(tdef).and_then(|r| r.methods.iter().find(|(d, _)| *d == def).map(|&(_, n)| n));
+                    let item = name.map(|n| self.name(n).to_string()).unwrap_or_default();
+                    let span = self.span(a);
+                    self.err(
+                        "L0641",
+                        span,
+                        format!("`{tn}::{item}` with a builtin impl as this builtin's callable is not supported yet"),
+                        "Wrap it in a closure instead.",
+                    );
+                }
             }
         }
     }
@@ -497,7 +603,20 @@ impl<'p> Ctx<'p> {
     /// A reification to a fn pointer has no fn to point at: reject.
     fn finish_marker_value(&mut self, e: ExprId, res: Res, tr: TraitRef, name: Sym, span: Span) {
         let ei = self.ei(e);
-        if matches!(self.out.coerce[ei], Coerce::ReifyFn(_)) {
+        // The reification may sit on a later use of the value (`let g:
+        // fn(&i32) -> i32 = f;` after `let f = Clone::clone;`): any
+        // reified expression of this trait method's `FnDef` type.
+        let method = match self.kind(self.out.expr_ty[ei]) {
+            TyKind::FnDef(m, _) => Some(m),
+            _ => None,
+        };
+        let reified = matches!(self.out.coerce[ei], Coerce::ReifyFn(_))
+            || method.is_some_and(|m| {
+                (0..self.out.coerce.len()).any(|i| {
+                    matches!(self.out.coerce[i], Coerce::ReifyFn(_)) && matches!(self.kind(self.out.expr_ty[i]), TyKind::FnDef(d, _) if d == m)
+                })
+            });
+        if reified {
             let tn = self.trait_name(tr.def);
             self.err(
                 "L0641",
@@ -526,11 +645,33 @@ impl<'p> Ctx<'p> {
                 TraitFnRes::Cast => self.set_res(e, Res::FromCast),
                 TraitFnRes::Default => self.set_res(e, Res::DefaultVal),
                 // The first argument is `&Self`: one deref to the value.
-                TraitFnRes::PrimCmp(kind) => self.set_res(e, Res::PrimCmp { kind, derefs: 1 }),
-                TraitFnRes::OrdPick(kind) => self.set_res(e, Res::OrdPick { kind, f: None, via: CmpVia::Partial(BinOp::Lt) }),
+                TraitFnRes::PrimCmp(kind) if !self.coerced_call_arg(e, span) => self.set_res(e, Res::PrimCmp { kind, derefs: 1 }),
+                TraitFnRes::OrdPick(kind) if !self.coerced_call_arg(e, span) => {
+                    self.set_res(e, Res::OrdPick { kind, f: None, via: CmpVia::Partial(BinOp::Lt) })
+                }
+                TraitFnRes::PrimCmp(_) | TraitFnRes::OrdPick(_) => {}
                 TraitFnRes::Failed => self.trait_fn_failed(tr, name, span, false),
             }
         }
+    }
+
+    /// True, with the error reported, when a trait path call that
+    /// lowers as the method form (`PrimCmp`, `OrdPick`) has an argument
+    /// with a coercion (`<i32 as Ord>::cmp(&&x, &y)`, `str::eq(&s, ..)`
+    /// at a `String`): that lowering reads each argument as its written
+    /// type, so the call is a reject, never a misread.
+    fn coerced_call_arg(&mut self, e: ExprId, span: Span) -> bool {
+        let ast::Expr::Call { args, .. } = self.p.ast.expr(e) else { return false };
+        if args.iter().all(|&a| self.out.coerce[self.ei(a)] == Coerce::None) {
+            return false;
+        }
+        self.err(
+            "L0641",
+            span,
+            "a builtin comparison through its trait path with a coerced argument is not supported yet",
+            "Pass the arguments at the exact types, or call the method form (`a.cmp(b)`).",
+        );
+        true
     }
 
     /// Replaces every `FnDef(method, from)` in the checked body's

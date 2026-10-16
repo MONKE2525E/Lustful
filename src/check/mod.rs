@@ -41,6 +41,7 @@ pub mod std_inherent;
 pub mod tls;
 pub mod traitpath;
 pub mod tryfrom;
+pub mod ufcs;
 pub mod usefulness;
 pub mod sync;
 pub mod unwind;
@@ -6422,7 +6423,29 @@ impl<'p> Ctx<'p> {
 
     fn coerce_expr(&mut self, e: ExprId, found: Ty, expected: Ty) -> bool {
         let span = self.span(e);
+        // An eta closure's argument (parser `eta_closure`) stands for a
+        // fn item's parameter, which is no coercion site: `str::cmp` as
+        // a `sort_by` callable over `&str` items takes `&&str` and
+        // rejects (rustc E0631), as the fn item does.
+        if self.is_eta_arg(e) {
+            self.run_obligations(false);
+            if self.unify(found, expected) {
+                return true;
+            }
+            self.mismatch(span, expected, found);
+            return false;
+        }
         self.coerce_at(found, expected, span, Some(e))
+    }
+
+    /// True for a parameter read inside an eta closure's call: a path
+    /// to a `__lust_eta` local at the span of its own binding (the
+    /// parser gives every eta node the path's span, which no written
+    /// read of a local shares).
+    pub(super) fn is_eta_arg(&self, e: ExprId) -> bool {
+        let Res::Local(l) = self.out.expr_res[self.ei(e)] else { return false };
+        let local = &self.out.locals[l as usize];
+        local.span == self.span(e) && self.name(local.name).starts_with("__lust_eta")
     }
 
     /// The Self type of the only impl of `trait_def` for an integer (or
@@ -10729,12 +10752,38 @@ impl<'p> Ctx<'p> {
             }
             return t;
         }
+        // `T::f` as a value on a type parameter, or `Self::f` in a
+        // trait default body: the trait comes from the bounds in scope
+        // (in an instance, the template's bound at the concrete `T`).
+        if let Some(base) = self.param_path_base(segs) {
+            let name = segs[1].name;
+            if let Some(tr) = self.instance_bound_ref(name, base).or_else(|| self.unique_item_trait(base, name))
+                && let Some(t) = self.trait_ref_fn_value(e, tr, name, span)
+            {
+                return t;
+            }
+        }
         // A trait's function as a value through the trait name
         // (`Into::into`, check/traitpath.rs).
         if let Some(t) = self.trait_path_fn_value(e, segs, span) {
             return t;
         }
-        if let Some(r) = self.resolve_assoc(segs, span) {
+        let mark = self.errs.len();
+        let resolved = self.resolve_assoc(segs, span);
+        // No inherent item, variant, or written impl fn of that name
+        // (`S::clone` for a derived Clone, `Self::default`, `i32::cmp`):
+        // the one trait in scope that has the item and holds for the
+        // type, as rustc probes traits after inherent items.
+        if resolved.is_none()
+            && segs.len() == 2
+            && let Some(base) = assoc_base.or_else(|| self.prim_ty_by_name(segs[0].name))
+            && let Some(tr) = self.unique_item_trait(base, segs[1].name)
+            && let Some(t) = self.trait_ref_fn_value(e, tr, segs[1].name, span)
+        {
+            self.errs.truncate(mark);
+            return t;
+        }
+        if let Some(r) = resolved {
             self.set_res(e, r);
             if r == Res::OptNone {
                 let v = match self.builtin_ctor_args(segs, 1, span) {
@@ -11710,6 +11759,22 @@ impl<'p> Ctx<'p> {
     /// `W::<u8>::new()`: type arguments written on the type segment
     /// of a path call fix the Self type of the inherent impl, and so
     /// the impl's parameters in the method's template args.
+    /// The type a two-segment `T::item` path heads with when `T` is a
+    /// type parameter in scope (its instance type in an instance), or
+    /// `Self` in a trait default body (the trait's Self param).
+    fn param_path_base(&self, segs: &[ast::PathSeg]) -> Option<Ty> {
+        if segs.len() != 2 {
+            return None;
+        }
+        let param_self = self.body_scope.self_ty.filter(|&t| matches!(self.tys.kind(t), TyKind::Param(_)));
+        self.body_scope
+            .param_tys
+            .iter()
+            .find(|(n, _)| *n == segs[0].name)
+            .map(|&(_, t)| t)
+            .or(if segs[0].name == self.p.known.self_type { param_self } else { None })
+    }
+
     /// In an instance of a generic body, the template's one bound on
     /// `self_ty` whose trait declares `method`, substituted at the
     /// instance's args: what a `T::method(..)` call meant in the
@@ -12784,16 +12849,7 @@ impl<'p> Ctx<'p> {
                 // `T::assoc_fn(..)` on a type parameter, or `Self::f(..)`
                 // in a trait default body (Self is the trait's param):
                 // the trait comes from the bounds in scope here.
-                let param_self = self.body_scope.self_ty.filter(|&t| matches!(self.tys.kind(t), TyKind::Param(_)));
-                if segs.len() == 2
-                    && let Some(base) = self
-                        .body_scope
-                        .param_tys
-                        .iter()
-                        .find(|(n, _)| *n == segs[0].name)
-                        .map(|&(_, t)| t)
-                        .or(if segs[0].name == p.known.self_type { param_self } else { None })
-                {
+                if let Some(base) = self.param_path_base(segs) {
                     // In an instance, the template's bound fixes the trait
                     // args (`U: From<u8>` at U = u16 calls `<u16 as
                     // From<u8>>::from`); a builtin Self's own impls can be
@@ -12854,7 +12910,12 @@ impl<'p> Ctx<'p> {
                         self.out.deref_coerce.truncate(place_lens.1);
                         self.out.index_recv.truncate(place_lens.2);
                         self.deref_sites.truncate(place_lens.3);
-                        let mut bases = vec![at];
+                        // An argument of no known type yet (an eta
+                        // closure's param, `|a, b| PartialEq::eq(a, b)`)
+                        // says nothing about Self: the deferred trait
+                        // path below types the call, Self a fresh var.
+                        let unknown = matches!(self.tys.kind(at), TyKind::Infer(v) if !v.is_int() && !v.is_float());
+                        let mut bases = if unknown { Vec::new() } else { vec![at] };
                         if let TyKind::Ref(_, _, inner) = self.tys.kind(at) {
                             bases.insert(0, self.deep(inner));
                         }
@@ -12885,7 +12946,7 @@ impl<'p> Ctx<'p> {
                                 return t;
                             }
                         }
-                        if matches!(segs[tseg].args, ast::GenericArgs::Angle(_)) {
+                        if !unknown && matches!(segs[tseg].args, ast::GenericArgs::Angle(_)) {
                             let shown = match self.tys.kind(at) {
                                 TyKind::Ref(_, _, inner) => self.deep(inner),
                                 _ => at,
@@ -12960,10 +13021,39 @@ impl<'p> Ctx<'p> {
                         // `String::default()`: no builtin item of that
                         // name, so a std trait's (as for aliases above).
                         if self.errs[mark..].iter().all(|d| matches!(d.code, "L0101" | "L0104"))
-                            && let Some(base) = self.builtin_path_base(segs, cs, expected)
+                            && let Some(base) = self
+                                .builtin_path_base(segs, cs, expected)
+                                .or_else(|| if segs.len() == 2 { self.prim_ty_by_name(segs[0].name) } else { None })
                         {
                             let saved = self.errs.split_off(mark);
-                            if let Some(t) = self.std_trait_assoc_call(e, callee, base, segs[segs.len() - 1].name, args, span) {
+                            let name = segs[segs.len() - 1].name;
+                            if let Some(t) = self.std_trait_assoc_call(e, callee, base, name, args, span) {
+                                return t;
+                            }
+                            // `i32::cmp(a, b)`, `String::eq(a, b)`: the one
+                            // trait in scope with the item that holds for
+                            // the builtin, deferred like `Ord::cmp(a, b)`.
+                            if let Some(tr) = self.unique_item_trait(base, name)
+                                && let Some(t) = self.trait_ref_call(e, tr, name, args, span)
+                            {
+                                return t;
+                            }
+                            self.errs.extend(saved);
+                        }
+                        // `Vec::len(&v)`, `std::thread::Builder::spawn(b, f)`:
+                        // a builtin method by path (check/ufcs.rs). The
+                        // builtin type may answer "not implemented" for
+                        // the item (L0640), as the sync types do.
+                        let n = segs.len();
+                        if n >= 2
+                            && !segs[n - 1].has_args()
+                            && self.errs[mark..].iter().all(|d| matches!(d.code, "L0101" | "L0104" | "L0640"))
+                        {
+                            // With no written type the receiver must be the
+                            // builtin the path names (`builtin_names_path`).
+                            let written = self.builtin_path_base(segs, cs, None);
+                            let saved = self.errs.split_off(mark);
+                            if let Some(t) = self.builtin_method_by_path(e, segs, written, cs, args, span, expected) {
                                 return t;
                             }
                             self.errs.extend(saved);
@@ -13235,9 +13325,32 @@ impl<'p> Ctx<'p> {
                         None => (vec![], ERROR),
                     },
                     Builtin::Clone => {
-                        // The associated form `Type::clone(&x)`:
-                        // the argument fixes the type.
-                        let base = self.new_var(false);
+                        // The associated form `Type::clone(&x)`: the
+                        // argument fixes the type, within the written
+                        // type's shape (`Rc::clone(&&rc)` derefs to the
+                        // `Rc`, never clones the reference).
+                        let written = match p.ast.expr(callee) {
+                            Expr::Path(segs) if segs.len() >= 2 => {
+                                let cs = self.span(callee);
+                                // `Arc::clone` and `sync::Weak::clone` pick
+                                // this builtin on a std path only (`sync_assoc`;
+                                // `rc::Weak::clone` is no builtin).
+                                let sync = match self.name(segs[segs.len() - 2].name) {
+                                    "Arc" => Some(crate::ty::sync::SyncTy::Arc),
+                                    "Weak" => Some(crate::ty::sync::SyncTy::ArcWeak),
+                                    _ => None,
+                                };
+                                match sync {
+                                    Some(k) => {
+                                        let v = self.new_var(false);
+                                        Some(crate::ty::sync::sync_ty(&mut self.tys, k, &[v]))
+                                    }
+                                    None => self.builtin_path_base(segs, cs, None),
+                                }
+                            }
+                            _ => None,
+                        };
+                        let base = written.unwrap_or_else(|| self.new_var(false));
                         self.deferred_clone.push((base, span));
                         let r = self.tys.mk_ref(false, base);
                         (vec![r], base)
@@ -18163,6 +18276,14 @@ impl<'p> Ctx<'p> {
             self.set_res(e, Res::Fn(f));
             return self.fn_value_ty_prefixed(e, f, &prefix, span);
         }
+        // No impl fn selects now (`<T as Sh>::mk` on a type parameter,
+        // `<i32 as Clone>::clone`): the trait ref's deferred value, as
+        // for `T::f`.
+        if let Some(tr) = hint.or_else(|| self.unique_item_trait(base, name))
+            && let Some(t) = self.trait_ref_fn_value(e, tr, name, span)
+        {
+            return t;
+        }
         self.err(
             "L0104",
             span,
@@ -18386,6 +18507,16 @@ impl<'p> Ctx<'p> {
     /// do (rustc E0599, E0034).
     fn unique_item_trait(&mut self, base: Ty, name: Sym) -> Option<TraitRef> {
         let p = self.p;
+        // A comparison trait's `Rhs` at a std type that has several
+        // `PartialEq` / `PartialOrd` impls in std (`String: PartialEq<&str>`)
+        // but one in lust: selecting the one impl would fix `Rhs` before
+        // the arguments do, so `String::eq(&a, &&b)` would deref-coerce
+        // where rustc rejects. Only scalars, user types, and params here.
+        let rhs_trait = |d: DefId| d == p.gx.lang.partial_eq || d == p.gx.lang.partial_ord;
+        let scalar_or_user = matches!(
+            self.kind(self.resolve(base)),
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Param(_)
+        ) || self.tys.local_adt(self.resolve(base)).is_some_and(|a| !generics::is_std_adt(&p.tys, a));
         let traits = p.gx.traits_by_method.get(&name)?.clone();
         let mut found: Option<DefId> = None;
         for trait_def in traits {
@@ -18407,6 +18538,9 @@ impl<'p> Ctx<'p> {
             }
         }
         let trait_def = found?;
+        if rhs_trait(trait_def) && !scalar_or_user {
+            return None;
+        }
         let n_inputs = p.gx.index.trait_record(trait_def)?.generics.params.len().saturating_sub(1);
         Some(self.fresh_trait_ref(trait_def, base, n_inputs))
     }
@@ -21707,6 +21841,7 @@ impl<'p> Ctx<'p> {
         method::finish_deferred_methods(self);
         self.finish_trait_fn_values();
         self.finish_trait_fn_calls();
+        self.reject_marker_callables();
         // `?` conversions deferred on a projection error type:
         // it normalizes now its types are known (fx-tryfrom).
         for (e, err_t, ret_err, span) in std::mem::take(&mut self.deferred_try) {
