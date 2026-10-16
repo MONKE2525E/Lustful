@@ -71,15 +71,17 @@ static int lh_capacity_to_buckets(uint64_t cap, uint64_t elem_size, uint64_t *ou
    them. The oversized-allocation reuse in hashbrown cannot trigger with
    the Rust Global allocator, which returns exactly the layout size, so
    it is not reproduced. */
-static void lh_alloc_buckets(lust_hash_table *t, uint64_t buckets) {
+static int lh_alloc_buckets(lust_hash_table *t, uint64_t buckets) {
     uint64_t ctrl_align = lh_ctrl_align(t);
-    if (t->elem_size && buckets > UINT64_MAX / t->elem_size) lust_hash_capacity_overflow();
+    /* A capacity overflow panics; under panic=unwind the panic returns
+       here and the table stays as it was. */
+    if (t->elem_size && buckets > UINT64_MAX / t->elem_size) return lust_hash_capacity_overflow(), 0;
     uint64_t data_bytes = t->elem_size * buckets;
-    if (data_bytes > UINT64_MAX - (ctrl_align - 1)) lust_hash_capacity_overflow();
+    if (data_bytes > UINT64_MAX - (ctrl_align - 1)) return lust_hash_capacity_overflow(), 0;
     uint64_t ctrl_offset = lh_align_up(data_bytes, ctrl_align);
-    if (ctrl_offset > UINT64_MAX - buckets - LH_WIDTH) lust_hash_capacity_overflow();
+    if (ctrl_offset > UINT64_MAX - buckets - LH_WIDTH) return lust_hash_capacity_overflow(), 0;
     uint64_t total = ctrl_offset + buckets + LH_WIDTH;
-    if (total > (uint64_t)INT64_MAX - (ctrl_align - 1)) lust_hash_capacity_overflow();
+    if (total > (uint64_t)INT64_MAX - (ctrl_align - 1)) return lust_hash_capacity_overflow(), 0;
     void *raw = malloc((size_t)(total + ctrl_align));
     if (!raw) lust_oom_size(total); /* hashbrown's table layout */
     uintptr_t base = lh_align_up((uint64_t)(uintptr_t)raw, ctrl_align);
@@ -89,6 +91,7 @@ static void lh_alloc_buckets(lust_hash_table *t, uint64_t buckets) {
     t->bucket_mask = buckets - 1;
     t->items = 0;
     t->growth_left = lh_bucket_mask_to_capacity(buckets - 1);
+    return 1;
 }
 
 static void lh_free_table(lust_hash_table *t) {
@@ -104,21 +107,22 @@ static void lh_free_table(lust_hash_table *t) {
 static int lh_is_singleton(const lust_hash_table *t) { return t->bucket_mask == 0; }
 static uint64_t lh_num_buckets(const lust_hash_table *t) { return t->bucket_mask + 1; }
 
-/* RawTableInner::with_capacity into an already-initialized layout. */
-static void lh_with_capacity(lust_hash_table *t, uint64_t capacity) {
-    if (capacity == 0) {
+/* RawTableInner::with_capacity into an already-initialized layout. 0
+   after a capacity overflow panic (panic=unwind), with `t` empty. */
+static int lh_with_capacity(lust_hash_table *t, uint64_t capacity) {
+    uint64_t buckets = 0;
+    if (capacity && !lh_capacity_to_buckets(capacity, t->elem_size, &buckets)) lust_hash_capacity_overflow();
+    if (capacity == 0 || !buckets || !lh_alloc_buckets(t, buckets)) {
         t->ctrl = (uint8_t *)lust_hash_static_empty;
         t->data = NULL;
         t->alloc_base = NULL;
         t->bucket_mask = 0;
         t->items = 0;
         t->growth_left = 0;
-        return;
+        return capacity == 0;
     }
-    uint64_t buckets;
-    if (!lh_capacity_to_buckets(capacity, t->elem_size, &buckets)) lust_hash_capacity_overflow();
-    lh_alloc_buckets(t, buckets);
     memset(t->ctrl, LUST_HASH_EMPTY, (size_t)(buckets + LH_WIDTH));
+    return 1;
 }
 
 void lust_hash_init(lust_hash_table *t, uint64_t elem_size, uint64_t elem_align) {
@@ -425,7 +429,7 @@ static void lh_resize_inner(lust_hash_table *t, uint64_t capacity, lust_hash_of_
     lust_hash_table nt;
     nt.elem_size = t->elem_size;
     nt.elem_align = t->elem_align;
-    lh_with_capacity(&nt, capacity);
+    if (!lh_with_capacity(&nt, capacity)) return;
     if (t->items) {
         uint64_t left = t->items;
         for (uint64_t i = 0; i < lh_num_buckets(t) && left; i++) {
@@ -447,7 +451,10 @@ static void lh_resize_inner(lust_hash_table *t, uint64_t capacity, lust_hash_of_
 
 /* RawTableInner::reserve_rehash_inner. */
 static void lh_reserve_rehash_inner(lust_hash_table *t, uint64_t additional, lust_hash_of_fn hash_of, void *hash_ctx) {
-    if (additional > UINT64_MAX - t->items) lust_hash_capacity_overflow();
+    if (additional > UINT64_MAX - t->items) {
+        lust_hash_capacity_overflow();
+        return;
+    }
     uint64_t new_items = t->items + additional;
     uint64_t full_capacity = lh_bucket_mask_to_capacity(t->bucket_mask);
     if (new_items <= full_capacity / 2) {
@@ -920,7 +927,10 @@ static void li_entries_alloc(lust_index_table *t, uint64_t new_cap) {
     void *raw = NULL;
     uint8_t *base = NULL;
     if (new_cap) {
-        if (new_cap > UINT64_MAX / t->entry_size) lust_hash_capacity_overflow();
+        if (new_cap > UINT64_MAX / t->entry_size) {
+            lust_hash_capacity_overflow();
+            return;
+        }
         uint64_t bytes = new_cap * t->entry_size;
         raw = malloc((size_t)(bytes + t->entry_align));
         if (!raw) lust_oom_size(bytes); /* indexmap's entries Vec */
