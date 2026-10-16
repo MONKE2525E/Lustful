@@ -234,7 +234,8 @@ impl<'p> Ctx<'p> {
     /// The str search and trim methods over a `Pattern` (tf-str):
     /// `find`, `rfind`, `contains`, `starts_with`, `ends_with`,
     /// `strip_prefix`, `strip_suffix`, the `trim_*_matches` family,
-    /// and the `matches` iterators, on a `str` or `String` receiver.
+    /// the `matches` iterators, and `replace` and `replacen`, on a
+    /// `str` or `String` receiver.
     /// The `char` and string-needle patterns of the search methods
     /// keep their older builtins (a char records `Coerce::CharPat`);
     /// char sets and closures run through `StrPat*` builtins over
@@ -244,6 +245,7 @@ impl<'p> Ctx<'p> {
         if self.kind(base) != TyKind::Str && !self.tys.is_string_ty(base) {
             return None;
         }
+        use Builtin as B;
         use it::MatchesMode as MM;
         #[derive(Clone, Copy, PartialEq)]
         enum Op {
@@ -258,8 +260,12 @@ impl<'p> Ctx<'p> {
             TrimStartMatches,
             TrimEndMatches,
             Matches(MM),
+            Replace,
+            Replacen,
         }
         let op = match self.p.interner.get(name) {
+            "replace" => Op::Replace,
+            "replacen" => Op::Replacen,
             "find" => Op::Find,
             "rfind" => Op::Rfind,
             "contains" => Op::Contains,
@@ -285,8 +291,18 @@ impl<'p> Ctx<'p> {
             "rmatch_indices" => Op::Matches(MM::RMatchIndices),
             _ => return None,
         };
-        if args.len() != 1 {
-            self.err("L0105", name_span, format!("this method takes 1 argument(s) but {} were given", args.len()), "Pass exactly the declared arguments.");
+        let n_args = match op {
+            Op::Replace => 2,
+            Op::Replacen => 3,
+            _ => 1,
+        };
+        if args.len() != n_args {
+            self.err(
+                "L0105",
+                name_span,
+                format!("this method takes {n_args} argument(s) but {} were given", args.len()),
+                "Pass exactly the declared arguments.",
+            );
             for &a in args {
                 self.expr(a, None);
             }
@@ -294,6 +310,28 @@ impl<'p> Ctx<'p> {
         }
         let a = args[0];
         let Some(t) = self.check_pattern_arg(a, name_span) else { return Some(ERROR) };
+        // `replace` and `replacen`: a char or string needle keeps the
+        // older `&str` builtins; a char set or a predicate runs alloc's
+        // `match_indices` loop over the split family's searchers.
+        if matches!(op, Op::Replace | Op::Replacen) {
+            let rest: &[Ty] = if op == Op::Replace { &[REF_STR] } else { &[REF_STR, USIZE] };
+            self.check_args(rest, &args[1..], name_span);
+            let b = if self.kind(t) == TyKind::Char || str_needle(&self.tys, t) {
+                if self.kind(t) == TyKind::Char {
+                    let ix = self.ei(a);
+                    self.out.coerce[ix] = Coerce::CharPat;
+                } else {
+                    self.coerce_expr(a, t, REF_STR);
+                }
+                if op == Op::Replace { B::StrReplace } else { B::StrReplacen }
+            } else if op == Op::Replace {
+                B::StrPatReplace
+            } else {
+                B::StrPatReplacen
+            };
+            self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+            return Some(STRING);
+        }
         self.reject_unsized_value(a);
         let needle = str_needle(&self.tys, t);
         // std's `trim_matches` needs a `DoubleEndedSearcher`, which
@@ -307,7 +345,6 @@ impl<'p> Ctx<'p> {
             );
             return Some(ERROR);
         }
-        use Builtin as B;
         let char_like = !needle && self.kind(t) != TyKind::Char;
         let (b, ret) = match op {
             Op::Matches(mode) => (B::StrMatches, it::mk_matches(&mut self.tys, t, mode)),
@@ -328,6 +365,7 @@ impl<'p> Ctx<'p> {
             Op::EndsWith => (B::StrEndsWith, BOOL),
             Op::StripPrefix => (B::StrStripPrefix, self.tys.mk_option(REF_STR)),
             Op::StripSuffix => (B::StrStripSuffix, self.tys.mk_option(REF_STR)),
+            Op::Replace | Op::Replacen => unreachable!("returned above"),
         };
         // The older builtins take the pattern as a `&str`: a char
         // becomes its encoding (`Coerce::CharPat`), and a needle

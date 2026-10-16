@@ -421,6 +421,10 @@ pub enum Builtin {
     // runs it through the split family's `lust_pat` searchers. The
     // `&str` and `char` forms keep the older builtins above.
     StrPatFind,
+    /// `str::replace` and `replacen` over a char set or predicate
+    /// (check/split.rs): alloc's `match_indices` loop.
+    StrPatReplace,
+    StrPatReplacen,
     StrPatRfind,
     StrPatContains,
     StrPatStartsWith,

@@ -31,6 +31,8 @@ impl FnGen<'_, '_> {
                 | B::StrTrimMatches
                 | B::StrTrimStartMatches
                 | B::StrTrimEndMatches
+                | B::StrPatReplace
+                | B::StrPatReplacen
         ) {
             return None;
         }
@@ -150,6 +152,22 @@ impl FnGen<'_, '_> {
                 };
                 Some(r)
             }
+            B::StrPatReplace | B::StrPatReplacen => {
+                // (`&str` or `&String`, pattern by value, `to`, count):
+                // alloc's `match_indices` loop (runtime `lust_pat_replacen`).
+                let hay = str_of(&vals[0], &tys[0]);
+                let to = str_of(&vals[2], &tys[2]);
+                let p = self.op_lust_ty(&ops[1]);
+                let _ = writeln!(self.out, "    {} {t}_v = {};", ctype(&tys[1]), vals[1]);
+                let pat = self.split_pat(p, SplitMode::Split, &format!("(&{t}_v)"));
+                let (count, cap) = if b == B::StrPatReplace { ("0xffffffffffffffffull".to_string(), 0) } else { (vals[3].clone(), 32) };
+                let _ = writeln!(self.out, "    lust_pat {t}_p = {pat}; {dc} {t} = lust_pat_replacen({hay}, &{t}_p, {to}, {count}, {cap});");
+                if needs_drop_c(self.p, &tys[1]) {
+                    self.want(Glue::Drop, &tys[1]);
+                    let _ = writeln!(self.out, "    drop_{}(&{t}_v);", mangle(&tys[1]));
+                }
+                Some(t)
+            }
             B::StrSplitUpper => Some(format!("lust_split_upper((const lust_split*)({}))", vals[0])),
             _ => {
                 // (`&str` or `&String`, pattern by value).
@@ -180,22 +198,15 @@ impl FnGen<'_, '_> {
     }
 
     /// The type of an operand: a constant's, or its place's (the local's
-    /// type through its derefs).
+    /// type through its projections: a closure pattern can sit in an
+    /// array element or a tuple field, `s.find(fs[0])`).
     fn op_lust_ty(&self, o: &Operand) -> Ty {
-        let pl = match o {
-            Operand::Move(pl) | Operand::Copy(pl) => pl,
-            Operand::Const(Const::Str(_)) => return REF_STR,
-            Operand::Const(Const::Char(_)) => return CHAR,
-            Operand::Const(_) => return ERROR,
-        };
-        let mut t = self.body.locals[pl.local as usize].ty;
-        for pr in &pl.proj {
-            t = match (self.body.tys.kind(t), pr) {
-                (TyKind::Ref(_, _, i), Proj::Deref) => i,
-                _ => return ERROR,
-            };
+        match o {
+            Operand::Move(_) | Operand::Copy(_) => self.callable_place_ty(o),
+            Operand::Const(Const::Str(_)) => REF_STR,
+            Operand::Const(Const::Char(_)) => CHAR,
+            Operand::Const(_) => ERROR,
         }
-        t
     }
 
     /// The pattern type and mode of a `&mut StrMatches<P, M>` operand.

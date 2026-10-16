@@ -2039,6 +2039,27 @@ int lust_matches_step(lust_split *s, const lust_pat *p, int back, uint64_t *idx,
     return 1;
 })
 
+/* `str::replace` / `replacen` over a char set or predicate pattern:
+   alloc's loop over `match_indices(pat).take(count)` into a String of
+   capacity `cap` (0 for `replace`, whose pattern has no UTF-8 form; 32
+   for `replacen`). The searcher stops after `count` matches, so a
+   predicate sees no char past the last replaced match. */
+lust_String lust_pat_replacen(lust_str hay, const lust_pat *p, lust_str to, uint64_t count, uint64_t cap) LUST_BODY({
+    lust_String r = lust_string_with_capacity(cap);
+    lust_split s;
+    s.hay = hay; s.start = 0; s.end = hay.len; s.fpos = 0; s.bpos = hay.len;
+    s.flags = LUST_SPLIT_MATCH_FW | LUST_SPLIT_MATCH_BW; s.count = 0;
+    uint64_t last = 0, done = 0, a, b;
+    while (done < count && lust_split_match_fw(&s, p, &a, &b)) {
+        lust_string_push_bytes(&r, hay.ptr + last, a - last);
+        lust_string_push_str(&r, to);
+        last = b;
+        done++;
+    }
+    lust_string_push_bytes(&r, hay.ptr + last, hay.len - last);
+    return r;
+})
+
 /* The primitive `FromStr` parsers (tf-str), core's semantics.
    Int kinds follow `IntErrorKind` (Empty 0, InvalidDigit 1,
    PosOverflow 2, NegOverflow 3): core's `from_str_radix` at radix
