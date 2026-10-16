@@ -1831,33 +1831,22 @@ fn bind_outline_macros(
         if tables.def_info.contains_key(&def) {
             continue;
         }
-        // An exported macro defined at the crate root has one binding
-        // there, and it is public: inserting the private textual
-        // binding first would keep it (same target reads as no change)
-        // and hide the macro from other crates.
-        if m.exported && module == job.root_module {
-            tables.insert(
-                module,
-                Namespace::Macro,
-                m.name,
-                Bind { target: Target::Def(def), vis: VisKind::Pub, rank: 2, def_module: module },
-            );
-        } else {
-            tables.insert(
-                module,
-                Namespace::Macro,
-                m.name,
-                Bind { target: Target::Def(def), vis: VisKind::Priv, rank: 2, def_module: module },
-            );
+        // A definition's binding in its own module is textual only
+        // (`macro_textual_binds`; rustc has none), and it never takes
+        // the place of a real binding. `#[macro_export]` puts a real,
+        // public one at the crate root, which replaces a textual-only
+        // binding of the name there; an exported root definition has
+        // only that one.
+        if !(m.exported && module == job.root_module) && tables.lookup(module, Namespace::Macro, m.name).is_none() {
+            tables.insert(module, Namespace::Macro, m.name, Bind { target: Target::Def(def), vis: VisKind::Priv, rank: 2, def_module: module });
             tables.macro_textual_binds.insert((module, m.name), def);
-            if m.exported {
-                tables.insert(
-                    job.root_module,
-                    Namespace::Macro,
-                    m.name,
-                    Bind { target: Target::Def(def), vis: VisKind::Pub, rank: 2, def_module: job.root_module },
-                );
+        }
+        if m.exported {
+            let root = job.root_module;
+            if tables.macro_textual_binds.remove(&(root, m.name)).is_some() {
+                tables.maps[root.0 as usize][ns_index(Namespace::Macro)].remove(&m.name);
             }
+            tables.insert(root, Namespace::Macro, m.name, Bind { target: Target::Def(def), vis: VisKind::Pub, rank: 2, def_module: root });
         }
         tables.def_info.insert(def, DefInfo { kind: ResKind::Macro, flat: m.name, module, vis: VisKind::Priv });
         if job.flat_prefix.is_empty() {
@@ -1977,7 +1966,10 @@ fn macro_tok_range(toks: &[crate::lexer::Token], start: usize) -> (usize, usize)
 #[derive(Clone)]
 struct UseSite {
     module: Vec<Sym>,
-    pubish: bool,
+    /// Where the binding is visible: None for `pub`, else the module
+    /// path it is visible within (`pub(crate)` is the root, a private
+    /// `use` its own module).
+    vis: Option<Vec<Sym>>,
     segs: Vec<Sym>,
     leading: bool,
     alias: Sym,
@@ -2027,7 +2019,7 @@ fn parse_use_trees(
     prefix: &[Sym],
     leading: bool,
     module: &[Sym],
-    pubish: bool,
+    vis: &Option<Vec<Sym>>,
     lo: u32,
     interner: &Interner,
     out: &mut Vec<UseSite>,
@@ -2056,12 +2048,12 @@ fn parse_use_trees(
                 match trees.get(i) {
                     Some(TokenTree::Delim(Delim::Brace, inner, _)) => {
                         for chunk in comma_chunks(inner) {
-                            parse_use_trees(&chunk, &segs, leading, module, pubish, lo, interner, out);
+                            parse_use_trees(&chunk, &segs, leading, module, vis, lo, interner, out);
                         }
                         return;
                     }
                     Some(TokenTree::Token(t)) if t.tok == Tok::Star => {
-                        out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias: Sym(0), glob: true, lo });
+                        out.push(UseSite { module: module.to_vec(), vis: vis.clone(), segs, leading, alias: Sym(0), glob: true, lo });
                         return;
                     }
                     _ => continue,
@@ -2084,7 +2076,7 @@ fn parse_use_trees(
     let self_sym = interner.intern("self");
     let alias = alias
         .unwrap_or_else(|| if segs.len() > 1 && *segs.last().unwrap() == self_sym { segs[segs.len() - 2] } else { *segs.last().unwrap() });
-    out.push(UseSite { module: module.to_vec(), pubish, segs, leading, alias, glob: false, lo });
+    out.push(UseSite { module: module.to_vec(), vis: vis.clone(), segs, leading, alias, glob: false, lo });
 }
 
 /// Scans one file's item-level `use` items (top level and inline
@@ -2096,13 +2088,15 @@ fn scan_use_sites(trees: &[crate::lexer::TokenTree], module: &[Sym], interner: &
         _ => None,
     };
     let mut i = 0;
-    let mut pubish = false;
+    let private = Some(module.to_vec());
+    let mut vis = private.clone();
     while i < trees.len() {
         match tok(trees, i) {
             Some(Tok::Pub) => {
-                pubish = true;
+                vis = None;
                 i += 1;
-                if matches!(trees.get(i), Some(TokenTree::Delim(Delim::Paren, _, _))) {
+                if let Some(TokenTree::Delim(Delim::Paren, inner, _)) = trees.get(i) {
+                    vis = restricted_vis(inner, module);
                     i += 1;
                 }
             }
@@ -2116,9 +2110,9 @@ fn scan_use_sites(trees: &[crate::lexer::TokenTree], module: &[Sym], interner: &
                     TokenTree::Token(t) => t.span.lo,
                     _ => 0,
                 };
-                parse_use_trees(&trees[start..end], &[], false, module, pubish, lo, interner, out);
+                parse_use_trees(&trees[start..end], &[], false, module, &vis, lo, interner, out);
                 i = end + 1;
-                pubish = false;
+                vis = private.clone();
             }
             Some(Tok::Mod) => {
                 if let (Some(name), Some(TokenTree::Delim(Delim::Brace, inner, _))) =
@@ -2132,19 +2126,45 @@ fn scan_use_sites(trees: &[crate::lexer::TokenTree], module: &[Sym], interner: &
                 } else {
                     i += 1;
                 }
-                pubish = false;
+                vis = private.clone();
             }
             Some(_) | None => {
                 // At item level a brace group belongs to an item the
                 // pattern above does not open (fn body, impl, const):
                 // the trees are nested, so skipping one tree skips it.
                 if !matches!(tok(trees, i), Some(Tok::Pound)) {
-                    pubish = false;
+                    vis = private.clone();
                 }
                 i += 1;
             }
         }
     }
+}
+
+/// The module path a `pub(..)` restriction makes a `use` visible
+/// within: `crate`, `self`, `super`, or `in` a path from those. A form
+/// this does not read (a bad path) keeps it private to `module`.
+fn restricted_vis(inner: &[crate::lexer::TokenTree], module: &[Sym]) -> Option<Vec<Sym>> {
+    use crate::lexer::{Tok, TokenTree};
+    let toks: Vec<Tok> = inner.iter().filter_map(|t| if let TokenTree::Token(t) = t { Some(t.tok) } else { None }).collect();
+    let segs: Vec<Tok> = toks.into_iter().filter(|t| *t != Tok::PathSep).collect();
+    let segs = if segs.first() == Some(&Tok::In) { &segs[1..] } else { &segs[..] };
+    let mut out = match segs.first() {
+        Some(Tok::Crate) => Vec::new(),
+        Some(Tok::SelfLower) => module.to_vec(),
+        Some(Tok::Super) => module[..module.len().saturating_sub(1)].to_vec(),
+        _ => return Some(module.to_vec()),
+    };
+    for t in &segs[1..] {
+        match t {
+            Tok::Super => {
+                out.pop();
+            }
+            Tok::Ident(s) => out.push(*s),
+            _ => return Some(module.to_vec()),
+        }
+    }
+    Some(out)
 }
 
 /// Rewrites `$crate` in the template groups of one macro definition
@@ -2403,13 +2423,16 @@ impl MacroEnv {
                            from: &[Sym],
                            textual: Option<usize>,
                            bindings: &FxMap<(Vec<Sym>, Sym), usize>,
+                           bvis: &FxMap<(Vec<Sym>, Sym), Option<Vec<Sym>>>,
                            ambiguous: &FxMap<(Vec<Sym>, Sym), ()>|
          -> Option<usize> {
             let last = *segs.last()?;
             let middle = &segs[..segs.len() - 1];
+            // A binding the use cannot see (rustc E0603) binds nothing.
             let by = |m: &[Sym]| {
                 let key = (m.to_vec(), last);
-                if ambiguous.contains_key(&key) { None } else { bindings.get(&key).copied() }
+                let visible = bvis.get(&key).is_none_or(|v| v.as_ref().is_none_or(|v| from.starts_with(v)));
+                if ambiguous.contains_key(&key) || !visible { None } else { bindings.get(&key).copied() }
             };
             if segs.len() == 1 && !leading {
                 return textual.or_else(|| by(from));
@@ -2480,19 +2503,33 @@ impl MacroEnv {
         // request.
         let mut writer: FxMap<(Vec<Sym>, Sym), (usize, bool)> = FxMap::default();
         let mut ambiguous: FxMap<(Vec<Sym>, Sym), ()> = FxMap::default();
+        // Where each binding is visible (see `UseSite::vis`); none
+        // recorded is public (`#[macro_export]`, a dependency's).
+        let mut bvis: FxMap<(Vec<Sym>, Sym), Option<Vec<Sym>>> = FxMap::default();
+        let seen_from = |bvis: &FxMap<(Vec<Sym>, Sym), Option<Vec<Sym>>>, key: &(Vec<Sym>, Sym), from: &[Sym]| {
+            bvis.get(key).is_none_or(|v| v.as_ref().is_none_or(|v| from.starts_with(v)))
+        };
         let mut rounds = 0usize;
         loop {
             let mut changed = false;
             for (si, site) in sites.iter().enumerate() {
-                if !site.pubish {
-                    continue;
-                }
                 if site.glob {
                     let target = resolve_glob_module(&site.segs, site.leading, &site.module, &bindings);
-                    let names: Vec<(Sym, usize)> =
-                        bindings.iter().filter(|((m, _), _)| *m == target).map(|((_, n), src)| (*n, *src)).collect();
-                    for (name, src) in names {
+                    let names: Vec<(Sym, usize, Option<Vec<Sym>>)> = bindings
+                        .iter()
+                        .filter(|((m, _), _)| *m == target)
+                        .filter(|(k, _)| seen_from(&bvis, k, &site.module))
+                        .map(|(k, src)| (k.1, *src, bvis.get(k).cloned().flatten()))
+                        .collect();
+                    for (name, src, src_vis) in names {
                         let key = (site.module.clone(), name);
+                        // The glob's binding reaches no further than
+                        // either the glob or the source binding.
+                        let vis = match (&site.vis, src_vis) {
+                            (None, v) => v,
+                            (Some(g), Some(v)) if v.len() > g.len() => Some(v),
+                            (g, _) => g.clone(),
+                        };
                         let from_ambiguous = ambiguous.contains_key(&(target.clone(), name));
                         match writer.get(&key).copied() {
                             Some((w, other_glob)) if w != si => {
@@ -2508,6 +2545,10 @@ impl MacroEnv {
                                     bindings.insert(key.clone(), src);
                                     changed = true;
                                 }
+                                if bvis.get(&key) != Some(&vis) {
+                                    bvis.insert(key.clone(), vis);
+                                    changed = true;
+                                }
                                 if from_ambiguous && ambiguous.insert(key, ()).is_none() {
                                     changed = true;
                                 }
@@ -2516,7 +2557,7 @@ impl MacroEnv {
                     }
                     continue;
                 }
-                if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, site_textual[si], &bindings, &ambiguous) {
+                if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, site_textual[si], &bindings, &bvis, &ambiguous) {
                     let key = (site.module.clone(), site.alias);
                     let may = match writer.get(&key) {
                         None => true,
@@ -2526,6 +2567,10 @@ impl MacroEnv {
                         writer.insert(key.clone(), (si, false));
                         bindings.insert(key.clone(), src);
                         ambiguous.remove(&key);
+                        changed = true;
+                    }
+                    if may && bvis.get(&key) != Some(&site.vis) {
+                        bvis.insert(key.clone(), site.vis.clone());
                         changed = true;
                     }
                 }
@@ -2539,6 +2584,39 @@ impl MacroEnv {
             rounds += 1;
             assert!(rounds <= 4 * sites.len() + 16, "macro re-export fixpoint did not settle");
         }
+        // A path call walks the modules of its path, and each one must
+        // be visible from the caller (rustc E0603): the module path a
+        // walk through `path` stays visible within is the narrowest
+        // scope on it (they nest, so the longest).
+        let module_at: FxMap<&[Sym], ModuleId> = tables
+            .modules
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.krate_root == job.root_module)
+            .map(|(i, m)| (m.path.as_slice(), ModuleId(i as u32)))
+            .collect();
+        let narrower = |a: Option<Vec<Sym>>, b: Option<Vec<Sym>>| match (a, b) {
+            (Some(a), Some(b)) => Some(if a.len() >= b.len() { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        let path_scope = |path: &[Sym], vis: Option<Vec<Sym>>| -> Option<Vec<Sym>> {
+            let mut out = vis;
+            for k in 1..=path.len() {
+                let (Some(&m), Some(&parent)) = (module_at.get(&path[..k]), module_at.get(&path[..k - 1])) else { continue };
+                let up = &path[..k - 1];
+                let scope = match &tables.modules[m.0 as usize].vis {
+                    VisKind::Pub => None,
+                    VisKind::Crate => Some(Vec::new()),
+                    VisKind::Priv => Some(up.to_vec()),
+                    VisKind::Super => Some(up[..up.len().saturating_sub(1)].to_vec()),
+                    VisKind::In(p) => {
+                        Some(tables.resolve_in_path(p, parent, interner).map_or_else(|| up.to_vec(), |r| tables.modules[r.0 as usize].path.clone()))
+                    }
+                };
+                out = narrower(out, scope);
+            }
+            out
+        };
         let mut seeds = Vec::with_capacity(bindings.len());
         let mut keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().collect();
         keys.sort_by(|a, b| {
@@ -2558,13 +2636,16 @@ impl MacroEnv {
                 strings: src.strings.clone(),
                 import_into: None,
                 ambiguous: false,
+                visible_in: path_scope(&key.0, bvis.get(key).cloned().flatten()),
             });
         }
         // Macros visible at this crate's root by path (its own
         // `#[macro_export]` definitions plus root re-exports), under
         // their binding names: what dependent crates receive.
         let mut root_sources: Vec<OwnedMacroSource> = Vec::new();
-        let mut root_keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().filter(|k| k.0.is_empty() && !ambiguous.contains_key(*k)).collect();
+        // Only a public binding reaches another crate.
+        let mut root_keys: Vec<&(Vec<Sym>, Sym)> =
+            bindings.keys().filter(|k| k.0.is_empty() && !ambiguous.contains_key(*k) && bvis.get(*k).is_none_or(Option::is_none)).collect();
         root_keys.sort_by(|a, b| interner.get(a.1).cmp(interner.get(b.1)));
         for key in root_keys {
             let src = owned[bindings[key]].clone();
@@ -2588,8 +2669,11 @@ impl MacroEnv {
                     continue;
                 }
                 let target = resolve_glob_module(&site.segs, site.leading, &site.module, &bindings);
-                let mut names: Vec<(Sym, usize)> =
-                    bindings.iter().filter(|((m, _), _)| *m == target).map(|((_, n), src)| (*n, *src)).collect();
+                let mut names: Vec<(Sym, usize)> = bindings
+                    .iter()
+                    .filter(|(k, _)| k.0 == target && seen_from(&bvis, k, &site.module))
+                    .map(|((_, n), src)| (*n, *src))
+                    .collect();
                 names.sort_by(|a, b| interner.get(a.0).cmp(interner.get(b.0)));
                 for (name, src_idx) in names {
                     let amb = ambiguous.contains_key(&(target.clone(), name))
@@ -2606,12 +2690,14 @@ impl MacroEnv {
                 let src = &owned[src_idx];
                 let mut tokens = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
                 rename_macro_token(&mut tokens, name);
+                let visible_in = path_scope(&target, bvis.get(&(target.clone(), name)).cloned().flatten());
                 extra.push(crate::expand::MacroSeed {
                     path: target,
                     tokens,
                     strings: src.strings.clone(),
                     import_into: Some(module),
                     ambiguous: amb,
+                    visible_in,
                 });
             }
             glob_seeds.push(extra);

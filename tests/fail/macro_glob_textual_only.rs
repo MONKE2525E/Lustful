@@ -1,4 +1,4 @@
-// expect: L0506
+// expect: L0802
 // rustc E0432: a glob does not copy a `macro_rules!` definition, so
 // `self::k` after `use super::*;` names nothing.
 mod m2 {

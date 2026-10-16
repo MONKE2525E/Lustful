@@ -672,7 +672,7 @@ impl ResolvedTables {
     /// Resolves a `pub(in path)` path, written relative to the defining
     /// module. The segments are module names (with `crate`, `self`, and
     /// `super` allowed in front), matched by name against module paths.
-    fn resolve_in_path(&self, path: &[Sym], def_module: ModuleId, interner: &Interner) -> Option<ModuleId> {
+    pub fn resolve_in_path(&self, path: &[Sym], def_module: ModuleId, interner: &Interner) -> Option<ModuleId> {
         let crate_sym = interner.intern("crate");
         let self_sym = interner.intern("self");
         let super_sym = interner.intern("super");
@@ -2548,10 +2548,12 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         // duplicating it; a second `use` is a duplicate.
                         let is_macro_self_use = ns == Namespace::Macro && tables.macro_textual_binds.contains_key(&(imp.module, bind_name));
                         if is_macro_self_use {
+                            // The binding turns real even with the same
+                            // target and visibility, so imports waiting
+                            // on it must retry.
                             tables.macro_textual_binds.remove(&(imp.module, bind_name));
-                            let changed_now = !matches!(tables.lookup(imp.module, ns, bind_name), Some(BindState::One(old)) if old.vis == bind.vis && old.target == bind.target);
                             tables.maps[imp.module.0 as usize][ns_index(ns)].insert(bind_name, BindState::One(bind));
-                            changed |= changed_now;
+                            changed = true;
                             continue;
                         }
                         // An earlier std alias of the same name in the

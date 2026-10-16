@@ -981,8 +981,11 @@ pub struct Expander<'a> {
     module_builtin_alias: FxMap<(Vec<Sym>, Sym), Sym>,
     /// `#[macro_export]` macros, visible by name at the crate root.
     exported: FxMap<Sym, u32>,
-    /// Macros addressable by module path (a `pub use` made them so).
+    /// Macros addressable by module path (a `use` made them so).
     by_path: FxMap<(Vec<Sym>, Sym), u32>,
+    /// The module path each restricted `by_path` binding is visible
+    /// within; a path call from outside it finds nothing (rustc E0603).
+    by_path_vis: FxMap<(Vec<Sym>, Sym), Vec<Sym>>,
     /// Every macro definition by its defining module, from the prescan:
     /// the table `use` resolution reads (a plain macro call still needs
     /// textual order, and does not read this).
@@ -996,6 +999,16 @@ pub struct Expander<'a> {
     ambiguous_imports: FxMap<(Vec<Sym>, Sym), ()>,
     /// The module path of the code being walked, from the crate root.
     module: Vec<Sym>,
+    /// `scope_depth` of the item list of the module being walked: a
+    /// `use` at this depth binds in the module, a deeper one in a block.
+    module_depth: u32,
+    /// The file being expanded (its end-of-file token's), apart from
+    /// macro definitions spliced in from other files.
+    own_file: Option<crate::diag::FileId>,
+    /// The module each textual definition written in this file was
+    /// defined in, by def index. A spliced definition (inherited from
+    /// a parent module or a `#[macro_use]` child file) has none.
+    textual_home: FxMap<u32, Vec<Sym>>,
     /// The file `file!` currently refers to (shown form), its filesystem
     /// path for relative includes, and its text for `line!` / `column!`.
     /// `include!` swaps these.
@@ -1075,8 +1088,12 @@ impl<'a> Expander<'a> {
             module_builtin_alias: FxMap::default(),
             exported: FxMap::default(),
             by_path: FxMap::default(),
+            by_path_vis: FxMap::default(),
             module_defs: FxMap::default(),
             module_imports: FxMap::default(),
+            module_depth: 0,
+            own_file: None,
+            textual_home: FxMap::default(),
             ambiguous_imports: FxMap::default(),
             module: ctx.module_path.clone(),
             cur_file: ctx.file_path.clone(),
@@ -1291,6 +1308,9 @@ pub struct MacroSeed {
     /// under this name (rustc E0659): the seed defines nothing, and a
     /// plain call of the name in that module is the L0507 error.
     pub ambiguous: bool,
+    /// The module path the path binding is visible within (a private
+    /// or `pub(..)` re-export); None when it is public.
+    pub visible_in: Option<Vec<Sym>>,
 }
 
 /// The value of a `recursion_limit` attribute from the trees after its
@@ -1399,6 +1419,7 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(
     let eof = lexed.tokens.last().cloned().unwrap_or(Token { tok: Tok::Eof, span: Span::default() });
     let mut st = Expander::new(ctx, lexed.strings);
     st.root_file = lexed.tokens.first().map(|t| t.span.file);
+    st.own_file = Some(eof.span.file);
     for seed in seeds {
         st.seed_macro(seed)?;
     }
@@ -1732,14 +1753,21 @@ impl<'a> Expander<'a> {
         let mut module: Vec<Sym> = self.ctx.module_path.clone();
         walk(self, trees, &mut module, true, &mut uses)?;
         // Public re-exports first, so other modules' imports can resolve
-        // through the path table they create.
+        // through the path table they create. A seed from the worklist's
+        // re-export fixpoint already holds the answer for a `use` it
+        // resolved (it reads textual scope at the `use`, which this
+        // prescan does not), so it is kept.
         for (module, segs, leading, alias, public) in &uses {
-            if *public && let Some(idx) = self.resolve_for_use(segs, *leading, module) {
+            if *public
+                && !self.by_path.contains_key(&(module.clone(), *alias))
+                && let Some(idx) = self.resolve_for_use(segs, *leading, module)
+            {
                 self.by_path.insert((module.clone(), *alias), idx);
             }
         }
         for (module, segs, leading, alias, _) in &uses {
-            if let Some(idx) = self.resolve_for_use(segs, *leading, module) {
+            let seeded = self.by_path.get(&(module.clone(), *alias)).copied();
+            if let Some(idx) = seeded.or_else(|| self.resolve_for_use(segs, *leading, module)) {
                 self.module_imports.insert((module.clone(), *alias), idx);
             } else if self.ctx.interner.get(*alias) != "_"
                 && let Some(canon) = self.std_builtin_macro(segs)
@@ -1836,6 +1864,10 @@ impl<'a> Expander<'a> {
                 let compiled = compile_macro(def.name, def.name_span, &body, at_root, def.span, &self.strings, self.ctx.interner)?;
                 let idx = self.register(Arc::new(compiled), at_root, false);
                 self.by_path.insert((seed.path.clone(), def.name), idx);
+                match &seed.visible_in {
+                    Some(v) => self.by_path_vis.insert((seed.path.clone(), def.name), v.clone()),
+                    None => self.by_path_vis.remove(&(seed.path.clone(), def.name)),
+                };
                 if let Some(module) = &seed.import_into {
                     self.module_imports.insert((module.clone(), def.name), idx);
                 }
@@ -1874,7 +1906,7 @@ impl<'a> Expander<'a> {
             self.exported.insert(def.name, idx);
         }
         if textual {
-            self.textual.push((def.name, idx, self.scope_depth));
+            self.push_textual(def.name, idx, def.name_span);
         }
         self.defs.push(def);
         idx
@@ -1898,6 +1930,15 @@ impl<'a> Expander<'a> {
     /// the same `macro_rules!` compiled more than once (a textual
     /// walk and a worklist seed) keeps its name span, so defs
     /// compare by it, not by index.
+    /// Makes one definition textually visible from here on, and notes
+    /// its module when it is written in this file.
+    fn push_textual(&mut self, name: Sym, idx: u32, name_span: Span) {
+        self.textual.push((name, idx, self.scope_depth));
+        if Some(name_span.file) == self.own_file {
+            self.textual_home.insert(idx, self.module.clone());
+        }
+    }
+
     fn same_macro(&self, a: u32, b: u32) -> bool {
         a == b
             || (a != u32::MAX
@@ -1912,21 +1953,33 @@ impl<'a> Expander<'a> {
         let explicit = self.imports.iter().rev().find(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d));
         let globs: Vec<(u32, u32)> = self.glob_macros.iter().filter(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d)).collect();
         let gdepth = globs.iter().map(|&(_, d)| d).max();
-        if let Some((tidx, dt)) = textual
-            && explicit.is_none_or(|(_, de)| dt >= de)
-            && gdepth.is_none_or(|dg| dt >= dg)
-        {
-            return PlainMacro::Found(tidx);
+        // rustc reads textual scope first: a textual definition is the
+        // answer whenever there is one, and a different macro a `use` or
+        // glob binds is only an ambiguity check (E0659, macro_rules vs
+        // modularized). It passes for a block binding when the
+        // definition is inside that block, and for a module binding when
+        // the definition is written in that same module.
+        if let Some((tidx, dt)) = textual {
+            let module_idx = self.module_imports.get(&(self.module.clone(), name)).copied();
+            let exported_idx = if self.module.is_empty() { self.exported.get(&name).copied() } else { None };
+            let home = self.textual_home.get(&tidx) == Some(&self.module);
+            let ok = |idx: u32, d: Option<u32>| -> bool {
+                self.same_macro(tidx, idx)
+                    || match d {
+                        Some(d) if d > self.module_depth => dt >= d,
+                        _ => home,
+                    }
+            };
+            let clash = self.imports.iter().any(|&(n, i, d)| n == name && !ok(i, Some(d)))
+                || globs.iter().any(|&(i, d)| !ok(i, Some(d)))
+                || module_idx.is_some_and(|i| !ok(i, None))
+                || exported_idx.is_some_and(|i| !ok(i, None))
+                || (module_idx.is_none() && !home && self.ambiguous_imports.contains_key(&(self.module.clone(), name)));
+            return if clash { PlainMacro::Ambiguous } else { PlainMacro::Found(tidx) };
         }
         if let Some((eidx, de)) = explicit
             && gdepth.is_none_or(|dg| de >= dg)
         {
-            // A textual definition outside this import's scope is
-            // not shadowed by it (the equal-depth case took the
-            // textual branch above).
-            if textual.is_some_and(|(tidx, _)| !self.same_macro(tidx, eidx)) {
-                return PlainMacro::Ambiguous;
-            }
             return PlainMacro::Found(eidx);
         }
         let Some(dg) = gdepth else { return PlainMacro::Fallthrough };
@@ -2023,7 +2076,11 @@ impl<'a> Expander<'a> {
         }
         let last = segs[segs.len() - 1].sym;
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
-        let by_module = |module: &[Sym]| -> Option<u32> { self.by_path.get(&(module.to_vec(), last)).copied() };
+        let by_module = |module: &[Sym]| -> Option<u32> {
+            let key = (module.to_vec(), last);
+            let visible = self.by_path_vis.get(&key).is_none_or(|v| self.module.starts_with(v));
+            if visible { self.by_path.get(&key).copied() } else { None }
+        };
         if !leading_colon && segs.len() == 1 {
             match self.plain_macro(last, texts[0]) {
                 PlainMacro::Found(idx) => return Some(idx),
@@ -2691,24 +2748,28 @@ impl<'a> Expander<'a> {
                 let group = take(&mut trees, i + 2);
                 let Tt::Delim(_, inner, gspan) = group else { unreachable!() };
                 let textual_len = self.textual.len();
-                let imports_len = self.imports.len();
-                let glob_len = self.glob_macros.len();
-                let glob_ty_len = self.glob_type_names.len();
+                // Names `use` and globs bind in the enclosing module or
+                // block are not in scope in a nested module; textual
+                // definitions are.
+                let imports = std::mem::take(&mut self.imports);
+                let globs = std::mem::take(&mut self.glob_macros);
+                let glob_tys = std::mem::take(&mut self.glob_type_names);
+                let builtins = std::mem::take(&mut self.builtin_imports);
                 if let Some(sym) = name_sym {
                     self.module.push(sym);
                 }
                 self.scope_depth += 1;
+                let module_depth = std::mem::replace(&mut self.module_depth, self.scope_depth);
                 let expanded = self.expand_list(inner, depth, true, false, nest + 1);
+                self.module_depth = module_depth;
                 self.scope_depth -= 1;
                 if name_sym.is_some() {
                     self.module.pop();
                 }
+                (self.imports, self.glob_macros, self.glob_type_names, self.builtin_imports) = (imports, globs, glob_tys, builtins);
                 let inner = expanded?;
                 let added: Vec<(Sym, u32, u32)> = self.textual[textual_len..].to_vec();
                 self.textual.truncate(textual_len);
-                self.imports.truncate(imports_len);
-                self.glob_macros.truncate(glob_len);
-                self.glob_type_names.truncate(glob_ty_len);
                 if pending_macro_use {
                     // The definitions join this scope from here on,
                     // at this depth (see `plain_macro`).
@@ -3165,7 +3226,7 @@ impl<'a> Expander<'a> {
             && let Some(&idx) = self.exported.get(&def.name)
             && self.defs[idx as usize].name_span == def.name_span
         {
-            self.textual.push((def.name, idx, self.scope_depth));
+            self.push_textual(def.name, idx, def.name_span);
             return Ok(());
         }
         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
@@ -3356,6 +3417,16 @@ impl<'a> Expander<'a> {
         if !call.leading_colon && call.segs.len() == 1 {
             let seg = &call.segs[0];
             if self.plain_call_ambiguous(seg) {
+                // With a textual definition in scope the conflict is
+                // rustc's macro_rules-vs-import one (`plain_macro`).
+                if self.textual.iter().any(|(n, _, _)| *n == seg.sym) {
+                    return Err(Diag::new(
+                        "L0507",
+                        call.span,
+                        format!("`{}` is ambiguous: a `macro_rules!` name and a macro imported from another module", seg.text),
+                        "Rename one of them, or call the imported one by its path.",
+                    ));
+                }
                 return Err(crate::resolve::imports::ambiguous_diag(&seg.text, call.span));
             }
         }
