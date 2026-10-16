@@ -95,6 +95,9 @@ pub(super) fn check_target(attrs: &[Attr], what: &str, flags: u8, interner: &Int
             "non_exhaustive" => flags & (T_ADT | T_VARIANT | T_FIELD) == 0,
             // rustc: allocators must be statics.
             "global_allocator" => flags & T_STATIC == 0,
+            // rustc: functions only; a field or a match arm only warns,
+            // and a statement is judged by its kind (`stmt_track_caller`).
+            "track_caller" => flags & (T_FN | T_FIELD) == 0 && what != "match arms" && what != "statements",
             // rustc's `useless_deprecated` (a trait impl method or block)
             // and its target check (an extern crate, `what` "extern crates").
             "deprecated" => (flags & T_TRAIT_IMPL != 0 && (flags & T_FN != 0 || what == "trait impl blocks")) || what == "extern crates" || flags & T_PARAM != 0,

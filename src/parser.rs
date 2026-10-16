@@ -3699,6 +3699,7 @@ impl<'a> Parser<'a> {
                     None
                 };
                 self.expect(Tok::Semi, "`;`")?;
+                self.stmt_track_caller(&stmt_attrs.attrs, false)?;
                 stmts.push(Stmt::Let { pat, ty, init, els, attrs: stmt_attrs.attrs, span: s.to(self.prev_span()) });
                 continue;
             }
@@ -3747,21 +3748,26 @@ impl<'a> Parser<'a> {
             // in rustc (it does not reach the macro's arguments), while
             // the same allow on an enclosing `let`, block, or arm does.
             // Drop it here so the lint still fires inside the invocation.
-            if matches!(self.ast.expr(expr), Expr::Macro { .. } | Expr::MacroCall(_)) {
+            let is_macro = matches!(self.ast.expr(expr), Expr::Macro { .. } | Expr::MacroCall(_));
+            if is_macro {
                 stmt_attrs.attrs.retain(|a| !is_allow(a, self.known));
             }
+            self.stmt_track_caller(&stmt_attrs.attrs, is_macro)?;
             // Attributes on an expression statement are stable only for
             // expression kinds with no trailing operator: rustc rejects
             // them on assignments, binary operations, casts, and ranges.
             // Disabled code is stripped before that check, so it is exempt.
-            if !self.cfg_syntax
-                && !stmt_attrs.attrs.is_empty()
-                && matches!(
-                    self.ast.expr(expr),
-                    Expr::Binary { .. } | Expr::Cast { .. } | Expr::Assign { .. } | Expr::AssignOp { .. } | Expr::Range { .. }
-                )
-            {
+            if !self.cfg_syntax && !stmt_attrs.attrs.is_empty() && self.attr_goes_to_operand(expr) {
                 return Err(syntax(stmt_attrs.attrs[0].span, "attributes on expressions are not permitted in this context"));
+            }
+            // A tool attribute (`rustfmt::skip`) on an expression statement
+            // with no `;` (a block tail or a block-like statement) is
+            // rustc E0658; with a `;` it is fine.
+            if !self.cfg_syntax
+                && self.peek() != Tok::Semi
+                && let Some(a) = stmt_attrs.attrs.iter().find(|a| a.path.len() > 1)
+            {
+                return Err(syntax(a.span, "attributes on expressions are not permitted in this context"));
             }
             if self.eat(Tok::Semi) {
                 stmts.push(Stmt::Expr { expr, semi: true, attrs: stmt_attrs.attrs });
@@ -4298,10 +4304,13 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 let pstart = self.span();
+                // rustc takes lint and cfg attributes here (the expander
+                // strips cfg).
+                let attrs = self.part_attributes("function parameters", attrs::T_PARAM)?.attrs;
                 let pat = self.pattern_one()?;
                 let ty = if self.eat(Tok::Colon) { Some(self.ty()?) } else { None };
                 let span = pstart.to(self.prev_span());
-                params.push(ClosureParam { pat, ty, attrs: Vec::new(), span });
+                params.push(ClosureParam { pat, ty, attrs, span });
                 if self.eat(Tok::Pipe) {
                     break;
                 }
@@ -4657,13 +4666,82 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// rustc rejects `#[track_caller]` on a `let` or expression statement
+    /// and only warns on a macro call statement.
+    fn stmt_track_caller(&self, attrs: &[Attr], is_macro: bool) -> PResult<()> {
+        match attrs.iter().find(|a| a.path.len() == 1 && self.interner.get(a.path[0].name) == "track_caller") {
+            Some(a) if !is_macro && !self.cfg_syntax => Err(Diag::new(
+                "L0524",
+                a.span,
+                "the `track_caller` attribute cannot be used on statements",
+                "Remove the `#[track_caller]` attribute.",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Outer attributes on a list element or a struct literal field
+    /// (`field`), where rustc takes them: lint levels (deny and forbid are
+    /// L0531 in `attrs::check_input`), doc comments, `must_use`, and
+    /// `cold`; tool attributes (`rustfmt::skip`) on a field only. Other
+    /// attributes are rejected. cfg runs never get here: the expander
+    /// strips them and checks their position.
+    fn elem_attributes(&mut self, field: bool) -> PResult<Vec<Attr>> {
+        if self.peek() != Tok::Pound || self.at_inner_attr() {
+            return Ok(Vec::new());
+        }
+        let parsed = self.part_attributes("expressions", 0)?;
+        if !self.cfg_syntax
+            && let Some(a) = parsed.attrs.iter().find(|a| {
+                if a.path.len() != 1 {
+                    return !field;
+                }
+                !matches!(self.interner.get(a.path[0].name), "allow" | "warn" | "expect" | "deny" | "forbid" | "doc" | "must_use" | "cold")
+            })
+        {
+            return Err(syntax(a.span, "attributes on expressions are not permitted in this context"));
+        }
+        Ok(parsed.attrs)
+    }
+
+    /// True when outer attributes on `e` would go to its left operand in
+    /// rustc (E0658): a binary operation, cast, range, or assignment that
+    /// is not in parentheses.
+    fn attr_goes_to_operand(&self, e: ExprId) -> bool {
+        !self.paren_lo.contains_key(&e.0)
+            && matches!(
+                self.ast.expr(e),
+                Expr::Binary { .. } | Expr::Cast { .. } | Expr::Assign { .. } | Expr::AssignOp { .. } | Expr::Range { .. }
+            )
+    }
+
+    /// One call argument, array element, or tuple element after the
+    /// first, with its outer attributes (`elem_attributes`), read and
+    /// dropped. A block element may carry inner attributes.
+    fn list_elem(&mut self) -> PResult<ExprId> {
+        let attrs = self.elem_attributes(false)?;
+        self.block_inner_ok = true;
+        let e = self.expr()?;
+        self.check_elem_attrs(&attrs, e)?;
+        Ok(e)
+    }
+
+    /// The E0658 check for attributes `attrs` on list element `e`.
+    fn check_elem_attrs(&self, attrs: &[Attr], e: ExprId) -> PResult<()> {
+        match attrs.first() {
+            Some(a) if !self.cfg_syntax && self.attr_goes_to_operand(e) => {
+                Err(syntax(a.span, "attributes on expressions are not permitted in this context"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn call_args(&mut self) -> PResult<Vec<ExprId>> {
         self.expect(Tok::LParen, "`(`")?;
         let mut args = Vec::new();
         while self.peek() != Tok::RParen {
             // A call argument block may carry inner attributes.
-            self.block_inner_ok = true;
-            args.push(self.expr()?);
+            args.push(self.list_elem()?);
             if !self.eat(Tok::Comma) {
                 break;
             }
@@ -4869,6 +4947,15 @@ impl<'a> Parser<'a> {
                     }
                     let old_let = self.let_ok;
                     self.let_ok = false;
+                    // Attributes on the first element: a tuple takes them,
+                    // a parenthesized expression does not (rustc E0658).
+                    let first_attrs = match self.elem_attributes(false) {
+                        Ok(a) => a,
+                        Err(d) => {
+                            self.let_ok = old_let;
+                            return Err(d);
+                        }
+                    };
                     let first = self.expr();
                     let mut elems = match first {
                         Ok(e) => vec![e],
@@ -4887,8 +4974,7 @@ impl<'a> Parser<'a> {
                         // first element is not armed: until a comma is seen
                         // it may still be a parenthesized expression, where
                         // rustc rejects inner attrs.
-                        self.block_inner_ok = true;
-                        match self.expr() {
+                        match self.list_elem() {
                             Ok(e) => elems.push(e),
                             Err(d) => {
                                 self.let_ok = old_let;
@@ -4899,6 +4985,13 @@ impl<'a> Parser<'a> {
                     let end = self.expect(Tok::RParen, "`)`");
                     self.let_ok = old_let;
                     end?;
+                    if let Some(a) = first_attrs.first()
+                        && !tuple
+                        && !self.cfg_syntax
+                    {
+                        return Err(syntax(a.span, "attributes on expressions are not permitted in this context"));
+                    }
+                    self.check_elem_attrs(&first_attrs, elems[0])?;
                     if tuple {
                         Expr::Tuple(elems)
                     } else {
@@ -4923,21 +5016,29 @@ impl<'a> Parser<'a> {
                     Expr::Array(Vec::new())
                 } else {
                     // An array element (or repeat value) block may carry
-                    // inner attributes; the repeat length may not.
+                    // inner attributes; the repeat length may not. An
+                    // element takes outer attributes, a repeat value does
+                    // not (rustc E0658).
+                    let first_attrs = self.elem_attributes(false)?;
                     self.block_inner_ok = true;
                     let first = self.expr()?;
                     if self.eat(Tok::Semi) {
+                        if let Some(a) = first_attrs.first()
+                            && !self.cfg_syntax
+                        {
+                            return Err(syntax(a.span, "attributes on expressions are not permitted in this context"));
+                        }
                         let len = self.expr()?;
                         self.expect(Tok::RBracket, "`]`")?;
                         Expr::ArrayRepeat { value: first, len }
                     } else {
+                        self.check_elem_attrs(&first_attrs, first)?;
                         let mut elems = vec![first];
                         while self.eat(Tok::Comma) {
                             if self.peek() == Tok::RBracket {
                                 break;
                             }
-                            self.block_inner_ok = true;
-                            elems.push(self.expr()?);
+                            elems.push(self.list_elem()?);
                         }
                         self.expect(Tok::RBracket, "`]`")?;
                         Expr::Array(elems)
@@ -5115,6 +5216,8 @@ impl<'a> Parser<'a> {
                 }
                 break;
             }
+            // A field takes lint attributes and doc comments, read and dropped.
+            self.elem_attributes(true)?;
             // A tuple struct literal names fields by index: `T { 0: 5, ..a }`.
             // Tuple field names are the index text (collect).
             let index = matches!(self.peek(), Tok::Int(..));
@@ -5313,10 +5416,12 @@ impl<'a> Parser<'a> {
             _ => 0,
         };
         if kind == MacroKind::Vec {
+            // Elements, or from_elem's value and length: each takes outer
+            // attributes, as call arguments do.
             while self.peek() != close {
-                args.push(self.expr()?);
+                args.push(self.list_elem()?);
                 if self.eat(Tok::Semi) {
-                    args.push(self.expr()?);
+                    args.push(self.list_elem()?);
                     repeat = true;
                     break;
                 }
