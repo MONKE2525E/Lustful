@@ -250,7 +250,9 @@ class External:
 
     def __init__(self, rustc, baseline):
         self.rustc = rustc
-        self.baseline = baseline
+        self.baseline = baseline if baseline and os.access(baseline, os.X_OK) else None
+        if baseline and not self.baseline:
+            print(f"sigops: baseline {baseline} is not an executable file; judging without it", flush=True)
         self.counts = {"states": 0, "false_accept": 0, "false_reject": 0, "known_fa": 0, "known_fr": 0,
                        "rustc_timeout": 0}
         self.tmp = tempfile.mkdtemp(prefix="lust-sigops-")
