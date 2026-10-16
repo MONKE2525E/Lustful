@@ -478,17 +478,26 @@ pub fn truncate_to_int(v: i128, it: IntTy) -> i128 {
 /// True when a value produced as `vt` may stand where `ty` is required in a
 /// const item: the types are equal, or they differ only by unsized coercions
 /// rustc applies at a reference (`&[T; N]` to `&[T]`), possibly nested inside
-/// tuples, arrays, or generic arguments. An `ERROR` on either side passes:
-/// that error was already reported where the type was formed.
+/// tuples, arrays, or generic arguments. The operand of `&` is not a
+/// coercion site, so a reference right behind a reference never unsizes
+/// (`&&[1]` is no `&&[u8]` in rustc; `&(&[1],)` is a `&(&[u8],)`). An
+/// `ERROR` on either side passes: that error was already reported where
+/// the type was formed.
 pub fn const_ty_compatible<T: TyIntern>(tys: &T, vt: Ty, ty: Ty) -> bool {
+    const_ty_fits(tys, vt, ty, true)
+}
+
+/// `const_ty_compatible`; `site` is false right behind a reference.
+fn const_ty_fits<T: TyIntern>(tys: &T, vt: Ty, ty: Ty, site: bool) -> bool {
     if vt == ty || vt == ERROR || ty == ERROR {
         return true;
     }
     match (tys.kind(vt), tys.kind(ty)) {
         (TyKind::Ref(_, m1, a), TyKind::Ref(_, m2, b)) => {
             (!m2.is_mut() || m1.is_mut())
-                && (const_ty_compatible(tys, a, b)
-                    || matches!((tys.kind(a), tys.kind(b)), (TyKind::Array(e1, _), TyKind::Slice(e2)) if const_ty_compatible(tys, e1, e2)))
+                && (const_ty_fits(tys, a, b, false)
+                    || site
+                        && matches!((tys.kind(a), tys.kind(b)), (TyKind::Array(e1, _), TyKind::Slice(e2)) if const_ty_compatible(tys, e1, e2)))
         }
         (TyKind::Tuple(a), TyKind::Tuple(b)) => {
             let (a, b) = (tys.tys_of(a), tys.tys_of(b));
@@ -1469,9 +1478,12 @@ impl Evaluator {
                 }
                 // A wanted reference type wants its pointee type inside, so an
                 // unsuffixed literal takes that width (except the slice form
-                // below, which has no single pointee value).
+                // below, which has no single pointee value). The operand of
+                // `&` is no coercion site: a wanted `&[T]` pointee is not
+                // passed in, so `&&[1]` stays no `&&[u8]`, as in rustc.
+                let slice_ref = |t: Ty| matches!(cx.tys_ref().kind(t), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_)));
                 let inner_expected = expected.and_then(|et| match cx.tys_ref().kind(et) {
-                    TyKind::Ref(_, _, inner) if !matches!(cx.tys_ref().kind(inner), TyKind::Slice(_)) => Some(inner),
+                    TyKind::Ref(_, _, inner) if !matches!(cx.tys_ref().kind(inner), TyKind::Slice(_)) && !slice_ref(inner) => Some(inner),
                     _ => None,
                 });
                 // A borrow of a drop temporary lives on only when the
