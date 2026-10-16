@@ -13,9 +13,9 @@ Three checks, all on the fork's own inputs:
          with the Cargo bins and once with the lust bins in their place. They find the bins
          through CARGO_BIN_EXE_<name>, a path fixed at build time in the cargo target dir,
          so the lust bins are copied over those paths and the Cargo ones put back after.
-GOPORT_TRACE is removed from the environment of every run: lust dev builds turn off the fork's
-`backtrace` feature (.lust.toml), so tsgo prints no backtrace there, and a backtrace's text
-cannot match Cargo's. The one test that sets GOPORT_TRACE (tsgo_panic_hook, stderr a closed
+GOPORT_TRACE is removed from the environment of every run: without the fork's `backtrace`
+feature (off by default and in lust dev builds) the bins print a fixed text in place of a
+backtrace, and a backtrace's text cannot match Cargo's. The one test that sets GOPORT_TRACE (tsgo_panic_hook, stderr a closed
 pipe) checks only the exit status, which is the same either way.
 
 Usage: tsrust_parity.py --fork DIR --cargo-bins DIR --lust-bins DIR --out DIR [--tests DIR]

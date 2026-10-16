@@ -106,11 +106,14 @@ is accepted. The shipped binary is unchanged.
 
 ## Example: ts-rust `backtrace`
 
-`crates/ts_goport` feature `backtrace` (default on) gates the
-`GOPORT_TRACE` debug output of the panic hooks in `src/bin/tsgo.rs`,
-`goport.rs`, `goport_build.rs`, `goport_emit.rs` and `goport_typesyms.rs`.
-The fork's `.lust.toml` excludes it: a backtrace's text depends on the
-compiler's symbols and cannot match Cargo's byte for byte.
+`crates/ts_goport` feature `backtrace` (default off) gates every
+`std::backtrace::Backtrace` call. All 15 sites (lib panic logs and panic
+replies, and the `GOPORT_TRACE` output of the bins' panic hooks) get their
+text from `src/backtrace.rs` (`capture`, `force_capture`). Off, each gives
+the fixed text "backtrace not captured (build with --features backtrace)":
+a backtrace's text depends on the compiler's symbols and cannot match
+Cargo's byte for byte. The fork's `.lust.toml` excludes it too, and
+`build-release.sh` turns it on for the default-features release build.
 `scripts/tsrust_parity.py` removes `GOPORT_TRACE` from its runs.
 
 ## Tools
