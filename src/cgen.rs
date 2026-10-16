@@ -1469,23 +1469,26 @@ fn ret_is_large(p: &Program, f: LocalDefId) -> bool {
 }
 
 /// True when a C function returns `t` through a hidden out-pointer:
-/// over 32 bytes, or a zero-sized type that holds a zero-length array
-/// (`[T; 0]`, also in a tuple or struct). tcc 0.9.28 crashes in a
-/// function that returns such a struct by value (see `param_dropped`
-/// for the same bug on parameters, and `zst_out_glue` for glue).
+/// over 32 bytes, or a zero-sized type whose C struct holds an array
+/// member (`[T; 0]`, `[No; 4]`, also in a tuple, struct, or `Cell`).
+/// tcc 0.9.28 returns such a struct in a register, and the caller
+/// stores a byte of it over its own frame (see `param_dropped` for the
+/// same bug on parameters, and `zst_out_glue` for glue).
 fn ret_by_out(p: &Program, t: &CTy) -> bool {
     let size = c_size_align(p, t).0;
-    size > 32 || (size == 0 && has_zero_len_array(p, t))
+    size > 32 || (size == 0 && zst_holds_array(p, t))
 }
 
-/// True when a zero-sized type holds a zero-length array.
-fn has_zero_len_array(p: &Program, t: &CTy) -> bool {
+/// True when the C struct of zero-sized type `t` holds an array member.
+/// Every array in a zero-sized type has size 0, whatever its length.
+/// Only the forms that embed a zero-sized value by value matter here:
+/// the others (Option's tag, RefCell's flag, ...) are never size 0.
+fn zst_holds_array(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::Array(_, 0) => true,
-        CTy::Array(e, _) => has_zero_len_array(p, e),
-        CTy::ArrayIter(e, n) => *n == 0 || has_zero_len_array(p, e),
-        CTy::Tuple(es) => es.iter().any(|e| has_zero_len_array(p, e)),
-        CTy::Adt(a) => p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| has_zero_len_array(p, &cty(&p.tys, f.ty)))),
+        CTy::Array(..) | CTy::ArrayIter(..) => true,
+        CTy::Tuple(es) => es.iter().any(|e| zst_holds_array(p, e)),
+        CTy::Cell(e) => zst_holds_array(p, e),
+        CTy::Adt(a) => p.adt(*a).variants.iter().any(|v| v.fields.iter().any(|f| zst_holds_array(p, &cty(&p.tys, f.ty)))),
         _ => false,
     }
 }
@@ -9060,7 +9063,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                         Some(l) => {
                             let v = &adt.variants[0];
                             if v.fields.is_empty() && l.align > 1 {
-                                let _ = writeln!(out, "struct A{an} {{ _Alignas({}) uint8_t _z[0]; }};", l.align);
+                                let _ = writeln!(out, "struct A{an} {{ _Alignas({}) lust_Unit _z; }};", l.align);
                             } else if v.fields.is_empty() {
                                 let _ = writeln!(out, "struct A{an} {{ }};");
                             } else {
