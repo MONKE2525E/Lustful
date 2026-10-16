@@ -15108,8 +15108,19 @@ impl<'p> Ctx<'p> {
                     Builtin::CmpMax | Builtin::CmpMin => {
                         let t = elem_of(self, 0);
                         let k = self.tys.kind(t);
+                        // The written name must be the builtin's own (not a
+                        // `use std::cmp::max as min` rename).
+                        let want = if b == Builtin::CmpMin { "min" } else { "max" };
+                        let name = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs.last().map(|s| s.name).filter(|&n| self.name(n) == want),
+                            _ => None,
+                        };
                         if !(matches!(k, TyKind::Int(_) | TyKind::Char | TyKind::Bool) || k.is_int_infer()) {
-                            self.errs.push(unsupported(span, "`cmp::max`/`cmp::min` on this type"));
+                            match name {
+                                // Other types call `Ord::min`/`max` (std's body).
+                                Some(name) if !matches!(k, TyKind::Infer(_) | TyKind::Error) => self.cmp_free_fn_as_ord(e, t, name, span),
+                                _ => self.errs.push(unsupported(span, "`cmp::max`/`cmp::min` on this type")),
+                            }
                         }
                     }
                     _ => {}

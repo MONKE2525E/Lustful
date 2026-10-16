@@ -175,6 +175,23 @@ impl<'p> Ctx<'p> {
         Some(self.tys.intern(TyKind::FnDef(method_def, args)))
     }
 
+    /// `cmp::min(a, b)` or `cmp::max(a, b)` at a type that is not a
+    /// builtin scalar: std's body is `v1.min(v2)`, so the call takes the
+    /// pick of `<T as Ord>::min` at body end (a written `min`, the trait
+    /// default, or the structural compare). The caller already checked
+    /// the arguments at `(T, T) -> T`, the trait method's signature.
+    pub(super) fn cmp_free_fn_as_ord(&mut self, e: ExprId, t: Ty, name: Sym, span: Span) {
+        let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        let tr = TraitRef { def: self.p.gx.lang.ord, args, bindings: EMPTY_BINDINGS };
+        let Some((method_def, full)) = self.trait_ref_full(tr, name) else {
+            self.errs.push(crate::diag::unsupported(span, "`cmp::max`/`cmp::min` on this type"));
+            return;
+        };
+        self.trait_ref_obligations(e, tr, method_def, &full, span);
+        let n_trait = self.tys.args(tr.args).len();
+        self.deferred_trait_fn_calls.push((e, tr, name, full[n_trait..].to_vec(), span));
+    }
+
     /// The method def of `name` in `tr`'s trait and its full generic
     /// arguments: `tr`'s, then fresh ones for the method's own params.
     fn trait_ref_full(&mut self, tr: TraitRef, name: Sym) -> Option<(DefId, Vec<GenericArg>)> {
