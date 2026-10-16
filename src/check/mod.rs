@@ -8430,6 +8430,18 @@ impl<'p> Ctx<'p> {
                     _ => None,
                 });
                 let t = self.expr(*expr, inner_expected);
+                // `&|a| a` against `&fn(..)`: a closure right under `&`
+                // keeps its closure type (rustc E0308); only a coercion
+                // site (`&{ |a| a }`, `&[|a| a]`) makes it a fn pointer.
+                if matches!(self.p.ast.expr(*expr), Expr::Closure { .. }) && matches!(self.kind(self.resolve(t)), TyKind::FnPtr(_)) {
+                    self.err(
+                        "L0110",
+                        span,
+                        "mismatched types: a closure right under `&` does not coerce to a fn pointer",
+                        "Coerce it first (`let f: fn(..) -> _ = |..| ..;`), then borrow `&f`.",
+                    );
+                    return ERROR;
+                }
                 self.check_packed_borrow(*expr, span);
                 // `&mut STATIC` (rustc E0596; `static mut` needs `unsafe`,
                 // which lust has not): lowering makes every static
