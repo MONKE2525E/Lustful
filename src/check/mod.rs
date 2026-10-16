@@ -758,6 +758,8 @@ pub enum Builtin {
     /// `Vec::into_boxed_slice`, `Box<[T]>::into_vec`, and by-value
     /// `Box<[T]>::into_iter` (a `vec::IntoIter<T>`, as in Rust 2024).
     VecIntoBoxedSlice,
+    /// `Vec::leak(self) -> &'a mut [T]`: the buffer stays allocated.
+    VecLeak,
     BoxSliceIntoVec,
     BoxSliceIntoIter,
     /// UTF-8 decoding (check/utf8.rs): `String::from_utf8`,
@@ -15868,6 +15870,9 @@ impl<'p> Ctx<'p> {
                     Some((B::VecReserveExact, Autoref::RefMut, vec![USIZE], UNIT))
                 } else if name == k.shrink_to_fit {
                     Some((B::VecShrinkToFit, Autoref::RefMut, vec![], UNIT))
+                } else if derefs == 0 && name == k.leak {
+                    let sl = self.tys.intern(TyKind::Slice(elem));
+                    Some((B::VecLeak, Autoref::None, vec![], self.tys.mk_ref(true, sl)))
                 } else if derefs == 0 && self.name(name) == "into_boxed_slice" {
                     let sl = self.tys.intern(TyKind::Slice(elem));
                     Some((B::VecIntoBoxedSlice, Autoref::None, vec![], self.tys.mk_boxed(sl)))

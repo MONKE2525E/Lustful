@@ -4190,6 +4190,7 @@ impl<'a> Parser<'a> {
             ("Rc" | "Arc", "clone" | "as_ptr" | "downgrade" | "strong_count" | "weak_count") => 1,
             ("Rc" | "Arc", "ptr_eq") => 2,
             ("char", "from_u32") => 1,
+            ("MaybeUninit", "uninit" | "zeroed") => 0,
             // By-value predicates, so `trim_matches(char::is_whitespace)`
             // takes them as the closure patterns lust has.
             ("char", "is_whitespace" | "is_alphabetic" | "is_alphanumeric" | "is_numeric" | "is_control" | "is_lowercase" | "is_uppercase") => 1,
@@ -4198,6 +4199,7 @@ impl<'a> Parser<'a> {
             // call): `map_or(0, Vec::len)`, `start(f, Builder::spawn)`.
             ("Builder", "spawn") => 2,
             ("Vec" | "String" | "VecDeque", "len" | "is_empty" | "capacity") => 1,
+            ("Vec", "leak") => 1,
             ("mem", "drop" | "take") => 1,
             ("mem", "swap" | "replace") => 2,
             ("Ord" | "PartialOrd", "cmp" | "partial_cmp" | "lt" | "le" | "gt" | "ge" | "max" | "min") => 2,

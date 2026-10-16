@@ -4438,6 +4438,14 @@ impl FnGen<'_, '_> {
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
             B::ExitCodeFrom => format!("((uint8_t){})", vals[0]),
+            // The slice over the buffer, which is never freed.
+            B::VecLeak => {
+                let CTy::Vec(e) = &tys[0] else { unreachable!("leak on a Vec") };
+                let (et, st) = (ctype(e), ctype(&CTy::Slice(e.clone())));
+                let v = self.tmp();
+                let _ = writeln!(self.out, "    lust_Vec {v} = {};", vals[0]);
+                format!("(({st}){{ ({et}*){v}.ptr, {v}.len }})")
+            }
             B::VecIntoBoxedSlice => {
                 // Rust shrinks the buffer to the length first.
                 let CTy::Vec(e) = &tys[0] else { unreachable!("into_boxed_slice on a Vec") };

@@ -530,6 +530,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::RefCellTake,
     Builtin::ExitCodeFrom,
     Builtin::VecIntoBoxedSlice,
+    Builtin::VecLeak,
     Builtin::BoxSliceIntoVec,
     // One row stands for the three owners (check/own.rs).
     Builtin::OwnFrom(crate::check::own::Owner::Rc),
@@ -1283,6 +1284,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::RefCellTake => (&["RefCell<T>"], vec![i.intern("take")], Call::Method),
         B::ExitCodeFrom => (&["std::process::ExitCode"], vec![k.from], Call::Associated),
         B::VecIntoBoxedSlice => (&["Vec<T>"], vec![i.intern("into_boxed_slice")], Call::Method),
+        B::VecLeak => (&["Vec<T>"], vec![k.leak], Call::Method),
         B::BoxSliceIntoVec => (&["Box<[T]>"], vec![i.intern("into_vec")], Call::Method),
         B::OwnFrom(_) => (&["Box<str>", "Rc<str>", "Rc<[T]>", "std::sync::Arc<str>", "std::sync::Arc<[T]>"], vec![k.from], Call::Associated),
         B::OwnIntoString => (&["Box<str>"], vec![i.intern("into_string")], Call::Method),
