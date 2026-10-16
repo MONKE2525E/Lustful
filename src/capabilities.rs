@@ -958,7 +958,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         B::MemTake => (&["core::mem"], vec![k.take], Call::Function),
         B::CmpMax => (&["core::cmp"], vec![k.max], Call::Function),
         B::CmpMin => (&["core::cmp"], vec![k.min], Call::Function),
-        B::HintBlackBox => (&["core::hint"], vec![i.intern("black_box")], Call::Function),
+        B::HintBlackBox => (&["std::hint"], vec![i.intern("black_box")], Call::Function),
         B::IterIter => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("iter")], Call::Method),
         B::IterIterMut => (&["Vec<T>", "[T]", "[T; n]"], vec![i.intern("iter_mut")], Call::Method),
         B::IterVecIntoIter => (&["Vec<T>"], vec![i.intern("into_iter")], Call::Method),
