@@ -40,6 +40,7 @@ void lust_sys_environ(lust_Vec *out);
 void lust_sys_argv(lust_Vec *out);
 int32_t lust_sys_getcwd(lust_Vec *out);
 int32_t lust_sys_chdir(const uint8_t *p, uint64_t len);
+int32_t lust_sys_symlink(const uint8_t *a, uint64_t alen, const uint8_t *b, uint64_t blen);
 int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out);
 
 /* Files and directories (std::fs): read a whole file into the Vec,

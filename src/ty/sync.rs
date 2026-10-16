@@ -74,10 +74,12 @@ pub enum SyncTy {
     /// `std::sync::TryLockError<T>`: only `WouldBlock` is reachable (no
     /// lock is ever poisoned), so its C form holds nothing.
     TryLockError,
+    /// `std::thread::Builder` (TRIAGE T5): name and stack size.
+    ThreadBuilder,
 }
 
 impl SyncTy {
-    pub const ALL: [SyncTy; 35] = [
+    pub const ALL: [SyncTy; 36] = [
         SyncTy::Arc,
         SyncTy::ArcWeak,
         SyncTy::AtomicBool,
@@ -113,6 +115,7 @@ impl SyncTy {
         SyncTy::OnceLock,
         SyncTy::Duration,
         SyncTy::TryLockError,
+        SyncTy::ThreadBuilder,
     ];
 
     /// The struct name (the def hash input and the printed name).
@@ -153,6 +156,7 @@ impl SyncTy {
             SyncTy::OnceLock => "OnceLock",
             SyncTy::Duration => "Duration",
             SyncTy::TryLockError => "TryLockError",
+            SyncTy::ThreadBuilder => "Builder",
         }
     }
 
@@ -161,7 +165,7 @@ impl SyncTy {
     pub fn module(self) -> &'static [&'static str] {
         match self {
             _ if k_is_atomic(self) => &["sync", "atomic"],
-            SyncTy::JoinHandle | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError | SyncTy::Scope | SyncTy::ScopedJoinHandle => &["thread"],
+            SyncTy::JoinHandle | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError | SyncTy::Scope | SyncTy::ScopedJoinHandle | SyncTy::ThreadBuilder => &["thread"],
             SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError => &["sync", "mpsc"],
             SyncTy::Duration => &["time"],
             _ => &["sync"],
@@ -190,6 +194,7 @@ impl SyncTy {
             | SyncTy::Condvar
             | SyncTy::Barrier
             | SyncTy::BarrierWaitResult
+            | SyncTy::ThreadBuilder
             | SyncTy::Duration => 0,
             _ => 1,
         }
@@ -231,7 +236,8 @@ impl SyncTy {
             | SyncTy::BarrierWaitResult
             | SyncTy::OnceLock
             | SyncTy::Duration
-            | SyncTy::TryLockError => return None,
+            | SyncTy::TryLockError
+            | SyncTy::ThreadBuilder => return None,
             SyncTy::AtomicBool => AtomicVal::Bool,
             SyncTy::AtomicI8 => AtomicVal::Int(IntTy::I8),
             SyncTy::AtomicU8 => AtomicVal::Int(IntTy::U8),

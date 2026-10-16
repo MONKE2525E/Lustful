@@ -27,6 +27,7 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
         (SyncTy::TryLockError, _) => "lust_Unit".into(),
         (SyncTy::Barrier, _) => "lust_Barrier".into(),
         (SyncTy::BarrierWaitResult, _) => "uint8_t".into(),
+        (SyncTy::ThreadBuilder, _) => "lust_ThreadBuilder".into(),
         (SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard, _) => format!("{}*", sync_ctype(k.guard().expect("a guard").0, e)),
         (SyncTy::PoisonError | SyncTy::SendError, _) => ctype(e),
         (SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver, _) => "lust_Chan*".into(),
@@ -69,6 +70,7 @@ pub(super) fn sync_layout(k: SyncTy) -> Option<Layout> {
         SyncTy::Duration => return Some(plain_layout(16, 8)),
         SyncTy::TryLockError => return Some(layout::zst_layout(1)),
         SyncTy::BarrierWaitResult => return Some(plain_layout(1, 1)),
+        SyncTy::ThreadBuilder => return Some(plain_layout(40, 8)),
         _ => {}
     }
     if k == SyncTy::ThreadId {
@@ -85,6 +87,7 @@ pub(super) fn sync_layout(k: SyncTy) -> Option<Layout> {
 /// True when a value of the sync type needs drop glue.
 pub(super) fn sync_needs_drop(p: &Program, k: SyncTy, e: &CTy) -> bool {
     match k {
+        SyncTy::ThreadBuilder => true,
         SyncTy::Mutex | SyncTy::RwLock | SyncTy::PoisonError | SyncTy::SendError | SyncTy::OnceLock => needs_drop_c(p, e),
         _ => {
             matches!(
@@ -115,6 +118,9 @@ pub(super) fn sync_collect_types(k: SyncTy, e: &CTy, out: &mut HashSet<CTy>) {
     }
     if matches!(k, SyncTy::PoisonError | SyncTy::SendError | SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle) {
         collect_types(e, out);
+    }
+    if k == SyncTy::ThreadBuilder {
+        out.insert(CTy::String);
     }
 }
 
@@ -197,6 +203,7 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         (_, SyncTy::Mutex | SyncTy::RwLock | SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard | SyncTy::PoisonError) => {
             lock_glue_def(p, g, k, e, &m, &ct, protos, defs, need)
         }
+        (_, SyncTy::ThreadBuilder) => builder_glue_def(p, g, &m, &ct, protos, defs, need),
         (_, SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError) => {
             thread_glue_def(g, k, &m, &ct, protos, defs)
         }
@@ -242,6 +249,46 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
             let _ = writeln!(defs, "void drop_{m}({ct} *p) {{\n  (void)p;\n}}\n");
         }
         _ => unreachable!("internal: no {g:?} glue for `{}`", k.name()),
+    }
+}
+
+/// Glue of `thread::Builder`: drop frees the name; Debug is
+/// std's struct form over the name and stack size options.
+fn builder_glue_def(p: &Program, g: Glue, m: &str, ct: &str, protos: &mut String, defs: &mut String, need: &mut dyn FnMut(Glue, &CTy)) {
+    let lit = |s: &str| format!("(lust_str){{(uint8_t*)\"{s}\", {}}}", s.len());
+    match g {
+        Glue::Drop => {
+            need(Glue::Drop, &CTy::String);
+            let _ = writeln!(protos, "void drop_{m}({ct} *p);");
+            let _ = writeln!(defs, "void drop_{m}({ct} *p) {{\n  if (p->has_name) drop_{}(&p->name);\n}}\n", mangle(&CTy::String));
+        }
+        Glue::Debug => {
+            // `Builder { name: Some("x"), stack_size: None }` over
+            // two Option values built from the fields (the name
+            // Option only borrows the String for printing).
+            let opt_str = CTy::Option(Box::new(CTy::String));
+            let opt_usize = CTy::Option(Box::new(CTy::Int(IntTy::Usize)));
+            let name_f = super::fmt::fmt_expr(&opt_str, FmtKind::Debug, "w", "(&no_)", need);
+            let stack_f = super::fmt::fmt_expr(&opt_usize, FmtKind::Debug, "w", "(&so_)", need);
+            let nf = variant_field(p, &opt_str, "no_", 1, 0);
+            let sf = variant_field(p, &opt_usize, "so_", 1, 0);
+            let _ = writeln!(protos, "int dbg_{m}(lust_Formatter *f, {ct} *p);");
+            let _ = writeln!(
+                defs,
+                "int dbg_{m}(lust_Formatter *f, {ct} *p) {{\n  {} no_; {} if (p->has_name) {{ {} {nf} = p->name; }} {} so_; {} if (p->has_stack) {{ {} {sf} = p->stack; }} lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, {name_f}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, {stack_f}); if ((w = lust_dstruct_field(&b, &s, {}))) lust_dstruct_field_end(&b, &s, lust_f_bool(w, 0)); return lust_dstruct_finish(&b);\n}}\n",
+                ctype(&opt_str),
+                disc_set(p, &opt_str, "no_", 0),
+                disc_set(p, &opt_str, "no_", 1),
+                ctype(&opt_usize),
+                disc_set(p, &opt_usize, "so_", 0),
+                disc_set(p, &opt_usize, "so_", 1),
+                lit("Builder"),
+                lit("name"),
+                lit("stack_size"),
+                lit("no_hooks"),
+            );
+        }
+        _ => unreachable!("internal: no {g:?} glue for `Builder`"),
     }
 }
 
@@ -695,6 +742,25 @@ impl FnGen<'_, '_> {
                 format!("(lust_thread_sleep(((lust_Duration){{ ({0}).f0, ({0}).f1 }})), ((lust_Unit){{}}))", vals[0])
             }
             S::ThreadSleep => format!("(lust_thread_sleep({}), ((lust_Unit){{}}))", vals[0]),
+            // `thread::Builder` (TRIAGE T5): a plain struct value.
+            S::BuilderNew => "((lust_ThreadBuilder){0})".into(),
+            S::BuilderName => {
+                let (t, v) = (self.tmp(), self.tmp());
+                self.want(Glue::Drop, &CTy::String);
+                let _ = writeln!(
+                    self.out,
+                    "    lust_ThreadBuilder {t} = {}; lust_String {v} = {}; if ({t}.has_name) drop_{}(&{t}.name); {t}.name = {v}; {t}.has_name = 1;",
+                    vals[0],
+                    vals[1],
+                    mangle(&CTy::String)
+                );
+                t
+            }
+            S::BuilderStackSize => {
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    lust_ThreadBuilder {t} = {}; {t}.stack = {}; {t}.has_stack = 1;", vals[0], vals[1]);
+                t
+            }
             S::ChanSend => {
                 let el = match deref_cty(&tys[0]) {
                     CTy::Sync(_, e) => *e,
@@ -814,6 +880,37 @@ impl FnGen<'_, '_> {
         let _ = writeln!(self.out, "    {h}->v = {v}; lust_arc_inc(&({h})->strong); (void)lust_arc_dec(&({h})->weak);");
         let _ = loc;
         format!("({h})")
+    }
+
+    /// `thread::available_parallelism` (TRIAGE T5): Ok of the
+    /// count as a NonZero, or Err of the errno as an io::Error
+    /// (its Repr::Os form, like fmt's io_result_of).
+    pub(super) fn avail_par(&mut self, dest: &CTy, loc: &str, post: &mut Vec<String>) -> String {
+        let _ = (loc, post);
+        let (nz, err_a) = match dest {
+            CTy::Result(a, b) => ((**a).clone(), (**b).clone()),
+            _ => return "0".into(),
+        };
+        let CTy::Adt(err_id) = err_a else { return "0".into() };
+        let repr_ty = self.p.adt(err_id).variants[0].fields[0].ty;
+        let repr_cty = cty(&self.p.tys, repr_ty);
+        let CTy::Adt(repr_a) = repr_cty else { return "0".into() };
+        let os = self.p.adt(repr_a).variants.iter().position(|v| self.p.interner.get(v.name) == "Os").expect("io::Error Repr has an Os variant");
+        let (t, e, n) = (self.tmp(), self.tmp(), self.tmp());
+        let okv = variant_field(self.p, dest, &t, 0, 0);
+        let errv = variant_field(self.p, dest, &t, 1, 0);
+        let osf = variant_field(self.p, &repr_cty, &format!("{errv}.f0"), os, 0);
+        let _ = writeln!(
+            self.out,
+            "    int32_t {e} = 0; uint64_t {n} = lust_avail_parallelism(&{e}); {} {t}; if ({n} > 0) {{ {} {okv} = ({}){{ {n} }}; }} else {{ {} {errv} = ({}){{ }}; }}",
+            ctype(dest),
+            disc_set(self.p, dest, &t, 0),
+            ctype(&nz),
+            disc_set(self.p, dest, &t, 1),
+            ctype(&err_a),
+        );
+        let _ = writeln!(self.out, "    if ({n} == 0) {{ {osf} = {e}; {} }}", disc_set(self.p, &repr_cty, &format!("{errv}.f0"), os));
+        t
     }
 
     /// `mpsc::channel()` or `sync_channel(cap)` into the C pair type
@@ -1024,7 +1121,7 @@ impl FnGen<'_, '_> {
     /// waits for every packet of the scope.
     pub(super) fn thread_closure_call(&mut self, op: SyncOp, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
         let ci = match op {
-            SyncOp::ScopeSpawn | SyncOp::OnceGetOrInit => 1,
+            SyncOp::ScopeSpawn | SyncOp::OnceGetOrInit | SyncOp::BuilderSpawn => 1,
             SyncOp::CondvarWaitWhile => 2,
             _ => 0,
         };
@@ -1082,6 +1179,47 @@ impl FnGen<'_, '_> {
         let _ = writeln!(self.prelude, "static void {run}(lust_JoinHdr *hp) {{\n  {pk} *k = (void *)hp;\n{body}}}");
         let _ = writeln!(self.prelude, "static void {drop}(lust_JoinHdr *hp) {{ {drop_ret} }}");
         let h = self.tmp();
+        if op == SyncOp::BuilderSpawn {
+            // `Builder::spawn` (TRIAGE T5): the io::Result of the
+            // handle, or of the errno the spawn failed with (the
+            // packet and env drop then, as std drops the closure).
+            let (bv, _) = self.operand(&ops[0], loc, post);
+            let jh = CTy::Sync(SyncTy::JoinHandle, Box::new(ret.clone()));
+            let err_a = AdtId(
+                self.p
+                    .adts
+                    .iter()
+                    .position(|a| self.p.interner.get(a.name).ends_with("$io$Error") && self.p.display_path(a.name) == "std::io::Error")
+                    .expect("Builder::spawn only lowers when std::io is loaded") as u32,
+            );
+            let res = CTy::Result(Box::new(jh), Box::new(CTy::Adt(err_a)));
+            collect_types(&res, &mut self.sig_types);
+            let (t, e2) = (self.tmp(), self.tmp());
+            let okv = variant_field(self.p, &res, &t, 0, 0);
+            let errv = variant_field(self.p, &res, &t, 1, 0);
+            let repr_ty = self.p.adt(err_a).variants[0].fields[0].ty;
+            let repr_cty = cty(&self.p.tys, repr_ty);
+            let CTy::Adt(repr_a) = repr_cty else { return "0".into() };
+            let os = self.p.adt(repr_a).variants.iter().position(|v| self.p.interner.get(v.name) == "Os").expect("io::Error Repr has an Os variant");
+            let osf = variant_field(self.p, &repr_cty, &format!("{errv}.f0"), os, 0);
+            let drop_env2 = if needs_drop_c(self.p, &env_ty) {
+                self.want(Glue::Drop, &env_ty);
+                format!("drop_{}(&{h}->env); ", mangle(&env_ty))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                self.out,
+                "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = 0; {h}->env = {env}; lust_ThreadBuilder bv_ = {bv}; int32_t {e2} = lust_thread_spawn_builder(&{h}->h, &bv_); drop_{}(&bv_); {} {t}; if ({e2} == 0) {{ {} {okv} = &{h}->h; }} else {{ {drop_env2}lust_dealloc((void*){h}, sizeof({pk}), _Alignof({pk})); {} {errv} = ({}){{ }}; {osf} = {e2}; {} }}",
+                mangle(&CTy::Sync(SyncTy::ThreadBuilder, Box::new(CTy::Unit))),
+                ctype(&res),
+                disc_set(self.p, &res, &t, 0),
+                disc_set(self.p, &res, &t, 1),
+                ctype(&CTy::Adt(err_a)),
+                disc_set(self.p, &repr_cty, &format!("{errv}.f0"), os),
+            );
+            return t;
+        }
         let _ = writeln!(
             self.out,
             "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_thread_spawn(&{h}->h, {loc});"

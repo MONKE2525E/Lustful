@@ -201,6 +201,21 @@ int32_t lust_sys_chdir(const uint8_t *p, uint64_t len) {
     return r == 0 ? 0 : e;
 }
 
+int32_t lust_sys_symlink(const uint8_t *a, uint64_t alen, const uint8_t *b, uint64_t blen) {
+    char *x = lust_sys_cstr(a, alen);
+    if (!x) return -1;
+    char *y = lust_sys_cstr(b, blen);
+    if (!y) {
+        free(x);
+        return -1;
+    }
+    int r = symlink(x, y);
+    int e = errno;
+    free(x);
+    free(y);
+    return r == 0 ? 0 : e;
+}
+
 int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
     char *s = lust_sys_cstr(p, len);
     if (!s) return -1;

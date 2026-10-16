@@ -2747,6 +2747,7 @@ impl FnGen<'_, '_> {
                 t
             }
             CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::ChanTrySend)) => self.chan_try_send(args, dest_cty, loc, post),
+            CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::AvailPar)) => self.avail_par(dest_cty, loc, post),
             // `MaybeUninit::uninit` and `zeroed` (TRIAGE T5): a
             // zero compound literal of the destination type (an
             // uninitialized value may hold any bytes; zero is one).
@@ -3837,7 +3838,8 @@ impl FnGen<'_, '_> {
             | crate::check::sync::SyncOp::ScopeSpawn
             | crate::check::sync::SyncOp::ThreadScope
             | crate::check::sync::SyncOp::CondvarWaitWhile
-            | crate::check::sync::SyncOp::OnceGetOrInit),
+            | crate::check::sync::SyncOp::OnceGetOrInit
+            | crate::check::sync::SyncOp::BuilderSpawn),
         ) = b
         {
             return self.thread_closure_call(op, ops, loc, post);

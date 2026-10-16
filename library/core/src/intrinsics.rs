@@ -18,6 +18,7 @@
 //     pub fn panic_hook_custom(on: bool);              // std: a set_hook hook is installed
 //     pub fn panic_default_hook(file: &str, line: u32, col: u32, msg: &str);  // std: default hook text
 //     pub fn char_case(c: u32, upper: bool) -> u128;  // core: case mapping packed (points lo, count hi)
+//     pub fn sys_symlink(original: &[u8], link: &[u8]) -> i32;  // std: 0, errno, or -1 (NUL byte)
 //
 // The std platform crate (library/std/src/platform.rs, W-SHIM; C in
 // src/runtime/sys.c):

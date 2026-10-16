@@ -10375,6 +10375,38 @@ impl<'p> Ctx<'p> {
                 return ty;
             }
         }
+        // `NonZero::MIN` and `MAX` (TRIAGE T5): the wrapped
+        // integer's own bounds, as an aggregate constant.
+        if segs.len() >= 2 {
+            let ty_seg = &segs[segs.len() - 2];
+            let item = self.name(segs.last().unwrap().name).to_string();
+            if matches!(item.as_str(), "MIN" | "MAX") {
+                let inner = match self.nonzero_alias_inner(ty_seg.name) {
+                    Some(i) => Some(int(i)),
+                    None if self.name(ty_seg.name) == "NonZero" => match ty_seg.type_args().first() {
+                        Some(&a) => Some(self.resolve_written(a)),
+                        None => None,
+                    },
+                    None => None,
+                };
+                if let Some(inner) = inner
+                    && let TyKind::Int(it) = self.kind(inner)
+                {
+                    let bits = it.bits();
+                    let v = if item.as_str() == "MAX" {
+                        if it == IntTy::U128 { -1 } else { crate::ty::consteval::truncate_to_int(it.max128() as i128, it) }
+                    } else if it.signed() {
+                        if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) }
+                    } else {
+                        1
+                    };
+                    let val = crate::ty::consteval::ConstValue::Aggregate(vec![crate::ty::consteval::ConstValue::Int(v)]);
+                    let i = self.ei(e);
+                    self.out.const_exprs[i] = Some(val);
+                    return generics::nonzero_ty(&mut self.tys, inner);
+                }
+            }
+        }
         // Associated consts of inherent impls (Self::A, Type::A) read
         // as their evaluated value, like free consts. Inherent items
         // shadow trait items, as in rustc. Same-name consts of

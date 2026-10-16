@@ -374,5 +374,16 @@ pub mod unix {
                 self.blocks
             }
         }
+
+        /// Creates a symbolic link pointing at `original`
+        /// (`symlink(2)`), as std's `os::unix::fs::symlink` does.
+        pub fn symlink<P: AsRef<crate::path::Path>, Q: AsRef<crate::path::Path>>(
+            original: P,
+            link: Q,
+        ) -> crate::io::Result<()> {
+            let a = original.as_ref().as_os_str().as_encoded_bytes();
+            let b = link.as_ref().as_os_str().as_encoded_bytes();
+            crate::fs::status(core::intrinsics::sys_symlink(a, b))
+        }
     }
 }

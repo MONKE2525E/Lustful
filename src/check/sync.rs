@@ -143,6 +143,16 @@ pub enum SyncOp {
     CondvarWaitTimeoutMs,
     /// `WaitTimeoutResult::timed_out`.
     WaitTimedOut,
+    /// `thread::Builder::new` (TRIAGE T5).
+    BuilderNew,
+    /// `Builder::name(self, name)`.
+    BuilderName,
+    /// `Builder::stack_size(self, size)`.
+    BuilderStackSize,
+    /// `Builder::spawn(self, f)`.
+    BuilderSpawn,
+    /// `thread::available_parallelism`.
+    AvailPar,
     /// `Condvar::new()`, `Barrier::new(n)`, `OnceLock::new()` (const fns).
     SyncNew(SyncTy),
     CondvarWait,
@@ -182,7 +192,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 112] = [
+    pub const ALL: [SyncOp; 117] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -263,6 +273,11 @@ impl SyncOp {
         SyncOp::CondvarWaitTimeout,
         SyncOp::CondvarWaitTimeoutMs,
         SyncOp::WaitTimedOut,
+        SyncOp::BuilderNew,
+        SyncOp::BuilderName,
+        SyncOp::BuilderStackSize,
+        SyncOp::BuilderSpawn,
+        SyncOp::AvailPar,
         SyncOp::SyncNew(SyncTy::Condvar),
         SyncOp::CondvarWait,
         SyncOp::CondvarWaitWhile,
@@ -384,6 +399,11 @@ impl SyncOp {
             SyncOp::CondvarWaitTimeout => (&["std::sync::Condvar"], &["wait_timeout"], m),
             SyncOp::CondvarWaitTimeoutMs => (&["std::sync::Condvar"], &["wait_timeout_ms"], m),
             SyncOp::WaitTimedOut => (&["std::sync::WaitTimeoutResult"], &["timed_out"], m),
+            SyncOp::BuilderNew => (&["std::thread::Builder"], &["new"], a),
+            SyncOp::BuilderName => (&["std::thread::Builder"], &["name"], m),
+            SyncOp::BuilderStackSize => (&["std::thread::Builder"], &["stack_size"], m),
+            SyncOp::BuilderSpawn => (&["std::thread::Builder"], &["spawn"], m),
+            SyncOp::AvailPar => (&["std::thread"], &["available_parallelism"], f),
             SyncOp::SyncNew(_) => (&["std::sync::Condvar", "std::sync::Barrier", "std::sync::OnceLock<T>"], &["new"], a),
             SyncOp::CondvarWait => (&["std::sync::Condvar"], &["wait"], m),
             SyncOp::CondvarWaitWhile => (&["std::sync::Condvar"], &["wait_while"], m),
@@ -456,6 +476,8 @@ pub fn sync_glue(tys: &impl TyIntern, t: Ty, g: SyncGlue) -> Option<Result<bool,
         // arithmetic are not in lust yet: they reject).
         (SyncTy::Duration, G::Default | G::Clone | G::Copy | G::PartialEq) => Ok(true),
         (SyncTy::OnceLock, G::Debug) => Err(elem?),
+        // `thread::Builder` is Debug (TRIAGE T5).
+        (SyncTy::ThreadBuilder, G::Debug) => Ok(true),
         // `Thread` is `Clone`; `ThreadId` is `Copy` and `Eq`.
         (SyncTy::Thread, G::Clone) => Ok(true),
         (SyncTy::ThreadId, G::Clone | G::Copy | G::PartialEq) => Ok(true),
@@ -505,6 +527,7 @@ pub fn sync_free_fn(path: &[&str]) -> Option<SyncOp> {
         ["std", "thread", "panicking"] => Some(SyncOp::ThreadPanicking),
         ["std", "thread", "scope"] => Some(SyncOp::ThreadScope),
         ["std", "thread", "sleep"] => Some(SyncOp::ThreadSleep),
+        ["std", "thread", "available_parallelism"] => Some(SyncOp::AvailPar),
         ["std", "sync", "mpsc", "channel"] => Some(SyncOp::Channel),
         ["std", "sync", "mpsc", "sync_channel"] => Some(SyncOp::SyncChannel),
         _ => None,
@@ -568,6 +591,7 @@ impl<'p> Ctx<'p> {
             (SyncTy::Duration, _, "from_micros") => SyncOp::DurFrom(2),
             (SyncTy::Duration, _, "from_nanos") => SyncOp::DurFrom(3),
             (SyncTy::PoisonError, _, "new") => SyncOp::PoisonNew,
+            (SyncTy::ThreadBuilder, _, "new") => SyncOp::BuilderNew,
             // `PoisonError::into_inner` and kin by path, as a
             // value too (`unwrap_or_else(PoisonError::into_inner)`,
             // TRIAGE T5): a PrimAssoc over the method's SyncOp.
@@ -605,6 +629,17 @@ impl<'p> Ctx<'p> {
             Some(a) => self.tys.adt_ty(a),
             None => sync_ty(&mut self.tys, SyncTy::Duration, &[]),
         }
+    }
+
+    /// The platform `std::io::Error` type, when the platform
+    /// crate is in the session (its mention triggers load it).
+    fn io_error_ty(&mut self) -> Ty {
+        let p = self.p;
+        (0..p.adts.len() as u32)
+            .map(AdtId)
+            .find(|&a| p.shipped_crate_at(p.adt(a).span) == Some(crate::ty::lang::ShippedCrate::Std) && p.display_path(p.adt(a).name) == "std::io::Error")
+            .map(|a| self.tys.adt_ty(a))
+            .unwrap_or(ERROR)
     }
 
     /// Parameter and return types of a `Builtin::Sync` associated or free
@@ -688,6 +723,12 @@ impl<'p> Ctx<'p> {
                 (vec![], sync_ty(&mut self.tys, k, args))
             }
             SyncOp::PoisonNew => (vec![elem], sync_ty(&mut self.tys, SyncTy::PoisonError, &[elem])),
+            SyncOp::BuilderNew => (vec![], sync_ty(&mut self.tys, SyncTy::ThreadBuilder, &[])),
+            SyncOp::AvailPar => {
+                let nz = generics::nonzero_ty(&mut self.tys, int(IntTy::Usize));
+                let err = self.io_error_ty();
+                (vec![], self.tys.mk_result(nz, err))
+            }
             // `spawn<F, T>(f: F) -> JoinHandle<T>` where `F: FnOnce() -> T
             // + Send + 'static, T: Send + 'static` (a generic parameter
             // needs the bound here; the borrow checker proves concrete
@@ -925,11 +966,40 @@ impl<'p> Ctx<'p> {
                 }
                 _ => return None,
             }
-        } else if let Some(k @ (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread | SyncTy::Scope)) = crate::ty::sync::sync_kind(&self.tys, base) {
+        } else if let Some(k @ (SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Thread | SyncTy::Scope | SyncTy::ThreadBuilder)) = crate::ty::sync::sync_kind(&self.tys, base) {
             match (k, n.as_str()) {
                 // `spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope,
                 // T>` where `F: FnOnce() -> T + Send + 'scope, T: Send +
                 // 'scope` (the regions in borrowck/regions.rs).
+                // `Builder::name(self, name) -> Builder` and
+                // `stack_size(self, size) -> Builder`: by value.
+                (SyncTy::ThreadBuilder, "name") => {
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::BuilderName), derefs, autoref: Autoref::None });
+                    self.check_args(&[STRING], args, span);
+                    return Some(sync_ty(&mut self.tys, SyncTy::ThreadBuilder, &[]));
+                }
+                (SyncTy::ThreadBuilder, "stack_size") => {
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::BuilderStackSize), derefs, autoref: Autoref::None });
+                    self.check_args(&[USIZE], args, span);
+                    return Some(sync_ty(&mut self.tys, SyncTy::ThreadBuilder, &[]));
+                }
+                // `Builder::spawn<F, T>(self, f) -> io::Result<JoinHandle<T>>`.
+                (SyncTy::ThreadBuilder, "spawn") => {
+                    let ret = self.new_var(false);
+                    let f = self.fn_once_param(&[], ret, span);
+                    self.require_send(f, span);
+                    self.require_send(ret, span);
+                    self.require_static(f, span);
+                    self.require_static(ret, span);
+                    let h = sync_ty(&mut self.tys, SyncTy::JoinHandle, &[ret]);
+                    let err = self.io_error_ty();
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::BuilderSpawn), derefs, autoref: Autoref::None });
+                    self.check_args(&[f], args, span);
+                    return Some(self.tys.mk_result(h, err));
+                }
                 (SyncTy::Scope, "spawn") => {
                     let ret = self.new_var(false);
                     let f = self.fn_once_param(&[], ret, span);

@@ -259,8 +259,10 @@ int lust_arc_take_unique(uint64_t *h) LUST_BODY({
 long syscall(long number, ...);
 #if defined(__x86_64__)
 #define LUST_SYS_FUTEX 202
+#define LUST_SYS_SCHED_GETAFFINITY 204
 #elif defined(__aarch64__)
 #define LUST_SYS_FUTEX 98
+#define LUST_SYS_SCHED_GETAFFINITY 123
 #endif
 #endif
 int sched_yield(void);
@@ -395,6 +397,8 @@ typedef struct lust_ThreadInfo {
     uint64_t id;
     const uint8_t *name;
     uint64_t name_len;
+    /* A Builder name's owned copy (0 for a static name). */
+    uint8_t *name_buf;
 } lust_ThreadInfo;
 
 /* A `thread::Scope`: the count of its live packets. The scope's end
@@ -430,11 +434,14 @@ static int lust_cur_once;
 /* ThreadId(1) is the main thread; spawned threads count from 2 in spawn
    order, as std assigns them. */
 static uint64_t lust_next_tid = 2;
-static lust_ThreadInfo lust_main_info = {1, 1, (const uint8_t *)"main", 4};
+static lust_ThreadInfo lust_main_info = {1, 1, (const uint8_t *)"main", 4, 0};
 
 static void lust_thread_info_release(void *p) {
     lust_ThreadInfo *t = (lust_ThreadInfo *)p;
-    if (t && t != &lust_main_info && __atomic_sub_fetch(&t->rc, 1, 4) == 0) free(t);
+    if (t && t != &lust_main_info && __atomic_sub_fetch(&t->rc, 1, 4) == 0) {
+        free(t->name_buf);
+        free(t);
+    }
 }
 static int lust_cur_ready;
 static void lust_cur_key_init(void) {
@@ -503,11 +510,155 @@ void lust_thread_spawn(lust_JoinHdr *h, lust_loc loc) LUST_BODY({
     t->id = __atomic_fetch_add(&lust_next_tid, 1, 0);
     t->name = 0;
     t->name_len = 0;
+    t->name_buf = 0;
     h->th = t;
     h->rc = 2;
     h->done = 0;
     h->panicked = 0;
     if (pthread_create(&h->t, 0, lust_thread_entry, h) != 0) lust_panic_cstr_owned("failed to spawn thread", loc);
+})
+
+/* A `thread::Builder` value (cgen/sync.rs lays it out): the
+   name as a String, the stack size in bytes (0 = default), and
+   whether a name was set (an empty name is Some("")). */
+typedef struct lust_ThreadBuilder {
+    lust_String name;
+    uint64_t stack;
+    uint8_t has_name;
+    uint8_t has_stack;
+} lust_ThreadBuilder;
+
+int pthread_attr_init(void *attr);
+int pthread_attr_destroy(void *attr);
+int pthread_attr_setstacksize(void *attr, uint64_t size);
+int pthread_setname_np(unsigned long t, const char *name);
+
+/* `Builder::spawn`: lust_thread_spawn with the builder's name
+   and stack size. 0, or the errno of the failed call (the caller
+   builds std's io::Error from it). The name bytes are copied:
+   the ThreadInfo owns them. An interior NUL truncates the OS
+   thread name; the Thread::name value keeps the full string, as
+   std's does (its CString would fail there: see the check for
+   the panic on a NUL in the caller). */
+int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST_BODY({
+    if (h->scope) __atomic_add_fetch(&h->scope->live, 1, 5);
+    pthread_once(&lust_cur_once, lust_cur_key_init);
+    lust_ThreadInfo *t = (lust_ThreadInfo *)malloc(sizeof(lust_ThreadInfo));
+    if (!t) lust_oom();
+    t->rc = 2;
+    t->id = __atomic_fetch_add(&lust_next_tid, 1, 0);
+    t->name = 0;
+    t->name_len = 0;
+    t->name_buf = 0;
+    if (b->has_name) {
+        uint8_t *copy = (uint8_t *)malloc(b->name.len ? b->name.len : 1);
+        if (!copy) lust_oom();
+        for (uint64_t i = 0; i < b->name.len; i++) copy[i] = b->name.ptr[i];
+        t->name = copy;
+        t->name_len = b->name.len;
+        t->name_buf = copy;
+    }
+    h->th = t;
+    h->rc = 2;
+    h->done = 0;
+    h->panicked = 0;
+    /* pthread_attr_t is opaque and platform-sized; a zeroed
+       64-byte block covers glibc's (56 bytes) on the targets
+       lust runs on. */
+    uint64_t attr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    void *attrp = 0;
+    if (b->has_stack) {
+        pthread_attr_init(attr);
+        uint64_t sz = b->stack < 16384 ? 16384 : b->stack;
+        int e2 = pthread_attr_setstacksize(attr, sz);
+        if (e2 != 0) {
+            pthread_attr_destroy(attr);
+            lust_thread_info_release(t);
+            lust_thread_info_release(t);
+            if (h->scope) __atomic_sub_fetch(&h->scope->live, 1, 5);
+            return e2;
+        }
+        attrp = attr;
+    }
+    int r = pthread_create(&h->t, attrp, lust_thread_entry, h);
+    if (attrp) pthread_attr_destroy(attr);
+    if (r != 0) {
+        lust_thread_info_release(t);
+        lust_thread_info_release(t);
+        if (h->scope) __atomic_sub_fetch(&h->scope->live, 1, 5);
+        return r;
+    }
+    if (b->has_name) {
+        char nm[16];
+        uint64_t n = b->name.len < 15 ? b->name.len : 15;
+        uint64_t i = 0;
+        for (; i < n && b->name.ptr[i] != 0; i++) nm[i] = (char)b->name.ptr[i];
+        nm[i] = 0;
+        pthread_setname_np(h->t, nm);
+    }
+    return 0;
+})
+
+/* `thread::available_parallelism`: the cgroup quota when one
+   applies (rounded up, at least 1), else the affinity count,
+   as std computes it on Linux. 0 with *err set on failure. */
+static uint64_t lust_cgroup_quota(void) LUST_BODY({
+    /* cgroup v2 cpu.max: "<quota|max> <period>". */
+    FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
+    if (f) {
+        char buf[128];
+        char *got = fgets(buf, sizeof buf, f);
+        fclose(f);
+        if (got && buf[0] >= '0' && buf[0] <= '9') {
+            uint64_t quota = 0, period = 0;
+            const char *p = buf;
+            while (*p >= '0' && *p <= '9') quota = quota * 10 + (uint64_t)(*p++ - '0');
+            while (*p == ' ') p++;
+            while (*p >= '0' && *p <= '9') period = period * 10 + (uint64_t)(*p++ - '0');
+            if (quota > 0 && period > 0) {
+                uint64_t q = (quota + period - 1) / period;
+                return q ? q : 1;
+            }
+        }
+        return 0;
+    }
+    /* cgroup v1 cpu.cfs_quota_us / cpu.cfs_period_us. */
+    long quota = -2, period = -2;
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+    if (!f) return 0;
+    if (fscanf(f, "%ld", &quota) != 1) quota = -2;
+    fclose(f);
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+    if (!f) return 0;
+    if (fscanf(f, "%ld", &period) != 1) period = -2;
+    fclose(f);
+    if (quota > 0 && period > 0) {
+        uint64_t q = ((uint64_t)quota + (uint64_t)period - 1) / (uint64_t)period;
+        return q ? q : 1;
+    }
+    return 0;
+})
+
+uint64_t lust_avail_parallelism(int32_t *err) LUST_BODY({
+    *err = 0;
+    uint64_t quota = lust_cgroup_quota();
+    if (quota > 0) return quota;
+#ifdef LUST_SYS_SCHED_GETAFFINITY
+    uint64_t mask[16] = {0};
+    long r = syscall(LUST_SYS_SCHED_GETAFFINITY, 0, sizeof mask, mask);
+    if (r < 0) {
+        *err = errno;
+        return 0;
+    }
+    uint64_t n = 0;
+    for (int i = 0; i < 16; i++) n += (uint64_t)__builtin_popcountll(mask[i]);
+    if (n > 0) return n;
+    *err = 0;
+    return 1;
+#else
+    *err = 38; /* ENOSYS */
+    return 0;
+#endif
 })
 
 /* Waits for the thread; the caller then moves the result out and calls

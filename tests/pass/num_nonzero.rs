@@ -24,4 +24,9 @@ fn main() {
     println!("{} {}", std::mem::size_of::<Option<NonZeroU32>>(), std::mem::size_of::<Option<Id>>());
     let none: Option<NonZeroU32> = NonZeroU32::new(0);
     println!("{:?} {}", none, none.is_none());
+    println!("{:?} {:?} {:?} {:?}", NonZeroU32::MIN, NonZeroU32::MAX, NonZeroI32::MIN, NonZeroI32::MAX);
+    println!("{:?}", NonZero::<u64>::MAX.get());
+    const M: NonZeroU32 = NonZeroU32::MIN;
+    println!("{}", M.get());
+    println!("{}", NonZeroU32::new(1).unwrap() == NonZeroU32::MIN);
 }

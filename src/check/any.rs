@@ -782,6 +782,7 @@ fn tn_sync(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::sync::Sync
         S::JoinHandle => return one("std::thread::join_handle::JoinHandle"),
         S::Thread => "std::thread::thread::Thread".into(),
         S::ThreadId => "std::thread::id::ThreadId".into(),
+        S::ThreadBuilder => "std::thread::builder::Builder".into(),
         S::ScopedJoinHandle => return lt_one("std::thread::scoped::ScopedJoinHandle"),
         S::Sender => return one("std::sync::mpsc::Sender"),
         S::SyncSender => return one("std::sync::mpsc::SyncSender"),
@@ -953,6 +954,11 @@ fn tn_std_adt(p: &Program, tys: &mut impl TyIntern, t: Ty, def: DefId, open: boo
         20 => return plain("core::num::error::FloatErrorKind"),
         21 => return plain("core::str::error::ParseBoolError"),
         22 => return plain("core::char::convert::ParseCharError"),
+        23 => return plain("core::char::convert::CharErrorKind"),
+        24 => return plain("core::array::TryFromSliceError"),
+        25 => tn_apply("core::num::nonzero::NonZero", vec![tn_first(p, tys, t, open, in_sig)?]),
+        26 => tn_apply("std::sync::mpsc::TrySendError", vec![tn_first(p, tys, t, open, in_sig)?]),
+        27 => return plain("std::sync::WaitTimeoutResult"),
         _ => return plain("core::char::convert::CharErrorKind"),
     }))
 }

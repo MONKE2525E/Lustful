@@ -2490,6 +2490,11 @@ impl Evaluator {
             return Ok((ConstValue::Variant(variant, Vec::new()), ty));
         }
         // Associated consts of integer types: `i64::MAX`, `usize::MAX`, `u8::MIN`, ...
+        if segs.len() >= 2 {
+            if let Some(v) = self.nonzero_assoc_const(cx, segs) {
+                return Ok(v);
+            }
+        }
         if segs.len() == 2 {
             if let Some(v) = self.int_assoc_const(cx, cx.sym_text(segs[0].name), cx.sym_text(segs[1].name)) {
                 return Ok(v);
@@ -2612,6 +2617,47 @@ impl Evaluator {
             _ => return None,
         };
         Some((ConstValue::Int(v), super::int(it)))
+    }
+
+    /// `NonZeroU32::MIN` and kin (TRIAGE T5), by written alias
+    /// names (the last two segments, after import expansion).
+    fn nonzero_assoc_const<'a, C: ConstCx<'a>>(&self, cx: &mut C, segs: &[ast::PathSeg]) -> Option<TypedValue> {
+        let (ty_seg, item_seg) = segs.split_at(segs.len() - 1);
+        let it = match cx.sym_text(ty_seg.last()?.name) {
+            "NonZeroU8" => IntTy::U8,
+            "NonZeroU16" => IntTy::U16,
+            "NonZeroU32" => IntTy::U32,
+            "NonZeroU64" => IntTy::U64,
+            "NonZeroU128" => IntTy::U128,
+            "NonZeroUsize" => IntTy::Usize,
+            "NonZeroI8" => IntTy::I8,
+            "NonZeroI16" => IntTy::I16,
+            "NonZeroI32" => IntTy::I32,
+            "NonZeroI64" => IntTy::I64,
+            "NonZeroI128" => IntTy::I128,
+            "NonZeroIsize" => IntTy::Isize,
+            _ => return None,
+        };
+        let bits = it.bits();
+        let v = match cx.sym_text(item_seg[0].name) {
+            "MAX" => {
+                if it == IntTy::U128 {
+                    -1
+                } else {
+                    truncate_to_int(it.max128() as i128, it)
+                }
+            }
+            "MIN" => {
+                if it.signed() {
+                    if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) }
+                } else {
+                    1
+                }
+            }
+            _ => return None,
+        };
+        let t = crate::check::generics::nonzero_ty(cx.tys(), super::int(it));
+        Some((ConstValue::Aggregate(vec![ConstValue::Int(v)]), t))
     }
 
     fn binary<'a, C: ConstCx<'a>>(

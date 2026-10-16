@@ -1217,6 +1217,12 @@ pub fn resolve_crate_cached(
 /// (`STD_PLATFORM_MODULES`): a plain byte scan, so a mention in a
 /// comment or string only costs the platform crate's resolve.
 pub fn mentions_std_platform(text: &str) -> bool {
+    // `thread::Builder` and `available_parallelism` return
+    // `io::Result` (TRIAGE T5): naming either loads the platform
+    // crate so check can name `std::io::Error`.
+    if text.contains("thread::Builder") || text.contains("available_parallelism") {
+        return true;
+    }
     text.match_indices("std::").any(|(i, _)| {
         let rest = &text[i + 5..];
         match rest.strip_prefix('{') {
