@@ -1961,6 +1961,12 @@ struct Ctx<'p> {
     /// args (zonked into the entry and requested as instances at body
     /// end).
     deref_sites: Vec<(DerefTable, usize, bool, LocalDefId, Vec<GenericArg>)>,
+    /// Expressions with entries in `out.deref_recv`, `deref_coerce`, or
+    /// `index_recv`. A second check of such an expression (a trial check,
+    /// or an argument checked to pick a form and then again) first drops
+    /// its old entries (`forget_place_steps`), so lowering runs each user
+    /// `deref` and `index` once, as recorded by the last check.
+    place_step_exprs: crate::intern::FxMap<ExprId, ()>,
     /// Or-pattern alternatives being checked against the first
     /// alternative's bindings, innermost last (see the `Pat::Or`
     /// arm of `pattern_mode`).
@@ -2252,6 +2258,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         call_expected: None,
         deref_depth: 0,
         deref_sites: Vec::new(),
+        place_step_exprs: Default::default(),
         or_frames: Vec::new(),
         or_log: None,
         pat_marks: Vec::new(),
@@ -6653,10 +6660,42 @@ impl<'p> Ctx<'p> {
         let target_ref = self.tys.mk_ref(mutable, target);
         let idx = self.out.deref_recv.len();
         self.out.deref_recv.push((e, DerefRecv { depth, before, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref }));
+        self.place_step_exprs.insert(e, ());
         if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
             self.deref_sites.push((DerefTable::Recv, idx, false, f, impl_args));
         }
         Some(ret)
+    }
+
+    /// Drops the place-step entries an earlier check of `e` recorded
+    /// (see `place_step_exprs`): all of them at the start of a check of
+    /// `e`, or with `coerce_only` its deref-coercion steps before a new
+    /// coercion of `e` records its own. An entry is marked dead, not
+    /// removed, so `deref_sites` indexes stay valid.
+    fn forget_place_steps(&mut self, e: ExprId, coerce_only: bool) {
+        if self.place_step_exprs.is_empty() || !self.place_step_exprs.contains_key(&e) {
+            return;
+        }
+        const DEAD: ExprId = ExprId(u32::MAX);
+        for (x, _) in self.out.deref_coerce.iter_mut() {
+            if *x == e {
+                *x = DEAD;
+            }
+        }
+        if coerce_only {
+            return;
+        }
+        self.place_step_exprs.remove(&e);
+        for (x, _) in self.out.deref_recv.iter_mut() {
+            if *x == e {
+                *x = DEAD;
+            }
+        }
+        for (x, _) in self.out.index_recv.iter_mut() {
+            if *x == e {
+                *x = DEAD;
+            }
+        }
     }
 
     /// One user `Deref` step of a place (a field access through it, or
@@ -6679,6 +6718,7 @@ impl<'p> Ctx<'p> {
         // Place steps record outermost first.
         let depth = self.out.deref_recv.iter().filter(|(x, _)| *x == e).count() as u8;
         self.out.deref_recv.push((e, DerefRecv { depth, before, f, args: Vec::new(), f_mut, args_mut: Vec::new(), mutable: false, target_ref }));
+        self.place_step_exprs.insert(e, ());
         let is_template = |cx: &Self, f: LocalDefId| cx.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
         if is_template(self, f) {
             self.deref_sites.push((DerefTable::Recv, idx, false, f, args));
@@ -6724,6 +6764,7 @@ impl<'p> Ctx<'p> {
             steps.push((before, f, args, target));
             let inner_snap = self.snapshot_vars();
             if self.unify(target, y) {
+                self.forget_place_steps(e, true);
                 let idx0 = self.out.deref_coerce.len();
                 for (i, (b, f, args, target)) in steps.into_iter().enumerate() {
                     let target_ref = self.tys.mk_ref(mutable, target);
@@ -6736,6 +6777,7 @@ impl<'p> Ctx<'p> {
                         self.deref_sites.push((DerefTable::Coerce, idx0 + i, false, f, args));
                     }
                 }
+                self.place_step_exprs.insert(e, ());
                 return Some(Coerce::UserDeref(self.tys.mk_ref(mutable, y)));
             }
             self.rollback_vars(inner_snap);
@@ -6747,6 +6789,7 @@ impl<'p> Ctx<'p> {
                 _ => false,
             };
             if tail_ok {
+                self.forget_place_steps(e, true);
                 let idx0 = self.out.deref_coerce.len();
                 for (i, (b, f, args, target)) in steps.into_iter().enumerate() {
                     let target_ref = self.tys.mk_ref(mutable, target);
@@ -6759,6 +6802,7 @@ impl<'p> Ctx<'p> {
                         self.deref_sites.push((DerefTable::Coerce, idx0 + i, false, f, args));
                     }
                 }
+                self.place_step_exprs.insert(e, ());
                 return Some(Coerce::UserDerefTail(self.tys.mk_ref(mutable, y)));
             }
             self.rollback_vars(inner_snap);
@@ -6826,6 +6870,7 @@ impl<'p> Ctx<'p> {
         };
         let idx = self.out.index_recv.len();
         self.out.index_recv.push((e, IndexRecv { f, args: Vec::new(), f_mut, args_mut: Vec::new() }));
+        self.place_step_exprs.insert(e, ());
         let is_template = |cx: &Self, f: LocalDefId| cx.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
         if is_template(self, f) {
             self.deref_sites.push((DerefTable::Index, idx, false, f, args));
@@ -7795,6 +7840,7 @@ impl<'p> Ctx<'p> {
     }
 
     fn expr_inner(&mut self, e: ExprId, expected: Option<Ty>) -> Ty {
+        self.forget_place_steps(e, false);
         let span = self.span(e);
         let p = self.p;
         match p.ast.expr(e) {
@@ -13287,6 +13333,28 @@ impl<'p> Ctx<'p> {
                             self.set_res(e, Res::Builtin(Builtin::ConvInto));
                             (vec![at], STRING)
                         } else {
+                            // rustc picks the `From` impl by the argument's
+                            // own type, with no deref coercion: `&str`,
+                            // `&mut str`, and `&String` only (`&&str`,
+                            // `&Box<str>`, `&mut String` are E0277).
+                            let exact = match self.kind(at) {
+                                TyKind::Ref(_, m, inner) => {
+                                    let inner = self.resolve(inner);
+                                    inner == STR || (inner == STRING && !m.is_mut()) || matches!(self.kind(inner), TyKind::Infer(v) if !v.is_int() && !v.is_float())
+                                }
+                                TyKind::Infer(v) => !v.is_int() && !v.is_float(),
+                                TyKind::Error => true,
+                                _ => false,
+                            };
+                            if !exact {
+                                let tn = self.tn(at);
+                                self.err(
+                                    "L0612",
+                                    span,
+                                    format!("no impl of `From<{tn}>` for `String`"),
+                                    "Pass a `&str`, a `&String`, a `String`, or a `char`.",
+                                );
+                            }
                             (vec![REF_STR], STRING)
                         }
                     }
@@ -14494,6 +14562,7 @@ impl<'p> Ctx<'p> {
         turbofish: &[ast::GenericArg],
         expected: Option<Ty>,
     ) -> Ty {
+        self.forget_place_steps(e, false);
         let rt = self.deep(rt);
         self.call_expected = expected.map(|t| (e, t));
         // ARCH 2.12 run point: a method call must know the receiver type. The

@@ -4181,10 +4181,14 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.equate_all(&gv, &dv[gv.len()..]);
             return;
         }
-        // `thread::spawn(f)`: `F: 'static` and `T: 'static` (W-THREADS).
-        // Every region of the closure (its captured borrows) and of the
-        // handle must be `'static`.
-        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::ThreadSpawn)) = target {
+        // `thread::spawn(f)` and `Builder::spawn(self, f)`: `F: 'static`
+        // and `T: 'static` (W-THREADS). Every region of the closure (its
+        // captured borrows) and of the handle must be `'static` (a
+        // `Builder` holds no borrows).
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(
+            crate::check::sync::SyncOp::ThreadSpawn | crate::check::sync::SyncOp::BuilderSpawn,
+        )) = target
+        {
             for &x in avs.iter().flat_map(|(_, v)| v).chain(&srcs).chain(&dv) {
                 self.edge(x, 0);
             }
