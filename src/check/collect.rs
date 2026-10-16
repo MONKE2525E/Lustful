@@ -6171,6 +6171,55 @@ fn block_item_builtin_names(ast: &Ast, interner: &Interner, errs: &mut Vec<Diag>
             errs.push(not_yet("L0820", span, "a block type item named like a builtin or std type"));
         }
     }
+    // A block item named like a generic parameter of an enclosing fn
+    // shadows it in rustc, but a mono instance reads the name as the
+    // parameter's argument (`struct T` in `fn f<T>` printed the
+    // argument's `T::default()`, a wrong output). Only names some
+    // generic list declares take the per-item scope walk.
+    let mut param_names: Vec<Sym> = Vec::new();
+    let mut add = |g: &ast::Generics| {
+        for q in &g.params {
+            if let ast::GenericParam::Type { name, .. } | ast::GenericParam::Const { name, .. } = q {
+                param_names.push(*name);
+            }
+        }
+    };
+    for item in ast.items.iter().chain(&ast.stmt_items) {
+        match &item.kind {
+            ItemKind::Fn(f) => add(&f.generics),
+            ItemKind::Impl(imp) => {
+                add(&imp.generics);
+                imp.fns.iter().for_each(|f| add(&f.generics));
+            }
+            ItemKind::Trait(t) => {
+                add(&t.generics);
+                t.fns.iter().for_each(|f| add(&f.generics));
+            }
+            _ => {}
+        }
+    }
+    if param_names.is_empty() {
+        return;
+    }
+    for item in &ast.stmt_items {
+        let (name, span) = match &item.kind {
+            ItemKind::Struct(s) => (s.name, s.name_span),
+            ItemKind::Enum(e) => (e.name, e.name_span),
+            ItemKind::Union(u) => (u.name, u.name_span),
+            ItemKind::Trait(t) => (t.name, t.name_span),
+            ItemKind::Type(a) => (a.name, a.name_span),
+            ItemKind::Const(c) => match c.name {
+                Some(n) => (n, c.name_span),
+                None => continue,
+            },
+            ItemKind::Static(st) => (st.name, st.name_span),
+            ItemKind::Fn(f) => (f.name, f.name_span),
+            _ => continue,
+        };
+        if param_names.contains(&name) && outer_param_names(ast, item.span).contains(&name) {
+            errs.push(not_yet("L0820", span, "a block item named like a generic parameter of the enclosing fn"));
+        }
+    }
 }
 
 fn visible_stmt_items(item_blocks: &[(Span, Vec<u32>)], at: Span) -> Vec<u32> {
