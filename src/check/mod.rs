@@ -1998,6 +1998,9 @@ struct Ctx<'p> {
     deferred_debug: Vec<(Ty, Span)>,
     /// Types a `take` builds with `Default::default()`.
     deferred_default: Vec<(Ty, Span)>,
+    /// `vec![x; n]` element types still open at the macro: their Clone
+    /// check runs at body end.
+    deferred_vec_clone: Vec<(Ty, Span)>,
     /// Element types of Rc fns that lust only has for a sized `T`
     /// (by-value `try_unwrap` and `into_inner`, `get_mut`, and
     /// `downgrade`, whose `Weak` is a thin pointer).
@@ -2455,6 +2458,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_coerce_casts: Vec::new(),
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
+        deferred_vec_clone: Vec::new(),
         deferred_sized: Vec::new(),
         deferred_downgrade: Vec::new(),
         deferred_make_mut: Vec::new(),
@@ -19128,7 +19132,12 @@ impl<'p> Ctx<'p> {
                     self.expect_expr(args[0], elem);
                     self.expect_expr(args[1], USIZE);
                     let elem = self.deep(elem);
-                    if !has_clone(self.p, &self.tys, elem) && !matches!(self.kind(elem), TyKind::Infer(_)) {
+                    // An element type a later use fixes (`vec![Vec::new(); n]`,
+                    // then a push) waits for body end, as rustc's `T: Clone`
+                    // obligation does.
+                    if self.tys.flags(elem).contains_infer() && !matches!(self.kind(elem), TyKind::Infer(_)) {
+                        self.deferred_vec_clone.push((elem, span));
+                    } else if !has_clone(self.p, &self.tys, elem) && !matches!(self.kind(elem), TyKind::Infer(_)) {
                         let tn = self.tn(elem);
                         self.err(
                             "L0112",
@@ -23773,6 +23782,13 @@ impl<'p> Ctx<'p> {
             } else {
                 // The default glue reads the type's layout.
                 self.record_glue_reads(self.p.gx.lang.default, t);
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_vec_clone) {
+            let t = self.deep(t);
+            if !has_clone(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
+                let tn = self.tn(t);
+                self.err("L0112", span, format!("`vec![x; n]` needs Clone, but `{tn}` is not Clone"), "Derive Clone on the element type.");
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_downgrade) {
