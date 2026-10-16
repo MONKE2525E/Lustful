@@ -620,6 +620,10 @@ pub enum Builtin {
     /// `try_fold(init, f)` with an `Option` or `Result` closure result.
     IterTryFold,
     IterForEach,
+    /// `partition` and `unzip` into a pair of Vecs (core 1.99's fold
+    /// with `extend_one`; `unzip` reserves the hint's lower bound first).
+    IterPartition,
+    IterUnzip,
     IterMin,
     IterMax,
     IterMinByKey,
@@ -16548,6 +16552,11 @@ impl<'p> Ctx<'p> {
                     let sl = self.tys.intern(TyKind::Slice(elem));
                     let r = self.tys.mk_ref(true, sl);
                     Some((B::VecAsMutSlice, Autoref::RefMut, vec![], r))
+                } else if name == k.to_vec {
+                    // `[T]::to_vec` through the Vec's `Deref<Target = [T]>`.
+                    self.deferred_clone.push((elem, name_span));
+                    let v = self.tys.mk_vec(elem);
+                    Some((B::SliceToVec, Autoref::Ref, vec![], v))
                 } else if self.name(name) == "spare_capacity_mut" {
                     let mu = generics::maybe_uninit_ty(&mut self.tys, elem);
                     let sl = self.tys.intern(TyKind::Slice(mu));

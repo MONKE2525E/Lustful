@@ -112,6 +112,8 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::IterFold
             | B::IterTryFold
             | B::IterForEach
+            | B::IterPartition
+            | B::IterUnzip
             | B::IterMin
             | B::IterMax
             | B::IterMinByKey
@@ -1331,6 +1333,25 @@ impl Ex<'_, '_> {
                 }
                 self.drop_local(owned);
                 self.drop_local(fl);
+            }
+            B::IterPartition | B::IterUnzip => {
+                let i = arg()?;
+                let f = if b == B::IterPartition { Some(arg()?) } else { None };
+                let (owned, ty) = self.own(i)?;
+                let fl = match f {
+                    Some(f) => {
+                        let fty = self.op_ty(&f)?;
+                        let fl = self.local(fty);
+                        self.assign(Place::local(fl), Rvalue::Use(f));
+                        Some((fl, fty))
+                    }
+                    None => None,
+                };
+                self.partition_unzip(Place::local(owned), ty, fl, dest, dest_ty)?;
+                self.drop_local(owned);
+                if let Some((fl, _)) = fl {
+                    self.drop_local(fl);
+                }
             }
             B::IterFold => {
                 let (i, init, f) = (arg()?, arg()?, arg()?);
@@ -5873,6 +5894,76 @@ impl Ex<'_, '_> {
             let u = this.local(UNIT);
             this.call_fn(fty, fpl.clone(), vec![ax], Place::local(u))
         })
+    }
+
+    /// `partition(f)` (with `f`) and `unzip()` into `(Vec<A>, Vec<B>)`, as
+    /// core 1.99: two empty Vecs, then one fold that pushes each item to
+    /// the side `f(&x)` picks, or each pair's halves to both. `unzip`
+    /// first reserves the hint's lower bound in both when it is not 0
+    /// (the tuple's `extend_reserve`).
+    fn partition_unzip(&mut self, itp: Place, ty: Ty, f: Option<(Local, Ty)>, dest: Place, dest_ty: Ty) -> R {
+        let TyKind::Tuple(ts) = self.body.tys.kind(dest_ty) else { return Err("iterator expansion: partition into a non-pair".into()) };
+        let (va, vb) = {
+            let v = self.body.tys.tys_of(ts);
+            (v[0], v[1])
+        };
+        let (Some(ea), Some(eb)) = (self.body.tys.vec_elem(va), self.body.tys.vec_elem(vb)) else {
+            return Err("iterator expansion: partition into non-Vecs".into());
+        };
+        let (a, b) = (self.local(va), self.local(vb));
+        self.assign(Place::local(a), Rvalue::VecLit(ea, Vec::new()));
+        self.assign(Place::local(b), Rvalue::VecLit(eb, Vec::new()));
+        let push = |this: &mut Self, v: Local, vt: Ty, x: Operand| {
+            let rv = this.ref_to(true, Place::local(v), vt);
+            let u = this.local(UNIT);
+            this.call_builtin(Builtin::VecPush, vec![Operand::Move(Place::local(rv)), x], Place::local(u));
+        };
+        if f.is_none() {
+            let (lo, _) = self.hint(itp.clone(), ty)?;
+            let some = self.cmp(crate::ast::BinOp::Gt, Operand::Copy(Place::local(lo)), Self::usize_c(0));
+            let (yes, no) = self.branch(some);
+            let join = self.block();
+            self.cur = yes;
+            for (v, vt) in [(a, va), (b, vb)] {
+                let rv = self.ref_to(true, Place::local(v), vt);
+                let u = self.local(UNIT);
+                self.call_builtin(Builtin::VecReserve, vec![Operand::Move(Place::local(rv)), Operand::Copy(Place::local(lo))], Place::local(u));
+            }
+            self.goto(join);
+            self.cur = no;
+            self.goto(join);
+            self.cur = join;
+        }
+        self.each(&itp, ty, &mut |this, x, item| {
+            match f {
+                Some((fl, fty)) => {
+                    let rx = this.ref_to(false, Place::local(x), item);
+                    let r = this.local(BOOL);
+                    this.call_fn(fty, Place::local(fl), vec![Operand::Move(Place::local(rx))], Place::local(r))?;
+                    let (yes, no) = this.branch(Operand::Copy(Place::local(r)));
+                    let join = this.block();
+                    this.cur = yes;
+                    let ax = this.take(Place::local(x), item);
+                    push(this, a, va, ax);
+                    this.goto(join);
+                    this.cur = no;
+                    let ax = this.take(Place::local(x), item);
+                    push(this, b, vb, ax);
+                    this.goto(join);
+                    this.cur = join;
+                }
+                None => {
+                    let x0 = this.take(Place::local(x).project(Proj::Field(0)), ea);
+                    push(this, a, va, x0);
+                    let x1 = this.take(Place::local(x).project(Proj::Field(1)), eb);
+                    push(this, b, vb, x1);
+                }
+            }
+            Ok(())
+        })?;
+        let (ma, mb) = (self.take(Place::local(a), va), self.take(Place::local(b), vb));
+        self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![ma, mb]));
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

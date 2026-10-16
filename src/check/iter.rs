@@ -25,7 +25,6 @@ const DECLARED_ONLY: &[&str] = &[
     "map_while",
     "scan",
     "fuse",
-    "partition",
     "partition_in_place",
     "is_partitioned",
     "try_for_each",
@@ -34,7 +33,6 @@ const DECLARED_ONLY: &[&str] = &[
     "try_find",
     "rposition",
     "rev_position",
-    "unzip",
     "copied_",
     "cycle",
     "array_chunks",
@@ -1331,6 +1329,35 @@ impl<'p> Ctx<'p> {
                 let f = self.fn_mut_param(&[item], UNIT, span);
                 (B::IterForEach, vec![f], UNIT)
             }
+            // `partition<B, F>(self, f) -> (B, B)` and `unzip<A, B, FromA,
+            // FromB>(self) -> (FromA, FromB)`: lust builds Vec targets the
+            // expected type (or `partition`'s turbofish) names.
+            "partition" => {
+                let ri = r(self, item);
+                let f = self.fn_mut_param_ref(&[ri], BOOL, span);
+                let named = turbofish.first().and_then(|g| match g {
+                    ast::GenericArg::Type(t) => Some(self.resolve_written(*t)),
+                    _ => None,
+                });
+                let want = self.pair_target(expected, named, [item, item], "partition", span);
+                let Some(ret) = want else { return self.iter_bail(args) };
+                (B::IterPartition, vec![f], ret)
+            }
+            "unzip" => {
+                let d = self.deep(item);
+                let TyKind::Tuple(ts) = self.kind(d) else {
+                    let tn = self.tn(d);
+                    self.err("L0612", span, format!("`unzip` needs items that are pairs, not `{tn}`"), "Map each item to a `(a, b)` pair first.");
+                    return self.iter_bail(args);
+                };
+                let parts = self.tys.tys_of(ts).to_vec();
+                let [a, b] = parts[..] else {
+                    self.err("L0612", span, "`unzip` needs items that are pairs", "Map each item to a `(a, b)` pair first.");
+                    return self.iter_bail(args);
+                };
+                let Some(ret) = self.pair_target(expected, None, [a, b], "unzip", span) else { return self.iter_bail(args) };
+                (B::IterUnzip, vec![], ret)
+            }
             "min" | "max" => {
                 self.deferred_ord.push((item, span));
                 let o = self.tys.mk_option(item);
@@ -1854,6 +1881,48 @@ impl<'p> Ctx<'p> {
             _ => return None,
         };
         Some(it::mk_iter(&mut self.tys, ik, &args))
+    }
+
+    /// The `(Vec<x>, Vec<y>)` result of `partition` or `unzip`: the
+    /// written target (`named`, both halves) or the expected pair. Each
+    /// half must be a Vec of its items; an open half is rustc's E0282
+    /// when nothing fixes it, so lust asks for the annotation (L0610),
+    /// and another collection is L0640.
+    fn pair_target(&mut self, expected: Option<Ty>, named: Option<Ty>, items: [Ty; 2], what: &str, span: Span) -> Option<Ty> {
+        let halves = match (named, expected.map(|t| self.deep(t))) {
+            (Some(b), _) => [b, b],
+            (None, Some(t)) => match self.kind(t) {
+                TyKind::Tuple(ts) if self.tys.tys_of(ts).len() == 2 => {
+                    let v = self.tys.tys_of(ts).to_vec();
+                    [v[0], v[1]]
+                }
+                _ => [ERROR, ERROR],
+            },
+            (None, None) => [ERROR, ERROR],
+        };
+        for (h, it) in halves.into_iter().zip(items) {
+            let h = self.deep(h);
+            match self.tys.vec_elem(h) {
+                Some(el) => {
+                    if !self.unify(el, it) {
+                        self.mismatch(span, el, it);
+                        return None;
+                    }
+                }
+                None if h == ERROR || matches!(self.kind(h), TyKind::Infer(_)) => {
+                    self.err("L0610", span, format!("type annotations needed: the target of this `{what}` must be known here"), "Annotate the result, such as `let (a, b): (Vec<_>, Vec<_>) = ..`.");
+                    return None;
+                }
+                None => {
+                    let tn = self.tn(h);
+                    self.err("L0640", span, format!("`{what}` into `{tn}` is not implemented yet"), "Collect into a pair of `Vec`s.");
+                    return None;
+                }
+            }
+        }
+        let pair = [self.deep(halves[0]), self.deep(halves[1])];
+        let ts = self.tys.intern_tys(&pair);
+        Some(self.tys.intern(TyKind::Tuple(ts)))
     }
 
     /// The deferred collects whose target a later use made a `Vec`: that

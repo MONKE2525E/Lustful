@@ -8918,6 +8918,8 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
             | B::IterMinByKey
             | B::IterMaxByKey
             | B::IterCollect
+            | B::IterPartition
+            | B::IterUnzip
             | B::FromIter
             | B::IterSum
             | B::IterProduct

@@ -5698,6 +5698,8 @@ impl FnGen<'_, '_> {
             | B::IterFold
             | B::IterTryFold
             | B::IterForEach
+            | B::IterPartition
+            | B::IterUnzip
             | B::IterMin
             | B::IterMax
             | B::IterMinByKey
