@@ -1748,14 +1748,19 @@ fn iterator_shadows(cx: &mut Ctx, step: Ty, name: Sym) -> bool {
 }
 
 /// The reject for an `iterator_shadows` call (L0640: the `Iterator`
-/// method is declared, lust has no port; L0104 for rustc's E0034), or
-/// a miss for the ones lust's builtin iterator methods answer.
-fn iterator_shadow_reject(cx: &mut Ctx, step: Ty, name: Sym, name_span: Span, args: &[ExprId]) -> Probe {
+/// method is declared, lust has no port; L0104 for rustc's E0034).
+/// `eq`/`ne` on the iterator Adt itself are lust's builtin
+/// `Iterator::eq` (check/iter.rs, through `ByNext`), taken here, at
+/// rustc's by-value step, before any autoref'd `PartialEq::eq` or
+/// inherent `&self` method.
+fn iterator_shadow_reject(cx: &mut Ctx, e: ExprId, step: Ty, name: Sym, name_span: Span, args: &[ExprId], expected: Option<Ty>) -> Probe {
     let n = cx.p.interner.get(name).to_string();
-    // `eq`/`ne` on the iterator Adt itself: lust's builtin `Iterator::eq`
-    // (check/iter.rs, through `ByNext`) takes it after this search.
-    if matches!(n.as_str(), "eq" | "ne") && cx.tys.local_adt(step).is_some() {
-        return Probe::Miss;
+    if matches!(n.as_str(), "eq" | "ne")
+        && cx.tys.local_adt(step).is_some()
+        && let Expr::MethodCall { recv, .. } = cx.p.ast.expr(e)
+        && let Some(t) = cx.iter_method(e, *recv, step, step, 0, name, name_span, args, &[], expected)
+    {
+        return Probe::Hit(t);
     }
     let tn = cx.tn(step);
     if matches!(n.as_str(), "max" | "min") {
@@ -1912,7 +1917,7 @@ fn method_search_steps(
         let groups = [by_value, vec![ref_probe, autoref_self(ref_probe)], refmut_group];
         for (gi, group) in groups.iter().enumerate() {
             if gi == 1 && iter_shadow {
-                return iterator_shadow_reject(cx, step, name, name_span, args);
+                return iterator_shadow_reject(cx, e, step, name, name_span, args, expected);
             }
             for &probe in group {
                 match dyn_probe(cx, e, probe, derefs, name, name_span, args, explicit, None) {

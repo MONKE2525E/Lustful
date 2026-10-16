@@ -1,7 +1,7 @@
-// expect: L0640
+// expect: L0612
 // rustc E0277: `x.eq(&x)` on a by-value iterator is `Iterator::eq`
 // (found before the autoref'd `PartialEq::eq`), and `&I` is no
-// IntoIterator. Lust has no `Iterator::eq`, so it rejects too.
+// IntoIterator.
 #[derive(PartialEq)]
 struct I(u8);
 impl Iterator for I {
