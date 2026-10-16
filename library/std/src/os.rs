@@ -287,6 +287,19 @@ pub mod unix {
     pub mod fs {
         use crate::fs::Metadata;
 
+        /// Unix-specific extensions to `fs::DirBuilder`: the mode new
+        /// directories get (before the umask).
+        pub trait DirBuilderExt {
+            fn mode(&mut self, mode: u32) -> &mut Self;
+        }
+
+        impl DirBuilderExt for crate::fs::DirBuilder {
+            fn mode(&mut self, mode: u32) -> &mut crate::fs::DirBuilder {
+                self.mode = mode;
+                self
+            }
+        }
+
         /// Unix-specific extensions to `fs::Metadata`: the raw
         /// stat fields, as std exposes them.
         pub trait MetadataExt {

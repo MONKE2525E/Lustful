@@ -300,11 +300,13 @@ int32_t lust_sys_write_file(const uint8_t *p, uint64_t len, const uint8_t *d, ui
 }
 
 /* One path syscall: 0, errno, or -1 for a NUL byte. `op`: 0 mkdir
-   (0777), 1 unlink, 2 rmdir. */
+   (0777), 1 unlink, 2 rmdir, 3 | mode << 8 mkdir with that mode
+   (`DirBuilder`; the kernel keeps only the low 12 bits anyway). */
 int32_t lust_sys_path_op(const uint8_t *p, uint64_t len, int32_t op) {
     char *s = lust_sys_cstr(p, len);
     if (!s) return -1;
-    int r = op == 0 ? mkdir(s, 0777) : op == 1 ? unlink(s) : rmdir(s);
+    int code = op & 0xff;
+    int r = code == 0 ? mkdir(s, 0777) : code == 1 ? unlink(s) : code == 3 ? mkdir(s, (mode_t)((op >> 8) & 07777)) : rmdir(s);
     int e = errno;
     free(s);
     return r == 0 ? 0 : e;

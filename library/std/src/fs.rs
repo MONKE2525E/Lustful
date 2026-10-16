@@ -376,6 +376,69 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     status(core::intrinsics::sys_path_op(bytes_of(path.as_ref()), 0))
 }
 
+/// A builder for new directories (`std::fs::DirBuilder`, Rust 1.99): the
+/// mode (0o777 unless `os::unix::fs::DirBuilderExt::mode` sets it) and
+/// whether missing parents are made too. It has no `Debug`: std prints
+/// the mode in a form lust does not port, so a use rejects.
+pub struct DirBuilder {
+    pub(crate) mode: u32,
+    recursive: bool,
+}
+
+impl DirBuilder {
+    pub fn new() -> DirBuilder {
+        DirBuilder { mode: 0o777, recursive: false }
+    }
+
+    pub fn recursive(&mut self, recursive: bool) -> &mut Self {
+        self.recursive = recursive;
+        self
+    }
+
+    pub fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        self.create_inner(path.as_ref())
+    }
+
+    fn create_inner(&self, path: &Path) -> io::Result<()> {
+        if self.recursive { self.create_dir_all(path) } else { self.mkdir(path) }
+    }
+
+    fn mkdir(&self, path: &Path) -> io::Result<()> {
+        status(core::intrinsics::sys_path_op(bytes_of(path), 3 | (((self.mode & 0o7777) as i32) << 8)))
+    }
+
+    /// std 1.99's `DirBuilder::create_dir_all`: mkdir up the ancestors
+    /// until one exists, then down again.
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        if path == Path::new("") || path.parent() == None {
+            return Ok(());
+        }
+        let ancestors = path.ancestors();
+        let mut uncreated_dirs = 0;
+        for ancestor in ancestors {
+            if ancestor == Path::new("") || ancestor.parent() == None {
+                break;
+            }
+            match self.mkdir(ancestor) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => uncreated_dirs += 1,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && ancestor.is_dir() => break,
+                Err(e) => return Err(e),
+            }
+        }
+        let mut uncreated_dirs_vec: Vec<&Path> = Vec::with_capacity(uncreated_dirs);
+        uncreated_dirs_vec.extend(ancestors.take(uncreated_dirs));
+        for uncreated_dir in uncreated_dirs_vec.iter().rev() {
+            if let Err(e) = self.mkdir(uncreated_dir) {
+                if e.kind() != io::ErrorKind::AlreadyExists || !uncreated_dir.is_dir() {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Creates a directory and every missing parent, as std's
 /// `DirBuilder::create_dir_all`: an existing directory is fine.
 pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
