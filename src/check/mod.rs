@@ -355,6 +355,17 @@ pub enum Builtin {
     /// closure as the test, called as (current, previous kept).
     VecDedupBy,
     VecDedupByKey,
+    /// `v.splice(range, it);` as an expression statement (R4): the
+    /// `Splice` drops at once, so the call is drain, drop of the drained
+    /// items, and core's `Splice::drop` fill over a `TrustedLen`
+    /// replacement (lower/iter/splice.rs, with the steps below).
+    VecSplice,
+    /// Internal steps of `VecSplice` on its `vec::Drain` (runtime/core.c).
+    SpliceBegin,
+    SpliceReserve,
+    SpliceGap,
+    SplicePut,
+    SpliceMoveTail,
     /// `[T]::get` and `get_mut` with a range index: the bounds
     /// travel as drain's four words; out-of-range is `None`
     /// (check/slice.rs, runtime `lust_range_bounds_get`).
@@ -1808,6 +1819,9 @@ struct Ctx<'p> {
     /// `Range<{integer}>::len` and kin: the element must end as one of
     /// core's exact-size range integers (check/iter.rs `exact_size`).
     deferred_exact_range: Vec<(Ty, Span)>,
+    /// The expression of the expression statement being checked (`e;`):
+    /// `Vec::splice` is taken only there, where its `Splice` drops at once.
+    stmt_expr: Option<ExprId>,
     /// Item or key types an iterator method needs to be Ord (`min`,
     /// `max`, `min_by_key`, `max_by_key`), re-tested at finish.
     deferred_ord: Vec<(Ty, Span)>,
@@ -2171,6 +2185,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_collect: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_exact_range: Vec::new(),
+        stmt_expr: None,
         deferred_ord: Vec::new(),
         deferred_sort_ord: Vec::new(),
         deferred_fn_casts: Vec::new(),
@@ -7029,7 +7044,9 @@ impl<'p> Ctx<'p> {
                 // Body items and statement macros are rejected by the parser today.
                 Stmt::Item(_) | Stmt::Macro { .. } => {}
                 Stmt::Expr { expr, semi, .. } => {
+                    let saved = std::mem::replace(&mut self.stmt_expr, semi.then_some(*expr));
                     let t = self.expr(*expr, if *semi { None } else { Some(UNIT) });
+                    self.stmt_expr = saved;
                     if self.kind(t) == TyKind::Never {
                         diverges = true;
                     } else if !semi && !self.unify(t, UNIT) {

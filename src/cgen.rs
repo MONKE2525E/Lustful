@@ -5371,7 +5371,13 @@ impl FnGen<'_, '_> {
             | B::SlicePartitionPoint
             | B::VecExtendFromWithin
             | B::VecDedupBy
-            | B::VecDedupByKey => unreachable!("emitted by cgen/slices.rs"),
+            | B::VecDedupByKey
+            | B::SpliceBegin
+            | B::SpliceReserve
+            | B::SpliceGap
+            | B::SplicePut
+            | B::SpliceMoveTail => unreachable!("emitted by cgen/slices.rs"),
+            B::VecSplice => unreachable!("expanded in lower/iter.rs"),
             B::VecResizeWith => unreachable!("expanded in lower/iter.rs"),
             B::SliceCopyWithin => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);

@@ -60,6 +60,7 @@ impl<'p> Ctx<'p> {
             "resize_with" => "resize_with",
             "dedup_by" => "dedup_by",
             "dedup_by_key" => "dedup_by_key",
+            "splice" => "splice",
             _ => return None,
         };
         if matches!(
@@ -75,6 +76,12 @@ impl<'p> Ctx<'p> {
                 | "dedup_by_key"
         ) {
             return self.slice_method_r4(e, recv, base, elem, derefs, n, name_span, args, turbofish);
+        }
+        if n == "splice" {
+            if self.tys.vec_elem(base).is_none() {
+                return None;
+            }
+            return Some(self.splice_method(e, recv, elem, derefs, name_span, args, turbofish));
         }
         if n == "join" || n == "concat" {
             return self.slice_join_concat(e, recv, elem, derefs, name_span, args, n == "join");
@@ -564,6 +571,76 @@ impl<'p> Ctx<'p> {
             return Some(ERROR);
         }
         Some(ret)
+    }
+
+    /// `Vec::splice(range, replace_with)` (R4). Taken as an expression
+    /// statement only: its `Splice` then drops at once, and the call is
+    /// core's drain plus `Splice::drop`. The replacement is a builtin
+    /// `TrustedLen` iterator (or a collection that turns into one), so
+    /// its size hint is exact and nothing is left to collect. The range
+    /// records like drain's.
+    #[allow(clippy::too_many_arguments)]
+    fn splice_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        elem: Ty,
+        derefs: u8,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+    ) -> Ty {
+        if !turbofish.is_empty() {
+            self.errs.push(not_yet("L0721", name_span, "turbofish on `splice`"));
+            return self.slice_bail(args);
+        }
+        if args.len() != 2 {
+            self.err("L0105", name_span, "`splice` takes 2 arguments", "Pass the range and the replacement items.");
+            return self.slice_bail(args);
+        }
+        if self.stmt_expr != Some(e) {
+            self.errs.push(not_yet("L0641", name_span, "`splice` whose `Splice` value is used (lust takes `v.splice(range, items);` as a statement)"));
+            return self.slice_bail(args);
+        }
+        let Some(form) = self.drain_range_form(e, args[0], name_span) else {
+            self.expr(args[1], None);
+            return ERROR;
+        };
+        let at = self.expr(args[1], None);
+        let at = self.deep(at);
+        let it = match self.into_iter_ty(at) {
+            Some(it) if self.splice_trusted(it) => it,
+            Some(_) => {
+                self.errs.push(not_yet("L0641", self.span(args[1]), "`splice` with this replacement (lust takes slices, Vecs, arrays, and their std iterators)"));
+                return ERROR;
+            }
+            None => {
+                let tn = self.tn(at);
+                self.err("L0612", self.span(args[1]), format!("`{tn}` is not an iterator lust can splice in"), "Pass an iterator, a slice, an array, or a Vec.");
+                return ERROR;
+            }
+        };
+        let item = self.iter_item(it);
+        if !self.unify(item, elem) {
+            self.mismatch(self.span(args[1]), elem, item);
+            return ERROR;
+        }
+        self.check_packed_borrow(recv, name_span);
+        self.out.drain_ranges.push((e, form));
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::VecSplice, derefs, autoref: Autoref::RefMut });
+        UNIT
+    }
+
+    /// True for the replacement iterators `splice` takes: std
+    /// `TrustedLen` kinds with an exact size hint.
+    fn splice_trusted(&mut self, t: Ty) -> bool {
+        use crate::ty::iter::IterKind as K;
+        let t = self.deep(t);
+        match crate::ty::iter::iter_parts(&self.tys, t) {
+            Some((K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::ArrayIntoIter, _)) => true,
+            Some((K::Copied | K::Cloned | K::Map | K::Rev | K::Enumerate, a)) => self.splice_trusted(a[0]),
+            _ => false,
+        }
     }
 
     fn slice_bail(&mut self, args: &[ExprId]) -> Ty {

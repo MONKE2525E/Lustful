@@ -1670,7 +1670,7 @@ impl<'p> Ctx<'p> {
     /// `IntoIterator`: an iterator as itself, `&X`/`&mut X` over a
     /// Vec, slice, or array as a slice iterator, a Vec by value as
     /// `vec::IntoIter`. None for other types.
-    fn into_iter_ty(&mut self, t: Ty) -> Option<Ty> {
+    pub(super) fn into_iter_ty(&mut self, t: Ty) -> Option<Ty> {
         // A collection iterator struct chains as its inner iterator.
         if let Some(inner) = self.p.collection_iter_inner(&mut self.tys, t) {
             return Some(inner);

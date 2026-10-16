@@ -22,6 +22,7 @@ use crate::ty::iter::{self as it, IterKind};
 use crate::ty::*;
 
 mod char_range;
+mod splice;
 
 type R = Result<(), String>;
 
@@ -55,6 +56,7 @@ fn expands(b: Builtin) -> bool {
             | B::RangeIsEmpty
             | B::RangeContains
             | B::VecResizeWith
+            | B::VecSplice
             | B::RangeInclStart
             | B::RangeInclEnd
             | B::IterMap
@@ -1149,6 +1151,11 @@ impl Ex<'_, '_> {
                 self.goto(lp);
                 self.cur = join;
                 self.drop_local(fl);
+                self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
+            }
+            B::VecSplice => {
+                let (v, st, sv, et, ev, rw) = (arg()?, arg()?, arg()?, arg()?, arg()?, arg()?);
+                self.splice(v, [st, sv, et, ev], rw)?;
                 self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
             }
             B::RangeIsEmpty | B::RangeInclStart | B::RangeInclEnd => {

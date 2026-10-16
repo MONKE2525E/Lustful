@@ -3337,6 +3337,50 @@ impl<'p> Lower<'p> {
         self.call_into(CallTarget::Builtin(b), vec![Operand::Move(Place::local(t)), stag, sval, etag, eval], d, span);
     }
 
+    /// `v.splice(range, items);` (R4): like `drain_into`, the Vec's
+    /// `&mut` (two-phase) and the range's four words, then the
+    /// replacement value; the call expands in lower/iter/splice.rs.
+    fn splice_into(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], derefs: u8, dest: Option<&Place>, span: Span) {
+        let Some(form) = self.ck.drain_range(e) else { return };
+        let root = self.deref_steps(e, recv, span);
+        let root_ty = match &root {
+            Some(pl) => self.body.locals[pl.local as usize].ty,
+            None => self.ty(recv),
+        };
+        let recv_ty = self.peel(root_ty, derefs);
+        let pl = Self::derefs(
+            match &root {
+                Some(pl) => pl.clone(),
+                None => self.place_for_mut(recv),
+            },
+            derefs,
+        );
+        let mt = self.ref_ty(true, recv_ty);
+        let t = self.temp(mt);
+        let rw_ty = self.ty(args[1]);
+        let rw = self.temp(rw_ty);
+        let two_phase = root.is_none() && !pl.proj.iter().any(|x| matches!(x, Proj::Index(_)));
+        let bounds = if two_phase {
+            let st = self.ref_ty(false, recv_ty);
+            let reserve = self.temp(st);
+            self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
+            let bounds = self.drain_bounds(e, args[0], form, span);
+            self.expr_into(args[1], Some(&Place::local(rw)));
+            self.push(StmtKind::FakeRead(reserve), span);
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            bounds
+        } else {
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            let bounds = self.drain_bounds(e, args[0], form, span);
+            self.expr_into(args[1], Some(&Place::local(rw)));
+            bounds
+        };
+        let (stag, sval, etag, eval) = bounds;
+        let rw_op = self.operand_from(Place::local(rw), rw_ty);
+        let d = self.call_dest(dest, self.ty(e));
+        self.call_into(CallTarget::Builtin(Builtin::VecSplice), vec![Operand::Move(Place::local(t)), stag, sval, etag, eval, rw_op], d, span);
+    }
+
     /// `[T]::copy_within`: like `drain_into`, the receiver's `&mut`
     /// and the range bounds as four words, then the destination
     /// index. The reservation is two-phase only on a slice place:
@@ -4195,6 +4239,10 @@ impl<'p> Lower<'p> {
         }
         if let Res::BuiltinMethod { b: Builtin::VecDrain | Builtin::StringDrain, derefs, .. } = self.ck.res(e) {
             self.drain_into(e, recv, args, derefs, dest, span);
+            return;
+        }
+        if let Res::BuiltinMethod { b: Builtin::VecSplice, derefs, .. } = self.ck.res(e) {
+            self.splice_into(e, recv, args, derefs, dest, span);
             return;
         }
         if let Res::BuiltinMethod { b: Builtin::SliceCopyWithin | Builtin::VecExtendFromWithin, derefs, .. } = self.ck.res(e) {

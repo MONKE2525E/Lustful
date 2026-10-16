@@ -148,6 +148,45 @@ impl FnGen<'_, '_> {
                 let _ = write!(self.out, "{body}");
                 "((lust_Unit){})".into()
             }
+            // The `splice` steps on its `vec::Drain` (lower/iter/splice.rs).
+            B::SpliceBegin | B::SpliceReserve | B::SpliceGap | B::SplicePut | B::SpliceMoveTail => {
+                let CTy::Ref(dt) = &tys[0] else { unreachable!() };
+                let CTy::VecDrain(e) = &**dt else { unreachable!() };
+                let et = ctype(e);
+                let (p, dv) = (self.tmp(), self.tmp());
+                let _ = writeln!(self.out, "    lust_VecDrain *{p} = {}; lust_Vec *{dv} = (lust_Vec *){p}->vec;", vals[0]);
+                match b {
+                    // `drain.by_ref().for_each(drop)`; the tail length.
+                    B::SpliceBegin => {
+                        if needs_drop_c(self.p, e) {
+                            self.want(Glue::Drop, e);
+                            let i = self.tmp();
+                            let _ = writeln!(self.out, "    for (uint64_t {i} = {p}->front; {i} < {p}->back; {i}++) drop_{}(&(({et}*){dv}->ptr)[{i}]);", mangle(e));
+                        }
+                        let _ = writeln!(self.out, "    {p}->front = {p}->back;");
+                        format!("{p}->tail_len")
+                    }
+                    B::SpliceReserve => {
+                        let _ = writeln!(self.out, "    lust_vec_reserve({dv}, {}, sizeof({et}), _Alignof({et}));", vals[1]);
+                        "((lust_Unit){})".into()
+                    }
+                    B::SpliceGap => format!("({p}->start < {p}->tail_start)"),
+                    B::SplicePut => {
+                        let _ = writeln!(self.out, "    (({et}*){dv}->ptr)[{p}->start] = {}; {p}->start++; {dv}->len = {p}->start;", vals[1]);
+                        "((lust_Unit){})".into()
+                    }
+                    _ => {
+                        // `move_tail(n)`: `buf.reserve(tail_start + tail_len, n)`,
+                        // then the tail moves up by n.
+                        let (old, n) = (self.tmp(), &vals[1]);
+                        let _ = writeln!(
+                            self.out,
+                            "    uint64_t {old} = {dv}->len; {dv}->len = {p}->tail_start + {p}->tail_len;\n    lust_vec_reserve({dv}, {n}, sizeof({et}), _Alignof({et})); {dv}->len = {old};\n    lust_memmove((({et}*){dv}->ptr) + {p}->tail_start + {n}, (({et}*){dv}->ptr) + {p}->tail_start, {p}->tail_len * sizeof({et})); {p}->tail_start += {n};"
+                        );
+                        "((lust_Unit){})".into()
+                    }
+                }
+            }
             _ => return None,
         })
     }
