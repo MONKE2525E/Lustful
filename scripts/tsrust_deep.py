@@ -12,8 +12,18 @@ The copy is scratch: nothing here is a fork change. Fix the causes in lust or in
 then run the plain census (scripts/tsrust-full.sh).
 
 Usage: tsrust_deep.py --fork DIR --lust PATH --work DIR [--only a,b] [--max-rounds N]
+                       [--rustc] [--save-clean FILE.tgz]
 Targets default to the three library crates in dependency order (goport_util,
 goport_lsproto, ts_goport). Output: <work>/deep.json and a ranked table on stdout.
+
+--rustc makes a clean fork that BOTH compilers accept (scripts/tsedit.py edits it): when lust
+accepts a target, `cargo check` it with lust's dev features too, remove the items that hold
+rustc's errors (cause `rustc:<code>`), and go on. A rustc-only error on code lust accepts is a
+census artefact (an item a removal left half used) or a lust false accept: the run prints them
+as `tsrust-deep: rustc-only` lines. All targets then run again until one pass removes nothing,
+because a later target's removals can break an earlier one (shared files).
+--save-clean writes the files of the pruned copy that differ from the fork as a tar.gz (unpack
+it over a fork tree to get the clean fork).
 """
 import argparse
 import json
@@ -50,6 +60,36 @@ def errors(lust, t, work, env):
         ln = sp.get("line", 0) if f and prune.located(f, sp) else 0
         out.append((f, ln, d.get("code", "?"), d.get("message", "")))
     return r.returncode, out, r.stderr
+
+
+def rustc_errors(t, work, copy):
+    """`cargo check` of one target in the copy: (rc, located errors as (file, line, code, msg))."""
+    env = dict(os.environ, CARGO_TARGET_DIR=str(work / "rustc-target"))
+    r = subprocess.run(tsrust_full.cargo_check_cmd(t, copy), cwd=copy, env=env, capture_output=True, text=True, timeout=3600)
+    out = []
+    for line in r.stderr.splitlines():
+        m = re.match(r"^(.+?\.rs):(\d+):(\d+): error(\[E\d+\])?: (.*)$", line)
+        if m:
+            out.append((str((copy / m.group(1)).resolve()), int(m.group(2)), (m.group(4) or "").strip("[]") or "E????", m.group(5)))
+    return r.returncode, out, r.stderr
+
+
+def save_clean(fork, copy, dest):
+    """tar.gz of the copy's files that differ from the fork (paths relative to the fork root)."""
+    import tarfile
+
+    changed = []
+    for p in sorted(copy.rglob("*.rs")):
+        rel = p.relative_to(copy)
+        if "target" in rel.parts:
+            continue
+        orig = fork / rel
+        if not orig.exists() or orig.read_bytes() != p.read_bytes():
+            changed.append(rel)
+    with tarfile.open(dest, "w:gz") as tf:
+        for rel in changed:
+            tf.add(copy / rel, arcname=str(rel))
+    print(f"tsrust-deep: clean fork: {len(changed)} changed files in {dest}", flush=True)
 
 
 def in_item(err, cache):
@@ -115,6 +155,8 @@ def main():
     ap.add_argument("--work", required=True, type=Path)
     ap.add_argument("--only", default=",".join(DEFAULT))
     ap.add_argument("--max-rounds", type=int, default=200)
+    ap.add_argument("--rustc", action="store_true", help="also prune until cargo check accepts each target")
+    ap.add_argument("--save-clean", default="", help="write the changed files of the pruned copy to this tar.gz")
     a = ap.parse_args()
     prune.build_items_tool()
     work = a.work.resolve()
@@ -130,12 +172,34 @@ def main():
     # pruning, rustc can reject the copy (a removed item whose only user is cfg'd out for lust).
     for name in a.only.split(","):
         errors(a.lust, by_name[name], work, env)
+    for pass_no in range(1, (4 if a.rustc else 1) + 1):
+        pass_start = len(removed)
+        one_pass(a, by_name, work, copy, env, removed, cause_of_name, status, pass_no)
+        if len(removed) == pass_start:
+            break
+    if a.save_clean:
+        save_clean(a.fork.resolve(), copy, Path(a.save_clean).resolve())
+    report(removed, status, copy, work)
+
+
+def one_pass(a, by_name, work, copy, env, removed, cause_of_name, status, pass_no):
+    """One run over the targets: prune each until it checks (or stops). Rounds after the first
+    pass only start when the target fails again."""
     for name in a.only.split(","):
         t = by_name[name]
         for rnd in range(1, a.max_rounds + 1):
             rc, errs, stderr = errors(a.lust, t, work, env)
+            tool = "lust"
+            if rc == 0 and a.rustc:
+                rc, errs, stderr = rustc_errors(t, work, copy)
+                tool = "rustc"
+                for e in errs:
+                    print(f"tsrust-deep: rustc-only {name}: {os.path.relpath(e[0], copy)}:{e[1]} {e[2]} {e[3][:160]}", flush=True)
+                if rc != 0 and not errs:
+                    status[name] = f"stopped: cargo check exit {rc} with no located error: {stderr.strip()[-300:]}"
+                    break
             if rc == 0:
-                status[name] = f"ok after {rnd - 1} rounds"
+                status[name] = f"ok after {rnd - 1} rounds" + (f" (pass {pass_no})" if pass_no > 1 else "")
                 break
             if not errs:
                 status[name] = f"stopped: exit {rc} with no diagnostic: {tsrust_full.crash_reason({'stderr': stderr, 'rc': rc})}"
@@ -158,7 +222,7 @@ def main():
                 continue
             before = len(removed)
             try:
-                prune.prune_round(located, "lust", removed, copy, [], lambda c, m: None)
+                prune.prune_round(located, tool, removed, copy, [], lambda c, m: None)
             except SystemExit as e:
                 status[name] = f"stopped: {e}"
                 break
@@ -166,6 +230,8 @@ def main():
                 status[name] = f"stopped: nothing removed for {errs[0][2]} {errs[0][3][:120]}"
                 break
             for r in removed[before:]:
+                if tool == "rustc":
+                    r["code"] = f"rustc:{r['code']}"
                 key = (r["code"], tsrust_full.norm_message(r["message"], copy).removeprefix("unlocated: "))
                 parent = next((cause_of_name[n] for n in names_in(r["message"]) if n in cause_of_name), None)
                 r["cause"] = list(parent or key)
@@ -176,6 +242,10 @@ def main():
         else:
             status[name] = f"stopped: {a.max_rounds} rounds"
         print(f"tsrust-deep: {name}: {status[name]}", flush=True)
+
+
+def report(removed, status, copy, work):
+    """deep.json and the ranked cause table."""
     causes = {}
     for r in removed:
         c = causes.setdefault(tuple(r["cause"]), {"own": 0, "cascade": 0, "items": 0, "files": set(), "example": f"{r['file']} `{r['name']}`"})

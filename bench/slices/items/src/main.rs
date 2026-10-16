@@ -6,6 +6,15 @@
 //! slice-items --tests <root.rs>: every `#[test]` fn in the module tree (scripts/tsrust_build.py):
 //! `test <file> <fn line> <module path>::<name> <ignore 0|1> <returns a value 0|1>`, after it
 //! one `mod <file> <line> <private 0|1> <name>` per module on its path (the line of `mod`).
+//! slice-items --sites <file.rs>: edit sites for scripts/tsedit.py, one per line:
+//!   `fn ol oc cl cc sig_line paren_l paren_c ret_l ret_c where_l where_c n_inputs flags name tparams`
+//!   (body braces, the `)` that closes the inputs, the end of the return type, the `where`
+//!   keyword; 0 0 when absent; flags: g generic type params, m inherent impl method, t trait
+//!   impl method, d trait default body, s self receiver, r returns `impl Trait`, c const,
+//!   a async, u unsafe, n nested in a fn body, x under a cfg or test attribute, `-` for none;
+//!   tparams: the fn's own type params, comma separated, `-` for none)
+//!   `derive line depth kind name generic traits` (a one-line `#[derive(..)]` on a struct
+//!   or enum; depth = inline mod depth, generic 0/1, traits comma separated)
 //!
 //! bench/slices/prune.py removes the innermost item that holds a lust or
 //! rustc error. Removable units: items at file level and inside inline
@@ -38,6 +47,13 @@ fn main() {
             tests(&parse(p).items, p, steps, &mut out);
         }
         print!("{out}");
+        return;
+    }
+    if args.len() == 3 && args[1] == "--sites" {
+        let file = parse(Path::new(&args[2]));
+        let mut v = Sites::default();
+        syn::visit::visit_file(&mut v, &file);
+        print!("{}", v.out);
         return;
     }
     if args.len() == 3 && args[1] == "--bodies" {
@@ -260,5 +276,146 @@ impl<'a> syn::visit::Visit<'a> for Bodies {
             self.body(b, f.sig.span().start().line);
         }
         syn::visit::visit_trait_item_fn(self, f);
+    }
+}
+
+/// Collects edit sites for `--sites` (scripts/tsedit.py picks its one-fn edits from them).
+#[derive(Default)]
+struct Sites {
+    out: String,
+    /// Inline `mod` depth, fn-body depth, and cfg/test attribute depth of the walk.
+    mods: usize,
+    fns: usize,
+    cfg: usize,
+    /// The enclosing impl: 'm' inherent, 't' trait impl; the enclosing trait: 'd'.
+    owner: Option<char>,
+}
+
+/// True for `#[cfg(..)]`, `#[cfg_attr(..)]`, and `#[test]`.
+fn cfg_like(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr") || a.path().is_ident("test"))
+}
+
+fn lc(s: proc_macro2::LineColumn) -> String {
+    format!("{} {}", s.line, s.column + 1)
+}
+
+impl Sites {
+    fn site(&mut self, attrs: &[syn::Attribute], sig: &syn::Signature, block: &syn::Block) {
+        let (o, c) = (block.brace_token.span.open().start(), block.brace_token.span.close().start());
+        let paren = sig.paren_token.span.close().start();
+        let ret = match &sig.output {
+            syn::ReturnType::Type(_, ty) => lc(ty.span().end()),
+            syn::ReturnType::Default => "0 0".into(),
+        };
+        let wh = sig.generics.where_clause.as_ref().map_or("0 0".into(), |w| lc(w.where_token.span.start()));
+        let tparams: Vec<String> = sig.generics.type_params().map(|t| t.ident.to_string()).collect();
+        let mut flags = String::new();
+        let mut flag = |on: bool, f: char| {
+            if on {
+                flags.push(f)
+            }
+        };
+        flag(!tparams.is_empty(), 'g');
+        if let Some(k) = self.owner {
+            flag(true, k);
+        }
+        flag(sig.receiver().is_some(), 's');
+        flag(matches!(&sig.output, syn::ReturnType::Type(_, ty) if matches!(**ty, syn::Type::ImplTrait(_))), 'r');
+        flag(sig.constness.is_some(), 'c');
+        flag(sig.asyncness.is_some(), 'a');
+        flag(sig.unsafety.is_some(), 'u');
+        flag(self.fns > 0, 'n');
+        flag(self.cfg > 0 || cfg_like(attrs), 'x');
+        let flags = if flags.is_empty() { "-".into() } else { flags };
+        let tp = if tparams.is_empty() { "-".into() } else { tparams.join(",") };
+        self.out.push_str(&format!(
+            "fn {} {} {} {} {} {} {} {flags} {} {tp}\n",
+            lc(o),
+            lc(c),
+            sig.span().start().line,
+            lc(paren),
+            ret,
+            wh,
+            sig.inputs.len(),
+            sig.ident
+        ));
+    }
+
+    fn derive(&mut self, attrs: &[syn::Attribute], kind: &str, name: &syn::Ident, generics: &syn::Generics) {
+        for a in attrs.iter().filter(|a| a.path().is_ident("derive")) {
+            let (s, e) = (a.span().start(), a.span().end());
+            let Ok(paths) = a.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated) else {
+                continue;
+            };
+            if s.line != e.line || paths.is_empty() {
+                continue;
+            }
+            let traits: Vec<String> =
+                paths.iter().map(|p| p.segments.iter().map(|g| g.ident.to_string()).collect::<Vec<_>>().join("::")).collect();
+            let generic = generics.params.iter().any(|p| !matches!(p, syn::GenericParam::Lifetime(_))) as u8;
+            let x = if self.cfg > 0 || self.fns > 0 || cfg_like(attrs) { "x" } else { "" };
+            self.out.push_str(&format!("derive {} {} {kind}{x} {name} {generic} {}\n", s.line, self.mods, traits.join(",")));
+        }
+    }
+
+    /// Runs `f` one level deeper in the cfg count when `attrs` has a cfg-like attribute.
+    fn under<F: FnOnce(&mut Self)>(&mut self, attrs: &[syn::Attribute], f: F) {
+        let c = cfg_like(attrs) as usize;
+        self.cfg += c;
+        f(self);
+        self.cfg -= c;
+    }
+}
+
+impl<'a> syn::visit::Visit<'a> for Sites {
+    fn visit_item_mod(&mut self, m: &'a syn::ItemMod) {
+        self.mods += 1;
+        self.under(&m.attrs, |v| syn::visit::visit_item_mod(v, m));
+        self.mods -= 1;
+    }
+    fn visit_item_impl(&mut self, i: &'a syn::ItemImpl) {
+        let prev = self.owner.replace(if i.trait_.is_some() { 't' } else { 'm' });
+        self.under(&i.attrs, |v| syn::visit::visit_item_impl(v, i));
+        self.owner = prev;
+    }
+    fn visit_item_trait(&mut self, t: &'a syn::ItemTrait) {
+        let prev = self.owner.replace('d');
+        self.under(&t.attrs, |v| syn::visit::visit_item_trait(v, t));
+        self.owner = prev;
+    }
+    fn visit_item_struct(&mut self, s: &'a syn::ItemStruct) {
+        self.derive(&s.attrs, "struct", &s.ident, &s.generics);
+        self.under(&s.attrs, |v| syn::visit::visit_item_struct(v, s));
+    }
+    fn visit_item_enum(&mut self, e: &'a syn::ItemEnum) {
+        self.derive(&e.attrs, "enum", &e.ident, &e.generics);
+        self.under(&e.attrs, |v| syn::visit::visit_item_enum(v, e));
+    }
+    fn visit_item_fn(&mut self, f: &'a syn::ItemFn) {
+        let prev = self.owner.take();
+        self.site(&f.attrs, &f.sig, &f.block);
+        self.fns += 1;
+        self.under(&f.attrs, |v| syn::visit::visit_item_fn(v, f));
+        self.fns -= 1;
+        self.owner = prev;
+    }
+    fn visit_impl_item_fn(&mut self, f: &'a syn::ImplItemFn) {
+        self.site(&f.attrs, &f.sig, &f.block);
+        let prev = self.owner.take();
+        self.fns += 1;
+        self.under(&f.attrs, |v| syn::visit::visit_impl_item_fn(v, f));
+        self.fns -= 1;
+        self.owner = prev;
+    }
+    fn visit_trait_item_fn(&mut self, f: &'a syn::TraitItemFn) {
+        if let Some(b) = &f.default {
+            self.site(&f.attrs, &f.sig, b);
+        }
+        let prev = self.owner.take();
+        self.fns += 1;
+        self.under(&f.attrs, |v| syn::visit::visit_trait_item_fn(v, f));
+        self.fns -= 1;
+        self.owner = prev;
     }
 }

@@ -91,6 +91,32 @@ def lust_cmd(lust, verb, t, out):
     return cmd
 
 
+def cargo_feature_args(t, fork):
+    """Cargo flags that select the features a lust dev check of target `t` uses: the package
+    `default` list minus the fork's .lust.toml `dev-exclude-features` (or its exact
+    `dev-features`), as src/protocol.rs reads them. Used where cargo must check the same
+    cfg as lust (tsrust_deep.py --rustc, scripts/tsedit.py)."""
+    import tomllib
+
+    pkg = tomllib.loads(Path(t["manifest"]).read_text())
+    table = pkg.get("features", {})
+    cfg_path = Path(fork) / ".lust.toml"
+    cfg = tomllib.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    if "dev-features" in cfg:
+        feats = cfg["dev-features"]
+    else:
+        feats = [f for f in table.get("default", []) if f not in cfg.get("dev-exclude-features", [])]
+    args = ["--no-default-features"]
+    return args + ["--features", ",".join(feats)] if feats else args
+
+
+def cargo_check_cmd(t, fork):
+    """`cargo check` of one target with lust's dev features (short messages, offline)."""
+    pkg = t["name"].split(":")[0]
+    sel = ["--lib"] if t["kind"] != "bin" else ["--bin", t["bin"]]
+    return ["cargo", "check", "-p", pkg, *sel, "--offline", "--message-format", "short", *cargo_feature_args(t, fork)]
+
+
 def run_lust(lust, verb, t, out, timeout):
     """One lust check or build. Returns a result dict: status ok | error | hang | crash, and the
     diagnostics. A timeout is a hang, never a reject (BRIEF rule)."""
