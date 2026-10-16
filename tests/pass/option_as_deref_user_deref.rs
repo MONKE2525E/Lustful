@@ -1,6 +1,5 @@
-// expect: L0104
-// A user Deref type: Rust accepts; lust has no Deref impls in its
-// Option source yet.
+// A user Deref type: core's generic `impl<T: Deref> Option<T>` calls
+// the user's `deref`.
 use std::ops::Deref;
 struct W(String);
 impl Deref for W {

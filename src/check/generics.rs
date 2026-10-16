@@ -7962,8 +7962,22 @@ pub fn add_synthetic_impls(p: &mut Program) {
     for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default, lang.partial_eq, lang.partial_ord, lang.ord] {
         insert_synthetic(p, &mut ordinal, tr, STRING, &rhs_of(tr, STRING), g0.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
-    insert_synthetic(p, &mut ordinal, lang.deref, STRING, &[], g0.clone(), vec![(lang.assoc_target, STR)], Synthetic::Lang, false, span);
+    // Deref and DerefMut, as alloc and core have them: String to str,
+    // Vec<T> to [T], &T to T, and &mut T to T (both). Calls of
+    // `deref`/`deref_mut` on these are conversion builtins (check/convert.rs).
     let vec_p0 = p.tys.mk_vec(p0);
+    let slice_p0 = p.tys.intern(TyKind::Slice(p0));
+    for (self_pat, target, g, has_mut) in [
+        (STRING, STR, g0.clone(), true),
+        (vec_p0, slice_p0, one.clone(), true),
+        (ref_p0, p0, one.clone(), false),
+        (mut_p0, p0, one.clone(), true),
+    ] {
+        insert_synthetic(p, &mut ordinal, lang.deref, self_pat, &[], g.clone(), vec![(lang.assoc_target, target)], Synthetic::Lang, false, span);
+        if has_mut {
+            insert_synthetic(p, &mut ordinal, lang.deref_mut, self_pat, &[], g, Vec::new(), Synthetic::Lang, false, span);
+        }
+    }
     let opt_p0 = p.tys.mk_option(p0);
     for (self_pat, with_copy) in [(vec_p0, false), (opt_p0, true)] {
         // `Default` for `Vec<T>` and `Option<T>` holds for every T.

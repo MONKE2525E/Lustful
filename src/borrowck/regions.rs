@@ -7710,6 +7710,36 @@ impl<'b, 'p> Builder<'b, 'p> {
         true
     }
 
+    /// The vars of `<T as Deref>::Target` (assoc `a`, args `pa`) at
+    /// erased type `e` when `T` is a bound param whose erased type is a
+    /// builtin pointer (`&`, `&mut`, Box, Rc, Arc, Cow, a RefCell or lock
+    /// guard): the pointee's own vars inside `T`'s, after the pointer's
+    /// regions. None for anything else (a user impl's target).
+    fn deref_target_vars(&mut self, a: crate::ty::AssocId, pa: crate::ty::ArgsId, e: Ty, binds: &FxMap<u32, Vec<u32>>) -> Option<Vec<u32>> {
+        let p = self.p;
+        if a.0 != p.gx.lang.assoc_target {
+            return None;
+        }
+        let Some(GenericArg::Ty(t)) = p.tys.args(pa).first().copied() else { return None };
+        let TyKind::Param(j) = p.tys.kind(t) else { return None };
+        let (vars, et) = (binds.get(&j.0)?, *self.bind_tys.get(&j.0)?);
+        let tys = &self.body.tys;
+        let (off, inner) = match tys.kind(et) {
+            TyKind::Ref(r, _, inner) => (u32::from(!bound(r)), inner),
+            _ if tys.smart_elem(et).is_some() || crate::check::collect::cow_arg(tys, et).is_some() => {
+                let inner = tys.smart_elem(et).or_else(|| crate::check::collect::cow_arg(tys, et))?;
+                // The pointee is the first type arg, after the Adt's regions.
+                (adt_regions(p, tys, et), inner)
+            }
+            _ => return None,
+        };
+        if inner != e {
+            return None;
+        }
+        let n = self.sc.slots(e);
+        vars.get(off as usize..(off + n) as usize).map(|v| v.to_vec())
+    }
+
     fn inst_walk(&mut self, r: Ty, e: Ty, univ: &[u32], binds: &mut FxMap<u32, Vec<u32>>, out: &mut Vec<u32>) -> bool {
         let tys = &self.p.tys;
         let et = &self.body.tys;
@@ -7756,6 +7786,47 @@ impl<'b, 'p> Builder<'b, 'p> {
                         }
                     }
                 }
+                true
+            }
+            // A projection over the callee's bound type params outside a
+            // trait view (`&'a <T as Deref>::Target` in core's generic
+            // `Option::as_deref`): its regions can only be some of the
+            // params' (an impl's params are fixed by its Self type) or
+            // `'static`. In a covariant place of the return, every param
+            // region outlives its vars (the result lives no longer than
+            // the shortest); in an argument or an invariant place they
+            // are all equal. Neither is looser than rustc's normalized
+            // signature, and the reference's own region stays the
+            // signature's (the opaque rule tied it to a dyn's `'static`).
+            (TyKind::Projection(a, pa), _) => {
+                // `<T as Deref>::Target` over a builtin pointer `T` is its
+                // pointee, region for region: share those vars.
+                if let Some(v) = self.deref_target_vars(a, pa, e, binds) {
+                    out.extend_from_slice(&v);
+                    return true;
+                }
+                let mut src = Vec::new();
+                for g in tys.args(pa).to_vec() {
+                    match g.as_ty().map(|t| tys.kind(t)) {
+                        Some(TyKind::Param(j)) => match binds.get(&j.0) {
+                            Some(v) => src.extend_from_slice(v),
+                            None => return false,
+                        },
+                        Some(_) => return false,
+                        None => {}
+                    }
+                }
+                // With no param regions bound (`S` with `Out = &'static
+                // str`), the projection's regions can only be `'static`:
+                // fresh vars no argument loan reaches.
+                let n = self.sc.slots(e) as usize;
+                let v: Vec<u32> = (0..n).map(|_| self.fresh()).collect();
+                if self.inst_ret && !self.inst_inv.0 {
+                    self.flow_all(&src, &v);
+                } else {
+                    self.equate_all(&src, &v);
+                }
+                out.extend_from_slice(&v);
                 true
             }
             (TyKind::Ref(rr, rm, ri), TyKind::Ref(er, em, ei)) if rm == em => {

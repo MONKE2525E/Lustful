@@ -8,8 +8,8 @@
 // `unsafe` (`unwrap_unchecked` becomes a plain match), and `Pin`.
 // `#[track_caller]` sits where core has it.
 //
-// Not here yet (a call rejects): as_pin_ref, as_pin_mut,
-// unwrap_unchecked, and `as_deref` on a user `Deref` type. `iter`,
+// Not here yet (a call rejects): as_pin_ref, as_pin_mut, and
+// unwrap_unchecked. `iter`,
 // `iter_mut`, and `into_iter` are builtin (check/iter.rs), like the
 // Vec forms.
 
@@ -292,100 +292,23 @@ impl<T> Option<T> {
     }
 }
 
-// `as_deref` and `as_deref_mut`: core has one impl over `T: Deref`;
-// lust has no `Deref` impls for its builtin types yet, so these are
-// that impl at each std `Deref` type lust knows (`String`, `Vec`,
-// `Box`, `Rc`, `Arc`, references). Same results; a user `Deref` type
-// or `Cow` rejects (no method), and an `Option<_>` whose payload is
-// still open rejects as ambiguous (check's lang enum probe).
-impl Option<String> {
-    pub fn as_deref(&self) -> Option<&str> {
-        match *self {
-            Some(ref t) => Some(t.as_str()),
-            None => None,
-        }
-    }
-
-    pub fn as_deref_mut(&mut self) -> Option<&mut str> {
-        match *self {
-            Some(ref mut t) => Some(t.as_mut_str()),
+// `as_deref` and `as_deref_mut`, as core has them: one impl over `T:
+// Deref` (`DerefMut`); `<T as Deref>::Target` is core's `T::Target`.
+// On a builtin `T` the `deref` call is a conversion builtin
+// (check/convert.rs `deref_call`).
+impl<T: core::ops::Deref> Option<T> {
+    pub fn as_deref(&self) -> Option<&<T as core::ops::Deref>::Target> {
+        match self.as_ref() {
+            Some(t) => Some(t.deref()),
             None => None,
         }
     }
 }
 
-impl<T> Option<Vec<T>> {
-    pub fn as_deref(&self) -> Option<&[T]> {
-        match *self {
-            Some(ref t) => Some(t.as_slice()),
-            None => None,
-        }
-    }
-
-    pub fn as_deref_mut(&mut self) -> Option<&mut [T]> {
-        match *self {
-            Some(ref mut t) => Some(t.as_mut_slice()),
-            None => None,
-        }
-    }
-}
-
-impl<T: ?Sized> Option<Box<T>> {
-    pub fn as_deref(&self) -> Option<&T> {
-        match *self {
-            Some(ref t) => Some(&**t),
-            None => None,
-        }
-    }
-
-    pub fn as_deref_mut(&mut self) -> Option<&mut T> {
-        match *self {
-            Some(ref mut t) => Some(&mut **t),
-            None => None,
-        }
-    }
-}
-
-// `Rc` and `Arc` deref only shared (no `DerefMut`), so they have no
-// `as_deref_mut`.
-impl<T: ?Sized> Option<std::rc::Rc<T>> {
-    pub fn as_deref(&self) -> Option<&T> {
-        match *self {
-            Some(ref t) => Some(&**t),
-            None => None,
-        }
-    }
-}
-
-impl<T: ?Sized> Option<std::sync::Arc<T>> {
-    pub fn as_deref(&self) -> Option<&T> {
-        match *self {
-            Some(ref t) => Some(&**t),
-            None => None,
-        }
-    }
-}
-
-impl<T: ?Sized> Option<&T> {
-    pub fn as_deref(&self) -> Option<&T> {
-        match *self {
-            Some(t) => Some(t),
-            None => None,
-        }
-    }
-}
-
-impl<T: ?Sized> Option<&mut T> {
-    pub fn as_deref(&self) -> Option<&T> {
-        match *self {
-            Some(ref t) => Some(&**t),
-            None => None,
-        }
-    }
-
-    pub fn as_deref_mut(&mut self) -> Option<&mut T> {
-        match *self {
-            Some(ref mut t) => Some(&mut **t),
+impl<T: core::ops::DerefMut> Option<T> {
+    pub fn as_deref_mut(&mut self) -> Option<&mut <T as core::ops::Deref>::Target> {
+        match self.as_mut() {
+            Some(t) => Some(t.deref_mut()),
             None => None,
         }
     }

@@ -221,6 +221,9 @@ impl<'p> Ctx<'p> {
             return None;
         }
         let rt = self.deep(rt);
+        if matches!(n, "deref" | "deref_mut") {
+            return self.deref_call(e, recv, rt, n == "deref_mut", name_span);
+        }
         // Self: where the template's pick put it (an instance of a
         // generic body), else one reference peeled (the by-value step of
         // a `&self` method), else the receiver by autoref.
@@ -366,6 +369,122 @@ impl<'p> Ctx<'p> {
         self.check_packed_borrow(recv, name_span);
         self.set_res(e, Res::BuiltinMethod { b, derefs: core_derefs, autoref });
         Some(self.tys.mk_ref(mutable, target))
+    }
+
+    /// `x.deref()` and `x.deref_mut()` on a builtin Self (see
+    /// `builtin_deref_target`): std's impls return `&**self`, which is
+    /// the conversion builtin of `&Self` to `&Target`. Self is the template's pick in an instance, else
+    /// rustc's probe order: at each autoderef step a `&X` (`&mut X`)
+    /// value whose X derefs, then the step itself by autoref. A
+    /// mutable call through a shared reference, `Rc`, or `Arc` is
+    /// left to the other dispatch (rustc rejects it: E0596). User
+    /// Adts resolve their own impls in the generic method search.
+    pub(super) fn deref_call(&mut self, e: ExprId, recv: ExprId, rt: Ty, mutable: bool, name_span: Span) -> Option<Ty> {
+        let lang = self.p.gx.lang;
+        let tr = if mutable { lang.deref_mut } else { lang.deref };
+        let replayed = self.replay_pick(e).filter(|pk| pk.trait_def == tr);
+        let in_scope = super::method::trait_in_scope_pub(self, tr)
+            || self.enclosing_impl_trait_pub() == Some(tr)
+            || self.env().iter().any(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == tr));
+        if replayed.is_none() && !in_scope {
+            return None;
+        }
+        let (self_ty, derefs) = match replayed {
+            Some(pick) => {
+                let mut t = rt;
+                for _ in 0..pick.derefs {
+                    t = match self.tys.kind(t) {
+                        TyKind::Ref(_, _, inner) => self.deep(inner),
+                        _ => self.deep(self.tys.smart_elem(t)?),
+                    };
+                }
+                (t, pick.derefs)
+            }
+            None => self.deref_probe(rt, mutable)?,
+        };
+        let target = self.builtin_deref_target(self_ty, mutable)?;
+        // A Cow derefs through its view builtin; a guard's `ConvDeref`
+        // lowers as a reborrow of its target place (lower.rs).
+        let b = if crate::check::collect::cow_arg(&self.tys, self_ty).is_some() { Builtin::CowDeref } else { self.conv_builtin(self_ty, target) };
+        let autoref = if mutable { Autoref::RefMut } else { Autoref::Ref };
+        self.check_packed_borrow(recv, name_span);
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
+        Some(self.tys.mk_ref(mutable, target))
+    }
+
+    /// The Self type and builtin derefs of a `deref`/`deref_mut` call
+    /// on a receiver of type `rt` (see `deref_call`), in rustc's probe
+    /// order. None when the first step that could hit is a user Adt, a
+    /// parameter, or another type whose impls the generic method search
+    /// answers (`(&w).deref()` is the user's `deref`; `(&&w).deref()` is
+    /// core's `&T` impl, with `&W` as Self).
+    fn deref_probe(&mut self, rt: Ty, mutable: bool) -> Option<(Ty, u8)> {
+        let deferred = |cx: &Self, t: Ty| {
+            matches!(cx.tys.kind(t), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) | TyKind::Dyn(..) | TyKind::Infer(_))
+                || (cx.tys.local_adt(t).is_some() && crate::check::collect::cow_arg(&cx.tys, t).is_none())
+        };
+        let mut t = rt;
+        for d in 0..8u8 {
+            if let TyKind::Ref(_, m, x) = self.tys.kind(t) {
+                let x = self.deep(x);
+                if deferred(self, x) {
+                    return None;
+                }
+                if (!mutable || m.is_mut()) && self.builtin_deref_target(x, mutable).is_some() {
+                    return Some((x, d + 1));
+                }
+            }
+            if deferred(self, t) {
+                return None;
+            }
+            if self.builtin_deref_target(t, mutable).is_some() {
+                return Some((t, d));
+            }
+            t = match self.tys.kind(t) {
+                TyKind::Ref(_, m, x) if !mutable || m.is_mut() => self.deep(x),
+                _ if self.tys.boxed_elem(t).is_some() => self.deep(self.tys.boxed_elem(t)?),
+                _ if !mutable && self.tys.rc_elem(t).is_some() => self.deep(self.tys.rc_elem(t)?),
+                _ => match self.tys.guard_elem(t) {
+                    Some((el, m)) if !mutable || m => self.deep(el),
+                    _ => return None,
+                },
+            };
+        }
+        None
+    }
+
+    /// The `Deref::Target` of a builtin type with a core or std
+    /// `Deref` impl (`DerefMut` when `mutable`): String, Vec, Box,
+    /// Rc, Arc, references, `Cow`, and the `RefCell` and lock guards.
+    /// None for every other type, user Adts included.
+    fn builtin_deref_target(&mut self, t: Ty, mutable: bool) -> Option<Ty> {
+        if let Some(b) = crate::check::collect::cow_arg(&self.tys, t) {
+            return (!mutable).then(|| self.deep(b));
+        }
+        if self.tys.local_adt(t).is_some() {
+            return None;
+        }
+        if let Some((el, m)) = self.tys.guard_elem(t) {
+            return (!mutable || m).then(|| self.deep(el));
+        }
+        match self.tys.kind(t) {
+            TyKind::Ref(_, m, inner) if !mutable || m.is_mut() => return Some(self.deep(inner)),
+            TyKind::Ref(..) => return None,
+            _ => {}
+        }
+        if self.tys.is_string_ty(t) {
+            return Some(STR);
+        }
+        if let Some(el) = self.tys.vec_elem(t) {
+            return Some(self.tys.intern(TyKind::Slice(el)));
+        }
+        if let Some(el) = self.tys.boxed_elem(t) {
+            return Some(self.deep(el));
+        }
+        match self.tys.rc_elem(t) {
+            Some(el) if !mutable => Some(self.deep(el)),
+            _ => None,
+        }
     }
 
     /// The builtin a synthetic conversion impl runs for a deferred

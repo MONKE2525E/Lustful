@@ -14931,6 +14931,18 @@ impl<'p> Ctx<'p> {
         if !builtin_only && let Some(ret) = self.std_shadow_call(e, rt, base, name, name_span, args, &explicit, expected) {
             return ret;
         }
+        // `deref`/`deref_mut` whose first hit in rustc's probe is a std
+        // impl (core's `&T`, Box, Cow, ...) answer before the user and Cow
+        // searches, which would deref further (check/convert.rs).
+        if !builtin_only
+            && turbofish.is_empty()
+            && args.is_empty()
+            && matches!(self.p.interner.get(name), "deref" | "deref_mut")
+            && let drt = self.deep(rt)
+            && let Some(ret) = self.deref_call(e, recv, drt, self.p.interner.get(name) == "deref_mut", name_span)
+        {
+            return ret;
+        }
         // The inherent methods of `core::cmp::Ordering` (no user
         // impl can add inherent methods to it).
         if let Some(ret) = self.ordering_method(e, base, derefs, name, name_span, args) {

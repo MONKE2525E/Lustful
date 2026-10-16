@@ -31,7 +31,6 @@ pub(crate) fn add_std_shadow_impls(p: &mut Program) {
         // `AsRef<U> for &T` and `&mut T` where `T: AsRef<U>`.
         table.push((lang.as_ref, r, vec![u], 2, vec![(lang.as_ref, t, vec![u])]));
         table.push((lang.borrow, r, vec![t], 1, vec![]));
-        table.push((lang.deref, r, vec![], 1, vec![]));
     }
     // `PartialEq<&B> for &A` (and the `&mut` mixes), `PartialOrd` likewise.
     for (a, b) in [(rt, ru), (rt, mu), (mt, ru), (mt, mu)] {
@@ -46,7 +45,6 @@ pub(crate) fn add_std_shadow_impls(p: &mut Program) {
     }
     table.push((lang.as_mut, mt, vec![u], 2, vec![(lang.as_mut, t, vec![u])]));
     table.push((lang.borrow_mut, mt, vec![t], 1, vec![]));
-    table.push((lang.deref_mut, mt, vec![], 1, vec![]));
     // core's `impl<T: ?Sized> !Clone for &mut T`: a user `Clone` for
     // `&mut Local` conflicts with it (rustc E0751).
     table.push((lang.clone, mt, vec![], 1, vec![]));
@@ -62,8 +60,6 @@ pub(crate) fn add_std_shadow_impls(p: &mut Program) {
     table.push((lang.from, rct, vec![bt], 1, vec![]));
     let names = [p.interner.intern("T"), p.interner.intern("U")];
     for (i, (trait_def, self_pat, inputs, n, clauses)) in table.into_iter().enumerate() {
-        // `Deref for &T` and `&mut T` name `Target = T`.
-        let assoc_tys = if trait_def == lang.deref { vec![(lang.assoc_target, t)] } else { Vec::new() };
         let negative = trait_def == lang.clone && self_pat == mt;
         let trait_ref = mk_ref(p, trait_def, self_pat, &inputs);
         let predicates = clauses.into_iter().map(|(d, s, ins)| Predicate::Trait(Binder::plain(mk_ref(p, d, s, &ins)))).collect();
@@ -78,7 +74,7 @@ pub(crate) fn add_std_shadow_impls(p: &mut Program) {
             trait_def,
             trait_ref,
             generics: Generics { parent: None, params, predicates },
-            assoc_tys,
+            assoc_tys: Vec::new(),
             assoc_consts: Vec::new(),
             items: Vec::new(),
             synthetic: Synthetic::Lang,

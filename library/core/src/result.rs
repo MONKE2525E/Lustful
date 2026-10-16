@@ -3,8 +3,8 @@
 // see option.rs in this crate for how the splice works and what is
 // left out of core's forms.
 //
-// Not here yet (a call rejects): unwrap_unchecked,
-// unwrap_err_unchecked, and `as_deref` on a user `Deref` type.
+// Not here yet (a call rejects): unwrap_unchecked and
+// unwrap_err_unchecked.
 // `iter`, `iter_mut`, and `into_iter` are builtin (check/iter.rs).
 
 impl<T, E> Result<T, E> {
@@ -248,53 +248,17 @@ impl<T, E> Result<T, E> {
     }
 }
 
-// `as_deref` and `as_deref_mut` at each std `Deref` type lust knows
-// (see option.rs).
-impl<E> Result<String, E> {
-    pub fn as_deref(&self) -> Result<&str, &E> {
-        match *self {
-            Ok(ref t) => Ok(t.as_str()),
-            Err(ref e) => Err(e),
-        }
-    }
-
-    pub fn as_deref_mut(&mut self) -> Result<&mut str, &mut E> {
-        match *self {
-            Ok(ref mut t) => Ok(t.as_mut_str()),
-            Err(ref mut e) => Err(e),
-        }
+// `as_deref` and `as_deref_mut`, as core has them: one impl over `T:
+// Deref` (`DerefMut`); see option.rs.
+impl<T: core::ops::Deref, E> Result<T, E> {
+    pub fn as_deref(&self) -> Result<&<T as core::ops::Deref>::Target, &E> {
+        self.as_ref().map(|t| t.deref())
     }
 }
 
-impl<T, E> Result<Vec<T>, E> {
-    pub fn as_deref(&self) -> Result<&[T], &E> {
-        match *self {
-            Ok(ref t) => Ok(t.as_slice()),
-            Err(ref e) => Err(e),
-        }
-    }
-
-    pub fn as_deref_mut(&mut self) -> Result<&mut [T], &mut E> {
-        match *self {
-            Ok(ref mut t) => Ok(t.as_mut_slice()),
-            Err(ref mut e) => Err(e),
-        }
-    }
-}
-
-impl<T: ?Sized, E> Result<Box<T>, E> {
-    pub fn as_deref(&self) -> Result<&T, &E> {
-        match *self {
-            Ok(ref t) => Ok(&**t),
-            Err(ref e) => Err(e),
-        }
-    }
-
-    pub fn as_deref_mut(&mut self) -> Result<&mut T, &mut E> {
-        match *self {
-            Ok(ref mut t) => Ok(&mut **t),
-            Err(ref mut e) => Err(e),
-        }
+impl<T: core::ops::DerefMut, E> Result<T, E> {
+    pub fn as_deref_mut(&mut self) -> Result<&mut <T as core::ops::Deref>::Target, &mut E> {
+        self.as_mut().map(|t| t.deref_mut())
     }
 }
 

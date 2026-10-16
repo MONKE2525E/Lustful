@@ -1,4 +1,4 @@
-// expect: L0104
+// expect: L0612
 // `Rc<T>` has no `DerefMut`, so `Option<Rc<T>>` has no `as_deref_mut`.
 use std::rc::Rc;
 fn main() {

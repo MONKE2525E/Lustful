@@ -4339,6 +4339,21 @@ impl<'p> Lower<'p> {
             self.prim_op_into(e, recv, args, dest, span, kind, derefs);
             return;
         }
+        // `guard.deref()` / `guard.deref_mut()` on a `RefCell` or lock
+        // guard (check/convert.rs `deref_call`): a reborrow of the
+        // guard's target place, as `&*guard` lowers.
+        if let Res::BuiltinMethod { b: Builtin::ConvDeref, derefs, autoref } = self.ck.res(e)
+            && args.is_empty()
+            && self.body.tys.guard_elem(self.peel(self.ty(recv), derefs)).is_some()
+        {
+            let m = autoref == Autoref::RefMut;
+            let pl = if m { self.place_for_mut(recv) } else { self.place(recv) };
+            let target = self.peel(self.ty(recv), derefs + 1);
+            let rt = self.ref_ty(m, target);
+            let out = self.call_dest(dest, rt);
+            self.assign(out, Rvalue::Ref(m, Self::derefs(pl, derefs + 1)), span);
+            return;
+        }
         /// What a method call calls once its receiver is in place.
         enum Callee {
             Fn(LocalDefId),
