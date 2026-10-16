@@ -2691,7 +2691,13 @@ pub(crate) fn trait_def_of_path(
             ));
         }
     }
-    let found = if segs.len() == 1 { cx.trait_by_bare_name(interner, last.name) } else { cx.trait_by_name(interner, last.name) };
+    // A checked std path names the std trait: a user trait of the same
+    // name (`trait Sub`) must not take std's `impl core::ops::Sub`.
+    let found = if segs.len() == 1 {
+        cx.trait_by_bare_name(interner, last.name)
+    } else {
+        cx.lang.by_name(interner.get(last.name)).or_else(|| cx.trait_names.get(&last.name).copied())
+    };
     found.ok_or_else(|| {
         let n = crate::intern::source_path(interner.get(last.name));
         let fix = match crate::ty::lang::std_trait_module(&n) {

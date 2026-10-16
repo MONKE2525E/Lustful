@@ -777,7 +777,10 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
     // Std source names no user type (`resolve_cx_in`), so the hidden
     // lifetime test (which reads the user type table) does not apply.
     let std = p.in_lang_methods(imp.span);
-    if !std && let Some(span) = hidden_lifetime(p, imp.self_ty) {
+    // The impl's own type params shadow user types of the same name
+    // (`impl<R: Read> Read for &mut R` with a `struct R<'a>` around).
+    let params: Vec<Sym> = imp.generics.params.iter().filter_map(|g| if let ast::GenericParam::Type { name, .. } = g { Some(*name) } else { None }).collect();
+    if !std && p.shipped_crate_at(imp.span).is_none() && let Some(span) = hidden_lifetime(p, imp.self_ty, &params) {
         errs.push(Diag::new(
             "L0202",
             span,
@@ -961,13 +964,16 @@ fn resolve_item_ty(p: &mut Program, id: ast::TyId, self_ty: Option<Ty>) -> Resul
 
 /// The span of a path to a user Adt with lifetime params that writes none
 /// (a hidden lifetime), anywhere in a written type.
-fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
+fn hidden_lifetime(p: &Program, id: ast::TyId, params: &[Sym]) -> Option<Span> {
     match p.ast.ty(id) {
-        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) => hidden_lifetime(p, *inner),
-        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => hidden_lifetime(p, *inner),
-        TyExpr::Tuple(elems) => elems.iter().find_map(|&e| hidden_lifetime(p, e)),
+        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) => hidden_lifetime(p, *inner, params),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => hidden_lifetime(p, *inner, params),
+        TyExpr::Tuple(elems) => elems.iter().find_map(|&e| hidden_lifetime(p, e, params)),
         TyExpr::Path(segs) => {
             let last = segs.last()?;
+            if segs.len() == 1 && params.contains(&last.name) {
+                return None;
+            }
             let lts = p
                 .type_names
                 .get(&last.name)
@@ -983,7 +989,7 @@ fn hidden_lifetime(p: &Program, id: ast::TyId) -> Option<Span> {
                 return Some(p.ast.ty_span(id));
             }
             segs.iter().find_map(|s| match &s.args {
-                ast::GenericArgs::Angle(a) => a.iter().find_map(|g| if let ast::GenericArg::Type(t) = g { hidden_lifetime(p, *t) } else { None }),
+                ast::GenericArgs::Angle(a) => a.iter().find_map(|g| if let ast::GenericArg::Type(t) = g { hidden_lifetime(p, *t, params) } else { None }),
                 _ => None,
             })
         }
