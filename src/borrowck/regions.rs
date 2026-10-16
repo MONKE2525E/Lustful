@@ -1202,6 +1202,9 @@ pub(super) struct OwnSig {
     /// they must outlive (`OpaqueInfo::outlives`) and its item's regioned
     /// type (`OpaqueInfo::item_out`, `Builder::rpit_item_edges`).
     pub ret_vars: Option<(Vec<Univ>, Option<Ty>)>,
+    /// The universal an elided lifetime in that item type stands for:
+    /// Rust's output elision (`&self`'s, else the one input lifetime).
+    pub ret_elided: Option<Univ>,
     /// Per type param that a dyn coercion in the body unsizes: its index
     /// and the universal that stands for it (`param_univs`).
     pub param_univ: Vec<(u32, Univ)>,
@@ -1519,6 +1522,29 @@ fn params_in(tys: &impl TyIntern, t: Ty, out: &mut Vec<u32>) {
 }
 
 /// The universal of a regioned signature region.
+/// The universal of a fn's elided output lifetime under Rust's elision
+/// rules: `&self`'s (or `&mut self`'s) region, else the one region its
+/// inputs hold. None otherwise (rustc E0106).
+fn output_elision(p: &Program, has_self: bool, sig: &RegionSig) -> Option<Univ> {
+    if has_self
+        && let Some(&p0) = sig.params.first()
+        && let TyKind::Ref(Region::Param(k), _, _) = p.tys.kind(p0)
+    {
+        return Some(k + 1);
+    }
+    let mut rs = Vec::new();
+    for &t in &sig.params {
+        elision_regions(&p.tys, t, &mut rs);
+    }
+    rs.retain(|r| matches!(r, Region::Param(_)));
+    rs.sort_by_key(|r| if let Region::Param(k) = r { *k } else { 0 });
+    rs.dedup();
+    match rs[..] {
+        [Region::Param(k)] => Some(k + 1),
+        _ => None,
+    }
+}
+
 fn univ_of(r: Region, fresh: &mut impl FnMut() -> Univ) -> Univ {
     match r {
         Region::Static => 0,
@@ -1545,6 +1571,7 @@ impl OwnSig {
             call_out: false,
             ret_cap: None,
             ret_vars: None,
+            ret_elided: None,
             param_univ: Vec::new(),
         };
         if closure {
@@ -1609,6 +1636,7 @@ impl OwnSig {
             {
                 let mut none = || 0;
                 own.ret_vars = Some((info.outlives.iter().map(|&r| univ_of(r, &mut none)).collect(), info.item_out));
+                own.ret_elided = sig.and_then(|s| output_elision(p, f.self_kind.is_some(), s));
             }
             ret.push(rc);
             for &r in &ret {
@@ -4676,6 +4704,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if let CallTarget::Builtin(b) = target
                 && self.call_cell(b, &avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(b) = target
+                && self.call_poison(b, &avs, dt, &dv) => {}
+            _ if let CallTarget::Builtin(b) = target
                 && self.call_tls(b, &avs, dt, &dv) => {}
             // A builtin whose only regioned arguments are closures, and whose
             // result does not hold a closure (`cond.then(|| ..)`): the result
@@ -5082,6 +5112,34 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// cell's (`RefMut` invariantly) behind the guard's own region, which
     /// the borrow of the cell outlives. False for any other call (the
     /// caller goes on).
+    /// `PoisonError::into_inner` (and `get_ref`, `get_mut`): the result
+    /// is the error's value (or a borrow of it) with exactly its slots,
+    /// so a guard's borrow does not reach the `'static` object lifetime
+    /// of what it guards (`lock().unwrap_or_else(PoisonError::into_inner)`).
+    fn call_poison(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        use crate::check::sync::SyncOp as S;
+        let crate::check::Builtin::Sync(op @ (S::PoisonIntoInner | S::PoisonGetRef | S::PoisonGetMut)) = b else { return false };
+        let Some((at, av)) = avs.first() else { return false };
+        let tys = &self.body.tys;
+        let (err, ev, outer) = match tys.kind(*at) {
+            TyKind::Ref(_, _, inner) if !av.is_empty() => (inner, av[1..].to_vec(), Some(av[0])),
+            _ => (*at, av.clone(), None),
+        };
+        let Some(g) = tys.adt_first_ty_arg(err) else { return false };
+        if adt_regions(self.p, tys, err) != 0 || ev.len() != self.sc.slots(g) as usize {
+            return false;
+        }
+        match (op, outer, self.body.tys.kind(dt)) {
+            (S::PoisonIntoInner, None, _) => self.relate(g, &ev, dt, dv, Variance::Co),
+            (S::PoisonGetRef | S::PoisonGetMut, Some(o), TyKind::Ref(_, m, inner)) if !dv.is_empty() => {
+                self.edge(o, dv[0]);
+                let v = if m.is_mut() { Variance::Inv } else { Variance::Co };
+                self.relate(g, &ev, inner, &dv[1..], v)
+            }
+            _ => false,
+        }
+    }
+
     fn call_cell(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         use crate::check::Builtin as B;
         if !matches!(
@@ -5368,7 +5426,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             for (&v, &r) in c.iter().zip(&rs) {
                 let mut none = || u32::MAX;
-                let u = univ_of(r, &mut none);
+                let u = if r == Region::Erased { self.own.ret_elided.unwrap_or(u32::MAX) } else { univ_of(r, &mut none) };
                 if u != u32::MAX {
                     self.edge(v, u);
                 }
@@ -7695,6 +7753,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let p = self.p;
         let root = root_fn(p, self.body.fn_id);
         let (s_ins, s_out, univ): (Vec<Ty>, Ty, Vec<u32>) = match self.body.tys.kind(src) {
+            TyKind::FnDef(def, args) if def == crate::ty::prim_fn_def() => return self.flow_prim_item(args, ins, out, binds),
             TyKind::FnDef(def, _) => {
                 let Some(fs) = p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l)) else { return false };
                 let univ: Vec<u32> = (0..fs.n_univ).map(|_| self.fresh()).collect();
@@ -7739,6 +7798,35 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.bound_var = None;
         self.bind_tys = saved;
         ok
+    }
+
+    /// `flow_by_signature` for a primitive builtin method item
+    /// (`check::prim_item_value`): `PoisonError::into_inner` returns its
+    /// error's value, so the output's regions are exactly the input's
+    /// (`unwrap_or_else(PoisonError::into_inner)` keeps a guard's borrow
+    /// out of the `'static` object lifetime it guards). False for the
+    /// others (the conservative flow).
+    fn flow_prim_item(&mut self, args: ArgsId, ins: &[u32], out: u32, binds: &FxMap<u32, Vec<u32>>) -> bool {
+        let code = match self.body.tys.args(args).get(2) {
+            Some(GenericArg::Const(c)) => match self.body.tys.const_kind(*c) {
+                crate::ty::ConstKind::Int(v) => v as u32,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if crate::check::prim_builtin_of_code(code) != Some(crate::check::Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner)) {
+            return false;
+        }
+        let ([e], Some(dst)) = (ins, binds.get(&out)) else { return false };
+        let Some(src) = binds.get(e) else { return false };
+        if src.len() != dst.len() {
+            return false;
+        }
+        for (&a, &b) in src.clone().iter().zip(&dst.clone()) {
+            self.edge(a, b);
+            self.edge(b, a);
+        }
+        true
     }
 
     /// The regioned signature of a type param `F` of this body's fn (its

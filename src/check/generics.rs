@@ -5131,8 +5131,9 @@ pub struct OpaqueInfo {
 }
 
 /// `OpaqueInfo::item_out` and `OpaqueInfo::outlives` of the bounds of a
-/// return-position `impl Trait`. An elided lifetime there gives no item
-/// type (`'_`: no outlives region).
+/// return-position `impl Trait`. An elided lifetime in the item type is
+/// `Region::Erased` (borrowck takes the fn's output elision lifetime,
+/// `output_elision`); `+ '_` gives no outlives region.
 fn rpit_region_bounds(
     ast: &Ast,
     interner: &Interner,
@@ -5144,7 +5145,7 @@ fn rpit_region_bounds(
 ) -> (Option<Ty>, Vec<Region>) {
     let mut ks = scope.clone();
     ks.fn_ptr_free = false;
-    ks.regions = RegionMode::Keep { next: None, elided: None };
+    ks.regions = RegionMode::Keep { next: None, elided: Some(Region::Erased) };
     let (mut item, mut outlives) = (None, Vec::new());
     for b in bounds {
         match b {
