@@ -65,6 +65,13 @@ pub fn slice_try_shape(tys: &impl crate::ty::TyIntern, src: Ty, dst: Ty) -> bool
     }
 }
 
+/// The shape of core's `TryFrom<Vec<T>> for [T; N]` (no
+/// unification), for the solver's `Error` normalization: the error
+/// is the Vec type itself.
+pub fn vec_try_shape(tys: &impl crate::ty::TyIntern, src: Ty, dst: Ty) -> bool {
+    tys.builtin_of(src) == Some(BuiltinTy::Vec) && matches!(tys.kind(dst), TyKind::Array(el, _) if tys.adt_first_ty_arg(src) == Some(el))
+}
+
 /// True for the concrete scalar kinds the pair table covers.
 fn scalar_kind(k: TyKind) -> bool {
     matches!(k, TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
@@ -110,6 +117,31 @@ impl<'p> Ctx<'p> {
         Some(TryErr::Slice)
     }
 
+    /// Core's `TryFrom<Vec<T>> for [T; N]` (no bound on `T`): the
+    /// impl's `Error`, the Vec type itself, with the elements
+    /// unified; None for any other pair.
+    pub(super) fn vec_try_from(&mut self, src: Ty, dst: Ty) -> Option<Ty> {
+        let src = self.deep(src);
+        if self.tys.builtin_of(src) != Some(BuiltinTy::Vec) {
+            return None;
+        }
+        let el = self.tys.adt_first_ty_arg(src)?;
+        let TyKind::Array(el2, _) = self.kind(dst) else { return None };
+        if !self.unify(el, el2) {
+            return None;
+        }
+        Some(src)
+    }
+
+    /// The `Error` type of core's array `TryFrom` pairs: a slice
+    /// source (`slice_try_from`) or a Vec source (`vec_try_from`).
+    pub(super) fn array_try_err(&mut self, src: Ty, dst: Ty) -> Option<Ty> {
+        if let Some(sort) = self.slice_try_from(src, dst) {
+            return Some(self.try_err_ty(sort));
+        }
+        self.vec_try_from(src, dst)
+    }
+
     /// Selection for a `TryFrom` or `TryInto` obligation between
     /// scalar types, ahead of the solver (like numeric `From`):
     /// a checked cast with no impl record behind it. None when
@@ -131,8 +163,7 @@ impl<'p> Ctx<'p> {
         }
         // The slice-to-array pairs, ahead of the scalar table
         // (tf-slice): a checked length test with no impl record.
-        if let Some(sort) = self.slice_try_from(src, dst) {
-            let err_ty = self.try_err_ty(sort);
+        if let Some(err_ty) = self.array_try_err(src, dst) {
             let assoc = if tr.def == lang.try_from { lang.assoc_try_from_error } else { lang.assoc_try_into_error };
             for (a, ga) in self.tys.bindings(tr.bindings).to_vec() {
                 if a == assoc && ga.as_ty().is_some_and(|want| !self.unify(err_ty, want)) {
@@ -178,8 +209,8 @@ impl<'p> Ctx<'p> {
         } else {
             return None;
         };
-        if let Some(sort) = self.slice_try_from(src, dst) {
-            return Some(self.try_err_ty(sort));
+        if let Some(err) = self.array_try_err(src, dst) {
+            return Some(err);
         }
         let (sk, dk) = (self.kind(src), self.kind(dst));
         let sort = scalar_try_from(sk, dk)?;
@@ -223,10 +254,9 @@ impl<'p> Ctx<'p> {
         let (sk, dk) = (self.kind(src), self.kind(base));
         // The slice-to-array forms (tf-slice): the same checked
         // cast res, lowered by the destination type.
-        if hint_ok && let Some(sort) = self.slice_try_from(src, base) {
+        if hint_ok && let Some(err) = self.array_try_err(src, base) {
             self.set_res(callee, Res::TryFromCast);
             self.set_res(e, Res::TryFromCast);
-            let err = self.try_err_ty(sort);
             return Some(self.tys.mk_result(base, err));
         }
         if hint_ok && scalar_kind(dk) {
@@ -351,7 +381,7 @@ impl<'p> Ctx<'p> {
         let hint = hint.filter(|h| h.def == lang.try_into)?;
         let dst = self.deep(self.tys.args(hint.args).get(1).and_then(|g| g.as_ty())?);
         let (sk, dk) = (self.kind(base), self.kind(dst));
-        if let Some(sort) = self.slice_try_from(base, dst) {
+        if let Some(err) = self.array_try_err(base, dst) {
             let src = self.expr(args[0], Some(base));
             if !self.unify(src, base) {
                 self.mismatch(span, base, src);
@@ -359,7 +389,6 @@ impl<'p> Ctx<'p> {
             }
             self.set_res(callee, Res::TryFromCast);
             self.set_res(e, Res::TryFromCast);
-            let err = self.try_err_ty(sort);
             return Some(self.tys.mk_result(dst, err));
         }
         if !scalar_kind(sk) || !scalar_kind(dk) {
@@ -548,6 +577,71 @@ impl<'p> Ctx<'p> {
         let slice_err = self.try_err_ty(TryErr::Slice);
         let bindings = self.tys.intern_bindings(&[(lang.assoc_try_into_error, GenericArg::Ty(slice_err))]);
         let tr = TraitRef { def: lang.try_into, args: args_id, bindings };
+        self.obl.push_trait_at(tr, name_span, 0);
+        method::defer_trait_method(self, e, tr, name, Vec::new(), derefs, Autoref::None);
+        self.set_res(e, Res::PrimOp { kind: PrimOpKind::TryIntoCast, derefs });
+        Some(self.tys.mk_result(dst, err))
+    }
+
+    /// `vec.try_into()` to an array target: core's `TryFrom<Vec<T>>
+    /// for [T; N]`, the checked cast res lowered by the destination
+    /// type, with the Vec back in `Err` on a length miss. Only a Vec
+    /// value receiver (rustc picks the blanket `TryInto` at the
+    /// first autoderef step, so `(&v).try_into()` is no Vec pair).
+    /// None for any other receiver or a known non-array target, so
+    /// the trait search runs (user `TryFrom<Vec<..>>` impls).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn vec_try_into_method(
+        &mut self,
+        e: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+        turbofish: &[ast::GenericArg],
+        expected: Option<Ty>,
+        builtin_only: bool,
+    ) -> Option<Ty> {
+        let p = self.p;
+        let lang = &p.gx.lang;
+        if self.name(name) != "try_into" || !turbofish.is_empty() || derefs > 0 || self.tys.builtin_of(base) != Some(BuiltinTy::Vec) {
+            return None;
+        }
+        let replayed = self
+            .replayed_trait_ref(e, lang.try_into)
+            .and_then(|r| self.tys.args(r.args).get(1).and_then(|g| g.as_ty()))
+            .map(|t| self.deep(t));
+        let exp_pair = expected.map(|t| self.deep(t)).and_then(|t| self.tys.result_args(t));
+        let known = replayed.or_else(|| exp_pair.map(|(ok, _)| self.deep(ok)));
+        if let Some(dst) = known {
+            if !matches!(self.kind(dst), TyKind::Array(..)) {
+                return None;
+            }
+            let Some(err) = self.vec_try_from(base, dst) else {
+                let (sn, dn) = (self.tn(base), self.tn(dst));
+                self.err("L0612", name_span, format!("no impl of `TryFrom<{sn}>` for `{dn}`"), "Change the target type.");
+                return Some(ERROR);
+            };
+            if !builtin_only && self.prim_lang_guard(name, name_span, args, lang.try_into, base) {
+                return Some(ERROR);
+            }
+            self.check_args(&[], args, name_span);
+            self.set_res(e, Res::PrimOp { kind: PrimOpKind::TryIntoCast, derefs });
+            return Some(self.tys.mk_result(dst, err));
+        }
+        // The target is a later use's to fix, as the scalar form: the
+        // error stays the trait's projection, and the body end either
+        // keeps this cast (an array target) or re-points the call at
+        // a user `TryFrom<Vec<..>>` impl fn.
+        if !args.is_empty() {
+            self.check_args(&[], args, name_span);
+        }
+        let dst = self.new_var(false);
+        let proj_args = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(dst)]);
+        let err = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_try_into_error), proj_args));
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(dst)]);
+        let tr = TraitRef { def: lang.try_into, args: args_id, bindings: EMPTY_BINDINGS };
         self.obl.push_trait_at(tr, name_span, 0);
         method::defer_trait_method(self, e, tr, name, Vec::new(), derefs, Autoref::None);
         self.set_res(e, Res::PrimOp { kind: PrimOpKind::TryIntoCast, derefs });

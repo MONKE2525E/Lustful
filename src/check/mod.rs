@@ -576,6 +576,10 @@ pub enum Builtin {
     /// destination `Result` type tells the array length and form;
     /// emitted at the call terminator in cgen, like `DefaultGlue`.
     SliceTryInto,
+    /// Core's `TryFrom<Vec<T>> for [T; N]` (check/tryfrom.rs): the
+    /// elements move into the array and the buffer frees, or the
+    /// Vec moves into `Err`; emitted at the call terminator.
+    VecTryInto,
     /// The safe raw pointer surface (w-cinterop): `core::ptr::from_ref`
     /// and `from_mut` (the reference value as a raw pointer).
     PtrFromRef,
@@ -14723,6 +14727,10 @@ impl<'p> Ctx<'p> {
         }
         // `try_into()` from a slice to an array target (check/tryfrom.rs).
         if let Some(ret) = self.slice_try_into_method(e, rt, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
+            return ret;
+        }
+        // `try_into()` from a Vec to an array target (check/tryfrom.rs).
+        if let Some(ret) = self.vec_try_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
             return ret;
         }
         // `into_iter()` on a value that is its own iterator.

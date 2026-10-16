@@ -2752,6 +2752,29 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    if ({len} == {n}) {{ {ok_assign} {ok_d} }} else {{ {err_f} = {te}; {err_d} }}");
                 t
             }
+            // Core's `TryFrom<Vec<T>> for [T; N]`: on a length match the
+            // elements move into the array and the emptied Vec drops
+            // (its buffer frees); else the Vec moves into `Err`.
+            CallTarget::Builtin(Builtin::VecTryInto) => {
+                let (sv, sct) = self.operand(&args[0], loc, post);
+                let CTy::Result(ok, err) = dest_cty.clone() else { unreachable!() };
+                let CTy::Array(el, n) = &*ok else { unreachable!() };
+                let n = *n;
+                let res = CTy::Result(ok.clone(), err);
+                collect_types(&res, &mut self.sig_types);
+                self.want(Glue::Drop, &sct);
+                let (t, v, i) = (self.tmp(), self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
+                let elc = ctype(el);
+                let _ = writeln!(self.out, "    {} {t}; lust_Vec {v} = {sv};", ctype(&res));
+                let _ = writeln!(
+                    self.out,
+                    "    if ({v}.len == {n}) {{ for (uint64_t {i} = 0; {i} < {n}; {i}++) {ok_f}.v[{i}] = (({elc}*){v}.ptr)[{i}]; {v}.len = 0; drop_{}(&{v}); {ok_d} }} else {{ {err_f} = {v}; {err_d} }}",
+                    mangle(&sct)
+                );
+                t
+            }
             CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::ChanTrySend)) => self.chan_try_send(args, dest_cty, loc, post),
             CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::AvailPar)) => self.avail_par(dest_cty, loc, post),
             // `MaybeUninit::uninit` and `zeroed` (TRIAGE T5): a
@@ -4321,6 +4344,7 @@ impl FnGen<'_, '_> {
             }
             B::DefaultGlue => unreachable!("the default glue call is emitted at its call terminator"),
             B::SliceTryInto => unreachable!("the slice-to-array call is emitted at its call terminator"),
+            B::VecTryInto => unreachable!("the Vec-to-array call is emitted at its call terminator"),
             B::TlsWith
             | B::TlsTryWith
             | B::TlsWithBorrow

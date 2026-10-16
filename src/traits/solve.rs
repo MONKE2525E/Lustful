@@ -1122,6 +1122,9 @@ impl<'g> SolveCx for PureCx<'g> {
         if crate::check::tryfrom::slice_try_shape(&self.tys, src, dst) {
             return Some(g::try_from_slice_error_ty(&mut self.tys));
         }
+        if crate::check::tryfrom::vec_try_shape(&self.tys, src, dst) {
+            return Some(src);
+        }
         let (sk, dk) = (self.tys.kind(src), self.tys.kind(dst));
         let sort = crate::check::tryfrom::scalar_try_from(sk, dk)?;
         Some(match sort {

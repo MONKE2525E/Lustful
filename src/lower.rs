@@ -3790,6 +3790,11 @@ impl<'p> Lower<'p> {
             TyKind::Ref(_, _, i) => matches!(self.kind(i), TyKind::Array(..)),
             _ => false,
         };
+        if matches!(self.kind(dst_ty), TyKind::Array(..)) && self.body.tys.builtin_of(src_ty) == Some(crate::ty::BuiltinTy::Vec) {
+            // Core's `TryFrom<Vec<T>> for [T; N]`: the Vec moves in.
+            self.call_into(CallTarget::Builtin(Builtin::VecTryInto), vec![Operand::Move(Place::local(s))], d, span);
+            return;
+        }
         if err_def == Some(gdef::try_from_slice_error_def()) || (dst_arrayish && matches!(self.kind(src_ty), TyKind::Slice(_) | TyKind::Array(..) | TyKind::Ref(..))) {
             // A slice-to-array conversion (tf-slice): an array
             // source first becomes its slice; the destination type
