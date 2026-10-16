@@ -116,7 +116,7 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &Checked) -> Option<Diag> {
 /// True when `attrs` raise none of `names` to an error: an `allow`,
 /// `warn`, or `expect` names one. (`deny` and `forbid` of a lint lust
 /// does not otherwise check are rejected at parse, L0531.)
-fn leveled(p: &Program, attrs: &[Attr], names: &[&str]) -> bool {
+pub(crate) fn leveled(p: &Program, attrs: &[Attr], names: &[&str]) -> bool {
     fn has(trees: &[crate::lexer::TokenTree], p: &Program, names: &[&str]) -> bool {
         trees.iter().any(|t| match t {
             crate::lexer::TokenTree::Token(tok) => matches!(tok.tok, crate::lexer::Tok::Ident(s) if names.contains(&p.interner.get(s))),

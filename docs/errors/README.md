@@ -87,6 +87,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0617](L0617.md) | a type here needs an outlives bound that does not hold |
 | [L0621](L0621.md) | associated items are not supported yet |
 | [L0621](L0621.md) | associated consts are not supported yet |
+| [L0622](L0622.md) | `Self::V` is both a variant and an associated type |
 | [L0630](L0630.md) | outside the bounded const evaluator |
 | [L0631](L0631.md) | non-const call in a const context |
 | [L0632](L0632.md) | const and static items are not supported yet |

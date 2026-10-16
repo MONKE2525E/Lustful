@@ -74,7 +74,8 @@ prints "reserved, not yet emitted".
 | L0618-L0619 | Traits and inference | W-TRAITS-CORE | reserved | |
 | L0620 | Associated items | W-TRAITS-CORE | reserved | L0620 GAT |
 | L0621 | Associated items | W-TRAITS-CORE | in use | Associated item, binding, or qualified path is not supported yet (S3b parser reject) |
-| L0622-L0629 | Associated items | W-TRAITS-CORE | reserved | |
+| L0622 | Associated items | fx-traitdepth | in use | `Self::V` is both an enum variant and an associated type (rustc `ambiguous_associated_items`) |
+| L0623-L0629 | Associated items | W-TRAITS-CORE | reserved | |
 | L0630-L0631 | Const eval | W-CORELANG | in use | L0630 outside the bounded evaluator, L0631 non-const call in a const context |
 | L0632 | Const eval | W-CORELANG | in use | Const or static item, const fn, or const generic form is not supported yet (S3b parser reject) |
 | L0633 | Const eval | W-CORELANG | in use | Static or non-structural constant used in a pattern |

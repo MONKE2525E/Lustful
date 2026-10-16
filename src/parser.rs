@@ -76,8 +76,8 @@ pub struct Parser<'a> {
     /// True while parsing an `if` or `while` condition, where `let` may
     /// appear as a chain element.
     let_ok: bool,
-    /// `#[allow(..)]` attributes of enclosing scopes (crate and module
-    /// inner attrs, outer attrs on enclosing `mod`/`impl`/`trait` items,
+    /// `#[allow(..)]`, `#[warn(..)]`, and `#[expect(..)]` attributes of
+    /// enclosing scopes (crate and module inner attrs, outer attrs on enclosing `mod`/`impl`/`trait` items,
     /// impl and trait inner attrs). Every `FnDef` parsed inherits a copy,
     /// which is how the overflow lint sees a scope-level allow. Frames
     /// are length marks: push by extending, pop by truncating.
@@ -858,10 +858,13 @@ fn vis_not_permitted(span: Span) -> Diag {
     )
 }
 
-/// True when `attr` is a plain `#[allow(..)]` (the only attribute the
-/// parser propagates from an enclosing scope onto each `FnDef` in it).
+/// True when `attr` lowers a lint: `#[allow(..)]`, `#[warn(..)]`, or
+/// `#[expect(..)]` (the attributes the parser propagates from an enclosing
+/// scope onto each `FnDef` in it). A deny-by-default lint at warn no longer
+/// fails the build, and an unmet expectation is only a warning. `deny` and
+/// `forbid` of a rustc lint are L0531, so they never reach a lint here.
 fn is_allow(attr: &Attr, known: &Known) -> bool {
-    attr.path.len() == 1 && attr.path[0].name == known.allow
+    attr.path.len() == 1 && [known.allow, known.warn, known.expect].contains(&attr.path[0].name)
 }
 
 /// A token's name for error messages. Never shows the payload, so internal ids (interned

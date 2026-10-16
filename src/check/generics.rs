@@ -13307,6 +13307,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     check_supertrait_cycles(p, errs);
     check_impl_obligations(p, errs);
     crate::check::where_overflow::check_impls(p, errs);
+    crate::check::ambig_assoc::check(p, errs);
     check_copy_impls(p, errs);
     check_derive_bounds(p, errs);
     check_deferred_debug_fields(p, errs);

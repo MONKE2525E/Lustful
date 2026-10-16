@@ -2,6 +2,7 @@
 // integer-literal variables. Output is a set of side tables that lowering reads.
 // Signature collection runs before body checking, in `collect`.
 pub mod alias_path;
+pub mod ambig_assoc;
 pub mod assoc_eval;
 pub mod any;
 pub mod caller;
@@ -1750,6 +1751,9 @@ struct LoopCtx {
 struct Ctx<'p> {
     p: &'p Program,
     f: &'p FnInfo,
+    /// The crate's recursion limit (128 unless `#![recursion_limit]`):
+    /// nested trait obligations overflow at this depth, as in rustc.
+    recursion_limit: usize,
     /// The module this fn is defined in (root without the resolver),
     /// for field visibility checks (ARCH 1.5).
     module: crate::ty::defs::ModuleId,
@@ -2261,6 +2265,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
     let mut cx = Ctx {
         p,
         f,
+        recursion_limit: where_overflow::recursion_limit(p),
         module: defining_module(p, fid),
         tys: Tys::new(&p.tys),
         vars: Vec::new(),
@@ -2705,11 +2710,12 @@ struct KLint {
     stmt_allow_panic: u32,
 }
 
-/// True when an attribute is `#[allow(<name>)]` or `#[expect(<name>)]`
-/// (possibly one of several): both silence the lint, and an expectation
-/// the code does not meet is only a warning in rustc.
+/// True when an attribute is `#[allow(<name>)]`, `#[expect(<name>)]`, or
+/// `#[warn(<name>)]` (possibly one of several): each lowers a deny-by-default
+/// lint so it no longer fails the build, and an expectation the code does
+/// not meet is only a warning in rustc.
 pub fn allow_attr(attr: &ast::Attr, interner: &Interner, name: &str) -> bool {
-    if attr.path.len() != 1 || !matches!(interner.get(attr.path[0].name), "allow" | "expect") {
+    if attr.path.len() != 1 || !matches!(interner.get(attr.path[0].name), "allow" | "expect" | "warn") {
         return false;
     }
     let ast::AttrInput::List(_, trees) = &attr.input else { return false };
@@ -2896,6 +2902,13 @@ impl<'p> Ctx<'p> {
             _ => {}
         }
         None
+    }
+
+    /// True when an `allow`, `warn`, or `expect` of one of `names` covers
+    /// this body: on the fn, or on an enclosing impl, trait, module, or the
+    /// crate (the parser copies those scopes' lint attributes onto the fn).
+    fn lint_lifted(&self, names: &[&str]) -> bool {
+        deny_lints::leveled(self.p, &self.f.def(&self.p.ast).attrs, names)
     }
 
     fn tn(&self, t: Ty) -> String {
@@ -4867,7 +4880,11 @@ impl<'p> Ctx<'p> {
             self.obl.push(obligations::Obligation::DynStatic { span, bck: false });
         }
         if let Selection::Impl { nested, .. } = &sel {
-            if depth >= 64 {
+            // rustc's evaluation depth: the root obligation is depth 0 and
+            // its stack entry counts once more, so a nested obligation at
+            // depth `limit` overflows (an `Option` nested 128 deep asks
+            // `u8: Copy` at depth 128 and fails; 127 deep compiles).
+            if depth as usize + 1 >= self.recursion_limit {
                 return Selection::Overflow;
             }
             for pred in nested.clone() {
@@ -20188,7 +20205,8 @@ impl<'p> Ctx<'p> {
             Pat::Wild => {}
             Pat::Binding { name, mutable, by_ref } => {
                 // A plain binding named the same as a variant of the
-                // matched enum type is an error (rustc E0170): it can
+                // matched enum type is an error (rustc E0170, the
+                // deny-by-default `bindings_with_variant_name`): it can
                 // never mean the variant. `mut`, `ref`, and `@` forms
                 // are plain bindings and stay legal.
                 if !mutable && !by_ref {
@@ -20198,6 +20216,7 @@ impl<'p> Ctx<'p> {
                         && p.adt(a).variants.iter().any(|v| v.name == *name)
                         && self.lookup(*name, span.ctxt).is_none()
                         && !matches!(self.pat_ident(*name), PatIdent::Variant(b, _) if b == a)
+                        && !self.lint_lifted(&["bindings_with_variant_name"])
                     {
                         let (vn, en) = (self.name(*name).to_string(), p.display_path(p.adt(a).name));
                         self.err(
@@ -23597,7 +23616,7 @@ impl<'p> Ctx<'p> {
                 && let TyKind::Float(f) = self.tys.kind(self.out.expr_ty[i])
             {
                 let text = self.p.ast.strings[*s as usize].as_str();
-                if crate::check::collect::float_literal_overflows(text, f) {
+                if crate::check::collect::float_literal_overflows(text, f) && !self.lint_lifted(&["overflowing_literals"]) {
                     let sp = self.span(e);
                     self.err(
                         "L0118",
@@ -23612,7 +23631,7 @@ impl<'p> Ctx<'p> {
             {
                 let neg = self.negated_lits.contains(&e);
                 let max = if neg && it.signed() { it.max128() + 1 } else { it.max128() };
-                if *v > max {
+                if *v > max && !self.lint_lifted(&["overflowing_literals"]) {
                     let s = self.span(e);
                     self.err(
                         "L0118",
