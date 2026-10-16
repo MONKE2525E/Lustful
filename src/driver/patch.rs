@@ -360,6 +360,9 @@ pub(super) struct Patched {
     /// `item_names` as the changed names.
     pub item_scans: Option<Vec<crate::scan::ItemScan>>,
     pub item_names: Vec<Sym>,
+    /// The fns whose header an item edit replaced (`Front::fn_loc`
+    /// indexes): only their heads moved (`compile::slot_update`).
+    pub item_fns: Vec<usize>,
     /// A derive list or trait impl method edit came with it: the slot
     /// update runs in full mode.
     pub item_full: bool,
@@ -1797,6 +1800,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         const_edits,
         item_scans,
         item_names,
+        item_fns,
         item_full: derive_edit || item_full,
         derive_only: derive_edit && edited.is_empty(),
         files,

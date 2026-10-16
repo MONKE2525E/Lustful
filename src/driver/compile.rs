@@ -1273,9 +1273,25 @@ fn slot_update(
     crate_ids: CrateIds,
     scan_of: &dyn Fn(&Front, usize) -> (u64, u32),
     t: &mut Timer,
+    narrow: Option<&[usize]>,
 ) -> Result<(Vec<usize>, Vec<usize>, bool), String> {
     let fn_count = fn_at.len();
-    front.fn_loc = fn_locations(&front.ast);
+    // A proven item patch in signatures mode (`Patched::item_fns`, the
+    // edited fns): each new fn takes its old one's place with the same
+    // outline (item_outline.rs: attributes, qualifiers, name, generic
+    // names), and no item comes or goes. So fn locations, Adt and static
+    // ids, slot keys, and every other fn's head stand; only the edited
+    // fns' heads are new (`narrow_moved` proves it under the oracle).
+    let narrow = narrow.filter(|_| changed_names.is_some() && !front.def_order_loaded && front.fn_loc.len() == fn_count && front.fn_slot.len() >= fn_count);
+    if let Some(edited) = narrow
+        && super::item_oracle::on()
+        && let Some(why) = narrow_moved(front, crate_ids, edited)
+    {
+        super::item_oracle::fail("narrow slot update", "item", why);
+    }
+    if narrow.is_none() {
+        front.fn_loc = fn_locations(&front.ast);
+    }
     let after_reject = std::mem::take(&mut front.walk_after_reject);
     // The derive delta's keyed shortcuts hold only when derive keys are all
     // that moved since the last walk: not after a rejected collect.
@@ -1283,40 +1299,46 @@ fn slot_update(
         caches.derive_only = false;
     }
     let had_env = after_reject || front.env_hash.is_some();
-    // Cached output stays reusable in full mode when every Adt and
-    // static of the last parse keeps its session-local index in
-    // this parse (pure additions append at the end of the session
-    // order), except that growth in a fragile program (a nested
-    // static) can shift derived indices the maps do not name, so
-    // growth there still clears. (Instance Adt ids of a generic
-    // program shift too; a build regenerates C when they move.)
-    let (mut adt_ids, mut static_ids, mut fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
-    // A def order loaded from disk is trusted only when it names at
-    // least one def of this parse (`def_order_stale`).
-    if front.def_order_loaded {
-        front.def_order_loaded = false;
-        if def_order_stale(&front.def_order, &adt_ids, &static_ids) {
-            front.def_order = collect::DefOrder::default();
-            front.def_order_stored = 0;
-            (adt_ids, static_ids, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+    let (changed_names, nonfn_changed, ids_stable) = if narrow.is_some() {
+        front.ids_forced_full = false;
+        (changed_names, false, had_env)
+    } else {
+        // Cached output stays reusable in full mode when every Adt and
+        // static of the last parse keeps its session-local index in
+        // this parse (pure additions append at the end of the session
+        // order), except that growth in a fragile program (a nested
+        // static) can shift derived indices the maps do not name, so
+        // growth there still clears. (Instance Adt ids of a generic
+        // program shift too; a build regenerates C when they move.)
+        let (mut adt_ids, mut static_ids, mut fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+        // A def order loaded from disk is trusted only when it names at
+        // least one def of this parse (`def_order_stale`).
+        if front.def_order_loaded {
+            front.def_order_loaded = false;
+            if def_order_stale(&front.def_order, &adt_ids, &static_ids) {
+                front.def_order = collect::DefOrder::default();
+                front.def_order_stored = 0;
+                (adt_ids, static_ids, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+            }
         }
-    }
-    let grew = adt_ids.len() > front.prev_adt_ids.len() || static_ids.len() > front.prev_static_ids.len();
-    let ids_stable = had_env
-        && ids_kept(&front.prev_adt_ids, &adt_ids)
-        && ids_kept(&front.prev_static_ids, &static_ids)
-        && !(grew && (fragile || front.prev_order_fragile));
-    front.prev_adt_ids = adt_ids;
-    front.prev_static_ids = static_ids;
-    front.prev_order_fragile = fragile;
-    // Bodies and signatures modes keep cached C, which names Adts and
-    // statics by index. A fn or body edit can move those indices when a
-    // body holds a type item or a static (a removed fn or body item
-    // takes its types along, and the ranks after it move down), so such
-    // an edit takes the full path, as an item edit would.
-    front.ids_forced_full = had_env && !ids_stable && changed_names.is_some();
-    let changed_names = if front.ids_forced_full { None } else { changed_names };
-    let nonfn_changed = had_env && nonfn_items_changed(&front.items, &item_scans);
+        let grew = adt_ids.len() > front.prev_adt_ids.len() || static_ids.len() > front.prev_static_ids.len();
+        let ids_stable = had_env
+            && ids_kept(&front.prev_adt_ids, &adt_ids)
+            && ids_kept(&front.prev_static_ids, &static_ids)
+            && !(grew && (fragile || front.prev_order_fragile));
+        front.prev_adt_ids = adt_ids;
+        front.prev_static_ids = static_ids;
+        front.prev_order_fragile = fragile;
+        // Bodies and signatures modes keep cached C, which names Adts and
+        // statics by index. A fn or body edit can move those indices when a
+        // body holds a type item or a static (a removed fn or body item
+        // takes its types along, and the ranks after it move down), so such
+        // an edit takes the full path, as an item edit would.
+        front.ids_forced_full = had_env && !ids_stable && changed_names.is_some();
+        let changed_names = if front.ids_forced_full { None } else { changed_names };
+        let nonfn_changed = had_env && nonfn_items_changed(&front.items, &item_scans);
+        (changed_names, nonfn_changed, ids_stable)
+    };
     t.lap("slots: def ids");
     front.env_hash = Some(env);
     front.items = item_scans;
@@ -1417,29 +1439,40 @@ fn slot_update(
     // a removed function's slot is emptied. A known hash with a different path
     // text is a hash collision: stop with an internal error (section 1.7). The
     // same path twice is a duplicate definition, which `collect` reports.
-    let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
-    t.lap("slots: fn keys");
     let mut live = vec![false; front.slot_of.len()];
-    let mut fn_slot = Vec::with_capacity(keys.len());
-    for k in &keys {
-        if let Err(c) = def::insert_path(&mut front.slot_paths, k.disk, &k.path) {
-            return Err(c.to_string());
-        }
-        let slot = match front.slot_of.get(&k.disk) {
-            Some(&slot) => slot,
-            None => {
-                let slot = front.slot_of.len() as u32;
-                front.slot_of.insert(k.disk, slot);
-                slot
+    let keys = if narrow.is_some() {
+        front.fn_slot.truncate(fn_count);
+        for &slot in &front.fn_slot {
+            if let Some(l) = live.get_mut(slot as usize) {
+                *l = true;
             }
-        };
-        if slot as usize >= live.len() {
-            live.resize(slot as usize + 1, false);
         }
-        live[slot as usize] = true;
-        fn_slot.push(slot);
-    }
-    front.fn_slot = fn_slot;
+        None
+    } else {
+        let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
+        t.lap("slots: fn keys");
+        let mut fn_slot = Vec::with_capacity(keys.len());
+        for k in &keys {
+            if let Err(c) = def::insert_path(&mut front.slot_paths, k.disk, &k.path) {
+                return Err(c.to_string());
+            }
+            let slot = match front.slot_of.get(&k.disk) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = front.slot_of.len() as u32;
+                    front.slot_of.insert(k.disk, slot);
+                    slot
+                }
+            };
+            if slot as usize >= live.len() {
+                live.resize(slot as usize + 1, false);
+            }
+            live[slot as usize] = true;
+            fn_slot.push(slot);
+        }
+        front.fn_slot = fn_slot;
+        Some(keys)
+    };
     front.ast_fn_count = front.fn_slot.len();
     let n_slots = front.slot_of.len();
     caches.ok.resize(n_slots, false);
@@ -1453,7 +1486,7 @@ fn slot_update(
     // Compaction remap: move each live fn's per-slot state from its
     // old slot to its new one, by stable identity.
     if let Some((old_map, mut old)) = remap {
-        for (i, k) in keys.iter().enumerate() {
+        for (i, k) in keys.iter().flatten().enumerate() {
             let Some(&old_slot) = old_map.get(&k.disk) else { continue };
             let old_slot = old_slot as usize;
             let new_slot = front.fn_slot[i] as usize;
@@ -1473,22 +1506,22 @@ fn slot_update(
     // whether it is a const fn (its body feeds const evaluation, so a
     // body edit can move values other items baked in).
     let head_ast = &front.ast;
-    let (heads, is_const): (Vec<u64>, Vec<bool>) = par_map(&front.fn_loc, |&(item, sub)| {
-        let f = match (item != usize::MAX, sub) {
-            (false, Some(k)) => match &head_ast.stmt_items[k].kind {
-                ItemKind::Fn(d) => d,
-                _ => unreachable!("fn_loc out of date"),
-            },
-            _ => match (&head_ast.items[item].kind, sub) {
-                (ItemKind::Fn(d), None) => d,
-                (ItemKind::Impl(imp), Some(k)) => &imp.fns[k],
-                _ => unreachable!("fn_loc out of date"),
-            },
-        };
-        (super::ast_hash::fn_head_hash(head_ast, f), f.qual.is_const)
-    })
-    .into_iter()
-    .unzip();
+    let (heads, is_const): (Vec<u64>, Vec<bool>) = match narrow {
+        Some(edited) => (0..fn_count)
+            .map(|i| {
+                let (item, sub) = front.fn_loc[i];
+                let f = fn_def_at(head_ast, item, sub);
+                let head = if edited.contains(&i) { super::ast_hash::fn_head_hash(head_ast, f) } else { front.slot_head[front.fn_slot[i] as usize] };
+                (head, f.qual.is_const)
+            })
+            .unzip(),
+        None => par_map(&front.fn_loc, |&(item, sub)| {
+            let f = fn_def_at(head_ast, item, sub);
+            (super::ast_hash::fn_head_hash(head_ast, f), f.qual.is_const)
+        })
+        .into_iter()
+        .unzip(),
+    };
     t.lap("slots: assign+heads");
     // Instance slots are not AST fns: the generic block in `compile`
     // decides after collect which are live.
@@ -1534,12 +1567,20 @@ fn slot_update(
     // the tail's count guard catches any remaining disagreement.
     // On disagreement the const-fn question answers "may have
     // changed", so no body is reused on a guess.
+    // A changed name that is a top-level fn's own (not a method's).
+    let own_sig = |i: usize| match &keys {
+        Some(keys) => keys[i].free && names.contains(&keys[i].name),
+        None => {
+            let (item, sub) = front.fn_loc[i];
+            (item == usize::MAX || sub.is_none()) && names.contains(&fn_def_at(&front.ast, item, sub).name)
+        }
+    };
     let paired = fn_count.min(front.fn_loc.len());
     let const_fn_changed = fn_count != front.fn_loc.len()
         || (0..paired).any(|i| {
             is_const[i]
                 && (front.slot_hash.get(front.fn_slot[i] as usize).copied().unwrap_or(0) != scan_of(front, i).0
-                    || (keys[i].free && names.contains(&keys[i].name)))
+                    || own_sig(i))
         });
     let mut changed = Vec::new();
     let mut mention_only = Vec::new();
@@ -1547,7 +1588,7 @@ fn slot_update(
         let slot = front.fn_slot[i] as usize;
         let (hash, _) = scan_of(front, i);
         let idents = &front.chunks[fn_at[i].0].scan.body_idents[fn_at[i].1];
-        let own_sig_changed = keys[i].free && names.contains(&keys[i].name);
+        let own_sig_changed = own_sig(i);
         let mentions = own_sig_changed || idents.iter().any(|s| names.contains(s));
         let body_same = front.slot_hash[slot] == hash;
         // A changed head (parameter names, patterns, types) always
@@ -1596,6 +1637,32 @@ fn slot_update(
     }
     t.lap(if names.is_empty() { "parse (par)" } else { "parse changed chunks" });
     Ok((changed, mention_only, const_fn_changed))
+}
+
+/// Under the oracle: why `slot_update`'s narrow form for a proven item
+/// patch (the edited fns `edited`) would differ from its full form, if it
+/// would: fn locations, Adt or static ids, slot keys, or another fn's
+/// head moved. Reads only.
+fn narrow_moved(front: &Front, crate_ids: CrateIds, edited: &[usize]) -> Option<&'static str> {
+    if fn_locations(&front.ast) != front.fn_loc {
+        return Some("fn locations");
+    }
+    let (adts, statics, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+    if adts != front.prev_adt_ids || statics != front.prev_static_ids || fragile != front.prev_order_fragile {
+        return Some("def ids");
+    }
+    let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
+    if keys.len() != front.fn_loc.len() || keys.iter().zip(&front.fn_slot).any(|(k, &s)| front.slot_of.get(&k.disk) != Some(&s)) {
+        return Some("slot keys");
+    }
+    let head = |i: usize| {
+        let (item, sub) = front.fn_loc[i];
+        super::ast_hash::fn_head_hash(&front.ast, fn_def_at(&front.ast, item, sub))
+    };
+    if (0..front.fn_loc.len()).any(|i| !edited.contains(&i) && head(i) != front.slot_head[front.fn_slot[i] as usize]) {
+        return Some("heads");
+    }
+    None
 }
 
 /// Function names whose signature changed, or that were added or removed, if those are the only
@@ -1961,7 +2028,8 @@ fn resolved_setup(
             let names = (!p.item_full).then_some(names);
             let mode = if p.item_full { "full" } else { "signatures" };
             caches.derive_only = p.derive_only;
-            let slots = slot_update(front, caches, scans, env, names, &fn_at, crate_ids, &scan_of, t);
+            let narrow = (!p.item_full).then_some(&p.item_fns[..]);
+            let slots = slot_update(front, caches, scans, env, names, &fn_at, crate_ids, &scan_of, t, narrow);
             let (changed, mention_only, const_fn) = match slots {
                 Ok(c) => c,
                 Err(e) => {
@@ -2198,7 +2266,7 @@ fn resolved_setup(
     let hashes = body_hashes.clone();
     let scan_of = |_: &Front, i: usize| (hashes[i], lines[i]);
     let (changed, mention_only, const_fn_changed) =
-        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, crate_ids, &scan_of, t) {
+        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, crate_ids, &scan_of, t, None) {
             Ok(c) => c,
             Err(e) => {
                 front.env_hash = None;
@@ -2911,7 +2979,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Arc::make_mut(&mut front.ast).items = items;
         Arc::make_mut(&mut front.ast).stmt_items = stmt_items;
         Arc::make_mut(&mut front.ast).inner_attrs = inner_attrs;
-        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, crate_ids, &scan_of, &mut t) {
+        match slot_update(front, caches, item_scans, env, changed_names, &fn_at, crate_ids, &scan_of, &mut t, None) {
             Ok(c) => c,
             Err(e) => {
                 front.env_hash = None;
@@ -2962,7 +3030,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
         front.ast = Arc::new(ast);
         front.fresh_exprs = front.ast.exprs.len();
-        match slot_update(front, caches, item_scans, env, None, &fn_at, crate_ids, &scan_of, &mut t) {
+        match slot_update(front, caches, item_scans, env, None, &fn_at, crate_ids, &scan_of, &mut t, None) {
             Ok(c) => c,
             Err(e) => {
                 front.env_hash = None;
