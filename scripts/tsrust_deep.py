@@ -124,6 +124,11 @@ def main():
     env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(work / "lust-cache"), CARGO_TARGET_DIR=str(work / "cargo-target"))
     by_name = {t["name"]: t for t in tsrust_full.targets(copy)}
     removed, cause_of_name, status = [], {}, {}
+    # One check of every target on the unpruned copy first: a target that needs a build script
+    # record lust has not stored yet (the tsgo bin) gets it through `cargo check` now. After the
+    # pruning, rustc can reject the copy (a removed item whose only user is cfg'd out for lust).
+    for name in a.only.split(","):
+        errors(a.lust, by_name[name], work, env)
     for name in a.only.split(","):
         t = by_name[name]
         for rnd in range(1, a.max_rounds + 1):
