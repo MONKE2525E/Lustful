@@ -1,6 +1,11 @@
 // `Box::from(x)` whose target a later coercion fixes, as rustc infers it
 // (ts-rust ls/sourcedefinition.rs:657 `Box::leak(Box::from(&*text))`).
+// The leaked values stay reachable from statics, so the sanitized build
+// sees no leak.
 use std::rc::Rc;
+use std::sync::Mutex;
+static KEEP: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+static KEEP_BYTES: Mutex<Vec<&'static [u8]>> = Mutex::new(Vec::new());
 fn take_rc(r: Rc<str>) -> usize {
     r.len()
 }
@@ -19,4 +24,6 @@ fn main() {
     let mut boxes: Vec<Box<str>> = Vec::new();
     boxes.push(Box::from(s));
     println!("{a} {b} {:?} {} {:?}", c, take_rc(r), boxes);
+    KEEP.lock().unwrap().extend([a, b]);
+    KEEP_BYTES.lock().unwrap().push(c);
 }
