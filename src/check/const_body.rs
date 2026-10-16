@@ -41,7 +41,31 @@ struct Site {
 /// program (the module comment). Runs at the end of collect, when the
 /// program has no errors yet; diagnostics go to `errs`.
 pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
-    let sites = sites(p);
+    p.const_body_reads.clear();
+    check_sites(p, errs, &|_| true);
+}
+
+/// `check_all` for a kept program after a header or derive delta: only
+/// the bodies whose stored reads moved check again (all of them when the
+/// program records no reads).
+pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>) {
+    if !p.record_reads {
+        return check_all(p, errs);
+    }
+    let mut memo = crate::intern::FxMap::default();
+    let reads = std::mem::take(&mut p.const_body_reads);
+    let (dirty, clean): (Vec<_>, Vec<_>) = reads.into_iter().partition(|(_, r)| p.reads_dirty_memo(r, &mut memo) != 0);
+    p.const_body_reads = clean;
+    let dirty: Vec<FnLoc> = dirty.into_iter().map(|(l, _)| l).collect();
+    if !dirty.is_empty() {
+        check_sites(p, errs, &|l| dirty.contains(&l));
+    }
+}
+
+/// Checks the initializer bodies `keep` selects and stores their reads.
+fn check_sites(p: &mut Program, errs: &mut Vec<Diag>, keep: &dyn Fn(FnLoc) -> bool) {
+    let mut sites = sites(p);
+    sites.retain(|s| keep(s.loc));
     if sites.is_empty() {
         return;
     }
@@ -50,17 +74,28 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
     let prog: &Program = p;
     let results = crate::pool::par_map(&ids, |&f| {
         let (ck, mut e) = super::check_fn(prog, f);
-        if e.is_empty() {
-            let body = crate::lower::lower(prog, f, ck);
-            e.extend(crate::borrowck::borrowck(prog, &body));
-        } else if !may_borrow(prog, f) {
-            // The evaluator took a value the body checker does not type
-            // (a std item the checker lacks, a hoisted `LazyLock` init):
-            // with no binding, borrow, or static read, the value holds no
-            // borrow error, so the checker's limit is no reason to reject.
-            e.clear();
-        }
-        e
+        let mut reads = if e.is_empty() {
+            // Lowering and borrowck read derive lists too (Copy operands).
+            let ((mut reads, be), noted) = super::derive_delta::scoped(prog.record_reads, || {
+                let body = crate::lower::lower(prog, f, ck);
+                let be = crate::borrowck::borrowck(prog, &body);
+                (body.reads, be)
+            });
+            super::derive_delta::record(prog, &mut reads, &noted);
+            e.extend(be);
+            reads
+        } else {
+            if !may_borrow(prog, f) {
+                // The evaluator took a value the body checker does not
+                // type (a std item the checker lacks, a hoisted `LazyLock`
+                // init): with no binding, borrow, or static read, the
+                // value holds no borrow error, so the checker's limit is
+                // no reason to reject.
+                e.clear();
+            }
+            ck.reads
+        };
+        (prog.fns[f.0 as usize].loc, e, reads)
     });
     p.fns.truncate(base.0);
     p.fn_defs.truncate(base.1);
@@ -72,7 +107,12 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
         p.fn_siblings.remove(&f);
         p.regions.fns.remove(&f);
     }
-    errs.extend(results.into_iter().flatten());
+    for (loc, e, reads) in results {
+        errs.extend(e);
+        if p.record_reads {
+            p.const_body_reads.push((loc, reads));
+        }
+    }
 }
 
 /// The module whose names an initializer body sees: its item's (the

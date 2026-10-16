@@ -2183,6 +2183,18 @@ pub(super) fn reuse_kept(
         }
         return Err(why);
     }
+    // Const and static initializers are checked as bodies at the end of
+    // collect (check/const_body.rs) and read fn signatures and derive
+    // lists as fn bodies do: after a header or derive delta the ones whose
+    // reads moved check again, and any error sends the request to the
+    // full path.
+    if !headers.is_empty() || !derives.is_empty() {
+        let mut errs = Vec::new();
+        crate::check::const_body::check_dirty(&mut p, &mut errs);
+        if !errs.is_empty() {
+            return Err("const body");
+        }
+    }
     // An edited fn that returns `impl Trait`: collect reveals its hidden
     // type from the new body, so the program stands only while that type
     // does (`Front::rpit_edit` sends the request on to collect otherwise).

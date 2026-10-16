@@ -356,6 +356,10 @@ pub struct Program {
     /// For a nested fn, the stmt item indexes of its containing block:
     /// the sibling items its body may name.
     pub fn_siblings: HashMap<LocalDefId, Vec<u32>>,
+    /// The reads of each const and static initializer body's last check
+    /// (check/const_body.rs), by its location: a kept program checks
+    /// again only the bodies whose reads moved (`check_dirty`).
+    pub const_body_reads: Vec<(FnLoc, crate::driver::graph::Reads)>,
     pub type_names: HashMap<Sym, AdtId>,
     /// Adts with a written `Drop` impl, by written name. Const items
     /// evaluate before the impl index and `gx.drop_methods` exist;
@@ -3388,6 +3392,7 @@ pub fn collect_reuse(
         const_values: Vec::new(),
         scope_of_stmt: HashMap::default(),
         fn_siblings: HashMap::default(),
+        const_body_reads: Vec::new(),
         type_names: HashMap::default(),
         drop_adts: Default::default(),
         aliases: HashMap::default(),
