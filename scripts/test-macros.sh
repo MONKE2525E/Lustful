@@ -133,7 +133,9 @@ fi
 lust_pass_case() {
   # $1 fixture, $2 expected .out, $3 expected .expanded, $4 name
   local f=$1 out=$2 expanded=$3 name=$4
-  lust_cc "$LUST" build "$f" -o "$work/$name.lust" 2>"$work/$name.lust.err"
+  # The .out files come from rustc's default build, which unwinds: a
+  # case that catches a panic (catch_unwind) needs lust's unwind mode.
+  lust_cc "$LUST" build -C panic=unwind "$f" -o "$work/$name.lust" 2>"$work/$name.lust.err"
   local st=$?
   if is_timeout "$st"; then
     hang_note "$name" "lust build"
@@ -162,7 +164,7 @@ lust_pass_case() {
   lust_supported=$((lust_supported + 1))
   if [ "${SANITIZE:-0}" = 1 ]; then
     # The daemon is off in this runner, so --emit-c writes every unit.
-    lust_cc "$LUST" build "$f" -o "$work/$name.tmp" --emit-c "$work/$name.san" 2>/dev/null
+    lust_cc "$LUST" build -C panic=unwind "$f" -o "$work/$name.tmp" --emit-c "$work/$name.san" 2>/dev/null
     st=$?
     if is_timeout "$st"; then
       hang_note "$name" "lust build --emit-c"

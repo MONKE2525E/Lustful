@@ -19,9 +19,9 @@ user macro expansion, not pretty-printing:
   expansion, lust consumes them).
 - `#[macro_use]` markers are dropped (lust's expander acts on the
   marker and consumes it, rustc prints it).
-- rustc's `println!`, `format!`, and list-form `vec!` expansions
-  (the `_print`/`_eprint`, alloc format, and alloc boxed forms)
-  map back to the written macro calls.
+- rustc's `println!`, `format!`, `panic!`, and list-form `vec!`
+  expansions (the `_print`/`_eprint`, alloc format, `panic_fmt`, and
+  alloc boxed forms) map back to the written macro calls.
 - Format strings are positionalized (`{}` and `{name}` captures
   become `{0}`, `{1}` with captures appended as arguments), which is
   the form rustc prints and lust keeps as written.
@@ -327,6 +327,30 @@ def map_print(toks):
     return out
 
 
+def map_panic(toks):
+    """rustc's 2024 `panic!` expansion, `{ ::core::panicking::panic_fmt(
+    format_args!(..)); }`, back to the written `panic!(..)`."""
+    head = ["{", "::", "core", "::", "panicking", "::", "panic_fmt", "("]
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i:i + len(head)] == head:
+            parsed = format_args_at(toks, i + len(head))
+            if parsed is not None:
+                inner, end = parsed
+                if toks[end:end + 3] == [")", ";", "}"]:
+                    arm = out[-1:] == ["=>"]
+                    out += ["panic", "!", "("] + inner + [")"]
+                    i = end + 3
+                    # A block arm body takes no comma; the written
+                    # `=> panic!(..)` arm has one before the next arm.
+                    if arm and toks[i:i + 1] not in ([","], ["}"]):
+                        out.append(",")
+                    continue
+        out.append(toks[i])
+        i += 1
+    return out
+
+
 def positionalize(fmt, args):
     """Rewrite one format string to positional placeholders.
 
@@ -376,7 +400,7 @@ def positionalize(fmt, args):
     return "".join(out), captures
 
 
-FORMAT_CALLS = {"println", "print", "eprintln", "eprint", "format", "format_args"}
+FORMAT_CALLS = {"println", "print", "eprintln", "eprint", "format", "format_args", "panic"}
 
 
 def positionalize_calls(toks):
@@ -393,7 +417,7 @@ def positionalize_calls(toks):
                     if made is not None:
                         fmt, captures = made
                         fixed = ['"' + fmt + '"']
-                        rest = pieces[1:] + [[name] for name in captures]
+                        rest = [positionalize_calls(p) for p in pieces[1:]] + [[name] for name in captures]
                         out += [toks[i], "!", "("] + fixed
                         for piece in rest:
                             out += [","] + piece
@@ -618,6 +642,7 @@ def canonicalize(toks):
     toks = map_alloc_vec(toks)
     toks = map_vec_new(toks)
     toks = map_print(toks)
+    toks = map_panic(toks)
     toks = positionalize_calls(toks)
     toks = unwrap_parens(toks)
     toks = drop_arm_commas(toks)

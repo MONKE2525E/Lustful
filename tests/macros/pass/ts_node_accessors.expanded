@@ -65,26 +65,25 @@ _ : :: core :: clone :: AssertParamIsClone < & 'a crate :: astdata :: NodeList >
 automatically_derived ] impl < 'a > :: core :: marker :: Copy for AnyList < 'a > { } impl < 'a >
 AnyList < 'a > { pub fn nodes ( self ) -> & 'a crate :: astdata :: NodeList { match self { Self ::
 Nodes ( l ) => l , Self :: Modifiers ( m ) => & m . list } } pub fn modifiers ( self ) -> & 'a crate
-:: astdata :: ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ ) => { ::
-core :: panicking :: panic_fmt ( format_args ! ( "node list as modifiers" ) ) ; } } } } pub struct
-SelectorSite ; impl SelectorSite { pub const fn new ( ) -> Self { SelectorSite } } pub fn
-static_tier_ast_node ( n : Node ) -> Option < & 'static NodeData > { crate :: static_ast_node ( n )
-} pub fn read_ast_node_miss < R > ( n : Node , read : impl FnOnce ( & NodeData ) -> R ) -> R { read
-( crate :: static_ast_node ( n ) . expect ( "registered node" ) ) } pub fn scoped_node_list_of ( n :
-Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option < Option < AnyList < '_ >
-> > ) -> Option < crate :: NodeList > { let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map (
-| l | crate :: NodeList :: from_ts ( n . file_index ( ) , l . map ( AnyList :: nodes ) ) ) } pub fn
-scoped_modifiers_of ( n : Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option
-< Option < AnyList < '_ > > > ) -> Option < crate :: ModifierList > { let d = crate ::
-static_ast_node ( n ) ? ; sel ( d ) . map ( | l | crate :: ModifierList :: from_ts ( n . file_index
-( ) , l . map ( AnyList :: modifiers ) ) ) } } } pub type LoadedData = Option < & 'static NodeData >
-; pub enum SyntaxKind { ArrayBindingPattern , ArrayType , ArrowFunction , AsExpression ,
-AwaitExpression , BinaryExpression , BindingElement , Block , CallExpression , CallSignature ,
-CallSignatureDeclaration , CaseBlock , CaseClause , CaseOrDefaultClause , CatchClause ,
-ClassDeclaration , ClassExpression , ClassStaticBlockDeclaration , ComputedPropertyName ,
-ConditionalExpression , ConditionalType , ConditionalTypeNode , ConstructSignature ,
-ConstructSignatureDeclaration , Constructor , ConstructorDeclaration , ConstructorType ,
-ConstructorTypeNode , Decorator , DefaultClause , DeleteExpression , DoStatement ,
+:: astdata :: ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ ) =>
+panic ! ( "node list as modifiers" ) } } } pub struct SelectorSite ; impl SelectorSite { pub const
+fn new ( ) -> Self { SelectorSite } } pub fn static_tier_ast_node ( n : Node ) -> Option < & 'static
+NodeData > { crate :: static_ast_node ( n ) } pub fn read_ast_node_miss < R > ( n : Node , read :
+impl FnOnce ( & NodeData ) -> R ) -> R { read ( crate :: static_ast_node ( n ) . expect (
+"registered node" ) ) } pub fn scoped_node_list_of ( n : Node , _site : & SelectorSite , sel : impl
+FnOnce ( & NodeData ) -> Option < Option < AnyList < '_ > > > ) -> Option < crate :: NodeList > {
+let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map ( | l | crate :: NodeList :: from_ts ( n
+. file_index ( ) , l . map ( AnyList :: nodes ) ) ) } pub fn scoped_modifiers_of ( n : Node , _site
+: & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option < Option < AnyList < '_ > > > ) ->
+Option < crate :: ModifierList > { let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map ( | l
+| crate :: ModifierList :: from_ts ( n . file_index ( ) , l . map ( AnyList :: modifiers ) ) ) } } }
+pub type LoadedData = Option < & 'static NodeData > ; pub enum SyntaxKind { ArrayBindingPattern ,
+ArrayType , ArrowFunction , AsExpression , AwaitExpression , BinaryExpression , BindingElement ,
+Block , CallExpression , CallSignature , CallSignatureDeclaration , CaseBlock , CaseClause ,
+CaseOrDefaultClause , CatchClause , ClassDeclaration , ClassExpression , ClassStaticBlockDeclaration
+, ComputedPropertyName , ConditionalExpression , ConditionalType , ConditionalTypeNode ,
+ConstructSignature , ConstructSignatureDeclaration , Constructor , ConstructorDeclaration ,
+ConstructorType , ConstructorTypeNode , Decorator , DefaultClause , DeleteExpression , DoStatement ,
 ElementAccessExpression , EnumDeclaration , EnumMember , ExportAssignment , ExportDeclaration ,
 ExportSpecifier , ExpressionStatement , ExpressionWithTypeArguments , ExternalModuleReference ,
 ForInOrOfStatement , ForInStatement , ForOfStatement , ForStatement , FunctionDeclaration ,
@@ -2173,38 +2172,37 @@ NodeData :: VariableDeclaration ( d ) => { let f = file ; req ( f , d . name ) }
 } } } ) } } } } } # [ doc =
 "`Node::name_data` on `d`, the data of this node that the caller already loaded with `parsed_node_data` (see `data_accessor!`)."
 ] # [ must_use ] fn name_data_in ( self , d : LoadedData ) -> Node { let Some ( d ) = d else {
-return self . name_data ( ) ; } ; let n : Node = self ; if true { if ! is_data_of ( d , n ) { { ::
-core :: panicking :: panic_fmt ( format_args ! ( "data of another node" ) ) ; } } ; } ; { let file :
-usize = n . file_index ( ) ; match d { NodeData :: QualifiedName ( d ) => { let f = file ; if n .
-kind ( ) == SyntaxKind :: PropertyAccessExpression { req ( f , d . right ) } else { Node :: NIL } }
-NodeData :: BindingElement ( d ) => { let f = file ; opt ( f , d . name ) } NodeData ::
-ClassDeclaration ( d ) => { let f = file ; opt ( f , d . name ) } NodeData :: ClassExpression ( d )
-=> { let f = file ; opt ( f , d . name ) } NodeData :: FunctionDeclaration ( d ) => { let f = file ;
-opt ( f , d . name ) } NodeData :: FunctionExpression ( d ) => { let f = file ; opt ( f , d . name )
-} NodeData :: ImportClause ( d ) => { let f = file ; opt ( f , d . name ) } NodeData ::
-JsDocCallbackTag ( d ) => { let f = file ; opt ( f , d . name ) } NodeData :: JsDocLink ( d ) => {
-let f = file ; opt ( f , d . name ) } NodeData :: JsDocLinkCode ( d ) => { let f = file ; opt ( f ,
-d . name ) } NodeData :: JsDocLinkPlain ( d ) => { let f = file ; opt ( f , d . name ) } NodeData ::
-JsDocTypedefTag ( d ) => { let f = file ; opt ( f , d . name ) } NodeData :: EnumDeclaration ( d )
-=> { let f = file ; req ( f , d . name ) } NodeData :: EnumMember ( d ) => { let f = file ; req ( f
-, d . name ) } NodeData :: ExportSpecifier ( d ) => { let f = file ; req ( f , d . name ) } NodeData
-:: GetAccessorDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
-SetAccessorDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: ImportAttribute
-( d ) => { let f = file ; req ( f , d . name ) } NodeData :: ImportEqualsDeclaration ( d ) => { let
-f = file ; req ( f , d . name ) } NodeData :: ImportSpecifier ( d ) => { let f = file ; req ( f , d
-. name ) } NodeData :: InterfaceDeclaration ( d ) => { let f = file ; req ( f , d . name ) }
-NodeData :: JsDocNameReference ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
-JsDocParameterOrPropertyTag ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
-JsxAttribute ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: JsxNamespacedName ( d ) =>
-{ let f = file ; req ( f , d . name ) } NodeData :: MetaProperty ( d ) => { let f = file ; req ( f ,
-d . name ) } NodeData :: MethodDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData
-:: MethodSignatureDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
-ModuleDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: NamedTupleMember ( d
-) => { let f = file ; req ( f , d . name ) } NodeData :: NamespaceExport ( d ) => { let f = file ;
-req ( f , d . name ) } NodeData :: NamespaceExportDeclaration ( d ) => { let f = file ; req ( f , d
-. name ) } NodeData :: NamespaceImport ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
-ParameterDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
-PropertyAccessExpression ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
+return self . name_data ( ) ; } ; let n : Node = self ; if true { if ! is_data_of ( d , n ) { panic
+! ( "data of another node" ) } ; } ; { let file : usize = n . file_index ( ) ; match d { NodeData ::
+QualifiedName ( d ) => { let f = file ; if n . kind ( ) == SyntaxKind :: PropertyAccessExpression {
+req ( f , d . right ) } else { Node :: NIL } } NodeData :: BindingElement ( d ) => { let f = file ;
+opt ( f , d . name ) } NodeData :: ClassDeclaration ( d ) => { let f = file ; opt ( f , d . name ) }
+NodeData :: ClassExpression ( d ) => { let f = file ; opt ( f , d . name ) } NodeData ::
+FunctionDeclaration ( d ) => { let f = file ; opt ( f , d . name ) } NodeData :: FunctionExpression
+( d ) => { let f = file ; opt ( f , d . name ) } NodeData :: ImportClause ( d ) => { let f = file ;
+opt ( f , d . name ) } NodeData :: JsDocCallbackTag ( d ) => { let f = file ; opt ( f , d . name ) }
+NodeData :: JsDocLink ( d ) => { let f = file ; opt ( f , d . name ) } NodeData :: JsDocLinkCode ( d
+) => { let f = file ; opt ( f , d . name ) } NodeData :: JsDocLinkPlain ( d ) => { let f = file ;
+opt ( f , d . name ) } NodeData :: JsDocTypedefTag ( d ) => { let f = file ; opt ( f , d . name ) }
+NodeData :: EnumDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: EnumMember
+( d ) => { let f = file ; req ( f , d . name ) } NodeData :: ExportSpecifier ( d ) => { let f = file
+; req ( f , d . name ) } NodeData :: GetAccessorDeclaration ( d ) => { let f = file ; req ( f , d .
+name ) } NodeData :: SetAccessorDeclaration ( d ) => { let f = file ; req ( f , d . name ) }
+NodeData :: ImportAttribute ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
+ImportEqualsDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: ImportSpecifier
+( d ) => { let f = file ; req ( f , d . name ) } NodeData :: InterfaceDeclaration ( d ) => { let f =
+file ; req ( f , d . name ) } NodeData :: JsDocNameReference ( d ) => { let f = file ; req ( f , d .
+name ) } NodeData :: JsDocParameterOrPropertyTag ( d ) => { let f = file ; req ( f , d . name ) }
+NodeData :: JsxAttribute ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
+JsxNamespacedName ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: MetaProperty ( d ) =>
+{ let f = file ; req ( f , d . name ) } NodeData :: MethodDeclaration ( d ) => { let f = file ; req
+( f , d . name ) } NodeData :: MethodSignatureDeclaration ( d ) => { let f = file ; req ( f , d .
+name ) } NodeData :: ModuleDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
+NamedTupleMember ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: NamespaceExport ( d )
+=> { let f = file ; req ( f , d . name ) } NodeData :: NamespaceExportDeclaration ( d ) => { let f =
+file ; req ( f , d . name ) } NodeData :: NamespaceImport ( d ) => { let f = file ; req ( f , d .
+name ) } NodeData :: ParameterDeclaration ( d ) => { let f = file ; req ( f , d . name ) } NodeData
+:: PropertyAccessExpression ( d ) => { let f = file ; req ( f , d . name ) } NodeData ::
 PropertyAssignment ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: PropertyDeclaration
 ( d ) => { let f = file ; req ( f , d . name ) } NodeData :: PropertySignatureDeclaration ( d ) => {
 let f = file ; req ( f , d . name ) } NodeData :: ShorthandPropertyAssignment ( d ) => { let f =
@@ -2316,15 +2314,14 @@ TypeParameterDeclaration ( d ) => Some ( d . modifiers . as_ref ( ) . map ( AnyL
 , NodeData :: VariableStatement ( d ) => Some ( d . modifiers . as_ref ( ) . map ( AnyList ::
 Modifiers ) ) , _ => None } ) } } } . unwrap_or ( ModifierList :: NIL ) } } } # [ must_use ] pub fn
 modifiers_in ( self , d : LoadedData ) -> ModifierList { let Some ( d ) = d else { return self .
-modifiers ( ) ; } ; if true { if ! is_data_of ( d , self ) { { :: core :: panicking :: panic_fmt (
-format_args ! ( "data of another node" ) ) ; } } ; } ; { let file : usize = self . file_index ( ) ;
-match d { NodeData :: ArrowFunction ( d ) => { let f = file ; mods ( f , & d . modifiers ) }
-NodeData :: BinaryExpression ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData ::
-ClassDeclaration ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData ::
-ClassExpression ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData ::
-ClassStaticBlockDeclaration ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData ::
-ConstructorDeclaration ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData ::
-ConstructorTypeNode ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData ::
+modifiers ( ) ; } ; if true { if ! is_data_of ( d , self ) { panic ! ( "data of another node" ) } ;
+} ; { let file : usize = self . file_index ( ) ; match d { NodeData :: ArrowFunction ( d ) => { let
+f = file ; mods ( f , & d . modifiers ) } NodeData :: BinaryExpression ( d ) => { let f = file ;
+mods ( f , & d . modifiers ) } NodeData :: ClassDeclaration ( d ) => { let f = file ; mods ( f , & d
+. modifiers ) } NodeData :: ClassExpression ( d ) => { let f = file ; mods ( f , & d . modifiers ) }
+NodeData :: ClassStaticBlockDeclaration ( d ) => { let f = file ; mods ( f , & d . modifiers ) }
+NodeData :: ConstructorDeclaration ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData
+:: ConstructorTypeNode ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData ::
 EnumDeclaration ( d ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData :: EnumMember ( d
 ) => { let f = file ; mods ( f , & d . modifiers ) } NodeData :: ExportAssignment ( d ) => { let f =
 file ; mods ( f , & d . modifiers ) } NodeData :: ExportDeclaration ( d ) => { let f = file ; mods (
@@ -2400,22 +2397,22 @@ initializer ) } NodeData :: PropertyAssignment ( d ) => { let f = file ; req ( f
 "`Node::initializer_data` on `d`, the data of this node that the caller already loaded with `parsed_node_data` (see `data_accessor!`)."
 ] # [ must_use ] fn initializer_data_in ( self , d : LoadedData ) -> Node { let Some ( d ) = d else
 { return self . initializer_data ( ) ; } ; let n : Node = self ; if true { if ! is_data_of ( d , n )
-{ { :: core :: panicking :: panic_fmt ( format_args ! ( "data of another node" ) ) ; } } ; } ; { let
-file : usize = n . file_index ( ) ; match d { NodeData :: VariableDeclaration ( d ) => { let f =
-file ; opt ( f , d . initializer ) } NodeData :: ParameterDeclaration ( d ) => { let f = file ; opt
-( f , d . initializer ) } NodeData :: BindingElement ( d ) => { let f = file ; opt ( f , d .
-initializer ) } NodeData :: PropertyDeclaration ( d ) => { let f = file ; opt ( f , d . initializer
-) } NodeData :: EnumMember ( d ) => { let f = file ; opt ( f , d . initializer ) } NodeData ::
-ForStatement ( d ) => { let f = file ; opt ( f , d . initializer ) } NodeData :: JsxAttribute ( d )
-=> { let f = file ; opt ( f , d . initializer ) } NodeData :: PropertySignatureDeclaration ( d ) =>
-{ let f = file ; req ( f , d . initializer ) } NodeData :: PropertyAssignment ( d ) => { let f =
-file ; req ( f , d . initializer ) } NodeData :: ForInOrOfStatement ( d ) => { let f = file ; req (
-f , d . initializer ) } _ => Node :: NIL } } } # [ must_use ] fn postfix_token_data ( self ) -> Node
-{ let n : Node = self ; { let node : Node = n ; if match frozen_store_kind ( node ) { Some ( kind )
-=> kind != SyntaxKind :: Unknown && ! ( kind == SyntaxKind :: MethodDeclaration ) && ! ( kind ==
-SyntaxKind :: ShorthandPropertyAssignment ) && ! ( kind == SyntaxKind :: MethodSignature ) && ! (
-kind == SyntaxKind :: PropertySignature ) && ! ( kind == SyntaxKind :: PropertyAssignment ) && ! (
-kind == SyntaxKind :: PropertyDeclaration ) && ! ( kind == SyntaxKind :: EnumMember ) && ! ( kind ==
+{ panic ! ( "data of another node" ) } ; } ; { let file : usize = n . file_index ( ) ; match d {
+NodeData :: VariableDeclaration ( d ) => { let f = file ; opt ( f , d . initializer ) } NodeData ::
+ParameterDeclaration ( d ) => { let f = file ; opt ( f , d . initializer ) } NodeData ::
+BindingElement ( d ) => { let f = file ; opt ( f , d . initializer ) } NodeData ::
+PropertyDeclaration ( d ) => { let f = file ; opt ( f , d . initializer ) } NodeData :: EnumMember (
+d ) => { let f = file ; opt ( f , d . initializer ) } NodeData :: ForStatement ( d ) => { let f =
+file ; opt ( f , d . initializer ) } NodeData :: JsxAttribute ( d ) => { let f = file ; opt ( f , d
+. initializer ) } NodeData :: PropertySignatureDeclaration ( d ) => { let f = file ; req ( f , d .
+initializer ) } NodeData :: PropertyAssignment ( d ) => { let f = file ; req ( f , d . initializer )
+} NodeData :: ForInOrOfStatement ( d ) => { let f = file ; req ( f , d . initializer ) } _ => Node
+:: NIL } } } # [ must_use ] fn postfix_token_data ( self ) -> Node { let n : Node = self ; { let
+node : Node = n ; if match frozen_store_kind ( node ) { Some ( kind ) => kind != SyntaxKind ::
+Unknown && ! ( kind == SyntaxKind :: MethodDeclaration ) && ! ( kind == SyntaxKind ::
+ShorthandPropertyAssignment ) && ! ( kind == SyntaxKind :: MethodSignature ) && ! ( kind ==
+SyntaxKind :: PropertySignature ) && ! ( kind == SyntaxKind :: PropertyAssignment ) && ! ( kind ==
+SyntaxKind :: PropertyDeclaration ) && ! ( kind == SyntaxKind :: EnumMember ) && ! ( kind ==
 SyntaxKind :: GetAccessor ) && ! ( kind == SyntaxKind :: SetAccessor ) , None => false } { if true {
 if ! ! { let n__ : crate :: core :: Node = node ; match crate :: ast :: synthetic ::
 static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d : & crate :: astdata :: NodeData = data__
@@ -2458,30 +2455,29 @@ Node :: NIL } } } } ) } } } } } # [ doc =
 "`Node::postfix_token_data` on `d`, the data of this node that the caller already loaded with `parsed_node_data` (see `data_accessor!`)."
 ] # [ must_use ] fn postfix_token_data_in ( self , d : LoadedData ) -> Node { let Some ( d ) = d
 else { return self . postfix_token_data ( ) ; } ; let n : Node = self ; if true { if ! is_data_of (
-d , n ) { { :: core :: panicking :: panic_fmt ( format_args ! ( "data of another node" ) ) ; } } ; }
-; { let file : usize = n . file_index ( ) ; match d { NodeData :: MethodDeclaration ( d ) => { let f
-= file ; opt ( f , d . postfix_token ) } NodeData :: ShorthandPropertyAssignment ( d ) => { let f =
-file ; opt ( f , d . postfix_token ) } NodeData :: MethodSignatureDeclaration ( d ) => { let f =
-file ; opt ( f , d . postfix_token ) } NodeData :: PropertySignatureDeclaration ( d ) => { let f =
-file ; opt ( f , d . postfix_token ) } NodeData :: PropertyAssignment ( d ) => { let f = file ; opt
-( f , d . postfix_token ) } NodeData :: PropertyDeclaration ( d ) => { let f = file ; opt ( f , d .
-postfix_token ) } NodeData :: EnumMember ( d ) => { let f = file ; opt ( f , d . postfix_token ) }
-NodeData :: GetAccessorDeclaration ( d ) => { let f = file ; opt ( f , d . postfix_token ) }
-NodeData :: SetAccessorDeclaration ( d ) => { let f = file ; opt ( f , d . postfix_token ) } _ =>
-Node :: NIL } } } # [ must_use ] fn own_question_token ( self ) -> Option < Node > { let n : Node =
-self ; { let node : Node = n ; if match frozen_store_kind ( node ) { Some ( kind ) => kind !=
-SyntaxKind :: Unknown && ! ( kind == SyntaxKind :: Parameter ) && ! ( kind == SyntaxKind ::
-MappedType ) && ! ( kind == SyntaxKind :: NamedTupleMember ) && ! ( kind == SyntaxKind ::
-ConditionalExpression ) , None => false } { if true { if ! ! { let n__ : crate :: core :: Node =
-node ; match crate :: ast :: synthetic :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d
-: & crate :: astdata :: NodeData = data__ ; # [ allow ( non_exhaustive_omitted_patterns ) ] match d
-{ NodeData :: ParameterDeclaration ( _ ) | NodeData :: MappedTypeNode ( _ ) | NodeData ::
-NamedTupleMember ( _ ) | NodeData :: ConditionalExpression ( _ ) => true , _ => false } } None =>
-crate :: ast :: synthetic :: read_ast_node_miss ( n__ , | data__ | { let d : & crate :: astdata ::
-NodeData = data__ ; # [ allow ( non_exhaustive_omitted_patterns ) ] match d { NodeData ::
-ParameterDeclaration ( _ ) | NodeData :: MappedTypeNode ( _ ) | NodeData :: NamedTupleMember ( _ ) |
-NodeData :: ConditionalExpression ( _ ) => true , _ => false } } ) } } { :: core :: panicking ::
-panic (
+d , n ) { panic ! ( "data of another node" ) } ; } ; { let file : usize = n . file_index ( ) ; match
+d { NodeData :: MethodDeclaration ( d ) => { let f = file ; opt ( f , d . postfix_token ) } NodeData
+:: ShorthandPropertyAssignment ( d ) => { let f = file ; opt ( f , d . postfix_token ) } NodeData ::
+MethodSignatureDeclaration ( d ) => { let f = file ; opt ( f , d . postfix_token ) } NodeData ::
+PropertySignatureDeclaration ( d ) => { let f = file ; opt ( f , d . postfix_token ) } NodeData ::
+PropertyAssignment ( d ) => { let f = file ; opt ( f , d . postfix_token ) } NodeData ::
+PropertyDeclaration ( d ) => { let f = file ; opt ( f , d . postfix_token ) } NodeData :: EnumMember
+( d ) => { let f = file ; opt ( f , d . postfix_token ) } NodeData :: GetAccessorDeclaration ( d )
+=> { let f = file ; opt ( f , d . postfix_token ) } NodeData :: SetAccessorDeclaration ( d ) => {
+let f = file ; opt ( f , d . postfix_token ) } _ => Node :: NIL } } } # [ must_use ] fn
+own_question_token ( self ) -> Option < Node > { let n : Node = self ; { let node : Node = n ; if
+match frozen_store_kind ( node ) { Some ( kind ) => kind != SyntaxKind :: Unknown && ! ( kind ==
+SyntaxKind :: Parameter ) && ! ( kind == SyntaxKind :: MappedType ) && ! ( kind == SyntaxKind ::
+NamedTupleMember ) && ! ( kind == SyntaxKind :: ConditionalExpression ) , None => false } { if true
+{ if ! ! { let n__ : crate :: core :: Node = node ; match crate :: ast :: synthetic ::
+static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d : & crate :: astdata :: NodeData = data__
+; # [ allow ( non_exhaustive_omitted_patterns ) ] match d { NodeData :: ParameterDeclaration ( _ ) |
+NodeData :: MappedTypeNode ( _ ) | NodeData :: NamedTupleMember ( _ ) | NodeData ::
+ConditionalExpression ( _ ) => true , _ => false } } None => crate :: ast :: synthetic ::
+read_ast_node_miss ( n__ , | data__ | { let d : & crate :: astdata :: NodeData = data__ ; # [ allow
+( non_exhaustive_omitted_patterns ) ] match d { NodeData :: ParameterDeclaration ( _ ) | NodeData ::
+MappedTypeNode ( _ ) | NodeData :: NamedTupleMember ( _ ) | NodeData :: ConditionalExpression ( _ )
+=> true , _ => false } } ) } } { :: core :: panicking :: panic (
 "assertion failed: !with_data!(node, | d | matches!\n        (d, NodeData :: ParameterDeclaration (_)| NodeData :: MappedTypeNode\n        (_)| NodeData :: NamedTupleMember (_)| NodeData ::\n        ConditionalExpression (_)))"
 ) } ; } ; None } else { { let n__ : crate :: core :: Node = node ; match crate :: ast :: synthetic
 :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d : & crate :: astdata :: NodeData =
@@ -2499,95 +2495,95 @@ some_req ( f , d . question_token ) } _ => None } } } } ) } } } } } # [ doc =
 "`Node::own_question_token` on `d`, the data of this node that the caller already loaded with `parsed_node_data` (see `data_accessor!`)."
 ] # [ must_use ] fn own_question_token_in ( self , d : LoadedData ) -> Option < Node > { let Some (
 d ) = d else { return self . own_question_token ( ) ; } ; let n : Node = self ; if true { if !
-is_data_of ( d , n ) { { :: core :: panicking :: panic_fmt ( format_args ! ( "data of another node"
-) ) ; } } ; } ; { let file : usize = n . file_index ( ) ; match d { NodeData :: ParameterDeclaration
-( d ) => { let f = file ; some_opt ( f , d . question_token ) } NodeData :: MappedTypeNode ( d ) =>
-{ let f = file ; some_opt ( f , d . question_token ) } NodeData :: NamedTupleMember ( d ) => { let f
-= file ; some_opt ( f , d . question_token ) } NodeData :: ConditionalExpression ( d ) => { let f =
-file ; some_req ( f , d . question_token ) } _ => None } } } pub fn parameter_list ( self ) ->
-NodeList { { let node : Node = self ; if match frozen_store_kind ( node ) { Some ( kind ) => kind !=
-SyntaxKind :: Unknown && ! ( kind == SyntaxKind :: ArrowFunction ) && ! ( kind == SyntaxKind ::
-CallSignature ) && ! ( kind == SyntaxKind :: ConstructSignature ) && ! ( kind == SyntaxKind ::
-Constructor ) && ! ( kind == SyntaxKind :: FunctionDeclaration ) && ! ( kind == SyntaxKind ::
-FunctionExpression ) && ! ( kind == SyntaxKind :: GetAccessor ) && ! ( kind == SyntaxKind ::
-SetAccessor ) && ! ( kind == SyntaxKind :: IndexSignature ) && ! ( kind == SyntaxKind ::
-JsDocSignature ) && ! ( kind == SyntaxKind :: MethodDeclaration ) && ! ( kind == SyntaxKind ::
-MethodSignature ) && ! ( kind == SyntaxKind :: FunctionType ) && ! ( kind == SyntaxKind ::
-ConstructorType ) , None => false } { NodeList :: NIL } else { { let n__ : crate :: core :: Node =
-node ; match crate :: ast :: synthetic :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d
-: & 'static crate :: astdata :: NodeData = data__ ; let found : Option < Option < crate :: ast ::
-synthetic :: AnyList < 'static > > > = match d { NodeData :: ArrowFunction ( d ) => Some ( Some (
-AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: CallSignatureDeclaration ( d ) => Some (
-Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: ConstructSignatureDeclaration ( d )
-=> Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: ConstructorDeclaration ( d
-) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: FunctionDeclaration ( d )
-=> Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: FunctionExpression ( d ) =>
-Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: GetAccessorDeclaration ( d )
-=> Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: SetAccessorDeclaration ( d
-) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: IndexSignatureDeclaration
-( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: JsDocSignature ( d )
-=> Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: MethodDeclaration ( d ) =>
-Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: MethodSignatureDeclaration ( d
-) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: FunctionTypeNode ( d ) =>
-Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: ConstructorTypeNode ( d ) =>
-Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , _ => None } ; found . map ( | l | { crate
-:: ast :: NodeList :: from_ts ( n__ . file_index ( ) , l . map ( crate :: ast :: synthetic ::
-AnyList :: nodes ) ) } ) } None => { static SITE : crate :: ast :: synthetic :: SelectorSite = crate
-:: ast :: synthetic :: SelectorSite :: new ( ) ; crate :: ast :: synthetic :: scoped_node_list_of (
-n__ , & SITE , | d | match d { NodeData :: ArrowFunction ( d ) => Some ( Some ( AnyList :: Nodes ( &
-d . parameters ) ) ) , NodeData :: CallSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes
-( & d . parameters ) ) ) , NodeData :: ConstructSignatureDeclaration ( d ) => Some ( Some ( AnyList
-:: Nodes ( & d . parameters ) ) ) , NodeData :: ConstructorDeclaration ( d ) => Some ( Some (
-AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: FunctionDeclaration ( d ) => Some ( Some (
-AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: FunctionExpression ( d ) => Some ( Some (
-AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: GetAccessorDeclaration ( d ) => Some ( Some
-( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: SetAccessorDeclaration ( d ) => Some (
-Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: IndexSignatureDeclaration ( d ) =>
-Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: JsDocSignature ( d ) => Some (
-Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: MethodDeclaration ( d ) => Some (
-Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: MethodSignatureDeclaration ( d ) =>
-Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: FunctionTypeNode ( d ) => Some
-( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData :: ConstructorTypeNode ( d ) => Some (
-Some ( AnyList :: Nodes ( & d . parameters ) ) ) , _ => None } ) } } } . unwrap_or ( NodeList :: NIL
-) } } } pub fn type_argument_list ( self ) -> NodeList { { let n__ : crate :: core :: Node = self ;
-match crate :: ast :: synthetic :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d : &
-'static crate :: astdata :: NodeData = data__ ; let found : Option < Option < crate :: ast ::
-synthetic :: AnyList < 'static > > > = { let file : usize = 0 ; match d { NodeData :: CallExpression
-( d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData ::
-NewExpression ( d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData
-:: TaggedTemplateExpression ( d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments
-) } NodeData :: TypeReferenceNode ( d ) => { let f = file ; sel_type_arguments ( f , & d .
-type_arguments ) } NodeData :: ExpressionWithTypeArguments ( d ) => { let f = file ;
-sel_type_arguments ( f , & d . type_arguments ) } NodeData :: ImportTypeNode ( d ) => { let f = file
-; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: TypeQueryNode ( d ) => { let f =
-file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: JsxOpeningElement ( d ) => {
-let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: JsxSelfClosingElement (
-d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments ) } _ => None } } ; found .
-map ( | l | { crate :: ast :: NodeList :: from_ts ( n__ . file_index ( ) , l . map ( crate :: ast ::
-synthetic :: AnyList :: nodes ) ) } ) } None => { static SITE : crate :: ast :: synthetic ::
-SelectorSite = crate :: ast :: synthetic :: SelectorSite :: new ( ) ; crate :: ast :: synthetic ::
-scoped_node_list_of ( n__ , & SITE , | d | { let file : usize = 0 ; match d { NodeData ::
-CallExpression ( d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData
-:: NewExpression ( d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments ) }
-NodeData :: TaggedTemplateExpression ( d ) => { let f = file ; sel_type_arguments ( f , & d .
-type_arguments ) } NodeData :: TypeReferenceNode ( d ) => { let f = file ; sel_type_arguments ( f ,
-& d . type_arguments ) } NodeData :: ExpressionWithTypeArguments ( d ) => { let f = file ;
-sel_type_arguments ( f , & d . type_arguments ) } NodeData :: ImportTypeNode ( d ) => { let f = file
-; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: TypeQueryNode ( d ) => { let f =
-file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: JsxOpeningElement ( d ) => {
-let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: JsxSelfClosingElement (
-d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments ) } _ => None } } ) } } } .
-unwrap_or ( NodeList :: NIL ) } pub fn question_dot_token ( self ) -> Node { { let node : Node =
+is_data_of ( d , n ) { panic ! ( "data of another node" ) } ; } ; { let file : usize = n .
+file_index ( ) ; match d { NodeData :: ParameterDeclaration ( d ) => { let f = file ; some_opt ( f ,
+d . question_token ) } NodeData :: MappedTypeNode ( d ) => { let f = file ; some_opt ( f , d .
+question_token ) } NodeData :: NamedTupleMember ( d ) => { let f = file ; some_opt ( f , d .
+question_token ) } NodeData :: ConditionalExpression ( d ) => { let f = file ; some_req ( f , d .
+question_token ) } _ => None } } } pub fn parameter_list ( self ) -> NodeList { { let node : Node =
 self ; if match frozen_store_kind ( node ) { Some ( kind ) => kind != SyntaxKind :: Unknown && ! (
-kind == SyntaxKind :: ElementAccessExpression ) && ! ( kind == SyntaxKind ::
-PropertyAccessExpression ) && ! ( kind == SyntaxKind :: CallExpression ) && ! ( kind == SyntaxKind
-:: TaggedTemplateExpression ) , None => false } { if true { if ! ! { let n__ : crate :: core :: Node
-= node ; match crate :: ast :: synthetic :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let
-d : & crate :: astdata :: NodeData = data__ ; # [ allow ( non_exhaustive_omitted_patterns ) ] match
-d { NodeData :: ElementAccessExpression ( _ ) | NodeData :: PropertyAccessExpression ( _ ) |
-NodeData :: CallExpression ( _ ) | NodeData :: TaggedTemplateExpression ( _ ) => true , _ => false }
-} None => crate :: ast :: synthetic :: read_ast_node_miss ( n__ , | data__ | { let d : & crate ::
-astdata :: NodeData = data__ ; # [ allow ( non_exhaustive_omitted_patterns ) ] match d { NodeData ::
+kind == SyntaxKind :: ArrowFunction ) && ! ( kind == SyntaxKind :: CallSignature ) && ! ( kind ==
+SyntaxKind :: ConstructSignature ) && ! ( kind == SyntaxKind :: Constructor ) && ! ( kind ==
+SyntaxKind :: FunctionDeclaration ) && ! ( kind == SyntaxKind :: FunctionExpression ) && ! ( kind ==
+SyntaxKind :: GetAccessor ) && ! ( kind == SyntaxKind :: SetAccessor ) && ! ( kind == SyntaxKind ::
+IndexSignature ) && ! ( kind == SyntaxKind :: JsDocSignature ) && ! ( kind == SyntaxKind ::
+MethodDeclaration ) && ! ( kind == SyntaxKind :: MethodSignature ) && ! ( kind == SyntaxKind ::
+FunctionType ) && ! ( kind == SyntaxKind :: ConstructorType ) , None => false } { NodeList :: NIL }
+else { { let n__ : crate :: core :: Node = node ; match crate :: ast :: synthetic ::
+static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d : & 'static crate :: astdata :: NodeData =
+data__ ; let found : Option < Option < crate :: ast :: synthetic :: AnyList < 'static > > > = match
+d { NodeData :: ArrowFunction ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) ,
+NodeData :: CallSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) )
+) , NodeData :: ConstructSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d .
+parameters ) ) ) , NodeData :: ConstructorDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d
+. parameters ) ) ) , NodeData :: FunctionDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d .
+parameters ) ) ) , NodeData :: FunctionExpression ( d ) => Some ( Some ( AnyList :: Nodes ( & d .
+parameters ) ) ) , NodeData :: GetAccessorDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d
+. parameters ) ) ) , NodeData :: SetAccessorDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( &
+d . parameters ) ) ) , NodeData :: IndexSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes
+( & d . parameters ) ) ) , NodeData :: JsDocSignature ( d ) => Some ( Some ( AnyList :: Nodes ( & d
+. parameters ) ) ) , NodeData :: MethodDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d .
+parameters ) ) ) , NodeData :: MethodSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes (
+& d . parameters ) ) ) , NodeData :: FunctionTypeNode ( d ) => Some ( Some ( AnyList :: Nodes ( & d
+. parameters ) ) ) , NodeData :: ConstructorTypeNode ( d ) => Some ( Some ( AnyList :: Nodes ( & d .
+parameters ) ) ) , _ => None } ; found . map ( | l | { crate :: ast :: NodeList :: from_ts ( n__ .
+file_index ( ) , l . map ( crate :: ast :: synthetic :: AnyList :: nodes ) ) } ) } None => { static
+SITE : crate :: ast :: synthetic :: SelectorSite = crate :: ast :: synthetic :: SelectorSite :: new
+( ) ; crate :: ast :: synthetic :: scoped_node_list_of ( n__ , & SITE , | d | match d { NodeData ::
+ArrowFunction ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData ::
+CallSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) , NodeData
+:: ConstructSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) ,
+NodeData :: ConstructorDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) )
+, NodeData :: FunctionDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) ,
+NodeData :: FunctionExpression ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) ,
+NodeData :: GetAccessorDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) )
+, NodeData :: SetAccessorDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) )
+) , NodeData :: IndexSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters
+) ) ) , NodeData :: JsDocSignature ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) )
+, NodeData :: MethodDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) ,
+NodeData :: MethodSignatureDeclaration ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters )
+) ) , NodeData :: FunctionTypeNode ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) )
+, NodeData :: ConstructorTypeNode ( d ) => Some ( Some ( AnyList :: Nodes ( & d . parameters ) ) ) ,
+_ => None } ) } } } . unwrap_or ( NodeList :: NIL ) } } } pub fn type_argument_list ( self ) ->
+NodeList { { let n__ : crate :: core :: Node = self ; match crate :: ast :: synthetic ::
+static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d : & 'static crate :: astdata :: NodeData =
+data__ ; let found : Option < Option < crate :: ast :: synthetic :: AnyList < 'static > > > = { let
+file : usize = 0 ; match d { NodeData :: CallExpression ( d ) => { let f = file ; sel_type_arguments
+( f , & d . type_arguments ) } NodeData :: NewExpression ( d ) => { let f = file ;
+sel_type_arguments ( f , & d . type_arguments ) } NodeData :: TaggedTemplateExpression ( d ) => {
+let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: TypeReferenceNode ( d )
+=> { let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData ::
+ExpressionWithTypeArguments ( d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments
+) } NodeData :: ImportTypeNode ( d ) => { let f = file ; sel_type_arguments ( f , & d .
+type_arguments ) } NodeData :: TypeQueryNode ( d ) => { let f = file ; sel_type_arguments ( f , & d
+. type_arguments ) } NodeData :: JsxOpeningElement ( d ) => { let f = file ; sel_type_arguments ( f
+, & d . type_arguments ) } NodeData :: JsxSelfClosingElement ( d ) => { let f = file ;
+sel_type_arguments ( f , & d . type_arguments ) } _ => None } } ; found . map ( | l | { crate :: ast
+:: NodeList :: from_ts ( n__ . file_index ( ) , l . map ( crate :: ast :: synthetic :: AnyList ::
+nodes ) ) } ) } None => { static SITE : crate :: ast :: synthetic :: SelectorSite = crate :: ast ::
+synthetic :: SelectorSite :: new ( ) ; crate :: ast :: synthetic :: scoped_node_list_of ( n__ , &
+SITE , | d | { let file : usize = 0 ; match d { NodeData :: CallExpression ( d ) => { let f = file ;
+sel_type_arguments ( f , & d . type_arguments ) } NodeData :: NewExpression ( d ) => { let f = file
+; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: TaggedTemplateExpression ( d ) => {
+let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData :: TypeReferenceNode ( d )
+=> { let f = file ; sel_type_arguments ( f , & d . type_arguments ) } NodeData ::
+ExpressionWithTypeArguments ( d ) => { let f = file ; sel_type_arguments ( f , & d . type_arguments
+) } NodeData :: ImportTypeNode ( d ) => { let f = file ; sel_type_arguments ( f , & d .
+type_arguments ) } NodeData :: TypeQueryNode ( d ) => { let f = file ; sel_type_arguments ( f , & d
+. type_arguments ) } NodeData :: JsxOpeningElement ( d ) => { let f = file ; sel_type_arguments ( f
+, & d . type_arguments ) } NodeData :: JsxSelfClosingElement ( d ) => { let f = file ;
+sel_type_arguments ( f , & d . type_arguments ) } _ => None } } ) } } } . unwrap_or ( NodeList ::
+NIL ) } pub fn question_dot_token ( self ) -> Node { { let node : Node = self ; if match
+frozen_store_kind ( node ) { Some ( kind ) => kind != SyntaxKind :: Unknown && ! ( kind ==
+SyntaxKind :: ElementAccessExpression ) && ! ( kind == SyntaxKind :: PropertyAccessExpression ) && !
+( kind == SyntaxKind :: CallExpression ) && ! ( kind == SyntaxKind :: TaggedTemplateExpression ) ,
+None => false } { if true { if ! ! { let n__ : crate :: core :: Node = node ; match crate :: ast ::
+synthetic :: static_tier_ast_node ( n__ ) { Some ( data__ ) => { let d : & crate :: astdata ::
+NodeData = data__ ; # [ allow ( non_exhaustive_omitted_patterns ) ] match d { NodeData ::
+ElementAccessExpression ( _ ) | NodeData :: PropertyAccessExpression ( _ ) | NodeData ::
+CallExpression ( _ ) | NodeData :: TaggedTemplateExpression ( _ ) => true , _ => false } } None =>
+crate :: ast :: synthetic :: read_ast_node_miss ( n__ , | data__ | { let d : & crate :: astdata ::
+NodeData = data__ ; # [ allow ( non_exhaustive_omitted_patterns ) ] match d { NodeData ::
 ElementAccessExpression ( _ ) | NodeData :: PropertyAccessExpression ( _ ) | NodeData ::
 CallExpression ( _ ) | NodeData :: TaggedTemplateExpression ( _ ) => true , _ => false } } ) } } {
 :: core :: panicking :: panic (

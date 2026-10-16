@@ -65,26 +65,25 @@ core :: clone :: AssertParamIsClone < & 'a crate :: astdata :: NodeList > ; let 
 automatically_derived ] impl < 'a > :: core :: marker :: Copy for AnyList < 'a > { } impl < 'a >
 AnyList < 'a > { pub fn nodes ( self ) -> & 'a crate :: astdata :: NodeList { match self { Self ::
 Nodes ( l ) => l , Self :: Modifiers ( m ) => & m . list } } pub fn modifiers ( self ) -> & 'a crate
-:: astdata :: ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ ) => { ::
-core :: panicking :: panic_fmt ( format_args ! ( "node list as modifiers" ) ) ; } } } } pub struct
-SelectorSite ; impl SelectorSite { pub const fn new ( ) -> Self { SelectorSite } } pub fn
-static_tier_ast_node ( n : Node ) -> Option < & 'static NodeData > { crate :: static_ast_node ( n )
-} pub fn read_ast_node_miss < R > ( n : Node , read : impl FnOnce ( & NodeData ) -> R ) -> R { read
-( crate :: static_ast_node ( n ) . expect ( "registered node" ) ) } pub fn scoped_node_list_of ( n :
-Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option < Option < AnyList < '_ >
-> > ) -> Option < crate :: NodeList > { let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map (
-| l | crate :: NodeList :: from_ts ( n . file_index ( ) , l . map ( AnyList :: nodes ) ) ) } pub fn
-scoped_modifiers_of ( n : Node , _site : & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option
-< Option < AnyList < '_ > > > ) -> Option < crate :: ModifierList > { let d = crate ::
-static_ast_node ( n ) ? ; sel ( d ) . map ( | l | crate :: ModifierList :: from_ts ( n . file_index
-( ) , l . map ( AnyList :: modifiers ) ) ) } } } pub type LoadedData = Option < & 'static NodeData >
-; pub enum SyntaxKind { ArrayBindingPattern , ArrayType , ArrowFunction , AsExpression ,
-AwaitExpression , BinaryExpression , BindingElement , Block , CallExpression , CallSignature ,
-CallSignatureDeclaration , CaseBlock , CaseClause , CaseOrDefaultClause , CatchClause ,
-ClassDeclaration , ClassExpression , ClassStaticBlockDeclaration , ComputedPropertyName ,
-ConditionalExpression , ConditionalType , ConditionalTypeNode , ConstructSignature ,
-ConstructSignatureDeclaration , Constructor , ConstructorDeclaration , ConstructorType ,
-ConstructorTypeNode , Decorator , DefaultClause , DeleteExpression , DoStatement ,
+:: astdata :: ModifierList { match self { Self :: Modifiers ( m ) => m , Self :: Nodes ( _ ) =>
+panic ! ( "node list as modifiers" ) } } } pub struct SelectorSite ; impl SelectorSite { pub const
+fn new ( ) -> Self { SelectorSite } } pub fn static_tier_ast_node ( n : Node ) -> Option < & 'static
+NodeData > { crate :: static_ast_node ( n ) } pub fn read_ast_node_miss < R > ( n : Node , read :
+impl FnOnce ( & NodeData ) -> R ) -> R { read ( crate :: static_ast_node ( n ) . expect (
+"registered node" ) ) } pub fn scoped_node_list_of ( n : Node , _site : & SelectorSite , sel : impl
+FnOnce ( & NodeData ) -> Option < Option < AnyList < '_ > > > ) -> Option < crate :: NodeList > {
+let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map ( | l | crate :: NodeList :: from_ts ( n
+. file_index ( ) , l . map ( AnyList :: nodes ) ) ) } pub fn scoped_modifiers_of ( n : Node , _site
+: & SelectorSite , sel : impl FnOnce ( & NodeData ) -> Option < Option < AnyList < '_ > > > ) ->
+Option < crate :: ModifierList > { let d = crate :: static_ast_node ( n ) ? ; sel ( d ) . map ( | l
+| crate :: ModifierList :: from_ts ( n . file_index ( ) , l . map ( AnyList :: modifiers ) ) ) } } }
+pub type LoadedData = Option < & 'static NodeData > ; pub enum SyntaxKind { ArrayBindingPattern ,
+ArrayType , ArrowFunction , AsExpression , AwaitExpression , BinaryExpression , BindingElement ,
+Block , CallExpression , CallSignature , CallSignatureDeclaration , CaseBlock , CaseClause ,
+CaseOrDefaultClause , CatchClause , ClassDeclaration , ClassExpression , ClassStaticBlockDeclaration
+, ComputedPropertyName , ConditionalExpression , ConditionalType , ConditionalTypeNode ,
+ConstructSignature , ConstructSignatureDeclaration , Constructor , ConstructorDeclaration ,
+ConstructorType , ConstructorTypeNode , Decorator , DefaultClause , DeleteExpression , DoStatement ,
 ElementAccessExpression , EnumDeclaration , EnumMember , ExportAssignment , ExportDeclaration ,
 ExportSpecifier , ExpressionStatement , ExpressionWithTypeArguments , ExternalModuleReference ,
 ForInOrOfStatement , ForInStatement , ForOfStatement , ForStatement , FunctionDeclaration ,
