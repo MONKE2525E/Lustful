@@ -9501,8 +9501,21 @@ impl<'p> Ctx<'p> {
                 // unless the right side fixes it; such an operator waits
                 // for body end (`wait_assign_ops`).
                 let known_number = matches!(self.kind(self.resolve(lt)), TyKind::Int(_) | TyKind::Float(_));
-                let rt = self.expr(*rhs, if known_number { None } else { Some(lt) });
-                if known_number && self.unbound_general(self.resolve(self.peel_one_ref(rt).1)) {
+                // An open left side (`*last_bits |= bits` before a later push
+                // fixes the element type) is rustc's pending `?T: BitOrAssign<R>`
+                // obligation: it waits for body end too.
+                let open_lhs = self.unbound_general(self.resolve(lt));
+                // `String += x` and `Cow<str> += x` as `String + x` (`binary_with_lt`).
+                let lt_deep = self.deep(lt);
+                let expect = if *op == BinOp::Add && self.tys.is_string_ty(lt_deep) {
+                    Some(REF_STR)
+                } else if known_number || open_lhs || (*op == BinOp::Add && crate::check::collect::cow_arg(&self.tys, lt_deep) == Some(STR)) {
+                    None
+                } else {
+                    Some(lt)
+                };
+                let rt = self.expr(*rhs, expect);
+                if open_lhs || (known_number && self.unbound_general(self.resolve(self.peel_one_ref(rt).1))) {
                     self.set_res(e, Res::Bin { ld: 0, rd: 0 });
                     self.wait_assign_ops.push((e, *op, lt, rt, *rhs, span));
                     return UNIT;
@@ -18293,6 +18306,15 @@ impl<'p> Ctx<'p> {
     /// each `assert_eq!` whose left type was open (`wait_asserts`).
     fn finish_wait_binops(&mut self) {
         for (e, op, lt, rt, rhs, span) in std::mem::take(&mut self.wait_assign_ops) {
+            if self.unbound_general(self.resolve(lt)) {
+                self.err(
+                    "L0610",
+                    span,
+                    "type annotations needed: the left operand type of this operator must be known here",
+                    "Annotate the type of the value, such as `let mut x: u8 = make();`.",
+                );
+                continue;
+            }
             if self.unbound_general(self.resolve(self.peel_one_ref(rt).1)) {
                 self.err(
                     "L0610",
