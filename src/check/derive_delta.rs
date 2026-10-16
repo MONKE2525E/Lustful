@@ -18,6 +18,7 @@ use crate::check::collect::{Derives, Program};
 use crate::def::DefId;
 use crate::driver::graph::Reads;
 use crate::intern::Sym;
+use crate::traits::ImplId;
 use crate::traits::index::{ImplRecord, SelfHead};
 use crate::ty::{AdtId, ArgsId, Predicate, TraitRef, Ty, TyIntern, TyKind};
 use std::cell::{Cell, RefCell};
@@ -188,66 +189,117 @@ pub(crate) fn derives_from_names(p: &Program, old: Derives, is_enum: bool, names
     Ok(d)
 }
 
+/// What derive deltas wrote to a kept program, oldest first, so a refused
+/// delta can put the program back as it was (`restore`): each Adt row's
+/// old derive list, and each synthetic record's old dead flag (a record
+/// made for a trait the Adt never derived was dead before: it did not
+/// exist). The caller then keeps the program for the next request, as a
+/// refused header delta does (sigedit R9).
+#[derive(Default)]
+pub(crate) struct Undo {
+    rows: Vec<(usize, Derives)>,
+    records: Vec<(ImplId, bool)>,
+}
+
+impl Undo {
+    /// Puts back every derive list and record flag, newest first, and the
+    /// glue tables collect builds from them.
+    pub(crate) fn restore(self, p: &mut Program) {
+        if self.rows.is_empty() && self.records.is_empty() {
+            return;
+        }
+        for (id, dead) in self.records.into_iter().rev() {
+            p.gx.index.set_dead(id, dead);
+        }
+        for (i, d) in self.rows.into_iter().rev() {
+            p.adts[i].set_derives(d);
+        }
+        crate::check::generics::compute_glue_tables(p);
+    }
+}
+
 /// Applies a derive list edit of the local Adt template `a` to a kept
 /// program (sigedit PLAN R13) in place of a collect: the Adt and its
 /// instance rows take the new list, each toggled trait's synthetic
 /// record goes dead or comes back (no id or ordinal moves), and every
-/// collect check a derive list feeds runs again. Err names why the delta
-/// cannot stand (the caller collects in full): a trait the Adt had no
-/// record of when the program was collected, an added trait with a written
-/// impl for the Adt (E0119), a user impl with associated types whose bounds
-/// name a toggled trait, a written projection type that names the reach (its signature was
-/// normalized), or any diagnostic. On Err `p` is half
-/// edited and must be dropped. Ok gives the delta's reach (the keyed
-/// dirty walk reads it).
-pub(crate) fn apply(p: &mut Program, a: AdtId, new: Derives) -> Result<Reach, &'static str> {
+/// collect check a derive list feeds runs again. A trait the Adt never
+/// derived in this program gets its record from collect's own kernel
+/// (generics.rs `insert_derived`), appended with a new id: no other id
+/// moves. Err names why the delta cannot stand (the caller collects in
+/// full): an added trait with a written impl for the Adt (E0119), a user
+/// impl with associated types whose bounds name a toggled trait and whose
+/// projections can involve the reach (`assoc_impl_involved`), a written
+/// projection type that names the reach (its signature was normalized),
+/// or any diagnostic. Every write goes to `undo` first; on Err the caller
+/// restores it. Ok gives the delta's reach (the keyed dirty walk reads
+/// it), or None when no flag moved.
+pub(crate) fn apply(p: &mut Program, a: AdtId, new: Derives, undo: &mut Undo) -> Result<Option<Reach>, &'static str> {
     let def = p.derive_def(a).ok_or("derive adt")?;
     if p.gx.adt_instance_of.get(a.0 as usize).copied().flatten().is_some() {
         return Err("derive adt");
     }
     let old = p.adt(a).derives_unlogged();
-    let mut toggles: Vec<(DefId, bool)> = Vec::new();
-    for (tr, on) in derive_traits(p) {
-        if on(&old) != on(&new) {
-            toggles.push((tr, on(&new)));
+    // Each toggle: its trait, its flag order, and its record (None: a
+    // trait the Adt never derived in this program, made below).
+    let mut toggles: Vec<(DefId, usize, Option<ImplId>, bool)> = Vec::new();
+    for (k, (tr, on)) in derive_traits(p).into_iter().enumerate() {
+        if on(&old) == on(&new) {
+            continue;
         }
-    }
-    let mut ids = Vec::with_capacity(toggles.len());
-    for &(tr, on) in &toggles {
-        let id = p.gx.index.derived_record(def, tr).ok_or("derive new")?;
-        if !on && p.gx.index.is_dead(id) {
-            return Err("derive state");
+        let on = on(&new);
+        let id = p.gx.index.derived_record(def, tr);
+        match id {
+            Some(id) if on == p.gx.index.is_dead(id) => {}
+            None if on => {}
+            _ => return Err("derive state"),
         }
         // An added derive next to a written impl of the trait for the Adt
         // conflicts (E0119); the full path answers.
-        if on && p.gx.index.bucket(tr, SelfHead::Adt(def)).iter().any(|&o| o != id) {
+        if on && p.gx.index.bucket(tr, SelfHead::Adt(def)).iter().any(|&o| Some(o) != id) {
             return Err("derive written impl");
         }
-        ids.push((id, !on));
+        toggles.push((tr, k, id, on));
     }
-    // A signature normalized through such an impl's associated type would
-    // keep its old type (the delta does not normalize again).
-    if toggles.iter().any(|&(tr, _)| assoc_impl_names(p, tr)) {
-        return Err("derive assoc impl");
-    }
-    for i in 0..p.adts.len() {
-        if i == a.0 as usize || p.gx.adt_instance_of.get(i).copied().flatten().is_some_and(|(t, _)| t == def) {
-            p.adts[i].set_derives(new);
-        }
-    }
-    for (id, dead) in ids {
-        p.gx.index.set_dead(id, dead);
+    if toggles.is_empty() {
+        return Ok(None);
     }
     let reach = Reach::of(p, def);
     crate::driver::laps::mark("kept/derive reach");
+    // A signature normalized through such an impl's associated type would
+    // keep its old type (the delta does not normalize again).
+    if toggles.iter().any(|&(tr, ..)| assoc_impl_involved(p, tr, &reach)) {
+        return Err("derive assoc impl");
+    }
     // Collect checked these written types before it normalized them.
     if p.gx.written_projections.values().any(|tys| tys.iter().any(|&t| reach.ty(&p.tys, t))) {
         return Err("derive projection");
     }
+    for i in 0..p.adts.len() {
+        if i == a.0 as usize || p.gx.adt_instance_of.get(i).copied().flatten().is_some_and(|(t, _)| t == def) {
+            undo.rows.push((i, p.adts[i].derives_unlogged()));
+            p.adts[i].set_derives(new);
+        }
+    }
+    for (_, k, id, on) in toggles {
+        let id = match id {
+            Some(id) => id,
+            // Ids below `record_count` stand; the def's ordinal counts
+            // down from u32::MAX, past every ordinal collect gives out.
+            None => {
+                let mut ordinal = u32::MAX - p.gx.index.record_count() as u32;
+                let id = crate::check::generics::insert_derived(p, a.0 as usize, k, &mut ordinal).ok_or("derive adt")?;
+                undo.records.push((id, true));
+                continue;
+            }
+        };
+        // Its old dead flag: dead when the toggle puts it back.
+        undo.records.push((id, on));
+        p.gx.index.set_dead(id, !on);
+    }
     let mut errs = Vec::new();
     crate::check::generics::recheck_derive_items(p, &reach, &mut errs);
     if errs.is_empty() {
-        return Ok(reach);
+        return Ok(Some(reach));
     }
     let name = p.display_name(p.adt(a).name).to_string();
     log(&|| errs.iter().take(3).map(|e| format!("derive diag {name}: {} {}\n", e.code, e.message)).collect());
@@ -289,20 +341,84 @@ fn blanket_names(p: &Program, tr: DefId) -> bool {
 }
 
 /// True when a user impl with associated types (a written local impl)
-/// has a bound that names trait `tr`, itself or through its supertraits.
-fn assoc_impl_names(p: &Program, tr: DefId) -> bool {
+/// has a bound that names trait `tr`, itself or through its supertraits,
+/// and a type collect normalized may have gone through it with a reach
+/// Adt in its args: that type may hold an associated type the impl no
+/// longer gives (the delta does not normalize again). Such a type is the
+/// impl's own header, bounds or associated types, when they name the
+/// reach, or a projection of the impl's trait whose Self type can select
+/// the impl, in the written types (`written_projections`) of a fn or Adt
+/// template with an instance whose args name the reach (instances
+/// normalize after substitution). Written types that name the reach
+/// refuse on their own ("derive projection"); a body's projections are
+/// its reads, and its check runs again when one moves.
+fn assoc_impl_involved(p: &Program, tr: DefId, reach: &Reach) -> bool {
     use crate::traits::index::Synthetic;
-    p.gx.index.all_impls().any(|(_, rec)| {
-        !rec.assoc_tys.is_empty()
-            && rec.synthetic == Synthetic::None
-            && rec.local
-            && !p.std_source_span(rec.span)
-            && p.shipped_crate_at(rec.span).is_none()
-            && rec.generics.predicates.iter().any(|pred| match pred {
-                crate::ty::Predicate::Trait(b) => trait_reaches(p, b.value.def, tr, &mut Vec::new()),
-                _ => false,
-            })
+    let impls: Vec<&ImplRecord> = p
+        .gx
+        .index
+        .all_impls()
+        .map(|(_, rec)| rec)
+        .filter(|rec| {
+            !rec.assoc_tys.is_empty()
+                && rec.synthetic == Synthetic::None
+                && rec.local
+                && !p.std_source_span(rec.span)
+                && p.shipped_crate_at(rec.span).is_none()
+                && rec.generics.predicates.iter().any(|pred| match pred {
+                    crate::ty::Predicate::Trait(b) => trait_reaches(p, b.value.def, tr, &mut Vec::new()),
+                    _ => false,
+                })
+        })
+        .collect();
+    if impls.is_empty() {
+        return false;
+    }
+    if impls.iter().any(|rec| reach.record(&p.tys, rec)) {
+        return true;
+    }
+    let instances = p.gx.instance_by_key.keys().copied().chain(p.gx.adt_instance_of.iter().flatten().copied());
+    instances.into_iter().any(|(tdef, args)| {
+        reach.args(&p.tys, args)
+            && p.gx.written_projections.get(&tdef).is_some_and(|tys| tys.iter().any(|&t| projection_may_select(p, t, args, &impls)))
     })
+}
+
+/// True when type `t` (written in a template, `args` its instance's
+/// args) holds a projection that may select one of `impls`: its trait is
+/// an impl's trait, and its Self type, with the template's params taken
+/// from `args`, has that impl's head, or a head no index lookup knows
+/// (a projection, an opaque, a param). An impl of a trait with an
+/// associated type that is itself a projection can pass any projection
+/// on, so every projection of its trait counts.
+fn projection_may_select(p: &Program, t: Ty, args: ArgsId, impls: &[&ImplRecord]) -> bool {
+    let tys = &p.tys;
+    let walk = |e: Ty| projection_may_select(p, e, args, impls);
+    match tys.kind(t) {
+        TyKind::Projection(assoc, pa) => {
+            let Some(tr) = p.gx.index.trait_of_assoc(assoc.0) else { return true };
+            let self_ty = tys.args(pa).first().and_then(|g| g.as_ty()).map(|s| match tys.kind(s) {
+                TyKind::Param(i) => tys.args(args).get(i.0 as usize).and_then(|g| g.as_ty()),
+                _ => Some(s),
+            });
+            let head = self_ty.flatten().and_then(|s| crate::traits::index::head_of(tys, s, &|x| x));
+            let selects = |rec: &&ImplRecord| {
+                rec.trait_def == tr
+                    && (rec.blanket.is_some() || head.is_none_or(|h| h == rec.head) || rec.assoc_tys.iter().any(|&(_, a)| tys.flags(a).contains_projection()))
+            };
+            impls.iter().any(selects) || tys.args(pa).iter().any(|g| g.as_ty().is_some_and(walk))
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => walk(e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| walk(e)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(walk)),
+        TyKind::FnPtr(sig) => {
+            let sig = tys.sig(sig).value;
+            tys.tys_of(sig.inputs).iter().any(|&e| walk(e)) || walk(sig.output)
+        }
+        // A projection in a dyn type's bindings, conservatively.
+        TyKind::Dyn(..) => tys.flags(t).contains_projection(),
+        _ => false,
+    }
 }
 
 /// The derive bits of the derivable traits that `preds` name, directly or

@@ -486,6 +486,15 @@ pub(crate) struct KeptProgram {
     prefer: bool,
 }
 
+impl KeptProgram {
+    /// True when every edit since the program was kept is a derive list
+    /// edit (a program put back after a refused derive delta; the next
+    /// derive delta then moves every key those edits can move).
+    pub(crate) fn derive_edits_only(&self) -> bool {
+        self.edits.as_ref().is_some_and(|e| !e.is_empty() && e.iter().all(|x| x.derive.is_some()))
+    }
+}
+
 /// Keeps `program` for later requests, in its mode's slot.
 pub(crate) fn keep(front: &mut Front, mut program: crate::check::collect::Program) {
     let slot = usize::from(program.gx.walk_instances);
@@ -2002,8 +2011,17 @@ pub(super) fn reuse_kept(
     let mut derives: Vec<usize> = edits.iter().filter_map(|e| e.derive).collect();
     derives.sort_unstable();
     derives.dedup();
-    if !derives.is_empty() {
-        super::kept_derive::apply_derives(&mut p, front, caches, &derives, walk_instances)?;
+    if !derives.is_empty()
+        && let Err((why, intact)) = super::kept_derive::apply_derives(&mut p, front, caches, &derives, walk_instances)
+    {
+        // A refused derive delta undid its writes: the program is as it
+        // was, with its spans moved, and stays for the next request (a
+        // rejected derive edit, then its revert). Not after a header delta
+        // of this request: its writes stand.
+        if intact && headers.is_empty() {
+            front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: false });
+        }
+        return Err(why);
     }
     // An edited fn that returns `impl Trait`: collect reveals its hidden
     // type from the new body, so the program stands only while that type
@@ -3391,6 +3409,73 @@ pub fn run() -> i64 {
             let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
             assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Refused derive deltas (sigedit Sol review 2, item 3), each the cold
+    /// answer: a rejected derive edit (a derive diagnostic) undoes its
+    /// delta and keeps the program, so its revert takes the delta again,
+    /// also after an unrelated body edit, after repeated rejects, and after
+    /// a build of the rejected state. A trait the Adt never derived gets a
+    /// record from collect's kernel. An associated-type impl bounded by Copy
+    /// refuses only toggles whose reach it can involve.
+    #[test]
+    fn derive_refusals_keep_the_program() {
+        let dir = std::env::temp_dir().join(format!("lust-derive-undo-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "#[derive(Clone, Copy, Debug, PartialEq)]\npub struct P {\n    x: i64,\n}\n\n#[derive(Clone, Copy)]\npub struct Q(u8);\n\n\
+                   pub struct Rep<T>(T);\n\nimpl<T: Copy> Iterator for Rep<T> {\n    type Item = T;\n    fn next(&mut self) -> Option<T> {\n        \
+                   Some(self.0)\n    }\n}\n\nfn twice(p: P) -> (P, P) {\n    (p, p)\n}\n\npub fn run() -> i64 {\n    \
+                   let (a, b) = twice(P { x: 2 });\n    let mut r = Rep(3u8);\n    let q = Q(r.next().unwrap_or(0));\n    \
+                   println!(\"{:?} {}\", a == b, q.clone().0);\n    a.x\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let (full, no_clone) = ("#[derive(Clone, Copy, Debug, PartialEq)]", "#[derive(Copy, Debug, PartialEq)]");
+        let steps: &[(&str, &str, &str)] = &[
+            // Copy without Clone: a derive diagnostic, then the revert.
+            (full, no_clone, "derive_diag"),
+            (no_clone, full, "reuse"),
+            // An unrelated body edit while the reject stands.
+            (full, no_clone, "derive_diag"),
+            ("    a.x\n", "    a.x + 1\n", "derive_diag"),
+            (no_clone, full, "reuse"),
+            // Repeated rejects.
+            (full, no_clone, "derive_diag"),
+            (no_clone, "#[derive(Copy, Debug)]", "derive_diag"),
+            ("#[derive(Copy, Debug)]", full, "reuse"),
+            // First-ever derives: Hash and Eq in, out, in again.
+            (full, "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]", "reuse"),
+            ("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]", full, "reuse"),
+            (full, "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]", "reuse"),
+            // Rep's impl (bounded by Copy) cannot involve Q's reach.
+            ("#[derive(Clone, Copy)]\npub struct Q", "#[derive(Clone)]\npub struct Q", "reuse"),
+            ("#[derive(Clone)]\npub struct Q", "#[derive(Clone, Copy)]\npub struct Q", "reuse"),
+        ];
+        for &(old, new, kept) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            // The body edit takes the body patch, the others the item patch.
+            assert!(matches!(field(&v, "path"), "item" | "patch"), "{new:?}: {v}");
+            assert_eq!(field(&v, "kept"), kept, "{new:?}: {v}");
+        }
+        // A build of a rejected state, then the revert checks on the kept
+        // check program.
+        let full_hash = "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]";
+        edit(&m0, full_hash, "#[derive(Copy, Debug, PartialEq, Eq, Hash)]");
+        let built = run(&mut warm, &root, Cmd::Build);
+        let cold_dir = dir.join("obj-cold-build");
+        let mut cold = Session::new(cold_dir.clone(), false, SessionKey::synthetic(&root, false));
+        assert_eq!(built, run(&mut cold, &root, Cmd::Build), "warm and cold builds agree");
+        assert_ne!(built.0, 0);
+        let v = warm_equals_cold(&mut warm, &root, &m0, "#[derive(Copy, Debug, PartialEq, Eq, Hash)]", full_hash);
+        assert_eq!(field(&v, "kept"), "reuse", "{v}");
+        // A generic fn whose signature projects through Rep's impl, with
+        // an instance at Rep<Q>: Q's Copy toggle refuses.
+        edit(&m0, "pub fn run() -> i64 {\n", "fn first<I: Iterator>(mut i: I) -> Option<I::Item> {\n    i.next()\n}\n\npub fn run() -> i64 {\n    let _f = first(Rep(Q(1)));\n");
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let v = warm_equals_cold(&mut warm, &root, &m0, "#[derive(Clone, Copy)]\npub struct Q", "#[derive(Clone)]\npub struct Q");
+        assert_eq!(field(&v, "kept"), "derive_assoc_impl", "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

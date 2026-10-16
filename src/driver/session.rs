@@ -91,6 +91,11 @@ pub(crate) struct Front {
     /// (`compile`), so they recheck when a read moved. Full mode walks
     /// every passing body anyway, so a compaction remap drops the list.
     pub(crate) walk_pending: Vec<u32>,
+    /// `walk_pending` came only from failed collects whose kept program
+    /// stayed with derive list edits alone (a refused derive delta, undone):
+    /// the next derive delta on that program moves every key they can
+    /// move, so its keyed shortcuts still hold (`compile`).
+    pub(crate) pending_derive_only: bool,
     /// Set by a failed collect of a request with a const fn edit: values
     /// moved, and no body rechecked under them. The next request is a
     /// const fn edit too (`compile`).
@@ -398,6 +403,7 @@ impl Session {
                 rpit_edit: false,
                 walk_after_reject: false,
                 walk_pending: Vec::new(),
+                pending_derive_only: false,
                 const_fn_pending: false,
                 items: Vec::new(),
                 fn_loc: Vec::new(),

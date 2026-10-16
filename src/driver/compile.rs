@@ -3109,8 +3109,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let passed = |front: &Front, caches: &Caches, i: usize| front.fn_slot.get(i).is_some_and(|&s| caches.ok.get(s as usize) == Some(&true));
     // The derive delta's keyed shortcuts (its replays, the keyed dirty walk
     // below) hold only when a derive delta is all that moved since the
-    // last walk: not with a failed collect's leftovers.
-    if front.const_fn_pending || !front.walk_pending.is_empty() {
+    // last walk: not with a failed collect's leftovers, unless they came
+    // from refused derive deltas alone (`Front::pending_derive_only`).
+    let derive_leftovers = std::mem::take(&mut front.pending_derive_only);
+    if front.const_fn_pending || (!front.walk_pending.is_empty() && !derive_leftovers) {
         caches.derive_only = false;
     }
     if std::mem::take(&mut front.const_fn_pending) {
@@ -3317,6 +3319,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // collect may have seen a new trait system. The next request
             // takes them over (`Front::walk_pending`,
             // `Front::const_fn_pending`, `GenReuse::forget_failed_gate`).
+            // A kept program put back with derive list edits alone (its
+            // refused derive delta was undone) covers them: the next
+            // derive delta on it moves every key they moved.
+            let mode = usize::from(req.cmd == Cmd::Build);
+            front.pending_derive_only = !const_fn_changed && front.kept[mode].as_ref().is_some_and(|k| k.derive_edits_only());
             front.walk_pending.extend(mention_only.iter().filter_map(|&i| front.fn_slot.get(i).copied()));
             front.walk_pending.sort_unstable();
             front.walk_pending.dedup();

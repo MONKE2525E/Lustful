@@ -5549,7 +5549,9 @@ pub struct GenTables {
     /// program but not at that point of a collect.
     pub derive_marks: [usize; 3],
     /// The written types of each fn signature and Adt field list that held
-    /// a projection before `normalize_signatures`, by fn or Adt def. Well-
+    /// a projection before `normalize_signatures`, by fn or Adt def, and of
+    /// each impl Self type (by impl def) and const or static type (under
+    /// `item_types_key`) that held one before collect normalized it. Well-
     /// formedness ran on these; a derive delta refuses when one names its
     /// reach (it neither normalizes nor checks them again).
     pub written_projections: FxMap<DefId, Vec<Ty>>,
@@ -8333,6 +8335,55 @@ fn validate_method_sig(
     let _ = span;
 }
 
+/// The derived impl record of trait `k` (in `Derives` flag order: Clone,
+/// Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default) for the
+/// Adt template row `a`, with a bound per type parameter, as rustc writes
+/// them. `add_synthetic_impls` makes every derive's record with it; a
+/// derive delta makes the record of a trait the Adt never derived before
+/// with it too (check/derive_delta.rs), so both get the same record.
+pub(crate) fn insert_derived(p: &mut Program, a: usize, k: usize, ordinal: &mut u32) -> Option<crate::traits::ImplId> {
+    use crate::traits::index::Synthetic;
+    let lang = p.gx.lang;
+    let traits = [lang.clone, lang.copy, lang.debug, lang.partial_eq, lang.eq, lang.hash, lang.partial_ord, lang.ord, lang.default];
+    let names = ["Clone", "Copy", "Debug", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default"];
+    let (trait_def, dname) = (traits[k], p.interner.intern(names[k]));
+    let adt = AdtId(a as u32);
+    let (def, n_params) = p.gx.adt_info[a];
+    let is_enum = p.adt(adt).is_enum;
+    // A const parameter is a const arg (`ArrayStr<N>`), as in
+    // written impl headers; the others are type args.
+    let param_args: Vec<GenericArg> = (0..n_params as u32)
+        .map(|i| match p.gx.adt_generics[a].params.get(i as usize).map(|prm| prm.kind) {
+            Some(ParamKind::Const(_)) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i))),
+            _ => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i)))),
+        })
+        .collect();
+    let self_pat = p.tys.mk_adt(def, &param_args);
+    let with_rhs = trait_def == lang.partial_eq || trait_def == lang.partial_ord;
+    let rest: Vec<Ty> = if with_rhs { vec![self_pat] } else { Vec::new() };
+    let mut preds: Vec<Predicate> = Vec::new();
+    // rustc bounds every type parameter by the derived trait,
+    // except `Default` on an enum: its default variant is a
+    // unit variant, so that impl has no bounds at all.
+    // Std's `PhantomData<T>` impls have no bounds (std source,
+    // W-STD-C).
+    let bounded = !(trait_def == lang.default && is_enum) && !p.is_phantom_adt(adt);
+    for (i, param) in p.gx.adt_generics[a].params.clone().iter().enumerate() {
+        if !bounded || param.kind != ParamKind::Type {
+            continue;
+        }
+        let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
+        let mut tr_args = vec![GenericArg::Ty(t)];
+        if with_rhs {
+            tr_args.push(GenericArg::Ty(t));
+        }
+        let args = p.tys.intern_args(&tr_args);
+        preds.push(Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS })));
+    }
+    let generics = Generics { parent: None, params: p.gx.adt_generics[a].params.clone(), predicates: preds };
+    insert_synthetic(p, ordinal, trait_def, self_pat, &rest, generics, Vec::new(), Synthetic::Derive(dname, 1 << k), true, Span::default())
+}
+
 /// Derives and lang facts as synthetic impls (sections 2.2 and
 /// 2.6), inserted after every written impl so coherence sees one
 /// impl set. Bodies stay in the builtin derive paths until
@@ -8346,72 +8397,12 @@ pub fn add_synthetic_impls(p: &mut Program) {
     // The lang facts alone are about 1300 records (the shift operators
     // take every int on the right), plus up to 9 derives per Adt.
     p.gx.index.reserve(1400 + 9 * p.gx.adt_info.len());
-    // Derives: one record per (Adt template, derived trait), with
-    // a bound per type parameter, as rustc writes them.
-    let n_adts = p.gx.adt_info.len();
-    let names = ["Clone", "Copy", "Debug", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default"].map(|n| p.interner.intern(n));
-    for a in 0..n_adts {
-        let adt = AdtId(a as u32);
-        let (def, n_params) = p.gx.adt_info[a];
-        let (derives, is_enum) = (p.derives_of(adt), p.adt(adt).is_enum);
-        let wanted: [(bool, DefId, Sym); 9] = [
-            (derives.clone, lang.clone, names[0]),
-            (derives.copy, lang.copy, names[1]),
-            (derives.debug, lang.debug, names[2]),
-            (derives.partial_eq, lang.partial_eq, names[3]),
-            (derives.eq, lang.eq, names[4]),
-            (derives.hash, lang.hash, names[5]),
-            (derives.partial_ord, lang.partial_ord, names[6]),
-            (derives.ord, lang.ord, names[7]),
-            (derives.default, lang.default, names[8]),
-        ];
-        for (k, (on, trait_def, dname)) in wanted.into_iter().enumerate() {
-            if !on {
-                continue;
-            }
-            // A const parameter is a const arg (`ArrayStr<N>`), as in
-            // written impl headers; the others are type args.
-            let param_args: Vec<GenericArg> = (0..n_params as u32)
-                .map(|i| match p.gx.adt_generics[a].params.get(i as usize).map(|prm| prm.kind) {
-                    Some(ParamKind::Const(_)) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i))),
-                    _ => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i)))),
-                })
-                .collect();
-            let self_pat = p.tys.mk_adt(def, &param_args);
-            let with_rhs = trait_def == lang.partial_eq || trait_def == lang.partial_ord;
-            let rest: Vec<Ty> = if with_rhs { vec![self_pat] } else { Vec::new() };
-            let mut preds: Vec<Predicate> = Vec::new();
-            // rustc bounds every type parameter by the derived trait,
-            // except `Default` on an enum: its default variant is a
-            // unit variant, so that impl has no bounds at all.
-            // Std's `PhantomData<T>` impls have no bounds (std source,
-            // W-STD-C).
-            let bounded = !(trait_def == lang.default && is_enum) && !p.is_phantom_adt(adt);
-            for (i, param) in p.gx.adt_generics[a].params.clone().iter().enumerate() {
-                if !bounded || param.kind != ParamKind::Type {
-                    continue;
-                }
-                let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
-                let mut tr_args = vec![GenericArg::Ty(t)];
-                if with_rhs {
-                    tr_args.push(GenericArg::Ty(t));
-                }
-                let args = p.tys.intern_args(&tr_args);
-                preds.push(Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS })));
-            }
-            let generics = Generics { parent: None, params: p.gx.adt_generics[a].params.clone(), predicates: preds };
-            insert_synthetic(
-                p,
-                &mut ordinal,
-                trait_def,
-                self_pat,
-                &rest,
-                generics,
-                Vec::new(),
-                Synthetic::Derive(dname, 1 << k),
-                true,
-                span,
-            );
+    // Derives: one record per (Adt template, derived trait).
+    for a in 0..p.gx.adt_info.len() {
+        let derives = p.derives_of(AdtId(a as u32));
+        let on = [derives.clone, derives.copy, derives.debug, derives.partial_eq, derives.eq, derives.hash, derives.partial_ord, derives.ord, derives.default];
+        for k in (0..9).filter(|&k| on[k]) {
+            insert_derived(p, a, k, &mut ordinal);
         }
     }
     // Lang facts for builtin types.
@@ -10285,6 +10276,11 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
     }
     p.gx.mono_counts.0 += 1;
     body_errs
+}
+
+/// The `written_projections` key of the const and static item types.
+pub(crate) fn item_types_key(p: &Program) -> DefId {
+    DefId { krate: p.krate, hash: crate::def::item_hash(p.stable_crate, &["<written item types>"], crate::def::DefKind::Const, "", 0) }
 }
 
 /// Normalizes one global type through the solver, lifting the
@@ -13108,8 +13104,7 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&cra
 /// main's Termination and the const fn goals. Only the error count
 /// matters to the caller (any error falls back).
 pub(crate) fn recheck_derive_items(p: &mut Program, reach: &crate::check::derive_delta::Reach, errs: &mut Vec<Diag>) {
-    compute_glue_methods(p);
-    compute_written_hash(p);
+    compute_glue_tables(p);
     crate::driver::laps::mark("kept/derive glue");
     check_impl_obligations(p, errs, Some(reach));
     crate::check::where_overflow::check_impls(p, errs);
@@ -13126,6 +13121,14 @@ pub(crate) fn recheck_derive_items(p: &mut Program, reach: &crate::check::derive
     crate::check::collect::check_main_termination(p, errs);
     let goals: Vec<(TraitRef, Span)> = p.const_goals.iter().filter(|(tr, _)| reach.trait_ref(&p.tys, tr)).cloned().collect();
     crate::check::collect::prove_const_goals(p, goals, errs);
+}
+
+/// The glue tables collect builds from the derive lists and impls
+/// (`compute_glue_methods`, `compute_written_hash`), built again after a
+/// derive delta or its undo (check/derive_delta.rs).
+pub(crate) fn compute_glue_tables(p: &mut Program) {
+    compute_glue_methods(p);
+    compute_written_hash(p);
 }
 
 /// The `#[derive(Debug)]` field types collect deferred (see

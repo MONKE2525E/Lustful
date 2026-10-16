@@ -7,7 +7,9 @@
 # and uses A only through compound types (tuples, Option, arrays, Vec,
 # generic bounds, closures, a wrapper that derives over a field of A). A
 # sequence of versions then drops and adds Copy and Clone (and sometimes
-# Debug or PartialEq) on A's derive list. Every version runs on one warm
+# Debug or PartialEq) on A's derive list. Seeds 2 mod 3 take the round 4
+# programs (`versions4`): partial lists, first-ever derives, rejected lists
+# and their reverts after unrelated edits or repeated rejects. Every version runs on one warm
 # daemon (check, then run), a cold lust (LUST_NO_DAEMON=1), and rustc 1.99.
 #
 # Classes per version: false accept (lust accepts, rustc rejects), false
@@ -140,6 +142,18 @@ SHAPES = {
         "trait Pick {\n    type Out;\n}\nstruct Holder<T>(T);\nimpl<T: Clone> Pick for Holder<T> {\n    type Out = T;\n}\nfn pick_out(h: Holder<A>) -> <Holder<A> as Pick>::Out {\n    h.0\n}\n",
         "let o = pick_out(Holder(mk()));\n    println!(\"{}\", show(&o));",
     ),
+    # Round 4: an associated-type impl bounded by Copy that A's reach
+    # cannot involve, and one a generic fn's signature projects through
+    # with an instance at RepA<A>.
+    "assoc_iter_rep": (
+        "struct Rep<T>(T);\nimpl<T: Copy> Iterator for Rep<T> {\n    type Item = T;\n    fn next(&mut self) -> Option<T> {\n        Some(self.0)\n    }\n}\n",
+        "let mut r = Rep(4u8);\n    println!(\"{:?}\", r.next());",
+    ),
+    "assoc_iter_a": (
+        "struct RepA<T>(T);\nimpl<T: Copy> Iterator for RepA<T> {\n    type Item = T;\n    fn next(&mut self) -> Option<T> {\n        Some(self.0)\n    }\n}\n"
+        "fn first_of<I: Iterator>(mut i: I) -> Option<I::Item> {\n    i.next()\n}\n",
+        "let f = first_of(RepA(mk()));\n    println!(\"{}\", f.map(|a| show(&a)).unwrap_or_default());",
+    ),
     # R13 v2: A under user blanket impls bounded by a toggled trait.
     "blanket_overlap": (
         "trait Show3 {\n    fn s3(&self) -> u8 {\n        1\n    }\n}\nimpl<T: std::fmt::Debug> Show3 for T {}\nimpl Show3 for A {}\n",
@@ -185,7 +199,7 @@ FULL = ["Clone", "Copy", "Debug", "PartialEq"]
 FULL3 = ["Clone", "Copy", "Debug", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord"]
 
 
-def program(adt, derives, shapes, resolver=False, main_result=False):
+def program(adt, derives, shapes, resolver=False, main_result=False, unrel=None):
     defn, mk, show, alias, _ = adt
     out = ["const _ROUTE: u8 = 0;\n"] if resolver else []
     if derives:
@@ -197,6 +211,8 @@ def program(adt, derives, shapes, resolver=False, main_result=False):
     for sh in shapes:
         out.append(SHAPES[sh][0].replace("MK_CONST", mk))
     out.append("fn main() -> Result<(), A> {\n" if main_result else "fn main() {\n")
+    if unrel is not None:
+        out.append(f"    println!(\"u{unrel}\");\n")
     for sh in shapes:
         out.append("    {\n    " + SHAPES[sh][1] + "\n    }\n")
     if main_result:
@@ -247,8 +263,60 @@ def versions3(rng, full):
     return seq
 
 
+# Traits whose derive needs another derived trait (rustc E0277 without it).
+NEEDS = {"Copy": ["Clone"], "Eq": ["PartialEq"], "PartialOrd": ["PartialEq"], "Ord": ["PartialOrd", "Eq"]}
+
+
+def versions4(rng, full):
+    """Round 4 (refused deltas and undo): start from a partial list, so an
+    added trait is one the program never derived; rejected lists (a trait
+    without the one it needs), then their revert, sometimes after an
+    unrelated edit (`unrel` moves) or a second reject. Pairs of (derive
+    list, unrelated edit counter)."""
+    order = lambda ts: [t for t in full if t in ts]
+    cur = order(rng.sample(full, rng.randint(0, len(full) - 1)))
+    unrel = 0
+    seq = [(cur, unrel)]
+    for _ in range(rng.randint(3, 6)):
+        r = rng.random()
+        missing = [t for t in full if t not in cur]
+        if r < 0.3 and missing:
+            # A trait in, with what it needs (often never derived before).
+            t = rng.choice(missing)
+            cur = order(set(cur) | {t} | set(NEEDS.get(t, [])))
+            seq.append((cur, unrel))
+        elif r < 0.45 and cur:
+            cur = order(set(cur) - set(rng.sample(cur, rng.randint(1, min(2, len(cur))))))
+            cur = order([t for t in cur if all(n in cur for n in NEEDS.get(t, []))])
+            seq.append((cur, unrel))
+        else:
+            # A reject (a trait without what it needs), then maybe an
+            # unrelated edit or a second reject, then the revert.
+            t = rng.choice(list(NEEDS))
+            bad = order((set(cur) | {t}) - {rng.choice(NEEDS[t])})
+            seq.append((bad, unrel))
+            k = rng.random()
+            if k < 0.35:
+                unrel += 1
+                seq.append((bad, unrel))
+            elif k < 0.6:
+                t2 = rng.choice(list(NEEDS))
+                seq.append((order((set(bad) | {t2}) - {rng.choice(NEEDS[t2])}), unrel))
+            seq.append((cur, unrel))
+    return seq
+
+
 def gen(seed, resolver=False):
     rng = random.Random(seed)
+    if seed % 3 == 2:
+        adt = rng.choice(ADTS)
+        full = FULL3 + (["Default"] if adt[4] else [])
+        pool = [sh for sh in sorted(SHAPES) if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
+        shapes = rng.sample(pool, rng.randint(1, 4))
+        if rng.random() < 0.4:
+            shapes.append(rng.choice(["assoc_iter_rep", "assoc_iter_a"]))
+        shapes = sorted(set(shapes))
+        return [program(adt, d, shapes, resolver, False, u) for d, u in versions4(rng, full)]
     if seed % 2 == 0:
         # The round 1 programs: the first four Adt forms, the first shapes.
         adt = rng.choice(ADTS[:4])

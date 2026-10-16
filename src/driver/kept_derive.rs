@@ -24,8 +24,11 @@
 // Refused (the caller collects in full): a build (its instances and glue
 // would keep the old lists), an item the kept program has no Adt for, and
 // whatever `derive_delta::apply` refuses. Any diagnostic falls back too:
-// the full path gives the answer. The keyed shortcuts apply only when the
-// request's edits are all derive list edits (`Caches::derive_only`).
+// the full path gives the answer. A refusal before the replays undoes the
+// delta (`derive_delta::Undo`), and `reuse_kept` keeps the program for the
+// next request (usually the fix or the revert), as for a refused header
+// delta. The keyed shortcuts apply only when the request's edits are all
+// derive list edits (`Caches::derive_only`).
 use super::session::{Caches, Front};
 use crate::ast::ItemKind;
 use crate::check::collect::Program;
@@ -34,36 +37,49 @@ use crate::def::LocalDefId;
 
 /// Applies the derive list edits of the struct and enum items `items`
 /// (`ast.items` indexes) to the kept program `p`. Err names the first
-/// condition that failed (the `kept=` of `lust-visits:`); `p` is then half
-/// edited and must be dropped.
-pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches, items: &[usize], walk_instances: bool) -> Result<(), &'static str> {
+/// condition that failed (the `kept=` of `lust-visits:`), and says whether
+/// `p` is as it was: a refusal before the replays undoes the derive
+/// delta's writes (`derive_delta::Undo`), so the program can stay for the
+/// next request; after a replay wrote template or discovery state, `p` is
+/// half edited and must be dropped.
+pub(super) fn apply_derives(
+    p: &mut Program,
+    front: &Front,
+    caches: &mut Caches,
+    items: &[usize],
+    walk_instances: bool,
+) -> Result<(), (&'static str, bool)> {
     if walk_instances {
-        return Err("derive build");
+        return Err(("derive build", false));
     }
     // The node answers of the last collect read the old lists.
     caches.gen_reuse.forget_answers();
     // Entries stored from here on are this delta's own (`replay_discovery`).
     let start = crate::driver::gen_reuse::stamp_now();
+    let mut undo = crate::check::derive_delta::Undo::default();
     let mut moved: Option<crate::check::derive_delta::Reach> = None;
     for &item in items {
-        let (name, names, is_enum) = match &p.ast.items.get(item).ok_or("derive adt")?.kind {
-            ItemKind::Struct(s) => (s.name, s.derives.iter().map(|d| d.0).collect::<Vec<_>>(), false),
-            ItemKind::Enum(e) => (e.name, e.derives.iter().map(|d| d.0).collect::<Vec<_>>(), true),
-            _ => return Err("derive adt"),
-        };
-        let a = *p.type_names.get(&name).ok_or("derive adt")?;
-        if p.adt(a).name != name || p.adt(a).is_enum != is_enum {
-            return Err("derive adt");
+        match apply_item(p, item, &mut undo) {
+            Ok(Some(reach)) => {
+                moved = Some(match moved.take() {
+                    Some(m) => m.union(reach),
+                    None => reach,
+                })
+            }
+            Ok(None) => {}
+            Err(why) => {
+                undo.restore(p);
+                return Err((why, true));
+            }
         }
-        let new = crate::check::derive_delta::derives_from_names(p, p.adt(a).derives_unlogged(), is_enum, &names)?;
-        let reach = crate::check::derive_delta::apply(p, a, new)?;
-        moved = Some(match moved.take() {
-            Some(m) => m.union(reach),
-            None => reach,
-        });
     }
     crate::driver::laps::mark("kept/derive delta");
-    let Some(reach) = moved else { return Ok(()) };
+    // No flag moved (say the revert of a refused edit, whose delta was
+    // undone): no read key moved either.
+    let Some(reach) = moved else {
+        caches.derive_dirty = Some(vec![false; caches.slot_reads.len()]);
+        return Ok(());
+    };
     // The keyed dirty walk: only the read keys the delta can move
     // (graph.rs `Program::derive_key_moves`) are compared, for the slots
     // that read them. The compile tail rechecks the dirty slots.
@@ -84,7 +100,7 @@ pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches,
     // Without user generics collect runs no template check or discovery
     // (the lang enum methods' generics alone need neither in a check).
     if p.gx.user_generics {
-        replay_templates(p, front, caches, &reach, keyed, start)?;
+        replay_templates(p, front, caches, &reach, keyed, start).map_err(|why| (why, false))?;
         crate::driver::laps::mark("kept/derive templates");
         // A body's discovery reads are a subset of its check's, taken on
         // the same program: a body whose stored check reads are all clean
@@ -108,11 +124,29 @@ pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches,
         let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
         let stands = |g: LocalDefId| clean.get(g.0 as usize).copied().unwrap_or(false);
-        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None)?;
+        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None)
+            .map_err(|why| (why, false))?;
         crate::driver::laps::mark("kept/derive discovery");
     }
     caches.derive_dirty = Some(is_dirty);
     Ok(())
+}
+
+/// The derive delta of one struct or enum item (`ast.items` index `item`):
+/// its new list from the Ast, applied by `derive_delta::apply`, which logs
+/// its writes in `undo`. None when no flag moved.
+fn apply_item(p: &mut Program, item: usize, undo: &mut crate::check::derive_delta::Undo) -> Result<Option<crate::check::derive_delta::Reach>, &'static str> {
+    let (name, names, is_enum) = match &p.ast.items.get(item).ok_or("derive adt")?.kind {
+        ItemKind::Struct(s) => (s.name, s.derives.iter().map(|d| d.0).collect::<Vec<_>>(), false),
+        ItemKind::Enum(e) => (e.name, e.derives.iter().map(|d| d.0).collect::<Vec<_>>(), true),
+        _ => return Err("derive adt"),
+    };
+    let a = *p.type_names.get(&name).ok_or("derive adt")?;
+    if p.adt(a).name != name || p.adt(a).is_enum != is_enum {
+        return Err("derive adt");
+    }
+    let new = crate::check::derive_delta::derives_from_names(p, p.adt(a).derives_unlogged(), is_enum, &names)?;
+    crate::check::derive_delta::apply(p, a, new, undo)
 }
 
 /// The source names a body must mention to read a derive list of the

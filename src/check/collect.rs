@@ -4937,6 +4937,10 @@ pub fn collect_reuse(
                 // <S as X>::A`) stands for the normalized type
                 // when the projection resolves through impls
                 // already collected.
+                // A derive delta reads the written type (`written_projections`).
+                if p.tys.flags(self_pat).contains_projection() {
+                    p.gx.written_projections.entry(impl_def).or_default().push(self_pat);
+                }
                 let self_pat = generics::normalize_global(&mut p, self_pat);
                 impl_scope.self_ty = Some(self_pat);
                 impl_regions(&mut p, imp, impl_def, &mut impl_scope, &mut errs);
@@ -5942,7 +5946,13 @@ fn eval_pending_items(
             None => resolve_item_ty(p, ty_id, None),
         };
         let ty = match resolved {
-            Ok(t) => generics::normalize_item_ty(p, t),
+            Ok(t) => {
+                // A derive delta reads the written type (`written_projections`).
+                if p.tys.flags(t).contains_projection() {
+                    p.gx.written_projections.entry(generics::item_types_key(p)).or_default().push(t);
+                }
+                generics::normalize_item_ty(p, t)
+            }
             Err(d) => {
                 errs.push(d);
                 continue;
