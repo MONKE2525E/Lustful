@@ -347,14 +347,24 @@ pub(crate) type Bases = Vec<(usize, Option<crate::driver::gen_reuse::OutCopy>)>;
 /// new entries for those bodies, and the next delta compares with these.
 fn own_bases(p: &Program, front: &Front, caches: &Caches, fns: &[usize]) -> Bases {
     let reuse = &caches.gen_reuse;
-    let mut touched = Touched::new(p, fns);
+    let readers = readers(p, reuse, fns);
     let now = crate::driver::gen_reuse::stamp_now();
     (0..front.fn_loc.len() as u32)
         .map(LocalDefId)
         .filter(|&g| p.gx.fn_class.get(g.0 as usize) == Some(&FnClass::Plain) && !p.check_skips(g))
-        .filter(|&g| !reuse.newer(p, g, p.reuse_stamp, now) && !reuse.untouched(p, g, &mut |k| touched.hit(p, k)))
+        .filter(|&g| !reuse.newer(p, g, p.reuse_stamp, now) && !reuse.untouched_by(p, g, &readers))
         .map(|g| (g.0 as usize, reuse.out_copy(p.def_id(g))))
         .collect()
+}
+
+/// The defs whose stored entry may read a node `Touched` names for the
+/// edited fns `fns`, through gen_reuse's reverse index (the same keys:
+/// `GenReuse::readers`). The header delta tests entries against it in
+/// place of scanning each entry's reads.
+fn readers(p: &Program, reuse: &crate::driver::gen_reuse::GenReuse, fns: &[usize]) -> crate::intern::FxMap<crate::def::DefId, ()> {
+    let defs: Vec<crate::def::DefId> = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
+    let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
+    reuse.readers(&defs, &names)
 }
 
 /// The fns whose bodies reveal an opaque type and name one of the edited
@@ -409,6 +419,7 @@ fn replay_bodies(
     let fn_count = front.fn_loc.len();
     let mut touched = Touched::new(p, fns);
     let mut touched = |p: &Program, k: &ReadKey| touched.hit(p, k);
+    let readers = readers(p, &caches.gen_reuse, fns);
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
     let out = (|| {
@@ -429,7 +440,7 @@ fn replay_bodies(
                 continue;
             }
             // Every entry no newer than the program held for it.
-            if reuse.untouched(p, t, &mut |k| touched(p, k)) {
+            if reuse.untouched_by(p, t, &readers) {
                 continue;
             }
             // A template with no stored check (one with closures) stands
@@ -450,7 +461,7 @@ fn replay_bodies(
             recheck_template(p, t, &[(lo, hi)], caches)?;
         }
         super::laps::mark("collect/delta replay templates");
-        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false)
+        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers))
     })();
     (p.record_reads, p.unwind) = (record_reads, unwind);
     out
@@ -460,14 +471,17 @@ fn replay_bodies(
 /// header delta above, the derive delta in driver/kept_derive.rs), as a
 /// collect with generic reuse runs them. A body stands when the program
 /// holds its entry (none stored after `Program::reuse_stamp`) and the entry
-/// reads no node `touched` names, or when its stored output still holds,
-/// or when the caller proved it (`stands`: the derive delta's keyed walk).
+/// reads no node `touched` names (or, with `readers`, is not in that set:
+/// the header delta's reverse index of the same nodes), or when its stored
+/// output still holds, or when the caller proved it (`stands`: the derive
+/// delta's keyed walk).
 /// An entry stored after the program's stamp (and before `start`, when the
 /// delta began) checks against the output the program keeps for it
 /// (`bases`). Every other body checks again and must give the output
 /// collect built the program with (`GenReuse::out_copy`). A check still
 /// pending gives it too, as collect's last check of that body was; it is
 /// kept, not stored, as collect keeps it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn replay_discovery(
     p: &mut Program,
     caches: &mut Caches,
@@ -477,6 +491,7 @@ pub(super) fn replay_discovery(
     bases: &Bases,
     touched: &mut dyn FnMut(&Program, &ReadKey) -> bool,
     stands: &dyn Fn(LocalDefId) -> bool,
+    readers: Option<&crate::intern::FxMap<crate::def::DefId, ()>>,
 ) -> Result<(), &'static str> {
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
@@ -489,7 +504,10 @@ pub(super) fn replay_discovery(
             let own = bases.iter().find(|b| b.0 == g.0 as usize).map(|b| b.1.as_ref());
             let base = if reuse.newer(p, g, p.reuse_stamp, start) {
                 own.ok_or("sig mode")?.cloned()
-            } else if stands(g) || reuse.untouched(p, g, &mut |k| touched(p, k)) || reuse.discovery_holds(p, g) {
+            } else if stands(g)
+                || readers.map_or_else(|| reuse.untouched(p, g, &mut |k| touched(p, k)), |r| reuse.untouched_by(p, g, r))
+                || reuse.discovery_holds(p, g)
+            {
                 continue;
             } else {
                 reuse.out_copy(p.def_id(g))

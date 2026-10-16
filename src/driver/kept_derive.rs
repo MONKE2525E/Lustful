@@ -103,7 +103,7 @@ pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches,
         let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
         let stands = |g: LocalDefId| clean.get(g.0 as usize).copied().unwrap_or(false);
-        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands)?;
+        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None)?;
         crate::driver::laps::mark("kept/derive discovery");
     }
     caches.derive_dirty = Some(is_dirty);

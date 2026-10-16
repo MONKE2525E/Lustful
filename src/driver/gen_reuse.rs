@@ -156,6 +156,23 @@ pub struct GenReuse {
     pub trait_changed: bool,
     /// True once this collect reached `gate`.
     gated: bool,
+    /// The defs whose stored entry read each node a header delta can move
+    /// (`readers`): a superset, since a replaced entry leaves its old keys
+    /// until the next rebuild (`index_reads`).
+    readers_index: FxMap<ReaderKey, Vec<DefId>>,
+    /// Keys pushed into `readers_index` since its last rebuild.
+    readers_pushed: usize,
+}
+
+/// A node a header delta can move, as `GenReuse::readers_index` keys it:
+/// a def's signature, a binding or method set by written name, a binding
+/// by the def it resolves to, and any `Checked` read.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ReaderKey {
+    Sig(DefId),
+    Name(crate::intern::Sym),
+    Def(DefId),
+    Checked,
 }
 
 impl GenReuse {
@@ -163,6 +180,8 @@ impl GenReuse {
     pub fn clear(&mut self) {
         self.templates.clear();
         self.discovery.clear();
+        self.readers_index.clear();
+        self.readers_pushed = 0;
         self.unstored.clear();
     }
 
@@ -417,6 +436,7 @@ impl GenReuse {
         let picks = picks.iter().map(|&(e, pick)| (e.0 - lo, pick)).collect();
         let calls = calls.iter().map(|&(e, k)| (e.0 - lo, k)).collect();
         let entry = TemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads), n_exprs: hi - lo, picks, calls };
+        self.index_reads(p, p.def_id(t), &entry.reads);
         self.templates.insert(p.def_id(t), entry);
     }
 
@@ -480,6 +500,69 @@ impl GenReuse {
             _ => return false,
         };
         !reads.iter().any(|(k, _)| touched(k))
+    }
+
+    /// `untouched` for a header delta, through the reverse index: `readers`
+    /// is `GenReuse::readers` of the edited fns (no read scan per entry).
+    pub(crate) fn untouched_by(&self, p: &Program, f: LocalDefId, readers: &FxMap<DefId, ()>) -> bool {
+        let Some(src) = self.src_of(p, f).filter(|_| self.on) else { return false };
+        let def = p.def_id(f);
+        if self.unstored.contains_key(&def) || readers.contains_key(&def) {
+            return false;
+        }
+        let (lo, hi) = p.fn_def(f).exprs;
+        match (self.templates.get(&def), self.discovery.get(&def)) {
+            (Some(e), _) => e.src == src && e.n_exprs == hi - lo,
+            (None, Some(e)) => e.src == src,
+            _ => false,
+        }
+    }
+
+    /// The defs whose stored entry may read a node a header delta of the
+    /// fns `defs` (named `names`) moves: their signatures, the bindings
+    /// that resolve to them or share a name, the method sets of a name,
+    /// and every `Checked` read (`untouched_by` takes the set).
+    pub(crate) fn readers(&self, defs: &[DefId], names: &[crate::intern::Sym]) -> FxMap<DefId, ()> {
+        let keys = defs.iter().flat_map(|&d| [ReaderKey::Sig(d), ReaderKey::Def(d)]).chain(names.iter().map(|&n| ReaderKey::Name(n)));
+        keys.chain([ReaderKey::Checked]).filter_map(|k| self.readers_index.get(&k)).flatten().map(|&d| (d, ())).collect()
+    }
+
+    /// Adds entry `def`'s reads to `readers_index`. A binding indexes by
+    /// the def it resolves to now: an entry no newer than a kept program
+    /// held for it, so its bindings resolve as when it was stored. Rebuilt
+    /// from the live entries once stale keys outnumber them, before the new
+    /// keys go in (the caller stores the entry after this).
+    fn index_reads(&mut self, p: &Program, def: DefId, reads: &Reads) {
+        let push = |index: &mut FxMap<ReaderKey, Vec<DefId>>, def: DefId, reads: &Reads| {
+            let mut n = 0;
+            for (k, _) in reads.iter() {
+                let mut add = |key| {
+                    index.entry(key).or_default().push(def);
+                    n += 1;
+                };
+                match k {
+                    ReadKey::Sig(d) => add(ReaderKey::Sig(*d)),
+                    ReadKey::MethodSet(m) => add(ReaderKey::Name(m.name)),
+                    ReadKey::Binding(b) => {
+                        add(ReaderKey::Name(b.name));
+                        if let crate::driver::graph::BindingRes::Def(d) = p.binding_res(b.module, b.ns, b.name) {
+                            add(ReaderKey::Def(d));
+                        }
+                    }
+                    ReadKey::Checked(_) => add(ReaderKey::Checked),
+                    ReadKey::ImplSet(_) | ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => {}
+                }
+            }
+            n
+        };
+        let live = self.templates.len() + self.discovery.len();
+        if self.readers_pushed > 64 * live.max(64) {
+            let mut index = FxMap::default();
+            let entries = self.templates.iter().map(|(d, e)| (*d, &e.reads)).chain(self.discovery.iter().map(|(d, e)| (*d, &e.reads)));
+            let pushed: usize = entries.map(|(d, r)| push(&mut index, d, r)).sum();
+            (self.readers_index, self.readers_pushed) = (index, pushed);
+        }
+        self.readers_pushed += push(&mut self.readers_index, def, reads);
     }
 
     /// True when fn `f`'s stored discovery output still holds and is the
@@ -568,6 +651,7 @@ impl GenReuse {
             vtables: vtables.to_vec(),
         };
         self.unstored.remove(&p.def_id(f));
+        self.index_reads(p, p.def_id(f), &entry.reads);
         self.discovery.insert(p.def_id(f), entry);
     }
 }
