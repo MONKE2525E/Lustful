@@ -5076,9 +5076,14 @@ impl<'p> Ctx<'p> {
         {
             return Selection::Ambiguous;
         }
-        // An impl for a `'static` dyn type (`impl X for dyn Tr`).
+        // An impl for a `'static` dyn type (`impl X for dyn Tr`), picked
+        // for trait args that may hold a shorter lifetime.
         if let Selection::Impl { id, .. } = &sel
             && p.gx.static_dyn_impls.contains(&p.gx.index.get(*id).def)
+            && !self.tys.args(tr.args).to_vec().into_iter().filter_map(|g| g.as_ty()).all(|t| {
+                let t = self.deep(t);
+                !self.has_unbound_deep(t) && object::static_regions_known(p, &self.tys, t)
+            })
         {
             self.obl.push(obligations::Obligation::DynStatic { span });
         }

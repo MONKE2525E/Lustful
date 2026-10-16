@@ -877,6 +877,29 @@ pub fn has_erased_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     }
 }
 
+/// True when the `'static` regions of an impl header picked for `t` need
+/// no proof in the body: `t` has no erased dyn object lifetime and no
+/// reference (whose lifetime check erases). `impl Lg for Option<Rc<dyn
+/// Lg>>` picked for a field's `Option<Rc<dyn Lg>>`.
+pub fn static_regions_known(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    fn has_ref(tys: &impl TyIntern, t: Ty) -> bool {
+        let args_ref = |a: crate::ty::ArgsId| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_ref(tys, e)));
+        match tys.kind(t) {
+            TyKind::Ref(..) => true,
+            TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => has_ref(tys, e),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_ref(tys, e)),
+            TyKind::Adt(_, a) | TyKind::Closure(_, a) | TyKind::FnDef(_, a) | TyKind::Projection(_, a) | TyKind::Opaque(_, a) => args_ref(a),
+            TyKind::Dyn(..) => principal_of(tys, t).is_some_and(|pr| args_ref(pr.args)),
+            TyKind::FnPtr(sig) => {
+                let s = tys.sig(sig).value;
+                has_ref(tys, s.output) || tys.tys_of(s.inputs).iter().any(|&e| has_ref(tys, e))
+            }
+            _ => false,
+        }
+    }
+    !has_erased_dyn(p, tys, t) && !has_ref(tys, t)
+}
+
 /// True when a dyn type with an erased object lifetime sits in an
 /// invariant position of the return type `t`: under `&mut` or `*mut`
 /// (other than a dyn pointee of the outer reference or `RefMut`, which a
