@@ -8716,7 +8716,7 @@ pub fn iter_clone_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     let part = |t: Ty| if crate::ty::iter::is_iter(tys, t) { iter_clone_is_copy(p, tys, t) } else { is_copy(p, tys, t) };
     let ok_kind = match k {
         K::SliceIter | K::Range | K::RangeInclusive | K::Map | K::Filter | K::Enumerate | K::Rev | K::Take | K::Skip | K::Chain | K::Zip => true,
-        K::Copied | K::Cloned | K::FilterMap | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::RepeatN | K::ByNext => true,
+        K::Copied | K::Cloned | K::FilterMap | K::MapWhile | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::RepeatN | K::ByNext => true,
         K::Windows | K::CharIndices | K::Flatten | K::OptionIntoIter | K::OptionIter | K::ResultIter | K::ResultIntoIter => true,
         K::StrSplit | K::StrMatches | K::EncodeUtf16 | K::Chunks | K::ChunksExact | K::Utf8Chunks => true,
         K::MapIter | K::MapKeys | K::MapValues | K::SetIter => true,
@@ -8747,7 +8747,7 @@ fn iter_item_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         K::SliceIter | K::Windows | K::Chunks | K::ChunksExact | K::SliceSplit | K::CharIndices | K::StrSplit | K::StrMatches | K::EncodeUtf16 => true,
         K::OptionIter | K::ResultIter | K::Range | K::RangeInclusive => true,
         K::MapIter | K::MapKeys | K::MapValues | K::SetIter => true,
-        K::Map | K::FilterMap => is_copy(p, tys, arg(2)),
+        K::Map | K::FilterMap | K::MapWhile => is_copy(p, tys, arg(2)),
         K::Copied | K::Cloned => is_copy(p, tys, arg(1)),
         K::OptionIntoIter | K::ResultIntoIter | K::RepeatN => is_copy(p, tys, arg(0)),
         K::ByNext => is_copy(p, tys, arg(1)),

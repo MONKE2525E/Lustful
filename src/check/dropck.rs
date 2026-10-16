@@ -524,7 +524,7 @@ impl Dropck<'_, '_> {
             | K::TryCollect
             | K::StrSplit
             | K::StrMatches => at(0),
-            K::Map | K::Filter | K::Chain | K::Zip | K::FilterMap | K::TakeWhile | K::SkipWhile | K::Inspect | K::Flatten => two(0, 1),
+            K::Map | K::Filter | K::Chain | K::Zip | K::FilterMap | K::MapWhile | K::TakeWhile | K::SkipWhile | K::Inspect | K::Flatten => two(0, 1),
             K::SliceSplit | K::SliceSplitMut => at(1),
             K::MapIntoIter | K::MapIntoKeys | K::MapIntoValues => {
                 let pair = self.tuple(tys);

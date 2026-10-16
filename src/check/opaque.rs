@@ -844,6 +844,7 @@ fn inner_iter_args(k: crate::ty::iter::IterKind) -> &'static [usize] {
         K::Map
         | K::Filter
         | K::FilterMap
+        | K::MapWhile
         | K::Inspect
         | K::Enumerate
         | K::Take

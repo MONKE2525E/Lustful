@@ -431,7 +431,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::OptionIntoIter => cty(tys, a[0]),
         K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::VecDrain => cty(tys, a[0]),
         K::StringDrain => CTy::Char,
-        K::Map | K::FilterMap => cty(tys, a[2]),
+        K::Map | K::FilterMap | K::MapWhile => cty(tys, a[2]),
         K::Enumerate => CTy::Tuple(vec![CTy::Int(IntTy::Usize), iter_item_cty(tys, a[0])]),
         K::Zip => CTy::Tuple(vec![iter_item_cty(tys, a[0]), iter_item_cty(tys, a[1])]),
         K::Copied | K::Cloned => cty(tys, a[1]),
@@ -5752,6 +5752,7 @@ impl FnGen<'_, '_> {
             | B::IterCopied
             | B::IterCloned
             | B::IterTakeWhile
+            | B::IterMapWhile
             | B::IterSkipWhile
             | B::IterPeekable
             | B::IterPeek

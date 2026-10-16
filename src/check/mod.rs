@@ -575,6 +575,8 @@ pub enum Builtin {
     IterCloned,
     IterTakeWhile,
     IterSkipWhile,
+    /// `Iterator::map_while(f)` (R22): a `MapWhile` adapter.
+    IterMapWhile,
     IterPeekable,
     IterPeek,
     /// `Peekable::next_if(func)` and `next_if_eq(&expected)` (R22): one

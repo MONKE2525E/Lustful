@@ -80,6 +80,7 @@ pub fn iter_by_path(path: &[&str]) -> Option<StdIterPath> {
         ["std" | "core", "iter", "Copied"] => S::Kind(K::Copied),
         ["std" | "core", "iter", "Cloned"] => S::Kind(K::Cloned),
         ["std" | "core", "iter", "FilterMap"] => S::Kind(K::FilterMap),
+        ["std" | "core", "iter", "MapWhile"] => S::Kind(K::MapWhile),
         ["std" | "core", "iter", "TakeWhile"] => S::Kind(K::TakeWhile),
         ["std" | "core", "iter", "SkipWhile"] => S::Kind(K::SkipWhile),
         ["std" | "core", "iter", "StepBy"] => S::Kind(K::StepBy),
@@ -322,6 +323,7 @@ pub fn resolve_iter_path(
                     | K::Copied
                     | K::Cloned
                     | K::FilterMap
+                    | K::MapWhile
                     | K::TakeWhile
                     | K::SkipWhile
                     | K::StepBy
@@ -348,7 +350,7 @@ pub fn resolve_iter_path(
                     let arr = tys.intern(TyKind::Array(erased_args[0], const_args[0]));
                     extra.push(arr);
                 }
-                K::Map | K::FilterMap => {
+                K::Map | K::FilterMap | K::MapWhile => {
                     let TyKind::FnPtr(sig) = tys.kind(erased_args[1]) else {
                         return Err(unsupported("with a function type that is not a fn pointer"));
                     };

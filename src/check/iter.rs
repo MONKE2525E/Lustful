@@ -22,7 +22,6 @@ const DECLARED_ONLY: &[&str] = &[
     "advance_by",
     "flat_map",
     "flatten",
-    "map_while",
     "scan",
     "fuse",
     "partition_in_place",
@@ -1019,7 +1018,7 @@ impl<'p> Ctx<'p> {
             }
             // DoubleEndedIterator::next_back (W-STD-B).
             "next_back" => {
-                if !self.double_ended(base) {
+                if !self.double_ended(base, span) {
                     let tn = self.tn(base);
                     self.err("L0612", span, format!("`{tn}` is not a DoubleEndedIterator here"), "Iterate forward with `next`.");
                     return self.iter_bail(args);
@@ -1087,6 +1086,13 @@ impl<'p> Ctx<'p> {
                 let t = mk(self, K::FilterMap, &[base, f, out]);
                 (B::IterFilterMap, vec![f], t)
             }
+            "map_while" => {
+                let out = self.new_var(false);
+                let o = self.tys.mk_option(out);
+                let f = self.fn_mut_param(&[item], o, span);
+                let t = mk(self, K::MapWhile, &[base, f, out]);
+                (B::IterMapWhile, vec![f], t)
+            }
             "enumerate" => (B::IterEnumerate, vec![], mk(self, K::Enumerate, &[base])),
             // `flatten` and `flat_map` (W-STD-B): the inner items' (or the
             // closure output's) IntoIter is the second iterator.
@@ -1114,7 +1120,7 @@ impl<'p> Ctx<'p> {
                 return mk(self, K::Flatten, &[m, u]);
             }
             "rev" => {
-                if !self.double_ended(base) {
+                if !self.double_ended(base, span) {
                     let tn = self.tn(base);
                     self.err("L0612", span, format!("`{tn}` is not a double-ended iterator"), "Reverse a slice, Vec, or range iterator instead.");
                     return self.iter_bail(args);
@@ -1236,6 +1242,14 @@ impl<'p> Ctx<'p> {
                     };
                     let at = self.expr(*a, None);
                     let at = self.deep(at);
+                    // `Item: PartialEq<T>` does not fix an open `Item`
+                    // in rustc (E0282): no inference from `T` here.
+                    let it = self.deep(item);
+                    let lit = matches!(self.kind(it), TyKind::Infer(v) if v.is_int() || v.is_float());
+                    if self.has_unbound_var(it) && !lit {
+                        self.err("L0610", span, "type annotations needed: the item type of this `next_if_eq` must be known here", "Annotate the element type.");
+                        return ERROR;
+                    }
                     let want = r(self, item);
                     if !self.coerce_expr(*a, at, want) {
                         return ERROR;
@@ -1640,6 +1654,7 @@ impl<'p> Ctx<'p> {
                 | "map"
                 | "filter"
                 | "filter_map"
+                | "map_while"
                 | "enumerate"
                 | "rev"
                 | "take"
@@ -2014,8 +2029,9 @@ impl<'p> Ctx<'p> {
     }
 
     /// True when an iterator type is double-ended in Rust 1.99, for
-    /// the kinds lust has.
-    fn double_ended(&mut self, t: Ty) -> bool {
+    /// the kinds lust has. `span` places the deferred range checks of
+    /// `exact_size` (a `Zip` side).
+    fn double_ended(&mut self, t: Ty, span: Span) -> bool {
         use IterKind as K;
         if self.tys.is_chars_ty(t) {
             return true;
@@ -2036,11 +2052,16 @@ impl<'p> Ctx<'p> {
             | K::VecDrain
             | K::StringDrain
             | K::Args => true,
-            K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => self.double_ended(a[0]),
-            K::Chain => self.double_ended(a[0]) && self.double_ended(a[1]),
+            K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => self.double_ended(a[0], span),
+            K::Chain => self.double_ended(a[0], span) && self.double_ended(a[1], span),
+            // `A, B: DoubleEndedIterator + ExactSizeIterator` (R22). A
+            // side over a user iterator stays out: core's `next_back`
+            // trusts its `len`, and a dishonest `size_hint` would reach
+            // core's `unreachable!` (lower/iter.rs `zip_next_back`).
+            K::Zip => (0..2).all(|i| self.double_ended(a[i], span) && self.exact_size(a[i], span) && !it::has_by_next(&self.tys, a[i])),
             // These need ExactSizeIterator too: lust keeps them forward-only for now.
-            K::Enumerate | K::Take | K::Skip | K::Zip | K::StepBy => false,
-            K::TakeWhile | K::SkipWhile => false,
+            K::Enumerate | K::Take | K::Skip | K::StepBy => false,
+            K::TakeWhile | K::SkipWhile | K::MapWhile => false,
             K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::Utf8Chunks | K::Utf8Chunk => false,
             // hashbrown's iterators are forward-only.
             K::MapIter
@@ -2058,7 +2079,7 @@ impl<'p> Ctx<'p> {
             // Through `&mut I` (core: `impl<I: DoubleEndedIterator + ?Sized>
             // DoubleEndedIterator for &mut I`): as `I`.
             K::ByNext => match self.kind(a[0]) {
-                TyKind::Ref(_, Mut::Mut, inner) if self.tys.is_chars_ty(inner) || it::iter_parts(&self.tys, inner).is_some() => self.double_ended(inner),
+                TyKind::Ref(_, Mut::Mut, inner) if self.tys.is_chars_ty(inner) || it::iter_parts(&self.tys, inner).is_some() => self.double_ended(inner, span),
                 TyKind::Ref(_, Mut::Mut, inner) => by_next_fns(self.p, &self.tys, inner).is_ok_and(|f| f.next_back.is_some()),
                 _ => by_next_fns(self.p, &self.tys, a[0]).is_ok_and(|f| f.next_back.is_some()),
             },
@@ -2947,6 +2968,7 @@ const ITER_METHODS: &[&str] = &[
     "map",
     "filter",
     "filter_map",
+    "map_while",
     "enumerate",
     "rev",
     "take",

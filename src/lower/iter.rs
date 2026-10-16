@@ -63,6 +63,7 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::IterMap
             | B::IterFilter
             | B::IterFilterMap
+            | B::IterMapWhile
             | B::IterEnumerate
             | B::IterRev
             | B::IterTake
@@ -744,7 +745,7 @@ impl Ex<'_, '_> {
                 self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![Operand::Move(Place::local(s))]));
             }
-            B::IterMap | B::IterFilter | B::IterFilterMap | B::IterInspect => {
+            B::IterMap | B::IterFilter | B::IterFilterMap | B::IterMapWhile | B::IterInspect => {
                 let (i, f) = (self.unwrap_op(arg()?)?, arg()?);
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![i, f]));
             }
@@ -2814,10 +2815,8 @@ impl Ex<'_, '_> {
                 self.none(&dest, opt);
                 self.goto(join);
             }
+            K::Zip if back => self.zip_next_back(&itp, &a, &dest, opt, join)?,
             K::Zip => {
-                if back {
-                    return Err("iterator expansion: Zip is forward-only here".into());
-                }
                 let (ia, ib) = (self.item(a[0])?, self.item(a[1])?);
                 if self.tra_coerce(a[0]) && self.tra_coerce(a[1]) {
                     // Both sides random access (Rust's `Zip` over two
@@ -2879,6 +2878,26 @@ impl Ex<'_, '_> {
                     self.none(&dest, opt);
                     self.goto(join);
                 }
+            }
+            // core's `let x = self.iter.next()?; (self.predicate)(x)`:
+            // not fused, so a pull after a `None` from the predicate
+            // pulls the inner iterator again.
+            K::MapWhile => {
+                if back {
+                    return Err("iterator expansion: MapWhile is forward-only".into());
+                }
+                let inner_item = self.item(a[0])?;
+                let iopt = self.body.tys.mk_option(inner_item);
+                let t = self.local(iopt);
+                self.next(f(0), a[0], Place::local(t), false)?;
+                let (s, n) = self.switch_opt(&Place::local(t));
+                self.cur = s;
+                let px = self.take(Self::payload(&Place::local(t)), inner_item);
+                self.call_fn(a[1], f(1), vec![px], dest.clone())?;
+                self.goto(join);
+                self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
             }
             K::TakeWhile => {
                 if back {
@@ -2955,6 +2974,99 @@ impl Ex<'_, '_> {
             }
         }
         self.cur = join;
+        Ok(())
+    }
+
+    /// `Zip::next_back` (core 1.99 zip.rs, R22). Both sides are
+    /// double-ended and exact size (check/iter.rs `double_ended`).
+    ///
+    /// Two `TrustedRandomAccess` sides: core reads index `len - 1` of
+    /// each side after one trim of the longer side's back to `len`
+    /// (only a side that may have side effects is trimmed). lust's
+    /// sides are pulled from the front on each `next` (see the forward
+    /// arm), so a side holds `size + index` of core's elements: each
+    /// side is trimmed back to `len` with `next_back` (on a side without
+    /// side effects this is not observable), then one `next_back` of
+    /// each side is core's indexed read.
+    ///
+    /// Otherwise core's general `next_back`: trim the longer side by the
+    /// `len` difference, then `next_back` both.
+    fn zip_next_back(&mut self, itp: &Place, a: &[Ty], dest: &Place, opt: Ty, join: Bb) -> R {
+        use crate::ast::BinOp::*;
+        let f = |i: u32| itp.project(Proj::Field(i));
+        let (ia, ib) = (self.item(a[0])?, self.item(a[1])?);
+        if self.tra_coerce(a[0]) && self.tra_coerce(a[1]) {
+            let c = self.cmp(Lt, Operand::Copy(f(2)), Operand::Copy(f(3)));
+            let (go, spent) = self.branch(c);
+            self.cur = spent;
+            self.none(dest, opt);
+            self.goto(join);
+            self.cur = go;
+            let want = self.local(USIZE);
+            self.assign(Place::local(want), Rvalue::Bin(Sub, Operand::Copy(f(3)), Operand::Copy(f(2))));
+            self.assign(f(3), Rvalue::Bin(Sub, Operand::Copy(f(3)), Self::usize_c(1)));
+            for i in 0..2 {
+                let sz = self.size(f(i), a[i as usize])?;
+                let n = self.local(USIZE);
+                self.assign(Place::local(n), Rvalue::Bin(Sub, sz, Operand::Copy(Place::local(want))));
+                self.drop_back_n(f(i), a[i as usize], n)?;
+            }
+        } else {
+            let (al, _) = self.hint(f(0), a[0])?;
+            let (bl, _) = self.hint(f(1), a[1])?;
+            let (na, nb) = (self.local(USIZE), self.local(USIZE));
+            self.call_builtin(Builtin::SaturatingSub, vec![Operand::Copy(Place::local(al)), Operand::Copy(Place::local(bl))], Place::local(na));
+            self.call_builtin(Builtin::SaturatingSub, vec![Operand::Copy(Place::local(bl)), Operand::Copy(Place::local(al))], Place::local(nb));
+            self.drop_back_n(f(0), a[0], na)?;
+            self.drop_back_n(f(1), a[1], nb)?;
+        }
+        let (oa, ob) = (self.body.tys.mk_option(ia), self.body.tys.mk_option(ib));
+        let (ta, tb) = (self.local(oa), self.local(ob));
+        self.next(f(0), a[0], Place::local(ta), true)?;
+        self.next(f(1), a[1], Place::local(tb), true)?;
+        let (sa, na) = self.switch_opt(&Place::local(ta));
+        self.cur = sa;
+        let (sb, nb) = self.switch_opt(&Place::local(tb));
+        self.cur = sb;
+        let ts = self.body.tys.intern_tys(&[ia, ib]);
+        let item = self.body.tys.intern(TyKind::Tuple(ts));
+        let ax = self.take(Self::payload(&Place::local(ta)), ia);
+        let ay = self.take(Self::payload(&Place::local(tb)), ib);
+        let tup = self.local(item);
+        self.assign(Place::local(tup), Rvalue::TupleAgg(item, vec![ax, ay]));
+        let at = self.take(Place::local(tup), item);
+        self.some(dest, opt, at);
+        self.goto(join);
+        // Equal lengths make both sides end together; the mixed case
+        // (core's `unreachable!`) cannot happen over exact sides.
+        self.cur = nb;
+        self.drop_local(ta);
+        self.none(dest, opt);
+        self.goto(join);
+        self.cur = na;
+        self.drop_local(tb);
+        self.none(dest, opt);
+        self.goto(join);
+        Ok(())
+    }
+
+    /// core's `for _ in 0..n { s.next_back(); }`: each item drops at once.
+    fn drop_back_n(&mut self, s: Place, st: Ty, n: Local) -> R {
+        use crate::ast::BinOp::*;
+        let item = self.item(st)?;
+        let opt = self.body.tys.mk_option(item);
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let c = self.cmp(Gt, Operand::Copy(Place::local(n)), Self::usize_c(0));
+        let (go, end) = self.branch(c);
+        self.cur = go;
+        self.assign(Place::local(n), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Self::usize_c(1)));
+        let t = self.local(opt);
+        self.next(s.clone(), st, Place::local(t), true)?;
+        self.drop_local(t);
+        self.goto(lp);
+        self.cur = end;
         Ok(())
     }
 
@@ -3360,7 +3472,7 @@ impl Ex<'_, '_> {
         let Some((k, a)) = self.kind_args(ty) else { return self.body.tys.is_chars_ty(ty) };
         match k {
             K::Filter | K::FilterMap | K::SkipWhile | K::Zip | K::StepBy => true,
-            K::Map | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Peekable | K::Rev | K::TakeWhile => self.fold_pull_same(a[0]),
+            K::Map | K::MapWhile | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Peekable | K::Rev | K::TakeWhile => self.fold_pull_same(a[0]),
             K::Chain | K::Flatten => self.fold_pull_same(a[0]) && self.fold_pull_same(a[1]),
             K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::Range | K::RangeFrom | K::ArrayIntoIter | K::ByNext => true,
             _ => false,
@@ -4831,7 +4943,8 @@ impl Ex<'_, '_> {
                     }
                 }
             }
-            K::Filter | K::FilterMap | K::SkipWhile => {
+            // `MapWhile`: `(0, upper)` of the inner hint, as core's.
+            K::Filter | K::FilterMap | K::MapWhile | K::SkipWhile => {
                 let (_, ih) = self.hint(f(0), a[0])?;
                 self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
                 self.assign(Place::local(hi), Rvalue::Use(Operand::Move(Place::local(ih))));
@@ -5050,7 +5163,7 @@ impl Ex<'_, '_> {
             K::Map | K::Enumerate | K::Rev | K::Take | K::Copied | K::Cloned | K::Peekable => self.trusted_len(a[0]),
             K::Chain | K::Zip => self.trusted_len(a[0]) && self.trusted_len(a[1]),
             K::Skip | K::StepBy => self.tra_coerce(a[0]),
-            K::Filter | K::FilterMap | K::TakeWhile | K::SkipWhile | K::Inspect => false,
+            K::Filter | K::FilterMap | K::MapWhile | K::TakeWhile | K::SkipWhile | K::Inspect => false,
             K::RecvIter | K::RecvTryIter | K::RecvIntoIter => false,
             // Not `TrustedLen` in Rust 1.99 (`collect` of two keys
             // allocates 4).
@@ -6225,7 +6338,7 @@ impl Ex<'_, '_> {
         let (k, a) = self.kind_args(t)?;
         match k {
             K::SliceIter | K::SliceIterMut | K::VecIntoIter | K::ArrayIntoIter | K::RepeatN | K::OptionIntoIter => self.const_size(a[0]),
-            K::Map | K::FilterMap => self.const_size(a[2]),
+            K::Map | K::FilterMap | K::MapWhile => self.const_size(a[2]),
             K::Copied | K::Cloned | K::ByNext => self.const_size(a[1]),
             K::Filter | K::Rev | K::Take | K::Skip | K::Chain | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect => {
                 self.item_const_size(a[0])
@@ -6988,7 +7101,7 @@ impl Ex<'_, '_> {
     /// When `collect` into `Vec<T>` keeps the source buffer (std's
     /// `SpecFromIter` impls, W-STD-B): a `vec::IntoIter<S>` itself (0
     /// adapter levels), or through std's InPlaceIterable adapters lust has
-    /// (Map, Filter, FilterMap, Enumerate, Zip's first side, Skip, Take,
+    /// (Map, Filter, FilterMap, MapWhile, Enumerate, Zip's first side, Skip, Take,
     /// SkipWhile, TakeWhile, Inspect, Cloned) when S and T are not zero
     /// sized, align the same, and T is no larger. The adapter depth (each
     /// level's source is its field 0) and S.
@@ -7002,7 +7115,7 @@ impl Ex<'_, '_> {
         let mut cur = (k, a);
         loop {
             match cur.0 {
-                K::Map | K::Filter | K::FilterMap | K::Enumerate | K::Zip | K::Skip | K::Take | K::SkipWhile | K::TakeWhile | K::Inspect | K::Cloned | K::TryCollect => {
+                K::Map | K::Filter | K::FilterMap | K::MapWhile | K::Enumerate | K::Zip | K::Skip | K::Take | K::SkipWhile | K::TakeWhile | K::Inspect | K::Cloned | K::TryCollect => {
                     depth += 1;
                     cur = self.kind_args(cur.1[0])?;
                 }

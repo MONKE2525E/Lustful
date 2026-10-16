@@ -253,7 +253,7 @@ fn chain_overflow(p: &Program, ck: &crate::check::Checked, e: crate::ast::ExprId
             let slack = if build {
                 // Build boundaries (mono adds its own levels): the measured
                 // consumers, and two layers early for any other method.
-                let filtering = matches!(top, Some(K::Filter | K::Peekable | K::FilterMap | K::TakeWhile | K::SkipWhile));
+                let filtering = matches!(top, Some(K::Filter | K::Peekable | K::FilterMap | K::MapWhile | K::TakeWhile | K::SkipWhile));
                 match name {
                     "count" | "sum" => -(filtering as isize),
                     "fold" | "any" | "all" | "last" | "max" | "min" => -1,

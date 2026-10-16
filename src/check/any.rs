@@ -892,6 +892,7 @@ fn tn_iter(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::iter::Iter
         K::Map => two(tys, "core::iter::adapters::map::Map"),
         K::Filter => two(tys, "core::iter::adapters::filter::Filter"),
         K::FilterMap => two(tys, "core::iter::adapters::filter_map::FilterMap"),
+        K::MapWhile => two(tys, "core::iter::adapters::map_while::MapWhile"),
         K::TakeWhile => two(tys, "core::iter::adapters::take_while::TakeWhile"),
         K::SkipWhile => two(tys, "core::iter::adapters::skip_while::SkipWhile"),
         K::Inspect => two(tys, "core::iter::adapters::inspect::Inspect"),

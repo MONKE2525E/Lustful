@@ -5628,7 +5628,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         // `Map<I, F, B>`'s items are its `B` slots, which the closure's
         // output flows into at the `map` call.
         let parts = crate::ty::iter::iter_parts(&self.body.tys, t);
-        if let Some((crate::ty::iter::IterKind::Map | crate::ty::iter::IterKind::FilterMap, a)) = parts
+        if let Some((crate::ty::iter::IterKind::Map | crate::ty::iter::IterKind::FilterMap | crate::ty::iter::IterKind::MapWhile, a)) = parts
             && let [i, f, b, ..] = a[..]
         {
             let (ni, nf, nb) = (self.sc.slots(i) as usize, self.sc.slots(f) as usize, self.sc.slots(b) as usize);
@@ -6162,7 +6162,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::Utf8Chunks => own.clone(),
             K::Utf8Chunk => return None,
             K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::VecDrain => args[0].clone(),
-            K::Map | K::FilterMap | K::TryCollect => args[2].clone(),
+            K::Map | K::FilterMap | K::MapWhile | K::TryCollect => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
                 self.item_slots(a[0], &args[0])?
@@ -6589,7 +6589,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             // The closure's output (`FilterMap`'s `Option<B>` has `B`'s
             // slots): what its body returns of its captured slots (laid
             // out after the inner iterator's) and its free arguments.
-            K::Map | K::FilterMap => {
+            K::Map | K::FilterMap | K::MapWhile => {
                 let (Some(&f), Some(&bt)) = (a.get(1), a.get(2)) else { return false };
                 let TyKind::Closure(def, cargs) = self.body.tys.kind(f) else { return false };
                 let nf = self.sc.slots(f) as usize;

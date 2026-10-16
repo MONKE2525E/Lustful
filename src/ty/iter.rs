@@ -206,6 +206,9 @@ pub enum IterKind {
     SliceSplit,
     /// The `_mut` forms of `SliceSplit`: item `&mut [T]`.
     SliceSplitMut,
+    /// `MapWhile<I, P>` (R22): args `[I, P, B]` with `P` returning
+    /// `Option<B>`; fields (iter, predicate), as core's. Not fused.
+    MapWhile,
 }
 
 /// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
@@ -380,7 +383,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 65] = [
+    pub const ALL: [IterKind; 66] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -446,6 +449,7 @@ impl IterKind {
         IterKind::Args,
         IterKind::SliceSplit,
         IterKind::SliceSplitMut,
+        IterKind::MapWhile,
     ];
 
     /// True for the hashed-collection iterators.
@@ -532,6 +536,7 @@ impl IterKind {
             K::Args => (&["std", "env"], "Args"),
             K::SliceSplit => (&["core", "slice"], "Split"),
             K::SliceSplitMut => (&["core", "slice"], "SplitMut"),
+            K::MapWhile => (ADAPT, "MapWhile"),
         }
     }
 
@@ -556,7 +561,7 @@ impl IterKind {
     pub fn n_args(self) -> usize {
         use IterKind as K;
         match self {
-            K::Map | K::FilterMap | K::TryCollect | K::SliceSplit | K::SliceSplitMut => 3,
+            K::Map | K::FilterMap | K::MapWhile | K::TryCollect | K::SliceSplit | K::SliceSplitMut => 3,
             K::Flatten => 2,
             K::Filter
             | K::Chain
@@ -652,6 +657,7 @@ impl IterKind {
             K::Args => "std::env::Args",
             K::SliceSplit => "std::slice::Split",
             K::SliceSplitMut => "std::slice::SplitMut",
+            K::MapWhile => "std::iter::MapWhile",
         }
     }
 
@@ -659,7 +665,7 @@ impl IterKind {
     /// lust adds stay hidden).
     pub fn shown_args(self) -> usize {
         match self {
-            IterKind::Map | IterKind::FilterMap | IterKind::SliceSplit | IterKind::SliceSplitMut => 2,
+            IterKind::Map | IterKind::FilterMap | IterKind::MapWhile | IterKind::SliceSplit | IterKind::SliceSplitMut => 2,
             IterKind::Copied | IterKind::Cloned | IterKind::ArrayIntoIter | IterKind::Flatten | IterKind::StrSplit | IterKind::StrMatches => 1,
             // The `u8` arg of the UTF-8 kinds is lust's own marker.
             IterKind::Utf8Chunks | IterKind::Utf8Chunk => 0,
@@ -679,7 +685,7 @@ impl IterKind {
             K::VecIntoIter => &[F::VecArg(0), F::Usize, F::Usize],
             K::Range => &[F::Arg(0), F::Arg(0)],
             K::RangeInclusive => &[F::Arg(0), F::Arg(0), F::Bool],
-            K::Map | K::Filter | K::FilterMap | K::Inspect => &[F::Arg(0), F::Arg(1)],
+            K::Map | K::Filter | K::FilterMap | K::MapWhile | K::Inspect => &[F::Arg(0), F::Arg(1)],
             // `index` and `len` serve the random-access form only.
             K::Zip => &[F::Arg(0), F::Arg(1), F::Usize, F::Usize],
             K::Enumerate | K::Take | K::Skip => &[F::Arg(0), F::Usize],
@@ -758,6 +764,16 @@ pub fn mk_iter(tys: &mut impl TyIntern, k: IterKind, args: &[Ty]) -> Ty {
     tys.mk_adt(def, &a)
 }
 
+/// True when a builtin iterator type holds a `ByNext` (a user iterator
+/// or a type parameter) at any depth of its iterator args.
+pub fn has_by_next(tys: &impl TyIntern, t: Ty) -> bool {
+    match iter_parts(tys, t) {
+        Some((IterKind::ByNext, _)) => true,
+        Some((_, a)) => a.iter().any(|&x| is_iter(tys, x) && has_by_next(tys, x)),
+        None => false,
+    }
+}
+
 /// True for the types `item_ty` answers: builtin iterators and `Chars`.
 pub fn is_iter(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.builtin_of(t) {
@@ -783,7 +799,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::VecDrain => a[0],
         K::StringDrain => CHAR,
         K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk => return None,
-        K::Map | K::FilterMap => a[2],
+        K::Map | K::FilterMap | K::MapWhile => a[2],
         K::Filter | K::Rev | K::Take | K::Skip | K::Chain | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect => {
             item_ty(tys, a[0])?
         }
