@@ -16682,6 +16682,9 @@ impl<'p> Ctx<'p> {
                     continue;
                 }
                 let s = self.span(a);
+                // `format_args!` takes each argument by reference as a
+                // sized `T` (rustc E0277 on `println!("{:?}", *v)`).
+                self.require_sized(t, s);
                 self.check_fmt_arg(t, *spec, s);
             }
         }
@@ -20900,6 +20903,7 @@ impl<'p> Ctx<'p> {
         // Deferred format tests, with types as bound by now.
         for (t, spec, span) in std::mem::take(&mut self.deferred_fmt) {
             let t = self.deep(t);
+            self.require_sized(t, span);
             self.check_fmt_arg(t, spec, span);
         }
         // Deferred Clone and PartialEq needs of builtin Vec and
