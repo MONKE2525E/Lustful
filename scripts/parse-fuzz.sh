@@ -74,7 +74,11 @@ run_one() {
   f="$1"
   LUST_NO_DAEMON=1 timeout "${PARSE_FUZZ_TIMEOUT:-2}" "$LUST_BIN" check "$f" >/dev/null 2>&1
   code=$?
-  if [ "$code" -eq 124 ] || [ "$code" -eq 101 ] || [ "$code" -gt 128 ]; then
+  if [ "$code" -eq 124 ]; then
+    # A timeout under parallel load is retried once later, alone, with 6x the limit; only a
+    # second timeout is a hang (two land gates timed out on cases that pass in under 10 s idle).
+    echo "$f" >> "$FAILDIR/.slow"
+  elif [ "$code" -eq 101 ] || [ "$code" -gt 128 ]; then
     cp "$f" "$FAILDIR/"
     echo "BAD exit=$code $f"
   fi
@@ -82,6 +86,18 @@ run_one() {
 export -f run_one
 cd "$work" || exit 1
 ls case-*.rs | xargs -P 8 -I{} bash -c 'run_one "$@"' _ {}
+if [ -s "$faildir/.slow" ]; then
+  while read -r f; do
+    LUST_NO_DAEMON=1 timeout $(( ${PARSE_FUZZ_TIMEOUT:-2} * 6 )) "$lust" check "$f" >/dev/null 2>&1
+    code=$?
+    if [ "$code" -eq 124 ] || [ "$code" -eq 101 ] || [ "$code" -gt 128 ]; then
+      cp "$f" "$faildir/"; echo "BAD exit=$code $f (hang: also timed out alone at 6x the limit)"
+    else
+      echo "slow: $f timed out under load, passed alone"
+    fi
+  done < "$faildir/.slow"
+  rm -f "$faildir/.slow"
+fi
 
 bad=$(find "$faildir" -name 'case-*.rs' | wc -l)
 echo "parse-fuzz: $cases cases, $bad bad"
