@@ -13596,7 +13596,13 @@ impl<'p> Ctx<'p> {
                     }
                     return ERROR;
                 }
-                self.expr(args[0], None);
+                // `drop::<T>(x)`: x must have type T (rustc E0308).
+                if segs.last().is_some_and(|s| s.has_args()) {
+                    let t = self.callee_turbo_ty(callee, span);
+                    self.check_args(&[t], args, span);
+                } else {
+                    self.expr(args[0], None);
+                }
                 self.reject_unsized_value(args[0]);
                 self.set_res(e, Res::Builtin(Builtin::MemDrop));
                 return UNIT;
