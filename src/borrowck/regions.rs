@@ -1319,8 +1319,12 @@ pub(super) enum End {
 /// (`bound_slots`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BoundSlot {
-    /// The call's instantiation of a type param: free in the closure.
+    /// The call's instantiation of a projection: free in the closure.
     Free,
+    /// Slot `q` of the `n` slots of the call's instantiation of the
+    /// callee's type param `j`: free in the closure, paired with the
+    /// call's binding of `j` (`link_bound_closure`).
+    Param { j: u32, q: u32, n: u32 },
     /// An elided lifetime the bound writes: higher-ranked.
     Hr,
     /// A lifetime the bound names: this var (`'static` is 0).
@@ -7772,8 +7776,8 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// The free argument slots of the closure bound to `F` in a call's
     /// `F: Fn*(A..)` bound (`trait_args`; found through the type `F` binds,
     /// so a mono instance pairs like its template), equated with the
-    /// call's instantiation of each input that is a type param of the
-    /// callee (`binds`; `&T`: past its higher-ranked outer reference).
+    /// call's instantiation of each type param of the callee the input
+    /// holds (`binds`; at any depth: `T`, `&T`, `&V<'a, T>`).
     /// Records the closure in `bound_linked` when every free slot paired;
     /// `call` links any other closure conservatively.
     fn link_bound_closure(&mut self, trait_args: ArgsId, binds: &FxMap<u32, Vec<u32>>, sig: &RegionSig, univ: &[u32]) {
@@ -7822,34 +7826,20 @@ impl<'b, 'p> Builder<'b, 'p> {
                 paired[idx] = true;
             }
         }
-        let mut at_slot = 0usize;
-        for (i, &it) in inputs.iter().enumerate() {
-            let n = self.sc.slots(it) as usize;
-            let (skip, param) = match inputs_tmpl.get(i).map(|&t| p.tys.kind(t)) {
-                Some(TyKind::Param(j)) => (0, Some(j.0)),
-                Some(TyKind::Ref(_, _, inner)) => match p.tys.kind(inner) {
-                    TyKind::Param(j) => (1, Some(j.0)),
-                    _ => (0, None),
-                },
-                _ => (0, None),
-            };
-            if let Some(j) = param
+        // A slot inside a type param's instantiation (`T`, `&T`, `&V<'a,
+        // T>`) is equated with the call's binding of that slot.
+        for (idx, k) in kinds.iter().enumerate() {
+            if let BoundSlot::Param { j, q, n } = *k
                 && let Some(bv) = binds.get(&j)
-                && n >= skip
-                && bv.len() == n - skip
+                && bv.len() == n as usize
+                && slots.get(idx).is_some_and(|(r, _)| r.is_some())
+                && let Some(&v) = vars.get(idx)
             {
-                for (q, &b) in bv.iter().enumerate() {
-                    let idx = at_slot + skip + q;
-                    if slots.get(idx).is_some_and(|(r, _)| r.is_some())
-                        && let Some(&v) = vars.get(idx)
-                    {
-                        self.edge(v, b);
-                        self.edge(b, v);
-                        paired[idx] = true;
-                    }
-                }
+                let b = bv[q as usize];
+                self.edge(v, b);
+                self.edge(b, v);
+                paired[idx] = true;
             }
-            at_slot += n;
         }
         if slots.iter().enumerate().all(|(i, (r, _))| r.is_none() || paired.get(i) == Some(&true)) {
             self.bound_linked.push(def);
@@ -7939,7 +7929,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let target = |k: BoundSlot| match k {
             BoundSlot::Tie(u) => Some(u),
             BoundSlot::Hr => Some(0),
-            BoundSlot::Free => None,
+            BoundSlot::Free | BoundSlot::Param { .. } => None,
         };
         if outs.iter().all(|&k| target(k).is_none()) {
             return;
@@ -8533,9 +8523,10 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// Per slot of a closure input's erased type `t`, what the bound's
     /// input type `tmpl` (over the callee's params; regioned when the
     /// signature has it) makes of it: a type param or projection is the
-    /// call's instantiation (free); an elided lifetime (`Region::Bound`,
-    /// or any region in an erased bound) is higher-ranked; `'static` and
-    /// the callee's lifetime `k` tie the slot to `'static` and `univ[k]`.
+    /// call's instantiation (free; a param's slots name the param); an
+    /// elided lifetime (`Region::Bound`, or any region in an erased bound)
+    /// is higher-ranked; `'static` and the callee's lifetime `k` tie the
+    /// slot to `'static` and `univ[k]`.
     fn bound_slots(&mut self, tmpl: Ty, t: Ty, univ: &[u32], out: &mut Vec<BoundSlot>) {
         let p = self.p;
         let n = self.sc.slots(t) as usize;
@@ -8545,7 +8536,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ => BoundSlot::Hr,
         };
         match (p.tys.kind(tmpl), self.body.tys.kind(t)) {
-            (TyKind::Param(_) | TyKind::Projection(..), _) => out.extend(std::iter::repeat_n(BoundSlot::Free, n)),
+            (TyKind::Param(j), _) => out.extend((0..n as u32).map(|q| BoundSlot::Param { j: j.0, q, n: n as u32 })),
+            (TyKind::Projection(..), _) => out.extend(std::iter::repeat_n(BoundSlot::Free, n)),
             (TyKind::Ref(r, _, ti), TyKind::Ref(er, _, ei)) => {
                 if !bound(er) {
                     out.push(if bound(r) { BoundSlot::Hr } else { kind(r) });
