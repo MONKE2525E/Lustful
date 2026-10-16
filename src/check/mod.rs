@@ -19,6 +19,7 @@ pub mod extend;
 pub mod defaults;
 pub mod delta_audit;
 pub mod derive_delta;
+pub mod scalar_reads;
 pub mod fmt;
 pub mod generics;
 pub mod into;
@@ -2220,8 +2221,11 @@ fn use_item_trait_layers(p: &Program, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>
 /// marks the result poisoned instead.
 pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
     // Derive lists the check reads become `Derives` reads (R12).
-    let ((mut ck, mut errs), noted) = derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid));
+    // So do const fns the scalar evaluator ran for a length (`Checked`).
+    let (((mut ck, mut errs), noted), called) =
+        scalar_reads::scoped(p.record_reads, || derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid)));
     derive_delta::record(p, &mut ck.reads, &noted);
+    scalar_reads::record(p, &mut ck.reads, &called);
     // Drop-check overflow (rustc E0320) is judged on the generic body,
     // never an instance; a closure's body is its parent's check.
     let class = p.gx.fn_class.get(fid.0 as usize).copied().unwrap_or_default();

@@ -2629,6 +2629,7 @@ impl<'x> ScalarEval<'x> {
             return None;
         }
         let name = segs[0].name;
+        crate::check::scalar_reads::note(name);
         // A body item of this name in scope at the call wins: a
         // nested const fn is the only candidate, and another body
         // item shadows every module fn.
