@@ -789,13 +789,16 @@ pub fn layout_of_ty(tys: &impl TyIntern, shapes: &impl AdtShapes, t: Ty) -> Resu
 
 thread_local! {
     /// The innermost type whose layout failed in this thread's last
-    /// `layout_of_ty` call. Only diagnostics read it (`last_failure`).
-    static LAST_FAILURE: std::cell::Cell<Option<Ty>> = const { std::cell::Cell::new(None) };
+    /// `layout_of_ty` call, and whether the failure is a type that did not
+    /// resolve inside it. Only diagnostics read it (`last_failure`).
+    static LAST_FAILURE: std::cell::Cell<Option<(Ty, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// The innermost type of the last failed `layout_of_ty` call on this
-/// thread, so L0652 can name the form that has no layout.
-pub fn last_failure() -> Option<Ty> {
+/// thread, so L0652 can name the form that has no layout. When the
+/// failure is an unresolved type (already reported where it is
+/// written), this is the innermost Adt around it, with `true`.
+pub fn last_failure() -> Option<(Ty, bool)> {
     LAST_FAILURE.with(|f| f.get())
 }
 
@@ -849,8 +852,13 @@ fn go(
     }
     active.push((t, env));
     let r = compute(tys, shapes, t, env, frames, memo, active);
-    if r.is_err() && LAST_FAILURE.with(|f| f.get()).is_none() {
-        LAST_FAILURE.with(|f| f.set(Some(peel_param(tys, t, env, frames).0)));
+    if r.is_err() {
+        let u = peel_param(tys, t, env, frames).0;
+        LAST_FAILURE.with(|f| match f.get() {
+            None => f.set(Some((u, matches!(tys.kind(u), TyKind::Error)))),
+            Some((e, true)) if matches!(tys.kind(e), TyKind::Error) && matches!(tys.kind(u), TyKind::Adt(..)) => f.set(Some((u, true))),
+            _ => {}
+        });
     }
     active.pop();
     memo.push(((t, env), r.as_ref().ok().cloned()));

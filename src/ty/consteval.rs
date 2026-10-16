@@ -194,10 +194,17 @@ pub enum ConstGeneric {
 
 /// The questions the evaluator asks its caller.
 /// L0652's text for a `size_of` or `align_of` with no layout: it names the
-/// innermost type that has none (`layout::last_failure`), when known.
+/// innermost type that has none (`layout::last_failure`), when known, or
+/// the Adt whose field type did not resolve (that error is reported where
+/// the type is written; naming the Adt lets the census charge this one to
+/// it as a cascade).
 fn layout_fail_text<'a>(cx: &impl ConstCx<'a>, what: &str) -> String {
     match super::layout::last_failure() {
-        Some(t) => format!("unsupported layout form in `{what}`: `{}`", cx.ty_text(t)),
+        Some((t, true)) if !matches!(cx.tys_ref().kind(t), TyKind::Error) => {
+            format!("unsupported layout form in `{what}`: a field of `{}` has a type that did not resolve", cx.ty_text(t))
+        }
+        Some((_, true)) => format!("unsupported layout form in `{what}`: a type that did not resolve"),
+        Some((t, false)) => format!("unsupported layout form in `{what}`: `{}`", cx.ty_text(t)),
         None => format!("unsupported layout form in `{what}`"),
     }
 }
