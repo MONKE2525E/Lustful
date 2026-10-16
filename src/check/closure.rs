@@ -518,7 +518,7 @@ impl<'p> Ctx<'p> {
                 t = match *pr {
                     Proj::Deref => match self.kind(t) {
                         TyKind::Ref(_, _, inner) => inner,
-                        _ => return None,
+                        _ => self.tys.boxed_elem(t)?,
                     },
                     Proj::Downcast(v) => {
                         variant = v;
@@ -771,6 +771,12 @@ impl<'p> Ctx<'p> {
                 match self.cap_cat(*base) {
                     Cat::Place(mut pl) => {
                         for _ in 0..derefs {
+                            // Through `Rc`, a guard, or a `Vec`: an overloaded
+                            // deref, so the element is in a temporary's
+                            // pointee (`cap_index_base` borrows the pointer).
+                            if self.cap_smart(pl.ty).is_some() {
+                                return Cat::Rvalue;
+                            }
                             if !self.cap_deref(&mut pl) {
                                 return Cat::Bad;
                             }
@@ -785,13 +791,17 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// For a std smart pointer whose deref is an overloaded call (`Rc`,
-    /// `Arc`, a `RefCell` or lock guard): whether it has `DerefMut`.
-    /// None for references, `Box`, and every other type.
+    /// For a std type whose deref is an overloaded call (`Rc`, `Arc`, a
+    /// `RefCell` or lock guard, `String`, `Vec`, `Cow`): whether it has
+    /// `DerefMut`. None for references, `Box` (a builtin deref), and
+    /// every other type.
     fn cap_smart(&mut self, t: Ty) -> Option<bool> {
         let t = self.resolve(t);
-        if self.tys.rc_elem(t).is_some() {
+        if self.tys.rc_elem(t).is_some() || crate::check::collect::cow_arg(&self.tys, t).is_some() {
             return Some(false);
+        }
+        if self.tys.is_string_ty(t) || self.tys.vec_elem(t).is_some() {
+            return Some(true);
         }
         self.tys.guard_elem(t).map(|g| g.1)
     }
@@ -828,17 +838,21 @@ impl<'p> Ctx<'p> {
         self.resolve(t)
     }
 
-    /// Appends a builtin deref. False for anything but a reference.
+    /// Appends a builtin deref: of a reference, or of a `Box` (a place
+    /// projection in rustc, so captures go through it precisely). False
+    /// for any other type.
     fn cap_deref(&mut self, pl: &mut CPlace) -> bool {
         let t = self.resolve(pl.ty);
-        match self.kind(t) {
-            TyKind::Ref(_, _, inner) => {
-                pl.ty = t;
-                pl.push(CProj::Deref, inner);
-                true
-            }
-            _ => false,
-        }
+        let inner = match self.kind(t) {
+            TyKind::Ref(_, _, inner) => inner,
+            _ => match self.tys.boxed_elem(t) {
+                Some(inner) => inner,
+                None => return false,
+            },
+        };
+        pl.ty = t;
+        pl.push(CProj::Deref, inner);
+        true
     }
 
     /// Records one use of a place reached from a captured variable.
@@ -874,8 +888,11 @@ impl<'p> Ctx<'p> {
         let mut m = self.out.locals[pl.root as usize].mutable;
         for (pr, before) in &pl.projs {
             if *pr == CProj::Deref {
-                match self.kind(self.resolve(*before)) {
+                let before = self.resolve(*before);
+                match self.kind(before) {
                     TyKind::Ref(_, mm, _) if mm.is_mut() => m = true,
+                    // A `Box` deref keeps the box place's mutability.
+                    _ if self.tys.boxed_elem(before).is_some() => {}
                     _ => return false,
                 }
             }
@@ -1295,35 +1312,14 @@ impl<'p> Ctx<'p> {
                 let span = self.span(inner);
                 let m = if mutable { CaptureMode::MutRef } else { CaptureMode::Ref };
                 self.cap_use(pl, m, span, w);
+                // Index operands inside the pointer's place (`*v[i]`).
+                self.cap_walk(inner, mutable, w);
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.cap_walk(*base, mut_ctx, w),
             Expr::Deref(inner) => self.cap_walk(*inner, mut_ctx, w),
             Expr::Index { base, index } => {
-                if let Res::Index { derefs } | Res::SliceIndex { derefs } | Res::MapIndex { derefs } = res {
-                    let bt = self.out.expr_ty[self.ei(*base)];
-                    let bt = self.cap_peel(bt, derefs);
-                    let overloaded = self.tys.vec_elem(bt).is_some() || matches!(res, Res::SliceIndex { .. } | Res::MapIndex { .. });
-                    if overloaded {
-                        // `Index::index(&base)` / `IndexMut::index_mut(&mut base)`.
-                        let span = self.span(*base);
-                        match self.cap_cat(*base) {
-                            Cat::Place(mut pl) => {
-                                let mut ok = true;
-                                for _ in 0..derefs {
-                                    ok &= self.cap_deref(&mut pl);
-                                }
-                                if ok {
-                                    let m = if mut_ctx { CaptureMode::MutRef } else { CaptureMode::Ref };
-                                    self.cap_use(pl, m, span, w);
-                                } else {
-                                    self.cap_bad_if_upvar(*base, w);
-                                }
-                            }
-                            Cat::Bad => self.cap_bad_if_upvar(*base, w),
-                            Cat::Rvalue => {}
-                        }
-                    }
-                    self.cap_walk(*base, mut_ctx, w);
+                if let Res::Index { derefs } | Res::SliceIndex { derefs } | Res::MapIndex { derefs } | Res::TraitIndex { derefs } = res {
+                    self.cap_index_base(*base, derefs, res, mut_ctx, w);
                 } else {
                     self.cap_bad_if_upvar(*base, w);
                 }
@@ -1452,6 +1448,44 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The base of an index expression with `derefs` autoderef steps.
+    /// Builtin derefs (references, `Box`) extend the place; the first
+    /// overloaded deref (`Rc`, a guard, `Vec` to a slice) borrows the
+    /// place before it, as `deref(&p)` or `deref_mut(&mut p)` in a
+    /// mutable use, and ends it. An overloaded index (`Vec`, a range, a
+    /// map, a written `Index` impl) borrows the place after the derefs.
+    /// An array or slice index borrows nothing here: the place use is
+    /// the caller's (`cap_cat`).
+    fn cap_index_base(&mut self, base: ExprId, derefs: u8, res: Res, mut_ctx: bool, w: &mut CapWalk) {
+        let span = self.span(base);
+        let mode = |m: bool| if m { CaptureMode::MutRef } else { CaptureMode::Ref };
+        match self.cap_cat(base) {
+            Cat::Place(mut pl) => {
+                let mut done = false;
+                for _ in 0..derefs {
+                    if let Some(has_mut) = self.cap_smart(pl.ty) {
+                        self.cap_use(pl.clone(), mode(mut_ctx && has_mut), span, w);
+                        done = true;
+                        break;
+                    }
+                    if !self.cap_deref(&mut pl) {
+                        self.cap_bad_if_upvar(base, w);
+                        done = true;
+                        break;
+                    }
+                }
+                let t = self.resolve(pl.ty);
+                let overloaded = !matches!(res, Res::Index { .. }) || self.tys.vec_elem(t).is_some();
+                if !done && overloaded {
+                    self.cap_use(pl, mode(mut_ctx), span, w);
+                }
+            }
+            Cat::Bad => self.cap_bad_if_upvar(base, w),
+            Cat::Rvalue => {}
+        }
+        self.cap_walk(base, mut_ctx, w);
+    }
+
     /// A method receiver: builtin derefs, then a borrow per the
     /// autoref, or a by-value use. A deref that is not a reference
     /// (`String` to `str`) is an overloaded deref: it borrows the
@@ -1468,7 +1502,7 @@ impl<'p> Ctx<'p> {
                 let mut overloaded = false;
                 for _ in 0..derefs {
                     let t = self.resolve(pl.ty);
-                    if matches!(self.kind(t), TyKind::Ref(..)) {
+                    if matches!(self.kind(t), TyKind::Ref(..)) || self.tys.boxed_elem(t).is_some() {
                         self.cap_deref(&mut pl);
                     } else {
                         overloaded = true;
