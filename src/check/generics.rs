@@ -1314,6 +1314,10 @@ pub struct Scope {
     /// `Param` types in a template, concrete types in an
     /// instance. `T::assoc` paths resolve through this.
     pub param_tys: Vec<(Sym, Ty)>,
+    /// A mono instance's const parameter names to their values, for
+    /// body annotations that name them (`let a: [u8; N]`); a template
+    /// reads `const_params` instead.
+    pub const_values: Vec<(Sym, ConstId)>,
     /// When set, `_` in a written type resolves to a marker
     /// inference variable (body annotations). The counter holds
     /// the next marker id, from `INFER_MARKER_BASE`. An atomic
@@ -2193,6 +2197,11 @@ fn resolve_const_path_arg(
     {
         return Err(err());
     }
+    if let Some(&(_, c)) = scope.const_values.iter().find(|(n, _)| *n == seg.name)
+        && !ast.is_parenthesized_ty(t)
+    {
+        return Ok(c);
+    }
     if let Some(&(_, i, _)) = scope.const_params.iter().find(|(n, ..)| *n == seg.name) {
         // `(N)` is a const operation on the parameter, not the
         // parameter itself.
@@ -2225,6 +2234,11 @@ pub(crate) fn resolve_const_arg(
 ) -> Result<ConstId, Diag> {
     match ast.expr(e) {
         ast::Expr::Path(segs) if segs.len() == 1 => {
+            if let Some(&(_, c)) = scope.const_values.iter().find(|(n, _)| *n == segs[0].name)
+                && !ast.is_parenthesized(e)
+            {
+                return Ok(c);
+            }
             if let Some(&(_, i, _)) = scope.const_params.iter().find(|(n, ..)| *n == segs[0].name) {
                 // `(N)` is a const operation on the parameter, not
                 // the parameter itself (rustc: generic parameters
@@ -5595,6 +5609,25 @@ fn apit_param(
     span: Span,
     errs: &mut Vec<Diag>,
 ) -> Ty {
+    // An elided lifetime in the bound's generic args (`impl
+    // IntoIterator<Item = &u8>`) is unstable in rustc (E0658).
+    if let Some(at) = bounds.iter().find_map(|b| match b {
+        ast::TraitBound::Trait { trait_ref, .. } => trait_ref.path.iter().find_map(|seg| match &seg.args {
+            ast::GenericArgs::Angle(args) => args.iter().find_map(|a| match a {
+                ast::GenericArg::Type(t) | ast::GenericArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => elided_ref(ast, interner, *t),
+                _ => None,
+            }),
+            _ => None,
+        }),
+        _ => None,
+    }) {
+        errs.push(Diag::new(
+            "L0203",
+            at,
+            "an elided lifetime in an argument-position `impl Trait` is not stable Rust",
+            "Name the lifetime: `fn f<'a>(x: impl Iterator<Item = &'a T>)`.",
+        ));
+    }
     let idx = generics.params.len() as u32;
     let name = interner.intern(&format!("impl#{idx}"));
     generics.params.push(ParamDef { name, kind: ParamKind::Type, span });
@@ -5631,6 +5664,31 @@ fn apit_param(
     }
     generics.predicates.extend(preds);
     lhs
+}
+
+/// The span of an elided reference lifetime (`&T`, `&'_ T`) in a type
+/// written inside an `impl Trait` bound's generic args, not under `Fn`
+/// sugar, fn pointers, `dyn`, or a nested `impl Trait` (each has its own
+/// elision rules or its own check).
+fn elided_ref(ast: &Ast, interner: &Interner, id: ast::TyId) -> Option<Span> {
+    match ast.ty(id) {
+        TyExpr::Ref { lifetime, inner, .. } => match lifetime {
+            None => Some(ast.ty_span(id)),
+            Some(l) if matches!(interner.get(l.name), "'_" | "_") => Some(l.span),
+            Some(_) => elided_ref(ast, interner, *inner),
+        },
+        TyExpr::Paren(inner) | TyExpr::Slice(inner) | TyExpr::Ptr { inner, .. } | TyExpr::Array { inner, .. } => elided_ref(ast, interner, *inner),
+        TyExpr::Tuple(elems) => elems.iter().find_map(|&e| elided_ref(ast, interner, e)),
+        TyExpr::Path(segs) => segs.iter().find_map(|seg| match &seg.args {
+            ast::GenericArgs::Angle(args) => args.iter().find_map(|a| match a {
+                ast::GenericArg::Type(t) | ast::GenericArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => elided_ref(ast, interner, *t),
+                ast::GenericArg::Lifetime(l) if matches!(interner.get(l.name), "'_" | "_") => Some(l.span),
+                _ => None,
+            }),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 /// The `impl Trait` nodes nested in an argument type, outermost first:
@@ -9996,6 +10054,15 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
                 let t2 = subst(&mut p.tys, *t, args);
                 sc.param_tys.push((*name, t2));
             }
+            for &(name, i, _) in &ts.scope.const_params {
+                if let Some(GenericArg::Const(c)) = args.get(i as usize) {
+                    sc.const_values.push((name, *c));
+                }
+            }
+            // The template's named lifetimes, so a body annotation that
+            // names one (`let x: &'a T`) resolves in the instance too.
+            sc.lifetimes = ts.scope.lifetimes.clone();
+            sc.region_facts = ts.scope.region_facts.clone();
         }
         sc
     };
