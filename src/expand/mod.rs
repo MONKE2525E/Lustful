@@ -974,6 +974,9 @@ pub struct Expander<'a> {
     /// appear at statement positions, so group depth orders the
     /// lexical scopes macro resolution compares.
     scope_depth: u32,
+    /// True while the list being expanded is an enum body: its first
+    /// part is a variant (`A = 1 + 2`), not a block tail.
+    enum_body: bool,
     /// `use std::vec as v;` style renames of builtin macros seen
     /// during the walk: bound name to canonical macro name.
     builtin_imports: Vec<(Sym, Sym)>,
@@ -1084,6 +1087,7 @@ impl<'a> Expander<'a> {
             glob_macros: Vec::new(),
             glob_type_names: Vec::new(),
             scope_depth: 0,
+            enum_body: false,
             builtin_imports: Vec::new(),
             module_builtin_alias: FxMap::default(),
             exported: FxMap::default(),
@@ -2727,10 +2731,10 @@ fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
 /// says, even when the run expands to no attribute at all (E0658). The
 /// parser checks the attributes that reach it; a run the expander strips
 /// is checked here. The caller passes only runs at a statement start (after `;`, a
-/// brace group, or nothing); only a node that ends with `;` counts, as
-/// no field, variant, or arm does. A cfg'd operator expression as a
-/// block tail is a known gap.
-fn cfg_on_operator_stmt(trees: &[Tt], after: usize, interner: &Interner) -> bool {
+/// brace group, or nothing); a node that ends with `;` counts, as no
+/// field, variant, or arm does, and so does a block tail (`after_stmt`:
+/// not the first part of an enum body).
+fn cfg_on_operator_stmt(trees: &[Tt], after: usize, after_stmt: bool, interner: &Interner) -> bool {
     if tok_at(trees, after).map(|t| t.tok) == Some(Tok::Let) || item_end(trees, after, interner).is_some() {
         return false;
     }
@@ -2750,13 +2754,18 @@ fn cfg_on_operator_stmt(trees: &[Tt], after: usize, interner: &Interner) -> bool
     {
         return false;
     }
-    match node_end(trees, after) {
-        // A top-level `:` shows a field, parameter, or `let`-like node.
-        Some(end) if end > scan + 1 && trees[end - 1].is_tok(Tok::Semi) && !trees[scan..end].iter().any(|t| t.is_tok(Tok::Colon)) => {
-            expr_stmt_has_top_op(trees, scan, end - 1, operand)
-        }
-        _ => false,
+    let Some(end) = node_end(trees, after) else { return false };
+    // A top-level `:`, `,`, or `=>` shows a field, parameter, variant, or
+    // arm, not an expression statement.
+    if trees[scan..end].iter().any(|t| t.is_tok(Tok::Colon) || t.is_tok(Tok::Comma) || t.is_tok(Tok::FatArrow)) {
+        return false;
     }
+    if end > scan + 1 && trees[end - 1].is_tok(Tok::Semi) {
+        return expr_stmt_has_top_op(trees, scan, end - 1, operand);
+    }
+    // A block's tail (no `;`): `after_stmt` is false where the node may be
+    // an enum variant (a field or an arm has a `:` or `=>`, checked above).
+    after_stmt && end == trees.len() && end > scan && expr_stmt_has_top_op(trees, scan, end, operand)
 }
 
 /// The end of a dropped macro call node whose group is at `g` (the
@@ -3311,7 +3320,17 @@ impl<'a> Expander<'a> {
                 let glob_len = self.glob_macros.len();
                 let glob_ty_len = self.glob_type_names.len();
                 self.scope_depth += 1;
+                // An enum body: its first part is a variant, never a
+                // block's tail (`cfg_on_operator_stmt`).
+                let enum_body = d == Delim::Brace
+                    && out
+                        .iter()
+                        .rev()
+                        .take_while(|t| !t.is_tok(Tok::Semi) && !matches!(t, Tt::Delim(Delim::Brace, _, _)))
+                        .any(|t| t.is_tok(Tok::Enum));
+                let outer_enum = std::mem::replace(&mut self.enum_body, enum_body);
                 let expanded = self.expand_list(inner, depth, false, d == Delim::Brace, nest + 1);
+                self.enum_body = outer_enum;
                 self.scope_depth -= 1;
                 self.textual.truncate(textual_len);
                 self.imports.truncate(imports_len);
@@ -3396,16 +3415,19 @@ impl<'a> Expander<'a> {
         }
         // The parser checks attributes that reach it; a run the expander
         // strips here is checked first.
-        let stmt_start = match out.last() {
-            None => true,
+        // A run with nothing before it in a brace list may sit on a
+        // block's only tail, except in an enum body.
+        let after_stmt = match out.last() {
+            None => !self.enum_body,
             Some(Tt::Tok(t)) => t.tok == Tok::Semi,
             Some(Tt::Delim(d, _, _)) => *d == Delim::Brace,
             Some(Tt::Frag(..)) => false,
         };
+        let stmt_start = after_stmt || out.is_empty();
         if !item_list
             && stmt_start
             && let Some(a) = attrs.iter().find(|a| matches!(a.path.as_str(), "cfg" | "cfg_attr"))
-            && cfg_on_operator_stmt(trees, after, self.ctx.interner)
+            && cfg_on_operator_stmt(trees, after, after_stmt, self.ctx.interner)
         {
             return Err(err(
                 C_SYNTAX,
