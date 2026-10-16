@@ -1059,8 +1059,9 @@ fn predicted_def_ids(
         }
     }
     // Structs and enums inside function bodies rank with the other
-    // Adts (collect pass 1 folds the same hashes).
-    {
+    // Adts (collect pass 1 folds the same hashes). Without one, the
+    // fn hashes are not computed.
+    if def::has_body_type_items(ast) {
         let top = collect::top_fn_hashes(ast, interner, stable);
         let fn_ids = def::nested_fn_ids(
             ast,

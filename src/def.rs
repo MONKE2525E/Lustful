@@ -424,6 +424,13 @@ fn type_item_name(kind: &crate::ast::ItemKind) -> Option<crate::intern::Sym> {
     }
 }
 
+/// True when some function body holds a type item. Callers skip the
+/// fn hash work for body type identities when it is false (most
+/// programs; the perf gate's plain inputs).
+pub fn has_body_type_items(ast: &crate::ast::Ast) -> bool {
+    ast.stmt_items.iter().any(|it| type_item_name(&it.kind).is_some())
+}
+
 /// The `DefKind` of one type item inside a function body.
 pub fn type_item_kind(kind: &crate::ast::ItemKind) -> Option<DefKind> {
     use crate::ast::ItemKind;
@@ -442,7 +449,7 @@ pub fn type_item_kind(kind: &crate::ast::ItemKind) -> Option<DefKind> {
 pub fn nested_type_parents(ast: &crate::ast::Ast) -> Vec<(NestParent, u32)> {
     use crate::ast::ItemKind;
     let mut out = vec![(NestParent::Unknown, 0u32); ast.stmt_items.len()];
-    if !ast.stmt_items.iter().any(|it| type_item_name(&it.kind).is_some()) {
+    if !has_body_type_items(ast) {
         return out;
     }
     let mut spans: Vec<(crate::diag::Span, Option<NestParent>, u32)> = Vec::new();

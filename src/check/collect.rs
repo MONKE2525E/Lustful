@@ -3193,28 +3193,36 @@ pub fn collect_reuse(
         .filter(|b| b.stmts.iter().any(|s| matches!(s, ast::Stmt::Item(_))))
         .map(|b| (b.span, b.stmts.iter().filter_map(|s| if let ast::Stmt::Item(i) = s { Some(*i) } else { None }).collect()))
         .collect();
-    let early_top_hashes = top_fn_hashes(ast, interner, p.stable_crate);
-    let nested_fn_hashes: Vec<Option<crate::def::DefPathHash>> = crate::def::nested_fn_ids(
-        ast,
-        interner,
-        |b| early_top_hashes.get(&b).copied(),
-        |parent, name, disamb| crate::def::child_hash(*parent, crate::def::DefKind::Fn, name, disamb),
-        |seg, name| crate::def::free_fn_hash(p.stable_crate, &[seg], name),
-    );
-    let parent_hash_of = |parent: crate::def::NestParent| match parent {
-        crate::def::NestParent::Top(b) => early_top_hashes.get(&b).copied(),
-        crate::def::NestParent::Nested(k) => nested_fn_hashes.get(k as usize).copied().flatten(),
-        crate::def::NestParent::Unknown => None,
-    };
-    let stmt_type_parents = crate::def::nested_type_parents(ast);
-    let stmt_parent_hashes: Vec<Option<crate::def::DefPathHash>> = stmt_type_parents.iter().map(|&(par, _)| parent_hash_of(par)).collect();
-    let stmt_type_hashes: Vec<Option<crate::def::DefPathHash>> = crate::def::nested_type_ids(
-        ast,
-        interner,
-        |par| parent_hash_of(par),
-        |parent, kind, name, disamb| crate::def::child_hash(*parent, kind, name, disamb),
-        |seg, kind, name| crate::def::item_hash(p.stable_crate, &[seg], kind, name, 0),
-    );
+    // Without a type item in any body both tables are all `None`; the
+    // fn hashes they fold from are skipped (a whole-program pass).
+    let (stmt_parent_hashes, stmt_type_hashes): (Vec<Option<crate::def::DefPathHash>>, Vec<Option<crate::def::DefPathHash>>) =
+        if crate::def::has_body_type_items(ast) {
+            let early_top_hashes = top_fn_hashes(ast, interner, p.stable_crate);
+            let nested_fn_hashes: Vec<Option<crate::def::DefPathHash>> = crate::def::nested_fn_ids(
+                ast,
+                interner,
+                |b| early_top_hashes.get(&b).copied(),
+                |parent, name, disamb| crate::def::child_hash(*parent, crate::def::DefKind::Fn, name, disamb),
+                |seg, name| crate::def::free_fn_hash(p.stable_crate, &[seg], name),
+            );
+            let parent_hash_of = |parent: crate::def::NestParent| match parent {
+                crate::def::NestParent::Top(b) => early_top_hashes.get(&b).copied(),
+                crate::def::NestParent::Nested(k) => nested_fn_hashes.get(k as usize).copied().flatten(),
+                crate::def::NestParent::Unknown => None,
+            };
+            let stmt_type_parents = crate::def::nested_type_parents(ast);
+            let parents = stmt_type_parents.iter().map(|&(par, _)| parent_hash_of(par)).collect();
+            let types = crate::def::nested_type_ids(
+                ast,
+                interner,
+                |par| parent_hash_of(par),
+                |parent, kind, name, disamb| crate::def::child_hash(*parent, kind, name, disamb),
+                |seg, kind, name| crate::def::item_hash(p.stable_crate, &[seg], kind, name, 0),
+            );
+            (parents, types)
+        } else {
+            (vec![None; ast.stmt_items.len()], vec![None; ast.stmt_items.len()])
+        };
     let mut adt_id_of_stmt_item: Vec<Option<AdtId>> = vec![None; ast.stmt_items.len()];
 
     // Pass 1: type names, so fields can refer to types defined later.
@@ -3281,8 +3289,7 @@ pub fn collect_reuse(
     // The lossy decoders name it only in their return types, so their
     // names count too.
     let lossy = interner.intern("to_string_lossy");
-    if ast_mentions(ast, interner.intern("Cow"))
-        || ast_mentions(ast, interner.intern("from_utf8_lossy"))
+    if ast_mentions(ast, &[interner.intern("Cow"), interner.intern("from_utf8_lossy")])
         || ast.exprs.iter().any(|e| matches!(e, ast::Expr::MethodCall { name, .. } if *name == lossy))
     {
         p.gx.has_generics = true;
@@ -3312,6 +3319,9 @@ pub fn collect_reuse(
             p.gx.adt_instance_of.push(None);
         }
     }
+    // Whether the program uses a generic synthetic std Adt: one Ast
+    // pass, read in the loop below.
+    let uses_generic_std = generics::ast_uses_generic_std(ast, interner);
     for (src, &rank) in adt_srcs.iter().zip(&adt_ranks) {
         let (item_idx, name, span, is_enum, hash) = (src.0, src.1, src.2, src.3, src.4);
         // `Cow` is entry 9 of `std_adts`.
@@ -3637,8 +3647,8 @@ pub fn collect_reuse(
             p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr, non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
             if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 || usize::MAX - item_idx == 26 || usize::MAX - item_idx == 28 {
-                // `Bound<T>` and `NonZero<T>`: the generic synthetic
-                // std Adts. Give each its param and field table, as
+                // `Bound<T>`, `NonZero<T>`, `TrySendError<T>`, and `MaybeUninit<T>`:
+                // the generic synthetic std Adts. Give each its param and field table, as
                 // the field pass does for a user generic type.
                 p.gx.adt_info[id.0 as usize] = (def, 1);
                 // Their instances need the generic machinery, but only
@@ -3646,7 +3656,7 @@ pub fn collect_reuse(
                 // fast path; the perf gate measures those). Both
                 // flags, like `Cow`: mono's lang-enum fast path
                 // (user_generics false) makes no Adt instances.
-                if generics::ast_uses_bound(ast, interner) || generics::ast_uses_nonzero(ast, interner) || generics::ast_uses_try_send_error(ast, interner) || generics::ast_uses_maybe_uninit(ast, interner) {
+                if uses_generic_std {
                     p.gx.has_generics = true;
                     p.gx.user_generics = true;
                 }
@@ -8931,9 +8941,10 @@ impl crate::ty::layout::AdtShapes for Program {
 }
 
 /// True when a type, value, or pattern path of the crate has a segment
-/// named `name` (W-STD-B: whether a synthetic generic std enum is used).
-fn ast_mentions(ast: &Ast, name: Sym) -> bool {
-    let hit = |segs: &[ast::PathSeg]| segs.iter().any(|s| s.name == name);
+/// named one of `names` (W-STD-B: whether a synthetic generic std enum
+/// is used). One pass for all the names.
+fn ast_mentions(ast: &Ast, names: &[Sym]) -> bool {
+    let hit = |segs: &[ast::PathSeg]| segs.iter().any(|s| names.contains(&s.name));
     ast.tys.iter().any(|t| matches!(t, TyExpr::Path(segs) if hit(segs)))
         || ast.exprs.iter().any(|e| matches!(e, ast::Expr::Path(segs) if hit(segs)))
         || ast.pats.iter().any(|p| match p {

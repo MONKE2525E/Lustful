@@ -10208,74 +10208,32 @@ fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
     }
 }
 
-/// True when the program mentions `Bound`, its variants, or the
-/// `RangeBounds` bound methods by name. `Bound<T>` is a generic
-/// synthetic Adt registered for every program; its instances need
-/// the generic machinery, but only in programs that use it (the
-/// perf gate measures plain programs too).
-pub fn ast_uses_bound(ast: &Ast, interner: &Interner) -> bool {
-    let named = |segs: &[ast::PathSeg]| {
-        segs.iter().any(|s| matches!(interner.get(s.name), "Bound" | "Included" | "Excluded" | "Unbounded" | "RangeBounds"))
-    };
-    ast.exprs.iter().any(|e| match e {
-        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "start_bound" | "end_bound"),
-        ast::Expr::Path(segs) => named(segs),
-        ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
-        _ => false,
-    }) || ast.tys.iter().any(|t| match t {
-        TyExpr::Path(segs) => named(segs),
-        TyExpr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
-        _ => false,
-    }) || ast.pats.iter().any(|p| match p {
-        ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } => named(segs),
-        _ => false,
-    })
-}
+/// Path segment names that mark a use of a generic synthetic std Adt:
+/// `Bound` (its variants and `RangeBounds`), `NonZero` (and its
+/// aliases), `TrySendError` (and `try_send`), and `MaybeUninit`. A synthetic std Adt
+/// that needs the generic flags adds its names here, not a new scan.
+const GENERIC_STD_NAMES: &[&str] = &[
+    "Bound", "Included", "Excluded", "Unbounded", "RangeBounds",
+    "NonZero", "NonZeroU8", "NonZeroU16", "NonZeroU32", "NonZeroU64", "NonZeroU128", "NonZeroUsize",
+    "NonZeroI8", "NonZeroI16", "NonZeroI32", "NonZeroI64", "NonZeroI128", "NonZeroIsize",
+    "TrySendError", "try_send", "MaybeUninit",
+];
 
-pub fn ast_uses_nonzero(ast: &Ast, interner: &Interner) -> bool {
-    let named = |segs: &[ast::PathSeg]| {
-        segs.iter().any(|s| matches!(interner.get(s.name), "NonZero" | "NonZeroU8" | "NonZeroU16" | "NonZeroU32" | "NonZeroU64" | "NonZeroU128" | "NonZeroUsize" | "NonZeroI8" | "NonZeroI16" | "NonZeroI32" | "NonZeroI64" | "NonZeroI128" | "NonZeroIsize"))
-    };
-    ast.exprs.iter().any(|e| match e {
-        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "get" | "available_parallelism"),
-        ast::Expr::Path(segs) => named(segs),
-        ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
-        _ => false,
-    }) || ast.tys.iter().any(|t| match t {
-        TyExpr::Path(segs) => named(segs),
-        TyExpr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
-        _ => false,
-    }) || ast.pats.iter().any(|p| match p {
-        ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } => named(segs),
-        _ => false,
-    })
-}
+/// Method names that mark the same uses: the `RangeBounds` bound
+/// methods, `NonZero::get` and `available_parallelism`, `try_send`,
+/// and `MaybeUninit`'s `uninit` and `write`.
+const GENERIC_STD_METHODS: &[&str] = &["start_bound", "end_bound", "get", "available_parallelism", "try_send", "uninit", "write"];
 
-pub fn ast_uses_try_send_error(ast: &Ast, interner: &Interner) -> bool {
-    let named = |segs: &[ast::PathSeg]| {
-        segs.iter().any(|s| matches!(interner.get(s.name), "TrySendError" | "try_send"))
-    };
+/// True when the program uses a generic synthetic std Adt (`Bound<T>`,
+/// `NonZero<T>`, `TrySendError<T>`, `MaybeUninit<T>`) by one of the names above. These
+/// Adts are registered for every program; their instances need the
+/// generic machinery, but only in programs that use them (the perf
+/// gate measures plain programs too). One pass over the Ast: collect
+/// calls it once.
+pub fn ast_uses_generic_std(ast: &Ast, interner: &Interner) -> bool {
+    let named = |segs: &[ast::PathSeg]| segs.iter().any(|s| GENERIC_STD_NAMES.contains(&interner.get(s.name)));
     ast.exprs.iter().any(|e| match e {
-        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "try_send"),
-        ast::Expr::Path(segs) => named(segs),
-        ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
-        _ => false,
-    }) || ast.tys.iter().any(|t| match t {
-        TyExpr::Path(segs) => named(segs),
-        TyExpr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
-        _ => false,
-    }) || ast.pats.iter().any(|p| match p {
-        ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } => named(segs),
-        _ => false,
-    })
-}
-
-pub fn ast_uses_maybe_uninit(ast: &Ast, interner: &Interner) -> bool {
-    let named = |segs: &[ast::PathSeg]| {
-        segs.iter().any(|s| matches!(interner.get(s.name), "MaybeUninit"))
-    };
-    ast.exprs.iter().any(|e| match e {
-        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "uninit" | "write"),
+        ast::Expr::MethodCall { name, .. } => GENERIC_STD_METHODS.contains(&interner.get(*name)),
         ast::Expr::Path(segs) => named(segs),
         ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
         _ => false,

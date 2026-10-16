@@ -940,7 +940,7 @@ fn outside_fn_reason(ast: &Ast, file: FileId, a: usize, b: usize) -> &'static st
 
 /// True when a lexed body has no token that collect's whole-Ast scans
 /// look for: `dyn` (a `dyn` type turns on the generic machinery) and
-/// the names `ast_mentions` and `ast_uses_bound` scan for. Closure
+/// the Cow and Bound names of `ast_mentions` and `ast_uses_generic_std`. Closure
 /// expressions are checked on the nodes (`find_body_edit`).
 fn plain_body(lexed: &lexer::Lexed, interner: &crate::intern::Interner) -> bool {
     const SCANNED: &[&str] = &["Cow", "Bound", "Included", "Excluded", "Unbounded", "RangeBounds", "start_bound", "end_bound"];
