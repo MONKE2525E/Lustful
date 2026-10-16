@@ -1285,8 +1285,10 @@ impl Evaluator {
                 (ConstValue::Aggregate(vals), cx.tys().intern(TyKind::Tuple(ts)))
             }
             Expr::Array(elems) => {
+                // A slice expectation is the backing array of `&[..]` at a
+                // slice type: its elements want the slice's element.
                 let exp_elem = expected.and_then(|t| match cx.tys_ref().kind(t) {
-                    TyKind::Array(el, _) => Some(el),
+                    TyKind::Array(el, _) | TyKind::Slice(el) => Some(el),
                     _ => None,
                 });
                 let mut vals = Vec::new();
@@ -1305,7 +1307,7 @@ impl Evaluator {
                 let ConstValue::Int(n) = nv else { return Err(outside(span, "this array length")) };
                 let n = u64::try_from(n).map_err(|_| outside(span, "this array length"))?;
                 let exp_elem = expected.and_then(|t| match cx.tys_ref().kind(t) {
-                    TyKind::Array(el, _) => Some(el),
+                    TyKind::Array(el, _) | TyKind::Slice(el) => Some(el),
                     _ => None,
                 });
                 // Every repeat evaluates its operand once. A const
@@ -1483,7 +1485,7 @@ impl Evaluator {
                 // passed in, so `&&[1]` stays no `&&[u8]`, as in rustc.
                 let slice_ref = |t: Ty| matches!(cx.tys_ref().kind(t), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_)));
                 let inner_expected = expected.and_then(|et| match cx.tys_ref().kind(et) {
-                    TyKind::Ref(_, _, inner) if !matches!(cx.tys_ref().kind(inner), TyKind::Slice(_)) && !slice_ref(inner) => Some(inner),
+                    TyKind::Ref(_, _, inner) if !slice_ref(inner) => Some(inner),
                     _ => None,
                 });
                 // A borrow of a drop temporary lives on only when the
@@ -1503,11 +1505,21 @@ impl Evaluator {
                 let (v, rt) = if let ConstValue::Str(_) = v {
                     return Ok(Flow::Val((v, t)));
                 } else if let Some(et) = expected
-                    && matches!(cx.tys_ref().kind(et), TyKind::Ref(_, _, s) if matches!(cx.tys_ref().kind(s), TyKind::Slice(_)))
+                    && let TyKind::Ref(_, _, s) = cx.tys_ref().kind(et)
+                    && let TyKind::Slice(want) = cx.tys_ref().kind(s)
                     && matches!(v, ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Bytes(_))
                 {
                     // `&[1, 2]` at a slice type: the aggregate is the slice
-                    // backing; materialization builds the fat value.
+                    // backing; materialization builds the fat value. Its
+                    // elements must fit the slice's (array elements are
+                    // coercion sites): `&[true]` is no `&[u8]`.
+                    let fits = match cx.tys_ref().kind(t) {
+                        TyKind::Array(el, _) | TyKind::Slice(el) => const_ty_compatible(cx.tys_ref(), el, want),
+                        _ => false,
+                    };
+                    if !fits {
+                        return Err(const_ty_mismatch(span, "this slice element"));
+                    }
                     (v, et)
                 } else {
                     let rt = cx.tys().mk_ref(*mutable, t);
