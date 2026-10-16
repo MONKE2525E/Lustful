@@ -11592,12 +11592,20 @@ impl<'p> Ctx<'p> {
                     TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS }
                 }
             };
+            // A trait applies when its impl selects at all, also when
+            // that impl has no fn to name here (a default body with
+            // `generic` false, a synthetic impl, open impl params):
+            // rustc counts it for the ambiguity (E0034).
             let snap = self.snapshot_vars();
             let obl_len = self.obl_len();
-            let found = self.trait_fn_of(tr, name, generic, span).is_some();
+            let applies = match self.select_obligation_at(tr, span, 0) {
+                Selection::Impl { .. } | Selection::ParamEvidence(_) | Selection::Builtin => true,
+                Selection::Ambiguous => rec.generics.params.len() > 1,
+                _ => false,
+            };
             self.rollback_vars(snap);
             self.obl_truncate(obl_len);
-            if found {
+            if applies {
                 hits.push(tr);
             }
         }
@@ -12333,7 +12341,10 @@ impl<'p> Ctx<'p> {
         {
             return self.assoc_call_deferred(e, base, hint, trait_def, name, args, span);
         }
-        match hits.len() {
+        // A trait with open inputs applies too: with another trait that
+        // has the method, the path is ambiguous (rustc E0034).
+        let hits_len = if ambiguous.is_empty() { hits.len() } else { hit_traits.len() + ambiguous.len() };
+        match hits_len {
             0 if default_glue && hit_traits.len() == 1 => {
                 self.record_glue_reads(p.gx.lang.default, base);
                 self.record_pick(e, hit_traits[0], 0, ReceiverForm::Value);
@@ -18775,6 +18786,8 @@ impl<'p> Ctx<'p> {
         ) || self.tys.local_adt(self.resolve(base)).is_some_and(|a| !generics::is_std_adt(&p.tys, a));
         let traits = p.gx.traits_by_method.get(&name)?.clone();
         let mut found: Option<DefId> = None;
+        // The one found trait's selection was ambiguous.
+        let mut open = false;
         for trait_def in traits {
             if !method::trait_in_scope_pub(self, trait_def) {
                 continue;
@@ -18783,15 +18796,23 @@ impl<'p> Ctx<'p> {
             let snap = self.snapshot_vars();
             let obl_len = self.obl_len();
             let tr = self.fresh_trait_ref(trait_def, base, n_inputs);
-            let holds = matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_) | Selection::Builtin);
+            let sel = self.select_obligation(tr);
             self.rollback_vars(snap);
             self.obl_truncate(obl_len);
-            if holds {
-                if found.is_some() {
+            let holds = matches!(sel, Selection::Impl { .. } | Selection::ParamEvidence(_) | Selection::Builtin);
+            // A trait whose open inputs leave several impls (`Tr2<u8>`
+            // and `Tr2<u16>` for `S`) also applies: with another trait
+            // the item is ambiguous (rustc E0034), so none is unique.
+            if holds || (n_inputs > 0 && matches!(sel, Selection::Ambiguous)) {
+                if found.is_some() || open {
                     return None;
                 }
+                open = !holds;
                 found = Some(trait_def);
             }
+        }
+        if open {
+            return None;
         }
         let trait_def = found?;
         if rhs_trait(trait_def) && !scalar_or_user {
