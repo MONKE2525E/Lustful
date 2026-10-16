@@ -4926,6 +4926,10 @@ pub struct GenTables {
     /// the lang enums only, and mono skips work no instance needs
     /// (see `materialize`).
     pub user_generics: bool,
+    /// Fns that hand out a `Cow` the caller need not name (`uses_cow` in
+    /// collect): a kept program without user generics stands only while
+    /// no edited body calls one.
+    pub cow_fns: Vec<crate::intern::Sym>,
     /// (templates checked, concrete instances made).
     pub mono_counts: (usize, usize),
     /// The template checks, by checked fn: each template body is
@@ -5049,6 +5053,7 @@ impl Default for GenTables {
             borrow_impls: FxMap::default(),
             has_generics: false,
             user_generics: false,
+            cow_fns: Vec::new(),
             mono_counts: (0, 0),
             template_checks: FxMap::default(),
             trait_picks: FxMap::default(),

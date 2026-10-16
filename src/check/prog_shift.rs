@@ -134,6 +134,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         borrow_impls: _,
         has_generics: _,
         user_generics: _,
+        cow_fns: _,
         mono_counts: _,
         template_checks: _,
         trait_picks: _,

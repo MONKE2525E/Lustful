@@ -3310,13 +3310,8 @@ pub fn collect_reuse(
     for (k, name, def, is_enum) in generics::std_adts() {
         adt_srcs.push((usize::MAX - k, interner.intern(name), Span::default(), is_enum, def.hash));
     }
-    // A program that names `Cow` (W-STD-B) instantiates it: mono runs.
-    // The lossy decoders name it only in their return types, so their
-    // names count too.
-    let lossy = interner.intern("to_string_lossy");
-    if ast_mentions(ast, &[interner.intern("Cow"), interner.intern("from_utf8_lossy")])
-        || ast.exprs.iter().any(|e| matches!(e, ast::Expr::MethodCall { name, .. } if *name == lossy))
-    {
+    // A program that uses `Cow` (W-STD-B) instantiates it: mono runs.
+    if uses_cow(&mut p, ast, interner) {
         p.gx.has_generics = true;
         p.gx.user_generics = true;
     }
@@ -9006,18 +9001,67 @@ impl crate::ty::layout::AdtShapes for Program {
     }
 }
 
-/// True when a type, value, or pattern path of the crate has a segment
-/// named one of `names` (W-STD-B: whether a synthetic generic std enum
-/// is used). One pass for all the names.
-fn ast_mentions(ast: &Ast, names: &[Sym]) -> bool {
-    let hit = |segs: &[ast::PathSeg]| segs.iter().any(|s| names.contains(&s.name));
-    ast.tys.iter().any(|t| matches!(t, TyExpr::Path(segs) if hit(segs)))
-        || ast.exprs.iter().any(|e| matches!(e, ast::Expr::Path(segs) if hit(segs)))
-        || ast.pats.iter().any(|p| match p {
-            ast::Pat::Path(segs) => hit(segs),
-            ast::Pat::TupleStruct { path, .. } => hit(path),
+/// True when the program uses `Cow` (W-STD-B: the synthetic generic std
+/// enum must be instantiated): user source names it in a type, value, or
+/// pattern path, or calls a fn that hands one out without the caller
+/// naming it. Those are the lossy decoders (std routes, not spliced
+/// source) and every spliced shipped fn whose signature names `Cow`. A
+/// mention inside spliced shipped source alone does not count: an
+/// `impl Option<Cow<_>>` in core's option.rs would otherwise turn the
+/// generic machinery on for every compile that splices it (tf-std2,
+/// realish20 collect 19 to 74 ms).
+fn uses_cow(p: &mut Program, ast: &Ast, interner: &crate::intern::Interner) -> bool {
+    let cow = interner.intern("Cow");
+    let shipped = |sp: Span| p.shipped_crate_at(sp).is_some();
+    let hit = |segs: &[ast::PathSeg]| segs.iter().any(|s| s.name == cow);
+    let mut shipped_cow_tys: Vec<Span> = Vec::new();
+    for (i, t) in ast.tys.iter().enumerate() {
+        if matches!(t, TyExpr::Path(segs) if hit(segs)) {
+            let sp = ast.ty_span(ast::TyId(i as u32));
+            if !shipped(sp) {
+                return true;
+            }
+            shipped_cow_tys.push(sp);
+        }
+    }
+    let user_value = ast.exprs.iter().enumerate().any(|(i, e)| matches!(e, ast::Expr::Path(segs) if hit(segs)) && !shipped(ast.expr_span(ast::ExprId(i as u32))));
+    let user_pat = ast.pats.iter().enumerate().any(|(i, pat)| {
+        matches!(pat, ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } if hit(segs)) && !shipped(ast.pat_span(ast::PatId(i as u32)))
+    });
+    if user_value || user_pat {
+        return true;
+    }
+    // Names of fns that hand out a `Cow`: the routed lossy decoders, and
+    // shipped fns whose parameter or return types hold a shipped `Cow` type.
+    let mut names = vec![interner.intern("from_utf8_lossy"), interner.intern("to_string_lossy")];
+    if !shipped_cow_tys.is_empty() {
+        let within = |outer: Span| shipped_cow_tys.iter().any(|s| s.file == outer.file && s.lo >= outer.lo && s.hi <= outer.hi);
+        let mut sig = |def: &ast::FnDef| {
+            if shipped(def.name_span)
+                && (def.ret.is_some_and(|r| within(ast.ty_span(r))) || def.params.iter().any(|q| within(ast.ty_span(q.ty))))
+            {
+                names.push(def.name);
+            }
+        };
+        for it in &ast.items {
+            match &it.kind {
+                ItemKind::Fn(def) => sig(def),
+                ItemKind::Impl(imp) => imp.fns.iter().for_each(&mut sig),
+                ItemKind::Trait(tr) => tr.fns.iter().for_each(&mut sig),
+                _ => {}
+            }
+        }
+    }
+    let used = ast.exprs.iter().enumerate().any(|(i, e)| {
+        let named = match e {
+            ast::Expr::MethodCall { name, .. } => names.contains(name),
+            ast::Expr::Path(segs) => segs.last().is_some_and(|s| names.contains(&s.name)),
             _ => false,
-        })
+        };
+        named && !shipped(ast.expr_span(ast::ExprId(i as u32)))
+    });
+    p.gx.cow_fns = names;
+    used
 }
 
 /// The `B` of a `Cow<'a, B>` type (W-STD-B): its Debug, Display,

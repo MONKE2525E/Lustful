@@ -940,7 +940,7 @@ fn outside_fn_reason(ast: &Ast, file: FileId, a: usize, b: usize) -> &'static st
 
 /// True when a lexed body has no token that collect's whole-Ast scans
 /// look for: `dyn` (a `dyn` type turns on the generic machinery) and
-/// the Cow and Bound names of `ast_mentions` and `ast_uses_generic_std`. Closure
+/// the Cow and Bound names of `uses_cow` and `ast_uses_generic_std`. Closure
 /// expressions are checked on the nodes (`find_body_edit`).
 fn plain_body(lexed: &lexer::Lexed, interner: &crate::intern::Interner) -> bool {
     const SCANNED: &[&str] = &["Cow", "Bound", "Included", "Excluded", "Unbounded", "RangeBounds", "start_bound", "end_bound"];
@@ -1330,6 +1330,11 @@ pub(super) fn reuse_kept(
         if !e.plain && !p.gx.user_generics {
             return Err("body scan");
         }
+        // A body that now calls a fn handing out a `Cow` turns the
+        // generic flags on in collect (`uses_cow`).
+        if !p.gx.user_generics && calls_cow_fn(&p, e.fn_index) {
+            return Err("body scan");
+        }
         // Body items keep their indexes, text, and blocks (`same_items`),
         // so the program's statics, consts, item blocks, and nested fn
         // signatures stand. Closure and template tables key on Ast nodes,
@@ -1448,6 +1453,18 @@ pub(super) fn reuse_kept(
         }
     }
     Ok((p, spans, template_errs))
+}
+
+/// True when the edited fn's new body calls one of `cow_fns` by method
+/// or path, or when the edit has no fn to scan (a nested body item).
+fn calls_cow_fn(p: &crate::check::collect::Program, fn_index: Option<usize>) -> bool {
+    let Some(i) = fn_index else { return true };
+    let def = p.fn_def(crate::def::LocalDefId(i as u32));
+    p.ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|e| match e {
+        crate::ast::Expr::MethodCall { name, .. } => p.gx.cow_fns.contains(name),
+        crate::ast::Expr::Path(segs) => segs.last().is_some_and(|s| p.gx.cow_fns.contains(&s.name)),
+        _ => false,
+    })
 }
 
 /// Moves the span keys and module spans of the resolver tables for one
