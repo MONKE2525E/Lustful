@@ -126,9 +126,17 @@ def run_lust(lust, verb, t, out, timeout):
     }
 
 
+def norm_code_text(m):
+    """One `...` span of a message: module paths and generic arguments dropped, so
+    `Result<Vec<(String, Entry)>, x::GenerateError>` and `Result<Vec<_>, _>` are one key."""
+    t = re.sub(r"<.*>", "<..>", m.group(1))
+    return "`" + re.sub(r"\b[A-Za-z_]\w*::", "", t) + "`"
+
+
 def norm_message(msg, fork):
-    """Root cause key text: numbers masked, fork paths made relative."""
+    """Root cause key text: fork paths made relative, code spans reduced, numbers masked."""
     msg = msg.replace(str(fork) + "/", "")
+    msg = re.sub(r"`([^`]*)`", norm_code_text, msg)
     return re.sub(r"\d+", "N", msg)
 
 

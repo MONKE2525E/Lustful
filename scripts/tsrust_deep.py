@@ -58,6 +58,44 @@ def in_item(err, cache):
     return any(it[0] <= err[1] <= it[1] for it in prune.items_of(f, cache))
 
 
+def remove_users(copy, names, cause_of_name, removed, target):
+    """Remove every innermost item of the copy whose text names one of `names` as a word.
+    Each removal is a cascade of that name's root cause. Returns the number removed."""
+    pat = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b")
+    n = 0
+    for p in sorted(copy.rglob("*.rs")):
+        if "target" in p.parts:
+            continue
+        lines = p.read_text().split("\n")
+        items = prune.items_of(str(p), {})
+        hits = {}
+        for i, line in enumerate(lines, 1):
+            m = pat.search(line.split("//")[0])
+            if not m:
+                continue
+            inner = [it for it in items if it[0] <= i <= it[1]]
+            if inner:
+                it = max(inner, key=lambda t: (t[2], -(t[1] - t[0])))
+                hits.setdefault((it[0], it[1]), (it, m.group(1)))
+        spans = sorted(hits)
+        outer = []
+        for sp in spans:
+            if outer and sp[0] >= outer[-1][0] and sp[1] <= outer[-1][1]:
+                continue
+            outer.append(sp)
+        for sp in sorted(outer, reverse=True):
+            it, nm = hits[sp]
+            del lines[sp[0] - 1:sp[1]]
+            removed.append({"file": os.path.relpath(p, copy), "kind": it[3], "name": it[4], "lines": sp[1] - sp[0] + 1,
+                            "by": "users", "code": "USES", "message": f"uses removed `{nm}`",
+                            "cause": list(cause_of_name[nm]), "target": target})
+            cause_of_name.setdefault(it[4], cause_of_name[nm])
+            n += 1
+        if outer:
+            p.write_text("\n".join(lines))
+    return n
+
+
 def names_in(msg):
     """Item names an error message points at: the last path segment of each `...` text."""
     out = set()
@@ -103,8 +141,14 @@ def main():
             cache = {}
             located = [e for e in errs if e[1] > 0 and Path(e[0]).resolve().is_relative_to(copy) and in_item(e, cache)]
             if not located:
-                status[name] = f"stopped: no located error: {errs[0][2]} {errs[0][3][:160]}"
-                break
+                # Errors with no span on disk that name an item an earlier round removed (macro
+                # output that used it): remove the items that mention that name, as its cascade.
+                gone = {n for e in errs for n in names_in(e[3]) if n in cause_of_name}
+                if not gone or not remove_users(copy, gone, cause_of_name, removed, name):
+                    status[name] = f"stopped: no located error: {errs[0][2]} {errs[0][3][:160]}"
+                    break
+                print(f"tsrust-deep: {name} round {rnd}: removed users of {sorted(gone)}", flush=True)
+                continue
             before = len(removed)
             try:
                 prune.prune_round(located, "lust", removed, copy, [], lambda c, m: None)

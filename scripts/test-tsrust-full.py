@@ -33,12 +33,16 @@ expect("one cause for masked numbers", len(rows), 1)
 expect("sites count once over targets", rows[0]["count"], 2)
 expect("targets", rows[0]["targets"], ["lib", "lib:bin"])
 expect("first span is relative", rows[0]["first"], "src/a.rs:3:5")
-expect("message masked", rows[0]["message"], "unresolved import `x::YN`")
+expect("message masked", rows[0]["message"], "unresolved import `YN`")
 
 crash = res("t1", [], "crash", "thread 'main' panicked at src/x.rs:12:3:\nboom")
 rows = tf.group([crash, dict(crash, target="t2")], fork)
 expect("crashes group", [(r["code"], r["count"]) for r in rows], [("CRASH", 2)])
 expect("norm path", tf.norm_message("file /w/fork/src/a.rs line 10", fork), "file src/a.rs line N")
+
+expect("generic args merge", tf.norm_message("`collect` into `Result<Vec<(String, x::E)>, x::G>` is not implemented", fork),
+       tf.norm_message("`collect` into `Result<Vec<_>, _>` is not implemented", fork))
+expect("paths drop", tf.norm_message("unresolved import `rustix::fs::RawDir`", fork), "unresolved import `RawDir`")
 
 print(f"test-tsrust-full: {'FAILED ' + repr(failures) if failures else 'all passed'}")
 sys.exit(1 if failures else 0)
