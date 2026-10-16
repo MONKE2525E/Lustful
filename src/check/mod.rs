@@ -24078,7 +24078,7 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
             let ty = self.cx.tys.mk_option(elem);
             return Some((AdtId(u32::MAX), 0, ty));
         }
-        let (adt, variant) = variant_of(p, segs)?;
+        let (adt, variant) = self.self_variant_of(segs)?;
         if p.adt(adt).variants[variant as usize].shape != VariantShape::Unit {
             return None;
         }
@@ -24189,6 +24189,24 @@ impl CheckCx<'_, '_> {
                 [_, v] => p.adt(a).variants.iter().position(|x| x.name == v.name).map(|i| (a, i as u32)),
                 _ => None,
             };
+        }
+        // A type item of an enclosing block shadows the module's (R18):
+        // `E::X` in a body with its own `enum E` is that enum's variant.
+        // A block alias or trait of the name is no Adt here.
+        if let [head, rest @ ..] = segs
+            && rest.len() <= 1
+        {
+            let bs = &self.cx.body_scope;
+            if bs.local_aliases.iter().any(|e| e.0 == head.name) || bs.local_traits.iter().any(|e| e.0 == head.name) {
+                return None;
+            }
+            if let Some(a) = self.cx.local_adt_of(head.name) {
+                return match rest {
+                    [] => (!p.adt(a).is_enum).then_some((a, 0)),
+                    [v] => p.adt(a).variants.iter().position(|x| x.name == v.name).map(|i| (a, i as u32)),
+                    _ => None,
+                };
+            }
         }
         variant_of(p, segs)
     }

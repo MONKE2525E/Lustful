@@ -7977,15 +7977,38 @@ impl CollectCx<'_> {
             let path: Vec<&str> = segs.iter().map(|s| self.p.interner.get(s.name)).collect();
             return generics::std_variant_of(self.p, &path);
         }
+        // A type item of a block in scope shadows the module's (R18): a
+        // block `const K = E::X as usize` next to its own `enum E` reads
+        // that enum. A block alias or trait of the name is no Adt here.
+        let adt_named = |n: Sym| -> Option<AdtId> {
+            for &si in self.cur_scope.iter().rev() {
+                let item = &self.p.ast.stmt_items[si as usize];
+                let named = match &item.kind {
+                    ItemKind::Struct(d) => d.name == n,
+                    ItemKind::Enum(d) => d.name == n,
+                    ItemKind::Union(d) => d.name == n,
+                    ItemKind::Type(d) => d.name == n,
+                    ItemKind::Trait(d) => d.name == n,
+                    _ => false,
+                };
+                if named {
+                    return match self.p.body_type_items.get(&si) {
+                        Some(BodyTypeItem::Adt(a)) => Some(*a),
+                        _ => None,
+                    };
+                }
+            }
+            self.p.type_names.get(&n).copied()
+        };
         if segs.len() == 1 {
-            let &a = self.p.type_names.get(&head(segs[0].name))?;
+            let a = adt_named(head(segs[0].name))?;
             if self.p.adt(a).is_enum {
                 return None;
             }
             return Some((a, 0));
         }
         if segs.len() == 2 {
-            let &a = self.p.type_names.get(&head(segs[0].name))?;
+            let a = adt_named(head(segs[0].name))?;
             let v = self.p.adt(a).variants.iter().position(|v| v.name == segs[1].name)?;
             return Some((a, v as u32));
         }
