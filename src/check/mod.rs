@@ -934,6 +934,18 @@ pub enum Builtin {
     EntryIntoMut,
     EntryInsert,
     EntryGetMut,
+    /// `Entry::insert_entry(self, v) -> OccupiedEntry` and the
+    /// `OccupiedEntry` methods (std 1.99's `hash_map` API).
+    EntryInsertEntry,
+    /// `HashMap::get_key_value(&self, &Q) -> Option<(&K, &V)>`.
+    MapGetKeyValue,
+    OccKey,
+    OccGet,
+    OccGetMut,
+    OccIntoMut,
+    OccInsert,
+    OccRemove,
+    OccRemoveEntry,
     SetInsert,
     SetContains,
     SetRemove,

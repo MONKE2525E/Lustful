@@ -185,6 +185,10 @@ int lust_hash_remove(lust_hash_table *t, uint64_t hash, lust_hash_eq_fn eq, void
 /* Erases bucket `index`, which must be full. `out_elem` as above; pass
    NULL and drop the element yourself before or after as needed. */
 void lust_hash_erase_at(lust_hash_table *t, uint64_t index, void *out_elem);
+/* The bucket index of a full bucket's slot (an OccupiedEntry's). With a
+   zero-sized element every slot has one address and the map holds at most
+   one element: its bucket. */
+uint64_t lust_hash_index_of(const lust_hash_table *t, const void *slot);
 
 /* Ensures room for `additional` more elements. May rehash in place (same
    bucket count, tombstones cleared) when the new length fits in half the

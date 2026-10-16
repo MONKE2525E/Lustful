@@ -19,7 +19,7 @@ pub(super) fn is_table(k: HashTy) -> bool {
 /// True for the hash types cgen declares a struct for: the tables and
 /// `Entry`.
 pub(super) fn has_struct(k: HashTy) -> bool {
-    matches!(k, HashTy::HashMap | HashTy::HashSet | HashTy::Entry) || k.is_iter_form()
+    matches!(k, HashTy::HashMap | HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry) || k.is_iter_form()
 }
 
 /// The member list of a declared hash struct: a table and its builder,
@@ -27,7 +27,7 @@ pub(super) fn has_struct(k: HashTy) -> bool {
 /// and the key moved in).
 pub(super) fn struct_fields(t: &CTy) -> String {
     match t {
-        CTy::Hash(HashTy::Entry, a) => format!("lust_hash_table *t; uint64_t hash; void *slot; {} key;", ctype(&a[0])),
+        CTy::Hash(HashTy::Entry | HashTy::OccupiedEntry, a) => format!("lust_hash_table *t; uint64_t hash; void *slot; {} key;", ctype(&a[0])),
         // An owning iterator's `it.t` points at its own `t`: re-pointed
         // before each use, since the struct moves.
         CTy::Hash(k, _) if k.is_owning_iter() => "lust_hash_table t; lust_hash_iter it;".to_string(),
@@ -43,7 +43,7 @@ pub(super) fn hash_ctype(k: HashTy, mangled: &str) -> String {
         HashTy::RandomState => "lust_random_state".into(),
         HashTy::DefaultHasher => "lust_sip13".into(),
         HashTy::BuildHasherDefault => "lust_Unit".into(),
-        HashTy::Entry => format!("HE_{mangled}"),
+        HashTy::Entry | HashTy::OccupiedEntry => format!("HE_{mangled}"),
         _ => format!("HI_{mangled}"),
     }
 }
@@ -52,7 +52,7 @@ pub(super) fn hash_ctype(k: HashTy, mangled: &str) -> String {
 /// for a set.
 pub(super) fn elem_cty(t: &CTy) -> CTy {
     match t {
-        CTy::Hash(HashTy::HashMap | HashTy::Entry, a) => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
+        CTy::Hash(HashTy::HashMap | HashTy::Entry | HashTy::OccupiedEntry, a) => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
         CTy::Hash(HashTy::HashSet, a) => a[0].clone(),
         CTy::Hash(k, a) if k.is_iter_form() && a.len() == 2 => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
         CTy::Hash(k, a) if k.is_iter_form() => a[0].clone(),
@@ -689,6 +689,15 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::EntryIntoMut
             | B::EntryInsert
             | B::EntryGetMut
+            | B::EntryInsertEntry
+            | B::MapGetKeyValue
+            | B::OccKey
+            | B::OccGet
+            | B::OccGetMut
+            | B::OccIntoMut
+            | B::OccInsert
+            | B::OccRemove
+            | B::OccRemoveEntry
             | B::SetInsert
             | B::SetContains
             | B::SetRemove
@@ -862,7 +871,7 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    lust_hash_clear(&{r}->t, {drop}, 0);");
                 Some("((lust_Unit){})".into())
             }
-            B::MapGet | B::MapGetMut | B::MapContainsKey | B::SetContains | B::SetGet => {
+            B::MapGet | B::MapGetMut | B::MapGetKeyValue | B::MapContainsKey | B::SetContains | B::SetGet => {
                 // hashbrown's `get_inner`: an empty table answers None
                 // without hashing the key.
                 let (q, qp) = self.q_arg(&tys[1], &vals[1]);
@@ -876,7 +885,16 @@ impl FnGen<'_, '_> {
                 Some(match b {
                     B::MapContainsKey | B::SetContains => format!("((uint8_t)({f} != 0))"),
                     _ => {
-                        let some = self.make_variant(dest, 1, &[if b == B::SetGet { f.clone() } else { format!("(&{f}->f1)") }]);
+                        let found = match b {
+                            B::SetGet => f.clone(),
+                            // `(&K, &V)`: the dest's tuple, both fields in the bucket.
+                            B::MapGetKeyValue => {
+                                let CTy::Option(pair) = dest else { unreachable!("get_key_value returns an Option") };
+                                format!("(({}){{ &{f}->f0, &{f}->f1 }})", ctype(pair))
+                            }
+                            _ => format!("(&{f}->f1)"),
+                        };
+                        let some = self.make_variant(dest, 1, &[found]);
                         let none = self.make_variant(dest, 0, &[]);
                         let _ = writeln!(self.out, "    {dc} {t} = {f} ? {some} : {none};");
                         t
@@ -1073,6 +1091,78 @@ impl FnGen<'_, '_> {
                     vals[1]
                 );
                 Some(t)
+            }
+            // std's `Entry::insert_entry`: occupied, `entry.insert(v)` (the
+            // new value is stored, then the old one drops); vacant, the
+            // key and value go into the slot `entry()` reserved. The
+            // OccupiedEntry is the Entry's struct with its slot set.
+            B::EntryInsertEntry => {
+                let ec = elem_cty(&recv);
+                let e = ctype(&ec);
+                let vc = match &ec {
+                    CTy::Tuple(es) => es[1].clone(),
+                    _ => CTy::Unit,
+                };
+                let vt = ctype(&vc);
+                let (ev, vv) = (self.tmp(), self.tmp());
+                let drop_old = if needs_drop_c(self.p, &vc) {
+                    self.want(Glue::Drop, &vc);
+                    format!(" drop_{}(&o_{t});", mangle(&vc))
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    {} {ev} = {}; {vt} {vv} = {};\n    if ({ev}.slot) {{ {vt} o_{t} = (({e}*){ev}.slot)->f1; (({e}*){ev}.slot)->f1 = {vv};{drop_old} }} else {{ {e} *n_{t} = ({e}*)lust_hash_insert_no_grow_slot({ev}.t, {ev}.hash, 0); n_{t}->f0 = {ev}.key; n_{t}->f1 = {vv}; {ev}.slot = n_{t}; }}\n    {dc} {t}; {t}.t = {ev}.t; {t}.hash = {ev}.hash; {t}.slot = {ev}.slot;",
+                    ctype(&recv),
+                    vals[0],
+                    vals[1]
+                );
+                Some(t)
+            }
+            B::OccKey | B::OccGet | B::OccGetMut => {
+                let e = ctype(&elem_cty(&recv));
+                let f = if b == B::OccKey { "f0" } else { "f1" };
+                Some(format!("(&(({e}*){r}->slot)->{f})"))
+            }
+            B::OccIntoMut => {
+                let e = ctype(&elem_cty(&recv));
+                let ev = self.tmp();
+                let _ = writeln!(self.out, "    {} {ev} = {};", ctype(&recv), vals[0]);
+                Some(format!("(&(({e}*){ev}.slot)->f1)"))
+            }
+            // `mem::replace(self.get_mut(), value)`.
+            B::OccInsert => {
+                let ec = elem_cty(&recv);
+                let e = ctype(&ec);
+                let vt = match &ec {
+                    CTy::Tuple(es) => ctype(&es[1]),
+                    _ => "lust_Unit".into(),
+                };
+                let _ = writeln!(self.out, "    {vt} {t} = (({e}*){r}->slot)->f1; (({e}*){r}->slot)->f1 = {};", vals[1]);
+                Some(t)
+            }
+            // hashbrown's `OccupiedEntry::remove_entry` erases the bucket
+            // and moves the pair out; `remove` then drops the key.
+            B::OccRemove | B::OccRemoveEntry => {
+                let ec = elem_cty(&recv);
+                let e = ctype(&ec);
+                let ev = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    {} {ev} = {}; {e} {t}; lust_hash_erase_at({ev}.t, lust_hash_index_of({ev}.t, {ev}.slot), &{t});",
+                    ctype(&recv),
+                    vals[0]
+                );
+                if b == B::OccRemoveEntry {
+                    return Some(t);
+                }
+                let kc = key_cty(&recv);
+                if needs_drop_c(self.p, &kc) {
+                    self.want(Glue::Drop, &kc);
+                    let _ = writeln!(self.out, "    drop_{}(&{t}.f0);", mangle(&kc));
+                }
+                Some(format!("{t}.f1"))
             }
             B::HashIterNew => {
                 // A borrowing iterator walks the table in place; an owning

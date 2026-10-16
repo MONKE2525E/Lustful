@@ -551,6 +551,8 @@ impl AdtTables {
                     HashTy::HashMap | HashTy::HashSet => (Variance::Co, DropMode::Owned),
                     HashTy::BuildHasherDefault => (Variance::Co, DropMode::None),
                     HashTy::Entry => (Variance::Inv, if j == 0 { DropMode::Owned } else { DropMode::None }),
+                    // `OccupiedEntry` holds the map's `&'a mut` and owns nothing.
+                    HashTy::OccupiedEntry => (Variance::Inv, DropMode::None),
                     HashTy::RandomState | HashTy::DefaultHasher => (Variance::Inv, DropMode::Owned),
                     // The C forms of the iterators are never types (no def).
                     HashTy::IterPairs | HashTy::IterKeys | HashTy::IterValues | HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues => {
@@ -665,7 +667,7 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
         Some(BuiltinTy::Fmt(k)) if k.is_builder() || k == crate::ty::fmt::FmtTy::Arguments => return 1,
         // The lock guards borrow their lock (W-THREADS).
         Some(BuiltinTy::Sync(k)) if k.regions() > 0 => return k.regions(),
-        Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry)) => return 1,
+        Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry)) => return 1,
         Some(_) => return 0,
         None => {}
     }
@@ -4705,6 +4707,8 @@ impl<'b, 'p> Builder<'b, 'p> {
                 && self.call_map_get(&avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(crate::check::Builtin::SetGet) = target
                 && self.call_set_get(&avs, dt, &dv) => {}
+            _ if let CallTarget::Builtin(crate::check::Builtin::MapGetKeyValue) = target
+                && self.call_map_key_value(&avs, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(b) if hash_lookup_builtin(b)) && !avs.is_empty() => {
                 self.call_opaque(&avs[..1], dt, &dv)
             }
@@ -5676,6 +5680,25 @@ impl<'b, 'p> Builder<'b, 'p> {
         true
     }
 
+    /// `map.get_key_value(&q)` (rustc `-> Option<(&'r K, &'r V)>`): both
+    /// references are the receiver's loan, and K and V are the map's own
+    /// (subtypes behind the `&`). False when the types do not pair.
+    fn call_map_key_value(&mut self, avs: &[(Ty, Vec<u32>)], dv: &[u32]) -> bool {
+        let Some((t0, v0)) = avs.first() else { return false };
+        let TyKind::Ref(_, _, map) = self.body.tys.kind(*t0) else { return false };
+        let Some((crate::ty::hash::HashTy::HashMap, margs)) = crate::ty::hash::hash_parts(&self.body.tys, map) else { return false };
+        let &[k, v, ..] = &margs[..] else { return false };
+        let (nk, nv) = (self.sc.slots(k) as usize, self.sc.slots(v) as usize);
+        if v0.len() < 1 + nk + nv || dv.len() != nk + nv + 2 {
+            return false;
+        }
+        let (kv, vv) = (v0[1..1 + nk].to_vec(), v0[1 + nk..1 + nk + nv].to_vec());
+        let (rk, dk, rv, dvv) = (dv[0], dv[1..1 + nk].to_vec(), dv[1 + nk], dv[2 + nk..].to_vec());
+        self.edge(v0[0], rk);
+        self.edge(v0[0], rv);
+        self.relate(k, &kv, k, &dk, Variance::Co) && self.relate(v, &vv, v, &dvv, Variance::Co)
+    }
+
     /// `set.get(&q)` (rustc `-> Option<&'r T>`): the reference is the
     /// receiver's loan, and `T` is the set's own `T` (a subtype behind the
     /// `&`), as `call_map_get` does for a map's V. A `HashSet<&'static
@@ -5699,32 +5722,67 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// and the map's K and V regions (invariant: it can insert, and the
     /// probe key flows into K); the `&'a mut V` an Entry method returns
     /// is that loan's, with the map's V regions; `and_modify` gives the
-    /// same Entry back. A stored value (`or_insert`'s argument) and a
-    /// closure form's closure (all its regions) flow into V. The keys'
-    /// regions never reach the loan.
+    /// same Entry back, `insert_entry` an `OccupiedEntry` of the same
+    /// loan and regions. A stored value (`or_insert`'s, `insert_entry`'s,
+    /// and `OccupiedEntry::insert`'s argument) and a closure form's
+    /// closure (all its regions) flow into V. The owned results of
+    /// `OccupiedEntry::insert`, `remove`, and `remove_entry` carry the
+    /// entry's K and V regions, not the loan. The keys' regions never
+    /// reach the loan.
     fn call_hash_entry(&mut self, b: crate::check::Builtin, avs: &[(Ty, Vec<u32>)], dv: &[u32]) -> bool {
         use crate::check::Builtin as B;
         use crate::ty::hash::hash_parts;
         let Some((t0, v0)) = avs.first() else { return false };
-        // The Entry (or, for `entry`, the map behind its `&mut`) and its K, V.
-        let (holder, entry_args) = if b == B::MapEntry {
-            let TyKind::Ref(_, _, map) = self.body.tys.kind(*t0) else { return false };
-            (map, hash_parts(&self.body.tys, map))
+        // The Entry (or, for `entry`, the map behind its `&mut`; for the
+        // `&self` and `&mut self` methods of `OccupiedEntry`, the entry
+        // behind the reference, whose loan is `self_r`) and its K, V.
+        let by_ref = matches!(b, B::OccKey | B::OccGet | B::OccGetMut | B::OccInsert);
+        let (entry_args, v0, self_r) = if b == B::MapEntry || by_ref {
+            let TyKind::Ref(_, _, inner) = self.body.tys.kind(*t0) else { return false };
+            let Some((&r0, rest)) = v0.split_first() else { return false };
+            let inner_v = if b == B::MapEntry { &v0[..] } else { rest };
+            (hash_parts(&self.body.tys, inner), inner_v, r0)
         } else {
-            (*t0, hash_parts(&self.body.tys, *t0))
+            (hash_parts(&self.body.tys, *t0), &v0[..], 0)
         };
-        let _ = holder;
         let Some((_, ka)) = entry_args else { return false };
         let (Some(&kt), Some(&vt)) = (ka.first(), ka.get(1)) else { return false };
         let (nk, nv) = (self.sc.slots(kt) as usize, self.sc.slots(vt) as usize);
-        let (Some((&own, hv)), Some((&dst, rv))) = (v0.split_first(), dv.split_first()) else { return false };
+        let Some((&own, hv)) = v0.split_first() else { return false };
         if hv.len() < nk + nv {
             return false;
         }
         let (hk, hvv) = (hv[..nk].to_vec(), hv[nk..nk + nv].to_vec());
+        // The owned results: `insert`'s old value, `remove`'s value, and
+        // `remove_entry`'s pair carry the entry's K and V regions, never
+        // its loan; `insert` stores its argument in V.
+        match b {
+            B::OccInsert | B::OccRemove => {
+                if b == B::OccInsert
+                    && let Some((t1, v1)) = avs.get(1)
+                {
+                    self.relate(*t1, v1, vt, &hvv, Variance::Co);
+                }
+                return dv.len() == nv && self.relate(vt, &hvv, vt, dv, Variance::Co);
+            }
+            B::OccRemoveEntry => {
+                return dv.len() == nk + nv && self.relate(kt, &hk, kt, &dv[..nk], Variance::Co) && self.relate(vt, &hvv, vt, &dv[nk..], Variance::Co);
+            }
+            // `&'r K` or `&'r (mut) V` from `&'r self`: the result borrows
+            // that loan, and its K or V is the entry's (invariant: a write
+            // through `get_mut` stores into the map).
+            B::OccKey | B::OccGet | B::OccGetMut => {
+                let Some((&x, rv)) = dv.split_first() else { return false };
+                self.edge(self_r, x);
+                let (t, slots) = if b == B::OccKey { (kt, &hk) } else { (vt, &hvv) };
+                return rv.len() == slots.len() && self.relate(t, slots, t, rv, Variance::Inv);
+            }
+            _ => {}
+        }
+        let Some((&dst, rv)) = dv.split_first() else { return false };
         self.edge(own, dst);
         match b {
-            B::MapEntry | B::EntryAndModify => {
+            B::MapEntry | B::EntryAndModify | B::EntryInsertEntry => {
                 if rv.len() < nk + nv {
                     return false;
                 }
@@ -5735,6 +5793,12 @@ impl<'b, 'p> Builder<'b, 'p> {
                     && let Some((t1, v1)) = avs.get(1)
                 {
                     self.relate(*t1, v1, kt, &rk, Variance::Co);
+                }
+                // `insert_entry` stores its value in V.
+                if b == B::EntryInsertEntry
+                    && let Some((t1, v1)) = avs.get(1)
+                {
+                    self.relate(*t1, v1, vt, &hvv, Variance::Co);
                 }
             }
             _ => {
@@ -8786,7 +8850,7 @@ fn sort_by_builtin(b: crate::check::Builtin) -> bool {
 /// returned.
 fn hash_lookup_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
-    matches!(b, B::MapGet | B::MapGetMut | B::MapContainsKey | B::MapRemove | B::MapRemoveEntry | B::SetContains | B::SetRemove | B::SetGet)
+    matches!(b, B::MapGet | B::MapGetMut | B::MapGetKeyValue | B::MapContainsKey | B::MapRemove | B::MapRemoveEntry | B::SetContains | B::SetRemove | B::SetGet)
 }
 
 /// `map.entry(k)` and the Entry methods that return the value or the
@@ -8795,7 +8859,20 @@ fn entry_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
     matches!(
         b,
-        B::MapEntry | B::EntryOrInsert | B::EntryOrDefault | B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify
+        B::MapEntry
+            | B::EntryOrInsert
+            | B::EntryOrDefault
+            | B::EntryOrInsertWith
+            | B::EntryOrInsertWithKey
+            | B::EntryAndModify
+            | B::EntryInsertEntry
+            | B::OccKey
+            | B::OccGet
+            | B::OccGetMut
+            | B::OccIntoMut
+            | B::OccInsert
+            | B::OccRemove
+            | B::OccRemoveEntry
     )
 }
 
@@ -8897,7 +8974,7 @@ fn has_interior(tys: &impl TyIntern, t: Ty) -> bool {
 
 fn has_mut_ref(tys: &impl TyIntern, t: Ty) -> bool {
     // A map Entry holds `&'a mut HashMap<K, V>` (W-STD-B).
-    if let Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry)) = tys.builtin_of(t) {
+    if let Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry)) = tys.builtin_of(t) {
         return true;
     }
     match tys.kind(t) {

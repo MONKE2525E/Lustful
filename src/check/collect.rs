@@ -8548,7 +8548,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
         use crate::ty::hash::HashTy;
         return match k {
             HashTy::HashMap | HashTy::HashSet => a.iter().all(|&e| glue_clone(p, tys, e, seen)),
-            HashTy::Entry => false,
+            HashTy::Entry | HashTy::OccupiedEntry => false,
             _ => true,
         };
     }

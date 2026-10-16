@@ -40,13 +40,17 @@ pub fn hasher_write_arg(name: &str) -> Option<Option<IntTy>> {
 
 /// HashMap and HashSet methods Rust declares that lust does not port
 /// yet: a call rejects with L0640 naming the method.
+/// True for `HashMap` and `HashSet` (not an Entry form).
+fn table_kind(k: HashTy) -> bool {
+    matches!(k, HashTy::HashMap | HashTy::HashSet)
+}
+
 const DECLARED_ONLY: &[&str] = &[
     "drain",
     "extract_if",
     "try_reserve",
     "shrink_to_fit",
     "shrink_to",
-    "get_key_value",
     "get_many_mut",
     "hasher",
     "union",
@@ -405,11 +409,11 @@ impl<'p> Ctx<'p> {
     ) -> Option<Ty> {
         use Builtin as B;
         let (kind, targs) = hash_parts(&self.tys, base)?;
-        if !matches!(kind, HashTy::HashMap | HashTy::HashSet | HashTy::Entry) {
+        if !matches!(kind, HashTy::HashMap | HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry) {
             return None;
         }
         let n = self.p.interner.get(name);
-        if kind != HashTy::Entry
+        if table_kind(kind)
             && matches!(n, "iter" | "iter_mut" | "keys" | "values" | "values_mut" | "into_iter" | "into_keys" | "into_values")
             && let Some(t) = self.hash_iter_source(e, recv, rt, kind, &targs, derefs, n, name_span, args)
         {
@@ -447,7 +451,7 @@ impl<'p> Ctx<'p> {
                 let f = self.fn_mut_param_ref(&[rk], BOOL, name_span);
                 Some((B::SetRetain, Autoref::RefMut, vec![f], UNIT, None))
             }
-            (HashTy::HashMap, "get" | "get_mut" | "contains_key" | "remove" | "remove_entry") => {
+            (HashTy::HashMap, "get" | "get_mut" | "get_key_value" | "contains_key" | "remove" | "remove_entry") => {
                 let (q, rq) = lookup(self);
                 let (b, autoref, ret) = match n {
                     "get" => {
@@ -459,6 +463,12 @@ impl<'p> Ctx<'p> {
                         (B::MapGetMut, Autoref::RefMut, self.tys.mk_option(r))
                     }
                     "contains_key" => (B::MapContainsKey, Autoref::Ref, BOOL),
+                    "get_key_value" => {
+                        let (rk, rv) = (self.tys.mk_ref(false, k), self.tys.mk_ref(false, v));
+                        let ts = self.tys.intern_tys(&[rk, rv]);
+                        let kv = self.tys.intern(TyKind::Tuple(ts));
+                        (B::MapGetKeyValue, Autoref::Ref, self.tys.mk_option(kv))
+                    }
                     "remove_entry" => {
                         let ts = self.tys.intern_tys(&[k, v]);
                         let kv = self.tys.intern(TyKind::Tuple(ts));
@@ -520,6 +530,20 @@ impl<'p> Ctx<'p> {
                 let f = self.fn_once_param(&[rv], UNIT, name_span);
                 Some((B::EntryAndModify, Autoref::None, vec![f], base, None))
             }
+            (HashTy::Entry, "insert_entry") => {
+                let occ = mk_hash(&mut self.tys, HashTy::OccupiedEntry, &[k, v]);
+                Some((B::EntryInsertEntry, Autoref::None, vec![v], occ, None))
+            }
+            (HashTy::OccupiedEntry, "key") => Some((B::OccKey, Autoref::Ref, vec![], self.tys.mk_ref(false, k), None)),
+            (HashTy::OccupiedEntry, "get") => Some((B::OccGet, Autoref::Ref, vec![], self.tys.mk_ref(false, v), None)),
+            (HashTy::OccupiedEntry, "get_mut") => Some((B::OccGetMut, Autoref::RefMut, vec![], self.tys.mk_ref(true, v), None)),
+            (HashTy::OccupiedEntry, "into_mut") => Some((B::OccIntoMut, Autoref::None, vec![], self.tys.mk_ref(true, v), None)),
+            (HashTy::OccupiedEntry, "insert") => Some((B::OccInsert, Autoref::RefMut, vec![v], v, None)),
+            (HashTy::OccupiedEntry, "remove") => Some((B::OccRemove, Autoref::None, vec![], v, None)),
+            (HashTy::OccupiedEntry, "remove_entry") => {
+                let kv = self.tys.intern_tys(&[k, v]);
+                Some((B::OccRemoveEntry, Autoref::None, vec![], self.tys.intern(TyKind::Tuple(kv)), None))
+            }
             _ => None,
         };
         let Some((b, autoref, params, ret, q)) = found else {
@@ -527,7 +551,7 @@ impl<'p> Ctx<'p> {
                 self.expr(a, None);
             }
             let tn = self.tn(base);
-            if DECLARED_ONLY.contains(&n) || matches!(n, "insert_entry") {
+            if DECLARED_ONLY.contains(&n) {
                 self.errs.push(Diag::new(
                     "L0640",
                     name_span,
@@ -912,7 +936,7 @@ pub fn hash_ctor_builtin(k: HashTy, item: &str) -> Option<Builtin> {
         "with_hasher" if table => Builtin::HashWithHasher,
         "with_capacity_and_hasher" if table => Builtin::HashWithCapacityAndHasher,
         "from" if table => Builtin::HashFromArray,
-        "default" if k != HashTy::Entry => Builtin::HashDefault,
+        "default" if !matches!(k, HashTy::Entry | HashTy::OccupiedEntry) => Builtin::HashDefault,
         _ => return None,
     })
 }

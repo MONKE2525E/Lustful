@@ -602,6 +602,15 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::EntryIntoMut,
     Builtin::EntryInsert,
     Builtin::EntryGetMut,
+    Builtin::EntryInsertEntry,
+    Builtin::MapGetKeyValue,
+    Builtin::OccKey,
+    Builtin::OccGet,
+    Builtin::OccGetMut,
+    Builtin::OccIntoMut,
+    Builtin::OccInsert,
+    Builtin::OccRemove,
+    Builtin::OccRemoveEntry,
     Builtin::SetInsert,
     Builtin::SetContains,
     Builtin::SetRemove,
@@ -1234,6 +1243,21 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         ),
         // Internal steps of the closure forms, never called by name.
         B::EntryOccupied | B::EntryIntoMut | B::EntryInsert | B::EntryGetMut => (&[], vec![], Call::Method),
+        B::EntryInsertEntry => (&["hash_map::Entry<K, V>"], vec![i.intern("insert_entry")], Call::Method),
+        B::MapGetKeyValue => (&["HashMap<K, V, S>"], vec![i.intern("get_key_value")], Call::Method),
+        B::OccKey | B::OccGet | B::OccGetMut | B::OccIntoMut | B::OccInsert | B::OccRemove | B::OccRemoveEntry => (
+            &["hash_map::OccupiedEntry<K, V>"],
+            vec![
+                i.intern("key"),
+                i.intern("get"),
+                i.intern("get_mut"),
+                i.intern("into_mut"),
+                i.intern("insert"),
+                i.intern("remove"),
+                i.intern("remove_entry"),
+            ],
+            Call::Method,
+        ),
         B::HashIterNew | B::HashIterNext | B::HashIterLen => (
             &["HashMap<K, V, S>", "HashSet<T, S>"],
             vec![

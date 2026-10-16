@@ -1091,7 +1091,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                     HashTy::RandomState => Some(plain_layout(16, 8)),
                     HashTy::DefaultHasher => Some(plain_layout(72, 8)),
                     HashTy::BuildHasherDefault => Some(layout::zst_layout(1)),
-                    HashTy::Entry => {
+                    HashTy::Entry | HashTy::OccupiedEntry => {
                         let key = go(p, args.first()?, seen)?;
                         layout::struct_layout(&[layout::ptr_layout(), layout::int_layout(IntTy::U64), layout::ptr_layout(), key], c).ok()
                     }
@@ -1383,7 +1383,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 crate::ty::hash::HashTy::BuildHasherDefault => (0, 1),
                 k if k.is_owning_iter() => (104, 8),
                 k if k.is_iter_form() => (40, 8),
-                crate::ty::hash::HashTy::Entry => {
+                crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry => {
                     // `{ table ptr, hash, slot ptr, K key }`
                     let (ks, ka) = args.first().map_or((0, 1), |k| go(p, k, seen));
                     let align = ka.max(8);
@@ -4427,6 +4427,15 @@ impl FnGen<'_, '_> {
             | B::EntryIntoMut
             | B::EntryInsert
             | B::EntryGetMut
+            | B::EntryInsertEntry
+            | B::MapGetKeyValue
+            | B::OccKey
+            | B::OccGet
+            | B::OccGetMut
+            | B::OccIntoMut
+            | B::OccInsert
+            | B::OccRemove
+            | B::OccRemoveEntry
             | B::SetInsert
             | B::SetContains
             | B::SetRemove
