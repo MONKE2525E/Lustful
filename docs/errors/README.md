@@ -102,6 +102,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0720](L0720.md) | ambiguous method |
 | [L0721](L0721.md) | this method or receiver form is not supported yet |
 | [L0721](L0721.md) | this method form is not supported yet |
+| [L0730](L0730.md) | overflow while adding drop-check rules |
 | [L0731](L0731.md) | explicit lifetime arguments on a fn |
 | [L0733](L0733.md) | lifetime may not live long enough |
 | [L0734](L0734.md) | lifetime mismatch with the trait method |

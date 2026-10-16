@@ -1,0 +1,5 @@
+// expect: L0730
+// rustc E0320: each Rc level is two drop-check steps (Rc, then RcInner); 65 levels pass the limit of 128.
+#[allow(dead_code)]
+fn f(_x: std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<std::rc::Rc<u8>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>) {}
+fn main() {}

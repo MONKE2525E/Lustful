@@ -89,7 +89,7 @@ prints "reserved, not yet emitted".
 | L0720 | Methods and receivers | W-TRAITS-CORE | in use | L0720 ambiguous method; plain "no such method" stays L0104 |
 | L0721 | Methods and receivers | W-TRAITS-CORE | in use | Method turbofish or typed receiver form is not supported yet (S3b) |
 | L0722-L0729 | Methods and receivers | W-TRAITS-CORE | reserved | L0722 unsupported receiver type |
-| L0730 | Regions and drop check | W-BORROW | reserved | L0730 drop check |
+| L0730 | Regions and drop check | tf-mdrop | in use | Drop check overflow: a type whose drop check never ends (rustc E0320) |
 | L0731 | Regions and drop check | W-BORROW | in use | Explicit lifetime turbofish arg |
 | L0732 | Regions and drop check | W-BORROW | reserved | L0732 placeholder region escapes |
 | L0733 | Regions and drop check | W-BORROW | in use | A region relation the signature does not give (rustc "lifetime may not live long enough") |

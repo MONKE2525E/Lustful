@@ -27,6 +27,7 @@ pub mod method;
 pub mod object;
 pub mod obligations;
 pub mod outlives;
+pub mod dropck;
 pub mod opaque;
 pub mod own;
 pub mod picks;
@@ -2132,8 +2133,19 @@ fn use_item_trait_layers(p: &Program, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>
 /// marks the result poisoned instead.
 pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
     // Derive lists the check reads become `Derives` reads (R12).
-    let ((mut ck, errs), noted) = derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid));
+    let ((mut ck, mut errs), noted) = derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid));
     derive_delta::record(p, &mut ck.reads, &noted);
+    // Drop-check overflow (rustc E0320) is judged on the generic body,
+    // never an instance; a closure's body is its parent's check.
+    let class = p.gx.fn_class.get(fid.0 as usize).copied().unwrap_or_default();
+    if errs.is_empty()
+        && matches!(class, generics::FnClass::Plain | generics::FnClass::Template)
+        && !p.in_lang_methods(p.fn_def(fid).name_span)
+        && p.fn_shipped_crate(fid).is_none()
+        && let Some(d) = dropck::check_body(p, fid, &mut ck)
+    {
+        errs.push(d);
+    }
     (ck, errs)
 }
 
