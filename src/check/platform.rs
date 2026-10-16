@@ -82,6 +82,11 @@ const UPSTREAM_UNSAFE_FNS: &[&str] = &["from_raw_fd", "borrow_raw"];
 /// cannot name them, and cannot define one in an impl of a shipped trait.
 const HIDDEN_PREFIX: &str = "__lust_";
 
+/// The name prefix of std fns that only adapter crates may call (a std
+/// hook upstream's std lacks, `io::Error::__lust_adapter_error`). User
+/// code that names one rejects as an adapter's `__lust_` hook does.
+const ADAPTER_ONLY_PREFIX: &str = "__lust_adapter_";
+
 /// True when `span` is in shipped source: spliced std, the platform
 /// crate, or an adapter crate's files.
 fn shipped_span(p: &Program, span: Span) -> bool {
@@ -128,11 +133,12 @@ impl Ctx<'_> {
                 super::Res::Fn(f) | super::Res::Method { f, .. } => f,
                 _ => continue,
             };
-            // Hidden: an adapter's `__lust_` hook (std's own internal
-            // `__lust_` fns sit behind public std paths and stay usable).
+            // Hidden: an adapter's `__lust_` hook, or a std hook for adapters
+            // (std's other internal `__lust_` fns sit behind public std paths
+            // and stay usable).
             let def_span = p.fn_def(f).name_span;
             let name = p.name(p.fn_info(f).name);
-            let hidden = name.starts_with(HIDDEN_PREFIX) && p.adapter_at(def_span).is_some();
+            let hidden = name.starts_with(HIDDEN_PREFIX) && p.adapter_at(def_span).is_some() || name.starts_with(ADAPTER_ONLY_PREFIX);
             if !hidden && !UPSTREAM_UNSAFE_FNS.contains(&name) {
                 continue;
             }

@@ -31,7 +31,23 @@ enum Repr {
     /// payload is the text of a `&str` or `String`, the error types lust
     /// accepts here.
     Custom(ErrorKind, String),
+    /// A kind with a payload of an adapter crate's own data-less error
+    /// type (`__lust_adapter_error`): the payload's Display and Debug.
+    CustomFmt(ErrorKind, PayloadFmt, PayloadFmt),
 }
+
+/// Prints one side (Display or Debug) of a `Repr::CustomFmt` payload.
+type PayloadFmt = fn(&mut fmt::Formatter<'_>) -> fmt::Result;
+
+/// Debug of a `Repr::CustomFmt` payload as a struct field.
+struct PayloadDebug(PayloadFmt);
+
+impl fmt::Debug for PayloadDebug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (self.0)(f)
+    }
+}
+
 
 /// The payloads `Error::new` and `Error::other` take in lust: `&str`
 /// and `String` (std takes anything convertible into a boxed error).
@@ -68,6 +84,17 @@ impl Error {
         Error::new(ErrorKind::Other, error)
     }
 
+    /// For adapter crates only (user code that names it is L0104): std's
+    /// `Error::new(kind, payload)` for an adapter's payload type that has no
+    /// data (flate2's `CompressError`). `display` and `debug` print the
+    /// payload, as std prints a `Custom` error through the boxed payload.
+    /// Not generic on purpose: a generic inherent fn here slowed method
+    /// lookup on io::Error in programs with unresolved names (parse-fuzz).
+    #[doc(hidden)]
+    pub fn __lust_adapter_error(kind: ErrorKind, display: PayloadFmt, debug: PayloadFmt) -> Error {
+        Error { repr: Repr::CustomFmt(kind, display, debug) }
+    }
+
     /// Creates an error from an OS error code.
     pub fn from_raw_os_error(code: i32) -> Error {
         Error { repr: Repr::Os(code) }
@@ -88,6 +115,7 @@ impl Error {
             Repr::Simple(kind) => kind,
             Repr::SimpleMessage(kind, _) => kind,
             Repr::Custom(kind, _) => kind,
+            Repr::CustomFmt(kind, _, _) => kind,
         }
     }
 
@@ -103,6 +131,7 @@ impl Error {
             Repr::Simple(kind) => kind == ErrorKind::Interrupted,
             Repr::SimpleMessage(kind, _) => kind == ErrorKind::Interrupted,
             Repr::Custom(kind, _) => kind == ErrorKind::Interrupted,
+            Repr::CustomFmt(kind, _, _) => kind == ErrorKind::Interrupted,
         }
     }
 }
@@ -130,6 +159,7 @@ impl fmt::Display for Error {
             Repr::Simple(kind) => f.write_str(kind.as_str()),
             Repr::SimpleMessage(_, message) => f.pad(message),
             Repr::Custom(_, text) => f.pad(text),
+            Repr::CustomFmt(_, display, _) => display(f),
         }
     }
 }
@@ -144,6 +174,7 @@ impl fmt::Debug for Error {
             Repr::Simple(kind) => f.debug_tuple("Kind").field(kind).finish(),
             Repr::SimpleMessage(kind, message) => f.debug_struct("Error").field("kind", kind).field("message", message).finish(),
             Repr::Custom(kind, text) => f.debug_struct("Custom").field("kind", kind).field("error", text).finish(),
+            Repr::CustomFmt(kind, _, debug) => f.debug_struct("Custom").field("kind", kind).field("error", &PayloadDebug(*debug)).finish(),
         }
     }
 }
