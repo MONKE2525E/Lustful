@@ -504,6 +504,13 @@ pub(super) enum Callee {
     /// pointer; that entry consumes the value and frees the box. `.0` is
     /// the C type of `R`.
     DynOnce(CTy, u32),
+    /// A `&dyn Fn(..) -> R` or `&mut dyn FnMut(..) -> R` value (a fat
+    /// reference: goport.rs `guard(emit_file)` with `emit_file: &dyn
+    /// Fn() -> EmitResult`): the call is the vtable's call entry
+    /// (`VT_HEADER`) on the data pointer with the arguments, as a `dyn
+    /// Fn*` call is; nothing is consumed. `.0` is the C type of `R`,
+    /// `.1` the C types of the parameters.
+    DynRef(CTy, Vec<CTy>),
 }
 
 /// The runtime width suffix of an atomic (`1`, `2`, `4`, or `8`).
@@ -891,12 +898,7 @@ impl FnGen<'_, '_> {
         let once = !matches!(callee, Callee::Closure(_, false));
         let (env, env_ty) = self.operand(&ops[0], loc, post);
         collect_types(&env_ty, &mut self.sig_types);
-        let ret = match &callee {
-            Callee::Closure(f, _) | Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
-            Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
-            Callee::DynOnce(r, _) => r.clone(),
-            Callee::Ptr(_) => unreachable!("a fn pointer type"),
-        };
+        let ret = self.callee_ret(&callee);
         collect_types(&ret, &mut self.sig_types);
         let it = format!("RcI_{}", mangle(&ret));
         let (h, ev, w) = (self.tmp(), self.tmp(), self.tmp());
@@ -1129,13 +1131,21 @@ impl FnGen<'_, '_> {
     }
 
     /// What a callable operand calls: a closure's body fn (and whether it
-    /// takes its env by value), a fn item's instance, or a fn pointer.
+    /// takes its env by value), a fn item's instance, a fn pointer, or a
+    /// `dyn Fn*` object. Behind one reference (`catch_unwind(&f)`,
+    /// `spawn_scoped(scope, &work)`) a closure's body takes the
+    /// reference value as its `&self`/`&mut self` env, so it is passed
+    /// as is (the by-value form); a fn item has no value to read; a
+    /// reference to a `dyn Fn*` is `Callee::DynRef`. Any other reference
+    /// (to a fn pointer) is `bad_callable`.
     pub(super) fn callee_of(&self, o: &Operand) -> Callee {
-        let mut t = self.callable_place_ty(o);
-        // A callable behind one reference (a by-ref capture of a
-        // `Copy` closure) calls what it points at.
+        let t = self.callable_place_ty(o);
         if let TyKind::Ref(_, _, i) = self.body.tys.kind(t) {
-            t = i;
+            return match self.body.tys.kind(i) {
+                TyKind::Closure(def, _) => Callee::Closure(self.p.gx.closures[&def].body_fn, true),
+                TyKind::FnDef(..) => self.callee_of_ty(i),
+                _ => self.callee_of_ty(t),
+            };
         }
         self.callee_of_ty(t)
     }
@@ -1188,7 +1198,10 @@ impl FnGen<'_, '_> {
         t
     }
 
-    /// The callee a closure, fn item or fn pointer type calls.
+    /// The callee a closure, fn item or fn pointer type calls (also a
+    /// `Box<dyn FnOnce>` and a reference to a `dyn Fn`/`FnMut`). Any
+    /// other type sets `bad_callable`, which `gen_fn` reports as an
+    /// error, and gives a placeholder callee.
     pub(super) fn callee_of_ty(&self, t: Ty) -> Callee {
         match self.body.tys.kind(t) {
             TyKind::Closure(def, _) => {
@@ -1196,7 +1209,7 @@ impl FnGen<'_, '_> {
                 Callee::Closure(entry.body_fn, entry.kind == crate::check::closure::ClosureKind::FnOnce)
             }
             TyKind::FnDef(def, fargs) => {
-                let f = self.p.local_def(def.hash).expect("internal: a fn item with no local def");
+                let Some(f) = self.p.local_def(def.hash) else { return self.uncallable(t) };
                 let gargs: Vec<GenericArg> = self.body.tys.args(fargs).to_vec();
                 let f = if gargs.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &gargs).expect("internal: no fn instance") };
                 Callee::Fn(f)
@@ -1213,7 +1226,50 @@ impl FnGen<'_, '_> {
                 // (check/closure.rs, a `dyn Fn*` call).
                 Callee::DynOnce(cty(&self.body.tys, out), crate::check::object::VT_HEADER)
             }
-            _ => panic!("internal: a thread call takes a closure, fn item, fn pointer, or Box<dyn FnOnce>"),
+            TyKind::Ref(_, m, d) if let Some((ret, params)) = self.dyn_fn_sig(d, m == Mut::Mut) => Callee::DynRef(ret, params),
+            _ => self.uncallable(t),
+        }
+    }
+
+    /// A callable type the builtin calls cannot call: records it in
+    /// `bad_callable` (the first one wins; `gen_fn` reports it) and
+    /// gives a placeholder callee whose code is never used.
+    fn uncallable(&self, t: Ty) -> Callee {
+        if self.bad_callable.get().is_none() {
+            self.bad_callable.set(Some(t));
+        }
+        Callee::DynRef(CTy::Unit, Vec::new())
+    }
+
+    /// The C return and parameter types of `dyn Fn(..) -> R` (or of `dyn
+    /// FnMut(..) -> R` when `mutable`, a `&mut` to it): the object types
+    /// a reference to which is a callable (`Callee::DynRef`).
+    fn dyn_fn_sig(&self, d: Ty, mutable: bool) -> Option<(CTy, Vec<CTy>)> {
+        let tys = &self.body.tys;
+        if !matches!(tys.kind(d), TyKind::Dyn(..)) {
+            return None;
+        }
+        let pr = crate::check::object::principal_of(tys, d)?;
+        let lang = &self.p.gx.lang;
+        if pr.def != lang.fn_ && !(mutable && pr.def == lang.fn_mut) {
+            return None;
+        }
+        let out_def = lang.output_of(lang.fn_once)?;
+        let out = tys.bindings(pr.bindings).iter().find(|(d, _)| *d == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
+        let params = match tys.args(pr.args).get(1).and_then(|g| g.as_ty()).map(|t| tys.kind(t)) {
+            Some(TyKind::Tuple(ts)) => tys.tys_of(ts).iter().map(|&t| cty(tys, t)).collect(),
+            _ => Vec::new(),
+        };
+        Some((cty(tys, out), params))
+    }
+
+    /// The C return type of a call of `callee`.
+    pub(super) fn callee_ret(&self, callee: &Callee) -> CTy {
+        match callee {
+            Callee::Closure(f, _) | Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
+            Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            Callee::DynOnce(r, _) | Callee::DynRef(r, _) => r.clone(),
+            Callee::Ptr(_) => unreachable!("a fn pointer type"),
         }
     }
 
@@ -1253,6 +1309,28 @@ impl FnGen<'_, '_> {
                 }
                 v
             }
+            Callee::DynRef(r, params) => {
+                collect_types(r, &mut self.sig_types);
+                // A zero-sized parameter is not in the entry's C
+                // signature (`param_dropped`), so its argument is not
+                // passed either.
+                let mut tys = vec!["void *".to_string()];
+                let mut pre = String::new();
+                for (t, a) in params.iter().zip(args) {
+                    collect_types(t, &mut self.sig_types);
+                    if !param_dropped(self.p, t) {
+                        tys.push(ctype(t));
+                        let _ = write!(pre, ", {a}");
+                    }
+                }
+                let (v, rt, k, tys) = (self.tmp(), ctype(r), crate::check::object::VT_HEADER, tys.join(", "));
+                if ret_by_out(self.p, r) {
+                    let _ = writeln!(out, "  {rt} {v}; ((void (*)({rt} *, {tys}))({env}.vt[{k}]))(&{v}, {env}.data{pre});");
+                } else {
+                    let _ = writeln!(out, "  {rt} {v} = (({rt} (*)({tys}))({env}.vt[{k}]))({env}.data{pre});");
+                }
+                v
+            }
             Callee::Ptr(ft) => {
                 let CTy::FnPtr(_, r) = ft else { unreachable!("a fn pointer type") };
                 let v = self.tmp();
@@ -1286,16 +1364,10 @@ impl FnGen<'_, '_> {
         if matches!(op, SyncOp::CondvarWaitWhile | SyncOp::CondvarWaitTimeoutWhile | SyncOp::OnceGetOrInit) {
             return self.closure_wait_or_init(op, ops, ci, loc, post);
         }
-        let mut callee = self.callee_of(&ops[ci]);
         // A thread's `&F` of a `Fn` closure (`spawn_scoped(scope, &work)`;
-        // check/traitpath.rs allows no other reference): the reference is
-        // the body's `&self` env, passed as is.
-        if matches!(op, SyncOp::ThreadSpawn | SyncOp::ScopeSpawn | SyncOp::BuilderSpawn | SyncOp::BuilderSpawnScoped)
-            && matches!(self.body.tys.kind(self.callable_place_ty(&ops[ci])), TyKind::Ref(..))
-            && let Callee::Closure(f, false) = callee
-        {
-            callee = Callee::Closure(f, true);
-        }
+        // check/traitpath.rs allows no other reference) passes the
+        // reference as the body's env (`callee_of`).
+        let callee = self.callee_of(&ops[ci]);
         let once = !matches!(callee, Callee::Closure(_, false));
         let scope = match op {
             SyncOp::ScopeSpawn => self.operand(&ops[0], loc, post).0,
@@ -1304,12 +1376,7 @@ impl FnGen<'_, '_> {
         };
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
         collect_types(&env_ty, &mut self.sig_types);
-        let ret = match &callee {
-            Callee::Closure(f, _) | Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
-            Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
-            Callee::DynOnce(r, _) => r.clone(),
-            Callee::Ptr(_) => unreachable!("a fn pointer type"),
-        };
+        let ret = self.callee_ret(&callee);
         collect_types(&ret, &mut self.sig_types);
         let drop_env = |this: &mut Self, out: &mut String, e: &str| {
             if !once && needs_drop_c(this.p, &env_ty) {

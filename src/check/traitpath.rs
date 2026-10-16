@@ -648,6 +648,29 @@ impl<'p> Ctx<'p> {
                     self.errs.push(generics::dyn_not_yet(span, "a `dyn FnOnce` value or a reference to a callable as a thread's function"));
                     continue;
                 }
+                // The builtins whose start calls the value (`catch_unwind`,
+                // `get_or_init`, `wait_while`, `fetch_update`, `new_cyclic`,
+                // the thread starts) take its last argument through
+                // cgen/sync.rs `callee_of`: other forms (a `Box<dyn Fn>`, a
+                // reference to a fn pointer, `&&F`) have no call there.
+                // `catch_unwind(AssertUnwindSafe(f))` calls `f` (lower/unwind.rs).
+                let tc = match self.tys.local_adt(t0) {
+                    Some(adt) if b == Builtin::Sync(crate::check::sync::SyncOp::CatchUnwind) && crate::check::unwind::is_assert_unwind_safe(p, adt) => {
+                        self.tys.adt_first_ty_arg(t0).map_or(t0, |f| self.deep(f))
+                    }
+                    _ => t0,
+                };
+                if k + 1 == args.len() && calls_value(b) && !self.callee_value_ok(tc) {
+                    let tn = self.tn(tc);
+                    let span = self.span(a);
+                    self.err(
+                        "L0641",
+                        span,
+                        format!("a `{tn}` as this builtin's function is not supported yet"),
+                        "Wrap the call in a closure, for example `catch_unwind(|| f())`.",
+                    );
+                    continue;
+                }
                 let mut t = t0;
                 loop {
                     t = match self.kind(t) {
@@ -682,6 +705,26 @@ impl<'p> Ctx<'p> {
                     );
                 }
             }
+        }
+    }
+
+    /// Whether cgen/sync.rs `callee_of` calls a value of type `t`: a
+    /// closure, fn item, fn pointer or `Box<dyn FnOnce>`; a reference to a
+    /// closure or fn item; `&dyn Fn` or `&mut dyn Fn`/`FnMut`.
+    fn callee_value_ok(&mut self, t: Ty) -> bool {
+        let lang = &self.p.gx.lang;
+        if let TyKind::Ref(_, m, i) = self.kind(t) {
+            let i = self.deep(i);
+            return match self.kind(i) {
+                TyKind::Closure(..) | TyKind::FnDef(..) => true,
+                TyKind::Dyn(..) => crate::check::object::principal_of(&self.tys, i)
+                    .is_some_and(|pr| pr.def == lang.fn_ || (m == Mut::Mut && pr.def == lang.fn_mut)),
+                _ => false,
+            };
+        }
+        match self.kind(t) {
+            TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(_) => true,
+            _ => self.tys.boxed_elem(t).and_then(|d| crate::check::object::principal_of(&self.tys, d)).is_some_and(|pr| pr.def == lang.fn_once),
         }
     }
 
@@ -901,4 +944,27 @@ impl<'p> Ctx<'p> {
             "Call it as a method (`value.name(..)`) with the trait in scope, or wrap that call in a closure.",
         );
     }
+}
+
+/// The builtins whose last argument is a function they call through
+/// cgen/sync.rs `callee_of` (`Ctx::callee_value_ok`).
+fn calls_value(b: Builtin) -> bool {
+    use crate::check::sync::SyncOp as S;
+    matches!(
+        b,
+        Builtin::RcNewCyclic
+            | Builtin::Sync(
+                S::CatchUnwind
+                    | S::ThreadSpawn
+                    | S::ThreadScope
+                    | S::ScopeSpawn
+                    | S::BuilderSpawn
+                    | S::BuilderSpawnScoped
+                    | S::OnceGetOrInit
+                    | S::CondvarWaitWhile
+                    | S::CondvarWaitTimeoutWhile
+                    | S::AtomicFetchUpdate
+                    | S::ArcNewCyclic
+            )
+    )
 }

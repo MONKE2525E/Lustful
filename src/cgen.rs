@@ -1016,6 +1016,10 @@ struct FnGen<'b, 'p> {
     /// Its slot would stay empty, so the call would read garbage or
     /// jump to null: `gen_fn` reports it as an internal error instead.
     bad_callee: Option<LocalDefId>,
+    /// The first callable type a builtin's call cannot call
+    /// (`sync::FnGen::callee_of_ty`: a `Box<dyn Fn>`, a `&&dyn Fn`):
+    /// `gen_fn` reports it as an error instead of using the code.
+    bad_callable: std::cell::Cell<Option<Ty>>,
     /// Locals that hold one constant array index (see
     /// `borrowck::const_index_locals`): a move out of `a[c]` is a
     /// partial move like a field move.
@@ -1775,6 +1779,9 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     if let Some(f) = g.bad_callee {
         return FnOut { error: Some(no_body_error(p, body, f)), ..Default::default() };
     }
+    if let Some(t) = g.bad_callable.get() {
+        return FnOut { error: Some(bad_callable_error(p, body, t)), ..Default::default() };
+    }
     if !g.prelude.is_empty() {
         g.out = std::mem::take(&mut g.prelude) + &g.out;
     }
@@ -1819,6 +1826,7 @@ impl<'b, 'p> FnGen<'b, 'p> {
             move_paths: vec![Vec::new(); n_locals],
             bad_move: false,
             bad_callee: None,
+            bad_callable: std::cell::Cell::new(None),
             const_index: crate::borrowck::const_index_locals(body),
             index_spans: index_spans(body),
             map,
@@ -1860,6 +1868,15 @@ fn int_impl_line(ty: IntTy) -> u32 {
         IntTy::U128 => 1354,
         IntTy::Usize => 1452,
     }
+}
+
+/// The driver-facing message for `FnGen::bad_callable`.
+fn bad_callable_error(p: &Program, body: &Body, t: Ty) -> String {
+    format!(
+        "code generation for `{}`: a builtin call (`catch_unwind`, a thread start, `OnceLock::get_or_init`, `sort_by`, `retain`, ...) whose callable has type `{}` is not supported yet; wrap the call in a closure",
+        p.display_path(p.fn_info(body.fn_id).name),
+        crate::check::collect::ty_name(p, &body.tys, t)
+    )
 }
 
 /// The driver-facing message for `FnGen::bad_move`.
@@ -4005,13 +4022,15 @@ impl FnGen<'_, '_> {
     /// The callable argument of a builtin whose C adapter calls it (a sort
     /// comparator or key, a `binary_search_by` probe, a `retain`
     /// predicate, a `bool::then` fn): a closure, a fn item or a fn
-    /// pointer (`sync::Callee`; check rejects a `dyn` one), behind
+    /// pointer, or a reference to a `dyn Fn`/`FnMut` (`sync::Callee`), behind
     /// `.1` references or boxes. Its value's C type is `.2`.
     fn adapter_callee(&self, o: &Operand) -> (sync::Callee, u8, CTy) {
         let mut t = self.callable_place_ty(o);
         let mut derefs = 0;
         loop {
             t = match self.body.tys.kind(t) {
+                // A reference to a `dyn Fn*` is the callee (`Callee::DynRef`).
+                TyKind::Ref(_, _, i) if matches!(self.body.tys.kind(i), TyKind::Dyn(..)) => break,
                 TyKind::Ref(_, _, i) => i,
                 _ if let Some(i) = self.body.tys.boxed_elem(t) => i,
                 _ => break,
@@ -4023,12 +4042,7 @@ impl FnGen<'_, '_> {
 
     /// The C return type of an `adapter_callee`.
     fn adapter_callee_ret(&self, c: &(sync::Callee, u8, CTy)) -> CTy {
-        match &c.0 {
-            sync::Callee::Closure(f, _) | sync::Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
-            sync::Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
-            sync::Callee::DynOnce(r, _) => r.clone(),
-            sync::Callee::Ptr(_) => unreachable!("a fn pointer type"),
-        }
+        self.callee_ret(&c.0)
     }
 
     /// A call of an `adapter_callee` whose value (or the first of its
