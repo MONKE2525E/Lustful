@@ -490,12 +490,38 @@ impl<'b, 'p> Ck<'b, 'p> {
     }
 }
 
-/// Borrow-checks one function body.
+/// True for a mono instance body, or a closure body fn inside one (at any
+/// depth). Its template, and the template's closures, are borrow-checked
+/// once as written (`check::generics::template_check`, in `lust check` and
+/// in builds alike), as rustc checks only the generic body.
+fn in_instance(p: &Program, f: LocalDefId) -> bool {
+    use crate::check::generics::FnClass;
+    let mut f = f;
+    loop {
+        match p.gx.fn_class.get(f.0 as usize) {
+            Some(FnClass::Instance) => return true,
+            Some(FnClass::Closure) => match p.gx.closure_fns.get(&f).and_then(|d| p.gx.closures.get(d)) {
+                Some(c) => f = c.parent,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
+/// Borrow-checks one function body. An instance body reports only its
+/// lowering errors (`in_instance`): `lust check` makes no instances, so a build that
+/// checked them would reject programs `lust check` accepts, where the
+/// instance's concrete types (a `T` that holds a lifetime) meet the call
+/// rules that the template's opaque params never reach.
 pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
-    let mut ck = Ck::new(p, body);
     if !body.lower_errs.is_empty() {
         return body.lower_errs.clone();
     }
+    if in_instance(p, body.fn_id) {
+        return Vec::new();
+    }
+    let mut ck = Ck::new(p, body);
     // An `impl Trait` value in a view body (a template check) is
     // tracked through `Body::opaque_locals`: its local gets a capture
     // var for every region the opaque captures, drop-live unless its
