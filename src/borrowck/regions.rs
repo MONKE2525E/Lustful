@@ -4772,6 +4772,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 && entry_builtin(b)
                 && self.call_hash_entry(b, &avs, &dv) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::HashExtend)) && self.call_hash_extend(&avs) => {}
+            _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::VecExtend)) && self.call_vec_extend(&avs) => {}
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::CowToMut)) && self.call_cow_to_mut(&avs, &dv) => {}
             // Cow addition copies the right side's bytes into an
             // Owned result (in place for `add_assign`): the right
@@ -4785,6 +4786,10 @@ impl<'b, 'p> Builder<'b, 'p> {
             // its captures reach neither the slice nor the unit result,
             // and `link_closure_args` gave its args the elements.
             _ if matches!(target, CallTarget::Builtin(b) if sort_by_builtin(b)) => {}
+            // `any(f)` and kin take `f` by value and run it during the call
+            // only: its captures reach neither the iterator nor a result
+            // with no regions (`link_closure_args` gave its args the items).
+            _ if matches!(target, CallTarget::Builtin(b) if consume_closure_builtin(b)) && dv.is_empty() => {}
             // So does `retain`'s predicate, which takes `&T`: its captures
             // reach neither the Vec (or set) nor the unit result
             // (`retain_mut` and a map's `retain` hand out `&mut T` and
@@ -4850,7 +4855,15 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ => {
                 match target {
                     CallTarget::Fn(f) if self.returns_opaque(f) => {
-                        let fixed = self.opaque_static_items(f, dt, &dv);
+                        let mut fixed = self.opaque_static_items(f, dt, &dv);
+                        // A `'static` written in the value's type (a captured
+                        // `Rc<dyn Fn()>`'s object lifetime) is no captured
+                        // lifetime of the call.
+                        let mut rs = Vec::new();
+                        self.sc.slot_regions(dt, &mut rs);
+                        if rs.len() == dv.len() {
+                            fixed.extend(dv.iter().zip(&rs).filter(|(_, r)| **r == Region::Static).map(|(&v, _)| v));
+                        }
                         let dv: Vec<u32> = dv.iter().copied().filter(|v| !fixed.contains(v)).collect();
                         self.call_opaque_from(&avs, &all, dt, &dv)
                     }
@@ -5983,6 +5996,31 @@ impl<'b, 'p> Builder<'b, 'p> {
         true
     }
 
+    /// `v.extend(iter)` with a builtin iterator: the items' regions
+    /// outlive the elements' (`Extend<&T>` copies, so an item's leading
+    /// borrow does not flow); the iterator's own loans and a closure's
+    /// captures reach the Vec only through the items. False (nothing
+    /// added) for another argument or unknown item slots.
+    fn call_vec_extend(&mut self, avs: &[(Ty, Vec<u32>)]) -> bool {
+        let [(t0, v0), (it, iv)] = avs else { return false };
+        let TyKind::Ref(_, Mut::Mut, vt) = self.body.tys.kind(*t0) else { return false };
+        let Some(elem) = self.body.tys.vec_elem(vt) else { return false };
+        let n = self.sc.slots(elem) as usize;
+        let Some(ev) = v0.get(1..1 + n) else { return false };
+        let ev = ev.to_vec();
+        if crate::ty::iter::iter_parts(&self.body.tys, *it).is_none() {
+            return false;
+        }
+        let Some(item_vars) = self.item_slots(*it, iv) else { return false };
+        let item_vars = match item_vars.len() {
+            k if k == n => item_vars,
+            k if k == n + 1 => item_vars[1..].to_vec(),
+            _ => return false,
+        };
+        self.flow_all(&item_vars, &ev);
+        true
+    }
+
     /// `table.extend(iter)` (W-STD-B): the items' regions outlive the
     /// table's element regions; the iterator's own loans do not reach
     /// the table unless an item holds them. False (nothing added) when
@@ -6889,9 +6927,11 @@ impl<'b, 'p> Builder<'b, 'p> {
     }
 
     /// The vars of a call of `f` that its `impl Trait` value captures:
-    /// every argument region, or with a `use<..>` list
-    /// (`RegionSig::opaque_caps`) the call's vars for the universals the
-    /// list names and for every type param (all of which it captures).
+    /// the call's vars for the universals a `use<..>` list names
+    /// (`RegionSig::opaque_caps`), or for every universal without one
+    /// (edition 2024 captures every lifetime param, elided ones too), and
+    /// for every type param (all of which it captures). A `'static` in an
+    /// argument type (`Rc<dyn Fn()>`'s object lifetime) is no param.
     /// The signature is instantiated as in `call_sig_with`: arguments
     /// flow into fresh universals, related by the callee's facts and by
     /// the bounds its param types imply (`&'a &'b u8`: `'b: 'a`), so a
@@ -6904,7 +6944,10 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some(sig) = p.regions.opaque_sig(p, f).filter(|s| s.params.len() == avs.len() && info.params.len() == avs.len()) else {
             return all();
         };
-        let Some(caps) = &sig.opaque_caps else { return all() };
+        let caps: Vec<u32> = match &sig.opaque_caps {
+            Some(c) => c.clone(),
+            None => (0..sig.n_univ).collect(),
+        };
         let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
         self.bind_tys.clear();
@@ -9012,6 +9055,14 @@ fn by_ref_item(b: Option<crate::check::Builtin>) -> bool {
     use crate::check::Builtin as B;
     matches!(b, Some(B::IterFilter | B::IterTakeWhile | B::IterSkipWhile | B::IterInspect | B::IterFind | B::IterMinByKey | B::IterMaxByKey | B::VecRetain | B::VecRetainMut | B::MapRetain | B::SetRetain))
         || b.is_some_and(sort_by_builtin)
+}
+
+/// Iterator methods that call their closure argument during the call
+/// and keep nothing of it (`any`, `all`, `position`, `rposition`,
+/// `for_each`).
+fn consume_closure_builtin(b: crate::check::Builtin) -> bool {
+    use crate::check::Builtin as B;
+    matches!(b, B::IterAny | B::IterAll | B::IterPosition | B::IterRposition | B::IterForEach)
 }
 
 /// `sort_by(f)`, `sort_by_key(f)`, and their unstable forms: `f` takes
