@@ -6798,9 +6798,15 @@ impl Rewrite<'_> {
     fn local_item_use(&mut self, ast: &Ast, kind: &ImportKind, item: u32, base: Vec<Sym>, span: Span, scopes: &mut [Frame]) {
         let self_sym = self.interner.intern("self");
         let Some(it) = ast.stmt_items.get(item as usize) else { return };
-        let variant_of = |v: Sym| match &it.kind {
-            ItemKind::Enum(e) => e.variants.iter().find(|x| x.name == v).map(|_| ()),
-            _ => None,
+        // A variant's namespaces: a struct variant binds the type
+        // namespace only (`X { .. }`), so a value of its name (the
+        // prelude `Some`) stays visible; unit and tuple variants bind both.
+        let variant_of = |v: Sym| -> Option<&'static [Namespace]> {
+            let ItemKind::Enum(e) = &it.kind else { return None };
+            e.variants.iter().find(|x| x.name == v).map(|x| match x.fields {
+                crate::ast::VariantFields::Struct(_) => &[Namespace::Type][..],
+                _ => &[Namespace::Type, Namespace::Value][..],
+            })
         };
         let ctor = matches!(&it.kind, ItemKind::Struct(s) if !matches!(s.fields, crate::ast::VariantFields::Struct(_)));
         let bind = |this: &mut Self, scopes: &mut [Frame], name: Sym, nss: &[Namespace], path: Vec<Sym>, glob: bool| {
@@ -6838,10 +6844,10 @@ impl Rewrite<'_> {
                         let nss: &[Namespace] = if ctor { &[Namespace::Type, Namespace::Value] } else { &[Namespace::Type] };
                         bind(self, scopes, name, nss, base, false);
                     }
-                    [v] if variant_of(*v).is_some() => {
+                    [v] if let Some(nss) = variant_of(*v) => {
                         let mut p = base;
                         p.push(*v);
-                        bind(self, scopes, name, &[Namespace::Type, Namespace::Value], p, false);
+                        bind(self, scopes, name, nss, p, false);
                     }
                     _ => self.push_unresolved_use(span, path),
                 }
@@ -6852,7 +6858,8 @@ impl Rewrite<'_> {
                     for v in vs {
                         let mut p = base.clone();
                         p.push(v);
-                        bind(self, scopes, v, &[Namespace::Type, Namespace::Value], p, true);
+                        let nss = variant_of(v).unwrap_or(&[]);
+                        bind(self, scopes, v, nss, p, true);
                     }
                 }
                 _ => self.push_unresolved_use(span, path),

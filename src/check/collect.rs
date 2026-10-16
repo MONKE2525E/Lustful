@@ -4147,6 +4147,25 @@ pub fn collect_reuse(
         // value (the implicit increment then overflows, E0370).
         let mut next_disc: Option<i128> = Some(0);
         let disc_max = crate::ty::consteval::int_stored(disc_want.max128(), disc_want);
+        // `Self` in a field type names the Adt at its own params
+        // (`next: Option<Box<Self>>`), as in rustc. Only for Adts whose
+        // params are all types: a lifetime or const param keeps the
+        // L0102 reject. The scope is the fields' own copy.
+        let self_args: Option<Vec<GenericArg>> = {
+            let g = &p.gx.adt_generics[id.0 as usize];
+            let lifetimes = match &item.kind {
+                ItemKind::Struct(st) => st.generics.params.iter().any(|g| matches!(g, ast::GenericParam::Lifetime { .. })),
+                ItemKind::Enum(e) => e.generics.params.iter().any(|g| matches!(g, ast::GenericParam::Lifetime { .. })),
+                _ => true,
+            };
+            (!lifetimes && g.params.iter().all(|q| matches!(q.kind, ParamKind::Type)))
+                .then(|| (0..g.params.len() as u32).map(|i| GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i))))).collect())
+        };
+        if let Some(args) = self_args {
+            let def = p.def_of_adt(id);
+            let self_ty = p.tys.mk_adt(def, &args);
+            p.gx.adt_scopes[id.0 as usize].self_ty.get_or_insert(self_ty);
+        }
         // The Adt's scope with regions kept, for the fields' regioned types.
         let mut keep_scope = p.gx.adt_scopes[id.0 as usize].clone();
         keep_scope.regions = generics::RegionMode::Keep { next: None, elided: None };
