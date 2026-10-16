@@ -168,6 +168,19 @@ pub enum Builtin {
     CastUnsigned,
     Isqrt,
     CheckedIsqrt,
+    /// `next_power_of_two` and `checked_next_power_of_two` (unsigned)
+    /// and the integer logarithms `ilog2`, `ilog10`, `ilog` with their
+    /// checked forms (tf-small-a, R13). The unchecked logs panic at the
+    /// caller (core's `#[track_caller]`); `next_power_of_two` overflows
+    /// at core's `uint_impl!` line.
+    NextPowerOfTwo,
+    CheckedNextPowerOfTwo,
+    Ilog2,
+    Ilog10,
+    Ilog,
+    CheckedIlog2,
+    CheckedIlog10,
+    CheckedIlog,
     BitWidth,
     HighestOne,
     LowestOne,
@@ -924,7 +937,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::FloatLn, Builtin::FloatLog, Builtin::FloatLog10, Builtin::FloatLog2, Builtin::FloatMax, Builtin::FloatMin,
     Builtin::FloatMulAdd, Builtin::FloatPowf, Builtin::FloatPowi, Builtin::FloatRecip, Builtin::FloatRound, Builtin::FloatSignum,
     Builtin::FloatSqrt, Builtin::FloatToBits, Builtin::FloatTrunc, Builtin::HighestOne, Builtin::IsMultipleOf, Builtin::IsNegative,
-    Builtin::IsPositive, Builtin::IsPowerOfTwo, Builtin::IsolateHighestOne, Builtin::IsolateLowestOne, Builtin::Isqrt, Builtin::LeadingOnes,
+    Builtin::IsPositive, Builtin::IsPowerOfTwo, Builtin::IsolateHighestOne, Builtin::IsolateLowestOne, Builtin::Isqrt, Builtin::NextPowerOfTwo, Builtin::CheckedNextPowerOfTwo, Builtin::Ilog2, Builtin::Ilog10, Builtin::Ilog, Builtin::CheckedIlog2, Builtin::CheckedIlog10, Builtin::CheckedIlog, Builtin::LeadingOnes,
     Builtin::LeadingZeros, Builtin::LowestOne, Builtin::MakeAsciiLowercase, Builtin::MakeAsciiUppercase, Builtin::Max, Builtin::Min,
     Builtin::MixedCheckedAdd, Builtin::MixedCheckedSub, Builtin::MixedOverflowingAdd, Builtin::MixedOverflowingSub, Builtin::MixedSaturatingAdd, Builtin::MixedSaturatingSub,
     Builtin::MixedStrictAdd, Builtin::MixedStrictSub, Builtin::MixedWrappingAdd, Builtin::MixedWrappingSub, Builtin::NextMultipleOf, Builtin::OverflowingAbs,
@@ -15508,6 +15521,26 @@ impl<'p> Ctx<'p> {
         // 128-bit forms stay out with the families below.
         if n == k.isqrt {
             return un(B::Isqrt);
+        }
+        // R13 (tf-small-a): powers of two (unsigned) and the integer logs.
+        match self.p.interner.get(n) {
+            "next_power_of_two" if !s => return un(B::NextPowerOfTwo),
+            "checked_next_power_of_two" if !s => {
+                let o = self.tys.mk_option(t);
+                return Some((B::CheckedNextPowerOfTwo, Autoref::None, vec![], o));
+            }
+            "ilog2" => return Some((B::Ilog2, Autoref::None, vec![], u32t)),
+            "ilog10" => return Some((B::Ilog10, Autoref::None, vec![], u32t)),
+            "ilog" => return Some((B::Ilog, Autoref::None, vec![t], u32t)),
+            m @ ("checked_ilog2" | "checked_ilog10" | "checked_ilog") => {
+                let o = self.tys.mk_option(u32t);
+                return Some(match m {
+                    "checked_ilog2" => (B::CheckedIlog2, Autoref::None, vec![], o),
+                    "checked_ilog10" => (B::CheckedIlog10, Autoref::None, vec![], o),
+                    _ => (B::CheckedIlog, Autoref::None, vec![t], o),
+                });
+            }
+            _ => {}
         }
         if n == k.checked_isqrt && s {
             let o = self.tys.mk_option(t);

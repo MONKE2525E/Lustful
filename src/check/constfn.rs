@@ -186,6 +186,14 @@ fn builtin_is_const(b: Builtin) -> bool {
             | IsPositive
             | IsNegative
             | IsPowerOfTwo
+            | NextPowerOfTwo
+            | CheckedNextPowerOfTwo
+            | Ilog2
+            | Ilog10
+            | Ilog
+            | CheckedIlog2
+            | CheckedIlog10
+            | CheckedIlog
             | Abs
             | Pow
             // Float inherent methods that are const in 1.99. The

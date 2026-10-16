@@ -4678,6 +4678,14 @@ impl FnGen<'_, '_> {
             | B::CastUnsigned
             | B::Isqrt
             | B::CheckedIsqrt
+            | B::NextPowerOfTwo
+            | B::CheckedNextPowerOfTwo
+            | B::Ilog2
+            | B::Ilog10
+            | B::Ilog
+            | B::CheckedIlog2
+            | B::CheckedIlog10
+            | B::CheckedIlog
             | B::BitWidth
             | B::HighestOne
             | B::LowestOne
@@ -6562,6 +6570,60 @@ impl FnGen<'_, '_> {
                     "    uint64_t {x} = {masked_a}; {ct} {t} = {x} == 0 ? ({ct})0 : ({ct})((1ull << ({bits} - 1 - lust_leading_zeros64({x}, {bits}))) & {mask});"
                 );
                 t
+            }
+            // R13: `one_less_than_next_power_of_two() + 1`, the add
+            // overflowing at core's `uint_impl!` line; the checked form
+            // answers None there.
+            B::NextPowerOfTwo | B::CheckedNextPowerOfTwo => {
+                let (x, m, t) = (self.tmp(), self.tmp(), self.tmp());
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {x} = {masked_a}; uint64_t {m} = {x} <= 1 ? 0 : (({mask}) >> lust_leading_zeros64({x} - 1, {bits}));"
+                );
+                if b == B::NextPowerOfTwo {
+                    let nloc = num_loc(it, false);
+                    let _ = writeln!(
+                        self.out,
+                        "    if ({m} == ({mask})) lust_panic_cstr(\"attempt to add with overflow\", {nloc}); {ct} {t} = ({ct})({m} + 1);"
+                    );
+                    t
+                } else {
+                    let _ = writeln!(self.out, "    {ct} {t} = ({ct})(({m} + 1) & ({mask}));");
+                    self.int_option_c(&t, &format!("{m} != ({mask})"), it)
+                }
+            }
+            // R13: floor logarithms of a positive value; the unchecked
+            // forms panic at the caller (`ilog` checks its base first).
+            B::Ilog2 | B::Ilog10 | B::Ilog | B::CheckedIlog2 | B::CheckedIlog10 | B::CheckedIlog => {
+                let (x, base, r, ok) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+                let pos = if sgn { format!("({a} > 0)") } else { format!("({a} != 0)") };
+                let base_v = match b {
+                    B::Ilog2 | B::CheckedIlog2 => "2".to_string(),
+                    B::Ilog10 | B::CheckedIlog10 => "10".to_string(),
+                    _ => format!("({ub} & {mask})"),
+                };
+                let base_ok = match b {
+                    B::Ilog | B::CheckedIlog if sgn => format!("({} >= 2)", vals[1]),
+                    B::Ilog | B::CheckedIlog => format!("({base_v} >= 2)"),
+                    _ => "1".to_string(),
+                };
+                let _ = writeln!(
+                    self.out,
+                    "    uint64_t {x} = {masked_a}, {base} = {base_v}; uint8_t {ok} = {base_ok} && {pos}; uint32_t {r} = 0;\n    if ({ok}) while ({x} >= {base}) {{ {x} /= {base}; {r}++; }}"
+                );
+                match b {
+                    B::Ilog | B::Ilog2 | B::Ilog10 => {
+                        if b == B::Ilog {
+                            let _ = writeln!(
+                                self.out,
+                                "    if (!({base_ok})) lust_panic_cstr(\"base of integer logarithm must be at least 2\", {loc});"
+                            );
+                        }
+                        let _ = writeln!(self.out, "    if (!{pos}) lust_panic_cstr(\"argument of integer logarithm must be positive\", {loc});");
+                        r
+                    }
+                    _ => self.int_option_c(&r, &ok, IntTy::U32),
+                }
             }
             B::Isqrt | B::CheckedIsqrt => {
                 let root = format!("lust_isqrt64({masked_a})");
