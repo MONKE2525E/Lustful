@@ -3491,6 +3491,18 @@ pub fn collect_reuse(
                     )
                 }
 
+                // core: `struct NonZero<T>(T)` (TRIAGE T5). Debug
+                // and Display forward to the integer (synthetic
+                // impls in generics.rs, glue in cgen/fmt.rs), so
+                // only the value traits derive here.
+                25 => {
+                    let t = p.tys.intern(TyKind::Param(ParamId(0)));
+                    (
+                        generics::nonzero_def(),
+                        vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", t)], disc: 0, non_exhaustive: false }],
+                        Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, partial_ord: true, ord: true, hash: true, ..Derives::default() },
+                    )
+                }
                 // core: `#[derive(Clone, Copy, Debug, Hash, PartialEq,
                 // Eq)] enum Bound<T>`, in this order.
                 _ => {
@@ -3510,17 +3522,17 @@ pub fn collect_reuse(
             p.adts[id.0 as usize] =
                 AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            if usize::MAX - item_idx == 12 {
-                // `Bound<T>`: the one generic synthetic std Adt. Give
-                // it its param and field table, as the field pass does
-                // for a user generic enum.
+            if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 {
+                // `Bound<T>` and `NonZero<T>`: the generic synthetic
+                // std Adts. Give each its param and field table, as
+                // the field pass does for a user generic type.
                 p.gx.adt_info[id.0 as usize] = (def, 1);
-                // Its instances need the generic machinery, but only
-                // in programs that use it (plain programs keep the
+                // Their instances need the generic machinery, but only
+                // in programs that use them (plain programs keep the
                 // fast path; the perf gate measures those). Both
                 // flags, like `Cow`: mono's lang-enum fast path
                 // (user_generics false) makes no Adt instances.
-                if generics::ast_uses_bound(ast, interner) {
+                if generics::ast_uses_bound(ast, interner) || generics::ast_uses_nonzero(ast, interner) {
                     p.gx.has_generics = true;
                     p.gx.user_generics = true;
                 }
@@ -3535,7 +3547,11 @@ pub fn collect_reuse(
                 let env = generics::elaborate_env(&mut p.tys, &p.gx.index, &p.gx.adt_generics[id.0 as usize].predicates.clone());
                 p.gx.adt_envs[id.0 as usize] = env;
                 let t = p.tys.intern(TyKind::Param(ParamId(0)));
-                p.regions.adt_fields.insert(def, vec![vec![t], vec![t], Vec::new()]);
+                if usize::MAX - item_idx == 12 {
+                    p.regions.adt_fields.insert(def, vec![vec![t], vec![t], Vec::new()]);
+                } else {
+                    p.regions.adt_fields.insert(def, vec![vec![t]]);
+                }
             }
             if generics::std_adt_has_flat_name(usize::MAX - item_idx) && !std_taken.contains(&name) {
                 p.type_names.insert(name, id);
@@ -8238,6 +8254,8 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         // `Infallible`'s Display is `match *self {}`:
                         // it exists, and no value reaches it.
                         || d == generics::infallible_def()
+                        // `NonZero<T>` displays its integer (TRIAGE T5).
+                        || d == generics::nonzero_def()
                 })
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))

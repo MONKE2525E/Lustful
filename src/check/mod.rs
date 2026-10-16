@@ -835,6 +835,12 @@ pub enum Builtin {
     BoundAsRef,
     BoundMap,
     BoundCloned,
+    /// `core::num::NonZero::new` (TRIAGE T5): lowered in
+    /// lower.rs as an Option of the aggregate (the niche makes
+    /// a zero argument read as None).
+    NonZeroNew,
+    /// `NonZero::get`: the wrapped integer (field 0).
+    NonZeroGet,
     /// `Range::is_empty` and the range kinds' `contains`, plus
     /// `RangeInclusive::start` and `end`: expanded in lower/iter.rs.
     RangeIsEmpty,
@@ -882,7 +888,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::StringIntoBytes, Builtin::StringIsEmpty, Builtin::StringLen, Builtin::SwapBytes, Builtin::ToString, Builtin::TrailingOnes,
     Builtin::TrailingZeros, Builtin::UnboundedShl, Builtin::UnboundedShr, Builtin::UnsignedAbs, Builtin::WrappingAbs, Builtin::WrappingAdd,
     Builtin::WrappingDiv, Builtin::WrappingMul, Builtin::WrappingNeg, Builtin::WrappingPow, Builtin::WrappingRem, Builtin::WrappingShl,
-    Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast,
+    Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet,
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
@@ -3336,6 +3342,14 @@ impl<'p> Ctx<'p> {
         // type is the one extra; its legality is checked where the
         // call is checked (and deferred for an item value, like
         // `String::from`).
+        // `NonZero::get` as a value (`map_or(1, NonZero::get)`,
+        // TRIAGE T5): the wrapped integer, by value.
+        if let Some(inner) = generics::nonzero_elem(&self.tys, self_ty) {
+            if self.name(name) == "get" {
+                return Some((B::NonZeroGet, vec![self_ty], inner, Vec::new()));
+            }
+            return None;
+        }
         if name == k.from && matches!(self.kind(self_ty), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool) {
             let src = match extra.first() {
                 Some(&t) => t,
@@ -3495,6 +3509,26 @@ impl<'p> Ctx<'p> {
             return None;
         }
         Some((Res::PrimAssoc { b, self_ty, name }, params, ret))
+    }
+
+    /// The integer inside a `NonZero` alias name (`NonZeroU32`
+    /// gives `u32`), if the name is one.
+    fn nonzero_alias_inner(&self, ty_name: Sym) -> Option<IntTy> {
+        match self.name(ty_name) {
+            "NonZeroU8" => Some(IntTy::U8),
+            "NonZeroU16" => Some(IntTy::U16),
+            "NonZeroU32" => Some(IntTy::U32),
+            "NonZeroU64" => Some(IntTy::U64),
+            "NonZeroU128" => Some(IntTy::U128),
+            "NonZeroUsize" => Some(IntTy::Usize),
+            "NonZeroI8" => Some(IntTy::I8),
+            "NonZeroI16" => Some(IntTy::I16),
+            "NonZeroI32" => Some(IntTy::I32),
+            "NonZeroI64" => Some(IntTy::I64),
+            "NonZeroI128" => Some(IntTy::I128),
+            "NonZeroIsize" => Some(IntTy::Isize),
+            _ => None,
+        }
     }
 
     /// The primitive type a two-segment path's first segment names
@@ -10458,6 +10492,33 @@ impl<'p> Ctx<'p> {
                 return r;
             }
         }
+        // `NonZero::new`, `NonZeroU64::new`, and `NonZero::get` by
+        // path (TRIAGE T5/T12): `new` is the constructor builtin,
+        // `get` rides the primitive assoc machinery as a value.
+        if self.name(ty_name) == "NonZero" || self.name(ty_name).starts_with("NonZero") && self.nonzero_alias_inner(ty_name).is_some() {
+            let inner = match self.nonzero_alias_inner(ty_name) {
+                Some(i) => int(i),
+                None => match self.builtin_ctor_args(segs, 1, span) {
+                    Some(a) => a[0],
+                    None => self.new_var(false),
+                },
+            };
+            if item == k.new {
+                return Some(Res::Builtin(Builtin::NonZeroNew));
+            }
+            if self.name(item) == "get" && prim_builtin_code(Builtin::NonZeroGet).is_some() {
+                let self_ty = generics::nonzero_ty(&mut self.tys, inner);
+                return Some(Res::PrimAssoc { b: Builtin::NonZeroGet, self_ty, name: item });
+            }
+            let tn = self.name(ty_name).to_string();
+            self.err(
+                "L0104",
+                span,
+                format!("no variant or associated function `{}` on `{tn}`", self.name(item)),
+                "Check the name.",
+            );
+            return None;
+        }
         // A primitive type's method by path (`u8::is_ascii_digit`,
         // `str::len`, `char::to_lowercase`; TRIAGE T12): a std source
         // inherent fn when one is registered, else the builtin
@@ -12659,6 +12720,27 @@ impl<'p> Ctx<'p> {
                     Builtin::F64FromBits => (vec![int(IntTy::U64)], self.tys.float_ty(FloatTy::F64)),
                     Builtin::F32FromBits => (vec![int(IntTy::U32)], self.tys.float_ty(FloatTy::F32)),
                     Builtin::CharFromU32 => (vec![int(IntTy::U32)], self.tys.mk_option(CHAR)),
+                    Builtin::NonZeroNew => {
+                        // `NonZero::new(x)` and `NonZeroU64::new(x)`
+                        // (TRIAGE T5): the integer from the alias
+                        // name, the written type argument, or the
+                        // expected type's element.
+                        let inner = match p.ast.expr(callee) {
+                            Expr::Path(segs) if segs.len() >= 2 => {
+                                let ty_name = segs[segs.len() - 2].name;
+                                match self.nonzero_alias_inner(ty_name) {
+                                    Some(i) => int(i),
+                                    None => match self.builtin_ctor_args(segs, 1, span) {
+                                        Some(a) => a[0],
+                                        None => self.new_var(false),
+                                    },
+                                }
+                            }
+                            _ => self.new_var(false),
+                        };
+                        let nz = generics::nonzero_ty(&mut self.tys, inner);
+                        (vec![inner], self.tys.mk_option(nz))
+                    }
                     Builtin::CharFromDigit => (vec![int(IntTy::U32), int(IntTy::U32)], self.tys.mk_option(CHAR)),
                     Builtin::CharIsAlphabeticUnicode
                     | Builtin::CharIsNumericUnicode
@@ -13725,6 +13807,10 @@ impl<'p> Ctx<'p> {
         }
         // The inherent methods of `core::ops::Bound<T>` (same).
         if let Some(ret) = self.bound_adt_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
+        // The inherent methods of `core::num::NonZero<T>` (same).
+        if let Some(ret) = self.nonzero_adt_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         // The inherent methods of `alloc::borrow::Cow` (W-STD-B).

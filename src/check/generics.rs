@@ -846,6 +846,24 @@ pub fn atomic_ordering_ty(tys: &mut impl TyIntern) -> Ty {
     tys.intern(TyKind::Adt(atomic_ordering_def(), EMPTY_ARGS))
 }
 
+/// The def of `core::num::NonZero<T>` (TRIAGE T5): a synthetic
+/// generic struct Adt over its integer, like `Bound`. The def
+/// itself lives in `ty` so layout can name it.
+pub fn nonzero_def() -> DefId {
+    crate::ty::nonzero_def()
+}
+
+/// The `core::num::NonZero<T>` type.
+pub fn nonzero_ty(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    tys.mk_adt(nonzero_def(), &[GenericArg::Ty(t)])
+}
+
+/// The integer inside a `NonZero<T>` type, when `t` is one.
+pub fn nonzero_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    let (def, _) = tys.adt_parts(t)?;
+    (def == nonzero_def()).then(|| tys.adt_first_ty_arg(t)).flatten()
+}
+
 /// The def of `core::ops::Bound<T>`, a synthetic generic enum Adt:
 /// `Included(T)`, `Excluded(T)`, `Unbounded`, in std's order.
 pub fn bound_def() -> DefId {
@@ -869,14 +887,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 25] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 26] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 25] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 25]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 26] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 26]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -905,6 +923,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 25] {
             (22, "ParseCharError", adt(&["core", "char"], "ParseCharError"), false),
             (23, "CharErrorKind", adt(&["core", "char"], "CharErrorKind"), true),
             (24, "TryFromSliceError", adt(&["core", "array"], "TryFromSliceError"), false),
+            (25, "NonZero", adt(&["core", "num"], "NonZero"), false),
         ]
     })
 }
@@ -913,7 +932,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 25] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -947,6 +966,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("mpsc", "TryRecvError", try_recv_error_def()),
         ("any", "TypeId", type_id_def()),
         ("ops", "Bound", bound_def()),
+        ("num", "NonZero", nonzero_def()),
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
         ("cell", "BorrowMutError", borrow_mut_error_def()),
@@ -3197,6 +3217,54 @@ pub(crate) fn resolve_path_ty(
                     return Err(Diag::new("L0110", span, "`Bound` takes one type argument", "Write `Bound<&T>`, for example."));
                 }
                 return Ok(tys.mk_adt(bound_def(), &args));
+            }
+            // `core::num::NonZero<T>` and its aliases
+            // (`NonZeroU32` and kin, TRIAGE T5): one integer
+            // argument, explicit or from the alias name.
+            if path.len() == 3 && path[1] == "num" && (path[2] == "NonZero" || path[2].starts_with("NonZero")) {
+                let seg = segs.last().unwrap();
+                let alias = match path[2] {
+                    "NonZeroU8" => Some(IntTy::U8),
+                    "NonZeroU16" => Some(IntTy::U16),
+                    "NonZeroU32" => Some(IntTy::U32),
+                    "NonZeroU64" => Some(IntTy::U64),
+                    "NonZeroU128" => Some(IntTy::U128),
+                    "NonZeroUsize" => Some(IntTy::Usize),
+                    "NonZeroI8" => Some(IntTy::I8),
+                    "NonZeroI16" => Some(IntTy::I16),
+                    "NonZeroI32" => Some(IntTy::I32),
+                    "NonZeroI64" => Some(IntTy::I64),
+                    "NonZeroI128" => Some(IntTy::I128),
+                    "NonZeroIsize" => Some(IntTy::Isize),
+                    _ => None,
+                };
+                let inner = if let Some(i) = alias {
+                    if seg.has_args() {
+                        return Err(Diag::new("L0110", span, format!("`{}` takes no type arguments", path[2]), "Remove the `<...>` part."));
+                    }
+                    int(i)
+                } else if path[2] == "NonZero" {
+                    let GenericArgs::Angle(a) = &seg.args else {
+                        return Err(Diag::new("L0110", span, "`NonZero` takes one type argument", "Write `NonZero<u32>`, for example."));
+                    };
+                    let args: Vec<GenericArg> =
+                        resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, "NonZero")?.into_iter().filter(|g| g.as_ty().is_some()).collect();
+                    if args.len() != 1 {
+                        return Err(Diag::new("L0110", span, "`NonZero` takes one type argument", "Write `NonZero<u32>`, for example."));
+                    }
+                    args[0].as_ty().unwrap()
+                } else {
+                    return Err(Diag::new("L0102", span, format!("unknown type `{}`", path[2]), "Check the spelling, or define the type."));
+                };
+                if !matches!(tys.kind(inner), TyKind::Int(_)) {
+                    return Err(Diag::new(
+                        "L0612",
+                        span,
+                        "the argument of `NonZero` is not an integer type".to_string(),
+                        "NonZero wraps an integer type.",
+                    ));
+                }
+                return Ok(nonzero_ty(tys, inner));
             }
             // The owning std iterators (W-STD-B, ty/iter.rs).
             if let Some(k) = crate::ty::iter::owning_by_path(&path) {
@@ -7498,6 +7566,15 @@ pub fn add_synthetic_impls(p: &mut Program) {
             }
         }
     }
+    // `NonZero<T>` (TRIAGE T5): Debug and Display forward to the
+    // integer, as core's impls do (glue in cgen/fmt.rs). The value
+    // traits are the Adt's derives (collect.rs).
+    {
+        let nz_p0 = nonzero_ty(&mut p.tys, p0);
+        let mut g1 = one.clone();
+        g1.predicates = pred_on_p0(p, lang.display);
+        insert_synthetic(p, &mut ordinal, lang.display, nz_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
+    }
     // Rc<T>: Clone needs no bound on T (it bumps the count);
     // the rest follow the pointee like Box, with Deref only.
     {
@@ -9908,6 +9985,25 @@ pub fn ast_uses_bound(ast: &Ast, interner: &Interner) -> bool {
     };
     ast.exprs.iter().any(|e| match e {
         ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "start_bound" | "end_bound"),
+        ast::Expr::Path(segs) => named(segs),
+        ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.tys.iter().any(|t| match t {
+        TyExpr::Path(segs) => named(segs),
+        TyExpr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.pats.iter().any(|p| match p {
+        ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } => named(segs),
+        _ => false,
+    })
+}
+
+pub fn ast_uses_nonzero(ast: &Ast, interner: &Interner) -> bool {
+    let named = |segs: &[ast::PathSeg]| {
+        segs.iter().any(|s| matches!(interner.get(s.name), "NonZero" | "NonZeroU8" | "NonZeroU16" | "NonZeroU32" | "NonZeroU64" | "NonZeroU128" | "NonZeroUsize" | "NonZeroI8" | "NonZeroI16" | "NonZeroI32" | "NonZeroI64" | "NonZeroI128" | "NonZeroIsize"))
+    };
+    ast.exprs.iter().any(|e| match e {
+        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "get" | "available_parallelism"),
         ast::Expr::Path(segs) => named(segs),
         ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
         _ => false,

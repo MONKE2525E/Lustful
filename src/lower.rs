@@ -1931,6 +1931,44 @@ impl<'p> Lower<'p> {
                         | crate::check::sync::SyncOp::ResumeUnwind
                         | crate::check::sync::SyncOp::PanicAny),
                     )) => self.unwind_call(op, args, ops, dest, ty, span),
+                    Res::Builtin(Builtin::NonZeroNew) => {
+                        // `NonZero::new(x)` (TRIAGE T5): None for
+                        // zero, else Some of the aggregate.
+                        let nz_ty = self.body.tys.option_elem(ty).unwrap_or(ty);
+                        match (self.body.tys.local_adt(nz_ty), ops.into_iter().next()) {
+                            (Some(a), Some(op)) => {
+                                let inner = self.body.tys.adt_first_ty_arg(nz_ty).unwrap_or(nz_ty);
+                                let it = match self.kind(inner) {
+                                    TyKind::Int(i) => i,
+                                    _ => IntTy::U64,
+                                };
+                                let xv = self.temp(inner);
+                                self.assign(Place::local(xv), Rvalue::Use(op), span);
+                                let c = self.temp(BOOL);
+                                self.assign(
+                                    Place::local(c),
+                                    Rvalue::Bin(crate::ast::BinOp::Ne, Operand::Copy(Place::local(xv)), Operand::Const(Const::Int(0, it))),
+                                    span,
+                                );
+                                let out = self.temp(ty);
+                                let (tb, eb, end) = (self.new_block(), self.new_block(), self.new_block());
+                                let b = &mut self.body.blocks[self.cur.0 as usize];
+                                b.term = Terminator::If(Operand::Copy(Place::local(c)), tb, eb);
+                                b.term_span = span;
+                                self.cur = tb;
+                                let t = self.temp(nz_ty);
+                                self.assign(Place::local(t), Rvalue::Aggregate(a, 0, vec![Operand::Move(Place::local(xv))]), span);
+                                self.assign(Place::local(out), Rvalue::Opt(ty, Some(Operand::Move(Place::local(t)))), span);
+                                self.goto(end, span);
+                                self.cur = eb;
+                                self.assign(Place::local(out), Rvalue::Opt(ty, None), span);
+                                self.goto(end, span);
+                                self.cur = end;
+                                self.set_or_temp(dest, Rvalue::Use(Operand::Move(Place::local(out))), ty, span);
+                            }
+                            _ => {}
+                        }
+                    }
                     Res::Builtin(b) => {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Builtin(b), ops, d, span);

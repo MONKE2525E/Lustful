@@ -3935,6 +3935,8 @@ impl FnGen<'_, '_> {
             }
             B::ConvInto => unreachable!("expanded per conversion (lower/iter.rs)"),
             B::PrimFromCast => unreachable!("lowered as a cast (lower.rs)"),
+            B::NonZeroNew => unreachable!("lowered as an aggregate (lower.rs)"),
+            B::NonZeroGet => format!("(({0}).f0)", vals[0]),
             B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => unreachable!("expanded with its closure (lower/iter.rs)"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own

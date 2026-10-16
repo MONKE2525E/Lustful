@@ -474,6 +474,31 @@ impl<'p> Ctx<'p> {
         Some(ret)
     }
 
+    /// The inherent methods of `core::num::NonZero<T>` lust takes:
+    /// `get` (the wrapped integer). `new` is an associated fn
+    /// (check's `resolve_assoc`); the rest of std's arithmetic
+    /// surface on NonZero is not modeled yet.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn nonzero_adt_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+    ) -> Option<Ty> {
+        let _ = recv;
+        let inner = generics::nonzero_elem(&self.tys, self.resolve(base))?;
+        if self.name(name) != "get" {
+            return None;
+        }
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::NonZeroGet, derefs, autoref: Autoref::None });
+        self.check_args(&[], args, name_span);
+        Some(inner)
+    }
+
     /// `RangeBounds::start_bound` and `end_bound` on a builtin range
     /// kind, a `(Bound, Bound)` pair, or a shared reference to one
     /// (for the reference, `derefs` reaches the value). user impls

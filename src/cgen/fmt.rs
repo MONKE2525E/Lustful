@@ -159,6 +159,13 @@ fn builder_list(n: &str, elem: &str, et: &CTy, need: &mut dyn FnMut(Glue, &CTy))
 
 /// The body of `dbg_<m>`: Rust's Debug for `t`, through the builders.
 pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+    // `NonZero<T>` prints its integer, with no wrapper name.
+    if let CTy::Adt(a) = t
+        && p.def_of_adt(*a) == crate::ty::nonzero_def()
+    {
+        let inner = cty(&p.tys, p.adt(*a).variants[0].fields[0].ty);
+        return format!("  return {};\n", fmt_expr(&inner, FmtKind::Debug, "f", "(&p->f0)", need));
+    }
     // `Cow<B>` prints the `B` it derefs to, with no variant name.
     if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {
         return format!("  {decl}\n  return {};\n", fmt_expr(&rb, FmtKind::Debug, "f", "(&v_)", need));
@@ -309,6 +316,13 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
 /// The body of `disp_<m>`: only types with a user Display impl reach
 /// Display glue (every other Display type is a leaf in `fmt_expr`).
 pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+    // `NonZero<T>` displays its integer, with no wrapper name.
+    if let CTy::Adt(a) = t
+        && p.def_of_adt(*a) == crate::ty::nonzero_def()
+    {
+        let inner = cty(&p.tys, p.adt(*a).variants[0].fields[0].ty);
+        return format!("  return {};\n", fmt_expr(&inner, FmtKind::Display, "f", "(&p->f0)", need));
+    }
     // `Cow<B>` displays the `B` it derefs to (W-STD-B).
     if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {
         return format!("  {decl}\n  return {};\n", fmt_expr(&rb, FmtKind::Display, "f", "(&v_)", need));

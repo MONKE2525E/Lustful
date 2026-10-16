@@ -915,6 +915,14 @@ fn compute(
             }
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => Ok(ptr_layout()),
             Some(_) => Err(()),
+            // `core::num::NonZero<T>` (TRIAGE T5): the integer
+            // itself, with zero as the niche.
+            None if tys.adt_parts(t).is_some_and(|(def, _)| def == super::nonzero_def()) => {
+                match tys.adt_first_ty_arg(t).map(|a| tys.kind(a)) {
+                    Some(TyKind::Int(i)) => Ok(nonzero_layout(i)),
+                    _ => Err(()),
+                }
+            }
             None => {
                 let id = tys.local_adt(t).ok_or(())?;
                 let shape = shapes.adt_shape(id).ok_or(())?;

@@ -619,6 +619,13 @@ pub fn prim_fn_def() -> DefId {
     builtin_def(&["__lust"], "PrimFn")
 }
 
+/// The def of `core::num::NonZero<T>` (TRIAGE T5): a synthetic
+/// std Adt (check/collect.rs registers it like `Bound`), named
+/// here so layout can give it the zero niche.
+pub fn nonzero_def() -> DefId {
+    builtin_def(&["core", "num"], "NonZero")
+}
+
 /// The defs of the types that were closed `TyKind` cases before S3a. They become real
 /// std-crate defs when source std lands (ARCH 3.1); until then the builtin code paths
 /// in check, lower, and cgen recognize them through the `TyIntern` compat helpers.
