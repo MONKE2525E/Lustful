@@ -4074,41 +4074,15 @@ impl FnGen<'_, '_> {
             }
             B::BoxSliceIntoIter => format!("((lust_VecIter){{ (void*)({0}).ptr, ({0}).len, ({0}).len, 0 }})", vals[0]),
             B::ParseIntErrorKind => format!("(&({})->f0)", vals[0]),
-            B::ParseInt(it) => {
-                // The primitive int `FromStr` (tf-str): the runtime
-                // parses into two words plus an `IntErrorKind` tag;
-                // here they become the `Result` and its error struct.
-                let p = self.p;
-                let (Some(pie), Some(iek)) = (
-                    p.tys.local_adt_of(crate::check::generics::parse_int_error_def()),
-                    p.tys.local_adt_of(crate::check::generics::int_error_kind_def()),
-                ) else {
-                    unreachable!("parse type-checks only with std's error Adts")
-                };
-                let val_ty = CTy::Int(it);
-                let res = CTy::Result(Box::new(val_ty.clone()), Box::new(CTy::Adt(pie)));
-                collect_types(&res, &mut self.sig_types);
-                let (t, lo, hi, kind) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
-                let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
-                let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
-                let a = str_of(&vals[0], &tys[0]);
-                let _ = writeln!(self.out, "    uint64_t {lo}, {hi}; int {kind}; {} {t};", ctype(&res));
-                let _ = writeln!(
-                    self.out,
-                    "    if (lust_parse_int({a}, {}, {}, &{lo}, &{hi}, &{kind})) {{ {ok_f} = {}; {ok_d} }}",
-                    u8::from(it.signed()),
-                    it.bits(),
-                    if it.bits() >= 128 { format!("(({}){{ {lo}, {hi} }})", ctype(&val_ty)) } else { format!("(({}){lo})", ctype(&val_ty)) }
-                );
-                let kct = CTy::Adt(iek);
-                let kinds: Vec<String> = (0..4).map(|v| self.make_variant(&kct, v, &[])).collect();
-                let _ = writeln!(
-                    self.out,
-                    "    else {{ {err_f}.f0 = {kind} == 0 ? {} : {kind} == 1 ? {} : {kind} == 2 ? {} : {}; {err_d} }}",
-                    kinds[0], kinds[1], kinds[2], kinds[3]
-                );
-                t
+            B::FromStrRadix(it) => {
+                // core panics on a radix outside 2..=36 before parsing,
+                // at its `from_str_radix` line for the type's sign.
+                let sloc = std_loc(0, if it.signed() { 1866 } else { 1867 }, 1);
+                let _ = writeln!(self.out, "    lust_radix_check({}, {sloc});", vals[1]);
+                self.parse_int_c(it, &str_of(&vals[0], &tys[0]), &vals[1])
             }
+            // The primitive int `FromStr` (tf-str), at radix 10.
+            B::ParseInt(it) => self.parse_int_c(it, &str_of(&vals[0], &tys[0]), "10"),
             B::ParseFloat(f) => {
                 let p = self.p;
                 let (Some(pfe), Some(fek)) = (
@@ -5982,6 +5956,42 @@ impl FnGen<'_, '_> {
     /// `builtin`). Widths up to 64 run through the generic word ops in
     /// core.c; 128-bit values use the two-word helpers for the subset
     /// the checker lets through.
+    /// The int parse of `a` (a `lust_str` expression) at `radix` (a
+    /// `u32` expression already checked to be in 2..=36): the runtime
+    /// parses into two words plus an `IntErrorKind` tag; here they
+    /// become the `Result` and its error struct (tf-str, R26).
+    fn parse_int_c(&mut self, it: IntTy, a: &str, radix: &str) -> String {
+        let p = self.p;
+        let (Some(pie), Some(iek)) = (
+            p.tys.local_adt_of(crate::check::generics::parse_int_error_def()),
+            p.tys.local_adt_of(crate::check::generics::int_error_kind_def()),
+        ) else {
+            unreachable!("parse type-checks only with std's error Adts")
+        };
+        let val_ty = CTy::Int(it);
+        let res = CTy::Result(Box::new(val_ty.clone()), Box::new(CTy::Adt(pie)));
+        collect_types(&res, &mut self.sig_types);
+        let (t, lo, hi, kind) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+        let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
+        let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
+        let _ = writeln!(self.out, "    uint64_t {lo}, {hi}; int {kind}; {} {t};", ctype(&res));
+        let _ = writeln!(
+            self.out,
+            "    if (lust_parse_int_radix({a}, {radix}, {}, {}, &{lo}, &{hi}, &{kind})) {{ {ok_f} = {}; {ok_d} }}",
+            u8::from(it.signed()),
+            it.bits(),
+            if it.bits() >= 128 { format!("(({}){{ {lo}, {hi} }})", ctype(&val_ty)) } else { format!("(({}){lo})", ctype(&val_ty)) }
+        );
+        let kct = CTy::Adt(iek);
+        let kinds: Vec<String> = (0..4).map(|v| self.make_variant(&kct, v, &[])).collect();
+        let _ = writeln!(
+            self.out,
+            "    else {{ {err_f}.f0 = {kind} == 0 ? {} : {kind} == 1 ? {} : {kind} == 2 ? {} : {}; {err_d} }}",
+            kinds[0], kinds[1], kinds[2], kinds[3]
+        );
+        t
+    }
+
     fn int_method_c(&mut self, b: Builtin, vals: &[String], tys: &[CTy], loc: &str) -> String {
         use Builtin as B;
         use std::fmt::Write as _;

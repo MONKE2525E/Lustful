@@ -396,6 +396,8 @@ pub enum Builtin {
     /// The primitive `FromStr` parsers (tf-str, runtime/core.c):
     /// one `&str` in, a `Result` of the value or its parse error out.
     ParseInt(IntTy),
+    /// `uN::from_str_radix(&str, u32)` (TRIAGE R26): `ParseInt` at a radix.
+    FromStrRadix(IntTy),
     ParseFloat(FloatTy),
     ParseBool,
     ParseChar,
@@ -3483,6 +3485,11 @@ impl<'p> Ctx<'p> {
             if let Some(b) = from_bytes {
                 let arr = self.int_bytes_ty(i);
                 return Some((b, vec![arr], self_ty, Vec::new()));
+            }
+            if self.name(name) == "from_str_radix" {
+                let err = generics::parse_int_error_ty(&mut self.tys);
+                let ret = self.tys.mk_result(self_ty, err);
+                return Some((B::FromStrRadix(i), vec![REF_STR, int(IntTy::U32)], ret, Vec::new()));
             }
         }
         let (b, autoref, params, ret) = match self.kind(self_ty) {

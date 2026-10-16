@@ -1965,8 +1965,9 @@ int lust_matches_step(lust_split *s, const lust_pat *p, int back, uint64_t *idx,
    10 checks each digit, then the checked multiply and add, in
    order, so an overflow ahead of a bad digit reports the overflow.
    The magnitude is accumulated in two words, so 128-bit targets
-   take the same path. */
-int lust_parse_int(lust_str s, int is_signed, int bits, uint64_t *lo, uint64_t *hi, int *kind) LUST_BODY({
+   take the same path. `from_str_radix` (R26) runs it at any radix in
+   2..=36 (the caller checks the range); a letter digit is either case. */
+int lust_parse_int_radix(lust_str s, uint32_t radix, int is_signed, int bits, uint64_t *lo, uint64_t *hi, int *kind) LUST_BODY({
     *lo = 0; *hi = 0;
     if (s.len == 0) { *kind = 0; return 0; }
     uint64_t i = 0;
@@ -1995,15 +1996,16 @@ int lust_parse_int(lust_str s, int is_signed, int bits, uint64_t *lo, uint64_t *
     uint64_t rlo = 0, rhi = 0;
     for (; i < s.len; i++) {
         uint8_t ch = s.ptr[i];
-        if (ch < '0' || ch > '9') { *kind = 1; return 0; }
-        uint64_t d = ch - '0';
-        /* r = r * 10 + d, checked against the limit. A high word
+        uint64_t d = ch >= '0' && ch <= '9' ? (uint64_t)(ch - '0')
+            : (ch | 32) >= 'a' && (ch | 32) <= 'z' ? (uint64_t)((ch | 32) - 'a' + 10) : 99;
+        if (d >= radix) { *kind = 1; return 0; }
+        /* r = r * radix + d, checked against the limit. A high word
            that would wrap past two words is past every limit. */
-        uint64_t lo10 = (rlo & 0xffffffffULL) * 10;
-        uint64_t hi10 = (rlo >> 32) * 10 + (lo10 >> 32);
-        if (rhi > (0xffffffffffffffffULL - (hi10 >> 32)) / 10) { *kind = neg ? 3 : 2; return 0; }
+        uint64_t lo10 = (rlo & 0xffffffffULL) * radix;
+        uint64_t hi10 = (rlo >> 32) * radix + (lo10 >> 32);
+        if (rhi > (0xffffffffffffffffULL - (hi10 >> 32)) / radix) { *kind = neg ? 3 : 2; return 0; }
         uint64_t nlo = (lo10 & 0xffffffffULL) | ((hi10 & 0xffffffffULL) << 32);
-        uint64_t nhi = (hi10 >> 32) + rhi * 10;
+        uint64_t nhi = (hi10 >> 32) + rhi * radix;
         nlo += d;
         if (nlo < d) {
             if (nhi == 0xffffffffffffffffULL) { *kind = neg ? 3 : 2; return 0; }
@@ -2028,6 +2030,19 @@ int lust_parse_int(lust_str s, int is_signed, int bits, uint64_t *lo, uint64_t *
     }
     *kind = 0;
     return 1;
+})
+
+int lust_parse_int(lust_str s, int is_signed, int bits, uint64_t *lo, uint64_t *hi, int *kind) LUST_BODY({
+    return lust_parse_int_radix(s, 10, is_signed, bits, lo, hi, kind);
+})
+
+/* core's `from_str_radix` radix check: a panic before any parsing. */
+void lust_radix_check(uint32_t radix, lust_loc loc) LUST_BODY({
+    if (radix >= 2 && radix <= 36) return;
+    lust_String m = lust_string_new();
+    lust_string_push_cstr(&m, "from_ascii_bytes_radix: radix must lie in the range `[2, 36]` - found ");
+    lust_fmt_u64(&m, radix);
+    lust_panic_dyn(&m, loc);
 })
 
 /* The float parsers of float.c (Rust's grammar, correctly
