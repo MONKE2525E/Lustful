@@ -134,9 +134,7 @@ fn apply(
     }
     super::laps::mark("collect/delta redo");
     // Until the replay stores its outputs, every write has an undo: the
-    // old records and template checks go back and `p` stands. A template
-    // with closures registers new closure fns, so after its check `p` is
-    // half edited.
+    // old records and template checks go back and `p` stands.
     let mut undos = Some(Undos { sigs: undos, templates: Vec::new() });
     for (&i, &(rpit, old_ret)) in fns.iter().zip(&old_rets) {
         let f = LocalDefId(i as u32);
@@ -180,7 +178,7 @@ fn apply(
 
 /// What a header delta wrote before its replay stored anything: the old
 /// records of the edited fns and the template checks it ran again, in
-/// order. `None` once a write has no undo (`p` is half edited).
+/// order. `fail` takes it.
 struct Undos {
     sigs: Vec<crate::check::delta_audit::SigUndo>,
     templates: Vec<TemplateUndo>,
@@ -210,26 +208,21 @@ struct TemplateUndo {
 }
 
 /// `recheck_template` that first takes its undo into `undos`. A template
-/// whose body has closures has none (its check may register closure fns):
-/// `undos` becomes `None`.
+/// with closures has one too: `recheck_template` refuses before any write
+/// unless its closures are the registered ones, and then the check's
+/// `register_closures` writes the values those records hold.
 fn recheck_undoable(p: &mut Program, t: LocalDefId, old: &[(u32, u32)], caches: &mut Caches, undos: &mut Option<Undos>) -> Result<(), &'static str> {
     if let Some(u) = undos.as_mut() {
-        if generics::fn_has_closures(p, t) || p.gx.closures.values().any(|c| c.parent == t) {
-            *undos = None;
-        } else {
-            let in_old = |e: crate::ast::ExprId| old.iter().any(|r| e.0 >= r.0 && e.0 < r.1);
-            u.templates.push(TemplateUndo {
-                t,
-                picks: p.gx.trait_picks.iter().filter(|(e, _)| in_old(**e)).map(|(e, k)| (*e, *k)).collect(),
-                closures: p.gx.template_closures.iter().filter(|(k, _)| k.0 == t).map(|(k, v)| (*k, v.clone())).collect(),
-                calls: p.gx.template_calls.iter().filter(|(k, _)| k.0 == t).map(|(k, v)| (*k, *v)).collect(),
-                hidden: {
-                    let od = generics::opaque_def(p.def_id(t));
-                    (od, p.gx.opaque_hidden.get(&od).copied())
-                },
-                tpl_out: caches.gen_reuse.tpl_out_of(t),
-            });
-        }
+        let in_old = |e: crate::ast::ExprId| old.iter().any(|r| e.0 >= r.0 && e.0 < r.1);
+        let od = generics::opaque_def(p.def_id(t));
+        u.templates.push(TemplateUndo {
+            t,
+            picks: p.gx.trait_picks.iter().filter(|(e, _)| in_old(**e)).map(|(e, k)| (*e, *k)).collect(),
+            closures: p.gx.template_closures.iter().filter(|(k, _)| k.0 == t).map(|(k, v)| (*k, v.clone())).collect(),
+            calls: p.gx.template_calls.iter().filter(|(k, _)| k.0 == t).map(|(k, v)| (*k, *v)).collect(),
+            hidden: (od, p.gx.opaque_hidden.get(&od).copied()),
+            tpl_out: caches.gen_reuse.tpl_out_of(t),
+        });
     }
     recheck_template(p, t, old, caches)
 }

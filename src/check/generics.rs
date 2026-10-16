@@ -10642,7 +10642,7 @@ fn names_lang_enum_method(p: &Program, fid: LocalDefId, names: &[Sym]) -> bool {
     })
 }
 
-pub(crate) fn fn_has_closures(p: &Program, fid: LocalDefId) -> bool {
+fn fn_has_closures(p: &Program, fid: LocalDefId) -> bool {
     let (lo, hi) = p.fn_def(fid).exprs;
     (lo..hi).any(|x| matches!(p.ast.expr(ast::ExprId(x)), ast::Expr::Closure { .. }))
 }
