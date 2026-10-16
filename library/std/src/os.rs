@@ -300,6 +300,26 @@ pub mod unix {
             }
         }
 
+        /// Unix-specific extensions to `fs::Permissions`: the raw mode
+        /// bits, as std keeps them (`mode_t`, no masking).
+        pub trait PermissionsExt {
+            fn mode(&self) -> u32;
+            fn set_mode(&mut self, mode: u32);
+            fn from_mode(mode: u32) -> Self;
+        }
+
+        impl PermissionsExt for crate::fs::Permissions {
+            fn mode(&self) -> u32 {
+                self.mode as u32
+            }
+            fn set_mode(&mut self, mode: u32) {
+                self.mode = mode as u64;
+            }
+            fn from_mode(mode: u32) -> crate::fs::Permissions {
+                crate::fs::Permissions { mode: mode as u64 }
+            }
+        }
+
         /// Unix-specific extensions to `fs::Metadata`: the raw
         /// stat fields, as std exposes them.
         pub trait MetadataExt {

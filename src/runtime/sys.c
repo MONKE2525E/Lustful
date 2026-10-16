@@ -306,7 +306,14 @@ int32_t lust_sys_path_op(const uint8_t *p, uint64_t len, int32_t op) {
     char *s = lust_sys_cstr(p, len);
     if (!s) return -1;
     int code = op & 0xff;
-    int r = code == 0 ? mkdir(s, 0777) : code == 1 ? unlink(s) : code == 3 ? mkdir(s, (mode_t)((op >> 8) & 07777)) : rmdir(s);
+    int r;
+    if (code == 4) {
+        /* std's `fs::set_permissions`: chmod, retried on EINTR (cvt_r).
+           The kernel keeps only the S_IALLUGO bits, the ones passed. */
+        do r = chmod(s, (mode_t)((op >> 8) & 07777)); while (r != 0 && errno == EINTR);
+    } else {
+        r = code == 0 ? mkdir(s, 0777) : code == 1 ? unlink(s) : code == 3 ? mkdir(s, (mode_t)((op >> 8) & 07777)) : rmdir(s);
+    }
     int e = errno;
     free(s);
     return r == 0 ? 0 : e;

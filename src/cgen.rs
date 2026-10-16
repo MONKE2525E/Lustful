@@ -2784,6 +2784,20 @@ impl FnGen<'_, '_> {
                 let (v, _) = self.operand(&args[0], loc, post);
                 format!("(({}){{ {v} }})", ctype(dest_cty))
             }
+            // alloc's `spare_capacity_mut`: `ptr.add(len)` for `capacity -
+            // len` elements of `MaybeUninit<T>` (`T`'s C layout). A
+            // zero-sized `T` keeps the dangling pointer.
+            CallTarget::Builtin(Builtin::VecSpareCapacityMut) => {
+                let (v, vt) = self.operand(&args[0], loc, post);
+                let CTy::Ref(inner) = &vt else { unreachable!("spare_capacity_mut takes &mut Vec") };
+                let CTy::Vec(e) = &**inner else { unreachable!("spare_capacity_mut takes &mut Vec") };
+                let et = ctype(e);
+                let zst = c_layout(self.p, e).is_some_and(|l| l.size == 0);
+                let ptr = if zst { format!("({v})->ptr") } else { format!("(void*)((({et}*)({v})->ptr) + ({v})->len)") };
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t}; {t}.ptr = {ptr}; {t}.len = ({v})->cap - ({v})->len;", ctype(dest_cty));
+                t
+            }
             CallTarget::Builtin(b) => match self.hash_builtin(b, args, dest_cty, loc, post) {
                 Some(v) => v,
                 None => match self.split_builtin(b, args, dest_cty, loc, post) {
@@ -4049,7 +4063,9 @@ impl FnGen<'_, '_> {
             B::WaitTimedOut => format!("((*{0}).f0)", vals[0]),
             B::MaybeUninitWrite => format!("(((*{0}).f0 = {1}), &(*{0}).f0)", vals[0], vals[1]),
             B::MaybeUninitAsPtr | B::MaybeUninitAsMutPtr => format!("(&(*{0}).f0)", vals[0]),
-            B::MaybeUninitUninit | B::MaybeUninitZeroed | B::MaybeUninitNew => unreachable!("dest-typed compound literals in the call dispatch"),
+            B::MaybeUninitUninit | B::MaybeUninitZeroed | B::MaybeUninitNew | B::VecSpareCapacityMut => {
+                unreachable!("dest-typed compound literals in the call dispatch")
+            }
             B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => unreachable!("expanded with its closure (lower/iter.rs)"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own

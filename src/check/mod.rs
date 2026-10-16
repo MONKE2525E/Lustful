@@ -327,6 +327,9 @@ pub enum Builtin {
     VecGetMut,
     VecAsSlice,
     VecAsMutSlice,
+    /// `Vec::spare_capacity_mut`: `&mut [MaybeUninit<T>]` over
+    /// `len..capacity` of the buffer (cgen/slices.rs).
+    VecSpareCapacityMut,
     SliceToVec,
     /// `[T]::starts_with` and `ends_with` (tf-slice): elementwise
     /// `PartialEq` against a needle slice.
@@ -15517,6 +15520,11 @@ impl<'p> Ctx<'p> {
                     let sl = self.tys.intern(TyKind::Slice(elem));
                     let r = self.tys.mk_ref(true, sl);
                     Some((B::VecAsMutSlice, Autoref::RefMut, vec![], r))
+                } else if self.name(name) == "spare_capacity_mut" {
+                    let mu = generics::maybe_uninit_ty(&mut self.tys, elem);
+                    let sl = self.tys.intern(TyKind::Slice(mu));
+                    let r = self.tys.mk_ref(true, sl);
+                    Some((B::VecSpareCapacityMut, Autoref::RefMut, vec![], r))
                 } else if self.name(name) == "as_ptr" {
                     Some((B::SeqAsPtr, Autoref::Ref, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, elem))))
                 } else if self.name(name) == "as_mut_ptr" {

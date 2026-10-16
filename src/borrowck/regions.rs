@@ -8060,6 +8060,7 @@ fn receiver_builtin(b: crate::check::Builtin) -> bool {
             | B::VecLastMut
             | B::VecAsSlice
             | B::VecAsMutSlice
+            | B::VecSpareCapacityMut
             | B::StringAsStr
             | B::StringAsMutStr
             | B::StrTrim

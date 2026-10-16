@@ -437,6 +437,12 @@ impl CStr {
         self.inner.len() == 1
     }
 
+    /// The bytes without the final NUL as text, as std's `to_str`
+    /// (`str::from_utf8` of `to_bytes`).
+    pub fn to_str(&self) -> Result<&str, core::str::Utf8Error> {
+        core::str::from_utf8(self.to_bytes())
+    }
+
     /// The bytes as text, borrowed when valid, else lossy owned.
     pub fn to_string_lossy(&self) -> Cow<'_, str> {
         match bytes_to_str(self.to_bytes()) {

@@ -2216,7 +2216,6 @@ const STD_PLATFORM_COMPAT_PATHS: &[&str] = &[
     "std/os/unix/fs/FileExt",
     "std/os/unix/fs/FileTypeExt",
     "std/os/unix/fs/OpenOptionsExt",
-    "std/os/unix/fs/PermissionsExt",
     "std/os/unix/fs/chown",
     "std/os/unix/fs/fchown",
     "std/os/unix/fs/lchown",

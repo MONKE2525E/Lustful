@@ -478,6 +478,12 @@ fn create_dir_all_inner(path: &Path) -> io::Result<()> {
 }
 
 /// Removes a file (or a symlink).
+/// std's Linux `set_permissions`: chmod to the permission's mode (the
+/// kernel keeps its low 12 bits).
+pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result<()> {
+    status(core::intrinsics::sys_path_op(bytes_of(path.as_ref()), 4 | (((perm.mode & 0o7777) as i32) << 8)))
+}
+
 pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     status(core::intrinsics::sys_path_op(bytes_of(path.as_ref()), 1))
 }
@@ -597,7 +603,7 @@ impl fmt::Debug for FileType {
 /// The permission bits of a file.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Permissions {
-    mode: u64,
+    pub(crate) mode: u64,
 }
 
 impl Permissions {
@@ -609,39 +615,43 @@ impl Permissions {
 
 impl fmt::Debug for Permissions {
     /// As std: `Permissions(FilePermissions { mode: 0o100644 (-rw-r--r--) })`.
+    /// std's `Mode` Debug: the octal value, then the `ls` form only for a
+    /// directory, block or char device, symlink, fifo, or regular file;
+    /// the sticky bit shows (`t`, `T`) only on a directory.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let m = self.mode;
         let kind = match m & S_IFMT {
-            S_IFDIR => 'd',
-            S_IFLNK => 'l',
-            0o010000 => 'p',
-            0o140000 => 's',
-            0o020000 => 'c',
-            0o060000 => 'b',
-            _ => '-',
+            S_IFDIR => Some('d'),
+            0o060000 => Some('b'),
+            0o020000 => Some('c'),
+            S_IFLNK => Some('l'),
+            0o010000 => Some('p'),
+            0o100000 => Some('-'),
+            _ => None,
         };
-        let mut text = String::new();
-        text.push(kind);
-        let bit = |b: u64, c: char| if m & b != 0 { c } else { '-' };
-        let exec = |x: u64, special: u64, set: char, unset: char| {
-            if m & special != 0 {
-                if m & x != 0 { set } else { unset }
-            } else if m & x != 0 {
-                'x'
-            } else {
-                '-'
-            }
-        };
-        text.push(bit(0o400, 'r'));
-        text.push(bit(0o200, 'w'));
-        text.push(exec(0o100, 0o4000, 's', 'S'));
-        text.push(bit(0o040, 'r'));
-        text.push(bit(0o020, 'w'));
-        text.push(exec(0o010, 0o2000, 's', 'S'));
-        text.push(bit(0o004, 'r'));
-        text.push(bit(0o002, 'w'));
-        text.push(exec(0o001, 0o1000, 't', 'T'));
-        let mode = PermModeText(format!("{:#08o} ({})", m, text));
+        let mut text = format!("{:#08o}", m);
+        if let Some(kind) = kind {
+            let bit = |b: u64, c: char| if m & b != 0 { c } else { '-' };
+            let exec = |x: u64, special: u64, set: char, unset: char| match (m & x != 0, m & special != 0) {
+                (true, true) => set,
+                (false, true) => unset,
+                (true, false) => 'x',
+                (false, false) => '-',
+            };
+            text.push_str(" (");
+            text.push(kind);
+            text.push(bit(0o400, 'r'));
+            text.push(bit(0o200, 'w'));
+            text.push(exec(0o100, 0o4000, 's', 'S'));
+            text.push(bit(0o040, 'r'));
+            text.push(bit(0o020, 'w'));
+            text.push(exec(0o010, 0o2000, 's', 'S'));
+            text.push(bit(0o004, 'r'));
+            text.push(bit(0o002, 'w'));
+            text.push(if kind == 'd' { exec(0o001, 0o1000, 't', 'T') } else { bit(0o001, 'x') });
+            text.push(')');
+        }
+        let mode = PermModeText(text);
         f.debug_tuple("Permissions").field(&FilePerm { mode }).finish()
     }
 }
