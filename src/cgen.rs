@@ -8871,9 +8871,16 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Slice(e) => by_value_deps(&CTy::Ref(e.clone()), &mut deps),
             CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
             CTy::Sync(k, e) if k.is_cell_struct() => by_value_deps(e, &mut deps),
+            // A fn pointer typedef is a declarator: its parameter and
+            // return structs may be incomplete there (C11 6.7.6.3), and
+            // each has a forward typedef above. Only another fn pointer
+            // typedef must come first. Counting the structs made a false
+            // cycle for `struct ByFn<T> { g: Option<fn(ByFn<(T, T)>)> }`
+            // that left the Option incomplete inside the struct.
             CTy::FnPtr(ps, r) => {
                 ps.iter().for_each(|e| by_value_deps(e, &mut deps));
                 by_value_deps(r, &mut deps);
+                deps.retain(|d| matches!(d, CTy::FnPtr(..)));
             }
             CTy::Hash(_, args) => {
                 // A table holds its builder by value; an Entry its key.
