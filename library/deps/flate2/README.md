@@ -1,8 +1,9 @@
 # Adapter: flate2 1.1.10
 
-Lust adapter crate (docs/ARCH.md section 3.6) for the read
-side ts-rust uses (diagnostics_loc.rs decodes locale data with
-MultiGzDecoder). Gate: `scripts/test-adapters.sh flate2`.
+Lust adapter crate (docs/ARCH.md section 3.6) for the parts
+ts-rust uses: the read side (diagnostics_loc.rs decodes locale
+data with MultiGzDecoder) and `write::GzEncoder` (pprof.rs writes
+the CPU profile). Gate: `scripts/test-adapters.sh flate2`.
 
 ## Implemented, same results as upstream
 
@@ -13,7 +14,21 @@ MultiGzDecoder). Gate: `scripts/test-adapters.sh flate2`.
   CRC and size trailer checks, and the zlib Adler check.
   Error kinds and messages match upstream for bad headers,
   corrupt deflate streams, bad checksums, and truncation.
-- `Compression` (the level type alone; no encoder takes it).
+- `write::GzEncoder`: `new`, `get_ref`, `get_mut`, `try_finish`,
+  `finish`, `Write` (`write`, `flush`), `Read` (to the inner
+  reader), and `Drop` (finishes, errors ignored). It is a line for
+  line port of upstream's gz/write.rs, zio.rs `Writer`, and the
+  miniz backend, over a copy of miniz_oxide 0.9.1's deflate source
+  (`src/miniz/`, upstream's text with the edits listed in
+  `src/miniz/mod.rs`). So the gzip bytes, and the order and size of
+  every write and flush call on the inner writer, are upstream's for
+  every input, level, and write/flush pattern, also when the inner
+  writer fails or takes short writes. A failed `try_finish` followed
+  by `flush` returns upstream's `CompressError` io::Error (same
+  Display and Debug, through a std hook only adapters can call).
+  Checked against cargo builds of flate2 1.1.10 with generated
+  probes (tf-flate2 REPORT).
+- `Compression`.
 - A unit without a backend feature (`rust_backend` or
   `miniz_oxide`) fails to build, as upstream does.
 - A decode error returns the bytes decoded before it first,
@@ -28,9 +43,10 @@ MultiGzDecoder). Gate: `scripts/test-adapters.sh flate2`.
 
 ## Rejected (lust error, never a different answer)
 
-- All encoding: the `write` and `bufread` modules and every
-  encoder type. A byte-exact copy of the miniz_oxide
-  compressor is not a small adapter; pprof.rs (the gzip
-  writer user) stays blocked on this crate for that form.
+- Every encoder but `write::GzEncoder` (`DeflateEncoder`,
+  `ZlibEncoder`, the read and bufread encoders), the write-side
+  decoders, `GzBuilder`, `Debug` of `GzEncoder` (upstream prints
+  its internal state), the `bufread` module,
+  `Compress`/`Decompress`, and the low-level types.
 - `bufread` decoders, `Decompress` and the low-level types,
   `Crc` and `GzBuilder` helpers, and layout queries.

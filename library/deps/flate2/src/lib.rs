@@ -1,12 +1,15 @@
-// Lust adapter for flate2 1.1.10 (docs/ARCH.md section 3.6):
-// the read side only. `read::GzDecoder`, `read::MultiGzDecoder`,
+// Lust adapter for flate2 1.1.10 (docs/ARCH.md section 3.6).
+// The read side: `read::GzDecoder`, `read::MultiGzDecoder`,
 // `read::ZlibDecoder`, and `read::DeflateDecoder` decode with
 // a pure-Rust inflate in this crate, with flate2's error kinds
-// and messages for the corrupt forms. Encoding is not here:
-// a byte-exact copy of miniz_oxide's compressor is not a small
-// adapter, so `write` and `bufread` and the encoder types are
-// absent and such code rejects in lust (README). Decoding is
-// canonical, so every valid stream gives upstream's bytes.
+// and messages for the corrupt forms. Decoding is canonical,
+// so every valid stream gives upstream's bytes.
+//
+// The write side: `write::GzEncoder` only, a port of upstream's
+// encoder over a copy of miniz_oxide 0.9.1's deflate source
+// (`miniz/`, the backend upstream's default `rust_backend` uses),
+// so the gzip bytes equal upstream's. Every other encoder, the
+// `bufread` module, and `GzBuilder` are absent and reject (README).
 //
 // The first read pulls the whole input through (the decoders
 // ts-rust feeds are byte slices); a decode error still returns
@@ -20,11 +23,12 @@
 compile_error!("flate2 needs a backend feature (`rust_backend` or `miniz_oxide`)");
 
 pub mod read;
+pub mod write;
 
 mod inflate;
+mod miniz;
 
-/// Compression level (the read side has no use for it, but the
-/// type is part of the crate surface ts-rust names).
+/// Compression level, as `write::GzEncoder` takes it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Compression(u32);
 
@@ -36,9 +40,11 @@ impl Default for Compression {
 }
 
 impl Compression {
-    /// A level from 0 (none) to 9 (best); values above 9 clamp
-    /// in upstream to 9 through its backend, kept raw here as
-    /// upstream's own field does.
+    /// A level from 0 (none) to 9 (best), kept raw as upstream's
+    /// own field does. The encoder passes it to miniz as upstream
+    /// does: 10 is miniz's slowest level, a level above 255 falls
+    /// back to 1, and a level above 10 fails upstream's
+    /// `debug_assert!` in builds with debug assertions.
     pub const fn new(level: u32) -> Compression {
         Compression(level)
     }

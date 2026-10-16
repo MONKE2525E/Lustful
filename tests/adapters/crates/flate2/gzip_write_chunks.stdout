@@ -1,0 +1,7 @@
+after flush 2: 4775 bytes out
+after flush 5: 8402 bytes out
+after flush 8: 11364 bytes out
+after flush 11: 14262 bytes out
+len 15163 fnv 4b07627de22b6b41 calls 18 flushes 4
+first calls [10, 1000, 1000, 1000, 1000, 765, 1000, 1000]
+dropped len 1242 fnv ebca13337d4a9d56

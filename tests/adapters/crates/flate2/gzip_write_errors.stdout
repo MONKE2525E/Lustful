@@ -1,0 +1,36 @@
+-- fail at write 1 (zero false)
+write_all Err(Other)
+try_finish Ok(())
+out 20 bytes
+-- fail at write 3 (zero true)
+write_all Err(WriteZero)
+try_finish Ok(())
+out 39169 bytes
+-- fail at write 12 (zero false)
+write_all Ok(())
+try_finish Err(Custom { kind: Other, error: "disk full" })
+flush: deflate compression error | Custom { kind: Other, error: CompressError { msg: None } } | Custom {
+    kind: Other,
+    error: CompressError {
+        msg: None,
+    },
+} | [deflate compression error] | Other
+try_finish again Err("deflate compression error")
+out 71844 bytes
+-- fail at write 16 (zero true)
+write_all Ok(())
+try_finish Err(Kind(WriteZero))
+flush: deflate compression error | Custom { kind: Other, error: CompressError { msg: None } } | Custom {
+    kind: Other,
+    error: CompressError {
+        msg: None,
+    },
+} | [deflate compression error] | Other
+try_finish again Err("deflate compression error")
+out 71844 bytes
+-- fail at write 20 (zero false)
+write_all Ok(())
+try_finish Err(Custom { kind: Other, error: "disk full" })
+flush ok
+try_finish again Ok(())
+out 77745 bytes
