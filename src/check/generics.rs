@@ -9473,18 +9473,7 @@ pub fn normalize_item_ty(p: &mut Program, t: Ty) -> Ty {
 /// what they instantiate (check/project.rs).
 fn normalize_signatures(p: &mut Program) {
     for i in 0..p.fns.len() {
-        let (params, ret) = (p.fns[i].params.clone(), p.fns[i].ret);
-        if !params.iter().chain([&ret]).any(|&t| p.tys.flags(t).contains_projection()) {
-            continue;
-        }
-        let env = p.gx.fn_scopes.get(i).map(|s| s.env.clone()).unwrap_or_default();
-        let params: Vec<Ty> = params.into_iter().map(|t| normalize_global_in(p, &env, t)).collect();
-        let ret = normalize_global_in(p, &env, ret);
-        if let Some(data) = p.defs.get_mut(p.fn_defs[i]) {
-            data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
-        }
-        p.fns[i].params = params;
-        p.fns[i].ret = ret;
+        normalize_fn_sig(p, i);
     }
     for a in 0..p.adts.len() {
         let has_projection = p.adts[a].variants.iter().flat_map(|v| &v.fields).any(|f| p.tys.flags(f.ty).contains_projection());
@@ -9499,6 +9488,24 @@ fn normalize_signatures(p: &mut Program) {
             }
         }
     }
+}
+
+/// Normalizes the projections in fn `i`'s signature under its env, in
+/// `FnInfo` and the def table (`normalize_signatures`, or a signature
+/// delta for the fn it edited).
+pub(crate) fn normalize_fn_sig(p: &mut Program, i: usize) {
+    let (params, ret) = (p.fns[i].params.clone(), p.fns[i].ret);
+    if !params.iter().chain([&ret]).any(|&t| p.tys.flags(t).contains_projection()) {
+        return;
+    }
+    let env = p.gx.fn_scopes.get(i).map(|s| s.env.clone()).unwrap_or_default();
+    let params: Vec<Ty> = params.into_iter().map(|t| normalize_global_in(p, &env, t)).collect();
+    let ret = normalize_global_in(p, &env, ret);
+    if let Some(data) = p.defs.get_mut(p.fn_defs[i]) {
+        data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
+    }
+    p.fns[i].params = params;
+    p.fns[i].ret = ret;
 }
 
 /// Substitutes and normalizes a list of signature types.
@@ -12000,32 +12007,8 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
     // also serve the param-free predicate rule.
     // Each written type carries its own span (a field type's, for an
     // Adt), so a failed bound points at the type that owes it.
-    let mut items: Vec<(Vec<(Ty, Span)>, Vec<(Ty, Span)>, Generics, Span)> = Vec::new();
+    let mut items: Vec<WfItem> = (0..p.fns.len()).filter_map(|i| wf_fn_item(p, i)).collect();
     let at = |tys: Vec<Ty>, span: Span| -> Vec<(Ty, Span)> { tys.into_iter().map(|t| (t, span)).collect() };
-    for i in 0..p.fns.len() {
-        // Stubs are trait method signatures again, and a trait
-        // default template is its trait method: both are checked
-        // from `trait_methods` below.
-        if p.gx.fn_class.get(i) == Some(&FnClass::Stub) || p.gx.trait_methods.contains_key(&p.fn_defs[i]) {
-            continue;
-        }
-        let info = p.fn_info(LocalDefId(i as u32));
-        let mut tys: Vec<Ty> = info.params.clone();
-        tys.push(info.ret);
-        let values = if info.def(&p.ast).body.is_some() { tys.clone() } else { Vec::new() };
-        // Plain fns keep their generics (with any where clause)
-        // only in the def table, so read them from there.
-        let mut generics = match p.gx.fn_templates.get(i).cloned().flatten() {
-            Some(t) => t.generics,
-            None => p.defs.get(p.def_id(LocalDefId(i as u32))).map_or_else(Generics::default, |d| d.generics.clone()),
-        };
-        let span = info.def(&p.ast).name_span;
-        // A trait default body's signature assumes `Self: Trait`.
-        if let Some(own) = own_trait_pred(p, p.def_id(LocalDefId(i as u32)), &generics) {
-            generics.predicates.push(own);
-        }
-        items.push((at(tys, span), at(values, span), generics, span));
-    }
     let methods: Vec<(DefId, Vec<Ty>, bool, Generics, Span)> =
         p.gx.trait_methods
             .iter()
@@ -12091,91 +12074,145 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
     }
     let adt_idx = adt_first_index(p);
     check_default_wf(p, &adt_idx, errs);
-    // Under an empty env a type's goals have one answer for every item
-    // (most signatures have no where clause): an item whose types all
-    // passed in an earlier such item owes nothing new.
-    let (mut wf_ok, mut sized_ok): (FxMap<Ty, ()>, FxMap<Ty, ()>) = Default::default();
-    for (tys, values, generics, span) in items {
-        let plain = generics.predicates.is_empty();
-        if plain && tys.iter().all(|(t, _)| wf_ok.contains_key(t)) && values.iter().all(|(t, _)| sized_ok.contains_key(t)) {
-            continue;
-        }
-        let errs_before = errs.len();
-        let (tys_seen, values_seen): (Vec<Ty>, Vec<Ty>) = (tys.iter().map(|x| x.0).collect(), values.iter().map(|x| x.0).collect());
-        let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
-        let mut goals: Vec<(TraitRef, Span)> = Vec::new();
-        // Sized goals from value positions and `parts` fail as
-        // L0110; a failed param-bound goal keeps the L0612 shape.
-        let mut sized_goals: Vec<(TraitRef, Span)> = Vec::new();
-        for (t, tspan) in values {
-            sized_goals.push((sized_ref(p, t), tspan));
-        }
-        let mut seen: Vec<Ty> = Vec::new();
-        for (t, tspan) in tys {
-            let (mut g2, mut s2) = (Vec::new(), Vec::new());
-            wf_goals(p, &adt_idx, t, &mut seen, &mut g2, &mut s2);
-            goals.extend(g2.into_iter().map(|g| (g, tspan)));
-            sized_goals.extend(s2.into_iter().map(|g| (g, tspan)));
-        }
-        // The types a where clause names are written types too
-        // (`where Vec<T>: Clone` needs `T: Sized`).
-        for pred in &generics.predicates {
-            if let Predicate::Trait(b) = pred {
-                for g in p.tys.args(b.value.args).to_vec() {
-                    if let Some(t) = g.as_ty() {
-                        let (mut g2, mut s2) = (Vec::new(), Vec::new());
-                        wf_goals(p, &adt_idx, t, &mut seen, &mut g2, &mut s2);
-                        goals.extend(g2.into_iter().map(|g| (g, span)));
-                        sized_goals.extend(s2.into_iter().map(|g| (g, span)));
-                    }
+    let mut memo = WfMemo::default();
+    for item in items {
+        check_wf_item(p, &adt_idx, item, &mut memo, errs);
+    }
+}
+
+/// The types that passed in an earlier WF item with no predicates: under
+/// an empty env a type's goals have one answer for every item (most
+/// signatures have no where clause), so an item whose types all passed
+/// owes nothing new.
+#[derive(Default)]
+struct WfMemo {
+    wf_ok: FxMap<Ty, ()>,
+    sized_ok: FxMap<Ty, ()>,
+}
+
+/// One item `check_written_wf` checks: its written types and value
+/// types with their spans, its generics, and its span.
+type WfItem = (Vec<(Ty, Span)>, Vec<(Ty, Span)>, Generics, Span);
+
+/// The WF item of fn `i`, None for a fn checked from `trait_methods`.
+fn wf_fn_item(p: &mut Program, i: usize) -> Option<WfItem> {
+    // Stubs are trait method signatures again, and a trait
+    // default template is its trait method: both are checked
+    // from `trait_methods` (`check_written_wf`).
+    if p.gx.fn_class.get(i) == Some(&FnClass::Stub) || p.gx.trait_methods.contains_key(&p.fn_defs[i]) {
+        return None;
+    }
+    let at = |tys: Vec<Ty>, span: Span| -> Vec<(Ty, Span)> { tys.into_iter().map(|t| (t, span)).collect() };
+    let info = p.fn_info(LocalDefId(i as u32));
+    let mut tys: Vec<Ty> = info.params.clone();
+    tys.push(info.ret);
+    let values = if info.def(&p.ast).body.is_some() { tys.clone() } else { Vec::new() };
+    // Plain fns keep their generics (with any where clause)
+    // only in the def table, so read them from there.
+    let mut generics = match p.gx.fn_templates.get(i).cloned().flatten() {
+        Some(t) => t.generics,
+        None => p.defs.get(p.def_id(LocalDefId(i as u32))).map_or_else(Generics::default, |d| d.generics.clone()),
+    };
+    let span = info.def(&p.ast).name_span;
+    // A trait default body's signature assumes `Self: Trait`.
+    if let Some(own) = own_trait_pred(p, p.def_id(LocalDefId(i as u32)), &generics) {
+        generics.predicates.push(own);
+    }
+    Some((at(tys, span), at(values, span), generics, span))
+}
+
+/// `check_written_wf` for one fn only: a signature delta runs it for
+/// the fn it edited (`delta_audit::redo_sig`).
+pub(crate) fn check_fn_wf(p: &mut Program, f: LocalDefId, errs: &mut Vec<Diag>) {
+    if let Some(item) = wf_fn_item(p, f.0 as usize) {
+        let adt_idx = adt_first_index(p);
+        check_wf_item(p, &adt_idx, item, &mut WfMemo::default(), errs);
+    }
+}
+
+/// Checks one WF item: Sized for its value types, the bounds its
+/// written types and where clause types owe, and that each predicate
+/// over none of its params holds.
+fn check_wf_item(p: &mut Program, adt_idx: &FxMap<DefId, usize>, (tys, values, generics, span): WfItem, memo: &mut WfMemo, errs: &mut Vec<Diag>) {
+    let plain = generics.predicates.is_empty();
+    if plain && tys.iter().all(|(t, _)| memo.wf_ok.contains_key(t)) && values.iter().all(|(t, _)| memo.sized_ok.contains_key(t)) {
+        return;
+    }
+    let errs_before = errs.len();
+    let (tys_seen, values_seen): (Vec<Ty>, Vec<Ty>) = (tys.iter().map(|x| x.0).collect(), values.iter().map(|x| x.0).collect());
+    let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
+    let mut goals: Vec<(TraitRef, Span)> = Vec::new();
+    // Sized goals from value positions and `parts` fail as
+    // L0110; a failed param-bound goal keeps the L0612 shape.
+    let mut sized_goals: Vec<(TraitRef, Span)> = Vec::new();
+    for (t, tspan) in values {
+        sized_goals.push((sized_ref(p, t), tspan));
+    }
+    let mut seen: Vec<Ty> = Vec::new();
+    for (t, tspan) in tys {
+        let (mut g2, mut s2) = (Vec::new(), Vec::new());
+        wf_goals(p, &adt_idx, t, &mut seen, &mut g2, &mut s2);
+        goals.extend(g2.into_iter().map(|g| (g, tspan)));
+        sized_goals.extend(s2.into_iter().map(|g| (g, tspan)));
+    }
+    // The types a where clause names are written types too
+    // (`where Vec<T>: Clone` needs `T: Sized`).
+    for pred in &generics.predicates {
+        if let Predicate::Trait(b) = pred {
+            for g in p.tys.args(b.value.args).to_vec() {
+                if let Some(t) = g.as_ty() {
+                    let (mut g2, mut s2) = (Vec::new(), Vec::new());
+                    wf_goals(p, &adt_idx, t, &mut seen, &mut g2, &mut s2);
+                    goals.extend(g2.into_iter().map(|g| (g, span)));
+                    sized_goals.extend(s2.into_iter().map(|g| (g, span)));
                 }
             }
         }
-        // A predicate over no parameter of the item must hold
-        // outright (`where String: Copy`).
-        for pred in &generics.predicates {
-            let Predicate::Trait(b) = pred else { continue };
-            if b.count != 0 {
-                continue;
-            }
-            let n_params = generics.params.len() as u32;
-            let mentions_param = p
-                .tys
-                .args(b.value.args)
-                .iter()
-                .filter_map(|g| g.as_ty())
-                .any(|t| (0..n_params).any(|i| ty_uses_param(&p.tys, t, i) || ty_uses_const_param(&p.tys, t, i)));
-            if !mentions_param && !prove_goal(p, &[], b.value) {
-                let gname = p.gx.index.trait_record(b.value.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
-                errs.push(Diag::new(
-                    "L0612",
-                    span,
-                    format!("the bound `{gname}` in this item's where clause does not hold"),
-                    "Remove the bound, or change the types so it holds.",
-                ));
-            }
-        }
-        if let Some((goal, gspan)) = sized_goals.into_iter().find(|(g, _)| !prove_goal(p, &env, *g)) {
-            let t = p.tys.args(goal.args).first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
-            errs.push(crate::check::sized::unsized_diag(p, &p.tys, t, gspan));
+    }
+    // A predicate over no parameter of the item must hold
+    // outright (`where String: Copy`).
+    for pred in &generics.predicates {
+        let Predicate::Trait(b) = pred else { continue };
+        if b.count != 0 {
             continue;
         }
-        for (goal, gspan) in goals {
-            if !prove_wf_goal(p, &env, goal) {
-                let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
-                errs.push(Diag::new(
-                    "L0612",
-                    gspan,
-                    format!("a type here does not satisfy the `{gname}` bound its definition requires"),
-                    format!("Add the `{gname}` bound to this item, or change the type so the bound holds."),
-                ));
-                break;
-            }
+        let n_params = generics.params.len() as u32;
+        let mentions_param = p
+            .tys
+            .args(b.value.args)
+            .iter()
+            .filter_map(|g| g.as_ty())
+            .any(|t| (0..n_params).any(|i| ty_uses_param(&p.tys, t, i) || ty_uses_const_param(&p.tys, t, i)));
+        if !mentions_param && !prove_goal(p, &[], b.value) {
+            let gname = p.gx.index.trait_record(b.value.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
+            errs.push(Diag::new(
+                "L0612",
+                span,
+                format!("the bound `{gname}` in this item's where clause does not hold"),
+                "Remove the bound, or change the types so it holds.",
+            ));
         }
-        if plain && errs.len() == errs_before {
-            wf_ok.extend(tys_seen.into_iter().map(|t| (t, ())));
-            sized_ok.extend(values_seen.into_iter().map(|t| (t, ())));
+    }
+    if let Some((goal, gspan)) = sized_goals.into_iter().find(|(g, _)| !prove_goal(p, &env, *g)) {
+        let t = p.tys.args(goal.args).first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+        errs.push(crate::check::sized::unsized_diag(p, &p.tys, t, gspan));
+        return;
+    }
+    for (goal, gspan) in goals {
+        if !prove_wf_goal(p, &env, goal) {
+            let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
+            errs.push(Diag::new(
+                "L0612",
+                gspan,
+                format!("a type here does not satisfy the `{gname}` bound its definition requires"),
+                format!("Add the `{gname}` bound to this item, or change the type so the bound holds."),
+            ));
+            break;
         }
+    }
+    if plain && errs.len() == errs_before {
+        memo.wf_ok.extend(tys_seen.into_iter().map(|t| (t, ())));
+        memo.sized_ok.extend(values_seen.into_iter().map(|t| (t, ())));
     }
 }
 

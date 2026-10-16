@@ -94,6 +94,16 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// Checks the items queued since `check_all` (a signature delta's) with
+/// the Adt tables it inferred, and drops them.
+pub(crate) fn check_queued(p: &mut Program, errs: &mut Vec<Diag>) {
+    for it in std::mem::take(&mut p.regions.outlives_items) {
+        if let Some(d) = check_item(p, &it) {
+            errs.push(d);
+        }
+    }
+}
+
 fn check_item(p: &mut Program, it: &Item) -> Option<Diag> {
     let cx = Cx { regions: &p.regions, index: &p.gx.index };
     let env = implied_env(&cx, &mut p.tys, &it.implied, &it.facts, &it.preds);

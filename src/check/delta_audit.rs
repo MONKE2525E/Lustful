@@ -16,8 +16,10 @@
 // digest hashes the fields a signature delta writes or reads, so a cold
 // collect before and after a refactor (LUST_PROGRAM_DIGEST) and a warm
 // delta against a cold collect can be compared field by field.
-use super::collect::Program;
-use super::generics::GenTables;
+use super::collect::{self, FnLoc, FnSite, Install, ParentGen, Program};
+use super::generics::{self, FnClass, GenTables};
+use crate::def::LocalDefId;
+use crate::diag::Diag;
 use std::fmt::Write as _;
 use std::hash::Hasher;
 
@@ -218,5 +220,106 @@ pub fn dump_if_asked(p: &Program, errors: usize) {
     use std::io::Write as _;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Collect's work for one plain fn's signature, done again over the
+/// program's Ast (a header delta of the kept program): the record under
+/// its cached parent (`Program::impl_parents`) written over the old one,
+/// then the checks `finish_collect` runs over signatures, in its order
+/// (dyn types, written WF, outlives), then normalization. Err when the fn
+/// would not stay a plain fn, or when its `impl Trait` return comes or
+/// goes (`rpit`: the fn defines one before the edit; without it, any
+/// `impl Trait` refuses). Diagnostics go to `errs`. The caller reveals
+/// the hidden type of an `impl Trait` return again.
+pub(crate) fn redo_sig(p: &mut Program, f: LocalDefId, rpit: bool, errs: &mut Vec<Diag>) -> Result<(), &'static str> {
+    let (ast, interner, known) = (p.ast.clone(), p.interner.clone(), p.known.clone());
+    let info = p.fn_info(f);
+    let (loc, owner) = (info.loc, info.owner);
+    let fdef = p.def_id(f);
+    let (parent_gen, parent) = match loc {
+        FnLoc::Item(_) => (ParentGen::default(), None),
+        FnLoc::Impl(item, _) => (p.impl_parents.get(&item).cloned().ok_or("sig loc")?, p.defs.get(fdef).and_then(|d| d.parent)),
+        _ => return Err("sig loc"),
+    };
+    let site = FnSite { loc, owner, self_ty: parent_gen.scope.self_ty, parent, hash: fdef.hash };
+    let rec = collect::fn_record(p, &ast, &interner, &known, site, &parent_gen, errs);
+    if rec.is_template() {
+        return Err("sig class");
+    }
+    if rec.has_opaque() != rpit {
+        return Err("sig rpit");
+    }
+    if !errs.is_empty() {
+        return Err("sig diag");
+    }
+    collect::install_fn(p, rec, Install::Replace(f));
+    crate::check::object::check_fn_signature(p, f, errs);
+    generics::check_fn_wf(p, f, errs);
+    crate::check::outlives::check_queued(p, errs);
+    generics::normalize_fn_sig(p, f.0 as usize);
+    Ok(())
+}
+
+/// Reveals plain fn `f`'s own `impl Trait` again from its body under
+/// its new signature, as `reveal_plain` does in collect. The hidden type
+/// must be the one the program holds (or none, before and after): other
+/// fns' revealed returns and every reader of the opaque then stand, and
+/// `f`'s revealed return is its old one (`old_ret`).
+pub(crate) fn reveal_again(p: &mut Program, f: LocalDefId, old_ret: crate::ty::Ty) -> Result<(), &'static str> {
+    let (record_reads, unwind) = (p.record_reads, p.unwind);
+    (p.record_reads, p.unwind) = (true, false);
+    let stands = crate::check::opaque::hidden_stands(p, f);
+    (p.record_reads, p.unwind) = (record_reads, unwind);
+    if !stands {
+        return Err("hidden type");
+    }
+    if p.gx.opaque_ret_of.contains_key(&f) {
+        let opaque = p.fns[f.0 as usize].ret;
+        p.gx.opaque_ret_of.insert(f, opaque);
+        p.fns[f.0 as usize].ret = old_ret;
+    }
+    Ok(())
+}
+
+/// A test hook (`LUST_SIGDELTA_SELFTEST=1`, or `v` to print a count): after a clean collect, redoes
+/// the signature of every plain free fn and inherent method on the same
+/// Ast (`redo_sig`). The digest must stay the same and no diagnostic may
+/// appear, and an `impl Trait` return must reveal the same hidden type;
+/// it panics otherwise. Nested fns are left out (a header delta refuses
+/// them).
+pub fn self_test_if_asked(p: &mut Program) {
+    static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(mode) = ON.get_or_init(|| std::env::var("LUST_SIGDELTA_SELFTEST").ok().filter(|v| v == "1" || v == "v")) else { return };
+    let before = digest(p);
+    let mut redone = 0usize;
+    let (mut total, mut worst) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    for i in 0..p.fns.len() {
+        let f = LocalDefId(i as u32);
+        let inherent = matches!(p.fns[i].loc, FnLoc::Impl(..)) && p.gx.inherent_self_pats.contains_key(&f);
+        if p.gx.fn_class[i] != FnClass::Plain || !(matches!(p.fns[i].loc, FnLoc::Item(_)) || inherent) {
+            continue;
+        }
+        let rpit = p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)));
+        let old_ret = p.fns[i].ret;
+        let mut errs = Vec::new();
+        let t0 = std::time::Instant::now();
+        let r = redo_sig(p, f, rpit, &mut errs).and_then(|()| if rpit { reveal_again(p, f, old_ret) } else { Ok(()) });
+        let dt = t0.elapsed();
+        (total, worst) = (total + dt, worst.max(dt));
+        assert!(
+            r.is_ok() && errs.is_empty(),
+            "sigdelta selftest: fn {i} ({}): {r:?} {:?}",
+            p.display_name(p.fns[i].name),
+            errs.first().map(|d| &d.message)
+        );
+        redone += 1;
+    }
+    let after = digest(p);
+    let moved: Vec<&str> = before.iter().zip(&after).filter(|(a, b)| a != b).map(|(a, _)| a.0).collect();
+    assert!(moved.is_empty(), "sigdelta selftest: {redone} fns redone, digest fields moved: {moved:?}");
+    if mode == "v" {
+        let mean = total.as_secs_f64() * 1e3 / redone.max(1) as f64;
+        eprintln!("sigdelta selftest: {redone} fns redone, digest stands; mean {mean:.3} ms, max {:.3} ms", worst.as_secs_f64() * 1e3);
     }
 }

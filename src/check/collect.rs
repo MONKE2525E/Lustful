@@ -4534,7 +4534,7 @@ pub fn collect_reuse(
     let plain_parent = ParentGen::default;
     let add_fn = |p: &mut Program, site: FnSite, parent_gen: &ParentGen, errs: &mut Vec<Diag>| -> LocalDefId {
         let rec = fn_record(p, ast, interner, known, site, parent_gen, errs);
-        install_fn(p, rec)
+        install_fn(p, rec, Install::Push)
     };
     // W-BORROW: each lifetime alias's body, checked once like rustc does
     // (an unused alias with an unknown type is still an error), and its
@@ -5090,6 +5090,9 @@ pub fn collect_reuse(
     }
     generics::finish_collect(&mut p, &mut errs);
     prove_const_goals(&mut p, const_goals, &mut errs);
+    if errs.is_empty() {
+        crate::check::delta_audit::self_test_if_asked(&mut p);
+    }
     if let Some(main) = p.main {
         let f = p.fn_info(main);
         // Rust's Termination for main: (), ExitCode, or Result<T, E>
@@ -5153,6 +5156,17 @@ pub(crate) struct FnRecord {
     region_sig: Option<crate::borrowck::RegionSig>,
     opaque: Option<(DefId, generics::OpaqueInfo)>,
     outlives: Option<crate::check::outlives::Item>,
+}
+
+impl FnRecord {
+    /// The fn has generic parameters (its own, or its impl's).
+    pub(crate) fn is_template(&self) -> bool {
+        !self.generics.params.is_empty()
+    }
+    /// The signature returns `impl Trait`.
+    pub(crate) fn has_opaque(&self) -> bool {
+        self.opaque.is_some() || self.region_sig.as_ref().is_some_and(|r| r.opaque_caps.is_some())
+    }
 }
 
 /// Resolves the signature of the fn at `site.loc` under its parent's
@@ -5286,9 +5300,21 @@ pub(crate) fn fn_record(
     }
 }
 
-/// Appends one fn's record to the program's fn tables, as the next
-/// `LocalDefId`, and returns that id.
-pub(crate) fn install_fn(p: &mut Program, rec: FnRecord) -> LocalDefId {
+/// Where `install_fn` writes a record.
+#[derive(Clone, Copy)]
+pub(crate) enum Install {
+    /// As the next `LocalDefId` (collect).
+    Push,
+    /// Over this fn's entry (a signature delta, `delta_audit::redo_sig`):
+    /// the fn keeps its identity, location, and slots in every table.
+    Replace(LocalDefId),
+}
+
+/// Writes one fn's record into the program's fn tables and returns its
+/// id. Replace leaves the def record's other fields (parent, vis) as they
+/// are, and queues the outlives item like collect does: the caller checks
+/// `regions.outlives_items` (`outlives::check_all` took collect's).
+pub(crate) fn install_fn(p: &mut Program, rec: FnRecord, mode: Install) -> LocalDefId {
     let FnRecord {
         site,
         name,
@@ -5315,7 +5341,14 @@ pub(crate) fn install_fn(p: &mut Program, rec: FnRecord) -> LocalDefId {
     if is_template {
         p.mark_generic(name_span);
     }
-    let id = LocalDefId(p.fns.len() as u32);
+    let id = match mode {
+        Install::Push => LocalDefId(p.fns.len() as u32),
+        Install::Replace(f) => {
+            p.regions.opaque_sigs.remove(&f);
+            p.regions.fns.remove(&f);
+            f
+        }
+    };
     if let Some(rs) = region_sig {
         if rs.opaque_caps.is_some() {
             p.regions.opaque_sigs.insert(id, rs);
@@ -5324,19 +5357,34 @@ pub(crate) fn install_fn(p: &mut Program, rec: FnRecord) -> LocalDefId {
         }
     }
     let def_id = DefId { krate: p.krate, hash: site.hash };
+    let template = if is_template { Some(generics::FnTemplate { generics: generics.clone(), env: env.clone() }) } else { None };
+    let class = if is_template { generics::FnClass::Template } else { generics::FnClass::Plain };
+    let scope = generics::FnScope { env, scope: body_scope };
+    if let Install::Replace(f) = mode {
+        let i = f.0 as usize;
+        debug_assert_eq!(p.fn_defs[i], def_id);
+        if let Some(data) = p.defs.get_mut(def_id) {
+            data.generics = generics;
+            data.sig = SigData::Fn { params: params.clone(), ret };
+        }
+        let info = &mut p.fns[i];
+        (info.self_kind, info.params, info.ret, info.ret_borrows_from, info.is_const) = (self_kind, params, ret, ret_borrows_from, is_const);
+        (p.gx.fn_templates[i], p.gx.fn_scopes[i], p.gx.fn_class[i]) = (template, scope, class);
+        return f;
+    }
     p.fn_defs.push(def_id);
     p.def_by_hash.entry(site.hash).or_insert(id);
     // The def table record mirrors `FnInfo` for identity, kind, and generics;
     // body checking still reads `FnInfo` through the compat path.
     let kind = if site.owner.is_some() { DefsKind::Method } else { DefsKind::Fn };
     let mut data = DefData::skeleton(kind, site.parent, name, Vis::Priv, name_span);
-    data.generics = generics.clone();
+    data.generics = generics;
     data.sig = SigData::Fn { params: params.clone(), ret };
     p.defs.insert(def_id, data);
     p.fns.push(FnInfo { name, loc: site.loc, owner: site.owner, self_kind, params, ret, ret_borrows_from, is_const });
-    p.gx.fn_templates.push(if is_template { Some(generics::FnTemplate { generics, env: env.clone() }) } else { None });
-    p.gx.fn_scopes.push(generics::FnScope { env, scope: body_scope });
-    p.gx.fn_class.push(if is_template { generics::FnClass::Template } else { generics::FnClass::Plain });
+    p.gx.fn_templates.push(template);
+    p.gx.fn_scopes.push(scope);
+    p.gx.fn_class.push(class);
     id
 }
 

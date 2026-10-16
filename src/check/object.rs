@@ -649,16 +649,7 @@ pub fn check_signatures(p: &Program, errs: &mut Vec<Diag>) {
             errs.push(d);
         }
     };
-    let sig_diag = |params: &[Ty], ret: Ty, def: &crate::ast::FnDef, push: &mut dyn FnMut(Option<Diag>)| {
-        let skip = usize::from(def.self_param.is_some());
-        for (i, param) in def.params.iter().enumerate() {
-            if let Some(&t) = params.get(i + skip) {
-                push(dyn_type_diag(p, &p.tys, t, p.ast.ty_span(param.ty)));
-            }
-        }
-        let rspan = def.ret.map_or(def.name_span, |t| p.ast.ty_span(t));
-        push(dyn_type_diag(p, &p.tys, ret, rspan));
-    };
+    let sig_diag = |params: &[Ty], ret: Ty, def: &crate::ast::FnDef, push: &mut dyn FnMut(Option<Diag>)| sig_diags(p, params, ret, def, push);
     for (i, f) in p.fns.iter().enumerate() {
         let class = p.gx.fn_class.get(i).copied().unwrap_or_default();
         if !matches!(class, FnClass::Plain | FnClass::Template) || p.gx.trait_methods.contains_key(&p.fn_defs[i]) {
@@ -707,6 +698,36 @@ pub fn check_signatures(p: &Program, errs: &mut Vec<Diag>) {
     for &(t, span) in &p.gx.dyn_impl_sites {
         push(dyn_type_diag(p, &p.tys, t, span));
     }
+}
+
+/// The dyn type checks of one signature: each parameter type at its
+/// written type's span, then the return type.
+fn sig_diags(p: &Program, params: &[Ty], ret: Ty, def: &crate::ast::FnDef, push: &mut dyn FnMut(Option<Diag>)) {
+    let skip = usize::from(def.self_param.is_some());
+    for (i, param) in def.params.iter().enumerate() {
+        if let Some(&t) = params.get(i + skip) {
+            push(dyn_type_diag(p, &p.tys, t, p.ast.ty_span(param.ty)));
+        }
+    }
+    let rspan = def.ret.map_or(def.name_span, |t| p.ast.ty_span(t));
+    push(dyn_type_diag(p, &p.tys, ret, rspan));
+}
+
+/// `check_signatures` for one plain fn or template only: a signature
+/// delta runs it for the fn it edited (`delta_audit::redo_sig`).
+pub fn check_fn_signature(p: &Program, f: crate::def::LocalDefId, errs: &mut Vec<Diag>) {
+    if p.gx.trait_names.is_empty() {
+        return;
+    }
+    let info = p.fn_info(f);
+    let mut push = |d: Option<Diag>| {
+        if let Some(d) = d
+            && !errs.iter().any(|e| e.span == d.span && e.code == d.code)
+        {
+            errs.push(d);
+        }
+    };
+    sig_diags(p, &info.params, info.ret, info.def(&p.ast), &mut push);
 }
 
 /// One object method candidate for a dyn receiver: the trait that owns
