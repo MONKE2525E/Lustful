@@ -112,7 +112,12 @@ root = pathlib.Path(sys.argv[2])
 assert cap["schema"] == 1 and cap["kind"] == "capabilities"
 assert "push" in cap["methods"]["Vec<T>"] and "unwrap" in cap["methods"]["Option<T>"]
 assert cap["associated_functions"]["String"] == ["from", "from_utf16_lossy", "from_utf8", "from_utf8_lossy", "new", "with_capacity"]
-assert cap["functions"] == {"std::env": ["args"], "std::mem": ["drop", "forget"], "std::fmt": ["format"], "core::intrinsics (std source only)": ["once_init", "once_take", "panic_hook_location", "panic_hook_payload", "panic_hook_ref", "panic_hook_swap"], "core::mem": ["replace", "swap", "take"], "core::cmp": ["max", "min"], "std::sync::atomic": ["compiler_fence", "fence"], "std::hint": ["spin_loop"], "std::thread": ["available_parallelism", "current", "panicking", "scope", "sleep", "spawn", "yield_now"], "std::panic": ["catch_unwind", "panic_any", "resume_unwind"], "std::sync::mpsc": ["channel", "sync_channel"], "std::process": ["exit"], "std::iter": ["repeat_n"], "std::array": ["from_fn"], "core::slice": ["from_mut", "from_ref"], "core::ptr": ["addr_eq", "eq", "from_mut", "from_ref", "null", "null_mut"]}
+# A pinned list of every std fn collided when two landings each added one
+# (like the codes check below). Check the shape and a stable core instead.
+fns = cap["functions"]
+assert all(isinstance(v, list) and v == sorted(set(v)) for v in fns.values()), fns
+core = {"std::env": {"args"}, "std::mem": {"drop", "forget"}, "core::mem": {"replace", "swap", "take"}, "std::thread": {"spawn", "scope", "sleep"}, "std::process": {"exit"}}
+assert all(m in fns and names <= set(fns[m]) for m, names in core.items()), fns
 assert len(cap["integer_types"]) == 12
 # Every literal at an unsupported(...) call site is named in the rejected list.
 features = [r["feature"] for r in cap["rejected"]]
