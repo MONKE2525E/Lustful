@@ -1717,6 +1717,8 @@ pub mod vec_deque {
             let len = self.buf.len();
             self.buf.append(&mut other.buf);
             self.note_grow(pre, len);
+            // std empties `other` with `len = 0, head = 0`.
+            other.head = 0;
         }
 
         pub fn split_off(&mut self, at: usize) -> VecDeque<T> {
