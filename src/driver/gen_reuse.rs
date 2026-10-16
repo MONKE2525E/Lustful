@@ -102,6 +102,30 @@ impl OutCopy {
                 || self.requests.len() == requests.len()
                     && self.requests.iter().zip(requests).all(|((d, a), (t, b))| *d == p.def_id(*t) && a == b))
     }
+
+    /// Which part of `out` differs from this copy where `same` compares
+    /// (a refusal log line).
+    pub(crate) fn differs(&self, out: &Discovered) -> String {
+        let (adt_tys, _, closures, vtables) = out;
+        let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).count();
+        let mut parts = Vec::new();
+        if self.closures != *closures {
+            let at = self.closures.iter().zip(closures).position(|(a, b)| a != b);
+            parts.push(format!("closures {} -> {} (first at {at:?})", self.closures.len(), closures.len()));
+        }
+        let (a, b): (Vec<_>, Vec<_>) = (
+            self.adt_tys.iter().filter(|t| crate::check::generics::may_make_instances(t)).collect(),
+            adt_tys.iter().filter(|t| crate::check::generics::may_make_instances(t)).collect(),
+        );
+        if a != b {
+            let same_set = a.iter().all(|t| b.contains(t)) && b.iter().all(|t| a.contains(t));
+            parts.push(format!("makers {} -> {} (same set {same_set})", makers(&self.adt_tys), makers(adt_tys)));
+        }
+        if self.vtables != *vtables {
+            parts.push(format!("vtables {} -> {}", self.vtables.len(), vtables.len()));
+        }
+        parts.join(", ")
+    }
 }
 
 /// What one stored discovery check replays: Adt types, requests with
@@ -170,12 +194,12 @@ pub struct GenReuse {
 }
 
 /// A node a header delta can move, as `GenReuse::readers_index` keys it:
-/// a def's signature, a binding or method set by written name, a binding
-/// by the def it resolves to, and any `Checked` read.
+/// a def's signature, a binding by the def it resolves to, a method set
+/// of an Adt head by (Adt def, name), and any `Checked` read.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ReaderKey {
     Sig(DefId),
-    Name(crate::intern::Sym),
+    Method(DefId, crate::intern::Sym),
     Def(DefId),
     Checked,
     /// An `ImplSet` read of a bucket of this trait (any head).
@@ -550,12 +574,12 @@ impl GenReuse {
     }
 
     /// The defs whose stored entry may read a node a header delta of the
-    /// fns `defs` (named `names`) moves: their signatures, the bindings
-    /// that resolve to them or share a name, the method sets of a name,
-    /// the impl buckets of `traits` (an edited trait impl method's trait),
-    /// and every `Checked` read (`untouched_by` takes the set).
-    pub(crate) fn readers(&self, defs: &[DefId], names: &[crate::intern::Sym], traits: &[DefId]) -> FxMap<DefId, ()> {
-        let keys = defs.iter().flat_map(|&d| [ReaderKey::Sig(d), ReaderKey::Def(d)]).chain(names.iter().map(|&n| ReaderKey::Name(n)));
+    /// fns `defs` moves: their signatures, the bindings that resolve to
+    /// them, the method sets `methods` (Adt def, name) that hold one, the
+    /// impl buckets of `traits` (an edited trait impl method's trait), and
+    /// every `Checked` read (`untouched_by` takes the set).
+    pub(crate) fn readers(&self, defs: &[DefId], methods: &[(DefId, crate::intern::Sym)], traits: &[DefId]) -> FxMap<DefId, ()> {
+        let keys = defs.iter().flat_map(|&d| [ReaderKey::Sig(d), ReaderKey::Def(d)]).chain(methods.iter().map(|&(a, n)| ReaderKey::Method(a, n)));
         let keys = keys.chain(traits.iter().map(|&t| ReaderKey::Trait(t)));
         keys.chain([ReaderKey::Checked]).filter_map(|k| self.readers_index.get(&k)).flatten().map(|&d| (d, ())).collect()
     }
@@ -575,9 +599,13 @@ impl GenReuse {
                 };
                 match k {
                     ReadKey::Sig(d) => add(ReaderKey::Sig(*d)),
-                    ReadKey::MethodSet(m) => add(ReaderKey::Name(m.name)),
+                    // Only an Adt head has candidates (`method_candidates`).
+                    ReadKey::MethodSet(m) => {
+                        if let crate::driver::graph::Head::Adt(a) = m.head {
+                            add(ReaderKey::Method(a, m.name));
+                        }
+                    }
                     ReadKey::Binding(b) => {
-                        add(ReaderKey::Name(b.name));
                         if let crate::driver::graph::BindingRes::Def(d) = p.binding_res(b.module, b.ns, b.name) {
                             add(ReaderKey::Def(d));
                         }

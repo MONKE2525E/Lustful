@@ -44,7 +44,7 @@ use crate::check::collect::{FnLoc, Program};
 use crate::check::generics::{self, FnClass};
 use crate::def::LocalDefId;
 use crate::diag::Diag;
-use crate::driver::graph::{BindingRes, ReadKey};
+use crate::driver::graph::{BindingRes, Head, ReadKey};
 
 /// One header edit: the edited AST fn (its `LocalDefId` index) and its
 /// old body's expression range (a template's picks key on it).
@@ -386,12 +386,18 @@ fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'sta
 /// method) impl buckets of its trait whose answers hash them (graph.rs
 /// `binding_fingerprint`, `method_set_fingerprint`, `impl_content`). No
 /// other node reads an edited fn's record (every other fn keeps its
-/// signature and hidden type). A `Checked` read never holds by fingerprint.
+/// signature and hidden type). A binding hashes the def it resolves to,
+/// and the delta moves no resolution (the item patch keeps the resolver
+/// tables, and a header edit keeps the fn's name: `fn_outline`), so only
+/// one that resolves to an edited fn moves. A method set holds only the
+/// inherent methods of its Adt head (`method_candidates`), so only the
+/// sets of an edited method's Adt and name move. A `Checked` read never
+/// holds by fingerprint.
 /// A successful delta leaves its set in `Caches::header_moves` (the
 /// compile tail's keyed walk, read only).
 pub(crate) struct Touched {
     defs: Vec<crate::def::DefId>,
-    names: Vec<crate::intern::Sym>,
+    methods: Vec<(crate::def::DefId, crate::intern::Sym)>,
     traits: Vec<crate::def::DefId>,
     seen: crate::intern::FxMap<ReadKey, bool>,
 }
@@ -399,24 +405,30 @@ pub(crate) struct Touched {
 impl Touched {
     fn new(p: &Program, fns: &[usize]) -> Touched {
         let defs = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
-        let names = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
-        Touched { defs, names, traits: impl_traits(p, fns), seen: Default::default() }
+        Touched { defs, methods: method_sets(p, fns), traits: impl_traits(p, fns), seen: Default::default() }
     }
 
     /// True when the delta may move the fingerprint of `k`.
     pub(crate) fn hit(&mut self, p: &Program, k: &ReadKey) -> bool {
-        let (defs, names, traits) = (&self.defs, &self.names, &self.traits);
+        let (defs, methods, traits) = (&self.defs, &self.methods, &self.traits);
         *self.seen.entry(*k).or_insert_with(|| match k {
             ReadKey::Sig(d) => defs.contains(d),
-            ReadKey::MethodSet(m) => names.contains(&m.name),
-            ReadKey::Binding(b) => {
-                names.contains(&b.name) || matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d))
-            }
+            ReadKey::MethodSet(m) => matches!(m.head, Head::Adt(a) if methods.contains(&(a, m.name))),
+            ReadKey::Binding(b) => matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d)),
             ReadKey::Checked(_) => true,
             ReadKey::ImplSet(s) => traits.contains(&s.trait_),
             ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => false,
         })
     }
+}
+
+/// The method sets (Adt def, name) that hold one of the edited fns `fns`
+/// as an inherent method candidate (collect's `inherent_methods`).
+fn method_sets(p: &Program, fns: &[usize]) -> Vec<(crate::def::DefId, crate::intern::Sym)> {
+    let fs: Vec<LocalDefId> = fns.iter().map(|&i| LocalDefId(i as u32)).collect();
+    let mut out: Vec<_> = p.gx.inherent_methods.iter().filter(|(_, v)| v.iter().any(|f| fs.contains(f))).map(|(k, _)| *k).collect();
+    out.sort_unstable_by_key(|(d, n)| (d.krate, d.hash.0, *n));
+    out
 }
 
 /// The traits of the trait impls that hold the edited fns `fns`.
@@ -459,8 +471,7 @@ fn own_bases(p: &Program, front: &Front, caches: &Caches, fns: &[usize]) -> Base
 /// place of scanning each entry's reads.
 fn readers(p: &Program, reuse: &crate::driver::gen_reuse::GenReuse, fns: &[usize]) -> crate::intern::FxMap<crate::def::DefId, ()> {
     let defs: Vec<crate::def::DefId> = fns.iter().map(|&i| p.def_id(LocalDefId(i as u32))).collect();
-    let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
-    reuse.readers(&defs, &names, &impl_traits(p, fns))
+    reuse.readers(&defs, &method_sets(p, fns), &impl_traits(p, fns))
 }
 
 /// The fns whose bodies reveal an opaque type and name one of the edited
@@ -638,7 +649,9 @@ pub(super) fn replay_discovery(
             let pending = checked.closure_map_pending;
             let out = generics::discovery_out(p, &checked, &discarded);
             if !base.same(p, &out, walk_instances) {
-                crate::check::derive_delta::log(&|| format!("discovery {}: output differs (pending {pending})\n", p.display_name(p.fn_def(g).name)));
+                crate::check::derive_delta::log(&|| {
+                    format!("discovery {}: output differs (pending {pending}): {}\n", p.display_name(p.fn_def(g).name), base.differs(&out))
+                });
                 return Err("discovery");
             }
             let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
