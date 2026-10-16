@@ -89,6 +89,21 @@ impl<'p> Ctx<'p> {
         t
     }
 
+    /// True when an adapter's callable of type `t` is a `dyn` value (behind
+    /// references and boxes) that the expansion cannot call as `FnMut`: a
+    /// `dyn FnOnce` (lower/iter.rs `call_fn` calls `dyn Fn` and `dyn FnMut`).
+    fn dyn_once_callable(&mut self, t: Ty) -> bool {
+        let mut t = self.peel_callable_refs(t);
+        while let Some(inner) = self.tys.boxed_elem(t) {
+            t = self.peel_callable_refs(inner);
+        }
+        if !matches!(self.kind(t), TyKind::Dyn(..)) {
+            return false;
+        }
+        let lang = self.p.gx.lang;
+        crate::check::object::principal_of(&self.tys, t).is_none_or(|pr| pr.def != lang.fn_ && pr.def != lang.fn_mut)
+    }
+
     /// `iter`, `iter_mut`, and `into_iter` on Vec, slices, and arrays,
     /// and every iterator method on a builtin iterator or `Chars`
     /// receiver. Returns None when the call is none of these, so the
@@ -1365,10 +1380,9 @@ impl<'p> Ctx<'p> {
                 self.set_res(e, Res::BuiltinMethod { b: B::IterTryFold, derefs, autoref: Autoref::RefMut });
                 self.check_packed_borrow(recv, span);
                 self.expect_expr(args[1], f);
-                let ft = self.peel_callable_refs(f);
-                if matches!(self.kind(ft), TyKind::Dyn(..)) || self.tys.boxed_elem(ft).is_some() {
+                if self.dyn_once_callable(f) {
                     let s = self.span(args[1]);
-                    self.errs.push(generics::dyn_not_yet(s, "a `dyn Fn` value or a reference to a callable as an iterator adapter's callable"));
+                    self.errs.push(generics::dyn_not_yet(s, "a `dyn FnOnce` value as an iterator adapter's callable"));
                     return ERROR;
                 }
                 // A fn item or fn pointer's output is an obligation's.
@@ -1579,17 +1593,15 @@ impl<'p> Ctx<'p> {
             }
         }
         self.check_args(&params, args, span);
-        // The expansion calls closures, fn items, and fn pointers, also
-        // behind references (`.for_each(&mut f)`, lower/iter.rs `call_fn`);
-        // a `dyn Fn` value or a box around a callable (`.map(r)` for
-        // `r: &dyn Fn(..)`) meets the bound but has no expansion yet.
-        // Callable params are the `fn_mut_param` vars.
+        // The expansion calls closures, fn items, fn pointers, and `dyn Fn`
+        // and `dyn FnMut` values, also behind references and boxes
+        // (`.for_each(&mut f)`, `.map(r)` for `r: &dyn Fn(..)`, lower/iter.rs
+        // `call_fn`). Callable params are the `fn_mut_param` vars.
         for (&a, &pt) in args.iter().zip(&params) {
             let is_callable_param = matches!(self.tys.kind(pt), TyKind::Infer(v) if self.iter_closure_args.contains_key(&v.0));
-            let t = self.peel_callable_refs(pt);
-            if is_callable_param && (matches!(self.kind(t), TyKind::Dyn(..)) || self.tys.boxed_elem(t).is_some()) {
+            if is_callable_param && self.dyn_once_callable(pt) {
                 let s = self.span(a);
-                self.errs.push(generics::dyn_not_yet(s, "a `dyn Fn` value or a reference to a callable as an iterator adapter's callable"));
+                self.errs.push(generics::dyn_not_yet(s, "a `dyn FnOnce` value as an iterator adapter's callable"));
                 return ERROR;
             }
         }

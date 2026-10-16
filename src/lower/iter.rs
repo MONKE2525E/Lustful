@@ -423,6 +423,24 @@ impl Ex<'_, '_> {
             self.shim_line = saved;
             return r;
         }
+        // A box around a callable calls what it holds (`impl FnMut for
+        // Box<F>`); a `dyn Fn` or `dyn FnMut` value calls its vtable's call
+        // entry through a reference, as a call of the value does
+        // (check/closure.rs). Check rejects a `dyn FnOnce` here.
+        if let Some(inner) = self.body.tys.boxed_elem(f_ty) {
+            return self.call_fn(inner, f_place.deref(), args, dest);
+        }
+        if let Some(pr) = crate::check::object::principal_of(&self.body.tys, f_ty) {
+            let lang = &self.p.gx.lang;
+            if pr.def != lang.fn_ && pr.def != lang.fn_mut {
+                return Err("iterator expansion: a `dyn FnOnce` behind an FnMut bound".into());
+            }
+            let r = self.ref_to(pr.def == lang.fn_mut, f_place, f_ty);
+            let mut ops = vec![Operand::Move(Place::local(r))];
+            ops.extend(args);
+            self.call(CallTarget::Dyn(crate::check::object::VT_HEADER), ops, dest);
+            return Ok(());
+        }
         // A fn pointer, fn item, or tuple constructor (W-CHECK-G): a plain
         // call, as `Ctx::callable_res` resolves a call of the value.
         match self.body.tys.kind(f_ty) {
@@ -6895,6 +6913,14 @@ impl Ex<'_, '_> {
                 let args = self.body.tys.args(fargs).to_vec();
                 let f = if args.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &args).ok_or("iterator expansion: no key fn instance")? };
                 Ok(self.p.fn_info(f).ret)
+            }
+            // Behind a reference or a box, and a `dyn Fn` value: its
+            // `Output` binding (`call_fn` calls the vtable's entry).
+            TyKind::Ref(_, _, inner) => self.closure_output(inner),
+            _ if let Some(inner) = self.body.tys.boxed_elem(fty) => self.closure_output(inner),
+            TyKind::Dyn(..) => {
+                let pr = crate::check::object::principal_of(&self.body.tys, fty).ok_or("iterator expansion: a dyn key fn with no principal")?;
+                Ok(self.body.tys.bindings(pr.bindings).first().and_then(|(_, g)| g.as_ty()).unwrap_or(crate::ty::UNIT))
             }
             _ => Err("iterator expansion: key fn is not a closure, fn pointer, or fn item".into()),
         }
