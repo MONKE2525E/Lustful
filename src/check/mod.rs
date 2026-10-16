@@ -18625,14 +18625,16 @@ impl<'p> Ctx<'p> {
         // turbofish (with defaults) and the written fields: field types
         // are the template's, substituted with those args.
         let gen_args: Vec<GenericArg> = self.value_path_args(a, path, span);
-        // An expectation that names dyn types (`W<&dyn Tr>`) fixes the
-        // params first, so the fields become coercion sites for them,
-        // as rustc's expected inputs make them (ARCH 2.8).
+        // An expectation of the same Adt (`let r: P<[u32]> = P { .. }`,
+        // `W<&dyn Tr>`) fixes the params first, so the fields become
+        // coercion sites for them (`|v| &v.links` to `fn(&V) -> &[u32]`,
+        // `Box::new([1, 2])` to `Box<[u8]>`), as rustc's expected inputs
+        // make them (ARCH 2.8). A user Adt never coerces to another
+        // instance of itself, so the literal's type must be that one.
         if !gen_args.is_empty()
             && let Some(want) = expected.map(|t| self.deep(t))
             && let Some((def, eargs)) = self.tys.adt_parts(want)
             && def == p.gx.adt_info[a.0 as usize].0
-            && object::mentions_dyn(&self.tys, want)
         {
             let eargs: Vec<GenericArg> = self.tys.args(eargs).to_vec();
             for (g, w) in gen_args.iter().zip(eargs) {
