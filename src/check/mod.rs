@@ -2518,16 +2518,24 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
 }
 
 /// Drops each inference failure (L0610 "type annotations needed", L0111
-/// "cannot infer the type of") that follows another error of the body,
-/// as rustc does (`tainted_by_errors`: no E0282/E0283/E0284 once the body
-/// has an error). Such a failure is most often a follow-on of that error
-/// (a missing method leaves its result and closure params unknown).
+/// "cannot infer the type of", and any error about a type that is still
+/// unknown, `_`, or an error type, `{error}`: a field, deref, cast or
+/// iterator use of it) that follows another error of the body, as rustc
+/// does (`tainted_by_errors`: no E0282/E0283/E0284 once the body has an
+/// error, and no error at all about an error type). Such a failure is most
+/// often a follow-on of that error (a missing method leaves its result and
+/// closure params unknown).
 /// "Follows" is in check order or in source order: lust checks a call's
 /// arguments before it reports the call's own miss, where rustc checks
 /// them after it. A body with inference failures only keeps them all, so
 /// this never turns a reject into an accept.
 fn drop_followon_infer(errs: &mut Vec<Diag>) {
-    let is_infer = |d: &Diag| d.code == "L0610" || (d.code == "L0111" && d.message.starts_with("cannot infer the type of"));
+    let is_infer = |d: &Diag| {
+        d.code == "L0610"
+            || (d.code == "L0111" && d.message.starts_with("cannot infer the type of"))
+            || d.message.contains("`_`")
+            || d.message.contains("{error}")
+    };
     let Some(first) = errs.iter().position(|d| !is_infer(d)) else { return };
     // The first other error's position in each file.
     let mut min_lo: std::collections::HashMap<crate::diag::FileId, u32> = std::collections::HashMap::new();
