@@ -1293,9 +1293,12 @@ impl<'b, 'p> Ck<'b, 'p> {
     /// then writes, where MIR uses a temporary per operand: a later operand
     /// keeps its local's loans in scope (rustc E0503 on `x + *m`), and an
     /// earlier operand whose value holds regions keeps them until the
-    /// statement completes. `j` is the access's operand index (`None` for
-    /// the final write); `carriers` are (root local, value holds regions)
-    /// per operand, in order.
+    /// statement completes. The accessed operand's own root counts too: its
+    /// use keeps its regions live here, so a loan of itself that it carries
+    /// (`tie(&'a mut N<'a>)`, then `take(d)`: rustc E0505) is in scope at its
+    /// last use. `j` is the access's operand index (`None` for the final
+    /// write); `carriers` are (root local, value holds regions) per operand,
+    /// in order.
     fn live_for(&self, q: usize, j: Option<usize>, carriers: &[(Local, bool)]) -> BitSet {
         let mut out = BitSet::new(self.loans.len());
         if !self.report || self.loans.is_empty() || self.scope.is_empty() {
@@ -1304,13 +1307,31 @@ impl<'b, 'p> Ck<'b, 'p> {
         let wl = self.wl;
         for li in bit_iter(&self.scope[q * wl..(q + 1) * wl]) {
             let sibling = carriers.iter().enumerate().any(|(i, &(root, regions))| {
-                Some(i) != j && (regions || j.is_some_and(|j| i > j)) && self.carries(li, root)
+                (Some(i) == j || regions || j.is_some_and(|j| i > j)) && self.carries(li, root)
             });
             if sibling || self.needed_after(li, q) {
                 out.insert(li);
             }
         }
         out
+    }
+
+    /// Adds to `live` the loans in scope at `Drop(l)` (point `q`) that `l`'s
+    /// own destructor holds: their region reaches `l`'s drop-live slots, so
+    /// the drop uses them. A loan of `l` among them conflicts with the drop
+    /// (rustc E0597 on `let r = tie(&mut d);` with `d: D<'a>`, `D: Drop`, and
+    /// `tie(&'a mut D<'a>)`), though no later point needs it.
+    fn drop_held(&self, q: usize, l: Local, live: &mut BitSet) {
+        let Some(sol) = &self.sol else { return };
+        if !self.report || self.scope.is_empty() || !sol.drop_live.get(l as usize).is_some_and(|&d| d) {
+            return;
+        }
+        let wl = self.wl;
+        for li in bit_iter(&self.scope[q * wl..(q + 1) * wl]) {
+            if bit_has(sol.drop_set(li), l as usize) {
+                live.insert(li);
+            }
+        }
     }
 
     /// The carriers of a statement's operands for `live_for`: each operand's
@@ -1582,7 +1603,10 @@ impl<'b, 'p> Ck<'b, 'p> {
             }
             StmtKind::Drop(l) | StmtKind::StorageDead(l) => {
                 let place = Place::local(*l);
-                let live = self.live_for(q, None, &[]);
+                let mut live = self.live_for(q, None, &[]);
+                if matches!(s, StmtKind::Drop(_)) {
+                    self.drop_held(q, *l, &mut live);
+                }
                 self.access(&place, Access::Dead, span, &live, None);
                 let li = *l as usize;
                 bit_unset(st.init_mut(), li);
