@@ -806,10 +806,26 @@ impl FnGen<'_, '_> {
         }
         let v = self.callee_call_c(&mut body, &callee, &ev, &[]);
         let after = if once { String::new() } else { drop_env.clone() };
-        let _ = writeln!(
-            self.out,
-            "    if (lust_once_begin(&({target})->st)) {{\n{body}  ({target})->v = {v}; lust_once_finish(&({target})->st); {after}\n    }} else {{ {drop_env} }}"
-        );
+        // panic=unwind: an init closure that panicked sets nothing. A
+        // by-ref env drops first, with the exception held aside (a call
+        // made while one is pending returns at once), as std drops `f`
+        // inside the call; a panic in that drop aborts, as in cleanup.
+        // Then the lock is empty again and the `lust_once_abort`
+        // statement takes the call's unwind check (`unwind::wrap_calls`;
+        // the `(void)` statements before it take none).
+        let set = format!("({target})->v = {v}; lust_once_finish(&({target})->st); {after}");
+        let set = if self.p.unwind {
+            let env = if after.is_empty() {
+                String::new()
+            } else {
+                let x = self.tmp();
+                format!("lust_exc {x}; (void)lust_unw_take(&{x}); (void){after} if (lust_unw_mine()) (void)lust_unw_cleanup_abort(); (void)lust_unw_resume(&{x});")
+            };
+            format!("if (lust_unw_pending && lust_unw_mine()) {{ {env} lust_once_abort(&({target})->st); }} else {{ {set} }}")
+        } else {
+            set
+        };
+        let _ = writeln!(self.out, "    if (lust_once_begin(&({target})->st)) {{\n{body}  {set}\n    }} else {{ {drop_env} }}");
         format!("(&({target})->v)")
     }
 

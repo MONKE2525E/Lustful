@@ -780,6 +780,14 @@ void lust_once_finish(uint32_t *st) LUST_BODY({
     lust_futex_wake(st, 0x7fffffff);
 })
 
+/* A set whose init closure panicked (panic=unwind): the lock is empty
+   again, and one waiting thread becomes the next setter, as in std. */
+void lust_once_abort(uint32_t *st) LUST_BODY({
+    uint32_t zero = 0;
+    __atomic_store(st, &zero, 3);
+    lust_futex_wake(st, 0x7fffffff);
+})
+
 int lust_once_is_done(uint32_t *st) LUST_BODY({
     uint32_t s;
     __atomic_load(st, &s, 2);
