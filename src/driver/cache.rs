@@ -3,13 +3,12 @@
 //     An unchanged file with the same flags replays the stored response in a few
 //     milliseconds: about 4 ms for check and 8 ms for build on the dev box.
 //   - Per-C-unit objects (`unit-*`): a unit's compiled object keyed by compiler id,
-//     debug flag, and the section 4.2 unit key (IR instance fingerprints + used-slots
-//     hash, plus the driver's glue and header-type fold). Keyed units do not key on
-//     C text: the text is a function of the IR and the used slots, so a slot change
-//     rekeys, misses, and re-emits C from cached IR with no front-end redo. Units
-//     with no instance key (main, runtime, glue; key 0) still fold their C text in.
-//     A restarted daemon reuses objects for every unit whose key held; only changed
-//     units go through tcc.
+//     debug flag, and the unit's full C text. The object is a function of those three
+//     alone, so a hit is exactly as sound as running tcc. (An earlier key on IR
+//     fingerprints and used slots missed slots that cgen prints by other routes, such
+//     as a closure an adapter instance calls, and served stale objects after an edit
+//     renumbered slots: fx-unitcache.) A restarted daemon or a cold build reuses the
+//     object of every unit whose C did not change; only changed units go through tcc.
 //   - The slot manifest per final bin (`slots-*`): DiskDefId to slot, so a restarted
 //     daemon recovers the same slot assignment in any crate load order (8.4).
 //
@@ -27,7 +26,6 @@
 // files, so an in-place tcc upgrade misses too. `LUST_CACHE_COMPILER_ID` mixes an extra
 // string into the id (tests use it to stand in for a rebuilt compiler).
 use crate::def::DiskDefId;
-use crate::driver::graph::UnitKey;
 use crate::intern::FxMap;
 use crate::protocol::{Cmd, Request, Response, SessionKey};
 
@@ -213,31 +211,26 @@ impl Cache {
         self.dir.join(format!("req-{key}{ext}"))
     }
 
-    /// The disk key of one C unit's object: compiler id, debug flag,
-    /// and the 4.2 unit key. A keyed unit (fn and table units) keys on
-    /// that alone: its C is a function of the key inputs. An unkeyed
-    /// unit (key 0: main, runtime, glue) has no instance identity, so
-    /// its C text stays in the key. See the module docs.
-    fn unit_key(&self, unit: UnitKey, c_text: &str, debug: bool) -> String {
-        let text: &[u8] = if unit.0 == 0 { c_text.as_bytes() } else { b"unit-v2" };
-        let (a, b) =
-            hash128(&[&self.id.0.to_le_bytes(), &self.id.1.to_le_bytes(), &[debug as u8], &unit.0.to_le_bytes(), text], 29);
+    /// The disk key of one C unit's object: compiler id, debug flag, and
+    /// the unit's C text. See the module docs.
+    pub fn unit_key(&self, c_text: &str, debug: bool) -> String {
+        let (a, b) = hash128(&[&self.id.0.to_le_bytes(), &self.id.1.to_le_bytes(), &[debug as u8], b"unit-v3", c_text.as_bytes()], 29);
         format!("{a:016x}{b:016x}")
     }
 
-    /// Copies a cached unit object to `dest`. False on a miss (no entry,
-    /// or the copy failed): the caller compiles the unit with tcc.
-    pub fn unit_object(&self, unit: UnitKey, c_text: &str, debug: bool, dest: &Path) -> bool {
-        let src = self.dir.join(format!("unit-{}.o", self.unit_key(unit, c_text, debug)));
-        std::fs::copy(&src, dest).is_ok()
+    /// Copies the cached unit object under `key` (see `unit_key`) to `dest`.
+    /// False on a miss (no entry, or the copy failed): the caller compiles
+    /// the unit with tcc.
+    pub fn unit_object(&self, key: &str, dest: &Path) -> bool {
+        std::fs::copy(self.dir.join(format!("unit-{key}.o")), dest).is_ok()
     }
 
-    /// Stores a freshly compiled unit object under its key. Runs the same
+    /// Stores a freshly compiled unit object under `key`. Runs the same
     /// size-cap eviction as whole-request stores.
-    pub fn store_unit_object(&self, unit: UnitKey, c_text: &str, debug: bool, obj: &Path) {
-        let key = format!("unit-{}.o", self.unit_key(unit, c_text, debug));
-        self.copy_in(obj, &self.dir.join(&key));
-        self.evict(&key);
+    pub fn store_unit_object(&self, key: &str, obj: &Path) {
+        let name = format!("unit-{key}.o");
+        self.copy_in(obj, &self.dir.join(&name));
+        self.evict(&name);
     }
 
     /// The manifest file for one session selection. The session text
@@ -484,30 +477,21 @@ mod tests {
     /// stored unit object copies back out byte for byte.
     #[test]
     fn unit_objects_round_trip_and_key_on_every_input() {
-        use crate::driver::graph::UnitKey;
         let dir = std::env::temp_dir().join(format!("lust-unit-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cache = Cache { dir: dir.clone(), id: (3, 4) };
-        let base = cache.unit_key(UnitKey(9), "int f(void);", false);
-        assert_ne!(base, cache.unit_key(UnitKey(10), "int f(void);", false), "unit key (used slots / instances)");
-        // A keyed unit does not key on C text: the text is a function
-        // of the IR fingerprints and used slots in the unit key, so a
-        // slot change rekeys through the used-slots hash alone.
-        assert_eq!(base, cache.unit_key(UnitKey(9), "int g(void);", false), "keyed unit ignores C text");
-        assert_ne!(
-            cache.unit_key(UnitKey(0), "int f(void);", false),
-            cache.unit_key(UnitKey(0), "int g(void);", false),
-            "unkeyed unit still keys on C text"
-        );
-        assert_ne!(base, cache.unit_key(UnitKey(9), "int f(void);", true), "debug flag");
-        assert_ne!(base, Cache { dir: dir.clone(), id: (5, 4) }.unit_key(UnitKey(9), "int f(void);", false), "compiler id");
+        let base = cache.unit_key("int f(void);", false);
+        // Any C change misses, even one only a slot number apart.
+        assert_ne!(base, cache.unit_key("int g(void);", false), "C text");
+        assert_ne!(base, cache.unit_key("int f(void);", true), "debug flag");
+        assert_ne!(base, Cache { dir: dir.clone(), id: (5, 4) }.unit_key("int f(void);", false), "compiler id");
         let obj = dir.join("made.o");
         std::fs::write(&obj, b"fake-object").unwrap();
         let dest = dir.join("dest.o");
-        assert!(!cache.unit_object(UnitKey(9), "int f(void);", false, &dest), "miss before store");
-        cache.store_unit_object(UnitKey(9), "int f(void);", false, &obj);
-        assert!(cache.unit_object(UnitKey(9), "int f(void);", false, &dest), "hit after store");
+        assert!(!cache.unit_object(&base, &dest), "miss before store");
+        cache.store_unit_object(&base, &obj);
+        assert!(cache.unit_object(&base, &dest), "hit after store");
         assert_eq!(std::fs::read(&dest).unwrap(), b"fake-object");
         let _ = std::fs::remove_dir_all(&dir);
     }

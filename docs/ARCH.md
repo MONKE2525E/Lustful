@@ -2395,8 +2395,13 @@ assignment is part of code identity:
   small and holds no user code.
 - C-unit objects and per-instance C are separate cache
   entries (8.4). The backend compiles groups of instances
-  into units, so the object key names the unit's instance
-  fingerprints plus its used-slots hash.
+  into units. The disk object key is the unit's full C
+  text (plus compiler id and debug flag): the used-slots
+  rule above decides when C is re-emitted, and an
+  unrelated unit's C does not change, so its object is
+  still reused. A key on instance fingerprints plus the
+  used-slots hash served stale objects when cgen printed
+  a slot the used list missed (fx-unitcache).
 - Gate for this rule: add one reachable generic
   instance to a built fixture and show that the objects
   of unrelated units are reused (same keys, no
@@ -4116,10 +4121,8 @@ cfg hash, graph key of 1.1, node fingerprint). Stored:
 - Std crates: signature surface, generic templates, and
   prebuilt non-generic instances (3.8).
 - Per instance: its mono IR, keyed by the instance
-  fingerprint. Per C unit: C text and the compiled
-  object, keyed by the unit's instance fingerprints
-  plus the unit's *used-slots hash* (4.2); the table
-  unit alone keys on the full slot manifest hash. These
+  fingerprint. Per C unit: the compiled object, keyed
+  by the unit's C text (4.2). These
   are separate entries, because the backend compiles groups
   of instances, not one object per instance. A
   cached-cold build re-runs the front end (fast, and it

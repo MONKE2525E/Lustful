@@ -255,17 +255,9 @@ pub(crate) struct Caches {
     /// This request's edits are all derive list edits (`Patched::derive_only`).
     pub(crate) derive_only: bool,
     /// Slots each slot's generated C references (itself plus its `Fn` call
-    /// targets), collected from the IR at codegen. A unit's used-slots
-    /// hash (section 4.2) is computed over the union for its slots.
+    /// targets), collected from the IR at codegen. Read by the dead-callee
+    /// checks.
     pub(crate) slot_used: Vec<Vec<u32>>,
-    /// Per-slot instance fingerprint for unit keys: the IR
-    /// fingerprint of the slot's lowered body (`ir_cache`), set
-    /// exactly when its `FnOut` is. Stable across sessions and slot
-    /// assignments (stable def identities, structural types, relative
-    /// locations), so a unit's object key needs no C text: a slot
-    /// change rekeys through the used-slots hash and the C is
-    /// re-emitted from `slot_ir`.
-    pub(crate) slot_fp: Vec<u64>,
     /// The cached IR body per slot, in the translatable form of
     /// `ir_cache::CachedBody`. Set when the slot's body is lowered;
     /// read when a slot renumber makes its C stale and the C must be
@@ -442,7 +434,6 @@ impl Session {
                 derive_dirty: None,
                 derive_only: false,
                 slot_used: Vec::new(),
-                slot_fp: Vec::new(),
                 slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,

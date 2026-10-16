@@ -433,7 +433,6 @@ fn wipe_slot(caches: &mut Caches, s: usize) {
     caches.ok[s] = true;
     caches.slot_reads[s] = None;
     caches.slot_used[s].clear();
-    caches.slot_fp[s] = 0;
     caches.slot_ir[s] = None;
 }
 
@@ -1226,7 +1225,6 @@ fn slot_update(
         has_out: Vec<bool>,
         reads: Vec<Option<crate::driver::graph::Reads>>,
         used: Vec<Vec<u32>>,
-        fp: Vec<u64>,
         ir: Vec<Option<super::ir_cache::CachedBody>>,
         hash: Vec<u64>,
         head: Vec<u64>,
@@ -1239,7 +1237,6 @@ fn slot_update(
             has_out: std::mem::take(&mut caches.has_out),
             reads: std::mem::take(&mut caches.slot_reads),
             used: std::mem::take(&mut caches.slot_used),
-            fp: std::mem::take(&mut caches.slot_fp),
             ir: std::mem::take(&mut caches.slot_ir),
             hash: std::mem::take(&mut front.slot_hash),
             head: std::mem::take(&mut front.slot_head),
@@ -1280,7 +1277,6 @@ fn slot_update(
         caches.has_out.clear();
         caches.slot_reads.clear();
         caches.slot_used.clear();
-        caches.slot_fp.clear();
         caches.slot_ir.clear();
         front.slot_hash.clear();
         front.slot_head.clear();
@@ -1343,7 +1339,6 @@ fn slot_update(
     caches.out.resize_with(n_slots, FnOut::default);
     caches.slot_reads.resize_with(n_slots, || None);
     caches.slot_used.resize_with(n_slots, Vec::new);
-    caches.slot_fp.resize(n_slots, 0);
     caches.slot_ir.resize_with(n_slots, || None);
     front.slot_hash.resize(n_slots, 0);
     front.slot_head.resize(n_slots, 0);
@@ -1363,7 +1358,6 @@ fn slot_update(
             caches.out[new_slot] = std::mem::take(&mut old.out[old_slot]);
             caches.slot_reads[new_slot] = old.reads[old_slot].take();
             caches.slot_used[new_slot] = std::mem::take(&mut old.used[old_slot]);
-            caches.slot_fp[new_slot] = old.fp[old_slot];
             caches.slot_ir[new_slot] = old.ir[old_slot].take();
             front.slot_hash[new_slot] = old.hash[old_slot];
             front.slot_head[new_slot] = old.head[old_slot];
@@ -1400,7 +1394,6 @@ fn slot_update(
         caches.ok[slot] = true;
         caches.slot_reads[slot] = None;
         caches.slot_used[slot].clear();
-        caches.slot_fp[slot] = 0;
         caches.slot_ir[slot] = None;
         // A fn of the same identity and text can come back (an edit
         // undone, a nested fn's ordinal among same-name fns of its
@@ -3235,8 +3228,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.out.resize_with(n_slots, FnOut::default);
         caches.slot_reads.resize_with(n_slots, || None);
         caches.slot_used.resize_with(n_slots, Vec::new);
-        caches.slot_fp.resize(n_slots, 0);
-        caches.slot_ir.resize_with(n_slots, || None);
+            caches.slot_ir.resize_with(n_slots, || None);
         front.slot_hash.resize(n_slots, 0);
         front.inst_slot.resize(n_slots, false);
         front.slot_env.resize(n_slots, 0);
@@ -3737,14 +3729,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);
-        // Instance fingerprint: the lowered IR (see `Caches::slot_fp`),
-        // never the emitted C (which prints slot numbers; those ride
-        // in the used-slots hash instead).
+        // The IR fingerprint a slot-moved re-emit checks its rebuilt
+        // body against (see `ir_cache::CachedBody`).
         let base_line = line_base_of(front, *i);
         let fp = super::ir_cache::ir_fingerprint(&program, body, &map, base_line);
-        if let Some(x) = caches.slot_fp.get_mut(s) {
-            *x = fp;
-        }
         caches.out[s] = out;
         caches.has_out[s] = true;
         dirty_slots.push(s);
@@ -3903,8 +3891,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // A fresh base: no base yet under this debug setting, or a one-shot
     // (static) build. Growth no longer forces one (section 4.2): when
     // slots outgrow the table capacity or a new fn unit appears, only
-    // the table unit (whose C is the capacity plus the unit list; its
-    // identity is `graph::table_unit_key`) rebuilds and the base
+    // the table unit (whose C is the capacity plus the unit list)
+    // rebuilds and the base
     // relinks over the existing unit objects. Unrelated units keep
     // their objects, in the session and in the disk unit cache.
     let fresh_base = caches.objects != Some(req.debug) || !caches.persistent;
@@ -4030,245 +4018,25 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             return resp;
         }
     }
-    // Per-unit object identity (section 4.2): each fn unit keys on its
-    // instances' IR fingerprints (one instance per fn today) plus its
-    // used-slots hash and its unit number; the table unit keys on the
-    // full slot manifest. The disk object cache keys on that alone for
-    // keyed units (see cache.rs): C text is a function of the IR, the
-    // used slots, and the unit number (its register fn name),
-    // so a hit is exactly as sound as recompiling, and a slot change
-    // misses and re-emits. Adding one reachable fn changes no
-    // unrelated unit's key: its object is copied from disk and tcc
-    // never sees it.
-    let manifest = crate::driver::graph::SlotManifest::from_disk_slots(&front.slot_of);
-    // The stable hash of one C type for unit keys: Adts by C name (the
-    // id: `A<id>`, and glue symbols such as `drop_A<id>` that other
-    // units call by name) plus the layout fingerprint of their def (the
-    // unit header prints their definitions), everything else
-    // structural. Instance Adt ids are creation order, so an edit that
-    // adds an instance early moves the names of later ones; a unit
-    // whose C names moved must miss.
-    fn cty_fp(p: &collect::Program, c: &cgen::CTy) -> u64 {
-        fn inner(h: &mut crate::intern::FxHasher, p: &collect::Program, c: &cgen::CTy) {
-            use std::hash::Hash;
-            match c {
-                cgen::CTy::Unit => 0u8.hash(h),
-                cgen::CTy::Bool => 1u8.hash(h),
-                cgen::CTy::Char => 2u8.hash(h),
-                cgen::CTy::Int(i) => (3u8, i.name()).hash(h),
-                cgen::CTy::Str => 4u8.hash(h),
-                cgen::CTy::String => 5u8.hash(h),
-                cgen::CTy::Vec(x) => {
-                    6u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Option(x) => {
-                    7u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Ref(x) => {
-                    8u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Ptr(x) => {
-                    44u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Adt(a) => {
-                    (9u8, a.0).hash(h);
-                    crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);
-                }
-                cgen::CTy::Chars => 11u8.hash(h),
-                cgen::CTy::Fmt(k) => (40u8, *k as u8).hash(h),
-                cgen::CTy::Unsized(a, x) => {
-                    (41u8, a.0).hash(h);
-                    crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Hash(k, args) => {
-                    (43u8, *k as u8, args.len() as u64).hash(h);
-                    for t in args {
-                        inner(h, p, t);
-                    }
-                }
-                cgen::CTy::Tuple(ts) => {
-                    12u8.hash(h);
-                    (ts.len() as u64).hash(h);
-                    for t in ts {
-                        inner(h, p, t);
-                    }
-                }
-                cgen::CTy::Array(x, n) => {
-                    (13u8, n).hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Slice(x) => {
-                    14u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Float(f) => (15u8, f.name()).hash(h),
-                cgen::CTy::FnPtr(inputs, out) => {
-                    16u8.hash(h);
-                    (inputs.len() as u64).hash(h);
-                    for t in inputs {
-                        inner(h, p, t);
-                    }
-                    inner(h, p, out);
-                }
-                cgen::CTy::Result(a, b) => {
-                    17u8.hash(h);
-                    inner(h, p, a);
-                    inner(h, p, b);
-                }
-                cgen::CTy::Boxed(x) => {
-                    18u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Rc(x) => {
-                    19u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Dyn => 20u8.hash(h),
-                cgen::CTy::BoxDyn => 41u8.hash(h),
-                cgen::CTy::RcDyn => 42u8.hash(h),
-                cgen::CTy::WeakDyn(arc) => (50u8, *arc).hash(h),
-                cgen::CTy::WeakOwn(arc, x) => {
-                    (51u8, *arc).hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::VecIter(x) => {
-                    21u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::ArrayIter(x, n) => {
-                    (45u8, n).hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::VecDrain(x) => {
-                    43u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::StrDrain => 44u8.hash(h),
-                cgen::CTy::Weak(x) => {
-                    22u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::RefCell(x) => {
-                    23u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Cell(x) => {
-                    24u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Guard(x, m) => {
-                    (25u8, *m).hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::ExitCode => 26u8.hash(h),
-                cgen::CTy::AccessError => 28u8.hash(h),
-                cgen::CTy::BoxSlice(x) => {
-                    27u8.hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::Own(k, x) => {
-                    (46u8, *k).hash(h);
-                    inner(h, p, x);
-                }
-                cgen::CTy::DynCell => 47u8.hash(h),
-                cgen::CTy::DynGuard(m) => (48u8, *m).hash(h),
-                cgen::CTy::DynLock(g) => (49u8, *g).hash(h),
-                cgen::CTy::Sync(k, x) => {
-                    (28u8, *k).hash(h);
-                    inner(h, p, x);
-                }
-            }
-        }
-        let mut h = crate::intern::FxHasher::default();
-        inner(&mut h, p, c);
-        std::hash::Hasher::finish(&h)
-    }
-    let unit_key_of = |u: usize| -> crate::driver::graph::UnitKey {
-        use crate::driver::graph::{Fingerprint, used_slots_hash};
-        match u {
-            3 => crate::driver::graph::table_unit_key(&manifest, caches.table_cap, fn_units.len()),
-            // The location unit's C is a function of its tables alone,
-            // which `loc_fp` hashes: key on it directly (never 0, the
-            // unkeyed sentinel), so base and overlay copies of
-            // different tables cannot serve each other from disk.
-            LOC_UNIT => crate::driver::graph::UnitKey(if loc_fp == 0 { 1 } else { loc_fp }),
-            g if g >= FIRST_FN_UNIT => {
-                let range = &groups[g - FIRST_FN_UNIT];
-                let instances: Vec<Fingerprint> =
-                    range.clone().map(|s| Fingerprint(caches.slot_fp.get(s).copied().unwrap_or(0))).collect();
-                let mut pairs: Vec<(crate::driver::graph::InstanceKeyHash, u32)> = Vec::new();
-                for s in range.clone() {
-                    if let Some(used) = caches.slot_used.get(s) {
-                        for &used_slot in used {
-                            if let Some(k) = manifest.key_at(used_slot) {
-                                pairs.push((k, used_slot));
-                            }
-                        }
-                    }
-                }
-                let base = crate::driver::graph::unit_key(&instances, used_slots_hash(&pairs));
-                // Glue placement and header types are unit C inputs
-                // the instance fingerprints do not cover: which glue
-                // this unit carries statically (versus the shared
-                // glue unit), and the layouts of the C types its
-                // header declares. Fold both into the key.
-                let mut extra: Vec<(u64, u64, bool)> = Vec::new();
-                for s in range.clone() {
-                    let Some(out) = caches.out.get(s) else { continue };
-                    for (g, c) in &out.glue {
-                        let shared = caches.glue.shared.as_ref().is_none_or(|set| set.contains(&(g.clone(), c.clone())));
-                        let mut gh = crate::intern::FxHasher::default();
-                        std::hash::Hash::hash(&std::mem::discriminant(g), &mut gh);
-                        extra.push((std::hash::Hasher::finish(&gh), cty_fp(&program, c), shared));
-                    }
-                    for c in &out.types {
-                        extra.push((u64::MAX, cty_fp(&program, c), false));
-                    }
-                }
-                extra.sort_unstable();
-                extra.dedup();
-                // The unit number is a C input too: the unit's register
-                // fn is `lust_register_u<g>`. Two units of only empty
-                // slots (generic templates, stubs, dead fns) otherwise
-                // share a key, and a disk hit serves one the other's
-                // object (a duplicate register symbol at link).
-                let mut h = crate::intern::FxHasher::default();
-                std::hash::Hash::hash(&"cunit-glue-v2", &mut h);
-                std::hash::Hash::hash(&g, &mut h);
-                std::hash::Hash::hash(&base.0, &mut h);
-                for e in extra {
-                    std::hash::Hash::hash(&e, &mut h);
-                }
-                crate::driver::graph::UnitKey(std::hash::Hasher::finish(&h))
-            }
-            _ => crate::driver::graph::UnitKey(0),
-        }
-    };
+    // Disk unit objects key on each unit's full C text (see cache.rs):
+    // tcc's output is a function of the C, the debug flag, and the
+    // compiler, so a hit can never serve an object whose C differs. The
+    // C is already built here for every unit in `todo`, so the key costs
+    // one hash per unit.
     let mut unit_hits = 0usize;
-    let mut misses: Vec<(PathBuf, String, crate::driver::graph::UnitKey)> = Vec::new();
+    let mut misses: Vec<(PathBuf, String, Option<String>)> = Vec::new();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
-    for ((obj, c), &(u, overlay)) in units.iter().zip(todo.iter()) {
-        // An overlay copy of a unit differs from its base copy only
-        // in the register symbol name, which no fingerprint above
-        // sees: key the two forms apart, or a base object could serve
-        // an overlay link (unresolved `lust_overlay_u<N>`).
-        let key = if overlay {
-            let mut h = crate::intern::FxHasher::default();
-            std::hash::Hash::hash(&"cunit-overlay-v1", &mut h);
-            std::hash::Hash::hash(&unit_key_of(u).0, &mut h);
-            crate::driver::graph::UnitKey(std::hash::Hasher::finish(&h))
-        } else {
-            unit_key_of(u)
-        };
-        if disk_cache.as_ref().is_some_and(|cache| cache.unit_object(key, c, req.debug, obj)) {
+    let keys: Vec<Option<String>> = match &disk_cache {
+        Some(cache) => par_map(&units, |(_, c)| Some(cache.unit_key(c, req.debug))),
+        None => vec![None; units.len()],
+    };
+    for ((obj, c), key) in units.iter().zip(keys) {
+        if let (Some(cache), Some(k)) = (&disk_cache, &key)
+            && cache.unit_object(k, obj)
+        {
             unit_hits += 1;
         } else {
             misses.push((obj.clone(), c.clone(), key));
@@ -4280,8 +4048,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
     if let Some(cache) = disk_cache {
-        for (obj, c, key) in &misses {
-            cache.store_unit_object(*key, c, req.debug, obj);
+        for (obj, _, key) in &misses {
+            if let Some(k) = key {
+                cache.store_unit_object(k, obj);
+            }
         }
     }
     caches.objects = Some(req.debug);
