@@ -9,7 +9,10 @@
 # sequence of versions then drops and adds Copy and Clone (and sometimes
 # Debug or PartialEq) on A's derive list. Seeds 2 mod 3 take the round 4
 # programs (`versions4`): partial lists, first-ever derives, rejected lists
-# and their reverts after unrelated edits or repeated rejects. Every version runs on one warm
+# and their reverts after unrelated edits or repeated rejects. Seeds 1 mod 6
+# take the round 5 programs (`versions5`): templates (generic fns, closures,
+# trait default bodies, generic impl methods, a generic const fn) whose
+# bodies use one derived trait of A, which a version then drops. Every version runs on one warm
 # daemon (check, then run), a cold lust (LUST_NO_DAEMON=1), and rustc 1.99.
 #
 # Classes per version: false accept (lust accepts, rustc rejects), false
@@ -19,7 +22,7 @@
 # and under LUST_CHECK_ITEMPATCH=1 on any patch oracle failure or a program
 # the oracle never checked.
 #
-# Usage: python3 scripts/derive_sweep.py [--count N] [--seed S] [--jobs J] [--keep DIR] [--resolver]
+# Usage: python3 scripts/derive_sweep.py [--count N] [--seed S] [--step K] [--jobs J] [--keep DIR] [--resolver]
 # --resolver adds a `const` item to every program, so the daemon takes the resolver path (with
 # its body patch) instead of the single-file chunk path. The patch oracle (LUST_CHECK_ITEMPATCH=1)
 # covers both paths.
@@ -174,9 +177,49 @@ SHAPES = {
 }
 
 ROUND1_SHAPES = sorted(list(SHAPES)[: list(SHAPES).index("hash_map")])
+# The shapes rounds 3 and 4 sample (round 5 adds its own below).
+BASE_SHAPES = sorted(SHAPES)
+
+# Round 5 (rule zero, w-sig-front 14:41): a template whose body names A
+# and uses one derived trait of A. Its check (borrowck included) must
+# read that trait, so dropping it checks the template again. Bodies take
+# `a: A` and give a String; per trait the use, per context the template.
+T5_USES = {
+    "Copy": "{ let b = a; let c = a; show(&b) + &show(&c) }",
+    "Clone": "{ let b = a.clone(); show(&b) + &show(&a) }",
+    "Debug": "format!(\"{:?}\", a)",
+    "PartialEq": "format!(\"{}\", a == a)",
+    "Eq": "{ need_eq(&a); show(&a) }",
+    "PartialOrd": "format!(\"{}\", a < a)",
+    "Ord": "format!(\"{:?}\", a.cmp(&a))",
+    "Hash": "{ let mut h = std::collections::hash_map::DefaultHasher::new(); std::hash::Hash::hash(&a, &mut h); show(&a) }",
+    "Default": "{ let _d = a; show(&A::default()) }",
+}
+T5_HELPERS = "fn need_eq<X: Eq>(_x: &X) {}\n"
+# Contexts: (items with NAME and BODY, main expression). `gmk` gets its
+# value from mk() alone; `gmkc` does too, inside a template with closures
+# (no stored check: it rechecks when its body names the reach).
+T5_CONTEXTS = {
+    "gfn": ("fn NAME<T>(a: A, _t: T) -> String {\n    BODY\n}\n", "NAME(mk(), 0u8)"),
+    "gclosure": ("fn NAME<T>(a: A, _t: T) -> String {\n    let f = |a: A| BODY;\n    f(a)\n}\n", "NAME(mk(), 'c')"),
+    "gdefault": ("trait NAMET {\n    fn NAME(&self, a: A) -> String {\n        BODY\n    }\n}\nimpl NAMET for u8 {}\n", "1u8.NAME(mk())"),
+    "gimpl": ("struct NAMES<T>(T);\nimpl<T> NAMES<T> {\n    fn NAME(&self, a: A) -> String {\n        BODY\n    }\n}\n", "NAMES(2u16).NAME(mk())"),
+    "gmk": ("fn NAME<T>(_t: T) -> String {\n    let a = mk();\n    BODY\n}\n", "NAME(3i32)"),
+    "gmkc": ("fn NAME<T>(_t: T) -> String {\n    let g = || 1u8;\n    let a = mk();\n    format!(\"{}{}\", g(), BODY)\n}\n", "NAME(true)"),
+}
+for _tr, _use in T5_USES.items():
+    for _cx, (_items, _call) in T5_CONTEXTS.items():
+        _name = f"t5_{_cx}_{_tr.lower()}"
+        _helper = T5_HELPERS.replace("need_eq", "need_eq_" + _name) if _tr == "Eq" else ""
+        SHAPES[_name] = (_helper + _items.replace("NAME", _name).replace("BODY", _use.replace("need_eq", "need_eq_" + _name)),
+                         f"println!(\"{{}}\", {_call.replace('NAME', _name)});")
+# A generic const fn that copies A twice (Copy only).
+SHAPES["t5_constfn_copy"] = ("const fn t5_constfn_copy<T: Copy>(a: A, t: T) -> (A, A, T) {\n    (a, a, t)\n}\n",
+                             "let (x, y, _) = t5_constfn_copy(mk(), 1u8);\n    println!(\"{} {}\", show(&x), show(&y));")
+T5_SHAPES = sorted(sh for sh in SHAPES if sh.startswith("t5_"))
 
 # Shapes that need a trait an Adt form cannot derive: Default (enum forms).
-NEEDS_DEFAULT = {"generic_default"}
+NEEDS_DEFAULT = {"generic_default"} | {f"t5_{c}_default" for c in T5_CONTEXTS}
 # Shapes a generic Adt form leaves out: lust rejects `#[derive(Copy)]` over a
 # field of a generic Adt instance (`AG<u8>`) in both modes (a false reject).
 NOT_GENERIC = {"wrapper_derive", "wrapper_of_wrapper"}
@@ -306,12 +349,43 @@ def versions4(rng, full):
     return seq
 
 
+def versions5(rng, full, shapes):
+    """Round 5: from the full list, drop a trait one of the template
+    shapes uses (with the traits that need it, or alone: a derive error),
+    then go back to full, sometimes after a second drop. Some programs
+    start without the trait, so the add comes first."""
+    order = lambda ts: [t for t in full if t in ts]
+    used = [sh.rsplit("_", 1)[1] for sh in shapes if sh.startswith("t5_")]
+    traits = [t for t in full if t.lower() in used]
+
+    def drop(t):
+        if rng.random() < 0.8:
+            return order([u for u in full if u != t and t not in NEEDS.get(u, []) and not (u == "Ord" and t == "PartialEq")])
+        return order([u for u in full if u != t])
+
+    seq = [drop(rng.choice(traits))] if rng.random() < 0.25 else []
+    seq.append(full)
+    for _ in range(rng.randint(2, 4)):
+        seq.append(drop(rng.choice(traits)))
+        if rng.random() < 0.3:
+            seq.append(drop(rng.choice(traits)))
+        seq.append(full)
+    return seq
+
+
 def gen(seed, resolver=False):
     rng = random.Random(seed)
+    if seed % 6 == 1:
+        adt = rng.choice(ADTS)
+        full = FULL3 + (["Default"] if adt[4] else [])
+        pool = [sh for sh in T5_SHAPES if adt[4] or sh not in NEEDS_DEFAULT]
+        shapes = rng.sample(pool, rng.randint(1, 3)) + rng.sample(BASE_SHAPES, rng.randint(0, 1))
+        shapes = [sh for sh in sorted(set(shapes)) if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
+        return [program(adt, d, shapes, resolver) for d in versions5(rng, full, shapes)]
     if seed % 3 == 2:
         adt = rng.choice(ADTS)
         full = FULL3 + (["Default"] if adt[4] else [])
-        pool = [sh for sh in sorted(SHAPES) if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
+        pool = [sh for sh in BASE_SHAPES if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
         shapes = rng.sample(pool, rng.randint(1, 4))
         if rng.random() < 0.4:
             shapes.append(rng.choice(["assoc_iter_rep", "assoc_iter_a"]))
@@ -324,7 +398,7 @@ def gen(seed, resolver=False):
         return [program(adt, d, shapes, resolver) for d in versions(rng)]
     adt = rng.choice(ADTS)
     full = FULL3 + (["Default"] if adt[4] else [])
-    pool = [sh for sh in sorted(SHAPES) if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
+    pool = [sh for sh in BASE_SHAPES if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
     shapes = rng.sample(pool, rng.randint(2, 6))
     main_result = rng.random() < 0.2
     return [program(adt, d, shapes, resolver, main_result) for d in versions3(rng, full)]
@@ -420,6 +494,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--step", type=int, default=1, help="seed stride (--seed 1 --step 6: round 5 programs only)")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--keep", default="")
     ap.add_argument("--resolver", action="store_true", help="route every program to the resolver path")
@@ -427,7 +502,7 @@ def main():
     if not os.path.exists(LUST):
         print(f"{LUST} missing; run scripts/build.sh", file=sys.stderr)
         return 2
-    seeds = [(a.seed + i, a.keep, a.resolver) for i in range(a.count)]
+    seeds = [(a.seed + i * a.step, a.keep, a.resolver) for i in range(a.count)]
     with ProcessPoolExecutor(max_workers=a.jobs) as pool:
         results = list(pool.map(case, seeds))
     tot = {"versions": 0, "fa": 0, "fr": 0, "wc": 0, "wrong": 0, "hang": 0, "oracle": 0, "oracle_ok": 0, "rustc_rejects": 0}
