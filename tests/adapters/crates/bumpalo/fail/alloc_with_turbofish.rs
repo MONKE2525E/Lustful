@@ -1,4 +1,4 @@
-// expect: L0111
+// expect: L0612
 // rustc E0277: upstream `alloc_with<F, T>` takes the closure type first.
 fn main() {
     let b = bumpalo::Bump::new();

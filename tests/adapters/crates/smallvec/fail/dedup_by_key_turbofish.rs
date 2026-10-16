@@ -1,4 +1,4 @@
-// expect: L0610
+// expect: L0612
 // rustc E0277: upstream `dedup_by_key<F, K>` takes the closure type first.
 use smallvec::SmallVec;
 
