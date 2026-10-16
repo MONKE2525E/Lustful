@@ -1749,6 +1749,9 @@ struct Ctx<'p> {
     /// Item types an iterator method needs to be Copy (`copied`),
     /// re-tested at finish as above (W-STD-A).
     deferred_copy: Vec<(Ty, Span)>,
+    /// `Range<{integer}>::len` and kin: the element must end as one of
+    /// core's exact-size range integers (check/iter.rs `exact_size`).
+    deferred_exact_range: Vec<(Ty, Span)>,
     /// Item or key types an iterator method needs to be Ord (`min`,
     /// `max`, `min_by_key`, `max_by_key`), re-tested at finish.
     deferred_ord: Vec<(Ty, Span)>,
@@ -2111,6 +2114,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_eq: Vec::new(),
         deferred_collect: Vec::new(),
         deferred_copy: Vec::new(),
+        deferred_exact_range: Vec::new(),
         deferred_ord: Vec::new(),
         deferred_sort_ord: Vec::new(),
         deferred_fn_casts: Vec::new(),
@@ -21249,6 +21253,15 @@ impl<'p> Ctx<'p> {
             if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_exact_range) {
+            let t = self.deep(t);
+            if let TyKind::Int(i) = self.kind(t)
+                && !iter::exact_range_int(i)
+            {
+                let tn = self.tn(t);
+                self.err("L0612", span, format!("no impl of `ExactSizeIterator` for `std::ops::Range<{tn}>`"), "Use a range of `usize` or of a 32-bit or narrower integer.");
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_default) {

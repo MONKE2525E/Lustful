@@ -957,7 +957,7 @@ impl<'p> Ctx<'p> {
                 (B::IterNextBack, vec![], o)
             }
             "len" => {
-                if !self.exact_size(base) {
+                if !self.exact_size(base, span) {
                     return self.iter_unknown(n, span, base, args);
                 }
                 (B::IterLen, vec![], USIZE)
@@ -1796,7 +1796,7 @@ impl<'p> Ctx<'p> {
 
     /// True when Rust 1.99 implements `ExactSizeIterator` for an
     /// iterator type (the kinds lust has): the gate for `.len()`.
-    pub(super) fn exact_size(&mut self, t: Ty) -> bool {
+    pub(super) fn exact_size(&mut self, t: Ty, span: Span) -> bool {
         use IterKind as K;
         if self.tys.is_chars_ty(t) {
             return false;
@@ -1817,11 +1817,16 @@ impl<'p> Ctx<'p> {
         };
         match k {
             // core's `range_exact_iter_impl!` list: not the 64-bit,
-            // 128-bit, or `char` ranges.
-            K::Range => matches!(
-                self.kind(self.resolve(a[0])),
-                TyKind::Int(IntTy::Usize | IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::Isize | IntTy::I8 | IntTy::I16 | IntTy::I32)
-            ),
+            // 128-bit, or `char` ranges. An integer variable is checked
+            // once it is known (`deferred_exact_range`).
+            K::Range => match self.kind(self.resolve(a[0])) {
+                TyKind::Int(i) => exact_range_int(i),
+                k if k.is_int_infer() => {
+                    self.deferred_exact_range.push((a[0], span));
+                    true
+                }
+                _ => false,
+            },
             K::SliceIter
             | K::SliceIterMut
             | K::VecIntoIter
@@ -1850,19 +1855,19 @@ impl<'p> Ctx<'p> {
             | K::SetIter
             | K::SetIntoIter => true,
             K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::StepBy | K::Copied | K::Cloned | K::Peekable | K::Inspect => {
-                self.exact_size(a[0])
+                self.exact_size(a[0], span)
             }
             // `Chain` is not `ExactSizeIterator` in std, even over
             // exact iterators; `Zip` is, over two exact ones. Neither
             // is `RangeInclusive` (its length can overflow `usize`).
-            K::Zip => self.exact_size(a[0]) && self.exact_size(a[1]),
+            K::Zip => self.exact_size(a[0], span) && self.exact_size(a[1], span),
             // A user iterator through its `next`: exact when its
             // written `ExactSizeIterator` impl takes the default
             // `len` over an honest `size_hint` (`ByNextFns::exact`),
             // or when the held type is bound-only exact evidence.
             K::ByNext => match by_next_fns(self.p, &self.tys, a[0]) {
                 Ok(f) => f.exact,
-                Err(_) => self.exact_size(a[0]),
+                Err(_) => self.exact_size(a[0], span),
             },
             _ => false,
         }
@@ -2724,4 +2729,10 @@ pub fn by_next_fns(p: &Program, src: &dyn crate::ty::TyIntern, t: Ty) -> Result<
                     && !r.items.iter().any(|d| p.local_def(d.hash).is_some_and(|l| p.name(p.fn_info(l).name) == "len"))
             });
     Ok(ByNextFns { next, size_hint, next_back, item, exact })
+}
+
+/// The integer types core's `range_exact_iter_impl!` makes
+/// `Range<T>: ExactSizeIterator`.
+pub(super) fn exact_range_int(i: IntTy) -> bool {
+    matches!(i, IntTy::Usize | IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::Isize | IntTy::I8 | IntTy::I16 | IntTy::I32)
 }
