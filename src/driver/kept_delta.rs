@@ -368,11 +368,11 @@ fn replay_bodies(p: &mut Program, front: &Front, caches: &mut Caches, fns: &[usi
             if !base.same(p, &out, walk_instances) {
                 return Err("discovery");
             }
+            let (adt_tys, reqs, closures, vts) = &out;
             if discarded.is_empty() {
-                let (adt_tys, reqs, closures, vts) = &out;
                 reuse.store_discovered(p, g, &checked.reads, adt_tys, reqs, closures, vts);
             } else {
-                reuse.note_unstored(p, g);
+                reuse.note_unstored(p, g, adt_tys, reqs, closures, vts);
             }
             reuse.discovery_checked += 1;
             drop((checked, discarded));

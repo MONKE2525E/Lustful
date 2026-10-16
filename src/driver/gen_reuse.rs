@@ -76,6 +76,7 @@ struct DiscoveryEntry {
 }
 
 /// A copy of one stored discovery output (`GenReuse::out_copy`).
+#[derive(Clone)]
 pub(crate) struct OutCopy {
     adt_tys: Vec<OwnedTy>,
     requests: Vec<(DefId, Vec<OwnedArg>)>,
@@ -124,8 +125,10 @@ pub struct GenReuse {
     templates: FxMap<DefId, TemplateEntry>,
     discovery: FxMap<DefId, DiscoveryEntry>,
     /// Defs whose last discovery check stored nothing (a body error), so
-    /// their entry, if any, is older than what that collect used.
-    unstored: FxMap<DefId, ()>,
+    /// their entry, if any, is older than what that collect used. Each
+    /// keeps that check's output, stamped (`next_stamp`): never replayed,
+    /// only compared (`out_copy`).
+    unstored: FxMap<DefId, (u64, OutCopy)>,
     /// Node answers of this collect's program, for read replays.
     memo: FxMap<ReadKey, Read>,
     /// This collect's template check outputs that instances replay, by
@@ -172,8 +175,18 @@ impl GenReuse {
     }
 
     /// Notes that a fresh discovery check of `f` stored nothing.
-    pub fn note_unstored(&mut self, p: &Program, f: LocalDefId) {
-        self.unstored.insert(p.def_id(f), ());
+    pub fn note_unstored(
+        &mut self,
+        p: &Program,
+        f: LocalDefId,
+        adt_tys: &[OwnedTy],
+        requests: &[(LocalDefId, Vec<OwnedArg>)],
+        closures: &[OwnedClosure],
+        vtables: &[(OwnedTy, OwnedTy)],
+    ) {
+        let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
+        let copy = OutCopy { adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec(), vtables: vtables.to_vec() };
+        self.unstored.insert(p.def_id(f), (next_stamp(), copy));
     }
 
     /// Drops every entry when the trait-system key moved since the last
@@ -429,7 +442,9 @@ impl GenReuse {
     /// refuses then, driver/kept_delta.rs).
     pub(crate) fn newer(&self, p: &Program, f: LocalDefId, stamp: u64) -> bool {
         let def = p.def_id(f);
-        self.templates.get(&def).is_some_and(|e| e.stamp > stamp) || self.discovery.get(&def).is_some_and(|e| e.stamp > stamp)
+        self.templates.get(&def).is_some_and(|e| e.stamp > stamp)
+            || self.discovery.get(&def).is_some_and(|e| e.stamp > stamp)
+            || self.unstored.get(&def).is_some_and(|e| e.0 > stamp)
     }
 
     /// True when fn `f`'s stored template check or discovery output was
@@ -453,10 +468,11 @@ impl GenReuse {
         !reads.iter().any(|(k, _)| touched(k))
     }
 
-    /// True when fn `f`'s stored discovery output still holds
-    /// (`discovered` without the copy).
+    /// True when fn `f`'s stored discovery output still holds and is the
+    /// one its last check made (`discovered` without the copy; after a
+    /// check with a body error, the program holds that check's output).
     pub fn discovery_holds(&mut self, p: &Program, f: LocalDefId) -> bool {
-        let Some(src) = self.src_of(p, f).filter(|_| self.on) else { return false };
+        let Some(src) = self.src_of(p, f).filter(|_| self.on && !self.unstored.contains_key(&p.def_id(f))) else { return false };
         let Some(e) = self.discovery.get(&p.def_id(f)) else { return false };
         e.src == src && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads)
     }
@@ -489,13 +505,13 @@ impl GenReuse {
         stored.into_iter().any(|r| defs.iter().any(|&d| r.contains(&ReadKey::Checked(d))))
     }
 
-    /// A copy of the stored discovery output of the fn with def `def`,
-    /// unless its last discovery check stored nothing: what collect used
+    /// A copy of the last discovery output of the fn with def `def`, the
+    /// stored one or that of a check with a body error: what collect used
     /// for that body. The daemon's kept programs take one per edited fn
     /// at the patch (driver/patch.rs).
     pub(crate) fn out_copy(&self, def: DefId) -> Option<OutCopy> {
-        if self.unstored.contains_key(&def) {
-            return None;
+        if let Some((_, c)) = self.unstored.get(&def) {
+            return Some(c.clone());
         }
         let e = self.discovery.get(&def)?;
         Some(OutCopy { adt_tys: e.adt_tys.clone(), requests: e.requests.clone(), closures: e.closures.clone(), vtables: e.vtables.clone() })

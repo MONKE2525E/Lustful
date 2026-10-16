@@ -11618,7 +11618,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 } else if discarded.is_empty() && !checked.closure_map_pending {
                     reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
                 } else {
-                    reuse.note_unstored(p, fid);
+                    reuse.note_unstored(p, fid, &adt_tys, &reqs, &closures_owned, &vts);
                 }
                 (adt_tys, reqs, closures_owned, vts)
             };
