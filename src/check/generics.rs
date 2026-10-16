@@ -9974,6 +9974,10 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     // Std platform bodies are no roots in `lust check` (`check_skips`).
     queue.retain(|&f| !p.check_skips(f));
     crate::mono::vtable::eager_vtables(p, &mut queue);
+    // Eager vtable method instances of std impls (every `Error` impl
+    // once std source names `dyn Error`, F3) are std bodies too: no
+    // discovery roots in `lust check`, as above.
+    queue.retain(|&f| !p.check_skips(f));
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
     let mut drop_done = 0u32;
@@ -10115,6 +10119,9 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
             ensure_written_hash(p, &mut next_queue);
         }
         next_queue.extend(recheck);
+        // Std bodies an ensured vtable or glue method named are no
+        // discovery roots in `lust check` either (`check_skips`).
+        next_queue.retain(|&f| !p.check_skips(f));
         queue = next_queue;
     }
     p.gx.reuse = reuse;
