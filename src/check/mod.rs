@@ -782,6 +782,10 @@ pub enum Builtin {
     /// structurally ordered type (-1, 0, 1, or 2 for unordered), as
     /// an `i8`: `partial_cmp` and `cmp` read it once.
     CmpCode,
+    /// `CmpCode` through the `PCmp` glue (`PartialOrd` order: a
+    /// written `partial_cmp` of an element that also has `Ord`), for
+    /// `partial_cmp` on a type `has_ord` does not take.
+    PCmpCode,
     /// `Option::as_ref`, `as_mut`, `take`, `replace`, and
     /// `Result::as_ref`, `as_mut` (W-STD-A phase 3).
     SliceSort,
@@ -15524,7 +15528,11 @@ impl<'p> Ctx<'p> {
             // uses the `eq` and `cmp` glue for them.
             self.record_glue_reads(p.gx.lang.partial_eq, base);
             let ok = match self.name(name) {
-                "partial_cmp" | "lt" | "le" | "gt" | "ge" => has_ord(p, &self.tys, base),
+                // `partial_cmp` also takes the `PCmp` glue: elements with a
+                // written `partial_cmp` beside an `Ord` impl (lower.rs
+                // picks `PCmpCode` then).
+                "partial_cmp" => has_ord(p, &self.tys, base) || has_partial_cmp(p, &self.tys, base),
+                "lt" | "le" | "gt" | "ge" => has_ord(p, &self.tys, base),
                 "cmp" => has_total_ord(p, &self.tys, base),
                 "eq" | "ne" => has_eq(p, &self.tys, base),
                 _ => false,

@@ -3378,7 +3378,10 @@ impl<'p> Lower<'p> {
                 } else {
                     let i8_ty = int(IntTy::I8);
                     let c = self.temp(i8_ty);
-                    self.call_into(CallTarget::Builtin(Builtin::CmpCode), vec![code_a, code_b], Place::local(c), span);
+                    // `partial_cmp` on a type only the `PCmp` glue orders
+                    // (check/mod.rs): that glue's code.
+                    let b = if partial && !has_ord(self.p, &self.body.tys, recv_ty) { Builtin::PCmpCode } else { Builtin::CmpCode };
+                    self.call_into(CallTarget::Builtin(b), vec![code_a, code_b], Place::local(c), span);
                     Some(c)
                 };
                 let cmp = |this: &mut Self, op: BinOp| {

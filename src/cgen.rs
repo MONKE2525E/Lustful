@@ -5372,7 +5372,8 @@ impl FnGen<'_, '_> {
                     format!("({0} > {1} ? {0} : {1})", vals[0], vals[1])
                 }
             }
-            B::CmpCode => {
+            B::CmpCode | B::PCmpCode => {
+                let (g, pre) = if b == B::PCmpCode { (Glue::PCmp, "pcmp") } else { (Glue::Cmp, "cmp") };
                 // Both operands are references to the compared type (a
                 // slice operand is the fat value itself).
                 let (t, a, b) = match &tys[0] {
@@ -5380,8 +5381,8 @@ impl FnGen<'_, '_> {
                     CTy::Ref(inner) => ((**inner).clone(), vals[0].clone(), vals[1].clone()),
                     other => (other.clone(), format!("(&{})", vals[0]), format!("(&{})", vals[1])),
                 };
-                self.want(Glue::Cmp, &t);
-                format!("cmp_{}({a}, {b})", mangle(&t))
+                self.want(g, &t);
+                format!("{pre}_{}({a}, {b})", mangle(&t))
             }
             // `vec::IntoIter` (W-STD-A): the moved-in buffer, then
             // `next` and `next_back` take from `front..len`.
