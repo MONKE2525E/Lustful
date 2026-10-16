@@ -16636,6 +16636,7 @@ impl<'p> Ctx<'p> {
             | (TyKind::Bool, CV::Bool(_))
             | (TyKind::Char, CV::Char(_))
             | (TyKind::Float(_), CV::Float(..))
+            | (TyKind::Unit, CV::Unit | CV::Aggregate(_))
             | (TyKind::Tuple(_), CV::Unit) => Some(()),
             (TyKind::Ref(_, Mut::Shared, inner), CV::Str(_)) if self.kind(inner) == TyKind::Str => Some(()),
             (TyKind::Tuple(ts), CV::Aggregate(vals)) => {
@@ -16695,7 +16696,7 @@ impl<'p> Ctx<'p> {
                     return None;
                 }
                 let (v, vals) = match val {
-                    CV::Aggregate(vals) if !p.adt(a).is_enum => (0, vals),
+                    CV::Aggregate(vals) | CV::Variant(0, vals) if !p.adt(a).is_enum => (0, vals),
                     CV::Variant(v, vals) if p.adt(a).is_enum => (*v, vals),
                     _ => return fail(self),
                 };
