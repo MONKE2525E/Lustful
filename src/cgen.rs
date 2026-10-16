@@ -6330,7 +6330,9 @@ impl FnGen<'_, '_> {
         let _ = writeln!(self.out, "    {ct} {x} = {}; uint64_t {y} = (uint64_t)({}) & {mask};", vals[0], vals[1]);
         if sgn {
             // Signed receiver, unsigned magnitude argument.
-            let (thr, op) = if sub { (format!("((uint64_t){x} - {min_u})"), "-") } else { (format!("({max_u} - (uint64_t){x})"), "+") };
+            // The room below is `x - MIN`: on the sign-extended word,
+            // `x - 2^(bits-1)` taken mod 2^bits (the mask), as `x + 2^(bits-1)`.
+            let (thr, op) = if sub { (format!("(((uint64_t){x} - {min_u}) & {mask})"), "-") } else { (format!("({max_u} - (uint64_t){x})"), "+") };
             let _ = writeln!(self.out, "    uint64_t {r} = ((uint64_t){x} {op} {y}) & {mask}; int {ovf} = {y} > {thr};");
         } else {
             // Unsigned receiver, signed argument: its sign decides
