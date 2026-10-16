@@ -55,6 +55,12 @@ int32_t lust_sys_realpath(const uint8_t *p, uint64_t len, lust_Vec *out);
 int32_t lust_sys_read_dir(const uint8_t *p, uint64_t len, lust_Vec *out);
 int32_t lust_sys_remove_dir_all(const uint8_t *p, uint64_t len);
 
+/* The statx birth time behind `Metadata::created` (sys.c):
+   1 with the seconds and nanoseconds in the out args when the
+   filesystem reports one, else 0. */
+int32_t lust_sys_btime_path(const char *path, int32_t follow, int64_t *sec, int64_t *nsec);
+int32_t lust_sys_btime_fd(int32_t fd, int64_t *sec, int64_t *nsec);
+
 uint32_t lust_sys_getpid(void);
 
 /* The OS text of an error code, as std's `error_string` (strerror). */

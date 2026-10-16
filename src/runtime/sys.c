@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 
 extern char **environ;
 
@@ -305,22 +306,86 @@ int32_t lust_sys_rename(const uint8_t *a, uint64_t alen, const uint8_t *b, uint6
     return r == 0 ? 0 : e;
 }
 
+/* The statx birth time (std's `Metadata::created` on Linux reads
+   statx with AT_STATX_SYNC_AS_STAT): 1 when the filesystem reports
+   one (STATX_BTIME in the mask). The kernel's struct statx (stable
+   ABI, 256 bytes) is spelled out as in sysx.c, with its own name. */
+struct lust_btime_time {
+    int64_t tv_sec;
+    uint32_t tv_nsec;
+    int32_t reserved;
+};
+struct lust_btime_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t spare0[1];
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    struct lust_btime_time stx_atime;
+    struct lust_btime_time stx_btime;
+    struct lust_btime_time stx_ctime;
+    struct lust_btime_time stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint32_t stx_dio_mem_align;
+    uint32_t stx_dio_offset_align;
+    uint64_t spare3[12];
+};
+#ifndef LUST_SYS_statx
+#define LUST_SYS_statx 332
+#endif
+
+static int32_t lust_btime_read(int32_t dirfd, const char *path, int32_t flags, int64_t *sec, int64_t *nsec) {
+    struct lust_btime_statx stx;
+    long r = syscall(LUST_SYS_statx, dirfd, path, flags, 0x800 /* STATX_BTIME */, &stx);
+    if (r != 0 || !(stx.stx_mask & 0x800)) return 0;
+    *sec = stx.stx_btime.tv_sec;
+    *nsec = stx.stx_btime.tv_nsec;
+    return 1;
+}
+
+int32_t lust_sys_btime_path(const char *path, int32_t follow, int64_t *sec, int64_t *nsec) {
+    /* AT_STATX_SYNC_AS_STAT (0x800) in the high flags is 0; the
+       nofollow bit is AT_SYMLINK_NOFOLLOW (0x100). */
+    return lust_btime_read(AT_FDCWD, path, follow ? 0 : 0x100, sec, nsec);
+}
+
+int32_t lust_sys_btime_fd(int32_t fd, int64_t *sec, int64_t *nsec) {
+    return lust_btime_read(fd, "", 0x1000 /* AT_EMPTY_PATH */, sec, nsec);
+}
+
 /* stat (follow != 0) or lstat into 8-byte little-endian fields of the
    Vec: mode, size, mtime seconds, mtime nanoseconds, uid, gid, nlink,
-   ino, dev, atime s, atime ns, ctime s, ctime ns, blocks, blksize, rdev. */
+   ino, dev, atime s, atime ns, ctime s, ctime ns, blocks, blksize, rdev,
+   btime s, btime ns, has-btime (Metadata::created). */
 int32_t lust_sys_stat(const uint8_t *p, uint64_t len, uint8_t follow, lust_Vec *out) {
     char *s = lust_sys_cstr(p, len);
     if (!s) return -1;
     struct stat st;
     int r = follow ? stat(s, &st) : lstat(s, &st);
     int e = errno;
+    if (r != 0) {
+        free(s);
+        return e;
+    }
+    int64_t bsec = 0, bnsec = 0;
+    int32_t has_btime = lust_sys_btime_path(s, follow, &bsec, &bnsec);
     free(s);
-    if (r != 0) return e;
-    uint64_t f[16] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec, st.st_uid, st.st_gid,
+    uint64_t f[19] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec, st.st_uid, st.st_gid,
                       (uint64_t)st.st_nlink, (uint64_t)st.st_ino, (uint64_t)st.st_dev, (uint64_t)st.st_atim.tv_sec,
                       (uint64_t)st.st_atim.tv_nsec, (uint64_t)st.st_ctim.tv_sec, (uint64_t)st.st_ctim.tv_nsec, (uint64_t)st.st_blocks,
-                      (uint64_t)st.st_blksize, (uint64_t)st.st_rdev};
-    for (int i = 0; i < 16; i++) {
+                      (uint64_t)st.st_blksize, (uint64_t)st.st_rdev, (uint64_t)bsec, (uint64_t)bnsec, (uint64_t)has_btime};
+    for (int i = 0; i < 19; i++) {
         uint8_t b[8];
         for (int k = 0; k < 8; k++) b[k] = (uint8_t)(f[i] >> (8 * k));
         lust_sys_push(out, b, 8);
