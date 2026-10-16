@@ -284,8 +284,10 @@ def sig_generic(rng, fs):
 
 
 def sig_states(rng, fs):
-    """One op: (op name, states to visit). No state when it has no site."""
-    op = rng.choice(OPS)
+    """One op: (op name, states to visit). No state when it has no site.
+    SIGOPS_ONLY=a,b limits the ops (a sweep that targets one path)."""
+    only = [o for o in os.environ.get("SIGOPS_ONLY", "").split(",") if o in OPS]
+    op = rng.choice(only or OPS)
     return op, globals()[op](rng, fs)
 
 
