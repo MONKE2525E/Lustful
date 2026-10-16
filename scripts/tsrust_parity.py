@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Parity of the ts-rust fork's binaries: built by lust vs built by Cargo.
 
-Two checks, both on the fork's own test inputs:
+Three checks, all on the fork's own inputs:
+  tools  the codegen tools (ts_ast_codegen, ts_diagnostics_codegen) on the checked-in schema,
+         catalog JSON and generated files (TOOL_RUNS), run in the fork root: stdout, stderr,
+         exit code and the files written to one scratch dir must be byte-equal.
   runs   every bin on every fixture project of crates/ts_goport/tests (each dir with a
          tsconfig.json under fixtures/ and effect_fixtures/): stdout, stderr, exit code and
          every file the run writes must be byte-equal. Each run gets a fresh copy of the
@@ -16,7 +19,7 @@ Usage: tsrust_parity.py --fork DIR --cargo-bins DIR --lust-bins DIR --out DIR [-
   --lust-bins   dir with the lust builds, named <package>-<bin> (tsrust_full.py writes them)
   --tests       <cargo target>/release/deps (the integration test executables); default from
                 --cargo-bins
-Last line: "tsrust-parity: <same>/<runs> runs same, <same>/<tests> test bins same"
+Last line: "tsrust-parity: <same>/<runs> runs same, <same>/<tests> test bins same, <same>/<tools> tool runs same"
 """
 import argparse
 import hashlib
@@ -29,6 +32,69 @@ from pathlib import Path
 
 BINS = ["tsgo", "goport", "goport_emit", "goport_typesyms", "astdump", "goport_build", "goport_multiprog", "goport_live_programs", "goport_watch"]
 TESTS = ["early_emit", "emit_pool", "fswatch_linux", "multi_program", "source_map_cut", "tsgo_launch", "tsgo_panic_hook"]
+
+
+# Codegen tool runs: args relative to the fork root; "{out}" is the scratch dir for written files.
+TOOL_RUNS = {
+    "ts_ast_codegen": [
+        ["emit"],
+        ["emit", "tools/ts_ast_codegen/spec/ast.json", "{out}/syntax_kind.rs"],
+        ["emit-ast", "{out}/ast_generated.rs"],
+        ["check", "crates/ts_goport/src/astdata/syntax_kind.rs"],
+        ["check-ast", "crates/ts_goport/src/astdata/ast_generated.rs"],
+        ["check-ast", "crates/ts_goport/src/astdata/syntax_kind.rs"],
+        [],
+    ],
+    "ts_diagnostics_codegen": [
+        ["--input", "crates/ts_goport/data/effect/effectDiagnosticMessages.json", "--output", "{out}/catalog.rs"],
+        ["--input", "tools/ts_ast_codegen/spec/ast.json", "--output", "{out}/catalog.rs"],
+        ["--names-output", "{out}/diag.rs", "--output", "{out}/catalog.rs"],
+        ["--output"],
+        [],
+    ],
+}
+
+
+def parity_tools(fork, cargo_bins, lust_bins, out, timeout):
+    """TOOL_RUNS with the Cargo and the lust build of each tool, in the fork root."""
+    scratch = out / "parity-tools"
+    rows = []
+    for tool, runs in TOOL_RUNS.items():
+        cb, lb = cargo_bins / tool, lust_bins / f"{tool}-{tool}"
+        for args in runs:
+            argv = [x.replace("{out}", str(scratch)) for x in args]
+            tag = f"{tool} {' '.join(args)}"
+            if not lb.exists() or not cb.exists():
+                rows.append((tag, "no lust bin" if not lb.exists() else "no cargo bin"))
+                continue
+            res = []
+            for b in (cb, lb):
+                shutil.rmtree(scratch, ignore_errors=True)
+                scratch.mkdir(parents=True)
+                try:
+                    r = subprocess.run([str(b)] + argv, cwd=fork, capture_output=True, timeout=timeout)
+                    res.append(((r.returncode, r.stdout, r.stderr), tree_digest(scratch)))
+                except subprocess.TimeoutExpired:
+                    res.append((("hang", b"", b""), []))
+            rows.append((tag, compare(res[0], res[1])))
+    shutil.rmtree(scratch, ignore_errors=True)
+    return rows
+
+
+def compare(a, b):
+    """One row result for two (rc, stdout, stderr), files results: "same" or the first difference."""
+    (a, ta), (b, tb) = a, b
+    if a == b and ta == tb:
+        return "same"
+    if a[0] != b[0]:
+        return f"exit cargo {a[0]} lust {b[0]}"
+    if a[1] != b[1]:
+        return "stdout " + first_diff(a[1], b[1])
+    if a[2] != b[2]:
+        return "stderr " + first_diff(a[2], b[2])
+    da, db = dict(ta), dict(tb)
+    diff = sorted(k for k in set(da) | set(db) if da.get(k) != db.get(k))
+    return f"files differ: {', '.join(diff[:5])}"
 
 
 def projects(fork):
@@ -109,20 +175,7 @@ def parity_runs(fork, cargo_bins, lust_bins, out, timeout):
                 if not cb.exists():
                     rows.append((tag, "no cargo bin"))
                     continue
-                a, ta = run_one(cmd, src, work, timeout)
-                b, tb = run_one([str(lb)] + cmd[1:], src, work, timeout)
-                if a == b and ta == tb:
-                    rows.append((tag, "same"))
-                elif a[0] != b[0]:
-                    rows.append((tag, f"exit cargo {a[0]} lust {b[0]}"))
-                elif a[1] != b[1]:
-                    rows.append((tag, "stdout " + first_diff(a[1], b[1])))
-                elif a[2] != b[2]:
-                    rows.append((tag, "stderr " + first_diff(a[2], b[2])))
-                else:
-                    da, db = dict(ta), dict(tb)
-                    diff = sorted(k for k in set(da) | set(db) if da.get(k) != db.get(k))
-                    rows.append((tag, f"files differ: {', '.join(diff[:5])}"))
+                rows.append((tag, compare(run_one(cmd, src, work, timeout), run_one([str(lb)] + cmd[1:], src, work, timeout))))
     shutil.rmtree(out / "parity-work", ignore_errors=True)
     return rows
 
@@ -171,7 +224,7 @@ def parity_tests(fork, cargo_bins, lust_bins, deps, timeout):
             a = run_tests(exe, cwd, timeout)
             missing = [b for b in BINS if not (lust_bins / f"ts_goport-{b}").exists()]
             if missing:
-                rows.append((t, f"cargo bins: {a[1]}; no lust bin for {', '.join(missing)}"))
+                rows.append((t, f"no lust bin for {', '.join(missing)} (cargo bins: {a[1]})"))
                 continue
             for b in BINS:
                 put_bin(lust_bins / f"ts_goport-{b}", cargo_bins / b)
@@ -198,20 +251,23 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     if not cb.exists():
         sys.exit(f"tsrust-parity: no Cargo bins at {cb}")
+    tools = parity_tools(fork, cb, lb, out, a.timeout)
     runs = parity_runs(fork, cb, lb, out, a.timeout)
     tests = parity_tests(fork, cb, lb, a.tests or cb / "deps", a.timeout * 4)
     with open(out / "parity.txt", "w") as f:
-        for tag, res in runs + tests:
+        for tag, res in tools + runs + tests:
             f.write(f"{res}\t{tag}\n")
-    bad = [(t, r) for t, r in runs + tests if r != "same" and not r.startswith("no lust bin")]
-    nobin = sum(r.startswith("no lust bin") for _, r in runs)
+    bad = [(t, r) for t, r in tools + runs + tests if r != "same" and not r.startswith("no lust bin")]
+    nobin = sum(r.startswith("no lust bin") for _, r in tools + runs)
     if nobin:
         print(f"tsrust-parity: {nobin} runs have no lust bin yet")
     for t, r in bad[:40]:
         print(f"tsrust-parity: DIFF {t}: {r}")
     rs = sum(r == "same" for _, r in runs)
     ts = sum(r == "same" for _, r in tests)
-    print(f"tsrust-parity: {rs}/{len(runs)} runs same, {ts}/{len(tests)} test bins same (all rows: {out / 'parity.txt'})")
+    tl = sum(r == "same" for _, r in tools)
+    print(f"tsrust-parity: {rs}/{len(runs)} runs same, {ts}/{len(tests)} test bins same, {tl}/{len(tools)} tool runs same"
+          f" (all rows: {out / 'parity.txt'})")
 
 
 if __name__ == "__main__":
