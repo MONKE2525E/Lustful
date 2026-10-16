@@ -184,6 +184,14 @@ pub enum IterKind {
     /// `&str`, invalid `&[u8]`). Not an iterator: the item type of
     /// `Utf8Chunks`, carried here like the range kinds.
     Utf8Chunk,
+    /// The short-circuit wrapper of a `collect` into `Result<C, E>`
+    /// or `Option<C>` (F3; core's `ProcessResults` in std). Args
+    /// `[I, E, T]`: the source iterator, the error type (`()` marks
+    /// the `Option` form), and the item `T`. Fields: the source,
+    /// then the first failure seen (`Option<E>`), in std's
+    /// declaration order for drop. Never named in source: only the
+    /// `collect` expansion builds one (lower/iter.rs).
+    TryCollect,
 }
 
 /// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
@@ -302,7 +310,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 61] = [
+    pub const ALL: [IterKind; 62] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -364,6 +372,7 @@ impl IterKind {
         IterKind::ChunksExactMut,
         IterKind::Utf8Chunks,
         IterKind::Utf8Chunk,
+        IterKind::TryCollect,
     ];
 
     /// True for the hashed-collection iterators.
@@ -446,6 +455,7 @@ impl IterKind {
             K::ChunksExactMut => (&["core", "slice"], "ChunksExactMut"),
             K::Utf8Chunks => (&["core", "str"], "Utf8Chunks"),
             K::Utf8Chunk => (&["core", "str"], "Utf8Chunk"),
+            K::TryCollect => (&["core", "iter", "lust"], "TryCollect"),
         }
     }
 
@@ -470,7 +480,7 @@ impl IterKind {
     pub fn n_args(self) -> usize {
         use IterKind as K;
         match self {
-            K::Map | K::FilterMap => 3,
+            K::Map | K::FilterMap | K::TryCollect => 3,
             K::Flatten => 2,
             K::Filter
             | K::Chain
@@ -562,6 +572,7 @@ impl IterKind {
             K::ChunksExactMut => "std::slice::ChunksExactMut",
             K::Utf8Chunks => "std::str::Utf8Chunks",
             K::Utf8Chunk => "std::str::Utf8Chunk",
+            K::TryCollect => "",
         }
     }
 
@@ -639,6 +650,7 @@ impl IterKind {
             // No stored value; one dummy field, as `RangeInclusive`
             // stores its flag.
             K::RangeFull => &[F::Bool],
+            K::TryCollect => &[F::Arg(0), F::OptArg(1)],
         }
     }
 }
@@ -752,6 +764,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
             _ => REF_STR,
         },
         K::EncodeUtf16 => int(IntTy::U16),
+        K::TryCollect => a[2],
     })
 }
 

@@ -8506,7 +8506,7 @@ impl<'p> Ctx<'p> {
                 // `?` is a match whose break arm returns, so its value
                 // is a diverging variable when nothing else fixes it
                 // (`let _ = Err(e)?;`), as in rustc.
-                let t = self.try_expr(e, *inner, span);
+                let t = self.try_expr(e, *inner, span, expected);
                 self.mark_diverging(t);
                 t
             }
@@ -8530,8 +8530,30 @@ impl<'p> Ctx<'p> {
     /// type matches, widens numerically, or converts through a
     /// `From` impl, selected here like `From::from` itself is in
     /// `assoc_call`. The conversion plan rides in `Res` for lowering.
-    fn try_expr(&mut self, e: ExprId, inner: ExprId, span: Span) -> Ty {
-        let it0 = self.expr(inner, None);
+    fn try_expr(&mut self, e: ExprId, inner: ExprId, span: Span, expected: Option<Ty>) -> Ty {
+        // The operand's expected type, for a try `collect` whose
+        // turbofish names the wrapper (`collect::<Result<_, _>>()?`
+        // into a `Vec` binding, F3): the binding's type is the
+        // value inside the wrapper, so the operand expects the
+        // wrapper around it. Only the written wrapper name decides
+        // the shape; every other operand keeps no expected type.
+        let inner_expected = expected.and_then(|t| {
+            let Expr::MethodCall { name, generic_args, .. } = self.p.ast.expr(inner) else { return None };
+            if self.name(*name) != "collect" {
+                return None;
+            }
+            let [ast::GenericArg::Type(ty)] = generic_args.as_slice() else { return None };
+            let crate::ast::TyExpr::Path(segs) = self.p.ast.ty(*ty) else { return None };
+            match segs.last().map(|s| self.name(s.name)) {
+                Some("Result") => {
+                    let e = self.new_var(false);
+                    Some(self.tys.mk_result(t, e))
+                }
+                Some("Option") => Some(self.tys.mk_option(t)),
+                _ => None,
+            }
+        });
+        let it0 = self.expr(inner, inner_expected);
         self.run_obligations(false);
         let it = self.resolve(it0);
         let ret = self.closure_rets.last().copied().unwrap_or(self.fn_ret);

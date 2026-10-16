@@ -2374,6 +2374,61 @@ impl Ex<'_, '_> {
                 self.cur = miss;
                 self.goto(lp);
             }
+            // The try-collect wrapper (F3; core's `ProcessResults`):
+            // yield the value inside each `Ok` or `Some`; at the
+            // first `Err` or `None`, store it in field 1 and end.
+            // Once failed, later pulls end at once without pulling
+            // the source, as std's `next` checks the stored error.
+            K::TryCollect => {
+                if back {
+                    return Err("iterator expansion: TryCollect is forward-only here".into());
+                }
+                let inner_item = self.item(a[0])?;
+                let (failed, go) = self.switch_opt(&f(1));
+                self.cur = failed;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = go;
+                let iopt = self.body.tys.mk_option(inner_item);
+                let t = self.local(iopt);
+                self.next(f(0), a[0], Place::local(t), false)?;
+                let (s, n) = self.switch_opt(&Place::local(t));
+                self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
+                self.cur = s;
+                let x = self.local(inner_item);
+                let px = self.take(Self::payload(&Place::local(t)), inner_item);
+                self.assign(Place::local(x), Rvalue::Use(px));
+                let err_ty = a[1];
+                let opt_err = self.body.tys.mk_option(err_ty);
+                if self.body.tys.result_args(inner_item).is_some() {
+                    // `Ok` is discriminant 0, `Err` 1 (place_ty).
+                    let d = self.local(int(IntTy::U32));
+                    self.assign(Place::local(d), Rvalue::Discriminant(Place::local(x)));
+                    let (ok, bad) = (self.block(), self.block());
+                    self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(0, ok)], bad));
+                    self.cur = ok;
+                    let v = self.take(Place::local(x).project(Proj::Downcast(0)).project(Proj::Field(0)), item);
+                    self.some(&dest, opt, v);
+                    self.goto(join);
+                    self.cur = bad;
+                    let ev = self.take(Place::local(x).project(Proj::Downcast(1)).project(Proj::Field(0)), err_ty);
+                    self.some(&f(1), opt_err, ev);
+                    self.none(&dest, opt);
+                    self.goto(join);
+                } else {
+                    let (some, none) = self.switch_opt(&Place::local(x));
+                    self.cur = some;
+                    let v = self.take(Self::payload(&Place::local(x)), item);
+                    self.some(&dest, opt, v);
+                    self.goto(join);
+                    self.cur = none;
+                    self.some(&f(1), opt_err, Operand::Const(Const::Unit));
+                    self.none(&dest, opt);
+                    self.goto(join);
+                }
+            }
             K::Enumerate => {
                 if back {
                     return Err("iterator expansion: Enumerate is forward-only here".into());
@@ -3883,6 +3938,13 @@ impl Ex<'_, '_> {
                 self.cur = join;
             }
             K::Map | K::Inspect | K::Copied | K::Cloned | K::Enumerate | K::Rev => return self.hint(f(0), a[0]),
+            // `ProcessResults::size_hint`: no lower bound (the next
+            // item can fail), the source's upper bound.
+            K::TryCollect => {
+                let (_, ihi) = self.hint(f(0), a[0])?;
+                self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
+                self.assign(Place::local(hi), Rvalue::Use(Operand::Move(Place::local(ihi))));
+            }
             // `CharIndices` forwards to its `Chars`.
             K::CharIndices => return self.hint(f(0), CHARS),
             // The str matches forms: std's default `(0, None)`.
@@ -4296,6 +4358,9 @@ impl Ex<'_, '_> {
             // to arrays) of a fixed size.
             K::Flatten => self.trusted_len(a[0]) && self.item_const_size(a[0]).is_some(),
             K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => false,
+            // `ProcessResults` is not `TrustedLen` (a failure can
+            // end it early), whatever the source is.
+            K::TryCollect => false,
         }
     }
 
@@ -5480,10 +5545,23 @@ impl Ex<'_, '_> {
 
     /// `collect` into `Vec<T>` (Rust's `SpecFromIter` capacity rules),
     /// `Box<[T]>` (a `Vec` collect boxed at the end), or `String`
-    /// (the `FromIterator` impl per item type).
+    /// (the `FromIterator` impl per item type). A try target
+    /// (`Result<C, E>`, `Option<C>`) goes through `collect_try`.
     fn collect(&mut self, itp: Place, ty: Ty, dest: Place, dest_ty: Ty) -> R {
         use crate::ast::BinOp::*;
         let item = self.item(ty)?;
+        // Try collect (F3): the checker has unified the item with
+        // `Result<T, E>` or `Option<T>` for these destinations.
+        let try_parts = match (self.body.tys.result_args(dest_ty), self.body.tys.result_args(item)) {
+            (Some((c, e)), Some((t, _))) => Some((c, e, t, true)),
+            _ => match (self.body.tys.option_elem(dest_ty), self.body.tys.option_elem(item)) {
+                (Some(c), Some(t)) => Some((c, UNIT, t, false)),
+                _ => None,
+            },
+        };
+        if let Some((c, err_ty, inner, is_result)) = try_parts {
+            return self.collect_try(itp, ty, dest, dest_ty, c, err_ty, inner, is_result);
+        }
         let join = self.block();
         if self.body.tys.is_string_ty(dest_ty) {
             let s = self.local(STRING);
@@ -5705,6 +5783,61 @@ impl Ex<'_, '_> {
         Ok(())
     }
 
+    /// `collect` into `Result<C, E>` or `Option<C>` (F3): core's
+    /// generic impls collect `C` from a short-circuit wrapper over
+    /// the source (the `TryCollect` kind, std's `ProcessResults`),
+    /// then read the wrapper's stored failure. Drop order is
+    /// std's: on a failure the wrapper drops first (the source
+    /// iterator and its unconsumed items), then the built prefix
+    /// of `C`; the error value itself moves into the result.
+    /// Capacity on the success path is the inner collect's own,
+    /// over the wrapper (its hint has no lower bound, and the
+    /// in-place reuse rules read through it).
+    fn collect_try(&mut self, itp: Place, ty: Ty, dest: Place, dest_ty: Ty, c: Ty, err_ty: Ty, inner: Ty, is_result: bool) -> R {
+        let wrap_ty = it::mk_iter(&mut self.body.tys, IterKind::TryCollect, &[ty, err_ty, inner]);
+        let w = self.local(wrap_ty);
+        let opt_err = self.body.tys.mk_option(err_ty);
+        let slot = self.local(opt_err);
+        self.none(&Place::local(slot), opt_err);
+        let src = self.take(itp, ty);
+        self.assign(Place::local(w), Rvalue::TupleAgg(wrap_ty, vec![src, Operand::Move(Place::local(slot))]));
+        let coll = self.local(c);
+        self.collect(Place::local(w), wrap_ty, Place::local(coll), c)?;
+        let join = self.block();
+        let slot_pl = Place::local(w).project(Proj::Field(1));
+        let (failed, ok) = self.switch_opt(&slot_pl);
+        // Success: wrap the collection, then drop the wrapper (the
+        // exhausted source), as std drops it before returning.
+        self.cur = ok;
+        let cv = self.take(Place::local(coll), c);
+        if is_result {
+            self.assign(dest.clone(), Rvalue::Res(dest_ty, true, cv));
+        } else {
+            self.some(&dest, dest_ty, cv);
+        }
+        self.drop_local(w);
+        self.goto(join);
+        // Failure: take the error out, drop the wrapper, then the
+        // built prefix, then write the failure result.
+        self.cur = failed;
+        if is_result {
+            let e = self.local(err_ty);
+            let ev = self.take(Self::payload(&slot_pl), err_ty);
+            self.assign(Place::local(e), Rvalue::Use(ev));
+            self.drop_local(w);
+            self.drop_local(coll);
+            let ev = self.take(Place::local(e), err_ty);
+            self.assign(dest.clone(), Rvalue::Res(dest_ty, false, ev));
+        } else {
+            self.drop_local(w);
+            self.drop_local(coll);
+            self.none(&dest, dest_ty);
+        }
+        self.goto(join);
+        self.cur = join;
+        Ok(())
+    }
+
     /// When `collect` into `Vec<T>` keeps the source buffer (std's
     /// `SpecFromIter` impls, W-STD-B): a `vec::IntoIter<S>` itself (0
     /// adapter levels), or through std's InPlaceIterable adapters lust has
@@ -5722,7 +5855,7 @@ impl Ex<'_, '_> {
         let mut cur = (k, a);
         loop {
             match cur.0 {
-                K::Map | K::Filter | K::FilterMap | K::Enumerate | K::Zip | K::Skip | K::Take | K::SkipWhile | K::TakeWhile | K::Inspect | K::Cloned => {
+                K::Map | K::Filter | K::FilterMap | K::Enumerate | K::Zip | K::Skip | K::Take | K::SkipWhile | K::TakeWhile | K::Inspect | K::Cloned | K::TryCollect => {
                     depth += 1;
                     cur = self.kind_args(cur.1[0])?;
                 }

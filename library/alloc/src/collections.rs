@@ -725,6 +725,52 @@ pub mod btree_map {
         }
     }
 
+    // Core's generic try collect over this map (F3), written out
+    // here (a generic `B::from_iter` call on a parameter is not
+    // in the subset yet): pull the `Ok` prefix, bulk-build it
+    // exactly as `from_iter` does, and on an `Err` drop the
+    // source iterator before the built prefix, as std's order is.
+    impl<K: Ord, V, E> FromIterator<Result<(K, V), E>> for Result<BTreeMap<K, V>, E> {
+        fn from_iter<I: IntoIterator<Item = Result<(K, V), E>>>(iter: I) -> Result<BTreeMap<K, V>, E> {
+            let mut items: Vec<(K, V)> = Vec::new();
+            let mut it = iter.into_iter();
+            loop {
+                match it.next() {
+                    Some(Ok(kv)) => items.push(kv),
+                    Some(Err(e)) => {
+                        let built = BTreeMap { entries: sorted_dedup_last(items) };
+                        drop(it);
+                        drop(built);
+                        return Err(e);
+                    }
+                    None => break,
+                }
+            }
+            Ok(BTreeMap { entries: sorted_dedup_last(items) })
+        }
+    }
+
+    // The `Option` form of the try collect above.
+    impl<K: Ord, V> FromIterator<Option<(K, V)>> for Option<BTreeMap<K, V>> {
+        fn from_iter<I: IntoIterator<Item = Option<(K, V)>>>(iter: I) -> Option<BTreeMap<K, V>> {
+            let mut items: Vec<(K, V)> = Vec::new();
+            let mut it = iter.into_iter();
+            loop {
+                match it.next() {
+                    Some(Some(kv)) => items.push(kv),
+                    Some(None) => {
+                        let built = BTreeMap { entries: sorted_dedup_last(items) };
+                        drop(it);
+                        drop(built);
+                        return None;
+                    }
+                    None => break,
+                }
+            }
+            Some(BTreeMap { entries: sorted_dedup_last(items) })
+        }
+    }
+
     /// Std's `Extend` is an insert loop: a repeated key keeps the
     /// key already in the map and takes the new value, dropping
     /// the replaced values as it goes.
@@ -1169,6 +1215,50 @@ pub mod btree_set {
                 items.push(v);
             }
             BTreeSet { items: sorted_dedup_last_set(items) }
+        }
+    }
+
+    // Core's generic try collects over this set (F3), written out
+    // as the map's are (see `btree_map`): bulk-build the success
+    // prefix, and on a failure drop the source iterator before
+    // the built prefix.
+    impl<T: Ord, E> FromIterator<Result<T, E>> for Result<BTreeSet<T>, E> {
+        fn from_iter<I: IntoIterator<Item = Result<T, E>>>(iter: I) -> Result<BTreeSet<T>, E> {
+            let mut items: Vec<T> = Vec::new();
+            let mut it = iter.into_iter();
+            loop {
+                match it.next() {
+                    Some(Ok(v)) => items.push(v),
+                    Some(Err(e)) => {
+                        let built = BTreeSet { items: sorted_dedup_last_set(items) };
+                        drop(it);
+                        drop(built);
+                        return Err(e);
+                    }
+                    None => break,
+                }
+            }
+            Ok(BTreeSet { items: sorted_dedup_last_set(items) })
+        }
+    }
+
+    impl<T: Ord> FromIterator<Option<T>> for Option<BTreeSet<T>> {
+        fn from_iter<I: IntoIterator<Item = Option<T>>>(iter: I) -> Option<BTreeSet<T>> {
+            let mut items: Vec<T> = Vec::new();
+            let mut it = iter.into_iter();
+            loop {
+                match it.next() {
+                    Some(Some(v)) => items.push(v),
+                    Some(None) => {
+                        let built = BTreeSet { items: sorted_dedup_last_set(items) };
+                        drop(it);
+                        drop(built);
+                        return None;
+                    }
+                    None => break,
+                }
+            }
+            Some(BTreeSet { items: sorted_dedup_last_set(items) })
         }
     }
 

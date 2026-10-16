@@ -4595,7 +4595,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::Utf8Chunks => own.clone(),
             K::Utf8Chunk => return None,
             K::VecIntoIter | K::Range | K::RangeInclusive | K::VecDrain => args[0].clone(),
-            K::Map | K::FilterMap => args[2].clone(),
+            K::Map | K::FilterMap | K::TryCollect => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
                 self.item_slots(a[0], &args[0])?
@@ -4994,6 +4994,19 @@ impl<'b, 'p> Builder<'b, 'p> {
                 out.extend(xs.into_iter().map(|x| x[1..].to_vec()));
                 true
             }
+            // The try wrapper's item is the value inside the inner
+            // item (`Result<T, E>` or `Option<T>`): the first of its
+            // slots, in the wrapper type's own arg order (F3).
+            K::TryCollect => {
+                let Some(&bt) = a.get(2) else { return false };
+                let nb = self.sc.slots(bt) as usize;
+                let mut xs = Vec::new();
+                if !vars.get(..n0).is_some_and(|v| self.iter_items(a0, v, &mut xs)) || xs.iter().any(|x| x.len() < nb) {
+                    return false;
+                }
+                out.extend(xs.into_iter().map(|x| x[..nb].to_vec()));
+                true
+            }
             // The closure's output (`FilterMap`'s `Option<B>` has `B`'s
             // slots): what its body returns of its captured slots (laid
             // out after the inner iterator's) and its free arguments.
@@ -5108,7 +5121,42 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some((_, args)) = self.body.tys.adt_parts(dt) else { return false };
         let comps: Vec<Ty> = self.body.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
         let collect = matches!(b, crate::check::Builtin::IterCollect | crate::check::Builtin::FromIter);
+        // A try collect result (`Result<C, E>` or `Option<C>`, F3)
+        // holds the item inside `C` plus, for `Result`, the error:
+        // its parts are `C`'s own item parts then `E`, which is
+        // also the item's slot order (`Result<T, E>`), when `C`
+        // has no further slotted args after its item parts.
+        let coll_parts = |this: &mut Self, c: Ty| -> Option<Vec<Ty>> {
+            let (_, cargs) = this.body.tys.adt_parts(c)?;
+            let ccomps: Vec<Ty> = this.body.tys.args(cargs).iter().filter_map(|g| g.as_ty()).collect();
+            let p = match (this.body.tys.builtin_of(c), &ccomps[..]) {
+                (Some(BuiltinTy::Vec), &[t]) => vec![t],
+                (Some(BuiltinTy::Hash(HashTy::HashMap)), &[k, v, _]) => vec![k, v],
+                (Some(BuiltinTy::Hash(HashTy::HashSet)), &[t, _]) => vec![t],
+                (Some(BuiltinTy::Boxed), &[s]) => match this.body.tys.kind(s) {
+                    TyKind::Slice(e) => vec![e],
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let mut total = 0usize;
+            for &t in &p {
+                total += this.sc.slots(t) as usize;
+            }
+            (total == this.sc.slots(c) as usize).then_some(p)
+        };
         let parts = match (self.body.tys.builtin_of(dt), &comps[..]) {
+            (Some(BuiltinTy::Result), &[c, e]) if collect => match coll_parts(self, c) {
+                Some(mut p) => {
+                    p.push(e);
+                    p
+                }
+                None => return false,
+            },
+            (Some(BuiltinTy::Option), &[c]) if collect => match coll_parts(self, c) {
+                Some(p) => p,
+                None => return false,
+            },
             (Some(BuiltinTy::Option | BuiltinTy::Vec), &[t]) => vec![t],
             (Some(BuiltinTy::Hash(HashTy::HashMap)), &[k, v, _]) if collect => vec![k, v],
             (Some(BuiltinTy::Hash(HashTy::HashSet)), &[t, _]) if collect => vec![t],

@@ -75,6 +75,9 @@ enum FromIterProbe {
 enum FromIterClass {
     Collect,
     BTree,
+    /// `Result<BTreeMap<..>, E>` and kin (F3): core's generic
+    /// try-collect impl over the BTree target.
+    TryBTree,
     Unsupported,
 }
 
@@ -1107,6 +1110,20 @@ impl<'p> Ctx<'p> {
             }
             "collect" => {
                 let target = self.iter_target(turbofish, expected, span);
+                // A turbofish with holes (`collect::<Result<_, _>>()?`)
+                // gets its holes from the expected type, as rustc's
+                // inference does; without this the inner collection
+                // of a try target is a bare variable here (F3). A
+                // mismatch rolls back: the caller's own check of the
+                // result type reports it.
+                if !turbofish.is_empty()
+                    && let Some(want) = expected
+                {
+                    let snap = self.snapshot_vars();
+                    if !self.unify(target, want) {
+                        self.rollback_vars(snap);
+                    }
+                }
                 // A source collection (`BTreeMap`, `BTreeSet`, or a user
                 // type with a `FromIterator` impl, adapter crates
                 // included): the call is its
@@ -1120,12 +1137,24 @@ impl<'p> Ctx<'p> {
                 // `Vec`'s, so it takes the builtin collect below and
                 // lowering wraps the `Vec` (W-STD-C phase 2).
                 let tr = self.resolve(target);
+                // A try target (`Result<C, E>` or `Option<C>`, F3):
+                // the source-collection question is about `C` and
+                // the item inside the `Result` or `Option`; the
+                // obligation and the deferred call stay on the whole
+                // target, as core's generic impl names it.
+                let (route_ty, route_item) = match self.try_collect_parts(tr) {
+                    Some((c, err)) => match self.try_collect_inner(item, err, span) {
+                        Some(inner) => (c, inner),
+                        None => return self.iter_bail(args),
+                    },
+                    None => (tr, item),
+                };
                 let from_iter_ref = |this: &mut Self| TraitRef {
                     def: this.p.gx.lang.from_iterator,
-                    args: this.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]),
+                    args: this.tys.intern_args(&[GenericArg::Ty(route_ty), GenericArg::Ty(route_item)]),
                     bindings: EMPTY_BINDINGS,
                 };
-                if let Some(a) = self.tys.local_adt(tr).or_else(|| self.tys.adt_parts(tr).and_then(|(d, _)| self.tys.local_adt_of(d)))
+                if let Some(a) = self.tys.local_adt(route_ty).or_else(|| self.tys.adt_parts(route_ty).and_then(|(d, _)| self.tys.local_adt_of(d)))
                     && !self.p.is_vec_deque_adt(a)
                     && args.is_empty()
                     && (self.p.is_std_adt(a)
@@ -1138,7 +1167,7 @@ impl<'p> Ctx<'p> {
                     // entry type: unify it now, so `collect::<BTreeMap<_,
                     // _>>()` infers `K` and `V` from the items.
                     let path = self.p.display_path(self.p.adt(a).name);
-                    let targs: Vec<Ty> = self.tys.adt_parts(tr).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+                    let targs: Vec<Ty> = self.tys.adt_parts(route_ty).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
                     let entry = match (path.rsplit("::").next(), targs.as_slice()) {
                         (Some("BTreeMap"), [k, v]) => {
                             let ts = self.tys.intern_tys(&[*k, *v]);
@@ -1148,9 +1177,9 @@ impl<'p> Ctx<'p> {
                         _ => None,
                     };
                     if let Some(entry) = entry
-                        && !self.unify(entry, item)
+                        && !self.unify(entry, route_item)
                     {
-                        self.mismatch(span, entry, item);
+                        self.mismatch(span, entry, route_item);
                         return self.iter_bail(args);
                     }
                     let targs = self.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]);
@@ -1591,7 +1620,7 @@ impl<'p> Ctx<'p> {
             // A user iterator with a `DoubleEndedIterator` impl.
             K::ByNext => by_next_fns(self.p, &self.tys, a[0]).is_ok_and(|f| f.next_back.is_some()),
             // Forward only in lust so far.
-            K::Flatten => false,
+            K::Flatten | K::TryCollect => false,
             K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => true,
             // The str splits (W-STD-B): by mode, and over a pattern whose
             // searcher is double-ended (char, char sets, predicates; not
@@ -1698,11 +1727,46 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The parts of a try collect target (F3, core's two generic
+    /// impls): `Result<C, E>` gives `(C, Some(E))`, `Option<C>`
+    /// gives `(C, None)`. No other `FromIterator` impl names a
+    /// `Result` or `Option`, so every such target is a try one.
+    fn try_collect_parts(&mut self, t: Ty) -> Option<(Ty, Option<Ty>)> {
+        let t = self.resolve(t);
+        if let Some((c, e)) = self.tys.result_args(t) {
+            return Some((self.resolve(c), Some(self.resolve(e))));
+        }
+        self.tys.option_elem(t).map(|c| (self.resolve(c), None))
+    }
+
+    /// The item inside a try collect's items: `item` unified with
+    /// `Result<T, E>` or `Option<T>` for a fresh `T`, which it then
+    /// returns. A mismatch is rustc's trait error, reported so.
+    fn try_collect_inner(&mut self, item: Ty, err: Option<Ty>, span: Span) -> Option<Ty> {
+        let inner = self.new_var(false);
+        let want = match err {
+            Some(e) => self.tys.mk_result(inner, e),
+            None => self.tys.mk_option(inner),
+        };
+        if !self.unify(want, item) {
+            self.mismatch(span, want, item);
+            return None;
+        }
+        Some(inner)
+    }
+
     /// `collect` into `Vec<Item>`, `Box<[Item]>`, or `String` (from
     /// `char`, `&char`, `&str`, or `String` items): the targets lust
-    /// builds.
+    /// builds. A try target recurses on its inner collection with
+    /// the item inside the `Result` or `Option` (F3).
     pub(super) fn collect_target_ok(&mut self, target: Ty, item: Ty, span: Span) -> bool {
         let t = self.resolve(target);
+        if let Some((c, err)) = self.try_collect_parts(t) {
+            return match self.try_collect_inner(item, err, span) {
+                Some(inner) => self.collect_target_ok(c, inner, span),
+                None => false,
+            };
+        }
         // alloc's `FromIterator<T> for Box<[T]>` collects a `Vec`
         // and boxes it (lowering mirrors that). The deep form: a
         // `Box::from_iter` target's element is a variable the
@@ -1977,6 +2041,7 @@ impl<'p> Ctx<'p> {
                 Some(self.resolve(target))
             }
             FromIterClass::BTree => Some(self.btree_from_iter(e, target, at, item, turbo.name, span)),
+            FromIterClass::TryBTree => Some(self.try_btree_from_iter(e, target, at, item, turbo.name, span)),
             FromIterClass::Unsupported => unreachable!(),
         }
     }
@@ -2004,6 +2069,41 @@ impl<'p> Ctx<'p> {
         let Some(entry) = entry else { return ERROR };
         if !self.unify(entry, item) {
             self.mismatch(span, entry, item);
+            return ERROR;
+        }
+        let targs = self.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]);
+        let trait_ref = TraitRef { def: self.p.gx.lang.from_iterator, args: targs, bindings: EMPTY_BINDINGS };
+        self.obl.push_trait_at(trait_ref, span, 0);
+        method::defer_path_call(self, e, trait_ref, name, vec![GenericArg::Ty(at)]);
+        self.record_pick(e, self.p.gx.lang.from_iterator, 0, ReceiverForm::Value);
+        tr
+    }
+
+    /// `Result::<BTreeMap<..>, E>::from_iter(arg)` and kin (F3):
+    /// core's generic try-collect impl, selected at body end like
+    /// `btree_from_iter`. The entry type unifies with the item
+    /// inside the `Result` or `Option`.
+    fn try_btree_from_iter(&mut self, e: ExprId, target: Ty, at: Ty, item: Ty, name: Sym, span: Span) -> Ty {
+        let tr = self.resolve(target);
+        let Some((c, err)) = self.try_collect_parts(tr) else { return ERROR };
+        let Some(inner) = self.try_collect_inner(item, err, span) else { return ERROR };
+        let Some(a) = self.tys.local_adt(c).or_else(|| self.tys.adt_parts(c).and_then(|(d, _)| self.tys.local_adt_of(d))) else {
+            return ERROR;
+        };
+        let path = self.p.display_path(self.p.adt(a).name);
+        let targs: Vec<Ty> =
+            self.tys.adt_parts(c).map(|(_, x)| self.tys.args(x).iter().filter_map(|g| g.as_ty()).collect()).unwrap_or_default();
+        let entry = match (path.rsplit("::").next(), targs.as_slice()) {
+            (Some("BTreeMap"), [k, v]) => {
+                let ts = self.tys.intern_tys(&[*k, *v]);
+                Some(self.tys.intern(TyKind::Tuple(ts)))
+            }
+            (Some("BTreeSet"), [t]) => Some(*t),
+            _ => None,
+        };
+        let Some(entry) = entry else { return ERROR };
+        if !self.unify(entry, inner) {
+            self.mismatch(span, entry, inner);
             return ERROR;
         }
         let targs = self.tys.intern_args(&[GenericArg::Ty(tr), GenericArg::Ty(item)]);
@@ -2127,6 +2227,15 @@ impl<'p> Ctx<'p> {
     /// errors. `Unsupported` is a rustc impl lust has no build for.
     fn from_iter_class(&mut self, t: Ty) -> Option<FromIterClass> {
         let t = self.resolve(t);
+        // A try target builds through its inner collection's class
+        // (F3): builtin inners take the `Collect` expansion, BTree
+        // inners core's generic try impl.
+        if let Some((c, _)) = self.try_collect_parts(t) {
+            return match self.from_iter_class(c) {
+                Some(FromIterClass::BTree) => Some(FromIterClass::TryBTree),
+                other => other,
+            };
+        }
         let dt = self.deep(t);
         if self.tys.vec_elem(t).is_some() || self.tys.boxed_slice_elem(dt).is_some() || self.tys.is_string_ty(t) {
             return Some(FromIterClass::Collect);
@@ -2152,7 +2261,6 @@ impl<'p> Ctx<'p> {
             };
         }
         match self.tys.builtin_of(t) {
-            Some(BuiltinTy::Option | BuiltinTy::Result) => Some(FromIterClass::Unsupported),
             Some(BuiltinTy::Boxed) => self.tys.boxed_elem(t).and_then(|e| self.unsized_from_iter(e)),
             Some(BuiltinTy::Rc) => self.tys.rc_elem(t).and_then(|e| self.unsized_from_iter(e)),
             _ if t == UNIT => Some(FromIterClass::Unsupported),
