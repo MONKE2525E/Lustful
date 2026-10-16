@@ -7253,9 +7253,14 @@ fn check_lang_method(
         let t = subst(&mut p.tys, sig.ret, &args);
         rewrite_impl_projections(p, t, self_ty, &assoc_tys)
     };
+    // The method's own bounds (the impl's included) are the env: a
+    // supertrait's `Self::Item` may be fixed only through one
+    // (`impl<A, F: FnOnce() -> A> DoubleEndedIterator for OnceWith<F>`).
+    let preds = p.gx.fn_templates.get(local.0 as usize).cloned().flatten().map_or(Vec::new(), |t| t.generics.predicates);
+    let env = crate::traits::solve::elaborate_in(&mut p.tys, &p.gx.index, &preds);
     let mut cx = PureCx::new(&p.tys);
     let mut solver = Solver::new();
-    let mut norm = |t: Ty| normalize(&mut solver, &mut cx, &p.gx.index, &[], t);
+    let mut norm = |t: Ty| normalize(&mut solver, &mut cx, &p.gx.index, &env, t);
     let same = want_params.iter().zip(&got_params).all(|(&w, &g)| norm(w) == norm(g)) && norm(want_ret) == norm(got_ret);
     if !same {
         errs.push(Diag::new("L0110", f_name_span, format!("method `{n}` has an incompatible type for the trait"), fix));

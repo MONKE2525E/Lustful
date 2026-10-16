@@ -8,10 +8,10 @@
 // Lust std source, adapted from rust-lang/rust 1.99
 // `core/src/iter/sources/{once,once_with,from_fn,successors}.rs`. Not
 // here: `FusedIterator` and `TrustedLen` (lust has no such traits, so a
-// bound on them rejects), and `DoubleEndedIterator for OnceWith` (lust
-// cannot yet match `next_back` when `A` is fixed only by `F`'s bound, so
-// `once_with(..).rev()` rejects). `Once<T>` holds `Option<T>` where core holds an
-// `option::IntoIter<T>`; its Debug text writes core's nesting by hand
+// bound on them rejects; lowering knows which of these types std marks
+// `TrustedLen`, src/lower/iter.rs `std_trusted_len`). `Once<T>` holds
+// `Option<T>` where core holds an `option::IntoIter<T>`; its Debug text
+// writes core's nesting by hand
 // (`Once { inner: IntoIter { inner: Item { opt: Some(1) } } }`).
 
 /// Creates an iterator that yields an element exactly once.
@@ -104,6 +104,12 @@ impl<A, F: FnOnce() -> A> Iterator for OnceWith<F> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = if self.make.is_some() { 1 } else { 0 };
         (len, Some(len))
+    }
+}
+
+impl<A, F: FnOnce() -> A> DoubleEndedIterator for OnceWith<F> {
+    fn next_back(&mut self) -> Option<A> {
+        self.next()
     }
 }
 
