@@ -977,6 +977,9 @@ pub struct Expander<'a> {
     /// True while the list being expanded is an enum body: its first
     /// part is a variant (`A = 1 + 2`), not a block tail.
     enum_body: bool,
+    /// What kind of list is being expanded, for the position rules of a
+    /// cfg run (`cfg_run_misplaced`).
+    group: Group,
     /// `use std::vec as v;` style renames of builtin macros seen
     /// during the walk: bound name to canonical macro name.
     builtin_imports: Vec<(Sym, Sym)>,
@@ -1088,6 +1091,7 @@ impl<'a> Expander<'a> {
             glob_type_names: Vec::new(),
             scope_depth: 0,
             enum_body: false,
+            group: Group::Brace,
             builtin_imports: Vec::new(),
             module_builtin_alias: FxMap::default(),
             exported: FxMap::default(),
@@ -2768,6 +2772,243 @@ fn cfg_on_operator_stmt(trees: &[Tt], after: usize, after_stmt: bool, interner: 
     after_stmt && end == trees.len() && end > scan && expr_stmt_has_top_op(trees, scan, end, operand)
 }
 
+/// What kind of list `expand_list` walks, for `cfg_run_misplaced`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Group {
+    /// The file, a module, or a brace group: items, statements, a block's
+    /// tail, fields, variants, arms.
+    Brace,
+    /// Call or method arguments: `(..)` after an operand.
+    Args,
+    /// Fn parameters, or the fields of a tuple struct or variant.
+    Decl,
+    /// A tuple or a parenthesized expression: any other `(..)`.
+    Tuple,
+    /// An array: `[..]` after no operand.
+    Array,
+    /// `vec![..]`: elements, or a value and a length.
+    Vec,
+    /// A type, an index, or the arguments of a builtin macro other than
+    /// `vec!`: no outer attribute fits.
+    Closed,
+    /// A pattern, and the groups inside it: no outer attribute fits.
+    Pat,
+    /// An expression fragment, or a macro expansion in expression
+    /// position: true when an attribute fits where it lands.
+    Expr(bool),
+}
+
+impl Group {
+    /// True for a comma-separated list of expressions or parameters.
+    fn is_list(self) -> bool {
+        matches!(self, Group::Args | Group::Decl | Group::Tuple | Group::Array | Group::Vec)
+    }
+}
+
+/// The index after the list element that starts at `s`: after its
+/// top-level `,`, or the list end.
+fn elem_end(trees: &[Tt], s: usize) -> usize {
+    (s..trees.len()).find(|&k| trees[k].is_tok(Tok::Comma)).map_or(trees.len(), |k| k + 1)
+}
+
+/// The kind of the delimited group `d` that follows `out` (the trees
+/// before it in a list of kind `outer`); `next` is the tree after it.
+fn group_kind(d: Delim, out: &[Tt], next: Option<&Tt>, outer: Group, enum_body: bool) -> Group {
+    let prev = prev_tree(out);
+    let prev_tok = match prev {
+        Some(Tt::Tok(t)) => Some(t.tok),
+        _ => None,
+    };
+    // A pattern: after `let` or `for` (the scan stops at the `=` or `in`
+    // that ends one), before `=>` or `in`, or inside another pattern.
+    let after_let = out
+        .iter()
+        .rev()
+        .take_while(|t| !matches!(t, Tt::Delim(Delim::Brace, _, _)) && ![Tok::Semi, Tok::Eq, Tok::In, Tok::FatArrow].iter().any(|&k| t.is_tok(k)))
+        .any(|t| t.is_tok(Tok::Let) || t.is_tok(Tok::For));
+    let pattern = after_let || outer == Group::Pat || matches!(next, Some(Tt::Tok(t)) if matches!(t.tok, Tok::FatArrow | Tok::In));
+    match d {
+        Delim::Brace => Group::Brace,
+        Delim::Paren if enum_body || decl_params(out) => Group::Decl,
+        _ if pattern => Group::Pat,
+        Delim::Paren if prev_tok == Some(Tok::Arrow) => Group::Closed,
+        Delim::Paren if ends_operand(out) => Group::Args,
+        Delim::Bracket if ends_operand(out) => Group::Closed,
+        Delim::Paren => Group::Tuple,
+        Delim::Bracket => Group::Array,
+    }
+}
+
+/// The last tree of `out`, looking inside transparent fragments (a
+/// forwarded `tt`, ident, or lifetime).
+fn prev_tree(out: &[Tt]) -> Option<&Tt> {
+    for t in out.iter().rev() {
+        match t {
+            Tt::Frag(k, inner, _) if k.transparent() => {
+                if let Some(t) = prev_tree(inner) {
+                    return Some(t);
+                }
+            }
+            _ => return Some(t),
+        }
+    }
+    None
+}
+
+/// True when `out` ends with a complete operand, so a `(` or `[` after
+/// it is a call or an index: a name, a literal, a group other than a
+/// block, `?`, an expression fragment, or the `>` of a turbofish.
+fn ends_operand(out: &[Tt]) -> bool {
+    match prev_tree(out) {
+        Some(Tt::Delim(d, _, _)) => *d != Delim::Brace,
+        Some(Tt::Frag(k, _, _)) => matches!(k, FragKind::Expr | FragKind::Expr2021 | FragKind::Path | FragKind::Literal | FragKind::Ty),
+        Some(Tt::Tok(t)) => match t.tok {
+            Tok::Ident(_)
+            | Tok::Int(..)
+            | Tok::Float(_)
+            | Tok::Str(..)
+            | Tok::ByteStr(_)
+            | Tok::ByteChar(_)
+            | Tok::Char(..)
+            | Tok::True
+            | Tok::False
+            | Tok::SelfLower
+            | Tok::SelfUpper
+            | Tok::Super
+            | Tok::Crate
+            | Tok::Await
+            | Tok::Question => true,
+            Tok::Gt | Tok::Shr => (0..out.len()).any(|k| {
+                out[k].is_tok(Tok::PathSep) && out.get(k + 1).is_some_and(|t| t.is_tok(Tok::Lt)) && generics_end(out, k + 1, out.len()) == Some(out.len())
+            }),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// True when `out` ends with the head of a fn or tuple struct whose
+/// parameter or field list comes next: `fn name`, `struct Name`, either
+/// with generic parameters.
+fn decl_params(out: &[Tt]) -> bool {
+    let mut e = out.len();
+    if out.last().is_some_and(|t| t.is_tok(Tok::Gt) || t.is_tok(Tok::Shr)) {
+        // Back to the `<` that opens the generic parameters.
+        let mut depth = 0i32;
+        let open = (0..e).rev().find(|&k| {
+            match tok_at(out, k).map(|t| t.tok) {
+                Some(Tok::Gt) => depth += 1,
+                Some(Tok::Shr) => depth += 2,
+                Some(Tok::Lt) => depth -= 1,
+                Some(Tok::Shl) => depth -= 2,
+                _ => {}
+            }
+            depth <= 0
+        });
+        let Some(open) = open else { return false };
+        e = open;
+    }
+    e >= 2 && matches!(out[e - 1], Tt::Tok(Token { tok: Tok::Ident(_), .. })) && matches!(tok_at(out, e - 2).map(|t| t.tok), Some(Tok::Fn | Tok::Struct))
+}
+
+/// True when the top level of `trees[s..]` has `tok`.
+fn has_top(trees: &[Tt], s: usize, tok: Tok) -> bool {
+    trees[s.min(trees.len())..].iter().any(|t| t.is_tok(tok))
+}
+
+/// True when the list element (call argument, array or tuple element)
+/// that starts at `s` and runs to the next top-level `,` has a binary
+/// operator, cast, range, or assignment at its top level. An element
+/// with a top-level `:` is a parameter or field, not an expression.
+fn element_has_top_op(trees: &[Tt], s: usize) -> bool {
+    let e = (s..trees.len()).find(|&k| trees[k].is_tok(Tok::Comma)).unwrap_or(trees.len());
+    !trees[s.min(e)..e].iter().any(|t| t.is_tok(Tok::Colon)) && expr_stmt_has_top_op(trees, s, e, true)
+}
+
+/// `element_has_top_op` for a `vec!` part, which also ends at a
+/// top-level `;` (`vec![value; length]`).
+fn element_has_top_op_semi(trees: &[Tt], s: usize) -> bool {
+    let e = (s..trees.len()).find(|&k| trees[k].is_tok(Tok::Comma) || trees[k].is_tok(Tok::Semi)).unwrap_or(trees.len());
+    expr_stmt_has_top_op(trees, s, e, true)
+}
+
+/// True when a `cfg` or `cfg_attr` run that ends at `after` sits where
+/// rustc takes no outer attribute, so rustc rejects it whatever the cfg
+/// says (E0658). `out` holds the trees before the run in a list of kind
+/// `group` (not an item list). rustc takes outer attributes on items,
+/// statements, a block's tail, fields, variants, arms, and parameters,
+/// and on the elements of call arguments, arrays, and tuples. On a
+/// statement or element whose top level is a binary operator, cast,
+/// range, or assignment, the attribute goes to the left operand: an
+/// error too.
+fn cfg_run_misplaced(out: &[Tt], trees: &[Tt], after: usize, group: Group, enum_body: bool, interner: &Interner) -> bool {
+    if in_where_clause(out) {
+        return true;
+    }
+    let prev = prev_tree(out);
+    let prev_tok = match prev {
+        Some(Tt::Tok(t)) => Some(t.tok),
+        _ => None,
+    };
+    let stmt_start = match prev {
+        None => true,
+        Some(Tt::Tok(t)) => t.tok == Tok::Semi,
+        Some(Tt::Delim(d, _, _)) => *d == Delim::Brace,
+        Some(Tt::Frag(k, _, _)) => matches!(k, FragKind::Stmt | FragKind::Item | FragKind::Block),
+    };
+    let first_or_comma = prev.is_none() || prev_tok == Some(Tok::Comma);
+    match group {
+        // A run with nothing before it in a brace list may sit on a
+        // block's only tail, except in an enum body.
+        Group::Brace if stmt_start => cfg_on_operator_stmt(trees, after, prev.is_some() || !enum_body, interner),
+        Group::Brace | Group::Decl if first_or_comma => false,
+        Group::Expr(ok) if prev.is_none() => !ok || element_has_top_op(trees, after),
+        // `(#[a] x)` is a parenthesized expression; `[#[a] x; n]` a repeat.
+        Group::Tuple if prev.is_none() && !has_top(trees, after, Tok::Comma) => true,
+        // `vec![#[a] x; n]`: from_elem's arguments (a cfg that is off
+        // drops one, which the drop path rejects).
+        Group::Vec if first_or_comma || prev_tok == Some(Tok::Semi) => element_has_top_op_semi(trees, after),
+        Group::Array if has_top(trees, after, Tok::Semi) => true,
+        // A later closure parameter: `g(|a, #[a] b| ..)`.
+        Group::Args | Group::Tuple | Group::Array | Group::Vec if prev_tok == Some(Tok::Comma) && in_closure_params(out) => false,
+        Group::Args | Group::Tuple | Group::Array | Group::Vec if first_or_comma => element_has_top_op(trees, after),
+        // Closure parameters: `|#[a] x|` opens them, `x | #[a] y` does not.
+        _ if prev_tok == Some(Tok::Pipe) => ends_operand(&out[..out.len() - 1]),
+        // Generic parameters: `fn f<#[a] T>`, `impl<#[a] T>`.
+        _ if prev_tok == Some(Tok::Lt) => !generics_open(&out[..out.len() - 1], interner),
+        _ => true,
+    }
+}
+
+/// True when `out` ends inside a where clause, which takes no attribute
+/// (rustc E0658).
+fn in_where_clause(out: &[Tt]) -> bool {
+    out.iter().rev().take_while(|t| !t.is_tok(Tok::Semi) && !matches!(t, Tt::Delim(Delim::Brace, _, _))).any(|t| t.is_tok(Tok::Where))
+}
+
+/// True when `out` ends inside closure parameters: its last top-level
+/// `|` opens them (no operand before it).
+fn in_closure_params(out: &[Tt]) -> bool {
+    let Some(k) = (0..out.len()).rev().find(|&k| out[k].is_tok(Tok::Pipe) || out[k].is_tok(Tok::OrOr)) else { return false };
+    out[k].is_tok(Tok::Pipe) && !ends_operand(&out[..k])
+}
+
+/// True when a `<` after `out` opens generic parameters: after `impl` or
+/// `for`, or after the name of a fn, struct, enum, union, trait, or type.
+fn generics_open(out: &[Tt], interner: &Interner) -> bool {
+    let n = out.len();
+    match tok_at(out, n.wrapping_sub(1)).map(|t| t.tok) {
+        Some(Tok::Impl | Tok::For) => true,
+        Some(Tok::Ident(_)) => match tok_at(out, n.wrapping_sub(2)).map(|t| t.tok) {
+            Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Trait | Tok::Type) => true,
+            // `union` is a contextual keyword.
+            Some(t @ Tok::Ident(_)) => seg_text(t, interner).as_deref() == Some("union"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// The end of a dropped macro call node whose group is at `g` (the
 /// path starts at `start`). A brace call is a whole statement or item,
 /// as in rustc, unless `.` or `?` continues it or `=>` or `,` shows it
@@ -3192,7 +3433,13 @@ impl<'a> Expander<'a> {
                 let call_span = segs.first().map_or(group_span, |s| s.span.to(group_span));
                 self.check_depth(depth, extra, call_span, || fmt_name.to_string())?;
                 let msg = if fmt_name == "assert" { builtin::assert_message(self, &inner, call_span)? } else { Vec::new() };
-                let mut expanded_inner = self.expand_list(inner, depth + args, false, false, nest + 1)?;
+                // `vec!` arguments are array elements or from_elem's
+                // arguments; the other builtins take no outer attribute.
+                let group = if fmt_name == "vec" { Group::Vec } else { Group::Closed };
+                let outer_group = std::mem::replace(&mut self.group, group);
+                let expanded_inner = self.expand_list(inner, depth + args, false, false, nest + 1);
+                self.group = outer_group;
+                let mut expanded_inner = expanded_inner?;
                 expanded_inner.extend(msg);
                 if !written_lit && matches!(fmt_name, "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut expanded_inner, group_span);
@@ -3213,7 +3460,22 @@ impl<'a> Expander<'a> {
                 let call = Call { segs, leading_colon, head, delim, inner, group_span, span };
                 let mut next = group_idx + 1;
                 let expanded = self.expand_call(&call, depth)?;
-                let mut expanded = self.expand_list(expanded, depth + 1, item_list, stmt_list, nest)?;
+                // An expansion in expression position takes an outer
+                // attribute where the call could have one.
+                let at_stmt = item_list
+                    || (self.group == Group::Brace
+                        && (out.is_empty()
+                            || matches!(out.last(), Some(Tt::Tok(t)) if t.tok == Tok::Semi)
+                            || matches!(out.last(), Some(Tt::Delim(Delim::Brace, _, _)))));
+                let group = if at_stmt {
+                    self.group
+                } else {
+                    Group::Expr(!cfg_run_misplaced(&out, &trees, i, self.group, self.enum_body, self.ctx.interner))
+                };
+                let outer_group = std::mem::replace(&mut self.group, group);
+                let expanded = self.expand_list(expanded, depth + 1, item_list, stmt_list, nest);
+                self.group = outer_group;
+                let mut expanded = expanded?;
                 let begins_item = starts_item(&expanded, self.ctx.interner);
                 let next_is_semi = tok_at(&trees, next).map(|t| t.tok) == Some(Tok::Semi);
                 if item_list && !expanded.is_empty() && begins_item && call.delim != Delim::Brace && !next_is_semi {
@@ -3328,9 +3590,22 @@ impl<'a> Expander<'a> {
                         .rev()
                         .take_while(|t| !t.is_tok(Tok::Semi) && !matches!(t, Tt::Delim(Delim::Brace, _, _)))
                         .any(|t| t.is_tok(Tok::Enum));
+                let group = group_kind(d, &out, trees.get(i + 1), self.group, self.enum_body);
+                // A tuple stays a tuple when cfg drops all but one element:
+                // `(#[cfg(off)] a, b)` is `(b,)`.
+                let tuple = group == Group::Tuple && has_top(&inner, 0, Tok::Comma);
+                let outer_group = std::mem::replace(&mut self.group, group);
                 let outer_enum = std::mem::replace(&mut self.enum_body, enum_body);
                 let expanded = self.expand_list(inner, depth, false, d == Delim::Brace, nest + 1);
                 self.enum_body = outer_enum;
+                self.group = outer_group;
+                let expanded = match expanded {
+                    Ok(mut e) if tuple && !e.is_empty() && !has_top(&e, 0, Tok::Comma) => {
+                        e.push(Tt::Tok(Token { tok: Tok::Comma, span: gspan }));
+                        Ok(e)
+                    }
+                    other => other,
+                };
                 self.scope_depth -= 1;
                 self.textual.truncate(textual_len);
                 self.imports.truncate(imports_len);
@@ -3349,10 +3624,20 @@ impl<'a> Expander<'a> {
                 // unexpanded (`add!(add!(1, 2), 3)` binds the inner
                 // call inside the expr fragment), so walk the
                 // fragment's trees like any other list here.
+                let group = match &trees[i] {
+                    Tt::Frag(FragKind::Expr | FragKind::Expr2021, _, _) => {
+                        Group::Expr(item_list || !cfg_run_misplaced(&out, &trees, i, self.group, self.enum_body, self.ctx.interner))
+                    }
+                    Tt::Frag(FragKind::Stmt | FragKind::Item | FragKind::Block, _, _) => Group::Brace,
+                    Tt::Frag(k, _, _) if k.transparent() => self.group,
+                    _ => Group::Closed,
+                };
                 let tree = take(&mut trees, i);
                 let Tt::Frag(kind, inner, fspan) = tree else { unreachable!() };
-                let expanded = self.expand_list(inner, depth, false, false, nest + 1)?;
-                out.push(Tt::Frag(kind, expanded, fspan));
+                let outer_group = std::mem::replace(&mut self.group, group);
+                let expanded = self.expand_list(inner, depth, false, false, nest + 1);
+                self.group = outer_group;
+                out.push(Tt::Frag(kind, expanded?, fspan));
             }
             i += 1;
         }
@@ -3415,19 +3700,8 @@ impl<'a> Expander<'a> {
         }
         // The parser checks attributes that reach it; a run the expander
         // strips here is checked first.
-        // A run with nothing before it in a brace list may sit on a
-        // block's only tail, except in an enum body.
-        let after_stmt = match out.last() {
-            None => !self.enum_body,
-            Some(Tt::Tok(t)) => t.tok == Tok::Semi,
-            Some(Tt::Delim(d, _, _)) => *d == Delim::Brace,
-            Some(Tt::Frag(..)) => false,
-        };
-        let stmt_start = after_stmt || out.is_empty();
-        if !item_list
-            && stmt_start
-            && let Some(a) = attrs.iter().find(|a| matches!(a.path.as_str(), "cfg" | "cfg_attr"))
-            && cfg_on_operator_stmt(trees, after, after_stmt, self.ctx.interner)
+        if let Some(a) = attrs.iter().find(|a| matches!(a.path.as_str(), "cfg" | "cfg_attr"))
+            && if item_list { in_where_clause(out) } else { cfg_run_misplaced(out, trees, after, self.group, self.enum_body, self.ctx.interner) }
         {
             return Err(err(
                 C_SYNTAX,
@@ -3498,6 +3772,26 @@ impl<'a> Expander<'a> {
                 "cfg" => {
                     let on = builtin::eval_cfg(&attr.inner, &self.ctx.cfg, self, attr.span)?;
                     if !on {
+                        // A list element (argument, parameter, tuple or
+                        // array element) runs to its comma, even a
+                        // block-like one (`[#[cfg(off)] if c {1} else {2}, 3]`).
+                        if self.group.is_list() {
+                            // `vec![x; n]` takes two arguments: rustc
+                            // rejects one that cfg removes.
+                            if self.group == Group::Vec
+                                && (has_top(trees, after, Tok::Semi) || out.iter().any(|t| t.is_tok(Tok::Semi)))
+                            {
+                                return Err(err(
+                                    C_SYNTAX,
+                                    attr.span,
+                                    "`#[cfg]` cannot remove a part of `vec![value; length]`",
+                                    "Remove the attribute, or put the cfg on the whole statement.",
+                                ));
+                            }
+                            let end = elem_end(trees, after);
+                            self.check_disabled_syntax(trees, start, end, crate::parser::CfgSyntaxHint::Node, depth)?;
+                            return Ok(end);
+                        }
                         if let Some(def) = macro_rules_at(trees, after, self.ctx.interner) {
                             // A definition body is token trees rustc
                             // does not grammar-check before stripping;
@@ -3880,7 +4174,11 @@ impl<'a> Expander<'a> {
                 }
                 let written_lit = is_str_lit_arg(&call.inner);
                 let msg = if name == "assert" { builtin::assert_message(self, &call.inner, call.span)? } else { Vec::new() };
-                let mut inner = self.expand_list(call.inner.clone(), depth + args, false, false, 0)?;
+                let group = if name == "vec" { Group::Vec } else { Group::Closed };
+                let outer_group = std::mem::replace(&mut self.group, group);
+                let inner = self.expand_list(call.inner.clone(), depth + args, false, false, 0);
+                self.group = outer_group;
+                let mut inner = inner?;
                 inner.extend(msg);
                 if !written_lit && matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint" | "format" | "panic") {
                     mark_format_str(&mut inner, call.span);
