@@ -1978,10 +1978,24 @@ impl<'p> Ctx<'p> {
                     // Behind a reference (`F = Box<&C>`, `&&C`, `Box<&mut C>`)
                     // the closure is called in place by its own kind:
                     // `&C: FnOnce` calls `C` by `Fn`, `&mut C` by `FnMut`.
-                    let mode = if via_ref {
-                        kind
-                    } else {
-                        self.template_call_mode(e).or_else(|| self.view_calls.get(&e).copied()).unwrap_or(kind)
+                    // A call the opaque view made behind the same `&` layers
+                    // (`r()` on `r: &impl FnOnce()`) goes through the opaque's
+                    // bound, as in rustc: `FnOnce` moves out of `*r` (E0507)
+                    // and `FnMut` borrows it mutably (E0596), whatever the
+                    // hidden closure's kind. A `Copy` opaque copies `*r`
+                    // out: an `Fn` closure gives the same call in place.
+                    let view = self.view_calls.get(&e).copied().filter(|v| via_ref && v.refs == derefs);
+                    let mode = match view {
+                        Some(v) if v.kind == ClosureKind::FnOnce && v.copy => {
+                            if kind != ClosureKind::Fn {
+                                self.err("L0820", span, "this closure call is not supported yet", "Call the closure where it is defined.");
+                                return ERROR;
+                            }
+                            kind
+                        }
+                        Some(v) => v.kind,
+                        None if via_ref => kind,
+                        None => self.template_call_mode(e).or_else(|| self.view_calls.get(&e).map(|v| v.kind)).unwrap_or(kind),
                     };
                     self.out.closure_calls.push((e, mode));
                     self.set_res(e, Res::ClosureCall { kind: mode, derefs });

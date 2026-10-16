@@ -1896,7 +1896,7 @@ struct Ctx<'p> {
     /// The Fn trait each call of an opaque callable went through in the
     /// opaque view, which the revealed check keeps (a closure behind
     /// `impl FnOnce` is consumed even when it is `Fn`).
-    view_calls: crate::intern::FxMap<ExprId, closure::ClosureKind>,
+    view_calls: crate::intern::FxMap<ExprId, opaque::ViewCall>,
     /// The bounds of the callee opaque types this body has met, elaborated,
     /// after the fn's own env (`opaque::note_opaques`); empty until one.
     opaque_env: Vec<Predicate>,

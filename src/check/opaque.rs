@@ -302,7 +302,37 @@ pub(crate) fn opaque_bound_holds(p: &Program, tys: &impl TyIntern, t: Ty, trait_
 #[derive(Default)]
 pub(super) struct ViewOut {
     pub picks: FxMap<ExprId, picks::TraitPick>,
-    pub calls: FxMap<ExprId, closure::ClosureKind>,
+    pub calls: FxMap<ExprId, ViewCall>,
+}
+
+/// How the opaque view called an `impl Fn*` value (`ViewOut::calls`):
+/// the Fn trait, the `&` layers peeled off the callee before the opaque
+/// (`r()` on `r: &impl FnOnce()` is 1), and whether the opaque is `Copy`.
+#[derive(Clone, Copy)]
+pub(super) struct ViewCall {
+    pub kind: closure::ClosureKind,
+    pub refs: u8,
+    pub copy: bool,
+}
+
+/// The `ViewCall` of each call in an opaque view's `closure_calls`.
+fn view_calls(p: &Program, view: &Checked) -> FxMap<ExprId, ViewCall> {
+    let call = |&(e, kind): &(ExprId, closure::ClosureKind)| {
+        let (mut refs, mut copy) = (0u8, false);
+        if let Expr::Call { callee, .. } = p.ast.expr(e) {
+            let mut t = view.ty(*callee);
+            while let TyKind::Ref(_, _, inner) = view.tys.kind(t) {
+                refs += 1;
+                t = inner;
+            }
+            match view.tys.kind(t) {
+                TyKind::Opaque(..) => copy = opaque_bound_holds(p, &view.tys, t, p.gx.lang.copy),
+                _ => refs = 0,
+            }
+        }
+        (e, ViewCall { kind, refs, copy })
+    };
+    view.closure_calls.iter().map(call).collect()
 }
 
 /// How a value holds `impl Trait` values, from its type in the opaque
@@ -429,7 +459,7 @@ pub(super) fn check_fn_opaque<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'
             if !errs.is_empty() || !uses {
                 return (view, errs);
             }
-            let out = ViewOut { picks: view.trait_picks.iter().copied().collect(), calls: view.closure_calls.iter().copied().collect() };
+            let out = ViewOut { picks: view.trait_picks.iter().copied().collect(), calls: view_calls(p, &view) };
             let (mut ck, mut errs) = check_fn_mode(p, fid, OpaqueMode::Revealed, out);
             holds_from_view(p, fid, &view, &mut ck, &mut errs);
             (ck, errs)

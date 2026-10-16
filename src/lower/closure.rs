@@ -236,7 +236,9 @@ impl<'p> Lower<'p> {
         let env = match (kind, mode) {
             (ClosureKind::FnOnce, _) if moved => Operand::Move(place),
             (ClosureKind::FnOnce, _) => self.operand_from(place, cty),
-            (_, ClosureKind::FnOnce) if !by_ref => {
+            // (Behind a reference only an opaque `FnOnce` call moves: the
+            // checker's view mode, rustc E0507 on `*r`.)
+            (_, ClosureKind::FnOnce) if !by_ref || moved => {
                 let own = self.temp(cty);
                 let op = if moved { Operand::Move(place) } else { self.operand_from(place, cty) };
                 self.assign(Place::local(own), Rvalue::Use(op), span);
