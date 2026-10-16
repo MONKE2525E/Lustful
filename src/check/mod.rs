@@ -3843,6 +3843,17 @@ impl<'p> Ctx<'p> {
 
     /// True when `t` is a plain fn's item type (not a constructor), so it
     /// coerces to a function pointer backed by a slot trampoline.
+    /// The element type of `Vec<T>` behind one shared reference
+    /// (`x = &Vec<T>`, so `&&Vec<T>` coerces to a shared `&[T]` through
+    /// two derefs; ts-rust core.rs `Declarations::deref`). None for a
+    /// mutable target, which a shared reference cannot give.
+    fn shared_ref_vec_elem(&self, x: Ty, em: Mut) -> Option<Ty> {
+        match self.kind(self.resolve(x)) {
+            TyKind::Ref(_, _, v) if !em.is_mut() => self.tys.vec_elem(self.resolve(v)),
+            _ => None,
+        }
+    }
+
     fn is_fn_item(&self, t: Ty) -> bool {
         match self.kind(t) {
             TyKind::FnDef(def, _) => self.p.is_fn_item_def(def),
@@ -5821,6 +5832,7 @@ impl<'p> Ctx<'p> {
                         .tys
                         .vec_elem(self.resolve(x))
                         .or_else(|| self.tys.smart_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
+                        .or_else(|| self.shared_ref_vec_elem(x, em))
                     {
                         Some(xe) => match self.kind(y) {
                             TyKind::Slice(ye) => self.unify(xe, ye),

@@ -1108,8 +1108,9 @@ impl<'p> Lower<'p> {
                 let mut inner = self.peel(ty, 1);
                 let mut place = place.deref();
                 // `&Box<Vec<T>>` and `&Rc<Vec<T>>` slice through
-                // the smart pointer as well.
-                if let Some(b) = self.body.tys.smart_elem(inner) {
+                // the smart pointer as well, and `&&Vec<T>` through
+                // the inner reference.
+                if let Some(b) = self.slice_source_inner(inner) {
                     place = place.deref();
                     inner = b;
                 }
@@ -1221,6 +1222,16 @@ impl<'p> Lower<'p> {
     /// The type of `e` after its recorded coercion, for temporaries
     /// that hold the coerced operand: the type `operand` produces (a
     /// struct field `&[]` into `&[u8]` is a slice, not `&[u8; 0]`).
+    /// What a slice coercion's source (behind its outer reference)
+    /// derefs to on the way to the Vec or array: a smart pointer's
+    /// value, or an inner reference's target.
+    fn slice_source_inner(&self, inner: Ty) -> Option<Ty> {
+        match self.kind(inner) {
+            TyKind::Ref(_, _, b) => Some(b),
+            _ => self.body.tys.smart_elem(inner),
+        }
+    }
+
     fn coerced_ty(&mut self, e: ExprId) -> Ty {
         let ty = self.ty(e);
         match self.ck.coerce(e) {
@@ -1242,7 +1253,7 @@ impl<'p> Lower<'p> {
             }
             Coerce::SliceFromArray(m) | Coerce::SliceFromVec(m) => {
                 let mut inner = self.peel(ty, 1);
-                if let Some(b) = self.body.tys.smart_elem(inner) {
+                if let Some(b) = self.slice_source_inner(inner) {
                     inner = b;
                 }
                 let elem = match self.kind(inner) {
