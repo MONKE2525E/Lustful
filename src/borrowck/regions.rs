@@ -1196,6 +1196,12 @@ pub(super) struct OwnSig {
     /// captures its hidden type has no slot for. The ret slots' rule
     /// applies to it: only the captured universals outlive it.
     pub ret_cap: Option<Univ>,
+    /// An `impl Trait` return with a region signature: the returned
+    /// value's vars only outlive `ret_cap` (its regions are inferred, each
+    /// a captured lifetime), they equal no universal; and the universals
+    /// they must outlive (`OpaqueInfo::outlives`) and its item's regioned
+    /// type (`OpaqueInfo::item_out`, `Builder::rpit_item_edges`).
+    pub ret_vars: Option<(Vec<Univ>, Option<Ty>)>,
     /// Per type param that a dyn coercion in the body unsizes: its index
     /// and the universal that stands for it (`param_univs`).
     pub param_univ: Vec<(u32, Univ)>,
@@ -1514,6 +1520,7 @@ impl OwnSig {
             ends: Vec::new(),
             call_out: false,
             ret_cap: None,
+            ret_vars: None,
             param_univ: Vec::new(),
         };
         if closure {
@@ -1572,6 +1579,13 @@ impl OwnSig {
             let rc = own.fresh_univ(&f.name, p);
             own.names[rc as usize] = "the lifetimes the returned `impl Trait` captures".into();
             own.ret_cap = Some(rc);
+            if sig.is_some()
+                && let TyKind::Opaque(od, _) = p.tys.kind(p.ret_view(body.fn_id))
+                && let Some(info) = p.gx.opaques.get(&od)
+            {
+                let mut none = || 0;
+                own.ret_vars = Some((info.outlives.iter().map(|&r| univ_of(r, &mut none)).collect(), info.item_out));
+            }
             ret.push(rc);
             for &r in &ret {
                 if caps.is_some() && r > sig.map_or(0, |s| s.n_univ) {
@@ -3156,16 +3170,31 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
         }
         // Entry: parameter locals and the return place equal the signature.
+        let ret_vars = self.own.ret_vars.clone();
         for l in 0..=self.body.arg_count.min(self.own.slots.len().saturating_sub(1)) {
             let base = self.local_base[l];
             for (i, u) in self.own.slots[l].clone().into_iter().enumerate() {
+                if l == 0
+                    && let (Some((outlives, _)), Some(rc)) = (&ret_vars, self.own.ret_cap)
+                {
+                    self.edge(base + i as u32, rc);
+                    for &b in outlives {
+                        self.edge(base + i as u32, b);
+                    }
+                    continue;
+                }
                 self.edge(base + i as u32, u);
                 self.edge(u, base + i as u32);
             }
         }
         if let (Some(rc), Some(&c)) = (self.own.ret_cap, self.cap_var.get(&0)) {
             self.edge(c, rc);
-            self.edge(rc, c);
+            if ret_vars.is_none() {
+                self.edge(rc, c);
+            }
+        }
+        if let Some((_, Some(item))) = ret_vars {
+            self.rpit_item_edges(item);
         }
         let body = self.body;
         for (bi, b) in body.blocks.iter().enumerate() {
@@ -5186,6 +5215,47 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
         }
         vars
+    }
+
+    /// The returned iterator's items outlive the regions its `Iterator<Item
+    /// = T>` bound writes in `T` (`OwnSig::ret_vars`): per candidate item
+    /// (`iter_items`) whose slots pair with `T`'s, each slot of a named
+    /// lifetime or `'static` outlives that universal.
+    fn rpit_item_edges(&mut self, item: Ty) {
+        let t = self.body.locals[0].ty;
+        let n = self.sc.slots(t) as usize;
+        let base = self.local_base[0];
+        let vars: Vec<u32> = (0..n as u32).map(|i| base + i).collect();
+        let mut rs = Vec::new();
+        regions_of(&self.p.tys, item, &mut rs);
+        let mut cands = Vec::new();
+        // `Map<I, F, B>`'s items are its `B` slots, which the closure's
+        // output flows into at the `map` call.
+        let parts = crate::ty::iter::iter_parts(&self.body.tys, t);
+        if let Some((crate::ty::iter::IterKind::Map | crate::ty::iter::IterKind::FilterMap, a)) = parts
+            && let [i, f, b, ..] = a[..]
+        {
+            let (ni, nf, nb) = (self.sc.slots(i) as usize, self.sc.slots(f) as usize, self.sc.slots(b) as usize);
+            let at = adt_regions(self.p, &self.body.tys, t) as usize + ni + nf;
+            match vars.get(at..at + nb) {
+                Some(v) => cands.push(v.to_vec()),
+                None => return,
+            }
+        } else if !self.iter_items(t, &vars, &mut cands) {
+            return;
+        }
+        for c in cands {
+            if c.len() != rs.len() {
+                continue;
+            }
+            for (&v, &r) in c.iter().zip(&rs) {
+                let mut none = || u32::MAX;
+                let u = univ_of(r, &mut none);
+                if u != u32::MAX {
+                    self.edge(v, u);
+                }
+            }
+        }
     }
 
     /// The output slots of closure `def` that its bound output makes the

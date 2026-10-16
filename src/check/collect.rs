@@ -5630,6 +5630,7 @@ pub(crate) fn install_fn(p: &mut Program, rec: FnRecord, mode: Install) -> Local
         opaque,
         outlives,
     } = rec;
+    let has_opaque = opaque.is_some();
     if let Some((od, info)) = opaque {
         p.gx.opaques.insert(od, info);
     }
@@ -5649,7 +5650,7 @@ pub(crate) fn install_fn(p: &mut Program, rec: FnRecord, mode: Install) -> Local
         }
     };
     if let Some(rs) = region_sig {
-        if rs.opaque_caps.is_some() {
+        if rs.opaque_caps.is_some() || has_opaque {
             p.regions.opaque_sigs.insert(id, rs);
         } else {
             p.regions.fns.insert(id, rs);

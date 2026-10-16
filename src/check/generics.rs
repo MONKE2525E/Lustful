@@ -5092,6 +5092,55 @@ pub struct OpaqueInfo {
     /// `RPIT_PARAM`): a returned closure's output slots take theirs
     /// (`rpit_bound_output`).
     pub fn_outs: Vec<crate::borrowck::FnBound>,
+    /// An `Iterator<Item = T>` bound's `T` with regions (named lifetimes
+    /// `Region::Param`, `'static`): the defining body's returned items
+    /// must outlive them (`Builder::rpit_item_edges`).
+    pub item_out: Option<Ty>,
+    /// The written lifetime bounds (`+ 'a`, `+ 'static`) as regions: every
+    /// region of the returned value outlives them.
+    pub outlives: Vec<Region>,
+}
+
+/// `OpaqueInfo::item_out` and `OpaqueInfo::outlives` of the bounds of a
+/// return-position `impl Trait`. An elided lifetime there gives no item
+/// type (`'_`: no outlives region).
+fn rpit_region_bounds(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    bounds: &[TraitBound],
+) -> (Option<Ty>, Vec<Region>) {
+    let mut ks = scope.clone();
+    ks.fn_ptr_free = false;
+    ks.regions = RegionMode::Keep { next: None, elided: None };
+    let (mut item, mut outlives) = (None, Vec::new());
+    for b in bounds {
+        match b {
+            TraitBound::Lifetime(lt) => match interner.get(lt.name) {
+                "static" => outlives.push(Region::Static),
+                "_" => {}
+                _ => outlives.extend(scope.lifetimes.iter().find(|(n, _)| *n == lt.name).map(|&(_, i)| Region::Param(i))),
+            },
+            TraitBound::Trait { trait_ref, .. } => {
+                let Some(seg) = trait_ref.path.last() else { continue };
+                if interner.get(seg.name) != "Iterator" {
+                    continue;
+                }
+                let GenericArgs::Angle(args) = &seg.args else { continue };
+                for g in args {
+                    if let AstArg::Binding { name, kind: ast::BindingKind::EqTy(t), .. } = g
+                        && interner.get(*name) == "Item"
+                    {
+                        item = resolve_scoped(ast, interner, known, cx, tys, *t, &ks).ok();
+                    }
+                }
+            }
+        }
+    }
+    (item, outlives)
 }
 
 /// The def of the return-position `impl Trait` of one fn.
@@ -5806,7 +5855,8 @@ pub fn resolve_fn_sig(
                         super::use_caps::check_list(interner, &generics, c, errs);
                     }
                     let fn_outs = fn_bounds_in(ast, interner, known, tys, cx, &scope, &[(crate::borrowck::RPIT_PARAM, bounds.as_slice())]);
-                    opaque = Some((od, OpaqueInfo { owner, bounds: preds, fn_outs }));
+                    let (item_out, outlives) = rpit_region_bounds(ast, interner, known, cx, tys, &scope, bounds);
+                    opaque = Some((od, OpaqueInfo { owner, bounds: preds, fn_outs, item_out, outlives }));
                     oty
                 }
             }
@@ -6098,7 +6148,7 @@ fn region_sig(
         // An `impl Trait` with a `use<..>` list: its region signature
         // goes to `RegionTables::opaque_sigs`, whose rules never read
         // the return.
-        Some(_) if opaque_caps.is_some() => UNIT,
+        Some(t) if opaque_caps.is_some() || matches!(ast.ty(t), TyExpr::ImplTrait { .. }) => UNIT,
         Some(t) => match resolve_scoped(ast, interner, known, cx, tys, t, &rs) {
             Ok(t) => t,
             Err(d) => {
