@@ -8615,6 +8615,18 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 insert_synthetic(p, &mut ordinal, tr, guard, &[], g1, Vec::new(), Synthetic::Lang, false, span);
             }
         }
+        // The RefCell guards deref to `T` (R08), as in core: `Ref`
+        // and `RefMut`, and `RefMut` also `DerefMut`. The lock guards'
+        // records are in check/sync.rs. A `deref` call on a guard lowers
+        // as a reborrow of its target (check/convert.rs).
+        let guards = [(p.tys.mk_builtin1(|d| d.ref_guard, p0), false), (p.tys.mk_builtin1(|d| d.ref_mut_guard, p0), true)];
+        for (guard, has_mut) in guards {
+            let target = vec![(lang.assoc_target, p0)];
+            insert_synthetic(p, &mut ordinal, lang.deref, guard, &[], one.clone(), target, Synthetic::Lang, false, span);
+            if has_mut {
+                insert_synthetic(p, &mut ordinal, lang.deref_mut, guard, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+            }
+        }
     }
     // `NonZero<T>` (TRIAGE T5): Debug and Display forward to the
     // integer, as core's impls do (glue in cgen/fmt.rs). The value
