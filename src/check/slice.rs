@@ -68,6 +68,13 @@ impl<'p> Ctx<'p> {
                 (if n == "starts_with" { B::SliceStartsWith } else { B::SliceEndsWith }, Autoref::Ref, vec![r], BOOL)
             }
             "fill" => {
+                // `fill` runs `clone_from` per element; a hash
+                // table's own clone_from reuse is the same precise
+                // reject as a direct `clone_from` call.
+                if crate::check::collect::mentions_hash_table(self.p, &self.tys, elem) {
+                    self.errs.push(not_yet("L0640", name_span, "`fill` on a slice of a type holding a hash table"));
+                    return Some(self.slice_bail(args));
+                }
                 self.deferred_clone.push((elem, name_span));
                 (B::SliceFill, Autoref::RefMut, vec![elem], UNIT)
             }
