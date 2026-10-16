@@ -11320,7 +11320,8 @@ impl<'p> Ctx<'p> {
                 return f.map(|(f, _)| Res::Fn(f));
             }
         }
-        let tn = self.name(ty_name).to_string();
+        // A std source type's own name, not its hidden module path.
+        let tn = crate::intern::source_name(self.name(ty_name)).to_string();
         self.err("L0104", span, format!("no variant or associated function `{}` on `{tn}`", self.name(item)), "Check the name.");
         None
     }
