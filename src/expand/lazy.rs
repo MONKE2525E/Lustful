@@ -84,8 +84,10 @@ fn hoistable(toks: &[Token], at: usize, interner: &Interner) -> Option<Hoist> {
         return None;
     }
     let ty_start = at + 3;
-    let eq = scan_to(toks, ty_start, |t| t == Tok::Eq)?;
-    let semi = scan_to(toks, eq + 1, |t| t == Tok::Semi)?;
+    let eq = scan_to(toks, ty_start, true, |t| t == Tok::Eq)?;
+    // The initializer is an expression: `<` and `>` there may be
+    // comparisons (`.filter(|t| t.len() > 2)`), never brackets to count.
+    let semi = scan_to(toks, eq + 1, false, |t| t == Tok::Semi)?;
     // PATH: identifiers and `::` (a turbofish is not supported here).
     let mut open = eq + 1;
     while matches!(toks.get(open)?.tok, Tok::Ident(_) | Tok::PathSep) {
@@ -107,21 +109,23 @@ fn hoistable(toks: &[Token], at: usize, interner: &Interner) -> Option<Hoist> {
     }
     let span = toks[k].span;
     k += 1;
-    // One argument only: the first `,` at depth 0 inside the call may
-    // only be a trailing one (`PATH(|| BODY,)`).
-    let end = match scan_to(toks, k, |t| t == Tok::Comma) {
-        Some(c) if c + 1 == close => c,
-        Some(c) if c < close => return None,
-        _ => close,
-    };
+    // One argument only: after the closure comes `)` or a trailing
+    // `,)` (`PATH(|| BODY,)`).
     let (ret, body) = if toks.get(k)?.tok == Tok::Arrow {
         // `|| -> R { .. }`: the body is the block after the written type.
-        let lb = scan_to(toks, k + 1, |t| t == Tok::LBrace)?;
-        if lb >= end || matching_close(toks, lb)? != end - 1 {
+        let lb = scan_to(toks, k + 1, true, |t| t == Tok::LBrace)?;
+        let rb = matching_close(toks, lb)?;
+        let trailing = rb + 2 == close && toks[rb + 1].tok == Tok::Comma;
+        if lb >= close || !(rb + 1 == close || trailing) {
             return None;
         }
-        (toks[k + 1..lb].to_vec(), lb..end)
+        (toks[k + 1..lb].to_vec(), lb..rb + 1)
     } else {
+        let end = match scan_to(toks, k, false, |t| t == Tok::Comma) {
+            Some(c) if c + 1 == close => c,
+            Some(c) if c < close => return None,
+            _ => close,
+        };
         (lazy_value_ty(&toks[ty_start..eq], interner)?, k..end)
     };
     if body.is_empty() {
@@ -132,17 +136,25 @@ fn hoistable(toks: &[Token], at: usize, interner: &Interner) -> Option<Hoist> {
 }
 
 /// The first index at or after `from` whose token satisfies `want`, at
-/// bracket depth 0 (parens, brackets, braces, and angle brackets), or
-/// None when the enclosing group closes first.
-fn scan_to(toks: &[Token], from: usize, want: impl Fn(Tok) -> bool) -> Option<usize> {
+/// bracket depth 0 (parens, brackets, braces, and with `angles` angle
+/// brackets: in a type, not in an expression), or None when the
+/// enclosing group closes first.
+fn scan_to(toks: &[Token], from: usize, angles: bool, want: impl Fn(Tok) -> bool) -> Option<usize> {
     let mut depth = 0i32;
     for (i, t) in toks.iter().enumerate().skip(from) {
         if depth == 0 && want(t.tok) {
             return Some(i);
         }
         match t.tok {
-            Tok::LParen | Tok::LBracket | Tok::LBrace | Tok::Lt => depth += 1,
-            Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Gt => {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+            Tok::Lt if angles => depth += 1,
+            Tok::Gt if angles => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            Tok::RParen | Tok::RBracket | Tok::RBrace => {
                 depth -= 1;
                 if depth < 0 {
                     return None;
