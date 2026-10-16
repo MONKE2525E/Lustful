@@ -345,7 +345,8 @@ pub(crate) fn reveal_again(p: &mut Program, f: LocalDefId, old_ret: crate::ty::T
 }
 
 /// A test hook (`LUST_SIGDELTA_SELFTEST=1`, or `v` to print counts,
-/// timing, and the refusal census): after a clean collect, redoes the
+/// timing, and the refusal census, also to the file `LUST_SIGDELTA_CENSUS`
+/// names): after a clean collect, redoes the
 /// signature of every plain or template free fn and inherent method on the
 /// same Ast (`redo_sig`). The digest must stay the same, no diagnostic may
 /// appear, and a plain fn's `impl Trait` return must reveal the same hidden
@@ -402,6 +403,15 @@ pub fn self_test_if_asked(p: &mut Program) {
     if mode == "v" {
         let mean = total.as_secs_f64() * 1e3 / redone.max(1) as f64;
         eprintln!("sigdelta selftest: {redone} fns redone, digest stands; mean {mean:.3} ms, max {:.3} ms", worst.as_secs_f64() * 1e3);
-        eprintln!("sigdelta census: {:?}", crate::driver::kept_delta::census(p));
+        let census = format!("sigdelta census: {} fns {:?}", p.fns.len(), crate::driver::kept_delta::census(p));
+        eprintln!("{census}");
+        // A daemon's stderr is often not kept: `LUST_SIGDELTA_CENSUS`
+        // names a file that gets the line too.
+        if let Ok(path) = std::env::var("LUST_SIGDELTA_CENSUS") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{census}");
+            }
+        }
     }
 }
