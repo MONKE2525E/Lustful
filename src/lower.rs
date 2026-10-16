@@ -403,11 +403,15 @@ impl<'p> Lower<'p> {
     /// checker recorded for this expression (W-TRAITS-CORE through
     /// the lower owner). Plain fns answer themselves.
     /// The checker's regioned `let` annotations (W-BORROW) on the IR
-    /// locals their bindings lowered to.
+    /// locals their bindings lowered to. In a closure body, a captured
+    /// variable's shadow local takes none: the enclosing body's own `let`
+    /// holds that annotation, and the capture's regions are the closure's
+    /// captured ones, which its requirements relate there.
     fn map_annotations(&mut self) {
         for &(cl, t) in &self.ck.annotations {
             if let Some(&l) = self.local_map.get(cl as usize)
                 && l != u32::MAX
+                && !self.upvars.as_ref().is_some_and(|u| u.shadows(l))
             {
                 self.body.annotations.push((l, t));
             }

@@ -30,6 +30,13 @@ pub(super) struct Upvars {
 }
 
 impl Upvars {
+    /// True when `l` is the shadow local of a captured variable.
+    pub(super) fn shadows(&self, l: Local) -> bool {
+        self.shadow.iter().any(|&(s, _)| s == l)
+    }
+}
+
+impl Upvars {
     fn root_of(&self, l: Local) -> Option<u32> {
         self.shadow.iter().find(|(s, _)| *s == l).map(|(_, r)| *r)
     }
@@ -156,8 +163,8 @@ pub fn lower_closure<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -
     lw.expr_into(*body_expr, Some(&Place::local(0)));
     lw.pop_scope(span);
     lw.terminate(Terminator::Return, span);
-    lw.rewrite_upvars();
     lw.map_annotations();
+    lw.rewrite_upvars();
     lw.mark_opaque_locals();
     lw.body
 }
