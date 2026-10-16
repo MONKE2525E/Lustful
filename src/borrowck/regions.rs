@@ -7035,6 +7035,47 @@ impl<'b, 'p> Builder<'b, 'p> {
         })
     }
 
+    /// In a closure body: per lifetime `'k` of the enclosing fn (by `k`),
+    /// the universal of a closure parameter slot whose annotation names it
+    /// (`|p: &mut Parser<'a>, _| parse_element(p)`), when every lifetime
+    /// that the regioned types `tys` name has one. Its creator ties such a
+    /// slot to that lifetime (`closure_arg_slots`), so a call through the
+    /// enclosing fn's `Fn` bound may bind `'k` to it. Other entries are
+    /// fresh vars (no named input uses them).
+    fn closure_named_univs(&mut self, tys: &[Ty]) -> Option<Vec<u32>> {
+        let p = self.p;
+        let c = p.gx.closure_fns.get(&self.body.fn_id).and_then(|d| p.gx.closures.get(d))?;
+        let slots = closure_arg_slots(&mut self.sc, c).ok()?;
+        let mut map: Vec<Option<u32>> = Vec::new();
+        let mut at = 0usize;
+        for l in 2..=self.body.arg_count {
+            let us = self.own.slots.get(l)?.clone();
+            for (s, &u) in us.iter().enumerate() {
+                if let Some((_, Some(Region::Param(k)))) = slots.get(at + s)
+                    && u != 0
+                {
+                    let k = *k as usize;
+                    if map.len() <= k {
+                        map.resize(k + 1, None);
+                    }
+                    map[k].get_or_insert(u);
+                }
+            }
+            at += us.len();
+        }
+        if at != slots.len() {
+            return None;
+        }
+        let mut rs = Vec::new();
+        for &t in tys {
+            regions_of(&p.tys, t, &mut rs);
+        }
+        if rs.iter().any(|r| matches!(r, Region::Param(k) if map.get(*k as usize).copied().flatten().is_none())) {
+            return None;
+        }
+        Some(map.into_iter().map(|u| u.unwrap_or_else(|| self.fresh())).collect())
+    }
+
     fn call_fn_bound(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         let p = self.p;
         if p.gx.fn_class.get(f.0 as usize) != Some(&crate::check::generics::FnClass::Stub) {
@@ -7059,6 +7100,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         if !is_call {
             return false;
         }
+        let mut closure_univ: Vec<u32> = Vec::new();
         if self.own.closure {
             let named = |ts: &[Ty]| {
                 let mut rs = Vec::new();
@@ -7067,22 +7109,29 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 rs.iter().any(|r| matches!(r, Region::Param(_)))
             };
-            // An input that must live for the fn's lifetime cannot be
-            // proved here; an output that does takes the conservative rule.
-            if named(&b.inputs) {
-                self.errs.push(Diag::new(
-                    "L0203",
-                    self.span,
-                    "a call inside a closure through an `Fn` bound whose argument names a lifetime of the enclosing fn is not supported yet",
-                    "Make the call outside the closure, or write the bound with an elided lifetime.",
-                ));
-                return false;
-            }
+            // An input that must live for the fn's lifetime is proved here
+            // only when a parameter annotation names that lifetime (its
+            // slot stands for it, `closure_named_univs`); an output that
+            // names one takes the conservative rule.
             if b.output.is_some_and(|o| named(&[o])) {
                 return false;
             }
+            if named(&b.inputs) {
+                match self.closure_named_univs(&b.inputs) {
+                    Some(u) => closure_univ = u,
+                    None => {
+                        self.errs.push(Diag::new(
+                            "L0203",
+                            self.span,
+                            "a call inside a closure through an `Fn` bound whose argument names a lifetime of the enclosing fn is not supported yet",
+                            "Annotate the closure parameter with that lifetime, make the call outside the closure, or write the bound with an elided lifetime.",
+                        ));
+                        return false;
+                    }
+                }
+            }
         }
-        let univ: Vec<u32> = if self.own.closure { Vec::new() } else { (1..=sig.n_univ).collect() };
+        let univ: Vec<u32> = if self.own.closure { closure_univ } else { (1..=sig.n_univ).collect() };
         let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
         self.bind_tys.clear();
         let mut ok = true;
