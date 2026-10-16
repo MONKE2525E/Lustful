@@ -17805,8 +17805,21 @@ impl<'p> Ctx<'p> {
                     }
                 }
             }
-            let at = self.tys.adt_ty(a);
+            // The base has the literal's own type (type-changing update
+            // is unstable): `Hooks<u8> { a, ..Hooks::default() }`.
+            let at = if gen_args.is_empty() {
+                self.tys.adt_ty(a)
+            } else {
+                let (def, _) = p.gx.adt_info[a.0 as usize];
+                self.tys.mk_adt(def, &gen_args)
+            };
             self.expect_expr(u, at);
+            if !gen_args.is_empty() {
+                let preds = p.gx.adt_generics[a.0 as usize].predicates.clone();
+                if !preds.is_empty() {
+                    self.push_predicates(&preds, &gen_args, span);
+                }
+            }
             return at;
         }
         let missing: Vec<String> =
