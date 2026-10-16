@@ -1589,13 +1589,18 @@ impl<'a> Program {
     }
 
     /// The method candidate set without recording. See `binding_res`.
+    /// Mono instances of an inherent template join the compat method
+    /// table (`generics::fn_instance`), but the template is the
+    /// candidate: which instances exist depends on what collect
+    /// materialized, so with them the set (and a `MethodSet` read)
+    /// would differ between a warm and a cold program of the same text.
     fn method_candidates(&self, head: Head, name: Sym, form: ReceiverForm) -> MethodSet {
         let mut set = MethodSet::default();
         if let Head::Adt(def) = head
             && let Some(a) = self.adt_by_def(def)
             && let Some(fs) = self.methods.get(&(a, name))
         {
-            for &f in fs {
+            for &f in fs.iter().filter(|f| self.gx.fn_class.get(f.0 as usize) != Some(&crate::check::generics::FnClass::Instance)) {
                 let receiver = match self.fn_info(f).self_kind {
                     Some(SelfKind::Value) | Some(SelfKind::Typed) => Some(ReceiverForm::Value),
                     Some(SelfKind::Ref) => Some(ReceiverForm::Ref),
