@@ -87,6 +87,7 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
     let items = std::mem::take(&mut p.regions.outlives_items);
     // Body annotations read the Adt tables too (`check_body_ty`).
     infer_adts(p);
+    check_adt_statics(p, errs);
     for it in items {
         if let Some(d) = check_item(p, &it) {
             errs.push(d);
@@ -636,13 +637,17 @@ fn infer_adts(p: &mut Program) {
             }
             let env = implied_env(&cx, &mut p.tys, &fields, &facts, &[]);
             let mut table: Vec<Req> = Vec::new();
+            // rustc infers no `'static` requirement from fields: only a
+            // declared `'a: 'static` or `T: 'static` counts (a field that
+            // needs one undeclared is `check_adt_statics`'s error).
+            let declared_static = |x: Region| matches!(x, Region::Param(i) if facts.contains(&(i, STATIC_FACT)));
             for &(x, r) in &env.re {
-                if matches!(x, Region::Param(_)) && named(r) && x != r && !table.contains(&(GenericArg::Lifetime(x), r)) {
+                if matches!(x, Region::Param(_)) && named(r) && x != r && (r != Region::Static || declared_static(x)) && !table.contains(&(GenericArg::Lifetime(x), r)) {
                     table.push((GenericArg::Lifetime(x), r));
                 }
             }
             for &(x, r) in &env.ty {
-                if named(r) && !table.contains(&(GenericArg::Ty(x), r)) {
+                if named(r) && r != Region::Static && !table.contains(&(GenericArg::Ty(x), r)) {
                     table.push((GenericArg::Ty(x), r));
                 }
             }
@@ -661,6 +666,38 @@ fn infer_adts(p: &mut Program) {
         }
         if !changed {
             break;
+        }
+    }
+}
+
+/// rustc E0310 / E0478 at an Adt definition: a field that needs `T: 'static`
+/// or `'a: 'static` needs the Adt to declare it (`struct S<T>(In<T>)` with
+/// `struct In<T: 'static>` is an error; rustc infers no `'static` bound).
+/// Std source Adts are valid as written.
+fn check_adt_statics(p: &mut Program, errs: &mut Vec<Diag>) {
+    let mut defs: Vec<DefId> = p.regions.adt_fields.keys().copied().collect();
+    defs.sort_by_key(|d| (d.krate.0, d.hash.0));
+    for d in defs {
+        let Some(a) = p.adt_by_def(d) else { continue };
+        let span = p.adt(a).span;
+        if p.shipped_crate_at(span).is_some() || p.in_lang_methods(span) {
+            continue;
+        }
+        let cx = Cx { regions: &p.regions, index: &p.gx.index };
+        let fields: Vec<Ty> = cx.regions.adt_fields[&d].iter().flatten().copied().collect();
+        if !fields.iter().any(|&t| may_need(&cx, &p.tys, t)) {
+            continue;
+        }
+        let facts = cx.regions.adt_facts.get(&d).cloned().unwrap_or_default();
+        let preds = p.gx.adt_generics[a.0 as usize].predicates.clone();
+        let env = implied_env(&cx, &mut p.tys, &[], &facts, &preds);
+        let mut reqs = Vec::new();
+        for &t in &fields {
+            let t = expand_free(&mut p.tys, t);
+            wf(&cx, &mut p.tys, t, &mut reqs);
+        }
+        if let Some(&(g, r)) = reqs.iter().find(|&&(g, r)| r == Region::Static && !holds(&cx, &p.tys, &env, g, r)) {
+            errs.push(diag(&cx, &p.tys, &env, g, r, span));
         }
     }
 }
